@@ -39,7 +39,10 @@ consumers — external-facing, publish candidate), `scripts/tools/stelops`,
 
 ## P0 — speed + repo bootstrap
 
-- [ ] Deploy VEL fixes (prebuild + vote pipeline, in tree, harness 1744→635ms) to all 4 nodes, measure 45 min (target: mean ≤1.0s, p99 <2s, zero >5s). Twice aborted — needs a live window.
+- [x] Deploy VEL fixes (prebuild + vote pipeline, build `573d86f5`) to all 4 nodes
+  (2026-10-29 rolling, `.old` kept): no divergence/panics, all finalizing.
+  Tempo 8.2 s/blk (dirty window) → ~2.5 s/blk sustained; rounds 6200+ → single
+  digits converging. r0 still rarely decides (slow-proposer slots + WAN).
 - [x] `git init` + baseline commit (833c71e); nested repos absorbed (history in `.archive/nested-history.txt`)
 - [x] Per-part private remotes carry `hdae-baseline-2026-10-29` (main/agent branches untouched):
   `immtes/stellereum`, `immtes/infnode` (renamed from infmail-valid-backend),

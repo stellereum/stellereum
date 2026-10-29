@@ -15,7 +15,10 @@ Machine state: `STATUS.md`. Why: `docs/specs/`.
 ## P0 — speed + repo bootstrap
 
 - [ ] Deploy VEL fixes (prebuild + vote pipeline, in tree, harness 1744→635ms) to all 4 nodes, measure 45 min (target: mean ≤1.0s, p99 <2s, zero >5s). Twice aborted — needs a live window.
-- [ ] `git init` + first commit (blocks ALL of Phase 5 worktrees).
+- [x] `git init` + baseline commit (833c71e); nested repos absorbed (history in `.archive/nested-history.txt`)
+- [x] Per-part private remotes carry `hdae-baseline-2026-10-29` (main/agent branches untouched):
+  `immtes/stellereum`, `immtes/infnode` (renamed from infmail-valid-backend),
+  `immtes/stellereum-contracts`, `immtes/stell-wallet`, `immtes/stellereum-indexer`
 - [ ] Hour-long block-time measurement (read-only) to settle sustained-tempo baseline.
 
 ## P1 — product gaps

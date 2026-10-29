@@ -48,7 +48,8 @@ consumers — external-facing, publish candidate), `scripts/tools/stelops`,
 
 ## P2 — hygiene
 
-- [ ] `cargo fmt` whole tree (advisory-dirty everywhere now) + flip fmt to hard gate.
+- [x] `cargo fmt` whole tree (commit `fc028d9`, mechanical, checks green)
+- [ ] Flip fmt to hard gate (currently advisory in `verify_testnet_ideal.sh`).
 - [ ] Install: `just`, `cargo-nextest`, `sccache`/`mold` (all absent; scripts degrade gracefully).
 - [ ] System disk 86% (outside repo scope — operator level).
 

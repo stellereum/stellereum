@@ -1,4 +1,6 @@
-//! §2 zkML, SUCCINCT half: Groth16 over BLS12-381 on the live block path.
+//! §2 zkML, ATTESTATION half: PQ-STARK-BLAKE3 (`STELLEREUM_PQ_STARK_BLAKE3_V1`)
+//! trace attestations on the live block path (Groth16/arkworks were replaced;
+//! there is no succinct ZK here — see `zkml_capabilities()`).
 //!
 //! Companion to `tests/zkml_live_tests.rs` (the re-execution half). What this
 //! file pins end to end:
@@ -8,7 +10,8 @@
 //!   (`snark::prove_attestation`) -> on-chain verify
 //!   (`SysCallVerifyZkMlAttestation`, discriminant 38);
 //! * the verify handler's binding checks (model hash, VK hash, I/O shape,
-//!   input range) and its cryptographic core (`ark_groth16::verify`);
+//!   input range) and its cryptographic core (BLAKE3 Merkle-trace recompute,
+//!   NOT `ark_groth16::verify`);
 //! * the constrained-format gate (i8 weights / u16 inputs / bounded
 //!   accumulator): legacy unbounded models keep the re-execution path but
 //!   are refused a VK;
@@ -1558,4 +1561,32 @@ fn snark_production_single_party_setup_marks_attestation() {
 
     // Empty attestation refused even on the production path.
     assert!(model_spec_with_attestation(&m.attestation_view(), vec![]).is_err());
+}
+
+#[test]
+fn snark_proof_leaves_inputs_and_outputs_public_no_hiding() {
+    // LIMIT pin ("NOT zero-knowledge, NOT hiding"): the attestation proof
+    // carries the public inputs AND outputs IN THE CLEAR — anyone holding the
+    // proof reads them. If a future change encrypted or removed them, this
+    // fails; the honest name stays "re-execution attestation".
+    let m = tiny_model();
+    let (pk_bytes, vk) = test_setup(&m, ATTEST_TEST_SEED);
+    let (out, proof) = prove_for(&m, &[3, 4], &pk_bytes, &vk);
+    assert_eq!(proof.public_inputs, vec![3u64, 4], "inputs ride in the clear");
+    assert_eq!(
+        proof.public_outputs,
+        out.iter().map(|&x| x as u64).collect::<Vec<_>>(),
+        "outputs ride in the clear"
+    );
+    assert_eq!(
+        proof.public_outputs,
+        vec![11u64, 7],
+        "outputs are the forward pass"
+    );
+    // And the machine-readable statement agrees: sound, but neither
+    // zero-knowledge nor succinct nor hiding.
+    let caps = stellereum::zkml::zkml_capabilities();
+    assert!(caps.sound);
+    assert!(!caps.zero_knowledge && !caps.succinct && !caps.hiding);
+    assert!(caps.protocol.contains("re-execution"));
 }

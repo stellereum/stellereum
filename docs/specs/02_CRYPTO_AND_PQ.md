@@ -28,6 +28,18 @@ Source of truth in code: `stellereum/src/post_quantum.rs`, `bls.rs`,
 - Consensus votes: chain-id + height/round bound preimages (see spec 04).
 - `STELL-MSGSIG-V1` envelopes also carry paymaster sponsor fields.
 
+## zkML (verifiable inference by re-execution — NOT succinct ZK)
+
+- Protocol tag `STELLEREUM_PQ_STARK_BLAKE3_V1` (`zkml_attestation.rs`):
+  BLAKE3 Merkle-trace attestations, verifier recomputes. Groth16/arkworks
+  were removed (no ark dependency); legacy `snark_*` helper names remain.
+- `zkml_capabilities()`: sound, NOT zero-knowledge, NOT succinct, NOT hiding;
+  TEST-ONLY deterministic setups are refused a VK on the live path.
+- ML-DSA-44 (`0x03`): fail-closed DISABLED — `from_id(3)` errs, verify
+  returns false, registry refuses (pinned by `mldsa_*` tests).
+- Phase-1 tracks live in `stellereum/docs/PLAN-VRF.md` (VRF: math bound, NOT wired into
+  sortition) and `stellereum/docs/PLAN-POP.md` (BLS PoP: format exists, gate unchanged).
+
 ## Invariants (executable: `cargo test -p stellereum --lib post_quantum`)
 
 1. FIPS-206 test vectors pass; non-FIPS Falcon code paths are absent.

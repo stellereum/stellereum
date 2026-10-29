@@ -273,17 +273,33 @@ mod tests {
         assert_eq!(dy, 3_626);
         assert_eq!(get_reserve_a(0), 11_000);
         assert_eq!(get_reserve_b(0), 40_000 - 3_626);
+        // Constant-product invariant: the fee stays in the pool, so k grows.
+        let k_after_ab = 11_000i64 * (40_000 - 3_626) as i64;
+        assert_eq!(k_after_ab, 400_114_000);
+        assert!(k_after_ab > 10_000i64 * 40_000, "k must grow by the fee leg");
 
         // Swap B -> A (Reverse Swap): sell 3,000 Token B
         let quote_ba = swap_quote_b_for_a(3_000);
-        assert!(quote_ba > 0);
+        assert_eq!(quote_ba, 835);
         let dx_back = swap_b_for_a(3_000);
         assert_eq!(dx_back, quote_ba);
+        assert_eq!(get_reserve_a(0), 11_000 - 835);
+        assert_eq!(get_reserve_b(0), (40_000 - 3_626) + 3_000);
+        assert_eq!(get_total_shares(0), 25_000, "swaps must not mint shares");
+        let k_after_ba = (11_000 - 835) as i64 * ((40_000 - 3_626) + 3_000) as i64;
+        assert_eq!(k_after_ba, 400_236_710);
+        assert!(
+            k_after_ba > k_after_ab,
+            "k must grow monotonically across fee swaps"
+        );
 
         // Withdraw half shares
         let with_arg = 1_000_000 + 5_000;
         let payout_a = withdraw(with_arg);
-        assert!(payout_a > 0);
+        assert_eq!(payout_a, 2_033, "5k/25k of 10_165 reserve A");
         assert_eq!(shares_of(1), 20_000);
+        assert_eq!(get_total_shares(0), 20_000, "burned shares leave supply");
+        assert_eq!(get_reserve_a(0), 10_165 - 2_033);
+        assert_eq!(get_reserve_b(0), 39_374 - 7_874);
     }
 }

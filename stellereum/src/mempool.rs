@@ -37,7 +37,16 @@ pub struct PendingActivationBuffer {
 }
 
 impl PendingActivationBuffer {
+    /// Per-account cap on buffered out-of-order nonces (mirrors
+    /// [`MAX_ACTIVATION_BUFFER_NONCES_PER_ACCOUNT`]).
+    ///
+    /// Safety role (admission DoS bound): one account cannot eat the whole
+    /// global buffer and lock out legitimate unactivated accounts.
     pub const MAX_NONCES_PER_ACCOUNT: usize = MAX_ACTIVATION_BUFFER_NONCES_PER_ACCOUNT;
+    /// Global ceiling on buffered activation transactions.
+    ///
+    /// Safety role (memory DoS bound): caps total buffered bytes across all
+    /// accounts; overflow reports [`MempoolError::Full`] (fail-closed).
     pub const MAX_GLOBAL_BUFFERED_TXS: usize = 2048;
 
     pub fn new() -> Self {

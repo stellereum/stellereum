@@ -602,3 +602,72 @@ async fn staking_lazy_reward_accumulator_moves_the_root() {
          move the root"
     );
 }
+
+/// Monolithic snapshot/restore round-trip: a snapshot restores byte-identical
+/// state (same root, same balances), while truncated or garbage bytes are
+/// refused fail-closed with the live engine untouched.
+///
+/// Gap pin: the chunked path pins poisoned-chunk refusal elsewhere, but the
+/// monolithic `create_snapshot`/`restore_snapshot` round-trip had no
+/// integration pin in the snapshot/sync/state-root scope — a silent partial
+/// restore here would fork the node from the network under one root.
+#[tokio::test]
+async fn monolithic_snapshot_restore_roundtrip_preserves_root_and_refuses_garbage() {
+    // Positive: snapshot then restore lands on the identical root.
+    let src = InMemoryStateEngine::new();
+    let a = funded_key(41).verifying_key().to_bytes();
+    let b = funded_key(42).verifying_key().to_bytes();
+    src.credit_native(&a, 1_000_000).await.expect("credit");
+    src.credit_native(&b, 2_000_000).await.expect("credit");
+    let root = src.get_state_root().await;
+    let bytes = src.create_snapshot().await;
+    assert!(!bytes.is_empty(), "snapshot must carry state");
+
+    let dst = InMemoryStateEngine::new();
+    dst.restore_snapshot(&bytes)
+        .await
+        .expect("valid snapshot restores");
+    assert_eq!(
+        dst.get_state_root().await, root,
+        "restore must reproduce the snapshotted root"
+    );
+    assert_eq!(dst.get_account(&a).await.unwrap().balance, 1_000_000);
+    assert_eq!(dst.get_account(&b).await.unwrap().balance, 2_000_000);
+
+    // Negative fail-closed: truncated and garbage snapshots are refused and
+    // leave the live engine untouched.
+    let victim = InMemoryStateEngine::new();
+    let keep = funded_key(43).verifying_key().to_bytes();
+    victim
+        .credit_native(&keep, 999_999)
+        .await
+        .expect("credit");
+    let root_before = victim.get_state_root().await;
+
+    let cut = bytes.len() / 2;
+    assert!(cut > 0, "snapshot must be non-empty");
+    let err = victim
+        .restore_snapshot(&bytes[..cut])
+        .await
+        .expect_err("truncated snapshot must be refused");
+    assert!(!err.is_empty(), "refusal must say why");
+    assert_eq!(
+        victim.get_account(&keep).await.unwrap().balance,
+        999_999,
+        "refused restore must not touch accounts"
+    );
+    assert_eq!(
+        victim.get_state_root().await, root_before,
+        "refused restore must not move the root"
+    );
+
+    let err = victim
+        .restore_snapshot(&[0xDE, 0xAD, 0xBE, 0xEF])
+        .await
+        .expect_err("garbage snapshot must be refused");
+    assert!(!err.is_empty(), "refusal must say why");
+    assert_eq!(
+        victim.get_state_root().await, root_before,
+        "refused restore must not move the root"
+    );
+}

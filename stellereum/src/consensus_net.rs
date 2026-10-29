@@ -74,9 +74,17 @@ pub const MAX_CONSENSUS_MSG: usize = 32 * 1024 * 1024;
 pub const MAX_TX_MSG: usize = 1024 * 1024;
 
 /// Max consensus messages carried in one batch (P3-H4 gossip batching).
+///
+/// Safety role (DoS bound + liveness): bounds per-batch verify work so one
+/// gossip batch cannot force unbounded signature checks; large enough that an
+/// honest round's votes still fit in few batches.
 pub const MAX_BATCH_ITEMS: usize = 32;
 
 /// Max encoded bytes of a single batch (P3-H4 gossip batching).
+///
+/// Safety role (DoS bound): caps batch wire size far below
+/// [`MAX_CONSENSUS_MSG`] so a single peer cannot force a 32 MiB
+/// deserialize/verify from one envelope.
 pub const MAX_BATCH_BYTES: usize = 512 * 1024;
 
 /// A broadcast sub-stage slower than this is logged at WARN (rate-limited);
@@ -499,6 +507,10 @@ struct PeerHealth {
 }
 
 /// Skip a peer after this many consecutive failures.
+///
+/// Safety role (liveness): one slow/dead peer's consecutive timeouts stop
+/// stalling the flush once the streak reaches this bound; a single timeout
+/// never skips (avoids cascade evictions).
 const PEER_SKIP_THRESHOLD: u32 = 3;
 /// ...and retry it after this long (short cooldown so reconnects don't stall consensus).
 const PEER_SKIP_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);

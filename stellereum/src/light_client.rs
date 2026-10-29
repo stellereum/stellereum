@@ -2554,6 +2554,69 @@ mod tests {
     }
 
     #[test]
+    fn test_archive_proof_rejects_tampered_proof_nodes_fail_closed() {
+        // Fail-closed pin at the light-client layer: a proof that is genuine
+        // except for tampered wire nodes (or a mismatched value) is about a
+        // trusted root yet does not authenticate there, so it is refused as
+        // `NotIncluded` — never verified, never trusted.
+        let (trie, root, present, missing) = archive_trie();
+        let lc = client_for(root);
+
+        // Inclusion: flip a byte in the last wire node.
+        let trie_proof = trie.generate_proof(&present).expect("proof");
+        let mut tampered =
+            crate::cpat2::ArchiveProof::inclusion(7, root, present, &trie_proof).expect("archive");
+        assert!(lc.verify_archive_proof(&tampered).is_ok(), "sanity: untampered verifies");
+        let last = tampered.proof_nodes.len() - 1;
+        let mut raw = hex::decode(&tampered.proof_nodes[last]).expect("nodes are hex");
+        raw[0] ^= 0xFF;
+        tampered.proof_nodes[last] = hex::encode(raw);
+        assert!(!tampered.verify(), "sanity: tampered nodes break the proof itself");
+        assert!(matches!(
+            lc.verify_archive_proof(&tampered),
+            Err(LightError::NotIncluded { .. })
+        ));
+        assert!(lc.verify_archive_proof_json(&tampered.to_json()).is_err());
+
+        // Inclusion with genuine nodes but a mismatched value.
+        let mut wrong_value =
+            crate::cpat2::ArchiveProof::inclusion(7, root, present, &trie_proof).expect("archive");
+        wrong_value.value = Some(b"something-else".to_vec());
+        assert!(!wrong_value.verify());
+        assert!(matches!(
+            lc.verify_archive_proof(&wrong_value),
+            Err(LightError::NotIncluded { .. })
+        ));
+
+        // Exclusion: tampered nodes fail closed too.
+        let trie_excl = trie
+            .generate_exclusion_proof(&missing)
+            .expect("exclusion proof");
+        let mut tampered_excl =
+            crate::cpat2::ArchiveProof::exclusion(7, root, missing, &trie_excl).expect("archive");
+        assert!(
+            lc.verify_archive_proof(&tampered_excl).is_ok(),
+            "sanity: untampered exclusion verifies"
+        );
+        let last = tampered_excl.proof_nodes.len() - 1;
+        let mut raw = hex::decode(&tampered_excl.proof_nodes[last]).expect("nodes are hex");
+        raw[0] ^= 0xFF;
+        tampered_excl.proof_nodes[last] = hex::encode(raw);
+        assert!(!tampered_excl.verify());
+        assert!(matches!(
+            lc.verify_archive_proof(&tampered_excl),
+            Err(LightError::NotIncluded { .. })
+        ));
+
+        // Garbage nodes fail closed, never as an empty proof.
+        let mut garbage =
+            crate::cpat2::ArchiveProof::inclusion(7, root, present, &trie_proof).expect("archive");
+        garbage.proof_nodes = vec!["zz".to_string()];
+        assert!(!garbage.verify());
+        assert!(lc.verify_archive_proof(&garbage).is_err());
+    }
+
+    #[test]
     fn test_historical_root_answer_becomes_a_trusted_checkpoint() {
         // End to end: the client follows a QC-anchored chain from its trusted
         // anchor, then verifies an archive proof against the adopted root.

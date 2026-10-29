@@ -29,10 +29,11 @@ use stellereum::bridge::{
     LARGE_WITHDRAWAL_THRESHOLD_NANO, WITHDRAWAL_TIME_LOCK_SECS,
 };
 use stellereum::commitment::{commitment_digest, CommitmentSnapshot};
-use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
+use stellereum::sharding::{Block, Transaction, BASE_WORKCHAIN_SHARD_INITIAL, MASTERCHAIN_SHARD};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::svm::{OpCode, GAS_BRIDGE_INTENT};
+use stellereum::xshard2pc::XpcActivation;
 
 /// Fixed, realistic block timestamp. Never 0: 0 is exactly the bug I12 pins.
 const TS: u64 = 1_760_000_000;
@@ -1423,4 +1424,138 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
         )
         .await;
     assert_eq!(out.status, vec![false], "release of refunded request fails");
+}
+
+// ===========================================================================
+// C7 shard gate pin: bridge intents settle on the masterchain ONLY.
+// (`state_engine.rs`: settling the same intents on a workchain would credit
+// twice against per-engine state, so the block path fails closed when
+// `cross_shard_enabled && tx.source_shard != MASTERCHAIN_SHARD`.)
+// The control proves the refusal is the gate, not a broken intent: the same
+// quorum deposit+attest pair applies on the masterchain and is refused from
+// a workchain shard, crediting nobody and committing no replay entry.
+// ===========================================================================
+
+/// A workchain-source transaction carrying bridge intents, on an engine with
+/// cross-shard enabled (so the C7 condition is fully armed).
+fn workchain_bridge_tx(payer: &SigningKey, nonce: u64, ops: Vec<OpCode>) -> Transaction {
+    let gas = GAS_BRIDGE_INTENT * ops.len() as u64 + 1_000;
+    Transaction::sign_with_payload(
+        payer,
+        payer.verifying_key().to_bytes(),
+        0,
+        gas,
+        nonce,
+        BASE_WORKCHAIN_SHARD_INITIAL,
+        BASE_WORKCHAIN_SHARD_INITIAL,
+        ops,
+    )
+}
+
+#[tokio::test]
+async fn bridge_intents_from_a_workchain_are_refused() {
+    let (e, vals) = setup(3).await;
+    // Premise: cross-shard starts OFF; the gate needs it ON to arm.
+    assert!(
+        !e.cross_shard_enabled(),
+        "fresh engine must not enable cross-shard by default"
+    );
+    e.enable_cross_shard();
+    assert!(e.cross_shard_enabled());
+
+    let payer = key(0x0B);
+    let payer_pk = payer.verifying_key().to_bytes();
+    e.credit_native(&payer_pk, STELL).await.expect("fund payer");
+
+    // Control: quorum deposit on the masterchain applies exactly once.
+    let recipient_mc = [0xB0u8; 32];
+    let dep_mc = deposit([0x81u8; 32], recipient_mc, 1_000 * STELL);
+    let att_mc = attest(&dep_mc, &vals[..2]);
+    let out = e
+        .apply_block_transition(
+            &bridge_block(1, TS, vec![bridge_tx(&payer, 0, ops(Some(att_mc), dep_mc))], payer_pk),
+            0,
+        )
+        .await;
+    assert_eq!(out.status, vec![true], "control quorum deposit must apply");
+    assert_eq!(balance(&e, &recipient_mc).await, 1_000 * STELL);
+    let escrow_after_control = balance(&e, &BRIDGE_ESCROW).await;
+
+    // Attack: the same shape of quorum deposit, sourced from a workchain.
+    let recipient_wc = [0xB1u8; 32];
+    let dep_wc = deposit([0x82u8; 32], recipient_wc, 1_000 * STELL);
+    let att_wc = attest(&dep_wc, &vals[..2]);
+    let out = e
+        .apply_block_transition(
+            &bridge_block(
+                2,
+                TS + 1,
+                vec![workchain_bridge_tx(&payer, 1, ops(Some(att_wc), dep_wc))],
+                payer_pk,
+            ),
+            0,
+        )
+        .await;
+    assert_eq!(
+        out.status,
+        vec![false],
+        "workchain-sourced bridge intents must not settle"
+    );
+    assert_eq!(
+        balance(&e, &recipient_wc).await,
+        0,
+        "a refused workchain deposit credits nobody"
+    );
+    assert!(
+        !e.bridge_read()
+            .await
+            .processed_source_txs
+            .contains(&[0x82u8; 32]),
+        "no replay-set entry may be committed for the refused deposit"
+    );
+    assert!(
+        e.bridge_read()
+            .await
+            .processed_source_txs
+            .contains(&[0x81u8; 32]),
+        "the masterchain control entry survives"
+    );
+    assert_eq!(
+        balance(&e, &BRIDGE_ESCROW).await,
+        escrow_after_control,
+        "escrow moves only for masterchain settlement"
+    );
+}
+
+// ===========================================================================
+// 2PC activation-buffer pin (spec 03: "2PC-gated flows stay out until
+// `STELL_XPC_ACTIVATION_HEIGHT` (currently OFF everywhere)").
+// The switch itself lives in `xshard2pc::XpcActivation` (default `Disabled`)
+// with the env wiring in `main.rs`; this pins the OFF-by-default premise the
+// whole gated-surface table rests on, plus the boundary semantics an eventual
+// activation height will obey.
+// ===========================================================================
+
+#[tokio::test]
+async fn xpc_two_phase_commit_stays_off_until_an_activation_height() {
+    // Default is off, and off means off at EVERY height, past included.
+    assert_eq!(XpcActivation::default(), XpcActivation::Disabled);
+    assert!(!XpcActivation::Disabled.is_active_at(0));
+    assert!(!XpcActivation::Disabled.is_active_at(u64::MAX));
+    assert_eq!(XpcActivation::Disabled.boundary(), None);
+
+    // Boundary semantics for the day an activation height is configured:
+    // strictly below is legacy, at-and-above is 2PC. No silent early-on.
+    let at_100 = XpcActivation::FromHeight(100);
+    assert!(!at_100.is_active_at(99));
+    assert!(at_100.is_active_at(100));
+    assert!(at_100.is_active_at(u64::MAX));
+    assert_eq!(at_100.boundary(), Some(100));
+
+    // The engine ships with cross-shard (the 2PC's transport) disabled.
+    let fresh = InMemoryStateEngine::new();
+    assert!(
+        !fresh.cross_shard_enabled(),
+        "2PC-gated flows stay out on a fresh engine"
+    );
 }

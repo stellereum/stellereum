@@ -395,8 +395,16 @@ pub fn attach_vote_falcon(key: &FalconKeypair, msg: &[u8], signature: &mut Vec<u
 }
 
 /// Sentinel marker ID for Full Epoch Certificate (CEC).
+///
+/// Safety role (quorum accounting): unmintable sentinel (`[0xFE; 32]`) that
+/// carries zero voting power in any validator set, so the envelope entry
+/// counts toward quorum only via its verified aggregate, never by itself.
 pub const PQ_QC_MARKER_ID: ValidatorId = [0xFE; 32];
 /// Sentinel marker ID for Micro-Committee (µQC).
+///
+/// Safety role (quorum accounting): unmintable sentinel (`[0xFD; 32]`) that
+/// carries zero voting power in any validator set, so the µQC entry counts
+/// toward quorum only via its verified member signatures, never by itself.
 pub const PQ_UQC_MARKER_ID: ValidatorId = [0xFD; 32];
 /// Magic prefix of a Micro-Committee post-quantum envelope payload.
 ///
@@ -3281,12 +3289,30 @@ pub const MAX_SCAN_SPAN: Round = 4_096;
 pub const NIL_CIRCUIT_BREAKER_K: u32 = 3;
 
 /// Per-round backoff of the DETERMINISTIC round timeout (ms per round).
+///
+/// Safety role (liveness): grows the timeout with the round so a slow network
+/// still converges instead of view-changing forever; deterministic on every
+/// node (function of round only) so rounds stay synchronized. Bounded by
+/// [`DETERMINISTIC_BACKOFF_CAP_MS`].
 pub const DETERMINISTIC_BACKOFF_PER_ROUND_MS: u64 = 500;
 /// Cap on the round-driven backoff half of the deterministic timeout.
+///
+/// Safety role (liveness + DoS bound): keeps a pathological round (round 1M)
+/// from installing an unbounded timeout that would stall finality; the cap
+/// still exceeds any realistic WAN skew, so honest catch-up is unaffected.
 pub const DETERMINISTIC_BACKOFF_CAP_MS: u64 = 10_000;
 /// Adaptive extension per unit of proposer missed-streak (ledger `missed`).
+///
+/// Safety role (liveness): gives a historically slow proposer's rounds extra
+/// time instead of timing out a valid proposal; input is committed block
+/// content (identical on every node), so the extension cannot desynchronize
+/// rounds. Bounded by [`ADAPTIVE_EXTENSION_CAP_MS`].
 pub const ADAPTIVE_EXTENSION_PER_MISS_MS: u64 = 500;
 /// Hard cap on the adaptive (slow-proposer) extension half.
+///
+/// Safety role (liveness + DoS bound): bounds how far one proposer's streak
+/// can stretch a round, so a grinded `missed` streak cannot park the chain;
+/// the cap still covers the observed slow-proposer tail.
 pub const ADAPTIVE_EXTENSION_CAP_MS: u64 = 5_000;
 
 /// Consecutive missed proposals per validator that counts as "repeatedly

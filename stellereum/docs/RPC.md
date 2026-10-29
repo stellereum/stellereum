@@ -1002,6 +1002,62 @@ byte, and the floor is the mempool `base_fee` served read-only as
 `stell_baseFee`. A wallet that forwards this figure is never told a number the
 same node would reject for under-declared gas.
 
+### EVM / `net_*` / `web3_*` compatibility surface
+
+The node serves a read-only EVM-compatible view plus the standard `net_*` /
+`web3_*` network labels so wallets, explorers and EVM tooling can connect
+without a Stellereum adapter. All of these are **live in the `POST /`
+dispatch** (`src/rpc.rs` → `src/evm_adapter.rs`); they never mutate state.
+`eth_sendRawTransaction` is the one write: it converts the signed EVM bytes
+to a Stellereum transaction and admits it through the same mempool gate as
+`stell_sendRawTransaction` (open submission by design — the signature, nonce
+and solvency authenticate the caller).
+
+| method | params | result |
+| --- | --- | --- |
+| `eth_chainId` | — | `"0x167d"` (effective chain id as `0x`-hex) |
+| `net_version` | — | `"5757"` (same id, decimal) |
+| `web3_clientVersion` | — | client string |
+| `net_listening` | — | bool |
+| `net_peerCount` | — | `"0x2"` testnet-known default (no live peer table on this path) |
+| `eth_syncing` | — | bool (true while a recent verified peer height is above ours) |
+| `eth_gasPrice` | — | display-only `0x`-hex (admission floor lives in `stell_baseFee`) |
+| `eth_maxPriorityFeePerGas` | — | display-only `0x`-hex |
+| `eth_estimateGas` | `[{to, data, …}]` | `max(pure EVM figure, live admission floor)` as `0x`-hex (see above) |
+| `eth_feeHistory` | EIP-1559 `feeHistory` params | fee-history object for the finalized head |
+| `eth_getCode` | `[address, block]` | deployed code or `"0x"` |
+| `eth_getBalance` | `[address, block]` | balance as `0x`-hex (nano-STELL × 10⁹ wei mapping) |
+| `eth_getTransactionCount` | `[address, block]` | nonce as `0x`-hex |
+| `eth_blockNumber` | — | finalized height as `0x`-hex |
+| `eth_getBlockByNumber` | `[block, full_txs?]` | block view or `null` |
+| `eth_getBlockByHash` | `[hash, full_txs?]` | block view or `null` |
+| `eth_getTransactionReceipt` | `[hash]` | receipt view or `null` |
+| `eth_getTransactionByHash` | `[hash]` | tx view or `null` |
+| `eth_getBlockTransactionCountByHash` | `[hash]` | count as `0x`-hex or `null` |
+| `eth_getBlockTransactionCountByNumber` | `[block]` | count as `0x`-hex or `null` |
+| `eth_getTransactionByBlockHashAndIndex` | `[hash, index]` | tx view or `null` |
+| `eth_getTransactionByBlockNumberAndIndex` | `[block, index]` | tx view or `null` |
+| `eth_getUncleCountByBlockHash` | `[hash]` | `"0x0"` for a known block, `null` for unknown (no uncles on this chain) |
+| `eth_getUncleCountByBlockNumber` | `[block]` | `"0x0"` for a known block, `null` for unknown |
+| `eth_getUncleByBlockHashAndIndex` | `[hash, index]` | `null` (no uncles) |
+| `eth_getUncleByBlockNumberAndIndex` | `[block, index]` | `null` (no uncles) |
+| `eth_call` | `[{to, data, …}, block]` | ERC-20 stub result (`0x…0001`, `u128::MAX` for allowance) or `"0x"` for unknown selectors — never executed |
+| `eth_newBlockFilter` | — | new filter id (`0x`-hex) |
+| `eth_newPendingTransactionFilter` | — | new filter id (`0x`-hex) |
+| `eth_newFilter` | filter object | new filter id (`0x`-hex) |
+| `eth_getFilterChanges` | `[id]` | pending hashes / logs since last poll (bounded) |
+| `eth_getFilterLogs` | `[id]` | pending logs (bounded) |
+| `eth_uninstallFilter` | `[id]` | bool |
+| `eth_getLogs` | filter object | matching contract events (bounded) |
+| `eth_getStorageAt` | `[address, slot, block]` | storage word as `0x`-hex |
+| `eth_sendRawTransaction` | `[signed bytes]` | EVM keccak hash on admission (L1 leg admitted first, then the EVM intent) |
+
+Unknown EVM selectors return `"0x"`; unknown block/tx hashes return `null`
+(JSON-RPC success with a null result), never an invented block. Filter ids
+are 64-bit random `0x`-hex and expire after `FILTER_TTL_SECS` (300 s); at
+most `MAX_ACTIVE_FILTERS` (10 000) live filters with at most
+`MAX_PENDING_PER_FILTER` (1 000) pending entries each.
+
 ### `stell_faucet`
 
 Parameters: `{"address": "<hex>"}` or the bare string form, plus an optional
@@ -2274,7 +2330,7 @@ parameter names) so a client can discover it with a single call.
 
 ### Method list
 
-The namespace has **38 methods** in six domains plus discovery. **No method in
+The namespace has **35 methods** in seven domains plus discovery. **No method in
 this namespace is token-gated**: a read answers from committed state, and a
 "prepare" method answers with bytes to sign — neither touches the chain.
 
@@ -2493,6 +2549,24 @@ registered to another master is refused.
 latched circuit breaker: a peg/deviation violation latches it, and only a
 **passed governance vote** can clear it.
 
+#### Shielded path
+
+| method | kind | params | result |
+| --- | --- | --- | --- |
+| `stell_shieldedTransfer` | prepare | `{to, amount, [fee], [sender]}` | the shielded transfer to sign (shield entry + `SysCallConfidentialTransfer2`); also `to`, `amount`, `confidential_fee`, `gas_breakdown`, `openings`, `viewing_payload`, `custody_warning` |
+| `stell_shieldedBalance` | read | `{viewing_key, [payloads]}` | `{view_pub, coins, coin_count, undecryptable, spendable_sum, chain}` — spendable shielded balance scanned with a viewing key |
+| `stell_unshield` | prepare | `{to, amount, inputs, [sender]}` | the shielded exit to sign (pays the signer); also `to`, `amount`, `inputs` |
+
+Transparent stays the base layer: these are the first-class entry/exit arms
+over the existing confidential opcodes (`src/native_api.rs`, `src/crypto_privacy.rs`).
+Both writes are prepare-only — the wallet signs the returned transaction and
+submits it via `stell_sendRawTransaction`. `to` accepts a plain address
+(hex or Stl57) or a stealth object `{view_pub, spend_pub}`. Amounts are
+decimal strings; blindings in `openings` are spend secrets (store like
+private keys). `stell_shieldedBalance` never echoes the viewing key (only the
+public `view_pub` is returned); payloads that fail to decrypt are counted in
+`undecryptable`, never as zero-valued coins.
+
 #### Discovery
 
 | method | kind | params | result |
@@ -2557,7 +2631,7 @@ for a mistyped token id would show an empty balance instead of a failure.
 | `stell_getBlockTransactions` | read | — | `{height}` | `{height, txs}` or `-32004` |
 | `stell_getShards` | read | — | — or `height` (number, optional) | `{shards, total_shards, routing_prefix_bits, sharding}` |
 | `stell_getShardTopology` | read | — | — | `{parameters, shards, transitions, total_accounts, total_balance}` |
-| `stell_getInvalidations` | read | — | — or `limit` (number, optional) | `{invalidations, count}` (≤64 signals) |
+| `stell_getInvalidations` | read | — | — or `limit` (number, optional) | `{invalidations, count}` (≤64 signals; `stell_invalidationFeed` is an alias) |
 | `stell_getBalance` | read | — | address (bare or object) | `{balance, nonce}` |
 | `stell_getBalanceSpv` | read | — | `{address}` | above + `stateRoot`, `proof` |
 | `stell_getProof` | read | — | `{address, [storage_keys], [block_height]}` | `{address, balance, nonce, account_proof, storage_proofs, state_root, height, exists}` |
@@ -2615,13 +2689,14 @@ for a mistyped token id would show an empty balance instead of a failure.
 | `stell_verifyMessage` | read | — | `{address, message\|message_hex, signature, [chain_id]}` | `{valid, address, scheme, scheme_id, chain_id}` |
 | `stell_signTypedData` | sign (node key, devnet-only) | **yes** | `{contract, method, [args], [value], [nonce], [chain_id]}` | `{address, scheme, scheme_id, signature, canonical, chain_id}` |
 | `stell_verifyTypedData` | read | — | `{address, contract, method, [args], [value], [nonce], [chain_id], signature}` | `{valid, address, scheme, scheme_id, canonical}` |
-| `stell_nativeApi` | read | — | — | the native-namespace manifest (38 methods) |
+| `stell_nativeApi` | read | — | — | the native-namespace manifest (35 methods) |
 | `stell_token*` (9) | read / prepare | — | see §9 | see §9 |
 | `stell_stake*` / `stell_delegate` / `stell_undelegate` / `stell_claimRewards` | prepare | — | see §9 | see §9 |
 | `stell_bridge*` (6) | read / prepare | — | see §9 | see §9 |
-| `stell_orderBook*` (3) | read / prepare | — | see §9 | see §9 |
+| `stell_orderBook*` (5) | read / prepare | — | see §9 | see §9 |
 | `stell_sessionKey*` (3) | read / prepare | — | see §9 | see §9 |
 | `stell_oracle*` (2) | read | — | see §9 | see §9 |
+| `stell_shielded*` / `stell_unshield` (3) | read / prepare | — | see §9 | see §9 |
 
 ---
 

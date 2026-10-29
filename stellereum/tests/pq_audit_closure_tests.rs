@@ -387,6 +387,39 @@ fn bls_config_debug_redacts_seed() {
     assert!(cfg2.local_vote_seed.is_none());
 }
 
+// F-HIGH-1 (BLS no-PoP): the startup gate is a LOUD refusal, not a silent
+// fallback. Pins the message so a future edit cannot weaken it into a
+// warning, and pins default-OFF when the flag is unset.
+#[test]
+fn bls_qc_refusal_is_loud_and_default_is_off() {
+    use stellereum::bls::{refuse_bls_qc_if_enabled, BLS_QC_ENV};
+    let _g = SERIAL.lock().unwrap();
+    let prior = std::env::var(BLS_QC_ENV).ok();
+    // Enabled: loud refusal naming the structural gap and the recovery.
+    std::env::set_var(BLS_QC_ENV, "1");
+    let err = refuse_bls_qc_if_enabled().expect_err("STELL_BLS_QC=1 must be refused");
+    assert!(
+        err.contains("proof-of-possession"),
+        "must name the missing PoP: {err}"
+    );
+    assert!(err.contains("rogue-key"), "must name the attack: {err}");
+    assert!(err.contains("STELL_BLS_QC"), "must name the flag: {err}");
+    assert!(
+        err.contains("Ed25519"),
+        "must name the safe fallback: {err}"
+    );
+    // Unset: default OFF, gate passes (Ed25519 baseline, byte-identical).
+    std::env::remove_var(BLS_QC_ENV);
+    assert!(
+        refuse_bls_qc_if_enabled().is_ok(),
+        "unset flag must start normally"
+    );
+    match prior {
+        Some(v) => std::env::set_var(BLS_QC_ENV, v),
+        None => std::env::remove_var(BLS_QC_ENV),
+    }
+}
+
 // ============================================================================
 // F-HIGH-2: pure-PQ single/batch parity on the vote path
 // ============================================================================

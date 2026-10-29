@@ -511,4 +511,52 @@ mod tests {
         assert!(expected_draws_to_capture_seats(4, 4, 5).is_infinite());
         assert_eq!(expected_draws_to_capture_seats(4, 4, 0), 1.0);
     }
+
+    /// PLAN-VRF phase-1 boundary: the sortition election does NOT consult the
+    /// VRF registry — the committee is fully determined by (parent hash,
+    /// height, round, stake). Registering verified VRF keys must not move any
+    /// election outcome. This pins the "planned, NOT live" status: if phase 3
+    /// ever wires the lottery in, THIS test must be updated deliberately, not
+    /// silently broken.
+    #[test]
+    fn phase1_sortition_election_ignores_vrf_registry() {
+        use crate::consensus::{
+            derive_sortition_committee, sortition_seed, ValidatorSet,
+        };
+        let ids: Vec<[u8; 32]> = (1u8..=4).map(|i| [i; 32]).collect();
+        let vs = ValidatorSet::from_list(ids.iter().map(|id| (*id, 10)).collect());
+        let parent = [0x5Au8; 32];
+        let before = derive_sortition_committee(&vs, 9, 2, 2, &parent);
+        assert_eq!(before.len(), 2, "fixture must elect two of four");
+        // Register a verified VRF key for every validator...
+        let mut reg = VrfRegistry::new();
+        for id in &ids {
+            let falcon =
+                crate::post_quantum::FalconKeypair::generate_from_seed_bytes(id);
+            let vrf_pk = VrfSecret::from_seed(id).public_key().to_bytes();
+            let sig = falcon.sign(&vrf_binding_preimage(id, &vrf_pk));
+            reg.register(
+                &VrfBinding {
+                    validator_id: *id,
+                    vrf_pk,
+                    falcon_sig: sig,
+                },
+                falcon.public_key(),
+            )
+            .expect("honest binding registers");
+        }
+        assert_eq!(reg.len(), 4);
+        // ...and the election is byte-identical: VRF not consulted.
+        let after = derive_sortition_committee(&vs, 9, 2, 2, &parent);
+        assert_eq!(
+            before, after,
+            "phase 1: VRF registry contents must not move the committee"
+        );
+        // The parent hash is still the only entropy (grindable until phase 3).
+        assert_ne!(
+            sortition_seed(&parent, 9, 2),
+            sortition_seed(&[0x6Bu8; 32], 9, 2),
+            "a new parent must re-draw the seed"
+        );
+    }
 }

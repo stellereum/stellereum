@@ -47,7 +47,8 @@ consumers — external-facing, publish candidate), `scripts/tools/stelops`,
 - [x] Per-part private remotes carry `hdae-baseline-2026-10-29` (main/agent branches untouched):
   `immtes/stellereum`, `immtes/infnode` (renamed from infmail-valid-backend),
   `immtes/stellereum-contracts`, `immtes/stell-wallet`, `immtes/stellereum-indexer`
-- [ ] Hour-long block-time measurement (read-only) to settle sustained-tempo baseline.
+- [ ] Hour tempo verdict (meter running `/tmp/opencode/tempo-hour.log`): sustained
+  mean/p50/p99 + views/block. r0-decide rate: slow-proposer slots (C/D 1-vCPU) vs misses.
 
 ## P1 — product gaps
 

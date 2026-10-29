@@ -165,7 +165,8 @@ fn test_scheme_metadata_and_discriminants() {
 
     assert_eq!(PqScheme::from_id(1).unwrap(), PqScheme::Ed25519);
     assert_eq!(PqScheme::from_id(2).unwrap(), PqScheme::Falcon512);
-    assert_eq!(PqScheme::from_id(3).unwrap(), PqScheme::MlDsa44);
+    // Audit HIGH-2: 0x03 fail-closed like the node.
+    assert!(PqScheme::from_id(3).is_err());
     assert_eq!(PqScheme::from_id(4).unwrap(), PqScheme::Hybrid);
     assert!(PqScheme::from_id(0).is_err());
     assert!(PqScheme::from_id(5).is_err());
@@ -197,8 +198,11 @@ fn test_scheme_from_str_parsing() {
         "falcon-512".parse::<PqScheme>().unwrap(),
         PqScheme::Falcon512
     );
-    assert_eq!("mldsa44".parse::<PqScheme>().unwrap(), PqScheme::MlDsa44);
-    assert_eq!("ml-dsa-44".parse::<PqScheme>().unwrap(), PqScheme::MlDsa44);
+    // Audit HIGH-2: ML-DSA-44 is fail-closed DISABLED (mirrors node
+    // `from_id(3)` refusal) — parse paths must refuse it loudly.
+    assert!("mldsa44".parse::<PqScheme>().is_err());
+    assert!("ml-dsa-44".parse::<PqScheme>().is_err());
+    assert!("3".parse::<PqScheme>().is_err());
     assert_eq!("hybrid".parse::<PqScheme>().unwrap(), PqScheme::Hybrid);
     assert!("not-a-scheme".parse::<PqScheme>().is_err());
 }
@@ -310,7 +314,7 @@ fn test_cli_pq_generate_help() {
 fn test_cli_pq_generate_execution_all_schemes() {
     let bin = env!("CARGO_BIN_EXE_stell");
 
-    for scheme_str in ["falcon512", "mldsa44", "hybrid"] {
+    for scheme_str in ["falcon512", "hybrid"] {
         let out = Command::new(bin)
             .args(["pq-generate", "--scheme", scheme_str])
             .output()
@@ -335,13 +339,27 @@ fn test_cli_pq_generate_execution_all_schemes() {
         assert_eq!(hex_part.len(), 64);
         assert!(parse_hex32(hex_part).is_ok());
     }
+    // Audit HIGH-2: disabled scheme must refuse generation fail-closed.
+    let out = Command::new(bin)
+        .args(["pq-generate", "--scheme", "mldsa44"])
+        .output()
+        .expect("exec");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success() || combined.to_lowercase().contains("disabled"),
+        "mldsa44 generation must refuse (fail-closed); got: {combined}"
+    );
 }
 
 #[test]
 fn test_cli_pq_address_execution_all_schemes() {
     let bin = env!("CARGO_BIN_EXE_stell");
 
-    for scheme_str in ["falcon512", "mldsa44", "hybrid", "ed25519"] {
+    for scheme_str in ["falcon512", "hybrid", "ed25519"] {
         let out = Command::new(bin)
             .args(["pq-address", "--scheme", scheme_str])
             .output()
@@ -355,6 +373,20 @@ fn test_cli_pq_address_execution_all_schemes() {
         assert!(stdout.contains("Derived PQ Address:"));
         assert!(stdout.contains("Raw Address Hex:"));
     }
+    // Audit HIGH-2: disabled scheme refused even for address derivation.
+    let out = Command::new(bin)
+        .args(["pq-address", "--scheme", "mldsa44"])
+        .output()
+        .expect("exec");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success() || combined.to_lowercase().contains("disabled"),
+        "mldsa44 address derivation must refuse (fail-closed); got: {combined}"
+    );
 }
 
 #[test]

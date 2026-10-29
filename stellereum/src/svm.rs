@@ -135,6 +135,11 @@ pub const GAS_CONFIDENTIAL_UNSHIELD: u64 = 3_500;
 /// txs. Fail-closed in the handlers below.
 pub const MAX_CONFIDENTIAL_IO_PER_TX: usize = 16;
 pub const MAX_UNSHIELD_INPUTS_PER_TX: usize = 64;
+/// Hard cap on viewing payloads per `stell_shieldedBalance` scan (audit F1:
+/// unbounded array = unauth CPU DoS: hex parse + X25519 DH + KDF + Pedersen
+/// commit per entry). Read-only scan, so the cap is generous (4x unshield);
+/// larger histories paginate client-side. Fail-closed in the handler.
+pub const MAX_SHIELDED_SCAN_PAYLOADS: usize = 256;
 /// Per-input cost inside an unshield exit (one Pedersen recomputation, 1.75x scaled).
 pub const GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT: u64 = 525;
 /// Gas to enqueue an actor message (`OpCode::SysCallActorSend`): the opcode

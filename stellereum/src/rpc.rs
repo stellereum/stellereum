@@ -2666,6 +2666,14 @@ fn parse_estimate_payload(p: &Value, to_addr: [u8; 32]) -> Result<Vec<crate::svm
                     arg: 0,
                 }]);
             }
+            // Audit F2: a non-hex `method` is a NAME, never code — bound it
+            // (a 200KB method string is parse-level DoS before gas applies).
+            if s.len() > 1024 {
+                return Err(format!(
+                    "method exceeds cap 1024 bytes (got {})",
+                    s.len()
+                ));
+            }
             return Ok(vec![crate::svm::OpCode::SysCallCallContract {
                 contract: to_addr,
                 method: s.as_bytes().to_vec(),
@@ -2675,6 +2683,14 @@ fn parse_estimate_payload(p: &Value, to_addr: [u8; 32]) -> Result<Vec<crate::svm
         if let Some(arr) = payload_val.as_array() {
             if arr.is_empty() {
                 return Ok(Vec::new());
+            }
+            // Audit F2: bound the opcode count pre-parse (allocation + sim
+            // setup happen before the gas budget binds).
+            if arr.len() > 1024 {
+                return Err(format!(
+                    "payload ops exceed cap 1024 (got {})",
+                    arr.len()
+                ));
             }
             if let Ok(ops) = serde_json::from_value::<Vec<crate::svm::OpCode>>(payload_val.clone())
             {
@@ -2712,10 +2728,28 @@ fn parse_estimate_payload(p: &Value, to_addr: [u8; 32]) -> Result<Vec<crate::svm
     }
 
     if let Some(method_val) = p.get("method") {
+        // Audit F2: a `method` param is a NAME, never code — bound both
+        // shapes (string bytes and byte-array) before simulation.
         let method = match method_val {
-            Value::String(s) => s.as_bytes().to_vec(),
-            Value::Array(_) => serde_json::from_value(method_val.clone())
-                .map_err(|e: serde_json::Error| e.to_string())?,
+            Value::String(s) => {
+                if s.len() > 1024 {
+                    return Err(format!(
+                        "method exceeds cap 1024 bytes (got {})",
+                        s.len()
+                    ));
+                }
+                s.as_bytes().to_vec()
+            }
+            Value::Array(arr) => {
+                if arr.len() > 1024 {
+                    return Err(format!(
+                        "method bytes exceed cap 1024 (got {})",
+                        arr.len()
+                    ));
+                }
+                serde_json::from_value(method_val.clone())
+                    .map_err(|e: serde_json::Error| e.to_string())?
+            }
             _ => return Err("invalid method in contract call".to_string()),
         };
         let arg = if let Some(a) = p.get("arg").or_else(|| p.get("args")) {

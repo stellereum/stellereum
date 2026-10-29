@@ -553,7 +553,7 @@ pub fn verify_pq_signature(
 
 /// Internal Ed25519 verification using ed25519-dalek.
 fn verify_ed25519(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use ed25519_dalek::{Signature, VerifyingKey};
 
     let Ok(vk_bytes) = <[u8; 32]>::try_from(pubkey) else {
         return false;
@@ -561,11 +561,17 @@ fn verify_ed25519(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
     let Ok(vk) = VerifyingKey::from_bytes(&vk_bytes) else {
         return false;
     };
+    // Audit HIGH-1: strict verification + small-order refusal. `verify`
+    // accepts malleable/small-order signatures that consensus (`verify_strict`)
+    // refuses — one path must not accept what the other rejects.
+    if vk.is_weak() {
+        return false;
+    }
     let Ok(sig_bytes) = <[u8; 64]>::try_from(signature) else {
         return false;
     };
     let sig = Signature::from_bytes(&sig_bytes);
-    vk.verify(message, &sig).is_ok()
+    vk.verify_strict(message, &sig).is_ok()
 }
 
 pub(crate) fn keccak_f1600(state: &mut [u64; 25]) {

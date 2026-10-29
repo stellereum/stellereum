@@ -1102,7 +1102,12 @@ impl Mempool {
         if self.sealed_epoch != epoch {
             // The old epoch's ciphertexts are dead: their key is gone and
             // nobody can unseal them. Drop them (the senders re-gossip).
-            self.sealed.clear();
+            // Audit F2: release the shared per-sender slots the dropped
+            // ciphertexts held — otherwise the quota leaks permanently and
+            // a heavy sealed sender is eventually refused on an empty pool.
+            for envelope in std::mem::take(&mut self.sealed).into_values() {
+                self.release_sender_slot(&envelope.meta.from);
+            }
             self.sealed_epoch = epoch;
         }
     }

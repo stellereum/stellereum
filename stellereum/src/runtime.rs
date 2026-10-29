@@ -2257,8 +2257,13 @@ impl ValidatorRuntime {
 
     /// Mature any unbonding entries whose cooldown has elapsed (called on
     /// finalization so funds become withdrawable without an external trigger).
+    /// Fail-closed (audit P2): an overflow refusal is logged LOUD and the
+    /// entries stay pending (retried next finalization); maturation never
+    /// destroys dust to keep liveness.
     pub async fn process_unbonding(&mut self, now: u64) {
-        self.state.staking_write().await.process_unbonding(now);
+        if let Err(e) = self.state.staking_write().await.process_unbonding(now) {
+            tracing::error!("unbonding maturation refused (funds stay pending): {e}");
+        }
     }
 
     /// Withdraw matured self-bond funds (credited back to the validator).

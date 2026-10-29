@@ -606,7 +606,10 @@ impl PqMicroCertificate {
 /// "unified"; both are pinned for n = 1..8 by
 /// `bridge::tests::quorum_formulas_are_pinned_per_domain`.
 pub fn consensus_quorum_min(n: u64) -> u64 {
-    (n * 2) / 3 + 1
+    // Audit F4: u128 arithmetic — `(n*2)` panics in debug / wraps in release
+    // at absurd powers, and saturating would UNDERESTIMATE the quorum
+    // (weakening it). floor(2n/3)+1 always fits u64, computed exactly.
+    ((n as u128 * 2) / 3 + 1) as u64
 }
 
 /// Strict quorum threshold for micro-committee of size k: floor(2*k/3) + 1.
@@ -3442,6 +3445,16 @@ impl HeightConsensus {
         if Some(proposer) != self.proposer() {
             return Err("wrong proposer".to_string());
         }
+        // Audit F1: one value per round. A second DISTINCT proposal in the
+        // same round (equivocating proposer) must not overwrite the first —
+        // mid-round flips split prevotes. Re-receipt of the IDENTICAL body
+        // (rebroadcast) stays Ok (idempotent).
+        if let Some((p, h)) = &self.proposal {
+            if *p == proposer && *h == block_hash && self.proposal_round == Some(self.round) {
+                return Ok(());
+            }
+            return Err("proposal already recorded for this round".to_string());
+        }
         self.proposal = Some((proposer, block_hash));
         self.proposal_round = Some(self.round);
         Ok(())
@@ -4216,6 +4229,17 @@ impl HeightConsensus {
         if round <= self.round {
             return false;
         }
+        // Audit F3: a SINGLE far-future vote never moves us (trickle-drag:
+        // one dribbled vote per timeout would ratchet +8/timeout and silence
+        // us). Corroboration re-opens the chase: TWO DISTINCT validators at
+        // the same far round is the network's real position, not one peer's
+        // claim (a lone Byzantine cannot fake corroboration within <1/3).
+        // Near chase (<= LOOKBACK) is unchanged (1-round-offset deadlock fix).
+        if round > self.round.saturating_add(ROUND_LOOKBACK)
+            && self.supporting_peers_count(round) < 2
+        {
+            return false;
+        }
         let before = self.round;
         self.sync_round_to(round);
         self.round != before
@@ -4585,6 +4609,9 @@ mod tests {
         // Regression (audit 2026-10-06): repeated verified votes ratcheted
         // +8 per message without bound (r9700, zero QCs). Past the per-round
         // budget further syncs are refused; the timeout path still advances.
+        // NOTE (audit F3, 2026-10-29): single-VOTE far chase is refused at
+        // the `observe_peer_round` gate (corroboration: 2 distinct peers);
+        // this DIRECT-call path keeps burst semantics (bounded by budget).
         let mut hc = hc4();
         for _ in 0..20 {
             hc.sync_round_to(1000);

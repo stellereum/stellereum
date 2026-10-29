@@ -327,7 +327,7 @@ async fn delegated_stake_exits_through_begin_then_withdraw() {
     engine
         .staking_write()
         .await
-        .process_unbonding(UNBONDING_PERIOD_SECS + 1);
+        .process_unbonding(UNBONDING_PERIOD_SECS + 1).unwrap();
     assert_eq!(
         engine
             .staking_read()
@@ -606,11 +606,11 @@ fn withdrawal_cannot_be_replayed_or_double_matured() {
     // Self-bond unbond + delegator undelegation, matured in the same instant.
     l.unbond(val, MIN_VALIDATOR_BOND, 0).unwrap();
     l.undelegate(del, val, stell(1_000), 0).unwrap();
-    l.process_unbonding(UNBONDING_PERIOD_SECS + 1);
+    l.process_unbonding(UNBONDING_PERIOD_SECS + 1).unwrap();
     let pending_after_first = l.unbonding.len();
     // Maturing AGAIN at a later time must not re-credit anything.
-    l.process_unbonding(UNBONDING_PERIOD_SECS * 2 + 5);
-    l.process_unbonding(u64::MAX / 2);
+    l.process_unbonding(UNBONDING_PERIOD_SECS * 2 + 5).unwrap();
+    l.process_unbonding(u64::MAX / 2).unwrap();
     println!(
         "unbonding entries after the first maturity: {pending_after_first}, later: {}",
         l.unbonding.len()
@@ -647,7 +647,7 @@ fn withdrawal_cannot_be_replayed_or_double_matured() {
     }
     // Cross-owner withdrawal is refused: the delegator's entry is not the
     // validator's and vice versa.
-    l.process_unbonding(u64::MAX / 2);
+    l.process_unbonding(u64::MAX / 2).unwrap();
     println!("NEGATIVE RESULT: unbond/withdraw is single-use and owner-scoped");
     assert_eq!(l.withdrawable_of(&val), 0);
     assert_eq!(l.withdrawable_delegator(&val, &del), 0);

@@ -278,7 +278,7 @@ fn load_staggered_unbond_withdraw_recovers_post_slash_exactly() {
     );
 
     // Staggered maturation: at BASE + PERIOD only the first (k=0) entry is due.
-    l.process_unbonding(BASE + UNBONDING_PERIOD_SECS);
+    l.process_unbonding(BASE + UNBONDING_PERIOD_SECS).unwrap();
     let j0 = exiting[0];
     assert_eq!(
         l.withdrawable_delegator(&validator_of(j0), &del_addr(j0)),
@@ -299,7 +299,7 @@ fn load_staggered_unbond_withdraw_recovers_post_slash_exactly() {
     );
 
     // Full maturation then per-delegator withdraw of exact post-slash figures.
-    l.process_unbonding(BASE + 24 * STEP + UNBONDING_PERIOD_SECS);
+    l.process_unbonding(BASE + 24 * STEP + UNBONDING_PERIOD_SECS).unwrap();
     assert!(l.unbonding.is_empty(), "all staggered entries must mature");
     for j in &exiting {
         let got = l
@@ -448,7 +448,7 @@ fn load_downtime_slash_debits_map_aggregate_and_pool() {
     // Phase 2: the unbonding MATURES. A matured unbond is withdrawable, not
     // slashable, so the NEXT downtime streak lands on the delegators - and
     // the map MUST move with it.
-    l.process_unbonding(UNBONDING_PERIOD_SECS);
+    l.process_unbonding(UNBONDING_PERIOD_SECS).unwrap();
     let matured: u64 = l.withdrawable.values().sum();
     assert_eq!(
         matured, in_flight_after,

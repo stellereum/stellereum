@@ -99,7 +99,7 @@ fn reward_double_dip_across_unbonding_conserves_emission() {
 
     // Principal is separate from rewards: the matured unbonding still pays
     // exactly the undelegated principal, once.
-    l.process_unbonding(UNBONDING_PERIOD_SECS + 1);
+    l.process_unbonding(UNBONDING_PERIOD_SECS + 1).unwrap();
     assert_eq!(l.withdrawable_delegator(&v, &d1), stell(1_000));
     assert_eq!(l.withdraw_delegator(d1, v).unwrap(), stell(1_000));
     assert_eq!(l.withdrawable_delegator(&v, &d1), 0);
@@ -275,7 +275,7 @@ fn dust_delegations_rejected_and_mass_unbond_leaves_no_dust() {
     );
 
     // Mature and withdraw everything: exact principal back, zero dust.
-    l.process_unbonding(UNBONDING_PERIOD_SECS + 1);
+    l.process_unbonding(UNBONDING_PERIOD_SECS + 1).unwrap();
     let mut withdrawn = 0u64;
     for who in &small {
         assert_eq!(l.withdrawable_delegator(&v, who), MIN_DELEGATION);
@@ -289,7 +289,7 @@ fn dust_delegations_rejected_and_mass_unbond_leaves_no_dust() {
         "no dust keys left in the delegation map"
     );
     // Re-maturing must not re-credit anything.
-    l.process_unbonding(u64::MAX / 2);
+    l.process_unbonding(u64::MAX / 2).unwrap();
     assert!(l.withdrawable.is_empty(), "re-maturity must not mint dust");
 }
 

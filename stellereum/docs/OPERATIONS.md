@@ -1217,6 +1217,7 @@ keys are incomplete NTRU keys that still load and keep the address): see
 | `INFNODE_KEY_PASSPHRASE` | any non-empty string | oldest fallback, checked last |
 | `STELL_KEY_PLAINTEXT` | `1` / `true` / `yes` / `on` | **explicit opt-out**: write the keys in plaintext. Anything else (or unset) keeps them encrypted |
 | `STELL_KEY_PROMPT` | `1` | ask for the passphrase on the terminal instead of reading it from the environment. Only used when stdin is a TTY, so a systemd unit never blocks on a prompt |
+| `STELL_LEGACY_GENESIS_ROOT` | must be UNSET on live nodes | genesis-replay escape hatch ONLY: `=1` routes Falcon keygen to the historical weak path to reproduce pinned genesis keys. Any live validator/wallet with it set mints brute-forceable keys (loud ERROR logged per derive). Set it for a genesis re-execution, verify, then UNSET immediately. |
 
 The first non-empty of `STELL_NODE_PASSPHRASE`, `STELL_KEY_PASSPHRASE`,
 `INFNODE_KEY_PASSPHRASE` wins. Setting more than one is a mistake: the extra

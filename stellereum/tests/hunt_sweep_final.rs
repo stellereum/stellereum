@@ -297,7 +297,7 @@ fn withdrawable_is_paid_out_but_never_debited() {
     // Cycle 0: delegate, unbond, mature.
     l.delegate(d, v, stake).unwrap();
     l.undelegate(d, v, stake, 0).unwrap();
-    l.process_unbonding(UNBONDING_PERIOD_SECS + 1);
+    l.process_unbonding(UNBONDING_PERIOD_SECS + 1).unwrap();
     let matured = l.withdrawable_delegator(&v, &d);
     assert_eq!(matured, stake, "one matured claim");
 

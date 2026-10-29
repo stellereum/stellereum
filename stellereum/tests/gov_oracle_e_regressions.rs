@@ -277,7 +277,7 @@ fn e7_vote_then_exit_cannot_flip_rejected_to_passed() {
     );
     // Terminal transition released the locks: the exit now succeeds.
     l2.undelegate(b2, a2, stell(9_000), 2).unwrap();
-    l2.process_unbonding(UNBONDING_PERIOD_SECS + 3);
+    l2.process_unbonding(UNBONDING_PERIOD_SECS + 3).unwrap();
     assert_eq!(Governance::total_voting_power(&l2), stell(20_000) as u128);
 }
 

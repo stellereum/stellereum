@@ -1241,19 +1241,40 @@ impl StakingLedger {
 
     /// Move all matured unbonding entries into `withdrawable`, crediting the
     /// entry's OWNER (validator for self-bond, delegator for undelegation).
-    pub fn process_unbonding(&mut self, now: u64) {
+    ///
+    /// Audit P2: fail-closed arithmetic (like L3 `add_bond`/`delegate`):
+    /// every maturing amount is pre-validated against its withdrawable key
+    /// BEFORE anything moves, so an overflow refusal leaves all entries
+    /// pending (partial maturation is the bug being closed).
+    pub fn process_unbonding(&mut self, now: u64) -> Result<(), StakingError> {
+        use std::collections::HashMap;
+        let mut maturing: HashMap<(ValidatorId, [u8; 32]), u128> = HashMap::new();
+        for e in self.unbonding.iter().filter(|e| now >= e.release_at) {
+            let owner = e.owner.unwrap_or([0u8; 32]);
+            *maturing.entry((e.validator, owner)).or_insert(0) += e.amount as u128;
+        }
+        for ((v, o), sum) in &maturing {
+            let cur = self.withdrawable.get(&(*v, *o)).copied().unwrap_or(0) as u128;
+            if cur + sum > u64::MAX as u128 {
+                return Err(StakingError::ArithmeticOverflow);
+            }
+        }
         let mut still_pending = Vec::new();
         for e in self.unbonding.drain(..) {
             if now >= e.release_at {
                 let owner = e.owner.unwrap_or([0u8; 32]);
                 let key = (e.validator, owner);
                 let entry = self.withdrawable.entry(key).or_insert(0);
-                *entry = entry.saturating_add(e.amount);
+                // Provably unreachable after the pre-pass above (defense in depth).
+                *entry = entry
+                    .checked_add(e.amount)
+                    .ok_or(StakingError::ArithmeticOverflow)?;
             } else {
                 still_pending.push(e);
             }
         }
         self.unbonding = still_pending;
+        Ok(())
     }
 
     pub fn withdrawable_of(&self, validator: &ValidatorId) -> u64 {
@@ -1436,19 +1457,44 @@ impl StakingLedger {
             .filter(|e| e.validator == validator && e.owner.is_none())
             .map(|e| e.amount)
             .sum();
+        // Audit P1: in-flight delegator stake (unbonding, owner set) is part
+        // of the slashable base — it secured the chain during the infraction
+        // window. Excluding it let exiting stake escape the burn entirely.
+        let unbonding_deleg: u64 = self
+            .unbonding
+            .iter()
+            .filter(|e| e.validator == validator && e.owner.is_some())
+            .map(|e| e.amount)
+            .sum();
         let total = self_bond
             .saturating_add(delegated_now)
-            .saturating_add(unbonding_self);
+            .saturating_add(unbonding_self)
+            .saturating_add(unbonding_deleg);
         let burn = (total as u128 * slash_bps as u128 / BPS_DENOMINATOR as u128) as u64;
         if burn == 0 {
             return Ok(0);
         }
+        // In-flight delegator stake takes its haircut FIRST (pro-rata, floored
+        // like the active pool below): exiting stake cannot shelter behind the
+        // validator's bond. Active delegations keep the self-first shield.
+        let mut unbond_cut_total = 0u64;
+        for entry in self.unbonding.iter_mut() {
+            if entry.validator == validator && entry.owner.is_some() {
+                let cut =
+                    (entry.amount as u128 * slash_bps as u128 / BPS_DENOMINATOR as u128) as u64;
+                let cut = cut.min(entry.amount);
+                entry.amount -= cut;
+                unbond_cut_total += cut;
+            }
+        }
+        self.unbonding.retain(|e| e.amount > 0);
+        let mut remaining = burn.saturating_sub(unbond_cut_total);
         // Consume self-bond first.
-        let from_self = burn.min(self_bond);
+        let from_self = remaining.min(self_bond);
         if let Some(v) = self.validators.get_mut(&validator) {
             v.self_bond -= from_self;
         }
-        let mut remaining = burn - from_self;
+        remaining -= from_self;
 
         // Consume validator's pending unbonding entries.
         if remaining > 0 {
@@ -2566,11 +2612,11 @@ mod tests {
         l.bond(vid(1), stell(3000), DEFAULT_COMMISSION_BPS).unwrap();
         l.unbond(vid(1), stell(1000), 1_000).unwrap();
         // still below release time
-        l.process_unbonding(1_000);
+        l.process_unbonding(1_000).unwrap();
         assert_eq!(l.withdrawable_of(&vid(1)), 0);
         assert_eq!(l.withdraw(vid(1)), Err(StakingError::NothingToWithdraw));
         // after cooldown
-        l.process_unbonding(1_000 + UNBONDING_PERIOD_SECS);
+        l.process_unbonding(1_000 + UNBONDING_PERIOD_SECS).unwrap();
         assert_eq!(l.withdrawable_of(&vid(1)), stell(1000));
         assert_eq!(l.withdraw(vid(1)).unwrap(), stell(1000));
     }
@@ -2787,8 +2833,8 @@ mod tests {
         assert!(
             l.unbonding
                 .iter()
-                .any(|u| u.validator == vid(2) && u.amount == stell(200)),
-            "pending unbonding follows the record"
+                .any(|u| u.validator == vid(2) && u.amount == stell(180)),
+            "pending unbonding follows the record (200 less the 10% slash haircut, audit P1)"
         );
         assert!(
             l.unbonding.iter().all(|u| u.validator != vid(1)),
@@ -2844,7 +2890,7 @@ mod tests {
         l.bond(vid(1), stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
         l.delegate(del(1), vid(1), stell(1500)).unwrap();
         l.undelegate(del(1), vid(1), stell(1500), 0).unwrap();
-        l.process_unbonding(UNBONDING_PERIOD_SECS + 1);
+        l.process_unbonding(UNBONDING_PERIOD_SECS + 1).unwrap();
 
         // The validator must NOT be able to withdraw the delegator's stake.
         assert_eq!(l.withdrawable_of(&vid(1)), 0);
@@ -2861,7 +2907,7 @@ mod tests {
         l.delegate(del(1), vid(1), stell(1000)).unwrap();
         l.unbond(vid(1), stell(2000), 0).unwrap(); // validator self-bond
         l.undelegate(del(1), vid(1), stell(1000), 0).unwrap(); // delegator stake
-        l.process_unbonding(UNBONDING_PERIOD_SECS + 1);
+        l.process_unbonding(UNBONDING_PERIOD_SECS + 1).unwrap();
 
         // Amounts are tracked separately per owner: no cross-credit.
         assert_eq!(l.withdrawable_of(&vid(1)), stell(2000));
@@ -3189,7 +3235,7 @@ mod tests {
             "second claim pays nothing"
         );
         // Exit queue: nothing matured yet (cooldown not elapsed).
-        l.process_unbonding(1);
+        l.process_unbonding(1).unwrap();
         assert_eq!(l.withdrawable_delegator(&vid(1), &del(1)), 0);
         assert_eq!(
             l.withdraw_delegator(del(1), vid(1)),
@@ -3197,7 +3243,7 @@ mod tests {
             "early withdraw of unmatured exit must fail closed"
         );
         // After maturity the exit pays exactly once.
-        l.process_unbonding(UNBONDING_PERIOD_SECS + 1);
+        l.process_unbonding(UNBONDING_PERIOD_SECS + 1).unwrap();
         assert_eq!(l.withdrawable_delegator(&vid(1), &del(1)), stell(1000));
         assert_eq!(l.withdraw_delegator(del(1), vid(1)).unwrap(), stell(1000));
         assert_eq!(
@@ -3607,6 +3653,9 @@ mod tests {
     struct EagerRef {
         validators: HashMap<ValidatorId, EagerVal>,
         delegations: HashMap<(ValidatorId, [u8; 32]), u64>,
+        /// In-flight (unbonding) delegator stake, mirrored from the lazy
+        /// pipeline (audit P1: exiting stake takes the slash haircut first).
+        unbonding: Vec<(ValidatorId, [u8; 32], u64)>,
         /// Materialised (already credited) delegator rewards.
         rewards: HashMap<(ValidatorId, [u8; 32]), u64>,
         /// Cumulative amounts already claimed (so a comparison can use the
@@ -3673,22 +3722,40 @@ mod tests {
             } else {
                 self.delegations.insert(key, cur - amount);
             }
+            // Mirror the lazy pipeline: exiting stake stays slashable until
+            // matured (audit P1).
+            self.unbonding.push((v, d, amount));
         }
 
         fn slash(&mut self, v: ValidatorId, bps: u64) {
             let Some(val) = self.validators.get(&v).cloned() else {
                 return;
             };
-            let total = val.self_bond + val.delegated;
+            let unbond_sum: u64 = self
+                .unbonding
+                .iter()
+                .filter(|(vid, _, _)| *vid == v)
+                .map(|(_, _, a)| *a)
+                .sum();
+            let total = val.self_bond + val.delegated + unbond_sum;
             let burn = (total as u128 * bps as u128 / BPS_DENOMINATOR as u128) as u64;
             if burn == 0 {
                 return;
             }
-            let from_self = burn.min(val.self_bond);
+            // In-flight haircut first (mirrors the lazy order, audit P1).
+            let mut remaining = burn;
+            for entry in self.unbonding.iter_mut().filter(|(vid, _, _)| *vid == v) {
+                let cut = (entry.2 as u128 * bps as u128 / BPS_DENOMINATOR as u128) as u64;
+                let cut = cut.min(entry.2);
+                entry.2 -= cut;
+                remaining = remaining.saturating_sub(cut);
+            }
+            self.unbonding.retain(|(_, _, a)| *a > 0);
+            let from_self = remaining.min(val.self_bond);
             if let Some(slot) = self.validators.get_mut(&v) {
                 slot.self_bond -= from_self;
             }
-            let remaining = burn - from_self;
+            remaining -= from_self;
             if remaining == 0 || val.delegated == 0 {
                 return;
             }

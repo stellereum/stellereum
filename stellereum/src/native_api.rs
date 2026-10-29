@@ -2446,9 +2446,12 @@ async fn session_keys(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, 
         .map(|s| parse_address(&s))
         .transpose()
         .map_err(|e| invalid(format!("parameter 'master': {e}")))?;
+    // Audit F4: honor `limit` (default 100, cap 1000 — same convention as
+    // bridge deposits); an unbounded registry dump is unauth CPU/bandwidth DoS.
+    let limit = opt_u64(p, "limit").unwrap_or(100).min(1000) as usize;
     let reg = engine.session_keys_read().await;
     let mut list: Vec<Value> = Vec::new();
-    for (pk, rec) in reg.entries.iter() {
+    for (pk, rec) in reg.entries.iter().take(limit) {
         if let Some(m) = filter.as_ref() {
             if rec.master != *m {
                 continue;
@@ -2815,6 +2818,15 @@ async fn shielded_balance(
     let mut spendable_sum: u64 = 0;
     let mut undecryptable: u64 = 0;
     if let Some(arr) = p.get("payloads").and_then(|v| v.as_array()) {
+        // Audit F1: bound the scan (unauth CPU DoS otherwise); see
+        // `MAX_SHIELDED_SCAN_PAYLOADS`. Larger histories paginate client-side.
+        if arr.len() > crate::svm::MAX_SHIELDED_SCAN_PAYLOADS {
+            return Err(NativeApiError::InvalidParams(format!(
+                "payloads exceeds cap {} (got {})",
+                crate::svm::MAX_SHIELDED_SCAN_PAYLOADS,
+                arr.len()
+            )));
+        }
         for (i, item) in arr.iter().enumerate() {
             let parsed = (|| -> Result<EncryptedViewingPayload, String> {
                 let obj = item

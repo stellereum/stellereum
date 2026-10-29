@@ -232,7 +232,10 @@ impl PqScheme {
         match id {
             1 => Ok(Self::Ed25519),
             2 => Ok(Self::Falcon512),
-            3 => Ok(Self::MlDsa44),
+            // Audit HIGH-2: ML-DSA-44 is fail-closed DISABLED node-side
+            // (node `from_id(3)` errs) — mirror the refusal here so the
+            // wallet can never construct disabled-scheme keys.
+            3 => Err("ML-DSA-44 is disabled (fail-closed): use falcon512 or hybrid".to_string()),
             4 => Ok(Self::Hybrid),
             other => Err(format!("Unknown scheme ID: {other}")),
         }
@@ -280,10 +283,13 @@ impl std::str::FromStr for PqScheme {
         match s.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
             "ed25519" | "1" => Ok(Self::Ed25519),
             "falcon512" | "falcon" | "2" => Ok(Self::Falcon512),
-            "mldsa44" | "mldsa" | "dilithium" | "dilithium2" | "3" => Ok(Self::MlDsa44),
+            // Audit HIGH-2: disabled like node side (also blocks CLI pq-generate).
+            "mldsa44" | "mldsa" | "dilithium" | "dilithium2" | "3" => Err(
+                "ML-DSA-44 is disabled (fail-closed): use falcon512 or hybrid".to_string(),
+            ),
             "hybrid" | "4" => Ok(Self::Hybrid),
             other => Err(format!(
-                "Unknown scheme: '{other}'. Available schemes: ed25519, falcon512, mldsa44, hybrid"
+                "Unknown scheme: '{other}'. Available schemes: ed25519, falcon512, hybrid"
             )),
         }
     }
@@ -497,34 +503,10 @@ impl PqKeyPair {
                 );
                 sk.sign(message).to_bytes().to_vec()
             }
-            PqScheme::MlDsa44 => {
-                let mut sig = vec![0u8; MLDSA44_SIG_LEN];
-                sig[0] = 0x01;
-                let rho = &self.public_key[..32];
-                let t1 = &self.public_key[32..];
-                let mut h = blake3::Hasher::new_derive_key("MLDSA44_VERIFY_V4");
-                h.update(rho);
-                h.update(t1);
-                h.update(message);
-                let mu = *h.finalize().as_bytes();
-
-                let mut filler = blake3::Hasher::new_derive_key("MLDSA44_SIG_BODY_V4");
-                filler.update(&self._secret_key.bytes);
-                filler.update(message);
-                let mut reader = filler.finalize_xof();
-                reader.fill(&mut sig[..MLDSA44_SIG_LEN - 1]);
-                sig[0] = 0x01;
-
-                let c_tilde = &sig[..32];
-                let z_without_trailer = &sig[32..sig.len() - 1];
-                let mut binding = blake3::Hasher::new_derive_key("MLDSA44_BINDING_V4");
-                binding.update(&mu);
-                binding.update(c_tilde);
-                binding.update(z_without_trailer);
-                let expected = binding.finalize();
-                sig[MLDSA44_SIG_LEN - 1] = expected.as_bytes()[0];
-                sig
-            }
+            // Audit HIGH-2: ML-DSA-44 is disabled node-side (verify always
+            // false) — the wallet must not mint signatures that can never
+            // verify (funds-lock footgun). Fail closed with an empty sig.
+            PqScheme::MlDsa44 => Vec::new(),
         }
     }
 }

@@ -338,15 +338,24 @@ impl WalletSignature {
         }
         let pubkey = take(bytes, &mut cur, pubkey_len, "pubkey")?;
         // Extra fail-closed guard for Ed25519: a non-curve point is not a key.
-        if scheme == PqScheme::Ed25519
-            && VerifyingKey::from_bytes(
-                &<[u8; 32]>::try_from(pubkey.as_slice()).expect("len checked"),
-            )
-            .is_err()
-        {
-            return Err(
-                "wallet signature: Ed25519 public key is not a valid curve point".to_string(),
-            );
+        // Audit HIGH-1: also refuse small-order keys (`is_weak`) — they parse
+        // but verify malleably; consensus strictness must hold here too.
+        if scheme == PqScheme::Ed25519 {
+            let vk_bytes = <[u8; 32]>::try_from(pubkey.as_slice()).expect("len checked");
+            match VerifyingKey::from_bytes(&vk_bytes) {
+                Err(_) => {
+                    return Err(
+                        "wallet signature: Ed25519 public key is not a valid curve point"
+                            .to_string(),
+                    )
+                }
+                Ok(vk) if vk.is_weak() => {
+                    return Err(
+                        "wallet signature: Ed25519 public key is small-order".to_string(),
+                    )
+                }
+                Ok(_) => {}
+            }
         }
         let mut slen = [0u8; 2];
         slen.copy_from_slice(&take(bytes, &mut cur, 2, "sig_len")?);

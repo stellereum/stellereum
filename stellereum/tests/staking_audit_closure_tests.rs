@@ -564,7 +564,7 @@ async fn l2_zero_address_never_delegates_nor_withdraws() {
     // Mature the self-bond under (v, [0;32]), then prove the delegator path
     // cannot touch it while the validator path still can.
     l.unbond(v, stell(1100), 0).unwrap();
-    l.process_unbonding(UNBONDING_PERIOD_SECS + 1);
+    l.process_unbonding(UNBONDING_PERIOD_SECS + 1).unwrap();
     assert_eq!(l.withdrawable_of(&v), stell(1100));
     assert_eq!(
         l.withdraw_delegator([0u8; 32], v),
@@ -665,10 +665,10 @@ async fn unbonding_matures_only_after_period() {
     let v = [0x91u8; 32];
     l.bond(v, stell(1100), 0).unwrap();
     l.unbond(v, stell(1100), 1_000).unwrap();
-    l.process_unbonding(1_000 + UNBONDING_PERIOD_SECS - 1);
+    l.process_unbonding(1_000 + UNBONDING_PERIOD_SECS - 1).unwrap();
     assert_eq!(l.withdrawable_of(&v), 0, "one second early is still locked");
     assert_eq!(l.withdraw(v), Err(StakingError::NothingToWithdraw));
-    l.process_unbonding(1_000 + UNBONDING_PERIOD_SECS);
+    l.process_unbonding(1_000 + UNBONDING_PERIOD_SECS).unwrap();
     assert_eq!(l.withdrawable_of(&v), stell(1100));
     assert_eq!(l.withdraw(v).unwrap(), stell(1100));
     assert_eq!(l.withdraw(v), Err(StakingError::NothingToWithdraw));

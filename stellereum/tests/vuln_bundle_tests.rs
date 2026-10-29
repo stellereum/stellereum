@@ -120,7 +120,8 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     engine
         .staking_write()
         .await
-        .process_unbonding(UNBONDING_PERIOD_SECS + 1);
+        .process_unbonding(UNBONDING_PERIOD_SECS + 1)
+        .unwrap();
     assert_eq!(
         engine.staking_read().await.withdrawable_of(&vaddr),
         floor,

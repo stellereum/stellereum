@@ -6250,10 +6250,17 @@ impl InMemoryStateEngine {
         }
 
         // 4. Mature unbondings. Deterministic: the clock is the block's own
-        //    timestamp, never local wall time.
-        self.staking_write()
+        //    timestamp, never local wall time. Fail-closed (audit P2): an
+        //    overflow refusal is logged LOUD and the entries stay pending
+        //    (retried next block) — maturation never destroys dust, and the
+        //    infallible apply path never halts the chain over it.
+        if let Err(e) = self
+            .staking_write()
             .await
-            .process_unbonding(block.timestamp);
+            .process_unbonding(block.timestamp)
+        {
+            tracing::error!("unbonding maturation refused (funds stay pending): {e}");
+        }
 
         // 5. Downtime slash, from the CANONICAL certificate the block carries.
         //
@@ -8838,6 +8845,51 @@ impl InMemoryStateEngine {
             let bal = self.token_balance(&quote_id, a).await;
             if bal < *need {
                 return Err(format!("CLOB settlement: buyer {a:?} lacks wUSDT"));
+            }
+        }
+
+        // 2b) Mint-budget pre-validation (audit P0): every wUSDT Mint below
+        // releases previously-locked escrow, and a mid-loop Mint refusal
+        // (cap / paused / renounced minter) AFTER earlier legs applied is a
+        // partial settlement (moved funds + escrow/book desync). Refuse the
+        // whole settlement upfront when the quote token cannot cover it.
+        // The bound is EXACT from above, never estimated: every Mint take is
+        // bounded by the escrow record it releases (take <= locked), so the
+        // sum of touched records' locked wUSDT bounds total mints. It can
+        // only OVER-refuse (fat escrows near a tight cap) with a clear
+        // error — the safe direction. Mirrors `cancel_order_settled`'s
+        // pre-validation discipline.
+        {
+            let escrows = self.order_escrow.read().await;
+            let mut touched_locked: u128 = 0;
+            for t in &trades {
+                if let Some(rec) = escrows.get(&(pair, t.maker_order_id)) {
+                    touched_locked += rec.locked_quote_wusdt as u128;
+                }
+            }
+            drop(escrows);
+            let tokens = self.tokens_read().await;
+            let tok = tokens.get(&quote_id).ok_or_else(|| {
+                "CLOB settlement: quote (wUSDT) token missing".to_string()
+            })?;
+            if tok.metadata.minter == [0u8; 32] {
+                return Err(
+                    "CLOB settlement: quote token minter renounced, escrow cannot release"
+                        .to_string(),
+                );
+            }
+            if tok.metadata.paused {
+                return Err(
+                    "CLOB settlement: quote token paused, escrow cannot release".to_string(),
+                );
+            }
+            if let Some(cap) = tok.metadata.max_supply {
+                let supply = tok.metadata.total_supply as u128;
+                if supply + touched_locked > cap as u128 {
+                    return Err(format!(
+                        "CLOB settlement: wUSDT mint budget exceeded (supply {supply} + locked {touched_locked} > cap {cap})"
+                    ));
+                }
             }
         }
 

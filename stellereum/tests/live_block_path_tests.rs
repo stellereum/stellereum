@@ -340,7 +340,8 @@ async fn block_timestamp_reaches_the_vm_unbonding_maturity() {
     engine
         .staking_write()
         .await
-        .process_unbonding(BLOCK_TS + UNBONDING_PERIOD_SECS - 1);
+        .process_unbonding(BLOCK_TS + UNBONDING_PERIOD_SECS - 1)
+        .unwrap();
     assert_eq!(
         engine.staking_read().await.withdrawable_of(&validator),
         0,
@@ -349,7 +350,8 @@ async fn block_timestamp_reaches_the_vm_unbonding_maturity() {
     engine
         .staking_write()
         .await
-        .process_unbonding(BLOCK_TS + UNBONDING_PERIOD_SECS);
+        .process_unbonding(BLOCK_TS + UNBONDING_PERIOD_SECS)
+        .unwrap();
     assert_eq!(
         engine.staking_read().await.withdrawable_of(&validator),
         floor(),

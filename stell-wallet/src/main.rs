@@ -3807,6 +3807,14 @@ async fn execute_command(
                 Some(s) => parse_hex16(&s, "salt")?,
                 None => pq::DEFAULT_SALT,
             };
+            // Audit HIGH-2: ML-DSA-44 is fail-closed DISABLED (node never
+            // verifies it). Refuse here: clap's ValueEnum bypasses FromStr,
+            // so parse-level refusal alone cannot cover this command.
+            if scheme == pq::PqScheme::MlDsa44 {
+                anyhow::bail!(
+                    "ML-DSA-44 is disabled (fail-closed): use falcon512, hybrid or ed25519"
+                );
+            }
 
             let (pk_bytes, generated) = match pubkey {
                 Some(pk_hex) => {
@@ -3875,6 +3883,13 @@ async fn execute_command(
 
         Commands::PqGenerate { scheme, salt } => {
             let scheme = pq::PqScheme::from(scheme);
+            // Audit HIGH-2: ML-DSA-44 is fail-closed DISABLED (node never
+            // verifies it) — refuse generation so no unusable keys are minted.
+            if scheme == pq::PqScheme::MlDsa44 {
+                anyhow::bail!(
+                    "ML-DSA-44 is disabled (fail-closed): use falcon512 or hybrid"
+                );
+            }
             let salt_bytes = match salt {
                 Some(s) => parse_hex16(&s, "salt")?,
                 None => pq::DEFAULT_SALT,

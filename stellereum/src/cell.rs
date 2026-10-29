@@ -185,7 +185,8 @@ impl BagOfCells {
             let refs_len = bytes[offset] as usize;
             offset += 1;
 
-            let data_len = u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+            let data_len =
+                u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
 
             if offset + data_len + refs_len * 32 > bytes.len() {

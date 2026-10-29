@@ -8,6 +8,8 @@
 //! Env-sensitive tests serialize on `ENV_LOCK` because `std::env` is
 //! process-global and `cargo test` runs tests on threads.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use stellereum::post_quantum::{derive_pq_address, PqScheme};
 use stellereum::state_engine::memory_bounds::{
     accounts_memory_warn_threshold, accounts_over_watermark, estimate_accounts_bytes,
@@ -15,20 +17,13 @@ use stellereum::state_engine::memory_bounds::{
 };
 use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::storage::{self, Storage};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn unique_dir(tag: &str) -> std::path::PathBuf {
     let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "stell_mem_{}_{}_{}",
-        std::process::id(),
-        tag,
-        n
-    ))
+    std::env::temp_dir().join(format!("stell_mem_{}_{}_{}", std::process::id(), tag, n))
 }
 
 fn addr_from_u64(i: u64) -> [u8; 32] {
@@ -94,8 +89,9 @@ fn block_cache_disk_fallback_serves_evicted_entry() {
     assert_eq!(got, None);
 
     // Disk error → None as well (fail-open for reads, never fail-closed).
-    let got =
-        c.get_or_load_block([9u8; 32], |_| Err::<Option<Vec<u8>>, String>("disk down".into()));
+    let got = c.get_or_load_block([9u8; 32], |_| {
+        Err::<Option<Vec<u8>>, String>("disk down".into())
+    });
     assert_eq!(got, None);
 }
 
@@ -108,7 +104,11 @@ fn block_cache_cap_is_env_overridable() {
     std::env::set_var("STELL_MAX_CACHED_BLOCKS", "not-a-number");
     assert_eq!(max_cached_blocks(), 2048, "bad value falls back to default");
     std::env::set_var("STELL_MAX_CACHED_BLOCKS", "0");
-    assert_eq!(max_cached_blocks(), 2048, "zero must not mean store-nothing");
+    assert_eq!(
+        max_cached_blocks(),
+        2048,
+        "zero must not mean store-nothing"
+    );
     std::env::remove_var("STELL_MAX_CACHED_BLOCKS");
 }
 
@@ -169,7 +169,11 @@ async fn pq_disk_serves_entries_skipped_by_fallback() {
     assert_eq!(engine.pq_fallback_evictions(), 0);
     for (addr, pk) in &pinned {
         let got = engine.get_pinned_pubkey(addr);
-        assert_eq!(got, Some((PqScheme::Ed25519, pk.to_vec())), "disk serves all");
+        assert_eq!(
+            got,
+            Some((PqScheme::Ed25519, pk.to_vec())),
+            "disk serves all"
+        );
     }
     std::env::remove_var("STELL_MAX_PQ_FALLBACK_ENTRIES");
 }
@@ -288,7 +292,10 @@ fn sled_config_tunables_are_safe_and_effective() {
 fn account_watermark_accounting_is_env_overridable() {
     let _g = ENV_LOCK.lock().unwrap();
     assert_eq!(estimate_accounts_bytes(10_000_000), 3_840_000_000);
-    assert_eq!(estimate_accounts_bytes(u64::MAX), u64::MAX.saturating_mul(384));
+    assert_eq!(
+        estimate_accounts_bytes(u64::MAX),
+        u64::MAX.saturating_mul(384)
+    );
 
     std::env::remove_var("STELL_MAX_ACCOUNTS_WARN");
     assert_eq!(accounts_memory_warn_threshold(), 5_000_000);

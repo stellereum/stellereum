@@ -48,7 +48,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use stellereum::consensus::{
-    BlockHash, HeightConsensus, QuorumCertificate, Vote, VoteKind, ValidatorSet,
+    BlockHash, HeightConsensus, QuorumCertificate, ValidatorSet, Vote, VoteKind,
 };
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, Transaction};
@@ -85,7 +85,10 @@ pub fn effective_round_timeout_ms(base_ms: u64, timeouts: u32) -> u64 {
 
 #[derive(Clone, Debug)]
 enum Msg {
-    Proposal { round: u32, block: Block },
+    Proposal {
+        round: u32,
+        block: Block,
+    },
     Vote(Vote),
     Committed {
         height: u64,
@@ -540,9 +543,8 @@ impl Cluster {
                         && pr + 1 >= round
                         && now.saturating_sub(at) < self.nodes[i].base_timeout_ms
             );
-            let want_nil = !has_live
-                && elapsed >= 2 * self.nodes[i].base_timeout_ms
-                && !peer_alive_in_round;
+            let want_nil =
+                !has_live && elapsed >= 2 * self.nodes[i].base_timeout_ms && !peer_alive_in_round;
             if self.nodes[i].voting
                 && self.nodes[i].last_prevoted != Some((height, round))
                 && (has_live || want_nil)
@@ -790,7 +792,11 @@ impl Cluster {
             heights: self.nodes.iter().map(|n| n.rt.hc.height).collect(),
             rounds: self.nodes.iter().map(|n| n.rt.hc.round).collect(),
             prevotes_cast: self.nodes.iter().map(|n| n.prevotes_cast.clone()).collect(),
-            precommits_cast: self.nodes.iter().map(|n| n.precommits_cast.clone()).collect(),
+            precommits_cast: self
+                .nodes
+                .iter()
+                .map(|n| n.precommits_cast.clone())
+                .collect(),
             finalized: self.nodes.iter().map(|n| n.rt.finalized.clone()).collect(),
             virtual_ms: self.now_ms,
         }

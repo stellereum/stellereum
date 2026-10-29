@@ -16,9 +16,9 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
 use stellereum::bls::*;
 use stellereum::consensus::*;
-use std::collections::{BTreeMap, HashSet};
 
 /// bincode(QuorumCertificate) captured from the code BEFORE the BLS envelope
 /// existed: height 7, round 1, precommit for block 0xAB*32, signed by the
@@ -67,8 +67,12 @@ fn legacy_verify(cert: &OldQuorumCertificate, validators: &ValidatorSet) -> bool
         if vp == 0 {
             continue;
         }
-        let Ok(vk) = VerifyingKey::from_bytes(voter) else { continue };
-        let Ok(sig) = Signature::from_slice(sig_bytes) else { continue };
+        let Ok(vk) = VerifyingKey::from_bytes(voter) else {
+            continue;
+        };
+        let Ok(sig) = Signature::from_slice(sig_bytes) else {
+            continue;
+        };
         candidates.push((vk, sig, vp));
     }
     if candidates.is_empty() {
@@ -114,14 +118,21 @@ impl Fixture {
             .map(|i| BlsSecretKey::from_seed(&[(i + 1) as u8; 32]))
             .collect();
         let vs = ValidatorSet::from_list(
-            ed.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect(),
+            ed.iter()
+                .map(|k| (k.verifying_key().to_bytes(), 1))
+                .collect(),
         );
         let registry: BlsKeyRegistry = ed
             .iter()
             .zip(&bls)
             .map(|(k, b)| (k.verifying_key().to_bytes(), b.public_key()))
             .collect();
-        Self { ed, bls, vs, registry }
+        Self {
+            ed,
+            bls,
+            vs,
+            registry,
+        }
     }
 
     fn enabled_config(&self) -> QcBlsConfig {
@@ -150,7 +161,10 @@ impl Fixture {
         let mut signatures = Vec::new();
         for i in ed_signers {
             let v = Vote::sign(&self.ed[i], height, round, kind, target);
-            signatures.push((self.ed[i].verifying_key().to_bytes(), v.ed25519_signature().to_vec()));
+            signatures.push((
+                self.ed[i].verifying_key().to_bytes(),
+                v.ed25519_signature().to_vec(),
+            ));
         }
         if let Some(range) = agg_signers {
             let sigs: Vec<_> = range.map(|i| (i, self.bls[i].sign(&msg))).collect();
@@ -158,7 +172,13 @@ impl Fixture {
             let payload = encode_qc_bls_envelope(&aggregate, height, round, kind, target);
             signatures.push((BLS_QC_MARKER_ID, payload));
         }
-        QuorumCertificate { height, round, kind, block_hash: target, signatures }
+        QuorumCertificate {
+            height,
+            round,
+            kind,
+            block_hash: target,
+            signatures,
+        }
     }
 }
 
@@ -188,17 +208,27 @@ fn golden_old_certificate_decodes_and_verifies_under_new_code() {
         (k1.verifying_key().to_bytes(), 1),
         (k2.verifying_key().to_bytes(), 1),
     ]);
-    assert!(qc.verify(&vs), "old certificate must verify under the new code");
+    assert!(
+        qc.verify(&vs),
+        "old certificate must verify under the new code"
+    );
 
     // Byte-exact roundtrip: the layout is unchanged, so re-encoding is the
     // same bytes a pre-change binary wrote.
-    assert_eq!(bincode::serialize(&qc).unwrap(), bytes, "roundtrip must be byte-identical");
+    assert_eq!(
+        bincode::serialize(&qc).unwrap(),
+        bytes,
+        "roundtrip must be byte-identical"
+    );
 
     // The OLD field layout decodes the OLD bytes identically as well — the
     // mirror struct exists to prove the layouts are interchangeable.
     let old = old_layout(&bytes);
     assert_eq!(bincode::serialize(&old).unwrap(), bytes);
-    assert!(legacy_verify(&old, &vs), "baseline verifier accepts its own bytes");
+    assert!(
+        legacy_verify(&old, &vs),
+        "baseline verifier accepts its own bytes"
+    );
 }
 
 #[test]
@@ -250,14 +280,20 @@ fn bls_only_certificate_fails_closed_under_old_code_and_flag_off_new_code() {
     // the aggregate is not counted, the Ed25519 list is short.
     {
         let _off = disabled();
-        assert!(!qc.verify(&f.vs), "flag-off verification must fail closed on a BLS-only certificate");
+        assert!(
+            !qc.verify(&f.vs),
+            "flag-off verification must fail closed on a BLS-only certificate"
+        );
     }
 
     // New code with the flag ON and the registry present: strict BLS
     // verification counts the quorum.
     {
         let _on = set_qc_bls_for_tests(f.enabled_config());
-        assert!(qc.verify(&f.vs), "flag-on verification must accept the aggregate quorum");
+        assert!(
+            qc.verify(&f.vs),
+            "flag-on verification must accept the aggregate quorum"
+        );
     }
 }
 
@@ -297,8 +333,7 @@ fn strict_bls_path_rejects_tampered_insufficient_and_mis_bound_aggregates() {
         .chain((1..3).map(|i| (i, f.bls[i].sign(&msg))))
         .collect();
     let tampered = aggregate_signatures(&bad_sigs, 3).unwrap();
-    qc.signatures[0].1 =
-        encode_qc_bls_envelope(&tampered, 9, 2, VoteKind::Precommit, Some(bh));
+    qc.signatures[0].1 = encode_qc_bls_envelope(&tampered, 9, 2, VoteKind::Precommit, Some(bh));
     assert!(!qc.verify(&f.vs), "a tampered aggregate must reject");
 
     // Insufficient: only 2 of 3 validators signed (power 2 < quorum 3).
@@ -310,11 +345,17 @@ fn strict_bls_path_rejects_tampered_insufficient_and_mis_bound_aggregates() {
     // Mis-bound: the envelope was created for a DIFFERENT height. The
     // binding check rejects it before any pairing.
     qc.signatures[0].1 = encode_qc_bls_envelope(&good, 10, 2, VoteKind::Precommit, Some(bh));
-    assert!(!qc.verify(&f.vs), "an envelope bound to another height must reject");
+    assert!(
+        !qc.verify(&f.vs),
+        "an envelope bound to another height must reject"
+    );
 
     // Wrong target block.
     qc.signatures[0].1 = encode_qc_bls_envelope(&good, 9, 2, VoteKind::Precommit, Some([0xEE; 32]));
-    assert!(!qc.verify(&f.vs), "an envelope bound to another block must reject");
+    assert!(
+        !qc.verify(&f.vs),
+        "an envelope bound to another block must reject"
+    );
 
     // Garbage payload under the marker id: decode fails, falls through, and
     // with no Ed25519 list the certificate rejects.
@@ -345,7 +386,10 @@ fn bls_path_ignores_a_garbage_ed25519_list() {
             ),
         ],
     };
-    assert!(qc.verify(&f.vs), "strict pairing counts; the garbage list never matters");
+    assert!(
+        qc.verify(&f.vs),
+        "strict pairing counts; the garbage list never matters"
+    );
 }
 
 #[test]
@@ -373,7 +417,10 @@ fn any_bls_failure_falls_back_to_the_ed25519_list() {
     // Same certificate, flag OFF entirely: fallback again.
     {
         let _off = disabled();
-        assert!(qc.verify(&f.vs), "flag-off verification accepts via the Ed25519 list");
+        assert!(
+            qc.verify(&f.vs),
+            "flag-off verification accepts via the Ed25519 list"
+        );
     }
 
     // A certificate with ONLY an Ed25519 quorum (no aggregate at all — what a
@@ -382,8 +429,14 @@ fn any_bls_failure_falls_back_to_the_ed25519_list() {
     {
         let _on = set_qc_bls_for_tests(f.enabled_config());
         let plain = f.cert(12, 0, VoteKind::Precommit, Some(bh), 0..3, None);
-        assert!(!plain.signatures.iter().any(|(id, _)| *id == BLS_QC_MARKER_ID));
-        assert!(plain.verify(&f.vs), "flag-on verification accepts a plain Ed25519 certificate");
+        assert!(!plain
+            .signatures
+            .iter()
+            .any(|(id, _)| *id == BLS_QC_MARKER_ID));
+        assert!(
+            plain.verify(&f.vs),
+            "flag-on verification accepts a plain Ed25519 certificate"
+        );
     }
 }
 
@@ -391,7 +444,14 @@ fn any_bls_failure_falls_back_to_the_ed25519_list() {
 fn certificate_roundtrip_keeps_the_envelope_intact() {
     let f = Fixture::new(3);
     let _on = set_qc_bls_for_tests(f.enabled_config());
-    let qc = f.cert(21, 1, VoteKind::Precommit, Some([0x77; 32]), 0..3, Some(0..3));
+    let qc = f.cert(
+        21,
+        1,
+        VoteKind::Precommit,
+        Some([0x77; 32]),
+        0..3,
+        Some(0..3),
+    );
     let bytes = bincode::serialize(&qc).unwrap();
     let back: QuorumCertificate = bincode::deserialize(&bytes).unwrap();
     assert_eq!(back, qc, "certificate must survive a bincode roundtrip");
@@ -422,11 +482,17 @@ fn marker_id_counts_for_nothing_and_legacy_skips_it() {
     };
     let bytes = bincode::serialize(&qc).unwrap();
     let old = old_layout(&bytes);
-    assert!(!legacy_verify(&old, &f.vs), "old code must skip the marker entry");
+    assert!(
+        !legacy_verify(&old, &f.vs),
+        "old code must skip the marker entry"
+    );
 
     // New code: a non-envelope marker payload also counts for nothing.
     let _on = set_qc_bls_for_tests(f.enabled_config());
-    assert!(!qc.verify(&f.vs), "a non-envelope marker entry counts for nothing");
+    assert!(
+        !qc.verify(&f.vs),
+        "a non-envelope marker entry counts for nothing"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +522,11 @@ fn vote_envelope_roundtrip_and_flag_off_bytes_unchanged() {
             local_vote_seed: Some(seed),
         });
         let v = Vote::sign(&sk, 5, 1, VoteKind::Prevote, Some([1u8; 32]));
-        assert_eq!(v.signature.len(), VOTE_BLS_PART_LEN, "flag-on votes carry the envelope");
+        assert_eq!(
+            v.signature.len(),
+            VOTE_BLS_PART_LEN,
+            "flag-on votes carry the envelope"
+        );
         assert!(v.signature.starts_with(VOTE_BLS_MAGIC));
         assert_eq!(v.ed25519_signature().len(), 64, "the Ed25519 half is bare");
         let bls_half = v.bls_signature().expect("envelope carries a BLS half");
@@ -464,7 +534,9 @@ fn vote_envelope_roundtrip_and_flag_off_bytes_unchanged() {
         // The BLS half really is a signature over the vote message by the
         // configured local seed's key.
         let cfg_key = BlsSecretKey::from_seed(&seed);
-        assert!(cfg_key.public_key().verify(&msg, &BlsSignature::from_bytes(&bls_half).unwrap()));
+        assert!(cfg_key
+            .public_key()
+            .verify(&msg, &BlsSignature::from_bytes(&bls_half).unwrap()));
 
         // OLD code: `Signature::from_slice` over the whole 176-byte field.
         // Fail closed — this is why the flag must be enabled network-wide.
@@ -509,7 +581,8 @@ fn vote_set_certificate_attaches_and_verifies_end_to_end() {
         let _on = set_qc_bls_for_tests(f.enabled_config());
         let mut set = VoteSet::new();
         for i in 0..3 {
-            set.add(make_vote(i), &f.vs, h, 0, VoteKind::Precommit).expect("vote accepted");
+            set.add(make_vote(i), &f.vs, h, 0, VoteKind::Precommit)
+                .expect("vote accepted");
         }
         let qc = set
             .certificate(Some(bh), &f.vs, &[0u8; 32])
@@ -530,7 +603,9 @@ fn vote_set_certificate_attaches_and_verifies_end_to_end() {
         // A BLS-only view of the same certificate (Ed25519 entries removed)
         // still verifies — the aggregate alone carries the quorum.
         let mut bls_only = qc.clone();
-        bls_only.signatures.retain(|(id, _)| *id == BLS_QC_MARKER_ID);
+        bls_only
+            .signatures
+            .retain(|(id, _)| *id == BLS_QC_MARKER_ID);
         assert!(bls_only.verify(&f.vs));
     }
 
@@ -540,7 +615,8 @@ fn vote_set_certificate_attaches_and_verifies_end_to_end() {
         let _off = disabled();
         let mut set = VoteSet::new();
         for i in 0..3 {
-            set.add(make_vote(i), &f.vs, h, 0, VoteKind::Precommit).expect("vote accepted");
+            set.add(make_vote(i), &f.vs, h, 0, VoteKind::Precommit)
+                .expect("vote accepted");
         }
         let qc = set
             .certificate(Some(bh), &f.vs, &[0u8; 32])
@@ -569,8 +645,11 @@ async fn mixed_bls_and_ed25519_sides_do_not_fork() {
 
     let s_bls = std::sync::Arc::new(InMemoryStateEngine::new());
     let s_ed = std::sync::Arc::new(InMemoryStateEngine::new());
-    s_bls.update_account(AccountState::new(from, 10_000_000)).await;
-    s_ed.update_account(AccountState::new(from, 10_000_000)).await;
+    s_bls
+        .update_account(AccountState::new(from, 10_000_000))
+        .await;
+    s_ed.update_account(AccountState::new(from, 10_000_000))
+        .await;
     assert_eq!(s_bls.get_state_root().await, s_ed.get_state_root().await);
 
     // Two ValidatorRuntimes: one we will treat as the BLS-enabled side, one
@@ -585,12 +664,11 @@ async fn mixed_bls_and_ed25519_sides_do_not_fork() {
 
     // ---- height 1: certificate WITH the BLS aggregate ----
     let proposer1 = f.vs.proposer_for(1, 0).expect("proposer");
-    let key1 = f
-        .ed
-        .iter()
-        .find(|k| k.verifying_key().to_bytes() == proposer1)
-        .expect("proposer key")
-        .clone();
+    let key1 =
+        f.ed.iter()
+            .find(|k| k.verifying_key().to_bytes() == proposer1)
+            .expect("proposer key")
+            .clone();
     let mut b1 = Block {
         shard_id: MASTERCHAIN_SHARD,
         height: 1,
@@ -607,16 +685,20 @@ async fn mixed_bls_and_ed25519_sides_do_not_fork() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     b1.sign_block(&key1);
     let bh1 = b1.compute_hash();
     let cert_bls = f.cert(1, 0, VoteKind::Precommit, Some(bh1), 0..2, Some(0..2));
-    assert!(cert_bls.signatures.iter().any(|(id, _)| *id == BLS_QC_MARKER_ID));
+    assert!(cert_bls
+        .signatures
+        .iter()
+        .any(|(id, _)| *id == BLS_QC_MARKER_ID));
 
     // BLS side (flag ON): adopts the augmented certificate.
     {
         let _on = set_qc_bls_for_tests(f.enabled_config());
-        v_bls.adopt_committed(1, b1.clone(), cert_bls.clone())
+        v_bls
+            .adopt_committed(1, b1.clone(), cert_bls.clone())
             .await
             .expect("BLS side must accept a BLS-carrying certificate");
     }
@@ -636,12 +718,11 @@ async fn mixed_bls_and_ed25519_sides_do_not_fork() {
 
     // ---- height 2: certificate WITHOUT the aggregate (plain Ed25519) ----
     let proposer2 = f.vs.proposer_for(2, 0).expect("proposer");
-    let key2 = f
-        .ed
-        .iter()
-        .find(|k| k.verifying_key().to_bytes() == proposer2)
-        .expect("proposer key")
-        .clone();
+    let key2 =
+        f.ed.iter()
+            .find(|k| k.verifying_key().to_bytes() == proposer2)
+            .expect("proposer key")
+            .clone();
     let mut b2 = Block {
         shard_id: MASTERCHAIN_SHARD,
         height: 2,
@@ -662,17 +743,21 @@ async fn mixed_bls_and_ed25519_sides_do_not_fork() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     b2.sign_block(&key2);
     let bh2 = b2.compute_hash();
     let cert_ed = f.cert(2, 0, VoteKind::Precommit, Some(bh2), 0..2, None);
-    assert!(!cert_ed.signatures.iter().any(|(id, _)| *id == BLS_QC_MARKER_ID));
+    assert!(!cert_ed
+        .signatures
+        .iter()
+        .any(|(id, _)| *id == BLS_QC_MARKER_ID));
 
     // BLS side (flag ON) accepts a plain Ed25519 certificate — it never
     // REQUIRES the aggregate.
     {
         let _on = set_qc_bls_for_tests(f.enabled_config());
-        v_bls.adopt_committed(2, b2.clone(), cert_ed.clone())
+        v_bls
+            .adopt_committed(2, b2.clone(), cert_ed.clone())
             .await
             .expect("BLS side must accept a plain Ed25519 certificate");
     }

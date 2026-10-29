@@ -1,6 +1,7 @@
 //! Почтовый ящик InfMail: E2E-шифрование (crypto_box: X25519 + XChaCha20),
 //! реестр пользователей и индексы ящиков в DHT-KV.
 
+use crate::keyring::{protect, secure_dir, unprotect, write_private};
 use anyhow::{anyhow, bail, Result};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
@@ -8,7 +9,6 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::RngCore;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
-use crate::keyring::{protect, secure_dir, unprotect, write_private};
 
 /// Пара ящика: X25519 (E2E) + Ed25519 (подпись отправителя/владельца).
 pub struct MailKeys {
@@ -24,7 +24,12 @@ impl MailKeys {
         let public = PublicKey::from(&secret);
         let ed_sig = SigningKey::generate(&mut rand::rngs::OsRng);
         let ed_ver = ed_sig.verifying_key();
-        Self { secret, public, ed_sig, ed_ver }
+        Self {
+            secret,
+            public,
+            ed_sig,
+            ed_ver,
+        }
     }
 
     pub fn save(&self, dir: &std::path::Path, email: &str) -> Result<()> {
@@ -33,7 +38,10 @@ impl MailKeys {
         let mut ed_hex = hex::encode(self.ed_sig.to_bytes());
         let mut contents = format!("x:{}\ned:{}", x_hex, ed_hex);
         // Шифруем (если задана INFNODE_KEY_PASSPHRASE) и пишем с правами 0600.
-        write_private(&dir.join(format!("{email}.key")), &protect(contents.as_bytes()))?;
+        write_private(
+            &dir.join(format!("{email}.key")),
+            &protect(contents.as_bytes()),
+        )?;
         x_hex.zeroize();
         ed_hex.zeroize();
         contents.zeroize();
@@ -48,14 +56,20 @@ impl MailKeys {
                 .map_err(|e| anyhow!("keystore dir {}: {e}", dir.display()))?;
             let dir_mode = dir_meta.permissions().mode() & 0o777;
             if dir_mode != 0o700 {
-                bail!("keystore dir {} has insecure permissions 0o{:03o}, expected 0o700", dir.display(), dir_mode);
+                bail!(
+                    "keystore dir {} has insecure permissions 0o{:03o}, expected 0o700",
+                    dir.display(),
+                    dir_mode
+                );
             }
             let key_path = dir.join(format!("{email}.key"));
-            let key_meta = std::fs::metadata(&key_path)
-                .map_err(|e| anyhow!("{email}.key: {e}"))?;
+            let key_meta = std::fs::metadata(&key_path).map_err(|e| anyhow!("{email}.key: {e}"))?;
             let key_mode = key_meta.permissions().mode() & 0o777;
             if key_mode != 0o600 {
-                bail!("{email}.key has insecure permissions 0o{:03o}, expected 0o600", key_mode);
+                bail!(
+                    "{email}.key has insecure permissions 0o{:03o}, expected 0o600",
+                    key_mode
+                );
             }
         }
         let raw = std::fs::read_to_string(dir.join(format!("{email}.key")))?;
@@ -63,19 +77,30 @@ impl MailKeys {
         let mut x_hex = None;
         let mut ed_hex = None;
         for line in plain.lines() {
-            if let Some(v) = line.strip_prefix("x:") { x_hex = Some(v.to_string()); }
-            else if let Some(v) = line.strip_prefix("ed:") { ed_hex = Some(v.to_string()); }
+            if let Some(v) = line.strip_prefix("x:") {
+                x_hex = Some(v.to_string());
+            } else if let Some(v) = line.strip_prefix("ed:") {
+                ed_hex = Some(v.to_string());
+            }
         }
         let xb: [u8; 32] = hex::decode(x_hex.ok_or_else(|| anyhow!("x seed отсутствует"))?.trim())?
-            .try_into().map_err(|_| anyhow!("x seed 32"))?;
-        let eb: [u8; 32] = hex::decode(ed_hex.ok_or_else(|| anyhow!("ed seed отсутствует"))?.trim())?
-            .try_into().map_err(|_| anyhow!("ed seed 32"))?;
+            .try_into()
+            .map_err(|_| anyhow!("x seed 32"))?;
+        let eb: [u8; 32] =
+            hex::decode(ed_hex.ok_or_else(|| anyhow!("ed seed отсутствует"))?.trim())?
+                .try_into()
+                .map_err(|_| anyhow!("ed seed 32"))?;
         plain.zeroize();
         let secret = StaticSecret::from(xb);
         let public = PublicKey::from(&secret);
         let ed_sig = SigningKey::from_bytes(&eb);
         let ed_ver = ed_sig.verifying_key();
-        Ok(Self { secret, public, ed_sig, ed_ver })
+        Ok(Self {
+            secret,
+            public,
+            ed_sig,
+            ed_ver,
+        })
     }
 
     pub fn x_hex(&self) -> String {
@@ -92,7 +117,10 @@ impl MailKeys {
 
     pub fn verify(ed_pub: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
         VerifyingKey::from_bytes(ed_pub)
-            .map(|k| k.verify_strict(msg, &ed25519_dalek::Signature::from_bytes(sig)).is_ok())
+            .map(|k| {
+                k.verify_strict(msg, &ed25519_dalek::Signature::from_bytes(sig))
+                    .is_ok()
+            })
             .unwrap_or(false)
     }
 }

@@ -163,11 +163,7 @@ impl StealthAddress {
     }
 
     /// Recipient checks if the stealth address belongs to them using view private key
-    pub fn is_for_recipient(
-        &self,
-        view_priv: &Scalar,
-        spend_pub: &[u8; 32],
-    ) -> Option<bool> {
+    pub fn is_for_recipient(&self, view_priv: &Scalar, spend_pub: &[u8; 32]) -> Option<bool> {
         let ephem_pt = CompressedRistretto(self.ephemeral_pub).decompress()?;
         let spend_pt = CompressedRistretto(*spend_pub).decompress()?;
 
@@ -204,7 +200,9 @@ impl StealthAddress {
         let s_scalar = Scalar::from_bytes_mod_order(s_bytes);
         let one_time_priv = spend_priv + s_scalar;
         // The derived key must correspond to THIS address.
-        let derived_pub = (RISTRETTO_BASEPOINT_POINT * one_time_priv).compress().to_bytes();
+        let derived_pub = (RISTRETTO_BASEPOINT_POINT * one_time_priv)
+            .compress()
+            .to_bytes();
         if derived_pub != self.one_time_pub {
             return None;
         }
@@ -221,12 +219,7 @@ impl StealthAddress {
         let r_pt = RISTRETTO_BASEPOINT_POINT * k;
         let r_bytes = r_pt.compress().to_bytes();
 
-        let e = challenge_scalar(&[
-            b"STELL_STEALTH_SCHNORR_V1",
-            &pub_bytes,
-            &r_bytes,
-            message,
-        ]);
+        let e = challenge_scalar(&[b"STELL_STEALTH_SCHNORR_V1", &pub_bytes, &r_bytes, message]);
         let s = k + e * one_time_priv;
 
         let mut sig = [0u8; 64];
@@ -273,12 +266,7 @@ impl StealthAddress {
             None => return false,
         };
 
-        let e = challenge_scalar(&[
-            b"STELL_STEALTH_SCHNORR_V1",
-            one_time_pub,
-            &r_bytes,
-            message,
-        ]);
+        let e = challenge_scalar(&[b"STELL_STEALTH_SCHNORR_V1", one_time_pub, &r_bytes, message]);
 
         let sg = RISTRETTO_BASEPOINT_POINT * s;
         let r_ep = r_pt + (pub_pt * e);
@@ -302,11 +290,7 @@ pub fn sign_stealth_message(one_time_priv: &Scalar, message: &[u8]) -> [u8; 64] 
 }
 
 /// Verify a stealth signature against a one-time public key.
-pub fn verify_stealth_signature(
-    one_time_pub: &[u8; 32],
-    message: &[u8],
-    signature: &[u8],
-) -> bool {
+pub fn verify_stealth_signature(one_time_pub: &[u8; 32], message: &[u8], signature: &[u8]) -> bool {
     StealthAddress::verify_one_time_signature(one_time_pub, message, signature)
 }
 
@@ -357,7 +341,9 @@ impl ViewingKey {
         view_hasher.update(b"VIEWING_KEY_DERIVE");
         let view_scalar_bytes: [u8; 32] = view_hasher.finalize().into();
         let view_priv = Scalar::from_bytes_mod_order(view_scalar_bytes);
-        let view_pub = (RISTRETTO_BASEPOINT_POINT * view_priv).compress().to_bytes();
+        let view_pub = (RISTRETTO_BASEPOINT_POINT * view_priv)
+            .compress()
+            .to_bytes();
         Self {
             view_priv: view_priv.to_bytes(),
             view_pub,
@@ -385,7 +371,9 @@ impl ViewingKey {
         spend_hasher.update(b"SPEND_KEY_DERIVE");
         let spend_scalar_bytes: [u8; 32] = spend_hasher.finalize().into();
         let spend_priv = Scalar::from_bytes_mod_order(spend_scalar_bytes);
-        let spend_pub = (RISTRETTO_BASEPOINT_POINT * spend_priv).compress().to_bytes();
+        let spend_pub = (RISTRETTO_BASEPOINT_POINT * spend_priv)
+            .compress()
+            .to_bytes();
         (spend_priv, spend_pub)
     }
 
@@ -449,7 +437,10 @@ impl ViewingKey {
     }
 
     /// Auditor decrypts value and blinding factor using their viewing key
-    pub fn decrypt_amount(&self, payload: &EncryptedViewingPayload) -> Result<(u64, Scalar), String> {
+    pub fn decrypt_amount(
+        &self,
+        payload: &EncryptedViewingPayload,
+    ) -> Result<(u64, Scalar), String> {
         let ephem_pt = CompressedRistretto(payload.ephemeral_pub)
             .decompress()
             .ok_or_else(|| "Invalid ephemeral pubkey".to_string())?;
@@ -533,10 +524,11 @@ impl ConfidentialTransfer {
         }
 
         // Sum input points
-        let mut sum_in = match CompressedRistretto(self.input_commitments[0].commitment).decompress() {
-            Some(p) => p,
-            None => return false,
-        };
+        let mut sum_in =
+            match CompressedRistretto(self.input_commitments[0].commitment).decompress() {
+                Some(p) => p,
+                None => return false,
+            };
         for c in &self.input_commitments[1..] {
             let p = match CompressedRistretto(c.commitment).decompress() {
                 Some(p) => p,
@@ -546,10 +538,11 @@ impl ConfidentialTransfer {
         }
 
         // Sum output points
-        let mut sum_out = match CompressedRistretto(self.output_commitments[0].commitment).decompress() {
-            Some(p) => p,
-            None => return false,
-        };
+        let mut sum_out =
+            match CompressedRistretto(self.output_commitments[0].commitment).decompress() {
+                Some(p) => p,
+                None => return false,
+            };
         for c in &self.output_commitments[1..] {
             let p = match CompressedRistretto(c.commitment).decompress() {
                 Some(p) => p,
@@ -772,7 +765,11 @@ impl BitProof {
         let k = Scalar::random(&mut rng);
         let t_true = k * (*GENERATOR_H);
 
-        let (t0, t1) = if bit { (t_false, t_true) } else { (t_true, t_false) };
+        let (t0, t1) = if bit {
+            (t_false, t_true)
+        } else {
+            (t_true, t_false)
+        };
         let e = challenge_scalar(&[
             b"STELL_BIT_OR_V1",
             &p0.compress().to_bytes(),
@@ -788,7 +785,12 @@ impl BitProof {
         } else {
             (e_true, s_true, e_false, s_false)
         };
-        Self { e0: e0.to_bytes(), s0: s0.to_bytes(), e1: e1.to_bytes(), s1: s1.to_bytes() }
+        Self {
+            e0: e0.to_bytes(),
+            s0: s0.to_bytes(),
+            e1: e1.to_bytes(),
+            s1: s1.to_bytes(),
+        }
     }
 
     pub fn verify(commitment: &PedersenCommitment, proof: &BitProof) -> bool {
@@ -906,10 +908,18 @@ impl RangeProof {
         }
         // Sanity: the decomposition must reconstruct the commitment exactly.
         debug_assert!(Self::verify_reconstruction(commitment, &bit_commitments, n));
-        Self { bits, bit_commitments, bit_proofs }
+        Self {
+            bits,
+            bit_commitments,
+            bit_proofs,
+        }
     }
 
-    fn verify_reconstruction(commitment: &PedersenCommitment, bits: &[PedersenCommitment], n: usize) -> bool {
+    fn verify_reconstruction(
+        commitment: &PedersenCommitment,
+        bits: &[PedersenCommitment],
+        n: usize,
+    ) -> bool {
         let mut points = Vec::with_capacity(n);
         let mut scalars = Vec::with_capacity(n);
         for (i, c) in bits.iter().enumerate().take(n) {
@@ -1155,20 +1165,32 @@ impl std::fmt::Display for ConfidentialError {
         match self {
             ConfidentialError::EmptyTransfer => write!(f, "transfer has no inputs or no outputs"),
             ConfidentialError::InvalidCommitment(c) => {
-                write!(f, "commitment is not a valid Ristretto point: {}", hex::encode(c))
+                write!(
+                    f,
+                    "commitment is not a valid Ristretto point: {}",
+                    hex::encode(c)
+                )
             }
             ConfidentialError::ConservationViolated => {
                 write!(f, "input and output commitments do not balance to fee*G")
             }
             ConfidentialError::DuplicateInput(c) => {
-                write!(f, "input commitment repeated in one transfer: {}", hex::encode(c))
+                write!(
+                    f,
+                    "input commitment repeated in one transfer: {}",
+                    hex::encode(c)
+                )
             }
             ConfidentialError::DoubleSpend(c) => {
                 write!(f, "input commitment already spent: {}", hex::encode(c))
             }
             ConfidentialError::FeeOverflow => write!(f, "accumulated fees overflow u64"),
             ConfidentialError::NotOwner(c) => {
-                write!(f, "input commitment not owned by sender: {}", hex::encode(c))
+                write!(
+                    f,
+                    "input commitment not owned by sender: {}",
+                    hex::encode(c)
+                )
             }
             ConfidentialError::BadOpening(c) => {
                 write!(f, "commitment opening does not match: {}", hex::encode(c))
@@ -1267,7 +1289,10 @@ impl ConfidentialState {
     /// has none. Consensus reads must not distinguish "absent" from "committed
     /// to zero with zero blinding": both are the identity point.
     pub fn balance(&self, account: &[u8; 32]) -> PedersenCommitment {
-        self.balances.get(account).copied().unwrap_or(ZERO_COMMITMENT)
+        self.balances
+            .get(account)
+            .copied()
+            .unwrap_or(ZERO_COMMITMENT)
     }
 
     pub fn is_spent(&self, commitment: &[u8; 32]) -> bool {
@@ -1317,7 +1342,10 @@ impl ConfidentialState {
         // Intra-transfer duplicate inputs: a multiset is required for the sum to
         // mean anything, and rejecting them early keeps the spent set exact.
         for (i, c) in tx.input_commitments.iter().enumerate() {
-            if tx.input_commitments[..i].iter().any(|p| p.commitment == c.commitment) {
+            if tx.input_commitments[..i]
+                .iter()
+                .any(|p| p.commitment == c.commitment)
+            {
                 return Err(ConfidentialError::DuplicateInput(c.commitment));
             }
         }
@@ -1359,7 +1387,8 @@ impl ConfidentialState {
             let new_sender = decode_commitment(&self.balance(sender))? - sum_in;
             let new_recipient = decode_commitment(&self.balance(recipient))? + sum_out;
             self.balances.insert(*sender, encode_point(new_sender));
-            self.balances.insert(*recipient, encode_point(new_recipient));
+            self.balances
+                .insert(*recipient, encode_point(new_recipient));
         }
         for c in &tx.input_commitments {
             self.spent.insert(c.commitment);
@@ -1398,7 +1427,10 @@ impl ConfidentialState {
         tx.verify_ranges(input_ranges, output_ranges)?;
         // 2. Intra-transfer duplicate inputs.
         for (i, c) in tx.input_commitments.iter().enumerate() {
-            if tx.input_commitments[..i].iter().any(|p| p.commitment == c.commitment) {
+            if tx.input_commitments[..i]
+                .iter()
+                .any(|p| p.commitment == c.commitment)
+            {
                 return Err(ConfidentialError::DuplicateInput(c.commitment));
             }
         }
@@ -1424,7 +1456,9 @@ impl ConfidentialState {
             return Err(ConfidentialError::ConservationViolated);
         }
         // 6. Fee total must not overflow (checked, not mutated).
-        self.total_fees.checked_add(tx.fee).ok_or(ConfidentialError::FeeOverflow)?;
+        self.total_fees
+            .checked_add(tx.fee)
+            .ok_or(ConfidentialError::FeeOverflow)?;
         Ok(())
     }
 
@@ -1590,7 +1624,10 @@ fn put_addr<S: crate::commitment::PreimageSink>(h: &mut S, tag: &[u8], v: &[u8; 
 /// conditional: balances are walked in `BTreeMap` (key) order, the spent set in
 /// `BTreeSet` order, and every collection's length is written so two different
 /// states cannot encode to the same preimage.
-pub fn write_confidential_domain<S: crate::commitment::PreimageSink>(h: &mut S, state: &ConfidentialState) {
+pub fn write_confidential_domain<S: crate::commitment::PreimageSink>(
+    h: &mut S,
+    state: &ConfidentialState,
+) {
     if state.is_empty() {
         return;
     }
@@ -1701,8 +1738,7 @@ mod tests {
             let points: Vec<RistrettoPoint> = (0..n)
                 .map(|_| RISTRETTO_BASEPOINT_POINT * Scalar::random(&mut rng))
                 .collect();
-            let scalars: Vec<Scalar> =
-                (0..n).map(|_| Scalar::random(&mut rng)).collect();
+            let scalars: Vec<Scalar> = (0..n).map(|_| Scalar::random(&mut rng)).collect();
             let mut expected = RistrettoPoint::identity();
             for (p, s) in points.iter().zip(scalars.iter()) {
                 expected += p * s;
@@ -1733,12 +1769,17 @@ mod tests {
         );
         let empty = ConfidentialTransfer::new(vec![], vec![], 0);
         let junk = ConfidentialTransfer::new(
-            vec![PedersenCommitment { commitment: [0xFF; 32] }],
+            vec![PedersenCommitment {
+                commitment: [0xFF; 32],
+            }],
             vec![PedersenCommitment::commit(0, &Scalar::from(1u64))],
             0,
         );
         let txs = vec![good, forged, empty, junk];
-        let scalar: Vec<bool> = txs.iter().map(|t| t.verify_balance_conservation()).collect();
+        let scalar: Vec<bool> = txs
+            .iter()
+            .map(|t| t.verify_balance_conservation())
+            .collect();
         assert_eq!(scalar, vec![true, false, false, false]);
         assert_eq!(
             ConfidentialTransfer::batch_verify_balance_conservation(&txs),
@@ -1771,7 +1812,9 @@ mod tests {
             BitProof::verify(&c, &bad),
             BitProof::verify_scalar(&c, &bad)
         );
-        let junk = PedersenCommitment { commitment: [0xFF; 32] };
+        let junk = PedersenCommitment {
+            commitment: [0xFF; 32],
+        };
         assert!(!BitProof::verify(&junk, &proof));
         assert!(!BitProof::verify_scalar(&junk, &proof));
     }
@@ -1782,14 +1825,20 @@ mod tests {
 
         // Bob's viewing key and spend key
         let bob_view_priv = Scalar::random(&mut rng);
-        let bob_view_pub = (RISTRETTO_BASEPOINT_POINT * bob_view_priv).compress().to_bytes();
+        let bob_view_pub = (RISTRETTO_BASEPOINT_POINT * bob_view_priv)
+            .compress()
+            .to_bytes();
         let bob_spend_priv = Scalar::random(&mut rng);
-        let bob_spend_pub = (RISTRETTO_BASEPOINT_POINT * bob_spend_priv).compress().to_bytes();
+        let bob_spend_pub = (RISTRETTO_BASEPOINT_POINT * bob_spend_priv)
+            .compress()
+            .to_bytes();
 
         // Charlie's viewing key and spend key
         let charlie_view_priv = Scalar::random(&mut rng);
         let charlie_spend_priv = Scalar::random(&mut rng);
-        let charlie_spend_pub = (RISTRETTO_BASEPOINT_POINT * charlie_spend_priv).compress().to_bytes();
+        let charlie_spend_pub = (RISTRETTO_BASEPOINT_POINT * charlie_spend_priv)
+            .compress()
+            .to_bytes();
 
         // Alice generates StealthAddress for Bob using Bob's view_pub and spend_pub
         let stealth = StealthAddress::generate(&bob_view_pub, &bob_spend_pub)
@@ -1816,13 +1865,17 @@ mod tests {
 
         // Assert that RISTRETTO_BASEPOINT_POINT * one_time_priv matches stealth.one_time_pub!
         assert_eq!(
-            (RISTRETTO_BASEPOINT_POINT * one_time_priv).compress().to_bytes(),
+            (RISTRETTO_BASEPOINT_POINT * one_time_priv)
+                .compress()
+                .to_bytes(),
             stealth.one_time_pub,
             "Compressed point of one_time_priv must match stealth.one_time_pub"
         );
         assert_eq!(
             RISTRETTO_BASEPOINT_POINT * one_time_priv,
-            CompressedRistretto(stealth.one_time_pub).decompress().unwrap(),
+            CompressedRistretto(stealth.one_time_pub)
+                .decompress()
+                .unwrap(),
             "Ristretto point of one_time_priv must match decompressed stealth.one_time_pub"
         );
 
@@ -1929,7 +1982,10 @@ mod tests {
 
         // Check deterministic alias
         assert_eq!(ViewingKey::from_seed(&bob_seed).view_pub, bob_vk.view_pub);
-        assert_eq!(ViewingKey::from_scalar(&bob_vk.private_scalar()).view_pub, bob_vk.view_pub);
+        assert_eq!(
+            ViewingKey::from_scalar(&bob_vk.private_scalar()).view_pub,
+            bob_vk.view_pub
+        );
 
         let charlie_seed = [0x99u8; 32];
         let charlie_vk = ViewingKey::derive_from_seed(&charlie_seed);
@@ -1940,9 +1996,15 @@ mod tests {
             .expect("Stealth address generation succeeds");
 
         // Bob identifies it via ViewingKey helper
-        assert_eq!(bob_vk.is_for_recipient(&stealth, &bob_spend_pub), Some(true));
+        assert_eq!(
+            bob_vk.is_for_recipient(&stealth, &bob_spend_pub),
+            Some(true)
+        );
         // Charlie does not
-        assert_eq!(charlie_vk.is_for_recipient(&stealth, &charlie_spend_pub), Some(false));
+        assert_eq!(
+            charlie_vk.is_for_recipient(&stealth, &charlie_spend_pub),
+            Some(false)
+        );
 
         // Bob derives one-time private key via ViewingKey helper
         let one_time_priv = bob_vk
@@ -1951,19 +2013,27 @@ mod tests {
 
         // Verification equation holds
         assert_eq!(
-            (RISTRETTO_BASEPOINT_POINT * one_time_priv).compress().to_bytes(),
+            (RISTRETTO_BASEPOINT_POINT * one_time_priv)
+                .compress()
+                .to_bytes(),
             stealth.one_time_pub
         );
         assert_eq!(
             RISTRETTO_BASEPOINT_POINT * one_time_priv,
-            CompressedRistretto(stealth.one_time_pub).decompress().unwrap()
+            CompressedRistretto(stealth.one_time_pub)
+                .decompress()
+                .unwrap()
         );
 
         // Bob signs and verifies
         let memo = b"Audited fund transfer transaction";
         let sig = sign_stealth_message(&one_time_priv, memo);
         assert!(verify_stealth_signature(&stealth.one_time_pub, memo, &sig));
-        assert!(!verify_stealth_signature(&stealth.one_time_pub, b"Altered memo", &sig));
+        assert!(!verify_stealth_signature(
+            &stealth.one_time_pub,
+            b"Altered memo",
+            &sig
+        ));
     }
 }
 #[cfg(test)]
@@ -1981,7 +2051,15 @@ mod auto_bits_tests {
 
     #[test]
     fn prove_auto_round_trips_both_widths() {
-        for v in [0u64, 1, 100, (1u64 << 32) - 1, 1u64 << 32, 5_000_000_000, u64::MAX >> 1] {
+        for v in [
+            0u64,
+            1,
+            100,
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            5_000_000_000,
+            u64::MAX >> 1,
+        ] {
             let r = Scalar::from(v.wrapping_add(7));
             let c = PedersenCommitment::commit(v, &r);
             let p = RangeProof::prove_auto(&c, v, &r);
@@ -2002,7 +2080,10 @@ mod auto_bits_tests {
         assert_eq!(p2.bits, 64);
         let pairs = [(&c1, &p1), (&c2, &p2)];
         let got = RangeProof::batch_verify(&pairs);
-        let want: Vec<bool> = pairs.iter().map(|(c, p)| RangeProof::verify(c, p)).collect();
+        let want: Vec<bool> = pairs
+            .iter()
+            .map(|(c, p)| RangeProof::verify(c, p))
+            .collect();
         assert_eq!(got, want);
         assert_eq!(got, vec![true, true]);
     }

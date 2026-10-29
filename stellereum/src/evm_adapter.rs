@@ -21,15 +21,15 @@
 //! - `EvmReceipt`
 //! - `EvmFeeHistory`
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
-use crate::state_engine::InMemoryStateEngine;
 use crate::rpc::RpcState;
+use crate::state_engine::InMemoryStateEngine;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 /// Default chain ID for Stellereum network (5757).
 ///
@@ -381,7 +381,9 @@ pub async fn eth_call_with_engine(
     engine: &InMemoryStateEngine,
     params: &Value,
 ) -> Result<Value, JsonRpcError> {
-    global_adapter().handle_eth_call_with_engine(engine, params).await
+    global_adapter()
+        .handle_eth_call_with_engine(engine, params)
+        .await
 }
 
 pub fn eth_new_block_filter() -> String {
@@ -389,7 +391,9 @@ pub fn eth_new_block_filter() -> String {
 }
 
 pub fn eth_new_pending_transaction_filter() -> String {
-    GLOBAL_EVM_ADAPTER.filter_manager.new_pending_transaction_filter()
+    GLOBAL_EVM_ADAPTER
+        .filter_manager
+        .new_pending_transaction_filter()
 }
 
 pub fn eth_new_filter(params: &Value) -> Result<String, JsonRpcError> {
@@ -499,7 +503,9 @@ pub fn extract_raw_evm_bytes(params: &Value) -> Result<Vec<u8>, JsonRpcError> {
         .unwrap_or(raw_hex);
     let raw = hex::decode(clean).map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
     if raw.is_empty() || raw.len() > MAX_EVM_RAW_TX_BYTES {
-        return Err(JsonRpcError::invalid_params("empty or oversized raw transaction"));
+        return Err(JsonRpcError::invalid_params(
+            "empty or oversized raw transaction",
+        ));
     }
     Ok(raw)
 }
@@ -514,14 +520,16 @@ pub fn extract_raw_evm_bytes(params: &Value) -> Result<Vec<u8>, JsonRpcError> {
 /// served identity is dynamic, verification is pinned so all nodes agree.
 pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError> {
     if raw.is_empty() || raw.len() > MAX_EVM_RAW_TX_BYTES {
-        return Err(JsonRpcError::invalid_params("empty or oversized raw transaction"));
+        return Err(JsonRpcError::invalid_params(
+            "empty or oversized raw transaction",
+        ));
     }
     let tx_hash = format!("0x{}", hex::encode(keccak256(raw)));
 
     // Decode + strictly verify (chain_id, low-s, ecrecover).
     let evm_tx: EvmTransaction = if !raw.is_empty() && raw[0] == 0x02 {
-        let decoded = parse_eip1559_envelope(raw)
-            .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
+        let decoded =
+            parse_eip1559_envelope(raw).map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
         let from = decoded
             .verify_signature()
             .map_err(|e| JsonRpcError::server_error(INTERNAL_ERROR_CODE, e.to_string()))?;
@@ -552,10 +560,7 @@ pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError
             tx_type: Some("0x2".to_string()),
             chain_id: Some(CHAIN_ID_HEX.to_string()),
             max_fee_per_gas: Some(format!("0x{:x}", decoded.max_fee_per_gas)),
-            max_priority_fee_per_gas: Some(format!(
-                "0x{:x}",
-                decoded.max_priority_fee_per_gas
-            )),
+            max_priority_fee_per_gas: Some(format!("0x{:x}", decoded.max_priority_fee_per_gas)),
             access_list: None,
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
@@ -571,9 +576,7 @@ pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError
             Some(cid) => {
                 return Err(JsonRpcError::server_error(
                     INTERNAL_ERROR_CODE,
-                    format!(
-                        "EIP-155 replay protection mismatch: expected chain 5757, got {cid}"
-                    ),
+                    format!("EIP-155 replay protection mismatch: expected chain 5757, got {cid}"),
                 ))
             }
             None => {
@@ -690,10 +693,8 @@ pub const SECP_ENVELOPE_LEN: usize = 100;
 
 /// secp256k1 curve order N (for low-s normalization of settlement signatures).
 pub const SECP256K1_N: [u8; 32] = [
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
-    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b,
-    0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
 ];
 
 fn secp_sub_n_minus_s(s: &[u8; 32]) -> [u8; 32] {
@@ -811,8 +812,8 @@ pub fn verify_secp_settlement(tx: &crate::sharding::Transaction) -> Result<[u8; 
         return Err("secp signature s is not canonical (EIP-2)".to_string());
     }
     let sighash = keccak256(&tx.signing_message());
-    let recovered =
-        ecrecover(&sighash, recid as u64, &r, &s).map_err(|e| format!("secp ecrecover failed: {e}"))?;
+    let recovered = ecrecover(&sighash, recid as u64, &r, &s)
+        .map_err(|e| format!("secp ecrecover failed: {e}"))?;
     let expected = stell_to_evm_address(&tx.from);
     if recovered != expected {
         return Err("secp envelope recovers a different sender than tx.from".to_string());
@@ -835,9 +836,8 @@ pub fn build_secp_settlement_tx(
 ) -> Result<crate::sharding::Transaction, String> {
     let norm = normalize_hash(evm_hash_hex).map_err(|e| format!("bad evm hash: {e}"))?;
     let evm_bytes = parse_hash_bytes(&norm).map_err(|e| format!("bad evm hash: {e}"))?;
-    let sender20 =
-        pubkey_to_address(secp_key.verifying_key().to_encoded_point(false).as_bytes())
-            .map_err(|e| e.to_string())?;
+    let sender20 = pubkey_to_address(secp_key.verifying_key().to_encoded_point(false).as_bytes())
+        .map_err(|e| e.to_string())?;
     let from32 = evm_to_stell_address(&sender20);
     // Signing bytes of the unsigned body (empty signature => base message).
     let unsigned = crate::sharding::Transaction {
@@ -971,11 +971,18 @@ impl JsonRpcError {
     }
 
     pub fn invalid_request(detail: impl Into<String>) -> Self {
-        Self::with_data(INVALID_REQUEST_CODE, "Invalid Request", json!(detail.into()))
+        Self::with_data(
+            INVALID_REQUEST_CODE,
+            "Invalid Request",
+            json!(detail.into()),
+        )
     }
 
     pub fn method_not_found(method: &str) -> Self {
-        Self::new(METHOD_NOT_FOUND_CODE, format!("Method not found: '{method}'"))
+        Self::new(
+            METHOD_NOT_FOUND_CODE,
+            format!("Method not found: '{method}'"),
+        )
     }
 
     pub fn invalid_params(detail: impl Into<String>) -> Self {
@@ -1109,13 +1116,19 @@ impl FilterCriteria {
                     } else if first.is_null() {
                         return Ok(Self::default());
                     } else {
-                        return Err(JsonRpcError::invalid_params("expected filter object in params array"));
+                        return Err(JsonRpcError::invalid_params(
+                            "expected filter object in params array",
+                        ));
                     }
                 } else {
                     return Ok(Self::default());
                 }
             }
-            _ => return Err(JsonRpcError::invalid_params("filter parameters must be an object")),
+            _ => {
+                return Err(JsonRpcError::invalid_params(
+                    "filter parameters must be an object",
+                ))
+            }
         };
 
         let from_block = obj.get("fromBlock").and_then(|v| match v {
@@ -1134,7 +1147,10 @@ impl FilterCriteria {
             match addr_val {
                 Value::String(s) => Some(FilterAddress::Single(s.clone())),
                 Value::Array(arr) => {
-                    let list: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                    let list: Vec<String> = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
                     Some(FilterAddress::Multiple(list))
                 }
                 _ => None,
@@ -1144,20 +1160,23 @@ impl FilterCriteria {
         };
 
         let topics = obj.get("topics").and_then(|v| v.as_array()).map(|arr| {
-                let mut parsed_topics = Vec::new();
-                for item in arr {
-                    match item {
-                        Value::Null => parsed_topics.push(None),
-                        Value::String(s) => parsed_topics.push(Some(FilterTopic::Single(s.clone()))),
-                        Value::Array(sub_arr) => {
-                            let list: Vec<String> = sub_arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-                            parsed_topics.push(Some(FilterTopic::Multiple(list)));
-                        }
-                        _ => parsed_topics.push(None),
+            let mut parsed_topics = Vec::new();
+            for item in arr {
+                match item {
+                    Value::Null => parsed_topics.push(None),
+                    Value::String(s) => parsed_topics.push(Some(FilterTopic::Single(s.clone()))),
+                    Value::Array(sub_arr) => {
+                        let list: Vec<String> = sub_arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect();
+                        parsed_topics.push(Some(FilterTopic::Multiple(list)));
                     }
+                    _ => parsed_topics.push(None),
                 }
-                parsed_topics
-            });
+            }
+            parsed_topics
+        });
 
         Ok(FilterCriteria {
             from_block,
@@ -1238,7 +1257,7 @@ impl FilterCriteria {
 pub enum FilterKind {
     Block {
         pending_hashes: Vec<String>,
-},
+    },
     PendingTransaction {
         pending_hashes: Vec<String>,
     },
@@ -1260,7 +1279,8 @@ pub struct FilterEntry {
 /// Thread-safe in-memory filter manager for `eth_new*Filter` and polling.
 #[derive(Debug)]
 pub struct FilterManager {
-#[allow(dead_code)] // GATE: filter-id counter reserved for multi-filter RPC sessions; kept for API stability.
+    #[allow(dead_code)]
+    // GATE: filter-id counter reserved for multi-filter RPC sessions; kept for API stability.
     next_id: AtomicU64,
     filters: RwLock<HashMap<String, FilterEntry>>,
 }
@@ -1413,15 +1433,22 @@ impl FilterManager {
 
         entry.last_poll = Instant::now();
         match entry.kind {
-            FilterKind::Block { ref mut pending_hashes } => {
+            FilterKind::Block {
+                ref mut pending_hashes,
+            } => {
                 let hashes = std::mem::take(pending_hashes);
                 Ok(json!(hashes))
             }
-            FilterKind::PendingTransaction { ref mut pending_hashes } => {
+            FilterKind::PendingTransaction {
+                ref mut pending_hashes,
+            } => {
                 let hashes = std::mem::take(pending_hashes);
                 Ok(json!(hashes))
             }
-            FilterKind::Log { ref mut pending_logs, .. } => {
+            FilterKind::Log {
+                ref mut pending_logs,
+                ..
+            } => {
                 let logs = std::mem::take(pending_logs);
                 Ok(json!(logs))
             }
@@ -1468,7 +1495,10 @@ impl FilterManager {
             if Self::is_expired(entry) {
                 continue;
             }
-            if let FilterKind::Block { ref mut pending_hashes } = entry.kind {
+            if let FilterKind::Block {
+                ref mut pending_hashes,
+            } = entry.kind
+            {
                 Self::push_bounded_hash(pending_hashes, hash_str.clone());
             }
         }
@@ -1481,7 +1511,10 @@ impl FilterManager {
             if Self::is_expired(entry) {
                 continue;
             }
-            if let FilterKind::PendingTransaction { ref mut pending_hashes } = entry.kind {
+            if let FilterKind::PendingTransaction {
+                ref mut pending_hashes,
+            } = entry.kind
+            {
                 Self::push_bounded_hash(pending_hashes, hash_str.clone());
             }
         }
@@ -1600,10 +1633,14 @@ pub fn extract_filter_id(params: &Value) -> Result<String, JsonRpcError> {
                         if let Some(u) = n.as_u64() {
                             Ok(format!("0x{:x}", u))
                         } else {
-                            Err(JsonRpcError::invalid_params("filter id must be a positive integer"))
+                            Err(JsonRpcError::invalid_params(
+                                "filter id must be a positive integer",
+                            ))
                         }
                     }
-                    _ => Err(JsonRpcError::invalid_params("filter id must be a string or integer")),
+                    _ => Err(JsonRpcError::invalid_params(
+                        "filter id must be a string or integer",
+                    )),
                 }
             } else {
                 Err(JsonRpcError::invalid_params("missing filter id"))
@@ -1614,7 +1651,9 @@ pub fn extract_filter_id(params: &Value) -> Result<String, JsonRpcError> {
             if let Some(u) = n.as_u64() {
                 Ok(format!("0x{:x}", u))
             } else {
-                Err(JsonRpcError::invalid_params("filter id must be a positive integer"))
+                Err(JsonRpcError::invalid_params(
+                    "filter id must be a positive integer",
+                ))
             }
         }
         _ => Err(JsonRpcError::invalid_params("invalid filter parameters")),
@@ -1674,7 +1713,11 @@ pub fn validate_storage_position(pos: &str) -> Result<(), JsonRpcError> {
     let stripped = trimmed
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
-        .ok_or_else(|| JsonRpcError::invalid_params(format!("invalid storage position '{pos}': missing 0x prefix")))?;
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(format!(
+                "invalid storage position '{pos}': missing 0x prefix"
+            ))
+        })?;
     if stripped.is_empty() || stripped.len() > 64 {
         return Err(JsonRpcError::invalid_params(format!(
             "invalid storage position '{pos}': expected 1..64 hex chars"
@@ -1692,7 +1735,9 @@ pub fn validate_storage_position(pos: &str) -> Result<(), JsonRpcError> {
 /// (object form `{address, position/slot, blockTag/block}` is also accepted).
 /// Returns `(address, position, tag)`; the address and position are validated,
 /// the tag defaults to `Latest`.
-pub fn parse_get_storage_at_params(params: &Value) -> Result<(String, String, BlockTag), JsonRpcError> {
+pub fn parse_get_storage_at_params(
+    params: &Value,
+) -> Result<(String, String, BlockTag), JsonRpcError> {
     match params {
         Value::Array(arr) => {
             if arr.len() < 2 {
@@ -1719,16 +1764,17 @@ pub fn parse_get_storage_at_params(params: &Value) -> Result<(String, String, Bl
             Ok((addr.to_string(), pos.to_string(), tag))
         }
         Value::Object(obj) => {
-            let addr = obj
-                .get("address")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| JsonRpcError::invalid_params("missing 'address' in params object"))?;
+            let addr = obj.get("address").and_then(|v| v.as_str()).ok_or_else(|| {
+                JsonRpcError::invalid_params("missing 'address' in params object")
+            })?;
             let pos = obj
                 .get("position")
                 .or_else(|| obj.get("slot"))
                 .or_else(|| obj.get("index"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| JsonRpcError::invalid_params("missing 'position' in params object"))?;
+                .ok_or_else(|| {
+                    JsonRpcError::invalid_params("missing 'position' in params object")
+                })?;
             validate_storage_position(pos)?;
             let tag = if let Some(t) = obj
                 .get("blockTag")
@@ -1809,7 +1855,9 @@ pub fn abi_decode_string(hex_str: &str) -> Result<String, String> {
     }
     let len_hex = &clean[len_offset..len_end];
     let len = usize::from_str_radix(len_hex, 16).map_err(|e| e.to_string())?;
-    let need_hex = len.checked_mul(2).ok_or("declared length overflows".to_string())?;
+    let need_hex = len
+        .checked_mul(2)
+        .ok_or("declared length overflows".to_string())?;
     let data_offset = len_offset
         .checked_add(64)
         .ok_or("offset overflows".to_string())?;
@@ -1913,7 +1961,10 @@ impl std::fmt::Debug for EvmAdapter {
             .field("base_fee", &self.base_fee)
             .field("head_block", &self.head_block)
             .field("gas_used_ratio", &self.gas_used_ratio)
-            .field("engine", &self.engine.as_ref().map(|_| "<InMemoryStateEngine>"))
+            .field(
+                "engine",
+                &self.engine.as_ref().map(|_| "<InMemoryStateEngine>"),
+            )
             .field("blocks_count", &self.blocks_by_number.len())
             .field("receipts_count", &self.receipts.len())
             .field("transactions_count", &self.transactions.len())
@@ -2205,8 +2256,9 @@ impl EvmAdapter {
     /// Validates the address, the 32-byte slot position and the block tag.
     pub fn eth_get_storage_at(&self, params: &Value) -> Result<String, JsonRpcError> {
         let (addr_str, _pos_str, _tag) = parse_get_storage_at_params(params)?;
-        let _ = parse_evm_or_stell_address(&addr_str)
-            .map_err(|e| JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}")))?;
+        let _ = parse_evm_or_stell_address(&addr_str).map_err(|e| {
+            JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}"))
+        })?;
         Ok(EMPTY_STORAGE_VALUE_HEX.to_string())
     }
 
@@ -2278,12 +2330,8 @@ impl EvmAdapter {
             SELECTOR_SYMBOL => abi_encode_string(&self.token_symbol),
             SELECTOR_DECIMALS => abi_encode_u8(self.token_decimals),
             SELECTOR_TOTAL_SUPPLY => abi_encode_u128(self.total_supply),
-            SELECTOR_TRANSFER | SELECTOR_APPROVE | SELECTOR_TRANSFER_FROM => {
-                abi_encode_bool(true)
-            }
-            SELECTOR_ALLOWANCE => {
-                abi_encode_u128(u128::MAX)
-            }
+            SELECTOR_TRANSFER | SELECTOR_APPROVE | SELECTOR_TRANSFER_FROM => abi_encode_bool(true),
+            SELECTOR_ALLOWANCE => abi_encode_u128(u128::MAX),
             SELECTOR_BALANCE_OF => {
                 let address = extract_address_from_calldata(rest);
                 let bal = self.get_balance(&address);
@@ -2329,12 +2377,8 @@ impl EvmAdapter {
             SELECTOR_SYMBOL => abi_encode_string(&self.token_symbol),
             SELECTOR_DECIMALS => abi_encode_u8(self.token_decimals),
             SELECTOR_TOTAL_SUPPLY => abi_encode_u128(self.total_supply),
-            SELECTOR_TRANSFER | SELECTOR_APPROVE | SELECTOR_TRANSFER_FROM => {
-                abi_encode_bool(true)
-            }
-            SELECTOR_ALLOWANCE => {
-                abi_encode_u128(u128::MAX)
-            }
+            SELECTOR_TRANSFER | SELECTOR_APPROVE | SELECTOR_TRANSFER_FROM => abi_encode_bool(true),
+            SELECTOR_ALLOWANCE => abi_encode_u128(u128::MAX),
             SELECTOR_BALANCE_OF => {
                 let address = extract_address_from_calldata(rest);
                 // Check local overrides first
@@ -2355,7 +2399,8 @@ impl EvmAdapter {
                         }
                     }
                     if stripped.len() == 40 {
-                        let stell_norm = format!("0x000000000000000000000000{}", stripped.to_lowercase());
+                        let stell_norm =
+                            format!("0x000000000000000000000000{}", stripped.to_lowercase());
                         if let Some(&val) = b.get(&stell_norm) {
                             return abi_encode_u128(val);
                         }
@@ -2437,7 +2482,8 @@ impl EvmAdapter {
         block_number: Option<u64>,
         tx_index: Option<u32>,
     ) {
-        let evm_tx = stell_tx_to_evm_with_chain(tx, block_hash, block_number, tx_index, self.chain_id);
+        let evm_tx =
+            stell_tx_to_evm_with_chain(tx, block_hash, block_number, tx_index, self.chain_id);
         self.insert_transaction(evm_tx);
     }
 
@@ -2451,12 +2497,17 @@ impl EvmAdapter {
             let mut block = b.clone();
             if !full_txs {
                 if let BlockTransactions::Full(ref txs) = block.transactions {
-                    block.transactions = BlockTransactions::Hashes(txs.iter().map(|t| t.hash.clone()).collect());
+                    block.transactions =
+                        BlockTransactions::Hashes(txs.iter().map(|t| t.hash.clone()).collect());
                 }
             } else if let BlockTransactions::Hashes(ref hashes) = block.transactions {
                 let hydrated: Vec<EvmTransaction> = hashes
                     .iter()
-                    .filter_map(|h| normalize_hash(h).ok().and_then(|norm| self.transactions.get(&norm).cloned()))
+                    .filter_map(|h| {
+                        normalize_hash(h)
+                            .ok()
+                            .and_then(|norm| self.transactions.get(&norm).cloned())
+                    })
                     .collect();
                 if hydrated.len() == hashes.len() && !hydrated.is_empty() {
                     block.transactions = BlockTransactions::Full(hydrated);
@@ -2472,12 +2523,17 @@ impl EvmAdapter {
             let mut block = b.clone();
             if !full_txs {
                 if let BlockTransactions::Full(ref txs) = block.transactions {
-                    block.transactions = BlockTransactions::Hashes(txs.iter().map(|t| t.hash.clone()).collect());
+                    block.transactions =
+                        BlockTransactions::Hashes(txs.iter().map(|t| t.hash.clone()).collect());
                 }
             } else if let BlockTransactions::Hashes(ref hashes) = block.transactions {
                 let hydrated: Vec<EvmTransaction> = hashes
                     .iter()
-                    .filter_map(|h| normalize_hash(h).ok().and_then(|norm| self.transactions.get(&norm).cloned()))
+                    .filter_map(|h| {
+                        normalize_hash(h)
+                            .ok()
+                            .and_then(|norm| self.transactions.get(&norm).cloned())
+                    })
                     .collect();
                 if hydrated.len() == hashes.len() && !hydrated.is_empty() {
                     block.transactions = BlockTransactions::Full(hydrated);
@@ -2545,33 +2601,54 @@ impl EvmAdapter {
         eth_pending_tx(&norm)
     }
 
-    pub fn eth_get_block_by_number(&self, tag: &str, full_txs: bool) -> Result<Option<EvmBlock>, JsonRpcError> {
+    pub fn eth_get_block_by_number(
+        &self,
+        tag: &str,
+        full_txs: bool,
+    ) -> Result<Option<EvmBlock>, JsonRpcError> {
         let parsed = BlockTag::parse_str(tag)?;
         Ok(self.get_block_by_number(&parsed, full_txs))
     }
 
-    pub fn eth_get_block_by_hash(&self, hash: &str, full_txs: bool) -> Result<Option<EvmBlock>, JsonRpcError> {
+    pub fn eth_get_block_by_hash(
+        &self,
+        hash: &str,
+        full_txs: bool,
+    ) -> Result<Option<EvmBlock>, JsonRpcError> {
         if normalize_hash(hash).is_err() {
-            return Err(JsonRpcError::invalid_params(format!("invalid block hash '{hash}'")));
+            return Err(JsonRpcError::invalid_params(format!(
+                "invalid block hash '{hash}'"
+            )));
         }
         Ok(self.get_block_by_hash(hash, full_txs))
     }
 
-    pub fn eth_get_transaction_receipt(&self, hash: &str) -> Result<Option<EvmReceipt>, JsonRpcError> {
-        let norm = normalize_hash(hash)
-            .map_err(|_| JsonRpcError::invalid_params(format!("invalid transaction hash '{hash}'")))?;
+    pub fn eth_get_transaction_receipt(
+        &self,
+        hash: &str,
+    ) -> Result<Option<EvmReceipt>, JsonRpcError> {
+        let norm = normalize_hash(hash).map_err(|_| {
+            JsonRpcError::invalid_params(format!("invalid transaction hash '{hash}'"))
+        })?;
         Ok(self.get_settled_receipt(&norm))
     }
 
-    pub fn eth_get_transaction_by_hash(&self, hash: &str) -> Result<Option<EvmTransaction>, JsonRpcError> {
-        let norm = normalize_hash(hash)
-            .map_err(|_| JsonRpcError::invalid_params(format!("invalid transaction hash '{hash}'")))?;
+    pub fn eth_get_transaction_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<EvmTransaction>, JsonRpcError> {
+        let norm = normalize_hash(hash).map_err(|_| {
+            JsonRpcError::invalid_params(format!("invalid transaction hash '{hash}'"))
+        })?;
         Ok(self.get_settled_transaction(&norm))
     }
 
     /// Number of transactions in a block looked up by hash.
     /// Returns `None` (JSON null) when the block is unknown.
-    pub fn get_block_transaction_count_by_hash(&self, hash: &str) -> Result<Option<String>, JsonRpcError> {
+    pub fn get_block_transaction_count_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<String>, JsonRpcError> {
         let norm = normalize_hash(hash)
             .map_err(|_| JsonRpcError::invalid_params(format!("invalid block hash '{hash}'")))?;
         match self.blocks_by_hash.get(&norm) {
@@ -2582,7 +2659,10 @@ impl EvmAdapter {
 
     /// Number of transactions in a block looked up by tag/number.
     /// Returns `None` (JSON null) when the block is unknown.
-    pub fn get_block_transaction_count_by_number(&self, tag: &BlockTag) -> Result<Option<String>, JsonRpcError> {
+    pub fn get_block_transaction_count_by_number(
+        &self,
+        tag: &BlockTag,
+    ) -> Result<Option<String>, JsonRpcError> {
         let height = tag.resolve(self.head_block);
         match self.blocks_by_number.get(&height) {
             Some(block) => Ok(Some(format_u64_hex(block_transaction_count(block) as u64))),
@@ -2635,7 +2715,10 @@ impl EvmAdapter {
 
     /// Uncle count for a block looked up by hash. Stellereum never produces
     /// uncles, so a known block reports `"0x0"`; unknown blocks report `None` (JSON null).
-    pub fn get_uncle_count_by_block_hash(&self, hash: &str) -> Result<Option<String>, JsonRpcError> {
+    pub fn get_uncle_count_by_block_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<String>, JsonRpcError> {
         let norm = normalize_hash(hash)
             .map_err(|_| JsonRpcError::invalid_params(format!("invalid block hash '{hash}'")))?;
         if self.blocks_by_hash.contains_key(&norm) {
@@ -2646,7 +2729,10 @@ impl EvmAdapter {
     }
 
     /// Uncle count for a block looked up by tag/number. See [`Self::get_uncle_count_by_block_hash`].
-    pub fn get_uncle_count_by_block_number(&self, tag: &BlockTag) -> Result<Option<String>, JsonRpcError> {
+    pub fn get_uncle_count_by_block_number(
+        &self,
+        tag: &BlockTag,
+    ) -> Result<Option<String>, JsonRpcError> {
         let height = tag.resolve(self.head_block);
         if self.blocks_by_number.contains_key(&height) {
             Ok(Some("0x0".to_string()))
@@ -2683,32 +2769,52 @@ impl EvmAdapter {
     }
 
     #[allow(non_snake_case)]
-    pub fn eth_getBlockByNumber(&self, tag: &str, full_txs: bool) -> Result<Option<EvmBlock>, JsonRpcError> {
+    pub fn eth_getBlockByNumber(
+        &self,
+        tag: &str,
+        full_txs: bool,
+    ) -> Result<Option<EvmBlock>, JsonRpcError> {
         self.eth_get_block_by_number(tag, full_txs)
     }
 
     #[allow(non_snake_case)]
-    pub fn eth_getBlockByHash(&self, hash: &str, full_txs: bool) -> Result<Option<EvmBlock>, JsonRpcError> {
+    pub fn eth_getBlockByHash(
+        &self,
+        hash: &str,
+        full_txs: bool,
+    ) -> Result<Option<EvmBlock>, JsonRpcError> {
         self.eth_get_block_by_hash(hash, full_txs)
     }
 
     #[allow(non_snake_case)]
-    pub fn eth_getTransactionReceipt(&self, hash: &str) -> Result<Option<EvmReceipt>, JsonRpcError> {
+    pub fn eth_getTransactionReceipt(
+        &self,
+        hash: &str,
+    ) -> Result<Option<EvmReceipt>, JsonRpcError> {
         self.eth_get_transaction_receipt(hash)
     }
 
     #[allow(non_snake_case)]
-    pub fn eth_getTransactionByHash(&self, hash: &str) -> Result<Option<EvmTransaction>, JsonRpcError> {
+    pub fn eth_getTransactionByHash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<EvmTransaction>, JsonRpcError> {
         self.eth_get_transaction_by_hash(hash)
     }
 
     #[allow(non_snake_case)]
-    pub fn eth_getBlockTransactionCountByHash(&self, hash: &str) -> Result<Option<String>, JsonRpcError> {
+    pub fn eth_getBlockTransactionCountByHash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<String>, JsonRpcError> {
         self.get_block_transaction_count_by_hash(hash)
     }
 
     #[allow(non_snake_case)]
-    pub fn eth_getBlockTransactionCountByNumber(&self, tag: &BlockTag) -> Result<Option<String>, JsonRpcError> {
+    pub fn eth_getBlockTransactionCountByNumber(
+        &self,
+        tag: &BlockTag,
+    ) -> Result<Option<String>, JsonRpcError> {
         self.get_block_transaction_count_by_number(tag)
     }
 
@@ -2736,7 +2842,10 @@ impl EvmAdapter {
     }
 
     #[allow(non_snake_case)]
-    pub fn eth_getUncleCountByBlockNumber(&self, tag: &BlockTag) -> Result<Option<String>, JsonRpcError> {
+    pub fn eth_getUncleCountByBlockNumber(
+        &self,
+        tag: &BlockTag,
+    ) -> Result<Option<String>, JsonRpcError> {
         self.get_uncle_count_by_block_number(tag)
     }
 
@@ -2769,7 +2878,9 @@ impl EvmAdapter {
     fn handle_get_block_by_hash(&self, params: &Value) -> Result<Value, JsonRpcError> {
         let (hash, full) = parse_get_block_by_hash_params(params)?;
         if normalize_hash(&hash).is_err() {
-            return Err(JsonRpcError::invalid_params(format!("invalid block hash '{hash}'")));
+            return Err(JsonRpcError::invalid_params(format!(
+                "invalid block hash '{hash}'"
+            )));
         }
         match self.get_block_by_hash(&hash, full) {
             Some(block) => Ok(json!(block)),
@@ -2793,7 +2904,10 @@ impl EvmAdapter {
         }
     }
 
-    fn handle_get_block_transaction_count_by_hash(&self, params: &Value) -> Result<Value, JsonRpcError> {
+    fn handle_get_block_transaction_count_by_hash(
+        &self,
+        params: &Value,
+    ) -> Result<Value, JsonRpcError> {
         let hash = parse_single_hash_param(params)?;
         match self.get_block_transaction_count_by_hash(&hash)? {
             Some(count) => Ok(json!(count)),
@@ -2801,7 +2915,10 @@ impl EvmAdapter {
         }
     }
 
-    fn handle_get_block_transaction_count_by_number(&self, params: &Value) -> Result<Value, JsonRpcError> {
+    fn handle_get_block_transaction_count_by_number(
+        &self,
+        params: &Value,
+    ) -> Result<Value, JsonRpcError> {
         let tag = parse_single_block_tag_param(params)?;
         match self.get_block_transaction_count_by_number(&tag)? {
             Some(count) => Ok(json!(count)),
@@ -2809,7 +2926,10 @@ impl EvmAdapter {
         }
     }
 
-    fn handle_get_transaction_by_block_hash_and_index(&self, params: &Value) -> Result<Value, JsonRpcError> {
+    fn handle_get_transaction_by_block_hash_and_index(
+        &self,
+        params: &Value,
+    ) -> Result<Value, JsonRpcError> {
         let (hash, index) = parse_block_hash_and_index_params(params)?;
         match self.get_transaction_by_block_hash_and_index(&hash, index)? {
             Some(tx) => Ok(json!(tx)),
@@ -2836,7 +2956,10 @@ impl EvmAdapter {
         }
     }
 
-    fn handle_get_uncle_count_by_block_number(&self, params: &Value) -> Result<Value, JsonRpcError> {
+    fn handle_get_uncle_count_by_block_number(
+        &self,
+        params: &Value,
+    ) -> Result<Value, JsonRpcError> {
         let tag = parse_single_block_tag_param(params)?;
         match self.get_uncle_count_by_block_number(&tag)? {
             Some(count) => Ok(json!(count)),
@@ -2844,7 +2967,10 @@ impl EvmAdapter {
         }
     }
 
-    fn handle_get_uncle_by_block_hash_and_index(&self, params: &Value) -> Result<Value, JsonRpcError> {
+    fn handle_get_uncle_by_block_hash_and_index(
+        &self,
+        params: &Value,
+    ) -> Result<Value, JsonRpcError> {
         let (hash, index) = parse_block_hash_and_index_params(params)?;
         match self.get_uncle_by_block_hash_and_index(&hash, index)? {
             Some(uncle) => Ok(uncle),
@@ -2878,21 +3004,31 @@ impl EvmAdapter {
     }
 
     #[allow(non_snake_case)]
-    pub fn eth_getCode(&self, address: impl AsRef<str>, block_tag: impl AsRef<str>) -> Result<&'static str, JsonRpcError> {
+    pub fn eth_getCode(
+        &self,
+        address: impl AsRef<str>,
+        block_tag: impl AsRef<str>,
+    ) -> Result<&'static str, JsonRpcError> {
         let addr_str = address.as_ref();
         let tag_str = block_tag.as_ref();
-        let _ = parse_evm_or_stell_address(addr_str)
-            .map_err(|e| JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}")))?;
+        let _ = parse_evm_or_stell_address(addr_str).map_err(|e| {
+            JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}"))
+        })?;
         let _ = BlockTag::parse_str(tag_str)?;
         Ok("0x")
     }
 
     #[allow(non_snake_case)]
-    pub fn eth_getBalance(&self, address: impl AsRef<str>, block_tag: impl AsRef<str>) -> Result<String, JsonRpcError> {
+    pub fn eth_getBalance(
+        &self,
+        address: impl AsRef<str>,
+        block_tag: impl AsRef<str>,
+    ) -> Result<String, JsonRpcError> {
         let addr_str = address.as_ref();
         let tag_str = block_tag.as_ref();
-        let stell_addr = parse_evm_or_stell_address(addr_str)
-            .map_err(|e| JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}")))?;
+        let stell_addr = parse_evm_or_stell_address(addr_str).map_err(|e| {
+            JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}"))
+        })?;
         let _ = BlockTag::parse_str(tag_str)?;
 
         if let Some(ref engine) = self.engine {
@@ -2906,11 +3042,16 @@ impl EvmAdapter {
     }
 
     #[allow(non_snake_case)]
-    pub fn eth_getTransactionCount(&self, address: impl AsRef<str>, block_tag: impl AsRef<str>) -> Result<String, JsonRpcError> {
+    pub fn eth_getTransactionCount(
+        &self,
+        address: impl AsRef<str>,
+        block_tag: impl AsRef<str>,
+    ) -> Result<String, JsonRpcError> {
         let addr_str = address.as_ref();
         let tag_str = block_tag.as_ref();
-        let stell_addr = parse_evm_or_stell_address(addr_str)
-            .map_err(|e| JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}")))?;
+        let stell_addr = parse_evm_or_stell_address(addr_str).map_err(|e| {
+            JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}"))
+        })?;
         let _ = BlockTag::parse_str(tag_str)?;
 
         if let Some(ref engine) = self.engine {
@@ -3051,14 +3192,15 @@ impl EvmAdapter {
             "eth_gasPrice" => Ok(json!(self.eth_gas_price())),
             "eth_maxPriorityFeePerGas" => Ok(json!(self.eth_max_priority_fee_per_gas())),
             "eth_estimateGas" => self.eth_estimate_gas(params).map(|v| json!(v)),
-            "eth_feeHistory" => self
-                .eth_fee_history(params)
-                .and_then(|h| serde_json::to_value(h).map_err(|e| JsonRpcError::internal_error(e.to_string()))),
+            "eth_feeHistory" => self.eth_fee_history(params).and_then(|h| {
+                serde_json::to_value(h).map_err(|e| JsonRpcError::internal_error(e.to_string()))
+            }),
             "eth_getCode" => Ok(json!(self::handle_eth_get_code(params)?)),
             "eth_getBalance" => {
                 let (addr_str, _tag) = parse_address_and_tag_params(params)?;
-                let stell_addr = parse_evm_or_stell_address(&addr_str)
-                    .map_err(|e| JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}")))?;
+                let stell_addr = parse_evm_or_stell_address(&addr_str).map_err(|e| {
+                    JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}"))
+                })?;
                 if let Some(ref engine) = self.engine {
                     if let Ok(guard) = engine.accounts.try_read() {
                         let bal_nano = guard.get(&stell_addr).map(|a| a.balance).unwrap_or(0);
@@ -3070,8 +3212,9 @@ impl EvmAdapter {
             }
             "eth_getTransactionCount" => {
                 let (addr_str, _tag) = parse_address_and_tag_params(params)?;
-                let stell_addr = parse_evm_or_stell_address(&addr_str)
-                    .map_err(|e| JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}")))?;
+                let stell_addr = parse_evm_or_stell_address(&addr_str).map_err(|e| {
+                    JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}"))
+                })?;
                 if let Some(ref engine) = self.engine {
                     if let Ok(guard) = engine.accounts.try_read() {
                         let nonce = guard.get(&stell_addr).map(|a| a.nonce).unwrap_or(0);
@@ -3098,9 +3241,7 @@ impl EvmAdapter {
                 self.handle_get_transaction_by_block_number_and_index(params)
             }
             "eth_getUncleCountByBlockHash" => self.handle_get_uncle_count_by_block_hash(params),
-            "eth_getUncleCountByBlockNumber" => {
-                self.handle_get_uncle_count_by_block_number(params)
-            }
+            "eth_getUncleCountByBlockNumber" => self.handle_get_uncle_count_by_block_number(params),
             "eth_getUncleByBlockHashAndIndex" => {
                 self.handle_get_uncle_by_block_hash_and_index(params)
             }
@@ -3143,7 +3284,11 @@ impl EvmAdapter {
     }
 
     /// Dispatch an RPC method call to its corresponding handler asynchronously, supporting state-backed methods.
-    pub async fn dispatch_async(&self, method: &str, params: &Value) -> Result<Value, JsonRpcError> {
+    pub async fn dispatch_async(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, JsonRpcError> {
         match method {
             "eth_getCode" => Ok(json!(self::handle_eth_get_code(params)?)),
             "eth_getBalance" => Ok(json!(self.eth_get_balance(params).await?)),
@@ -3181,49 +3326,39 @@ impl EvmAdapter {
         params: &Value,
     ) -> Result<Value, JsonRpcError> {
         match method {
-            "eth_blockNumber" => {
-                Ok(json!(st.eth_block_number()))
-            }
-            "eth_getBlockByNumber" => {
-                match st.handle_get_block_by_number(params).await {
-                    Ok(Some(b)) => Ok(json!(b)),
-                    Ok(None) => match self.handle_get_block_by_number(params) {
-                        Ok(v) => Ok(v),
-                        Err(e) => Err(e),
-                    },
+            "eth_blockNumber" => Ok(json!(st.eth_block_number())),
+            "eth_getBlockByNumber" => match st.handle_get_block_by_number(params).await {
+                Ok(Some(b)) => Ok(json!(b)),
+                Ok(None) => match self.handle_get_block_by_number(params) {
+                    Ok(v) => Ok(v),
                     Err(e) => Err(e),
-                }
-            }
-            "eth_getBlockByHash" => {
-                match st.handle_get_block_by_hash(params).await {
-                    Ok(Some(b)) => Ok(json!(b)),
-                    Ok(None) => match self.handle_get_block_by_hash(params) {
-                        Ok(v) => Ok(v),
-                        Err(e) => Err(e),
-                    },
+                },
+                Err(e) => Err(e),
+            },
+            "eth_getBlockByHash" => match st.handle_get_block_by_hash(params).await {
+                Ok(Some(b)) => Ok(json!(b)),
+                Ok(None) => match self.handle_get_block_by_hash(params) {
+                    Ok(v) => Ok(v),
                     Err(e) => Err(e),
-                }
-            }
-            "eth_getTransactionReceipt" => {
-                match st.handle_get_transaction_receipt(params).await {
-                    Ok(Some(r)) => Ok(json!(r)),
-                    Ok(None) => match self.handle_get_transaction_receipt(params) {
-                        Ok(v) => Ok(v),
-                        Err(e) => Err(e),
-                    },
+                },
+                Err(e) => Err(e),
+            },
+            "eth_getTransactionReceipt" => match st.handle_get_transaction_receipt(params).await {
+                Ok(Some(r)) => Ok(json!(r)),
+                Ok(None) => match self.handle_get_transaction_receipt(params) {
+                    Ok(v) => Ok(v),
                     Err(e) => Err(e),
-                }
-            }
-            "eth_getTransactionByHash" => {
-                match st.handle_get_transaction_by_hash(params).await {
-                    Ok(Some(tx)) => Ok(json!(tx)),
-                    Ok(None) => match self.handle_get_transaction_by_hash(params) {
-                        Ok(v) => Ok(v),
-                        Err(e) => Err(e),
-                    },
+                },
+                Err(e) => Err(e),
+            },
+            "eth_getTransactionByHash" => match st.handle_get_transaction_by_hash(params).await {
+                Ok(Some(tx)) => Ok(json!(tx)),
+                Ok(None) => match self.handle_get_transaction_by_hash(params) {
+                    Ok(v) => Ok(v),
                     Err(e) => Err(e),
-                }
-            }
+                },
+                Err(e) => Err(e),
+            },
             "eth_getBlockTransactionCountByHash" => {
                 match st.handle_get_block_transaction_count_by_hash(params).await {
                     Ok(Some(c)) => Ok(json!(c)),
@@ -3235,7 +3370,10 @@ impl EvmAdapter {
                 }
             }
             "eth_getBlockTransactionCountByNumber" => {
-                match st.handle_get_block_transaction_count_by_number(params).await {
+                match st
+                    .handle_get_block_transaction_count_by_number(params)
+                    .await
+                {
                     Ok(Some(c)) => Ok(json!(c)),
                     Ok(None) => match self.handle_get_block_transaction_count_by_number(params) {
                         Ok(v) => Ok(v),
@@ -3245,7 +3383,10 @@ impl EvmAdapter {
                 }
             }
             "eth_getTransactionByBlockHashAndIndex" => {
-                match st.handle_get_transaction_by_block_hash_and_index(params).await {
+                match st
+                    .handle_get_transaction_by_block_hash_and_index(params)
+                    .await
+                {
                     Ok(Some(tx)) => Ok(json!(tx)),
                     Ok(None) => match self.handle_get_transaction_by_block_hash_and_index(params) {
                         Ok(v) => Ok(v),
@@ -3255,9 +3396,13 @@ impl EvmAdapter {
                 }
             }
             "eth_getTransactionByBlockNumberAndIndex" => {
-                match st.handle_get_transaction_by_block_number_and_index(params).await {
+                match st
+                    .handle_get_transaction_by_block_number_and_index(params)
+                    .await
+                {
                     Ok(Some(tx)) => Ok(json!(tx)),
-                    Ok(None) => match self.handle_get_transaction_by_block_number_and_index(params) {
+                    Ok(None) => match self.handle_get_transaction_by_block_number_and_index(params)
+                    {
                         Ok(v) => Ok(v),
                         Err(e) => Err(e),
                     },
@@ -3307,7 +3452,8 @@ impl EvmAdapter {
                     self.max_priority_fee_per_gas,
                     self.gas_used_ratio,
                 )?;
-                Ok(serde_json::to_value(fh).map_err(|e| JsonRpcError::internal_error(e.to_string()))?)
+                Ok(serde_json::to_value(fh)
+                    .map_err(|e| JsonRpcError::internal_error(e.to_string()))?)
             }
             "eth_getLogs" => st.eth_get_logs(params).await,
             "eth_getStorageAt" => st.eth_get_storage_at(params).await.map(|v| json!(v)),
@@ -3366,21 +3512,19 @@ impl EvmAdapter {
                 }
                 serde_json::to_string(&responses).unwrap_or_default()
             }
-            Value::Object(_) => {
-                match serde_json::from_value::<JsonRpcRequest>(val) {
-                    Ok(req) => {
-                        let resp = self.handle_request_async(&req).await;
-                        serde_json::to_string(&resp).unwrap_or_default()
-                    }
-                    Err(e) => {
-                        let resp = JsonRpcResponse::<Value>::error(
-                            Value::Null,
-                            JsonRpcError::invalid_request(e.to_string()),
-                        );
-                        serde_json::to_string(&resp).unwrap_or_default()
-                    }
+            Value::Object(_) => match serde_json::from_value::<JsonRpcRequest>(val) {
+                Ok(req) => {
+                    let resp = self.handle_request_async(&req).await;
+                    serde_json::to_string(&resp).unwrap_or_default()
                 }
-            }
+                Err(e) => {
+                    let resp = JsonRpcResponse::<Value>::error(
+                        Value::Null,
+                        JsonRpcError::invalid_request(e.to_string()),
+                    );
+                    serde_json::to_string(&resp).unwrap_or_default()
+                }
+            },
             _ => {
                 let resp = JsonRpcResponse::<Value>::error(
                     Value::Null,
@@ -3438,31 +3582,31 @@ impl EvmAdapter {
                 }
                 let responses: Vec<JsonRpcResponse> = items
                     .into_iter()
-                    .map(|item| match serde_json::from_value::<JsonRpcRequest>(item) {
-                        Ok(req) => self.handle_request(&req),
-                        Err(e) => JsonRpcResponse::error(
-                            Value::Null,
-                            JsonRpcError::invalid_request(e.to_string()),
-                        ),
-                    })
+                    .map(
+                        |item| match serde_json::from_value::<JsonRpcRequest>(item) {
+                            Ok(req) => self.handle_request(&req),
+                            Err(e) => JsonRpcResponse::error(
+                                Value::Null,
+                                JsonRpcError::invalid_request(e.to_string()),
+                            ),
+                        },
+                    )
                     .collect();
                 serde_json::to_string(&responses).unwrap_or_default()
             }
-            Value::Object(_) => {
-                match serde_json::from_value::<JsonRpcRequest>(val) {
-                    Ok(req) => {
-                        let resp = self.handle_request(&req);
-                        serde_json::to_string(&resp).unwrap_or_default()
-                    }
-                    Err(e) => {
-                        let resp = JsonRpcResponse::<Value>::error(
-                            Value::Null,
-                            JsonRpcError::invalid_request(e.to_string()),
-                        );
-                        serde_json::to_string(&resp).unwrap_or_default()
-                    }
+            Value::Object(_) => match serde_json::from_value::<JsonRpcRequest>(val) {
+                Ok(req) => {
+                    let resp = self.handle_request(&req);
+                    serde_json::to_string(&resp).unwrap_or_default()
                 }
-            }
+                Err(e) => {
+                    let resp = JsonRpcResponse::<Value>::error(
+                        Value::Null,
+                        JsonRpcError::invalid_request(e.to_string()),
+                    );
+                    serde_json::to_string(&resp).unwrap_or_default()
+                }
+            },
             _ => {
                 let resp = JsonRpcResponse::<Value>::error(
                     Value::Null,
@@ -3762,18 +3906,22 @@ pub fn parse_hex_u128(s: &str) -> Result<u128, String> {
 /// Helper to parse a block count parameter (1..=1024).
 pub fn parse_block_count(val: &Value) -> Result<u64, JsonRpcError> {
     let count = match val {
-        Value::Number(n) => {
-            n.as_u64().ok_or_else(|| JsonRpcError::invalid_params("block count must be non-negative integer"))?
+        Value::Number(n) => n.as_u64().ok_or_else(|| {
+            JsonRpcError::invalid_params("block count must be non-negative integer")
+        })?,
+        Value::String(s) => parse_hex_u64(s)
+            .or_else(|_| s.parse::<u64>().map_err(|e| e.to_string()))
+            .map_err(|e| JsonRpcError::invalid_params(format!("invalid block count: {e}")))?,
+        _ => {
+            return Err(JsonRpcError::invalid_params(
+                "invalid block count parameter",
+            ))
         }
-        Value::String(s) => {
-            parse_hex_u64(s)
-                .or_else(|_| s.parse::<u64>().map_err(|e| e.to_string()))
-                .map_err(|e| JsonRpcError::invalid_params(format!("invalid block count: {e}")))?
-        }
-        _ => return Err(JsonRpcError::invalid_params("invalid block count parameter")),
     };
     if count == 0 || count > 1024 {
-        return Err(JsonRpcError::invalid_params("blockCount must be between 1 and 1024"));
+        return Err(JsonRpcError::invalid_params(
+            "blockCount must be between 1 and 1024",
+        ));
     }
     Ok(count)
 }
@@ -3852,10 +4000,14 @@ impl BlockTag {
                 if let Some(u) = n.as_u64() {
                     Ok(BlockTag::Number(u))
                 } else {
-                    Err(JsonRpcError::invalid_params(format!("invalid block number: {n}")))
+                    Err(JsonRpcError::invalid_params(format!(
+                        "invalid block number: {n}"
+                    )))
                 }
             }
-            _ => Err(JsonRpcError::invalid_params("block tag must be a string or integer")),
+            _ => Err(JsonRpcError::invalid_params(
+                "block tag must be a string or integer",
+            )),
         }
     }
 
@@ -3878,7 +4030,9 @@ impl BlockTag {
                 } else if let Ok(n) = parse_hex_u64(dec) {
                     Ok(BlockTag::Number(n))
                 } else {
-                    Err(JsonRpcError::invalid_params(format!("invalid block tag '{s}'")))
+                    Err(JsonRpcError::invalid_params(format!(
+                        "invalid block tag '{s}'"
+                    )))
                 }
             }
         }
@@ -3931,7 +4085,9 @@ pub fn parse_get_block_by_number_params(params: &Value) -> Result<(BlockTag, boo
             let tag = BlockTag::parse(params)?;
             Ok((tag, false))
         }
-        _ => Err(JsonRpcError::invalid_params("params must be an array or object")),
+        _ => Err(JsonRpcError::invalid_params(
+            "params must be an array or object",
+        )),
     }
 }
 
@@ -3962,7 +4118,9 @@ pub fn parse_get_block_by_hash_params(params: &Value) -> Result<(String, bool), 
             Ok((hash.to_string(), full))
         }
         Value::String(s) => Ok((s.clone(), false)),
-        _ => Err(JsonRpcError::invalid_params("params must be an array or object")),
+        _ => Err(JsonRpcError::invalid_params(
+            "params must be an array or object",
+        )),
     }
 }
 
@@ -3977,16 +4135,17 @@ pub fn parse_single_hash_param(params: &Value) -> Result<String, JsonRpcError> {
                 .map(|s| s.to_string())
                 .ok_or_else(|| JsonRpcError::invalid_params("hash must be a string"))
         }
-        Value::Object(obj) => {
-            obj.get("hash")
-                .or_else(|| obj.get("txHash"))
-                .or_else(|| obj.get("transactionHash"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| JsonRpcError::invalid_params("missing hash field"))
-        }
+        Value::Object(obj) => obj
+            .get("hash")
+            .or_else(|| obj.get("txHash"))
+            .or_else(|| obj.get("transactionHash"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| JsonRpcError::invalid_params("missing hash field")),
         Value::String(s) => Ok(s.clone()),
-        _ => Err(JsonRpcError::invalid_params("params must be an array or object")),
+        _ => Err(JsonRpcError::invalid_params(
+            "params must be an array or object",
+        )),
     }
 }
 
@@ -3998,7 +4157,11 @@ pub fn parse_tx_index_param(val: &Value) -> Result<u64, JsonRpcError> {
             .ok_or_else(|| JsonRpcError::invalid_params("index must be a non-negative integer")),
         Value::String(s) => {
             let trimmed = s.trim();
-            if trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")).is_some() {
+            if trimmed
+                .strip_prefix("0x")
+                .or_else(|| trimmed.strip_prefix("0X"))
+                .is_some()
+            {
                 parse_hex_u64(trimmed).map_err(JsonRpcError::invalid_params)
             } else if let Ok(dec) = trimmed.parse::<u64>() {
                 Ok(dec)
@@ -4006,7 +4169,9 @@ pub fn parse_tx_index_param(val: &Value) -> Result<u64, JsonRpcError> {
                 parse_hex_u64(trimmed).map_err(JsonRpcError::invalid_params)
             }
         }
-        _ => Err(JsonRpcError::invalid_params("index must be a hex quantity string or number")),
+        _ => Err(JsonRpcError::invalid_params(
+            "index must be a hex quantity string or number",
+        )),
     }
 }
 
@@ -4030,7 +4195,9 @@ pub fn parse_single_block_tag_param(params: &Value) -> Result<BlockTag, JsonRpcE
             BlockTag::parse(tag_val)
         }
         Value::String(_) | Value::Number(_) => BlockTag::parse(params),
-        _ => Err(JsonRpcError::invalid_params("params must be an array or object")),
+        _ => Err(JsonRpcError::invalid_params(
+            "params must be an array or object",
+        )),
     }
 }
 
@@ -4040,9 +4207,7 @@ pub fn parse_block_hash_and_index_params(params: &Value) -> Result<(String, u64)
     match params {
         Value::Array(arr) => {
             if arr.len() < 2 {
-                return Err(JsonRpcError::invalid_params(
-                    "expected [blockHash, index]",
-                ));
+                return Err(JsonRpcError::invalid_params("expected [blockHash, index]"));
             }
             let hash = arr[0]
                 .as_str()
@@ -4066,13 +4231,17 @@ pub fn parse_block_hash_and_index_params(params: &Value) -> Result<(String, u64)
             let index = parse_tx_index_param(idx_val)?;
             Ok((hash, index))
         }
-        _ => Err(JsonRpcError::invalid_params("params must be an array or object")),
+        _ => Err(JsonRpcError::invalid_params(
+            "params must be an array or object",
+        )),
     }
 }
 
 /// Parses `(blockNumber|tag, index)` parameters: `[tag, index]` or
 /// `{blockNumber/tag/block/number, index/position}`.
-pub fn parse_block_number_and_index_params(params: &Value) -> Result<(BlockTag, u64), JsonRpcError> {
+pub fn parse_block_number_and_index_params(
+    params: &Value,
+) -> Result<(BlockTag, u64), JsonRpcError> {
     match params {
         Value::Array(arr) => {
             if arr.len() < 2 {
@@ -4100,7 +4269,9 @@ pub fn parse_block_number_and_index_params(params: &Value) -> Result<(BlockTag, 
             let index = parse_tx_index_param(idx_val)?;
             Ok((tag, index))
         }
-        _ => Err(JsonRpcError::invalid_params("params must be an array or object")),
+        _ => Err(JsonRpcError::invalid_params(
+            "params must be an array or object",
+        )),
     }
 }
 
@@ -4134,7 +4305,11 @@ pub fn parse_reward_percentiles(val: &Value) -> Result<Option<Vec<f64>>, JsonRpc
                     Value::String(s) => s.parse::<f64>().map_err(|_| {
                         JsonRpcError::invalid_params(format!("invalid reward percentile: {s}"))
                     })?,
-                    _ => return Err(JsonRpcError::invalid_params("reward percentile must be numeric")),
+                    _ => {
+                        return Err(JsonRpcError::invalid_params(
+                            "reward percentile must be numeric",
+                        ))
+                    }
                 };
                 if !(0.0..=100.0).contains(&p) {
                     return Err(JsonRpcError::invalid_params(format!(
@@ -4152,7 +4327,9 @@ pub fn parse_reward_percentiles(val: &Value) -> Result<Option<Vec<f64>>, JsonRpc
             }
             Ok(Some(list))
         }
-        _ => Err(JsonRpcError::invalid_params("rewardPercentiles must be an array")),
+        _ => Err(JsonRpcError::invalid_params(
+            "rewardPercentiles must be an array",
+        )),
     }
 }
 
@@ -4183,12 +4360,20 @@ pub fn eth_estimate_gas_amount(params: &Value) -> Result<u64, JsonRpcError> {
                 match &arr[0] {
                     Value::Null => None,
                     Value::Object(map) => Some(map),
-                    _ => return Err(JsonRpcError::invalid_params("call object must be an object")),
+                    _ => {
+                        return Err(JsonRpcError::invalid_params(
+                            "call object must be an object",
+                        ))
+                    }
                 }
             }
         }
         Value::Object(map) => Some(map),
-        _ => return Err(JsonRpcError::invalid_params("params must be array or object")),
+        _ => {
+            return Err(JsonRpcError::invalid_params(
+                "params must be array or object",
+            ))
+        }
     };
 
     let Some(obj) = call_obj else {
@@ -4203,12 +4388,16 @@ pub fn eth_estimate_gas_amount(params: &Value) -> Result<u64, JsonRpcError> {
     let (has_calldata, calldata_bytes) = match data_str {
         Some(s) => {
             let t = s.trim();
-            let stripped = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+            let stripped = t
+                .strip_prefix("0x")
+                .or_else(|| t.strip_prefix("0X"))
+                .unwrap_or(t);
             if stripped.is_empty() {
                 (false, Vec::new())
             } else {
-                let bytes = hex::decode(stripped)
-                    .map_err(|e| JsonRpcError::invalid_params(format!("invalid hex data in call: {e}")))?;
+                let bytes = hex::decode(stripped).map_err(|e| {
+                    JsonRpcError::invalid_params(format!("invalid hex data in call: {e}"))
+                })?;
                 (true, bytes)
             }
         }
@@ -4275,10 +4464,10 @@ pub fn fee_history_impl(
             let count_v = map
                 .get("blockCount")
                 .or_else(|| map.get("block_count"))
-                .ok_or_else(|| JsonRpcError::invalid_params("missing blockCount in feeHistory params"))?;
-            let newest_v = map
-                .get("newestBlock")
-                .or_else(|| map.get("newest_block"));
+                .ok_or_else(|| {
+                    JsonRpcError::invalid_params("missing blockCount in feeHistory params")
+                })?;
+            let newest_v = map.get("newestBlock").or_else(|| map.get("newest_block"));
             let percentiles_v = map
                 .get("rewardPercentiles")
                 .or_else(|| map.get("reward_percentiles"));
@@ -4505,7 +4694,9 @@ pub fn evm_to_stell_address_from_hex(s: &str) -> Result<[u8; 32], String> {
 }
 
 /// Extracts (address_str, Option<BlockTag>) from JSON-RPC params.
-pub fn parse_address_and_tag_params(params: &Value) -> Result<(String, Option<BlockTag>), JsonRpcError> {
+pub fn parse_address_and_tag_params(
+    params: &Value,
+) -> Result<(String, Option<BlockTag>), JsonRpcError> {
     match params {
         Value::Array(arr) => {
             if arr.is_empty() {
@@ -4528,7 +4719,11 @@ pub fn parse_address_and_tag_params(params: &Value) -> Result<(String, Option<Bl
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| JsonRpcError::invalid_params("missing 'address' in params object"))?
                 .to_string();
-            let tag = if let Some(t_val) = obj.get("blockTag").or_else(|| obj.get("block_tag")).or_else(|| obj.get("block")) {
+            let tag = if let Some(t_val) = obj
+                .get("blockTag")
+                .or_else(|| obj.get("block_tag"))
+                .or_else(|| obj.get("block"))
+            {
                 Some(BlockTag::parse(t_val)?)
             } else {
                 None
@@ -4560,31 +4755,49 @@ pub fn eth_get_code() -> &'static str {
 
 /// Validates address format and block tag (if provided) and returns "0x".
 #[allow(non_snake_case)]
-pub fn eth_getCode(address: impl AsRef<str>, block_tag: impl AsRef<str>) -> Result<&'static str, JsonRpcError> {
+pub fn eth_getCode(
+    address: impl AsRef<str>,
+    block_tag: impl AsRef<str>,
+) -> Result<&'static str, JsonRpcError> {
     GLOBAL_EVM_ADAPTER.eth_getCode(address, block_tag)
 }
 
 /// Returns balance in Wei in hex format ("0x...") for an address.
 #[allow(non_snake_case)]
-pub fn eth_getBalance(address: impl AsRef<str>, block_tag: impl AsRef<str>) -> Result<String, JsonRpcError> {
+pub fn eth_getBalance(
+    address: impl AsRef<str>,
+    block_tag: impl AsRef<str>,
+) -> Result<String, JsonRpcError> {
     GLOBAL_EVM_ADAPTER.eth_getBalance(address, block_tag)
 }
 
 /// Returns nonce in hex format ("0x...") for an address.
 #[allow(non_snake_case)]
-pub fn eth_getTransactionCount(address: impl AsRef<str>, block_tag: impl AsRef<str>) -> Result<String, JsonRpcError> {
+pub fn eth_getTransactionCount(
+    address: impl AsRef<str>,
+    block_tag: impl AsRef<str>,
+) -> Result<String, JsonRpcError> {
     GLOBAL_EVM_ADAPTER.eth_getTransactionCount(address, block_tag)
 }
 
-pub fn eth_get_code_at(address: impl AsRef<str>, block_tag: impl AsRef<str>) -> Result<&'static str, JsonRpcError> {
+pub fn eth_get_code_at(
+    address: impl AsRef<str>,
+    block_tag: impl AsRef<str>,
+) -> Result<&'static str, JsonRpcError> {
     eth_getCode(address, block_tag)
 }
 
-pub fn eth_get_balance_at(address: impl AsRef<str>, block_tag: impl AsRef<str>) -> Result<String, JsonRpcError> {
+pub fn eth_get_balance_at(
+    address: impl AsRef<str>,
+    block_tag: impl AsRef<str>,
+) -> Result<String, JsonRpcError> {
     eth_getBalance(address, block_tag)
 }
 
-pub fn eth_get_transaction_count_at(address: impl AsRef<str>, block_tag: impl AsRef<str>) -> Result<String, JsonRpcError> {
+pub fn eth_get_transaction_count_at(
+    address: impl AsRef<str>,
+    block_tag: impl AsRef<str>,
+) -> Result<String, JsonRpcError> {
     eth_getTransactionCount(address, block_tag)
 }
 
@@ -4600,8 +4813,9 @@ pub fn handle_eth_get_code(params: &Value) -> Result<&'static str, JsonRpcError>
         };
         if has_params {
             let (addr_str, _tag) = parse_address_and_tag_params(params)?;
-            let _ = parse_evm_or_stell_address(&addr_str)
-                .map_err(|e| JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}")))?;
+            let _ = parse_evm_or_stell_address(&addr_str).map_err(|e| {
+                JsonRpcError::invalid_params(format!("invalid address '{addr_str}': {e}"))
+            })?;
         }
     }
     Ok(eth_get_code())
@@ -4622,10 +4836,7 @@ pub async fn eth_get_balance(
 }
 
 /// Handles `eth_getBalance` against an `RpcState`.
-pub async fn eth_get_balance_rpc(
-    st: &RpcState,
-    params: &Value,
-) -> Result<String, JsonRpcError> {
+pub async fn eth_get_balance_rpc(st: &RpcState, params: &Value) -> Result<String, JsonRpcError> {
     eth_get_balance(&st.engine, params).await
 }
 
@@ -4690,10 +4901,8 @@ pub async fn eth_get_block_by_number_rpc(
                 evm_block.transactions = BlockTransactions::Full(full_tx_list);
             }
         } else if !rows.is_empty() {
-            let tx_hashes: Vec<String> = rows
-                .iter()
-                .map(|r| stell_hash_to_evm(&r.tx_hash))
-                .collect();
+            let tx_hashes: Vec<String> =
+                rows.iter().map(|r| stell_hash_to_evm(&r.tx_hash)).collect();
             evm_block.transactions = BlockTransactions::Hashes(tx_hashes);
         }
         Ok(Some(evm_block))
@@ -4736,10 +4945,8 @@ pub async fn eth_get_block_by_hash_rpc(
                 evm_block.transactions = BlockTransactions::Full(full_tx_list);
             }
         } else if !rows.is_empty() {
-            let tx_hashes: Vec<String> = rows
-                .iter()
-                .map(|r| stell_hash_to_evm(&r.tx_hash))
-                .collect();
+            let tx_hashes: Vec<String> =
+                rows.iter().map(|r| stell_hash_to_evm(&r.tx_hash)).collect();
             evm_block.transactions = BlockTransactions::Hashes(tx_hashes);
         }
         Ok(Some(evm_block))
@@ -4791,7 +4998,10 @@ pub async fn eth_getTransactionByHash_rpc(
     eth_get_transaction_by_hash_rpc(st, tx_hash).await
 }
 
-pub fn eth_get_block_by_number(tag: &str, full_txs: bool) -> Result<Option<EvmBlock>, JsonRpcError> {
+pub fn eth_get_block_by_number(
+    tag: &str,
+    full_txs: bool,
+) -> Result<Option<EvmBlock>, JsonRpcError> {
     GLOBAL_EVM_ADAPTER.eth_get_block_by_number(tag, full_txs)
 }
 
@@ -4827,9 +5037,7 @@ pub fn eth_getTransactionByHash(hash: &str) -> Result<Option<EvmTransaction>, Js
     GLOBAL_EVM_ADAPTER.eth_get_transaction_by_hash(hash)
 }
 
-pub fn eth_get_block_transaction_count_by_hash(
-    hash: &str,
-) -> Result<Option<String>, JsonRpcError> {
+pub fn eth_get_block_transaction_count_by_hash(hash: &str) -> Result<Option<String>, JsonRpcError> {
     GLOBAL_EVM_ADAPTER.get_block_transaction_count_by_hash(hash)
 }
 
@@ -5026,13 +5234,22 @@ pub fn stell_receipt_to_evm(r: &crate::rpc::TxReceipt) -> EvmReceipt {
                     Some(stell_address_to_evm(&tx.to)),
                 )
             } else {
-                ("0x0000000000000000000000000000000000000000".to_string(), None)
+                (
+                    "0x0000000000000000000000000000000000000000".to_string(),
+                    None,
+                )
             }
         } else {
-            ("0x0000000000000000000000000000000000000000".to_string(), None)
+            (
+                "0x0000000000000000000000000000000000000000".to_string(),
+                None,
+            )
         }
     } else {
-        ("0x0000000000000000000000000000000000000000".to_string(), None)
+        (
+            "0x0000000000000000000000000000000000000000".to_string(),
+            None,
+        )
     };
 
     EvmReceipt {
@@ -5229,12 +5446,7 @@ pub fn stell_block_to_evm(b: &crate::sharding::Block, full_txs: bool) -> EvmBloc
             .iter()
             .enumerate()
             .map(|(idx, tx)| {
-                stell_tx_to_evm(
-                    tx,
-                    Some(block_hash),
-                    Some(b.height),
-                    Some(idx as u32),
-                )
+                stell_tx_to_evm(tx, Some(block_hash), Some(b.height), Some(idx as u32))
             })
             .collect();
         BlockTransactions::Full(full)
@@ -5439,7 +5651,10 @@ impl std::fmt::Display for RlpError {
             Self::UnexpectedEof => write!(f, "RLP error: unexpected end of input"),
             Self::LeadingZeroInLength => write!(f, "RLP error: leading zero in length field"),
             Self::NonCanonicalSingleByte => {
-                write!(f, "RLP error: single byte < 0x80 must be encoded directly without prefix")
+                write!(
+                    f,
+                    "RLP error: single byte < 0x80 must be encoded directly without prefix"
+                )
             }
             Self::NonCanonicalLength => {
                 write!(f, "RLP error: payload length < 56 encoded with long header")
@@ -5447,13 +5662,21 @@ impl std::fmt::Display for RlpError {
             Self::ExpectedBytes => write!(f, "RLP error: expected byte string, got list"),
             Self::ExpectedList => write!(f, "RLP error: expected list, got byte string"),
             Self::IntegerOverflow(ty) => write!(f, "RLP error: integer overflow for {ty}"),
-            Self::LeadingZeroInInteger => write!(f, "RLP error: integer has non-canonical leading zero"),
+            Self::LeadingZeroInInteger => {
+                write!(f, "RLP error: integer has non-canonical leading zero")
+            }
             Self::TrailingBytes => write!(f, "RLP error: trailing unparsed bytes after item"),
             Self::InvalidAddressLength(len) => {
-                write!(f, "RLP error: invalid address length {len}, expected 20 bytes")
+                write!(
+                    f,
+                    "RLP error: invalid address length {len}, expected 20 bytes"
+                )
             }
             Self::InvalidTransactionType(t) => {
-                write!(f, "RLP error: invalid or unsupported transaction type 0x{t:02x}")
+                write!(
+                    f,
+                    "RLP error: invalid or unsupported transaction type 0x{t:02x}"
+                )
             }
             Self::Custom(msg) => write!(f, "RLP error: {msg}"),
         }
@@ -5531,11 +5754,16 @@ impl RlpItem {
             }
             let total_header = 1 + len_of_len;
             // Checked bound (audit: total_header + len could overflow on hostile len == usize::MAX).
-            let remaining = data.len().checked_sub(total_header).ok_or(RlpError::UnexpectedEof)?;
+            let remaining = data
+                .len()
+                .checked_sub(total_header)
+                .ok_or(RlpError::UnexpectedEof)?;
             if remaining < len {
                 return Err(RlpError::UnexpectedEof);
             }
-            let end = total_header.checked_add(len).ok_or(RlpError::UnexpectedEof)?;
+            let end = total_header
+                .checked_add(len)
+                .ok_or(RlpError::UnexpectedEof)?;
             let payload = &data[total_header..end];
             Ok((RlpItem::Bytes(payload.to_vec()), &data[end..]))
         } else if first <= 0xf7 {
@@ -5562,11 +5790,16 @@ impl RlpItem {
                 return Err(RlpError::NonCanonicalLength);
             }
             let total_header = 1 + len_of_len;
-            let remaining = data.len().checked_sub(total_header).ok_or(RlpError::UnexpectedEof)?;
+            let remaining = data
+                .len()
+                .checked_sub(total_header)
+                .ok_or(RlpError::UnexpectedEof)?;
             if remaining < len {
                 return Err(RlpError::UnexpectedEof);
             }
-            let end = total_header.checked_add(len).ok_or(RlpError::UnexpectedEof)?;
+            let end = total_header
+                .checked_add(len)
+                .ok_or(RlpError::UnexpectedEof)?;
             let payload = &data[total_header..end];
             let items = decode_items_in_payload_with_depth(payload, depth + 1)?;
             Ok((RlpItem::List(items), &data[end..]))
@@ -5788,7 +6021,10 @@ fn decode_items_in_payload(payload: &[u8]) -> Result<Vec<RlpItem>, RlpError> {
     decode_items_in_payload_with_depth(payload, 1)
 }
 
-fn decode_items_in_payload_with_depth(mut payload: &[u8], depth: usize) -> Result<Vec<RlpItem>, RlpError> {
+fn decode_items_in_payload_with_depth(
+    mut payload: &[u8],
+    depth: usize,
+) -> Result<Vec<RlpItem>, RlpError> {
     if depth > RlpItem::MAX_DEPTH {
         return Err(RlpError::Custom(
             "RLP recursion depth limit exceeded".to_string(),
@@ -5975,11 +6211,7 @@ impl LegacyTransaction {
         let r = items[7].as_bytes32()?;
         let s = items[8].as_bytes32()?;
 
-        let chain_id = if v >= 35 {
-            Some((v - 35) / 2)
-        } else {
-            None
-        };
+        let chain_id = if v >= 35 { Some((v - 35) / 2) } else { None };
 
         Ok(Self {
             nonce,
@@ -6057,7 +6289,11 @@ impl LegacyTransaction {
     }
 
     /// Converts into EVM JSON-RPC transaction representation.
-    pub fn to_evm_transaction(&self, tx_hash: Option<[u8; 32]>, from: Option<[u8; 20]>) -> EvmTransaction {
+    pub fn to_evm_transaction(
+        &self,
+        tx_hash: Option<[u8; 32]>,
+        from: Option<[u8; 20]>,
+    ) -> EvmTransaction {
         let h = tx_hash.unwrap_or_else(|| self.compute_hash());
         let from_str = match from {
             Some(a) => format!("0x{}", hex::encode(a)),
@@ -6294,11 +6530,8 @@ impl Eip1559Transaction {
         fields.push(rlp_encode_u128(self.value));
         fields.push(rlp_encode_bytes(&self.data));
 
-        let access_entries: Vec<Vec<u8>> = self
-            .access_list
-            .iter()
-            .map(|item| item.encode())
-            .collect();
+        let access_entries: Vec<Vec<u8>> =
+            self.access_list.iter().map(|item| item.encode()).collect();
         fields.push(rlp_encode_list(&access_entries));
 
         fields.push(rlp_encode_u64(self.y_parity as u64));
@@ -6332,11 +6565,8 @@ impl Eip1559Transaction {
         fields.push(rlp_encode_u128(self.value));
         fields.push(rlp_encode_bytes(&self.data));
 
-        let access_entries: Vec<Vec<u8>> = self
-            .access_list
-            .iter()
-            .map(|item| item.encode())
-            .collect();
+        let access_entries: Vec<Vec<u8>> =
+            self.access_list.iter().map(|item| item.encode()).collect();
         fields.push(rlp_encode_list(&access_entries));
 
         let payload = rlp_encode_list(&fields);
@@ -6357,7 +6587,11 @@ impl Eip1559Transaction {
     }
 
     /// Converts into EVM JSON-RPC transaction representation.
-    pub fn to_evm_transaction(&self, tx_hash: Option<[u8; 32]>, from: Option<[u8; 20]>) -> EvmTransaction {
+    pub fn to_evm_transaction(
+        &self,
+        tx_hash: Option<[u8; 32]>,
+        from: Option<[u8; 20]>,
+    ) -> EvmTransaction {
         let h = tx_hash.unwrap_or_else(|| self.compute_hash());
         let from_str = match from {
             Some(a) => format!("0x{}", hex::encode(a)),
@@ -6407,7 +6641,13 @@ impl Eip1559Transaction {
     /// Recovers the 20-byte sender address using secp256k1 ECDSA and EIP-1559 rules.
     pub fn recover_sender(&self) -> Result<[u8; 20], EvmError> {
         let hash = self.signing_hash();
-        ecrecover_with_chain_id(&hash, self.y_parity as u64, &self.r, &self.s, Some(self.chain_id))
+        ecrecover_with_chain_id(
+            &hash,
+            self.y_parity as u64,
+            &self.r,
+            &self.s,
+            Some(self.chain_id),
+        )
     }
 
     /// Verifies that this transaction's signature is valid, strictly requiring
@@ -6454,7 +6694,8 @@ impl DecodedTransaction {
             .strip_prefix("0x")
             .or_else(|| trimmed.strip_prefix("0X"))
             .unwrap_or(trimmed);
-        let raw = hex::decode(stripped).map_err(|e| RlpError::Custom(format!("hex decode error: {e}")))?;
+        let raw = hex::decode(stripped)
+            .map_err(|e| RlpError::Custom(format!("hex decode error: {e}")))?;
         Self::decode(&raw)
     }
 
@@ -6531,7 +6772,11 @@ impl DecodedTransaction {
     }
 
     /// Converts to an EVM JSON-RPC transaction structure.
-    pub fn to_evm_transaction(&self, tx_hash: Option<[u8; 32]>, from: Option<[u8; 20]>) -> EvmTransaction {
+    pub fn to_evm_transaction(
+        &self,
+        tx_hash: Option<[u8; 32]>,
+        from: Option<[u8; 20]>,
+    ) -> EvmTransaction {
         match self {
             Self::Legacy(tx) => tx.to_evm_transaction(tx_hash, from),
             Self::Eip1559(tx) => tx.to_evm_transaction(tx_hash, from),
@@ -6607,10 +6852,8 @@ pub fn parse_eip1559_transaction(raw: &[u8]) -> Result<Eip1559Transaction, Strin
 /// N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 /// N / 2 = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
 pub const SECP256K1_HALF_N: [u8; 32] = [
-    0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d,
-    0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
+    0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
 ];
 
 /// Errors occurring during Ethereum signature verification or address recovery.
@@ -6633,19 +6876,33 @@ impl std::fmt::Display for EvmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidRecoveryId(v) => write!(f, "invalid recovery id / v parameter: {v}"),
-            Self::InvalidSignatureR => write!(f, "signature r value must be non-zero and within curve order"),
-            Self::InvalidSignatureS => write!(f, "signature s value must be non-zero and within allowed range"),
+            Self::InvalidSignatureR => write!(
+                f,
+                "signature r value must be non-zero and within curve order"
+            ),
+            Self::InvalidSignatureS => write!(
+                f,
+                "signature s value must be non-zero and within allowed range"
+            ),
             Self::InvalidSignature(e) => write!(f, "invalid signature: {e}"),
             Self::InvalidPublicKey(e) => write!(f, "invalid public key: {e}"),
             Self::InvalidMessageHash(e) => write!(f, "invalid message hash: {e}"),
             Self::ChainIdMismatch { expected, got } => {
-                write!(f, "EIP-155 chain ID mismatch: expected {expected}, got {got}")
+                write!(
+                    f,
+                    "EIP-155 chain ID mismatch: expected {expected}, got {got}"
+                )
             }
             Self::ReplayProtectionRequired => {
-                write!(f, "EIP-155 replay protection required, but legacy unprotected signature received")
+                write!(
+                    f,
+                    "EIP-155 replay protection required, but legacy unprotected signature received"
+                )
             }
             Self::HexDecodeError(e) => write!(f, "hex decoding failed: {e}"),
-            Self::InvalidAddressLength(len) => write!(f, "invalid address length: expected 20 bytes, got {len}"),
+            Self::InvalidAddressLength(len) => {
+                write!(f, "invalid address length: expected 20 bytes, got {len}")
+            }
             Self::SignatureRecoveryFailed(e) => write!(f, "ECDSA public key recovery failed: {e}"),
         }
     }
@@ -6760,12 +7017,7 @@ pub fn parse_v_with_chain_id_opts(
 /// - Pre-EIP-155 legacy transactions (`v = 27` or `28` -> `rec_id = v - 27`)
 ///
 /// Computes the 20-byte sender address: `keccak256(&uncompressed_pubkey[1..])[12..32]`.
-pub fn ecrecover(
-    hash: &[u8; 32],
-    v: u64,
-    r: &[u8; 32],
-    s: &[u8; 32],
-) -> Result<[u8; 20], String> {
+pub fn ecrecover(hash: &[u8; 32], v: u64, r: &[u8; 32], s: &[u8; 32]) -> Result<[u8; 20], String> {
     ecrecover_with_chain_id(hash, v, r, s, None).map_err(|e| e.to_string())
 }
 
@@ -6795,7 +7047,9 @@ pub fn validate_transaction_signature_with_chain_id(
 ) -> Result<[u8; 20], String> {
     // 1. EIP-2 canonical low-s check: s <= secp256k1_order / 2
     if !is_low_s(s) {
-        return Err("signature s is not canonical: must be <= secp256k1_order / 2 (EIP-2)".to_string());
+        return Err(
+            "signature s is not canonical: must be <= secp256k1_order / 2 (EIP-2)".to_string(),
+        );
     }
 
     // 2. Replay protection check: chain_id == expected_chain_id
@@ -6874,11 +7128,10 @@ pub fn ecrecover_pubkey_with_chain_id(
     sig_bytes[..32].copy_from_slice(r);
     sig_bytes[32..].copy_from_slice(s);
 
-    let signature = Signature::from_slice(&sig_bytes)
-        .map_err(|e| EvmError::InvalidSignature(e.to_string()))?;
+    let signature =
+        Signature::from_slice(&sig_bytes).map_err(|e| EvmError::InvalidSignature(e.to_string()))?;
 
-    let recid = RecoveryId::try_from(rec_id)
-        .map_err(|_| EvmError::InvalidRecoveryId(v))?;
+    let recid = RecoveryId::try_from(rec_id).map_err(|_| EvmError::InvalidRecoveryId(v))?;
 
     let vk = VerifyingKey::recover_from_prehash(message_hash, &signature, recid)
         .map_err(|e| EvmError::SignatureRecoveryFailed(e.to_string()))?;
@@ -7293,31 +7546,45 @@ mod tests {
         let adapter = EvmAdapter::new();
 
         // 1. eth_chainId -> "0x167d"
-        let chain_id_res = adapter.dispatch("eth_chainId", &Value::Null).expect("eth_chainId");
+        let chain_id_res = adapter
+            .dispatch("eth_chainId", &Value::Null)
+            .expect("eth_chainId");
         assert_eq!(chain_id_res, json!("0x167d"));
 
         // 2. net_version -> "5757"
-        let net_version_res = adapter.dispatch("net_version", &Value::Null).expect("net_version");
+        let net_version_res = adapter
+            .dispatch("net_version", &Value::Null)
+            .expect("net_version");
         assert_eq!(net_version_res, json!("5757"));
 
         // 3. web3_clientVersion -> "Stellereum/v5.0.0-evm-adapter"
-        let client_ver_res = adapter.dispatch("web3_clientVersion", &Value::Null).expect("web3_clientVersion");
+        let client_ver_res = adapter
+            .dispatch("web3_clientVersion", &Value::Null)
+            .expect("web3_clientVersion");
         assert_eq!(client_ver_res, json!("Stellereum/v5.0.0-evm-adapter"));
 
         // 4. net_listening -> true
-        let listening_res = adapter.dispatch("net_listening", &Value::Null).expect("net_listening");
+        let listening_res = adapter
+            .dispatch("net_listening", &Value::Null)
+            .expect("net_listening");
         assert_eq!(listening_res, json!(true));
 
         // 5. net_peerCount -> "0x2"
-        let peer_count_res = adapter.dispatch("net_peerCount", &Value::Null).expect("net_peerCount");
+        let peer_count_res = adapter
+            .dispatch("net_peerCount", &Value::Null)
+            .expect("net_peerCount");
         assert_eq!(peer_count_res, json!("0x2"));
 
         // 6. eth_syncing -> false
-        let syncing_res = adapter.dispatch("eth_syncing", &Value::Null).expect("eth_syncing");
+        let syncing_res = adapter
+            .dispatch("eth_syncing", &Value::Null)
+            .expect("eth_syncing");
         assert_eq!(syncing_res, json!(false));
 
         // 7. Unknown method -> -32601 Method not found
-        let err = adapter.dispatch("eth_unknownMethod", &Value::Null).expect_err("unknown method must error");
+        let err = adapter
+            .dispatch("eth_unknownMethod", &Value::Null)
+            .expect_err("unknown method must error");
         assert_eq!(err.code, METHOD_NOT_FOUND_CODE);
     }
 
@@ -7345,7 +7612,10 @@ mod tests {
         let resp3: JsonRpcResponse<String> = serde_json::from_str(&resp_json3).unwrap();
         assert_eq!(resp3.jsonrpc, "2.0");
         assert_eq!(resp3.id, json!(100));
-        assert_eq!(resp3.result, Some("Stellereum/v5.0.0-evm-adapter".to_string()));
+        assert_eq!(
+            resp3.result,
+            Some("Stellereum/v5.0.0-evm-adapter".to_string())
+        );
 
         let req_json4 = r#"{"jsonrpc":"2.0","method":"net_listening","params":[],"id":null}"#;
         let resp_json4 = adapter.handle_raw_json(req_json4);
@@ -7392,7 +7662,10 @@ mod tests {
         assert_eq!(batch_resp[1].result, Some(json!("5757")));
 
         assert_eq!(batch_resp[2].id, json!(3));
-        assert_eq!(batch_resp[2].result, Some(json!("Stellereum/v5.0.0-evm-adapter")));
+        assert_eq!(
+            batch_resp[2].result,
+            Some(json!("Stellereum/v5.0.0-evm-adapter"))
+        );
 
         assert_eq!(batch_resp[3].id, json!(4));
         assert_eq!(batch_resp[3].result, Some(json!(true)));
@@ -7433,8 +7706,11 @@ mod tests {
     fn test_evm_block_serde_exact() {
         let block = EvmBlock {
             number: Some("0x167d".to_string()),
-            hash: Some("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string()),
-            parent_hash: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+            hash: Some(
+                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
+            ),
+            parent_hash: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                .to_string(),
             nonce: Some("0x0000000000000000".to_string()),
             sha3_uncles: EMPTY_UNCLES_HASH.to_string(),
             logs_bloom: Some(EMPTY_LOGS_BLOOM.to_string()),
@@ -7505,7 +7781,9 @@ mod tests {
         let tx = EvmTransaction {
             hash: "0x111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000".to_string(),
             nonce: "0x1".to_string(),
-            block_hash: Some("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string()),
+            block_hash: Some(
+                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
+            ),
             block_number: Some("0x167d".to_string()),
             transaction_index: Some("0x0".to_string()),
             from: "0x0000000000000000000000000000000000000001".to_string(),
@@ -7523,7 +7801,10 @@ mod tests {
             max_priority_fee_per_gas: Some("0x3b9aca00".to_string()),
             access_list: Some(vec![EvmAccessListItem {
                 address: "0x0000000000000000000000000000000000000003".to_string(),
-                storage_keys: vec!["0x0000000000000000000000000000000000000000000000000000000000000000".to_string()],
+                storage_keys: vec![
+                    "0x0000000000000000000000000000000000000000000000000000000000000000"
+                        .to_string(),
+                ],
             }]),
             max_fee_per_blob_gas: None,
             blob_versioned_hashes: None,
@@ -7581,9 +7862,11 @@ mod tests {
     #[test]
     fn test_evm_receipt_serde_exact() {
         let receipt = EvmReceipt {
-            transaction_hash: "0x111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000".to_string(),
+            transaction_hash: "0x111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000"
+                .to_string(),
             transaction_index: "0x0".to_string(),
-            block_hash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
+            block_hash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                .to_string(),
             block_number: "0x167d".to_string(),
             from: "0x0000000000000000000000000000000000000001".to_string(),
             to: Some("0x0000000000000000000000000000000000000002".to_string()),
@@ -7592,12 +7875,22 @@ mod tests {
             contract_address: None,
             logs: vec![EvmLog {
                 address: "0x0000000000000000000000000000000000000002".to_string(),
-                topics: vec!["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string()],
-                data: "0x0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+                topics: vec![
+                    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                        .to_string(),
+                ],
+                data: "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    .to_string(),
                 block_number: Some("0x167d".to_string()),
-                transaction_hash: Some("0x111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000".to_string()),
+                transaction_hash: Some(
+                    "0x111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000"
+                        .to_string(),
+                ),
                 transaction_index: Some("0x0".to_string()),
-                block_hash: Some("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string()),
+                block_hash: Some(
+                    "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                        .to_string(),
+                ),
                 log_index: Some("0x0".to_string()),
                 removed: false,
             }],
@@ -7690,14 +7983,40 @@ mod tests {
         assert_eq!(custom.eth_gas_price(), "0x3eb2788000");
         assert_eq!(custom.eth_max_priority_fee_per_gas(), "0x0");
 
-        assert_eq!(custom.dispatch("eth_chainId", &Value::Null).unwrap(), json!("0x539"));
-        assert_eq!(custom.dispatch("net_version", &Value::Null).unwrap(), json!("1337"));
-        assert_eq!(custom.dispatch("web3_clientVersion", &Value::Null).unwrap(), json!("CustomClient/v1.0"));
-        assert_eq!(custom.dispatch("net_listening", &Value::Null).unwrap(), json!(false));
-        assert_eq!(custom.dispatch("net_peerCount", &Value::Null).unwrap(), json!("0x2a"));
-        assert_eq!(custom.dispatch("eth_syncing", &Value::Null).unwrap(), json!(true));
-        assert_eq!(custom.dispatch("eth_gasPrice", &Value::Null).unwrap(), json!("0x3eb2788000"));
-        assert_eq!(custom.dispatch("eth_maxPriorityFeePerGas", &Value::Null).unwrap(), json!("0x0"));
+        assert_eq!(
+            custom.dispatch("eth_chainId", &Value::Null).unwrap(),
+            json!("0x539")
+        );
+        assert_eq!(
+            custom.dispatch("net_version", &Value::Null).unwrap(),
+            json!("1337")
+        );
+        assert_eq!(
+            custom.dispatch("web3_clientVersion", &Value::Null).unwrap(),
+            json!("CustomClient/v1.0")
+        );
+        assert_eq!(
+            custom.dispatch("net_listening", &Value::Null).unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            custom.dispatch("net_peerCount", &Value::Null).unwrap(),
+            json!("0x2a")
+        );
+        assert_eq!(
+            custom.dispatch("eth_syncing", &Value::Null).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            custom.dispatch("eth_gasPrice", &Value::Null).unwrap(),
+            json!("0x3eb2788000")
+        );
+        assert_eq!(
+            custom
+                .dispatch("eth_maxPriorityFeePerGas", &Value::Null)
+                .unwrap(),
+            json!("0x0")
+        );
     }
 
     #[test]
@@ -7713,7 +8032,8 @@ mod tests {
         assert_eq!(parsed_gas_price, 269_282_213_888);
         assert_eq!(parsed_gas_price, DEFAULT_BASE_FEE);
 
-        let parsed_priority_fee = parse_hex_u128(eth_max_priority_fee_per_gas()).expect("must parse u128 hex");
+        let parsed_priority_fee =
+            parse_hex_u128(eth_max_priority_fee_per_gas()).expect("must parse u128 hex");
         assert_eq!(parsed_priority_fee, 1_000_000_000);
     }
 
@@ -7722,51 +8042,82 @@ mod tests {
         let adapter = EvmAdapter::new();
 
         // 1. eth_gasPrice -> "0x3eb2788000"
-        let gas_price_res = adapter.dispatch("eth_gasPrice", &Value::Null).expect("eth_gasPrice");
+        let gas_price_res = adapter
+            .dispatch("eth_gasPrice", &Value::Null)
+            .expect("eth_gasPrice");
         assert_eq!(gas_price_res, json!("0x3eb2788000"));
 
         // 2. eth_maxPriorityFeePerGas -> "0x3b9aca00"
-        let priority_res = adapter.dispatch("eth_maxPriorityFeePerGas", &Value::Null).expect("eth_maxPriorityFeePerGas");
+        let priority_res = adapter
+            .dispatch("eth_maxPriorityFeePerGas", &Value::Null)
+            .expect("eth_maxPriorityFeePerGas");
         assert_eq!(priority_res, json!("0x3b9aca00"));
 
         // 3. eth_estimateGas for transfer (empty params) -> "0x5208"
-        let est_empty = adapter.dispatch("eth_estimateGas", &json!([])).expect("estimate empty");
+        let est_empty = adapter
+            .dispatch("eth_estimateGas", &json!([]))
+            .expect("estimate empty");
         assert_eq!(est_empty, json!("0x5208"));
 
         // 4. eth_estimateGas for transfer (standard to/from/value call object) -> "0x5208"
-        let est_tx = adapter.dispatch("eth_estimateGas", &json!([{
-            "from": "0x1111111111111111111111111111111111111111",
-            "to": "0x2222222222222222222222222222222222222222",
-            "value": "0xde0b6b3a7640000"
-        }])).expect("estimate transfer");
+        let est_tx = adapter
+            .dispatch(
+                "eth_estimateGas",
+                &json!([{
+                    "from": "0x1111111111111111111111111111111111111111",
+                    "to": "0x2222222222222222222222222222222222222222",
+                    "value": "0xde0b6b3a7640000"
+                }]),
+            )
+            .expect("estimate transfer");
         assert_eq!(est_tx, json!("0x5208"));
 
         // 5. eth_estimateGas with empty data "0x" -> "0x5208"
-        let est_empty_data = adapter.dispatch("eth_estimateGas", &json!([{
-            "to": "0x2222222222222222222222222222222222222222",
-            "data": "0x"
-        }])).expect("estimate empty data");
+        let est_empty_data = adapter
+            .dispatch(
+                "eth_estimateGas",
+                &json!([{
+                    "to": "0x2222222222222222222222222222222222222222",
+                    "data": "0x"
+                }]),
+            )
+            .expect("estimate empty data");
         assert_eq!(est_empty_data, json!("0x5208"));
 
         // 6. eth_estimateGas with non-empty calldata (e.g. 4 bytes non-zero -> 21000 + 4*16 = 21064 = 0x5248)
-        let est_call = adapter.dispatch("eth_estimateGas", &json!([{
-            "to": "0x2222222222222222222222222222222222222222",
-            "data": "0x12345678"
-        }])).expect("estimate call data");
+        let est_call = adapter
+            .dispatch(
+                "eth_estimateGas",
+                &json!([{
+                    "to": "0x2222222222222222222222222222222222222222",
+                    "data": "0x12345678"
+                }]),
+            )
+            .expect("estimate call data");
         assert_eq!(est_call, json!("0x5248"));
 
         // 7. eth_estimateGas contract creation (no to field, with bytecode: 53000 + calldata gas)
         // 2 non-zero bytes (0x60, 0x80) -> 53000 + 32 = 53032 = 0xcf28
-        let est_create = adapter.dispatch("eth_estimateGas", &json!([{
-            "data": "0x6080"
-        }])).expect("estimate contract creation");
+        let est_create = adapter
+            .dispatch(
+                "eth_estimateGas",
+                &json!([{
+                    "data": "0x6080"
+                }]),
+            )
+            .expect("estimate contract creation");
         assert_eq!(est_create, json!("0xcf28"));
 
         // 8. Invalid hex in data -> error
-        let err = adapter.dispatch("eth_estimateGas", &json!([{
-            "to": "0x2222222222222222222222222222222222222222",
-            "data": "0xinvalid"
-        }])).expect_err("must error on invalid hex");
+        let err = adapter
+            .dispatch(
+                "eth_estimateGas",
+                &json!([{
+                    "to": "0x2222222222222222222222222222222222222222",
+                    "data": "0xinvalid"
+                }]),
+            )
+            .expect_err("must error on invalid hex");
         assert_eq!(err.code, INVALID_PARAMS_CODE);
     }
 
@@ -7775,7 +8126,9 @@ mod tests {
         let adapter = EvmAdapter::new();
 
         // 1. eth_feeHistory with array [4, "latest"]
-        let fee_hist_val = adapter.dispatch("eth_feeHistory", &json!([4, "latest"])).expect("fee history latest");
+        let fee_hist_val = adapter
+            .dispatch("eth_feeHistory", &json!([4, "latest"]))
+            .expect("fee history latest");
         let fh: EvmFeeHistory = serde_json::from_value(fee_hist_val).unwrap();
 
         // 5757 + 1 - 4 = 5754 = 0x167a
@@ -7790,14 +8143,18 @@ mod tests {
 
         // 2. eth_feeHistory with hex blockCount "0x4" and hex newestBlock "0x10" (16)
         // 16 + 1 - 4 = 13 = 0xd
-        let fee_hist_val2 = adapter.dispatch("eth_feeHistory", &json!(["0x4", "0x10"])).expect("fee history hex");
+        let fee_hist_val2 = adapter
+            .dispatch("eth_feeHistory", &json!(["0x4", "0x10"]))
+            .expect("fee history hex");
         let fh2: EvmFeeHistory = serde_json::from_value(fee_hist_val2).unwrap();
         assert_eq!(fh2.oldest_block, "0xd");
         assert_eq!(fh2.base_fee_per_gas.len(), 5);
         assert_eq!(fh2.gas_used_ratio.len(), 4);
 
         // 3. eth_feeHistory with rewardPercentiles [25.0, 75.0]
-        let fee_hist_val3 = adapter.dispatch("eth_feeHistory", &json!([4, "0x10", [25.0, 75.0]])).expect("fee history rewards");
+        let fee_hist_val3 = adapter
+            .dispatch("eth_feeHistory", &json!([4, "0x10", [25.0, 75.0]]))
+            .expect("fee history rewards");
         let fh3: EvmFeeHistory = serde_json::from_value(fee_hist_val3).unwrap();
         assert_eq!(fh3.oldest_block, "0xd");
         let rewards = fh3.reward.expect("must contain rewards");
@@ -7812,18 +8169,25 @@ mod tests {
 
         // 4. eth_feeHistory when newestBlock < blockCount - 1 (e.g. blockCount = 10, newestBlock = 2)
         // actual_count = 3 (blocks 0, 1, 2)
-        let fee_hist_val4 = adapter.dispatch("eth_feeHistory", &json!([10, 2])).expect("fee history near genesis");
+        let fee_hist_val4 = adapter
+            .dispatch("eth_feeHistory", &json!([10, 2]))
+            .expect("fee history near genesis");
         let fh4: EvmFeeHistory = serde_json::from_value(fee_hist_val4).unwrap();
         assert_eq!(fh4.oldest_block, "0x0");
         assert_eq!(fh4.base_fee_per_gas.len(), 4);
         assert_eq!(fh4.gas_used_ratio.len(), 3);
 
         // 5. eth_feeHistory object parameters
-        let fee_hist_val5 = adapter.dispatch("eth_feeHistory", &json!({
-            "blockCount": 2,
-            "newestBlock": "0x5",
-            "rewardPercentiles": [50.0]
-        })).expect("fee history object params");
+        let fee_hist_val5 = adapter
+            .dispatch(
+                "eth_feeHistory",
+                &json!({
+                    "blockCount": 2,
+                    "newestBlock": "0x5",
+                    "rewardPercentiles": [50.0]
+                }),
+            )
+            .expect("fee history object params");
         let fh5: EvmFeeHistory = serde_json::from_value(fee_hist_val5).unwrap();
         // 5 + 1 - 2 = 4 = 0x4
         assert_eq!(fh5.oldest_block, "0x4");
@@ -7841,23 +8205,33 @@ mod tests {
         let adapter = EvmAdapter::new();
 
         // 1. Missing params
-        let err1 = adapter.dispatch("eth_feeHistory", &json!([])).expect_err("empty params must fail");
+        let err1 = adapter
+            .dispatch("eth_feeHistory", &json!([]))
+            .expect_err("empty params must fail");
         assert_eq!(err1.code, INVALID_PARAMS_CODE);
 
         // 2. Block count 0
-        let err2 = adapter.dispatch("eth_feeHistory", &json!([0, "latest"])).expect_err("zero count must fail");
+        let err2 = adapter
+            .dispatch("eth_feeHistory", &json!([0, "latest"]))
+            .expect_err("zero count must fail");
         assert_eq!(err2.code, INVALID_PARAMS_CODE);
 
         // 3. Block count > 1024
-        let err3 = adapter.dispatch("eth_feeHistory", &json!([1025, "latest"])).expect_err(">1024 count must fail");
+        let err3 = adapter
+            .dispatch("eth_feeHistory", &json!([1025, "latest"]))
+            .expect_err(">1024 count must fail");
         assert_eq!(err3.code, INVALID_PARAMS_CODE);
 
         // 4. Reward percentile > 100
-        let err4 = adapter.dispatch("eth_feeHistory", &json!([2, "latest", [105.0]])).expect_err(">100 percentile must fail");
+        let err4 = adapter
+            .dispatch("eth_feeHistory", &json!([2, "latest", [105.0]]))
+            .expect_err(">100 percentile must fail");
         assert_eq!(err4.code, INVALID_PARAMS_CODE);
 
         // 5. Reward percentiles descending
-        let err5 = adapter.dispatch("eth_feeHistory", &json!([2, "latest", [80.0, 20.0]])).expect_err("descending percentiles must fail");
+        let err5 = adapter
+            .dispatch("eth_feeHistory", &json!([2, "latest", [80.0, 20.0]]))
+            .expect_err("descending percentiles must fail");
         assert_eq!(err5.code, INVALID_PARAMS_CODE);
     }
 
@@ -7900,17 +8274,11 @@ mod tests {
 
         // 6. Ethereum Empty Uncles Hash: keccak256(rlp([])) = keccak256([0xc0])
         let h_uncles = keccak256(&[0xc0]);
-        assert_eq!(
-            format!("0x{}", hex::encode(h_uncles)),
-            EMPTY_UNCLES_HASH
-        );
+        assert_eq!(format!("0x{}", hex::encode(h_uncles)), EMPTY_UNCLES_HASH);
 
         // 7. Ethereum Empty Trie Root Hash: keccak256(rlp("")) = keccak256([0x80])
         let h_root = keccak256(&[0x80]);
-        assert_eq!(
-            format!("0x{}", hex::encode(h_root)),
-            EMPTY_ROOT_HASH
-        );
+        assert_eq!(format!("0x{}", hex::encode(h_root)), EMPTY_ROOT_HASH);
 
         // 8. ERC-20 method selectors
         let h_transfer = keccak256(b"transfer(address,uint256)");
@@ -7938,7 +8306,10 @@ mod tests {
                     hasher.update(chunk);
                 }
                 let streamed = hasher.finalize();
-                assert_eq!(oneshot, streamed, "mismatch at len {len} with chunk_size {chunk_size}");
+                assert_eq!(
+                    oneshot, streamed,
+                    "mismatch at len {len} with chunk_size {chunk_size}"
+                );
             }
         }
     }
@@ -7954,47 +8325,80 @@ mod tests {
 
         // 2. Single byte in [0x00, 0x7f]
         assert_eq!(rlp_encode_bytes(&[0x00]), vec![0x00]);
-        assert_eq!(RlpItem::decode(&[0x00]).unwrap().as_bytes().unwrap(), &[0x00]);
+        assert_eq!(
+            RlpItem::decode(&[0x00]).unwrap().as_bytes().unwrap(),
+            &[0x00]
+        );
         assert_eq!(RlpItem::decode(&[0x00]).unwrap(), RlpItem::Byte(0x00));
         assert_eq!(rlp_decode(&[0x00]).unwrap(), RlpItem::Byte(0x00));
 
         assert_eq!(rlp_encode_bytes(&[0x0f]), vec![0x0f]);
-        assert_eq!(RlpItem::decode(&[0x0f]).unwrap().as_bytes().unwrap(), &[0x0f]);
+        assert_eq!(
+            RlpItem::decode(&[0x0f]).unwrap().as_bytes().unwrap(),
+            &[0x0f]
+        );
         assert_eq!(RlpItem::decode(&[0x0f]).unwrap(), RlpItem::Byte(0x0f));
 
         assert_eq!(rlp_encode_bytes(&[0x7f]), vec![0x7f]);
-        assert_eq!(RlpItem::decode(&[0x7f]).unwrap().as_bytes().unwrap(), &[0x7f]);
+        assert_eq!(
+            RlpItem::decode(&[0x7f]).unwrap().as_bytes().unwrap(),
+            &[0x7f]
+        );
         assert_eq!(RlpItem::decode(&[0x7f]).unwrap(), RlpItem::Byte(0x7f));
 
         // 3. Single byte >= 0x80 -> encoded with 0x81 prefix
         assert_eq!(rlp_encode_bytes(&[0x80]), vec![0x81, 0x80]);
-        assert_eq!(RlpItem::decode(&[0x81, 0x80]).unwrap().as_bytes().unwrap(), &[0x80]);
-        assert_eq!(RlpItem::decode(&[0x81, 0x80]).unwrap(), RlpItem::Bytes(vec![0x80]));
+        assert_eq!(
+            RlpItem::decode(&[0x81, 0x80]).unwrap().as_bytes().unwrap(),
+            &[0x80]
+        );
+        assert_eq!(
+            RlpItem::decode(&[0x81, 0x80]).unwrap(),
+            RlpItem::Bytes(vec![0x80])
+        );
 
         assert_eq!(rlp_encode_bytes(&[0xff]), vec![0x81, 0xff]);
-        assert_eq!(RlpItem::decode(&[0x81, 0xff]).unwrap().as_bytes().unwrap(), &[0xff]);
-        assert_eq!(RlpItem::decode(&[0x81, 0xff]).unwrap(), RlpItem::Bytes(vec![0xff]));
+        assert_eq!(
+            RlpItem::decode(&[0x81, 0xff]).unwrap().as_bytes().unwrap(),
+            &[0xff]
+        );
+        assert_eq!(
+            RlpItem::decode(&[0x81, 0xff]).unwrap(),
+            RlpItem::Bytes(vec![0xff])
+        );
 
         // 4. Short strings "dog" and "cat"
         let enc_dog = rlp_encode_bytes(b"dog");
         assert_eq!(enc_dog, vec![0x83, b'd', b'o', b'g']);
-        assert_eq!(RlpItem::decode(&enc_dog).unwrap().as_bytes().unwrap(), b"dog");
+        assert_eq!(
+            RlpItem::decode(&enc_dog).unwrap().as_bytes().unwrap(),
+            b"dog"
+        );
 
         let enc_cat = rlp_encode_bytes(b"cat");
         assert_eq!(enc_cat, vec![0x83, b'c', b'a', b't']);
-        assert_eq!(RlpItem::decode(&enc_cat).unwrap().as_bytes().unwrap(), b"cat");
+        assert_eq!(
+            RlpItem::decode(&enc_cat).unwrap().as_bytes().unwrap(),
+            b"cat"
+        );
 
         // 5. 55-byte string (short string boundary)
         let s55 = vec![0x61u8; 55];
         let mut enc55 = vec![0xb7];
         enc55.extend_from_slice(&s55);
-        assert_eq!(RlpItem::decode(&enc55).unwrap().as_bytes().unwrap(), s55.as_slice());
+        assert_eq!(
+            RlpItem::decode(&enc55).unwrap().as_bytes().unwrap(),
+            s55.as_slice()
+        );
 
         // 6. 56-byte string (long string boundary: 0xb8 + 1-byte length 0x38)
         let s56 = vec![0x62u8; 56];
         let mut enc56 = vec![0xb8, 0x38];
         enc56.extend_from_slice(&s56);
-        assert_eq!(RlpItem::decode(&enc56).unwrap().as_bytes().unwrap(), s56.as_slice());
+        assert_eq!(
+            RlpItem::decode(&enc56).unwrap().as_bytes().unwrap(),
+            s56.as_slice()
+        );
 
         // 7. 1024-byte string (multi-byte length: 0xb9 0x04 0x00)
         let s1024 = vec![0xab; 1024];
@@ -8003,7 +8407,10 @@ mod tests {
         assert_eq!(enc1024[1], 0x04);
         assert_eq!(enc1024[2], 0x00);
         assert_eq!(&enc1024[3..], s1024.as_slice());
-        assert_eq!(RlpItem::decode(&enc1024).unwrap().as_bytes().unwrap(), s1024.as_slice());
+        assert_eq!(
+            RlpItem::decode(&enc1024).unwrap().as_bytes().unwrap(),
+            s1024.as_slice()
+        );
 
         // 8. Lists
         // Empty list [] -> [0xc0]
@@ -8039,10 +8446,7 @@ mod tests {
         let l_nested = vec![0xc1, 0xc0];
         let l_both = rlp_encode_list(&[l_empty.clone(), l_nested.clone()]);
         let deep = rlp_encode_list(&[l_empty, l_nested, l_both]);
-        assert_eq!(
-            deep,
-            vec![0xc7, 0xc0, 0xc1, 0xc0, 0xc3, 0xc0, 0xc1, 0xc0]
-        );
+        assert_eq!(deep, vec![0xc7, 0xc0, 0xc1, 0xc0, 0xc3, 0xc0, 0xc1, 0xc0]);
         let dec_deep = RlpItem::decode(&deep).unwrap();
         assert_eq!(dec_deep.as_list().unwrap().len(), 3);
 
@@ -8058,21 +8462,39 @@ mod tests {
 
         // 1000 -> [0x82, 0x03, 0xe8]
         assert_eq!(rlp_encode_u64(1000), vec![0x82, 0x03, 0xe8]);
-        assert_eq!(RlpItem::decode(&[0x82, 0x03, 0xe8]).unwrap().as_u64().unwrap(), 1000);
+        assert_eq!(
+            RlpItem::decode(&[0x82, 0x03, 0xe8])
+                .unwrap()
+                .as_u64()
+                .unwrap(),
+            1000
+        );
 
         // 1024 -> [0x82, 0x04, 0x00]
         assert_eq!(rlp_encode_u64(1024), vec![0x82, 0x04, 0x00]);
-        assert_eq!(RlpItem::decode(&[0x82, 0x04, 0x00]).unwrap().as_u64().unwrap(), 1024);
+        assert_eq!(
+            RlpItem::decode(&[0x82, 0x04, 0x00])
+                .unwrap()
+                .as_u64()
+                .unwrap(),
+            1024
+        );
 
         // Large u64
         let max_u64 = u64::MAX;
         let enc_max_u64 = rlp_encode_u64(max_u64);
-        assert_eq!(RlpItem::decode(&enc_max_u64).unwrap().as_u64().unwrap(), max_u64);
+        assert_eq!(
+            RlpItem::decode(&enc_max_u64).unwrap().as_u64().unwrap(),
+            max_u64
+        );
 
         // Large u128
         let big_val = 1_000_000_000_000_000_000_000_000u128;
         let enc_big = rlp_encode_u128(big_val);
-        assert_eq!(RlpItem::decode(&enc_big).unwrap().as_u128().unwrap(), big_val);
+        assert_eq!(
+            RlpItem::decode(&enc_big).unwrap().as_u128().unwrap(),
+            big_val
+        );
     }
 
     #[test]
@@ -8127,10 +8549,7 @@ mod tests {
         );
 
         // 9. Empty buffer -> UnexpectedEof
-        assert_eq!(
-            RlpItem::decode(&[]).unwrap_err(),
-            RlpError::UnexpectedEof
-        );
+        assert_eq!(RlpItem::decode(&[]).unwrap_err(), RlpError::UnexpectedEof);
     }
 
     #[test]
@@ -8158,10 +8577,14 @@ mod tests {
         assert_eq!(legacy.chain_id, Some(1));
         assert_eq!(legacy.recovery_id(), 0);
 
-        let expected_r = hex::decode("28ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276").unwrap();
+        let expected_r =
+            hex::decode("28ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276")
+                .unwrap();
         assert_eq!(legacy.r, expected_r.as_slice());
 
-        let expected_s = hex::decode("67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83").unwrap();
+        let expected_s =
+            hex::decode("67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83")
+                .unwrap();
         assert_eq!(legacy.s, expected_s.as_slice());
 
         // 3. Official EIP-155 signing hash
@@ -8286,7 +8709,10 @@ mod tests {
         assert_eq!(evm_tx.tx_type, Some("0x2".to_string()));
         assert_eq!(evm_tx.chain_id, Some("0x167d".to_string()));
         assert_eq!(evm_tx.max_fee_per_gas, Some("0x826299e00".to_string()));
-        assert_eq!(evm_tx.max_priority_fee_per_gas, Some("0x59682f00".to_string()));
+        assert_eq!(
+            evm_tx.max_priority_fee_per_gas,
+            Some("0x59682f00".to_string())
+        );
         assert_eq!(evm_tx.access_list, Some(vec![]));
     }
 
@@ -8348,7 +8774,9 @@ mod tests {
         // Hardhat / Foundry Account #0:
         // Private key: 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
         // Expected address: 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
-        let privkey_bytes = hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
+        let privkey_bytes =
+            hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap();
         let signing_key = k256::ecdsa::SigningKey::from_slice(&privkey_bytes).unwrap();
         let verifying_key = signing_key.verifying_key();
         let encoded_point = verifying_key.to_encoded_point(false);
@@ -8363,22 +8791,34 @@ mod tests {
         assert_eq!(derived_addr.as_slice(), expected_addr.as_slice());
 
         // Also test with raw 64-byte coordinates (without 0x04 tag)
-        let derived_from_coords = pubkey_to_address(&uncompressed[1..]).expect("valid 64-byte pubkey");
+        let derived_from_coords =
+            pubkey_to_address(&uncompressed[1..]).expect("valid 64-byte pubkey");
         assert_eq!(derived_from_coords.as_slice(), expected_addr.as_slice());
 
         // Also test with 33-byte compressed public key
         let compressed_point = verifying_key.to_encoded_point(true);
-        let derived_from_compressed = pubkey_to_address(compressed_point.as_bytes()).expect("valid compressed pubkey");
+        let derived_from_compressed =
+            pubkey_to_address(compressed_point.as_bytes()).expect("valid compressed pubkey");
         assert_eq!(derived_from_compressed.as_slice(), expected_addr.as_slice());
     }
 
     #[test]
     fn test_ecrecover_known_hardhat_personal_sign_vector() {
-        let privkey_bytes = hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
+        let privkey_bytes =
+            hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap();
         let signing_key = k256::ecdsa::SigningKey::from_slice(&privkey_bytes).unwrap();
-        let expected_addr = pubkey_to_address(signing_key.verifying_key().to_encoded_point(false).as_bytes()).unwrap();
+        let expected_addr = pubkey_to_address(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        )
+        .unwrap();
 
-        let msg_hash_bytes = hex::decode("eff35bc70d30de07d572d42df29fb2c58971f11e0e854ef02eb4b29bb88d8792").unwrap();
+        let msg_hash_bytes =
+            hex::decode("eff35bc70d30de07d572d42df29fb2c58971f11e0e854ef02eb4b29bb88d8792")
+                .unwrap();
         let mut msg_hash = [0u8; 32];
         msg_hash.copy_from_slice(&msg_hash_bytes);
 
@@ -8394,7 +8834,8 @@ mod tests {
         assert_eq!(recovered, expected_addr);
 
         // 2. verify_signature helper
-        let is_valid = verify_signature(&expected_addr, &msg_hash, v, &r, &s).expect("verification succeeds");
+        let is_valid =
+            verify_signature(&expected_addr, &msg_hash, v, &r, &s).expect("verification succeeds");
         assert!(is_valid);
 
         // 3. Hex interface
@@ -8403,7 +8844,8 @@ mod tests {
             &format!("0x{:x}", v),
             &format!("0x{}", hex::encode(r)),
             &format!("0x{}", hex::encode(s)),
-        ).expect("hex ecrecover should succeed");
+        )
+        .expect("hex ecrecover should succeed");
         assert_eq!(recovered_hex, "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 
         // 4. Recover full 65-byte uncompressed public key
@@ -8431,7 +8873,9 @@ mod tests {
         );
 
         // Recover sender via LegacyTransaction method
-        let recovered_sender = legacy.recover_sender().expect("recover sender from EIP-155 tx");
+        let recovered_sender = legacy
+            .recover_sender()
+            .expect("recover sender from EIP-155 tx");
         let checksummed = to_checksum_address(&recovered_sender);
         assert_eq!(checksummed.len(), 42);
 
@@ -8443,19 +8887,34 @@ mod tests {
         // Replay protection: Expected chain ID 2 must FAIL with ChainIdMismatch
         let err_chain2 = ecrecover_with_chain_id(&sighash, legacy.v, &legacy.r, &legacy.s, Some(2))
             .expect_err("must reject replay attack on chain 2");
-        assert_eq!(err_chain2, EvmError::ChainIdMismatch { expected: 2, got: 1 });
+        assert_eq!(
+            err_chain2,
+            EvmError::ChainIdMismatch {
+                expected: 2,
+                got: 1
+            }
+        );
 
         // Replay protection: Stellereum chain ID 5757 must FAIL
-        let err_stell = ecrecover_with_chain_id(&sighash, legacy.v, &legacy.r, &legacy.s, Some(CHAIN_ID))
-            .expect_err("must reject replay attack on Stellereum (5757)");
-        assert_eq!(err_stell, EvmError::ChainIdMismatch { expected: 5757, got: 1 });
+        let err_stell =
+            ecrecover_with_chain_id(&sighash, legacy.v, &legacy.r, &legacy.s, Some(CHAIN_ID))
+                .expect_err("must reject replay attack on Stellereum (5757)");
+        assert_eq!(
+            err_stell,
+            EvmError::ChainIdMismatch {
+                expected: 5757,
+                got: 1
+            }
+        );
 
         // Verify low-s compliance
         assert!(is_low_s(&legacy.s));
         // `recover_sender` stays chain-agnostic (validates v consistency only),
         // but `verify_signature` strictly requires Stellereum chain_id == 5757,
         // so the mainnet (chain_id == 1) vector must be rejected here.
-        let err_verify = legacy.verify_signature().expect_err("foreign chain_id must be rejected");
+        let err_verify = legacy
+            .verify_signature()
+            .expect_err("foreign chain_id must be rejected");
         assert_eq!(
             err_verify,
             EvmError::ChainIdMismatch {
@@ -8468,9 +8927,17 @@ mod tests {
     #[test]
     fn test_ecrecover_eip1559_transaction_roundtrip() {
         // Sign and verify an EIP-1559 transaction using Hardhat Account #0
-        let privkey_bytes = hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
+        let privkey_bytes =
+            hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap();
         let signing_key = k256::ecdsa::SigningKey::from_slice(&privkey_bytes).unwrap();
-        let expected_sender = pubkey_to_address(signing_key.verifying_key().to_encoded_point(false).as_bytes()).unwrap();
+        let expected_sender = pubkey_to_address(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        )
+        .unwrap();
 
         let chain_id = CHAIN_ID; // 5757
         let nonce = 15u64;
@@ -8541,11 +9008,21 @@ mod tests {
 
     #[test]
     fn test_ecrecover_openzeppelin_vector() {
-        let privkey_bytes = hex::decode("4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d").unwrap();
+        let privkey_bytes =
+            hex::decode("4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d")
+                .unwrap();
         let signing_key = k256::ecdsa::SigningKey::from_slice(&privkey_bytes).unwrap();
-        let expected_addr = pubkey_to_address(signing_key.verifying_key().to_encoded_point(false).as_bytes()).unwrap();
+        let expected_addr = pubkey_to_address(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        )
+        .unwrap();
 
-        let hash_bytes = hex::decode("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421").unwrap();
+        let hash_bytes =
+            hex::decode("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
+                .unwrap();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&hash_bytes);
 
@@ -8586,21 +9063,36 @@ mod tests {
         let s = [0x02u8; 32];
 
         // 1. Invalid recovery id v = 2, 26, 34
-        assert_eq!(ecrecover_with_chain_id(&hash, 2, &r, &s, None).unwrap_err(), EvmError::InvalidRecoveryId(2));
-        assert_eq!(ecrecover_with_chain_id(&hash, 26, &r, &s, None).unwrap_err(), EvmError::InvalidRecoveryId(26));
-        assert_eq!(ecrecover_with_chain_id(&hash, 34, &r, &s, None).unwrap_err(), EvmError::InvalidRecoveryId(34));
+        assert_eq!(
+            ecrecover_with_chain_id(&hash, 2, &r, &s, None).unwrap_err(),
+            EvmError::InvalidRecoveryId(2)
+        );
+        assert_eq!(
+            ecrecover_with_chain_id(&hash, 26, &r, &s, None).unwrap_err(),
+            EvmError::InvalidRecoveryId(26)
+        );
+        assert_eq!(
+            ecrecover_with_chain_id(&hash, 34, &r, &s, None).unwrap_err(),
+            EvmError::InvalidRecoveryId(34)
+        );
         assert!(ecrecover(&hash, 2, &r, &s).is_err());
         assert!(ecrecover(&hash, 26, &r, &s).is_err());
         assert!(ecrecover(&hash, 34, &r, &s).is_err());
 
         // 2. r == 0
         let zero_r = [0u8; 32];
-        assert_eq!(ecrecover_with_chain_id(&hash, 27, &zero_r, &s, None).unwrap_err(), EvmError::InvalidSignatureR);
+        assert_eq!(
+            ecrecover_with_chain_id(&hash, 27, &zero_r, &s, None).unwrap_err(),
+            EvmError::InvalidSignatureR
+        );
         assert!(ecrecover(&hash, 27, &zero_r, &s).is_err());
 
         // 3. s == 0
         let zero_s = [0u8; 32];
-        assert_eq!(ecrecover_with_chain_id(&hash, 27, &r, &zero_s, None).unwrap_err(), EvmError::InvalidSignatureS);
+        assert_eq!(
+            ecrecover_with_chain_id(&hash, 27, &r, &zero_s, None).unwrap_err(),
+            EvmError::InvalidSignatureS
+        );
         assert!(ecrecover(&hash, 27, &r, &zero_s).is_err());
 
         // 4. Pre-EIP-155 legacy (v = 27) rejected when replay protection is strictly required
@@ -8617,11 +9109,26 @@ mod tests {
     fn test_to_checksum_address_official_eip55_vectors() {
         // Official EIP-55 test vectors
         let vectors = [
-            ("0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed", "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"),
-            ("0xfb6916095ca1df60bb79ce92ce3ea74c37c5d359", "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359"),
-            ("0xdbf03b407c01e7cd3cbea99509d93f8dddc8c6fb", "0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB"),
-            ("0xd1220a0cf47c7b9be7a2e6ba89f429762e7b9adb", "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb"),
-            ("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266", "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+            (
+                "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+                "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            ),
+            (
+                "0xfb6916095ca1df60bb79ce92ce3ea74c37c5d359",
+                "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359",
+            ),
+            (
+                "0xdbf03b407c01e7cd3cbea99509d93f8dddc8c6fb",
+                "0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB",
+            ),
+            (
+                "0xd1220a0cf47c7b9be7a2e6ba89f429762e7b9adb",
+                "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb",
+            ),
+            (
+                "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+            ),
         ];
 
         for (input, expected) in vectors {
@@ -8633,9 +9140,13 @@ mod tests {
 
     #[test]
     fn test_evm_transaction_verify_sender() {
-        let privkey_bytes = hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
+        let privkey_bytes =
+            hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap();
         let signing_key = k256::ecdsa::SigningKey::from_slice(&privkey_bytes).unwrap();
-        let hash_bytes = hex::decode("eff35bc70d30de07d572d42df29fb2c58971f11e0e854ef02eb4b29bb88d8792").unwrap();
+        let hash_bytes =
+            hex::decode("eff35bc70d30de07d572d42df29fb2c58971f11e0e854ef02eb4b29bb88d8792")
+                .unwrap();
         let mut msg_hash = [0u8; 32];
         msg_hash.copy_from_slice(&hash_bytes);
         let (sig, recid) = signing_key.sign_prehash_recoverable(&msg_hash).unwrap();
@@ -8671,6 +9182,9 @@ mod tests {
         // Tamper with from address
         let mut tampered = tx.clone();
         tampered.from = "0x0000000000000000000000000000000000000002".to_string();
-        assert!(!tampered.verify_sender().unwrap(), "tampered sender must not match");
+        assert!(
+            !tampered.verify_sender().unwrap(),
+            "tampered sender must not match"
+        );
     }
 }

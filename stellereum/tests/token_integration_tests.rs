@@ -37,7 +37,10 @@ async fn token_creation_commits_to_state_root() {
         .unwrap();
 
     let root_after = engine.get_state_root().await;
-    assert_ne!(root_before, root_after, "State root must change when a token is created");
+    assert_ne!(
+        root_before, root_after,
+        "State root must change when a token is created"
+    );
     assert_eq!(engine.token_balance(&id, &alice).await, 1_000_000);
     assert_eq!(engine.token_total_supply(&id).await, Some(1_000_000));
     assert_eq!(engine.all_token_ids().await.len(), 1);
@@ -55,7 +58,14 @@ async fn token_balance_is_spv_provable() {
         .unwrap();
 
     engine
-        .token_execute(&id, alice, TokenOp::Transfer { to: bob, amount: 250_000 })
+        .token_execute(
+            &id,
+            alice,
+            TokenOp::Transfer {
+                to: bob,
+                amount: 250_000,
+            },
+        )
         .await
         .unwrap();
 
@@ -71,7 +81,12 @@ async fn token_balance_is_spv_provable() {
 
     // Forged balance must NOT verify against the same proof
     assert!(
-        !PatriciaTrie::verify_merkle_proof(&root, &bob_key, &999_999_999u64.to_be_bytes(), &bob_proof),
+        !PatriciaTrie::verify_merkle_proof(
+            &root,
+            &bob_key,
+            &999_999_999u64.to_be_bytes(),
+            &bob_proof
+        ),
         "A forged token balance must fail SPV verification"
     );
 }
@@ -82,16 +97,29 @@ async fn token_transfer_updates_state() {
     let engine = InMemoryStateEngine::new();
     let alice = addr(1);
     let bob = addr(2);
-    let id = engine.create_token(alice, meta("T", "T"), 1_000).await.unwrap();
+    let id = engine
+        .create_token(alice, meta("T", "T"), 1_000)
+        .await
+        .unwrap();
 
     let root_before = engine.get_state_root().await;
     engine
-        .token_execute(&id, alice, TokenOp::Transfer { to: bob, amount: 400 })
+        .token_execute(
+            &id,
+            alice,
+            TokenOp::Transfer {
+                to: bob,
+                amount: 400,
+            },
+        )
         .await
         .unwrap();
     let root_after = engine.get_state_root().await;
 
-    assert_ne!(root_before, root_after, "State root must change after a token transfer");
+    assert_ne!(
+        root_before, root_after,
+        "State root must change after a token transfer"
+    );
     assert_eq!(engine.token_balance(&id, &alice).await, 600);
     assert_eq!(engine.token_balance(&id, &bob).await, 400);
 }
@@ -127,8 +155,15 @@ fn svm_token_transfer_syscall_succeeds() {
     };
 
     let ops = vec![
-        OpCode::SysCallTokenTransfer { token_id: id, to: bob, amount: 400 },
-        OpCode::SysCallTokenBalanceOf { token_id: id, account: bob },
+        OpCode::SysCallTokenTransfer {
+            token_id: id,
+            to: bob,
+            amount: 400,
+        },
+        OpCode::SysCallTokenBalanceOf {
+            token_id: id,
+            account: bob,
+        },
         OpCode::Halt,
     ];
 
@@ -137,8 +172,16 @@ fn svm_token_transfer_syscall_succeeds() {
     // (audit W6.6).
     let res = Svm::execute(&ops, 1_000_000, &mut ctx);
     match res {
-        VmExecutionResult::Success { return_value, token_events, .. } => {
-            assert_eq!(return_value, Some(400), "BalanceOf must push Bob's new balance");
+        VmExecutionResult::Success {
+            return_value,
+            token_events,
+            ..
+        } => {
+            assert_eq!(
+                return_value,
+                Some(400),
+                "BalanceOf must push Bob's new balance"
+            );
             assert_eq!(token_events.len(), 1);
         }
         other => panic!("Execution failed: {:?}", other),
@@ -179,18 +222,36 @@ fn svm_token_mutations_are_atomic_on_revert() {
 
     let ops = vec![
         // This token transfer would succeed on its own...
-        OpCode::SysCallTokenTransfer { token_id: id, to: bob, amount: 400 },
+        OpCode::SysCallTokenTransfer {
+            token_id: id,
+            to: bob,
+            amount: 400,
+        },
         // ...but this native transfer exceeds the balance and reverts the whole tx.
-        OpCode::Transfer { recipient: bob, amount: 9_999 },
+        OpCode::Transfer {
+            recipient: bob,
+            amount: 9_999,
+        },
     ];
 
     // 280_000 (the token transfer) + 280_000 (the native transfer).
     let res = Svm::execute(&ops, 1_000_000, &mut ctx);
-    assert!(matches!(res, VmExecutionResult::Reverted(_)), "VM must revert");
+    assert!(
+        matches!(res, VmExecutionResult::Reverted(_)),
+        "VM must revert"
+    );
 
     // CRITICAL: the token transfer must NOT have been committed.
-    assert_eq!(registry.balance_of(&id, &alice), 1_000, "Reverted tx must not move tokens");
-    assert_eq!(registry.balance_of(&id, &bob), 0, "Reverted tx must not credit tokens");
+    assert_eq!(
+        registry.balance_of(&id, &alice),
+        1_000,
+        "Reverted tx must not move tokens"
+    );
+    assert_eq!(
+        registry.balance_of(&id, &bob),
+        0,
+        "Reverted tx must not credit tokens"
+    );
 }
 
 /// SVM mint syscall enforces minter authority: a non-minter cannot mint.
@@ -223,9 +284,16 @@ fn svm_unauthorized_token_mint_rejected() {
         oracle: None,
     };
 
-    let ops = vec![OpCode::SysCallTokenMint { token_id: id, to: attacker, amount: 1_000_000 }];
+    let ops = vec![OpCode::SysCallTokenMint {
+        token_id: id,
+        to: attacker,
+        amount: 1_000_000,
+    }];
     let res = Svm::execute(&ops, 500_000, &mut ctx);
-    assert!(matches!(res, VmExecutionResult::Reverted(_)), "Unauthorized mint must revert");
+    assert!(
+        matches!(res, VmExecutionResult::Reverted(_)),
+        "Unauthorized mint must revert"
+    );
     assert_eq!(registry.balance_of(&id, &attacker), 0);
     assert_eq!(registry.token_count(), 1);
 }
@@ -256,7 +324,11 @@ fn svm_token_op_without_registry_reverts() {
         oracle: None,
     };
 
-    let ops = vec![OpCode::SysCallTokenTransfer { token_id: addr(7), to: addr(2), amount: 1 }];
+    let ops = vec![OpCode::SysCallTokenTransfer {
+        token_id: addr(7),
+        to: addr(2),
+        amount: 1,
+    }];
     let res = Svm::execute(&ops, 500_000, &mut ctx);
     assert!(matches!(res, VmExecutionResult::Reverted(_)));
 }
@@ -307,13 +379,21 @@ fn svm_token_create_syscall_full_loop() {
         VmExecutionResult::Success { token_events, .. } => token_events,
         other => panic!("Create failed: {:?}", other),
     };
-    assert_eq!(events.len(), 1, "creation with supply must emit the mint event");
+    assert_eq!(
+        events.len(),
+        1,
+        "creation with supply must emit the mint event"
+    );
     drop(ctx);
 
-    let id = registry.find_by_creator_name(&alice, "Test Coin", "TST")
+    let id = registry
+        .find_by_creator_name(&alice, "Test Coin", "TST")
         .expect("created token must resolve by (creator, name, symbol)");
     assert_eq!(registry.balance_of(&id, &alice), 1_000_000);
-    assert!(registry.get(&id).map(|t| t.is_minter(&alice)).unwrap_or(false));
+    assert!(registry
+        .get(&id)
+        .map(|t| t.is_minter(&alice))
+        .unwrap_or(false));
 
     // The fresh token is immediately usable: transfer + balance through the VM.
     let mut ctx = VmContext {
@@ -338,8 +418,15 @@ fn svm_token_create_syscall_full_loop() {
         oracle: None,
     };
     let ops2 = vec![
-        OpCode::SysCallTokenTransfer { token_id: id, to: bob, amount: 400_000 },
-        OpCode::SysCallTokenBalanceOf { token_id: id, account: bob },
+        OpCode::SysCallTokenTransfer {
+            token_id: id,
+            to: bob,
+            amount: 400_000,
+        },
+        OpCode::SysCallTokenBalanceOf {
+            token_id: id,
+            account: bob,
+        },
         OpCode::Halt,
     ];
     match Svm::execute(&ops2, 1_000_000, &mut ctx) {
@@ -355,7 +442,13 @@ fn svm_token_create_syscall_full_loop() {
 /// CREATE FAIL-CLOSED: bad metadata reverts, zero supply emits no event.
 #[test]
 fn svm_token_create_rejects_bad_metadata() {
-    fn try_create(name: &str, symbol: &str, decimals: u8, supply: u64, cap: Option<u64>) -> VmExecutionResult {
+    fn try_create(
+        name: &str,
+        symbol: &str,
+        decimals: u8,
+        supply: u64,
+        cap: Option<u64>,
+    ) -> VmExecutionResult {
         let mut registry = TokenRegistry::new();
         let mut ctx = VmContext {
             sender: addr(1),
@@ -392,14 +485,17 @@ fn svm_token_create_rejects_bad_metadata() {
     }
 
     for (name, symbol, dec, supply, cap) in [
-        ("", "TST", 6, 100, None),                       // empty name
-        ("T", "", 6, 100, None),                         // empty symbol
-        ("T", "TOOLONGSYMBOL12345", 6, 100, None),       // symbol > 16
-        ("T", "TST", 19, 100, None),                     // decimals > 18
-        ("T", "TST", 6, 3_000_000, Some(2_000_000)),     // supply above cap
+        ("", "TST", 6, 100, None),                   // empty name
+        ("T", "", 6, 100, None),                     // empty symbol
+        ("T", "TOOLONGSYMBOL12345", 6, 100, None),   // symbol > 16
+        ("T", "TST", 19, 100, None),                 // decimals > 18
+        ("T", "TST", 6, 3_000_000, Some(2_000_000)), // supply above cap
     ] {
         assert!(
-            matches!(try_create(name, symbol, dec, supply, cap), VmExecutionResult::Reverted(_)),
+            matches!(
+                try_create(name, symbol, dec, supply, cap),
+                VmExecutionResult::Reverted(_)
+            ),
             "must revert: name={:?} symbol={:?}",
             name,
             symbol
@@ -418,10 +514,24 @@ fn svm_token_create_rejects_bad_metadata() {
 async fn token_resolve_finds_by_creator_name() {
     let engine = InMemoryStateEngine::new();
     let alice = addr(1);
-    let id = engine.create_token(alice, meta("Wrapped USDT", "wUSDT"), 1_000_000).await.unwrap();
-    assert_eq!(engine.token_resolve(&alice, "Wrapped USDT", "wUSDT").await, Some(id));
-    assert_eq!(engine.token_resolve(&addr(9), "Wrapped USDT", "wUSDT").await, None);
-    assert_eq!(engine.token_resolve(&alice, "Wrapped USDT", "OTHER").await, None);
+    let id = engine
+        .create_token(alice, meta("Wrapped USDT", "wUSDT"), 1_000_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.token_resolve(&alice, "Wrapped USDT", "wUSDT").await,
+        Some(id)
+    );
+    assert_eq!(
+        engine
+            .token_resolve(&addr(9), "Wrapped USDT", "wUSDT")
+            .await,
+        None
+    );
+    assert_eq!(
+        engine.token_resolve(&alice, "Wrapped USDT", "OTHER").await,
+        None
+    );
 }
 
 /// PAUSE SEMANTIC (audit 2026-10-06): pause freezes movement, not approvals.
@@ -436,12 +546,40 @@ fn approvals_survive_pause_but_movement_does_not() {
     let t = registry.get_mut(&id).unwrap();
     t.metadata.paused = true;
     // Movement frozen...
-    assert!(registry.execute(&id, alice, TokenOp::Transfer { to: bob, amount: 10 }).is_err());
+    assert!(registry
+        .execute(
+            &id,
+            alice,
+            TokenOp::Transfer {
+                to: bob,
+                amount: 10
+            }
+        )
+        .is_err());
     // ...approvals not.
-    assert!(registry.execute(&id, alice, TokenOp::Approve { spender: bob, amount: 100 }).is_ok());
+    assert!(registry
+        .execute(
+            &id,
+            alice,
+            TokenOp::Approve {
+                spender: bob,
+                amount: 100
+            }
+        )
+        .is_ok());
     let t = registry.get_mut(&id).unwrap();
     t.metadata.paused = false;
-    assert!(registry.execute(&id, bob, TokenOp::TransferFrom { from: alice, to: bob, amount: 100 }).is_ok());
+    assert!(registry
+        .execute(
+            &id,
+            bob,
+            TokenOp::TransferFrom {
+                from: alice,
+                to: bob,
+                amount: 100
+            }
+        )
+        .is_ok());
     assert_eq!(registry.balance_of(&id, &bob), 100);
 }
 
@@ -459,8 +597,14 @@ fn minter_rotation_fails_closed_and_recreate_never_overwrites() {
         "silent renounce via set_minter is forbidden"
     );
     let id2 = registry.create_token(alice, meta("T", "T"), 500).unwrap();
-    assert_ne!(id, id2, "re-create must mint a distinct token, not overwrite");
+    assert_ne!(
+        id, id2,
+        "re-create must mint a distinct token, not overwrite"
+    );
     assert_eq!(registry.balance_of(&id, &alice), 1_000);
     assert_eq!(registry.balance_of(&id2, &alice), 500);
-    assert_eq!(format!("{}", TokenError::DuplicateToken), "token id already registered");
+    assert_eq!(
+        format!("{}", TokenError::DuplicateToken),
+        "token id already registered"
+    );
 }

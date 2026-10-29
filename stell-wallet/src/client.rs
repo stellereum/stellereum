@@ -15,6 +15,9 @@ use crate::rpc::{self, RpcConfig, SpvAnswer, TokenSpvAnswer, TxFinality};
 use ed25519_dalek::SigningKey;
 use infnode::config as node_config;
 use infnode::node::Node;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use stellereum::cell::PatriciaTrie;
 use stellereum::crypto_privacy::{ConfidentialTransfer, StealthAddress};
 use stellereum::network::P2pNetworkAdapter;
@@ -23,9 +26,6 @@ use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::token::TokenOp;
 use stellereum::wallet::WalletAccount;
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// Trait for key types that can authorize post-quantum transactions
 pub trait PqSigner {
@@ -95,8 +95,10 @@ pub struct LightClient {
     /// one nonce and the second pays a fee to fail (audit 2026-10-06). The
     /// hint reserves nonces locally; it expires after 10 min (a dropped tx
     /// must not pin a gap forever) and the chain value always wins upward.
-    #[allow(clippy::type_complexity)] // GATE: client cache shape is fixed by mempool/nonce tracking
-    pub inflight_nonce: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], (u64, u64)>>>,
+    #[allow(clippy::type_complexity)]
+    // GATE: client cache shape is fixed by mempool/nonce tracking
+    pub inflight_nonce:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], (u64, u64)>>>,
     pub recent_local_txs: std::sync::Arc<std::sync::Mutex<Vec<Transaction>>>,
 }
 
@@ -165,7 +167,9 @@ impl LightClient {
             rpc: None,
             receipt_timeout_secs: 360,
             receipt_poll_secs: 2,
-            inflight_nonce: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            inflight_nonce: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             recent_local_txs: std::sync::Arc::new(std::sync::Mutex::new(initial_local_txs)),
         })
     }
@@ -256,7 +260,10 @@ impl LightClient {
                 .unwrap_or(0)
         };
         let now = now_secs();
-        let mut m = self.inflight_nonce.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m = self
+            .inflight_nonce
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         m.retain(|_, (_, t)| now.saturating_sub(*t) < 600);
         let hint = m.get(address).map(|(n, _)| *n).unwrap_or(0);
         Ok(base.max(hint))
@@ -265,7 +272,10 @@ impl LightClient {
     /// Reserve the nonce after a tx: the next `nonce_of` for this sender
     /// returns at least `nonce + 1` until the hint expires.
     pub fn reserve_nonce(&self, sender: &[u8; 32], nonce: u64) {
-        let mut m = self.inflight_nonce.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m = self
+            .inflight_nonce
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let e = m.entry(*sender).or_insert((0, 0));
         if nonce + 1 > e.0 {
             *e = (nonce + 1, now_secs());
@@ -303,8 +313,7 @@ impl LightClient {
             // callers that display to humans use the 3-state verdict directly
             // (Absent renders neutral, not red).
             let verified =
-                rpc::verify_spv_balance_answer(address, &answer)
-                    == rpc::SpvVerdict::Verified;
+                rpc::verify_spv_balance_answer(address, &answer) == rpc::SpvVerdict::Verified;
             return Ok((answer.balance, answer.nonce, verified));
         }
 
@@ -362,10 +371,7 @@ impl LightClient {
     ///   Unknown — never "Confirmed" before a success receipt exists.
     /// - Local mode: applied to the local state cache and recorded as a
     ///   LOCAL SIMULATION (explicitly not chain finality).
-    pub async fn broadcast_tx(
-        &self,
-        tx: &Transaction,
-    ) -> Result<([u8; 32], TxFinality), String> {
+    pub async fn broadcast_tx(&self, tx: &Transaction) -> Result<([u8; 32], TxFinality), String> {
         if !tx.verify_signature() {
             return Err("Transaction signature verification failed".to_string());
         }
@@ -461,35 +467,62 @@ impl LightClient {
         // failure rolls the native leg back (see snapshot above).
         let token_res: Result<(), String> = async {
             for op in &tx.payload {
-            match op {
-                stellereum::svm::OpCode::SysCallTokenTransfer { token_id, to, amount } => {
-                    self.state_engine
-                        .token_execute(token_id, tx.from, TokenOp::Transfer { to: *to, amount: *amount })
-                        .await
-                        .map_err(|e| format!("local token transfer failed: {e}"))?;
+                match op {
+                    stellereum::svm::OpCode::SysCallTokenTransfer {
+                        token_id,
+                        to,
+                        amount,
+                    } => {
+                        self.state_engine
+                            .token_execute(
+                                token_id,
+                                tx.from,
+                                TokenOp::Transfer {
+                                    to: *to,
+                                    amount: *amount,
+                                },
+                            )
+                            .await
+                            .map_err(|e| format!("local token transfer failed: {e}"))?;
+                    }
+                    stellereum::svm::OpCode::SysCallTokenApprove {
+                        token_id,
+                        spender,
+                        amount,
+                    } => {
+                        self.state_engine
+                            .token_execute(
+                                token_id,
+                                tx.from,
+                                TokenOp::Approve {
+                                    spender: *spender,
+                                    amount: *amount,
+                                },
+                            )
+                            .await
+                            .map_err(|e| format!("local token approve failed: {e}"))?;
+                    }
+                    stellereum::svm::OpCode::SysCallTokenTransferFrom {
+                        token_id,
+                        from,
+                        to,
+                        amount,
+                    } => {
+                        self.state_engine
+                            .token_execute(
+                                token_id,
+                                tx.from,
+                                TokenOp::TransferFrom {
+                                    from: *from,
+                                    to: *to,
+                                    amount: *amount,
+                                },
+                            )
+                            .await
+                            .map_err(|e| format!("local token transfer-from failed: {e}"))?;
+                    }
+                    _ => {}
                 }
-                stellereum::svm::OpCode::SysCallTokenApprove { token_id, spender, amount } => {
-                    self.state_engine
-                        .token_execute(
-                            token_id,
-                            tx.from,
-                            TokenOp::Approve { spender: *spender, amount: *amount },
-                        )
-                        .await
-                        .map_err(|e| format!("local token approve failed: {e}"))?;
-                }
-                stellereum::svm::OpCode::SysCallTokenTransferFrom { token_id, from, to, amount } => {
-                    self.state_engine
-                        .token_execute(
-                            token_id,
-                            tx.from,
-                            TokenOp::TransferFrom { from: *from, to: *to, amount: *amount },
-                        )
-                        .await
-                        .map_err(|e| format!("local token transfer-from failed: {e}"))?;
-                }
-                _ => {}
-            }
             }
             Ok(())
         }
@@ -578,8 +611,12 @@ impl LightClient {
         shard: u32,
     ) -> Result<(Transaction, StealthAddress), String> {
         let stealth = StealthAddress::generate(recipient_view_pub, recipient_spend_pub)
-            .ok_or_else(|| "Failed to derive StealthAddress from view and spend keys".to_string())?;
-        let payload = vec![stellereum::svm::OpCode::SysCallPatriciaLookup(stealth.ephemeral_pub)];
+            .ok_or_else(|| {
+                "Failed to derive StealthAddress from view and spend keys".to_string()
+            })?;
+        let payload = vec![stellereum::svm::OpCode::SysCallPatriciaLookup(
+            stealth.ephemeral_pub,
+        )];
         let gas_limit = 10_000 + stellereum::svm::GAS_PATRICIA_LOOKUP;
         let tx = Transaction::sign_with_payload(
             &sender.signing_key,
@@ -597,7 +634,9 @@ impl LightClient {
     /// Extract 32-byte ephemeral public key from transaction payload if present.
     pub fn extract_ephemeral_pub(payload: &[stellereum::svm::OpCode]) -> Option<[u8; 32]> {
         for op in payload {
-            if let stellereum::svm::OpCode::SysCallPatriciaLookup(bytes) = op { return Some(*bytes) }
+            if let stellereum::svm::OpCode::SysCallPatriciaLookup(bytes) = op {
+                return Some(*bytes);
+            }
         }
         if payload.len() == 4 {
             if let (
@@ -605,7 +644,8 @@ impl LightClient {
                 stellereum::svm::OpCode::Push(w1),
                 stellereum::svm::OpCode::Push(w2),
                 stellereum::svm::OpCode::Push(w3),
-            ) = (&payload[0], &payload[1], &payload[2], &payload[3]) {
+            ) = (&payload[0], &payload[1], &payload[2], &payload[3])
+            {
                 let mut bytes = [0u8; 32];
                 bytes[0..8].copy_from_slice(&w0.to_le_bytes());
                 bytes[8..16].copy_from_slice(&w1.to_le_bytes());
@@ -661,21 +701,28 @@ impl LightClient {
             for block in blocks {
                 let tx_records = rpc::get_block_transactions(cfg, block.height).unwrap_or_default();
                 for r in tx_records {
-                    let raw_opt = r.raw_tx.or_else(|| {
-                        rpc::get_transaction_raw(cfg, &r.tx_hash).unwrap_or(None)
-                    });
+                    let raw_opt = r
+                        .raw_tx
+                        .or_else(|| rpc::get_transaction_raw(cfg, &r.tx_hash).unwrap_or(None));
                     if let Some(raw_hex) = raw_opt {
                         if let Ok(raw_bytes) = hex::decode(raw_hex) {
                             if let Ok(tx) = bincode::deserialize::<Transaction>(&raw_bytes) {
-                                if let Some(ephem_bytes) = Self::extract_ephemeral_pub(&tx.payload) {
+                                if let Some(ephem_bytes) = Self::extract_ephemeral_pub(&tx.payload)
+                                {
                                     let stealth = StealthAddress {
                                         one_time_pub: tx.to,
                                         ephemeral_pub: ephem_bytes,
                                     };
-                                    if stealth.is_for_recipient(view_priv, spend_pub) == Some(true) {
+                                    if stealth.is_for_recipient(view_priv, spend_pub) == Some(true)
+                                    {
                                         let tx_hash = tx.compute_tx_hash();
                                         if !detected.iter().any(|(_, _, _, h)| *h == tx_hash) {
-                                            detected.push((stealth, tx.amount, block.height, tx_hash));
+                                            detected.push((
+                                                stealth,
+                                                tx.amount,
+                                                block.height,
+                                                tx_hash,
+                                            ));
                                         }
                                     }
                                 }
@@ -740,10 +787,16 @@ impl LightClient {
         let prove_one = |c: &stellereum::crypto_privacy::PedersenCommitment, v: u64| {
             RangeProof::prove_auto(c, v, &r)
         };
-        let input_ranges: Vec<RangeProof> =
-            transfer.input_commitments.iter().map(|c| prove_one(c, in_val)).collect();
-        let output_ranges: Vec<RangeProof> =
-            transfer.output_commitments.iter().map(|c| prove_one(c, amount)).collect();
+        let input_ranges: Vec<RangeProof> = transfer
+            .input_commitments
+            .iter()
+            .map(|c| prove_one(c, in_val))
+            .collect();
+        let output_ranges: Vec<RangeProof> = transfer
+            .output_commitments
+            .iter()
+            .map(|c| prove_one(c, amount))
+            .collect();
         if !transfer.verify_balanced_with_ranges(&input_ranges, &output_ranges) {
             return Err("Range proofs failed locally — refusing to submit".to_string());
         }
@@ -810,8 +863,7 @@ impl LightClient {
             .into_option()
             .ok_or_else(|| "bad blinding (not canonical)".to_string())?;
         let c = PedersenCommitment::commit(amount, &r);
-        let gas = stellereum::svm::GAS_CONFIDENTIAL_SHIELD
-            .max(stellereum::svm::GAS_BASIC_TRANSFER);
+        let gas = stellereum::svm::GAS_CONFIDENTIAL_SHIELD.max(stellereum::svm::GAS_BASIC_TRANSFER);
         let tx = Transaction::sign_with_payload(
             signing_key,
             signing_key.verifying_key().to_bytes(),
@@ -842,25 +894,39 @@ impl LightClient {
         shard: u32,
     ) -> Result<([u8; 32], TxFinality), String> {
         use stellereum::crypto_privacy::UnshieldInput;
-        if commitments.len() != amounts.len() || amounts.len() != blindings.len() || commitments.is_empty() {
-            return Err("commitments/amounts/blindings must be non-empty and same length".to_string());
+        if commitments.len() != amounts.len()
+            || amounts.len() != blindings.len()
+            || commitments.is_empty()
+        {
+            return Err(
+                "commitments/amounts/blindings must be non-empty and same length".to_string(),
+            );
         }
         let inputs = commitments
             .into_iter()
             .zip(amounts)
             .zip(blindings)
-            .map(|((commitment, amount), blinding)| UnshieldInput { commitment, amount, blinding })
+            .map(|((commitment, amount), blinding)| UnshieldInput {
+                commitment,
+                amount,
+                blinding,
+            })
             .collect::<Vec<_>>();
         // Local pre-check: every opening must recompute (cheap, saves a fee).
         for inp in &inputs {
             if !stellereum::crypto_privacy::ConfidentialState::verify_opening(
-                &inp.commitment, inp.amount, &inp.blinding,
+                &inp.commitment,
+                inp.amount,
+                &inp.blinding,
             ) {
                 return Err("local opening check failed — refusing to submit".to_string());
             }
         }
         let gas = stellereum::svm::GAS_CONFIDENTIAL_UNSHIELD
-            .saturating_add((inputs.len() as u64).saturating_mul(stellereum::svm::GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT))
+            .saturating_add(
+                (inputs.len() as u64)
+                    .saturating_mul(stellereum::svm::GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT),
+            )
             .max(stellereum::svm::GAS_BASIC_TRANSFER);
         let tx = Transaction::sign_with_payload(
             signing_key,
@@ -878,7 +944,11 @@ impl LightClient {
     // ---------------- tokens (STS standard) ----------------
 
     /// Native token balance: on-chain in RPC mode, local registry otherwise.
-    pub async fn token_balance(&self, token_id: &[u8; 32], account: &[u8; 32]) -> Result<u64, String> {
+    pub async fn token_balance(
+        &self,
+        token_id: &[u8; 32],
+        account: &[u8; 32],
+    ) -> Result<u64, String> {
         if let Some(cfg) = &self.rpc {
             rpc::get_token_balance(cfg, &hex::encode(token_id), &hex::encode(account))
         } else {
@@ -893,11 +963,8 @@ impl LightClient {
         account: &[u8; 32],
     ) -> Result<(u64, bool, String), String> {
         let cfg = self.rpc_cfg()?;
-        let answer: TokenSpvAnswer = rpc::get_token_balance_spv(
-            cfg,
-            &hex::encode(token_id),
-            &hex::encode(account),
-        )?;
+        let answer: TokenSpvAnswer =
+            rpc::get_token_balance_spv(cfg, &hex::encode(token_id), &hex::encode(account))?;
         let verified = rpc::verify_token_spv_answer(token_id, account, &answer);
         Ok((answer.balance, verified, hex::encode(answer.state_root)))
     }
@@ -1358,7 +1425,11 @@ impl LightClient {
     /// Paginated token id listing: chain registry in RPC mode (parsed as the
     /// `{tokens, total, offset}` object shape), local registry otherwise.
     /// Returns `(token_hex_ids, total, offset)`.
-    pub async fn token_list(&self, limit: u64, offset: u64) -> Result<(Vec<String>, u64, u64), String> {
+    pub async fn token_list(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<(Vec<String>, u64, u64), String> {
         if let Some(cfg) = &self.rpc {
             let a = rpc::list_tokens(cfg, limit, offset)?;
             return Ok((a.tokens, a.total, a.offset));
@@ -1424,7 +1495,9 @@ impl LightClient {
         pair: u32,
     ) -> Result<(Option<u64>, Option<u64>, usize, usize), String> {
         let ob = self.orderbook_mgr.lock().await;
-        let book = ob.get_book(pair).ok_or_else(|| format!("Pair {pair} not found"))?;
+        let book = ob
+            .get_book(pair)
+            .ok_or_else(|| format!("Pair {pair} not found"))?;
         let (best_bid, best_ask) = book.get_best_bid_ask();
         let (bids_count, asks_count) = book.depth();
         Ok((best_bid, best_ask, bids_count, asks_count))
@@ -1437,7 +1510,9 @@ impl LightClient {
         } else {
             // Honest empty (audit 2026-10-06): the old placeholder rendered
             // as a live "Active Peer".
-            vec!["(no P2P adapter configured — no live peers; pass --config to connect)".to_string()]
+            vec![
+                "(no P2P adapter configured — no live peers; pass --config to connect)".to_string(),
+            ]
         }
     }
 }

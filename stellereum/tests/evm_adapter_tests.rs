@@ -1,50 +1,44 @@
 use serde_json::{json, Value};
 use std::sync::Arc;
 use stellereum::evm_adapter::{
-    abi_decode_string, abi_decode_u128, abi_decode_u8, abi_decode_u256_be,
-    abi_encode_bool, abi_encode_string, abi_encode_u128, abi_encode_u8, abi_encode_u256_be,
-    ecrecover, eth_block_number, eth_blockNumber, eth_call, eth_call_with_engine,
-    eth_chain_id, eth_estimate_gas, eth_estimateGas, eth_estimate_transfer_gas,
-    eth_fee_history, eth_fee_history_direct, eth_feeHistory_direct, eth_fee_history_with_head,
-    eth_gas_price, eth_gasPrice,
-    eth_get_balance, eth_getBalance,
-    eth_get_code, eth_getCode,
-    eth_get_transaction_count, eth_getTransactionCount,
-    eth_get_filter_changes, eth_get_filter_logs,
-    eth_max_priority_fee_per_gas,
-    eth_maxPriorityFeePerGas, eth_max_priority_fee_per_gas_choice, eth_max_priority_fee_per_gas_zero,
-    eth_new_block_filter, eth_new_filter, eth_new_pending_transaction_filter,
-    eth_syncing, eth_uninstall_filter, evm_address_from_hex, evm_address_to_hex,
-    evm_to_stell_address, evm_to_stell_address_from_hex,
-    extract_address_from_calldata, extract_calldata,
-    extract_filter_id, is_low_s, keccak256, keccak256_hex,
-    nano_to_wei, nano_to_wei_hex, nano_to_wei_str, net_listening, net_peer_count,
+    abi_decode_string, abi_decode_u128, abi_decode_u256_be, abi_decode_u8, abi_encode_bool,
+    abi_encode_string, abi_encode_u128, abi_encode_u256_be, abi_encode_u8, ecrecover,
+    eth_blockNumber, eth_block_number, eth_call, eth_call_with_engine, eth_chain_id,
+    eth_estimateGas, eth_estimate_gas, eth_estimate_transfer_gas, eth_feeHistory_direct,
+    eth_fee_history, eth_fee_history_direct, eth_fee_history_with_head, eth_gasPrice,
+    eth_gas_price, eth_getBalance, eth_getCode, eth_getTransactionCount, eth_get_balance,
+    eth_get_code, eth_get_filter_changes, eth_get_filter_logs, eth_get_transaction_count,
+    eth_maxPriorityFeePerGas, eth_max_priority_fee_per_gas, eth_max_priority_fee_per_gas_choice,
+    eth_max_priority_fee_per_gas_zero, eth_new_block_filter, eth_new_filter,
+    eth_new_pending_transaction_filter, eth_syncing, eth_uninstall_filter, evm_address_from_hex,
+    evm_address_to_hex, evm_to_stell_address, evm_to_stell_address_from_hex,
+    extract_address_from_calldata, extract_calldata, extract_filter_id, is_low_s, keccak256,
+    keccak256_hex, nano_to_wei, nano_to_wei_hex, nano_to_wei_str, net_listening, net_peer_count,
     net_version, normalize_address, normalize_filter_id, notify_block, notify_log,
-    notify_pending_tx,
-    parse_eip1559_envelope, parse_eip1559_transaction, parse_evm_address, parse_evm_or_stell_address,
-    parse_hex_u128, parse_hex_u64, parse_legacy_transaction, parse_raw_transaction,
-    pubkey_to_address, rlp_decode, rlp_encode, stell_address_from_hex, stell_address_to_evm,
-    stell_hash_to_evm, stell_to_evm_address, to_checksum_address, validate_transaction_signature, verify_transaction_signature,
-    web3_client_version, wei_hex_to_nano, wei_str_to_nano, wei_to_nano, wei_to_nano_hex, wei_to_nano_str,
-    AccessListItem, BlockTag, BlockTransactions,
-    DecodedTransaction, Eip1559Transaction, EvmAccessListItem, EvmAdapter, EvmBlock,
-    EvmError, EvmFeeHistory, EvmLog, EvmReceipt, EvmTransaction, FilterAddress, FilterCriteria,
-    FilterManager, FilterTopic, JsonRpcError, JsonRpcRequest, JsonRpcResponse, Keccak256,
-    LegacyTransaction, RlpItem, BASE_FEE_HEX, CHAIN_ID, CHAIN_ID_HEX, CLIENT_VERSION,
-    CONTRACT_CREATION_BASE_GAS, DEFAULT_BASE_FEE, DEFAULT_GAS_PRICE, DEFAULT_GAS_PRICE_HEX,
-    DEFAULT_MAX_PRIORITY_FEE, DEFAULT_MAX_PRIORITY_FEE_HEX, DEFAULT_TOKEN_DECIMALS, DEFAULT_TOKEN_NAME,
-    DEFAULT_TOKEN_SYMBOL, DEFAULT_TOTAL_SUPPLY, EMPTY_LOGS_BLOOM, EMPTY_ROOT_HASH,
-    EMPTY_UNCLES_HASH, FILTER_TTL_SECS, INVALID_PARAMS_CODE, MAX_ACTIVE_FILTERS, MAX_PENDING_PER_FILTER,
-    METHOD_NOT_FOUND_CODE, NANO_PER_STELL, NET_LISTENING, NET_PEER_COUNT, NET_VERSION,
-    SECP256K1_HALF_N,
-    SELECTOR_BALANCE_OF, SELECTOR_BALANCE_OF_HEX, SELECTOR_DECIMALS, SELECTOR_DECIMALS_HEX,
-    SELECTOR_NAME, SELECTOR_NAME_HEX, SELECTOR_SYMBOL, SELECTOR_SYMBOL_HEX,
-    SELECTOR_TOTAL_SUPPLY, SELECTOR_TOTAL_SUPPLY_HEX, STANDARD_TRANSFER_GAS, STANDARD_TRANSFER_GAS_HEX,
-    WEI_PER_NANO, WEI_PER_STELL, ZERO_MAX_PRIORITY_FEE_HEX,
+    notify_pending_tx, parse_eip1559_envelope, parse_eip1559_transaction, parse_evm_address,
+    parse_evm_or_stell_address, parse_hex_u128, parse_hex_u64, parse_legacy_transaction,
+    parse_raw_transaction, pubkey_to_address, rlp_decode, rlp_encode, stell_address_from_hex,
+    stell_address_to_evm, stell_hash_to_evm, stell_to_evm_address, to_checksum_address,
+    validate_transaction_signature, verify_transaction_signature, web3_client_version,
+    wei_hex_to_nano, wei_str_to_nano, wei_to_nano, wei_to_nano_hex, wei_to_nano_str,
+    AccessListItem, BlockTag, BlockTransactions, DecodedTransaction, Eip1559Transaction,
+    EvmAccessListItem, EvmAdapter, EvmBlock, EvmError, EvmFeeHistory, EvmLog, EvmReceipt,
+    EvmTransaction, FilterAddress, FilterCriteria, FilterManager, FilterTopic, JsonRpcError,
+    JsonRpcRequest, JsonRpcResponse, Keccak256, LegacyTransaction, RlpItem, BASE_FEE_HEX, CHAIN_ID,
+    CHAIN_ID_HEX, CLIENT_VERSION, CONTRACT_CREATION_BASE_GAS, DEFAULT_BASE_FEE, DEFAULT_GAS_PRICE,
+    DEFAULT_GAS_PRICE_HEX, DEFAULT_MAX_PRIORITY_FEE, DEFAULT_MAX_PRIORITY_FEE_HEX,
+    DEFAULT_TOKEN_DECIMALS, DEFAULT_TOKEN_NAME, DEFAULT_TOKEN_SYMBOL, DEFAULT_TOTAL_SUPPLY,
+    EMPTY_LOGS_BLOOM, EMPTY_ROOT_HASH, EMPTY_UNCLES_HASH, FILTER_TTL_SECS, INVALID_PARAMS_CODE,
+    MAX_ACTIVE_FILTERS, MAX_PENDING_PER_FILTER, METHOD_NOT_FOUND_CODE, NANO_PER_STELL,
+    NET_LISTENING, NET_PEER_COUNT, NET_VERSION, SECP256K1_HALF_N, SELECTOR_BALANCE_OF,
+    SELECTOR_BALANCE_OF_HEX, SELECTOR_DECIMALS, SELECTOR_DECIMALS_HEX, SELECTOR_NAME,
+    SELECTOR_NAME_HEX, SELECTOR_SYMBOL, SELECTOR_SYMBOL_HEX, SELECTOR_TOTAL_SUPPLY,
+    SELECTOR_TOTAL_SUPPLY_HEX, STANDARD_TRANSFER_GAS, STANDARD_TRANSFER_GAS_HEX, WEI_PER_NANO,
+    WEI_PER_STELL, ZERO_MAX_PRIORITY_FEE_HEX,
 };
-use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::rpc::{ReceiptIndex, RpcState};
 use stellereum::sharding::Transaction;
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
 #[test]
 fn test_eth_chain_id_format() {
@@ -53,7 +47,9 @@ fn test_eth_chain_id_format() {
     assert_eq!(chain_id_str, CHAIN_ID_HEX);
 
     // Verify hex parses to decimal 5757
-    let stripped = chain_id_str.strip_prefix("0x").expect("must have 0x prefix");
+    let stripped = chain_id_str
+        .strip_prefix("0x")
+        .expect("must have 0x prefix");
     let val = u64::from_str_radix(stripped, 16).expect("must parse as hex u64");
     assert_eq!(val, 5757);
     assert_eq!(val, CHAIN_ID);
@@ -126,7 +122,9 @@ fn test_evm_adapter_direct_dispatch() {
     assert_eq!(res, json!("5757"));
 
     // 3. web3_clientVersion -> "Stellereum/v5.0.0-evm-adapter"
-    let res = adapter.dispatch("web3_clientVersion", &Value::Null).unwrap();
+    let res = adapter
+        .dispatch("web3_clientVersion", &Value::Null)
+        .unwrap();
     assert_eq!(res, json!("Stellereum/v5.0.0-evm-adapter"));
 
     // 4. net_listening -> true
@@ -174,7 +172,10 @@ fn test_jsonrpc_string_request_and_response() {
     let resp3: JsonRpcResponse<String> = serde_json::from_str(&raw_resp3).unwrap();
     assert_eq!(resp3.jsonrpc, "2.0");
     assert_eq!(resp3.id, Value::Null);
-    assert_eq!(resp3.result, Some("Stellereum/v5.0.0-evm-adapter".to_string()));
+    assert_eq!(
+        resp3.result,
+        Some("Stellereum/v5.0.0-evm-adapter".to_string())
+    );
     assert!(resp3.error.is_none());
 
     // Boolean result for net_listening
@@ -244,8 +245,11 @@ fn test_jsonrpc_batch_call() {
 fn test_evm_block_exact_serde_structure() {
     let block = EvmBlock {
         number: Some("0x1".to_string()),
-        hash: Some("0x88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6".to_string()),
-        parent_hash: "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3".to_string(),
+        hash: Some(
+            "0x88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6".to_string(),
+        ),
+        parent_hash: "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"
+            .to_string(),
         nonce: Some("0x0000000000000042".to_string()),
         sha3_uncles: EMPTY_UNCLES_HASH.to_string(),
         logs_bloom: Some(EMPTY_LOGS_BLOOM.to_string()),
@@ -304,7 +308,10 @@ fn test_evm_block_exact_serde_structure() {
     ];
 
     for key in expected_keys {
-        assert!(map.contains_key(key), "Missing expected camelCase key: {key}");
+        assert!(
+            map.contains_key(key),
+            "Missing expected camelCase key: {key}"
+        );
     }
 
     // Verify roundtrip
@@ -317,7 +324,9 @@ fn test_evm_transaction_exact_serde_structure() {
     let tx = EvmTransaction {
         hash: "0x88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6".to_string(),
         nonce: "0x0".to_string(),
-        block_hash: Some("0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3".to_string()),
+        block_hash: Some(
+            "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3".to_string(),
+        ),
         block_number: Some("0x1".to_string()),
         transaction_index: Some("0x0".to_string()),
         from: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
@@ -335,7 +344,9 @@ fn test_evm_transaction_exact_serde_structure() {
         max_priority_fee_per_gas: Some("0x3b9aca00".to_string()),
         access_list: Some(vec![EvmAccessListItem {
             address: "0xcccccccccccccccccccccccccccccccccccccccc".to_string(),
-            storage_keys: vec!["0x0000000000000000000000000000000000000000000000000000000000000001".to_string()],
+            storage_keys: vec![
+                "0x0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ],
         }]),
         max_fee_per_blob_gas: None,
         blob_versioned_hashes: None,
@@ -368,7 +379,10 @@ fn test_evm_transaction_exact_serde_structure() {
     ];
 
     for key in expected_keys {
-        assert!(map.contains_key(key), "Missing expected camelCase key: {key}");
+        assert!(
+            map.contains_key(key),
+            "Missing expected camelCase key: {key}"
+        );
     }
 
     // Verify roundtrip
@@ -379,9 +393,11 @@ fn test_evm_transaction_exact_serde_structure() {
 #[test]
 fn test_evm_receipt_exact_serde_structure() {
     let receipt = EvmReceipt {
-        transaction_hash: "0x88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6".to_string(),
+        transaction_hash: "0x88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6"
+            .to_string(),
         transaction_index: "0x0".to_string(),
-        block_hash: "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3".to_string(),
+        block_hash: "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"
+            .to_string(),
         block_number: "0x1".to_string(),
         from: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         to: Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
@@ -390,12 +406,18 @@ fn test_evm_receipt_exact_serde_structure() {
         contract_address: None,
         logs: vec![EvmLog {
             address: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-            topics: vec!["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string()],
+            topics: vec![
+                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string(),
+            ],
             data: "0x0000000000000000000000000000000000000000000000000de0b6b3a7640000".to_string(),
             block_number: Some("0x1".to_string()),
-            transaction_hash: Some("0x88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6".to_string()),
+            transaction_hash: Some(
+                "0x88e96d4537bea4d9c05d12549907b32561d3bf31f45aae734cdc119f13406cb6".to_string(),
+            ),
             transaction_index: Some("0x0".to_string()),
-            block_hash: Some("0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3".to_string()),
+            block_hash: Some(
+                "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3".to_string(),
+            ),
             log_index: Some("0x0".to_string()),
             removed: false,
         }],
@@ -430,7 +452,10 @@ fn test_evm_receipt_exact_serde_structure() {
     ];
 
     for key in expected_keys {
-        assert!(map.contains_key(key), "Missing expected camelCase key: {key}");
+        assert!(
+            map.contains_key(key),
+            "Missing expected camelCase key: {key}"
+        );
     }
 
     // Verify roundtrip
@@ -496,7 +521,9 @@ fn test_eth_gas_price_wei_hex_format() {
 
     // 3. Verify dispatch via EvmAdapter
     let adapter = EvmAdapter::new();
-    let res = adapter.dispatch("eth_gasPrice", &Value::Null).expect("dispatch eth_gasPrice");
+    let res = adapter
+        .dispatch("eth_gasPrice", &Value::Null)
+        .expect("dispatch eth_gasPrice");
     assert_eq!(res, json!("0x3eb2788000"));
     assert_eq!(adapter.eth_gas_price(), "0x3eb2788000");
     assert_eq!(adapter.eth_gasPrice(), "0x3eb2788000");
@@ -504,7 +531,10 @@ fn test_eth_gas_price_wei_hex_format() {
     // 4. Custom gas price adapter configuration
     let custom = EvmAdapter::new().with_gas_price(1_000_000_000);
     assert_eq!(custom.eth_gas_price(), "0x3b9aca00");
-    assert_eq!(custom.dispatch("eth_gasPrice", &Value::Null).unwrap(), json!("0x3b9aca00"));
+    assert_eq!(
+        custom.dispatch("eth_gasPrice", &Value::Null).unwrap(),
+        json!("0x3b9aca00")
+    );
 }
 
 #[test]
@@ -530,13 +560,17 @@ fn test_eth_max_priority_fee_per_gas_format() {
 
     // 3. EvmAdapter default and zero dispatch
     let adapter = EvmAdapter::new();
-    let res = adapter.dispatch("eth_maxPriorityFeePerGas", &Value::Null).expect("dispatch default");
+    let res = adapter
+        .dispatch("eth_maxPriorityFeePerGas", &Value::Null)
+        .expect("dispatch default");
     assert_eq!(res, json!("0x3b9aca00"));
     assert_eq!(adapter.eth_max_priority_fee_per_gas(), "0x3b9aca00");
     assert_eq!(adapter.eth_maxPriorityFeePerGas(), "0x3b9aca00");
 
     let zero_adapter = EvmAdapter::new().with_max_priority_fee_per_gas(0);
-    let zero_res = zero_adapter.dispatch("eth_maxPriorityFeePerGas", &Value::Null).expect("dispatch zero");
+    let zero_res = zero_adapter
+        .dispatch("eth_maxPriorityFeePerGas", &Value::Null)
+        .expect("dispatch zero");
     assert_eq!(zero_res, json!("0x0"));
     assert_eq!(zero_adapter.eth_max_priority_fee_per_gas(), "0x0");
 }
@@ -556,7 +590,10 @@ fn test_eth_estimate_gas_transfers_and_calls() {
     assert_eq!(eth_estimateGas(&json!([])).unwrap(), "0x5208");
     assert_eq!(adapter.eth_estimate_gas(&json!([])).unwrap(), "0x5208");
     assert_eq!(adapter.eth_estimateGas(&json!([])).unwrap(), "0x5208");
-    assert_eq!(adapter.dispatch("eth_estimateGas", &json!([])).unwrap(), json!("0x5208"));
+    assert_eq!(
+        adapter.dispatch("eth_estimateGas", &json!([])).unwrap(),
+        json!("0x5208")
+    );
 
     // 3. Standard native transfer call object: from, to, value -> "0x5208"
     let tx_obj = json!([{
@@ -580,7 +617,10 @@ fn test_eth_estimate_gas_transfers_and_calls() {
         "to": "0x2222222222222222222222222222222222222222",
         "data": "0x"
     }]);
-    assert_eq!(adapter.dispatch("eth_estimateGas", &empty_data).unwrap(), json!("0x5208"));
+    assert_eq!(
+        adapter.dispatch("eth_estimateGas", &empty_data).unwrap(),
+        json!("0x5208")
+    );
 
     // 6. With block tag in params: [{"to": "..."}, "latest"]
     let with_tag = json!([{
@@ -594,41 +634,65 @@ fn test_eth_estimate_gas_transfers_and_calls() {
         "to": "0x2222222222222222222222222222222222222222",
         "data": "0x12345678"
     }]);
-    assert_eq!(adapter.dispatch("eth_estimateGas", &call_data).unwrap(), json!("0x5248"));
+    assert_eq!(
+        adapter.dispatch("eth_estimateGas", &call_data).unwrap(),
+        json!("0x5248")
+    );
 
     // 8. Calldata with zero bytes (4 gas per zero, 16 per non-zero): 0x00010200 -> 21000 + 2*4 + 2*16 = 21040 = 0x5230
     let mixed_data = json!([{
         "to": "0x2222222222222222222222222222222222222222",
         "data": "0x00010200"
     }]);
-    assert_eq!(adapter.dispatch("eth_estimateGas", &mixed_data).unwrap(), json!("0x5230"));
+    assert_eq!(
+        adapter.dispatch("eth_estimateGas", &mixed_data).unwrap(),
+        json!("0x5230")
+    );
 
     // 9. Input field alias for data
     let input_field = json!([{
         "to": "0x2222222222222222222222222222222222222222",
         "input": "0x12345678"
     }]);
-    assert_eq!(adapter.dispatch("eth_estimateGas", &input_field).unwrap(), json!("0x5248"));
+    assert_eq!(
+        adapter.dispatch("eth_estimateGas", &input_field).unwrap(),
+        json!("0x5248")
+    );
 
     // 10. Contract creation: no "to" field + bytecode in data -> 53000 + calldata gas
     // "0x6080" has 2 non-zero bytes: 53000 + 32 = 53032 = 0xcf28
     assert_eq!(CONTRACT_CREATION_BASE_GAS, 53_000);
     let create_call = json!([{ "data": "0x6080" }]);
-    assert_eq!(adapter.dispatch("eth_estimateGas", &create_call).unwrap(), json!("0xcf28"));
+    assert_eq!(
+        adapter.dispatch("eth_estimateGas", &create_call).unwrap(),
+        json!("0xcf28")
+    );
 
     // Contract creation with explicit empty "to": "0x"
     let create_empty_to = json!([{ "to": "0x", "data": "0x6080" }]);
-    assert_eq!(adapter.dispatch("eth_estimateGas", &create_empty_to).unwrap(), json!("0xcf28"));
+    assert_eq!(
+        adapter
+            .dispatch("eth_estimateGas", &create_empty_to)
+            .unwrap(),
+        json!("0xcf28")
+    );
 
     // 11. Error handling: invalid hex in data
-    let err_hex = adapter.dispatch("eth_estimateGas", &json!([{
-        "to": "0x2222222222222222222222222222222222222222",
-        "data": "0xnothex"
-    }])).unwrap_err();
+    let err_hex = adapter
+        .dispatch(
+            "eth_estimateGas",
+            &json!([{
+                "to": "0x2222222222222222222222222222222222222222",
+                "data": "0xnothex"
+            }]),
+        )
+        .unwrap_err();
     assert_eq!(err_hex.code, INVALID_PARAMS_CODE);
 
     // Invalid params type (e.g. string)
-    let err_type = adapter.dispatch("eth_estimateGas", &json!("invalid")).unwrap_err();
+    let err_type = adapter
+        .dispatch("eth_estimateGas", &json!("invalid"))
+        .unwrap_err();
     assert_eq!(err_type.code, INVALID_PARAMS_CODE);
 }
 
@@ -639,7 +703,9 @@ fn test_eth_fee_history_eip1559_metamask_compliance() {
     // MetaMask standard fee history query:
     // eth_feeHistory(block_count: 4, newest_block: "latest", reward_percentiles: [10.0, 50.0, 90.0])
     let params = json!([4, "latest", [10.0, 50.0, 90.0]]);
-    let res = adapter.dispatch("eth_feeHistory", &params).expect("eth_feeHistory latest");
+    let res = adapter
+        .dispatch("eth_feeHistory", &params)
+        .expect("eth_feeHistory latest");
 
     // 1. Structure verification: camelCase keys expected by MetaMask
     let obj = res.as_object().expect("fee history must be an object");
@@ -657,8 +723,14 @@ fn test_eth_fee_history_eip1559_metamask_compliance() {
     assert_eq!(oldest_block_str, "0x167a");
 
     // 3. baseFeePerGas: MUST have length block_count + 1 (5 items) for MetaMask pending fee calculation
-    let base_fees = obj["baseFeePerGas"].as_array().expect("baseFeePerGas is array");
-    assert_eq!(base_fees.len(), 5, "baseFeePerGas length must be block_count + 1");
+    let base_fees = obj["baseFeePerGas"]
+        .as_array()
+        .expect("baseFeePerGas is array");
+    assert_eq!(
+        base_fees.len(),
+        5,
+        "baseFeePerGas length must be block_count + 1"
+    );
     for fee in base_fees {
         let s = fee.as_str().expect("base fee item is hex string");
         assert!(s.starts_with("0x"));
@@ -668,8 +740,14 @@ fn test_eth_fee_history_eip1559_metamask_compliance() {
     }
 
     // 4. gasUsedRatio: MUST have length block_count (4 items) with floats in [0.0, 1.0]
-    let ratios = obj["gasUsedRatio"].as_array().expect("gasUsedRatio is array");
-    assert_eq!(ratios.len(), 4, "gasUsedRatio length must equal block_count");
+    let ratios = obj["gasUsedRatio"]
+        .as_array()
+        .expect("gasUsedRatio is array");
+    assert_eq!(
+        ratios.len(),
+        4,
+        "gasUsedRatio length must equal block_count"
+    );
     for ratio in ratios {
         let r = ratio.as_f64().expect("ratio is float");
         assert!((0.0..=1.0).contains(&r), "ratio {r} must be in [0.0, 1.0]");
@@ -680,7 +758,11 @@ fn test_eth_fee_history_eip1559_metamask_compliance() {
     assert_eq!(rewards.len(), 4, "reward length must equal block_count");
     for row in rewards {
         let row_arr = row.as_array().expect("reward row is array");
-        assert_eq!(row_arr.len(), 3, "reward row length must equal percentiles count");
+        assert_eq!(
+            row_arr.len(),
+            3,
+            "reward row length must equal percentiles count"
+        );
 
         let p10 = parse_hex_u128(row_arr[0].as_str().unwrap()).unwrap();
         let p50 = parse_hex_u128(row_arr[1].as_str().unwrap()).unwrap();
@@ -712,7 +794,9 @@ fn test_eth_fee_history_without_rewards() {
     let adapter = EvmAdapter::new();
 
     // Query fee history without 3rd parameter (rewardPercentiles)
-    let res = adapter.dispatch("eth_feeHistory", &json!([5, "latest"])).expect("fee history no rewards");
+    let res = adapter
+        .dispatch("eth_feeHistory", &json!([5, "latest"]))
+        .expect("fee history no rewards");
     let obj = res.as_object().unwrap();
 
     // reward field must be absent when not requested
@@ -734,7 +818,9 @@ fn test_eth_fee_history_block_tags_and_ranges() {
 
     // 1. Hex block count and hex newestBlock: 4 blocks ending at block 16 (0x10)
     // 16 + 1 - 4 = 13 = 0xd
-    let res_hex = adapter.dispatch("eth_feeHistory", &json!(["0x4", "0x10"])).unwrap();
+    let res_hex = adapter
+        .dispatch("eth_feeHistory", &json!(["0x4", "0x10"]))
+        .unwrap();
     let fh_hex: EvmFeeHistory = serde_json::from_value(res_hex).unwrap();
     assert_eq!(fh_hex.oldest_block, "0xd");
     assert_eq!(fh_hex.base_fee_per_gas.len(), 5);
@@ -743,7 +829,9 @@ fn test_eth_fee_history_block_tags_and_ranges() {
     // 2. Near genesis: requesting 10 blocks when newestBlock is 2
     // actual_count = min(10, 2 + 1) = 3 (blocks 0, 1, 2)
     // oldest_block = 2 + 1 - 3 = 0 = "0x0"
-    let res_genesis = adapter.dispatch("eth_feeHistory", &json!([10, 2, [50.0]])).unwrap();
+    let res_genesis = adapter
+        .dispatch("eth_feeHistory", &json!([10, 2, [50.0]]))
+        .unwrap();
     let fh_genesis: EvmFeeHistory = serde_json::from_value(res_genesis).unwrap();
     assert_eq!(fh_genesis.oldest_block, "0x0");
     assert_eq!(fh_genesis.base_fee_per_gas.len(), 4); // 3 + 1
@@ -751,11 +839,16 @@ fn test_eth_fee_history_block_tags_and_ranges() {
     assert_eq!(fh_genesis.reward.unwrap().len(), 3);
 
     // 3. Object parameters format
-    let res_obj = adapter.dispatch("eth_feeHistory", &json!({
-        "blockCount": 2,
-        "newestBlock": "0x8",
-        "rewardPercentiles": [25.0, 75.0]
-    })).unwrap();
+    let res_obj = adapter
+        .dispatch(
+            "eth_feeHistory",
+            &json!({
+                "blockCount": 2,
+                "newestBlock": "0x8",
+                "rewardPercentiles": [25.0, 75.0]
+            }),
+        )
+        .unwrap();
     let fh_obj: EvmFeeHistory = serde_json::from_value(res_obj).unwrap();
     // 8 + 1 - 2 = 7 = 0x7
     assert_eq!(fh_obj.oldest_block, "0x7");
@@ -796,23 +889,33 @@ fn test_eth_fee_history_parameter_validation_errors() {
     assert_eq!(err_empty.code, INVALID_PARAMS_CODE);
 
     // 2. Block count 0
-    let err_zero = adapter.dispatch("eth_feeHistory", &json!([0, "latest"])).unwrap_err();
+    let err_zero = adapter
+        .dispatch("eth_feeHistory", &json!([0, "latest"]))
+        .unwrap_err();
     assert_eq!(err_zero.code, INVALID_PARAMS_CODE);
 
     // 3. Block count > 1024
-    let err_overflow = adapter.dispatch("eth_feeHistory", &json!([1025, "latest"])).unwrap_err();
+    let err_overflow = adapter
+        .dispatch("eth_feeHistory", &json!([1025, "latest"]))
+        .unwrap_err();
     assert_eq!(err_overflow.code, INVALID_PARAMS_CODE);
 
     // 4. Percentile > 100
-    let err_pct = adapter.dispatch("eth_feeHistory", &json!([2, "latest", [105.0]])).unwrap_err();
+    let err_pct = adapter
+        .dispatch("eth_feeHistory", &json!([2, "latest", [105.0]]))
+        .unwrap_err();
     assert_eq!(err_pct.code, INVALID_PARAMS_CODE);
 
     // 5. Percentile < 0
-    let err_neg = adapter.dispatch("eth_feeHistory", &json!([2, "latest", [-5.0]])).unwrap_err();
+    let err_neg = adapter
+        .dispatch("eth_feeHistory", &json!([2, "latest", [-5.0]]))
+        .unwrap_err();
     assert_eq!(err_neg.code, INVALID_PARAMS_CODE);
 
     // 6. Descending percentiles
-    let err_desc = adapter.dispatch("eth_feeHistory", &json!([2, "latest", [80.0, 20.0]])).unwrap_err();
+    let err_desc = adapter
+        .dispatch("eth_feeHistory", &json!([2, "latest", [80.0, 20.0]]))
+        .unwrap_err();
     assert_eq!(err_desc.code, INVALID_PARAMS_CODE);
 }
 
@@ -842,7 +945,8 @@ fn test_metamask_gas_jsonrpc_string_dispatch_end_to_end() {
     assert_eq!(resp3.result.unwrap(), "0x5208");
 
     // 4. eth_feeHistory
-    let req4 = r#"{"jsonrpc":"2.0","method":"eth_feeHistory","params":[4,"latest",[25.0,75.0]],"id":4}"#;
+    let req4 =
+        r#"{"jsonrpc":"2.0","method":"eth_feeHistory","params":[4,"latest",[25.0,75.0]],"id":4}"#;
     let resp4_raw = adapter.handle_raw_json(req4);
     let resp4: JsonRpcResponse<EvmFeeHistory> = serde_json::from_str(&resp4_raw).unwrap();
     assert_eq!(resp4.id, json!(4));
@@ -864,7 +968,12 @@ fn test_metamask_gas_jsonrpc_string_dispatch_end_to_end() {
     assert_eq!(batch_resp.len(), 4);
     assert_eq!(batch_resp[0].result, Some(json!("0x3eb2788000")));
     assert_eq!(batch_resp[1].result, Some(json!("0x3b9aca00")));
-    assert!(batch_resp[2].result.as_ref().unwrap().get("oldestBlock").is_some());
+    assert!(batch_resp[2]
+        .result
+        .as_ref()
+        .unwrap()
+        .get("oldestBlock")
+        .is_some());
     assert_eq!(batch_resp[3].result, Some(json!("0x5208")));
 }
 
@@ -874,7 +983,9 @@ fn test_metamask_gas_indicator_calculation_simulation() {
 
     // Simulate MetaMask gas fee controller flow:
     // Step 1: Fetch EIP-1559 fee history with percentiles [10.0, 50.0, 90.0]
-    let fh_val = adapter.dispatch("eth_feeHistory", &json!([5, "latest", [10.0, 50.0, 90.0]])).unwrap();
+    let fh_val = adapter
+        .dispatch("eth_feeHistory", &json!([5, "latest", [10.0, 50.0, 90.0]]))
+        .unwrap();
     let fh: EvmFeeHistory = serde_json::from_value(fh_val).unwrap();
 
     // Step 2: Next block base fee is the last element of base_fee_per_gas
@@ -897,10 +1008,15 @@ fn test_metamask_gas_indicator_calculation_simulation() {
     let max_fee_medium = 2 * next_base_fee + medium_tip;
 
     // Step 5: Gas limit estimation via eth_estimateGas
-    let est_gas_hex = adapter.dispatch("eth_estimateGas", &json!([{
-        "to": "0x2222222222222222222222222222222222222222",
-        "value": "0xde0b6b3a7640000"
-    }])).unwrap();
+    let est_gas_hex = adapter
+        .dispatch(
+            "eth_estimateGas",
+            &json!([{
+                "to": "0x2222222222222222222222222222222222222222",
+                "value": "0xde0b6b3a7640000"
+            }]),
+        )
+        .unwrap();
     let gas_limit = parse_hex_u64(est_gas_hex.as_str().unwrap()).unwrap();
     assert_eq!(gas_limit, 21_000);
 
@@ -956,17 +1072,11 @@ fn test_keccak256_official_ethereum_vectors() {
 
     // 6. Ethereum Empty Uncles Hash: keccak256(rlp([])) = keccak256([0xc0])
     let uncles_hash = keccak256(&[0xc0]);
-    assert_eq!(
-        format!("0x{}", hex::encode(uncles_hash)),
-        EMPTY_UNCLES_HASH
-    );
+    assert_eq!(format!("0x{}", hex::encode(uncles_hash)), EMPTY_UNCLES_HASH);
 
     // 7. Ethereum Empty Trie Root Hash: keccak256(rlp("")) = keccak256([0x80])
     let root_hash = keccak256(&[0x80]);
-    assert_eq!(
-        format!("0x{}", hex::encode(root_hash)),
-        EMPTY_ROOT_HASH
-    );
+    assert_eq!(format!("0x{}", hex::encode(root_hash)), EMPTY_ROOT_HASH);
 
     // 8. Standard ERC-20 method selectors (first 4 bytes of Keccak-256)
     let transfer_hash = keccak256(b"transfer(address,uint256)");
@@ -1089,9 +1199,15 @@ fn test_rlp_decode_bytes_variant() {
     // 15 -> [0x0f] (Byte)
     assert_eq!(rlp_decode(&[0x0f]).unwrap().as_u64().unwrap(), 15);
     // 1000 -> [0x82, 0x03, 0xe8] (Bytes)
-    assert_eq!(rlp_decode(&[0x82, 0x03, 0xe8]).unwrap().as_u64().unwrap(), 1000);
+    assert_eq!(
+        rlp_decode(&[0x82, 0x03, 0xe8]).unwrap().as_u64().unwrap(),
+        1000
+    );
     // 1024 -> [0x82, 0x04, 0x00]
-    assert_eq!(rlp_decode(&[0x82, 0x04, 0x00]).unwrap().as_u64().unwrap(), 1024);
+    assert_eq!(
+        rlp_decode(&[0x82, 0x04, 0x00]).unwrap().as_u64().unwrap(),
+        1024
+    );
 }
 
 #[test]
@@ -1127,7 +1243,10 @@ fn test_rlp_decode_list_variant() {
     let complex = rlp_decode(&complex_raw).expect("valid complex nested list");
     assert_eq!(complex.as_list().unwrap().len(), 3);
     assert_eq!(complex.at(0).unwrap(), &RlpItem::List(vec![]));
-    assert_eq!(complex.at(1).unwrap(), &RlpItem::List(vec![RlpItem::List(vec![])]));
+    assert_eq!(
+        complex.at(1).unwrap(),
+        &RlpItem::List(vec![RlpItem::List(vec![])])
+    );
 
     // 5. rlp_encode roundtrip
     assert_eq!(rlp_encode(&complex), complex_raw);
@@ -1191,10 +1310,12 @@ fn test_eip155_legacy_transaction_official_vector() {
     assert_eq!(tx.chain_id, Some(1));
     assert_eq!(tx.recovery_id(), 0);
 
-    let expected_r = hex::decode("28ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276").unwrap();
+    let expected_r =
+        hex::decode("28ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276").unwrap();
     assert_eq!(tx.r.as_slice(), expected_r.as_slice());
 
-    let expected_s = hex::decode("67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83").unwrap();
+    let expected_s =
+        hex::decode("67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83").unwrap();
     assert_eq!(tx.s.as_slice(), expected_s.as_slice());
 
     // 3. Verify official EIP-155 signing hash
@@ -1256,7 +1377,8 @@ fn test_legacy_contract_creation_and_unprotected() {
     unprotected_tx.v = 27;
     unprotected_tx.chain_id = None;
     let enc_unprotected = unprotected_tx.encode();
-    let parsed_unprotected = parse_legacy_transaction(&enc_unprotected).expect("parse unprotected legacy tx");
+    let parsed_unprotected =
+        parse_legacy_transaction(&enc_unprotected).expect("parse unprotected legacy tx");
     assert_eq!(parsed_unprotected.v, 27);
     assert_eq!(parsed_unprotected.chain_id, None);
     assert_eq!(parsed_unprotected.recovery_id(), 0);
@@ -1286,7 +1408,10 @@ fn test_eip1559_type2_envelope_parsing_empty_access_list() {
     };
 
     let raw_envelope = tx.encode();
-    assert_eq!(raw_envelope[0], 0x02, "EIP-1559 envelope must start with 0x02 type byte");
+    assert_eq!(
+        raw_envelope[0], 0x02,
+        "EIP-1559 envelope must start with 0x02 type byte"
+    );
 
     // 1. Parse via parse_eip1559_envelope
     let parsed = parse_eip1559_envelope(&raw_envelope).expect("must parse EIP-1559 envelope");
@@ -1491,7 +1616,9 @@ fn test_erc20_name_call() {
         "to": "0x1111111111111111111111111111111111111111",
         "input": SELECTOR_NAME_HEX
     }]);
-    let eth_call_input = adapter.handle_eth_call(&call_input).expect("eth_call input name");
+    let eth_call_input = adapter
+        .handle_eth_call(&call_input)
+        .expect("eth_call input name");
     assert_eq!(
         abi_decode_string(eth_call_input.as_str().unwrap()).unwrap(),
         "Stellereum"
@@ -1568,10 +1695,7 @@ fn test_erc20_decimals_call() {
     let dispatch_res = adapter
         .dispatch("eth_call", &json!([{ "data": SELECTOR_DECIMALS_HEX }]))
         .expect("dispatch decimals");
-    assert_eq!(
-        abi_decode_u8(dispatch_res.as_str().unwrap()).unwrap(),
-        18
-    );
+    assert_eq!(abi_decode_u8(dispatch_res.as_str().unwrap()).unwrap(), 18);
 
     // 4. Custom decimals
     let custom_adapter = EvmAdapter::new().with_token_decimals(9);
@@ -1616,7 +1740,8 @@ fn test_erc20_balance_of_call() {
     let adapter = EvmAdapter::new();
 
     // 1. Unset address returns default 0
-    let calldata_alice = "0x70a082310000000000000000000000001111111111111111111111111111111111111111";
+    let calldata_alice =
+        "0x70a082310000000000000000000000001111111111111111111111111111111111111111";
     let res_zero = adapter.emulate_erc20_call(calldata_alice);
     let bal_zero = abi_decode_u128(&res_zero).expect("balance u128");
     assert_eq!(bal_zero, 0);
@@ -1634,7 +1759,9 @@ fn test_erc20_balance_of_call() {
         "to": "0x9999999999999999999999999999999999999999",
         "data": calldata_alice
     }]);
-    let eth_call_res = adapter.handle_eth_call(&call_obj).expect("eth_call balanceOf");
+    let eth_call_res = adapter
+        .handle_eth_call(&call_obj)
+        .expect("eth_call balanceOf");
     assert_eq!(
         abi_decode_u128(eth_call_res.as_str().unwrap()).unwrap(),
         balance_wei
@@ -1658,7 +1785,9 @@ fn test_erc20_balance_of_call() {
 
     // 5. Custom default balance
     let custom_adapter = EvmAdapter::new().with_default_balance(42);
-    let res_default = custom_adapter.emulate_erc20_call("0x70a082310000000000000000000000003333333333333333333333333333333333333333");
+    let res_default = custom_adapter.emulate_erc20_call(
+        "0x70a082310000000000000000000000003333333333333333333333333333333333333333",
+    );
     assert_eq!(abi_decode_u128(&res_default).unwrap(), 42);
 }
 
@@ -1672,10 +1801,15 @@ async fn test_erc20_balance_of_with_state_engine() {
     stell_addr_bytes[12..32].copy_from_slice(&evm_addr_bytes);
 
     let initial_nano = 7_000_000_000u64; // 7 STELL
-    engine.update_account(AccountState::new(stell_addr_bytes, initial_nano)).await;
+    engine
+        .update_account(AccountState::new(stell_addr_bytes, initial_nano))
+        .await;
 
     // Verify account exists in engine
-    let acct = engine.get_account(&stell_addr_bytes).await.expect("account exists");
+    let acct = engine
+        .get_account(&stell_addr_bytes)
+        .await
+        .expect("account exists");
     assert_eq!(acct.balance, initial_nano);
 
     // Construct balanceOf calldata for this account
@@ -1706,7 +1840,10 @@ async fn test_erc20_balance_of_with_state_engine() {
         .dispatch_with_engine(&engine, "eth_call", &json!([{ "data": calldata }]))
         .await
         .expect("dispatch_with_engine eth_call");
-    assert_eq!(abi_decode_u128(disp_res.as_str().unwrap()).unwrap(), expected_wei);
+    assert_eq!(
+        abi_decode_u128(disp_res.as_str().unwrap()).unwrap(),
+        expected_wei
+    );
 }
 
 #[test]
@@ -1715,10 +1852,16 @@ fn test_erc20_unrecognized_selectors_and_edge_cases() {
 
     // 1. ERC-20 mutation simulations (transfer, approve) return true (F-03 fix)
     let transfer_data = "0xa9059cbb00000000000000000000000011111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000001";
-    assert_eq!(adapter.emulate_erc20_call(transfer_data), abi_encode_bool(true));
+    assert_eq!(
+        adapter.emulate_erc20_call(transfer_data),
+        abi_encode_bool(true)
+    );
 
     let approve_data = "0x095ea7b300000000000000000000000011111111111111111111111111111111111111110000000000000000000000000000000000000000000000000000000000000001";
-    assert_eq!(adapter.emulate_erc20_call(approve_data), abi_encode_bool(true));
+    assert_eq!(
+        adapter.emulate_erc20_call(approve_data),
+        abi_encode_bool(true)
+    );
 
     // 2. Random unknown selector 0xdeadbeef
     assert_eq!(adapter.emulate_erc20_call("0xdeadbeef"), "0x");
@@ -1733,14 +1876,23 @@ fn test_erc20_unrecognized_selectors_and_edge_cases() {
     assert_eq!(adapter.handle_eth_call(&Value::Null).unwrap(), json!("0x"));
     assert_eq!(adapter.handle_eth_call(&json!([])).unwrap(), json!("0x"));
     assert_eq!(adapter.handle_eth_call(&json!([{}])).unwrap(), json!("0x"));
-    assert_eq!(adapter.handle_eth_call(&json!([{ "data": "0x" }])).unwrap(), json!("0x"));
-    assert_eq!(adapter.handle_eth_call(&json!([{ "data": "" }])).unwrap(), json!("0x"));
+    assert_eq!(
+        adapter.handle_eth_call(&json!([{ "data": "0x" }])).unwrap(),
+        json!("0x")
+    );
+    assert_eq!(
+        adapter.handle_eth_call(&json!([{ "data": "" }])).unwrap(),
+        json!("0x")
+    );
 }
 
 #[test]
 fn test_erc20_calls_through_jsonrpc_string_and_batch() {
     let adapter = EvmAdapter::new();
-    adapter.set_balance("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 999_000_000_000_000_000_000);
+    adapter.set_balance(
+        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        999_000_000_000_000_000_000,
+    );
 
     // 1. Single raw JSON string request
     let raw_req = r#"{
@@ -1770,15 +1922,30 @@ fn test_erc20_calls_through_jsonrpc_string_and_batch() {
     assert_eq!(responses.len(), 6);
 
     // id 1: name -> "Stellereum"
-    assert_eq!(abi_decode_string(&responses[0].result.clone().unwrap()).unwrap(), "Stellereum");
+    assert_eq!(
+        abi_decode_string(&responses[0].result.clone().unwrap()).unwrap(),
+        "Stellereum"
+    );
     // id 2: symbol -> "STELL"
-    assert_eq!(abi_decode_string(&responses[1].result.clone().unwrap()).unwrap(), "STELL");
+    assert_eq!(
+        abi_decode_string(&responses[1].result.clone().unwrap()).unwrap(),
+        "STELL"
+    );
     // id 3: decimals -> 18
-    assert_eq!(abi_decode_u8(&responses[2].result.clone().unwrap()).unwrap(), 18);
+    assert_eq!(
+        abi_decode_u8(&responses[2].result.clone().unwrap()).unwrap(),
+        18
+    );
     // id 4: totalSupply -> 10^27
-    assert_eq!(abi_decode_u128(&responses[3].result.clone().unwrap()).unwrap(), DEFAULT_TOTAL_SUPPLY);
+    assert_eq!(
+        abi_decode_u128(&responses[3].result.clone().unwrap()).unwrap(),
+        DEFAULT_TOTAL_SUPPLY
+    );
     // id 5: balanceOf -> 999 * 10^18
-    assert_eq!(abi_decode_u128(&responses[4].result.clone().unwrap()).unwrap(), 999_000_000_000_000_000_000);
+    assert_eq!(
+        abi_decode_u128(&responses[4].result.clone().unwrap()).unwrap(),
+        999_000_000_000_000_000_000
+    );
     // id 6: unknown -> "0x"
     assert_eq!(responses[5].result.clone().unwrap(), "0x");
 }
@@ -1880,20 +2047,24 @@ fn test_eth_new_pending_tx_filter_lifecycle() {
 
     // 5. Subsequent poll returns []
     assert_eq!(
-        adapter.eth_get_filter_changes(&json!([filter_id.clone()])).unwrap(),
+        adapter
+            .eth_get_filter_changes(&json!([filter_id.clone()]))
+            .unwrap(),
         json!([])
     );
 
     // 6. eth_getFilterLogs on pending tx filter returns []
     assert_eq!(
-        adapter.eth_get_filter_logs(&json!([filter_id.clone()])).unwrap(),
+        adapter
+            .eth_get_filter_logs(&json!([filter_id.clone()]))
+            .unwrap(),
         json!([])
     );
 
     // 7. eth_uninstallFilter returns true
-    assert!(
-        adapter.eth_uninstall_filter(&json!([filter_id.clone()])).unwrap()
-    );
+    assert!(adapter
+        .eth_uninstall_filter(&json!([filter_id.clone()]))
+        .unwrap());
 
     // 8. Polling uninstalled filter fails
     assert!(adapter.eth_get_filter_changes(&json!([filter_id])).is_err());
@@ -1924,12 +2095,18 @@ fn test_eth_new_filter_logs_lifecycle() {
     // 3. Construct matching log
     let matching_log = EvmLog {
         address: contract_addr.to_string(),
-        topics: vec!["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string()],
+        topics: vec![
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string(),
+        ],
         data: "0x0000000000000000000000000000000000000000000000000de0b6b3a7640000".to_string(),
         block_number: Some("0x10".to_string()),
-        transaction_hash: Some("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string()),
+        transaction_hash: Some(
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
+        ),
         transaction_index: Some("0x0".to_string()),
-        block_hash: Some("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string()),
+        block_hash: Some(
+            "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string(),
+        ),
         log_index: Some("0x0".to_string()),
         removed: false,
     };
@@ -1937,7 +2114,9 @@ fn test_eth_new_filter_logs_lifecycle() {
     // 4. Construct non-matching log (different address)
     let non_matching_log = EvmLog {
         address: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-        topics: vec!["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string()],
+        topics: vec![
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string(),
+        ],
         data: "0x0".to_string(),
         block_number: Some("0x10".to_string()),
         transaction_hash: Some("0x9999".to_string()),
@@ -1961,7 +2140,9 @@ fn test_eth_new_filter_logs_lifecycle() {
 
     // 7. Subsequent poll returns []
     assert_eq!(
-        adapter.eth_get_filter_changes(&json!([filter_id.clone()])).unwrap(),
+        adapter
+            .eth_get_filter_changes(&json!([filter_id.clone()]))
+            .unwrap(),
         json!([])
     );
 
@@ -1974,9 +2155,9 @@ fn test_eth_new_filter_logs_lifecycle() {
     assert_eq!(all_arr[0]["address"], contract_addr);
 
     // 9. Uninstall filter returns true
-    assert!(
-        adapter.eth_uninstall_filter(&json!([filter_id.clone()])).unwrap()
-    );
+    assert!(adapter
+        .eth_uninstall_filter(&json!([filter_id.clone()]))
+        .unwrap());
 
     // 10. Polling uninstalled filter fails
     assert!(adapter.eth_get_filter_logs(&json!([filter_id])).is_err());
@@ -2068,8 +2249,8 @@ fn test_filter_criteria_advanced_matching() {
 
     // 3. Block range filtering (fromBlock = 10, toBlock = 20)
     let criteria_blocks = FilterCriteria {
-        from_block: Some("0xa".to_string()),  // 10
-        to_block: Some("0x14".to_string()),   // 20
+        from_block: Some("0xa".to_string()), // 10
+        to_block: Some("0x14".to_string()),  // 20
         ..Default::default()
     };
 
@@ -2157,13 +2338,17 @@ fn test_filter_polling_through_jsonrpc_string_and_batch() {
 #[tokio::test]
 async fn test_erc20_and_filters_through_rpc_layer() {
     let engine = Arc::new(InMemoryStateEngine::new());
-    let mempool = Arc::new(tokio::sync::RwLock::new(stellereum::mempool::Mempool::default()));
+    let mempool = Arc::new(tokio::sync::RwLock::new(
+        stellereum::mempool::Mempool::default(),
+    ));
 
     // Fund test account on engine
     let user_evm = [0x77u8; 20];
     let mut user_stell = [0u8; 32];
     user_stell[12..32].copy_from_slice(&user_evm);
-    engine.update_account(AccountState::new(user_stell, 12_000_000_000)).await; // 12 STELL
+    engine
+        .update_account(AccountState::new(user_stell, 12_000_000_000))
+        .await; // 12 STELL
 
     let rpc_state = Arc::new(stellereum::rpc::RpcState {
         engine,
@@ -2171,10 +2356,16 @@ async fn test_erc20_and_filters_through_rpc_layer() {
         height: Arc::new(std::sync::atomic::AtomicU64::new(100)),
         node_id: "node1:test".to_string(),
         chain_id: 5757,
-        staking: Arc::new(tokio::sync::RwLock::new(stellereum::staking::StakingLedger::new())),
-        governance: Arc::new(tokio::sync::RwLock::new(stellereum::governance::Governance::new())),
+        staking: Arc::new(tokio::sync::RwLock::new(
+            stellereum::staking::StakingLedger::new(),
+        )),
+        governance: Arc::new(tokio::sync::RwLock::new(
+            stellereum::governance::Governance::new(),
+        )),
         recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
-        receipts: Arc::new(tokio::sync::RwLock::new(stellereum::rpc::ReceiptIndex::default())),
+        receipts: Arc::new(tokio::sync::RwLock::new(
+            stellereum::rpc::ReceiptIndex::default(),
+        )),
         auth_token: None,
         tx_broadcast: None,
         faucet: None,
@@ -2185,22 +2376,30 @@ async fn test_erc20_and_filters_through_rpc_layer() {
     });
 
     // 1. eth_call name() through RPC
-    let resp_name = rpc_state.call("eth_call", json!([{ "data": "0x06fdde03" }])).await;
+    let resp_name = rpc_state
+        .call("eth_call", json!([{ "data": "0x06fdde03" }]))
+        .await;
     let name_str = resp_name.as_str().unwrap().to_string();
     assert_eq!(abi_decode_string(&name_str).unwrap(), "Stellereum");
 
     // 2. eth_call symbol() through RPC
-    let resp_symbol = rpc_state.call("eth_call", json!([{ "data": "0x95d89b41" }])).await;
+    let resp_symbol = rpc_state
+        .call("eth_call", json!([{ "data": "0x95d89b41" }]))
+        .await;
     let symbol_str = resp_symbol.as_str().unwrap().to_string();
     assert_eq!(abi_decode_string(&symbol_str).unwrap(), "STELL");
 
     // 3. eth_call decimals() through RPC
-    let resp_dec = rpc_state.call("eth_call", json!([{ "data": "0x313ce567" }])).await;
+    let resp_dec = rpc_state
+        .call("eth_call", json!([{ "data": "0x313ce567" }]))
+        .await;
     let dec_str = resp_dec.as_str().unwrap().to_string();
     assert_eq!(abi_decode_u8(&dec_str).unwrap(), 18);
 
     // 4. eth_call totalSupply() through RPC
-    let resp_supply = rpc_state.call("eth_call", json!([{ "data": "0x18160ddd" }])).await;
+    let resp_supply = rpc_state
+        .call("eth_call", json!([{ "data": "0x18160ddd" }]))
+        .await;
     let supply_str = resp_supply.as_str().unwrap().to_string();
     assert_eq!(abi_decode_u128(&supply_str).unwrap(), DEFAULT_TOTAL_SUPPLY);
 
@@ -2209,20 +2408,29 @@ async fn test_erc20_and_filters_through_rpc_layer() {
         "0x70a08231000000000000000000000000{}",
         hex::encode(user_evm)
     );
-    let resp_bal = rpc_state.call("eth_call", json!([{ "data": calldata_bal }])).await;
+    let resp_bal = rpc_state
+        .call("eth_call", json!([{ "data": calldata_bal }]))
+        .await;
     let bal_str = resp_bal.as_str().unwrap().to_string();
     // 12 nano-STELL = 12 * 10^18 Wei
-    assert_eq!(abi_decode_u128(&bal_str).unwrap(), 12_000_000_000_000_000_000);
+    assert_eq!(
+        abi_decode_u128(&bal_str).unwrap(),
+        12_000_000_000_000_000_000
+    );
 
     // 6. eth_call with unknown selector through RPC returns "0x"
-    let resp_unknown = rpc_state.call("eth_call", json!([{ "data": "0xdeadbeef" }])).await;
+    let resp_unknown = rpc_state
+        .call("eth_call", json!([{ "data": "0xdeadbeef" }]))
+        .await;
     assert_eq!(resp_unknown, json!("0x"));
 
     // 7. Filter polling through RPC
     let resp_bf = rpc_state.call("eth_newBlockFilter", json!([])).await;
     let filter_id = resp_bf.as_str().unwrap().to_string();
 
-    let resp_un = rpc_state.call("eth_uninstallFilter", json!([filter_id])).await;
+    let resp_un = rpc_state
+        .call("eth_uninstallFilter", json!([filter_id]))
+        .await;
     assert_eq!(resp_un, json!(true));
 }
 
@@ -2234,9 +2442,14 @@ async fn test_evm_adapter_module_level_helpers() {
     assert_eq!(calldata, Some("0x06fdde03"));
 
     // 2. extract_address_from_calldata & normalize_address
-    let addr = extract_address_from_calldata("0000000000000000000000001111111111111111111111111111111111111111");
+    let addr = extract_address_from_calldata(
+        "0000000000000000000000001111111111111111111111111111111111111111",
+    );
     assert_eq!(addr, "0x1111111111111111111111111111111111111111");
-    assert_eq!(normalize_address("1111111111111111111111111111111111111111"), "0x1111111111111111111111111111111111111111");
+    assert_eq!(
+        normalize_address("1111111111111111111111111111111111111111"),
+        "0x1111111111111111111111111111111111111111"
+    );
 
     // 3. extract_filter_id & normalize_filter_id
     let id_extracted = extract_filter_id(&json!(["0x0a"])).unwrap();
@@ -2284,8 +2497,13 @@ async fn test_evm_adapter_module_level_helpers() {
 
     // 6. eth_call_with_engine
     let eng = InMemoryStateEngine::new();
-    let eng_res = eth_call_with_engine(&eng, &json!([{ "data": "0x06fdde03" }])).await.unwrap();
-    assert_eq!(abi_decode_string(eng_res.as_str().unwrap()).unwrap(), "Stellereum");
+    let eng_res = eth_call_with_engine(&eng, &json!([{ "data": "0x06fdde03" }]))
+        .await
+        .unwrap();
+    assert_eq!(
+        abi_decode_string(eng_res.as_str().unwrap()).unwrap(),
+        "Stellereum"
+    );
 
     // 7. Constants verification
     assert_eq!(DEFAULT_BASE_FEE, 0x3eb2788000);
@@ -2313,15 +2531,21 @@ fn test_signed_tx(
 
 async fn test_rpc_state_with_height(height: u64) -> Arc<RpcState> {
     let engine = Arc::new(InMemoryStateEngine::new());
-    let mempool = Arc::new(tokio::sync::RwLock::new(stellereum::mempool::Mempool::default()));
+    let mempool = Arc::new(tokio::sync::RwLock::new(
+        stellereum::mempool::Mempool::default(),
+    ));
     Arc::new(RpcState {
         engine,
         mempool,
         height: Arc::new(std::sync::atomic::AtomicU64::new(height)),
         node_id: "test-node:01".to_string(),
         chain_id: CHAIN_ID,
-        staking: Arc::new(tokio::sync::RwLock::new(stellereum::staking::StakingLedger::new())),
-        governance: Arc::new(tokio::sync::RwLock::new(stellereum::governance::Governance::new())),
+        staking: Arc::new(tokio::sync::RwLock::new(
+            stellereum::staking::StakingLedger::new(),
+        )),
+        governance: Arc::new(tokio::sync::RwLock::new(
+            stellereum::governance::Governance::new(),
+        )),
         recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
         receipts: Arc::new(tokio::sync::RwLock::new(ReceiptIndex::default())),
         auth_token: None,
@@ -2375,7 +2599,10 @@ async fn test_eth_get_block_by_number_metamask_compatibility() {
     assert_eq!(BlockTag::parse_str("earliest").unwrap(), BlockTag::Earliest);
     assert_eq!(BlockTag::parse_str("EARLIEST").unwrap(), BlockTag::Earliest);
     assert_eq!(BlockTag::parse_str("pending").unwrap(), BlockTag::Pending);
-    assert_eq!(BlockTag::parse_str("finalized").unwrap(), BlockTag::Finalized);
+    assert_eq!(
+        BlockTag::parse_str("finalized").unwrap(),
+        BlockTag::Finalized
+    );
     assert_eq!(BlockTag::parse_str("safe").unwrap(), BlockTag::Safe);
     assert_eq!(BlockTag::parse_str("0x0").unwrap(), BlockTag::Number(0));
     assert_eq!(BlockTag::parse_str("0x1").unwrap(), BlockTag::Number(1));
@@ -2401,7 +2628,8 @@ async fn test_eth_get_block_by_number_metamask_compatibility() {
     let statuses = vec![true, true];
     let fees = vec![21_000, 25_000]; // total gas used: 46_000 = 0xb3b0
 
-    st.record_receipts(1, block1_hash, &txs, &statuses, &fees).await;
+    st.record_receipts(1, block1_hash, &txs, &statuses, &fees)
+        .await;
 
     // 3. Test eth_getBlockByNumber("latest", false) -> array of tx hashes
     let block_hashes = st
@@ -2539,10 +2767,7 @@ async fn test_eth_get_block_by_number_metamask_compatibility() {
     assert_eq!(hex_block.number, Some("0x1".to_string()));
 
     // 9. Non-existent block returns None (result: null in JSON-RPC)
-    let missing_block = st
-        .eth_get_block_by_number("0x9999", false)
-        .await
-        .unwrap();
+    let missing_block = st.eth_get_block_by_number("0x9999", false).await.unwrap();
     assert!(missing_block.is_none());
 
     // 10. Invalid block tag returns JsonRpcError::invalid_params
@@ -2563,7 +2788,14 @@ async fn test_eth_get_block_by_hash_metamask_compatibility() {
 
     let key = test_signing_key(5);
     let tx = test_signed_tx(&key, [0x88u8; 32], 500_000_000, 21_000, 0);
-    st.record_receipts(1, block1_hash, std::slice::from_ref(&tx), &[true], &[21_000]).await;
+    st.record_receipts(
+        1,
+        block1_hash,
+        std::slice::from_ref(&tx),
+        &[true],
+        &[21_000],
+    )
+    .await;
 
     let hash_hex_lower = stell_hash_to_evm(&block1_hash);
     let hash_hex_upper = format!("0X{}", hex::encode(block1_hash).to_uppercase());
@@ -2644,7 +2876,8 @@ async fn test_eth_get_transaction_receipt_metamask_compatibility() {
     let statuses = vec![true, false]; // tx0: success, tx1: failure
     let fees = vec![21_000, 15_000]; // tx0 fee: 21_000, tx1 fee: 15_000
 
-    st.record_receipts(1, block_hash, &txs, &statuses, &fees).await;
+    st.record_receipts(1, block_hash, &txs, &statuses, &fees)
+        .await;
 
     // 1. Check successful transaction receipt (tx0)
     let r0 = st
@@ -2690,7 +2923,10 @@ async fn test_eth_get_transaction_receipt_metamask_compatibility() {
     ];
 
     for key in expected_receipt_keys {
-        assert!(r0_map.contains_key(key), "MetaMask expects receipt key: {key}");
+        assert!(
+            r0_map.contains_key(key),
+            "MetaMask expects receipt key: {key}"
+        );
     }
 
     assert_eq!(r0_map["status"].as_str().unwrap(), "0x1");
@@ -2721,7 +2957,11 @@ async fn test_eth_get_transaction_receipt_metamask_compatibility() {
 
     // 4. Non-existent receipt returns None
     let missing_hash = format!("0x{}", hex::encode([0xfeu8; 32]));
-    assert!(st.eth_get_transaction_receipt(&missing_hash).await.unwrap().is_none());
+    assert!(st
+        .eth_get_transaction_receipt(&missing_hash)
+        .await
+        .unwrap()
+        .is_none());
 
     // 5. Invalid hash format returns error
     assert!(st.eth_get_transaction_receipt("0xbad").await.is_err());
@@ -2739,7 +2979,14 @@ async fn test_eth_get_transaction_by_hash_metamask_compatibility() {
     let tx0_hash = tx0.compute_tx_hash();
 
     // Record finalized transaction receipt
-    st.record_receipts(1, block_hash, std::slice::from_ref(&tx0), &[true], &[21_000]).await;
+    st.record_receipts(
+        1,
+        block_hash,
+        std::slice::from_ref(&tx0),
+        &[true],
+        &[21_000],
+    )
+    .await;
 
     // 1. Lookup finalized transaction from receipts
     let evm_tx0 = st
@@ -2765,9 +3012,22 @@ async fn test_eth_get_transaction_by_hash_metamask_compatibility() {
     let tx_json = serde_json::to_value(&evm_tx0).unwrap();
     let tx_map = tx_json.as_object().unwrap();
     let expected_tx_keys = [
-        "hash", "nonce", "blockHash", "blockNumber", "transactionIndex",
-        "from", "to", "value", "gasPrice", "gas", "input", "v", "r", "s",
-        "type", "chainId",
+        "hash",
+        "nonce",
+        "blockHash",
+        "blockNumber",
+        "transactionIndex",
+        "from",
+        "to",
+        "value",
+        "gasPrice",
+        "gas",
+        "input",
+        "v",
+        "r",
+        "s",
+        "type",
+        "chainId",
     ];
     for key in expected_tx_keys {
         assert!(tx_map.contains_key(key), "MetaMask expects tx key: {key}");
@@ -2802,7 +3062,11 @@ async fn test_eth_get_transaction_by_hash_metamask_compatibility() {
 
     // 3. Non-existent transaction returns None
     let missing_hash = format!("0x{}", hex::encode([0xeeu8; 32]));
-    assert!(st.eth_get_transaction_by_hash(&missing_hash).await.unwrap().is_none());
+    assert!(st
+        .eth_get_transaction_by_hash(&missing_hash)
+        .await
+        .unwrap()
+        .is_none());
 
     // 4. Invalid hash format returns error
     assert!(st.eth_get_transaction_by_hash("0xdead").await.is_err());
@@ -2822,7 +3086,8 @@ async fn test_rpc_dispatch_metamask_jsonrpc_protocol_flow() {
     let tx_hash_hex = stell_hash_to_evm(&tx.compute_tx_hash());
     let head_hash_hex = stell_hash_to_evm(&head_hash);
 
-    st.record_receipts(10, head_hash, std::slice::from_ref(&tx), &[true], &[21_000]).await;
+    st.record_receipts(10, head_hash, std::slice::from_ref(&tx), &[true], &[21_000])
+        .await;
 
     // 1. eth_blockNumber -> "0xa" (10)
     let resp_bn = st.call("eth_blockNumber", json!([])).await;
@@ -2835,7 +3100,10 @@ async fn test_rpc_dispatch_metamask_jsonrpc_protocol_flow() {
     assert_eq!(resp_block_hashes["number"], json!("0xa"));
     assert_eq!(resp_block_hashes["hash"], json!(head_hash_hex));
     assert_eq!(resp_block_hashes["gasUsed"], json!("0x5208"));
-    assert_eq!(resp_block_hashes["transactions"], json!([tx_hash_hex.clone()]));
+    assert_eq!(
+        resp_block_hashes["transactions"],
+        json!([tx_hash_hex.clone()])
+    );
 
     // 3. eth_getBlockByNumber("latest", true)
     let resp_block_full = st
@@ -2929,12 +3197,12 @@ fn test_ecrecover_known_ethereum_transaction_vector() {
 
     // 2. Independently derive expected address from private key 0x4646...46
     let privkey_bytes = [0x46u8; 32];
-    let signing_key = k256::ecdsa::SigningKey::from_slice(&privkey_bytes)
-        .expect("valid secp256k1 private key");
+    let signing_key =
+        k256::ecdsa::SigningKey::from_slice(&privkey_bytes).expect("valid secp256k1 private key");
     let verifying_key = signing_key.verifying_key();
     let uncompressed_pt = verifying_key.to_encoded_point(false);
-    let expected_addr = pubkey_to_address(uncompressed_pt.as_bytes())
-        .expect("derive address from pubkey");
+    let expected_addr =
+        pubkey_to_address(uncompressed_pt.as_bytes()).expect("derive address from pubkey");
 
     // 3. Verify recovered address matches expected address exactly
     assert_eq!(recovered_addr, expected_addr);
@@ -2955,10 +3223,20 @@ fn test_ecrecover_known_ethereum_transaction_vector() {
 #[test]
 fn test_transaction_signature_validation_replay_protection_and_low_s() {
     // Generate valid signature using Hardhat Account #0
-    let privkey = hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
+    let privkey =
+        hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
     let signing_key = k256::ecdsa::SigningKey::from_slice(&privkey).unwrap();
-    let expected_addr = pubkey_to_address(signing_key.verifying_key().to_encoded_point(false).as_bytes()).unwrap();
-    assert_eq!(hex::encode(expected_addr), "f39fd6e51aad88f6f4ce6ab8827279cfffb92266");
+    let expected_addr = pubkey_to_address(
+        signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        hex::encode(expected_addr),
+        "f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+    );
 
     let test_tx_hash = keccak256(b"Stellereum L1 test transaction payload");
 
@@ -2995,8 +3273,9 @@ fn test_transaction_signature_validation_replay_protection_and_low_s() {
 
     // 3. Replay protection: Pre-EIP-155 unprotected legacy transaction (v = 27 or 28) must FAIL
     let legacy_v = 27u64 + rec_id as u64;
-    let err_unprot = validate_transaction_signature(&test_tx_hash, legacy_v, &r, &s)
-        .expect_err("unprotected legacy transaction must be rejected when replay protection is enforced");
+    let err_unprot = validate_transaction_signature(&test_tx_hash, legacy_v, &r, &s).expect_err(
+        "unprotected legacy transaction must be rejected when replay protection is enforced",
+    );
     assert!(
         err_unprot.contains("replay protection required") || err_unprot.contains("unprotected"),
         "error message should indicate replay protection required: {err_unprot}"
@@ -3022,9 +3301,16 @@ fn test_transaction_signature_validation_replay_protection_and_low_s() {
 
 #[test]
 fn test_ecrecover_eip1559_and_eip155_recovery_formulas() {
-    let privkey = hex::decode("4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d").unwrap();
+    let privkey =
+        hex::decode("4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d").unwrap();
     let signing_key = k256::ecdsa::SigningKey::from_slice(&privkey).unwrap();
-    let expected_addr = pubkey_to_address(signing_key.verifying_key().to_encoded_point(false).as_bytes()).unwrap();
+    let expected_addr = pubkey_to_address(
+        signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes(),
+    )
+    .unwrap();
 
     let tx_hash = keccak256(b"EIP-1559 typed transaction payload");
     let (sig, recid) = signing_key.sign_prehash_recoverable(&tx_hash).unwrap();
@@ -3048,14 +3334,14 @@ fn test_ecrecover_eip1559_and_eip155_recovery_formulas() {
     let extracted_rec_id = ((v_eip155 - 35 - 2 * chain_id) % 2) as u8;
     assert_eq!(extracted_rec_id, rec_id);
 
-    let recovered_155 = ecrecover(&tx_hash, v_eip155, &r, &s)
-        .expect("ecrecover with EIP-155 v must succeed");
+    let recovered_155 =
+        ecrecover(&tx_hash, v_eip155, &r, &s).expect("ecrecover with EIP-155 v must succeed");
     assert_eq!(recovered_155, expected_addr);
 
     // 3. Pre-EIP-155 legacy: v = 27 + rec_id
     let v_legacy = 27u64 + rec_id as u64;
-    let recovered_legacy = ecrecover(&tx_hash, v_legacy, &r, &s)
-        .expect("ecrecover with legacy v must succeed");
+    let recovered_legacy =
+        ecrecover(&tx_hash, v_legacy, &r, &s).expect("ecrecover with legacy v must succeed");
     assert_eq!(recovered_legacy, expected_addr);
 }
 
@@ -3066,21 +3352,32 @@ fn test_ecrecover_eip1559_and_eip155_recovery_formulas() {
 #[test]
 fn test_evm_to_stell_address_padding() {
     let evm_addr: [u8; 20] = [
-        0x5a, 0xae, 0xb6, 0x05, 0x3f, 0x3e, 0x94, 0xc9, 0xb9, 0xa0,
-        0x9f, 0x33, 0x66, 0x94, 0x35, 0xe7, 0xef, 0x1b, 0xea, 0xed,
+        0x5a, 0xae, 0xb6, 0x05, 0x3f, 0x3e, 0x94, 0xc9, 0xb9, 0xa0, 0x9f, 0x33, 0x66, 0x94, 0x35,
+        0xe7, 0xef, 0x1b, 0xea, 0xed,
     ];
 
     let stell_addr = evm_to_stell_address(&evm_addr);
 
     // 1. Verify exact 12 zero bytes on the left
-    assert_eq!(&stell_addr[0..12], &[0u8; 12], "left 12 bytes must be exactly 0");
+    assert_eq!(
+        &stell_addr[0..12],
+        &[0u8; 12],
+        "left 12 bytes must be exactly 0"
+    );
 
     // 2. Verify remaining 20 bytes match the EVM address
-    assert_eq!(&stell_addr[12..32], &evm_addr, "bytes 12..32 must match EVM address");
+    assert_eq!(
+        &stell_addr[12..32],
+        &evm_addr,
+        "bytes 12..32 must match EVM address"
+    );
 
     // 3. Roundtrip back to EVM address
     let extracted = stell_to_evm_address(&stell_addr);
-    assert_eq!(extracted, evm_addr, "stell_to_evm_address must recover exact EVM address");
+    assert_eq!(
+        extracted, evm_addr,
+        "stell_to_evm_address must recover exact EVM address"
+    );
 }
 
 #[test]
@@ -3092,14 +3389,17 @@ fn test_stell_to_evm_address_extraction() {
     stell_addr[12..32].copy_from_slice(&evm_part);
 
     let extracted = stell_to_evm_address(&stell_addr);
-    assert_eq!(extracted, evm_part, "must extract bytes 12..32 regardless of prefix");
+    assert_eq!(
+        extracted, evm_part,
+        "must extract bytes 12..32 regardless of prefix"
+    );
 }
 
 #[test]
 fn test_evm_address_from_hex_and_to_hex() {
     let evm_raw: [u8; 20] = [
-        0x5a, 0xae, 0xb6, 0x05, 0x3f, 0x3e, 0x94, 0xc9, 0xb9, 0xa0,
-        0x9f, 0x33, 0x66, 0x94, 0x35, 0xe7, 0xef, 0x1b, 0xea, 0xed,
+        0x5a, 0xae, 0xb6, 0x05, 0x3f, 0x3e, 0x94, 0xc9, 0xb9, 0xa0, 0x9f, 0x33, 0x66, 0x94, 0x35,
+        0xe7, 0xef, 0x1b, 0xea, 0xed,
     ];
 
     // 1. Parse 20-byte address with "0x" prefix
@@ -3115,11 +3415,15 @@ fn test_evm_address_from_hex_and_to_hex() {
     assert_eq!(parsed3, evm_raw);
 
     // 4. Parse 32-byte Stellereum address (64 hex characters) with 0x prefix
-    let parsed4 = evm_address_from_hex("0x0000000000000000000000005aaeb6053f3e94c9b9a09f33669435e7ef1beaed").unwrap();
+    let parsed4 =
+        evm_address_from_hex("0x0000000000000000000000005aaeb6053f3e94c9b9a09f33669435e7ef1beaed")
+            .unwrap();
     assert_eq!(parsed4, evm_raw);
 
     // 5. Parse 32-byte Stellereum address without 0x prefix
-    let parsed5 = evm_address_from_hex("0000000000000000000000005aaeb6053f3e94c9b9a09f33669435e7ef1beaed").unwrap();
+    let parsed5 =
+        evm_address_from_hex("0000000000000000000000005aaeb6053f3e94c9b9a09f33669435e7ef1beaed")
+            .unwrap();
     assert_eq!(parsed5, evm_raw);
 
     // 6. evm_address_to_hex formats with 0x prefix and lowercase
@@ -3132,9 +3436,21 @@ fn test_evm_address_from_hex_and_to_hex() {
 
     // 8. Error on invalid lengths
     assert!(evm_address_from_hex("0x1234").is_err(), "too short");
-    assert!(evm_address_from_hex("0x5aaeb6053f3e94c9b9a09f33669435e7ef1beae").is_err(), "39 hex chars");
-    assert!(evm_address_from_hex("0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed00").is_err(), "42 hex chars");
-    assert!(evm_address_from_hex("0x0000000000000000000000005aaeb6053f3e94c9b9a09f33669435e7ef1beaed00").is_err(), "66 hex chars");
+    assert!(
+        evm_address_from_hex("0x5aaeb6053f3e94c9b9a09f33669435e7ef1beae").is_err(),
+        "39 hex chars"
+    );
+    assert!(
+        evm_address_from_hex("0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed00").is_err(),
+        "42 hex chars"
+    );
+    assert!(
+        evm_address_from_hex(
+            "0x0000000000000000000000005aaeb6053f3e94c9b9a09f33669435e7ef1beaed00"
+        )
+        .is_err(),
+        "66 hex chars"
+    );
 
     // 9. Error on invalid characters
     assert!(evm_address_from_hex("0xzzzzb6053f3e94c9b9a09f33669435e7ef1beaed").is_err());
@@ -3194,8 +3510,16 @@ fn test_nano_to_wei_and_wei_to_nano_scaling() {
     assert_eq!(wei_to_nano(max_wei), u64::MAX);
 
     // 7. Sub-nano truncation
-    assert_eq!(wei_to_nano(999_999_999), 0, "sub-nano wei must truncate to 0");
-    assert_eq!(wei_to_nano(1_000_000_001), 1, "remainder truncates to 1 nano");
+    assert_eq!(
+        wei_to_nano(999_999_999),
+        0,
+        "sub-nano wei must truncate to 0"
+    );
+    assert_eq!(
+        wei_to_nano(1_000_000_001),
+        1,
+        "remainder truncates to 1 nano"
+    );
 
     // 8. Reversibility check
     for test_nano in [0, 1, 42, 1000, 1_000_000_000, 50_000_000_000] {
@@ -3219,7 +3543,10 @@ fn test_nano_wei_hex_and_string_helpers() {
     assert_eq!(wei_to_nano_hex(1_000_000_000_000_000_000), "0x3b9aca00");
 
     assert_eq!(wei_hex_to_nano("0xde0b6b3a7640000").unwrap(), 1_000_000_000);
-    assert_eq!(wei_str_to_nano("1000000000000000000").unwrap(), 1_000_000_000);
+    assert_eq!(
+        wei_str_to_nano("1000000000000000000").unwrap(),
+        1_000_000_000
+    );
 }
 
 #[tokio::test]
@@ -3229,57 +3556,88 @@ async fn test_eth_get_balance_scaling_and_hex() {
     let stell_addr = parse_evm_or_stell_address(evm_addr_hex).unwrap();
 
     // 1. Non-existent account returns "0x0"
-    let bal_empty = eth_get_balance(&engine, &json!([evm_addr_hex, "latest"])).await.unwrap();
+    let bal_empty = eth_get_balance(&engine, &json!([evm_addr_hex, "latest"]))
+        .await
+        .unwrap();
     assert_eq!(bal_empty, "0x0");
 
     // 2. Fund account with 5 STELL = 5_000_000_000 nano-STELL
     // Expected Wei: 5 * 10^18 = 5_000_000_000_000_000_000 = 0x4563918244f40000
-    engine.update_account(AccountState::new(stell_addr, 5_000_000_000)).await;
+    engine
+        .update_account(AccountState::new(stell_addr, 5_000_000_000))
+        .await;
 
     // Query with 20-byte EVM address
-    let bal_hex = eth_get_balance(&engine, &json!([evm_addr_hex, "latest"])).await.unwrap();
+    let bal_hex = eth_get_balance(&engine, &json!([evm_addr_hex, "latest"]))
+        .await
+        .unwrap();
     assert_eq!(bal_hex, "0x4563918244f40000");
 
     // Query with 32-byte Stellereum address
     let stell_hex = format!("0x{}", hex::encode(stell_addr));
-    let bal_hex_32 = eth_get_balance(&engine, &json!([stell_hex, "latest"])).await.unwrap();
+    let bal_hex_32 = eth_get_balance(&engine, &json!([stell_hex, "latest"]))
+        .await
+        .unwrap();
     assert_eq!(bal_hex_32, "0x4563918244f40000");
 
     // Query with block tags: earliest, pending, finalized, safe, hex number
     for tag in ["earliest", "pending", "finalized", "safe", "0x1"] {
-        let b = eth_get_balance(&engine, &json!([evm_addr_hex, tag])).await.unwrap();
+        let b = eth_get_balance(&engine, &json!([evm_addr_hex, tag]))
+            .await
+            .unwrap();
         assert_eq!(b, "0x4563918244f40000");
     }
 
     // Object parameter format
-    let bal_obj = eth_get_balance(&engine, &json!({ "address": evm_addr_hex, "blockTag": "latest" })).await.unwrap();
+    let bal_obj = eth_get_balance(
+        &engine,
+        &json!({ "address": evm_addr_hex, "blockTag": "latest" }),
+    )
+    .await
+    .unwrap();
     assert_eq!(bal_obj, "0x4563918244f40000");
 
     // Error on invalid address
-    assert!(eth_get_balance(&engine, &json!(["0xinvalid", "latest"])).await.is_err());
+    assert!(eth_get_balance(&engine, &json!(["0xinvalid", "latest"]))
+        .await
+        .is_err());
 
     // Error on invalid block tag
-    assert!(eth_get_balance(&engine, &json!([evm_addr_hex, "invalid_tag"])).await.is_err());
+    assert!(
+        eth_get_balance(&engine, &json!([evm_addr_hex, "invalid_tag"]))
+            .await
+            .is_err()
+    );
 
     // 3. Test through EvmAdapter with engine
     let adapter = EvmAdapter::new().with_engine(engine.clone());
-    let res = adapter.dispatch("eth_getBalance", &json!([evm_addr_hex, "latest"])).unwrap();
+    let res = adapter
+        .dispatch("eth_getBalance", &json!([evm_addr_hex, "latest"]))
+        .unwrap();
     assert_eq!(res, json!("0x4563918244f40000"));
 
-    let res_async = adapter.dispatch_async("eth_getBalance", &json!([evm_addr_hex, "latest"])).await.unwrap();
+    let res_async = adapter
+        .dispatch_async("eth_getBalance", &json!([evm_addr_hex, "latest"]))
+        .await
+        .unwrap();
     assert_eq!(res_async, json!("0x4563918244f40000"));
 
     let method_res = adapter.eth_getBalance(evm_addr_hex, "latest").unwrap();
     assert_eq!(method_res, "0x4563918244f40000");
 
     // 4. Test EvmAdapter with standalone in-memory balance in Wei
-    let standalone_adapter = EvmAdapter::new().with_balance(evm_addr_hex, 1_000_000_000_000_000_000);
+    let standalone_adapter =
+        EvmAdapter::new().with_balance(evm_addr_hex, 1_000_000_000_000_000_000);
     assert_eq!(
-        standalone_adapter.eth_getBalance(evm_addr_hex, "latest").unwrap(),
+        standalone_adapter
+            .eth_getBalance(evm_addr_hex, "latest")
+            .unwrap(),
         "0xde0b6b3a7640000"
     );
     assert_eq!(
-        standalone_adapter.dispatch("eth_getBalance", &json!([evm_addr_hex, "latest"])).unwrap(),
+        standalone_adapter
+            .dispatch("eth_getBalance", &json!([evm_addr_hex, "latest"]))
+            .unwrap(),
         json!("0xde0b6b3a7640000")
     );
 
@@ -3294,7 +3652,9 @@ async fn test_eth_get_transaction_count_nonce_hex() {
     let stell_addr = parse_evm_or_stell_address(evm_addr_hex).unwrap();
 
     // 1. Non-existent account returns "0x0"
-    let nonce_empty = eth_get_transaction_count(&engine, &json!([evm_addr_hex, "latest"])).await.unwrap();
+    let nonce_empty = eth_get_transaction_count(&engine, &json!([evm_addr_hex, "latest"]))
+        .await
+        .unwrap();
     assert_eq!(nonce_empty, "0x0");
 
     // 2. Account with nonce 42 (0x2a)
@@ -3302,29 +3662,48 @@ async fn test_eth_get_transaction_count_nonce_hex() {
     acc.nonce = 42;
     engine.update_account(acc).await;
 
-    let nonce_hex = eth_get_transaction_count(&engine, &json!([evm_addr_hex, "latest"])).await.unwrap();
+    let nonce_hex = eth_get_transaction_count(&engine, &json!([evm_addr_hex, "latest"]))
+        .await
+        .unwrap();
     assert_eq!(nonce_hex, "0x2a");
 
     // 32-byte address query
     let stell_hex = format!("0x{}", hex::encode(stell_addr));
-    let nonce_32 = eth_get_transaction_count(&engine, &json!([stell_hex, "latest"])).await.unwrap();
+    let nonce_32 = eth_get_transaction_count(&engine, &json!([stell_hex, "latest"]))
+        .await
+        .unwrap();
     assert_eq!(nonce_32, "0x2a");
 
     // Error on invalid address
-    assert!(eth_get_transaction_count(&engine, &json!(["0xbad", "latest"])).await.is_err());
+    assert!(
+        eth_get_transaction_count(&engine, &json!(["0xbad", "latest"]))
+            .await
+            .is_err()
+    );
 
     // Error on invalid block tag
-    assert!(eth_get_transaction_count(&engine, &json!([evm_addr_hex, "bogus"])).await.is_err());
+    assert!(
+        eth_get_transaction_count(&engine, &json!([evm_addr_hex, "bogus"]))
+            .await
+            .is_err()
+    );
 
     // 3. Test through EvmAdapter with engine
     let adapter = EvmAdapter::new().with_engine(engine);
-    let res = adapter.dispatch("eth_getTransactionCount", &json!([evm_addr_hex, "latest"])).unwrap();
+    let res = adapter
+        .dispatch("eth_getTransactionCount", &json!([evm_addr_hex, "latest"]))
+        .unwrap();
     assert_eq!(res, json!("0x2a"));
 
-    let res_async = adapter.dispatch_async("eth_getTransactionCount", &json!([evm_addr_hex, "latest"])).await.unwrap();
+    let res_async = adapter
+        .dispatch_async("eth_getTransactionCount", &json!([evm_addr_hex, "latest"]))
+        .await
+        .unwrap();
     assert_eq!(res_async, json!("0x2a"));
 
-    let method_res = adapter.eth_getTransactionCount(evm_addr_hex, "latest").unwrap();
+    let method_res = adapter
+        .eth_getTransactionCount(evm_addr_hex, "latest")
+        .unwrap();
     assert_eq!(method_res, "0x2a");
 
     // Standalone function
@@ -3346,21 +3725,30 @@ fn test_eth_get_code_always_returns_0x() {
     assert_eq!(adapter.eth_get_code(), "0x");
 
     // 3. JSON-RPC dispatch (both 20-byte and 32-byte addresses)
-    let res = adapter.dispatch("eth_getCode", &json!([evm_addr_hex, "latest"])).unwrap();
+    let res = adapter
+        .dispatch("eth_getCode", &json!([evm_addr_hex, "latest"]))
+        .unwrap();
     assert_eq!(res, json!("0x"));
 
     let stell_hex = "0x000000000000000000000000407d73d8a49eeb85d32cf465507dd71d507100c1";
-    let res_32 = adapter.dispatch("eth_getCode", &json!([stell_hex, "latest"])).unwrap();
+    let res_32 = adapter
+        .dispatch("eth_getCode", &json!([stell_hex, "latest"]))
+        .unwrap();
     assert_eq!(res_32, json!("0x"));
 
     // Empty params returns "0x"
-    assert_eq!(adapter.dispatch("eth_getCode", &Value::Null).unwrap(), json!("0x"));
+    assert_eq!(
+        adapter.dispatch("eth_getCode", &Value::Null).unwrap(),
+        json!("0x")
+    );
 
     // Invalid address produces error
     assert!(adapter.dispatch("eth_getCode", &json!(["0xbad"])).is_err());
 
     // Invalid block tag produces error
-    assert!(adapter.dispatch("eth_getCode", &json!([evm_addr_hex, "invalid_tag"])).is_err());
+    assert!(adapter
+        .dispatch("eth_getCode", &json!([evm_addr_hex, "invalid_tag"]))
+        .is_err());
 }
 
 #[tokio::test]
@@ -3370,13 +3758,19 @@ async fn test_eth_state_methods_via_rpc_layer() {
     let stell_addr = parse_evm_or_stell_address(evm_addr_hex).unwrap();
 
     // 1. Initially balance = 0, nonce = 0, code = "0x"
-    let res_bal = st.call("eth_getBalance", json!([evm_addr_hex, "latest"])).await;
+    let res_bal = st
+        .call("eth_getBalance", json!([evm_addr_hex, "latest"]))
+        .await;
     assert_eq!(res_bal, json!("0x0"));
 
-    let res_nonce = st.call("eth_getTransactionCount", json!([evm_addr_hex, "latest"])).await;
+    let res_nonce = st
+        .call("eth_getTransactionCount", json!([evm_addr_hex, "latest"]))
+        .await;
     assert_eq!(res_nonce, json!("0x0"));
 
-    let res_code = st.call("eth_getCode", json!([evm_addr_hex, "latest"])).await;
+    let res_code = st
+        .call("eth_getCode", json!([evm_addr_hex, "latest"]))
+        .await;
     assert_eq!(res_code, json!("0x"));
 
     // 2. Fund account with 2.5 STELL = 2_500_000_000 nano-STELL, nonce = 10 (0xa)
@@ -3386,16 +3780,22 @@ async fn test_eth_state_methods_via_rpc_layer() {
     st.engine.update_account(acc).await;
 
     // eth_getBalance via RPC
-    let res_bal_funded = st.call("eth_getBalance", json!([evm_addr_hex, "latest"])).await;
+    let res_bal_funded = st
+        .call("eth_getBalance", json!([evm_addr_hex, "latest"]))
+        .await;
     assert_eq!(res_bal_funded, json!("0x22b1c8c1227a0000"));
 
     // eth_getTransactionCount via RPC
-    let res_nonce_funded = st.call("eth_getTransactionCount", json!([evm_addr_hex, "latest"])).await;
+    let res_nonce_funded = st
+        .call("eth_getTransactionCount", json!([evm_addr_hex, "latest"]))
+        .await;
     assert_eq!(res_nonce_funded, json!("0xa"));
 
     // Also test 32-byte address format via RPC
     let stell_hex = format!("0x{}", hex::encode(stell_addr));
-    let res_bal_32 = st.call("eth_getBalance", json!([stell_hex, "latest"])).await;
+    let res_bal_32 = st
+        .call("eth_getBalance", json!([stell_hex, "latest"]))
+        .await;
     assert_eq!(res_bal_32, json!("0x22b1c8c1227a0000"));
 }
 
@@ -3446,20 +3846,29 @@ fn test_rlp_len_usize_max_returns_error_without_overflow() {
     // Sanity: this header really encodes usize::MAX on this platform.
     let mut check: usize = 0;
     for &b in &len_bytes {
-        check = check.checked_shl(8).and_then(|v| v.checked_add(b as usize)).unwrap();
+        check = check
+            .checked_shl(8)
+            .and_then(|v| v.checked_add(b as usize))
+            .unwrap();
     }
     assert_eq!(check, usize_max);
 
     let mut hostile_str = vec![0xbf];
     hostile_str.extend_from_slice(&len_bytes);
     let res_str = rlp_decode(&hostile_str);
-    assert!(res_str.is_err(), "len == usize::MAX string must be rejected, not overflow");
+    assert!(
+        res_str.is_err(),
+        "len == usize::MAX string must be rejected, not overflow"
+    );
 
     // Same for a long list: 0xff + 8 x 0xff.
     let mut hostile_list = vec![0xff];
     hostile_list.extend_from_slice(&len_bytes);
     let res_list = rlp_decode(&hostile_list);
-    assert!(res_list.is_err(), "len == usize::MAX list must be rejected, not overflow");
+    assert!(
+        res_list.is_err(),
+        "len == usize::MAX list must be rejected, not overflow"
+    );
 }
 
 #[test]
@@ -3468,14 +3877,20 @@ fn test_abi_decode_string_hostile_offset_len_returns_error_without_panic() {
     let huge_offset_hex = format!("0x{:0>64x}", (usize::MAX / 2) + 1);
     let body = format!("{huge_offset_hex}{}", "00".repeat(64));
     let res = abi_decode_string(&body);
-    assert!(res.is_err(), "overflowing offset must be rejected, not panic");
+    assert!(
+        res.is_err(),
+        "overflowing offset must be rejected, not panic"
+    );
 
     // Declared string len == usize::MAX: `len * 2` overflows -> Err, no panic.
     let normal_offset = format!("{:0>64x}", 32);
     let max_len = format!("{:0>64x}", usize::MAX);
     let payload = format!("0x{normal_offset}{max_len}");
     let res2 = abi_decode_string(&payload);
-    assert!(res2.is_err(), "len == usize::MAX must be rejected, not overflow");
+    assert!(
+        res2.is_err(),
+        "len == usize::MAX must be rejected, not overflow"
+    );
 }
 
 // ============================================================================
@@ -3485,8 +3900,14 @@ fn test_abi_decode_string_hostile_offset_len_returns_error_without_panic() {
 #[test]
 fn test_filter_gc_constants() {
     assert_eq!(FILTER_TTL_SECS, 300, "filter TTL must be 300s");
-    assert_eq!(MAX_ACTIVE_FILTERS, 10_000, "max active filters must be 10000");
-    assert_eq!(MAX_PENDING_PER_FILTER, 1_000, "max pending per filter must be 1000");
+    assert_eq!(
+        MAX_ACTIVE_FILTERS, 10_000,
+        "max active filters must be 10000"
+    );
+    assert_eq!(
+        MAX_PENDING_PER_FILTER, 1_000,
+        "max pending per filter must be 1000"
+    );
     assert_eq!(CHAIN_ID, 5757);
 }
 
@@ -3499,14 +3920,22 @@ fn test_filter_expiration_by_timeout_lazy_gc() {
     let log_id = manager.new_filter(FilterCriteria::default());
     assert_eq!(manager.get_filter_changes(&block_id).unwrap(), json!([]));
     assert_eq!(manager.get_filter_changes(&log_id).unwrap(), json!([]));
-    assert_eq!(manager.sweep_expired(), 0, "fresh filters must not be swept");
+    assert_eq!(
+        manager.sweep_expired(),
+        0,
+        "fresh filters must not be swept"
+    );
 
     // 2. Age the block filter beyond TTL -> lazy expiration on next poll.
     assert!(manager.expire_filter_for_test(&block_id));
-    let err_changes = manager.get_filter_changes(&block_id).expect_err("expired filter must report not found");
+    let err_changes = manager
+        .get_filter_changes(&block_id)
+        .expect_err("expired filter must report not found");
     assert_eq!(err_changes.message, "filter not found");
     // Second access still reports not found (entry was dropped, incl. buffers).
-    let err_again = manager.get_filter_changes(&block_id).expect_err("expired entry must stay gone");
+    let err_again = manager
+        .get_filter_changes(&block_id)
+        .expect_err("expired entry must stay gone");
     assert_eq!(err_again.message, "filter not found");
 
     // 3. Same for get_filter_logs on a log filter (all_logs must be freed).
@@ -3522,18 +3951,36 @@ fn test_filter_expiration_by_timeout_lazy_gc() {
         removed: false,
     });
     // Log filter was polled above so last_poll is fresh; all_logs has 1 entry.
-    assert_eq!(manager.get_filter_logs(&log_id).unwrap().as_array().unwrap().len(), 1);
+    assert_eq!(
+        manager
+            .get_filter_logs(&log_id)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(manager.expire_filter_for_test(&log_id));
-    let err_logs = manager.get_filter_logs(&log_id).expect_err("expired log filter must report not found on get_filter_logs");
+    let err_logs = manager
+        .get_filter_logs(&log_id)
+        .expect_err("expired log filter must report not found on get_filter_logs");
     assert_eq!(err_logs.message, "filter not found");
-    let err_changes2 = manager.get_filter_changes(&log_id).expect_err("expired log filter must report not found on get_filter_changes");
+    let err_changes2 = manager
+        .get_filter_changes(&log_id)
+        .expect_err("expired log filter must report not found on get_filter_changes");
     assert_eq!(err_changes2.message, "filter not found");
 
     // 4. sweep_expired collects idle filters without any poll.
     let stale_id = manager.new_block_filter();
     assert!(manager.expire_filter_for_test(&stale_id));
     assert_eq!(manager.sweep_expired(), 1, "one stale filter must be swept");
-    assert_eq!(manager.get_filter_changes(&stale_id).expect_err("swept filter is gone").message, "filter not found");
+    assert_eq!(
+        manager
+            .get_filter_changes(&stale_id)
+            .expect_err("swept filter is gone")
+            .message,
+        "filter not found"
+    );
 
     // 5. Active polling keeps a filter alive (no false expiry).
     let live_id = manager.new_block_filter();
@@ -3554,10 +4001,17 @@ fn test_filter_pending_cap_1000() {
     }
     let changes = manager.get_filter_changes(&block_id).unwrap();
     let arr = changes.as_array().unwrap();
-    assert_eq!(arr.len(), MAX_PENDING_PER_FILTER, "pending block hashes must be capped at 1000");
+    assert_eq!(
+        arr.len(),
+        MAX_PENDING_PER_FILTER,
+        "pending block hashes must be capped at 1000"
+    );
     // First 5 evicted, latest 1000 kept.
     assert_eq!(arr[0], json!(format!("0x{:064x}", 6)));
-    assert_eq!(arr[MAX_PENDING_PER_FILTER - 1], json!(format!("0x{:064x}", MAX_PENDING_PER_FILTER + 5)));
+    assert_eq!(
+        arr[MAX_PENDING_PER_FILTER - 1],
+        json!(format!("0x{:064x}", MAX_PENDING_PER_FILTER + 5))
+    );
 
     // Log buffers (pending_logs AND all_logs) are capped as well.
     let log_id = manager.new_filter(FilterCriteria::default());
@@ -3575,9 +4029,17 @@ fn test_filter_pending_cap_1000() {
         });
     }
     let pending = manager.get_filter_changes(&log_id).unwrap();
-    assert_eq!(pending.as_array().unwrap().len(), MAX_PENDING_PER_FILTER, "pending_logs must be capped at 1000");
+    assert_eq!(
+        pending.as_array().unwrap().len(),
+        MAX_PENDING_PER_FILTER,
+        "pending_logs must be capped at 1000"
+    );
     let all = manager.get_filter_logs(&log_id).unwrap();
-    assert_eq!(all.as_array().unwrap().len(), MAX_PENDING_PER_FILTER, "all_logs must be capped at 1000 (no unbounded growth)");
+    assert_eq!(
+        all.as_array().unwrap().len(),
+        MAX_PENDING_PER_FILTER,
+        "all_logs must be capped at 1000 (no unbounded growth)"
+    );
 }
 
 #[test]
@@ -3590,20 +4052,37 @@ fn test_verify_signature_rejects_foreign_chain_id() {
     // Recovery itself is chain-agnostic and succeeds...
     assert!(foreign_legacy.recover_sender().is_ok());
     // ...but strict verification must cut off чужой chain_id.
-    let err = foreign_legacy.verify_signature().expect_err("chain_id 1 must be rejected on Stellereum");
-    assert_eq!(err, EvmError::ChainIdMismatch { expected: 5757, got: 1 });
+    let err = foreign_legacy
+        .verify_signature()
+        .expect_err("chain_id 1 must be rejected on Stellereum");
+    assert_eq!(
+        err,
+        EvmError::ChainIdMismatch {
+            expected: 5757,
+            got: 1
+        }
+    );
 
     // --- Legacy: unprotected pre-EIP-155 (v = 27, chain_id = None) ---
     let mut unprotected = foreign_legacy.clone();
     unprotected.v = 27;
     unprotected.chain_id = None;
-    let err_unprot = unprotected.verify_signature().expect_err("unprotected legacy must be rejected");
+    let err_unprot = unprotected
+        .verify_signature()
+        .expect_err("unprotected legacy must be rejected");
     assert_eq!(err_unprot, EvmError::ReplayProtectionRequired);
 
     // --- Legacy: valid Stellereum signature (chain_id == 5757) must verify ---
-    let privkey = hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
+    let privkey =
+        hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
     let signing_key = k256::ecdsa::SigningKey::from_slice(&privkey).unwrap();
-    let expected_addr = pubkey_to_address(signing_key.verifying_key().to_encoded_point(false).as_bytes()).unwrap();
+    let expected_addr = pubkey_to_address(
+        signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes(),
+    )
+    .unwrap();
     let mut stell_legacy = LegacyTransaction {
         nonce: 7,
         gas_price: 20_000_000_000,
@@ -3624,10 +4103,20 @@ fn test_verify_signature_rejects_foreign_chain_id() {
     stell_legacy.v = 2 * CHAIN_ID + 35 + rec_id as u64;
     assert_eq!(stell_legacy.verify_signature().unwrap(), expected_addr);
     // And via the unified enum.
-    assert_eq!(DecodedTransaction::Legacy(stell_legacy.clone()).verify_signature().unwrap(), expected_addr);
     assert_eq!(
-        DecodedTransaction::Legacy(foreign_legacy.clone()).verify_signature().unwrap_err(),
-        EvmError::ChainIdMismatch { expected: 5757, got: 1 }
+        DecodedTransaction::Legacy(stell_legacy.clone())
+            .verify_signature()
+            .unwrap(),
+        expected_addr
+    );
+    assert_eq!(
+        DecodedTransaction::Legacy(foreign_legacy.clone())
+            .verify_signature()
+            .unwrap_err(),
+        EvmError::ChainIdMismatch {
+            expected: 5757,
+            got: 1
+        }
     );
 
     // --- EIP-1559: foreign chain_id == 1 must be cut off ---
@@ -3646,8 +4135,16 @@ fn test_verify_signature_rejects_foreign_chain_id() {
         r: [0x33; 32],
         s: [0x44; 32],
     };
-    let err_1559 = foreign_1559.verify_signature().expect_err("EIP-1559 chain_id 1 must be rejected");
-    assert_eq!(err_1559, EvmError::ChainIdMismatch { expected: 5757, got: 1 });
+    let err_1559 = foreign_1559
+        .verify_signature()
+        .expect_err("EIP-1559 chain_id 1 must be rejected");
+    assert_eq!(
+        err_1559,
+        EvmError::ChainIdMismatch {
+            expected: 5757,
+            got: 1
+        }
+    );
 
     // --- EIP-1559: valid Stellereum signature must verify ---
     let mut stell_1559 = Eip1559Transaction {
@@ -3672,10 +4169,20 @@ fn test_verify_signature_rejects_foreign_chain_id() {
     stell_1559.y_parity = recid2.to_byte();
     stell_1559.v = stell_1559.y_parity as u64;
     assert_eq!(stell_1559.verify_signature().unwrap(), expected_addr);
-    assert_eq!(DecodedTransaction::Eip1559(stell_1559.clone()).verify_signature().unwrap(), expected_addr);
     assert_eq!(
-        DecodedTransaction::Eip1559(foreign_1559.clone()).verify_signature().unwrap_err(),
-        EvmError::ChainIdMismatch { expected: 5757, got: 1 }
+        DecodedTransaction::Eip1559(stell_1559.clone())
+            .verify_signature()
+            .unwrap(),
+        expected_addr
+    );
+    assert_eq!(
+        DecodedTransaction::Eip1559(foreign_1559.clone())
+            .verify_signature()
+            .unwrap_err(),
+        EvmError::ChainIdMismatch {
+            expected: 5757,
+            got: 1
+        }
     );
 }
 
@@ -3714,7 +4221,8 @@ fn test_evm_block_fixture(number_hex: &str, hash: &str, txs: BlockTransactions) 
     EvmBlock {
         number: Some(number_hex.to_string()),
         hash: Some(hash.to_string()),
-        parent_hash: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        parent_hash: "0x0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
         nonce: Some("0x0000000000000000".to_string()),
         sha3_uncles: EMPTY_UNCLES_HASH.to_string(),
         logs_bloom: Some(EMPTY_LOGS_BLOOM.to_string()),
@@ -3758,46 +4266,68 @@ fn test_eth_get_block_transaction_count_metamask_format() {
 
     // MetaMask: eth_getBlockTransactionCountByHash -> QUANTITY hex
     let res_hash = adapter
-        .dispatch("eth_getBlockTransactionCountByHash", &json!([block_hash.clone()]))
+        .dispatch(
+            "eth_getBlockTransactionCountByHash",
+            &json!([block_hash.clone()]),
+        )
         .unwrap();
     assert_eq!(res_hash, json!("0x2"));
 
     // MetaMask: eth_getBlockTransactionCountByNumber with tag and hex number
     assert_eq!(
-        adapter.dispatch("eth_getBlockTransactionCountByNumber", &json!(["latest"])).unwrap(),
+        adapter
+            .dispatch("eth_getBlockTransactionCountByNumber", &json!(["latest"]))
+            .unwrap(),
         json!("0x2")
     );
     assert_eq!(
-        adapter.dispatch("eth_getBlockTransactionCountByNumber", &json!(["0x5"])).unwrap(),
+        adapter
+            .dispatch("eth_getBlockTransactionCountByNumber", &json!(["0x5"]))
+            .unwrap(),
         json!("0x2")
     );
     assert_eq!(
-        adapter.dispatch("eth_getBlockTransactionCountByNumber", &json!([5])).unwrap(),
+        adapter
+            .dispatch("eth_getBlockTransactionCountByNumber", &json!([5]))
+            .unwrap(),
         json!("0x2")
     );
 
     // Unknown block -> null
     let fake = format!("0x{}", hex::encode([0x99u8; 32]));
     assert_eq!(
-        adapter.dispatch("eth_getBlockTransactionCountByHash", &json!([fake.clone()])).unwrap(),
+        adapter
+            .dispatch("eth_getBlockTransactionCountByHash", &json!([fake.clone()]))
+            .unwrap(),
         Value::Null
     );
     assert_eq!(
-        adapter.dispatch("eth_getBlockTransactionCountByNumber", &json!(["0x9999"])).unwrap(),
+        adapter
+            .dispatch("eth_getBlockTransactionCountByNumber", &json!(["0x9999"]))
+            .unwrap(),
         Value::Null
     );
 
     // Invalid params -> -32602
     assert_eq!(
-        adapter.dispatch("eth_getBlockTransactionCountByHash", &json!(["0x123"])).unwrap_err().code,
+        adapter
+            .dispatch("eth_getBlockTransactionCountByHash", &json!(["0x123"]))
+            .unwrap_err()
+            .code,
         INVALID_PARAMS_CODE
     );
     assert_eq!(
-        adapter.dispatch("eth_getBlockTransactionCountByNumber", &json!(["bogus"])).unwrap_err().code,
+        adapter
+            .dispatch("eth_getBlockTransactionCountByNumber", &json!(["bogus"]))
+            .unwrap_err()
+            .code,
         INVALID_PARAMS_CODE
     );
     assert_eq!(
-        adapter.dispatch("eth_getBlockTransactionCountByHash", &json!([])).unwrap_err().code,
+        adapter
+            .dispatch("eth_getBlockTransactionCountByHash", &json!([]))
+            .unwrap_err()
+            .code,
         INVALID_PARAMS_CODE
     );
 
@@ -3826,36 +4356,54 @@ fn test_eth_get_transaction_by_block_and_index_metamask_format() {
 
     // By hash + index
     let got0 = adapter
-        .dispatch("eth_getTransactionByBlockHashAndIndex", &json!([block_hash.clone(), "0x0"]))
+        .dispatch(
+            "eth_getTransactionByBlockHashAndIndex",
+            &json!([block_hash.clone(), "0x0"]),
+        )
         .unwrap();
     assert_eq!(got0["hash"], json!(tx0.hash));
     assert_eq!(got0["transactionIndex"], json!("0x0"));
 
     let got1 = adapter
-        .dispatch("eth_getTransactionByBlockHashAndIndex", &json!([block_hash.clone(), "0x1"]))
+        .dispatch(
+            "eth_getTransactionByBlockHashAndIndex",
+            &json!([block_hash.clone(), "0x1"]),
+        )
         .unwrap();
     assert_eq!(got1["hash"], json!(tx1.hash));
 
     // By number + index (hex tag, decimal number index)
     let got_num = adapter
-        .dispatch("eth_getTransactionByBlockNumberAndIndex", &json!(["0x9", "0x1"]))
+        .dispatch(
+            "eth_getTransactionByBlockNumberAndIndex",
+            &json!(["0x9", "0x1"]),
+        )
         .unwrap();
     assert_eq!(got_num["hash"], json!(tx1.hash));
     let got_num_dec = adapter
-        .dispatch("eth_getTransactionByBlockNumberAndIndex", &json!(["latest", 0]))
+        .dispatch(
+            "eth_getTransactionByBlockNumberAndIndex",
+            &json!(["latest", 0]),
+        )
         .unwrap();
     assert_eq!(got_num_dec["hash"], json!(tx0.hash));
 
     // Out of range -> null
     assert_eq!(
         adapter
-            .dispatch("eth_getTransactionByBlockHashAndIndex", &json!([block_hash.clone(), "0x2"]))
+            .dispatch(
+                "eth_getTransactionByBlockHashAndIndex",
+                &json!([block_hash.clone(), "0x2"])
+            )
             .unwrap(),
         Value::Null
     );
     assert_eq!(
         adapter
-            .dispatch("eth_getTransactionByBlockNumberAndIndex", &json!(["0x9", "0x2"]))
+            .dispatch(
+                "eth_getTransactionByBlockNumberAndIndex",
+                &json!(["0x9", "0x2"])
+            )
             .unwrap(),
         Value::Null
     );
@@ -3863,25 +4411,53 @@ fn test_eth_get_transaction_by_block_and_index_metamask_format() {
     // Unknown block -> null
     let fake = format!("0x{}", hex::encode([0xfeu8; 32]));
     assert_eq!(
-        adapter.dispatch("eth_getTransactionByBlockHashAndIndex", &json!([fake.clone(), "0x0"])).unwrap(),
+        adapter
+            .dispatch(
+                "eth_getTransactionByBlockHashAndIndex",
+                &json!([fake.clone(), "0x0"])
+            )
+            .unwrap(),
         Value::Null
     );
     assert_eq!(
-        adapter.dispatch("eth_getTransactionByBlockNumberAndIndex", &json!(["0x9999", "0x0"])).unwrap(),
+        adapter
+            .dispatch(
+                "eth_getTransactionByBlockNumberAndIndex",
+                &json!(["0x9999", "0x0"])
+            )
+            .unwrap(),
         Value::Null
     );
 
     // Invalid params -> -32602
     assert_eq!(
-        adapter.dispatch("eth_getTransactionByBlockHashAndIndex", &json!([block_hash.clone(), "0xzz"])).unwrap_err().code,
+        adapter
+            .dispatch(
+                "eth_getTransactionByBlockHashAndIndex",
+                &json!([block_hash.clone(), "0xzz"])
+            )
+            .unwrap_err()
+            .code,
         INVALID_PARAMS_CODE
     );
     assert_eq!(
-        adapter.dispatch("eth_getTransactionByBlockHashAndIndex", &json!(["0x123", "0x0"])).unwrap_err().code,
+        adapter
+            .dispatch(
+                "eth_getTransactionByBlockHashAndIndex",
+                &json!(["0x123", "0x0"])
+            )
+            .unwrap_err()
+            .code,
         INVALID_PARAMS_CODE
     );
     assert_eq!(
-        adapter.dispatch("eth_getTransactionByBlockNumberAndIndex", &json!(["bogus", "0x0"])).unwrap_err().code,
+        adapter
+            .dispatch(
+                "eth_getTransactionByBlockNumberAndIndex",
+                &json!(["bogus", "0x0"])
+            )
+            .unwrap_err()
+            .code,
         INVALID_PARAMS_CODE
     );
 
@@ -3902,55 +4478,88 @@ fn test_eth_get_uncle_metamask_format() {
 
     // Uncle count is always 0x0 for a known block
     assert_eq!(
-        adapter.dispatch("eth_getUncleCountByBlockHash", &json!([block_hash.clone()])).unwrap(),
+        adapter
+            .dispatch("eth_getUncleCountByBlockHash", &json!([block_hash.clone()]))
+            .unwrap(),
         json!("0x0")
     );
     assert_eq!(
-        adapter.dispatch("eth_getUncleCountByBlockNumber", &json!(["0x3"])).unwrap(),
+        adapter
+            .dispatch("eth_getUncleCountByBlockNumber", &json!(["0x3"]))
+            .unwrap(),
         json!("0x0")
     );
     assert_eq!(
-        adapter.dispatch("eth_getUncleCountByBlockNumber", &json!(["latest"])).unwrap(),
+        adapter
+            .dispatch("eth_getUncleCountByBlockNumber", &json!(["latest"]))
+            .unwrap(),
         json!("0x0")
     );
 
     // Uncle by index is always null
     assert_eq!(
-        adapter.dispatch("eth_getUncleByBlockHashAndIndex", &json!([block_hash.clone(), "0x0"])).unwrap(),
+        adapter
+            .dispatch(
+                "eth_getUncleByBlockHashAndIndex",
+                &json!([block_hash.clone(), "0x0"])
+            )
+            .unwrap(),
         Value::Null
     );
     assert_eq!(
-        adapter.dispatch("eth_getUncleByBlockNumberAndIndex", &json!(["0x3", "0x0"])).unwrap(),
+        adapter
+            .dispatch("eth_getUncleByBlockNumberAndIndex", &json!(["0x3", "0x0"]))
+            .unwrap(),
         Value::Null
     );
 
     // Unknown block -> null (count and uncle)
     let fake = format!("0x{}", hex::encode([0xfdu8; 32]));
     assert_eq!(
-        adapter.dispatch("eth_getUncleCountByBlockHash", &json!([fake.clone()])).unwrap(),
+        adapter
+            .dispatch("eth_getUncleCountByBlockHash", &json!([fake.clone()]))
+            .unwrap(),
         Value::Null
     );
     assert_eq!(
-        adapter.dispatch("eth_getUncleCountByBlockNumber", &json!(["0x9999"])).unwrap(),
+        adapter
+            .dispatch("eth_getUncleCountByBlockNumber", &json!(["0x9999"]))
+            .unwrap(),
         Value::Null
     );
     assert_eq!(
-        adapter.dispatch("eth_getUncleByBlockHashAndIndex", &json!([fake.clone(), "0x0"])).unwrap(),
+        adapter
+            .dispatch(
+                "eth_getUncleByBlockHashAndIndex",
+                &json!([fake.clone(), "0x0"])
+            )
+            .unwrap(),
         Value::Null
     );
 
     // Invalid params -> -32602
     assert_eq!(
-        adapter.dispatch("eth_getUncleCountByBlockHash", &json!(["0x123"])).unwrap_err().code,
+        adapter
+            .dispatch("eth_getUncleCountByBlockHash", &json!(["0x123"]))
+            .unwrap_err()
+            .code,
         INVALID_PARAMS_CODE
     );
     assert_eq!(
-        adapter.dispatch("eth_getUncleByBlockHashAndIndex", &json!([block_hash.clone(), "nope"])).unwrap_err().code,
+        adapter
+            .dispatch(
+                "eth_getUncleByBlockHashAndIndex",
+                &json!([block_hash.clone(), "nope"])
+            )
+            .unwrap_err()
+            .code,
         INVALID_PARAMS_CODE
     );
 
     // Raw JSON-RPC MetaMask format
-    let raw_count = r#"{"jsonrpc":"2.0","method":"eth_getUncleCountByBlockNumber","params":["0x3"],"id":11}"#.to_string();
+    let raw_count =
+        r#"{"jsonrpc":"2.0","method":"eth_getUncleCountByBlockNumber","params":["0x3"],"id":11}"#
+            .to_string();
     let resp_raw = adapter.handle_raw_json(&raw_count);
     let resp: JsonRpcResponse<String> = serde_json::from_str(&resp_raw).unwrap();
     assert_eq!(resp.id, json!(11));
@@ -3977,39 +4586,111 @@ async fn test_rpc_dispatch_block_tx_uncle_metamask_flow() {
     let tx = test_signed_tx(&key, to, 1_000_000_000, 21_000, 0);
     let tx_hash_hex = stell_hash_to_evm(&tx.compute_tx_hash());
     let head_hash_hex = stell_hash_to_evm(&head_hash);
-    st.record_receipts(10, head_hash, std::slice::from_ref(&tx), &[true], &[21_000]).await;
+    st.record_receipts(10, head_hash, std::slice::from_ref(&tx), &[true], &[21_000])
+        .await;
 
     // Block tx counts via rpc.rs dispatch
-    assert_eq!(st.call("eth_getBlockTransactionCountByNumber", json!(["latest"])).await, json!("0x1"));
-    assert_eq!(st.call("eth_getBlockTransactionCountByNumber", json!(["0xa"])).await, json!("0x1"));
-    assert_eq!(st.call("eth_getBlockTransactionCountByHash", json!([head_hash_hex.clone()])).await, json!("0x1"));
-    assert_eq!(st.call("eth_getBlockTransactionCountByNumber", json!(["0x0"])).await, json!("0x0"));
+    assert_eq!(
+        st.call("eth_getBlockTransactionCountByNumber", json!(["latest"]))
+            .await,
+        json!("0x1")
+    );
+    assert_eq!(
+        st.call("eth_getBlockTransactionCountByNumber", json!(["0xa"]))
+            .await,
+        json!("0x1")
+    );
+    assert_eq!(
+        st.call(
+            "eth_getBlockTransactionCountByHash",
+            json!([head_hash_hex.clone()])
+        )
+        .await,
+        json!("0x1")
+    );
+    assert_eq!(
+        st.call("eth_getBlockTransactionCountByNumber", json!(["0x0"]))
+            .await,
+        json!("0x0")
+    );
 
     // Tx by block+index via rpc.rs dispatch
-    let by_num = st.call("eth_getTransactionByBlockNumberAndIndex", json!(["latest", "0x0"])).await;
+    let by_num = st
+        .call(
+            "eth_getTransactionByBlockNumberAndIndex",
+            json!(["latest", "0x0"]),
+        )
+        .await;
     assert_eq!(by_num["hash"], json!(tx_hash_hex.clone()));
     assert_eq!(by_num["blockNumber"], json!("0xa"));
     assert_eq!(by_num["transactionIndex"], json!("0x0"));
-    let by_hash = st.call("eth_getTransactionByBlockHashAndIndex", json!([head_hash_hex.clone(), "0x0"])).await;
+    let by_hash = st
+        .call(
+            "eth_getTransactionByBlockHashAndIndex",
+            json!([head_hash_hex.clone(), "0x0"]),
+        )
+        .await;
     assert_eq!(by_hash["hash"], json!(tx_hash_hex.clone()));
 
     // Out of range / missing -> null
     assert_eq!(
-        st.call("eth_getTransactionByBlockNumberAndIndex", json!(["latest", "0x1"])).await,
+        st.call(
+            "eth_getTransactionByBlockNumberAndIndex",
+            json!(["latest", "0x1"])
+        )
+        .await,
         Value::Null
     );
     let fake = format!("0x{}", hex::encode([0x99u8; 32]));
-    assert_eq!(st.call("eth_getBlockTransactionCountByHash", json!([fake.clone()])).await, Value::Null);
-    assert_eq!(st.call("eth_getTransactionByBlockHashAndIndex", json!([fake.clone(), "0x0"])).await, Value::Null);
+    assert_eq!(
+        st.call("eth_getBlockTransactionCountByHash", json!([fake.clone()]))
+            .await,
+        Value::Null
+    );
+    assert_eq!(
+        st.call(
+            "eth_getTransactionByBlockHashAndIndex",
+            json!([fake.clone(), "0x0"])
+        )
+        .await,
+        Value::Null
+    );
 
     // Uncles via rpc.rs dispatch: counts 0x0, bodies null
-    assert_eq!(st.call("eth_getUncleCountByBlockNumber", json!(["latest"])).await, json!("0x0"));
-    assert_eq!(st.call("eth_getUncleCountByBlockHash", json!([head_hash_hex.clone()])).await, json!("0x0"));
-    assert_eq!(st.call("eth_getUncleByBlockNumberAndIndex", json!(["latest", "0x0"])).await, Value::Null);
-    assert_eq!(st.call("eth_getUncleByBlockHashAndIndex", json!([head_hash_hex.clone(), "0x0"])).await, Value::Null);
+    assert_eq!(
+        st.call("eth_getUncleCountByBlockNumber", json!(["latest"]))
+            .await,
+        json!("0x0")
+    );
+    assert_eq!(
+        st.call(
+            "eth_getUncleCountByBlockHash",
+            json!([head_hash_hex.clone()])
+        )
+        .await,
+        json!("0x0")
+    );
+    assert_eq!(
+        st.call(
+            "eth_getUncleByBlockNumberAndIndex",
+            json!(["latest", "0x0"])
+        )
+        .await,
+        Value::Null
+    );
+    assert_eq!(
+        st.call(
+            "eth_getUncleByBlockHashAndIndex",
+            json!([head_hash_hex.clone(), "0x0"])
+        )
+        .await,
+        Value::Null
+    );
 
     // Errors surface as {"error": ...} through RpcState::call helper
-    let bad = st.call("eth_getBlockTransactionCountByHash", json!(["0x123"])).await;
+    let bad = st
+        .call("eth_getBlockTransactionCountByHash", json!(["0x123"]))
+        .await;
     assert!(bad.get("error").is_some());
 }
 
@@ -4033,17 +4714,21 @@ fn sign_eip1559_intent_low_s(
     if !stellereum::evm_adapter::is_low_s(&s) {
         // N - s, flip parity (same rule as build_secp_settlement_tx).
         const N: [u8; 32] = [
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
-            0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b,
-            0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
+            0xd0, 0x36, 0x41, 0x41,
         ];
         let mut out = [0u8; 32];
         let mut borrow: i32 = 0;
         for i in (0..32).rev() {
             let v = N[i] as i32 - s[i] as i32 - borrow;
-            if v < 0 { out[i] = (v + 256) as u8; borrow = 1; }
-            else { out[i] = v as u8; borrow = 0; }
+            if v < 0 {
+                out[i] = (v + 256) as u8;
+                borrow = 1;
+            } else {
+                out[i] = v as u8;
+                borrow = 0;
+            }
         }
         s = out;
         parity ^= 1;
@@ -4057,7 +4742,8 @@ fn sign_eip1559_intent_low_s(
 /// Build a valid signed EIP-1559 raw for CHAIN_ID 5757 with a unique nonce.
 fn build_signed_eip1559_raw(nonce: u64, to20: [u8; 20]) -> (String, String) {
     use stellereum::evm_adapter::Eip1559Transaction;
-    let privkey = hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
+    let privkey =
+        hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
     let key = k256::ecdsa::SigningKey::from_slice(&privkey).unwrap();
     let mut tx = Eip1559Transaction {
         chain_id: CHAIN_ID,
@@ -4077,7 +4763,10 @@ fn build_signed_eip1559_raw(nonce: u64, to20: [u8; 20]) -> (String, String) {
     sign_eip1559_intent_low_s(&mut tx, &key);
     let raw = tx.encode();
     let raw_hex = format!("0x{}", hex::encode(&raw));
-    let hash_hex = format!("0x{}", hex::encode(stellereum::evm_adapter::keccak256(&raw)));
+    let hash_hex = format!(
+        "0x{}",
+        hex::encode(stellereum::evm_adapter::keccak256(&raw))
+    );
     (raw_hex, hash_hex)
 }
 
@@ -4096,22 +4785,39 @@ async fn test_evm_pending_to_mined_receipt_via_secp() {
     assert_eq!(pending.block_hash, None);
 
     let st = test_rpc_state_with_height(41).await;
-    assert!(st.eth_get_transaction_receipt(&evm_hash).await.unwrap().is_none());
+    assert!(st
+        .eth_get_transaction_receipt(&evm_hash)
+        .await
+        .unwrap()
+        .is_none());
     // Pending view via RpcState has no block binding yet.
-    let pending_view = st.eth_get_transaction_by_hash(&evm_hash).await.unwrap().expect("pending intent");
+    let pending_view = st
+        .eth_get_transaction_by_hash(&evm_hash)
+        .await
+        .unwrap()
+        .expect("pending intent");
     assert_eq!(pending_view.block_number, None);
 
     // 2. Finalize the SAME EVM hash via a secp envelope (same secp key).
-    let privkey = hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
+    let privkey =
+        hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
     let secp_key = k256::ecdsa::SigningKey::from_slice(&privkey).unwrap();
-    let stell_tx = evm::build_secp_settlement_tx(&secp_key, &evm_hash, [0xAA; 32], 0, 21_000, 0).unwrap();
+    let stell_tx =
+        evm::build_secp_settlement_tx(&secp_key, &evm_hash, [0xAA; 32], 0, 21_000, 0).unwrap();
     assert!(evm::is_secp_settlement_tx(&stell_tx));
     assert!(evm::verify_secp_settlement(&stell_tx).is_ok());
     let stell_hash = stell_tx.compute_tx_hash();
 
     let block_hash = [0x5Eu8; 32];
     st.record_block(42, block_hash, 1, 1_700_000_100).await;
-    st.record_receipts(42, block_hash, std::slice::from_ref(&stell_tx), &[true], &[21_000]).await;
+    st.record_receipts(
+        42,
+        block_hash,
+        std::slice::from_ref(&stell_tx),
+        &[true],
+        &[21_000],
+    )
+    .await;
 
     // 3. Bidirectional mapping works.
     assert_eq!(evm::evm_to_stell_hash(&evm_hash).unwrap(), stell_hash);
@@ -4121,8 +4827,15 @@ async fn test_evm_pending_to_mined_receipt_via_secp() {
     );
 
     // 4. eth_getTransactionReceipt by EVM hash: full receipt, not null.
-    let receipt = st.eth_get_transaction_receipt(&evm_hash).await.unwrap().expect("settled receipt");
-    assert_eq!(receipt.transaction_hash.to_lowercase(), evm_hash.to_lowercase());
+    let receipt = st
+        .eth_get_transaction_receipt(&evm_hash)
+        .await
+        .unwrap()
+        .expect("settled receipt");
+    assert_eq!(
+        receipt.transaction_hash.to_lowercase(),
+        evm_hash.to_lowercase()
+    );
     assert_eq!(receipt.status, Some("0x1".to_string()));
     assert_eq!(receipt.block_number, "0x2a"); // 42
     assert_eq!(receipt.block_hash, evm::stell_hash_to_evm(&block_hash));
@@ -4130,7 +4843,11 @@ async fn test_evm_pending_to_mined_receipt_via_secp() {
     assert!(!receipt.cumulative_gas_used.is_empty());
 
     // 5. eth_getTransactionByHash by EVM hash: mined view wins over pending.
-    let mined = st.eth_get_transaction_by_hash(&evm_hash).await.unwrap().expect("mined tx");
+    let mined = st
+        .eth_get_transaction_by_hash(&evm_hash)
+        .await
+        .unwrap()
+        .expect("mined tx");
     assert_eq!(mined.hash.to_lowercase(), evm_hash.to_lowercase());
     assert_eq!(mined.block_number, Some("0x2a".to_string()));
     assert!(mined.block_hash.is_some());
@@ -4152,10 +4869,12 @@ async fn test_evm_settlement_mapping_both_directions_and_rejects_bad_envelope() 
     let submitted = evm::eth_send_raw_transaction(&json!([raw_hex])).unwrap();
     assert_eq!(submitted.to_lowercase(), evm_hash.to_lowercase());
 
-    let privkey = hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
+    let privkey =
+        hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
     let secp_key = k256::ecdsa::SigningKey::from_slice(&privkey).unwrap();
     // Unique stell nonce per test -> unique stell hash.
-    let stell_tx = evm::build_secp_settlement_tx(&secp_key, &evm_hash, [0xBB; 32], 0, 21_000, 77).unwrap();
+    let stell_tx =
+        evm::build_secp_settlement_tx(&secp_key, &evm_hash, [0xBB; 32], 0, 21_000, 77).unwrap();
     let stell_hash = stell_tx.compute_tx_hash();
 
     // Tampered envelope must NOT link (fail-closed).
@@ -4174,7 +4893,10 @@ async fn test_evm_settlement_mapping_both_directions_and_rejects_bad_envelope() 
     assert_eq!(linked_evm.to_lowercase(), evm_hash.to_lowercase());
     assert_eq!(linked_stell, stell_hash);
     assert_eq!(evm::evm_to_stell_hash(&evm_hash).unwrap(), stell_hash);
-    assert_eq!(evm::stell_to_evm_hash(&stell_hash).unwrap().to_lowercase(), evm_hash.to_lowercase());
+    assert_eq!(
+        evm::stell_to_evm_hash(&stell_hash).unwrap().to_lowercase(),
+        evm_hash.to_lowercase()
+    );
 
     // Unknown hashes resolve to None in both directions.
     let unknown = format!("0x{}", hex::encode([0xF0u8; 32]));
@@ -4185,11 +4907,26 @@ async fn test_evm_settlement_mapping_both_directions_and_rejects_bad_envelope() 
     let st = test_rpc_state_with_height(43).await;
     let block_hash = [0x6Au8; 32];
     st.record_block(43, block_hash, 1, 1_700_000_200).await;
-    st.record_receipts(43, block_hash, std::slice::from_ref(&stell_tx), &[true], &[21_000]).await;
-    let r = st.eth_get_transaction_receipt(&evm_hash).await.unwrap().unwrap();
+    st.record_receipts(
+        43,
+        block_hash,
+        std::slice::from_ref(&stell_tx),
+        &[true],
+        &[21_000],
+    )
+    .await;
+    let r = st
+        .eth_get_transaction_receipt(&evm_hash)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(r.transaction_hash.to_lowercase(), evm_hash.to_lowercase());
     assert_eq!(r.status, Some("0x1".to_string()));
-    let t = st.eth_get_transaction_by_hash(&evm_hash).await.unwrap().unwrap();
+    let t = st
+        .eth_get_transaction_by_hash(&evm_hash)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(t.hash.to_lowercase(), evm_hash.to_lowercase());
     assert!(t.block_number.is_some());
 }
@@ -4199,9 +4936,11 @@ fn test_evm_adapter_global_settled_lookup() {
     use stellereum::evm_adapter as evm;
     let (raw_hex, evm_hash) = build_signed_eip1559_raw(9003, [0x79; 20]);
     let _ = evm::eth_send_raw_transaction(&json!([raw_hex])).unwrap();
-    let privkey = hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
+    let privkey =
+        hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap();
     let secp_key = k256::ecdsa::SigningKey::from_slice(&privkey).unwrap();
-    let stell_tx = evm::build_secp_settlement_tx(&secp_key, &evm_hash, [0xCC; 32], 0, 21_000, 78).unwrap();
+    let stell_tx =
+        evm::build_secp_settlement_tx(&secp_key, &evm_hash, [0xCC; 32], 0, 21_000, 78).unwrap();
     let stell_hash = stell_tx.compute_tx_hash();
     evm::link_secp_settlement(&stell_tx);
 
@@ -4223,12 +4962,18 @@ fn test_evm_adapter_global_settled_lookup() {
         contract_address: None,
     };
     adapter.insert_stell_receipt(&stell_receipt);
-    let got = adapter.eth_get_transaction_receipt(&evm_hash).unwrap().expect("global settled receipt");
+    let got = adapter
+        .eth_get_transaction_receipt(&evm_hash)
+        .unwrap()
+        .expect("global settled receipt");
     assert_eq!(got.transaction_hash.to_lowercase(), evm_hash.to_lowercase());
     assert_eq!(got.status, Some("0x1".to_string()));
     assert_eq!(got.block_number, "0x7");
     assert_eq!(got.gas_used, "0x5208");
-    let got_tx = adapter.eth_get_transaction_by_hash(&evm_hash).unwrap().expect("global settled tx");
+    let got_tx = adapter
+        .eth_get_transaction_by_hash(&evm_hash)
+        .unwrap()
+        .expect("global settled tx");
     assert_eq!(got_tx.hash.to_lowercase(), evm_hash.to_lowercase());
 }
 
@@ -4236,7 +4981,13 @@ fn test_evm_adapter_global_settled_lookup() {
 // eth_getLogs (global + adapter + RPC) & eth_getStorageAt (empty storage)
 // ============================================================================
 
-fn test_log_fixture(addr: &str, topics: Vec<String>, block: &str, tx: &str, log_idx: &str) -> EvmLog {
+fn test_log_fixture(
+    addr: &str,
+    topics: Vec<String>,
+    block: &str,
+    tx: &str,
+    log_idx: &str,
+) -> EvmLog {
     EvmLog {
         address: addr.to_string(),
         topics,
@@ -4255,7 +5006,10 @@ fn test_receipt_fixture(tx_byte: u8, logs: Vec<EvmLog>) -> EvmReceipt {
         transaction_hash: format!("0x{}", hex::encode([tx_byte; 32])),
         transaction_index: "0x0".to_string(),
         block_hash: format!("0x{}", hex::encode([0xabu8; 32])),
-        block_number: logs.first().and_then(|l| l.block_number.clone()).unwrap_or_else(|| "0x1".to_string()),
+        block_number: logs
+            .first()
+            .and_then(|l| l.block_number.clone())
+            .unwrap_or_else(|| "0x1".to_string()),
         from: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         to: Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
         cumulative_gas_used: "0x5208".to_string(),
@@ -4285,13 +5039,23 @@ fn test_eth_get_logs_filtering_address_topics_blocks_and_limit() {
     let tx1 = format!("0x{}", hex::encode([0x11u8; 32]));
 
     let mut adapter = EvmAdapter::new();
-    adapter.insert_receipt(test_receipt_fixture(0x10, vec![
-        test_log_fixture(addr_a, vec![topic_t0.to_string()], "0x5", &tx0, "0x0"),
-        test_log_fixture(addr_a, vec![topic_t1.to_string()], "0x6", &tx0, "0x1"),
-    ]));
-    adapter.insert_receipt(test_receipt_fixture(0x11, vec![
-        test_log_fixture(addr_b, vec![topic_t0.to_string()], "0x7", &tx1, "0x0"),
-    ]));
+    adapter.insert_receipt(test_receipt_fixture(
+        0x10,
+        vec![
+            test_log_fixture(addr_a, vec![topic_t0.to_string()], "0x5", &tx0, "0x0"),
+            test_log_fixture(addr_a, vec![topic_t1.to_string()], "0x6", &tx0, "0x1"),
+        ],
+    ));
+    adapter.insert_receipt(test_receipt_fixture(
+        0x11,
+        vec![test_log_fixture(
+            addr_b,
+            vec![topic_t0.to_string()],
+            "0x7",
+            &tx1,
+            "0x0",
+        )],
+    ));
 
     // 1. Empty filter returns all 3 logs, deterministically ordered by block.
     let all = adapter.eth_get_logs(&json!([{}])).unwrap();
@@ -4302,31 +5066,60 @@ fn test_eth_get_logs_filtering_address_topics_blocks_and_limit() {
     assert_eq!(arr[2]["blockNumber"], json!("0x7"));
 
     // 2. Address filter (single + multi).
-    let by_a = adapter.eth_get_logs(&json!([{ "address": addr_a }])).unwrap();
+    let by_a = adapter
+        .eth_get_logs(&json!([{ "address": addr_a }]))
+        .unwrap();
     assert_eq!(by_a.as_array().unwrap().len(), 2);
-    let by_multi = adapter.eth_get_logs(&json!([{ "address": [addr_a, addr_b] }])).unwrap();
+    let by_multi = adapter
+        .eth_get_logs(&json!([{ "address": [addr_a, addr_b] }]))
+        .unwrap();
     assert_eq!(by_multi.as_array().unwrap().len(), 3);
-    let by_b = adapter.eth_get_logs(&json!([{ "address": addr_b }])).unwrap();
+    let by_b = adapter
+        .eth_get_logs(&json!([{ "address": addr_b }]))
+        .unwrap();
     assert_eq!(by_b.as_array().unwrap().len(), 1);
 
     // 3. Topics filter.
-    let by_t0 = adapter.eth_get_logs(&json!([{ "topics": [topic_t0] }])).unwrap();
+    let by_t0 = adapter
+        .eth_get_logs(&json!([{ "topics": [topic_t0] }]))
+        .unwrap();
     assert_eq!(by_t0.as_array().unwrap().len(), 2);
-    let by_t1 = adapter.eth_get_logs(&json!([{ "topics": [topic_t1] }])).unwrap();
+    let by_t1 = adapter
+        .eth_get_logs(&json!([{ "topics": [topic_t1] }]))
+        .unwrap();
     assert_eq!(by_t1.as_array().unwrap().len(), 1);
 
     // 4. Block range filter.
-    let ranged = adapter.eth_get_logs(&json!([{ "fromBlock": "0x6", "toBlock": "0x7" }])).unwrap();
+    let ranged = adapter
+        .eth_get_logs(&json!([{ "fromBlock": "0x6", "toBlock": "0x7" }]))
+        .unwrap();
     assert_eq!(ranged.as_array().unwrap().len(), 2);
-    let from_only = adapter.eth_get_logs(&json!([{ "fromBlock": "0x7" }])).unwrap();
+    let from_only = adapter
+        .eth_get_logs(&json!([{ "fromBlock": "0x7" }]))
+        .unwrap();
     assert_eq!(from_only.as_array().unwrap().len(), 1);
-    let to_only = adapter.eth_get_logs(&json!([{ "toBlock": "0x5" }])).unwrap();
+    let to_only = adapter
+        .eth_get_logs(&json!([{ "toBlock": "0x5" }]))
+        .unwrap();
     assert_eq!(to_only.as_array().unwrap().len(), 1);
 
     // 5. Combined filter + dispatch wiring (both method spellings hit the same handler).
-    let combo = adapter.dispatch("eth_getLogs", &json!([{ "address": addr_a, "topics": [topic_t0] }])).unwrap();
+    let combo = adapter
+        .dispatch(
+            "eth_getLogs",
+            &json!([{ "address": addr_a, "topics": [topic_t0] }]),
+        )
+        .unwrap();
     assert_eq!(combo.as_array().unwrap().len(), 1);
-    assert_eq!(adapter.eth_getLogs(&json!([{ "address": addr_a }])).unwrap().as_array().unwrap().len(), 2);
+    assert_eq!(
+        adapter
+            .eth_getLogs(&json!([{ "address": addr_a }]))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     // Global free-function aliases resolve (empty global may or may not contain our instance logs;
     // here we only assert the call shape is an array, instance-level asserts above pin the logic).
     assert!(evm::eth_get_logs(&json!([{}])).unwrap().is_array());
@@ -4362,38 +5155,107 @@ fn test_eth_get_storage_at_always_empty_but_validated() {
 
     // 1. Valid positional params return empty slot (all tags accepted, tag is validated only).
     for tag in ["latest", "earliest", "pending", "finalized", "safe", "0x1"] {
-        let got = adapter.eth_get_storage_at(&json!([addr, "0x0", tag])).unwrap();
+        let got = adapter
+            .eth_get_storage_at(&json!([addr, "0x0", tag]))
+            .unwrap();
         assert_eq!(got, empty);
     }
     // Without tag defaults to latest.
-    assert_eq!(adapter.eth_get_storage_at(&json!([addr, "0x01"])).unwrap(), empty);
+    assert_eq!(
+        adapter.eth_get_storage_at(&json!([addr, "0x01"])).unwrap(),
+        empty
+    );
     // Object form.
     assert_eq!(
-        adapter.eth_get_storage_at(&json!({ "address": addr, "position": "0x00", "blockTag": "latest" })).unwrap(),
+        adapter
+            .eth_get_storage_at(
+                &json!({ "address": addr, "position": "0x00", "blockTag": "latest" })
+            )
+            .unwrap(),
         empty
     );
     // Typed direct helper + camelCase aliases.
-    assert_eq!(adapter.eth_get_storage_at_direct(addr, "0x0", "latest").unwrap(), empty);
-    assert_eq!(adapter.eth_getStorageAt(&json!([addr, "0x0", "latest"])).unwrap(), empty);
-    assert_eq!(evm::eth_get_storage_at(&json!([addr, "0x0", "latest"])).unwrap(), empty);
-    assert_eq!(evm::eth_getStorageAt(&json!([addr, "0x0", "latest"])).unwrap(), empty);
+    assert_eq!(
+        adapter
+            .eth_get_storage_at_direct(addr, "0x0", "latest")
+            .unwrap(),
+        empty
+    );
+    assert_eq!(
+        adapter
+            .eth_getStorageAt(&json!([addr, "0x0", "latest"]))
+            .unwrap(),
+        empty
+    );
+    assert_eq!(
+        evm::eth_get_storage_at(&json!([addr, "0x0", "latest"])).unwrap(),
+        empty
+    );
+    assert_eq!(
+        evm::eth_getStorageAt(&json!([addr, "0x0", "latest"])).unwrap(),
+        empty
+    );
 
     // 2. Dispatch wiring.
-    assert_eq!(adapter.dispatch("eth_getStorageAt", &json!([addr, "0x0", "latest"])).unwrap(), json!(empty));
+    assert_eq!(
+        adapter
+            .dispatch("eth_getStorageAt", &json!([addr, "0x0", "latest"]))
+            .unwrap(),
+        json!(empty)
+    );
 
     // 3. Raw JSON-RPC shape.
-    let raw = format!(r#"{{"jsonrpc":"2.0","method":"eth_getStorageAt","params":["{addr}","0x0","latest"],"id":9}}"#);
+    let raw = format!(
+        r#"{{"jsonrpc":"2.0","method":"eth_getStorageAt","params":["{addr}","0x0","latest"],"id":9}}"#
+    );
     let resp_raw = adapter.handle_raw_json(&raw);
     let resp: JsonRpcResponse<String> = serde_json::from_str(&resp_raw).unwrap();
     assert_eq!(resp.id, json!(9));
     assert_eq!(resp.result.unwrap(), empty);
 
     // 4. Validation: bad address / position / tag -> -32602, never a fabricated value.
-    assert_eq!(adapter.dispatch("eth_getStorageAt", &json!(["0xbad", "0x0", "latest"])).unwrap_err().code, INVALID_PARAMS_CODE);
-    assert_eq!(adapter.dispatch("eth_getStorageAt", &json!([addr, "0x123456789012345678901234567890123456789012345678901234567890123456789", "latest"])).unwrap_err().code, INVALID_PARAMS_CODE);
-    assert_eq!(adapter.dispatch("eth_getStorageAt", &json!([addr, "nothex", "latest"])).unwrap_err().code, INVALID_PARAMS_CODE);
-    assert_eq!(adapter.dispatch("eth_getStorageAt", &json!([addr, "0x0", "bogus"])).unwrap_err().code, INVALID_PARAMS_CODE);
-    assert_eq!(adapter.dispatch("eth_getStorageAt", &json!([])).unwrap_err().code, INVALID_PARAMS_CODE);
+    assert_eq!(
+        adapter
+            .dispatch("eth_getStorageAt", &json!(["0xbad", "0x0", "latest"]))
+            .unwrap_err()
+            .code,
+        INVALID_PARAMS_CODE
+    );
+    assert_eq!(
+        adapter
+            .dispatch(
+                "eth_getStorageAt",
+                &json!([
+                    addr,
+                    "0x123456789012345678901234567890123456789012345678901234567890123456789",
+                    "latest"
+                ])
+            )
+            .unwrap_err()
+            .code,
+        INVALID_PARAMS_CODE
+    );
+    assert_eq!(
+        adapter
+            .dispatch("eth_getStorageAt", &json!([addr, "nothex", "latest"]))
+            .unwrap_err()
+            .code,
+        INVALID_PARAMS_CODE
+    );
+    assert_eq!(
+        adapter
+            .dispatch("eth_getStorageAt", &json!([addr, "0x0", "bogus"]))
+            .unwrap_err()
+            .code,
+        INVALID_PARAMS_CODE
+    );
+    assert_eq!(
+        adapter
+            .dispatch("eth_getStorageAt", &json!([]))
+            .unwrap_err()
+            .code,
+        INVALID_PARAMS_CODE
+    );
 }
 
 #[tokio::test]
@@ -4404,30 +5266,60 @@ async fn test_eth_get_logs_and_storage_via_rpc_layer() {
     // Honest emptiness on a fresh node: isolated address filter matches nothing
     // (Stell receipts carry no logs; global logs from other tests use other addresses).
     let isolated = "0xcccccccccccccccccccccccccccccccccccccccc";
-    let empty_logs = st.call("eth_getLogs", json!([{ "address": isolated }])).await;
+    let empty_logs = st
+        .call("eth_getLogs", json!([{ "address": isolated }]))
+        .await;
     assert_eq!(empty_logs, json!([]));
 
     // Storage via RPC dispatch returns the empty slot.
     let addr = "0x407d73d8a49eeb85d32cf465507dd71d507100c1";
-    let stored = st.call("eth_getStorageAt", json!([addr, "0x0", "latest"])).await;
+    let stored = st
+        .call("eth_getStorageAt", json!([addr, "0x0", "latest"]))
+        .await;
     assert_eq!(stored, json!(evm::EMPTY_STORAGE_VALUE_HEX));
 
     // Direct RpcState methods (both casings) agree.
-    assert_eq!(st.eth_get_logs(&json!([{ "address": isolated }])).await.unwrap(), json!([]));
-    assert_eq!(st.eth_getLogs(&json!([{ "address": isolated }])).await.unwrap(), json!([]));
-    assert_eq!(st.eth_get_storage_at(&json!([addr, "0x0", "latest"])).await.unwrap(), evm::EMPTY_STORAGE_VALUE_HEX);
-    assert_eq!(st.eth_getStorageAt(&json!([addr, "0x0", "latest"])).await.unwrap(), evm::EMPTY_STORAGE_VALUE_HEX);
+    assert_eq!(
+        st.eth_get_logs(&json!([{ "address": isolated }]))
+            .await
+            .unwrap(),
+        json!([])
+    );
+    assert_eq!(
+        st.eth_getLogs(&json!([{ "address": isolated }]))
+            .await
+            .unwrap(),
+        json!([])
+    );
+    assert_eq!(
+        st.eth_get_storage_at(&json!([addr, "0x0", "latest"]))
+            .await
+            .unwrap(),
+        evm::EMPTY_STORAGE_VALUE_HEX
+    );
+    assert_eq!(
+        st.eth_getStorageAt(&json!([addr, "0x0", "latest"]))
+            .await
+            .unwrap(),
+        evm::EMPTY_STORAGE_VALUE_HEX
+    );
 
     // dispatch_with_state merges the same way (isolated filter -> []).
     let adapter = EvmAdapter::new();
-    let via_state = adapter.dispatch_with_state(&st, "eth_getLogs", &json!([{ "address": isolated }])).await.unwrap();
+    let via_state = adapter
+        .dispatch_with_state(&st, "eth_getLogs", &json!([{ "address": isolated }]))
+        .await
+        .unwrap();
     assert_eq!(via_state, json!([]));
-    let stored_state = adapter.dispatch_with_state(&st, "eth_getStorageAt", &json!([addr, "0x0", "latest"])).await.unwrap();
+    let stored_state = adapter
+        .dispatch_with_state(&st, "eth_getStorageAt", &json!([addr, "0x0", "latest"]))
+        .await
+        .unwrap();
     assert_eq!(stored_state, json!(evm::EMPTY_STORAGE_VALUE_HEX));
 
     // RPC-level errors surface as {"error": ...} through the call helper.
-    let bad = st.call("eth_getStorageAt", json!(["0xbad", "0x0", "latest"])).await;
+    let bad = st
+        .call("eth_getStorageAt", json!(["0xbad", "0x0", "latest"]))
+        .await;
     assert!(bad.get("error").is_some());
 }
-
-

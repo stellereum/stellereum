@@ -24,11 +24,17 @@ use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 const N: usize = 4; // 4 validators at power 1 => quorum is 3
 
 fn keys() -> Vec<SigningKey> {
-    (0..N).map(|i| SigningKey::from_bytes(&[i as u8 + 1; 32])).collect()
+    (0..N)
+        .map(|i| SigningKey::from_bytes(&[i as u8 + 1; 32]))
+        .collect()
 }
 
 fn validators(keys: &[SigningKey]) -> ValidatorSet {
-    ValidatorSet::from_list(keys.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect())
+    ValidatorSet::from_list(
+        keys.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    )
 }
 
 fn hash_of(n: u8) -> BlockHash {
@@ -48,13 +54,23 @@ fn cert(signers: &[SigningKey], height: u64, kind: VoteKind, hash: BlockHash) ->
             (v.voter, v.signature)
         })
         .collect();
-    QuorumCertificate { height, round: 0, kind, block_hash: Some(hash), signatures }
+    QuorumCertificate {
+        height,
+        round: 0,
+        kind,
+        block_hash: Some(hash),
+        signatures,
+    }
 }
 
 /// A certificate that is genuinely signed for `signed_height` but whose
 /// `height` field claims something else — i.e. one whose height was rewritten
 /// after the fact.
-fn relabelled(signers: &[SigningKey], signed_height: u64, claimed_height: u64) -> QuorumCertificate {
+fn relabelled(
+    signers: &[SigningKey],
+    signed_height: u64,
+    claimed_height: u64,
+) -> QuorumCertificate {
     let mut c = cert(signers, signed_height, VoteKind::Precommit, hash_of(9));
     c.height = claimed_height;
     c
@@ -129,7 +145,7 @@ impl Fixture {
                 mmr_epoch_root: [0u8; 32],
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
-};
+            };
             // 3 of 4 signatures: a genuine power quorum, so these headers also
             // satisfy the block-level quorum check.
             for k in keys.iter().take(3) {
@@ -139,7 +155,16 @@ impl Fixture {
             blocks.push(b);
         }
 
-        Fixture { keys, validators, trie, state_root: trie_root, blocks, alice, bob, token }
+        Fixture {
+            keys,
+            validators,
+            trie,
+            state_root: trie_root,
+            blocks,
+            alice,
+            bob,
+            token,
+        }
     }
 
     /// The light header for `blocks[i]`, with the real precommit QC and the real
@@ -195,7 +220,9 @@ impl Fixture {
 
     fn token_proof(&self, acct: &[u8; 32]) -> MerkleProof {
         let key = stellereum::state_engine::token_balance_key(&self.token, acct);
-        self.trie.generate_merkle_proof(&key).expect("token balance is in the trie")
+        self.trie
+            .generate_merkle_proof(&key)
+            .expect("token balance is in the trie")
     }
 }
 
@@ -211,7 +238,10 @@ fn ghost() -> [u8; 32] {
 fn a_genuine_checkpoint_verifies_and_advances_the_client() {
     let f = Fixture::new(vec![]);
     let cp = f.checkpoint(0); // height 1
-    assert!(cp.verify(&f.validators).is_ok(), "a real precommit quorum is final");
+    assert!(
+        cp.verify(&f.validators).is_ok(),
+        "a real precommit quorum is final"
+    );
     assert!(!cp.is_self_referential());
 
     let mut lc = LightClient::new(f.validators.clone(), cp).unwrap();
@@ -231,7 +261,11 @@ fn a_genuine_checkpoint_verifies_and_advances_the_client() {
     // Re-anchoring onto a newer checkpoint resets the window and moves the tip.
     lc.advance_to_checkpoint(f.checkpoint(4)).unwrap();
     assert_eq!(lc.tip_height(), 5);
-    assert_eq!(lc.header_count(), 0, "re-anchoring resets the header window");
+    assert_eq!(
+        lc.header_count(),
+        0,
+        "re-anchoring resets the header window"
+    );
     assert_eq!(lc.checkpoint(), Some(&f.checkpoint(4)));
 
     // And the client keeps following from there.
@@ -299,7 +333,9 @@ fn a_prevote_quorum_is_not_finality_and_is_refused() {
         },
         ..f.checkpoint(0)
     };
-    let err = nil.verify(&f.validators).expect_err("a nil quorum names no block");
+    let err = nil
+        .verify(&f.validators)
+        .expect_err("a nil quorum names no block");
     assert!(err.contains("does not name this block hash"), "got: {err}");
 }
 
@@ -365,7 +401,12 @@ fn a_certificate_from_a_non_validator_is_refused() {
 
     // One throwaway key, signing correctly, with power of its own.
     let cp = Checkpoint {
-        cert: cert(std::slice::from_ref(&imposter), h.height, VoteKind::Precommit, h.block_hash),
+        cert: cert(
+            std::slice::from_ref(&imposter),
+            h.height,
+            VoteKind::Precommit,
+            h.block_hash,
+        ),
         ..f.checkpoint(0)
     };
     let err = cp
@@ -385,7 +426,13 @@ fn a_certificate_from_a_non_validator_is_refused() {
     let mixed = Checkpoint {
         cert: {
             let mut c = cert(&f.keys[..2], h.height, VoteKind::Precommit, h.block_hash);
-            let v = Vote::sign(&imposter, h.height, 0, VoteKind::Precommit, Some(h.block_hash));
+            let v = Vote::sign(
+                &imposter,
+                h.height,
+                0,
+                VoteKind::Precommit,
+                Some(h.block_hash),
+            );
             c.signatures.push((v.voter, v.signature));
             c
         },
@@ -401,7 +448,13 @@ fn a_certificate_from_a_non_validator_is_refused() {
     let with_imposter = Checkpoint {
         cert: {
             let mut c = cert(&f.keys[..3], h.height, VoteKind::Precommit, h.block_hash);
-            let v = Vote::sign(&imposter, h.height, 0, VoteKind::Precommit, Some(h.block_hash));
+            let v = Vote::sign(
+                &imposter,
+                h.height,
+                0,
+                VoteKind::Precommit,
+                Some(h.block_hash),
+            );
             c.signatures.push((v.voter, v.signature));
             c
         },
@@ -431,13 +484,21 @@ fn quorum_is_power_weighted_distinct_and_fails_closed() {
         cert: cert(&f.keys[..2], h.height, VoteKind::Precommit, h.block_hash),
         ..f.checkpoint(0)
     };
-    let err = sub.verify(&f.validators).expect_err("2 of 4 is not a quorum");
+    let err = sub
+        .verify(&f.validators)
+        .expect_err("2 of 4 is not a quorum");
     assert!(err.contains("2 of the 3 power required"), "got: {err}");
 
     // One validator signing many times is still one validator's power.
     let dup = Checkpoint {
         cert: {
-            let v = Vote::sign(&f.keys[0], h.height, 0, VoteKind::Precommit, Some(h.block_hash));
+            let v = Vote::sign(
+                &f.keys[0],
+                h.height,
+                0,
+                VoteKind::Precommit,
+                Some(h.block_hash),
+            );
             QuorumCertificate {
                 height: h.height,
                 round: 0,
@@ -463,11 +524,17 @@ fn quorum_is_power_weighted_distinct_and_fails_closed() {
     }
     topheavy.add(f.keys[3].verifying_key().to_bytes(), 1_000_000);
     let need = topheavy.quorum_power();
-    let cp = Checkpoint { cert: c, ..f.checkpoint(0) };
+    let cp = Checkpoint {
+        cert: c,
+        ..f.checkpoint(0)
+    };
     let err = cp
         .verify(&topheavy)
         .expect_err("3 of 4 by head count is not 2/3 of the stake");
-    assert!(err.contains(&format!("3 of the {need} power required")), "got: {err}");
+    assert!(
+        err.contains(&format!("3 of the {need} power required")),
+        "got: {err}"
+    );
 
     // An empty validator set fails closed rather than accepting anything.
     let empty = ValidatorSet::new();
@@ -512,7 +579,10 @@ fn a_header_forking_from_a_known_parent_is_refused() {
     let err = lc
         .apply_header(fork)
         .expect_err("a sibling of our tip is a fork, not a successor");
-    assert!(err.contains("forks"), "the rejection must say why, got: {err}");
+    assert!(
+        err.contains("forks"),
+        "the rejection must say why, got: {err}"
+    );
     assert_eq!(lc.tip_height(), 3, "a refused fork must not move the tip");
     assert_eq!(lc.header_count(), 2);
 
@@ -623,8 +693,15 @@ fn the_header_chain_is_bounded_and_refuses_to_exceed_its_cap() {
         .apply_header(f.header(CAP + 1))
         .expect_err("the window is full");
     assert!(err.contains("full"), "got: {err}");
-    assert!(err.contains("checkpoint"), "the error must say how to recover: {err}");
-    assert_eq!(lc.header_count(), CAP, "a refused header must not be stored");
+    assert!(
+        err.contains("checkpoint"),
+        "the error must say how to recover: {err}"
+    );
+    assert_eq!(
+        lc.header_count(),
+        CAP,
+        "a refused header must not be stored"
+    );
     assert_eq!(lc.tip_height(), CAP as u64 + 1, "the tip must not move");
 
     // It stays full: a flood of further headers grows nothing and moves nothing.
@@ -663,7 +740,11 @@ fn a_checkpoint_cannot_walk_the_client_back_onto_a_fork() {
         .advance_to_checkpoint(f.checkpoint(1))
         .expect_err("a checkpoint behind the tip must be refused");
     assert!(err.contains("older than the accepted tip"), "got: {err}");
-    assert_eq!(lc.header_count(), 3, "and the window must survive the attempt");
+    assert_eq!(
+        lc.header_count(),
+        3,
+        "and the window must survive the attempt"
+    );
 
     // Same height, different block: a peer offering an alternative history.
     // The certificate is genuine (over the alternative hash) so this exercises
@@ -674,7 +755,10 @@ fn a_checkpoint_cannot_walk_the_client_back_onto_a_fork() {
     let err = lc
         .advance_to_checkpoint(conflicting)
         .expect_err("a conflicting checkpoint must be refused");
-    assert!(err.contains("conflicts with a header already accepted"), "got: {err}");
+    assert!(
+        err.contains("conflicts with a header already accepted"),
+        "got: {err}"
+    );
 
     // Same block at the same height, but a different state root: the finalized
     // block's commitment is not negotiable. (The certificate does not commit
@@ -690,7 +774,12 @@ fn a_checkpoint_cannot_walk_the_client_back_onto_a_fork() {
     // attempt, refused even though the certificate is a genuine quorum.
     let mut moved = f.checkpoint(3);
     moved.height = 9;
-    moved.cert = cert(&f.keys[..3], 9, VoteKind::Precommit, f.blocks[3].compute_hash());
+    moved.cert = cert(
+        &f.keys[..3],
+        9,
+        VoteKind::Precommit,
+        f.blocks[3].compute_hash(),
+    );
     let err = lc
         .advance_to_checkpoint(moved)
         .expect_err("a block cannot move between heights");
@@ -704,7 +793,11 @@ fn a_checkpoint_cannot_walk_the_client_back_onto_a_fork() {
         .advance_to_checkpoint(forged)
         .expect_err("a non-validator's certificate is not a checkpoint");
     assert!(err.contains("refusing to re-anchor"), "got: {err}");
-    assert_eq!(lc.tip_height(), 4, "a refused re-anchor must not move the tip");
+    assert_eq!(
+        lc.tip_height(),
+        4,
+        "a refused re-anchor must not move the tip"
+    );
 
     // After a legitimate re-anchor, an older checkpoint is refused outright.
     lc.advance_to_checkpoint(f.checkpoint(3)).unwrap();
@@ -733,7 +826,11 @@ fn a_header_may_not_roll_the_state_back_to_a_superseded_root() {
         .apply_header(rollback)
         .expect_err("state must not roll back below a finalized height");
     assert!(err.contains("roll back"), "got: {err}");
-    assert_eq!(lc.state_root(), [0xBBu8; 32], "the tip's root must not move");
+    assert_eq!(
+        lc.state_root(),
+        [0xBBu8; 32],
+        "the tip's root must not move"
+    );
     assert_eq!(lc.header_count(), 2);
 
     // Carrying the parent's own root forward is NOT a rollback: a block that
@@ -768,13 +865,23 @@ fn a_valid_balance_proof_verifies_against_a_trusted_root() {
     assert_eq!(leaf.state_root, f.state_root);
     // The answer carries the height the root belongs to, so a caller can tell
     // how fresh the state it is looking at is.
-    assert_eq!(leaf.height, lc.tip_height(), "the root is committed at the tip");
+    assert_eq!(
+        leaf.height,
+        lc.tip_height(),
+        "the root is committed at the tip"
+    );
 
     // Token balances ride the same root, under a namespaced key the client
     // recomputes itself rather than taking from the server.
     let tproof = f.token_proof(&f.alice);
     let tok = lc
-        .verify_token_balance(&f.token, &f.alice, &777u64.to_be_bytes(), &tproof, f.state_root)
+        .verify_token_balance(
+            &f.token,
+            &f.alice,
+            &777u64.to_be_bytes(),
+            &tproof,
+            f.state_root,
+        )
         .expect("a token balance proof must verify");
     assert_eq!(tok.balance, 777);
     assert_eq!(tok.token_id, f.token);
@@ -784,7 +891,13 @@ fn a_valid_balance_proof_verifies_against_a_trusted_root() {
         .verify_account(&f.alice, &account_value(5_000, 3), &tproof, f.state_root)
         .is_err());
     assert!(lc
-        .verify_token_balance(&f.token, &f.bob, &777u64.to_be_bytes(), &tproof, f.state_root)
+        .verify_token_balance(
+            &f.token,
+            &f.bob,
+            &777u64.to_be_bytes(),
+            &tproof,
+            f.state_root
+        )
         .is_err());
 
     // A claim that does not match the leaf under it is refused even though the
@@ -916,7 +1029,10 @@ fn an_absent_key_is_reported_as_not_included_and_never_as_a_zero() {
     let single_proof = single
         .generate_merkle_proof(&lone)
         .expect("the lone account is in the trie");
-    assert!(single_proof.path.is_empty(), "a one-entry trie needs no path");
+    assert!(
+        single_proof.path.is_empty(),
+        "a one-entry trie needs no path"
+    );
 
     // NOTE: the certificate commits to (height, hash), not to the state root
     // (see the module docs, limitation 3), so anchoring a client on a synthetic
@@ -929,7 +1045,12 @@ fn an_absent_key_is_reported_as_not_included_and_never_as_a_zero() {
             block_hash: f.blocks[0].compute_hash(),
             parent_hash: f.blocks[0].prev_hash,
             state_root: single_root,
-            cert: cert(&f.keys[..3], 1, VoteKind::Precommit, f.blocks[0].compute_hash()),
+            cert: cert(
+                &f.keys[..3],
+                1,
+                VoteKind::Precommit,
+                f.blocks[0].compute_hash(),
+            ),
         },
     )
     .unwrap();
@@ -962,10 +1083,7 @@ fn proof_paths_are_bounded_so_a_forged_path_costs_nothing() {
     let err = lc
         .verify_account(&f.alice, &account_value(5_000, 3), &proof, f.state_root)
         .expect_err("an over-long path is not something the trie can produce");
-    assert!(
-        matches!(err, LightError::InvalidProof(_)),
-        "got: {err}"
-    );
+    assert!(matches!(err, LightError::InvalidProof(_)), "got: {err}");
 }
 
 #[test]
@@ -974,7 +1092,10 @@ fn roots_are_trusted_only_because_a_finalized_header_committed_them() {
     // Only the first two may ever be used to check a proof.
     let f = Fixture::new(vec![[0u8; 32], [0xA1u8; 32], [0xB2u8; 32]]);
     let mut lc = f.client(0, 2);
-    assert!(lc.trusts_root(&f.state_root), "the checkpoint's root is trusted");
+    assert!(
+        lc.trusts_root(&f.state_root),
+        "the checkpoint's root is trusted"
+    );
     assert!(lc.trusts_root(&[0xA1u8; 32]), "a header's root is trusted");
     assert!(lc.trusts_root(&[0xB2u8; 32]), "the tip's root is trusted");
     assert!(!lc.trusts_root(&[0xC3u8; 32]), "an uncommitted root is not");
@@ -982,7 +1103,11 @@ fn roots_are_trusted_only_because_a_finalized_header_committed_them() {
     assert_eq!(lc.state_root_at(1), Some(f.state_root));
     assert_eq!(lc.state_root_at(2), Some([0xA1u8; 32]));
     assert_eq!(lc.state_root_at(3), Some([0xB2u8; 32]));
-    assert_eq!(lc.state_root_at(4), None, "height 4 was never finalized here");
+    assert_eq!(
+        lc.state_root_at(4),
+        None,
+        "height 4 was never finalized here"
+    );
     assert_eq!(lc.trusted_height_of_root(&[0xB2u8; 32]), Some(3));
 
     // After re-anchoring, the roots the old window carried are forgotten: the
@@ -991,8 +1116,14 @@ fn roots_are_trusted_only_because_a_finalized_header_committed_them() {
     // check deeper than the window.
     lc.advance_to_checkpoint(f.checkpoint(2)).unwrap();
     assert!(lc.trusts_root(&[0xB2u8; 32]), "the new checkpoint's root");
-    assert!(!lc.trusts_root(&f.state_root), "the dropped checkpoint is forgotten");
-    assert!(!lc.trusts_root(&[0xA1u8; 32]), "the dropped header is forgotten");
+    assert!(
+        !lc.trusts_root(&f.state_root),
+        "the dropped checkpoint is forgotten"
+    );
+    assert!(
+        !lc.trusts_root(&[0xA1u8; 32]),
+        "the dropped header is forgotten"
+    );
     assert_eq!(lc.header_count(), 0);
 }
 
@@ -1017,7 +1148,10 @@ fn a_light_client_inherits_whatever_validator_set_it_was_given() {
         cert: cert(&impostors, h.height, VoteKind::Precommit, h.block_hash),
         ..f.checkpoint(0)
     };
-    assert!(cp.verify(&fake_set).is_ok(), "quorum holds inside the fake set");
+    assert!(
+        cp.verify(&fake_set).is_ok(),
+        "quorum holds inside the fake set"
+    );
     assert!(cp.verify(&f.validators).is_err(), "and not in the real one");
 
     let mut lc = LightClient::new(fake_set.clone(), cp).unwrap();
@@ -1040,7 +1174,11 @@ fn a_light_client_inherits_whatever_validator_set_it_was_given() {
         .advance_to_checkpoint(f.checkpoint(3))
         .expect_err("the real chain's checkpoint proves nothing to this client");
     assert!(err.contains("refusing to re-anchor"), "got: {err}");
-    assert_eq!(lc.tip_height(), 2, "and it keeps following the fabricated tip");
+    assert_eq!(
+        lc.tip_height(),
+        2,
+        "and it keeps following the fabricated tip"
+    );
     assert_eq!(
         lc.validators.validators, fake_set.validators,
         "the validator set is fixed at construction"

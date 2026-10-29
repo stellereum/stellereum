@@ -909,7 +909,14 @@ impl ChainSimulator {
             .config
             .start_time_ms
             .saturating_add(next.height.saturating_mul(self.config.block_time_ms));
-        let block_hash = compute_block_hash(&proposer, next.height, time_ms, &prev_root, &state_root, &txs);
+        let block_hash = compute_block_hash(
+            &proposer,
+            next.height,
+            time_ms,
+            &prev_root,
+            &state_root,
+            &txs,
+        );
 
         self.state = next;
         let block = SimBlock {
@@ -1492,11 +1499,9 @@ impl SimLog {
                 .and_then(|k| k.as_str())
                 .ok_or_else(|| SimError::LogCorrupt(format!("line {}: missing kind", index + 1)))?
                 .to_string();
-            let version = value
-                .get("v")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| SimError::LogCorrupt(format!("line {}: missing version", index + 1)))?
-                as u32;
+            let version = value.get("v").and_then(|v| v.as_u64()).ok_or_else(|| {
+                SimError::LogCorrupt(format!("line {}: missing version", index + 1))
+            })? as u32;
             if version != SIM_LOG_VERSION {
                 return Err(SimError::LogVersion {
                     found: version,
@@ -1542,8 +1547,7 @@ impl SimLog {
         let seed = hex::decode(&self.header.seed)
             .map_err(|e| SimError::LogCorrupt(format!("seed: {e}")))?;
         let config = self.header.config.to_sim_config(self.header.chain_id);
-        let mut simulator =
-            ChainSimulator::genesis(&seed, self.header.accounts as usize, config)?;
+        let mut simulator = ChainSimulator::genesis(&seed, self.header.accounts as usize, config)?;
 
         let genesis_root = simulator.state_root();
         let expected_genesis = hex::decode(&self.header.genesis_root)
@@ -1582,8 +1586,8 @@ impl SimLog {
 
             let mut txs = Vec::with_capacity(block.txs.len());
             for raw in &block.txs {
-                let bytes = hex::decode(raw)
-                    .map_err(|e| SimError::LogCorrupt(format!("tx bytes: {e}")))?;
+                let bytes =
+                    hex::decode(raw).map_err(|e| SimError::LogCorrupt(format!("tx bytes: {e}")))?;
                 let tx: Transaction = bincode::deserialize(&bytes)
                     .map_err(|e| SimError::LogCorrupt(format!("tx decode: {e}")))?;
                 txs.push(tx);
@@ -1644,7 +1648,10 @@ mod tests {
     }
 
     fn simulator() -> ChainSimulator {
-        let config = SimConfig { txs_per_block: 3, ..Default::default() };
+        let config = SimConfig {
+            txs_per_block: 3,
+            ..Default::default()
+        };
         ChainSimulator::genesis(&seed(), 4, config).unwrap()
     }
 
@@ -1788,15 +1795,7 @@ mod tests {
     fn fee_preview_rejects_a_low_gas_limit() {
         let sim = simulator();
         let key = derive_keypair(&seed(), b"validator", 0);
-        let tx = Transaction::sign(
-            &key,
-            sim.validators()[1].address,
-            1,
-            1,
-            0,
-            0,
-            0,
-        );
+        let tx = Transaction::sign(&key, sim.validators()[1].address, 1, 1, 0, 0, 0);
         assert!(matches!(
             sim.preview_fee(&tx),
             Err(SimError::GasLimitTooLow { .. })
@@ -1829,31 +1828,18 @@ mod tests {
         let sender = sim.validators()[1].address;
         let recipient = sim.validators()[2].address;
         let key = derive_keypair(&seed(), b"validator", 1);
-        let good = Transaction::sign(
-            &key,
-            recipient,
-            10,
-            sim.config().intrinsic_gas,
-            0,
-            0,
-            0,
-        );
+        let good = Transaction::sign(&key, recipient, 10, sim.config().intrinsic_gas, 0, 0, 0);
         // Second transaction has a stale nonce: the whole block must fail and
         // the state must stay untouched.
-        let bad = Transaction::sign(
-            &key,
-            recipient,
-            10,
-            sim.config().intrinsic_gas,
-            7,
-            0,
-            0,
-        );
+        let bad = Transaction::sign(&key, recipient, 10, sim.config().intrinsic_gas, 7, 0, 0);
         let root_before = sim.state_root();
         let err = sim.produce_block(0, vec![good.clone(), bad]).unwrap_err();
         assert!(matches!(err, SimError::BadNonce { .. }));
         assert_eq!(sim.state_root(), root_before);
-        assert_eq!(sim.balance(&sender), sim.config().genesis_balance - sim.config().validator_stake);
+        assert_eq!(
+            sim.balance(&sender),
+            sim.config().genesis_balance - sim.config().validator_stake
+        );
     }
 
     #[test]
@@ -1872,7 +1858,10 @@ mod tests {
         let broken = text.replace("\"v\":1", "\"v\":9");
         assert!(matches!(
             SimLog::parse(broken.as_bytes()),
-            Err(SimError::LogVersion { found: 9, expected: 1 })
+            Err(SimError::LogVersion {
+                found: 9,
+                expected: 1
+            })
         ));
 
         // A missing header is refused.

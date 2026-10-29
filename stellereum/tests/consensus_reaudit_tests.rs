@@ -214,9 +214,8 @@ fn the_wire_refuses_a_truncated_block_body() {
         "the wire must refuse a truncated body, not reinterpret it"
     );
     // The legacy shape still decodes on the store path.
-    let legacy: Result<Block, _> = stellereum::sharding::with_legacy_block_tolerance(|| {
-        bincode::deserialize(truncated)
-    });
+    let legacy: Result<Block, _> =
+        stellereum::sharding::with_legacy_block_tolerance(|| bincode::deserialize(truncated));
     assert!(
         legacy.is_ok(),
         "the store must still read a body persisted before the fields existed"
@@ -435,7 +434,11 @@ async fn a_later_round_certificate_supersedes_the_lock() {
     let bh = blk.compute_hash();
     let cert = cert_at(&ks, 6, bh);
     let r = rt.adopt_committed(1, blk, cert).await;
-    assert_eq!(r, Ok(bh), "a later-round certificate must supersede the lock");
+    assert_eq!(
+        r,
+        Ok(bh),
+        "a later-round certificate must supersede the lock"
+    );
 }
 
 #[tokio::test]

@@ -75,7 +75,11 @@ fn capture_warns(f: impl FnOnce()) -> String {
 
 #[test]
 fn bond_at_min_is_rejected_and_names_the_required_minimum() {
-    assert_eq!(STELL_MIN_BOND_BUFFER, 100 * STELL, "buffer default is 100 STELL");
+    assert_eq!(
+        STELL_MIN_BOND_BUFFER,
+        100 * STELL,
+        "buffer default is 100 STELL"
+    );
     assert_eq!(floor(), 1100 * STELL);
 
     let mut l = StakingLedger::new();
@@ -96,8 +100,14 @@ fn bond_at_min_is_rejected_and_names_the_required_minimum() {
     );
     // The error names the required minimum (operator must see the number).
     let msg = format!("{}", StakingError::BondBelowMinimum);
-    assert!(msg.contains(&floor().to_string()), "error must name the floor, got: {msg}");
-    assert!(msg.contains("MIN+buffer"), "error must say MIN+buffer, got: {msg}");
+    assert!(
+        msg.contains(&floor().to_string()),
+        "error must name the floor, got: {msg}"
+    );
+    assert!(
+        msg.contains("MIN+buffer"),
+        "error must say MIN+buffer, got: {msg}"
+    );
     // Nothing was created by the refusals.
     assert!(!l.validators.contains_key(&vid(1)));
 }
@@ -126,7 +136,10 @@ fn top_up_below_buffer_is_accepted_but_warns_loudly() {
         assert!(l.add_bond(vid(3), 50 * STELL).is_ok()); // 1095 < 1100
         assert_eq!(l.validators[&vid(3)].self_bond, 1095 * STELL);
     });
-    assert!(logs.contains("MIN-BOND-BUFFER"), "thin top-up must WARN, got: {logs}");
+    assert!(
+        logs.contains("MIN-BOND-BUFFER"),
+        "thin top-up must WARN, got: {logs}"
+    );
 }
 
 /// Validator C replay at ledger level: a floored bond, a slash that ejects,
@@ -155,12 +168,18 @@ fn slash_eject_then_top_up_rejoins_and_gains_detects_it() {
     // The hysteresis input flags exactly C — never A.
     let gains = staking::validator_set_gains(&without_c, &with_c);
     assert_eq!(gains, vec![(c, 1190 * STELL)]);
-    assert!(staking::validator_set_gains(&with_c, &with_c).is_empty(), "no gains, no warn");
+    assert!(
+        staking::validator_set_gains(&with_c, &with_c).is_empty(),
+        "no gains, no warn"
+    );
 
     // The WARN text carries member, power and height.
     let msg = staking::reentry_warn_message_for(&c, 1190 * STELL, 77);
     assert!(msg.contains(&hex::encode(c)), "must name the member: {msg}");
-    assert!(msg.contains(&(1190 * STELL).to_string()), "must name the power: {msg}");
+    assert!(
+        msg.contains(&(1190 * STELL).to_string()),
+        "must name the power: {msg}"
+    );
     assert!(msg.contains("77"), "must name the height: {msg}");
     assert!(msg.contains("VALIDATOR-RE-ENTRY"), "must be LOUD: {msg}");
 }
@@ -169,16 +188,34 @@ fn slash_eject_then_top_up_rejoins_and_gains_detects_it() {
 fn reentry_liveness_predicate_needs_window_plus_missed_streak() {
     // Inside the window: no risk yet (grace to come online and vote).
     assert!(!staking::reentry_liveness_risk(100, 100, 5));
-    assert!(!staking::reentry_liveness_risk(100, 100 + REENTRY_LIVENESS_WINDOW_HEIGHTS - 1, 9));
+    assert!(!staking::reentry_liveness_risk(
+        100,
+        100 + REENTRY_LIVENESS_WINDOW_HEIGHTS - 1,
+        9
+    ));
     // Past the window with a missed streak: risk.
-    assert!(staking::reentry_liveness_risk(100, 100 + REENTRY_LIVENESS_WINDOW_HEIGHTS, 1));
+    assert!(staking::reentry_liveness_risk(
+        100,
+        100 + REENTRY_LIVENESS_WINDOW_HEIGHTS,
+        1
+    ));
     // Past the window but voting (streak forgiven): no risk.
-    assert!(!staking::reentry_liveness_risk(100, 100 + REENTRY_LIVENESS_WINDOW_HEIGHTS, 0));
+    assert!(!staking::reentry_liveness_risk(
+        100,
+        100 + REENTRY_LIVENESS_WINDOW_HEIGHTS,
+        0
+    ));
     assert!(!staking::reentry_liveness_risk(100, 10_000, 0));
 
     let msg = staking::reentry_liveness_warn_message_for(&vid(9), 1190 * STELL, 100, 110, 4);
-    assert!(msg.contains("VALIDATOR-LIVENESS-RISK"), "must be LOUD: {msg}");
-    assert!(msg.contains(&hex::encode(vid(9))), "must name the member: {msg}");
+    assert!(
+        msg.contains("VALIDATOR-LIVENESS-RISK"),
+        "must be LOUD: {msg}"
+    );
+    assert!(
+        msg.contains(&hex::encode(vid(9))),
+        "must name the member: {msg}"
+    );
 }
 
 /// Runtime refresh: gaining a member emits the LOUD re-entry WARN (member,
@@ -196,13 +233,9 @@ async fn runtime_refresh_warns_counts_and_watches_reentrants_without_altering_th
     ledger.bond(a, floor(), DEFAULT_COMMISSION_BPS).unwrap();
 
     let engine = Arc::new(InMemoryStateEngine::new());
-    let mut rt = ValidatorRuntime::new(
-        ka,
-        ValidatorSet::from_list(vec![(a, 1)]),
-        engine.clone(),
-        1,
-    )
-    .with_staking(ledger);
+    let mut rt =
+        ValidatorRuntime::new(ka, ValidatorSet::from_list(vec![(a, 1)]), engine.clone(), 1)
+            .with_staking(ledger);
     assert_eq!(rt.validator_reentry_warns_total, 0);
 
     // First refresh installs {A: floor} — A was already present, so no gain.
@@ -211,18 +244,31 @@ async fn runtime_refresh_warns_counts_and_watches_reentrants_without_altering_th
     assert!(rt.reentry_watch.is_empty());
 
     // Bond B, then refresh under log capture: B is gained with a LOUD WARN.
-    engine.staking_write().await.bond(b, floor(), DEFAULT_COMMISSION_BPS).unwrap();
+    engine
+        .staking_write()
+        .await
+        .bond(b, floor(), DEFAULT_COMMISSION_BPS)
+        .unwrap();
     let mut changed = false;
     let logs = capture_warns(|| {
         tokio::task::block_in_place(|| {
-            changed = tokio::runtime::Handle::current()
-                .block_on(rt.refresh_validator_set_from_staking());
+            changed =
+                tokio::runtime::Handle::current().block_on(rt.refresh_validator_set_from_staking());
         })
     });
     assert!(changed, "set must gain B");
-    assert!(logs.contains("VALIDATOR-RE-ENTRY"), "gain must WARN loudly, got: {logs}");
-    assert!(logs.contains(&hex::encode(b)), "WARN must name the member, got: {logs}");
-    assert!(logs.contains(&floor().to_string()), "WARN must name the power, got: {logs}");
+    assert!(
+        logs.contains("VALIDATOR-RE-ENTRY"),
+        "gain must WARN loudly, got: {logs}"
+    );
+    assert!(
+        logs.contains(&hex::encode(b)),
+        "WARN must name the member, got: {logs}"
+    );
+    assert!(
+        logs.contains(&floor().to_string()),
+        "WARN must name the power, got: {logs}"
+    );
     assert_eq!(rt.validator_reentry_warns_total, 1);
 }
 
@@ -242,25 +288,35 @@ async fn runtime_refresh_gain_state_is_counted_watched_and_unaltered() {
     ledger.bond(a, floor(), DEFAULT_COMMISSION_BPS).unwrap();
 
     let engine = Arc::new(InMemoryStateEngine::new());
-    let mut rt = ValidatorRuntime::new(
-        ka,
-        ValidatorSet::from_list(vec![(a, 1)]),
-        engine.clone(),
-        1,
-    )
-    .with_staking(ledger);
+    let mut rt =
+        ValidatorRuntime::new(ka, ValidatorSet::from_list(vec![(a, 1)]), engine.clone(), 1)
+            .with_staking(ledger);
 
     assert!(rt.refresh_validator_set_from_staking().await);
     assert_eq!(rt.validator_reentry_warns_total, 0);
 
-    engine.staking_write().await.bond(b, floor(), DEFAULT_COMMISSION_BPS).unwrap();
-    assert!(rt.refresh_validator_set_from_staking().await, "set must gain B");
+    engine
+        .staking_write()
+        .await
+        .bond(b, floor(), DEFAULT_COMMISSION_BPS)
+        .unwrap();
+    assert!(
+        rt.refresh_validator_set_from_staking().await,
+        "set must gain B"
+    );
     assert_eq!(rt.validator_reentry_warns_total, 1, "one gain -> one count");
-    assert_eq!(rt.reentry_watch.get(&b), Some(&1), "B watched from height 1");
+    assert_eq!(
+        rt.reentry_watch.get(&b),
+        Some(&1),
+        "B watched from height 1"
+    );
     // W10.5: the gain is STAGED (activation height 2), not yet in force.
     // Drive the activation before asserting the installed set.
     rt.hc.height = 2;
-    assert!(rt.install_due_validator_set(), "staged set installs at activation");
+    assert!(
+        rt.install_due_validator_set(),
+        "staged set installs at activation"
+    );
     // NO consensus change: the derived set is installed verbatim.
     assert!(rt.validators.validators.contains_key(&b));
     assert_eq!(rt.validators.power_of(&b), floor());
@@ -270,7 +326,10 @@ async fn runtime_refresh_gain_state_is_counted_watched_and_unaltered() {
     // so it is healthy and leaves the watch.
     assert!(!rt.refresh_validator_set_from_staking().await);
     assert_eq!(rt.validator_reentry_warns_total, 1);
-    assert!(!rt.reentry_watch.contains_key(&b), "voting B leaves the watch");
+    assert!(
+        !rt.reentry_watch.contains_key(&b),
+        "voting B leaves the watch"
+    );
 }
 
 /// Liveness watch: a watched re-entrant with no votes for N heights trips the
@@ -292,31 +351,48 @@ async fn runtime_liveness_watch_rewarns_until_the_reentrant_votes() {
 
     let engine = Arc::new(InMemoryStateEngine::new());
     // Config set holds only A: the first refresh gains B as a re-entrant.
-    let mut rt = ValidatorRuntime::new(
-        ka,
-        ValidatorSet::from_list(vec![(a, 1)]),
-        engine.clone(),
-        1,
-    )
-    .with_staking(ledger);
+    let mut rt =
+        ValidatorRuntime::new(ka, ValidatorSet::from_list(vec![(a, 1)]), engine.clone(), 1)
+            .with_staking(ledger);
     assert!(rt.refresh_validator_set_from_staking().await);
     assert_eq!(rt.validator_reentry_warns_total, 1);
     assert_eq!(rt.reentry_watch.get(&b), Some(&1));
     // W10.5: install the staged gain before entering the liveness window.
     rt.hc.height = 2;
-    assert!(rt.install_due_validator_set(), "staged set installs at activation");
+    assert!(
+        rt.install_due_validator_set(),
+        "staged set installs at activation"
+    );
 
     // B goes dark: missed streak grows, heights pass the window.
-    engine.staking_write().await.validators.get_mut(&b).unwrap().missed = 4;
+    engine
+        .staking_write()
+        .await
+        .validators
+        .get_mut(&b)
+        .unwrap()
+        .missed = 4;
     rt.hc.height = 1 + REENTRY_LIVENESS_WINDOW_HEIGHTS;
     assert!(staking::reentry_liveness_risk(1, rt.hc.height, 4));
     // Refresh with no set change still sweeps the watch (repeating WARN path).
     rt.refresh_validator_set_from_staking().await;
     assert!(rt.reentry_watch.contains_key(&b), "dark B stays watched");
-    assert_eq!(rt.validator_reentry_warns_total, 1, "liveness WARNs do not recount gains");
+    assert_eq!(
+        rt.validator_reentry_warns_total, 1,
+        "liveness WARNs do not recount gains"
+    );
 
     // B votes again (streak forgiven): next refresh unwatches it.
-    engine.staking_write().await.validators.get_mut(&b).unwrap().missed = 0;
+    engine
+        .staking_write()
+        .await
+        .validators
+        .get_mut(&b)
+        .unwrap()
+        .missed = 0;
     rt.refresh_validator_set_from_staking().await;
-    assert!(!rt.reentry_watch.contains_key(&b), "voting B leaves the watch");
+    assert!(
+        !rt.reentry_watch.contains_key(&b),
+        "voting B leaves the watch"
+    );
 }

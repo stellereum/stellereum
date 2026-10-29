@@ -5,6 +5,7 @@ use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signer, VerifyingKey};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rand::RngCore;
+use reed_solomon_erasure::galois_8::ReedSolomon;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
@@ -18,9 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{timeout, Instant};
-use x509_parser::parse_x509_certificate;
-use reed_solomon_erasure::galois_8::ReedSolomon;
 use x25519_dalek::{PublicKey as XPub, StaticSecret as XSecret};
+use x509_parser::parse_x509_certificate;
 
 use crate::config::{NodeConfig, PeerConfig};
 use crate::keyring::NodeKeys;
@@ -388,14 +388,23 @@ fn kv_persist_tail(data_dir: PathBuf, json: String) {
 }
 
 impl Node {
-    pub async fn new(cfg: NodeConfig, keys: NodeKeys, data_dir: PathBuf, config_path: PathBuf) -> Result<Arc<Self>> {
+    pub async fn new(
+        cfg: NodeConfig,
+        keys: NodeKeys,
+        data_dir: PathBuf,
+        config_path: PathBuf,
+    ) -> Result<Arc<Self>> {
         let id = keys.id();
         let id_hex = keys.id_hex();
         let client_bind = cfg
             .client_listen
             .clone()
             .unwrap_or_else(|| "0.0.0.0:0".to_string());
-        let client_ep = Endpoint::client(client_bind.parse().map_err(|e| anyhow!("client-listen: {e}"))?)?;
+        let client_ep = Endpoint::client(
+            client_bind
+                .parse()
+                .map_err(|e| anyhow!("client-listen: {e}"))?,
+        )?;
         // NAT hole punching: client-сокет тоже принимает входящие (обратный пробой через NAT)
         let (certs, key) = build_tls(&keys)?;
         let mut sc = quinn::ServerConfig::with_single_cert(certs, key)?;
@@ -574,10 +583,7 @@ impl Node {
     }
 
     /// Fetch (or create) the anti-replay window for a specific connection.
-    async fn replay_window(
-        peer: &PeerLink,
-        conn_id: usize,
-    ) -> Arc<Mutex<ConnReplayWindow>> {
+    async fn replay_window(peer: &PeerLink, conn_id: usize) -> Arc<Mutex<ConnReplayWindow>> {
         if let Some(w) = peer.replay_windows.read().await.get(&conn_id) {
             return Arc::clone(w);
         }
@@ -597,7 +603,8 @@ impl Node {
     pub fn resolve(&self, sel: &str) -> Result<[u8; NODEID_LEN]> {
         if let Some(pid) = self.by_name.get(sel) {
             return Ok(*pid);
-        }        let s = sel.strip_prefix("inf1:").unwrap_or(sel);
+        }
+        let s = sel.strip_prefix("inf1:").unwrap_or(sel);
         let b = hex::decode(s)?;
         if b.len() != NODEID_LEN {
             bail!("node id must be 20 bytes");
@@ -669,7 +676,11 @@ impl Node {
         }
     }
 
-    async fn pick_conn(&self, peer: Option<&PeerLink>, pid: [u8; NODEID_LEN]) -> Option<Connection> {
+    async fn pick_conn(
+        &self,
+        peer: Option<&PeerLink>,
+        pid: [u8; NODEID_LEN],
+    ) -> Option<Connection> {
         // R18: `peer` читается ВЫЗЫВАЮЩИМ (поиск по peers здесь не нужен) — на
         // горячем пути запроса peers.read() делается ровно один раз в request_to,
         // а не три (request_to + connect_or_get + pick_conn). `None` = вызывающему
@@ -782,30 +793,29 @@ impl Node {
         // (conn looks alive, streams never open): the caller then burns its
         // whole timeout budget doing nothing, and since no error surfaces the
         // cached conn is reused forever. Fail fast so retry/evict can engage.
-        let (mut send, mut recv) = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            conn.open_bi(),
-        )
-        .await
-        .map_err(|_| anyhow!("open stream timeout"))??;
+        let (mut send, mut recv) =
+            tokio::time::timeout(std::time::Duration::from_secs(8), conn.open_bi())
+                .await
+                .map_err(|_| anyhow!("open stream timeout"))??;
         send.write_all(&f.encode()).await?;
         let _ = send.finish();
-        let bytes = timeout(Duration::from_secs(8), recv.read_to_end(proto::MAX_AUTH_FRAME))
-            .await
-            .map_err(|_| anyhow!("AUTH timeout"))??;
+        let bytes = timeout(
+            Duration::from_secs(8),
+            recv.read_to_end(proto::MAX_AUTH_FRAME),
+        )
+        .await
+        .map_err(|_| anyhow!("AUTH timeout"))??;
         let auth = Frame::decode(&bytes)?;
         let vk = VerifyingKey::from_bytes(&peer.cfg.ed_bytes()?)?;
-        if auth.kind != proto::kind::AUTH
-            || auth.src != pid
-            || !auth.verify(&vk)
-            || !ts_ok(auth.ts)
+        if auth.kind != proto::kind::AUTH || auth.src != pid || !auth.verify(&vk) || !ts_ok(auth.ts)
         {
             bail!("auth failed");
         }
         // forward secrecy: сессионный ключ из static+эфемерных ECDH
         let key = derive_session_key(&self.keys, &peer.cfg, &eph_sec, &auth.payload)?;
         self.sessions.write().await.insert(conn.stable_id(), key);
-        self.add_route(pid, addr.to_string(), &peer.cfg.ed_pub).await;
+        self.add_route(pid, addr.to_string(), &peer.cfg.ed_pub)
+            .await;
         self.routing_insert(pid, &peer.cfg.endpoints, &peer.cfg.ed_pub, &peer.cfg.x_pub)
             .await;
         // No replay reset needed: the anti-replay window is per CONNECTION now
@@ -842,7 +852,11 @@ impl Node {
     /// R18: `peer` передаётся вызывающим (один peers.read на весь запрос вместо
     /// двух-трёх); все прочие вызовы читают peers сами и приходят сюда с готовым
     /// PeerLink.
-    async fn connect_or_get(self: &Arc<Self>, peer: &PeerLink, pid: [u8; NODEID_LEN]) -> Result<Connection> {
+    async fn connect_or_get(
+        self: &Arc<Self>,
+        peer: &PeerLink,
+        pid: [u8; NODEID_LEN],
+    ) -> Result<Connection> {
         if let Some(c) = self.pick_conn(Some(peer), pid).await {
             return Ok(c);
         }
@@ -889,7 +903,11 @@ impl Node {
     /// fallback in `conn_with_session` can use it. A successful dial always
     /// registers a session (`connect_with_auth`), so the returned conn is
     /// immediately usable for requests.
-    async fn dial_peer(self: &Arc<Self>, peer: &PeerLink, pid: [u8; NODEID_LEN]) -> Result<Connection> {
+    async fn dial_peer(
+        self: &Arc<Self>,
+        peer: &PeerLink,
+        pid: [u8; NODEID_LEN],
+    ) -> Result<Connection> {
         let mut last_err = anyhow!("no endpoints");
         for ep in &peer.cfg.endpoints {
             let addr: SocketAddr = match ep.parse() {
@@ -928,7 +946,10 @@ impl Node {
                     }
                     Err(e) => {
                         last_err = anyhow!("{} @ {ep_str} (NAT punch): {e}", peer.cfg.name);
-                        eprintln!("[{}] connect {} @ {ep_str} (NAT punch): {e}", self.cfg.name, peer.cfg.name);
+                        eprintln!(
+                            "[{}] connect {} @ {ep_str} (NAT punch): {e}",
+                            self.cfg.name, peer.cfg.name
+                        );
                     }
                 }
             }
@@ -1154,12 +1175,10 @@ impl Node {
         svc: &str,
         payload: &[u8],
     ) -> Result<()> {
-        let (mut send, mut recv) = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            conn.open_bi(),
-        )
-        .await
-        .map_err(|_| anyhow!("open stream timeout"))??;
+        let (mut send, mut recv) =
+            tokio::time::timeout(std::time::Duration::from_secs(8), conn.open_bi())
+                .await
+                .map_err(|_| anyhow!("open stream timeout"))??;
         // Same priority rule as `request_on`: consensus traffic must never
         // queue behind bulk DHT/chunk transfers.
         if svc == "pubsub.msg" || svc == "consensus.sign" {
@@ -1219,12 +1238,10 @@ impl Node {
         // silently eating the caller's whole budget before the response timer
         // even starts.
         let t_open = std::time::Instant::now();
-        let (mut send, mut recv) = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            conn.open_bi(),
-        )
-        .await
-        .map_err(|_| anyhow!("open stream timeout"))??;
+        let (mut send, mut recv) =
+            tokio::time::timeout(std::time::Duration::from_secs(8), conn.open_bi())
+                .await
+                .map_err(|_| anyhow!("open stream timeout"))??;
         let open_ms = t_open.elapsed();
         // Priority scheduling: consensus traffic (pubsub.msg) must NEVER queue
         // behind bulk DHT/chunk storage transfers over WAN.
@@ -1267,9 +1284,12 @@ impl Node {
         let write_ms = t_write.elapsed();
         let _ = send.finish();
         let t_wait = std::time::Instant::now();
-        let bytes = timeout(Duration::from_secs(timeout_secs), recv.read_to_end(proto::MAX_FRAME))
-            .await
-            .map_err(|_| anyhow!("response timeout"))??;
+        let bytes = timeout(
+            Duration::from_secs(timeout_secs),
+            recv.read_to_end(proto::MAX_FRAME),
+        )
+        .await
+        .map_err(|_| anyhow!("response timeout"))??;
         let wait_ms = t_wait.elapsed();
         // Patch B: стадии запроса (open/write/wait) с join-ключом (f.seq, f.ts) —
         // приёмник логирует ТЕ ЖЕ seq/ts в "dispatch", обе ноды сидят на одних
@@ -1580,7 +1600,9 @@ impl Node {
             let state_hash = v["state_hash"].as_str().unwrap_or("").to_string();
             if state_hash.len() != 64 {
                 return Some(
-                    json!({ "ok": false, "err": "bad state_hash" }).to_string().into_bytes(),
+                    json!({ "ok": false, "err": "bad state_hash" })
+                        .to_string()
+                        .into_bytes(),
                 );
             }
             let sig = ed25519_dalek::Signer::sign(&self.keys.signing, state_hash.as_bytes());
@@ -1599,9 +1621,10 @@ impl Node {
             {
                 let mut subs = self.subs.write().await;
                 let by_node = subs.entry(topic.clone()).or_default();
-                let st = by_node
-                    .entry(from)
-                    .or_insert(SubState { ts: now_ms(), conns: HashMap::new() });
+                let st = by_node.entry(from).or_insert(SubState {
+                    ts: now_ms(),
+                    conns: HashMap::new(),
+                });
                 st.ts = now_ms();
                 st.conns.insert(conn.stable_id(), conn.clone());
             }
@@ -1635,7 +1658,9 @@ impl Node {
             let n = self
                 .deliver_local(&topic, &data, msg_id, seq, &origin, Some(exclude_conn))
                 .await;
-            self.metrics.msgs_delivered.fetch_add(n as u64, Ordering::Relaxed);
+            self.metrics
+                .msgs_delivered
+                .fetch_add(n as u64, Ordering::Relaxed);
             self.forward(&topic, &data, msg_id, seq, &origin, ttl, Some(from))
                 .await;
             Some(
@@ -1744,21 +1769,31 @@ impl Node {
                     eprintln!("[diag] pubsub.msg for topic with NO subscribers: {topic}");
                 }
                 if senders.len() != 1 {
-                    static DIAG_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static DIAG_N: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
                     let n = DIAG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if n.is_multiple_of(200) {
-                        eprintln!("[diag] pubsub.msg topic {topic} has {} subscriber(s) (sample {n})", senders.len());
+                        eprintln!(
+                            "[diag] pubsub.msg topic {topic} has {} subscriber(s) (sample {n})",
+                            senders.len()
+                        );
                     }
                 }
             }
             for msg in &ordered {
                 for tx in &senders {
                     if tx.send(msg.clone()).is_err() {
-                        self.metrics.msgs_dropped_dead_rx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.metrics
+                            .msgs_dropped_dead_rx
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
-            Some(json!({ "ok": true, "op": "msg", "topic": topic }).to_string().into_bytes())
+            Some(
+                json!({ "ok": true, "op": "msg", "topic": topic })
+                    .to_string()
+                    .into_bytes(),
+            )
         } else {
             None
         }
@@ -1915,8 +1950,8 @@ impl Node {
                     "seq": msg.seq,
                     "origin": msg.origin,
                 })
-                    .to_string()
-                    .into_bytes();
+                .to_string()
+                .into_bytes();
                 // живые соединения подписчика на этот топик
                 let live_conns: Vec<Connection> = self
                     .subs
@@ -1973,7 +2008,9 @@ impl Node {
                     if let Some(front) = q.front_mut() {
                         if sent {
                             q.pop_front();
-                            self.metrics.outbox_delivered.fetch_add(1, Ordering::Relaxed);
+                            self.metrics
+                                .outbox_delivered
+                                .fetch_add(1, Ordering::Relaxed);
                         } else {
                             front.attempts += 1;
                         }
@@ -2051,7 +2088,12 @@ impl Node {
             .read()
             .await
             .iter()
-            .map(|(k, v)| (format!("inf1:{}", hex::encode(k)), v.iter().cloned().collect()))
+            .map(|(k, v)| {
+                (
+                    format!("inf1:{}", hex::encode(k)),
+                    v.iter().cloned().collect(),
+                )
+            })
             .collect();
         if let Ok(json) = serde_json::to_string(&map) {
             self.write_file("outbox.json", json).await;
@@ -2070,9 +2112,10 @@ impl Node {
                             if b.len() == NODEID_LEN {
                                 let mut pid = [0u8; NODEID_LEN];
                                 pid.copy_from_slice(&b);
-                                entry
-                                    .entry(pid)
-                                    .or_insert(SubState { ts, conns: HashMap::new() });
+                                entry.entry(pid).or_insert(SubState {
+                                    ts,
+                                    conns: HashMap::new(),
+                                });
                             }
                         }
                     }
@@ -2164,7 +2207,9 @@ impl Node {
             Ok(b) if b.len() == NODEID_LEN => b,
             _ => {
                 return Some(
-                    json!({ "ok": false, "err": "bad node id" }).to_string().into_bytes(),
+                    json!({ "ok": false, "err": "bad node id" })
+                        .to_string()
+                        .into_bytes(),
                 );
             }
         };
@@ -2181,7 +2226,9 @@ impl Node {
         }
         if ttl == 0 {
             return Some(
-                json!({ "ok": true, "found": false, "node": target_hex }).to_string().into_bytes(),
+                json!({ "ok": true, "found": false, "node": target_hex })
+                    .to_string()
+                    .into_bytes(),
             );
         }
         // рекурсивный опрос пиров
@@ -2193,7 +2240,9 @@ impl Node {
             .copied()
             .filter(|p| *p != from)
             .collect();
-        let payload = json!({ "node": target_hex, "ttl": ttl - 1 }).to_string().into_bytes();
+        let payload = json!({ "node": target_hex, "ttl": ttl - 1 })
+            .to_string()
+            .into_bytes();
         let mut merged: Vec<String> = Vec::new();
         let mut found_ed: Option<String> = None;
         let mut handles = Vec::new();
@@ -2290,7 +2339,11 @@ impl Node {
                 self.write_file("routes.json", json).await;
             }
         }
-        Some(json!({ "ok": true, "op": "dht.update" }).to_string().into_bytes())
+        Some(
+            json!({ "ok": true, "op": "dht.update" })
+                .to_string()
+                .into_bytes(),
+        )
     }
 
     /// Рассылает свои маршруты пирам (самообучение сети).
@@ -2364,7 +2417,11 @@ impl Node {
     async fn dht_refresh(self: &Arc<Self>) {
         let mut target = self.id;
         target[19] ^= 0x01; // чуть-чуть другой ID, чтобы покрыть ближний бакет
-        let nodes = self.routing.read().await.closest(&target, crate::dht::ALPHA);
+        let nodes = self
+            .routing
+            .read()
+            .await
+            .closest(&target, crate::dht::ALPHA);
         for n in nodes {
             if self.ensure_dht_peer(&n).await.is_err() {
                 continue;
@@ -2555,7 +2612,8 @@ impl Node {
     async fn load_kv(&self) {
         let path = self.data_dir.join("kv.json");
         if let Ok(raw) = std::fs::read_to_string(&path) {
-            if let Ok(map) = serde_json::from_str::<HashMap<String, crate::dht::StoredValue>>(&raw) {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, crate::dht::StoredValue>>(&raw)
+            {
                 let mut kv = self.kv.write().await;
                 for (k, v) in map {
                     kv.restore(k, v);
@@ -2565,7 +2623,13 @@ impl Node {
     }
 
     /// Вставка/обновление узла в routing table + персистентность.
-    async fn routing_insert(&self, pid: [u8; NODEID_LEN], endpoints: &[String], ed_hex: &str, x_hex: &str) {
+    async fn routing_insert(
+        &self,
+        pid: [u8; NODEID_LEN],
+        endpoints: &[String],
+        ed_hex: &str,
+        x_hex: &str,
+    ) {
         let mut routing = self.routing.write().await;
         routing.insert(crate::dht::NodeInfo {
             id: pid,
@@ -2621,7 +2685,11 @@ impl Node {
             // реестр/манифесты или выкачать KV.
             // PENTEST F5: born rate-limited (0 = unlimited is for operator-pinned
             // static peers only, never for identities we learned from the network).
-            allow: vec!["dht.lookup".into(), "dht.update".into(), "dht.find_node".into()],
+            allow: vec![
+                "dht.lookup".into(),
+                "dht.update".into(),
+                "dht.find_node".into(),
+            ],
             rate_limit_per_sec: DYNAMIC_PEER_RATE_LIMIT_PER_SEC,
             role: None,
             storage_roles: vec![],
@@ -2633,7 +2701,10 @@ impl Node {
     }
 
     /// Итеративный Kademlia lookup: k ближайших к target.
-    pub async fn dht_find_node(self: &Arc<Self>, target: &[u8; NODEID_LEN]) -> Vec<crate::dht::NodeInfo> {
+    pub async fn dht_find_node(
+        self: &Arc<Self>,
+        target: &[u8; NODEID_LEN],
+    ) -> Vec<crate::dht::NodeInfo> {
         // начальные кандидаты: routing table + конфигурированные пиры (bootstrap)
         let mut candidates = self.routing.read().await.closest(target, crate::dht::K);
         {
@@ -2655,8 +2726,7 @@ impl Node {
             }
         }
         candidates.sort_by(|a, b| {
-            crate::dht::xor_distance(&a.id, target)
-                .cmp(&crate::dht::xor_distance(&b.id, target))
+            crate::dht::xor_distance(&a.id, target).cmp(&crate::dht::xor_distance(&b.id, target))
         });
         // Fast-path: in a small/static cluster (<= K nodes), all candidates are already known
         // locally from configured peers and routing table. Bypassing iterative network RPCs
@@ -2664,7 +2734,8 @@ impl Node {
         if candidates.len() <= crate::dht::K {
             return candidates;
         }
-        let mut queried: std::collections::HashSet<[u8; NODEID_LEN]> = std::collections::HashSet::new();
+        let mut queried: std::collections::HashSet<[u8; NODEID_LEN]> =
+            std::collections::HashSet::new();
         let mut no_progress = 0usize;
         let target_hex = format!("inf1:{}", hex::encode(target));
         loop {
@@ -2728,7 +2799,10 @@ impl Node {
                     .cmp(&crate::dht::xor_distance(&b.id, target))
             });
             merged.truncate(crate::dht::K);
-            let same = merged.iter().zip(candidates.iter()).all(|(a, b)| a.id == b.id);
+            let same = merged
+                .iter()
+                .zip(candidates.iter())
+                .all(|(a, b)| a.id == b.id);
             candidates = merged;
             if same {
                 no_progress += 1;
@@ -2765,8 +2839,7 @@ impl Node {
             }
         }
         candidates.sort_by(|a, b| {
-            crate::dht::xor_distance(&a.id, target)
-                .cmp(&crate::dht::xor_distance(&b.id, target))
+            crate::dht::xor_distance(&a.id, target).cmp(&crate::dht::xor_distance(&b.id, target))
         });
         candidates.into_iter().filter(|n| n.id != self.id).collect()
     }
@@ -2776,42 +2849,77 @@ impl Node {
         let s = target_hex.strip_prefix("inf1:").unwrap_or(&target_hex);
         let b = match hex::decode(s) {
             Ok(b) if b.len() == NODEID_LEN => b,
-            _ => return Some(json!({ "ok": false, "err": "bad target" }).to_string().into_bytes()),
+            _ => {
+                return Some(
+                    json!({ "ok": false, "err": "bad target" })
+                        .to_string()
+                        .into_bytes(),
+                )
+            }
         };
         let mut target = [0u8; NODEID_LEN];
         target.copy_from_slice(&b);
         let nodes = self.routing.read().await.closest(&target, crate::dht::K);
         let list: Vec<serde_json::Value> = nodes
             .iter()
-            .map(|n| json!({
-                "node_id": format!("inf1:{}", hex::encode(n.id)),
-                "endpoints": n.endpoints,
-                "ed_pub": n.ed_hex,
-                "x_pub": n.x_hex,
-            }))
+            .map(|n| {
+                json!({
+                    "node_id": format!("inf1:{}", hex::encode(n.id)),
+                    "endpoints": n.endpoints,
+                    "ed_pub": n.ed_hex,
+                    "x_pub": n.x_hex,
+                })
+            })
             .collect();
-        Some(json!({ "ok": true, "nodes": list }).to_string().into_bytes())
+        Some(
+            json!({ "ok": true, "nodes": list })
+                .to_string()
+                .into_bytes(),
+        )
     }
 
-    async fn handle_dht_store(self: &Arc<Self>, v: &serde_json::Value, from: [u8; NODEID_LEN]) -> Option<Vec<u8>> {
+    async fn handle_dht_store(
+        self: &Arc<Self>,
+        v: &serde_json::Value,
+        from: [u8; NODEID_LEN],
+    ) -> Option<Vec<u8>> {
         let key = v["key"].as_str().unwrap_or("").to_string();
         let value = v["value"].as_str().unwrap_or("").to_string();
         let ttl = v["ttl"].as_u64().unwrap_or(3600) as i64;
         if key.is_empty() {
-            return Some(json!({ "ok": false, "err": "key required" }).to_string().into_bytes());
+            return Some(
+                json!({ "ok": false, "err": "key required" })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         // Валидатор-авторитетные ключи web-слоя: recovery-коды и чёрные списки строго локальны
         // (утечка/подмена = захват аккаунта). Индексы ящиков (mail:) и файлов (files:) можно
         // реплицировать ТОЛЬКО пирам с соответствующей role хранения — ноды становятся
         // реальными держателями «каталога» писем/файлов для восстановления после потери kv.
-        if key.starts_with("recovery:") || key.starts_with("blacklist:") || key.starts_with("share:") {
-            return Some(json!({ "ok": false, "err": "key is local-authoritative" }).to_string().into_bytes());
+        if key.starts_with("recovery:")
+            || key.starts_with("blacklist:")
+            || key.starts_with("share:")
+        {
+            return Some(
+                json!({ "ok": false, "err": "key is local-authoritative" })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         if key.starts_with("mail:") && !self.peer_allows(&from, "mail").await {
-            return Some(json!({ "ok": false, "err": "peer role denies mail" }).to_string().into_bytes());
+            return Some(
+                json!({ "ok": false, "err": "peer role denies mail" })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         if key.starts_with("files:") && !self.peer_allows(&from, "files").await {
-            return Some(json!({ "ok": false, "err": "peer role denies files" }).to_string().into_bytes());
+            return Some(
+                json!({ "ok": false, "err": "peer role denies files" })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         // LWW по stored_at (если отправитель прислал): не затирать свежую локальную запись
         // устаревшей репликацией. Если stored_at не прислан — сохраняем текущее поведение.
@@ -2824,46 +2932,91 @@ impl Node {
             // Only the ancient side is clamped (in store_replica).
             const SKEW_ALLOWANCE_MS: i64 = 5 * 60 * 1000;
             if sa > crate::dht::now_ms() + SKEW_ALLOWANCE_MS {
-                return Some(json!({ "ok": true, "stored": key, "lww": "skew" }).to_string().into_bytes());
+                return Some(
+                    json!({ "ok": true, "stored": key, "lww": "skew" })
+                        .to_string()
+                        .into_bytes(),
+                );
             }
             let local_sa = self.kv.read().await.stored_at(&key);
             if sa <= local_sa {
-                return Some(json!({ "ok": true, "stored": key, "lww": "local" }).to_string().into_bytes());
+                return Some(
+                    json!({ "ok": true, "stored": key, "lww": "local" })
+                        .to_string()
+                        .into_bytes(),
+                );
             }
             // Replica with original age (audit 2026-10-06): preserve the
             // sender's clock so TTL fires on the original schedule instead of
             // resetting at every republish hop (immortal entries).
-            self.kv.write().await.store_replica(&key, value, ttl * 1000, self.id, sa);
+            self.kv
+                .write()
+                .await
+                .store_replica(&key, value, ttl * 1000, self.id, sa);
             self.mark_kv_dirty();
-            return Some(json!({ "ok": true, "stored": key, "replica": true }).to_string().into_bytes());
+            return Some(
+                json!({ "ok": true, "stored": key, "replica": true })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         // No clock on the sender: keep a present local value (audit follow-up
         // — legacy peers used to clobber newer locals AND reset their age).
         if self.kv.read().await.stored_at(&key) > 0 {
-            return Some(json!({ "ok": true, "stored": key, "lww": "local-present" }).to_string().into_bytes());
+            return Some(
+                json!({ "ok": true, "stored": key, "lww": "local-present" })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
-        self.kv.write().await.store(&key, value, ttl * 1000, self.id);
+        self.kv
+            .write()
+            .await
+            .store(&key, value, ttl * 1000, self.id);
         // R6: всплеск dht.store => ОДНО отложенное сохранение, а не N полных
         // перезаписей kv.json ( response клиенту не меняется ).
         self.mark_kv_dirty();
-        Some(json!({ "ok": true, "stored": key }).to_string().into_bytes())
+        Some(
+            json!({ "ok": true, "stored": key })
+                .to_string()
+                .into_bytes(),
+        )
     }
 
-    async fn handle_dht_find_value(self: &Arc<Self>, v: &serde_json::Value, from: [u8; NODEID_LEN]) -> Option<Vec<u8>> {
+    async fn handle_dht_find_value(
+        self: &Arc<Self>,
+        v: &serde_json::Value,
+        from: [u8; NODEID_LEN],
+    ) -> Option<Vec<u8>> {
         let key = v["key"].as_str().unwrap_or("").to_string();
         // Жёсткий отказ по сети для ключей захвата аккаунта: recovery-коды и чёрные списки.
         // (user:* — публичный реестр E2E-ключей, остаётся доступным для репликации.)
         // Индексы mail:/files: отдаём ТОЛЬКО пирам с соответствующей ролью хранения —
         // это позволяет валидатору восстановить «каталог» ящика/файлов с нод при потере kv,
         // не открывая его неизвестным/бесролевым пирам.
-        if key.starts_with("recovery:") || key.starts_with("blacklist:") || key.starts_with("share:") {
-            return Some(json!({ "ok": true, "found": false }).to_string().into_bytes());
+        if key.starts_with("recovery:")
+            || key.starts_with("blacklist:")
+            || key.starts_with("share:")
+        {
+            return Some(
+                json!({ "ok": true, "found": false })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         if key.starts_with("mail:") && !self.peer_allows(&from, "mail").await {
-            return Some(json!({ "ok": true, "found": false }).to_string().into_bytes());
+            return Some(
+                json!({ "ok": true, "found": false })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         if key.starts_with("files:") && !self.peer_allows(&from, "files").await {
-            return Some(json!({ "ok": true, "found": false }).to_string().into_bytes());
+            return Some(
+                json!({ "ok": true, "found": false })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         if let Some(value) = self.kv.write().await.get(&key) {
             return Some(
@@ -2879,19 +3032,29 @@ impl Node {
         let nodes = self.routing.read().await.closest(&target, crate::dht::K);
         let list: Vec<serde_json::Value> = nodes
             .iter()
-            .map(|n| json!({
-                "node_id": format!("inf1:{}", hex::encode(n.id)),
-                "endpoints": n.endpoints,
-                "ed_pub": n.ed_hex,
-                "x_pub": n.x_hex,
-            }))
+            .map(|n| {
+                json!({
+                    "node_id": format!("inf1:{}", hex::encode(n.id)),
+                    "endpoints": n.endpoints,
+                    "ed_pub": n.ed_hex,
+                    "x_pub": n.x_hex,
+                })
+            })
             .collect();
-        Some(json!({ "ok": true, "found": false, "nodes": list }).to_string().into_bytes())
+        Some(
+            json!({ "ok": true, "found": false, "nodes": list })
+                .to_string()
+                .into_bytes(),
+        )
     }
 
     /// dht.sync: отдать полный слепок KV (для догоняющей репликации при переподключении).
     /// Доступен только доверенным пирам (ACL), не TOFU-нодам.
-    async fn handle_dht_sync(self: &Arc<Self>, v: &serde_json::Value, from: [u8; NODEID_LEN]) -> Option<Vec<u8>> {
+    async fn handle_dht_sync(
+        self: &Arc<Self>,
+        v: &serde_json::Value,
+        from: [u8; NODEID_LEN],
+    ) -> Option<Vec<u8>> {
         let limit = v["limit"].as_u64().unwrap_or(10000) as usize;
         let now = crate::dht::now_ms();
         let mail_ok = self.peer_allows(&from, "mail").await;
@@ -2906,7 +3069,10 @@ impl Node {
                 // (иначе код восстановления утечёт на другую ноду).
                 // Индексы mail:/files: отдаём только пирам с соответствующей ролью хранения
                 // (приёмщик фильтрует по своей роли в catch_up_with — симметрично).
-                if k.starts_with("recovery:") || k.starts_with("blacklist:") || k.starts_with("share:") {
+                if k.starts_with("recovery:")
+                    || k.starts_with("blacklist:")
+                    || k.starts_with("share:")
+                {
                     continue;
                 }
                 if k.starts_with("mail:") && !mail_ok {
@@ -2950,7 +3116,10 @@ impl Node {
                         }
                         // локально-авторитетные ключи не принимаем от пиров (share-токены,
                         // recovery-коды, чёрные списки) — даже если пир их пришлёт старым слепком
-                        if k.starts_with("share:") || k.starts_with("recovery:") || k.starts_with("blacklist:") {
+                        if k.starts_with("share:")
+                            || k.starts_with("recovery:")
+                            || k.starts_with("blacklist:")
+                        {
                             continue;
                         }
                         if let Some(val) = e["value"].as_str() {
@@ -2959,7 +3128,13 @@ impl Node {
                             // перезаписывается устаревшей репликой при догоняющей репликации)
                             let sa = e["stored_at"].as_i64().unwrap_or(0);
                             let ttl = e["ttl"].as_i64().unwrap_or(0) * 1000;
-                            self.kv.write().await.merge_replica(k, val.to_string(), ttl, self.id, sa);
+                            self.kv.write().await.merge_replica(
+                                k,
+                                val.to_string(),
+                                ttl,
+                                self.id,
+                                sa,
+                            );
                         }
                     }
                     // R6: отложенное сохранение — синк не должен ждать
@@ -2987,7 +3162,8 @@ impl Node {
             }
             if let Ok(data) = std::fs::read(&path) {
                 let h = hex::encode(blake3::hash(&data).as_bytes());
-                map.entry(h).or_insert_with(|| e.file_name().to_string_lossy().to_string());
+                map.entry(h)
+                    .or_insert_with(|| e.file_name().to_string_lossy().to_string());
             }
         }
         map
@@ -3086,12 +3262,14 @@ impl Node {
                         // поток асинхронного рантайма
                         let me = self.clone();
                         let b = bucket.clone();
-                        content_map = tokio::task::spawn_blocking(move || me.local_chunk_content_map(&b))
-                            .await
-                            .ok();
+                        content_map =
+                            tokio::task::spawn_blocking(move || me.local_chunk_content_map(&b))
+                                .await
+                                .ok();
                         map_built_for = Some(bucket.clone());
                     }
-                    if let Some(fname) = content_map.as_ref().and_then(|m| m.get(expected)).cloned() {
+                    if let Some(fname) = content_map.as_ref().and_then(|m| m.get(expected)).cloned()
+                    {
                         let src = self.chunks_dir(&bucket).join(&fname);
                         if let Ok(data) = std::fs::read(&src) {
                             let dir = self.chunks_dir(&bucket);
@@ -3134,7 +3312,10 @@ impl Node {
                                     let dir = self.chunks_dir(&bucket);
                                     let _ = std::fs::create_dir_all(&dir);
                                     let _ = write_chunk_atomic(&dir, cid, &data);
-                                    eprintln!("[node] repair: {cid} получен от пира {}", hex::encode(&pid[..4]));
+                                    eprintln!(
+                                        "[node] repair: {cid} получен от пира {}",
+                                        hex::encode(&pid[..4])
+                                    );
                                 }
                             }
                         }
@@ -3159,7 +3340,10 @@ impl Node {
 
     fn chunks_dir(&self, bucket: &str) -> PathBuf {
         // bucket: "mail" или "files" (только буквы)
-        let safe: String = bucket.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let safe: String = bucket
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
         self.data_dir.join("chunks").join(safe)
     }
 
@@ -3184,7 +3368,10 @@ impl Node {
         if self.cfg.storage_roles.iter().any(|r| r == bucket) {
             return true;
         }
-        self.cfg.storage_roles.iter().any(|r| r != "mail" && r != "files")
+        self.cfg
+            .storage_roles
+            .iter()
+            .any(|r| r != "mail" && r != "files")
     }
 
     /// Может ли нода подписывать состояние консенсуса: сам валидатор или пир из cfg.validators.
@@ -3260,9 +3447,14 @@ impl Node {
     }
 
     /// Сохранить чанк локально с dedup-проверкой по содержимому (П.3.5).
-/// Возвращает (ok, dedup_hit, written_bytes).
-/// Используется и в handle_storage_store (по сети), и в store_mail_boxed (локально).
-async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, data: &[u8]) -> (bool, bool, usize) {
+    /// Возвращает (ok, dedup_hit, written_bytes).
+    /// Используется и в handle_storage_store (по сети), и в store_mail_boxed (локально).
+    async fn write_chunk_with_dedup(
+        self: &Arc<Self>,
+        bucket: &str,
+        chunk_id: &str,
+        data: &[u8],
+    ) -> (bool, bool, usize) {
         if !self.role_allows(bucket) {
             return (false, false, 0);
         }
@@ -3280,7 +3472,10 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
             if let Some(v) = kv.get(&dedup_key) {
                 if let Ok(d) = serde_json::from_str::<serde_json::Value>(&v) {
                     if let Some(nodes) = d["nodes"].as_array() {
-                        if nodes.iter().any(|x| x.as_str() == Some(&hex::encode(self.id))) {
+                        if nodes
+                            .iter()
+                            .any(|x| x.as_str() == Some(&hex::encode(self.id)))
+                        {
                             dedup_hit = true;
                         }
                     }
@@ -3307,7 +3502,11 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                 kv.get(&dedup_key)
                     .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
                     .and_then(|d| d["nodes"].as_array().cloned())
-                    .map(|arr| arr.into_iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .map(|arr| {
+                        arr.into_iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default()
             };
             let me = hex::encode(self.id);
@@ -3322,7 +3521,10 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
             let payload = serde_json::to_string(&entry).unwrap_or("{}".into());
             // dedup:* живёт только DEDUP_TTL_MS (5 мин) — иначе ключ копится
             // в kv.json месяцами (см. dht::DEDUP_TTL_MS).
-            self.kv.write().await.store(&dedup_key, payload, crate::dht::DEDUP_TTL_MS, self.id);
+            self.kv
+                .write()
+                .await
+                .store(&dedup_key, payload, crate::dht::DEDUP_TTL_MS, self.id);
         }
         (true, false, data.len())
     }
@@ -3330,7 +3532,11 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
     async fn handle_storage_store(self: &Arc<Self>, v: &serde_json::Value) -> Option<Vec<u8>> {
         let id = v["chunk_id"].as_str().unwrap_or("").to_string();
         if !self.valid_chunk_id(&id) {
-            return Some(json!({ "ok": false, "err": "bad chunk_id" }).to_string().into_bytes());
+            return Some(
+                json!({ "ok": false, "err": "bad chunk_id" })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         let bucket = v["bucket"].as_str().unwrap_or("files");
         if !self.role_allows(bucket) {
@@ -3343,7 +3549,13 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
         let data_b64 = v["data"].as_str().unwrap_or("").to_string();
         let data = match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
             Ok(d) => d,
-            Err(_) => return Some(json!({ "ok": false, "err": "bad data" }).to_string().into_bytes()),
+            Err(_) => {
+                return Some(
+                    json!({ "ok": false, "err": "bad data" })
+                        .to_string()
+                        .into_bytes(),
+                )
+            }
         };
         // Сверка с известными манифестами: если локально есть манифест с этим
         // chunk id и хэшем содержимого — несовпадение отклоняем (раньше приём
@@ -3431,7 +3643,9 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                 if let Ok(d) = serde_json::from_str::<serde_json::Value>(&v) {
                     if let Some(nodes) = d["nodes"].as_array() {
                         let have = nodes.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>();
-                        if have.len() >= want_replicas && have.iter().any(|h| *h == hex::encode(self.id)) {
+                        if have.len() >= want_replicas
+                            && have.iter().any(|h| *h == hex::encode(self.id))
+                        {
                             dedup_hit = true;
                         }
                     }
@@ -3453,12 +3667,16 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                 })
                 .await;
             }
-            return Some(json!({
-                "ok": true,
-                "chunk_id": id,
-                "bytes": nbytes,
-                "dedup": "hit",
-            }).to_string().into_bytes());
+            return Some(
+                json!({
+                    "ok": true,
+                    "chunk_id": id,
+                    "bytes": nbytes,
+                    "dedup": "hit",
+                })
+                .to_string()
+                .into_bytes(),
+            );
         }
         {
             // R2: запись чанка (write+rename) — в blocking-пуле; data переезжает
@@ -3481,7 +3699,11 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                 kv.get(&dedup_key)
                     .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
                     .and_then(|d| d["nodes"].as_array().cloned())
-                    .map(|arr| arr.into_iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .map(|arr| {
+                        arr.into_iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default()
             };
             let me = hex::encode(self.id);
@@ -3489,23 +3711,35 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                 nodes.push(me);
             }
             entry.insert("nodes".into(), serde_json::json!(nodes));
-            let payload = serde_json::to_string(&serde_json::Value::Object(entry)).unwrap_or("{}".into());
+            let payload =
+                serde_json::to_string(&serde_json::Value::Object(entry)).unwrap_or("{}".into());
             // dedup:* живёт только DEDUP_TTL_MS (5 мин) — иначе ключ копится
             // в kv.json месяцами (см. dht::DEDUP_TTL_MS).
-            self.kv.write().await.store(&dedup_key, payload, crate::dht::DEDUP_TTL_MS, self.id);
+            self.kv
+                .write()
+                .await
+                .store(&dedup_key, payload, crate::dht::DEDUP_TTL_MS, self.id);
         }
-        Some(json!({
-            "ok": true,
-            "chunk_id": id,
-            "bytes": nbytes,
-            "dedup": "stored",
-        }).to_string().into_bytes())
+        Some(
+            json!({
+                "ok": true,
+                "chunk_id": id,
+                "bytes": nbytes,
+                "dedup": "stored",
+            })
+            .to_string()
+            .into_bytes(),
+        )
     }
 
     async fn handle_storage_fetch(self: &Arc<Self>, v: &serde_json::Value) -> Option<Vec<u8>> {
         let id = v["chunk_id"].as_str().unwrap_or("").to_string();
         if !self.valid_chunk_id(&id) {
-            return Some(json!({ "ok": false, "err": "bad chunk_id" }).to_string().into_bytes());
+            return Some(
+                json!({ "ok": false, "err": "bad chunk_id" })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         let bucket = v["bucket"].as_str().unwrap_or("files");
         if !self.role_allows(bucket) {
@@ -3532,14 +3766,22 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                 .to_string()
                 .into_bytes(),
             ),
-            None => Some(json!({ "ok": false, "err": "not found" }).to_string().into_bytes()),
+            None => Some(
+                json!({ "ok": false, "err": "not found" })
+                    .to_string()
+                    .into_bytes(),
+            ),
         }
     }
 
     async fn handle_storage_delete(self: &Arc<Self>, v: &serde_json::Value) -> Option<Vec<u8>> {
         let id = v["chunk_id"].as_str().unwrap_or("").to_string();
         if !self.valid_chunk_id(&id) {
-            return Some(json!({ "ok": false, "err": "bad chunk_id" }).to_string().into_bytes());
+            return Some(
+                json!({ "ok": false, "err": "bad chunk_id" })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         let bucket = v["bucket"].as_str().unwrap_or("files");
         let path = self.chunks_dir(bucket).join(&id);
@@ -3582,12 +3824,21 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                     let payload = serde_json::to_string(&d).unwrap_or("{}".into());
                     // dedup:* живёт только DEDUP_TTL_MS (5 мин) — иначе ключ копится
                     // в kv.json месяцами (см. dht::DEDUP_TTL_MS).
-                    self.kv.write().await.store(&dedup_key, payload, crate::dht::DEDUP_TTL_MS, self.id);
+                    self.kv.write().await.store(
+                        &dedup_key,
+                        payload,
+                        crate::dht::DEDUP_TTL_MS,
+                        self.id,
+                    );
                 }
             }
         }
         let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
-        Some(json!({ "ok": true, "deleted": id }).to_string().into_bytes())
+        Some(
+            json!({ "ok": true, "deleted": id })
+                .to_string()
+                .into_bytes(),
+        )
     }
 
     /// Чтение из локального KV (манифесты storage).
@@ -3611,7 +3862,8 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
     /// Локальная запись в DHT-KV (валидатор хранит копию всегда — самодостаточность).
     /// TTL 30 дней: долгоживущие записи (реестр, индексы) не протухают при одиночной ноде.
     pub async fn kv_store_local(&self, key: &str, value: &str) {
-        self.kv_store_local_with_ttl(key, value, 30 * 24 * 3600 * 1000).await;
+        self.kv_store_local_with_ttl(key, value, 30 * 24 * 3600 * 1000)
+            .await;
     }
 
     /// Локальная запись в DHT-KV с явным TTL (мс).
@@ -3622,12 +3874,10 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
     /// (`KvStore::sweep`, перед каждым persist kv.json) выкидывает просроченное.
     /// Записи без вызова этой функции ведут себя как раньше (30 дней).
     pub async fn kv_store_local_with_ttl(&self, key: &str, value: &str, ttl_ms: i64) {
-        self.kv.write().await.store(
-            key,
-            value.to_string(),
-            ttl_ms,
-            self.id,
-        );
+        self.kv
+            .write()
+            .await
+            .store(key, value.to_string(), ttl_ms, self.id);
         // Local writes must reach kv.json promptly, not only via the 60s
         // dht_refresh persist: a crash inside that window loses publishes AND
         // the prune cursor (audit 2026-10-06). Dirty flag + 1s flush cycle
@@ -3654,9 +3904,13 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                     let mut target = [0u8; NODEID_LEN];
                     target.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
                     let closest = node.dht_find_node(&target).await;
-                    let payload = json!({ "bucket": bucket, "chunk_id": cid }).to_string().into_bytes();
+                    let payload = json!({ "bucket": bucket, "chunk_id": cid })
+                        .to_string()
+                        .into_bytes();
                     for n in closest {
-                        let _ = node.request_to(n.id, "storage.delete", payload.clone()).await;
+                        let _ = node
+                            .request_to(n.id, "storage.delete", payload.clone())
+                            .await;
                     }
                 }
             });
@@ -3829,7 +4083,12 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
     }
 
     /// Восстановление ciphertext из любых k доступных шардов.
-    fn ec_decode(slots: &mut [Option<Vec<u8>>], k: usize, n: usize, ct_len: usize) -> Option<Vec<u8>> {
+    fn ec_decode(
+        slots: &mut [Option<Vec<u8>>],
+        k: usize,
+        n: usize,
+        ct_len: usize,
+    ) -> Option<Vec<u8>> {
         let present = slots.iter().filter(|s| s.is_some()).count();
         if present < k {
             return None;
@@ -3887,12 +4146,15 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                     continue;
                 }
                 if self.ensure_dht_peer(n).await.is_ok() {
-                    let req = json!({ "bucket": bucket, "chunk_id": cid }).to_string().into_bytes();
+                    let req = json!({ "bucket": bucket, "chunk_id": cid })
+                        .to_string()
+                        .into_bytes();
                     if let Ok(resp) = self.request_to(n.id, "storage.fetch", req).await {
                         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
                             if v["ok"].as_bool().unwrap_or(false) {
                                 if let Some(b64) = v["data"].as_str() {
-                                    got = base64::engine::general_purpose::STANDARD.decode(b64).ok();
+                                    got =
+                                        base64::engine::general_purpose::STANDARD.decode(b64).ok();
                                 }
                             }
                         }
@@ -3901,7 +4163,9 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
             }
         }
         if got.is_none() {
-            eprintln!("[node] WARN: chunk {cid} of {bucket} served from LOCAL disk, not from the network");
+            eprintln!(
+                "[node] WARN: chunk {cid} of {bucket} served from LOCAL disk, not from the network"
+            );
             got = self.local_chunk_get(bucket, cid);
         }
         if let Some(expected) = expected_hash {
@@ -3986,7 +4250,11 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
         let mkey_s = mkey.clone();
         let manifest_s = manifest.to_string();
         tokio::spawn(async move {
-            let _ = timeout(Duration::from_secs(20), node.replicate_mail(&name_s, &[], &manifest_s, &mkey_s, &content_hash)).await;
+            let _ = timeout(
+                Duration::from_secs(20),
+                node.replicate_mail(&name_s, &[], &manifest_s, &mkey_s, &content_hash),
+            )
+            .await;
             for (cid, data) in to_replicate {
                 node.store_chunk_replicated("mail", &cid, &data).await;
             }
@@ -4006,7 +4274,12 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
     /// ИДЕМПОТЕНТНОСТЬ: key/nonce и chunk_id выводятся из содержимого (blob_key_nonce /
     /// chunk_id_for) — повторный store того же письма перезаписывает те же файлы чанков,
     /// а не добавляет новые (иначе ретраи федерации раздували каталог chunks/mail).
-    pub async fn store_mail_boxed(self: &Arc<Self>, name: &str, blob: &[u8], owner_pub: Option<&str>) -> usize {
+    pub async fn store_mail_boxed(
+        self: &Arc<Self>,
+        name: &str,
+        blob: &[u8],
+        owner_pub: Option<&str>,
+    ) -> usize {
         const CHUNK: usize = 1024 * 1024;
         let content_hash = blob_content_hash(blob);
         let (data_key, nonce) = blob_key_nonce("mail", name, &content_hash);
@@ -4028,7 +4301,8 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                 // (write_chunk_with_dedup досыпает файл, если его нет).
                 // Считаем по `ok`, а не по !dedup_hit: чанк есть локально — иначе
                 // идемпотентный репаблиш вернул бы 0 и web откатил квоту с 502.
-                let (ok, _dedup_hit, _bytes) = self.write_chunk_with_dedup("mail", &chunk_id, chunk).await;
+                let (ok, _dedup_hit, _bytes) =
+                    self.write_chunk_with_dedup("mail", &chunk_id, chunk).await;
                 if ok {
                     local_chunks += 1;
                 }
@@ -4113,7 +4387,9 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
         let mut target = [0u8; NODEID_LEN];
         target.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
         let closest = self.dht_find_node(&target).await;
-        let payload = json!({ "key": mkey, "value": manifest_str, "ttl": 30 * 24 * 3600 }).to_string().into_bytes();
+        let payload = json!({ "key": mkey, "value": manifest_str, "ttl": 30 * 24 * 3600 })
+            .to_string()
+            .into_bytes();
         for n in closest {
             if self.ensure_dht_peer(&n).await.is_ok() {
                 let _ = self.request_to(n.id, "dht.store", payload.clone()).await;
@@ -4129,11 +4405,19 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
 
     /// Скачать Proton-письмо (манифест с key_box) — расшифровывает ключ блоба приватным
     /// X25519-ключом владельца. Используется браузером через web-слой (владение уже проверено).
-    pub async fn fetch_mail_owner(self: &Arc<Self>, name: &str, owner_priv_hex: &str) -> Option<Vec<u8>> {
+    pub async fn fetch_mail_owner(
+        self: &Arc<Self>,
+        name: &str,
+        owner_priv_hex: &str,
+    ) -> Option<Vec<u8>> {
         self.fetch_mail_inner(name, Some(owner_priv_hex)).await
     }
 
-    async fn fetch_mail_inner(self: &Arc<Self>, name: &str, owner_priv: Option<&str>) -> Option<Vec<u8>> {
+    async fn fetch_mail_inner(
+        self: &Arc<Self>,
+        name: &str,
+        owner_priv: Option<&str>,
+    ) -> Option<Vec<u8>> {
         // кэш: если тело уже читали недавно (<60с) — отдаём из памяти (без сети)
         {
             let now = now_ms();
@@ -4156,7 +4440,9 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
             let q = json!({ "key": mkey }).to_string().into_bytes();
             let mut found = None;
             for n in closest.iter() {
-                if found.is_some() { break; }
+                if found.is_some() {
+                    break;
+                }
                 if self.ensure_dht_peer(n).await.is_ok() {
                     if let Ok(resp) = self.request_to(n.id, "dht.find_value", q.clone()).await {
                         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
@@ -4199,7 +4485,8 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                         continue;
                     }
                     let cid = c["id"].as_str().unwrap_or("");
-                    if let Some(data) = self.fetch_chunk_net("mail", cid, c["hash"].as_str()).await {
+                    if let Some(data) = self.fetch_chunk_net("mail", cid, c["hash"].as_str()).await
+                    {
                         slots[idx] = Some(data);
                         have += 1;
                         if have >= k {
@@ -4215,7 +4502,10 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
             let ct = Self::ec_decode(&mut slots, k, n, ct_len)?;
             let plain = e2e_decrypt(&dk, &nonce, &ct).ok();
             if let Some(p) = &plain {
-                self.mail_cache.write().await.insert(name.to_string(), (p.clone(), now_ms()));
+                self.mail_cache
+                    .write()
+                    .await
+                    .insert(name.to_string(), (p.clone(), now_ms()));
             }
             return plain;
         }
@@ -4234,34 +4524,50 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                     );
                 }
                 if got.is_none() {
-                // РАСПРЕДЕЛЁННОЕ чтение: ближайшие ноды (по DHT).
-                // Цель: валидатор не обязан хранить почту; чанки живут на storage-нодах.
-                {
-                    let h = blake3::hash(format!("mail:{cid}").as_bytes());
-                    let mut target = [0u8; NODEID_LEN];
-                    target.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
-                    let closest = self.dht_find_node(&target).await;
-                    // ДВА ПРОХОДА: сначала пиры с ЖИВЫМ соединением (мгновенно), затем остальные.
-                    // Иначе недоступный пир (нода за NAT, к которой валидатор не может дозвониться)
-                    // держит чтение письма на своём connect-таймауте и Inbox «висит» десятками секунд.
-                    for pass in 0..2u8 {
-                        if got.is_some() {
-                            break;
-                        }
-                        for n in closest.iter() {
+                    // РАСПРЕДЕЛЁННОЕ чтение: ближайшие ноды (по DHT).
+                    // Цель: валидатор не обязан хранить почту; чанки живут на storage-нодах.
+                    {
+                        let h = blake3::hash(format!("mail:{cid}").as_bytes());
+                        let mut target = [0u8; NODEID_LEN];
+                        target.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
+                        let closest = self.dht_find_node(&target).await;
+                        // ДВА ПРОХОДА: сначала пиры с ЖИВЫМ соединением (мгновенно), затем остальные.
+                        // Иначе недоступный пир (нода за NAT, к которой валидатор не может дозвониться)
+                        // держит чтение письма на своём connect-таймауте и Inbox «висит» десятками секунд.
+                        for pass in 0..2u8 {
                             if got.is_some() {
                                 break;
                             }
-                            let live = self.pick_conn(None, n.id).await.is_some();
-                            if (pass == 0) != live {
-                                continue;
-                            }
-                            if self.ensure_dht_peer(n).await.is_ok() {
-                                if let Ok(resp) = self.request_to(n.id, "storage.fetch", json!({ "bucket": "mail", "chunk_id": cid }).to_string().into_bytes()).await {
-                                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
-                                        if v["ok"].as_bool().unwrap_or(false) {
-                                            if let Some(b64) = v["data"].as_str() {
-                                                got = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok();
+                            for n in closest.iter() {
+                                if got.is_some() {
+                                    break;
+                                }
+                                let live = self.pick_conn(None, n.id).await.is_some();
+                                if (pass == 0) != live {
+                                    continue;
+                                }
+                                if self.ensure_dht_peer(n).await.is_ok() {
+                                    if let Ok(resp) = self
+                                        .request_to(
+                                            n.id,
+                                            "storage.fetch",
+                                            json!({ "bucket": "mail", "chunk_id": cid })
+                                                .to_string()
+                                                .into_bytes(),
+                                        )
+                                        .await
+                                    {
+                                        if let Ok(v) =
+                                            serde_json::from_slice::<serde_json::Value>(&resp)
+                                        {
+                                            if v["ok"].as_bool().unwrap_or(false) {
+                                                if let Some(b64) = v["data"].as_str() {
+                                                    got = base64::Engine::decode(
+                                                        &base64::engine::general_purpose::STANDARD,
+                                                        b64,
+                                                    )
+                                                    .ok();
+                                                }
                                             }
                                         }
                                     }
@@ -4269,7 +4575,6 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                             }
                         }
                     }
-                }
                 }
                 // проверка целостности: хэш чанка должен совпасть с манифестом (подмена?)
                 if let Some(expected) = c["hash"].as_str() {
@@ -4287,7 +4592,10 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
         let plain = e2e_decrypt(&dk, &nonce, &buf).ok();
         // кэш расшифрованных тел писем (60с) — повторное чтение Inbox не ходит в сеть
         if let Some(p) = &plain {
-            self.mail_cache.write().await.insert(name.to_string(), (p.clone(), now_ms()));
+            self.mail_cache
+                .write()
+                .await
+                .insert(name.to_string(), (p.clone(), now_ms()));
         }
         plain
     }
@@ -4295,7 +4603,8 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
     /// Обобщённое хранилище блобов (для файлов file.storage): локально сразу + фоновая
     /// репликация, как store_mail, но с произвольным бакетом и манифестом "{bucket}:{name}".
     pub async fn store_blob(self: &Arc<Self>, bucket: &str, name: &str, blob: &[u8]) -> usize {
-        self.store_blob_with_ttl(bucket, name, blob, 30 * 24 * 3600 * 1000).await
+        self.store_blob_with_ttl(bucket, name, blob, 30 * 24 * 3600 * 1000)
+            .await
     }
 
     /// `store_blob` с явным TTL манифеста (мс).
@@ -4311,7 +4620,8 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
         blob: &[u8],
         ttl_ms: i64,
     ) -> usize {
-        self.store_blob_boxed_with_ttl(bucket, name, blob, None, ttl_ms).await
+        self.store_blob_boxed_with_ttl(bucket, name, blob, None, ttl_ms)
+            .await
     }
 
     /// store_blob с Proton-моделью: если owner_pub задан (X25519 hex владельца), ключ блоба
@@ -4322,12 +4632,26 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
     /// контентом пишет в ТЕ ЖЕ файлы чанков (поверх, write_chunk_atomic) и кладёт тот же
     /// манифест — размер каталога не растёт. Другое содержимое => новые id; старые файлы
     /// остаются сиротами до prune-chunk-orphans.
-    pub async fn store_blob_boxed(self: &Arc<Self>, bucket: &str, name: &str, blob: &[u8], owner_pub: Option<&str>) -> usize {
-        self.store_blob_boxed_with_ttl(bucket, name, blob, owner_pub, 30 * 24 * 3600 * 1000).await
+    pub async fn store_blob_boxed(
+        self: &Arc<Self>,
+        bucket: &str,
+        name: &str,
+        blob: &[u8],
+        owner_pub: Option<&str>,
+    ) -> usize {
+        self.store_blob_boxed_with_ttl(bucket, name, blob, owner_pub, 30 * 24 * 3600 * 1000)
+            .await
     }
 
     /// `store_blob_boxed` с явным TTL манифеста (мс). См. `store_blob_with_ttl`.
-    pub async fn store_blob_boxed_with_ttl(self: &Arc<Self>, bucket: &str, name: &str, blob: &[u8], owner_pub: Option<&str>, ttl_ms: i64) -> usize {
+    pub async fn store_blob_boxed_with_ttl(
+        self: &Arc<Self>,
+        bucket: &str,
+        name: &str,
+        blob: &[u8],
+        owner_pub: Option<&str>,
+        ttl_ms: i64,
+    ) -> usize {
         const CHUNK: usize = 1024 * 1024;
         // содержимо-адресность: (key, nonce) и id чанков выводятся из H(plaintext)
         let content_hash = blob_content_hash(blob);
@@ -4382,7 +4706,8 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
             manifest["key"] = json!(hex::encode(data_key));
         }
         let mkey = Self::blob_manifest_key(bucket, name);
-        self.kv_store_local_with_ttl(&mkey, &manifest.to_string(), ttl_ms).await;
+        self.kv_store_local_with_ttl(&mkey, &manifest.to_string(), ttl_ms)
+            .await;
         let node = self.clone();
         let name = name.to_string();
         let bucket = bucket.to_string();
@@ -4392,7 +4717,15 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
         tokio::spawn(async move {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(20),
-                node.replicate_blob(&bucket, &name, &ct, &manifest_str, &mkey2, &content_hash, ttl_ms),
+                node.replicate_blob(
+                    &bucket,
+                    &name,
+                    &ct,
+                    &manifest_str,
+                    &mkey2,
+                    &content_hash,
+                    ttl_ms,
+                ),
             )
             .await;
         });
@@ -4461,7 +4794,9 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
             let q = json!({ "key": mkey }).to_string().into_bytes();
             let mut found = None;
             for n in closest.iter() {
-                if found.is_some() { break; }
+                if found.is_some() {
+                    break;
+                }
                 if self.ensure_dht_peer(n).await.is_ok() {
                     if let Ok(resp) = self.request_to(n.id, "dht.find_value", q.clone()).await {
                         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
@@ -4507,11 +4842,26 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                                 continue;
                             }
                             if self.ensure_dht_peer(n).await.is_ok() {
-                                if let Ok(resp) = self.request_to(n.id, "storage.fetch", json!({ "bucket": bucket, "chunk_id": cid }).to_string().into_bytes()).await {
-                                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
+                                if let Ok(resp) = self
+                                    .request_to(
+                                        n.id,
+                                        "storage.fetch",
+                                        json!({ "bucket": bucket, "chunk_id": cid })
+                                            .to_string()
+                                            .into_bytes(),
+                                    )
+                                    .await
+                                {
+                                    if let Ok(v) =
+                                        serde_json::from_slice::<serde_json::Value>(&resp)
+                                    {
                                         if v["ok"].as_bool().unwrap_or(false) {
                                             if let Some(b64) = v["data"].as_str() {
-                                                got = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok();
+                                                got = base64::Engine::decode(
+                                                    &base64::engine::general_purpose::STANDARD,
+                                                    b64,
+                                                )
+                                                .ok();
                                             }
                                         }
                                     }
@@ -4556,7 +4906,9 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
             if let Ok(resp) = self.request_to(pid, "dht.find_value", q.clone()).await {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
                     if v["found"].as_bool().unwrap_or(false) {
-                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(v["value"].as_str().unwrap_or("")) {
+                        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(
+                            v["value"].as_str().unwrap_or(""),
+                        ) {
                             if let Some(ed) = meta["ed_pub"].as_str() {
                                 return Some(ed.to_string());
                             }
@@ -4576,14 +4928,30 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
         // проверка владения: подпись над "email:ts" ключом владельца
         let ed_pub_hex = match self.user_ed_pub(&email).await {
             Some(e) => e,
-            None => return Some(json!({ "ok": false, "err": "user not registered" }).to_string().into_bytes()),
+            None => {
+                return Some(
+                    json!({ "ok": false, "err": "user not registered" })
+                        .to_string()
+                        .into_bytes(),
+                )
+            }
         };
         if sig.len() != 64 {
-            return Some(json!({ "ok": false, "err": "bad sig" }).to_string().into_bytes());
+            return Some(
+                json!({ "ok": false, "err": "bad sig" })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         let edb = match hex::decode(&ed_pub_hex) {
             Ok(b) if b.len() == 32 => b,
-            _ => return Some(json!({ "ok": false, "err": "bad ed_pub" }).to_string().into_bytes()),
+            _ => {
+                return Some(
+                    json!({ "ok": false, "err": "bad ed_pub" })
+                        .to_string()
+                        .into_bytes(),
+                )
+            }
         };
         let mut edk = [0u8; 32];
         edk.copy_from_slice(&edb);
@@ -4591,15 +4959,26 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
         sigk.copy_from_slice(&sig);
         let msg = format!("{email}:{ts}");
         if !crate::mailbox::MailKeys::verify(&edk, msg.as_bytes(), &sigk) {
-            return Some(json!({ "ok": false, "err": "not mailbox owner" }).to_string().into_bytes());
+            return Some(
+                json!({ "ok": false, "err": "not mailbox owner" })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         // анти-replay: подпись действительна только в окне ±5 минут
         if now_ms().abs_diff(ts) > 5 * 60 * 1000 {
-            return Some(json!({ "ok": false, "err": "signature expired" }).to_string().into_bytes());
+            return Some(
+                json!({ "ok": false, "err": "signature expired" })
+                    .to_string()
+                    .into_bytes(),
+            );
         }
         // владелец подтверждён — читаем индекс ящика
         let ikey = format!("mail:{email}:index");
-        let idx = self.get_local_kv(&ikey).await.unwrap_or_else(|| "[]".to_string());
+        let idx = self
+            .get_local_kv(&ikey)
+            .await
+            .unwrap_or_else(|| "[]".to_string());
         Some(json!({ "ok": true, "ids": serde_json::from_str::<Vec<String>>(&idx).unwrap_or_default() }).to_string().into_bytes())
     }
 
@@ -4621,7 +5000,11 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
         let mut updated = 0usize;
         let mut peers = self.peers.write().await;
         for (pid, link) in peers.iter_mut() {
-            if let Some(p) = new_cfg.peers.iter().find(|p| p.node_id_raw().ok() == Some(*pid)) {
+            if let Some(p) = new_cfg
+                .peers
+                .iter()
+                .find(|p| p.node_id_raw().ok() == Some(*pid))
+            {
                 let mut p = p.clone();
                 p.allow = p.effective_allow(&roles);
                 link.cfg.allow = p.allow;
@@ -4753,7 +5136,12 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
                 // 1) СКОНФИГУРИРОВАННЫЕ пиры (по имени): узел-держатель может не попадать
                 // в DHT-routing (например, подключается только входящими соединениями),
                 // и тогда ремонт его не спрашивал — хотя данные у него есть.
-                let names: Vec<String> = repair_node.cfg.peers.iter().map(|p| p.name.clone()).collect();
+                let names: Vec<String> = repair_node
+                    .cfg
+                    .peers
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect();
                 for name in names {
                     if let Ok(pid) = repair_node.resolve(&name) {
                         // ТАЙМАУТ: недоступный пир не должен занимать проход надолго
@@ -4790,10 +5178,9 @@ async fn write_chunk_with_dedup(self: &Arc<Self>, bucket: &str, chunk_id: &str, 
         {
             let node = self.clone();
             tokio::spawn(async move {
-                let mut sig = tokio::signal::unix::signal(
-                    tokio::signal::unix::SignalKind::hangup(),
-                )
-                .expect("SIGHUP handler");
+                let mut sig =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                        .expect("SIGHUP handler");
                 loop {
                     sig.recv().await;
                     node.reload_config().await;
@@ -4831,7 +5218,10 @@ async fn accept_loop(node: Arc<Node>, ep: Endpoint) {
             let permit = match sem.try_acquire() {
                 Ok(p) => p,
                 Err(_) => {
-                    eprintln!("[{}] too many incoming connections, refusing", node.cfg.name);
+                    eprintln!(
+                        "[{}] too many incoming connections, refusing",
+                        node.cfg.name
+                    );
                     incoming.refuse();
                     return;
                 }
@@ -4852,7 +5242,10 @@ async fn accept_loop(node: Arc<Node>, ep: Endpoint) {
             // Помечаем соединение как обслуживаемое, чтобы ensure_frame_loop не
             // поднял на нём второй цикл (здесь цикл блокирующий и держит permit).
             let sid = conn.stable_id();
-            node.looped.lock().unwrap_or_else(|e| e.into_inner()).insert(sid);
+            node.looped
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(sid);
             frame_loop(conn, node, None).await;
             drop(permit);
         });
@@ -4971,14 +5364,16 @@ async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NO
         match authed {
             // Challenge/auth stays SERIAL on the accept loop: only the accept
             // loop owns connection lifecycle and may set the authenticated pid.
-            None => match handle_stream(node.clone(), conn.clone(), send, recv, None, t_accept).await {
-                Ok(Some(pid)) => authed = Some(pid),
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("[{}] stream error: {e}", node.cfg.name);
-                    break;
+            None => {
+                match handle_stream(node.clone(), conn.clone(), send, recv, None, t_accept).await {
+                    Ok(Some(pid)) => authed = Some(pid),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("[{}] stream error: {e}", node.cfg.name);
+                        break;
+                    }
                 }
-            },
+            }
             // Authenticated traffic is handled CONCURRENTLY: each stream gets its
             // own task and its own permit, so one slow/hung request cannot block
             // every other stream on the connection.
@@ -5003,7 +5398,9 @@ async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NO
                 let conn = conn.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(e) = handle_stream(node.clone(), conn, send, recv, Some(pid), t_accept).await {
+                    if let Err(e) =
+                        handle_stream(node.clone(), conn, send, recv, Some(pid), t_accept).await
+                    {
                         eprintln!("[{}] stream task error: {e}", node.cfg.name);
                     }
                 });
@@ -5023,7 +5420,10 @@ async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NO
     // Соединение обслуживание закончило — снимаем отметку, чтобы тот же sid
     // снова не считался «уже с циклом» (важно для accept-пути, где цикл
     // блокирующий и сам себя не снимает).
-    node.looped.lock().unwrap_or_else(|e| e.into_inner()).remove(&sid);
+    node.looped
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&sid);
     node.sessions.write().await.remove(&sid);
     node.metrics.conns_closed.fetch_add(1, Ordering::Relaxed);
     node.metrics.conns_active.fetch_sub(1, Ordering::Relaxed);
@@ -5045,7 +5445,9 @@ async fn handle_stream(
     // (f.seq, f.ts) — тот же ключ логирует отправитель в "req_stages".
     let t_start = std::time::Instant::now();
     let disp_ms = t_start.saturating_duration_since(t_accept).as_millis() as u64;
-    node.metrics.dispatch_ms_max.fetch_max(disp_ms, Ordering::Relaxed);
+    node.metrics
+        .dispatch_ms_max
+        .fetch_max(disp_ms, Ordering::Relaxed);
     let t_read = std::time::Instant::now();
     // таймаут на чтение фрейма: клиент, открывший стрим и не закончивший его,
     // не должен вечно держать frame_loop (иначе каскад при убитых клиентах).
@@ -5079,7 +5481,9 @@ async fn handle_stream(
     };
     let report_stages = |f: &Frame, proc: Duration| {
         let proc_ms = proc.as_millis() as u64;
-        node.metrics.handler_ms_max.fetch_max(proc_ms, Ordering::Relaxed);
+        node.metrics
+            .handler_ms_max
+            .fetch_max(proc_ms, Ordering::Relaxed);
         if disp_ms >= 200 || read_ms >= 200 || proc_ms >= 200 {
             // R6: svc прямо в dispatch — раньше атрибуция медленных proc
             // требовала джойна с req/req_stages по trace/seq+ts (и ломалась
@@ -5191,8 +5595,13 @@ async fn handle_stream(
         node.sessions.write().await.insert(conn.stable_id(), key);
         // Per-connection window: nothing to reset. See connect_with_auth.
         node.add_conn(claimed, conn.clone()).await;
-        node.routing_insert(claimed, &peer.cfg.endpoints, &peer.cfg.ed_pub, &peer.cfg.x_pub)
-            .await;
+        node.routing_insert(
+            claimed,
+            &peer.cfg.endpoints,
+            &peer.cfg.ed_pub,
+            &peer.cfg.x_pub,
+        )
+        .await;
         *peer.conn.write().await = Some(conn.clone());
         node.remember_peer_addr(&peer, conn.remote_address()).await;
         node.add_route(claimed, conn.remote_address().to_string(), &peer.cfg.ed_pub)
@@ -5392,11 +5801,14 @@ async fn handle_stream(
             }
             let resp: Vec<u8> = if !crate::services::is_allowed(&peer.cfg.allow, &svc_name) {
                 node.metrics.reqs_denied.fetch_add(1, Ordering::Relaxed);
-                tlog("req_denied", json!({ "svc": svc_name, "from": hex::encode(pid) }));
-                json!({"ok": false, "err": "denied by ACL"}).to_string().into_bytes()
-            } else if let Some(resp) =
-                node.handle_node_svc(f.svc, &conn, pid, &plain).await
-            {
+                tlog(
+                    "req_denied",
+                    json!({ "svc": svc_name, "from": hex::encode(pid) }),
+                );
+                json!({"ok": false, "err": "denied by ACL"})
+                    .to_string()
+                    .into_bytes()
+            } else if let Some(resp) = node.handle_node_svc(f.svc, &conn, pid, &plain).await {
                 resp
             } else if let Some(h) = crate::services::handler_for(f.svc) {
                 let ctx = crate::services::Ctx {
@@ -5412,15 +5824,25 @@ async fn handle_stream(
                     Ok(v) => v,
                     Err(e) => {
                         node.metrics.reqs_errors.fetch_add(1, Ordering::Relaxed);
-                        terr("req_error", json!({ "svc": svc_name, "err": format!("{e}") }));
-                        json!({"ok": false, "err": format!("{e}")}).to_string().into_bytes()
+                        terr(
+                            "req_error",
+                            json!({ "svc": svc_name, "err": format!("{e}") }),
+                        );
+                        json!({"ok": false, "err": format!("{e}")})
+                            .to_string()
+                            .into_bytes()
                     }
                 }
             } else {
                 node.metrics.reqs_errors.fetch_add(1, Ordering::Relaxed);
-                json!({"ok": false, "err": "unknown service"}).to_string().into_bytes()
+                json!({"ok": false, "err": "unknown service"})
+                    .to_string()
+                    .into_bytes()
             };
-            tlog("req", json!({ "svc": svc_name, "from": hex::encode(pid), "ok": !resp.starts_with(b"{\"ok\":false") }));
+            tlog(
+                "req",
+                json!({ "svc": svc_name, "from": hex::encode(pid), "ok": !resp.starts_with(b"{\"ok\":false") }),
+            );
             let (ct, nonce) = e2e_encrypt(&key, &resp);
             let mut r = Frame {
                 kind: proto::kind::RESP,
@@ -5538,8 +5960,10 @@ pub fn chunk_id_for(bucket: &str, name: &str, offset: usize, content_hash: &[u8;
 /// (шарды считаются от детерминированного ct — см. blob_key_nonce).
 pub fn ec_chunk_id_for(bucket: &str, name: &str, index: usize, content_hash: &[u8; 32]) -> String {
     hex::encode(
-        blake3::hash(format!("{bucket}:{name}:ec:{index}:{}", hex::encode(content_hash)).as_bytes())
-            .as_bytes(),
+        blake3::hash(
+            format!("{bucket}:{name}:ec:{index}:{}", hex::encode(content_hash)).as_bytes(),
+        )
+        .as_bytes(),
     )
 }
 
@@ -5548,17 +5972,10 @@ pub fn ec_chunk_id_for(bucket: &str, name: &str, index: usize, content_hash: &[u
 /// fetch читал частично записанный файл → байты с несовпадающим хэшем
 /// ("chunk tamper", torn read). Rename в пределах одной fs — атомарен,
 /// читатели видят либо старый файл целиком, либо новый целиком.
-fn write_chunk_atomic(
-    dir: &std::path::Path,
-    chunk_id: &str,
-    data: &[u8],
-) -> std::io::Result<()> {
+fn write_chunk_atomic(dir: &std::path::Path, chunk_id: &str, data: &[u8]) -> std::io::Result<()> {
     // chunk_id уже проверен как hex (valid_chunk_id), но на всякий случай
     // отбрасываем разделители путей.
-    let safe_id: String = chunk_id
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect();
+    let safe_id: String = chunk_id.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     let tmp_name = format!(
         ".{safe_id}.tmp.{}-{}",
         std::process::id(),
@@ -5610,12 +6027,15 @@ pub fn proton_box_data(owner_pub_hex: &str, data: &[u8]) -> Option<String> {
     let data_key = rand::random::<[u8; 32]>();
     let (ct, nonce) = salsa_encrypt(&data_key, data);
     let key_box = box_wrap_key(owner_pub_hex, &data_key)?;
-    Some(json!({
-        "proto": "infmail-box-v1",
-        "key_box": key_box,
-        "nonce": hex::encode(&nonce),
-        "ct": hex::encode(&ct),
-    }).to_string())
+    Some(
+        json!({
+            "proto": "infmail-box-v1",
+            "key_box": key_box,
+            "nonce": hex::encode(&nonce),
+            "ct": hex::encode(&ct),
+        })
+        .to_string(),
+    )
 }
 
 /// Proton-инкапсуляция текста: случайный ключ шифрует plain (XSalsa20-Poly1305 = NaCl secretbox,
@@ -5623,20 +6043,26 @@ pub fn proton_box_data(owner_pub_hex: &str, data: &[u8]) -> Option<String> {
 /// Возвращает JSON-строку {"proto":"infmail-box-v1","key_box":{...},"nonce":hex,"ct":hex}.
 pub fn proton_box_body(owner_pub_hex: &str, plain: &str) -> Option<String> {
     if plain.is_empty() {
-        return Some(json!({
-            "proto": "infmail-box-v1",
-            "enc": json!(plain),
-        }).to_string());
+        return Some(
+            json!({
+                "proto": "infmail-box-v1",
+                "enc": json!(plain),
+            })
+            .to_string(),
+        );
     }
     let data_key = rand::random::<[u8; 32]>();
     let (ct, nonce) = salsa_encrypt(&data_key, plain.as_bytes());
     let key_box = box_wrap_key(owner_pub_hex, &data_key)?;
-    Some(json!({
-        "proto": "infmail-box-v1",
-        "key_box": key_box,
-        "nonce": hex::encode(&nonce),
-        "ct": hex::encode(&ct),
-    }).to_string())
+    Some(
+        json!({
+            "proto": "infmail-box-v1",
+            "key_box": key_box,
+            "nonce": hex::encode(&nonce),
+            "ct": hex::encode(&ct),
+        })
+        .to_string(),
+    )
 }
 
 /// Расшифровать proton_box_body JSON-строку приватным X25519-ключом. None если формат не тот.
@@ -5683,12 +6109,14 @@ pub fn box_unwrap_key(key_box: &serde_json::Value, owner_priv_hex: &str) -> Resu
     if priv_bytes.len() != 32 {
         bail!("private key: invalid length");
     }
-    let priv_key = XSecret::from(<[u8; 32]>::try_from(&priv_bytes[..]).map_err(|_| anyhow!("priv key"))?);
+    let priv_key =
+        XSecret::from(<[u8; 32]>::try_from(&priv_bytes[..]).map_err(|_| anyhow!("priv key"))?);
     let eph_pub_bytes = hex::decode(key_box["eph"].as_str().unwrap_or(""))?;
     if eph_pub_bytes.len() != 32 {
         bail!("eph key: invalid length");
     }
-    let eph_pub = XPub::from(<[u8; 32]>::try_from(&eph_pub_bytes[..]).map_err(|_| anyhow!("eph pub"))?);
+    let eph_pub =
+        XPub::from(<[u8; 32]>::try_from(&eph_pub_bytes[..]).map_err(|_| anyhow!("eph pub"))?);
     let shared = priv_key.diffie_hellman(&eph_pub);
     let nonce = hex::decode(key_box["nonce"].as_str().unwrap_or(""))?;
     let ct = hex::decode(key_box["ct"].as_str().unwrap_or(""))?;
@@ -5809,7 +6237,11 @@ fn parse_dht_node(v: &serde_json::Value) -> Option<crate::dht::NodeInfo> {
         id,
         endpoints: v["endpoints"]
             .as_array()
-            .map(|a| a.iter().filter_map(|e| e.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default(),
         ed_hex: v["ed_pub"].as_str().unwrap_or("").to_string(),
         x_hex: v["x_pub"].as_str().unwrap_or("").to_string(),
@@ -5819,11 +6251,7 @@ fn parse_dht_node(v: &serde_json::Value) -> Option<crate::dht::NodeInfo> {
 
 /// Текущий сессионный ключ соединения (stable_id).
 async fn session_key_of(node: &Node, conn: &Connection) -> Option<[u8; 32]> {
-    node.sessions
-        .read()
-        .await
-        .get(&conn.stable_id())
-        .copied()
+    node.sessions.read().await.get(&conn.stable_id()).copied()
 }
 
 /// Ожидание появления сессионного ключа с микроопросом (до max_wait_ms).
@@ -5971,7 +6399,6 @@ mod proton_tests {
 
 #[cfg(test)]
 mod chunk_hash_tests {
-    
 
     #[test]
     fn chunk_hash_matches_content() {
@@ -6019,7 +6446,9 @@ mod ec_tests {
         let (k, n) = (3usize, 5usize);
         let shards = Node::ec_encode(&data, k, n);
         let mut slots: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
-        slots[0] = None; slots[1] = None; slots[2] = None; // осталось 2 < k
+        slots[0] = None;
+        slots[1] = None;
+        slots[2] = None; // осталось 2 < k
         assert!(Node::ec_decode(&mut slots, k, n, data.len()).is_none());
     }
 
@@ -6029,7 +6458,8 @@ mod ec_tests {
             let data: Vec<u8> = (0..len).map(|i| (i % 199) as u8).collect();
             let shards = Node::ec_encode(&data, 3, 5);
             let mut slots: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
-            slots[1] = None; slots[4] = None;
+            slots[1] = None;
+            slots[4] = None;
             let back = Node::ec_decode(&mut slots, 3, 5, len).expect("decode");
             assert_eq!(back.len(), len);
             assert_eq!(back, data, "len={len}");
@@ -6072,9 +6502,14 @@ mod disk_growth_tests {
             std::env::temp_dir().join(format!("infnode-growth-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("tmpdir");
-        let node = Node::new(test_cfg("T"), NodeKeys::generate(), tmp.clone(), PathBuf::new())
-            .await
-            .expect("node");
+        let node = Node::new(
+            test_cfg("T"),
+            NodeKeys::generate(),
+            tmp.clone(),
+            PathBuf::new(),
+        )
+        .await
+        .expect("node");
         (node, tmp)
     }
 
@@ -6105,7 +6540,10 @@ mod disk_growth_tests {
         assert_eq!(h, blob_content_hash(&blob), "content id стабилен");
         let (k1, n1) = blob_key_nonce("files", "doc", &h);
         let (k2, n2) = blob_key_nonce("files", "doc", &h);
-        assert_eq!(k1, k2, "ключ детерминирован (как на одной ноде, так и между нодами)");
+        assert_eq!(
+            k1, k2,
+            "ключ детерминирован (как на одной ноде, так и между нодами)"
+        );
         assert_eq!(n1, n2, "nonce детерминирован");
         // шифрование с одними key/nonce даёт байт-в-байт тот же ct
         let ct1 = e2e_encrypt_det(&k1, &n1, &blob);
@@ -6144,20 +6582,37 @@ mod disk_growth_tests {
         let n1 = node.store_blob("files", "doc.bin", &blob).await;
         let files1 = chunk_files(&node, "files");
         assert!(n1 > 0, "first publish must store chunks");
-        assert_eq!(files1.len(), n1, "на диске ровно те чанки, что вернул store");
+        assert_eq!(
+            files1.len(),
+            n1,
+            "на диске ровно те чанки, что вернул store"
+        );
 
         let mkey = Node::blob_manifest_key("files", "doc.bin");
-        let manifest1 = node.get_local_kv(&mkey).await.expect("manifest after publish");
+        let manifest1 = node
+            .get_local_kv(&mkey)
+            .await
+            .expect("manifest after publish");
 
         // ПОВТОРНЫЙ publish того же имени с тем же контентом
         let n2 = node.store_blob("files", "doc.bin", &blob).await;
         let files2 = chunk_files(&node, "files");
-        let manifest2 = node.get_local_kv(&mkey).await.expect("manifest after republish");
+        let manifest2 = node
+            .get_local_kv(&mkey)
+            .await
+            .expect("manifest after republish");
 
-        assert_eq!(files1.len(), files2.len(), "file count must not grow on republish");
+        assert_eq!(
+            files1.len(),
+            files2.len(),
+            "file count must not grow on republish"
+        );
         assert_eq!(files1, files2, "republish must reuse the same chunk paths");
         assert_eq!(n1, n2);
-        assert_eq!(manifest1, manifest2, "манифест байт-в-байт тот же (id/key/nonce)");
+        assert_eq!(
+            manifest1, manifest2,
+            "манифест байт-в-байт тот же (id/key/nonce)"
+        );
         assert!(
             !files2.iter().any(|f| f.ends_with(".tmp")),
             "не должно оставаться временных файлов"
@@ -6180,7 +6635,10 @@ mod disk_growth_tests {
         node.store_blob("files", "doc.bin", &b).await;
         let files_now = chunk_files(&node, "files");
 
-        assert!(files_now.len() > files_a.len(), "новый контент => новые id/файлы");
+        assert!(
+            files_now.len() > files_a.len(),
+            "новый контент => новые id/файлы"
+        );
 
         let mkey = Node::blob_manifest_key("files", "doc.bin");
         let manifest: serde_json::Value =
@@ -6221,7 +6679,10 @@ mod disk_growth_tests {
         // как отказ и откатывает квоту)
         let n2 = node.store_mail("mail:abc", &blob).await;
         let files2 = chunk_files(&node, "mail");
-        assert_eq!(n1, n2, "идемпотентный репаблиш не должен выглядеть как отказ");
+        assert_eq!(
+            n1, n2,
+            "идемпотентный репаблиш не должен выглядеть как отказ"
+        );
         assert_eq!(files1, files2, "повторное store_mail не добавляет файлов");
 
         let back = node.fetch_mail("mail:abc").await.expect("fetch mail");
@@ -6236,12 +6697,17 @@ mod disk_growth_tests {
         // живая запись
         node.kv_store_local("files:alice", "[]").await;
         // уже просроченная
-        node.kv.write().await.store("expired:key", "x".into(), -1_000, node.id);
-        // свежий dedup
         node.kv
             .write()
             .await
-            .store("dedup:fresh", "{}".into(), crate::dht::DEDUP_TTL_MS, node.id);
+            .store("expired:key", "x".into(), -1_000, node.id);
+        // свежий dedup
+        node.kv.write().await.store(
+            "dedup:fresh",
+            "{}".into(),
+            crate::dht::DEDUP_TTL_MS,
+            node.id,
+        );
         // легаси-dedup: 30-дневный TTL, но последняя запись была 10 минут назад
         {
             let mut kv = node.kv.write().await;
@@ -6267,11 +6733,18 @@ mod disk_growth_tests {
 
         let raw = std::fs::read_to_string(tmp.join("kv.json")).expect("kv.json");
         let on_disk: HashMap<String, serde_json::Value> = serde_json::from_str(&raw).unwrap();
-        assert_eq!(on_disk.len(), after, "в файле не должно остаться мёртвых ключей");
+        assert_eq!(
+            on_disk.len(),
+            after,
+            "в файле не должно остаться мёртвых ключей"
+        );
         assert!(on_disk.contains_key("files:alice"));
         assert!(on_disk.contains_key("dedup:fresh"));
         assert!(!on_disk.contains_key("dedup:stale"), "старый dedup вычищен");
-        assert!(!on_disk.contains_key("expired:key"), "просроченная вычищена");
+        assert!(
+            !on_disk.contains_key("expired:key"),
+            "просроченная вычищена"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -6352,7 +6825,8 @@ mod disk_growth_tests {
         let mkey = Node::blob_manifest_key("files", "doc.bin");
         node.kv_store_local(&mkey, &manifest.to_string()).await;
 
-        let back = node.fetch_blob("files", "doc.bin")
+        let back = node
+            .fetch_blob("files", "doc.bin")
             .await
             .expect("legacy manifest + старые id читаются без миграции");
         assert_eq!(back, blob);
@@ -6413,7 +6887,10 @@ mod disk_growth_tests {
             },
         )
         .await;
-        assert!(outbox_file.exists(), "enqueue (a mutation) must persist outbox");
+        assert!(
+            outbox_file.exists(),
+            "enqueue (a mutation) must persist outbox"
+        );
 
         // (3) flush, который мутирует outbox (ретрай неудачной доставки),
         // обязан поднять dirty и перезаписать файл даже после его удаления.
@@ -6460,7 +6937,9 @@ mod disk_growth_tests {
         // второй всплеск В ПРЕДЕЛАХ окна — persist'а не происходит
         for i in 20..40u64 {
             let v = json!({ "key": format!("test:burst-{i}"), "value": "v", "ttl": 3600 });
-            node.handle_dht_store(&v, [1u8; NODEID_LEN]).await.expect("store");
+            node.handle_dht_store(&v, [1u8; NODEID_LEN])
+                .await
+                .expect("store");
         }
         node.kv_flush_if_due().await;
         assert_eq!(persists(), base + 1, "debounce-окно подавляет второй flush");
@@ -6517,7 +6996,10 @@ mod disk_growth_tests {
             "outbox persist прошёл мимо kv-гейта за {:?}",
             t0.elapsed()
         );
-        assert!(outbox_file.exists(), "outbox.json записан при занятом kv-гейте");
+        assert!(
+            outbox_file.exists(),
+            "outbox.json записан при занятом kv-гейте"
+        );
 
         // ...а сам kv-persist за СВОИМ гейтом встаёт (гейт per-file, kv ждёт только kv)
         let fut = node.persist_kv();
@@ -6548,21 +7030,29 @@ mod disk_growth_tests {
         // (a) store_blob_with_ttl выставляет expires ≈ now+ttl на манифесте...
         let ttl: i64 = 2 * 3600 * 1000;
         let before = crate::dht::now_ms();
-        node.store_blob_with_ttl("stell_blocks", "epoch_blk_deadbeef", b"body-bytes", ttl).await;
+        node.store_blob_with_ttl("stell_blocks", "epoch_blk_deadbeef", b"body-bytes", ttl)
+            .await;
         let mkey = Node::blob_manifest_key("stell_blocks", "epoch_blk_deadbeef");
         let entries = node.kv.read().await.entries_clone();
         let e = entries.get(&mkey).expect("manifest stored");
         assert!(
-            e.ttl_ms == ttl && e.expires >= before + ttl && e.expires <= crate::dht::now_ms() + ttl + 5_000,
+            e.ttl_ms == ttl
+                && e.expires >= before + ttl
+                && e.expires <= crate::dht::now_ms() + ttl + 5_000,
             "manifest carries the requested TTL (ttl={}, expires={})",
-            e.ttl_ms, e.expires
+            e.ttl_ms,
+            e.expires
         );
         // ...и тело читается, пока TTL живо.
-        let back = node.fetch_blob("stell_blocks", "epoch_blk_deadbeef").await.expect("fetch");
+        let back = node
+            .fetch_blob("stell_blocks", "epoch_blk_deadbeef")
+            .await
+            .expect("fetch");
         assert_eq!(back, b"body-bytes");
 
         // (b) Дефолтный store_blob — те же 30 дней, что раньше (old data safety).
-        node.store_blob("stell_blocks", "epoch_blk_legacy", b"legacy").await;
+        node.store_blob("stell_blocks", "epoch_blk_legacy", b"legacy")
+            .await;
         let mkey_legacy = Node::blob_manifest_key("stell_blocks", "epoch_blk_legacy");
         let entries = node.kv.read().await.entries_clone();
         let el = entries.get(&mkey_legacy).expect("legacy manifest stored");
@@ -6570,30 +7060,54 @@ mod disk_growth_tests {
 
         // (c) kv_store_local_with_ttl + sweep: просроченные stell-ключи уходят,
         // живые и долгоживущие (без expiry-концепта — далёкий expires) остаются.
-        node.kv_store_local_with_ttl("stell:height:0", "42000:deadbeef", ttl).await;
-        node.kv_store_local("stell:height:1", "42000:deadbeef").await;
-        node.kv.write().await.store("stell_blocks:gone", "x".into(), -1_000, node.id);
+        node.kv_store_local_with_ttl("stell:height:0", "42000:deadbeef", ttl)
+            .await;
+        node.kv_store_local("stell:height:1", "42000:deadbeef")
+            .await;
+        node.kv
+            .write()
+            .await
+            .store("stell_blocks:gone", "x".into(), -1_000, node.id);
         let (removed, _, _) = node.kv.write().await.sweep(crate::dht::now_ms());
         assert_eq!(removed, 1, "only the expired stell key");
-        assert!(node.get_local_kv("stell:height:0").await.is_some(), "live TTL key kept");
-        assert!(node.get_local_kv("stell:height:1").await.is_some(), "30d key kept");
-        assert!(node.get_local_kv("stell_blocks:gone").await.is_none(), "expired dropped");
+        assert!(
+            node.get_local_kv("stell:height:0").await.is_some(),
+            "live TTL key kept"
+        );
+        assert!(
+            node.get_local_kv("stell:height:1").await.is_some(),
+            "30d key kept"
+        );
+        assert!(
+            node.get_local_kv("stell_blocks:gone").await.is_none(),
+            "expired dropped"
+        );
 
         // (d) delete_blob_local: манифест + чанки уходят локально, fetch — None,
         // сетевого веера нет (в тесте пиров нет; важно — функция не падает и
         // возвращает число удалённых чанков).
-        let n = node.delete_blob_local("stell_blocks", "epoch_blk_deadbeef").await;
+        let n = node
+            .delete_blob_local("stell_blocks", "epoch_blk_deadbeef")
+            .await;
         assert!(n >= 1, "local chunks removed");
         assert!(node.get_local_kv(&mkey).await.is_none(), "manifest gone");
-        assert!(node.fetch_blob("stell_blocks", "epoch_blk_deadbeef").await.is_none());
+        assert!(node
+            .fetch_blob("stell_blocks", "epoch_blk_deadbeef")
+            .await
+            .is_none());
         // повторное удаление — идемпотентный no-op
-        assert_eq!(node.delete_blob_local("stell_blocks", "epoch_blk_deadbeef").await, 0);
+        assert_eq!(
+            node.delete_blob_local("stell_blocks", "epoch_blk_deadbeef")
+                .await,
+            0
+        );
         // дефолтный delete_blob поверх того же local-механизма — тоже ок
         assert!(node.delete_blob("stell_blocks", "epoch_blk_legacy").await >= 1);
         assert!(node.get_local_kv(&mkey_legacy).await.is_none());
 
         // (e) persist_kv выкидывает просроченные stell-манифесты из kv.json.
-        node.store_blob_with_ttl("stell_headers", "epoch_h_1", b"hdr", -1_000).await;
+        node.store_blob_with_ttl("stell_headers", "epoch_h_1", b"hdr", -1_000)
+            .await;
         node.persist_kv().await;
         let raw = std::fs::read_to_string(tmp.join("kv.json")).expect("kv.json");
         let on_disk: HashMap<String, serde_json::Value> = serde_json::from_str(&raw).unwrap();
@@ -6669,7 +7183,8 @@ mod session_heal_tests {
 
     impl Pair {
         async fn start(tag: &str, port_base: u16) -> Pair {
-            let tmp = std::env::temp_dir().join(format!("infnode-sessheal-{tag}-{}", std::process::id()));
+            let tmp =
+                std::env::temp_dir().join(format!("infnode-sessheal-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&tmp);
             std::fs::create_dir_all(&tmp).expect("tmpdir");
             let ka = NodeKeys::generate();
@@ -6715,7 +7230,14 @@ mod session_heal_tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             let lo_id = lo_keys.id();
             let hi_id = hi_keys.id();
-            Pair { lo, hi, lo_id, hi_id, tmp, serves }
+            Pair {
+                lo,
+                hi,
+                lo_id,
+                hi_id,
+                tmp,
+                serves,
+            }
         }
 
         fn stop(&self) {
@@ -6854,9 +7376,14 @@ mod pentest_net_tests {
             std::env::temp_dir().join(format!("infnode-pentest-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("tmpdir");
-        let node = Node::new(pentest_cfg("P"), NodeKeys::generate(), tmp.clone(), PathBuf::new())
-            .await
-            .expect("node");
+        let node = Node::new(
+            pentest_cfg("P"),
+            NodeKeys::generate(),
+            tmp.clone(),
+            PathBuf::new(),
+        )
+        .await
+        .expect("node");
         (node, tmp)
     }
 
@@ -6985,13 +7512,20 @@ mod pentest_net_tests {
         );
         assert_eq!(
             link.cfg.allow,
-            vec!["dht.lookup".to_string(), "dht.update".to_string(), "dht.find_node".to_string()],
+            vec![
+                "dht.lookup".to_string(),
+                "dht.update".to_string(),
+                "dht.find_node".to_string()
+            ],
             "a DHT-discovered identity must keep the discovery-only ACL"
         );
         // 21 rapid admissions through the peer's OWN bucket: #1 passes, the
         // rest refuse until the 20/s refill.
         let mut rate = link.rate.lock().await;
-        assert!(rate.allow(link.cfg.rate_limit_per_sec), "first lookup passes");
+        assert!(
+            rate.allow(link.cfg.rate_limit_per_sec),
+            "first lookup passes"
+        );
         for i in 2..=21u32 {
             assert!(
                 !rate.allow(link.cfg.rate_limit_per_sec),
@@ -7037,7 +7571,9 @@ mod pentest_net_tests {
         })
         .to_string();
         node.kv_store_local(&mkey, &manifest).await;
-        let (deleted, fanout) = node.delete_blob_local_inner(bucket, "epoch_blk_poison").await;
+        let (deleted, fanout) = node
+            .delete_blob_local_inner(bucket, "epoch_blk_poison")
+            .await;
         assert_eq!(deleted, 0, "traversal ids must not count as deletes");
         assert_eq!(
             fanout,
@@ -7045,12 +7581,21 @@ mod pentest_net_tests {
             "only the honest id may fan out to peers as storage.delete: {fanout:?}"
         );
         // Network fetch with a traversal id: None, no filesystem escape.
-        assert!(node.fetch_chunk_net(bucket, "../escape1", None).await.is_none());
-        assert!(node.fetch_chunk_net(bucket, "/etc/passwd", None).await.is_none());
+        assert!(node
+            .fetch_chunk_net(bucket, "../escape1", None)
+            .await
+            .is_none());
+        assert!(node
+            .fetch_chunk_net(bucket, "/etc/passwd", None)
+            .await
+            .is_none());
         assert!(node.fetch_chunk_net(bucket, "", None).await.is_none());
         // RPC fetch handler: loud refusal, never file bytes.
         let v = serde_json::json!({"bucket": bucket, "chunk_id": "../escape1"});
-        let resp = node.handle_storage_fetch(&v).await.expect("handler answers");
+        let resp = node
+            .handle_storage_fetch(&v)
+            .await
+            .expect("handler answers");
         let rv: serde_json::Value = serde_json::from_slice(&resp).expect("json");
         assert_eq!(rv["ok"], false);
         assert_eq!(rv["err"], "bad chunk_id");
@@ -7073,7 +7618,10 @@ mod pentest_net_tests {
         );
         let landed = dir.join(&target_id);
         assert!(
-            landed.is_file() && !std::fs::symlink_metadata(&landed).expect("meta").is_symlink(),
+            landed.is_file()
+                && !std::fs::symlink_metadata(&landed)
+                    .expect("meta")
+                    .is_symlink(),
             "the chunk must land as a regular file (symlink replaced)"
         );
         assert_eq!(std::fs::read(&landed).expect("chunk"), b"legit-bytes");

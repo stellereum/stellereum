@@ -91,7 +91,11 @@ fn locked_node_refuses_a_conflicting_precommit_qc() {
         hc.add_prevote(prevote(k, 1, 0, Some(Y))).unwrap();
         hc.add_precommit(precommit(k, 1, 0, Some(Y))).unwrap();
     }
-    assert_eq!(hc.locked, Some((X, 0)), "same-round evidence must not unlock");
+    assert_eq!(
+        hc.locked,
+        Some((X, 0)),
+        "same-round evidence must not unlock"
+    );
     assert_eq!(
         hc.try_precommit_quorum(),
         None,
@@ -178,7 +182,10 @@ fn higher_non_nil_palka_unlocks() {
     }
     let found = hc.try_prevote_quorum_at();
     assert_eq!(found, Some((1, Some(Y))));
-    assert_eq!(hc.locked, None, "the higher polka for Y must release the X lock");
+    assert_eq!(
+        hc.locked, None,
+        "the higher polka for Y must release the X lock"
+    );
 }
 
 /// CONVERGENCE: A locked on X, B locked on Y, C unlocked. The author
@@ -198,13 +205,18 @@ fn split_locks_converge_on_the_authors_reproposal() {
     for h in [&mut ha, &mut hb, &mut hc] {
         h.round = 1;
         let proposer = h.proposer().expect("the schedule must name a proposer");
-        h.receive_proposal(proposer, X).expect("round-1 X proposal must be accepted");
+        h.receive_proposal(proposer, X)
+            .expect("round-1 X proposal must be accepted");
     }
 
     // The prevote rule, pinned at unit level: lock-match votes the value,
     // lock-mismatch votes nil, unlocked votes the proposal.
     assert_eq!(ha.decide_prevote(), Some(X));
-    assert_eq!(hb.decide_prevote(), None, "B is locked on Y: it must nil-vote X");
+    assert_eq!(
+        hb.decide_prevote(),
+        None,
+        "B is locked on Y: it must nil-vote X"
+    );
     assert_eq!(hc.decide_prevote(), Some(X));
 
     // The round's prevotes (A:X, B:nil, C:X) reach every node.
@@ -225,7 +237,11 @@ fn split_locks_converge_on_the_authors_reproposal() {
     }
     // …and it unlocks B (round 1 > lock round 0, different value).
     assert_eq!(hb.locked, None, "the higher X polka must unlock B's Y lock");
-    assert_eq!(ha.locked, Some((X, 0)), "A's X lock is confirmed, not dropped");
+    assert_eq!(
+        ha.locked,
+        Some((X, 0)),
+        "A's X lock is confirmed, not dropped"
+    );
 
     // All three precommit X at the polka's round and decide X — one value,
     // no fork.
@@ -237,7 +253,10 @@ fn split_locks_converge_on_the_authors_reproposal() {
     assert_eq!(ha.try_precommit_quorum(), Some(X));
     assert_eq!(hb.try_precommit_quorum(), Some(X));
     assert_eq!(hc.try_precommit_quorum(), Some(X));
-    assert_eq!((ha.decided, hb.decided, hc.decided), (Some(X), Some(X), Some(X)));
+    assert_eq!(
+        (ha.decided, hb.decided, hc.decided),
+        (Some(X), Some(X), Some(X))
+    );
 }
 
 /// KNOWN LIMITATION (liveness, HIGH — see the review report): the symmetric
@@ -286,8 +305,16 @@ fn symmetric_split_lock_never_converges_without_unlocked_power() {
         ha.add_prevote(prevote(&b, 1, r, b_vote)).unwrap();
         hb.add_prevote(prevote(&a, 1, r, a_vote)).unwrap();
         hb.add_prevote(prevote(&b, 1, r, b_vote)).unwrap();
-        assert_eq!(ha.try_prevote_quorum_at(), None, "r{r}: no polka for either value");
-        assert_eq!(hb.try_prevote_quorum_at(), None, "r{r}: no polka for either value");
+        assert_eq!(
+            ha.try_prevote_quorum_at(),
+            None,
+            "r{r}: no polka for either value"
+        );
+        assert_eq!(
+            hb.try_prevote_quorum_at(),
+            None,
+            "r{r}: no polka for either value"
+        );
 
         ha.add_precommit(precommit(&a, 1, r, a_vote)).unwrap();
         ha.add_precommit(precommit(&b, 1, r, b_vote)).unwrap();

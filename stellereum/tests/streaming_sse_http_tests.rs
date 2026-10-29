@@ -60,7 +60,9 @@ async fn read_until_frame(sock: &mut tokio::net::TcpStream) -> String {
 #[tokio::test]
 async fn sse_endpoint_streams_event_stream_frames() {
     let st = test_state();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let app = rpc::router(st.clone());
     tokio::spawn(async move {
@@ -82,17 +84,25 @@ async fn sse_endpoint_streams_event_stream_frames() {
 
     let raw = read_until_frame(&mut sock).await;
     assert!(raw.contains("200 OK"), "status line, got: {raw}");
-    assert!(raw.contains("text/event-stream"), "content type, got: {raw}");
+    assert!(
+        raw.contains("text/event-stream"),
+        "content type, got: {raw}"
+    );
     assert!(raw.contains("data: {"), "SSE data frame, got: {raw}");
     assert!(raw.contains("\"height\":99"), "head payload, got: {raw}");
-    assert!(raw.contains("\"finality\":\"finalized\""), "finality tag, got: {raw}");
+    assert!(
+        raw.contains("\"finality\":\"finalized\""),
+        "finality tag, got: {raw}"
+    );
     assert!(raw.contains("\"shard_id\":0"), "shard id, got: {raw}");
 }
 
 #[tokio::test]
 async fn sse_endpoint_reports_an_unknown_subscription() {
     let st = test_state();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let app = rpc::router(st.clone());
     tokio::spawn(async move {
@@ -100,11 +110,9 @@ async fn sse_endpoint_reports_an_unknown_subscription() {
     });
 
     let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
-    sock.write_all(
-        b"GET /events?sub_id=deadbeef HTTP/1.1\r\nHost: localhost\r\n\r\n",
-    )
-    .await
-    .expect("request");
+    sock.write_all(b"GET /events?sub_id=deadbeef HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("request");
 
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -114,5 +122,8 @@ async fn sse_endpoint_reports_an_unknown_subscription() {
         .expect("read");
     buf.extend_from_slice(&chunk[..n]);
     let raw = String::from_utf8_lossy(&buf).to_string();
-    assert!(raw.contains("404"), "unknown subscription must be a 404, got: {raw}");
+    assert!(
+        raw.contains("404"),
+        "unknown subscription must be a 404, got: {raw}"
+    );
 }

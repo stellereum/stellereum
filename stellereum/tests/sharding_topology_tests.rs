@@ -100,8 +100,12 @@ fn leaves(tries: &[&PatriciaTrie]) -> std::collections::BTreeMap<[u8; 32], Vec<u
 fn split_and_merge_preserve_balances_ownership_and_converge() {
     let mut f = fixture(N_ACCOUNTS);
     let total_before = f.topology.total_balance();
-    let accounts_before: BTreeSet<[u8; 32]> =
-        f.topology.all_accounts().iter().map(|a| a.address).collect();
+    let accounts_before: BTreeSet<[u8; 32]> = f
+        .topology
+        .all_accounts()
+        .iter()
+        .map(|a| a.address)
+        .collect();
     assert_eq!(accounts_before.len() as u64, N_ACCOUNTS);
 
     // ---- SPLIT ---------------------------------------------------------
@@ -125,13 +129,12 @@ fn split_and_merge_preserve_balances_ownership_and_converge() {
     // 2. Every account is still owned by exactly one shard, and the OWNER is
     //    the shard the routing rule selects.
     let [c0, c1] = split.children;
-    f.topology.verify_invariants().expect("invariants after the split");
+    f.topology
+        .verify_invariants()
+        .expect("invariants after the split");
     for acct in f.topology.all_accounts() {
         let owner = f.topology.owner_of(&acct.address).expect("still owned");
-        let routed = route_shard(
-            &f.topology,
-            &ShardAddress::Workchain(acct.address),
-        );
+        let routed = route_shard(&f.topology, &ShardAddress::Workchain(acct.address));
         assert_eq!(owner, routed, "the rule and the ownership must agree");
         // The prefix bit at the split depth decides the child.
         let expected = if address_prefix_bit(&acct.address, split.plan.split_bit) == 0 {
@@ -167,7 +170,9 @@ fn split_and_merge_preserve_balances_ownership_and_converge() {
     // 4. The topology CONVERGES: a shard that has just split is not
     //    merge-eligible, so the cycle cannot oscillate.
     assert!(
-        f.topology.check_and_merge(c0.shard_id, c1.shard_id).is_none(),
+        f.topology
+            .check_and_merge(c0.shard_id, c1.shard_id)
+            .is_none(),
         "a freshly split shard must not be merge-eligible"
     );
     let shard_count = f.topology.shard_count();
@@ -194,17 +199,22 @@ fn split_and_merge_preserve_balances_ownership_and_converge() {
     assert_eq!(f.topology.total_balance(), total_before);
 
     // 6. Every account is back on one shard, with its balance.
-    f.topology.verify_invariants().expect("invariants after the merge");
-    let accounts_after: BTreeSet<[u8; 32]> =
-        f.topology.all_accounts().iter().map(|a| a.address).collect();
+    f.topology
+        .verify_invariants()
+        .expect("invariants after the merge");
+    let accounts_after: BTreeSet<[u8; 32]> = f
+        .topology
+        .all_accounts()
+        .iter()
+        .map(|a| a.address)
+        .collect();
     assert_eq!(accounts_after, accounts_before, "no account was lost");
     let expected_balances: std::collections::BTreeMap<[u8; 32], u64> = (0..N_ACCOUNTS)
         .map(|i| (synthetic_address(i), synthetic_balance(i)))
         .collect();
     for acct in f.topology.all_accounts() {
         assert_eq!(
-            acct.balance,
-            expected_balances[&acct.address],
+            acct.balance, expected_balances[&acct.address],
             "the balance must be preserved"
         );
     }
@@ -288,7 +298,10 @@ fn an_unclassified_trie_key_aborts_the_migration() {
         .execute_split(&big.trie)
         .expect_err("the migration must abort on an unclassified key");
     assert!(
-        matches!(err, stellereum::sharding::MigrationError::UnclassifiedKey(_)),
+        matches!(
+            err,
+            stellereum::sharding::MigrationError::UnclassifiedKey(_)
+        ),
         "unexpected error: {err:?}"
     );
 }
@@ -402,7 +415,11 @@ async fn run_get_method_reports_the_shard_the_same_rule_resolves() {
             json!({"address": format!("-1:{}", hex::encode(synthetic_address(0))), "method": "get"}),
         )
         .await;
-    assert_eq!(r["shard"].as_u64(), Some(0), "the -1: form is the masterchain");
+    assert_eq!(
+        r["shard"].as_u64(),
+        Some(0),
+        "the -1: form is the masterchain"
+    );
 }
 
 #[tokio::test]
@@ -426,10 +443,7 @@ async fn the_rpc_routing_rule_is_the_one_the_topology_uses() {
     let mut expected = std::collections::HashMap::new();
     for i in 0..1_000u64 {
         let addr = synthetic_address(i);
-        expected.insert(
-            addr,
-            route_shard(&topology, &ShardAddress::Workchain(addr)),
-        );
+        expected.insert(addr, route_shard(&topology, &ShardAddress::Workchain(addr)));
     }
     drop(topology);
 

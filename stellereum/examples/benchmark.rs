@@ -13,12 +13,12 @@
 //!   - Wire protocol: frame sign/verify + encode/decode (frames/sec)
 
 use ed25519_dalek::{Signer, SigningKey};
+use infnode::proto::Frame;
 use rand::rngs::OsRng;
 use std::time::Instant;
 use stellereum::cell::PatriciaTrie;
 use stellereum::consensus::{ValidatorSet, Vote, VoteKind, VoteSet};
 use stellereum::orderbook::{OrderSide, OrderbookActor};
-use infnode::proto::Frame;
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{OpCode, Svm, VmContext, VmExecutionResult};
@@ -59,8 +59,14 @@ async fn main() {
     println!("\n╔══════════════════════════════════════════════════════════════════════╗");
     println!("║         STELLEREUM PERFORMANCE BENCHMARK (TPS / LATENCY)             ║");
     println!("╚══════════════════════════════════════════════════════════════════════╝");
-    println!("  profile: {}   (run with --release for real numbers)",
-        if cfg!(debug_assertions) { "DEBUG (slow)" } else { "RELEASE" });
+    println!(
+        "  profile: {}   (run with --release for real numbers)",
+        if cfg!(debug_assertions) {
+            "DEBUG (slow)"
+        } else {
+            "RELEASE"
+        }
+    );
     println!();
 
     // ---- 1. Native transfer TPS -------------------------------------------
@@ -69,7 +75,9 @@ async fn main() {
         let sk = SigningKey::generate(&mut OsRng);
         let from = sk.verifying_key().to_bytes();
         let to = [2u8; 32];
-        engine.update_account(AccountState::new(from, u64::MAX / 2)).await;
+        engine
+            .update_account(AccountState::new(from, u64::MAX / 2))
+            .await;
 
         let n = 5_000u64;
         let txs: Vec<Transaction> = (0..n)
@@ -81,7 +89,11 @@ async fn main() {
             engine.apply_transaction(tx, 0).await.unwrap();
         }
         let secs = t.elapsed().as_secs_f64();
-        println!("  [Execution] Native transfer TPS ............ {:>10} tx/s  ({:.2?} total)", fmt(rate(n, secs)), t.elapsed());
+        println!(
+            "  [Execution] Native transfer TPS ............ {:>10} tx/s  ({:.2?} total)",
+            fmt(rate(n, secs)),
+            t.elapsed()
+        );
     }
 
     // ---- 2. Token transfer TPS --------------------------------------------
@@ -89,19 +101,32 @@ async fn main() {
         let engine = InMemoryStateEngine::new();
         let a = [1u8; 32];
         let b = [2u8; 32];
-        let id = engine.create_token(a, meta(), 1_000_000_000_000).await.unwrap();
+        let id = engine
+            .create_token(a, meta(), 1_000_000_000_000)
+            .await
+            .unwrap();
 
         let n = 2_000u64;
         let t = Instant::now();
         for i in 0..n {
             if i % 2 == 0 {
-                engine.token_execute(&id, a, TokenOp::Transfer { to: b, amount: 1 }).await.unwrap();
+                engine
+                    .token_execute(&id, a, TokenOp::Transfer { to: b, amount: 1 })
+                    .await
+                    .unwrap();
             } else {
-                engine.token_execute(&id, b, TokenOp::Transfer { to: a, amount: 1 }).await.unwrap();
+                engine
+                    .token_execute(&id, b, TokenOp::Transfer { to: a, amount: 1 })
+                    .await
+                    .unwrap();
             }
         }
         let secs = t.elapsed().as_secs_f64();
-        println!("  [Execution] Token transfer TPS ............ {:>10} tx/s  ({:.2?} total)", fmt(rate(n, secs)), t.elapsed());
+        println!(
+            "  [Execution] Token transfer TPS ............ {:>10} tx/s  ({:.2?} total)",
+            fmt(rate(n, secs)),
+            t.elapsed()
+        );
     }
 
     // ---- 3. SVM opcode throughput -----------------------------------------
@@ -132,10 +157,16 @@ async fn main() {
                 payouts: Vec::new(),
                 oracle: None,
             };
-            if let VmExecutionResult::Success { .. } = Svm::execute(&ops, 1_000_000, &mut ctx) { total_ops += ops.len() as u64 }
+            if let VmExecutionResult::Success { .. } = Svm::execute(&ops, 1_000_000, &mut ctx) {
+                total_ops += ops.len() as u64
+            }
         }
         let secs = t.elapsed().as_secs_f64();
-        println!("  [Execution] SVM opcode throughput ......... {:>10} ops/s ({:.2?} total)", fmt(rate(total_ops, secs)), t.elapsed());
+        println!(
+            "  [Execution] SVM opcode throughput ......... {:>10} ops/s ({:.2?} total)",
+            fmt(rate(total_ops, secs)),
+            t.elapsed()
+        );
     }
 
     // ---- 3b. SVM mixed realistic payload (measurement only) ----------------
@@ -160,7 +191,10 @@ async fn main() {
             for i in 0..len {
                 v.push(window[i % window.len()].clone());
                 if i % 200 == 199 {
-                    v.push(OpCode::Transfer { recipient: [9u8; 32], amount: 1 });
+                    v.push(OpCode::Transfer {
+                        recipient: [9u8; 32],
+                        amount: 1,
+                    });
                 }
             }
             v
@@ -191,20 +225,32 @@ async fn main() {
         let t = Instant::now();
         for _ in 0..3 {
             let mut ctx = mk_mixed_ctx();
-            if let VmExecutionResult::Success { .. } = Svm::execute(&ops, u64::MAX / 2, &mut ctx) { total_ops += ops.len() as u64 }
+            if let VmExecutionResult::Success { .. } = Svm::execute(&ops, u64::MAX / 2, &mut ctx) {
+                total_ops += ops.len() as u64
+            }
         }
         let secs = t.elapsed().as_secs_f64();
-        println!("  [Execution] SVM mixed single-call ......... {:>10} ops/s ({:.2?} total)", fmt(rate(total_ops, secs)), t.elapsed());
+        println!(
+            "  [Execution] SVM mixed single-call ......... {:>10} ops/s ({:.2?} total)",
+            fmt(rate(total_ops, secs)),
+            t.elapsed()
+        );
 
         let chunk = mk_mixed(1_000);
         let mut total_ops = 0u64;
         let t = Instant::now();
         for _ in 0..1_000 {
             let mut ctx = mk_mixed_ctx();
-            if let VmExecutionResult::Success { .. } = Svm::execute(&chunk, 1_000_000, &mut ctx) { total_ops += chunk.len() as u64 }
+            if let VmExecutionResult::Success { .. } = Svm::execute(&chunk, 1_000_000, &mut ctx) {
+                total_ops += chunk.len() as u64
+            }
         }
         let secs = t.elapsed().as_secs_f64();
-        println!("  [Execution] SVM mixed chunked ............. {:>10} ops/s ({:.2?} total)", fmt(rate(total_ops, secs)), t.elapsed());
+        println!(
+            "  [Execution] SVM mixed chunked ............. {:>10} ops/s ({:.2?} total)",
+            fmt(rate(total_ops, secs)),
+            t.elapsed()
+        );
     }
 
     // ---- 4. Orderbook matching --------------------------------------------
@@ -223,7 +269,12 @@ async fn main() {
             }
         }
         let secs = t.elapsed().as_secs_f64();
-        println!("  [Execution] Orderbook orders .............. {:>10} ord/s ({:.2?} total, {} fills)", fmt(rate(n, secs)), t.elapsed(), matched);
+        println!(
+            "  [Execution] Orderbook orders .............. {:>10} ord/s ({:.2?} total, {} fills)",
+            fmt(rate(n, secs)),
+            t.elapsed(),
+            matched
+        );
     }
 
     // ---- 5. Patricia trie --------------------------------------------------
@@ -237,7 +288,11 @@ async fn main() {
             trie.insert(&k, &i.to_be_bytes());
         }
         let secs = t.elapsed().as_secs_f64();
-        println!("  [State]     Trie inserts ................. {:>10} ins/s ({:.2?} total)", fmt(rate(n, secs)), t.elapsed());
+        println!(
+            "  [State]     Trie inserts ................. {:>10} ins/s ({:.2?} total)",
+            fmt(rate(n, secs)),
+            t.elapsed()
+        );
 
         let keys: Vec<[u8; 32]> = (0..n)
             .map(|i| {
@@ -250,9 +305,17 @@ async fn main() {
 
         let pn = 2_000u64;
         let t2 = Instant::now();
-        let proofs: Vec<_> = keys.iter().take(pn as usize).map(|k| trie.generate_merkle_proof(k).unwrap()).collect();
+        let proofs: Vec<_> = keys
+            .iter()
+            .take(pn as usize)
+            .map(|k| trie.generate_merkle_proof(k).unwrap())
+            .collect();
         let secs2 = t2.elapsed().as_secs_f64();
-        println!("  [State]     Merkle proof generation ...... {:>10} prf/s ({:.2?} total)", fmt(rate(pn, secs2)), t2.elapsed());
+        println!(
+            "  [State]     Merkle proof generation ...... {:>10} prf/s ({:.2?} total)",
+            fmt(rate(pn, secs2)),
+            t2.elapsed()
+        );
 
         let t3 = Instant::now();
         for (k, p) in keys.iter().take(pn as usize).zip(proofs.iter()) {
@@ -260,15 +323,26 @@ async fn main() {
             assert!(PatriciaTrie::verify_merkle_proof(&root, k, v, p));
         }
         let secs3 = t3.elapsed().as_secs_f64();
-        println!("  [State]     Merkle proof verification .... {:>10} vrf/s ({:.2?} total)", fmt(rate(pn, secs3)), t3.elapsed());
+        println!(
+            "  [State]     Merkle proof verification .... {:>10} vrf/s ({:.2?} total)",
+            fmt(rate(pn, secs3)),
+            t3.elapsed()
+        );
     }
 
     // ---- 6. Consensus vote ingestion --------------------------------------
     {
         let n = 2_000usize;
         let keys: Vec<SigningKey> = (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect();
-        let vs = ValidatorSet::from_list(keys.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect());
-        let votes: Vec<Vote> = keys.iter().map(|k| Vote::sign(k, 1, 0, VoteKind::Prevote, Some([7u8; 32]))).collect();
+        let vs = ValidatorSet::from_list(
+            keys.iter()
+                .map(|k| (k.verifying_key().to_bytes(), 1))
+                .collect(),
+        );
+        let votes: Vec<Vote> = keys
+            .iter()
+            .map(|k| Vote::sign(k, 1, 0, VoteKind::Prevote, Some([7u8; 32])))
+            .collect();
 
         let mut set = VoteSet::new();
         let t = Instant::now();
@@ -276,7 +350,11 @@ async fn main() {
             let _ = set.add(v, &vs, 1, 0, VoteKind::Prevote);
         }
         let secs = t.elapsed().as_secs_f64();
-        println!("  [Consensus] Vote verify+ingest ........... {:>10} vote/s ({:.2?} total)", fmt(rate(n as u64, secs)), t.elapsed());
+        println!(
+            "  [Consensus] Vote verify+ingest ........... {:>10} vote/s ({:.2?} total)",
+            fmt(rate(n as u64, secs)),
+            t.elapsed()
+        );
     }
 
     // ---- 7. Block hashing + signing ---------------------------------------
@@ -292,7 +370,11 @@ async fn main() {
             let _ = b.compute_hash();
         }
         let secs = t.elapsed().as_secs_f64();
-        println!("  [Consensus] Block hash+sign .............. {:>10} blk/s ({:.2?} total)", fmt(rate(n, secs)), t.elapsed());
+        println!(
+            "  [Consensus] Block hash+sign .............. {:>10} blk/s ({:.2?} total)",
+            fmt(rate(n, secs)),
+            t.elapsed()
+        );
     }
 
     // ---- 8. Wire protocol (frame sign/verify/encode/decode) ---------------

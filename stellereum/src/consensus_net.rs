@@ -179,8 +179,7 @@ pub fn vote_wire_key(msg: &ConsensusMsg) -> Option<VoteWireKey> {
 pub fn is_superseded_vote(msg: &ConsensusMsg, height: u64, round: u32) -> bool {
     match msg {
         ConsensusMsg::Vote { vote, .. } => {
-            vote.height == height
-                && vote.round.saturating_add(SUPERSEDED_ROUND_LAG) <= round
+            vote.height == height && vote.round.saturating_add(SUPERSEDED_ROUND_LAG) <= round
         }
         _ => false,
     }
@@ -189,13 +188,8 @@ pub fn is_superseded_vote(msg: &ConsensusMsg, height: u64, round: u32) -> bool {
 /// Coalesce one send batch: drop superseded votes for `(height, round)` and
 /// collapse duplicate votes to their first occurrence, preserving order.
 /// Proposals, commits and batches pass through untouched (order included).
-pub fn coalesce_for_send(
-    msgs: Vec<ConsensusMsg>,
-    height: u64,
-    round: u32,
-) -> Vec<ConsensusMsg> {
-    let mut seen: std::collections::HashSet<VoteWireKey> =
-        std::collections::HashSet::new();
+pub fn coalesce_for_send(msgs: Vec<ConsensusMsg>, height: u64, round: u32) -> Vec<ConsensusMsg> {
+    let mut seen: std::collections::HashSet<VoteWireKey> = std::collections::HashSet::new();
     msgs.into_iter()
         .filter(|m| {
             if is_superseded_vote(m, height, round) {
@@ -234,7 +228,10 @@ pub struct VoteSendFilter {
 
 impl VoteSendFilter {
     pub fn new(ttl: Duration) -> Self {
-        Self { ttl, sent: HashMap::new() }
+        Self {
+            ttl,
+            sent: HashMap::new(),
+        }
     }
 
     /// True when `msg` may go on the wire now. Records the send; an identical
@@ -264,14 +261,21 @@ static FLUSH_STAGE_GATE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ConsensusMsg {
     /// A proposer's block proposal for (height, round).
-    Proposal { height: u64, round: u32, block: Block },
+    Proposal {
+        height: u64,
+        round: u32,
+        block: Block,
+    },
     /// A prevote or precommit. `locked` carries the sender's locked block hash,
     /// and is Some ONLY on nil prevotes cast because of a lock (validRound-lite):
     /// it tells the block's author "I am stuck on YOUR body, re-propose it at
     /// your slot and we converge". Never set on block votes or precommits, so
     /// persisted quorum certificates stay hintless and byte-compatible.
     /// Wire-only (gossip, never persisted): both sides upgrade together.
-    Vote { vote: Vote, locked: Option<[u8; 32]> },
+    Vote {
+        vote: Vote,
+        locked: Option<[u8; 32]>,
+    },
     /// A block this node has committed (precommit quorum reached), together with
     /// the certificate that proves it.
     ///
@@ -344,7 +348,10 @@ pub fn send_outcome_records_health(fire_and_forget: bool) -> bool {
 /// path (a full block + QC) and its ACK is the sender's proof that the peer
 /// really got the block. It is also rare, so it costs nothing to wait for it.
 pub fn message_is_fire_and_forget(msg: &ConsensusMsg) -> bool {
-    matches!(msg, ConsensusMsg::Vote { .. } | ConsensusMsg::Proposal { .. })
+    matches!(
+        msg,
+        ConsensusMsg::Vote { .. } | ConsensusMsg::Proposal { .. }
+    )
 }
 
 /// True when EVERY member of a chunk is safe to send fire-and-forget.
@@ -356,7 +363,7 @@ pub fn batch_is_fire_and_forget(msgs: &[ConsensusMsg]) -> bool {
     !msgs.is_empty() && msgs.iter().all(message_is_fire_and_forget)
 }
 
- /// Encode `items` as one [`ConsensusMsg::Batch`] (P3-H4).
+/// Encode `items` as one [`ConsensusMsg::Batch`] (P3-H4).
 pub fn batch_encode(items: &[ConsensusMsg]) -> Result<Vec<u8>, String> {
     ConsensusMsg::batch_encode(items)
 }
@@ -390,10 +397,9 @@ impl ConsensusMsg {
         match self {
             ConsensusMsg::Proposal { .. } | ConsensusMsg::Committed { .. } => true,
             ConsensusMsg::Batch(..) => true,
-            ConsensusMsg::Vote { .. } => self
-                .encode()
-                .map(|b| b.len() >= 64 * 1024)
-                .unwrap_or(false),
+            ConsensusMsg::Vote { .. } => {
+                self.encode().map(|b| b.len() >= 64 * 1024).unwrap_or(false)
+            }
         }
     }
 
@@ -516,7 +522,11 @@ fn send_timeout() -> std::time::Duration {
 /// the threshold and the last failure is still inside the cooldown window.
 /// An old failure means "retry now" (returns false); a zero count never
 /// skips, even with a stale timestamp.
-fn peer_in_cooldown(fails: u32, last_fail: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+fn peer_in_cooldown(
+    fails: u32,
+    last_fail: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
     fails >= PEER_SKIP_THRESHOLD
         && last_fail.is_some_and(|t| now.saturating_duration_since(t) < PEER_SKIP_COOLDOWN)
 }
@@ -828,7 +838,9 @@ impl ConsensusNetwork {
     fn peer_ids(&self) -> Vec<[u8; 20]> {
         let mut out = Vec::new();
         for p in &self.adapter.node.cfg.peers {
-            let pid = p.node_id_raw().or_else(|_| self.adapter.node.resolve(&p.name));
+            let pid = p
+                .node_id_raw()
+                .or_else(|_| self.adapter.node.resolve(&p.name));
             match pid {
                 Ok(pid) => out.push(pid),
                 Err(e) => tracing::warn!("[consensus] cannot resolve peer {}: {e}", p.name),
@@ -904,18 +916,16 @@ impl ConsensusNetwork {
             let t = std::time::Instant::now();
             let r = tokio::time::timeout(
                 send_timeout(),
-                self.adapter.node.request_to(pid, "core.ping", b"{}".to_vec()),
+                self.adapter
+                    .node
+                    .request_to(pid, "core.ping", b"{}".to_vec()),
             )
             .await;
             match r {
                 Ok(Ok(_)) => {
                     self.peer_record(pid, true);
                     self.probe_timeout_clear(&pid);
-                    tracing::info!(
-                        "[net] probe {} ok in {:?}",
-                        hex::encode(pid),
-                        t.elapsed()
-                    );
+                    tracing::info!("[net] probe {} ok in {:?}", hex::encode(pid), t.elapsed());
                 }
                 Ok(Err(e)) => {
                     self.peer_record(pid, false);
@@ -1068,9 +1078,10 @@ impl ConsensusNetwork {
                         );
                         continue;
                     }
-                    let payload = serde_json::json!({ "topic": self.topic, "data": hex::encode(b) })
-                        .to_string()
-                        .into_bytes();
+                    let payload =
+                        serde_json::json!({ "topic": self.topic, "data": hex::encode(b) })
+                            .to_string()
+                            .into_bytes();
                     self.send_payload_with_skip(payload, exempt, fof).await;
                 }
                 Err(e) => {
@@ -1153,7 +1164,11 @@ impl ConsensusNetwork {
         // report); this names the transport stage vs stage (a).
         log_stage(
             &REQUEST_STAGE_GATE,
-            if fire_and_forget { "send_to" } else { "request_to" },
+            if fire_and_forget {
+                "send_to"
+            } else {
+                "request_to"
+            },
             &format!("peer={} total", hex::encode(pid)),
             elapsed,
         );
@@ -1214,7 +1229,8 @@ impl ConsensusNetwork {
                 Self::record_health(&health, pid, false);
                 tracing::warn!(
                     "[consensus] broadcast to {} transport-err in {:?}: {e}",
-                    hexid, elapsed,
+                    hexid,
+                    elapsed,
                 );
                 // NO eviction here. Eviction closes the shared connection,
                 // which kills the peer's frame_loop for it too; one slow
@@ -1228,7 +1244,8 @@ impl ConsensusNetwork {
                 Self::record_health(&health, pid, false);
                 tracing::warn!(
                     "[consensus] broadcast to {} TIMEOUT after {:?}",
-                    hexid, elapsed,
+                    hexid,
+                    elapsed,
                 );
                 // See above: time out, log, move on -- do not evict.
             }
@@ -1328,9 +1345,7 @@ impl ConsensusNetwork {
             );
         }
         if skipped > 0 {
-            tracing::debug!(
-                "[consensus] broadcast skipped {skipped} peer(s) in failure cooldown"
-            );
+            tracing::debug!("[consensus] broadcast skipped {skipped} peer(s) in failure cooldown");
         }
         if detached > 0 {
             tracing::debug!(
@@ -1428,7 +1443,10 @@ where
             log_stage(
                 &FLUSH_STAGE_GATE,
                 "flush_outbox",
-                &format!("items={items} queued={}", task_pending.load(Ordering::Relaxed)),
+                &format!(
+                    "items={items} queued={}",
+                    task_pending.load(Ordering::Relaxed)
+                ),
                 t.elapsed(),
             );
         }
@@ -1480,7 +1498,9 @@ impl TxGossip {
     fn peer_ids(&self) -> Vec<[u8; 20]> {
         let mut out = Vec::new();
         for p in &self.adapter.node.cfg.peers {
-            let pid = p.node_id_raw().or_else(|_| self.adapter.node.resolve(&p.name));
+            let pid = p
+                .node_id_raw()
+                .or_else(|_| self.adapter.node.resolve(&p.name));
             match pid {
                 Ok(pid) => out.push(pid),
                 Err(e) => tracing::warn!("[txgossip] cannot resolve peer {}: {e}", p.name),
@@ -1498,8 +1518,10 @@ impl TxGossip {
     /// Same join backoff as [`ConsensusNetwork::join`]: cooldown peers get no
     /// dial here, so a dead validator endpoint cannot turn every reconnect
     /// tick into a handshake-timeout storm.
-     pub async fn join(&self) {
-         let payload = serde_json::json!({ "topic": self.topic }).to_string().into_bytes();
+    pub async fn join(&self) {
+        let payload = serde_json::json!({ "topic": self.topic })
+            .to_string()
+            .into_bytes();
         // Concurrent with a bounded join budget (mirrors ConsensusNetwork):
         // serial dials paid a dead peer's full timeout on every window.
         let mut handles = Vec::new();
@@ -1525,7 +1547,7 @@ impl TxGossip {
         }
         let budget = std::time::Duration::from_millis(broadcast_join_timeout_ms());
         let (_done, _detached) = join_with_timeout(handles, budget).await;
-     }
+    }
 
     /// True when this peer is in failure cooldown (skip it: no dial, no join
     /// tax). Snapshot read, never held across await.
@@ -1596,7 +1618,9 @@ impl TxGossip {
             Ok(Ok(_)) => {
                 Self::record_health(&health, pid, true);
                 if elapsed >= std::time::Duration::from_millis(300) {
-                    tracing::warn!("[txgossip] broadcast to {hexid} slow: {elapsed:?} (still under the cap)");
+                    tracing::warn!(
+                        "[txgossip] broadcast to {hexid} slow: {elapsed:?} (still under the cap)"
+                    );
                 } else {
                     tracing::debug!("[txgossip] broadcast to {hexid} ok in {elapsed:?}");
                 }
@@ -1645,7 +1669,9 @@ impl TxGossip {
     /// detach (still sending, still recording) while the flush moves on.
     /// Best-effort still: at most 1 MiB/tx, oversized txs never gossiped.
     pub async fn broadcast(&self, tx: &crate::sharding::Transaction) {
-        let Ok(bytes) = bincode::serialize(tx) else { return };
+        let Ok(bytes) = bincode::serialize(tx) else {
+            return;
+        };
         self.broadcast_bytes(bytes).await;
     }
 
@@ -1812,7 +1838,12 @@ mod tests {
         let gate = AtomicU64::new(0);
         log_stage(&gate, "test", "fast", std::time::Duration::from_micros(1));
         log_stage(&gate, "test", "slow", std::time::Duration::from_millis(250));
-        log_stage(&gate, "test", "slow-again", std::time::Duration::from_millis(300));
+        log_stage(
+            &gate,
+            "test",
+            "slow-again",
+            std::time::Duration::from_millis(300),
+        );
     }
 
     /// FIRE-AND-FORGET is not a delivery proof: a local write success must
@@ -1865,7 +1896,8 @@ mod tests {
     }
 
     #[test]
-    fn inbound_peer_key_prefers_src_then_from() {        // The pubsub envelope infnode delivers carries the SENDER's node id
+    fn inbound_peer_key_prefers_src_then_from() {
+        // The pubsub envelope infnode delivers carries the SENDER's node id
         // in `src`; `from` is the legacy spelling. `src` wins when both are
         // present.
         let raw = r#"{"topic":"t","data":"00","msg_id":7,"src":"aa","from":"bb"}"#;
@@ -1905,7 +1937,10 @@ mod tests {
         // whole burst, peer B still has its own bucket.
         let mut limiter = InboundBulkLimiter::new(1024, 1024);
         let now = 1_000u64;
-        assert_eq!(limiter.admit(&key_a, 1024, false, now), InboundDecision::Allow);
+        assert_eq!(
+            limiter.admit(&key_a, 1024, false, now),
+            InboundDecision::Allow
+        );
         // A is now over budget -> deferred.
         assert!(
             matches!(
@@ -1924,7 +1959,8 @@ mod tests {
     }
 
     #[test]
-    fn peer_cooldown_skips_only_inside_the_window() {        use std::time::{Duration, Instant};
+    fn peer_cooldown_skips_only_inside_the_window() {
+        use std::time::{Duration, Instant};
         let now = Instant::now();
         // Below threshold: never skip, even with a fresh failure.
         assert!(!peer_in_cooldown(2, Some(now), now));
@@ -1971,8 +2007,11 @@ mod tests {
         };
         assert!(committed_bypasses_skip(&commit));
         assert!(batch_bypasses_skip(std::slice::from_ref(&commit)));
-        let proposal =
-            ConsensusMsg::Proposal { height: 9, round: 0, block: sample_block() };
+        let proposal = ConsensusMsg::Proposal {
+            height: 9,
+            round: 0,
+            block: sample_block(),
+        };
         assert!(!committed_bypasses_skip(&proposal));
         assert!(!batch_bypasses_skip(std::slice::from_ref(&proposal)));
         // A batch of only votes/proposals carries no live path.
@@ -1994,8 +2033,11 @@ mod tests {
         // ACK also delays the NEXT chunk.
         let vote = tagged_vote(1);
         assert!(message_is_fire_and_forget(&vote));
-        let proposal =
-            ConsensusMsg::Proposal { height: 9, round: 0, block: sample_block() };
+        let proposal = ConsensusMsg::Proposal {
+            height: 9,
+            round: 0,
+            block: sample_block(),
+        };
         assert!(message_is_fire_and_forget(&proposal));
         // A chunk of votes/proposals is fire-and-forget.
         assert!(batch_is_fire_and_forget(std::slice::from_ref(&vote)));
@@ -2044,15 +2086,23 @@ mod tests {
         };
         b.sign_block(&sk);
         b
-}
+    }
 
     #[test]
     fn proposal_roundtrip() {
-        let msg = ConsensusMsg::Proposal { height: 7, round: 0, block: sample_block() };
+        let msg = ConsensusMsg::Proposal {
+            height: 7,
+            round: 0,
+            block: sample_block(),
+        };
         let bytes = msg.encode().unwrap();
         let dec = ConsensusMsg::decode(&bytes).unwrap();
         match dec {
-            ConsensusMsg::Proposal { height, round, block } => {
+            ConsensusMsg::Proposal {
+                height,
+                round,
+                block,
+            } => {
                 assert_eq!(height, 7);
                 assert_eq!(round, 0);
                 assert_eq!(block.height, 7);
@@ -2065,7 +2115,10 @@ mod tests {
     fn vote_roundtrip() {
         let sk = SigningKey::generate(&mut OsRng);
         let v = Vote::sign(&sk, 3, 1, VoteKind::Prevote, Some([9u8; 32]));
-        let msg = ConsensusMsg::Vote { vote: v.clone(), locked: None };
+        let msg = ConsensusMsg::Vote {
+            vote: v.clone(),
+            locked: None,
+        };
         let bytes = msg.encode().unwrap();
         match ConsensusMsg::decode(&bytes).unwrap() {
             ConsensusMsg::Vote { vote: v2, locked } => {
@@ -2081,13 +2134,19 @@ mod tests {
     #[test]
     fn decode_rejects_garbage() {
         assert!(ConsensusMsg::decode(&[]).is_err(), "empty must be rejected");
-        assert!(ConsensusMsg::decode(&[0xFF, 0x00, 0x01]).is_err(), "garbage must be rejected");
+        assert!(
+            ConsensusMsg::decode(&[0xFF, 0x00, 0x01]).is_err(),
+            "garbage must be rejected"
+        );
     }
 
     #[test]
     fn decode_rejects_oversized() {
         let big = vec![0u8; MAX_CONSENSUS_MSG + 1];
-        assert!(ConsensusMsg::decode(&big).is_err(), "oversized must be rejected");
+        assert!(
+            ConsensusMsg::decode(&big).is_err(),
+            "oversized must be rejected"
+        );
     }
 
     /// PENTEST F1 (P1): appended trailing bytes must not ride along a valid
@@ -2099,25 +2158,38 @@ mod tests {
     fn pentest_decode_rejects_trailing_bytes() {
         let sk = SigningKey::generate(&mut OsRng);
         let v = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
-        let mut bytes = ConsensusMsg::Vote { vote: v, locked: None }.encode().unwrap();
+        let mut bytes = ConsensusMsg::Vote {
+            vote: v,
+            locked: None,
+        }
+        .encode()
+        .unwrap();
         bytes.extend_from_slice(&[0xAA; 64]);
         assert!(
             ConsensusMsg::decode(&bytes).is_err(),
             "trailing junk after a valid message must be rejected"
         );
         // A single trailing byte is the same attack at minimum size.
-        let mut one = ConsensusMsg::Proposal { height: 7, round: 0, block: sample_block() }
-            .encode()
-            .unwrap();
+        let mut one = ConsensusMsg::Proposal {
+            height: 7,
+            round: 0,
+            block: sample_block(),
+        }
+        .encode()
+        .unwrap();
         one.push(0x00);
         assert!(
             ConsensusMsg::decode(&one).is_err(),
             "one trailing byte must already fail the decode"
         );
         // Exact bytes still decode (no false positive from the hardening).
-        let exact = ConsensusMsg::Proposal { height: 7, round: 0, block: sample_block() }
-            .encode()
-            .unwrap();
+        let exact = ConsensusMsg::Proposal {
+            height: 7,
+            round: 0,
+            block: sample_block(),
+        }
+        .encode()
+        .unwrap();
         assert!(ConsensusMsg::decode(&exact).is_ok());
     }
 
@@ -2131,8 +2203,11 @@ mod tests {
     #[test]
     fn pentest_only_committed_bypasses_inbound_limiter() {
         let vote = tagged_vote(1);
-        let proposal =
-            ConsensusMsg::Proposal { height: 9, round: 0, block: sample_block() };
+        let proposal = ConsensusMsg::Proposal {
+            height: 9,
+            round: 0,
+            block: sample_block(),
+        };
         let batch = ConsensusMsg::Batch(vec![vote.clone()]);
         assert!(
             !inbound_is_critical(&vote),
@@ -2230,9 +2305,19 @@ mod tests {
         // a well-formed message parses
         let sk = SigningKey::generate(&mut OsRng);
         let v = Vote::sign(&sk, 1, 0, VoteKind::Precommit, None);
-        let data = hex::encode(ConsensusMsg::Vote { vote: v, locked: None }.encode().unwrap());
+        let data = hex::encode(
+            ConsensusMsg::Vote {
+                vote: v,
+                locked: None,
+            }
+            .encode()
+            .unwrap(),
+        );
         let raw = serde_json::json!({ "topic": consensus_topic("test"), "data": data }).to_string();
-        assert!(matches!(parse_incoming(&raw), Some(ConsensusMsg::Vote { .. })));
+        assert!(matches!(
+            parse_incoming(&raw),
+            Some(ConsensusMsg::Vote { .. })
+        ));
     }
 
     #[test]
@@ -2240,10 +2325,15 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let mut v = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
         v.block_hash = Some([2u8; 32]); // tamper after signing
-        let msg = ConsensusMsg::Vote { vote: v, locked: None };
+        let msg = ConsensusMsg::Vote {
+            vote: v,
+            locked: None,
+        };
         let bytes = msg.encode().unwrap();
         match ConsensusMsg::decode(&bytes).unwrap() {
-            ConsensusMsg::Vote { vote: v2, .. } => assert!(!v2.verify(), "tampered vote must fail verification"),
+            ConsensusMsg::Vote { vote: v2, .. } => {
+                assert!(!v2.verify(), "tampered vote must fail verification")
+            }
             _ => panic!("wrong variant"),
         }
     }
@@ -2266,8 +2356,11 @@ mod tests {
         // Batch envelope + trailing junk.
         let sk = SigningKey::generate(&mut OsRng);
         let v = Vote::sign(&sk, 1, 0, VoteKind::Prevote, None);
-        let batch_bytes =
-            ConsensusMsg::batch_encode(&[ConsensusMsg::Vote { vote: v, locked: None }]).unwrap();
+        let batch_bytes = ConsensusMsg::batch_encode(&[ConsensusMsg::Vote {
+            vote: v,
+            locked: None,
+        }])
+        .unwrap();
         let mut padded = batch_bytes.clone();
         padded.extend_from_slice(&[0xBB; 128]);
         assert!(
@@ -2339,11 +2432,17 @@ mod tests {
         let mut lim = InboundBulkLimiter::new(1024, 1024);
         let now = 1_000u64;
         // Flooder spends its whole 1 KiB burst on the first vote...
-        assert_eq!(lim.admit("flooder", 1024, false, now), InboundDecision::Allow);
+        assert_eq!(
+            lim.admit("flooder", 1024, false, now),
+            InboundDecision::Allow
+        );
         // ...and every further singleton vote in the same tick defers.
         for i in 0..32 {
             assert!(
-                matches!(lim.admit("flooder", 300, false, now), InboundDecision::Defer { .. }),
+                matches!(
+                    lim.admit("flooder", 300, false, now),
+                    InboundDecision::Defer { .. }
+                ),
                 "flooder vote {i} over budget must defer, not execute inline"
             );
         }
@@ -2358,8 +2457,14 @@ mod tests {
         // After a refill window the flooder earns budget back (deferral is
         // scheduling, not a ban) and the honest peer is still unaffected.
         let later = now + 2_000;
-        assert_eq!(lim.admit("flooder", 300, false, later), InboundDecision::Allow);
-        assert_eq!(lim.admit("honest", 300, false, later), InboundDecision::Allow);
+        assert_eq!(
+            lim.admit("flooder", 300, false, later),
+            InboundDecision::Allow
+        );
+        assert_eq!(
+            lim.admit("honest", 300, false, later),
+            InboundDecision::Allow
+        );
     }
 
     /// VERIFICATION F2-hardening, second half: a giant fake Committed bypasses
@@ -2391,7 +2496,10 @@ mod tests {
         // path needs ~1 proof per finalize, the cap is generous, and the 9th
         // proof in one tick is flood tail.
         for i in 0..COMMITTED_INNER_BUDGET_PER_TICK {
-            assert!(committed_admit_this_tick(i), "proof {i} within cap must verify");
+            assert!(
+                committed_admit_this_tick(i),
+                "proof {i} within cap must verify"
+            );
         }
         assert!(
             !committed_admit_this_tick(COMMITTED_INNER_BUDGET_PER_TICK),
@@ -2420,7 +2528,10 @@ mod tests {
         // Boundary: exactly 128 hex chars is a distinct bucket...
         let k128 = "ab".repeat(64);
         assert_eq!(k128.len(), 128);
-        assert_eq!(inbound_peer_key(&format!(r#"{{"topic":"t","data":"00","src":"{k128}"}}"#)), k128);
+        assert_eq!(
+            inbound_peer_key(&format!(r#"{{"topic":"t","data":"00","src":"{k128}"}}"#)),
+            k128
+        );
         // ...129 chars collapses to shared.
         let k129 = format!("{k128}ab");
         assert_eq!(
@@ -2441,7 +2552,10 @@ mod tests {
             assert_eq!(inbound_peer_key(&raw), shared, "raw={raw}");
         }
         // `from` fallback is gated identically (non-hex -> shared, hex distinct).
-        assert_eq!(inbound_peer_key(r#"{"topic":"t","data":"00","from":"cc"}"#), "cc");
+        assert_eq!(
+            inbound_peer_key(r#"{"topic":"t","data":"00","from":"cc"}"#),
+            "cc"
+        );
         // Two distinct malicious senders share ONE bucket: no minting, and the
         // shared bucket still rate-limits the aggregate (it is one token
         // bucket, not an exemption).
@@ -2452,10 +2566,17 @@ mod tests {
         let mut lim = InboundBulkLimiter::new(1024, 1024);
         assert_eq!(lim.admit(&m1, 1024, false, 1_000), InboundDecision::Allow);
         assert!(
-            matches!(lim.admit(&m2, 1024, false, 1_000), InboundDecision::Defer { .. }),
+            matches!(
+                lim.admit(&m2, 1024, false, 1_000),
+                InboundDecision::Defer { .. }
+            ),
             "malicious senders share one budget: the second must defer"
         );
-        assert_eq!(lim.peer_count(), 1, "malicious senders must not grow the map");
+        assert_eq!(
+            lim.peer_count(),
+            1,
+            "malicious senders must not grow the map"
+        );
     }
 
     /// VERIFICATION G1: only an attributable proposal (valid proposer
@@ -2549,9 +2670,19 @@ mod tests {
         let v1 = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
         let v2 = Vote::sign(&sk, 1, 0, VoteKind::Precommit, None);
         let items = vec![
-            ConsensusMsg::Vote { vote: v1, locked: None },
-            ConsensusMsg::Vote { vote: v2, locked: Some([2u8; 32]) },
-            ConsensusMsg::Proposal { height: 7, round: 0, block: sample_block() },
+            ConsensusMsg::Vote {
+                vote: v1,
+                locked: None,
+            },
+            ConsensusMsg::Vote {
+                vote: v2,
+                locked: Some([2u8; 32]),
+            },
+            ConsensusMsg::Proposal {
+                height: 7,
+                round: 0,
+                block: sample_block(),
+            },
         ];
         let bytes = ConsensusMsg::batch_encode(&items).unwrap();
         assert!(bytes.len() <= MAX_BATCH_BYTES);
@@ -2573,7 +2704,10 @@ mod tests {
     fn batch_rejects_nested() {
         let sk = SigningKey::generate(&mut OsRng);
         let v = Vote::sign(&sk, 1, 0, VoteKind::Prevote, None);
-        let inner = ConsensusMsg::Batch(vec![ConsensusMsg::Vote { vote: v, locked: None }]);
+        let inner = ConsensusMsg::Batch(vec![ConsensusMsg::Vote {
+            vote: v,
+            locked: None,
+        }]);
         let outer = ConsensusMsg::Batch(vec![inner]);
         // batch_encode rejects nesting up front
         if let ConsensusMsg::Batch(items) = &outer {
@@ -2624,8 +2758,15 @@ mod tests {
         let mut big = sample_block();
         big.transactions = txs;
         big.sign_block(&sk);
-        let msg = ConsensusMsg::Proposal { height: 7, round: 0, block: big };
-        assert!(msg.encode().unwrap().len() > MAX_BATCH_BYTES, "fixture must exceed the batch cap");
+        let msg = ConsensusMsg::Proposal {
+            height: 7,
+            round: 0,
+            block: big,
+        };
+        assert!(
+            msg.encode().unwrap().len() > MAX_BATCH_BYTES,
+            "fixture must exceed the batch cap"
+        );
         let items = vec![msg.clone(), msg];
         assert!(ConsensusMsg::batch_encode(&items).is_err());
         let raw = bincode::serialize(&ConsensusMsg::Batch(items)).unwrap();
@@ -2648,14 +2789,28 @@ mod tests {
         // batch bytes rather than misreading them as a proposal/vote.
         #[derive(serde::Serialize, serde::Deserialize)]
         enum OldConsensusMsg {
-            Proposal { height: u64, round: u32, block: Block },
-            Vote { vote: Vote, locked: Option<[u8; 32]> },
-            Committed { height: u64, block: Block, certificate: crate::consensus::QuorumCertificate },
+            Proposal {
+                height: u64,
+                round: u32,
+                block: Block,
+            },
+            Vote {
+                vote: Vote,
+                locked: Option<[u8; 32]>,
+            },
+            Committed {
+                height: u64,
+                block: Block,
+                certificate: crate::consensus::QuorumCertificate,
+            },
         }
         let sk = SigningKey::generate(&mut OsRng);
         let v = Vote::sign(&sk, 1, 0, VoteKind::Prevote, None);
-        let bytes =
-            ConsensusMsg::batch_encode(&[ConsensusMsg::Vote { vote: v, locked: None }]).unwrap();
+        let bytes = ConsensusMsg::batch_encode(&[ConsensusMsg::Vote {
+            vote: v,
+            locked: None,
+        }])
+        .unwrap();
         let res: Result<OldConsensusMsg, _> = bincode::deserialize(&bytes);
         assert!(res.is_err(), "old decoder must reject batch bytes");
     }
@@ -2664,10 +2819,18 @@ mod tests {
     fn is_large_flags_proposals_and_commits() {
         let sk = SigningKey::generate(&mut OsRng);
         let v = Vote::sign(&sk, 1, 0, VoteKind::Prevote, None);
-        let vote = ConsensusMsg::Vote { vote: v, locked: None };
+        let vote = ConsensusMsg::Vote {
+            vote: v,
+            locked: None,
+        };
         assert!(!is_large(&vote));
         assert!(!vote.is_large());
-        assert!(ConsensusMsg::Proposal { height: 1, round: 0, block: sample_block() }.is_large());
+        assert!(ConsensusMsg::Proposal {
+            height: 1,
+            round: 0,
+            block: sample_block()
+        }
+        .is_large());
     }
 
     #[test]
@@ -2675,7 +2838,8 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let tx = Transaction::sign(&sk, [1u8; 32], 10, 5, 0, 1, 1);
         let bytes = bincode::serialize(&tx).unwrap();
-        let raw = serde_json::json!({ "topic": tx_topic("test"), "data": hex::encode(bytes) }).to_string();
+        let raw = serde_json::json!({ "topic": tx_topic("test"), "data": hex::encode(bytes) })
+            .to_string();
         let parsed = parse_tx_incoming(&raw).unwrap();
         assert_eq!(parsed.amount, 10);
         assert!(parsed.verify_signature());
@@ -2733,9 +2897,16 @@ mod tests {
         });
 
         for id in 0u64..5 {
-            assert!(sender.enqueue(vec![tagged_vote(id)]), "enqueue {id} must succeed");
+            assert!(
+                sender.enqueue(vec![tagged_vote(id)]),
+                "enqueue {id} must succeed"
+            );
         }
-        assert_eq!(sender.queued(), 5, "all five chunks are pending before send");
+        assert_eq!(
+            sender.queued(),
+            5,
+            "all five chunks are pending before send"
+        );
 
         // The enqueue path is non-blocking: five chunks are already queued while
         // the worker is still sleeping on the first.
@@ -2743,7 +2914,11 @@ mod tests {
         while seen.lock().unwrap().len() < 5 && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2, 3, 4], "FIFO order must hold");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![0, 1, 2, 3, 4],
+            "FIFO order must hold"
+        );
         assert_eq!(sender.queued(), 0, "pending must drain to zero");
     }
 
@@ -2760,9 +2935,16 @@ mod tests {
         assert!(is_superseded_vote(&old_prevote, 9, 5));
         assert!(is_superseded_vote(&old_prevote, 9, 6));
         assert!(!is_superseded_vote(&old_prevote, 9, 4), "r+1 still counts");
-        assert!(!is_superseded_vote(&old_prevote, 10, 5), "other heights never drop");
+        assert!(
+            !is_superseded_vote(&old_prevote, 10, 5),
+            "other heights never drop"
+        );
         assert!(!is_superseded_vote(
-            &ConsensusMsg::Proposal { height: 9, round: 0, block: sample_block() },
+            &ConsensusMsg::Proposal {
+                height: 9,
+                round: 0,
+                block: sample_block()
+            },
             9,
             99,
         ));
@@ -2793,9 +2975,18 @@ mod tests {
             vote: Vote::sign(&sk, 9, 1, VoteKind::Prevote, Some([1u8; 32])),
             locked: None,
         };
-        let p = ConsensusMsg::Proposal { height: 9, round: 5, block: sample_block() };
+        let p = ConsensusMsg::Proposal {
+            height: 9,
+            round: 5,
+            block: sample_block(),
+        };
         let out = coalesce_for_send(vec![v(), v(), stale, p.clone(), v()], 9, 5);
-        assert_eq!(out.len(), 2, "one live vote + the proposal, got {}", out.len());
+        assert_eq!(
+            out.len(),
+            2,
+            "one live vote + the proposal, got {}",
+            out.len()
+        );
         assert!(matches!(out[0], ConsensusMsg::Vote { .. }));
         assert!(matches!(out[1], ConsensusMsg::Proposal { .. }));
     }
@@ -2809,13 +3000,26 @@ mod tests {
             vote: Vote::sign(&sk, 9, 4, VoteKind::Prevote, Some([1u8; 32])),
             locked: None,
         };
-        let p = ConsensusMsg::Proposal { height: 9, round: 4, block: sample_block() };
+        let p = ConsensusMsg::Proposal {
+            height: 9,
+            round: 4,
+            block: sample_block(),
+        };
         let t0 = Instant::now();
         let mut f = VoteSendFilter::new(Duration::from_millis(200));
         assert!(f.should_send(&v, t0));
-        assert!(!f.should_send(&v, t0 + Duration::from_millis(50)), "same-tick dup must coalesce");
-        assert!(f.should_send(&p, t0 + Duration::from_millis(50)), "proposals never deduped");
-        assert!(f.should_send(&p, t0 + Duration::from_millis(51)), "proposals never deduped twice");
+        assert!(
+            !f.should_send(&v, t0 + Duration::from_millis(50)),
+            "same-tick dup must coalesce"
+        );
+        assert!(
+            f.should_send(&p, t0 + Duration::from_millis(50)),
+            "proposals never deduped"
+        );
+        assert!(
+            f.should_send(&p, t0 + Duration::from_millis(51)),
+            "proposals never deduped twice"
+        );
         assert!(
             f.should_send(&v, t0 + Duration::from_millis(1000)),
             "loss-recovery retry past the window must pass"
@@ -2829,7 +3033,11 @@ mod tests {
         assert_eq!(retransmit_interval_ms(800, 0), 400);
         assert_eq!(retransmit_interval_ms(800, 799), 400);
         assert_eq!(retransmit_interval_ms(800, 800), 800);
-        assert_eq!(retransmit_interval_ms(800, 10_000), 1600, "capped at 2x timeout");
+        assert_eq!(
+            retransmit_interval_ms(800, 10_000),
+            1600,
+            "capped at 2x timeout"
+        );
         // Small timeouts keep a sane floor instead of a hot loop.
         assert_eq!(retransmit_interval_ms(200, 0), 150);
     }
@@ -2857,7 +3065,11 @@ mod tests {
             !sender.enqueue(vec![tagged_vote(255)]),
             "enqueue past MAX_PENDING_CHUNKS must be refused, not silently dropped"
         );
-        assert_eq!(sender.queued(), cap, "a refused enqueue must not consume a slot");
+        assert_eq!(
+            sender.queued(),
+            cap,
+            "a refused enqueue must not consume a slot"
+        );
     }
 }
 
@@ -2893,14 +3105,17 @@ mod decoder_fuzz_regressions {
     #[test]
     fn adversarial_prefixes_never_panic() {
         let mut corpus = vec![vec![], vec![0xFF], vec![0u8; 128]];
-        if let Ok(bytes) = (ConsensusMsg::Vote { vote: crate::consensus::Vote::signed_with(
-            [7u8; 32],
-            1,
-            0,
-            crate::consensus::VoteKind::Prevote,
-            None,
-            vec![0u8; 64],
-        ), locked: None }
+        if let Ok(bytes) = (ConsensusMsg::Vote {
+            vote: crate::consensus::Vote::signed_with(
+                [7u8; 32],
+                1,
+                0,
+                crate::consensus::VoteKind::Prevote,
+                None,
+                vec![0u8; 64],
+            ),
+            locked: None,
+        }
         .encode())
         {
             for n in 0..bytes.len() {
@@ -2919,7 +3134,11 @@ mod decoder_fuzz_regressions {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = ConsensusMsg::decode(input);
             }));
-            assert!(r.is_ok(), "ConsensusMsg::decode panicked on len {}", input.len());
+            assert!(
+                r.is_ok(),
+                "ConsensusMsg::decode panicked on len {}",
+                input.len()
+            );
         }
         for raw in ["", "not json", "{}", r#"{"data": "zz"}"#] {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3094,8 +3313,7 @@ pub fn committed_admit_this_tick(already_admitted: u32) -> bool {
 /// pinned by `report_p1_g2_g4_filed_without_content_is_closed_as_accepted`
 /// below, which re-asserts the two content-bearing bookends (G1, G5).
 pub fn proposal_hint_admissible(block: &Block, validators: &ValidatorSet) -> bool {
-    crate::consensus::verify_proposer_signature(block)
-        && validators.power_of(&block.proposer) != 0
+    crate::consensus::verify_proposer_signature(block) && validators.power_of(&block.proposer) != 0
 }
 
 /// Inbound admission outcome. There is deliberately no `Drop` variant: bulk
@@ -3255,7 +3473,9 @@ impl InboundBulkLimiter {
         } else {
             let shortfall = need - bucket.tokens;
             let wait = (shortfall / self.rate_bps * 1000.0).ceil() as u64;
-            InboundDecision::Defer { wait_ms: wait.clamp(1, INBOUND_MAX_DEFER_WAIT_MS) }
+            InboundDecision::Defer {
+                wait_ms: wait.clamp(1, INBOUND_MAX_DEFER_WAIT_MS),
+            }
         }
     }
 }

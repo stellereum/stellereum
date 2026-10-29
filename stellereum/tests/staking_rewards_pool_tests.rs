@@ -13,10 +13,10 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
-use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::staking::{
     MIN_VALIDATOR_BOND, REWARDS_EMISSION_CAP, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER,
 };
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
 /// New-bond floor since the re-entry fix: bare-MIN bonds are refused, so every
 /// SysCallStake below bonds exactly MIN+buffer.
@@ -86,7 +86,10 @@ async fn block_reward_mints_into_pool_and_claim_leaves_principal_untouched() {
                 &val,
                 0,
                 20_000,
-                vec![OpCode::SysCallStake { validator: val_addr, amount: bond_amount() }],
+                vec![OpCode::SysCallStake {
+                    validator: val_addr,
+                    amount: bond_amount(),
+                }],
             ),
             0,
         )
@@ -96,17 +99,26 @@ async fn block_reward_mints_into_pool_and_claim_leaves_principal_untouched() {
 
     // The block mint: reward R to the proposer.
     let r = 5 * STELL;
-    engine.apply_block_transition(&block_of(1, vec![], val_addr), r).await;
+    engine
+        .apply_block_transition(&block_of(1, vec![], val_addr), r)
+        .await;
     {
         let l = engine.staking_read().await;
-        assert_eq!(l.rewards_minted, r, "cumulative mint tracks the block reward");
+        assert_eq!(
+            l.rewards_minted, r,
+            "cumulative mint tracks the block reward"
+        );
         assert_eq!(l.rewards_pool, r, "mint funds the ledger pool 1:1");
         assert_eq!(
             l.validators[&val_addr].pending_rewards, r,
             "proposer accrues the full reward (no delegators)"
         );
     }
-    assert_eq!(bal(&engine, &REWARDS_POOL).await, r, "native mint lands in REWARDS_POOL");
+    assert_eq!(
+        bal(&engine, &REWARDS_POOL).await,
+        r,
+        "native mint lands in REWARDS_POOL"
+    );
     assert_eq!(
         bal(&engine, &STAKING_POOL).await,
         bond_amount(),
@@ -117,7 +129,14 @@ async fn block_reward_mints_into_pool_and_claim_leaves_principal_untouched() {
     let before = bal(&engine, &val_addr).await;
     engine
         .apply_transaction(
-            &tx_of(&val, 1, 100_000, vec![OpCode::SysCallClaimRewards { validator: val_addr }]),
+            &tx_of(
+                &val,
+                1,
+                100_000,
+                vec![OpCode::SysCallClaimRewards {
+                    validator: val_addr,
+                }],
+            ),
             0,
         )
         .await
@@ -127,7 +146,11 @@ async fn block_reward_mints_into_pool_and_claim_leaves_principal_untouched() {
         before + r - GAS_STAKE_CLAIM,
         "exact claim payout minus claim gas"
     );
-    assert_eq!(bal(&engine, &REWARDS_POOL).await, 0, "claim drains the rewards pool");
+    assert_eq!(
+        bal(&engine, &REWARDS_POOL).await,
+        0,
+        "claim drains the rewards pool"
+    );
     assert_eq!(
         bal(&engine, &STAKING_POOL).await,
         bond_amount(),
@@ -153,7 +176,10 @@ async fn delegator_rewards_come_from_pool_not_principal() {
                 &funder,
                 0,
                 20_000,
-                vec![OpCode::SysCallStake { validator, amount: bond_amount() }],
+                vec![OpCode::SysCallStake {
+                    validator,
+                    amount: bond_amount(),
+                }],
             ),
             0,
         )
@@ -171,18 +197,26 @@ async fn delegator_rewards_come_from_pool_not_principal() {
                 &delegator,
                 0,
                 100_000,
-                vec![OpCode::SysCallDelegate { validator, amount: 1_000 * STELL }],
+                vec![OpCode::SysCallDelegate {
+                    validator,
+                    amount: 1_000 * STELL,
+                }],
             ),
             0,
         )
         .await
         .unwrap();
     // Principal parked: bond + delegation, nothing else.
-    assert_eq!(bal(&engine, &STAKING_POOL).await, bond_amount() + 1_000 * STELL);
+    assert_eq!(
+        bal(&engine, &STAKING_POOL).await,
+        bond_amount() + 1_000 * STELL
+    );
     assert_eq!(bal(&engine, &REWARDS_POOL).await, 0);
 
     let r = 100 * STELL;
-    engine.apply_block_transition(&block_of(1, vec![], validator), r).await;
+    engine
+        .apply_block_transition(&block_of(1, vec![], validator), r)
+        .await;
     assert_eq!(bal(&engine, &REWARDS_POOL).await, r);
     assert_eq!(
         bal(&engine, &STAKING_POOL).await,
@@ -210,7 +244,10 @@ async fn delegator_rewards_come_from_pool_not_principal() {
         )
         .await
         .expect("delegator claim works");
-    assert_eq!(bal(&engine, &delegator_addr).await, before + owed - GAS_STAKE_CLAIM);
+    assert_eq!(
+        bal(&engine, &delegator_addr).await,
+        before + owed - GAS_STAKE_CLAIM
+    );
     assert_eq!(
         bal(&engine, &STAKING_POOL).await,
         bond_amount() + 1_000 * STELL,
@@ -234,7 +271,10 @@ async fn rewards_cap_is_fail_closed_over_cap() {
                 &val,
                 0,
                 20_000,
-                vec![OpCode::SysCallStake { validator: val_addr, amount: bond_amount() }],
+                vec![OpCode::SysCallStake {
+                    validator: val_addr,
+                    amount: bond_amount(),
+                }],
             ),
             0,
         )
@@ -249,20 +289,32 @@ async fn rewards_cap_is_fail_closed_over_cap() {
     }
 
     // 101 over the remaining 100: refused end-to-end (no mint, no credit).
-    engine.apply_block_transition(&block_of(1, vec![], val_addr), 101).await;
+    engine
+        .apply_block_transition(&block_of(1, vec![], val_addr), 101)
+        .await;
     {
         let l = engine.staking_read().await;
-        assert_eq!(l.rewards_minted, REWARDS_EMISSION_CAP - 100, "no partial mint");
+        assert_eq!(
+            l.rewards_minted,
+            REWARDS_EMISSION_CAP - 100,
+            "no partial mint"
+        );
         assert_eq!(l.rewards_pool, 50, "pool untouched by refused mint");
         assert_eq!(
             l.validators[&val_addr].pending_rewards, 0,
             "refused mint credits no phantom rewards"
         );
     }
-    assert_eq!(bal(&engine, &REWARDS_POOL).await, 0, "no native mint on refusal");
+    assert_eq!(
+        bal(&engine, &REWARDS_POOL).await,
+        0,
+        "no native mint on refusal"
+    );
 
     // Exactly to the cap: allowed.
-    engine.apply_block_transition(&block_of(2, vec![], val_addr), 100).await;
+    engine
+        .apply_block_transition(&block_of(2, vec![], val_addr), 100)
+        .await;
     {
         let l = engine.staking_read().await;
         assert_eq!(l.rewards_minted, REWARDS_EMISSION_CAP);
@@ -272,11 +324,20 @@ async fn rewards_cap_is_fail_closed_over_cap() {
     assert_eq!(bal(&engine, &REWARDS_POOL).await, 100);
 
     // At the cap: even 1 nano refuses.
-    engine.apply_block_transition(&block_of(3, vec![], val_addr), 1).await;
+    engine
+        .apply_block_transition(&block_of(3, vec![], val_addr), 1)
+        .await;
     {
         let l = engine.staking_read().await;
         assert_eq!(l.rewards_minted, REWARDS_EMISSION_CAP);
-        assert_eq!(l.validators[&val_addr].pending_rewards, 100, "still no phantom credit");
+        assert_eq!(
+            l.validators[&val_addr].pending_rewards, 100,
+            "still no phantom credit"
+        );
     }
-    assert_eq!(bal(&engine, &REWARDS_POOL).await, 100, "still no native mint");
+    assert_eq!(
+        bal(&engine, &REWARDS_POOL).await,
+        100,
+        "still no native mint"
+    );
 }

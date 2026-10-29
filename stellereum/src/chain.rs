@@ -219,7 +219,8 @@ pub struct ChainManager {
     /// per round retry). The cache moves the periodic O(128) spike off the
     /// hot path: first builder pays it, everyone else hits O(1).
     /// Bounded (32 epochs ≈ 4096 heights): evicted FIFO. Never on the wire.
-    #[allow(clippy::type_complexity)] // GATE: shape is local to this cache field; alias adds indirection
+    #[allow(clippy::type_complexity)]
+    // GATE: shape is local to this cache field; alias adds indirection
     mmr_cache: std::sync::Mutex<HashMap<u64, ([u8; 32], Vec<[u8; 32]>)>>,
 }
 
@@ -237,7 +238,11 @@ impl Clone for ChainManager {
             invalidations: self.invalidations.clone(),
             pending_invalidations: self.pending_invalidations.clone(),
             mmr_cache: std::sync::Mutex::new(
-                self.mmr_cache.lock().ok().map(|g| g.clone()).unwrap_or_default(),
+                self.mmr_cache
+                    .lock()
+                    .ok()
+                    .map(|g| g.clone())
+                    .unwrap_or_default(),
             ),
         }
     }
@@ -522,7 +527,12 @@ impl ChainManager {
     /// STAB: cached per epoch (O(1) hits after the first build per epoch);
     /// the MMR build leaves the hot path after one computation.
     pub fn epoch_mmr_root(&self, epoch: u64) -> Option<([u8; 32], Vec<[u8; 32]>)> {
-        if let Some(cached) = self.mmr_cache.lock().ok().and_then(|g| g.get(&epoch).cloned()) {
+        if let Some(cached) = self
+            .mmr_cache
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&epoch).cloned())
+        {
             return Some(cached);
         }
         let start = crate::mmr::epoch_start(epoch);
@@ -656,10 +666,7 @@ impl ChainManager {
     /// rolls back the old branch's blocks above the common ancestor
     /// (tip-first) and applies the new branch's (ancestor-first). `None`
     /// when the head does not move.
-    pub fn candidate_reorg_plan(
-        &self,
-        new_head: &BlockHash,
-    ) -> Result<Option<ReorgPlan>, String> {
+    pub fn candidate_reorg_plan(&self, new_head: &BlockHash) -> Result<Option<ReorgPlan>, String> {
         if !self.candidates.contains(new_head) {
             return Err("not a tracked candidate".to_string());
         }
@@ -933,11 +940,7 @@ impl ChainManager {
             .collect();
         ordered.sort();
         let excess = self.candidates.len() - MAX_TRACKED_CANDIDATES;
-        let dropped: Vec<BlockHash> = ordered
-            .into_iter()
-            .take(excess)
-            .map(|(_, h)| h)
-            .collect();
+        let dropped: Vec<BlockHash> = ordered.into_iter().take(excess).map(|(_, h)| h).collect();
         for h in &dropped {
             self.candidates.remove(h);
         }
@@ -1045,7 +1048,7 @@ mod tests {
         };
         b.sign_block(&sk);
         b
-}
+    }
 
     #[test]
     fn tree_links_and_ancestors() {
@@ -1069,7 +1072,11 @@ mod tests {
         let b2 = cm.insert(block(2, b1, 0xB2));
         let b3 = cm.insert(block(3, b2, 0xB3));
         cm.recompute_canonical();
-        assert_eq!(cm.best_head(), b3, "fork-choice must pick the longest chain");
+        assert_eq!(
+            cm.best_head(),
+            b3,
+            "fork-choice must pick the longest chain"
+        );
     }
 
     #[test]
@@ -1116,7 +1123,10 @@ mod tests {
         // Best head must remain the finalized chain head (fork does not descend from it)
         assert_eq!(cm.best_head(), a2);
         // Reorg to a fork diverging below finality must be rejected
-        assert!(cm.reorg_plan(&b3).is_err(), "reorg below finality must be rejected");
+        assert!(
+            cm.reorg_plan(&b3).is_err(),
+            "reorg below finality must be rejected"
+        );
     }
 
     #[test]
@@ -1137,7 +1147,10 @@ mod tests {
         let a1 = cm.insert(block(1, g, 0xA1));
         let a2 = cm.insert(block(2, a1, 0xA2));
         cm.finalize(a2).unwrap();
-        assert!(cm.finalize(a1).is_err(), "cannot finalize below the finalized height");
+        assert!(
+            cm.finalize(a1).is_err(),
+            "cannot finalize below the finalized height"
+        );
     }
 
     #[test]
@@ -1283,7 +1296,10 @@ mod tests {
         assert_eq!(signal.height, 1, "the first invalidated height");
         assert_eq!(cm.candidate_head, Some(b2));
         assert_eq!(cm.recent_invalidations().len(), 1);
-        assert!(!cm.candidates.contains(&a1), "the rolled-back block is gone");
+        assert!(
+            !cm.candidates.contains(&a1),
+            "the rolled-back block is gone"
+        );
     }
 
     /// A block that WAS finalized is NOT invalidated: it was applied, and
@@ -1318,7 +1334,10 @@ mod tests {
         }
         let win = cm.recent_invalidations();
         assert_eq!(win.len(), MAX_INVALIDATION_WINDOW);
-        assert_eq!(win.last().unwrap().height, (MAX_INVALIDATION_WINDOW + 9) as u64);
+        assert_eq!(
+            win.last().unwrap().height,
+            (MAX_INVALIDATION_WINDOW + 9) as u64
+        );
         // An empty signal carries no information and is never recorded.
         let before = cm.recent_invalidations().len();
         cm.record_invalidation(InvalidationSignal {
@@ -1380,8 +1399,9 @@ mod tests {
         }
         let (root, peaks) = cm.epoch_mmr_root(0).expect("epoch 0 is fully finalized");
         // Independent recomputation from the finalized hashes.
-        let leaves: Vec<BlockHash> =
-            (0u64..=127).map(|h| cm.finalized_at_height(h).unwrap()).collect();
+        let leaves: Vec<BlockHash> = (0u64..=127)
+            .map(|h| cm.finalized_at_height(h).unwrap())
+            .collect();
         let (expected, expected_peaks) = crate::mmr::mmr_root_for_leaves(&leaves);
         assert_eq!(root, expected);
         assert_eq!(peaks, expected_peaks);

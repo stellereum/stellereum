@@ -106,7 +106,13 @@ impl Pair {
         .await
         .expect("node A");
         let node_b = Node::new(
-            cfg("B", listen_b, vec![peer_of("A", &keys_a, listen_a)], false, vec![]),
+            cfg(
+                "B",
+                listen_b,
+                vec![peer_of("A", &keys_a, listen_a)],
+                false,
+                vec![],
+            ),
             keys_b.clone(),
             tmp.join("b"),
             PathBuf::new(),
@@ -221,10 +227,7 @@ async fn failing_stream_does_not_kill_connection() {
     let conn = warm_up(&p).await;
     // `stable_id()` is local to each endpoint, so record each side separately.
     let sid_b0 = conn.stable_id();
-    let sid_a0 = p
-        .conn_a()
-        .await
-        .expect("warm-up conn not registered on A");
+    let sid_a0 = p.conn_a().await.expect("warm-up conn not registered on A");
 
     // A malformed stream must fail ONLY that stream, not the connection.
     let (mut bad_send, _bad_recv) = conn.open_bi().await.expect("open bad stream");

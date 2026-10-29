@@ -1,17 +1,17 @@
 //! Real End-to-End BFT Consensus Benchmark with Realistic 250ms and 150ms Block Pacing
 //! Comparing Classical Ed25519 vs Pure Post-Quantum Falcon-512 Mode (STELL_PURE_PQ=1)
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use stellereum::consensus::{
     clear_validator_pq_keys_for_tests, derive_sortition_committee, register_validator_pq_key,
     vote_sign_bytes, PqMicroCertificate, ValidatorId, ValidatorSet, VoteKind,
 };
 use stellereum::post_quantum::{
-    derive_pq_address, is_pure_pq_enforced, set_pure_pq_override, DEFAULT_SALT, PqScheme,
-    PqSignatureEnvelope,
+    derive_pq_address, is_pure_pq_enforced, set_pure_pq_override, PqScheme, PqSignatureEnvelope,
+    DEFAULT_SALT,
 };
 use stellereum::runtime::Cluster;
 use stellereum::sharding::Transaction;
@@ -45,38 +45,49 @@ async fn main() {
     println!("║       AMD Ryzen 5 3600 (6 Cores / 12 Threads) | Pure PQ Falcon-512 + µQCs vs Classical Ed25519        ║");
     println!("╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════╝\n");
 
-    let configs: Vec<(usize, u64)> = vec![
-        (1_000, 250),
-        (1_000, 150),
-        (4_000, 250),
-        (4_000, 150),
-    ];
+    let configs: Vec<(usize, u64)> = vec![(1_000, 250), (1_000, 150), (4_000, 250), (4_000, 150)];
 
     let mut results: Vec<BenchmarkResult> = Vec::new();
 
     for &(total_txs, pacing_ms) in &configs {
         println!("==========================================================================================================");
-        println!("  CONFIG: {} Transactions @ {} ms block pacing", total_txs, pacing_ms);
+        println!(
+            "  CONFIG: {} Transactions @ {} ms block pacing",
+            total_txs, pacing_ms
+        );
         println!("==========================================================================================================");
 
         // 1. Run Classical Ed25519 baseline
         print!("  Running Classical Ed25519 BFT Cluster... ");
-        let classical_res = run_benchmark(BenchmarkMode::ClassicalEd25519, total_txs, pacing_ms).await;
+        let classical_res =
+            run_benchmark(BenchmarkMode::ClassicalEd25519, total_txs, pacing_ms).await;
         println!(
             "Done! Finalized {} txs across {} blocks in {:.3}s ({:.1} e2e TPS)",
-            classical_res.applied_txs, classical_res.blocks, classical_res.wall_clock_secs, classical_res.real_e2e_tps
+            classical_res.applied_txs,
+            classical_res.blocks,
+            classical_res.wall_clock_secs,
+            classical_res.real_e2e_tps
         );
 
         // 2. Run Pure Post-Quantum Falcon-512 Mode
         print!("  Running Pure Post-Quantum Falcon-512 BFT Cluster... ");
-        let pq_res = run_benchmark(BenchmarkMode::PurePostQuantumFalcon512, total_txs, pacing_ms).await;
+        let pq_res = run_benchmark(
+            BenchmarkMode::PurePostQuantumFalcon512,
+            total_txs,
+            pacing_ms,
+        )
+        .await;
         println!(
             "Done! Finalized {} txs across {} blocks in {:.3}s ({:.1} e2e TPS)",
             pq_res.applied_txs, pq_res.blocks, pq_res.wall_clock_secs, pq_res.real_e2e_tps
         );
 
-        let delta_tps = (pq_res.real_e2e_tps - classical_res.real_e2e_tps) / classical_res.real_e2e_tps * 100.0;
-        println!("  Speed Comparison: PQ vs Classical TPS Delta = {:+.2}%", delta_tps);
+        let delta_tps =
+            (pq_res.real_e2e_tps - classical_res.real_e2e_tps) / classical_res.real_e2e_tps * 100.0;
+        println!(
+            "  Speed Comparison: PQ vs Classical TPS Delta = {:+.2}%",
+            delta_tps
+        );
         println!("  Latency (avg/block):");
         println!(
             "    - Tx Verification: Classical = {:.1} µs | Falcon-512 = {:.1} µs",
@@ -127,24 +138,28 @@ async fn run_benchmark(mode: BenchmarkMode, total_txs: usize, pacing_ms: u64) ->
 
     // Setup 2-node BFT cluster (matching live validator stand topology)
     let val_keys: Vec<SigningKey> = (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
-    let val_ids: Vec<ValidatorId> = val_keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
+    let val_ids: Vec<ValidatorId> = val_keys
+        .iter()
+        .map(|k| k.verifying_key().to_bytes())
+        .collect();
     let val_set = ValidatorSet::from_list(val_ids.iter().map(|&id| (id, 1)).collect());
 
     // In Pure PQ mode, register Falcon-512 keys for validators
-    let val_falcon_keys: Vec<(ValidatorId, Vec<u8>, u8)> = if mode == BenchmarkMode::PurePostQuantumFalcon512 {
-        val_ids
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| {
-                let seed = 0xA0 + i as u8;
-                let pk = Transaction::sample_falcon512_pubkey(seed);
-                register_validator_pq_key(id, PqScheme::Falcon512, pk.clone());
-                (id, pk, seed)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let val_falcon_keys: Vec<(ValidatorId, Vec<u8>, u8)> =
+        if mode == BenchmarkMode::PurePostQuantumFalcon512 {
+            val_ids
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| {
+                    let seed = 0xA0 + i as u8;
+                    let pk = Transaction::sample_falcon512_pubkey(seed);
+                    register_validator_pq_key(id, PqScheme::Falcon512, pk.clone());
+                    (id, pk, seed)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
     let engine_a = Arc::new(InMemoryStateEngine::new());
     let engine_b = Arc::new(InMemoryStateEngine::new());
@@ -161,25 +176,37 @@ async fn run_benchmark(mode: BenchmarkMode, total_txs: usize, pacing_ms: u64) ->
     // Generate senders and transactions
     let senders_count = (total_txs / 20).max(1);
     let recipient = [0xEEu8; 32];
-    engine_a.update_account(AccountState::new(recipient, 0)).await;
-    engine_b.update_account(AccountState::new(recipient, 0)).await;
+    engine_a
+        .update_account(AccountState::new(recipient, 0))
+        .await;
+    engine_b
+        .update_account(AccountState::new(recipient, 0))
+        .await;
 
     let mut all_txs: Vec<Transaction> = Vec::with_capacity(total_txs);
 
     match mode {
         BenchmarkMode::ClassicalEd25519 => {
-            let sender_keys: Vec<SigningKey> = (0..senders_count).map(|_| SigningKey::generate(&mut OsRng)).collect();
+            let sender_keys: Vec<SigningKey> = (0..senders_count)
+                .map(|_| SigningKey::generate(&mut OsRng))
+                .collect();
             for sk in &sender_keys {
                 let addr = sk.verifying_key().to_bytes();
-                engine_a.update_account(AccountState::new(addr, 1_000_000_000_000)).await;
-                engine_b.update_account(AccountState::new(addr, 1_000_000_000_000)).await;
+                engine_a
+                    .update_account(AccountState::new(addr, 1_000_000_000_000))
+                    .await;
+                engine_b
+                    .update_account(AccountState::new(addr, 1_000_000_000_000))
+                    .await;
             }
             for sk in &sender_keys {
                 for nonce in 0..20u64 {
                     if all_txs.len() >= total_txs {
                         break;
                     }
-                    all_txs.push(Transaction::sign(sk, recipient, 1_000, 280_000, nonce, 0, 0));
+                    all_txs.push(Transaction::sign(
+                        sk, recipient, 1_000, 280_000, nonce, 0, 0,
+                    ));
                 }
             }
         }
@@ -189,8 +216,12 @@ async fn run_benchmark(mode: BenchmarkMode, total_txs: usize, pacing_ms: u64) ->
                 let seed = ((i % 250) + 1) as u8;
                 let pk = Transaction::sample_falcon512_pubkey(seed);
                 let addr = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
-                engine_a.update_account(AccountState::new(addr, 1_000_000_000_000)).await;
-                engine_b.update_account(AccountState::new(addr, 1_000_000_000_000)).await;
+                engine_a
+                    .update_account(AccountState::new(addr, 1_000_000_000_000))
+                    .await;
+                engine_b
+                    .update_account(AccountState::new(addr, 1_000_000_000_000))
+                    .await;
                 sender_falcon_keys.push((addr, pk, seed));
             }
             for (addr, pk, seed) in &sender_falcon_keys {
@@ -212,7 +243,8 @@ async fn run_benchmark(mode: BenchmarkMode, total_txs: usize, pacing_ms: u64) ->
                     };
                     let msg = tx.signing_message();
                     let sig = Transaction::create_falcon512_test_signature(pk, &msg, *seed);
-                    let env = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig);
+                    let env =
+                        PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig);
                     tx.signature = env.encode();
                     all_txs.push(tx);
                 }
@@ -262,7 +294,10 @@ async fn run_benchmark(mode: BenchmarkMode, total_txs: usize, pacing_ms: u64) ->
             let mut signatures = Vec::new();
             let mut bitmask = vec![0u8; 1];
             for (i, val_id) in committee.iter().enumerate() {
-                let (_, pk, seed) = val_falcon_keys.iter().find(|(id, _, _)| id == val_id).unwrap();
+                let (_, pk, seed) = val_falcon_keys
+                    .iter()
+                    .find(|(id, _, _)| id == val_id)
+                    .unwrap();
                 let sig = Transaction::create_falcon512_test_signature(pk, &msg, *seed);
                 signatures.push(sig);
                 bitmask[i / 8] |= 1 << (i % 8);
@@ -305,10 +340,15 @@ async fn run_benchmark(mode: BenchmarkMode, total_txs: usize, pacing_ms: u64) ->
 
         // 3. Measure Transaction batch verification latency
         let t_tx0 = Instant::now();
-        let txs_ok = Transaction::verify_signatures_batch(&cluster.nodes[0].blocks[&bh].transactions);
+        let txs_ok =
+            Transaction::verify_signatures_batch(&cluster.nodes[0].blocks[&bh].transactions);
         let tx_dur = t_tx0.elapsed();
         total_tx_verify_dur += tx_dur;
-        assert!(txs_ok, "Transaction batch verification failed at height {}", height);
+        assert!(
+            txs_ok,
+            "Transaction batch verification failed at height {}",
+            height
+        );
 
         // 4. Assert bit-identical state roots across cluster nodes
         let root_a = engine_a.get_state_root().await;

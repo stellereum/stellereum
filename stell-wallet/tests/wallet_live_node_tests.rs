@@ -148,7 +148,13 @@ async fn rpc_pay_pending_then_confirmed_after_finalize_hook() {
 
     // Consensus finalizes block 1 containing exactly this tx (the real hook).
     node.state
-        .record_receipts(1, [0x22u8; 32], std::slice::from_ref(&tx), &[true], &[280_000])
+        .record_receipts(
+            1,
+            [0x22u8; 32],
+            std::slice::from_ref(&tx),
+            &[true],
+            &[280_000],
+        )
         .await;
     let cfg = client.rpc.clone().unwrap();
     let after = rpc::poll_receipt(&cfg, &hex::encode(hash), 5, 1);
@@ -168,12 +174,24 @@ async fn rpc_failed_receipt_reports_failed_not_confirmed() {
     let tx = sender.create_transaction(wallet(0x32).address, 1_000_000_000, 0, 1, 1);
     let (hash, _) = client.broadcast_tx(&tx).await.unwrap();
     node.state
-        .record_receipts(9, [0x33u8; 32], std::slice::from_ref(&tx), &[false], &[280_000])
+        .record_receipts(
+            9,
+            [0x33u8; 32],
+            std::slice::from_ref(&tx),
+            &[false],
+            &[280_000],
+        )
         .await;
     let cfg = client.rpc.clone().unwrap();
     let after = rpc::poll_receipt(&cfg, &hex::encode(hash), 5, 1);
     assert!(
-        matches!(after, TxFinality::Failed { height: Some(9), .. }),
+        matches!(
+            after,
+            TxFinality::Failed {
+                height: Some(9),
+                ..
+            }
+        ),
         "expected Failed@9, got {after:?}"
     );
     assert!(!after.is_confirmed());
@@ -188,7 +206,10 @@ async fn rpc_write_without_token_is_rejected() {
     // Public signed transactions are accepted without an admin API token
     let anon = rpc_client(&node, None, None).await;
     let tx = sender.create_transaction(wallet(0x42).address, 1_000, 0, 1, 1);
-    let (_, finality) = anon.broadcast_tx(&tx).await.expect("public signed tx is accepted");
+    let (_, finality) = anon
+        .broadcast_tx(&tx)
+        .await
+        .expect("public signed tx is accepted");
     assert_eq!(finality, TxFinality::Pending);
 }
 
@@ -257,11 +278,20 @@ async fn rpc_token_balance_spv_and_send_admission() {
     let (hash, finality) = client.broadcast_tx(&tx).await.unwrap();
     assert_eq!(finality, TxFinality::Pending);
     node.state
-        .record_receipts(3, [0x44u8; 32], std::slice::from_ref(&tx), &[true], &[280_000])
+        .record_receipts(
+            3,
+            [0x44u8; 32],
+            std::slice::from_ref(&tx),
+            &[true],
+            &[280_000],
+        )
         .await;
     let cfg = client.rpc.clone().unwrap();
     let after = rpc::poll_receipt(&cfg, &hex::encode(hash), 5, 1);
-    assert!(matches!(after, TxFinality::Confirmed { height: 3, .. }), "{after:?}");
+    assert!(
+        matches!(after, TxFinality::Confirmed { height: 3, .. }),
+        "{after:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -275,8 +305,14 @@ async fn rpc_confidential_payload_admitted() {
     let recipient = wallet(0x72).address;
     let (hash, finality) = client
         .broadcast_confidential_tx(
-            &sender.signing_key, recipient, transfer, 3_000_000_000, 1_500,
-            blinding.to_bytes(), 0, 1,
+            &sender.signing_key,
+            recipient,
+            transfer,
+            3_000_000_000,
+            1_500,
+            blinding.to_bytes(),
+            0,
+            1,
         )
         .await
         .unwrap();
@@ -293,12 +329,17 @@ async fn rpc_stake_payload_admitted_to_mempool() {
 
     let client = rpc_client(&node, None, None).await;
     let tx = sender.create_payload_transaction(
-        vec![OpCode::SysCallStake { validator: sender.address, amount: 5_000_000_000 }],
+        vec![OpCode::SysCallStake {
+            validator: sender.address,
+            amount: 5_000_000_000,
+        }],
         stellereum::svm::GAS_STAKE_BOND + stellereum::svm::GAS_BASIC_TRANSFER,
         0,
     );
     // The builder signs a well-formed payload tx (verifies locally).
-    assert!(stellereum::sharding::Transaction::verify_signatures_batch(std::slice::from_ref(&tx)));
+    assert!(stellereum::sharding::Transaction::verify_signatures_batch(
+        std::slice::from_ref(&tx)
+    ));
     let (hash, finality) = client.broadcast_tx(&tx).await.unwrap();
     assert_eq!(hash, tx.compute_tx_hash());
     assert_eq!(finality, TxFinality::Pending);

@@ -53,7 +53,10 @@ fn parse_rejects_malformed() {
 fn self_consistency_accepts_valid_record() {
     let (_id, _ed, txt) = consistent_txt("1.2.3.4:9400");
     let rec = parse_validator_record(&txt).unwrap();
-    assert!(record_self_consistent(&rec), "valid node_id==blake3(ed_pub) must pass");
+    assert!(
+        record_self_consistent(&rec),
+        "valid node_id==blake3(ed_pub) must pass"
+    );
 }
 
 #[test]

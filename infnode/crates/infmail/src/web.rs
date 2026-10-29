@@ -247,7 +247,11 @@ fn resolve_db_email(db: &AccountsDb, email: &str) -> Option<String> {
         return Some(email.to_string());
     }
     for (owner, acc) in &db.accounts {
-        if acc.aliases.iter().any(|a| format!("{a}@{MAIL_DOMAIN}") == email) {
+        if acc
+            .aliases
+            .iter()
+            .any(|a| format!("{a}@{MAIL_DOMAIN}") == email)
+        {
             return Some(owner.clone());
         }
     }
@@ -273,7 +277,8 @@ pub async fn run(node: Arc<Node>, listen: &str, _static_dir: Option<PathBuf>) ->
         let sync_inflight_cu = sync_inflight.clone();
         let sync_last_cu = sync_last.clone();
         // backoff для аккаунтов со стабильными ошибками IMAP-логина (stale-ящики)
-        let sync_failures: Arc<Mutex<HashMap<String, (usize, i64)>>> = Arc::new(Mutex::new(HashMap::new()));
+        let sync_failures: Arc<Mutex<HashMap<String, (usize, i64)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         tokio::spawn(async move {
             loop {
                 let now0 = proto::now_ms();
@@ -282,7 +287,9 @@ pub async fn run(node: Arc<Node>, listen: &str, _static_dir: Option<PathBuf>) ->
                 // (иначе двойной инжект UNSEEN и двойной учёт квоты)
                 let inflight_now: HashSet<String> = sync_inflight_cu.lock().await.clone();
                 if !inflight_now.is_empty() {
-                    snapshot.accounts.retain(|email, _| !inflight_now.contains(email));
+                    snapshot
+                        .accounts
+                        .retain(|email, _| !inflight_now.contains(email));
                 }
                 // пропускаем аккаунты в backoff (3+ неудачи, таймаут 10 мин)
                 let fm = sync_failures.lock().await;
@@ -300,7 +307,9 @@ pub async fn run(node: Arc<Node>, listen: &str, _static_dir: Option<PathBuf>) ->
                     let slice: Vec<String> = keys.into_iter().take(take).collect();
                     snapshot.accounts.retain(|email, _| slice.contains(email));
                 }
-                if let Ok((results, failed)) = crate::inbound::inbound_sync_all(&node_cu, &snapshot).await {
+                if let Ok((results, failed)) =
+                    crate::inbound::inbound_sync_all(&node_cu, &snapshot).await
+                {
                     let now = proto::now_ms();
                     {
                         let mut last_map = sync_last_cu.lock().await;
@@ -443,7 +452,9 @@ pub async fn run(node: Arc<Node>, listen: &str, _static_dir: Option<PathBuf>) ->
         .await
         .map_err(|e| anyhow!("web listen {listen}: {e}"))?;
     println!("web API listening on {listen}");
-    axum::serve(listener, app).await.map_err(|e| anyhow!("axum: {e}"))
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| anyhow!("axum: {e}"))
 }
 
 fn router(state: WebState) -> Router {
@@ -451,12 +462,19 @@ fn router(state: WebState) -> Router {
     // Фронт ходит на /api/v1 relative через Next.js proxy (same-origin) — CORS нужен
     // только для прямых обращений. Разрешаем явный allowlist из env (прод) + dev-localhost.
     let mut allowed: Vec<String> = std::env::var("INFNODE_WEB_CORS_ORIGINS")
-        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-        .unwrap_or_else(|_| vec![
-            "http://localhost:3000".into(),
-            "http://127.0.0.1:3000".into(),
-            "http://localhost:3001".into(),
-        ]);
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_else(|_| {
+            vec![
+                "http://localhost:3000".into(),
+                "http://127.0.0.1:3000".into(),
+                "http://localhost:3001".into(),
+            ]
+        });
     // Пустой allowlist НЕ делает CORS открытым: откатываемся на локальный дефолт
     // (никогда не CorsLayer::permissive без явного env INFNODE_WEB_CORS_PERMISSIVE=1).
     if allowed.is_empty() {
@@ -473,7 +491,9 @@ fn router(state: WebState) -> Router {
             .iter()
             .filter_map(|o| axum::http::HeaderValue::from_str(o).ok())
             .collect();
-        CorsLayer::new().allow_origin(AllowOrigin::list(list)).allow_credentials(true)
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(list))
+            .allow_credentials(true)
     };
     Router::new()
         .route("/api/v1/auth/pow-challenge", get(pow_challenge))
@@ -484,7 +504,10 @@ fn router(state: WebState) -> Router {
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/verify-2fa", post(verify_2fa))
         .route("/api/v1/auth/register-web3", post(register_web3))
-        .route("/api/v1/web3/generate-payload", get(web3_generate_payload).post(web3_generate_payload))
+        .route(
+            "/api/v1/web3/generate-payload",
+            get(web3_generate_payload).post(web3_generate_payload),
+        )
         .route("/api/v1/web3/login", post(web3_login))
         .route("/api/v1/web3/select-account", post(web3_select_account))
         .route("/api/v1/web3/save-intent", post(web3_save_intent))
@@ -506,7 +529,10 @@ fn router(state: WebState) -> Router {
         .route("/api/v1/mail/inbox", get(mail_inbox))
         .route("/api/v1/mail/counts", get(mail_counts))
         .route("/api/v1/mail/{id}/attachment/{idx}", get(mail_attachment))
-        .route("/api/v1/mail/{id}/attachment/{idx}/save-to-files", post(mail_attachment_save))
+        .route(
+            "/api/v1/mail/{id}/attachment/{idx}/save-to-files",
+            post(mail_attachment_save),
+        )
         // Лимит тела 40 МБ: вложения разрешены до 25 МБ, base64 даёт +33% плюс
         // JSON-конверт. Без явного лимита действует дефолт axum 2 МБ — письма
         // с файлами от ~1.5 МБ падали с 413 и невнятной ошибкой на фронте
@@ -526,34 +552,73 @@ fn router(state: WebState) -> Router {
         .route("/api/v1/settings/quota", get(settings_quota))
         .route("/api/v1/settings/plan", get(settings_plan))
         .route("/api/v1/settings/subscribe", post(settings_subscribe))
-        .route("/api/v1/settings/subscribe-nonce", get(settings_subscribe_nonce))
-        .route("/api/v1/settings/change-password", post(settings_change_password))
-        .route("/api/v1/settings/account/delete", post(settings_account_delete))
+        .route(
+            "/api/v1/settings/subscribe-nonce",
+            get(settings_subscribe_nonce),
+        )
+        .route(
+            "/api/v1/settings/change-password",
+            post(settings_change_password),
+        )
+        .route(
+            "/api/v1/settings/account/delete",
+            post(settings_account_delete),
+        )
         .route("/api/v1/settings/2fa/status", get(settings_2fa_status))
         .route("/api/v1/settings/2fa/setup", get(settings_2fa_setup))
         .route("/api/v1/settings/2fa/enable", post(settings_2fa_enable))
         .route("/api/v1/settings/2fa/disable", post(settings_2fa_disable))
-        .route("/api/v1/settings/2fa/backup-codes", post(settings_2fa_backup_codes))
-        .route("/api/v1/settings/2fa/regenerate-codes", post(settings_2fa_backup_codes))
-        .route("/api/v1/settings/trusted-email", post(settings_trusted_email))
+        .route(
+            "/api/v1/settings/2fa/backup-codes",
+            post(settings_2fa_backup_codes),
+        )
+        .route(
+            "/api/v1/settings/2fa/regenerate-codes",
+            post(settings_2fa_backup_codes),
+        )
+        .route(
+            "/api/v1/settings/trusted-email",
+            post(settings_trusted_email),
+        )
         .route("/api/v1/settings/signature", get(settings_signature_get))
         .route("/api/v1/settings/signature", post(settings_signature_set))
         .route("/api/v1/settings/sessions", get(settings_sessions))
-        .route("/api/v1/settings/sessions/revoke", post(settings_sessions_revoke))
-        .route("/api/v1/settings/sessions/set-primary", post(settings_sessions_set_primary))
-        .route("/api/v1/settings/sessions/revoke-all", post(settings_sessions_revoke_all))
-        .route("/api/v1/settings/contract-balance", get(settings_contract_balance))
+        .route(
+            "/api/v1/settings/sessions/revoke",
+            post(settings_sessions_revoke),
+        )
+        .route(
+            "/api/v1/settings/sessions/set-primary",
+            post(settings_sessions_set_primary),
+        )
+        .route(
+            "/api/v1/settings/sessions/revoke-all",
+            post(settings_sessions_revoke_all),
+        )
+        .route(
+            "/api/v1/settings/contract-balance",
+            get(settings_contract_balance),
+        )
         .route("/api/v1/settings/aliases", get(settings_aliases_list))
         .route("/api/v1/settings/aliases", post(settings_aliases_add))
-        .route("/api/v1/settings/aliases/delete", post(settings_aliases_delete))
+        .route(
+            "/api/v1/settings/aliases/delete",
+            post(settings_aliases_delete),
+        )
         .route("/api/v1/files", get(files_list))
-        .route("/api/v1/files", post(files_upload).layer(axum::extract::DefaultBodyLimit::max(90 * 1024 * 1024)))
+        .route(
+            "/api/v1/files",
+            post(files_upload).layer(axum::extract::DefaultBodyLimit::max(90 * 1024 * 1024)),
+        )
         .route("/api/v1/files/review", get(files_review))
         .route("/api/v1/files/{name}", get(files_download))
         .route("/api/v1/files/{name}", delete(files_delete))
         .route("/api/v1/files/{name}/share", post(files_share_create))
         .route("/api/v1/files/share/{token}", get(files_share_download))
-        .route("/api/v1/files/share/{token}/revoke", post(files_share_revoke))
+        .route(
+            "/api/v1/files/share/{token}/revoke",
+            post(files_share_revoke),
+        )
         .route("/api/v1/files/shares", get(files_shares_list))
         .route("/api/v1/nft/status/{email}", get(nft_status))
         .route("/api/v1/nft/{token_id}/verify", get(nft_verify))
@@ -591,7 +656,13 @@ fn jwt_sign(secret: &[u8; 32], sub: &str, ttl_secs: i64) -> String {
     jwt_sign_full(secret, sub, ttl_secs, None, None)
 }
 
-fn jwt_sign_full(secret: &[u8; 32], sub: &str, ttl_secs: i64, sid: Option<&str>, epoch: Option<u32>) -> String {
+fn jwt_sign_full(
+    secret: &[u8; 32],
+    sub: &str,
+    ttl_secs: i64,
+    sid: Option<&str>,
+    epoch: Option<u32>,
+) -> String {
     let iat = proto::now_ms() / 1000;
     let exp = iat + ttl_secs;
     let header = b64url(b"{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
@@ -618,7 +689,11 @@ fn jwt_sign_2fa(secret: &[u8; 32], sub: &str) -> String {
     let iat = proto::now_ms() / 1000;
     let exp = iat + 300;
     let header = b64url(b"{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
-    let claims = b64url(json!({"sub": sub, "iat": iat, "exp": exp, "typ": "2fa"}).to_string().as_bytes());
+    let claims = b64url(
+        json!({"sub": sub, "iat": iat, "exp": exp, "typ": "2fa"})
+            .to_string()
+            .as_bytes(),
+    );
     let data = format!("{header}.{claims}");
     let mut mac = HmacSha256::new_from_slice(secret).expect("hmac");
     mac.update(data.as_bytes());
@@ -628,7 +703,10 @@ fn jwt_sign_2fa(secret: &[u8; 32], sub: &str) -> String {
 
 /// Верифицировать JWT и вернуть (sub, sid, v, typ).
 #[allow(clippy::type_complexity)] // GATE: JWT claims tuple is the standard claims shape
-fn jwt_verify_full(secret: &[u8; 32], token: &str) -> Option<(String, Option<String>, Option<u32>, Option<String>)> {
+fn jwt_verify_full(
+    secret: &[u8; 32],
+    token: &str,
+) -> Option<(String, Option<String>, Option<u32>, Option<String>)> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return None;
@@ -688,14 +766,22 @@ fn jwt_verify_pk(secret: &[u8; 32], token: &str) -> Option<(String, Option<Strin
         return None;
     }
     let verified = claims["v"].as_i64().unwrap_or(0) == 1;
-    Some((claims["sub"].as_str()?.to_string(), claims["pk"].as_str().map(String::from), verified))
+    Some((
+        claims["sub"].as_str()?.to_string(),
+        claims["pk"].as_str().map(String::from),
+        verified,
+    ))
 }
 
 fn jwt_sign_web3(secret: &[u8; 32], sub: &str, pk: &str, verified: bool, ttl_secs: i64) -> String {
     let iat = proto::now_ms() / 1000;
     let exp = iat + ttl_secs;
     let header = b64url(b"{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
-    let claims = b64url(json!({"sub": sub, "pk": pk, "v": if verified { 1 } else { 0 }, "iat": iat, "exp": exp}).to_string().as_bytes());
+    let claims = b64url(
+        json!({"sub": sub, "pk": pk, "v": if verified { 1 } else { 0 }, "iat": iat, "exp": exp})
+            .to_string()
+            .as_bytes(),
+    );
     let data = format!("{header}.{claims}");
     let mut mac = HmacSha256::new_from_slice(secret).expect("hmac");
     mac.update(data.as_bytes());
@@ -831,14 +917,20 @@ mod auth_token_tests {
         let mut bad = t.clone();
         bad.pop();
         bad.push(if t.ends_with('A') { 'B' } else { 'A' });
-        assert!(jwt_verify_full(&SECRET, &bad).is_none(), "подделанная подпись принята");
+        assert!(
+            jwt_verify_full(&SECRET, &bad).is_none(),
+            "подделанная подпись принята"
+        );
         // подпись другим секретом
         let other = jwt_sign_full(&[9u8; 32], "q1@infmail.org", 60, Some("sid-1"), None);
         assert!(jwt_verify_full(&SECRET, &other).is_none());
     }
 }
 
-async fn auth_email_sid(st: &WebState, headers: &HeaderMap) -> Result<(String, Option<String>), Response> {
+async fn auth_email_sid(
+    st: &WebState,
+    headers: &HeaderMap,
+) -> Result<(String, Option<String>), Response> {
     // Bearer (локальный/мульти-аккаунт) ИЛИ httpOnly-cookie (основная сессия) — любой источник.
     let token = if !bearer_token(headers).is_empty() {
         bearer_token(headers).to_string()
@@ -888,7 +980,8 @@ async fn issue_session(st: &WebState, email: &str, device: &str, ip: &str) -> St
     {
         let mut db = st.db.lock().await;
         if let Some(acc) = db.accounts.get_mut(email) {
-            acc.sessions.retain(|s| now - s.last_seen_ms < 90 * 24 * 3600 * 1000);
+            acc.sessions
+                .retain(|s| now - s.last_seen_ms < 90 * 24 * 3600 * 1000);
             acc.sessions.push(SessionInfo {
                 id: sid.clone(),
                 device: device.to_string(),
@@ -904,11 +997,7 @@ async fn issue_session(st: &WebState, email: &str, device: &str, ip: &str) -> St
 }
 
 fn err_json(code: StatusCode, msg: impl Into<String>) -> Response {
-    (
-        code,
-        Json(json!({ "error": msg.into() })),
-    )
-        .into_response()
+    (code, Json(json!({ "error": msg.into() }))).into_response()
 }
 
 fn err_unauth(msg: &str) -> Response {
@@ -1048,15 +1137,21 @@ fn enc_secret(key: &[u8; 32], plain: &str) -> String {
 fn dec_secret(key: &[u8; 32], stored: &str) -> Option<String> {
     let rest = stored.strip_prefix("enc1:")?;
     let mut it = rest.splitn(2, ':');
-    let n = base64::engine::general_purpose::STANDARD.decode(it.next()?).ok()?;
-    let c = base64::engine::general_purpose::STANDARD.decode(it.next()?).ok()?;
+    let n = base64::engine::general_purpose::STANDARD
+        .decode(it.next()?)
+        .ok()?;
+    let c = base64::engine::general_purpose::STANDARD
+        .decode(it.next()?)
+        .ok()?;
     let p = infnode::node::e2e_decrypt(key, &n, &c).ok()?;
     String::from_utf8(p).ok()
 }
 
 /// Расшифровать секреты аккаунтов, загруженных из файла (значения с префиксом enc1:).
 async fn decrypt_secrets(path: &std::path::Path, db: &mut AccountsDb) {
-    let Some(key) = secrets_key(path).await else { return };
+    let Some(key) = secrets_key(path).await else {
+        return;
+    };
     for (email, a) in db.accounts.iter_mut() {
         if let Some(sp) = a.smtp_pass.clone() {
             if sp.starts_with("enc1:") {
@@ -1101,7 +1196,10 @@ async fn load_db(path: &PathBuf) -> AccountsDb {
                     // запись ОТКЛЮЧАЕМ, файл не трогаем.
                     let n = serde_json::from_slice::<serde_json::Value>(&data)
                         .ok()
-                        .and_then(|v| v.get("accounts").and_then(|a| a.as_object().map(|o| o.len())))
+                        .and_then(|v| {
+                            v.get("accounts")
+                                .and_then(|a| a.as_object().map(|o| o.len()))
+                        })
                         .unwrap_or(0);
                     eprintln!(
                         "[web] CRITICAL: accounts.json не распарсился ({e}); аккаунтов в файле ~{n}. \
@@ -1160,7 +1258,9 @@ async fn save_db(path: &PathBuf, db: &AccountsDb) {
         return;
     }
     if last > 100 && new_n * 2 < last {
-        eprintln!("[web] CRITICAL: save_db отклонён — подозрительное усыхание базы {last} -> {new_n}");
+        eprintln!(
+            "[web] CRITICAL: save_db отклонён — подозрительное усыхание базы {last} -> {new_n}"
+        );
         return;
     }
     // ШИФР AT-REST: smtp_pass пишем в файл только в зашифрованном виде.
@@ -1239,7 +1339,10 @@ fn account_public_profile(a: &Account) -> serde_json::Value {
 /// DHT-ключ профиля: непрозрачный (blake3 от email). Адрес НЕ светится в имени
 /// ключа, разложенного по сети — иначе любой узел собрал бы список всех абонентов.
 pub fn acct_dht_key(email: &str) -> String {
-    format!("acct:{}", hex::encode(blake3::hash(email.to_lowercase().as_bytes()).as_bytes()))
+    format!(
+        "acct:{}",
+        hex::encode(blake3::hash(email.to_lowercase().as_bytes()).as_bytes())
+    )
 }
 
 /// Фоновый цикл: раз в 5 минут пишет публичные профили всех аккаунтов в DHT
@@ -1261,7 +1364,10 @@ pub async fn replicate_accounts_loop(node: &Arc<infnode::node::Node>, db: &Arc<M
                 ok += 1;
             }
         }
-        eprintln!("[web] account profiles replicated to DHT: {ok}/{}", snapshot.accounts.len());
+        eprintln!(
+            "[web] account profiles replicated to DHT: {ok}/{}",
+            snapshot.accounts.len()
+        );
     }
 }
 
@@ -1292,7 +1398,10 @@ pub async fn restore_account_on_demand(
     if p["email_exists"].as_bool() != Some(true) {
         return false;
     }
-    let mut acc = Account { pw_hash: String::new(), ..Account::default() };
+    let mut acc = Account {
+        pw_hash: String::new(),
+        ..Account::default()
+    };
     acc.created_ms = p["created_ms"].as_i64().unwrap_or(0);
     acc.quota_limit = p["quota_limit"].as_u64().unwrap_or(0);
     acc.bytes_used = p["bytes_used"].as_u64().unwrap_or(0);
@@ -1305,8 +1414,13 @@ pub async fn restore_account_on_demand(
     acc.ed_pub = p["ed_pub"].as_str().map(String::from);
     acc.totp_enabled = p["totp_enabled"].as_bool().unwrap_or(false);
     acc.session_epoch = p["session_epoch"].as_u64().unwrap_or(0) as u32;
-    acc.aliases = p["aliases"].as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+    acc.aliases = p["aliases"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     db.lock().await.accounts.insert(email.clone(), acc);
     let snap = db.lock().await.clone();
@@ -1364,10 +1478,13 @@ async fn kv_get_net(node: &Arc<Node>, key: &str) -> Option<String> {
 async fn kv_get_quick(node: &Arc<Node>, key: &str, timeout_ms: u64) -> Option<String> {
     let node = node.clone();
     let key = key.to_string();
-    tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), kv_get(&node, &key))
-        .await
-        .ok()
-        .flatten()
+    tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        kv_get(&node, &key),
+    )
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn kv_set(node: &Arc<Node>, key: &str, value: &str) -> usize {
@@ -1456,7 +1573,12 @@ async fn index_add(node: &Arc<Node>, key: &str, id: &str) {
     // повторное добавление (восстановление из trash) снимает tombstone, иначе
     // слияние со старой репликой его не воскресит, а чтение отфильтрует как удалённое
     tomb_remove(node, key, id).await;
-    kv_set(node, key, &serde_json::to_string(&ids).unwrap_or("[]".into())).await;
+    kv_set(
+        node,
+        key,
+        &serde_json::to_string(&ids).unwrap_or("[]".into()),
+    )
+    .await;
 }
 
 async fn index_remove(node: &Arc<Node>, key: &str, id: &str) {
@@ -1464,7 +1586,12 @@ async fn index_remove(node: &Arc<Node>, key: &str, id: &str) {
     ids.retain(|x| x != id);
     // tombstone для OR-set слияния: union старых реплик не должен воскрешать удалённое
     tomb_add(node, key, id).await;
-    kv_set(node, key, &serde_json::to_string(&ids).unwrap_or("[]".into())).await;
+    kv_set(
+        node,
+        key,
+        &serde_json::to_string(&ids).unwrap_or("[]".into()),
+    )
+    .await;
 }
 
 /// Ключ tombstones индексного ключа: "{index}:tombs" -> {id: ts_ms}.
@@ -1483,13 +1610,23 @@ async fn tombs_get(node: &Arc<Node>, key: &str) -> std::collections::HashMap<Str
 async fn tomb_add(node: &Arc<Node>, key: &str, id: &str) {
     let mut tombs = tombs_get(node, key).await;
     tombs.insert(id.to_string(), proto::now_ms());
-    kv_set(node, &tombs_key(key), &serde_json::to_string(&tombs).unwrap_or("{}".into())).await;
+    kv_set(
+        node,
+        &tombs_key(key),
+        &serde_json::to_string(&tombs).unwrap_or("{}".into()),
+    )
+    .await;
 }
 
 async fn tomb_remove(node: &Arc<Node>, key: &str, id: &str) {
     let mut tombs = tombs_get(node, key).await;
     if tombs.remove(id).is_some() {
-        kv_set(node, &tombs_key(key), &serde_json::to_string(&tombs).unwrap_or("{}".into())).await;
+        kv_set(
+            node,
+            &tombs_key(key),
+            &serde_json::to_string(&tombs).unwrap_or("{}".into()),
+        )
+        .await;
     }
 }
 
@@ -1621,14 +1758,20 @@ async fn register(
     // анти-бот: не более 100 регистраций с IP за 10 мин
     let ip = client_ip(&headers);
     if rate_limit(&st.reg_guard, &ip, 100, 10 * 60 * 1000).await {
-        return err_json(StatusCode::TOO_MANY_REQUESTS, "too many registrations, wait");
+        return err_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many registrations, wait",
+        );
     }
     let email = norm_email(&req.email);
     if !valid_email(&email) {
         return err_json(StatusCode::BAD_REQUEST, "invalid email (only @infmail.org)");
     }
     if req.password.len() < 8 {
-        return err_json(StatusCode::BAD_REQUEST, "password is shorter than 8 characters");
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "password is shorter than 8 characters",
+        );
     }
     // PoW-проверка: обязательна, если не отключена env INFNODE_POW_DISABLED=1
     if std::env::var("INFNODE_POW_DISABLED").as_deref() != Ok("1") {
@@ -1659,12 +1802,18 @@ async fn register(
     }
     if let Some(owner) = resolve_db_email(&db, &email) {
         if owner != email {
-            return err_json(StatusCode::CONFLICT, "this address is an alias of another account");
+            return err_json(
+                StatusCode::CONFLICT,
+                "this address is an alias of another account",
+            );
         }
     }
     // защита от захвата: email уже занят в DHT-реестре (зарегистрирован через CLI/иную ноду)
     if registry_get(&st.node, &email).await.is_some() {
-        return err_json(StatusCode::CONFLICT, "this address is already registered on the network");
+        return err_json(
+            StatusCode::CONFLICT,
+            "this address is already registered on the network",
+        );
     }
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
@@ -1694,15 +1843,15 @@ async fn register(
         e2e_secret: None,
         plan: "free".into(),
         paid_until_ms: 0,
-    totp_secret: None,
-    totp_enabled: false,
-    backup_codes: Vec::new(),
-    backup_codes_enc: Vec::new(),
-    trusted_email: None,
-    pending_email: None,
-    sessions: Vec::new(),
-    session_epoch: 0,
-    signature: None,
+        totp_secret: None,
+        totp_enabled: false,
+        backup_codes: Vec::new(),
+        backup_codes_enc: Vec::new(),
+        trusted_email: None,
+        pending_email: None,
+        sessions: Vec::new(),
+        session_epoch: 0,
+        signature: None,
     };
     db.accounts.insert(email.clone(), acc.clone());
     send_welcome_mail(&st, &email).await;
@@ -1736,10 +1885,15 @@ async fn register(
     ok_json(json!({ "token": token, "email": email }))
 }
 
-fn gen_smtp_pass() -> String {    use rand::Rng;
+fn gen_smtp_pass() -> String {
+    use rand::Rng;
     let mut rng = rand::thread_rng();
-    let chars: Vec<char> = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789!@#".chars().collect();
-    (0..16).map(|_| chars[rng.gen_range(0..chars.len())]).collect()
+    let chars: Vec<char> = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789!@#"
+        .chars()
+        .collect();
+    (0..16)
+        .map(|_| chars[rng.gen_range(0..chars.len())])
+        .collect()
 }
 
 /// Создание ящика в MTA (stalwart) для исходящей SMTP-почты.
@@ -1816,7 +1970,10 @@ async fn restore_stalwart_password(email: &str, smtp_pass: &str) -> bool {
             true
         }
         Ok(o) => {
-            eprintln!("[web] stalwart parity restore failed {email}: {}", String::from_utf8_lossy(&o.stderr));
+            eprintln!(
+                "[web] stalwart parity restore failed {email}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
             false
         }
         Err(e) => {
@@ -1832,7 +1989,11 @@ struct LoginReq {
     password: String,
 }
 
-async fn login(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<LoginReq>) -> Response {
+async fn login(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<LoginReq>,
+) -> Response {
     let email = norm_email(&req.email);
     let ip = client_ip(&headers);
     // если записи нет локально — возможно, узел потерял базу: пробуем поднять
@@ -1847,7 +2008,10 @@ async fn login(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<L
             drop(db);
             // брутфорс-защита: считаем ТОЛЬКО неудачные попытки с IP за 15 мин
             if rate_limit(&st.login_guard, &ip, 10, 15 * 60 * 1000).await {
-                return err_json(StatusCode::TOO_MANY_REQUESTS, "too many login attempts, wait");
+                return err_json(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many login attempts, wait",
+                );
             }
             return err_json(StatusCode::UNAUTHORIZED, "invalid email or password");
         }
@@ -1858,11 +2022,18 @@ async fn login(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<L
     let need_2fa_early = acc.totp_enabled;
     drop(db);
     let ok = PasswordHash::new(&pw_hash)
-        .map(|h| Argon2::default().verify_password(req.password.as_bytes(), &h).is_ok())
+        .map(|h| {
+            Argon2::default()
+                .verify_password(req.password.as_bytes(), &h)
+                .is_ok()
+        })
         .unwrap_or(false);
     if !ok {
         if rate_limit(&st.login_guard, &ip, 10, 15 * 60 * 1000).await {
-            return err_json(StatusCode::TOO_MANY_REQUESTS, "too many login attempts, wait");
+            return err_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many login attempts, wait",
+            );
         }
         return err_json(StatusCode::UNAUTHORIZED, "invalid email or password");
     }
@@ -1884,7 +2055,11 @@ async fn login(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<L
         .take(64)
         .collect::<String>();
     let token = issue_session(&st, &email, &device, &ip).await;
-    ok_with_session(json!({ "token": token.clone(), "email": email }), &token, 7 * 24 * 3600)
+    ok_with_session(
+        json!({ "token": token.clone(), "email": email }),
+        &token,
+        7 * 24 * 3600,
+    )
 }
 
 async fn me(State(st): State<WebState>, headers: HeaderMap) -> Response {
@@ -1941,7 +2116,8 @@ async fn logout(State(st): State<WebState>, headers: HeaderMap) -> Response {
         save_db(&st.db_path, &db).await;
     }
     // сброс cookie (Max-Age=0) — даже если токен невалиден
-    let cookie_val = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Secure; Path=/api; Max-Age=0");
+    let cookie_val =
+        format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Secure; Path=/api; Max-Age=0");
     let mut resp = ok_json(json!({ "ok": true }));
     if let Ok(v) = header::HeaderValue::from_str(&cookie_val) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
@@ -1952,11 +2128,16 @@ async fn logout(State(st): State<WebState>, headers: HeaderMap) -> Response {
 /// Доставить системное письмо от system@infmail.org в inbox юзера (внутреннее, без SMTP наружу).
 async fn deliver_system_mail(st: &WebState, to_email: &str, subject: &str, body: &str) {
     let at = proto::now_ms();
-    let id = hex::encode(blake3::hash(format!("sys:{to_email}:{at}:{}", rand::random::<u64>()).as_bytes()).as_bytes());
+    let id = hex::encode(
+        blake3::hash(format!("sys:{to_email}:{at}:{}", rand::random::<u64>()).as_bytes())
+            .as_bytes(),
+    );
     let envelope = json!({
         "sender": "system@infmail.org", "to": to_email, "at": at,
         "subject": subject, "body": body, "attachments": [],
-    }).to_string().into_bytes();
+    })
+    .to_string()
+    .into_bytes();
     st.node.store_mail(&format!("mail:{id}"), &envelope).await;
     index_add(&st.node, &mail_index_key(to_email, "Inbox"), &id).await;
 }
@@ -1986,7 +2167,9 @@ async fn recovery_request(State(st): State<WebState>, Json(req): Json<RecoveryRe
     drop(db);
     if !exists {
         // не раскрываем существование аккаунта
-        return ok_json(json!({ "ok": true, "message": "if the account exists — the code has been sent" }));
+        return ok_json(
+            json!({ "ok": true, "message": "if the account exists — the code has been sent" }),
+        );
     }
     use rand::Rng;
     let code: String = rand::thread_rng()
@@ -2036,10 +2219,17 @@ async fn recovery_2fa_hint(State(st): State<WebState>, Json(req): Json<Value>) -
     };
     if !ok {
         // намеренно та же ошибка, что и на неверный код в reset (без oracle)
-        return err_json(StatusCode::FORBIDDEN, "invalid current password or recovery code");
+        return err_json(
+            StatusCode::FORBIDDEN,
+            "invalid current password or recovery code",
+        );
     }
     let db = st.db.lock().await;
-    let needs_2fa = db.accounts.get(&email).map(|a| a.totp_enabled).unwrap_or(false);
+    let needs_2fa = db
+        .accounts
+        .get(&email)
+        .map(|a| a.totp_enabled)
+        .unwrap_or(false);
     drop(db);
     ok_json(json!({ "ok": true, "needs_2fa": needs_2fa }))
 }
@@ -2047,12 +2237,27 @@ async fn recovery_2fa_hint(State(st): State<WebState>, Json(req): Json<Value>) -
 async fn recovery_reset(State(st): State<WebState>, Json(req): Json<RecoveryReq>) -> Response {
     let email = norm_email(&req.email);
     // защита от брутфорса кода восстановления: 5 попыток на email в час
-    if rate_limit(&st.recovery_guard, &format!("reset:{email}"), 5, 3600 * 1000).await {
-        return err_json(StatusCode::TOO_MANY_REQUESTS, "too many recovery attempts, wait");
+    if rate_limit(
+        &st.recovery_guard,
+        &format!("reset:{email}"),
+        5,
+        3600 * 1000,
+    )
+    .await
+    {
+        return err_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many recovery attempts, wait",
+        );
     }
     let new_pass = match &req.new_pass {
         Some(p) if p.len() >= 8 => p.clone(),
-        _ => return err_json(StatusCode::BAD_REQUEST, "new password is shorter than 8 characters"),
+        _ => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "new password is shorter than 8 characters",
+            )
+        }
     };
     // Снапшот без удержания мьютекса: дальше сеть (kv) и Argon2 — под lock нельзя (H1-класс)
     struct ResetSnap {
@@ -2074,16 +2279,21 @@ async fn recovery_reset(State(st): State<WebState>, Json(req): Json<RecoveryReq>
         }
     };
     // путь 1: если знаешь текущий пароль — просто меняем
-    let old_ok = req.old_pass.as_ref().map(|op| {
-        PasswordHash::new(&snap.pw_hash)
-            .map(|h| Argon2::default().verify_password(op.as_bytes(), &h).is_ok())
-            .unwrap_or(false)
-    }).unwrap_or(false);
+    let old_ok = req
+        .old_pass
+        .as_ref()
+        .map(|op| {
+            PasswordHash::new(&snap.pw_hash)
+                .map(|h| Argon2::default().verify_password(op.as_bytes(), &h).is_ok())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
     // путь 2: код восстановления из KV
     let code_key = format!("recovery:{email}");
     let code_valid = match req.code {
         Some(c) => {
-            let stored = kv_get(&st.node, &code_key).await
+            let stored = kv_get(&st.node, &code_key)
+                .await
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok());
             match stored {
                 Some(v) => {
@@ -2100,7 +2310,10 @@ async fn recovery_reset(State(st): State<WebState>, Json(req): Json<RecoveryReq>
         None => false,
     };
     if !old_ok && !code_valid {
-        return err_json(StatusCode::FORBIDDEN, "invalid current password or recovery code");
+        return err_json(
+            StatusCode::FORBIDDEN,
+            "invalid current password or recovery code",
+        );
     }
     // H2: сброс через inbox-код не должен обходить 2FA — требуем второй фактор
     let mut burn_backup: Option<String> = None;
@@ -2166,12 +2379,19 @@ async fn pricing() -> Response {
     }))
 }
 
-async fn username_check(State(st): State<WebState>, headers: HeaderMap, Path(user): Path<String>) -> Response {
+async fn username_check(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Path(user): Path<String>,
+) -> Response {
     // Rate-limit по IP: защита от массового перечисления занятых имён (enumeration).
     // Не ломает регистрацию — юзеру хватает ~60 проверок за 10 минут.
     let ip = client_ip(&headers);
     if rate_limit(&st.reg_guard, &format!("chk:{ip}"), 60, 10 * 60 * 1000).await {
-        return err_json(StatusCode::TOO_MANY_REQUESTS, "too many availability checks");
+        return err_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many availability checks",
+        );
     }
     // реальная проверка занятости: локальная часть email (username@infmail.org)
     let username = user.to_lowercase();
@@ -2184,7 +2404,10 @@ async fn username_check(State(st): State<WebState>, headers: HeaderMap, Path(use
         } else {
             // алиасы: username может быть занят как алиас другого аккаунта
             for a in db.accounts.values() {
-                if a.aliases.iter().any(|al| format!("{al}@{MAIL_DOMAIN}") == email) {
+                if a.aliases
+                    .iter()
+                    .any(|al| format!("{al}@{MAIL_DOMAIN}") == email)
+                {
                     taken = true;
                     break;
                 }
@@ -2257,7 +2480,10 @@ async fn keys_e2e_secret(State(st): State<WebState>, headers: HeaderMap) -> Resp
     let db = st.db.lock().await;
     match db.accounts.get(&email).and_then(|a| a.e2e_secret.clone()) {
         Some(sec) => ok_json(json!({ "e2e_secret": sec })),
-        None => err_json(StatusCode::NOT_FOUND, "e2e_secret not configured for this account"),
+        None => err_json(
+            StatusCode::NOT_FOUND,
+            "e2e_secret not configured for this account",
+        ),
     }
 }
 
@@ -2326,12 +2552,19 @@ fn mail_index_key(email: &str, folder: &str) -> String {
     }
 }
 
-async fn mail_inbox(State(st): State<WebState>, headers: HeaderMap, query: axum::extract::Query<HashMap<String, String>>) -> Response {
+async fn mail_inbox(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    query: axum::extract::Query<HashMap<String, String>>,
+) -> Response {
     let email = match auth_email(&st, &headers).await {
         Ok(e) => e,
         Err(r) => return r,
     };
-    let folder = query.get("folder").cloned().unwrap_or_else(|| "Inbox".into());
+    let folder = query
+        .get("folder")
+        .cloned()
+        .unwrap_or_else(|| "Inbox".into());
     // On-demand доставка входящих: при открытии Inbox/Spam сразу тянем свежие письма из MTA
     // (если последний синк >10с назад и синк этого аккаунта не идёт прямо сейчас).
     // Защита от двойного инжекта UNSEEN / двойного учёта квоты — общий sync_inflight
@@ -2359,7 +2592,14 @@ async fn mail_inbox(State(st): State<WebState>, headers: HeaderMap, query: axum:
                                     a.quota_limit.min(1024 * 1024 * 1024)
                                 };
                                 let free = quota.saturating_sub(a.bytes_used);
-                                crate::inbound::inbound_sync_one(&st.node, &email, &sp, free, a.x_pub.clone()).await
+                                crate::inbound::inbound_sync_one(
+                                    &st.node,
+                                    &email,
+                                    &sp,
+                                    free,
+                                    a.x_pub.clone(),
+                                )
+                                .await
                             } else {
                                 (0, 0)
                             }
@@ -2378,7 +2618,10 @@ async fn mail_inbox(State(st): State<WebState>, headers: HeaderMap, query: axum:
                 let mut inflight = st.sync_inflight.lock().await;
                 inflight.remove(&email);
                 // синк отработал (даже если новых писем 0) — не гонять IMAP при каждом открытии
-                st.sync_last.lock().await.insert(email.clone(), proto::now_ms());
+                st.sync_last
+                    .lock()
+                    .await
+                    .insert(email.clone(), proto::now_ms());
             }
         }
     }
@@ -2409,7 +2652,8 @@ async fn mail_inbox(State(st): State<WebState>, headers: HeaderMap, query: axum:
     let del_set: HashSet<String> = del_vec.into_iter().collect();
     // blacklist отправителей (скрываем письма из чёрного списка, кроме Spam/Trash)
     let blacklist: HashSet<String> = if folder == "Inbox" || folder == "Archive" {
-        kv_get_local(&st.node, &format!("blacklist:{email}")).await
+        kv_get_local(&st.node, &format!("blacklist:{email}"))
+            .await
             .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
             .unwrap_or_default()
             .into_iter()
@@ -2418,8 +2662,15 @@ async fn mail_inbox(State(st): State<WebState>, headers: HeaderMap, query: axum:
         HashSet::new()
     };
     let search = query.get("q").cloned().unwrap_or_default().to_lowercase();
-    let limit = query.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(200).min(1000);
-    let offset = query.get("offset").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(200)
+        .min(1000);
+    let offset = query
+        .get("offset")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
     // Параллельная загрузка блобов писем (каждый fetch_mail может ходить в сеть/DHT-fallback).
     // JoinSet + Semaphore: bounded concurrency (не блокирует, не превышает лимит одновременных).
     let sem = Arc::new(tokio::sync::Semaphore::new(32));
@@ -2446,7 +2697,9 @@ async fn mail_inbox(State(st): State<WebState>, headers: HeaderMap, query: axum:
             // Используем meta-кэш ТОЛЬКО если он полон (содержит body). Неполные meta-кэши
             // со старого формата (только sender/to/subject/preview) игнорируем и перечитываем
             // полный конверт — иначе письма отдаются с пустым телом/вложениями.
-            let parsed_meta = meta.as_ref().and_then(|m| serde_json::from_str::<Value>(m).ok());
+            let parsed_meta = meta
+                .as_ref()
+                .and_then(|m| serde_json::from_str::<Value>(m).ok());
             let mut env = match &parsed_meta {
                 Some(p) if p["body"].as_str().is_some() => Some(p.clone()),
                 _ => None,
@@ -2462,7 +2715,9 @@ async fn mail_inbox(State(st): State<WebState>, headers: HeaderMap, query: axum:
                 {
                     Ok(b) => b,
                     Err(_) => {
-                        eprintln!("[web] WARN: fetch {name} timed out (5s) — listing without full body");
+                        eprintln!(
+                            "[web] WARN: fetch {name} timed out (5s) — listing without full body"
+                        );
                         None
                     }
                 };
@@ -2514,7 +2769,8 @@ async fn mail_inbox(State(st): State<WebState>, headers: HeaderMap, query: axum:
                         "subject": e["subject"], "preview": preview,
                         "body": e["body"], "dek": e.get("dek").cloned().unwrap_or(Value::Null),
                         "html": e["html"], "attachments": e["attachments"],
-                    }).to_string();
+                    })
+                    .to_string();
                     let mk = if folder_c == "Sent" || folder_c == "Drafts" {
                         format!("mail:{email_c}:sentmeta:{id_c2}")
                     } else {
@@ -2536,7 +2792,10 @@ async fn mail_inbox(State(st): State<WebState>, headers: HeaderMap, query: axum:
         let Some(env) = env else { continue };
         // владение: письмо должно быть адресовано юзеру (или его алиасу) или отправлено им.
         // (иначе злонамеренный пир может добавить чужой mail_id в свой индекс и прочитать тело)
-        let is_to_me = env["to"].as_str().map(|t| my_addresses.contains(t)).unwrap_or(false);
+        let is_to_me = env["to"]
+            .as_str()
+            .map(|t| my_addresses.contains(t))
+            .unwrap_or(false);
         let is_from_me = env["sender"].as_str() == Some(email.as_str());
         if !is_to_me && !is_from_me {
             continue;
@@ -2561,17 +2820,18 @@ async fn mail_inbox(State(st): State<WebState>, headers: HeaderMap, query: axum:
         }
         // Proton-модель: тело зашифровано — в списке показываем заглушку, не JSON-мусор.
         // s1. = конверт хранения (DEK), настоящее превью считает фронт после расшифровки.
-        let preview = if body.starts_with("{\"proto\":\"infmail-box-v1\"") || body.starts_with("s1.") {
-            "🔒 Encrypted message".to_string()
-        } else if body.len() > 120 {
-            let mut end = 120;
-            while end > 0 && !body.is_char_boundary(end) {
-                end -= 1;
-            }
-            body[..end].to_string()
-        } else {
-            body.clone()
-        };
+        let preview =
+            if body.starts_with("{\"proto\":\"infmail-box-v1\"") || body.starts_with("s1.") {
+                "🔒 Encrypted message".to_string()
+            } else if body.len() > 120 {
+                let mut end = 120;
+                while end > 0 && !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                body[..end].to_string()
+            } else {
+                body.clone()
+            };
         items.push(json!({
             "id": id,
             "sender": sender,
@@ -2635,8 +2895,14 @@ async fn mail_counts(State(st): State<WebState>, headers: HeaderMap) -> Response
         let ids = task.await.unwrap_or_default();
         let folder = folders[idx];
         let total = ids.len();
-        let unread = ids.iter().filter(|id| !del_set.contains(*id) && !read_set.contains(*id)).count();
-        out.insert(folder.to_string(), json!({ "total": total, "unread": unread }));
+        let unread = ids
+            .iter()
+            .filter(|id| !del_set.contains(*id) && !read_set.contains(*id))
+            .count();
+        out.insert(
+            folder.to_string(),
+            json!({ "total": total, "unread": unread }),
+        );
     }
     ok_json(json!(out))
 }
@@ -2691,7 +2957,11 @@ async fn mail_attachment(
         Some(m) => m,
         None => return err_json(StatusCode::NOT_FOUND, "attachment not found"),
     };
-    let Some(data) = st.node.fetch_blob("mail", &format!("mail:{id}:att:{idx}")).await else {
+    let Some(data) = st
+        .node
+        .fetch_blob("mail", &format!("mail:{id}:att:{idx}"))
+        .await
+    else {
         return err_json(StatusCode::NOT_FOUND, "attachment not found");
     };
     ok_json(json!({
@@ -2733,7 +3003,11 @@ async fn mail_attachment_save(
         Some(m) => m,
         None => return err_json(StatusCode::NOT_FOUND, "attachment not found"),
     };
-    let Some(data) = st.node.fetch_blob("mail", &format!("mail:{id}:att:{idx}")).await else {
+    let Some(data) = st
+        .node
+        .fetch_blob("mail", &format!("mail:{id}:att:{idx}"))
+        .await
+    else {
         return err_json(StatusCode::NOT_FOUND, "attachment not found");
     };
     if data.is_empty() {
@@ -2777,7 +3051,10 @@ async fn mail_attachment_save(
         };
         let fq = effective_file_quota(acc);
         if fq == 0 {
-            return err_json(StatusCode::PAYMENT_REQUIRED, "file storage is available by subscription");
+            return err_json(
+                StatusCode::PAYMENT_REQUIRED,
+                "file storage is available by subscription",
+            );
         }
         let new_total = acc.files_used + data.len() as u64;
         if new_total > fq {
@@ -2792,7 +3069,10 @@ async fn mail_attachment_save(
     // если имя занято — добавляем суффикс (n)
     let mut final_name = name.clone();
     let mut n = 1usize;
-    while list.iter().any(|e| e["name"].as_str() == Some(final_name.as_str())) {
+    while list
+        .iter()
+        .any(|e| e["name"].as_str() == Some(final_name.as_str()))
+    {
         let (stem, ext) = match name.rsplit_once('.') {
             Some((s, e)) if !e.is_empty() => (s.to_string(), format!(".{e}")),
             _ => (name.clone(), String::new()),
@@ -2806,7 +3086,12 @@ async fn mail_attachment_save(
     let blob_name = file_blob_key(&email, &final_name);
     st.node.store_blob("files", &blob_name, &data).await;
     list.push(json!({ "name": final_name, "size": data.len(), "at": proto::now_ms() }));
-    kv_set(&st.node, &ikey, &serde_json::to_string(&list).unwrap_or("[]".into())).await;
+    kv_set(
+        &st.node,
+        &ikey,
+        &serde_json::to_string(&list).unwrap_or("[]".into()),
+    )
+    .await;
     ok_json(json!({
         "ok": true,
         "name": final_name,
@@ -2862,7 +3147,8 @@ async fn mail_send(
                 },
             );
         }
-        return smtp_relay_external(&st, &from, &to, &req.subject, &req.body, req.attachments).await;
+        return smtp_relay_external(&st, &from, &to, &req.subject, &req.body, req.attachments)
+            .await;
     }
     if !valid_email(&to) {
         return err_json(StatusCode::BAD_REQUEST, "invalid recipient address");
@@ -2876,17 +3162,17 @@ async fn mail_send(
     };
     let owner_email = owner.clone().unwrap_or_else(|| to.clone());
     if !is_account && owner.is_none() && registry_get(&st.node, &to).await.is_none() {
-        return err_json(StatusCode::BAD_REQUEST, format!("recipient {to} is not registered"));
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!("recipient {to} is not registered"),
+        );
     }
     // Как в Proton: внутри сети без ключей не отправляем. У зарегистрированного
     // получателя x_pub обязан быть (публикуется при инициализации ключей на входе);
     // отсутствие = получатель ни разу не заходил. Тихий plaintext-фолбэк запрещён:
     // фронт такое больше не шлёт, старых клиентов режем здесь.
     let (sender_pub, recip_pub) = if to.ends_with(&format!("@{MAIL_DOMAIN}")) {
-        let (s, r) = tokio::join!(
-            registry_get(&st.node, &from),
-            registry_get(&st.node, &to)
-        );
+        let (s, r) = tokio::join!(registry_get(&st.node, &from), registry_get(&st.node, &to));
         (
             s.and_then(|v| v["x_pub"].as_str().map(String::from)),
             r.and_then(|v| v["x_pub"].as_str().map(String::from)),
@@ -2924,7 +3210,13 @@ async fn mail_send(
     if let Some(atts) = req.attachments {
         let mut total = 0usize;
         if atts.len() > crate::inbound::MAX_ATTACH_COUNT {
-            return err_json(StatusCode::PAYLOAD_TOO_LARGE, format!("too many attachments (max {})", crate::inbound::MAX_ATTACH_COUNT));
+            return err_json(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "too many attachments (max {})",
+                    crate::inbound::MAX_ATTACH_COUNT
+                ),
+            );
         }
         for (i, a) in atts.into_iter().enumerate() {
             let name = crate::inbound::sanitize_filename(&a.name)
@@ -2940,7 +3232,8 @@ async fn mail_send(
                 return err_json(StatusCode::PAYLOAD_TOO_LARGE, "attachments too large");
             }
             total += data.len();
-            let mime = a.mime
+            let mime = a
+                .mime
                 .map(|m| crate::inbound::sanitize_mime(&m))
                 .unwrap_or_else(|| "application/octet-stream".into());
             att_meta.push(json!({ "name": name, "mime": mime, "size": data.len() }));
@@ -2986,7 +3279,10 @@ async fn mail_send(
         if owner_email != from {
             if let Some(a) = db.accounts.get(&owner_email) {
                 if a.bytes_used + size > effective_mail_quota(a) {
-                    return err_json(StatusCode::PAYLOAD_TOO_LARGE, "recipient storage quota exceeded");
+                    return err_json(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "recipient storage quota exceeded",
+                    );
                 }
             }
         }
@@ -3007,7 +3303,11 @@ async fn mail_send(
         let mut it = v.split(',');
         let k = it.next()?.trim().parse::<usize>().ok()?;
         let n = it.next()?.trim().parse::<usize>().ok()?;
-        if k > 0 && n > k { Some((k, n)) } else { None }
+        if k > 0 && n > k {
+            Some((k, n))
+        } else {
+            None
+        }
     });
     let stored = match ec {
         Some((k, n)) => st.node.store_mail_ec(&name, &blob, None, k, n).await,
@@ -3042,8 +3342,12 @@ async fn mail_send(
     let meta = json!({
         "sender": from, "to": to, "at": at, "subject": req.subject, "preview": preview,
     });
-    st.node.kv_store_local(&format!("mail:{owner_email}:meta:{id}"), &meta.to_string()).await;
-    st.node.kv_store_local(&format!("mail:{from}:sentmeta:{id}"), &meta.to_string()).await;
+    st.node
+        .kv_store_local(&format!("mail:{owner_email}:meta:{id}"), &meta.to_string())
+        .await;
+    st.node
+        .kv_store_local(&format!("mail:{from}:sentmeta:{id}"), &meta.to_string())
+        .await;
 
     // best-effort pubsub-уведомление (в фоне, не блокирует ответ)
     let node = st.node.clone();
@@ -3052,20 +3356,19 @@ async fn mail_send(
     tokio::spawn(async move {
         let peers: Vec<String> = node.cfg.peers.iter().map(|p| p.name.clone()).collect();
         for name in peers {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                async {
-                    if let Ok(pid) = node.resolve(&name) {
-                        let _ = node
-                            .request_to(
-                                pid,
-                                "pubsub.publish",
-                                json!({ "topic": format!("mail:{to_notify}"), "data": id_notify }).to_string().into_bytes(),
-                            )
-                            .await;
-                    }
-                },
-            )
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                if let Ok(pid) = node.resolve(&name) {
+                    let _ = node
+                        .request_to(
+                            pid,
+                            "pubsub.publish",
+                            json!({ "topic": format!("mail:{to_notify}"), "data": id_notify })
+                                .to_string()
+                                .into_bytes(),
+                        )
+                        .await;
+                }
+            })
             .await;
         }
     });
@@ -3077,9 +3380,7 @@ async fn mail_send(
 /// поэтому оно сразу видно в списке и не зависит от сети.
 async fn send_welcome_mail(st: &WebState, email: &str) {
     let at = proto::now_ms();
-    let id = hex::encode(
-        blake3::hash(format!("welcome:{email}:{at}").as_bytes()).as_bytes(),
-    );
+    let id = hex::encode(blake3::hash(format!("welcome:{email}:{at}").as_bytes()).as_bytes());
     let subject = "Welcome to InfMail";
     let body = format!(
         "Welcome to InfMail!\n\n\
@@ -3143,25 +3444,29 @@ async fn mail_draft(
     // лимит на число черновиков (защита от DoS: без него юзер/злоумышленник с валидной
     // сессией может создать неограниченное число черновиков и заполнить хранилище).
     const MAX_DRAFTS: usize = 500;
-    let draft_count = index_list(&st.node, &mail_index_key(&email, "Drafts")).await.len();
+    let draft_count = index_list(&st.node, &mail_index_key(&email, "Drafts"))
+        .await
+        .len();
     if draft_count >= MAX_DRAFTS {
         return err_json(StatusCode::TOO_MANY_REQUESTS, "draft limit reached");
     }
-    let to_clean = if to.is_empty() { req.to.clone() } else { to.clone() };
+    let to_clean = if to.is_empty() {
+        req.to.clone()
+    } else {
+        to.clone()
+    };
     // черновик — тоже в конверт (box на владельца), если ключи есть
     let owner_pub = registry_get(&st.node, &email)
         .await
         .and_then(|v| v["x_pub"].as_str().map(String::from));
     let (body_stored, dek_val) = match owner_pub {
-        Some(pub_hex) => {
-            match storage_box_dek(&[(email.clone(), pub_hex)]) {
-                Some((dek, boxes)) => (
-                    storage_seal(&dek, req.body.as_bytes()),
-                    json!({ "boxes": boxes }),
-                ),
-                None => (req.body.clone(), Value::Null),
-            }
-        }
+        Some(pub_hex) => match storage_box_dek(&[(email.clone(), pub_hex)]) {
+            Some((dek, boxes)) => (
+                storage_seal(&dek, req.body.as_bytes()),
+                json!({ "boxes": boxes }),
+            ),
+            None => (req.body.clone(), Value::Null),
+        },
         None => (req.body.clone(), Value::Null),
     };
     let blob = json!({ "sender": email, "to": to_clean, "at": at, "subject": req.subject, "body": body_stored, "dek": dek_val })
@@ -3180,7 +3485,9 @@ async fn mail_draft(
         "sender": email, "to": req.to, "at": at, "subject": req.subject,
         "preview": preview, "body": body_stored, "dek": dek_val, "attachments": [],
     });
-    st.node.kv_store_local(&format!("mail:{email}:sentmeta:{id}"), &meta.to_string()).await;
+    st.node
+        .kv_store_local(&format!("mail:{email}:sentmeta:{id}"), &meta.to_string())
+        .await;
     let _guard = st.index_lock.lock().await;
     index_add(&st.node, &mail_index_key(&email, "Drafts"), &id).await;
     drop(_guard);
@@ -3273,7 +3580,12 @@ async fn mail_action(
             // переместить письмо в Корзину (Trash). Убираем из Inbox/Spam/Drafts/Archive.
             let inbox_key = format!("mail:{email}:index");
             let trash_key = format!("mail:{email}:trash-index");
-            for key in [&inbox_key, &format!("mail:{email}:spam-index"), &format!("mail:{email}:draft-index"), &format!("mail:{email}:archive-index")] {
+            for key in [
+                &inbox_key,
+                &format!("mail:{email}:spam-index"),
+                &format!("mail:{email}:draft-index"),
+                &format!("mail:{email}:archive-index"),
+            ] {
                 index_remove(&st.node, key, &req.mail_id).await;
             }
             index_add(&st.node, &trash_key, &req.mail_id).await;
@@ -3288,7 +3600,11 @@ async fn mail_action(
         "archive" => {
             // переместить в Архив (из Inbox/Spam/Trash)
             let archive_key = format!("mail:{email}:archive-index");
-            for key in [&format!("mail:{email}:index"), &format!("mail:{email}:spam-index"), &format!("mail:{email}:trash-index")] {
+            for key in [
+                &format!("mail:{email}:index"),
+                &format!("mail:{email}:spam-index"),
+                &format!("mail:{email}:trash-index"),
+            ] {
                 index_remove(&st.node, key, &req.mail_id).await;
             }
             index_add(&st.node, &archive_key, &req.mail_id).await;
@@ -3314,7 +3630,11 @@ async fn mail_action(
             // идемпотентность: если письмо нигде не индексировано — уже удалено, квоту не списываем повторно
             let mut present_before = false;
             for key in &index_keys {
-                if index_list(&st.node, key).await.iter().any(|x| x == &req.mail_id) {
+                if index_list(&st.node, key)
+                    .await
+                    .iter()
+                    .any(|x| x == &req.mail_id)
+                {
                     present_before = true;
                     break;
                 }
@@ -3326,9 +3646,14 @@ async fn mail_action(
             // проверки — чужая/битая ссылка давала 403 после порчи своих индексов).
             // Конверт собирает сервер, поэтому to/sender есть и у E2E-писем.
             let blob = fetch_mail_to(&st.node, &format!("mail:{}", req.mail_id), 8000).await;
-            let owned = blob.as_ref().and_then(|b| serde_json::from_slice::<Value>(b).ok()).map(|v| {
-                v["to"].as_str() == Some(email.as_str()) || v["sender"].as_str() == Some(email.as_str())
-            }).unwrap_or(false);
+            let owned = blob
+                .as_ref()
+                .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+                .map(|v| {
+                    v["to"].as_str() == Some(email.as_str())
+                        || v["sender"].as_str() == Some(email.as_str())
+                })
+                .unwrap_or(false);
             if !owned && blob.is_some() {
                 return err_json(StatusCode::FORBIDDEN, "no access to this email");
             }
@@ -3348,7 +3673,11 @@ async fn mail_action(
                 .map(|v| {
                     v["attachments"]
                         .as_array()
-                        .map(|a| a.iter().map(|x| x["size"].as_u64().unwrap_or(0)).sum::<u64>())
+                        .map(|a| {
+                            a.iter()
+                                .map(|x| x["size"].as_u64().unwrap_or(0))
+                                .sum::<u64>()
+                        })
                         .unwrap_or(0)
                 })
                 .unwrap_or(0);
@@ -3365,7 +3694,11 @@ async fn mail_action(
             // удаление у А убивало копию у Б и вешало ей висячую ссылку без возврата квоты).
             let others: Vec<String> = {
                 let db = st.db.lock().await;
-                db.accounts.keys().filter(|e| *e != &email).cloned().collect()
+                db.accounts
+                    .keys()
+                    .filter(|e| *e != &email)
+                    .cloned()
+                    .collect()
             };
             let mut shared = false;
             for o in &others {
@@ -3376,7 +3709,11 @@ async fn mail_action(
                     format!("mail:{o}:trash-index"),
                     format!("mail:{o}:archive-index"),
                 ] {
-                    if index_list(&st.node, &k).await.iter().any(|x| x == &req.mail_id) {
+                    if index_list(&st.node, &k)
+                        .await
+                        .iter()
+                        .any(|x| x == &req.mail_id)
+                    {
                         shared = true;
                         break;
                     }
@@ -3389,7 +3726,9 @@ async fn mail_action(
             if shared {
                 return ok_json(json!({ "ok": true, "kept_shared_copy": true }));
             }
-            st.node.delete_blob("mail", &format!("mail:{}", req.mail_id)).await;
+            st.node
+                .delete_blob("mail", &format!("mail:{}", req.mail_id))
+                .await;
             let att_count: usize = blob
                 .as_ref()
                 .and_then(|b| serde_json::from_slice::<Value>(b).ok())
@@ -3397,7 +3736,9 @@ async fn mail_action(
                 .unwrap_or(0)
                 .min(200);
             for i in 0..att_count {
-                st.node.delete_blob("mail", &format!("mail:{}:att:{}", req.mail_id, i)).await;
+                st.node
+                    .delete_blob("mail", &format!("mail:{}:att:{}", req.mail_id, i))
+                    .await;
             }
         }
         other => return err_json(StatusCode::BAD_REQUEST, format!("unknown action {other}")),
@@ -3425,7 +3766,12 @@ async fn mail_blacklist(
         .unwrap_or_default();
     if !list.iter().any(|s| s == &sender) {
         list.push(sender.clone());
-        kv_set(&st.node, &key, &serde_json::to_string(&list).unwrap_or("[]".into())).await;
+        kv_set(
+            &st.node,
+            &key,
+            &serde_json::to_string(&list).unwrap_or("[]".into()),
+        )
+        .await;
     }
     ok_json(json!({ "ok": true, "blacklisted": list }))
 }
@@ -3459,7 +3805,12 @@ async fn mail_unblock(
         .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
         .unwrap_or_default();
     list.retain(|s| s != &sender);
-    kv_set(&st.node, &key, &serde_json::to_string(&list).unwrap_or("[]".into())).await;
+    kv_set(
+        &st.node,
+        &key,
+        &serde_json::to_string(&list).unwrap_or("[]".into()),
+    )
+    .await;
     ok_json(json!({ "ok": true, "blacklisted": list }))
 }
 
@@ -3476,7 +3827,11 @@ async fn settings_plan(State(st): State<WebState>, headers: HeaderMap) -> Respon
     match db.accounts.get(&email) {
         Some(a) => {
             let now = proto::now_ms();
-            let plan = if a.paid_until_ms > now { "paid" } else { "free" };
+            let plan = if a.paid_until_ms > now {
+                "paid"
+            } else {
+                "free"
+            };
             let (mq, fq, al) = plan_limits(plan);
             let min_ton = std::env::var("INFNODE_SUB_MIN_TON")
                 .ok()
@@ -3490,7 +3845,11 @@ async fn settings_plan(State(st): State<WebState>, headers: HeaderMap) -> Respon
                 0
             };
             let plan_status = if a.paid_until_ms > now {
-                if days_left <= 3 { "expiring_soon" } else { "active" }
+                if days_left <= 3 {
+                    "expiring_soon"
+                } else {
+                    "active"
+                }
             } else {
                 "expired"
             };
@@ -3538,10 +3897,16 @@ async fn settings_change_password(
     };
     // rate-limit (ревью F6): чувствительная ручка без троттлинга
     if rate_limit(&st.login_guard, &format!("chpw:{email}"), 10, 900000).await {
-        return err_json(StatusCode::TOO_MANY_REQUESTS, "too many password changes, wait");
+        return err_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many password changes, wait",
+        );
     }
     if req.new_pass.len() < 8 {
-        return err_json(StatusCode::BAD_REQUEST, "new password is shorter than 8 characters");
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "new password is shorter than 8 characters",
+        );
     }
     // Argon2 ВНЕ мьютекса (тот же H1-класс: verify+hash ~0.2-1с под глобальным lock вешали API)
     let pw_hash = {
@@ -3552,7 +3917,11 @@ async fn settings_change_password(
         }
     };
     let ok = PasswordHash::new(&pw_hash)
-        .map(|h| Argon2::default().verify_password(req.current_pass.as_bytes(), &h).is_ok())
+        .map(|h| {
+            Argon2::default()
+                .verify_password(req.current_pass.as_bytes(), &h)
+                .is_ok()
+        })
         .unwrap_or(false);
     if !ok {
         return err_json(StatusCode::UNAUTHORIZED, "invalid current password");
@@ -3630,7 +3999,10 @@ async fn settings_account_delete(
     if rate_limit(&st.login_guard, &format!("del:{email}"), 10, 60 * 60 * 1000).await
         || rate_limit(&st.login_guard, &format!("deli:{ip}"), 30, 60 * 60 * 1000).await
     {
-        return err_json(StatusCode::TOO_MANY_REQUESTS, "too many delete attempts, wait");
+        return err_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many delete attempts, wait",
+        );
     }
     // пароль обязателен; при включённой 2FA обязателен и код (TOTP или бэкап-код).
     // Исключение: passwordless web3-аккаунты (pw_hash пуст — пароля нет по дизайну):
@@ -3664,7 +4036,14 @@ async fn settings_account_delete(
         }
     }
     // 1) собираем id писем из индексов, чтобы вычистить превью-мета
-    let folders = ["index", "sent-index", "draft-index", "spam-index", "trash-index", "archive-index"];
+    let folders = [
+        "index",
+        "sent-index",
+        "draft-index",
+        "spam-index",
+        "trash-index",
+        "archive-index",
+    ];
     let mut ids: Vec<String> = Vec::new();
     for f in folders {
         ids.extend(index_list(&st.node, &format!("mail:{email}:{f}")).await);
@@ -3684,7 +4063,10 @@ async fn settings_account_delete(
         removed_keys += 1;
     }
     for id in &ids {
-        for mk in [format!("mail:{email}:meta:{id}"), format!("mail:{email}:sentmeta:{id}")] {
+        for mk in [
+            format!("mail:{email}:meta:{id}"),
+            format!("mail:{email}:sentmeta:{id}"),
+        ] {
             kv_set(&st.node, &mk, "").await;
             st.node.kv_remove_local(&mk).await;
             meta_keys += 1;
@@ -3706,7 +4088,8 @@ async fn settings_account_delete(
     let stalwart = delete_stalwart_mailbox(&email).await;
     eprintln!("[web] account deleted: {email} (indexes={removed_keys}, metas={meta_keys}, stalwart={stalwart})");
     // сброс cookie — аккаунта больше нет, сессия мертва
-    let cookie_val = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Secure; Path=/api; Max-Age=0");
+    let cookie_val =
+        format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Secure; Path=/api; Max-Age=0");
     let mut resp = ok_json(json!({
         "ok": true,
         "deleted": { "index_keys": removed_keys, "meta_keys": meta_keys, "mails_indexed": ids.len() },
@@ -3807,7 +4190,11 @@ fn xor_codes(password: &str, codes: &[String]) -> Vec<String> {
     codes
         .iter()
         .map(|c| {
-            let x: Vec<u8> = c.bytes().enumerate().map(|(i, b)| b ^ k[i % k.len()]).collect();
+            let x: Vec<u8> = c
+                .bytes()
+                .enumerate()
+                .map(|(i, b)| b ^ k[i % k.len()])
+                .collect();
             hex::encode(x)
         })
         .collect()
@@ -3822,7 +4209,11 @@ fn unxor_codes(password: &str, enc: &[String]) -> Vec<String> {
             if x.is_empty() {
                 return None;
             }
-            let s: String = x.iter().enumerate().map(|(i, b)| (*b ^ k[i % k.len()]) as char).collect();
+            let s: String = x
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (*b ^ k[i % k.len()]) as char)
+                .collect();
             Some(s)
         })
         .collect()
@@ -3877,7 +4268,11 @@ struct Enable2FaReq {
     current_password: String,
 }
 
-async fn settings_2fa_enable(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<Enable2FaReq>) -> Response {
+async fn settings_2fa_enable(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<Enable2FaReq>,
+) -> Response {
     let email = match auth_email(&st, &headers).await {
         Ok(e) => e,
         Err(r) => return r,
@@ -3897,7 +4292,10 @@ async fn settings_2fa_enable(State(st): State<WebState>, headers: HeaderMap, Jso
     }
     let stored = acc.totp_secret.clone().unwrap_or_default();
     if stored.is_empty() || stored != req.secret {
-        return err_json(StatusCode::BAD_REQUEST, "secret does not match — request setup again");
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "secret does not match — request setup again",
+        );
     }
     if !infnode::totp::verify_totp(&stored, &req.code, now) {
         return err_json(StatusCode::BAD_REQUEST, "invalid authenticator code");
@@ -3933,7 +4331,11 @@ struct Disable2FaReq {
     code: String,
 }
 
-async fn settings_2fa_disable(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<Disable2FaReq>) -> Response {
+async fn settings_2fa_disable(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<Disable2FaReq>,
+) -> Response {
     let email = match auth_email(&st, &headers).await {
         Ok(e) => e,
         Err(r) => return r,
@@ -3962,7 +4364,10 @@ async fn settings_2fa_disable(State(st): State<WebState>, headers: HeaderMap, Js
             acc.backup_codes.iter().any(|c| c == &h)
         };
         if !totp_ok && !backup_ok {
-            return err_json(StatusCode::BAD_REQUEST, "authenticator or backup code required");
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "authenticator or backup code required",
+            );
         }
     }
     acc.totp_enabled = false;
@@ -3978,7 +4383,11 @@ struct BackupCodesReq {
     current_password: String,
 }
 
-async fn settings_2fa_backup_codes(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<BackupCodesReq>) -> Response {
+async fn settings_2fa_backup_codes(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<BackupCodesReq>,
+) -> Response {
     let email = match auth_email(&st, &headers).await {
         Ok(e) => e,
         Err(r) => return r,
@@ -3999,7 +4408,11 @@ async fn settings_2fa_backup_codes(State(st): State<WebState>, headers: HeaderMa
     ok_json(json!({ "backup_codes": plain }))
 }
 
-async fn settings_trusted_email(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+async fn settings_trusted_email(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<Value>,
+) -> Response {
     let email = match auth_email(&st, &headers).await {
         Ok(e) => e,
         Err(r) => return r,
@@ -4038,18 +4451,31 @@ async fn settings_signature_get(State(st): State<WebState>, headers: HeaderMap) 
     }
 }
 
-async fn settings_signature_set(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+async fn settings_signature_set(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<Value>,
+) -> Response {
     let email = match auth_email(&st, &headers).await {
         Ok(e) => e,
         Err(r) => return r,
     };
-    let sig = req["signature"].as_str().unwrap_or("").chars().take(2000).collect::<String>();
+    let sig = req["signature"]
+        .as_str()
+        .unwrap_or("")
+        .chars()
+        .take(2000)
+        .collect::<String>();
     let mut db = st.db.lock().await;
     let acc = match db.accounts.get_mut(&email) {
         Some(a) => a,
         None => return err_json(StatusCode::UNAUTHORIZED, "account not found"),
     };
-    acc.signature = if sig.trim().is_empty() { None } else { Some(sig.clone()) };
+    acc.signature = if sig.trim().is_empty() {
+        None
+    } else {
+        Some(sig.clone())
+    };
     save_db(&st.db_path, &db).await;
     ok_json(json!({ "ok": true, "signature": sig }))
 }
@@ -4071,7 +4497,11 @@ struct SessionReq {
     session_id: Option<String>,
 }
 
-async fn settings_sessions_revoke(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<SessionReq>) -> Response {
+async fn settings_sessions_revoke(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<SessionReq>,
+) -> Response {
     let email = match auth_email(&st, &headers).await {
         Ok(e) => e,
         Err(r) => return r,
@@ -4094,7 +4524,11 @@ async fn settings_sessions_revoke(State(st): State<WebState>, headers: HeaderMap
     ok_json(json!({ "ok": true }))
 }
 
-async fn settings_sessions_set_primary(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<SessionReq>) -> Response {
+async fn settings_sessions_set_primary(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<SessionReq>,
+) -> Response {
     let email = match auth_email(&st, &headers).await {
         Ok(e) => e,
         Err(r) => return r,
@@ -4140,9 +4574,11 @@ async fn settings_contract_balance(State(st): State<WebState>, headers: HeaderMa
                 return ok_json(json!({ "balance": "0", "admin_address": null }));
             }
             let addr2 = addr.clone();
-            let bal = tokio::task::spawn_blocking(move || crate::blockchain::get_contract_balance(&addr2))
-                .await
-                .unwrap_or(0);
+            let bal = tokio::task::spawn_blocking(move || {
+                crate::blockchain::get_contract_balance(&addr2)
+            })
+            .await
+            .unwrap_or(0);
             ok_json(json!({ "balance": bal.to_string(), "admin_address": null }))
         }
         Err(r) => r,
@@ -4166,14 +4602,21 @@ struct AliasReq {
     alias: String,
 }
 
-async fn settings_aliases_add(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<AliasReq>) -> Response {
+async fn settings_aliases_add(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<AliasReq>,
+) -> Response {
     let email = match auth_email(&st, &headers).await {
         Ok(e) => e,
         Err(r) => return r,
     };
     // rate-limit (ревью F6): чувствительная ручка без троттлинга
     if rate_limit(&st.login_guard, &format!("alias:{email}"), 30, 600000).await {
-        return err_json(StatusCode::TOO_MANY_REQUESTS, "too many alias operations, wait");
+        return err_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many alias operations, wait",
+        );
     }
     let local = req.alias.trim().to_lowercase();
     if local.is_empty() {
@@ -4197,7 +4640,11 @@ async fn settings_aliases_add(State(st): State<WebState>, headers: HeaderMap, Js
     if acc.aliases.iter().any(|a| a == &local) {
         return err_json(StatusCode::CONFLICT, "such alias already exists");
     }
-    let al = if acc.paid_until_ms > proto::now_ms() { plan_limits("paid").2 } else { FREE_ALIAS_LIMIT };
+    let al = if acc.paid_until_ms > proto::now_ms() {
+        plan_limits("paid").2
+    } else {
+        FREE_ALIAS_LIMIT
+    };
     if acc.aliases.len() >= al {
         return err_json(StatusCode::PAYLOAD_TOO_LARGE, format!("alias limit: {al}"));
     }
@@ -4205,16 +4652,28 @@ async fn settings_aliases_add(State(st): State<WebState>, headers: HeaderMap, Js
     save_db(&st.db_path, &db).await;
     drop(db);
     // best-effort синк в DHT-реестр (для CLI-адресации)
-    let x = st.db.lock().await.accounts.get(&email).and_then(|a| a.x_pub.clone());
+    let x = st
+        .db
+        .lock()
+        .await
+        .accounts
+        .get(&email)
+        .and_then(|a| a.x_pub.clone());
     if let Some(x) = x {
         let node = st.node.clone();
         let ed = "00".repeat(32);
-        tokio::spawn(async move { registry_set(&node, &alias_email, &x, &ed).await; });
+        tokio::spawn(async move {
+            registry_set(&node, &alias_email, &x, &ed).await;
+        });
     }
     ok_json(json!({ "ok": true, "alias": local }))
 }
 
-async fn settings_aliases_delete(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<AliasReq>) -> Response {
+async fn settings_aliases_delete(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<AliasReq>,
+) -> Response {
     let email = match auth_email(&st, &headers).await {
         Ok(e) => e,
         Err(r) => return r,
@@ -4249,25 +4708,28 @@ async fn nft_status(State(st): State<WebState>, Path(email): Path<String>) -> Re
     // ВАЖНО: сбой chain/RPC (429 rate limit, таймаут) — это НЕИЗВЕСТНО, а не «NFT нет».
     // Иначе владелец NFT видел бы «нет NFT» на каждом rate-limit TON Center.
     let email2 = email.clone();
-    let token_id = match tokio::task::spawn_blocking(move || crate::blockchain::check_nft_status(&email2)).await {
-        Ok(Ok(v)) => v,
-        _ => {
-            // Chain недоступен. Если есть прошлый ответ — отдаём его, помечая stale:
-            // это честнее и полезнее 503. Иначе 503 «неизвестно» (именно НЕ «нет NFT»).
-            let prev = { st.nft_status_cache.lock().await.get(&email).cloned() };
-            if let Some((ts, mut v)) = prev {
-                if let Some(o) = v.as_object_mut() {
-                    o.insert("stale".to_string(), json!(true));
-                    o.insert("cached_age_secs".to_string(), json!((now - ts) / 1000));
+    let token_id =
+        match tokio::task::spawn_blocking(move || crate::blockchain::check_nft_status(&email2))
+            .await
+        {
+            Ok(Ok(v)) => v,
+            _ => {
+                // Chain недоступен. Если есть прошлый ответ — отдаём его, помечая stale:
+                // это честнее и полезнее 503. Иначе 503 «неизвестно» (именно НЕ «нет NFT»).
+                let prev = { st.nft_status_cache.lock().await.get(&email).cloned() };
+                if let Some((ts, mut v)) = prev {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("stale".to_string(), json!(true));
+                        o.insert("cached_age_secs".to_string(), json!((now - ts) / 1000));
+                    }
+                    return ok_json(v);
                 }
-                return ok_json(v);
+                return err_json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "chain unavailable: NFT status unknown (not 'no NFT')",
+                );
             }
-            return err_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "chain unavailable: NFT status unknown (not 'no NFT')",
-            );
-        }
-    };
+        };
     // владелец on-chain (для детекта передачи NFT другому кошельку — owner_changed в UI)
     // отдельный spawn_blocking с таймаутом: chain-запрос не должен тормозить статус
     let owner = if let Some(tid) = token_id {
@@ -4288,7 +4750,10 @@ async fn nft_status(State(st): State<WebState>, Path(email): Path<String>) -> Re
         "owner": owner,
         "collection_address": collection,
     });
-    st.nft_status_cache.lock().await.insert(email, (now, body.clone()));
+    st.nft_status_cache
+        .lock()
+        .await
+        .insert(email, (now, body.clone()));
     ok_json(body)
 }
 
@@ -4300,7 +4765,10 @@ async fn nft_upgrade(State(st): State<WebState>, headers: HeaderMap) -> Response
     // проверяем настройку контрактов и сервиса карточек
     let collection = std::env::var("NFT_COLLECTION_ADDRESS").unwrap_or_default();
     if collection.is_empty() {
-        return err_json(StatusCode::BAD_REQUEST, "NFT Collection not configured (NFT_COLLECTION_ADDRESS)");
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "NFT Collection not configured (NFT_COLLECTION_ADDRESS)",
+        );
     }
     // проверяем подписывающий ключ
     if crate::nft::lsb::signing_key().is_none() {
@@ -4318,10 +4786,16 @@ async fn nft_upgrade(State(st): State<WebState>, headers: HeaderMap) -> Response
     let username = email.split('@').next().unwrap_or(&email).to_string();
     let creator_wallet = std::env::var("NFT_CREATOR_WALLET").unwrap_or_default();
     // генерируем карточку
-    match crate::nft::nft::generate_card(&username, token_id, &email, &collection, &creator_wallet) {
+    match crate::nft::nft::generate_card(&username, token_id, &email, &collection, &creator_wallet)
+    {
         Ok((png, payload)) => {
             let data_dir = st.node.data_dir.clone();
-            match crate::nft::nft::save_card(token_id, &png, &payload, data_dir.to_str().unwrap_or(".")) {
+            match crate::nft::nft::save_card(
+                token_id,
+                &png,
+                &payload,
+                data_dir.to_str().unwrap_or("."),
+            ) {
                 Ok(path) => ok_json(json!({
                     "ok": true,
                     "token_id": token_id,
@@ -4331,10 +4805,16 @@ async fn nft_upgrade(State(st): State<WebState>, headers: HeaderMap) -> Response
                     "card_path": path.to_string_lossy(),
                     "size": png.len(),
                 })),
-                Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to save card: {e}")),
+                Err(e) => err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to save card: {e}"),
+                ),
             }
         }
-        Err(e) => err_json(StatusCode::BAD_GATEWAY, format!("failed to generate card: {e}")),
+        Err(e) => err_json(
+            StatusCode::BAD_GATEWAY,
+            format!("failed to generate card: {e}"),
+        ),
     }
 }
 
@@ -4345,7 +4825,14 @@ async fn nft_upgrade(State(st): State<WebState>, headers: HeaderMap) -> Response
 /// Отправить письмо внешнему получателю через SMTP (валидатор = SMTP-клиент своего MTA).
 /// Конфиг: INFNODE_SMTP_HOST / _PORT / _USER / _PASS (по умолчанию relay через stalwart).
 /// MAIL FROM = отправитель; требует, чтобы у отправителя был ящик в MTA (provisioning).
-async fn smtp_relay_external(st: &WebState, from: &str, to: &str, subject: &str, body: &str, attachments: Option<Vec<MailAttachmentReq>>) -> Response {
+async fn smtp_relay_external(
+    st: &WebState,
+    from: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+    attachments: Option<Vec<MailAttachmentReq>>,
+) -> Response {
     use lettre::message::header::ContentType;
     use lettre::message::Message;
     use lettre::transport::smtp::authentication::Credentials;
@@ -4395,7 +4882,13 @@ async fn smtp_relay_external(st: &WebState, from: &str, to: &str, subject: &str,
     let mut att_blobs: Vec<(usize, Vec<u8>)> = Vec::new();
     if let Some(atts) = attachments.as_ref() {
         if atts.len() > crate::inbound::MAX_ATTACH_COUNT {
-            return err_json(StatusCode::PAYLOAD_TOO_LARGE, format!("too many attachments (max {})", crate::inbound::MAX_ATTACH_COUNT));
+            return err_json(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "too many attachments (max {})",
+                    crate::inbound::MAX_ATTACH_COUNT
+                ),
+            );
         }
         let mut total = 0usize;
         for (i, a) in atts.iter().enumerate() {
@@ -4406,7 +4899,10 @@ async fn smtp_relay_external(st: &WebState, from: &str, to: &str, subject: &str,
                         continue;
                     }
                     if data.len() > max_att.saturating_sub(total) {
-                        return err_json(StatusCode::PAYLOAD_TOO_LARGE, "attachments too large (max 25 MB)");
+                        return err_json(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "attachments too large (max 25 MB)",
+                        );
                     }
                     total += data.len();
                     att_blobs.push((i, data));
@@ -4427,11 +4923,16 @@ async fn smtp_relay_external(st: &WebState, from: &str, to: &str, subject: &str,
                 Err(_) => return err_json(StatusCode::BAD_REQUEST, "failed to assemble email"),
             }
         } else {
-            use lettre::message::MultiPart;
             use lettre::message::Attachment;
+            use lettre::message::MultiPart;
             let mut multipart = MultiPart::mixed().multipart(
-                MultiPart::alternative()
-                    .multipart(MultiPart::related().singlepart(lettre::message::SinglePart::builder().header(ContentType::TEXT_PLAIN).body(body.to_string()))),
+                MultiPart::alternative().multipart(
+                    MultiPart::related().singlepart(
+                        lettre::message::SinglePart::builder()
+                            .header(ContentType::TEXT_PLAIN)
+                            .body(body.to_string()),
+                    ),
+                ),
             );
             for a in atts {
                 let data = match base64::engine::general_purpose::STANDARD.decode(&a.data) {
@@ -4441,8 +4942,10 @@ async fn smtp_relay_external(st: &WebState, from: &str, to: &str, subject: &str,
                 if data.is_empty() {
                     continue;
                 }
-                let name = crate::inbound::sanitize_filename(&a.name).unwrap_or_else(|| "attachment".into());
-                let mime = a.mime
+                let name = crate::inbound::sanitize_filename(&a.name)
+                    .unwrap_or_else(|| "attachment".into());
+                let mime = a
+                    .mime
                     .map(|m| crate::inbound::sanitize_mime(&m))
                     .unwrap_or_else(|| "application/octet-stream".into());
                 let ct = match mime.parse::<ContentType>() {
@@ -4494,10 +4997,8 @@ async fn smtp_relay_external(st: &WebState, from: &str, to: &str, subject: &str,
             // (тело + мета + индекс Sent), чтобы оно было видно сразу.
             let at = proto::now_ms();
             let id = hex::encode(
-                blake3::hash(
-                    format!("{from}:{to}:{at}:{}", rand::random::<u64>()).as_bytes(),
-                )
-                .as_bytes(),
+                blake3::hash(format!("{from}:{to}:{at}:{}", rand::random::<u64>()).as_bytes())
+                    .as_bytes(),
             );
             // Sent-копия внешнего: конверт на отправителя, если ключи есть
             // (само письмо наружу всё равно уходит открытым SMTP — это неизбежно).
@@ -4546,8 +5047,8 @@ async fn smtp_relay_external(st: &WebState, from: &str, to: &str, subject: &str,
             // Квота: внешняя отправка раньше не учитывалась — счётчик почты
             // показывал 0 Bytes при непустом ящике. Считаем как у внутренних.
             {
-                let size = blob.len() as u64
-                    + att_blobs.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
+                let size =
+                    blob.len() as u64 + att_blobs.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
                 let mut db = st.db.lock().await;
                 if let Some(a) = db.accounts.get_mut(from) {
                     a.bytes_used = a.bytes_used.saturating_add(size);
@@ -4656,9 +5157,20 @@ async fn files_upload(
     }
     // защита от XSS через активные типы: html/svg/xml/js не храним в Files
     // (риск исполнения при открытии из предпросмотра)
-    let ext = req.name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    if matches!(ext.as_str(), "html" | "htm" | "svg" | "xml" | "xhtml" | "js" | "mjs") {
-        return err_json(StatusCode::BAD_REQUEST, "file type is forbidden in file storage");
+    let ext = req
+        .name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(
+        ext.as_str(),
+        "html" | "htm" | "svg" | "xml" | "xhtml" | "js" | "mjs"
+    ) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "file type is forbidden in file storage",
+        );
     }
     // квота файлов (раздельная от почты). При перезаписи файла возвращаем старый размер.
     {
@@ -4692,11 +5204,20 @@ async fn files_upload(
     let mut list = files_index(&st.node, &email).await;
     list.retain(|e| e["name"].as_str() != Some(req.name.as_str()));
     list.push(json!({ "name": req.name, "size": data.len(), "at": proto::now_ms() }));
-    kv_set(&st.node, &ikey, &serde_json::to_string(&list).unwrap_or("[]".into())).await;
+    kv_set(
+        &st.node,
+        &ikey,
+        &serde_json::to_string(&list).unwrap_or("[]".into()),
+    )
+    .await;
     ok_json(json!({ "ok": true, "name": req.name, "size": data.len() }))
 }
 
-async fn files_download(State(st): State<WebState>, headers: HeaderMap, Path(name): Path<String>) -> Response {
+async fn files_download(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
     let email = match auth_email(&st, &headers).await {
         Ok(e) => e,
         Err(r) => return r,
@@ -4715,7 +5236,11 @@ async fn files_download(State(st): State<WebState>, headers: HeaderMap, Path(nam
         })),
         None => {
             // обратная совместимость: старые файлы до папок хранились с raw-именем
-            if let Some(data) = st.node.fetch_blob("files", &format!("file:{email}:{name}")).await {
+            if let Some(data) = st
+                .node
+                .fetch_blob("files", &format!("file:{email}:{name}"))
+                .await
+            {
                 ok_json(json!({
                     "name": name,
                     "size": data.len(),
@@ -4744,7 +5269,11 @@ async fn files_share_create(
     // проверяем, что файл реально существует (владелец)
     let blob_name = file_blob_key(&email, &name);
     let has = st.node.fetch_blob("files", &blob_name).await.is_some()
-        || st.node.fetch_blob("files", &format!("file:{email}:{name}")).await.is_some();
+        || st
+            .node
+            .fetch_blob("files", &format!("file:{email}:{name}"))
+            .await
+            .is_some();
     if !has {
         return err_json(StatusCode::NOT_FOUND, "file not found");
     }
@@ -4756,7 +5285,9 @@ async fn files_share_create(
     let exp = proto::now_ms() + 30 * 24 * 3600 * 1000; // 30 дней
     let rec = json!({ "owner": email, "name": name, "exp": exp }).to_string();
     // share-ключи — локально-авторитетные (не реплицируются, см. handle_dht_store)
-    st.node.kv_store_local(&format!("share:file:{token}"), &rec).await;
+    st.node
+        .kv_store_local(&format!("share:file:{token}"), &rec)
+        .await;
     ok_json(json!({ "ok": true, "token": token, "url": format!("/api/v1/files/share/{token}") }))
 }
 
@@ -4776,7 +5307,12 @@ async fn files_share_revoke(
     let key = format!("share:file:{token}");
     let rec = match st.node.get_local_kv(&key).await {
         Some(r) => r,
-        None => return err_json(StatusCode::NOT_FOUND, "share not found (may live on another node)"),
+        None => {
+            return err_json(
+                StatusCode::NOT_FOUND,
+                "share not found (may live on another node)",
+            )
+        }
     };
     let owner = serde_json::from_str::<Value>(&rec)
         .ok()
@@ -4817,10 +5353,7 @@ async fn files_shares_list(State(st): State<WebState>, headers: HeaderMap) -> Re
 }
 
 /// Публичное скачивание по токену (без auth).
-async fn files_share_download(
-    State(st): State<WebState>,
-    Path(token): Path<String>,
-) -> Response {
+async fn files_share_download(State(st): State<WebState>, Path(token): Path<String>) -> Response {
     if token.len() != 32 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
         return err_json(StatusCode::BAD_REQUEST, "invalid token");
     }
@@ -4841,7 +5374,11 @@ async fn files_share_download(
     let blob_name = file_blob_key(&owner, &name);
     let data = match st.node.fetch_blob("files", &blob_name).await {
         Some(d) => Some(d),
-        None => st.node.fetch_blob("files", &format!("file:{owner}:{name}")).await,
+        None => {
+            st.node
+                .fetch_blob("files", &format!("file:{owner}:{name}"))
+                .await
+        }
     };
     match data {
         Some(data) => ok_json(json!({
@@ -4853,7 +5390,11 @@ async fn files_share_download(
     }
 }
 
-async fn files_delete(State(st): State<WebState>, headers: HeaderMap, Path(name): Path<String>) -> Response {
+async fn files_delete(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
     let email = match auth_email(&st, &headers).await {
         Ok(e) => e,
         Err(r) => return r,
@@ -4876,11 +5417,21 @@ async fn files_delete(State(st): State<WebState>, headers: HeaderMap, Path(name)
     if list.len() == before {
         return err_json(StatusCode::NOT_FOUND, "file not found");
     }
-    kv_set(&st.node, &ikey, &serde_json::to_string(&list).unwrap_or("[]".into())).await;
+    kv_set(
+        &st.node,
+        &ikey,
+        &serde_json::to_string(&list).unwrap_or("[]".into()),
+    )
+    .await;
     // физическое удаление: манифест + локальные чанки + best-effort на репликах
     // (пробуем новый хэш-ключ и старый raw-ключ для обратной совместимости)
-    let deleted = st.node.delete_blob("files", &file_blob_key(&email, &name)).await
-        + st.node.delete_blob("files", &format!("file:{email}:{name}")).await;
+    let deleted = st
+        .node
+        .delete_blob("files", &file_blob_key(&email, &name))
+        .await
+        + st.node
+            .delete_blob("files", &format!("file:{email}:{name}"))
+            .await;
     {
         let mut db = st.db.lock().await;
         if let Some(a) = db.accounts.get_mut(&email) {
@@ -4895,12 +5446,17 @@ async fn files_delete(State(st): State<WebState>, headers: HeaderMap, Path(name)
 fn file_type_from_name(name: &str) -> &'static str {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "svg" | "bmp" | "ico" | "heic" | "avif" => "image",
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "svg" | "bmp" | "ico" | "heic" | "avif" => {
+            "image"
+        }
         "mp4" | "mkv" | "webm" | "mov" | "avi" | "flv" | "wmv" | "m4v" => "video",
         "mp3" | "wav" | "flac" | "aac" | "ogg" | "opus" | "m4a" | "mid" | "midi" => "audio",
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp" | "rtf" | "txt" | "md" => "document",
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
+        | "rtf" | "txt" | "md" => "document",
         "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "tgz" | "zst" => "archive",
-        "rs" | "ts" | "tsx" | "js" | "mjs" | "py" | "go" | "c" | "cpp" | "h" | "hpp" | "java" | "rb" | "php" | "sh" | "json" | "yaml" | "yml" | "toml" | "sql" | "html" | "css" | "vue" | "jsx" => "code",
+        "rs" | "ts" | "tsx" | "js" | "mjs" | "py" | "go" | "c" | "cpp" | "h" | "hpp" | "java"
+        | "rb" | "php" | "sh" | "json" | "yaml" | "yml" | "toml" | "sql" | "html" | "css"
+        | "vue" | "jsx" => "code",
         _ => "other",
     }
 }
@@ -4935,7 +5491,10 @@ async fn files_review(State(st): State<WebState>, headers: HeaderMap) -> Respons
         let mkey = format!("f:{}", file_blob_key(&email, &fname));
         let mut mstr = st.node.get_local_kv(&mkey).await;
         if mstr.is_none() {
-            mstr = st.node.get_local_kv(&format!("f:file:{email}:{fname}")).await;
+            mstr = st
+                .node
+                .get_local_kv(&format!("f:file:{email}:{fname}"))
+                .await;
         }
         let mut assigned_node: Option<String> = None;
         if let Some(ms) = mstr {
@@ -4975,12 +5534,14 @@ async fn files_review(State(st): State<WebState>, headers: HeaderMap) -> Respons
         .collect();
     let nodes: Vec<Value> = by_node
         .iter()
-        .map(|(id, (b, c))| json!({
-            "id": id,
-            "name": id_to_name.get(id).cloned().unwrap_or_else(|| format!("{}…", &id[..8])),
-            "bytes": b,
-            "chunks": c,
-        }))
+        .map(|(id, (b, c))| {
+            json!({
+                "id": id,
+                "name": id_to_name.get(id).cloned().unwrap_or_else(|| format!("{}…", &id[..8])),
+                "bytes": b,
+                "chunks": c,
+            })
+        })
         .collect();
     ok_json(json!({
         "total_bytes": total_bytes,
@@ -5165,7 +5726,12 @@ fn web3n_parse(raw: Option<String>) -> Vec<Value> {
 }
 
 fn web3n_prune(mut list: Vec<Value>, now: i64) -> Vec<Value> {
-    list.retain(|e| e["ts"].as_i64().map(|t| now - t < WEB3N_TTL_MS).unwrap_or(false));
+    list.retain(|e| {
+        e["ts"]
+            .as_i64()
+            .map(|t| now - t < WEB3N_TTL_MS)
+            .unwrap_or(false)
+    });
     list
 }
 
@@ -5196,7 +5762,10 @@ async fn web3_generate_payload(State(st): State<WebState>) -> Response {
         list.drain(0..n);
     }
     st.node
-        .kv_store_local(WEB3N_KEY, &serde_json::to_string(&list).unwrap_or("[]".into()))
+        .kv_store_local(
+            WEB3N_KEY,
+            &serde_json::to_string(&list).unwrap_or("[]".into()),
+        )
         .await;
     ok_json(json!({
         "payload": {
@@ -5233,17 +5802,26 @@ struct Web3Domain {
     value: String,
 }
 
-async fn web3_login(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<Web3LoginReq>) -> Response {
+async fn web3_login(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<Web3LoginReq>,
+) -> Response {
     let ip = client_ip(&headers);
     if rate_limit(&st.login_guard, &format!("w3:{ip}"), 30, 15 * 60 * 1000).await {
-        return err_json(StatusCode::TOO_MANY_REQUESTS, "too many web3 login attempts");
+        return err_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many web3 login attempts",
+        );
     }
     // КОШЕЛЁК УЖЕ ПРИВЯЗАН? (восстановленная сессия, как Fragment) — вход по адресу без proof.
     // Только для НОВОГО кошелька (нет аккаунта) proof обязателен (доказательство владения).
     let wallet_norm = normalize_ton_address(&req.address);
     let known_wallet = {
         let db = st.db.lock().await;
-        db.accounts.values().any(|a| a.wallet.as_deref() == Some(wallet_norm.as_str()))
+        db.accounts
+            .values()
+            .any(|a| a.wallet.as_deref() == Some(wallet_norm.as_str()))
     };
     // verified=true только если владение адресом доказано криптографическим proof
     // (pk привязан к адресу). Путь known_wallet (вход по адресу без proof) — НЕ verified:
@@ -5277,7 +5855,11 @@ async fn web3_login(State(st): State<WebState>, headers: HeaderMap, Json(req): J
             .and_then(|v| v["salt"].as_str().map(String::from))
             .or_else(|| Some(p.clone()));
         let payload_ok = match issued {
-            Some(salt) if !salt.is_empty() && salt.len() <= 64 && salt.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            Some(salt)
+                if !salt.is_empty()
+                    && salt.len() <= 64
+                    && salt.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
                 let now = proto::now_ms();
                 let list = web3n_prune(web3n_parse(st.node.get_local_kv(WEB3N_KEY).await), now);
                 // ВАЖНО: здесь только ПРОВЕРЯЕМ, не сжигая nonce. Сжигаем после успешной
@@ -5286,7 +5868,9 @@ async fn web3_login(State(st): State<WebState>, headers: HeaderMap, Json(req): J
                 // «payload does not match issued nonce».
                 let mut ok = false;
                 for e in list.iter() {
-                    if e["salt"].as_str() == Some(salt.as_str()) && e["used"].as_bool() != Some(true) {
+                    if e["salt"].as_str() == Some(salt.as_str())
+                        && e["used"].as_bool() != Some(true)
+                    {
                         ok = true;
                         break;
                     }
@@ -5308,7 +5892,10 @@ async fn web3_login(State(st): State<WebState>, headers: HeaderMap, Json(req): J
             _ => false,
         };
         if !payload_ok {
-            return err_json(StatusCode::UNAUTHORIZED, "payload does not match issued nonce");
+            return err_json(
+                StatusCode::UNAUTHORIZED,
+                "payload does not match issued nonce",
+            );
         }
         let req_address = req.address.clone();
         let req_pubkey = req.public_key.clone();
@@ -5346,7 +5933,10 @@ async fn web3_login(State(st): State<WebState>, headers: HeaderMap, Json(req): J
             }
         }
         st.node
-            .kv_store_local(WEB3N_KEY, &serde_json::to_string(&list).unwrap_or("[]".into()))
+            .kv_store_local(
+                WEB3N_KEY,
+                &serde_json::to_string(&list).unwrap_or("[]".into()),
+            )
             .await;
         st.node.kv_remove_local("web3n_active").await;
     }
@@ -5379,7 +5969,9 @@ async fn web3_login(State(st): State<WebState>, headers: HeaderMap, Json(req): J
     // если кошелёк известен, но владение не подтверждено — отдаём признак для UI
     let known_wallet = {
         let db = st.db.lock().await;
-        db.accounts.values().any(|a| a.wallet.as_deref() == Some(wallet.as_str()))
+        db.accounts
+            .values()
+            .any(|a| a.wallet.as_deref() == Some(wallet.as_str()))
     };
     if known_wallet && accounts.is_empty() {
         return err_json(
@@ -5436,12 +6028,18 @@ async fn register_web3(
     // email не должен быть алиасом другого аккаунта (иначе перехват почты алиаса)
     if let Some(owner) = resolve_db_email(&db, &email) {
         if owner != email {
-            return err_json(StatusCode::CONFLICT, "this address is an alias of another account");
+            return err_json(
+                StatusCode::CONFLICT,
+                "this address is an alias of another account",
+            );
         }
     }
     // защита от захвата: email уже занят в DHT-реестре (зарегистрирован через CLI/иную ноду)
     if registry_get(&st.node, &email).await.is_some() {
-        return err_json(StatusCode::CONFLICT, "this address is already registered on the network");
+        return err_json(
+            StatusCode::CONFLICT,
+            "this address is already registered on the network",
+        );
     }
     // ПРОВЕРКА ОПЛАТЫ/ВЛАДЕНИЯ: web3-аккаунт создаётся ТОЛЬКО если email зарегистрирован
     // в TON Registry И владелец (getOwnerByHash) == текущий кошелёк (MED-2 фикс: «стек непуст»
@@ -5470,7 +6068,11 @@ async fn register_web3(
         .take(64)
         .collect::<String>();
     let token = issue_session(&st, &email, &device, &client_ip(&headers)).await;
-    ok_with_session(json!({ "token": token.clone(), "email": email }), &token, 7 * 24 * 3600)
+    ok_with_session(
+        json!({ "token": token.clone(), "email": email }),
+        &token,
+        7 * 24 * 3600,
+    )
 }
 
 #[derive(Deserialize)]
@@ -5497,7 +6099,10 @@ async fn web3_select_account(
         None => (None, false),
     };
     if !verified {
-        return err_json(StatusCode::UNAUTHORIZED, "wallet ownership not proven — sign with your wallet and try again");
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "wallet ownership not proven — sign with your wallet and try again",
+        );
     }
     let db = st.db.lock().await;
     let owned = db
@@ -5516,7 +6121,10 @@ async fn web3_select_account(
         .unwrap_or(false);
     drop(db);
     if !owned {
-        return err_json(StatusCode::UNAUTHORIZED, "account does not belong to this wallet");
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "account does not belong to this wallet",
+        );
     }
     let device = headers
         .get(header::USER_AGENT)
@@ -5553,7 +6161,10 @@ async fn web3_derive_keys(Json(req): Json<DeriveKeysReq>) -> Response {
         } else {
             err_json(
                 StatusCode::BAD_REQUEST,
-                resp["error"].as_str().unwrap_or("derive failed").to_string(),
+                resp["error"]
+                    .as_str()
+                    .unwrap_or("derive failed")
+                    .to_string(),
             )
         };
     }
@@ -5564,7 +6175,10 @@ async fn web3_derive_keys(Json(req): Json<DeriveKeysReq>) -> Response {
         } else {
             err_json(
                 StatusCode::BAD_REQUEST,
-                resp["error"].as_str().unwrap_or("derive failed").to_string(),
+                resp["error"]
+                    .as_str()
+                    .unwrap_or("derive failed")
+                    .to_string(),
             )
         };
     }
@@ -5597,11 +6211,21 @@ async fn web3_save_keys(
     // Валидация: x_pub — hex 32 байта (64 символа); signature — hex 64 байта (128 символов).
     let x_pub_bytes = match hex::decode(&req.x_pub) {
         Ok(b) if b.len() == 32 => b,
-        _ => return err_json(StatusCode::BAD_REQUEST, "invalid x_pub (must be 32 bytes hex)".to_string()),
+        _ => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "invalid x_pub (must be 32 bytes hex)".to_string(),
+            )
+        }
     };
     let _sig_bytes = match hex::decode(&req.signature) {
         Ok(b) if b.len() == 64 => b,
-        _ => return err_json(StatusCode::BAD_REQUEST, "invalid signature (must be 64 bytes hex)".to_string()),
+        _ => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "invalid signature (must be 64 bytes hex)".to_string(),
+            )
+        }
     };
     // Перепроверяем: производный x_pub должен соответствовать подписи (защита от подмены).
     let derived = crate::nft::derive::derive_x_pub_from_signature(&req.signature)
@@ -5647,11 +6271,10 @@ async fn web3_wallet_nfts(State(st): State<WebState>, headers: HeaderMap) -> Res
     let data_dir = st.node.data_dir.to_str().unwrap_or(".").to_string();
     let wallet_scan = wallet.clone();
     // сканируем токены коллекции (с лимитом в scan_nfts_by_wallet)
-    let token_ids = tokio::task::spawn_blocking(move || {
-        crate::blockchain::scan_nfts_by_wallet(&wallet_scan)
-    })
-    .await
-    .unwrap_or_default();
+    let token_ids =
+        tokio::task::spawn_blocking(move || crate::blockchain::scan_nfts_by_wallet(&wallet_scan))
+            .await
+            .unwrap_or_default();
     let mut nfts = Vec::new();
     for tid in token_ids {
         if let Some(meta) = crate::nft::nft::load_nft_meta(tid, &data_dir) {
@@ -5688,7 +6311,10 @@ async fn web3_recover_email(
         None => (None, false),
     };
     if !verified {
-        return err_json(StatusCode::UNAUTHORIZED, "wallet ownership not proven — sign with your wallet and try again");
+        return err_json(
+            StatusCode::UNAUTHORIZED,
+            "wallet ownership not proven — sign with your wallet and try again",
+        );
     }
     let db = st.db.lock().await;
     let owned = db
@@ -5720,7 +6346,8 @@ async fn web3_recover_email(
 pub async fn internal_notify(node: &Arc<Node>, email: &str, subject: &str, body: &str) {
     let at = proto::now_ms();
     let id = hex::encode(
-        blake3::hash(format!("{email}:notify:{at}:{}", rand::random::<u64>()).as_bytes()).as_bytes(),
+        blake3::hash(format!("{email}:notify:{at}:{}", rand::random::<u64>()).as_bytes())
+            .as_bytes(),
     );
     let envelope = json!({
         "sender": "infmail@infmail.org",
@@ -5773,11 +6400,17 @@ async fn web3_save_intent(
     // email не должен быть алиасом другого аккаунта (иначе перехват почты алиаса)
     if let Some(owner) = resolve_db_email(&db, &email) {
         if owner != email {
-            return err_json(StatusCode::CONFLICT, "this address is an alias of another account");
+            return err_json(
+                StatusCode::CONFLICT,
+                "this address is an alias of another account",
+            );
         }
     }
     if registry_get(&st.node, &email).await.is_some() {
-        return err_json(StatusCode::CONFLICT, "this address is already registered on the network");
+        return err_json(
+            StatusCode::CONFLICT,
+            "this address is already registered on the network",
+        );
     }
     // Шаг ДО оплаты: проверяем только свободу адреса и крипто-владение кошельком
     // (verified). Аккаунт НЕ создаём — иначе бесплатные аккаунты без оплаты.
@@ -5838,15 +6471,15 @@ async fn create_web3_account(
         e2e_secret: None,
         plan: "free".into(),
         paid_until_ms: 0,
-    totp_secret: None,
-    totp_enabled: false,
-    backup_codes: Vec::new(),
-    backup_codes_enc: Vec::new(),
-    trusted_email: None,
-    pending_email: None,
-    sessions: Vec::new(),
-    session_epoch: 0,
-    signature: None,
+        totp_secret: None,
+        totp_enabled: false,
+        backup_codes: Vec::new(),
+        backup_codes_enc: Vec::new(),
+        trusted_email: None,
+        pending_email: None,
+        sessions: Vec::new(),
+        session_epoch: 0,
+        signature: None,
     };
     let mut db = st.db.lock().await;
     // LOW-6: атомарный check-then-insert — два параллельных опроса (даблклик
@@ -5929,13 +6562,23 @@ async fn web3_poll_activation(
 
 /// 2FA на новой системе не используется (E2E-ключи генерируются без него).
 /// Заглушка для совместимости с фронтендом (вход никогда не требует 2FA).
-async fn verify_2fa(State(st): State<WebState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+async fn verify_2fa(
+    State(st): State<WebState>,
+    headers: HeaderMap,
+    Json(req): Json<Value>,
+) -> Response {
     let email_from_token = match auth_email_2fa(&st, &headers).await {
         Ok(e) => e,
         Err(r) => return r,
     };
     let ip = client_ip(&headers);
-    if rate_limit(&st.login_guard, &format!("2fa:{email_from_token}"), 5, 60 * 1000).await
+    if rate_limit(
+        &st.login_guard,
+        &format!("2fa:{email_from_token}"),
+        5,
+        60 * 1000,
+    )
+    .await
         || rate_limit(&st.login_guard, &format!("2fai:{ip}"), 20, 60 * 1000).await
     {
         return err_json(StatusCode::TOO_MANY_REQUESTS, "too many 2FA attempts, wait");
@@ -6078,7 +6721,10 @@ async fn nft_meta(State(st): State<WebState>, Path(token_id): Path<String>) -> R
     let collection = std::env::var("NFT_COLLECTION_ADDRESS").unwrap_or_default();
     // стандартный формат NFT-метаданных (GetGems/TON):
     // name, description, image, attributes
-    let name = meta["email"].as_str().unwrap_or(&format!("#{tid}")).to_string();
+    let name = meta["email"]
+        .as_str()
+        .unwrap_or(&format!("#{tid}"))
+        .to_string();
     let description = meta["description"]
         .as_str()
         .unwrap_or("InfMail NFT — Your web3 email name.")
@@ -6108,8 +6754,14 @@ async fn settings_subscribe(
 ) -> Response {
     // Демо/тестовый эндпоинт: включён только если задан INFNODE_WEB_ALLOW_DEMO_SUBSCRIBE=1.
     // В проде подписка активируется ТОЛЬКО индексером по реальному платежу в Storage-контракт.
-    if std::env::var("INFNODE_WEB_ALLOW_DEMO_SUBSCRIBE").map(|v| v != "1").unwrap_or(true) {
-        return err_json(StatusCode::FORBIDDEN, "subscription activates only by TON payment");
+    if std::env::var("INFNODE_WEB_ALLOW_DEMO_SUBSCRIBE")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+    {
+        return err_json(
+            StatusCode::FORBIDDEN,
+            "subscription activates only by TON payment",
+        );
     }
     let email = match auth_email(&st, &headers).await {
         Ok(e) => e,
@@ -6141,7 +6793,10 @@ async fn settings_subscribe_nonce(State(st): State<WebState>, headers: HeaderMap
     };
     // rate-limit (ревью F6): чувствительная ручка без троттлинга
     if rate_limit(&st.login_guard, &format!("subn:{email}"), 30, 600000).await {
-        return err_json(StatusCode::TOO_MANY_REQUESTS, "too many nonce requests, wait");
+        return err_json(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many nonce requests, wait",
+        );
     }
     // Идемпотентность (проф-поведение): если непотраченный nonce уже выдан и не истёк —
     // возвращаем ЕГО ЖЕ, а не новый. Иначе повторный скан кошелька меняет nonce,
@@ -6307,18 +6962,22 @@ async fn check_subscription_payments(
             //   - 1 месяц = 1 порог (0.5 TON) = 30 дней
             //   - 1 год   = 10 × порог (5 TON) = 365 дней (год дешевле)
             // Остаток сверх целых лет не теряется: переплата конвертируется в доп. месяцы.
-            let month_nanoton = min_nanoton;          // 0.5 TON = 1 месяц
-            let year_months: u64 = 10;                // 5 TON = 1 год
-            let months = value / month_nanoton;       // сколько месячных порогов покрывает платёж
+            let month_nanoton = min_nanoton; // 0.5 TON = 1 месяц
+            let year_months: u64 = 10; // 5 TON = 1 год
+            let months = value / month_nanoton; // сколько месячных порогов покрывает платёж
             let days = if months > 0 {
-                let years = months / year_months;              // полные годы (по 365 дней)
-                let rem_months = months % year_months;         // остаток — по 30 дней/мес
+                let years = months / year_months; // полные годы (по 365 дней)
+                let rem_months = months % year_months; // остаток — по 30 дней/мес
                 (years * 365 + rem_months * 30) as i64
             } else {
                 0
             };
             if days <= 0 {
-                eprintln!("[web] payment for {email} SKIPPED: below 1 month ({} TON < {} TON)", value as f64 / 1e9, min_ton);
+                eprintln!(
+                    "[web] payment for {email} SKIPPED: below 1 month ({} TON < {} TON)",
+                    value as f64 / 1e9,
+                    min_ton
+                );
                 continue;
             }
             acc.paid_until_ms = (acc.paid_until_ms.max(now)) + days * 24 * 3600 * 1000;

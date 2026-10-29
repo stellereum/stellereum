@@ -22,8 +22,8 @@ use stellereum_contract_sdk::address::{
     is_any_reserved, is_system_burn, PROTOCOL_RESERVED_DOMAINS, SYSTEM_BURN_DOMAINS,
 };
 use stellereum_contract_sdk::{
-    emit, setup_wasm_panic_handler, sload, sstore, ERR_ALREADY_EXISTS,
-    ERR_INVALID_ARGUMENT, ERR_UNAUTHORIZED, SUCCESS,
+    emit, setup_wasm_panic_handler, sload, sstore, ERR_ALREADY_EXISTS, ERR_INVALID_ARGUMENT,
+    ERR_UNAUTHORIZED, SUCCESS,
 };
 
 setup_wasm_panic_handler!();
@@ -64,15 +64,15 @@ fn domain_base(domain_id: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn get_min_bid(name_len: i64) -> i64 {
     match name_len {
-        4 => 200,          // 4 chars: 200 STELL
-        5 => 75,           // 5 chars: 75 STELL
-        6 => 50,           // 6 chars: 50 STELL
-        7 => 25,           // 7 chars: 25 STELL
-        8 => 20,           // 8 chars: 20 STELL
-        9 => 15,           // 9 chars: 15 STELL
-        10 => 10,          // 10 chars: 10 STELL
-        11..=126 => 5,     // 11+ chars: 5 STELL
-        _ => -1,           // < 4 or > 126: fail-closed
+        4 => 200,      // 4 chars: 200 STELL
+        5 => 75,       // 5 chars: 75 STELL
+        6 => 50,       // 6 chars: 50 STELL
+        7 => 25,       // 7 chars: 25 STELL
+        8 => 20,       // 8 chars: 20 STELL
+        9 => 15,       // 9 chars: 15 STELL
+        10 => 10,      // 10 chars: 10 STELL
+        11..=126 => 5, // 11+ chars: 5 STELL
+        _ => -1,       // < 4 or > 126: fail-closed
     }
 }
 
@@ -189,7 +189,11 @@ pub extern "C" fn place_bid(packed_arg: i64) -> i64 {
 
     let current_bid = sload(base + 2);
     // Minimum 10% raise
-    let min_increase = if current_bid / 10 > 0 { current_bid / 10 } else { 1 };
+    let min_increase = if current_bid / 10 > 0 {
+        current_bid / 10
+    } else {
+        1
+    };
     let new_bid = current_bid + min_increase;
 
     sstore(base + 1, bidder_id);
@@ -397,7 +401,10 @@ mod tests {
         assert_eq!(resolve(DOMAIN_STAKE), 99);
 
         // Protocol domain can be updated by treasury to new address 777
-        assert_eq!(transfer(DOMAIN_STAKE * 10_000_000_000 + 99 * 100_000 + 777), SUCCESS);
+        assert_eq!(
+            transfer(DOMAIN_STAKE * 10_000_000_000 + 99 * 100_000 + 777),
+            SUCCESS
+        );
         assert_eq!(resolve(DOMAIN_STAKE), 777);
     }
 
@@ -407,7 +414,11 @@ mod tests {
         init(99);
         let blackhole_id = 8888;
         let start_arg = blackhole_id * 10_000_000_000 + 55 * 100_000 + 9;
-        assert_eq!(start_auction(start_arg), blackhole_id, "blackhole.stl must be auctionable");
+        assert_eq!(
+            start_auction(start_arg),
+            blackhole_id,
+            "blackhole.stl must be auctionable"
+        );
 
         let bid_arg = blackhole_id * 10_000_000_000 + 77 * 10_000 + 1;
         assert_eq!(place_bid(bid_arg), 16);

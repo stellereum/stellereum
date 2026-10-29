@@ -85,7 +85,10 @@ fn reward_double_dip_across_unbonding_conserves_emission() {
     let c1 = l.claim_delegator_rewards(d1, v);
     assert_eq!(c1, stell(180), "d1 earned 90 + 90, exactly");
     let c1_again = l.claim_delegator_rewards(d1, v);
-    assert_eq!(c1_again, 0, "second claim must pay nothing (claim is remove-based)");
+    assert_eq!(
+        c1_again, 0,
+        "second claim must pay nothing (claim is remove-based)"
+    );
     let c2 = l.claim_delegator_rewards(d2, v);
     assert_eq!(c2, stell(180));
     let cv = l.claim_validator_rewards(v).unwrap();
@@ -138,10 +141,12 @@ fn commission_frontrun_cannot_clip_already_accrued_rewards() {
     let v = addr(31);
     let d1 = addr(32);
     let mut l = StakingLedger::new();
-    l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 1_000).unwrap(); // 10%
-    // Delegation matches the floor bond 1:1, so the reward-split numbers below
-    // (tuned to an even split) still hold exactly.
-    l.delegate(d1, v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER).unwrap();
+    l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 1_000)
+        .unwrap(); // 10%
+                   // Delegation matches the floor bond 1:1, so the reward-split numbers below
+                   // (tuned to an even split) still hold exactly.
+    l.delegate(d1, v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER)
+        .unwrap();
 
     // Round 1 at 10%: d1 accrues 90.
     l.distribute_reward(v, stell(200)).unwrap();
@@ -246,8 +251,7 @@ fn dust_delegations_rejected_and_mass_unbond_leaves_no_dust() {
         .map(|(_, a)| *a)
         .sum();
     assert_eq!(
-        l.validators[&v].delegated,
-        map_sum,
+        l.validators[&v].delegated, map_sum,
         "aggregate must equal the map exactly after mass delegation"
     );
     assert_eq!(map_sum, stell(5_000) + 300 * MIN_DELEGATION);
@@ -336,7 +340,10 @@ async fn faucet_caps_hold_and_treasury_stays_exact() {
             "capped address can never draw again through this instance"
         );
         for t in [t1, t2, t3] {
-            engine.apply_transaction(&t, 0).await.expect("faucet drip applies");
+            engine
+                .apply_transaction(&t, 0)
+                .await
+                .expect("faucet drip applies");
             applied += 1;
         }
     }
@@ -460,13 +467,50 @@ fn spammer_cannot_displace_fee_payers_or_force_losing_work() {
     let mut mp4 = Mempool::new(100, 100);
     let me = honest.verifying_key().to_bytes();
     let spam_me = spammer.verifying_key().to_bytes();
-    mp4.add(Transaction::sign(&honest, to, 10, GAS_BASIC_TRANSFER + 5_000, 0, 1, 1)).unwrap();
-    mp4.add(Transaction::sign(&honest, to, 10, GAS_BASIC_TRANSFER + 3_000, 1, 1, 1)).unwrap();
-    mp4.add(Transaction::sign(&honest, to, 10, GAS_BASIC_TRANSFER, 2, 1, 1)).unwrap();
+    mp4.add(Transaction::sign(
+        &honest,
+        to,
+        10,
+        GAS_BASIC_TRANSFER + 5_000,
+        0,
+        1,
+        1,
+    ))
+    .unwrap();
+    mp4.add(Transaction::sign(
+        &honest,
+        to,
+        10,
+        GAS_BASIC_TRANSFER + 3_000,
+        1,
+        1,
+        1,
+    ))
+    .unwrap();
+    mp4.add(Transaction::sign(
+        &honest,
+        to,
+        10,
+        GAS_BASIC_TRANSFER,
+        2,
+        1,
+        1,
+    ))
+    .unwrap();
     // Spammer account is at nonce 5: nonce-2 with a 1M fee is stale junk.
-    mp4.add(Transaction::sign(&spammer, to, 10, 1_000_000, 2, 1, 1)).unwrap();
+    mp4.add(Transaction::sign(&spammer, to, 10, 1_000_000, 2, 1, 1))
+        .unwrap();
     // ...while its nonce-5 floor-paying tx is executable and must be kept.
-    mp4.add(Transaction::sign(&spammer, to, 10, GAS_BASIC_TRANSFER, 5, 1, 1)).unwrap();
+    mp4.add(Transaction::sign(
+        &spammer,
+        to,
+        10,
+        GAS_BASIC_TRANSFER,
+        5,
+        1,
+        1,
+    ))
+    .unwrap();
     let picked_block = mp4.select_for_block(10, u64::MAX, |t| {
         if t.from == me {
             return t.nonce <= 2; // honest account nonce 0, contiguous prefix
@@ -531,8 +575,7 @@ async fn self_dealing_proposer_keeps_fee_accounting_exact() {
     ];
 
     let supply_before = pb + ab + bb;
-    let (applied, failed, fees, statuses, _) =
-        engine.apply_block_parallel_fees(&txs, 0).await;
+    let (applied, failed, fees, statuses, _) = engine.apply_block_parallel_fees(&txs, 0).await;
     assert_eq!(applied, 4, "all four txs (incl. zero-fee) apply");
     assert_eq!(failed, 0);
     assert_eq!(statuses, vec![true; 4], "block verdicts: all success");

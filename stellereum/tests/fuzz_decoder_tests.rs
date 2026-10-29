@@ -94,13 +94,22 @@ fn sample_block() -> Block {
 fn valid_consensus_vote() -> Vec<u8> {
     let sk = SigningKey::generate(&mut OsRng);
     let v = Vote::sign(&sk, 3, 1, VoteKind::Prevote, Some([9u8; 32]));
-    ConsensusMsg::Vote { vote: v, locked: None }.encode().unwrap()
+    ConsensusMsg::Vote {
+        vote: v,
+        locked: None,
+    }
+    .encode()
+    .unwrap()
 }
 
 fn valid_consensus_proposal() -> Vec<u8> {
-    ConsensusMsg::Proposal { height: 7, round: 0, block: sample_block() }
-        .encode()
-        .unwrap()
+    ConsensusMsg::Proposal {
+        height: 7,
+        round: 0,
+        block: sample_block(),
+    }
+    .encode()
+    .unwrap()
 }
 
 fn sample_tx() -> Transaction {
@@ -237,7 +246,12 @@ fn frame_empty_and_truncated_rejected_without_panic() {
             rejected += 1;
         }
     }
-    assert_eq!(rejected, valid.len(), "all {} prefixes must be rejected", valid.len());
+    assert_eq!(
+        rejected,
+        valid.len(),
+        "all {} prefixes must be rejected",
+        valid.len()
+    );
     assert_never_panics("frame/truncate", truncations(&valid), |b| {
         let _ = infnode::proto::Frame::decode(b);
     });
@@ -250,7 +264,11 @@ fn frame_oversized_lengths_rejected_without_panic() {
     // [34..54]=dst [54..62]=svc [62..64]=nlen u16 LE [64..68]=plen u32 LE.
     let mut cases: Vec<Vec<u8>> = Vec::new();
     // plen claims more than the 32 MiB cap.
-    for plen in [u32::MAX, (infnode::proto::MAX_FRAME as u32) + 1, 0x0100_0000u32] {
+    for plen in [
+        u32::MAX,
+        (infnode::proto::MAX_FRAME as u32) + 1,
+        0x0100_0000u32,
+    ] {
         let mut m = valid.clone();
         m[64..68].copy_from_slice(&plen.to_le_bytes());
         cases.push(m);
@@ -309,7 +327,11 @@ fn consensus_msg_empty_truncated_flips_never_panic() {
         let mut inputs = truncations(&valid);
         // Strict prefixes of a valid encoding must be rejected, never panic.
         for t in &inputs {
-            assert!(ConsensusMsg::decode(t).is_err(), "prefix of len {} must be rejected", t.len());
+            assert!(
+                ConsensusMsg::decode(t).is_err(),
+                "prefix of len {} must be rejected",
+                t.len()
+            );
         }
         inputs.extend(exhaustive_flips(&valid));
         inputs.extend(max_length_prefixes(&valid));
@@ -345,10 +367,19 @@ fn parse_incoming_fail_closed_on_fuzz() {
         String::from(r#"{"topic": "x"}"#),   // missing data
         format!(r#"{{"data": "{}"}}"#, "ff".repeat(1024)), // valid hex, garbage payload
         // oversized for ConsensusMsg (32 MiB cap) must be rejected even as hex
-        format!(r#"{{"data": "{}"}}"#, "00".repeat(stellereum::consensus_net::MAX_CONSENSUS_MSG + 1)),
+        format!(
+            r#"{{"data": "{}"}}"#,
+            "00".repeat(stellereum::consensus_net::MAX_CONSENSUS_MSG + 1)
+        ),
     ] {
-        assert!(parse_incoming(&raw).is_none(), "must be fail-closed: {raw:.60}");
-        assert!(parse_tx_incoming(&raw).is_none(), "must be fail-closed: {raw:.60}");
+        assert!(
+            parse_incoming(&raw).is_none(),
+            "must be fail-closed: {raw:.60}"
+        );
+        assert!(
+            parse_tx_incoming(&raw).is_none(),
+            "must be fail-closed: {raw:.60}"
+        );
     }
     // Fuzz the JSON envelope itself: random blobs as `raw`, plus random hex in
     // a well-formed envelope.
@@ -367,15 +398,23 @@ fn parse_incoming_fail_closed_on_fuzz() {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_incoming(raw))).is_err() {
             panics += 1;
         }
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_tx_incoming(raw))).is_err() {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_tx_incoming(raw)))
+            .is_err()
+        {
             panics += 1;
         }
     }
-    assert_eq!(panics, 0, "parse_incoming/parse_tx_incoming panicked on {panics} inputs");
+    assert_eq!(
+        panics, 0,
+        "parse_incoming/parse_tx_incoming panicked on {panics} inputs"
+    );
     // A well-formed envelope around a valid message still parses.
     let data = hex::encode(valid_consensus_vote());
     let raw = serde_json::json!({ "topic": "t", "data": data }).to_string();
-    assert!(matches!(parse_incoming(&raw), Some(ConsensusMsg::Vote { .. })));
+    assert!(matches!(
+        parse_incoming(&raw),
+        Some(ConsensusMsg::Vote { .. })
+    ));
     let data = hex::encode(valid_tx());
     let raw = serde_json::json!({ "topic": "t", "data": data }).to_string();
     assert!(parse_tx_incoming(&raw).is_some());
@@ -383,7 +422,10 @@ fn parse_incoming_fail_closed_on_fuzz() {
 
 #[test]
 fn parse_tx_incoming_size_bounds_hold_on_fuzz() {
-    assert!(parse_tx_incoming(r#"{"data": ""}"#).is_none(), "empty must be rejected");
+    assert!(
+        parse_tx_incoming(r#"{"data": ""}"#).is_none(),
+        "empty must be rejected"
+    );
     // Oversized payload (> 1 MiB) is rejected even if it would decode.
     let big_hex = hex::encode(vec![0u8; stellereum::consensus_net::MAX_TX_MSG + 1]);
     let raw = serde_json::json!({ "data": big_hex }).to_string();
@@ -412,7 +454,11 @@ fn transaction_empty_truncated_flips_maxprefix_random_never_panic() {
     assert!(decode_tx(&[]).is_err());
     let mut inputs = truncations(&valid);
     for t in &inputs {
-        assert!(decode_tx(t).is_err(), "tx prefix of len {} must be rejected", t.len());
+        assert!(
+            decode_tx(t).is_err(),
+            "tx prefix of len {} must be rejected",
+            t.len()
+        );
     }
     inputs.extend(exhaustive_flips(&valid));
     inputs.extend(max_length_prefixes(&valid));
@@ -439,7 +485,11 @@ fn transaction_oversized_and_maxcount_prefixes_never_panic() {
     }
     for m in &inputs {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_tx(m)));
-        assert!(r.is_ok(), "tx length-prefix input (len {}) panicked", m.len());
+        assert!(
+            r.is_ok(),
+            "tx length-prefix input (len {}) panicked",
+            m.len()
+        );
     }
     // A tx with a large-but-valid opcode payload still decodes (scale check).
     let sk = SigningKey::generate(&mut OsRng);
@@ -467,7 +517,11 @@ fn block_empty_truncated_flips_maxprefix_random_never_panic() {
     assert!(decode_block(&[]).is_err());
     let mut inputs = truncations(&valid);
     for t in &inputs {
-        assert!(decode_block(t).is_err(), "block prefix of len {} must be rejected", t.len());
+        assert!(
+            decode_block(t).is_err(),
+            "block prefix of len {} must be rejected",
+            t.len()
+        );
     }
     inputs.extend(exhaustive_flips(&valid));
     inputs.extend(max_length_prefixes(&valid));
@@ -503,7 +557,10 @@ fn block_validator_signatures_abuse_never_panics() {
     dup.validator_signatures.push(sig.clone());
     dup.validator_signatures.push(sig);
     let enc = bincode::serialize(&dup).unwrap();
-    assert!(decode_block(&enc).is_ok(), "duplicates must decode (verify dedups)");
+    assert!(
+        decode_block(&enc).is_ok(),
+        "duplicates must decode (verify dedups)"
+    );
     assert_never_panics("block/sigs", inputs, |b| {
         let _ = decode_block(b);
     });
@@ -582,7 +639,10 @@ fn report_all_zero_payloads_decode_as_valid_messages() {
     );
     let raw = serde_json::json!({ "data": "00".repeat(256) }).to_string();
     let tx = parse_tx_incoming(&raw).expect("zero tx currently decodes");
-    assert!(!tx.verify_signature(), "zero tx must fail signature verification");
+    assert!(
+        !tx.verify_signature(),
+        "zero tx must fail signature verification"
+    );
 }
 
 #[test]
@@ -612,7 +672,11 @@ fn report_decode_accepts_semantically_invalid_values() {
     assert!(bincode::deserialize::<Block>(&enc).is_ok());
 
     let x = stellereum::sharding::CrossShardMessage::new_trusted(
-        1, 2, sample_tx(), [0u8; 32], [0u8; 32],
+        1,
+        2,
+        sample_tx(),
+        [0u8; 32],
+        [0u8; 32],
     );
     let enc = bincode::serialize(&x).unwrap();
     let back: stellereum::sharding::CrossShardMessage = bincode::deserialize(&enc).unwrap();

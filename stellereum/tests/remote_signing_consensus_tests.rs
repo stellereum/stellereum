@@ -50,7 +50,13 @@ impl SignerTransport for FakeTransport {
     }
 }
 
-fn remote_setup(key: SigningKey) -> (ValidatorRuntime, Arc<AtomicBool>, Arc<std::sync::atomic::AtomicUsize>) {
+fn remote_setup(
+    key: SigningKey,
+) -> (
+    ValidatorRuntime,
+    Arc<AtomicBool>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
     let fail = Arc::new(AtomicBool::new(false));
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let transport = FakeTransport {
@@ -83,14 +89,19 @@ fn a_configured_remote_signer_is_what_signs_the_vote() {
     rt.hc.step = stellereum::consensus::Step::Prevote;
 
     let before = calls.load(Ordering::SeqCst);
-    let vote = rt.make_prevote().expect("the remote signer must produce a vote");
+    let vote = rt
+        .make_prevote()
+        .expect("the remote signer must produce a vote");
     assert!(
         calls.load(Ordering::SeqCst) > before,
         "the vote must have gone through the remote transport, not the local key"
     );
 
     // The vote must verify, and its voter must be the remote key.
-    assert!(vote.verify(), "a remote-signed vote must carry a valid signature");
+    assert!(
+        vote.verify(),
+        "a remote-signed vote must carry a valid signature"
+    );
     assert_eq!(vote.voter, key.verifying_key().to_bytes());
     assert_eq!(vote.kind, VoteKind::Prevote);
 }

@@ -73,7 +73,11 @@ fn stale_behind_vote_never_drags_ahead_backwards() {
     assert!(!hc.observe_peer_round(behind.voter, behind.round));
     assert_eq!(hc.round, 1550);
     assert_eq!(hc.max_peer_round(), Some(318));
-    assert_eq!(hc.deadlock_breaker_target(10_000, 300), None, "ahead node has nothing to jump to");
+    assert_eq!(
+        hc.deadlock_breaker_target(10_000, 300),
+        None,
+        "ahead node has nothing to jump to"
+    );
 }
 
 #[test]
@@ -84,7 +88,11 @@ fn breaker_decision_is_pure_and_forward_only() {
     hc.round = 318;
     hc.observe_peer_round(id(&ks[0]), 1550);
 
-    assert_eq!(hc.deadlock_breaker_target(299, 300), None, "no fire before timeout");
+    assert_eq!(
+        hc.deadlock_breaker_target(299, 300),
+        None,
+        "no fire before timeout"
+    );
     assert_eq!(hc.deadlock_breaker_target(300, 300), Some(1550));
     assert!(hc.apply_deadlock_jump(1550));
     assert_eq!(hc.round, 1550);
@@ -128,8 +136,15 @@ async fn two_nodes_with_1200_round_desync_converge_without_restart() {
     // future-round rule: converge within the per-round jump budget, never
     // teleport -- the corroborated breaker below still owns the huge jump).
     let a_vote = Vote::sign(&ks[0], H, 1550, VoteKind::Prevote, Some([7u8; 32]));
-    assert!(b.on_prevote(a_vote.clone()).is_err(), "far-ahead vote must not count as a vote");
-    assert_eq!(b.hc.max_peer_round(), Some(1550), "stale vote must feed the counter");
+    assert!(
+        b.on_prevote(a_vote.clone()).is_err(),
+        "far-ahead vote must not count as a vote"
+    );
+    assert_eq!(
+        b.hc.max_peer_round(),
+        Some(1550),
+        "stale vote must feed the counter"
+    );
     assert!(
         b.hc.round > 318 && b.hc.round <= 318 + MAX_SYNC_JUMPS_PER_ROUND * ROUND_LOOKBACK,
         "budget-bounded chase only, got r{}",
@@ -144,12 +159,23 @@ async fn two_nodes_with_1200_round_desync_converge_without_restart() {
     // Circuit breaker: B has had no progress for >timeout with a live peer
     // ahead => one bounded jump straight to max(peer rounds).
     let jumped = b.check_deadlock_breaker();
-    assert_eq!(jumped, Some(1550), "breaker must jump B to max(peer rounds)");
+    assert_eq!(
+        jumped,
+        Some(1550),
+        "breaker must jump B to max(peer rounds)"
+    );
     assert_eq!(b.hc.round, 1550);
-    assert_eq!(a.hc.round, 1550, "both nodes now share the round, no restart");
+    assert_eq!(
+        a.hc.round, 1550,
+        "both nodes now share the round, no restart"
+    );
 
     // Rate limit: a second immediate call must not jump again.
-    assert_eq!(b.check_deadlock_breaker(), None, "breaker fires at most once per window");
+    assert_eq!(
+        b.check_deadlock_breaker(),
+        None,
+        "breaker fires at most once per window"
+    );
 
     // Same objects, no restart: both can now form quorums at the joined round.
     let bh = [9u8; 32];
@@ -193,17 +219,26 @@ fn breaker_fires_with_empty_peer_set() {
     assert_eq!(hc.deadlock_breaker_target(400, 300), None);
     // ...but the no-progress local reset is due on the same timer.
     assert!(hc.deadlock_local_reset_due(400, 300));
-    assert!(!hc.deadlock_local_reset_due(299, 300), "no fire before timeout");
+    assert!(
+        !hc.deadlock_local_reset_due(299, 300),
+        "no fire before timeout"
+    );
     // Gate precondition for the drop below: bodyless AND no precommit QC
     // observed anywhere (no votes at all here). Had a QC been observed, the
     // lock would survive (see breaker_local_reset_keeps_bodyless_lock_when_...).
-    assert!(!hc.precommit_qc_observed(), "empty vote sets => gate passes");
+    assert!(
+        !hc.precommit_qc_observed(),
+        "empty vote sets => gate passes"
+    );
     // Bodyless lock with no QC behind it is dropped, the round ADVANCES (it is
     // never rewound: re-voting an already-used round is a self-equivocation),
     // and the quorum-scan window is widened so the round the network is
     // actually in becomes committable. Height untouched.
     assert!(hc.apply_deadlock_local_reset(false));
-    assert_eq!(hc.round, 413, "the re-phase must move FORWARD, never rewind");
+    assert_eq!(
+        hc.round, 413,
+        "the re-phase must move FORWARD, never rewind"
+    );
     assert_eq!(hc.locked, None);
     assert_eq!(hc.height, 92079);
     assert_eq!(hc.decided, None);
@@ -232,19 +267,35 @@ fn breaker_local_reset_keeps_bodyless_lock_when_precommit_qc_observed() {
     let mut hc = HeightConsensus::new(H, vs.clone());
     hc.round = 412;
     hc.locked = Some((a, 400)); // bodyless: `blocks` has no `a`
-    // 3-of-4 precommits for A at the current round: QC observable, but no
-    // prevote QC, so `try_precommit_quorum` could never decide (not called).
+                                // 3-of-4 precommits for A at the current round: QC observable, but no
+                                // prevote QC, so `try_precommit_quorum` could never decide (not called).
     for k in ks.iter().take(3) {
         let v = Vote::sign(k, H, 412, VoteKind::Precommit, Some(a));
         hc.add_precommit(v).unwrap();
     }
-    assert!(hc.precommit_qc_observed(), "quorum of precommits must be observable");
+    assert!(
+        hc.precommit_qc_observed(),
+        "quorum of precommits must be observable"
+    );
     assert_eq!(hc.decided, None, "no prevote QC => nothing decided");
-    assert!(hc.deadlock_local_reset_due(400, 300), "no peer ahead => reset path owns it");
+    assert!(
+        hc.deadlock_local_reset_due(400, 300),
+        "no peer ahead => reset path owns it"
+    );
     // Reset still advances the round and prunes — but the lock survives.
-    assert!(hc.apply_deadlock_local_reset(false), "round advance still happens");
-    assert_eq!(hc.round, 413, "the re-phase must move FORWARD, never rewind");
-    assert_eq!(hc.locked, Some((a, 400)), "QC-backed bodyless lock must survive");
+    assert!(
+        hc.apply_deadlock_local_reset(false),
+        "round advance still happens"
+    );
+    assert_eq!(
+        hc.round, 413,
+        "the re-phase must move FORWARD, never rewind"
+    );
+    assert_eq!(
+        hc.locked,
+        Some((a, 400)),
+        "QC-backed bodyless lock must survive"
+    );
     assert_eq!(hc.height, H);
     assert_eq!(hc.decided, None);
     // Steady state afterwards: keeping a non-droppable lock at pristine round 0
@@ -264,17 +315,26 @@ fn breaker_local_reset_keeps_lock_when_deciding_qc_banked() {
     let mut hc = HeightConsensus::new(H, vs.clone());
     hc.round = 5;
     for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, H, 5, VoteKind::Prevote, Some(a))).unwrap();
-        hc.add_precommit(Vote::sign(k, H, 5, VoteKind::Precommit, Some(a))).unwrap();
+        hc.add_prevote(Vote::sign(k, H, 5, VoteKind::Prevote, Some(a)))
+            .unwrap();
+        hc.add_precommit(Vote::sign(k, H, 5, VoteKind::Precommit, Some(a)))
+            .unwrap();
     }
-    assert_eq!(hc.try_precommit_quorum(), Some(a), "A decides and banks its QC");
+    assert_eq!(
+        hc.try_precommit_quorum(),
+        Some(a),
+        "A decides and banks its QC"
+    );
     // Simulate "decided but never executed" (body missing): progress never
     // stamped, so the timer lapses with no peer ahead.
     hc.round = 412;
     assert!(hc.precommit_qc_observed());
     assert!(hc.deadlock_local_reset_due(400, 300));
     assert!(hc.apply_deadlock_local_reset(false));
-    assert_eq!(hc.round, 413, "the re-phase must move FORWARD, never rewind");
+    assert_eq!(
+        hc.round, 413,
+        "the re-phase must move FORWARD, never rewind"
+    );
     assert_eq!(hc.locked, Some((a, 5)), "banked-QC lock must survive");
     assert_eq!(hc.decided, Some(a), "reset never clears decided");
     assert_eq!(hc.height, H);
@@ -288,9 +348,19 @@ fn breaker_local_reset_keeps_lock_whose_body_we_hold() {
     hc.round = 1595;
     hc.locked = Some(([7u8; 32], 1500)); // body IS in our store
     assert!(hc.deadlock_local_reset_due(10_000, 300));
-    assert!(hc.apply_deadlock_local_reset(true), "bodied lock: still advances the round");
-    assert_eq!(hc.round, 1596, "the re-phase must move FORWARD, never rewind");
-    assert_eq!(hc.locked, Some(([7u8; 32], 1500)), "bodied lock must survive");
+    assert!(
+        hc.apply_deadlock_local_reset(true),
+        "bodied lock: still advances the round"
+    );
+    assert_eq!(
+        hc.round, 1596,
+        "the re-phase must move FORWARD, never rewind"
+    );
+    assert_eq!(
+        hc.locked,
+        Some(([7u8; 32], 1500)),
+        "bodied lock must survive"
+    );
     assert_eq!(hc.height, 92079);
 }
 
@@ -304,7 +374,10 @@ fn breaker_peer_ahead_path_still_owns_the_jump() {
     hc.round = 318;
     hc.observe_peer_round(id(&ks[0]), 1550);
     assert_eq!(hc.deadlock_breaker_target(400, 300), Some(1550));
-    assert!(!hc.deadlock_local_reset_due(400, 300), "peer-ahead => jump path owns it");
+    assert!(
+        !hc.deadlock_local_reset_due(400, 300),
+        "peer-ahead => jump path owns it"
+    );
 }
 
 #[test]
@@ -350,11 +423,17 @@ fn breaker_never_moves_height_backward() {
     assert!(hc.deadlock_local_reset_due(600, 300));
     assert!(hc.apply_deadlock_local_reset(true));
     assert_eq!(hc.height, H, "reset must never change height");
-    assert_eq!(hc.round, 1596, "the re-phase must move FORWARD, never rewind");
+    assert_eq!(
+        hc.round, 1596,
+        "the re-phase must move FORWARD, never rewind"
+    );
     assert_eq!(hc.decided, None);
     // Repeated resets (once per window, as the caller rate-limits) never
     // drift the height either.
-    assert!(!hc.apply_deadlock_local_reset(true), "second reset is a no-op");
+    assert!(
+        !hc.apply_deadlock_local_reset(true),
+        "second reset is a no-op"
+    );
     assert_eq!(hc.height, H);
     assert_eq!(hc.round, 1596);
     // And the jump path still never moves backwards.

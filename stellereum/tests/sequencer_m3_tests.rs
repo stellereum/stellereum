@@ -16,8 +16,8 @@
 use ed25519_dalek::SigningKey;
 use stellereum::network::CrossShardTransport;
 use stellereum::sharding::{
-    Block, CrossShardKey, CrossShardMessage, L2Batch, L2Sequencer, SharedSequencer,
-    Transaction, BASE_WORKCHAIN_SHARD_INITIAL, MASTERCHAIN_SHARD,
+    Block, CrossShardKey, CrossShardMessage, L2Batch, L2Sequencer, SharedSequencer, Transaction,
+    BASE_WORKCHAIN_SHARD_INITIAL, MASTERCHAIN_SHARD,
 };
 
 const SHARD0: u32 = MASTERCHAIN_SHARD;
@@ -32,7 +32,14 @@ fn tx_with_nonce(signer: &SigningKey, to: [u8; 32], nonce: u64, s: u32, t: u32) 
 }
 
 fn msg_for(tx: Transaction, finalized: [u8; 32]) -> CrossShardMessage {
-    CrossShardMessage::new(tx.source_shard, tx.target_shard, tx, [0u8; 32], finalized, None)
+    CrossShardMessage::new(
+        tx.source_shard,
+        tx.target_shard,
+        tx,
+        [0u8; 32],
+        finalized,
+        None,
+    )
 }
 
 fn blank_block(shard: u32, height: u64, out: Vec<CrossShardMessage>) -> Block {
@@ -85,8 +92,14 @@ fn sequencer_order_comes_from_blocks_not_carrier_order() {
     let mut ids = vec![m1.msg_id, m2.msg_id];
     ids.sort();
     let assigned: Vec<[u8; 32]> = got0.iter().map(|(_, k)| k.msg_id).collect();
-    assert_eq!(assigned, ids, "assignment must follow (source_shard, msg_id), not vec order");
-    assert!(got0[0].0 + 1 == got0[1].0, "sequence numbers are contiguous");
+    assert_eq!(
+        assigned, ids,
+        "assignment must follow (source_shard, msg_id), not vec order"
+    );
+    assert!(
+        got0[0].0 + 1 == got0[1].0,
+        "sequence numbers are contiguous"
+    );
 
     // Replaying the same blocks on a fresh sequencer reproduces everything.
     let mut seq2 = SharedSequencer::new();
@@ -106,7 +119,14 @@ fn sequencer_order_comes_from_blocks_not_carrier_order() {
     for (s, k) in got0.iter().chain(got1.iter()) {
         assert_eq!(seq.sequence_of(k), Some(*s));
     }
-    assert_eq!(seq.sequence_of(&CrossShardKey { source_shard: 9, finalized_in_block: [0u8; 32], msg_id: [0u8; 32] }), None);
+    assert_eq!(
+        seq.sequence_of(&CrossShardKey {
+            source_shard: 9,
+            finalized_in_block: [0u8; 32],
+            msg_id: [0u8; 32]
+        }),
+        None
+    );
 }
 
 /// The watermark advances only from finalized blocks, monotonically.
@@ -142,7 +162,8 @@ fn l2_submit_is_append_only_hash_bound_and_signature_checked() {
 
     // Index 0 accepted.
     let batch0 = L2Batch::new(3, 0, vec![tx_with_nonce(&user, to, 0, SHARD0, SHARD0)]);
-    l2.submit_batch(batch0).expect("first batch must be admitted");
+    l2.submit_batch(batch0)
+        .expect("first batch must be admitted");
     assert_eq!(l2.expected_index(3), 1);
 
     // Duplicate index rejected.
@@ -161,7 +182,8 @@ fn l2_submit_is_append_only_hash_bound_and_signature_checked() {
     let t2 = tx_with_nonce(&user, to, 2, SHARD0, SHARD0);
     let swapped = L2Batch::new(3, 1, vec![t2.clone(), t1.clone()]);
     assert_eq!(swapped.payload_hash, L2Batch::payload_hash_of(&[t2, t1]));
-    l2.submit_batch(swapped).expect("correctly-bound batch admitted");
+    l2.submit_batch(swapped)
+        .expect("correctly-bound batch admitted");
 
     // Bad signature rejected.
     let mut bad = tx_with_nonce(&user, to, 3, SHARD0, SHARD0);
@@ -193,10 +215,7 @@ fn l2_inclusion_order_is_canonical_and_marks_prune_forward_only() {
         .iter()
         .map(|b| (b.l2_id, b.batch_index))
         .collect();
-    assert_eq!(
-        order,
-        vec![(5, 0), (5, 1), (5, 2), (7, 0), (7, 1), (7, 2)]
-    );
+    assert_eq!(order, vec![(5, 0), (5, 1), (5, 2), (7, 0), (7, 1), (7, 2)]);
     // Limit takes a prefix (ordering preserved for partial pulls).
     assert_eq!(l2.batches_for_inclusion(2).len(), 2);
     // Marking included prunes pending and records the watermark...

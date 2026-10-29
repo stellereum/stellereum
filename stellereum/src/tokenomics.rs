@@ -22,11 +22,11 @@ pub const BLOCK_REWARD_NANO: u64 = 317_000_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenAllocation {
-    pub genesis_vault: u64,       // 25% - 250M
-    pub liquidity_pools: u64,     // 15% - 150M
-    pub validator_rewards: u64,   // 35% - 350M
-    pub ecosystem_treasury: u64,  // 15% - 150M
-    pub core_team_vesting: u64,   // 10% - 100M
+    pub genesis_vault: u64,      // 25% - 250M
+    pub liquidity_pools: u64,    // 15% - 150M
+    pub validator_rewards: u64,  // 35% - 350M
+    pub ecosystem_treasury: u64, // 15% - 150M
+    pub core_team_vesting: u64,  // 10% - 100M
 }
 
 impl Default for TokenAllocation {
@@ -57,18 +57,15 @@ impl GenesisVault {
     /// Calculate STELL amount minted: (in_coins * price_usd) / $0.25
     /// asset_amount is in native decimals (micro for USDT, nano for TON/GRAM)
     /// price_micro_usd is in micro USD ($1 = 1_000_000)
-    pub fn calculate_mint(
-        asset_amount: u64,
-        asset_decimals: u32,
-        price_micro_usd: u64,
-    ) -> u64 {
+    pub fn calculate_mint(asset_amount: u64, asset_decimals: u32, price_micro_usd: u64) -> u64 {
         // Value in micro USD = (asset_amount * price_micro_usd) / 10^asset_decimals
         let divisor = 10u128.pow(asset_decimals);
         let value_micro_usd = ((asset_amount as u128) * (price_micro_usd as u128)) / divisor;
 
         // STELL tokens = value_micro_usd / 0.25 USD = value_micro_usd / 250_000
         // in nano-STELL (9 decimals):
-        let stell_nano = (value_micro_usd * 1_000_000_000u128) / (BASE_STELL_PRICE_MICRO_USD as u128);
+        let stell_nano =
+            (value_micro_usd * 1_000_000_000u128) / (BASE_STELL_PRICE_MICRO_USD as u128);
         stell_nano as u64
     }
 
@@ -83,7 +80,11 @@ impl GenesisVault {
             "USDT" => (6, &mut self.usdt_deposited_micro),
             "TON" => (9, &mut self.ton_deposited_nano),
             "GRAM" => (9, &mut self.gram_deposited_nano),
-            _ => return Err("Unsupported genesis asset. Only USDT, TON, and GRAM accepted".to_string()),
+            _ => {
+                return Err(
+                    "Unsupported genesis asset. Only USDT, TON, and GRAM accepted".to_string(),
+                )
+            }
         };
 
         let mint_nano = Self::calculate_mint(asset_amount, decimals, asset_price_micro_usd);
@@ -140,11 +141,13 @@ impl TeamVestingSchedule {
             return self.total_allocation;
         }
 
-        ((self.total_allocation as u128 * elapsed as u128) / (self.vesting_duration_secs as u128)) as u64
+        ((self.total_allocation as u128 * elapsed as u128) / (self.vesting_duration_secs as u128))
+            as u64
     }
 
     pub fn claimable_amount(&self, current_timestamp: u64) -> u64 {
-        self.unlocked_amount(current_timestamp).saturating_sub(self.claimed_amount)
+        self.unlocked_amount(current_timestamp)
+            .saturating_sub(self.claimed_amount)
     }
 
     /// Locked (unspendable) amount at `current_timestamp`: total minus unlocked.
@@ -156,7 +159,8 @@ impl TeamVestingSchedule {
     /// every transfer (a per-spend `claimable` check alone would let N spends
     /// of `unlocked` each drain N×`unlocked`).
     pub fn locked_amount(&self, current_timestamp: u64) -> u64 {
-        self.total_allocation.saturating_sub(self.unlocked_amount(current_timestamp))
+        self.total_allocation
+            .saturating_sub(self.unlocked_amount(current_timestamp))
     }
 
     /// Fail-closed single-spend gate against the claimable amount.
@@ -169,7 +173,11 @@ impl TeamVestingSchedule {
     /// [`Self::check_balance_floor`], which bounds cumulative spends without
     /// per-transfer bookkeeping) — this is the API an explicit claim opcode
     /// or off-chain accounting calls.
-    pub fn check_spend_allowed(&self, current_timestamp: u64, spend_amount: u64) -> Result<(), String> {
+    pub fn check_spend_allowed(
+        &self,
+        current_timestamp: u64,
+        spend_amount: u64,
+    ) -> Result<(), String> {
         let claimable = self.claimable_amount(current_timestamp);
         if spend_amount > claimable {
             return Err(format!(

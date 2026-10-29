@@ -18,14 +18,22 @@ async fn state() -> Arc<RpcState> {
     let engine = Arc::new(stellereum::state_engine::InMemoryStateEngine::new());
     Arc::new(RpcState {
         engine,
-        mempool: Arc::new(tokio::sync::RwLock::new(stellereum::mempool::Mempool::default())),
+        mempool: Arc::new(tokio::sync::RwLock::new(
+            stellereum::mempool::Mempool::default(),
+        )),
         height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         node_id: "inf1:proxy-ip".to_string(),
         chain_id: 5757,
-        staking: Arc::new(tokio::sync::RwLock::new(stellereum::staking::StakingLedger::new())),
-        governance: Arc::new(tokio::sync::RwLock::new(stellereum::governance::Governance::new())),
+        staking: Arc::new(tokio::sync::RwLock::new(
+            stellereum::staking::StakingLedger::new(),
+        )),
+        governance: Arc::new(tokio::sync::RwLock::new(
+            stellereum::governance::Governance::new(),
+        )),
         recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
-        receipts: Arc::new(tokio::sync::RwLock::new(stellereum::rpc::ReceiptIndex::default())),
+        receipts: Arc::new(tokio::sync::RwLock::new(
+            stellereum::rpc::ReceiptIndex::default(),
+        )),
         auth_token: None,
         tx_broadcast: None,
         faucet: None,

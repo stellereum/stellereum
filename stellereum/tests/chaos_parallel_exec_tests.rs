@@ -43,7 +43,9 @@ fn new_engine(parallel: bool) -> InMemoryStateEngine {
 async fn fund_engine(engine: &InMemoryStateEngine, keys: &[SigningKey], initial_bal: u64) {
     for sk in keys {
         let addr = sk.verifying_key().to_bytes();
-        engine.update_account(AccountState::new(addr, initial_bal)).await;
+        engine
+            .update_account(AccountState::new(addr, initial_bal))
+            .await;
     }
 }
 
@@ -59,7 +61,9 @@ async fn fuzz_random_blocks_bit_identical_roots() {
 
     // Pool of 30 senders with heterogeneous balances
     let num_senders = 30;
-    let senders: Vec<SigningKey> = (0..num_senders).map(|_| SigningKey::generate(&mut rng)).collect();
+    let senders: Vec<SigningKey> = (0..num_senders)
+        .map(|_| SigningKey::generate(&mut rng))
+        .collect();
 
     // 10 external recipient addresses (not senders)
     let external_recipients: Vec<[u8; 32]> = (0..10)
@@ -80,8 +84,12 @@ async fn fuzz_random_blocks_bit_identical_roots() {
         } else {
             0u64 // Zero balance
         };
-        engine_seq.update_account(AccountState::new(addr, bal)).await;
-        engine_par.update_account(AccountState::new(addr, bal)).await;
+        engine_seq
+            .update_account(AccountState::new(addr, bal))
+            .await;
+        engine_par
+            .update_account(AccountState::new(addr, bal))
+            .await;
     }
 
     let mut total_self_transfers = 0usize;
@@ -108,7 +116,10 @@ async fn fuzz_random_blocks_bit_identical_roots() {
         let mut sim_bal: HashMap<[u8; 32], u64> = HashMap::new();
         for sk in &senders {
             let addr = sk.verifying_key().to_bytes();
-            let acc = engine_seq.get_account(&addr).await.unwrap_or_else(|| AccountState::new(addr, 0));
+            let acc = engine_seq
+                .get_account(&addr)
+                .await
+                .unwrap_or_else(|| AccountState::new(addr, 0));
             sim_nonce.insert(addr, acc.nonce);
             sim_bal.insert(addr, acc.balance);
         }
@@ -164,7 +175,15 @@ async fn fuzz_random_blocks_bit_identical_roots() {
 
                 let amount = rng.gen_range(1..=50);
                 let gas_limit = rng.gen_range(0..=10);
-                txs.push(Transaction::sign(sk, shared_recipient, amount, gas_limit, nonce, 1, 1));
+                txs.push(Transaction::sign(
+                    sk,
+                    shared_recipient,
+                    amount,
+                    gas_limit,
+                    nonce,
+                    1,
+                    1,
+                ));
 
                 total_shared_recipients += 1;
                 sim_nonce.insert(from, nonce + 1);
@@ -208,7 +227,15 @@ async fn fuzz_random_blocks_bit_identical_roots() {
                 let to = external_recipients[rng.gen_range(0..external_recipients.len())];
                 let amount = rng.gen_range(1..=20);
                 let gas_limit = 5;
-                txs.push(Transaction::sign(sk, to, amount, gas_limit, nonce + rng.gen_range(5..=50), 1, 1));
+                txs.push(Transaction::sign(
+                    sk,
+                    to,
+                    amount,
+                    gas_limit,
+                    nonce + rng.gen_range(5..=50),
+                    1,
+                    1,
+                ));
 
                 total_gapped_nonces += 1;
             } else {
@@ -273,12 +300,27 @@ async fn fuzz_random_blocks_bit_identical_roots() {
     }
 
     // Verify chaos diversity coverage
-    assert!(total_self_transfers > 0, "chaos must include self transfers");
-    assert!(total_balance_exhausting > 0, "chaos must include balance exhausting txs");
-    assert!(total_duplicate_nonces > 0, "chaos must include duplicate nonces");
-    assert!(total_shared_recipients > 0, "chaos must include shared recipients");
+    assert!(
+        total_self_transfers > 0,
+        "chaos must include self transfers"
+    );
+    assert!(
+        total_balance_exhausting > 0,
+        "chaos must include balance exhausting txs"
+    );
+    assert!(
+        total_duplicate_nonces > 0,
+        "chaos must include duplicate nonces"
+    );
+    assert!(
+        total_shared_recipients > 0,
+        "chaos must include shared recipients"
+    );
     assert!(total_gapped_nonces > 0, "chaos must include gapped nonces");
-    assert!(total_txs_executed >= 2500, "executed adequate chaos transactions");
+    assert!(
+        total_txs_executed >= 2500,
+        "executed adequate chaos transactions"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -307,26 +349,34 @@ async fn parallel_exec_sender_conflict_exact_ordering() {
     let r4 = SigningKey::generate(&mut rng).verifying_key().to_bytes();
 
     let initial_bal = 10_000_000u64;
-    fund_engine(&engine_seq, &[alice.clone(), bob.clone(), charlie.clone(), dave.clone()], initial_bal).await;
-    fund_engine(&engine_par, &[alice.clone(), bob.clone(), charlie.clone(), dave.clone()], initial_bal).await;
+    fund_engine(
+        &engine_seq,
+        &[alice.clone(), bob.clone(), charlie.clone(), dave.clone()],
+        initial_bal,
+    )
+    .await;
+    fund_engine(
+        &engine_par,
+        &[alice.clone(), bob.clone(), charlie.clone(), dave.clone()],
+        initial_bal,
+    )
+    .await;
 
     // Block with multiple transactions from same sender (Alice: nonce 0, 1, 2)
     // mixed with disjoint senders (Bob: 0, 1, 2; Charlie: 0, 1; Dave: 0)
     let txs = vec![
         // Wave 0 candidates (disjoint senders, each nonce 0)
-        Transaction::sign(&alice, r1, 100, 10, 0, 1, 1),   // 0: Alice nonce 0
-        Transaction::sign(&bob, r2, 200, 10, 0, 1, 1),     // 1: Bob nonce 0
+        Transaction::sign(&alice, r1, 100, 10, 0, 1, 1), // 0: Alice nonce 0
+        Transaction::sign(&bob, r2, 200, 10, 0, 1, 1),   // 1: Bob nonce 0
         Transaction::sign(&charlie, r3, 300, 10, 0, 1, 1), // 2: Charlie nonce 0
-        Transaction::sign(&dave, r4, 400, 10, 0, 1, 1),    // 3: Dave nonce 0
-
+        Transaction::sign(&dave, r4, 400, 10, 0, 1, 1),  // 3: Dave nonce 0
         // Wave 1 candidates (sender conflicts with Wave 0, nonce 1)
-        Transaction::sign(&alice, r2, 110, 10, 1, 1, 1),   // 4: Alice nonce 1
-        Transaction::sign(&bob, r3, 210, 10, 1, 1, 1),     // 5: Bob nonce 1
+        Transaction::sign(&alice, r2, 110, 10, 1, 1, 1), // 4: Alice nonce 1
+        Transaction::sign(&bob, r3, 210, 10, 1, 1, 1),   // 5: Bob nonce 1
         Transaction::sign(&charlie, r4, 310, 10, 1, 1, 1), // 6: Charlie nonce 1
-
         // Wave 2 candidates (sender conflicts with Wave 1, nonce 2)
-        Transaction::sign(&alice, r3, 120, 10, 2, 1, 1),   // 7: Alice nonce 2
-        Transaction::sign(&bob, r4, 220, 10, 2, 1, 1),     // 8: Bob nonce 2
+        Transaction::sign(&alice, r3, 120, 10, 2, 1, 1), // 7: Alice nonce 2
+        Transaction::sign(&bob, r4, 220, 10, 2, 1, 1),   // 8: Bob nonce 2
     ];
 
     // Verify wave scheduling structure: exactly 3 waves
@@ -359,7 +409,11 @@ async fn parallel_exec_sender_conflict_exact_ordering() {
     let a_seq = engine_seq.get_account(&alice_addr).await.unwrap();
     let a_par = engine_par.get_account(&alice_addr).await.unwrap();
     assert_eq!(a_par.nonce, 3, "Alice nonce must advance exactly to 3");
-    assert_eq!(a_par.balance, initial_bal - 360, "Alice balance debited correctly");
+    assert_eq!(
+        a_par.balance,
+        initial_bal - 360,
+        "Alice balance debited correctly"
+    );
     assert_eq!(a_seq.nonce, a_par.nonce);
     assert_eq!(a_seq.balance, a_par.balance);
 
@@ -386,8 +440,12 @@ async fn parallel_exec_sender_conflict_exact_ordering() {
         Transaction::sign(&alice, r3, 10, 5, 4, 1, 1), // valid next nonce (4, since 5 failed) -> succeeds!
     ];
 
-    let adv_res_seq = engine_seq.apply_block_parallel_fees(&adv_txs, timestamp + 1).await;
-    let adv_res_par = engine_par.apply_block_parallel_fees(&adv_txs, timestamp + 1).await;
+    let adv_res_seq = engine_seq
+        .apply_block_parallel_fees(&adv_txs, timestamp + 1)
+        .await;
+    let adv_res_par = engine_par
+        .apply_block_parallel_fees(&adv_txs, timestamp + 1)
+        .await;
 
     assert_eq!(adv_res_seq.0, adv_res_par.0);
     assert_eq!(adv_res_seq.1, adv_res_par.1);
@@ -397,7 +455,10 @@ async fn parallel_exec_sender_conflict_exact_ordering() {
 
     let adv_root_seq = engine_seq.get_state_root().await;
     let adv_root_par = engine_par.get_state_root().await;
-    assert_eq!(adv_root_seq, adv_root_par, "adversarial state roots must match bit-identically");
+    assert_eq!(
+        adv_root_seq, adv_root_par,
+        "adversarial state roots must match bit-identically"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -420,8 +481,12 @@ async fn parallel_exec_balance_depletion_in_later_wave() {
     let engine_par = new_engine(true);
 
     let initial_balance = 100 * STELL;
-    engine_seq.update_account(AccountState::new(sender_addr, initial_balance)).await;
-    engine_par.update_account(AccountState::new(sender_addr, initial_balance)).await;
+    engine_seq
+        .update_account(AccountState::new(sender_addr, initial_balance))
+        .await;
+    engine_par
+        .update_account(AccountState::new(sender_addr, initial_balance))
+        .await;
 
     // Tx0: Sender -> B (60 STELL, wave 0)
     let tx0 = Transaction::sign(&sender, b_addr, 60 * STELL, 0, 0, 1, 1);
@@ -483,16 +548,28 @@ async fn parallel_exec_balance_depletion_in_later_wave() {
         let b2_addr = SigningKey::generate(&mut rng).verifying_key().to_bytes();
         let c2_addr = SigningKey::generate(&mut rng).verifying_key().to_bytes();
 
-        engine_s.update_account(AccountState::new(s2_addr, 100 * STELL)).await;
-        engine_p.update_account(AccountState::new(s2_addr, 100 * STELL)).await;
+        engine_s
+            .update_account(AccountState::new(s2_addr, 100 * STELL))
+            .await;
+        engine_p
+            .update_account(AccountState::new(s2_addr, 100 * STELL))
+            .await;
 
-        let payload_transfer = vec![OpCode::Transfer { recipient: b2_addr, amount: 60 * STELL }];
-        let p_tx0 = Transaction::sign_with_payload(&s2, b2_addr, 0, 300_000, 0, 1, 1, payload_transfer);
+        let payload_transfer = vec![OpCode::Transfer {
+            recipient: b2_addr,
+            amount: 60 * STELL,
+        }];
+        let p_tx0 =
+            Transaction::sign_with_payload(&s2, b2_addr, 0, 300_000, 0, 1, 1, payload_transfer);
         let p_tx1 = Transaction::sign(&s2, c2_addr, 50 * STELL, 300_000, 1, 1, 1);
 
         let p_txs = vec![p_tx0, p_tx1];
-        let res_s = engine_s.apply_block_parallel_fees(&p_txs, timestamp + 1).await;
-        let res_p = engine_p.apply_block_parallel_fees(&p_txs, timestamp + 1).await;
+        let res_s = engine_s
+            .apply_block_parallel_fees(&p_txs, timestamp + 1)
+            .await;
+        let res_p = engine_p
+            .apply_block_parallel_fees(&p_txs, timestamp + 1)
+            .await;
 
         assert_eq!(res_s.0, 1);
         assert_eq!(res_s.1, 1);
@@ -518,7 +595,10 @@ async fn parallel_exec_balance_depletion_in_later_wave() {
 
         let root_s = engine_s.get_state_root().await;
         let root_p = engine_p.get_state_root().await;
-        assert_eq!(root_s, root_p, "payload rollback state roots must match bit-identically");
+        assert_eq!(
+            root_s, root_p,
+            "payload rollback state roots must match bit-identically"
+        );
     }
 }
 
@@ -556,9 +636,20 @@ async fn parallel_exec_mixed_token_and_clob_payloads() {
 
     // Fund all participants with native STELL for fees and orders
     let initial_stell = 50_000_000u64;
-    for &addr in &[user_a_addr, user_b_addr, trader_1_addr, trader_2_addr, trader_3_addr, minter_addr] {
-        engine_seq.update_account(AccountState::new(addr, initial_stell)).await;
-        engine_par.update_account(AccountState::new(addr, initial_stell)).await;
+    for &addr in &[
+        user_a_addr,
+        user_b_addr,
+        trader_1_addr,
+        trader_2_addr,
+        trader_3_addr,
+        minter_addr,
+    ] {
+        engine_seq
+            .update_account(AccountState::new(addr, initial_stell))
+            .await;
+        engine_par
+            .update_account(AccountState::new(addr, initial_stell))
+            .await;
     }
 
     // Create two distinct STS fungible tokens on both engines
@@ -583,11 +674,25 @@ async fn parallel_exec_mixed_token_and_clob_payloads() {
     // Distribute token balances: User A has Token 1, User B has Token 2
     for engine in &[&engine_seq, &engine_par] {
         engine
-            .token_execute(&token_1, minter_addr, TokenOp::Transfer { to: user_a_addr, amount: 20_000 })
+            .token_execute(
+                &token_1,
+                minter_addr,
+                TokenOp::Transfer {
+                    to: user_a_addr,
+                    amount: 20_000,
+                },
+            )
             .await
             .unwrap();
         engine
-            .token_execute(&token_2, minter_addr, TokenOp::Transfer { to: user_b_addr, amount: 30_000 })
+            .token_execute(
+                &token_2,
+                minter_addr,
+                TokenOp::Transfer {
+                    to: user_b_addr,
+                    amount: 30_000,
+                },
+            )
             .await
             .unwrap();
     }
@@ -604,7 +709,11 @@ async fn parallel_exec_mixed_token_and_clob_payloads() {
         0,
         1,
         1,
-        vec![OpCode::SysCallTokenTransfer { token_id: token_1, to: recipient_a, amount: 5_000 }],
+        vec![OpCode::SysCallTokenTransfer {
+            token_id: token_1,
+            to: recipient_a,
+            amount: 5_000,
+        }],
     ));
 
     // Tx 1: Token 2 transfer (User B -> Recipient B)
@@ -616,7 +725,11 @@ async fn parallel_exec_mixed_token_and_clob_payloads() {
         0,
         1,
         1,
-        vec![OpCode::SysCallTokenTransfer { token_id: token_2, to: recipient_b, amount: 4_000 }],
+        vec![OpCode::SysCallTokenTransfer {
+            token_id: token_2,
+            to: recipient_b,
+            amount: 4_000,
+        }],
     ));
 
     // Tx 2: CLOB Limit Buy on Pair 1 (Trader 1)
@@ -629,7 +742,12 @@ async fn parallel_exec_mixed_token_and_clob_payloads() {
         0,
         1,
         1,
-        vec![OpCode::SysCallPlaceOrder { pair_id: 1, is_buy: true, price: 100_000, amount: 10 }],
+        vec![OpCode::SysCallPlaceOrder {
+            pair_id: 1,
+            is_buy: true,
+            price: 100_000,
+            amount: 10,
+        }],
     ));
 
     // Tx 3: CLOB Limit Buy on Pair 2 (Trader 2)
@@ -642,7 +760,12 @@ async fn parallel_exec_mixed_token_and_clob_payloads() {
         0,
         1,
         1,
-        vec![OpCode::SysCallPlaceOrder { pair_id: 2, is_buy: true, price: 200_000, amount: 20 }],
+        vec![OpCode::SysCallPlaceOrder {
+            pair_id: 2,
+            is_buy: true,
+            price: 200_000,
+            amount: 20,
+        }],
     ));
 
     // Tx 4: Plain STELL Transfer (Trader 3 -> plain_dest)
@@ -658,7 +781,11 @@ async fn parallel_exec_mixed_token_and_clob_payloads() {
         1,
         1,
         1,
-        vec![OpCode::SysCallTokenTransfer { token_id: token_1, to: recipient_a, amount: 2_000 }],
+        vec![OpCode::SysCallTokenTransfer {
+            token_id: token_1,
+            to: recipient_a,
+            amount: 2_000,
+        }],
     ));
 
     // Tx 6: User B sends more Token 2 (conflicts on Token 2 and user_b)
@@ -670,7 +797,11 @@ async fn parallel_exec_mixed_token_and_clob_payloads() {
         1,
         1,
         1,
-        vec![OpCode::SysCallTokenTransfer { token_id: token_2, to: recipient_b, amount: 3_000 }],
+        vec![OpCode::SysCallTokenTransfer {
+            token_id: token_2,
+            to: recipient_b,
+            amount: 3_000,
+        }],
     ));
 
     // Tx 7: Trader 1 places another order on Pair 1 (conflicts on Orderbook 1)
@@ -682,7 +813,12 @@ async fn parallel_exec_mixed_token_and_clob_payloads() {
         1,
         1,
         1,
-        vec![OpCode::SysCallPlaceOrder { pair_id: 1, is_buy: true, price: 105_000, amount: 5 }],
+        vec![OpCode::SysCallPlaceOrder {
+            pair_id: 1,
+            is_buy: true,
+            price: 105_000,
+            amount: 5,
+        }],
     ));
 
     // WAVE 2: Global barrier (Cancel order on Pair 1 by Trader 1)
@@ -707,12 +843,23 @@ async fn parallel_exec_mixed_token_and_clob_payloads() {
         2,
         1,
         1,
-        vec![OpCode::SysCallTokenTransfer { token_id: token_1, to: recipient_a, amount: 1_000 }],
+        vec![OpCode::SysCallTokenTransfer {
+            token_id: token_1,
+            to: recipient_a,
+            amount: 1_000,
+        }],
     ));
 
     let waves = DisjointScheduler::schedule(&txs);
-    assert!(waves.len() >= 4, "must schedule into at least 4 waves due to conflicts and global cancel barrier");
-    assert_eq!(waves[0], vec![0, 1, 2, 3, 4], "Wave 0 contains all 5 disjoint parallel tasks");
+    assert!(
+        waves.len() >= 4,
+        "must schedule into at least 4 waves due to conflicts and global cancel barrier"
+    );
+    assert_eq!(
+        waves[0],
+        vec![0, 1, 2, 3, 4],
+        "Wave 0 contains all 5 disjoint parallel tasks"
+    );
 
     let timestamp = 1_700_000_300;
     let res_seq = engine_seq.apply_block_parallel_fees(&txs, timestamp).await;
@@ -728,22 +875,49 @@ async fn parallel_exec_mixed_token_and_clob_payloads() {
 
     let root_seq = engine_seq.get_state_root().await;
     let root_par = engine_par.get_state_root().await;
-    assert_eq!(root_seq, root_par, "state roots must match bit-identically across mixed token & clob waves");
+    assert_eq!(
+        root_seq, root_par,
+        "state roots must match bit-identically across mixed token & clob waves"
+    );
 
     // Verify token resource isolation and exact balance updates:
     // User A: 20_000 - 5_000 - 2_000 - 1_000 = 12_000
     // Recipient A: 5_000 + 2_000 + 1_000 = 8_000
-    assert_eq!(engine_seq.token_balance(&token_1, &user_a_addr).await, 12_000);
-    assert_eq!(engine_par.token_balance(&token_1, &user_a_addr).await, 12_000);
-    assert_eq!(engine_seq.token_balance(&token_1, &recipient_a).await, 8_000);
-    assert_eq!(engine_par.token_balance(&token_1, &recipient_a).await, 8_000);
+    assert_eq!(
+        engine_seq.token_balance(&token_1, &user_a_addr).await,
+        12_000
+    );
+    assert_eq!(
+        engine_par.token_balance(&token_1, &user_a_addr).await,
+        12_000
+    );
+    assert_eq!(
+        engine_seq.token_balance(&token_1, &recipient_a).await,
+        8_000
+    );
+    assert_eq!(
+        engine_par.token_balance(&token_1, &recipient_a).await,
+        8_000
+    );
 
     // User B: 30_000 - 4_000 - 3_000 = 23_000
     // Recipient B: 4_000 + 3_000 = 7_000
-    assert_eq!(engine_seq.token_balance(&token_2, &user_b_addr).await, 23_000);
-    assert_eq!(engine_par.token_balance(&token_2, &user_b_addr).await, 23_000);
-    assert_eq!(engine_seq.token_balance(&token_2, &recipient_b).await, 7_000);
-    assert_eq!(engine_par.token_balance(&token_2, &recipient_b).await, 7_000);
+    assert_eq!(
+        engine_seq.token_balance(&token_2, &user_b_addr).await,
+        23_000
+    );
+    assert_eq!(
+        engine_par.token_balance(&token_2, &user_b_addr).await,
+        23_000
+    );
+    assert_eq!(
+        engine_seq.token_balance(&token_2, &recipient_b).await,
+        7_000
+    );
+    assert_eq!(
+        engine_par.token_balance(&token_2, &recipient_b).await,
+        7_000
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -795,7 +969,10 @@ async fn parallel_exec_cyclic_chains() {
 
         let root_seq = engine_seq.get_state_root().await;
         let root_par = engine_par.get_state_root().await;
-        assert_eq!(root_seq, root_par, "basic 3-cycle roots must be bit-identical");
+        assert_eq!(
+            root_seq, root_par,
+            "basic 3-cycle roots must be bit-identical"
+        );
 
         // Net balance unchanged minus 10 gas fee: initial_bal - 10
         for addr in &[a_addr, b_addr, c_addr] {
@@ -832,22 +1009,58 @@ async fn parallel_exec_cyclic_chains() {
         let mut txs = Vec::new();
         // Hop 0 for all cycles
         for (k1, k2, _) in &cycle_keys {
-            txs.push(Transaction::sign(k1, k2.verifying_key().to_bytes(), 100, 10, 0, 1, 1));
+            txs.push(Transaction::sign(
+                k1,
+                k2.verifying_key().to_bytes(),
+                100,
+                10,
+                0,
+                1,
+                1,
+            ));
         }
         // Hop 1 for all cycles
         for (_, k2, k3) in &cycle_keys {
-            txs.push(Transaction::sign(k2, k3.verifying_key().to_bytes(), 100, 10, 0, 1, 1));
+            txs.push(Transaction::sign(
+                k2,
+                k3.verifying_key().to_bytes(),
+                100,
+                10,
+                0,
+                1,
+                1,
+            ));
         }
         // Hop 2 for all cycles
         for (k1, _, k3) in &cycle_keys {
-            txs.push(Transaction::sign(k3, k1.verifying_key().to_bytes(), 100, 10, 0, 1, 1));
+            txs.push(Transaction::sign(
+                k3,
+                k1.verifying_key().to_bytes(),
+                100,
+                10,
+                0,
+                1,
+                1,
+            ));
         }
 
         let waves = DisjointScheduler::schedule(&txs);
         assert_eq!(waves.len(), 3, "must schedule into exactly 3 waves");
-        assert_eq!(waves[0].len(), num_cycles, "Wave 0: all cycle hop 0s run concurrently");
-        assert_eq!(waves[1].len(), num_cycles, "Wave 1: all cycle hop 1s run concurrently");
-        assert_eq!(waves[2].len(), num_cycles, "Wave 2: all cycle hop 2s run concurrently");
+        assert_eq!(
+            waves[0].len(),
+            num_cycles,
+            "Wave 0: all cycle hop 0s run concurrently"
+        );
+        assert_eq!(
+            waves[1].len(),
+            num_cycles,
+            "Wave 1: all cycle hop 1s run concurrently"
+        );
+        assert_eq!(
+            waves[2].len(),
+            num_cycles,
+            "Wave 2: all cycle hop 2s run concurrently"
+        );
 
         let timestamp = 1_700_000_410;
         let res_seq = engine_seq.apply_block_parallel_fees(&txs, timestamp).await;
@@ -862,7 +1075,10 @@ async fn parallel_exec_cyclic_chains() {
 
         let root_seq = engine_seq.get_state_root().await;
         let root_par = engine_par.get_state_root().await;
-        assert_eq!(root_seq, root_par, "concurrent cycles roots must be bit-identical");
+        assert_eq!(
+            root_seq, root_par,
+            "concurrent cycles roots must be bit-identical"
+        );
     }
 
     // Sub-case 3: Long 12-node cycle ring
@@ -871,7 +1087,9 @@ async fn parallel_exec_cyclic_chains() {
         let engine_par = new_engine(true);
 
         let ring_size = 12;
-        let ring: Vec<SigningKey> = (0..ring_size).map(|_| SigningKey::generate(&mut rng)).collect();
+        let ring: Vec<SigningKey> = (0..ring_size)
+            .map(|_| SigningKey::generate(&mut rng))
+            .collect();
 
         fund_engine(&engine_seq, &ring, 100_000).await;
         fund_engine(&engine_par, &ring, 100_000).await;
@@ -935,6 +1153,9 @@ async fn parallel_exec_cyclic_chains() {
 
         let root_seq = engine_seq.get_state_root().await;
         let root_par = engine_par.get_state_root().await;
-        assert_eq!(root_seq, root_par, "broken cycle roots must be bit-identical");
+        assert_eq!(
+            root_seq, root_par,
+            "broken cycle roots must be bit-identical"
+        );
     }
 }

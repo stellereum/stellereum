@@ -64,7 +64,9 @@ fn peer_of(name: &str, keys: &NodeKeys, listen: &str) -> PeerConfig {
 
 /// Ask a peer to add us to its network-subscription table for `topic`.
 async fn subscribe_at_peer(me: &Arc<Node>, peer_id: [u8; 20], topic: &str) {
-    let payload = serde_json::json!({ "topic": topic }).to_string().into_bytes();
+    let payload = serde_json::json!({ "topic": topic })
+        .to_string()
+        .into_bytes();
     tokio::time::timeout(
         Duration::from_secs(5),
         me.request_to(peer_id, "pubsub.subscribe", payload),
@@ -83,7 +85,10 @@ async fn expect_payload(
         .await
         .unwrap_or_else(|_| panic!("{who} never received a message containing {needle}"))
         .unwrap_or_else(|| panic!("{who} subscription channel closed"));
-    assert!(got.contains(needle), "{who} received the wrong payload: {got}");
+    assert!(
+        got.contains(needle),
+        "{who} received the wrong payload: {got}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -135,7 +140,9 @@ async fn pubsub_delivers_in_both_directions() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // A -> B
-    let p = serde_json::json!({ "topic": topic, "data": "a2b" }).to_string().into_bytes();
+    let p = serde_json::json!({ "topic": topic, "data": "a2b" })
+        .to_string()
+        .into_bytes();
     node_a
         .request_to(keys_b.id(), "pubsub.msg", p)
         .await
@@ -143,7 +150,9 @@ async fn pubsub_delivers_in_both_directions() {
     expect_payload(&mut rx_b, "a2b", "B").await;
 
     // B -> A: the direction that used to be dead, because B is the dialer.
-    let p = serde_json::json!({ "topic": topic, "data": "b2a" }).to_string().into_bytes();
+    let p = serde_json::json!({ "topic": topic, "data": "b2a" })
+        .to_string()
+        .into_bytes();
     node_b
         .request_to(keys_a.id(), "pubsub.msg", p)
         .await

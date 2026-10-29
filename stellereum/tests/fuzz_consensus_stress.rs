@@ -22,12 +22,12 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::time::{Duration, Instant};
 use stellereum::consensus::{
     vote_sign_bytes, QuorumCertificate, ValidatorSet, Vote, VoteKind, MAX_COMMIT_CERT_SIGNERS,
 };
 use stellereum::consensus_net::{ConsensusMsg, MAX_BATCH_BYTES, MAX_BATCH_ITEMS};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
-use std::time::{Duration, Instant};
 
 /// Per-input wall-clock budget. Anything slower than this on a sub-32 MiB
 /// input is unbounded work (allocation or loop) on peer-controlled bytes, not
@@ -119,7 +119,11 @@ fn valid_batch_bytes() -> Vec<u8> {
             vote: Vote::sign(&sk, 7, 0, VoteKind::Precommit, Some([1u8; 32])),
             locked: Some([2u8; 32]),
         },
-        ConsensusMsg::Proposal { height: 7, round: 0, block: sample_block() },
+        ConsensusMsg::Proposal {
+            height: 7,
+            round: 0,
+            block: sample_block(),
+        },
     ];
     ConsensusMsg::batch_encode(&items).expect("valid batch must encode")
 }
@@ -132,9 +136,7 @@ fn valid_batch_bytes() -> Vec<u8> {
 /// input panics the decoder or takes longer than `PER_INPUT`.
 fn decode_guarded(input: &[u8]) -> Result<ConsensusMsg, String> {
     let t = Instant::now();
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ConsensusMsg::decode(input)
-    }));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ConsensusMsg::decode(input)));
     let dt = t.elapsed();
     assert!(
         dt < PER_INPUT,
@@ -143,7 +145,10 @@ fn decode_guarded(input: &[u8]) -> Result<ConsensusMsg, String> {
     );
     match r {
         Ok(res) => res,
-        Err(_) => panic!("ConsensusMsg::decode panicked on a {}-byte input", input.len()),
+        Err(_) => panic!(
+            "ConsensusMsg::decode panicked on a {}-byte input",
+            input.len()
+        ),
     }
 }
 
@@ -152,7 +157,10 @@ fn decode_guarded(input: &[u8]) -> Result<ConsensusMsg, String> {
 /// that produces an `Ok` batch violating one of these is a decode bug.
 fn assert_batch_invariants(input_len: usize, msg: &ConsensusMsg) {
     if let ConsensusMsg::Batch(items) = msg {
-        assert!(!items.is_empty(), "decode returned an EMPTY batch (input {input_len} B)");
+        assert!(
+            !items.is_empty(),
+            "decode returned an EMPTY batch (input {input_len} B)"
+        );
         assert!(
             items.len() <= MAX_BATCH_ITEMS,
             "decode returned a batch with {} items (> {MAX_BATCH_ITEMS})",
@@ -213,7 +221,10 @@ fn random_byte_storm_50k_no_panic_no_timeout_fail_closed() {
         accepted, 0,
         "{accepted}/{N} random inputs decoded Ok (fixed seed — new variant or looser framing?)"
     );
-    assert!(total < TOTAL, "50k-input storm took {total:?} (budget {TOTAL:?})");
+    assert!(
+        total < TOTAL,
+        "50k-input storm took {total:?} (budget {TOTAL:?})"
+    );
     eprintln!("random_byte_storm: {N} inputs in {total:?} ({accepted} accepted)");
 }
 
@@ -236,7 +247,11 @@ fn valid_batch_roundtrips_and_truncations_at_every_offset_fail_closed() {
     // and ConsensusMsg::decode must return Err — never Ok, never a panic.
     for n in 0..valid.len() {
         let res = decode_guarded(&valid[..n]);
-        assert!(res.is_err(), "truncation to {n}/{} bytes was ACCEPTED", valid.len());
+        assert!(
+            res.is_err(),
+            "truncation to {n}/{} bytes was ACCEPTED",
+            valid.len()
+        );
     }
     // Empty input is a specific case of the above and must stay rejected.
     assert!(ConsensusMsg::decode(&[]).is_err());
@@ -246,7 +261,11 @@ fn valid_batch_roundtrips_and_truncations_at_every_offset_fail_closed() {
 #[test]
 fn batch_length_prefix_flips_never_accept_invalid_structure() {
     let valid = valid_batch_bytes();
-    assert_eq!(&valid[0..4], &3u32.to_le_bytes(), "Batch must be variant tag 3");
+    assert_eq!(
+        &valid[0..4],
+        &3u32.to_le_bytes(),
+        "Batch must be variant tag 3"
+    );
     let declared = u64::from_le_bytes(valid[4..12].try_into().unwrap());
     assert_eq!(declared, 3);
 
@@ -332,7 +351,10 @@ fn batch_huge_declared_counts_fail_closed_fast() {
         let mut m = valid.clone();
         m[4..12].copy_from_slice(&count.to_le_bytes());
         let res = decode_guarded(&m);
-        assert!(res.is_err(), "declared count {count} must be rejected, got Ok");
+        assert!(
+            res.is_err(),
+            "declared count {count} must be rejected, got Ok"
+        );
     }
 
     // HARDENED BEHAVIOUR (PENTEST F1 `reject_trailing_bytes`): a REDUCED count
@@ -356,7 +378,11 @@ fn batch_huge_declared_counts_fail_closed_fast() {
     let big = vec![0u8; stellereum::consensus_net::MAX_CONSENSUS_MSG + 1];
     let t = Instant::now();
     assert!(ConsensusMsg::decode(&big).is_err());
-    assert!(t.elapsed() < PER_INPUT, "oversize gate took {:?}", t.elapsed());
+    assert!(
+        t.elapsed() < PER_INPUT,
+        "oversize gate took {:?}",
+        t.elapsed()
+    );
 }
 
 #[test]
@@ -372,7 +398,10 @@ fn nested_batches_fail_closed_at_every_depth() {
     let d2 = ConsensusMsg::Batch(vec![ConsensusMsg::Batch(vec![one.clone()])]);
     let raw = bincode::serialize(&d2).unwrap();
     let err = decode_guarded(&raw).unwrap_err();
-    assert!(err.contains("nested"), "depth-2 nest rejected for the wrong reason: {err}");
+    assert!(
+        err.contains("nested"),
+        "depth-2 nest rejected for the wrong reason: {err}"
+    );
 
     // Depth 3 (nested inside nested).
     let d3 = ConsensusMsg::Batch(vec![ConsensusMsg::Batch(vec![ConsensusMsg::Batch(vec![
@@ -380,7 +409,10 @@ fn nested_batches_fail_closed_at_every_depth() {
     ])])]);
     let raw = bincode::serialize(&d3).unwrap();
     let err = decode_guarded(&raw).unwrap_err();
-    assert!(err.contains("nested"), "depth-3 nest rejected for the wrong reason: {err}");
+    assert!(
+        err.contains("nested"),
+        "depth-3 nest rejected for the wrong reason: {err}"
+    );
 
     // A nested batch buried among valid siblings.
     let mixed = ConsensusMsg::Batch(vec![
@@ -390,17 +422,26 @@ fn nested_batches_fail_closed_at_every_depth() {
     ]);
     let raw = bincode::serialize(&mixed).unwrap();
     let err = decode_guarded(&raw).unwrap_err();
-    assert!(err.contains("nested"), "buried nest rejected for the wrong reason: {err}");
+    assert!(
+        err.contains("nested"),
+        "buried nest rejected for the wrong reason: {err}"
+    );
 
     // The encoder refuses nesting up front as well (belt and braces).
     if let ConsensusMsg::Batch(items) = d2 {
-        assert!(ConsensusMsg::batch_encode(&items).is_err(), "encoder must refuse nested batches");
+        assert!(
+            ConsensusMsg::batch_encode(&items).is_err(),
+            "encoder must refuse nested batches"
+        );
     }
 
     // Truncations of a nested payload must also fail closed, never panic.
     let raw = bincode::serialize(&mixed).unwrap();
     for n in 0..raw.len() {
-        assert!(decode_guarded(&raw[..n]).is_err(), "nested truncation to {n} accepted");
+        assert!(
+            decode_guarded(&raw[..n]).is_err(),
+            "nested truncation to {n} accepted"
+        );
     }
     assert!(wall.elapsed() < TOTAL);
 }
@@ -446,7 +487,10 @@ fn qc_verify_empty_signer_list_false_quickly() {
     let empty_set = ValidatorSet::new();
     assert_eq!(empty_set.total_power(), 0);
     let t = Instant::now();
-    assert!(!qc4.verify(&empty_set), "empty validator set must never verify");
+    assert!(
+        !qc4.verify(&empty_set),
+        "empty validator set must never verify"
+    );
     assert!(t.elapsed() < PER_INPUT, "empty set took {:?}", t.elapsed());
 }
 
@@ -459,14 +503,20 @@ fn qc_verify_huge_signer_lists_false_quickly() {
     let t = Instant::now();
     assert!(!qc.verify(&set), "cap+1 signer list must be rejected");
     let dt = t.elapsed();
-    assert!(dt < Duration::from_millis(50), "cap+1 took {dt:?}: cap check is not O(1)");
+    assert!(
+        dt < Duration::from_millis(50),
+        "cap+1 took {dt:?}: cap check is not O(1)"
+    );
 
     // (b) Two orders of magnitude past the cap.
     qc.signatures = vec![([0u8; 32], vec![0u8; 64]); 100_000];
     let t = Instant::now();
     assert!(!qc.verify(&set), "100k signer list must be rejected");
     let dt = t.elapsed();
-    assert!(dt < Duration::from_millis(50), "100k took {dt:?}: cap check is not O(1)");
+    assert!(
+        dt < Duration::from_millis(50),
+        "100k took {dt:?}: cap check is not O(1)"
+    );
 
     // (c) AT the cap with parseable, in-set, distinct voters and well-shaped
     //     but wrong signatures: this is the designed worst case (batch verify
@@ -493,9 +543,15 @@ fn qc_verify_huge_signer_lists_false_quickly() {
     };
     assert_eq!(qc_cap.signatures.len(), MAX_COMMIT_CERT_SIGNERS);
     let t = Instant::now();
-    assert!(!qc_cap.verify(&set_big), "all-bad signatures at the cap must not verify");
+    assert!(
+        !qc_cap.verify(&set_big),
+        "all-bad signatures at the cap must not verify"
+    );
     let dt = t.elapsed();
-    assert!(dt < Duration::from_secs(3), "at-cap verify took {dt:?} (expected ~100-300ms)");
+    assert!(
+        dt < Duration::from_secs(3),
+        "at-cap verify took {dt:?} (expected ~100-300ms)"
+    );
     eprintln!("qc_verify at-cap ({MAX_COMMIT_CERT_SIGNERS} bad sigs): {dt:?}");
 
     // (d) Duplicate-heavy list: 4096 copies of ONE honest signature must dedup
@@ -507,8 +563,15 @@ fn qc_verify_huge_signer_lists_false_quickly() {
         ..qc4.clone()
     };
     let t = Instant::now();
-    assert!(!qc_dup.verify(&set4), "duplicated signatures must dedup, not accumulate power");
-    assert!(t.elapsed() < Duration::from_millis(500), "dedup path took {:?}", t.elapsed());
+    assert!(
+        !qc_dup.verify(&set4),
+        "duplicated signatures must dedup, not accumulate power"
+    );
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "dedup path took {:?}",
+        t.elapsed()
+    );
 }
 
 #[test]
@@ -524,7 +587,10 @@ fn qc_verify_mismatched_and_malformed_signatures_false() {
             (v.voter, v.signature)
         })
         .collect();
-    assert!(!foreign.verify(&set), "non-validator voters must not verify");
+    assert!(
+        !foreign.verify(&set),
+        "non-validator voters must not verify"
+    );
 
     // (b) Malformed signature lengths: each skipped as a candidate, list ends
     //     up empty -> false. Includes the overlong case (bytes that are not a
@@ -543,42 +609,66 @@ fn qc_verify_mismatched_and_malformed_signatures_false() {
     let (v2, s2) = swapped.signatures[1].clone();
     swapped.signatures[0] = (v1, s2);
     swapped.signatures[1] = (v2, s1);
-    assert!(!swapped.verify(&set), "cross-wired voter/signature pairs must not verify");
+    assert!(
+        !swapped.verify(&set),
+        "cross-wired voter/signature pairs must not verify"
+    );
 
     // (d) Right signers, wrong message: votes were cast at height 10, the QC
     //     claims height 11 -> every signature fails.
     let mut wrong_height = qc.clone();
     wrong_height.height = 11;
-    assert!(!wrong_height.verify(&set), "height-mismatched QC must not verify");
+    assert!(
+        !wrong_height.verify(&set),
+        "height-mismatched QC must not verify"
+    );
 
     let mut wrong_round = qc.clone();
     wrong_round.round = 9;
-    assert!(!wrong_round.verify(&set), "round-mismatched QC must not verify");
+    assert!(
+        !wrong_round.verify(&set),
+        "round-mismatched QC must not verify"
+    );
 
     let mut wrong_hash = qc.clone();
     wrong_hash.block_hash = Some([9u8; 32]);
-    assert!(!wrong_hash.verify(&set), "hash-mismatched QC must not verify");
+    assert!(
+        !wrong_hash.verify(&set),
+        "hash-mismatched QC must not verify"
+    );
 
     let mut nil_hash = qc.clone();
     nil_hash.block_hash = None;
-    assert!(!nil_hash.verify(&set), "nil-vs-block mismatch must not verify");
+    assert!(
+        !nil_hash.verify(&set),
+        "nil-vs-block mismatch must not verify"
+    );
 
     let mut wrong_kind = qc.clone();
     wrong_kind.kind = VoteKind::Prevote;
-    assert!(!wrong_kind.verify(&set), "prevote signatures must not prove a precommit QC");
+    assert!(
+        !wrong_kind.verify(&set),
+        "prevote signatures must not prove a precommit QC"
+    );
 
     // (e) Garbage voter keys (not even valid curve points).
     let mut garbage_keys = qc.clone();
     for (voter, _) in garbage_keys.signatures.iter_mut() {
         *voter = [0xFFu8; 32];
     }
-    assert!(!garbage_keys.verify(&set), "unparseable voter keys must not verify");
+    assert!(
+        !garbage_keys.verify(&set),
+        "unparseable voter keys must not verify"
+    );
 
     // (f) Only half the quorum present.
     let (_, qc4) = qc_fixture(4);
     let mut half = qc4.clone();
     half.signatures.truncate(2);
-    assert!(!half.verify(&set), "2 of 4 signatures (< 3 needed) must not verify");
+    assert!(
+        !half.verify(&set),
+        "2 of 4 signatures (< 3 needed) must not verify"
+    );
 
     // Still fail-closed under time budget for the whole battery.
     qc.signatures.clear();
@@ -589,14 +679,20 @@ fn qc_verify_mismatched_and_malformed_signatures_false() {
 fn qc_verify_accepts_true_quorum_and_survives_single_bad_sig() {
     let (set, qc) = qc_fixture(4);
     let t = Instant::now();
-    assert!(qc.verify(&set), "4/4 honest precommits must verify (quorum = 3)");
+    assert!(
+        qc.verify(&set),
+        "4/4 honest precommits must verify (quorum = 3)"
+    );
 
     // One corrupted signature: batch verify fails, slow path must still count
     // the 3 good ones and accept (an attacker must not be able to break a real
     // quorum by appending one bad signature).
     let mut one_bad = qc.clone();
     one_bad.signatures[2].1[0] ^= 0x01;
-    assert!(one_bad.verify(&set), "3/4 valid must still reach quorum (slow path)");
+    assert!(
+        one_bad.verify(&set),
+        "3/4 valid must still reach quorum (slow path)"
+    );
 
     // Two corrupted: 2 < 3 -> false.
     let mut two_bad = qc.clone();
@@ -621,7 +717,11 @@ fn vote_sign_bytes_is_deterministic_and_field_injective() {
     // Fixed layout: domain tag + chain_id(BE8) + height(BE8) + round(BE4)
     // + kind(1) + flag(1) [+ hash(32) when Some].
     let with_hash = vote_sign_bytes(1, 2, VoteKind::Prevote, &hash);
-    assert_eq!(&with_hash[..prefix.len()], prefix, "missing domain separator");
+    assert_eq!(
+        &with_hash[..prefix.len()],
+        prefix,
+        "missing domain separator"
+    );
     assert_eq!(with_hash.len(), prefix.len() + 8 + 8 + 4 + 1 + 1 + 32);
     assert_eq!(with_hash[prefix.len() + 20], 0, "Prevote must encode as 0");
     assert_eq!(with_hash[prefix.len() + 21], 1, "Some(hash) flag");
@@ -654,7 +754,10 @@ fn vote_sign_bytes_is_deterministic_and_field_injective() {
             for k in [VoteKind::Prevote, VoteKind::Precommit] {
                 for bh in [None, Some([0u8; 32]), Some([1u8; 32]), Some([0xFFu8; 32])] {
                     let b = vote_sign_bytes(h, r, k, &bh);
-                    assert!(seen.insert(b.clone()), "preimage collision for h={h} r={r} k={k:?} bh={bh:?}");
+                    assert!(
+                        seen.insert(b.clone()),
+                        "preimage collision for h={h} r={r} k={k:?} bh={bh:?}"
+                    );
                     checked += 1;
                 }
             }
@@ -679,7 +782,11 @@ fn block_precommit_qc_roundtrip_and_old_format_assumptions() {
     let bytes = bincode::serialize(&block).expect("block must serialize");
 
     let back: Block = bincode::deserialize(&bytes).expect("block with qc must decode");
-    assert_eq!(back.precommit_qc, Some(qc.clone()), "QC must survive the roundtrip");
+    assert_eq!(
+        back.precommit_qc,
+        Some(qc.clone()),
+        "QC must survive the roundtrip"
+    );
     assert_eq!(back.height, block.height);
     assert_eq!(
         bincode::serialize(&back).unwrap(),
@@ -692,15 +799,27 @@ fn block_precommit_qc_roundtrip_and_old_format_assumptions() {
     // otherwise finalisation would fork the identity of an already-voted block.
     let mut without = block.clone();
     without.precommit_qc = None;
-    assert_eq!(block.compute_hash(), without.compute_hash(), "qc must not affect the hash");
+    assert_eq!(
+        block.compute_hash(),
+        without.compute_hash(),
+        "qc must not affect the hash"
+    );
     let mut other_qc = block.clone();
     if let Some(q) = other_qc.precommit_qc.as_mut() {
         q.round += 1;
     }
-    assert_eq!(block.compute_hash(), other_qc.compute_hash(), "qc content must not affect the hash");
+    assert_eq!(
+        block.compute_hash(),
+        other_qc.compute_hash(),
+        "qc content must not affect the hash"
+    );
 
     // A proposal wrapping the finalized block roundtrips too (wire path).
-    let msg = ConsensusMsg::Proposal { height: 7, round: 0, block: block.clone() };
+    let msg = ConsensusMsg::Proposal {
+        height: 7,
+        round: 0,
+        block: block.clone(),
+    };
     let enc = msg.encode().unwrap();
     match ConsensusMsg::decode(&enc).expect("proposal with qc-bearing block must decode") {
         ConsensusMsg::Proposal { block: b2, .. } => {
@@ -809,13 +928,15 @@ fn block_precommit_qc_roundtrip_and_old_format_assumptions() {
 
     // And the same rule holds for the standalone QC type.
     assert!(
-        bincode::deserialize::<QuorumCertificate>(&bincode::serialize(&QcWithoutSignatures {
-            height: 10,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some([7u8; 32]),
-        })
-        .unwrap())
+        bincode::deserialize::<QuorumCertificate>(
+            &bincode::serialize(&QcWithoutSignatures {
+                height: 10,
+                round: 0,
+                kind: VoteKind::Precommit,
+                block_hash: Some([7u8; 32]),
+            })
+            .unwrap()
+        )
         .is_err(),
         "changed QuorumCertificate layout must fail closed"
     );

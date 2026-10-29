@@ -4,8 +4,8 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 #[derive(Default)]
 pub struct Metrics {
@@ -45,7 +45,9 @@ pub struct Metrics {
 pub type ServiceCounters = Arc<std::sync::Mutex<HashMap<String, u64>>>;
 
 fn fmt_metric(out: &mut String, name: &str, help: &str, value: u64) {
-    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"));
+    out.push_str(&format!(
+        "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
+    ));
 }
 
 pub fn render(
@@ -58,32 +60,162 @@ pub fn render(
 ) -> String {
     let mut out = String::new();
     fmt_metric(&mut out, "infnode_uptime_seconds", "uptime", uptime_s);
-    fmt_metric(&mut out, "infnode_frames_in_total", "frames received", m.frames_in.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_frames_out_total", "frames sent", m.frames_out.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_requests_total", "service requests", m.reqs_total.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_requests_denied_total", "ACL-denied requests", m.reqs_denied.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_requests_errors_total", "request errors", m.reqs_errors.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_bytes_in_total", "payload bytes received", m.bytes_in.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_bytes_out_total", "payload bytes sent", m.bytes_out.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_connections_accepted_total", "connections accepted", m.conns_accepted.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_connections_closed_total", "connections closed", m.conns_closed.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_connections_active", "currently active connections", m.conns_active.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_reconnects_total", "reconnects", m.reconnects.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_outbox_delivered_total", "outbox messages delivered", m.outbox_delivered.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_outbox_dropped_total", "outbox messages dropped", m.outbox_dropped.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_messages_published_total", "pubsub publishes", m.msgs_published.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_messages_delivered_total", "pubsub deliveries", m.msgs_delivered.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_messages_dropped_no_sub_total", "pubsub.msg with no subscribers", m.msgs_dropped_no_sub.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_messages_dropped_dead_rx_total", "pubsub.msg to dropped receivers", m.msgs_dropped_dead_rx.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_dispatch_ms_max", "max stream-accept to handler-start delay (ms)", m.dispatch_ms_max.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_handler_ms_max", "max in-handler frame processing time (ms)", m.handler_ms_max.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_fs_write_ms_total", "time spent in blocking file writes (ms)", m.fs_write_ms_total.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_kv_persists_total", "kv.json full rewrites (after debounce)", m.kv_persists_total.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_log_dropped_total", "log lines dropped on full queue", crate::log::LOG_DROPPED.load(Ordering::Relaxed));
-    fmt_metric(&mut out, "infnode_log_write_ms_total", "time spent writing log lines (ms)", crate::log::LOG_WRITE_NS.load(Ordering::Relaxed) / 1_000_000);
-    fmt_metric(&mut out, "infnode_outbox_size", "pending outbox messages", outbox_size as u64);
-    fmt_metric(&mut out, "infnode_subscriptions_topics", "topics with subscribers", subs_topics as u64);
-    fmt_metric(&mut out, "infnode_peers_configured", "configured peers", peer_count as u64);
+    fmt_metric(
+        &mut out,
+        "infnode_frames_in_total",
+        "frames received",
+        m.frames_in.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_frames_out_total",
+        "frames sent",
+        m.frames_out.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_requests_total",
+        "service requests",
+        m.reqs_total.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_requests_denied_total",
+        "ACL-denied requests",
+        m.reqs_denied.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_requests_errors_total",
+        "request errors",
+        m.reqs_errors.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_bytes_in_total",
+        "payload bytes received",
+        m.bytes_in.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_bytes_out_total",
+        "payload bytes sent",
+        m.bytes_out.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_connections_accepted_total",
+        "connections accepted",
+        m.conns_accepted.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_connections_closed_total",
+        "connections closed",
+        m.conns_closed.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_connections_active",
+        "currently active connections",
+        m.conns_active.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_reconnects_total",
+        "reconnects",
+        m.reconnects.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_outbox_delivered_total",
+        "outbox messages delivered",
+        m.outbox_delivered.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_outbox_dropped_total",
+        "outbox messages dropped",
+        m.outbox_dropped.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_messages_published_total",
+        "pubsub publishes",
+        m.msgs_published.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_messages_delivered_total",
+        "pubsub deliveries",
+        m.msgs_delivered.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_messages_dropped_no_sub_total",
+        "pubsub.msg with no subscribers",
+        m.msgs_dropped_no_sub.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_messages_dropped_dead_rx_total",
+        "pubsub.msg to dropped receivers",
+        m.msgs_dropped_dead_rx.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_dispatch_ms_max",
+        "max stream-accept to handler-start delay (ms)",
+        m.dispatch_ms_max.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_handler_ms_max",
+        "max in-handler frame processing time (ms)",
+        m.handler_ms_max.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_fs_write_ms_total",
+        "time spent in blocking file writes (ms)",
+        m.fs_write_ms_total.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_kv_persists_total",
+        "kv.json full rewrites (after debounce)",
+        m.kv_persists_total.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_log_dropped_total",
+        "log lines dropped on full queue",
+        crate::log::LOG_DROPPED.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_log_write_ms_total",
+        "time spent writing log lines (ms)",
+        crate::log::LOG_WRITE_NS.load(Ordering::Relaxed) / 1_000_000,
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_outbox_size",
+        "pending outbox messages",
+        outbox_size as u64,
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_subscriptions_topics",
+        "topics with subscribers",
+        subs_topics as u64,
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_peers_configured",
+        "configured peers",
+        peer_count as u64,
+    );
     let svc = svc.lock().unwrap();
     for (name, count) in svc.iter() {
         let key = format!("infnode_service_requests_total{{service=\"{name}\"}} {count}\n");
@@ -92,7 +224,11 @@ pub fn render(
     out
 }
 
-pub fn spawn(addr: &str, metrics: Arc<Metrics>, svc: Arc<std::sync::Mutex<HashMap<String, u64>>>) -> Result<()> {
+pub fn spawn(
+    addr: &str,
+    metrics: Arc<Metrics>,
+    svc: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr)?;
     std::thread::spawn(move || {
         for stream in listener.incoming() {

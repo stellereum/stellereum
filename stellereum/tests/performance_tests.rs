@@ -13,7 +13,11 @@ use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{OpCode, Svm, VmContext, VmExecutionResult};
 
 fn tps(iters: u64, secs: f64) -> f64 {
-    if secs <= 0.0 { 0.0 } else { iters as f64 / secs }
+    if secs <= 0.0 {
+        0.0
+    } else {
+        iters as f64 / secs
+    }
 }
 
 #[tokio::test]
@@ -22,10 +26,14 @@ async fn perf_native_transfer_tps() {
     let sk = SigningKey::generate(&mut OsRng);
     let from = sk.verifying_key().to_bytes();
     let to = [2u8; 32];
-    engine.update_account(AccountState::new(from, u64::MAX / 2)).await;
+    engine
+        .update_account(AccountState::new(from, u64::MAX / 2))
+        .await;
 
     let n = 500u64;
-    let txs: Vec<Transaction> = (0..n).map(|i| Transaction::sign(&sk, to, 1, 0, i, 1, 1)).collect();
+    let txs: Vec<Transaction> = (0..n)
+        .map(|i| Transaction::sign(&sk, to, 1, 0, i, 1, 1))
+        .collect();
 
     let t = Instant::now();
     for tx in &txs {
@@ -91,7 +99,13 @@ fn perf_trie_insert_smoke() {
     }
     let secs = t.elapsed().as_secs_f64();
     let rate = tps(n, secs);
-    println!("[perf] trie insert = {:.0} ins/s  (NOTE: O(n) rebuild, target of Stage 4)", rate);
+    println!(
+        "[perf] trie insert = {:.0} ins/s  (NOTE: O(n) rebuild, target of Stage 4)",
+        rate
+    );
     // Very loose: just ensure it completes and is not absurdly slow.
-    assert!(rate > 5.0, "trie insert path is pathologically slow: {rate}");
+    assert!(
+        rate > 5.0,
+        "trie insert path is pathologically slow: {rate}"
+    );
 }

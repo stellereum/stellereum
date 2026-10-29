@@ -20,7 +20,10 @@ fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<se
     if let Some(err) = resp.get("error") {
         anyhow::bail!("node rejected {method}: {err}");
     }
-    Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    Ok(resp
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
 }
 
 fn main() -> Result<()> {
@@ -43,21 +46,44 @@ fn main() -> Result<()> {
     let faucet_hex = hex::encode(faucet_addr);
     println!("faucet_addr: {faucet_hex}");
 
-    let bal = rpc_call(&rpc_url, "stell_getBalance", serde_json::json!({ "address": faucet_hex }))?;
+    let bal = rpc_call(
+        &rpc_url,
+        "stell_getBalance",
+        serde_json::json!({ "address": faucet_hex }),
+    )?;
     println!("faucet balance/nonce: {bal}");
 
     let vals = rpc_call(&rpc_url, "stell_getValidators", serde_json::json!({}))?;
     println!("validators: {}", serde_json::to_string_pretty(&vals)?);
 
     for (name, v) in [
-        ("A", "c2313fbaf5c0b1a4921f132bed48772f0d0b788b8f27ad7f96772610996c3361"),
-        ("D", "eddf81632831d8e9747dc38edbb2c88a835e246a0310d74c8b12b8df6e32e4cc"),
-        ("B", "9c675ebc6cd20c9226da2fcbf6c167647e4e948b78368f038058b6b419175fcd"),
-        ("C", "021776cdf2b3b644e91dbe44fbef4a29f5a8ebf80b01055d3e7cc83a85659694"),
+        (
+            "A",
+            "c2313fbaf5c0b1a4921f132bed48772f0d0b788b8f27ad7f96772610996c3361",
+        ),
+        (
+            "D",
+            "eddf81632831d8e9747dc38edbb2c88a835e246a0310d74c8b12b8df6e32e4cc",
+        ),
+        (
+            "B",
+            "9c675ebc6cd20c9226da2fcbf6c167647e4e948b78368f038058b6b419175fcd",
+        ),
+        (
+            "C",
+            "021776cdf2b3b644e91dbe44fbef4a29f5a8ebf80b01055d3e7cc83a85659694",
+        ),
     ] {
-        let s = rpc_call(&rpc_url, "stell_stakeOf", serde_json::json!({ "validator": v }))?;
+        let s = rpc_call(
+            &rpc_url,
+            "stell_stakeOf",
+            serde_json::json!({ "validator": v }),
+        )?;
         println!("stakeOf({name}): {s}");
     }
-    println!("tip: {}", rpc_call(&rpc_url, "eth_blockNumber", serde_json::json!({}))?);
+    println!(
+        "tip: {}",
+        rpc_call(&rpc_url, "eth_blockNumber", serde_json::json!({}))?
+    );
     Ok(())
 }

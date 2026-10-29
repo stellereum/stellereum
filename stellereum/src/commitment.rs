@@ -47,9 +47,9 @@
 //! that no two different states can encode to the same bytes.
 
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 /// Byte sink for the commitment preimage.
 ///
@@ -82,7 +82,7 @@ impl PreimageSink for Vec<u8> {
 }
 
 use crate::contract::ContractRegistry;
-use crate::orderbook::{OrderSide, OrderType, OrderbookManager, Order};
+use crate::orderbook::{Order, OrderSide, OrderType, OrderbookManager};
 use crate::pmm::PrimaryMarketMaker;
 use crate::sharding::CrossShardKey;
 use crate::staking::{StakingLedger, UnbondingEntry};
@@ -660,10 +660,19 @@ fn governance_digest<S: PreimageSink>(h: &mut S, g: &crate::governance::Governan
     let ap = &g.applied;
     for (tag, v) in [
         (b"gov_applied_min_bond".as_slice(), ap.min_validator_bond),
-        (b"gov_applied_equiv_slash".as_slice(), ap.equivocation_slash_bps),
-        (b"gov_applied_commission".as_slice(), ap.default_commission_bps),
+        (
+            b"gov_applied_equiv_slash".as_slice(),
+            ap.equivocation_slash_bps,
+        ),
+        (
+            b"gov_applied_commission".as_slice(),
+            ap.default_commission_bps,
+        ),
         (b"gov_applied_block_reward".as_slice(), ap.block_reward),
-        (b"gov_applied_pmm_buffer".as_slice(), ap.pmm_redemption_buffer_bps),
+        (
+            b"gov_applied_pmm_buffer".as_slice(),
+            ap.pmm_redemption_buffer_bps,
+        ),
     ] {
         match v {
             Some(x) => {
@@ -1056,7 +1065,11 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
     // denominator (the remainder only means something against the delegated
     // total it was carried from).
     if !l.reward_accumulators.is_empty() || !l.delegator_reward_checkpoints.is_empty() {
-        put_bytes(h, b"staking_reward_accumulator_domain", b"STAKING_REWARD_ACC_V1");
+        put_bytes(
+            h,
+            b"staking_reward_accumulator_domain",
+            b"STAKING_REWARD_ACC_V1",
+        );
         let mut accs: BTreeMap<&[u8; 32], &crate::staking::ValidatorRewardState> = BTreeMap::new();
         for (k, v) in &l.reward_accumulators {
             accs.insert(k, v);
@@ -1096,7 +1109,12 @@ fn unbonding_digest<S: PreimageSink>(h: &mut S, e: &UnbondingEntry) {
     put_u64(h, b"unbond_release_at", e.release_at);
 }
 
-fn pmm_digest<S: PreimageSink>(h: &mut S, p: &PrimaryMarketMaker, usdt: &Option<[u8; 32]>, treasury: &[u8; 32]) {
+fn pmm_digest<S: PreimageSink>(
+    h: &mut S,
+    p: &PrimaryMarketMaker,
+    usdt: &Option<[u8; 32]>,
+    treasury: &[u8; 32],
+) {
     put_u128(h, b"pmm_minted_nano", p.minted_nano);
     put_u128(h, b"pmm_reserve_micro", p.reserve_micro);
     put_u128(h, b"pmm_redemption_buffer_micro", p.redemption_buffer_micro);
@@ -1257,10 +1275,10 @@ fn session_keys_digest<S: PreimageSink>(h: &mut S, reg: &crate::zkml::SessionKey
         put_addr(h, b"session_master", &r.master);
         put_u64(h, b"session_valid_until", r.valid_until);
         put_u64(h, b"session_max_gas_spend", r.max_gas_spend);
-    put_u64(h, b"session_gas_spent", r.gas_spent);
-    put_u64(h, b"session_scope", r.scope);
-    put_u64(h, b"session_max_value_per_tx", r.max_value_per_tx);
-    put_bool(h, b"session_revoked", r.revoked);
+        put_u64(h, b"session_gas_spent", r.gas_spent);
+        put_u64(h, b"session_scope", r.scope);
+        put_u64(h, b"session_max_value_per_tx", r.max_value_per_tx);
+        put_bool(h, b"session_revoked", r.revoked);
     }
 }
 
@@ -1924,9 +1942,10 @@ mod tests {
     #[test]
     fn vesting_schedules_move_the_digest() {
         let mut s = empty_snapshot();
-        s.staking
-            .vesting_schedules
-            .insert([0x44u8; 32], crate::tokenomics::TeamVestingSchedule::new(1_000));
+        s.staking.vesting_schedules.insert(
+            [0x44u8; 32],
+            crate::tokenomics::TeamVestingSchedule::new(1_000),
+        );
         assert_ne!(
             digest_of(&s),
             digest_of(&empty_snapshot()),
@@ -1936,10 +1955,10 @@ mod tests {
 
         // ...and so does the floor's own parameters.
         let mut moved = empty_snapshot();
-        moved
-            .staking
-            .vesting_schedules
-            .insert([0x44u8; 32], crate::tokenomics::TeamVestingSchedule::new(1_000));
+        moved.staking.vesting_schedules.insert(
+            [0x44u8; 32],
+            crate::tokenomics::TeamVestingSchedule::new(1_000),
+        );
         moved
             .staking
             .vesting_schedules
@@ -2092,17 +2111,19 @@ mod tests {
     fn a_conditional_map_that_becomes_empty_again_is_transparent() {
         // Start from a state that USED the domain...
         let mut used = empty_snapshot();
-        used.staking
-            .validator_pq_keys
-            .insert([0x33u8; 32], (crate::post_quantum::PqScheme::Ed25519, vec![0xAB; 32]));
+        used.staking.validator_pq_keys.insert(
+            [0x33u8; 32],
+            (crate::post_quantum::PqScheme::Ed25519, vec![0xAB; 32]),
+        );
         assert_ne!(digest_of(&used), digest_of(&empty_snapshot()));
 
         // ...and empty it again (the PQ micro-committee arm removes a
         // validator's key, so this really happens on a live chain).
         let mut emptied = empty_snapshot();
-        emptied.staking
-            .validator_pq_keys
-            .insert([0x33u8; 32], (crate::post_quantum::PqScheme::Ed25519, vec![0xAB; 32]));
+        emptied.staking.validator_pq_keys.insert(
+            [0x33u8; 32],
+            (crate::post_quantum::PqScheme::Ed25519, vec![0xAB; 32]),
+        );
         emptied.staking.validator_pq_keys.remove(&[0x33u8; 32]);
         assert_eq!(
             digest_of(&emptied),
@@ -2141,10 +2162,10 @@ mod tests {
         // A PQ key of 32 bytes and one of 33 bytes must differ (the public
         // key length is written, never implied by the scheme).
         let mut short = empty_snapshot();
-        short
-            .staking
-            .validator_pq_keys
-            .insert([0x33u8; 32], (crate::post_quantum::PqScheme::Ed25519, vec![0xAB; 32]));
+        short.staking.validator_pq_keys.insert(
+            [0x33u8; 32],
+            (crate::post_quantum::PqScheme::Ed25519, vec![0xAB; 32]),
+        );
         let mut long = empty_snapshot();
         long.staking.validator_pq_keys.insert(
             [0x33u8; 32],
@@ -2160,10 +2181,10 @@ mod tests {
         // accumulator without checkpoints and a checkpoint without an
         // accumulator are different states.
         let mut acc_only = empty_snapshot();
-        acc_only
-            .staking
-            .reward_accumulators
-            .insert([0x77u8; 32], crate::staking::ValidatorRewardState::default());
+        acc_only.staking.reward_accumulators.insert(
+            [0x77u8; 32],
+            crate::staking::ValidatorRewardState::default(),
+        );
         let mut cp_only = empty_snapshot();
         cp_only
             .staking
@@ -2188,7 +2209,9 @@ mod tests {
             remainder_den: 11,
             ..Default::default()
         };
-        base.staking.reward_accumulators.insert([0x77u8; 32], state.clone());
+        base.staking
+            .reward_accumulators
+            .insert([0x77u8; 32], state.clone());
 
         let mut no_carry = empty_snapshot();
         let mut state2 = state.clone();
@@ -2461,10 +2484,7 @@ mod tests {
             fill!(Domain::Escrow, escrow_preimage(&s.order_escrow)),
             fill!(Domain::Governance, governance_preimage(&s.governance)),
             fill!(Domain::Oracle, oracle_preimage(&s.oracle)),
-            fill!(
-                Domain::SessionKeys,
-                session_keys_preimage(&s.session_keys)
-            ),
+            fill!(Domain::SessionKeys, session_keys_preimage(&s.session_keys)),
             fill!(Domain::Books, books_preimage(&s.orderbooks)),
             fill!(Domain::Bridge, bridge_preimage(&s.bridge)),
             fill!(
@@ -2476,10 +2496,7 @@ mod tests {
                 )
             ),
             fill!(Domain::Xpc, xpc_preimage(&s.cross_shard_xpc)),
-            fill!(
-                Domain::Confidential,
-                confidential_preimage(confidential)
-            ),
+            fill!(Domain::Confidential, confidential_preimage(confidential)),
             fill!(Domain::Zkml, zkml_preimage(zkml)),
         ];
         let refs: [&[u8]; 14] = [
@@ -2530,7 +2547,10 @@ mod tests {
         cache.reset_counters();
         let cached2 = assemble_test(&s, &confidential, &zkml, &gens, &mut cache);
         assert_eq!(cached2, reference);
-        assert_eq!(cache.hits, 14, "steady-state recommit must hit every domain");
+        assert_eq!(
+            cache.hits, 14,
+            "steady-state recommit must hit every domain"
+        );
         assert_eq!(cache.misses, 0);
     }
 
@@ -2572,7 +2592,10 @@ mod tests {
             contracts_preimage(&s2.contracts),
             "changed state must still match the reference path"
         );
-        assert_ne!(changed, reference, "the manifest change must move the domain");
+        assert_ne!(
+            changed, reference,
+            "the manifest change must move the domain"
+        );
         assert_eq!(
             cache.misses - misses_before,
             1,
@@ -2723,7 +2746,10 @@ mod tests {
             "[perf] commitment_digest populated (1500 tokens/300 contracts/200 vals): streaming={streaming_ms:.2}ms cold-cached={cold_ms:.2}ms hot-cached(all-hit)={hot_ms:.2}ms speedup={:.1}x",
             if hot_ms > 0.0 { streaming_ms / hot_ms } else { f64::INFINITY },
         );
-        assert_eq!(cache.hits, 14, "steady-state recommit must hit every domain");
+        assert_eq!(
+            cache.hits, 14,
+            "steady-state recommit must hit every domain"
+        );
         assert_eq!(cache.misses, 0);
         // Touch one contract's STORAGE (its manifest is unchanged) and bump
         // only the contracts generation: the domain rebuilds, but every

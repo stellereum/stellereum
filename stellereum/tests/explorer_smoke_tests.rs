@@ -15,20 +15,30 @@ async fn state() -> Arc<RpcState> {
     let faucet_key = [0x11u8; 32];
     engine
         .update_account(AccountState::new(
-            ed25519_dalek::SigningKey::from_bytes(&faucet_key).verifying_key().to_bytes(),
+            ed25519_dalek::SigningKey::from_bytes(&faucet_key)
+                .verifying_key()
+                .to_bytes(),
             10_000_000_000_000,
         ))
         .await;
     let st = Arc::new(RpcState {
         engine,
-        mempool: Arc::new(tokio::sync::RwLock::new(stellereum::mempool::Mempool::default())),
+        mempool: Arc::new(tokio::sync::RwLock::new(
+            stellereum::mempool::Mempool::default(),
+        )),
         height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         node_id: "inf1:smoke".to_string(),
         chain_id: 5757,
-        staking: Arc::new(tokio::sync::RwLock::new(stellereum::staking::StakingLedger::new())),
-        governance: Arc::new(tokio::sync::RwLock::new(stellereum::governance::Governance::new())),
+        staking: Arc::new(tokio::sync::RwLock::new(
+            stellereum::staking::StakingLedger::new(),
+        )),
+        governance: Arc::new(tokio::sync::RwLock::new(
+            stellereum::governance::Governance::new(),
+        )),
         recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
-        receipts: Arc::new(tokio::sync::RwLock::new(stellereum::rpc::ReceiptIndex::default())),
+        receipts: Arc::new(tokio::sync::RwLock::new(
+            stellereum::rpc::ReceiptIndex::default(),
+        )),
         auth_token: None,
         tx_broadcast: None,
         faucet: Some(Arc::new(stellereum::rpc::Faucet::new(
@@ -126,16 +136,25 @@ async fn explorer_serves_index_and_apis() {
 
     let (status, body) = http_get(addr, "/").await;
     assert!(status.contains("200"), "index status: {status}");
-    assert!(body.contains("Stellereum Explorer"), "index must render the UI");
+    assert!(
+        body.contains("Stellereum Explorer"),
+        "index must render the UI"
+    );
 
     let (status, body) = http_get(addr, "/api/stats").await;
     assert!(status.contains("200"), "stats status: {status}");
     assert!(body.contains("5757"), "stats must include chain id: {body}");
-    assert!(body.contains("\"height\":42"), "stats must include height: {body}");
+    assert!(
+        body.contains("\"height\":42"),
+        "stats must include height: {body}"
+    );
 
     let (status, body) = http_get(addr, "/api/blocks").await;
     assert!(status.contains("200"));
-    assert!(body.contains("\"height\":42"), "blocks feed must list the block: {body}");
+    assert!(
+        body.contains("\"height\":42"),
+        "blocks feed must list the block: {body}"
+    );
 
     let hexaddr = hex::encode([3u8; 32]);
     let (status, body) = http_get(addr, &format!("/api/spv/{hexaddr}")).await;
@@ -154,11 +173,19 @@ async fn explorer_serves_index_and_apis() {
 
     // CORS headers on responses
     let (status, _) = http_get(addr, "/health").await;
-    assert!(status.to_lowercase().contains("access-control-allow-origin: *") || status.contains("200"));
+    assert!(
+        status
+            .to_lowercase()
+            .contains("access-control-allow-origin: *")
+            || status.contains("200")
+    );
 
     // bad address -> 400
     let (status, _) = http_get(addr, "/api/balance/zzzz").await;
-    assert!(status.contains("400"), "bad address must be rejected: {status}");
+    assert!(
+        status.contains("400"),
+        "bad address must be rejected: {status}"
+    );
 }
 
 #[tokio::test]
@@ -168,15 +195,24 @@ async fn faucet_requires_token_and_then_caps_out() {
 
     // GET on the faucet must NOT mint (POST-only; crawlers must not mint).
     let (status, _) = http_get(addr, &format!("/api/faucet/{who}?token=smoke-token")).await;
-    assert!(status.contains("405"), "GET faucet must be refused: {status}");
+    assert!(
+        status.contains("405"),
+        "GET faucet must be refused: {status}"
+    );
 
     // Anonymous drain attempt must be refused (no token at all).
     let (status, _) = http_post(addr, &format!("/api/faucet/{who}"), "").await;
-    assert!(status.contains("401"), "anonymous drip must be rejected: {status}");
+    assert!(
+        status.contains("401"),
+        "anonymous drip must be rejected: {status}"
+    );
 
     // A wrong token must be refused too.
     let (status, _) = http_post(addr, &format!("/api/faucet/{who}?token=wrong"), "").await;
-    assert!(status.contains("401"), "bad token must be rejected: {status}");
+    assert!(
+        status.contains("401"),
+        "bad token must be rejected: {status}"
+    );
 
     // The token may also arrive as an auth header instead of a query param.
     let (status, body) = http_post_with(
@@ -186,16 +222,26 @@ async fn faucet_requires_token_and_then_caps_out() {
         &[("Authorization", "Bearer smoke-token")],
     )
     .await;
-    assert!(status.contains("200"), "header token drip must succeed: {status}");
+    assert!(
+        status.contains("200"),
+        "header token drip must succeed: {status}"
+    );
     assert!(body.contains("10000000000"), "must credit 10 STELL: {body}");
 
     // Draining the whole lifetime cap (100 STELL) takes 10 calls of 10.
     for _ in 0..9 {
-        let (status, _) = http_post(addr, &format!("/api/faucet/{who}?token=smoke-token"), "").await;
-        assert!(status.contains("200"), "drip within cap must succeed: {status}");
+        let (status, _) =
+            http_post(addr, &format!("/api/faucet/{who}?token=smoke-token"), "").await;
+        assert!(
+            status.contains("200"),
+            "drip within cap must succeed: {status}"
+        );
     }
     let (status, body) = http_post(addr, &format!("/api/faucet/{who}?token=smoke-token"), "").await;
-    assert!(status.contains("429"), "cap exhausted must be rejected: {status} {body}");
+    assert!(
+        status.contains("429"),
+        "cap exhausted must be rejected: {status} {body}"
+    );
 }
 
 #[tokio::test]
@@ -221,7 +267,9 @@ async fn rpc_nested_route_has_cors_headers() {
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"stell_chainId","params":{}}"#;
     let (status, _) = http_post(addr, "/rpc", body).await;
     assert!(
-        status.to_lowercase().contains("access-control-allow-origin"),
+        status
+            .to_lowercase()
+            .contains("access-control-allow-origin"),
         "nested /rpc must carry CORS headers: {status}"
     );
 }

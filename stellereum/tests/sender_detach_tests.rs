@@ -31,9 +31,9 @@ use std::time::Duration;
 use stellereum::consensus::{QuorumCertificate, Vote, VoteKind};
 use stellereum::consensus_net::{
     broadcast_join_timeout_ms, committed_bypasses_skip, join_with_timeout,
-    parse_broadcast_join_timeout_ms, parse_probe_evict_after, plan_peer_send,
-    probe_evict_after, probe_timeout_should_evict, SendPlan,
-    BROADCAST_JOIN_TIMEOUT_MS_DEFAULT, PROBE_EVICT_AFTER_DEFAULT, ConsensusMsg,
+    parse_broadcast_join_timeout_ms, parse_probe_evict_after, plan_peer_send, probe_evict_after,
+    probe_timeout_should_evict, ConsensusMsg, SendPlan, BROADCAST_JOIN_TIMEOUT_MS_DEFAULT,
+    PROBE_EVICT_AFTER_DEFAULT,
 };
 use stellereum::sharding::Block;
 
@@ -100,8 +100,7 @@ async fn join_detach_slow_peer_does_not_delay_flush() {
         9u32
     });
     let t = std::time::Instant::now();
-    let (done, detached) =
-        join_with_timeout(vec![fast, slow], Duration::from_millis(50)).await;
+    let (done, detached) = join_with_timeout(vec![fast, slow], Duration::from_millis(50)).await;
     let took = t.elapsed();
     // The fast peer's outcome is observed; the slow one detaches ...
     assert_eq!(done, vec![7u32], "fast peer outcome must be collected");
@@ -211,7 +210,10 @@ fn probe_evicts_only_after_n_consecutive_timeouts() {
 
     // The decision: sub-threshold streaks keep the connection ...
     assert!(!probe_timeout_should_evict(0, 3));
-    assert!(!probe_timeout_should_evict(1, 3), "single timeout must never evict");
+    assert!(
+        !probe_timeout_should_evict(1, 3),
+        "single timeout must never evict"
+    );
     assert!(!probe_timeout_should_evict(2, 3));
     // ... the Nth consecutive timeout evicts, and the streak staying red
     // keeps evicting (the peer is still dead).

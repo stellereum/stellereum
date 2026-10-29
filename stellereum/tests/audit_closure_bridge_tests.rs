@@ -54,7 +54,12 @@ fn attest_for(dep: &BridgeIntent, signers: &[SigningKey]) -> BridgeIntent {
     }
 }
 
-fn quorum_proof(hash: [u8; 32], recipient: [u8; 32], amount: u64, signers: &[SigningKey]) -> BridgeIntent {
+fn quorum_proof(
+    hash: [u8; 32],
+    recipient: [u8; 32],
+    amount: u64,
+    signers: &[SigningKey],
+) -> BridgeIntent {
     let dep = deposit(hash, recipient, amount);
     let att = attest_for(&dep, signers);
     let signatures = match att {
@@ -108,7 +113,12 @@ fn genuine_failure_proof(
 }
 
 fn model() -> QuantizedLinearModel {
-    QuantizedLinearModel::new(vec![QuantizedLayer::new(2, 2, vec![2, -1, 1, 3], vec![1, -2])])
+    QuantizedLinearModel::new(vec![QuantizedLayer::new(
+        2,
+        2,
+        vec![2, -1, 1, 3],
+        vec![1, -2],
+    )])
 }
 
 // ===========================================================================
@@ -283,11 +293,10 @@ fn b2_false_challenge_confirm_slashes_bond_no_reward() {
         .effects
         .iter()
         .filter_map(|e| match e {
-            stellereum::bridge::BridgeEffect::Unpark { recipient: r, amount: a }
-                if *r == recipient =>
-            {
-                Some(*a)
-            }
+            stellereum::bridge::BridgeEffect::Unpark {
+                recipient: r,
+                amount: a,
+            } if *r == recipient => Some(*a),
             _ => None,
         })
         .sum();
@@ -296,10 +305,10 @@ fn b2_false_challenge_confirm_slashes_bond_no_reward() {
         amount + bond,
         "clawback returns plus the slashed bond; no 10% reward moves"
     );
-    assert!(!plan.effects.iter().any(|e| matches!(
-        e,
-        stellereum::bridge::BridgeEffect::Burn { .. }
-    )));
+    assert!(!plan
+        .effects
+        .iter()
+        .any(|e| matches!(e, stellereum::bridge::BridgeEffect::Burn { .. })));
 }
 
 /// B2 / SEC-01: an UNPROVEN challenge never pays a bounty.
@@ -1109,7 +1118,11 @@ fn b2_suppressed_evidence_defers_exactly_k_times_then_refuses() {
         assert!(plan.effects.is_empty(), "a defer moves no coin");
         let d = plan.state.disputes.get(&0).unwrap();
         assert!(!d.resolved, "a defer never settles");
-        assert_eq!(d.deadline, now + RESOLVE_DEFER_SECS, "defer {i}: one window out");
+        assert_eq!(
+            d.deadline,
+            now + RESOLVE_DEFER_SECS,
+            "defer {i}: one window out"
+        );
         let next = d.deadline;
         state = plan.state;
         now = next;
@@ -1159,10 +1172,7 @@ fn b2_failing_evidence_before_deadline_revokes_nothing() {
         .state;
     let err = s2
         .plan(
-            &[
-                failing_proof(hash),
-                BridgeIntent::Resolve { dispute_id: 0 },
-            ],
+            &[failing_proof(hash), BridgeIntent::Resolve { dispute_id: 0 }],
             &pubs,
             challenger,
             TS + 20,
@@ -1246,7 +1256,12 @@ fn b3_refund_then_release_is_refused_deletion_wins() {
     assert!(!s2.pending_withdrawals.contains_key(&0));
     // Release of the refunded id: unknown.
     let err = s2
-        .plan(&[BridgeIntent::Release { req_id: 0 }], &pubs, payer, TS + REFUND_GRACE_SECS + 2)
+        .plan(
+            &[BridgeIntent::Release { req_id: 0 }],
+            &pubs,
+            payer,
+            TS + REFUND_GRACE_SECS + 2,
+        )
         .expect_err("release-after-refund must fail (deleted)");
     assert!(err.contains("not found"), "got: {err}");
     // Double refund: unknown too.

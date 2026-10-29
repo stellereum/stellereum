@@ -68,8 +68,14 @@ fn f3_chain_id_serving_tracks_effective_id_while_pins_stay() {
     assert_eq!(evm::effective_chain_id(), 5757);
     assert_eq!(evm::eth_chain_id(), "0x167d");
     assert_eq!(evm::net_version(), "5757");
-    assert_eq!(evm::eth_chain_id(), evm::eth_chain_id_for(evm::effective_chain_id()));
-    assert_eq!(evm::net_version(), evm::net_version_for(evm::effective_chain_id()));
+    assert_eq!(
+        evm::eth_chain_id(),
+        evm::eth_chain_id_for(evm::effective_chain_id())
+    );
+    assert_eq!(
+        evm::net_version(),
+        evm::net_version_for(evm::effective_chain_id())
+    );
 }
 
 #[test]
@@ -80,17 +86,32 @@ fn f3_foreign_chain_tx_rejected_by_pinned_verifier() {
     let decoded = evm::parse_legacy_transaction(&raw).expect("official vector decodes");
     assert_eq!(decoded.chain_id, Some(1));
     // Pinned legacy verifier: chain 1 != 5757 -> mismatch.
-    let err = decoded.verify_signature().expect_err("foreign chain must be refused");
+    let err = decoded
+        .verify_signature()
+        .expect_err("foreign chain must be refused");
     assert!(
-        matches!(err, evm::EvmError::ChainIdMismatch { expected: 5757, got: 1 }),
+        matches!(
+            err,
+            evm::EvmError::ChainIdMismatch {
+                expected: 5757,
+                got: 1
+            }
+        ),
         "unexpected error: {err}"
     );
     // Chain-aware ecrecover agrees.
     let sighash = decoded.signing_hash();
-    let err2 = evm::ecrecover_with_chain_id(&sighash, decoded.v, &decoded.r, &decoded.s, Some(5757))
-        .expect_err("foreign chain must be refused");
+    let err2 =
+        evm::ecrecover_with_chain_id(&sighash, decoded.v, &decoded.r, &decoded.s, Some(5757))
+            .expect_err("foreign chain must be refused");
     assert!(
-        matches!(err2, evm::EvmError::ChainIdMismatch { expected: 5757, got: 1 }),
+        matches!(
+            err2,
+            evm::EvmError::ChainIdMismatch {
+                expected: 5757,
+                got: 1
+            }
+        ),
         "unexpected error: {err2}"
     );
     // Same bytes are FINE when the caller asks for chain 1: the refusal is
@@ -162,10 +183,18 @@ fn f3_valid_5757_tx_passes_pinned_verifier_and_parses_back() {
     let (raw, sender) = sign_5757_legacy(0, 1_000_000_000_000_000_000);
     let decoded = evm::parse_legacy_transaction(&raw).expect("our tx decodes");
     assert_eq!(decoded.chain_id, Some(5757));
-    assert_eq!(decoded.verify_signature().expect("pinned verifier accepts 5757"), sender);
+    assert_eq!(
+        decoded
+            .verify_signature()
+            .expect("pinned verifier accepts 5757"),
+        sender
+    );
     // Admission gate files the intent and returns the keccak hash.
     let hash = evm::eth_send_raw_transaction_bytes(&raw).expect("gate admits 5757 tx");
-    assert!(hash.starts_with("0x") && hash.len() == 66, "keccak hash, got {hash}");
+    assert!(
+        hash.starts_with("0x") && hash.len() == 66,
+        "keccak hash, got {hash}"
+    );
     assert_eq!(hash, format!("0x{}", hex::encode(evm::keccak256(&raw))));
     // Re-admission of the same bytes is idempotent (same hash, no error).
     assert_eq!(evm::eth_send_raw_transaction_bytes(&raw).unwrap(), hash);
@@ -187,9 +216,15 @@ fn f5_rlp_deep_nesting_rejected() {
         inner
     }
     // 65 nested single-item lists: depth 65 > MAX_DEPTH 64 must fail.
-    assert!(evm::RlpItem::decode(&nest(65)).is_err(), "depth-65 nest must be refused");
+    assert!(
+        evm::RlpItem::decode(&nest(65)).is_err(),
+        "depth-65 nest must be refused"
+    );
     // Depth exactly 64 still decodes (the cap is not off-by-one).
-    assert!(evm::RlpItem::decode(&nest(64)).is_ok(), "depth-64 nest must decode");
+    assert!(
+        evm::RlpItem::decode(&nest(64)).is_ok(),
+        "depth-64 nest must decode"
+    );
 }
 
 #[test]
@@ -214,7 +249,10 @@ fn f5_rlp_noncanonical_forms_rejected() {
     assert_eq!(item.as_u64(), Err(evm::RlpError::LeadingZeroInInteger));
     // Integer wider than u64.
     let wide = evm::RlpItem::decode(&[0x89, 1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
-    assert!(matches!(wide.as_u64(), Err(evm::RlpError::IntegerOverflow(_))));
+    assert!(matches!(
+        wide.as_u64(),
+        Err(evm::RlpError::IntegerOverflow(_))
+    ));
 }
 
 #[test]
@@ -242,7 +280,10 @@ fn f5_raw_tx_size_cap_enforced_before_decode() {
     let big = vec![0u8; evm::MAX_EVM_RAW_TX_BYTES + 1];
     assert!(evm::eth_send_raw_transaction_bytes(&big).is_err());
     assert!(evm::extract_raw_evm_bytes(&json!([format!("0x{}", "00".repeat(big.len()))])).is_err());
-    assert!(evm::extract_raw_evm_bytes(&json!([])).is_err(), "empty params refused");
+    assert!(
+        evm::extract_raw_evm_bytes(&json!([])).is_err(),
+        "empty params refused"
+    );
     // Empty bytes refused too.
     assert!(evm::eth_send_raw_transaction_bytes(&[]).is_err());
 }
@@ -287,11 +328,21 @@ fn f6_high_s_rejected_at_every_strict_layer() {
     assert!(!evm::is_low_s(&hi), "malleated s must be high-s");
     let sighash = decoded.signing_hash();
     // Strict layers refuse high-s...
-    assert!(evm::validate_transaction_signature_with_chain_id(&sighash, decoded.v, &decoded.r, &hi, Some(5757)).is_err());
+    assert!(evm::validate_transaction_signature_with_chain_id(
+        &sighash,
+        decoded.v,
+        &decoded.r,
+        &hi,
+        Some(5757)
+    )
+    .is_err());
     // ...including the legacy verifier (low-s gate fires before recovery).
     let mut bad = decoded.clone();
     bad.s = hi;
-    assert!(matches!(bad.verify_signature(), Err(evm::EvmError::InvalidSignatureS)));
+    assert!(matches!(
+        bad.verify_signature(),
+        Err(evm::EvmError::InvalidSignatureS)
+    ));
 }
 
 #[test]
@@ -320,7 +371,10 @@ fn f6_cross_deployment_replay_is_chain_bound() {
     let sighash = decoded.signing_hash();
     assert!(matches!(
         evm::ecrecover_with_chain_id(&sighash, decoded.v, &decoded.r, &decoded.s, Some(1)),
-        Err(evm::EvmError::ChainIdMismatch { expected: 1, got: 5757 })
+        Err(evm::EvmError::ChainIdMismatch {
+            expected: 1,
+            got: 5757
+        })
     ));
 }
 
@@ -331,11 +385,18 @@ fn f6_cross_deployment_replay_is_chain_bound() {
 #[test]
 fn f4_estimate_serves_pure_figure_at_zero_floor() {
     assert_eq!(evm::eth_estimate_gas_impl(&json!([])).unwrap(), "0x5208");
-    assert_eq!(evm::eth_estimate_gas_with_floor(&json!([]), 0).unwrap(), "0x5208");
+    assert_eq!(
+        evm::eth_estimate_gas_with_floor(&json!([]), 0).unwrap(),
+        "0x5208"
+    );
     // 4 non-zero calldata bytes: 21000 + 4*16 = 21064 = 0x5248.
-    let call = json!([{ "to": "0x3535353535353535353535353535353535353535", "data": "0xaabbccdd" }]);
+    let call =
+        json!([{ "to": "0x3535353535353535353535353535353535353535", "data": "0xaabbccdd" }]);
     assert_eq!(evm::eth_estimate_gas_impl(&call).unwrap(), "0x5248");
-    assert_eq!(evm::eth_estimate_gas_with_floor(&call, 0).unwrap(), "0x5248");
+    assert_eq!(
+        evm::eth_estimate_gas_with_floor(&call, 0).unwrap(),
+        "0x5248"
+    );
 }
 
 #[test]
@@ -347,8 +408,12 @@ fn f4_estimate_never_below_admission_floor() {
         "0x445c0"
     );
     // Floor below the pure figure is a no-op (calldata-heavy estimate wins).
-    let call = json!([{ "to": "0x3535353535353535353535353535353535353535", "data": "0xaabbccdd" }]);
-    assert_eq!(evm::eth_estimate_gas_with_floor(&call, 1000).unwrap(), "0x5248");
+    let call =
+        json!([{ "to": "0x3535353535353535353535353535353535353535", "data": "0xaabbccdd" }]);
+    assert_eq!(
+        evm::eth_estimate_gas_with_floor(&call, 1000).unwrap(),
+        "0x5248"
+    );
     // Contract creation base (53k) still floored upward the same way.
     let create = json!([{ "data": "0x6001" }]);
     let pure = evm::eth_estimate_gas_impl(&create).unwrap();
@@ -369,11 +434,14 @@ fn f4_estimate_never_below_admission_floor() {
 async fn eth_call_sandbox_reads_only_and_never_panics() {
     use stellereum::state_engine::{AccountState, InMemoryStateEngine};
     let engine = InMemoryStateEngine::new();
-    engine.update_account(AccountState::new([9u8; 32], 1_000_000)).await;
+    engine
+        .update_account(AccountState::new([9u8; 32], 1_000_000))
+        .await;
     let root_before = engine.get_state_root().await;
 
     // Unknown selector -> "0x", twice (deterministic, no state created).
-    let unknown = json!([{ "to": "0x3535353535353535353535353535353535353535", "data": "0xdeadbeef" }]);
+    let unknown =
+        json!([{ "to": "0x3535353535353535353535353535353535353535", "data": "0xdeadbeef" }]);
     let a = evm::eth_call_with_engine(&engine, &unknown).await.unwrap();
     let b = evm::eth_call_with_engine(&engine, &unknown).await.unwrap();
     assert_eq!(a, json!("0x"));
@@ -394,12 +462,16 @@ async fn eth_call_sandbox_reads_only_and_never_panics() {
     // 100 KiB of calldata: bounded work, prompt empty answer (input is under
     // the body cap; emulation does one selector match, no iteration over it).
     let huge = format!("0x{}", "ab".repeat(50_000));
-    let v = evm::eth_call_with_engine(&engine, &json!([{ "data": huge }])).await.unwrap();
+    let v = evm::eth_call_with_engine(&engine, &json!([{ "data": huge }]))
+        .await
+        .unwrap();
     assert_eq!(v, json!("0x"));
 
     // Known selector still emulates (balanceOf path exercises the engine read).
     let bal_of = format!("0x70a08231{}", "00".repeat(12) + &"09".repeat(20));
-    let v = evm::eth_call_with_engine(&engine, &json!([{ "data": bal_of }])).await.unwrap();
+    let v = evm::eth_call_with_engine(&engine, &json!([{ "data": bal_of }]))
+        .await
+        .unwrap();
     assert!(v.as_str().unwrap().starts_with("0x"));
 
     // No state was touched by any of the above.
@@ -414,7 +486,7 @@ const TESTKEY_HEX: &str = "11111111111111111111111111111111111111111111111111111
 
 #[test]
 fn f7_serving_refuses_test_key_that_genesis_allows() {
-    use stellereum::rpc as rpc;
+    use stellereum::rpc;
     let _env = EnvGuard::take(&[
         rpc::FAUCET_KEY_ENV,
         rpc::FAUCET_KEY_FILE_ENV,
@@ -426,7 +498,10 @@ fn f7_serving_refuses_test_key_that_genesis_allows() {
 
     // SERVING loader: hard refusal of the well-known public test key.
     let serving = rpc::load_faucet_seed();
-    assert!(serving.is_err(), "serving must refuse 0x11..11 without the dev override");
+    assert!(
+        serving.is_err(),
+        "serving must refuse 0x11..11 without the dev override"
+    );
     assert!(serving.unwrap_err().contains("PUBLIC test key"));
 
     // GENESIS loader: warns but returns (root determinism for chains founded
@@ -444,7 +519,7 @@ fn f7_no_serving_path_uses_genesis_loader() {
     // Tripwire for the airtight split: the serving loader must keep refusing
     // the test key while the genesis loader allows it — if a future refactor
     // merges them, the test above fails. Here we pin the gate helpers too.
-    use stellereum::rpc as rpc;
+    use stellereum::rpc;
     assert!(rpc::is_test_key_seed(&rpc::TEST_FAUCET_SEED));
     assert!(!rpc::is_test_key_seed(&[0x42u8; 32]));
     assert!(rpc::is_dev_unsafe_testkey(Some("1")));
@@ -461,7 +536,7 @@ fn f7_no_serving_path_uses_genesis_loader() {
 
 #[test]
 fn f7_key_file_perm_gate_fail_closed() {
-    use stellereum::rpc as rpc;
+    use stellereum::rpc;
     let dir = std::env::temp_dir().join(format!("stell_audit_closeout_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("faucet.key");
@@ -472,7 +547,10 @@ fn f7_key_file_perm_gate_fail_closed() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let err = rpc::load_faucet_seed_from_file(&path).expect_err("0644 must be refused");
-        assert!(err.contains("0600") || err.contains("permissions"), "got: {err}");
+        assert!(
+            err.contains("0600") || err.contains("permissions"),
+            "got: {err}"
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let seed = rpc::load_faucet_seed_from_file(&path).expect("0600 must load");
         assert_eq!(seed, rpc::TEST_FAUCET_SEED);
@@ -510,7 +588,10 @@ fn f8_untrusted_peer_spoof_is_ignored_rightmost_default() {
     // Remote attacker claims to be the victim; TCP peer is untrusted.
     let peer: IpAddr = "8.8.8.8".parse().unwrap();
     let headers = real_headers(&[("x-forwarded-for", "1.2.3.4")]);
-    assert_eq!(cip::resolve_with(&headers, peer, &trusted, cip::XffMode::Rightmost), peer);
+    assert_eq!(
+        cip::resolve_with(&headers, peer, &trusted, cip::XffMode::Rightmost),
+        peer
+    );
     // Unknown mode strings fall back to Rightmost (fail-safe).
     assert_eq!(cip::XffMode::parse("weird-mode"), cip::XffMode::Rightmost);
 }
@@ -562,7 +643,10 @@ fn f8_spoof_cannot_hop_rate_limit_buckets() {
     let forged = real_headers(&[("x-forwarded-for", "9.9.9.9, 1.2.3.4")]);
     let resolved2 = cip::resolve_with(&forged, proxy_peer, &trusted, cip::XffMode::Rightmost);
     assert_eq!(resolved2, victim);
-    assert!(!limiter.check_at(resolved2, now), "victim bucket already exhausted");
+    assert!(
+        !limiter.check_at(resolved2, now),
+        "victim bucket already exhausted"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -586,20 +670,36 @@ fn f10_api_address_parsing_fuzz() {
     assert_eq!(parse_addr(&format!("0x{good}")), Some([9u8; 32]));
     // Uppercase hex is accepted; an `0X` prefix is not (only `0x`/bare).
     assert_eq!(parse_addr(&good.to_uppercase()), Some([9u8; 32]));
-    assert!(parse_addr(&format!("0X{good}")).is_none(), "0X prefix is not accepted");
+    assert!(
+        parse_addr(&format!("0X{good}")).is_none(),
+        "0X prefix is not accepted"
+    );
 }
 
 #[test]
 fn f10_hash_parsing_fuzz() {
     // Malformed hashes fail closed (Err), never panic.
-    for bad in ["", "0x", "0xzz", "abc", &"00".repeat(31), &"00".repeat(33), "0x00"] {
-        assert!(evm::normalize_hash(bad).is_err() || evm::parse_hash_bytes(bad).is_err(), "{bad:?}");
+    for bad in [
+        "",
+        "0x",
+        "0xzz",
+        "abc",
+        &"00".repeat(31),
+        &"00".repeat(33),
+        "0x00",
+    ] {
+        assert!(
+            evm::normalize_hash(bad).is_err() || evm::parse_hash_bytes(bad).is_err(),
+            "{bad:?}"
+        );
     }
     let good = format!("0x{}", "ab".repeat(32));
     let norm = evm::normalize_hash(&good).expect("32-byte hash normalizes");
     assert_eq!(evm::parse_hash_bytes(&norm).unwrap(), [0xabu8; 32]);
     // Unknown-but-wellformed hashes resolve to None (honest null), not an error.
-    assert!(evm::global_adapter().get_transaction_receipt(&good).is_none());
+    assert!(evm::global_adapter()
+        .get_transaction_receipt(&good)
+        .is_none());
     assert!(evm::global_adapter().get_settled_receipt(&good).is_none());
 }
 
@@ -609,7 +709,10 @@ fn f10_metrics_exposes_nothing_sensitive() {
     // Hostile peer id cannot forge a series or smuggle a newline.
     let evil = "evil\"\nstell_fake_metric 1\n# HELP x";
     let clean = sanitize_label_value(evil);
-    assert!(!clean.contains('\n') && !clean.contains('\r'), "got: {clean:?}");
+    assert!(
+        !clean.contains('\n') && !clean.contains('\r'),
+        "got: {clean:?}"
+    );
     let reg = Registry::new();
     reg.observe_peer_latency(evil, 0.5);
     reg.set_peer_round_lag(evil, 3);
@@ -649,11 +752,27 @@ fn f10_metrics_exposes_nothing_sensitive() {
             || line.starts_with("stellereum_");
         assert!(known, "unexpected scrape line: {line}");
     }
-    assert!(!text.contains("stell_fake_metric 1\n"), "forged series must not appear");
+    assert!(
+        !text.contains("stell_fake_metric 1\n"),
+        "forged series must not appear"
+    );
     // No secrets anywhere in exposition vocabulary. Needles are precise
     // secret-class names: bare "token" hits public "…tokens…" vocabulary.
-    for needle in ["auth_token", "faucet_token", "secret_key", "private_key", "mnemonic", "faucet_key", "api_key", "password", "seed"] {
-        assert!(!text.to_lowercase().contains(needle), "scrape leaks {needle}");
+    for needle in [
+        "auth_token",
+        "faucet_token",
+        "secret_key",
+        "private_key",
+        "mnemonic",
+        "faucet_key",
+        "api_key",
+        "password",
+        "seed",
+    ] {
+        assert!(
+            !text.to_lowercase().contains(needle),
+            "scrape leaks {needle}"
+        );
     }
 }
 
@@ -697,13 +816,20 @@ async fn i3_state_root_identical_across_nodes_and_stable_across_reads() {
     use stellereum::state_engine::{AccountState, InMemoryStateEngine};
     async fn build() -> stellereum::cell::CellHash {
         let engine = InMemoryStateEngine::new();
-        engine.update_account(AccountState::new([1u8; 32], 1_000)).await;
-        engine.update_account(AccountState::new([2u8; 32], 2_000)).await;
+        engine
+            .update_account(AccountState::new([1u8; 32], 1_000))
+            .await;
+        engine
+            .update_account(AccountState::new([2u8; 32], 2_000))
+            .await;
         // Read twice around the committed mutation: the second read folds at
         // most once, later reads are stable (deliberate commitment fold).
         let first = engine.get_state_root().await;
         let second = engine.get_state_root().await;
-        assert_eq!(first, second, "reads must be stable (fold-once, then fixed)");
+        assert_eq!(
+            first, second,
+            "reads must be stable (fold-once, then fixed)"
+        );
         second
     }
     // Two independent engines ("nodes") applying the same mutations agree.
@@ -719,9 +845,16 @@ fn receipt_unknown_hash_is_honest_null() {
     // Never fabricated: unknown hash -> None (JSON null on the wire) at every
     // receipt lookup layer.
     let unknown = format!("0x{}", "cd".repeat(32));
-    assert!(evm::global_adapter().get_transaction_receipt(&unknown).is_none());
-    assert!(evm::global_adapter().get_settled_receipt(&unknown).is_none());
-    assert!(evm::evm_to_stell_hash(&unknown).is_none(), "no pending mapping for unknown");
+    assert!(evm::global_adapter()
+        .get_transaction_receipt(&unknown)
+        .is_none());
+    assert!(evm::global_adapter()
+        .get_settled_receipt(&unknown)
+        .is_none());
+    assert!(
+        evm::evm_to_stell_hash(&unknown).is_none(),
+        "no pending mapping for unknown"
+    );
 }
 
 #[test]
@@ -804,18 +937,30 @@ fn f9_turnstile_misconfiguration_fails_closed() {
     // Exactly one key: misconfigured (public faucet must answer 503).
     std::env::set_var(ts::TURNSTILE_SITE_KEY_ENV, "site");
     std::env::remove_var(ts::TURNSTILE_SECRET_KEY_ENV);
-    assert_eq!(ts::CaptchaConfig::from_env(), ts::CaptchaConfig::Misconfigured);
+    assert_eq!(
+        ts::CaptchaConfig::from_env(),
+        ts::CaptchaConfig::Misconfigured
+    );
     std::env::remove_var(ts::TURNSTILE_SITE_KEY_ENV);
     std::env::set_var(ts::TURNSTILE_SECRET_KEY_ENV, "secret");
-    assert_eq!(ts::CaptchaConfig::from_env(), ts::CaptchaConfig::Misconfigured);
+    assert_eq!(
+        ts::CaptchaConfig::from_env(),
+        ts::CaptchaConfig::Misconfigured
+    );
     // Blank counts as unset (unit-file `KEY=` does not half-enable).
     std::env::set_var(ts::TURNSTILE_SITE_KEY_ENV, "   ");
-    assert_eq!(ts::CaptchaConfig::from_env(), ts::CaptchaConfig::Misconfigured);
+    assert_eq!(
+        ts::CaptchaConfig::from_env(),
+        ts::CaptchaConfig::Misconfigured
+    );
     // Secret never appears in Debug (field NAME secret_key is fine; VALUE must not leak).
     std::env::set_var(ts::TURNSTILE_SITE_KEY_ENV, "site");
     let cfg = ts::CaptchaConfig::from_env();
     assert!(cfg.secret_key().is_some());
-    assert!(!format!("{cfg:?}").contains(": \"secret\""), "secret value leaked: {cfg:?}");
+    assert!(
+        !format!("{cfg:?}").contains(": \"secret\""),
+        "secret value leaked: {cfg:?}"
+    );
 }
 
 #[tokio::test]
@@ -831,7 +976,9 @@ async fn f9_gate_verify_fails_closed_without_secret_or_on_reject() {
             _token: &str,
             _remote: Option<std::net::IpAddr>,
         ) -> ts::CaptchaVerdict {
-            ts::CaptchaVerdict::Rejected { error_codes: vec!["invalid-input-response".into()] }
+            ts::CaptchaVerdict::Rejected {
+                error_codes: vec!["invalid-input-response".into()],
+            }
         }
     }
     struct Unreachable;
@@ -842,7 +989,9 @@ async fn f9_gate_verify_fails_closed_without_secret_or_on_reject() {
             _token: &str,
             _remote: Option<std::net::IpAddr>,
         ) -> ts::CaptchaVerdict {
-            ts::CaptchaVerdict::Unavailable { reason: "siteverify unreachable".into() }
+            ts::CaptchaVerdict::Unavailable {
+                reason: "siteverify unreachable".into(),
+            }
         }
     }
 
@@ -881,13 +1030,21 @@ async fn f9_gate_verify_fails_closed_without_secret_or_on_reject() {
             if token.is_empty() {
                 ts::CaptchaVerdict::Success
             } else {
-                ts::CaptchaVerdict::Rejected { error_codes: vec![] }
+                ts::CaptchaVerdict::Rejected {
+                    error_codes: vec![],
+                }
             }
         }
     }
     let gate = ts::CaptchaGate::new(
-        ts::CaptchaConfig::Enabled { site_key: "s".into(), secret_key: "k".into() },
+        ts::CaptchaConfig::Enabled {
+            site_key: "s".into(),
+            secret_key: "k".into(),
+        },
         Arc::new(AcceptEmptyOnly),
     );
-    assert!(matches!(gate.verify("x", None).await, ts::CaptchaVerdict::Rejected { .. }));
+    assert!(matches!(
+        gate.verify("x", None).await,
+        ts::CaptchaVerdict::Rejected { .. }
+    ));
 }

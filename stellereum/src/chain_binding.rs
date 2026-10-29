@@ -50,7 +50,9 @@ pub struct ChainBindingActivation {
 impl ChainBindingActivation {
     /// Refusal never activates (phase 1+2 behaviour).
     pub fn never() -> Self {
-        Self { height: CHAIN_BINDING_NEVER }
+        Self {
+            height: CHAIN_BINDING_NEVER,
+        }
     }
 
     /// Refuse unbound transactions at and after `height`.
@@ -198,13 +200,19 @@ mod tests {
         assert!(at.refusal_active(10_000));
         assert!(at.refusal_active(10_001));
         // Env: unset/garbage/zero => never.
-        assert_eq!(ChainBindingActivation::from_env(), ChainBindingActivation::never());
+        assert_eq!(
+            ChainBindingActivation::from_env(),
+            ChainBindingActivation::never()
+        );
     }
 
     #[test]
     fn phase1_behaviour_is_admit_everything() {
         let never = ChainBindingActivation::never();
-        assert!(check_admission(false, 1, &never, CHAIN_ID).is_ok(), "phase 1 admits unbound");
+        assert!(
+            check_admission(false, 1, &never, CHAIN_ID).is_ok(),
+            "phase 1 admits unbound"
+        );
         assert!(check_admission(true, 1, &never, CHAIN_ID).is_ok());
     }
 
@@ -221,8 +229,14 @@ mod tests {
             err.starts_with(UNBOUND_REFUSED_ERR_PREFIX),
             "refusal string must start with the pinned prefix: {err}"
         );
-        assert!(err.contains("10000"), "refusal names the activation height: {err}");
-        assert!(err.contains("5757"), "refusal names the chain id to bind to: {err}");
+        assert!(
+            err.contains("10000"),
+            "refusal names the activation height: {err}"
+        );
+        assert!(
+            err.contains("5757"),
+            "refusal names the chain id to bind to: {err}"
+        );
         assert!(check_admission(false, 10_001, &act, CHAIN_ID).is_err());
     }
 
@@ -230,8 +244,7 @@ mod tests {
     fn activation_drain_keeps_bound_and_drops_unbound_only_when_active() {
         let act = ChainBindingActivation::at_height(100);
         // Pre-activation: nothing drops (even unbound).
-        let (kept, dropped) =
-            partition_at_activation(vec![("a", false), ("b", true)], 99, &act);
+        let (kept, dropped) = partition_at_activation(vec![("a", false), ("b", true)], 99, &act);
         assert_eq!(kept, vec!["a", "b"]);
         assert!(dropped.is_empty());
         // At activation: bound stays, unbound drops, order preserved.
@@ -240,8 +253,11 @@ mod tests {
         assert_eq!(kept, vec!["b"]);
         assert_eq!(dropped, vec!["a", "c"]);
         // Never-activation: full pass-through.
-        let (kept, dropped) =
-            partition_at_activation(vec![("a", false)], u64::MAX - 1, &ChainBindingActivation::never());
+        let (kept, dropped) = partition_at_activation(
+            vec![("a", false)],
+            u64::MAX - 1,
+            &ChainBindingActivation::never(),
+        );
         assert_eq!(kept, vec!["a"]);
         assert!(dropped.is_empty());
     }
@@ -251,8 +267,7 @@ mod tests {
         let pending = wallet_requirement_doc(CHAIN_ID, &ChainBindingActivation::never());
         assert!(pending.contains("5757"));
         assert!(pending.contains("metered"));
-        let enforced =
-            wallet_requirement_doc(CHAIN_ID, &ChainBindingActivation::at_height(50_000));
+        let enforced = wallet_requirement_doc(CHAIN_ID, &ChainBindingActivation::at_height(50_000));
         assert!(enforced.contains("REQUIRED"));
         assert!(enforced.contains("50000"));
     }

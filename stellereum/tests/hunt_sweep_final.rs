@@ -12,11 +12,11 @@
 //!     in `delegations` was never reduced, so the same stake is paid out twice.
 
 use stellereum::pmm::PrimaryMarketMaker;
-use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::staking::{
     StakingLedger, DOWNTIME_PENALTY_COOLDOWN, MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER,
     UNBONDING_PERIOD_SECS,
 };
+use stellereum::state_engine::InMemoryStateEngine;
 
 const NANO: u64 = 1_000_000_000;
 fn usdt(n: u64) -> u64 {
@@ -62,7 +62,9 @@ fn pmm_dust_buy_sell_loop_never_profits() {
     let mut rounds = 0u64;
     for i in 1..=2_000u64 {
         let u = i; // 1..2000 micro-USD
-        let Ok(r) = pmm.buy_with_usdt(u) else { continue };
+        let Ok(r) = pmm.buy_with_usdt(u) else {
+            continue;
+        };
         total_in += r.usdt_paid as i128;
         // Redeem everything we can immediately, then repeat.
         while pmm.max_redeemable_stell() > 0 {
@@ -78,7 +80,10 @@ fn pmm_dust_buy_sell_loop_never_profits() {
     println!("total USDT in  = {total_in}");
     println!("total USDT out = {total_out}");
     println!("net            = {:+}", total_out - total_in);
-    assert!(total_out <= total_in, "ATTACKER GOAL: the loop must not profit");
+    assert!(
+        total_out <= total_in,
+        "ATTACKER GOAL: the loop must not profit"
+    );
     // The ring-fenced buffer must never go negative and the reserve must never
     // be over-drawn.
     assert!(pmm.redemption_buffer_micro <= pmm.reserve_micro);
@@ -102,10 +107,16 @@ fn pmm_curve_never_mints_more_than_it_is_paid() {
                     // The 20% buffer blocks a full drain; measure the largest
                     // redeemable slice instead and extrapolate the shortfall.
                     let max = probe.max_redeemable_stell();
-                    if max == 0 { 0 } else { probe.sell_stell(max).unwrap().usdt_paid as i128 }
+                    if max == 0 {
+                        0
+                    } else {
+                        probe.sell_stell(max).unwrap().usdt_paid as i128
+                    }
                 }
             }
-        } else { 0 };
+        } else {
+            0
+        };
         if curve_value > r.usdt_paid as i128 {
             panic!(
                 "${usd}: minted {} nano for {} micro-USD but the curve values it at {}",
@@ -149,7 +160,10 @@ fn token_burn_debits_the_holder_before_checking_the_supply_counter() {
     let before_bal = t.balance_of(&holder);
     let before_supply = t.metadata.total_supply;
     let r = t.burn(holder, holder, 1_500);
-    println!("holder balance {before_bal} -> {} (supply still {before_supply})", t.balance_of(&holder));
+    println!(
+        "holder balance {before_bal} -> {} (supply still {before_supply})",
+        t.balance_of(&holder)
+    );
     println!("burn(1500) with total_supply=1000 returned {r:?}");
 
     // The call FAILED...
@@ -188,7 +202,9 @@ async fn downtime_slashing_double_spends_the_staking_pool() {
     let delegated = 100 * NANO; // 100 STELL
     let pool_start = self_bond + delegated; // exactly what the two stakes deposited
 
-    e.credit_native(&stellereum::staking::STAKING_POOL, pool_start).await.unwrap();
+    e.credit_native(&stellereum::staking::STAKING_POOL, pool_start)
+        .await
+        .unwrap();
     {
         let mut l = e.staking_write().await;
         l.bond(v, self_bond, 0).unwrap();
@@ -221,8 +237,7 @@ async fn downtime_slashing_double_spends_the_staking_pool() {
     }
 
     // `apply_downtime_slashes` does exactly this: take the burn out of the pool.
-    e
-        .debit_native(&stellereum::staking::STAKING_POOL, burned)
+    e.debit_native(&stellereum::staking::STAKING_POOL, burned)
         .await
         .map(|_| ())
         .unwrap_or(());
@@ -244,16 +259,15 @@ async fn downtime_slashing_double_spends_the_staking_pool() {
     // FIXED: `note_missed_heights` now routes through `slash()`, so `delegations`
     // is reduced in lockstep with the aggregate. The pool is no longer double-spent.
     assert_eq!(
-        burned + claim, pool_start,
+        burned + claim,
+        pool_start,
         "burned plus remaining claim must equal initial pool"
     );
     assert_eq!(pool_now, claim, "pool balance must equal remaining claims");
 }
 
 fn l_total(e: &InMemoryStateEngine, v: [u8; 32]) -> u64 {
-    e.try_staking_read()
-        .map(|g| g.total_stake(&v))
-        .unwrap_or(0)
+    e.try_staking_read().map(|g| g.total_stake(&v)).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +290,8 @@ fn withdrawable_is_paid_out_but_never_debited() {
     let mut l = StakingLedger::new();
     let v = [0x08; 32];
     let d = [0xD8; 32];
-    l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0).unwrap();
+    l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
+        .unwrap();
     let stake = 100 * NANO;
 
     // Cycle 0: delegate, unbond, mature.
@@ -313,7 +328,10 @@ fn withdrawable_is_paid_out_but_never_debited() {
     l.delegate(d, v, stake).unwrap();
     let third = l.undelegate(d, v, matured, 0);
     println!("after re-delegating the same stake, the same matured claim pays again: {third:?}");
-    assert!(third.is_ok(), "the same matured amount is claimable a second time");
+    assert!(
+        third.is_ok(),
+        "the same matured amount is claimable a second time"
+    );
 
     // Two independent 100-STELL payout claims now exist, plus the untouched
     // withdrawable counter, all against a single 100-STELL deposit.
@@ -324,7 +342,10 @@ fn withdrawable_is_paid_out_but_never_debited() {
         .map(|u| u.amount)
         .sum();
     println!("independent payout claims recorded for {d:?} = {claims}");
-    println!("withdrawable counter still showing          = {}", l.withdrawable_delegator(&v, &d));
+    println!(
+        "withdrawable counter still showing          = {}",
+        l.withdrawable_delegator(&v, &d)
+    );
     assert!(
         claims >= 2 * stake,
         "duplicate payout claims: {claims} against a {stake} deposit"

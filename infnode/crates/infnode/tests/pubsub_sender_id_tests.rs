@@ -54,10 +54,7 @@ fn peer_of(name: &str, keys: &NodeKeys, listen: &str) -> PeerConfig {
     }
 }
 
-async fn next_payload(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
-    who: &str,
-) -> String {
+async fn next_payload(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>, who: &str) -> String {
     tokio::time::timeout(Duration::from_secs(15), rx.recv())
         .await
         .unwrap_or_else(|_| panic!("{who} never received a message"))

@@ -49,7 +49,9 @@ pub fn is_valid_asset_symbol(asset: &str) -> bool {
     let b = asset.as_bytes();
     !b.is_empty()
         && b.len() <= MAX_ASSET_SYMBOL_BYTES
-        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_' || *c == b'.' || *c == b'/')
+        && b.iter().all(|c| {
+            c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_' || *c == b'.' || *c == b'/'
+        })
 }
 
 /// Freshness of a signed feed against the BLOCK timestamp.
@@ -94,8 +96,7 @@ pub fn deviation_bps(price: u64, reference: u64) -> u64 {
         return if price == 0 { 0 } else { u64::MAX };
     }
     let diff = price.abs_diff(reference);
-    ((diff as u128 * 10_000) / reference as u128)
-        .min(u64::MAX as u128) as u64
+    ((diff as u128 * 10_000) / reference as u128).min(u64::MAX as u128) as u64
 }
 
 /// Base (priced) asset of a trading pair: the asset whose committed oracle
@@ -215,11 +216,7 @@ impl OracleState {
     /// for the peg/deviation cases also latches `breaker_tripped`; the caller
     /// decides whether that latch survives (the VM rolls back price state but
     /// preserves the latch, see `state_engine::execute_payload`).
-    pub fn commit_feed(
-        &mut self,
-        feed: &PriceFeedUpdate,
-        block_time: u64,
-    ) -> Result<u64, String> {
+    pub fn commit_feed(&mut self, feed: &PriceFeedUpdate, block_time: u64) -> Result<u64, String> {
         // 0. Breaker latch: once tripped nothing gets through.
         if self.breaker_tripped {
             return Err("Circuit breaker is currently active. Trades paused.".to_string());
@@ -505,11 +502,19 @@ impl OracleSafetyEngine {
     }
 
     pub fn set_dex_twap(&mut self, asset: &str, price_micro_usd: u64) {
-        self.dex_twap_prices.insert(asset.to_string(), price_micro_usd);
+        self.dex_twap_prices
+            .insert(asset.to_string(), price_micro_usd);
     }
 
-    pub fn record_dex_trade(&mut self, asset: &str, price_micro_usd: u64, timestamp: u64, volume: u64) {
-        self.twap_calculator.record_trade(asset, price_micro_usd, timestamp, volume);
+    pub fn record_dex_trade(
+        &mut self,
+        asset: &str,
+        price_micro_usd: u64,
+        timestamp: u64,
+        volume: u64,
+    ) {
+        self.twap_calculator
+            .record_trade(asset, price_micro_usd, timestamp, volume);
         if let Some(twap) = self.twap_calculator.calculate_twap(asset, timestamp) {
             self.dex_twap_prices.insert(asset.to_string(), twap);
         }
@@ -577,7 +582,9 @@ impl OracleSafetyEngine {
         };
 
         // Tier 3: Circuit Breaker validation against TWAP
-        let twap_ref = self.twap_calculator.calculate_twap(asset, current_time)
+        let twap_ref = self
+            .twap_calculator
+            .calculate_twap(asset, current_time)
             .or_else(|| self.dex_twap_prices.get(asset).copied());
 
         if let Some(twap) = twap_ref {

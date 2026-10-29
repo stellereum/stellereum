@@ -28,7 +28,13 @@ pub type H = [u8; 32];
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Node {
     Leaf(Key, Vec<u8>),
-    Branch { skip: u16, bit: u8, left: Box<Node>, right: Box<Node>, hash: H },
+    Branch {
+        skip: u16,
+        bit: u8,
+        left: Box<Node>,
+        right: Box<Node>,
+        hash: H,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,14 +78,18 @@ pub fn branch_hash(skip: u16, bit: u8, l: &H, r: &H) -> H {
 
 #[inline]
 fn bit(k: &Key, d: usize) -> u8 {
-    if d >= 256 { return 0; }
+    if d >= 256 {
+        return 0;
+    }
     (k[d / 8] >> (7 - (d % 8))) & 1
 }
 
 /// Length of common prefix of two keys from absolute depth `from`.
 fn common(a: &Key, b: &Key, from: usize) -> usize {
     let mut d = from;
-    while d < 256 && bit(a, d) == bit(b, d) { d += 1; }
+    while d < 256 && bit(a, d) == bit(b, d) {
+        d += 1;
+    }
     d
 }
 
@@ -95,7 +105,13 @@ fn mk_branch(skip: u16, bit: u8, left: Node, right: Node) -> Node {
     let l = node_hash(&left);
     let r = node_hash(&right);
     let h = branch_hash(skip, bit, &l, &r);
-    Node::Branch { skip, bit, left: Box::new(left), right: Box::new(right), hash: h }
+    Node::Branch {
+        skip,
+        bit,
+        left: Box::new(left),
+        right: Box::new(right),
+        hash: h,
+    }
 }
 
 /// Insert `key` into subtree rooted at `node`, consuming keys from absolute
@@ -111,7 +127,7 @@ fn insert(node: Option<Node>, key: Key, val: Vec<u8>, depth: usize) -> Node {
             // cp < 256. Divergence at cp.
             let skip = (cp - depth) as u16;
             let bit0 = bit(&ek, cp); // existing key's bit at divergence
-            // left = bit 0, right = bit 1
+                                     // left = bit 0, right = bit 1
             let (left, right) = if bit0 == 0 {
                 (Node::Leaf(ek, ev), Node::Leaf(key, val))
             } else {
@@ -120,13 +136,26 @@ fn insert(node: Option<Node>, key: Key, val: Vec<u8>, depth: usize) -> Node {
             let _ = bit0;
             mk_branch(skip, 0, left, right)
         }
-        Some(Node::Branch { skip, bit: bbit, left, right, hash }) => {
+        Some(Node::Branch {
+            skip,
+            bit: bbit,
+            left,
+            right,
+            hash,
+        }) => {
             let bp = depth + skip as usize; // absolute divergence point of this branch
             if bp >= 256 {
-                return Node::Branch { skip, bit: bbit, left, right, hash };
+                return Node::Branch {
+                    skip,
+                    bit: bbit,
+                    left,
+                    right,
+                    hash,
+                };
             }
             // Does the incoming key match all skipped bits [depth, bp)?
-            let cp_skip = common_prefix_len(&key, left.as_ref(), right.as_ref(), depth, skip as usize);
+            let cp_skip =
+                common_prefix_len(&key, left.as_ref(), right.as_ref(), depth, skip as usize);
             if cp_skip < skip as usize {
                 // Incoming key diverges BEFORE this branch's divergence point.
                 // Split here: new branch at (depth + cp_skip).
@@ -188,7 +217,13 @@ fn representative_key(n: &Node) -> Option<Key> {
 fn collapse(parent_skip: u16, sibling: Node) -> Node {
     match sibling {
         Node::Leaf(k, v) => Node::Leaf(k, v),
-        Node::Branch { skip: sib_skip, bit: sib_bit, left: sib_left, right: sib_right, .. } => {
+        Node::Branch {
+            skip: sib_skip,
+            bit: sib_bit,
+            left: sib_left,
+            right: sib_right,
+            ..
+        } => {
             let new_skip = parent_skip + 1 + sib_skip;
             mk_branch(new_skip, sib_bit, *sib_left, *sib_right)
         }
@@ -208,13 +243,33 @@ impl Node {
                     Some(Node::Leaf(k, v))
                 }
             }
-            Node::Branch { skip, bit: bbit, left, right, hash } => {
+            Node::Branch {
+                skip,
+                bit: bbit,
+                left,
+                right,
+                hash,
+            } => {
                 let bp = depth + skip as usize;
                 if bp >= 256 {
-                    return Some(Node::Branch { skip, bit: bbit, left, right, hash });
+                    return Some(Node::Branch {
+                        skip,
+                        bit: bbit,
+                        left,
+                        right,
+                        hash,
+                    });
                 }
-                if common_prefix_len(key, left.as_ref(), right.as_ref(), depth, skip as usize) < skip as usize {
-                    return Some(Node::Branch { skip, bit: bbit, left, right, hash });
+                if common_prefix_len(key, left.as_ref(), right.as_ref(), depth, skip as usize)
+                    < skip as usize
+                {
+                    return Some(Node::Branch {
+                        skip,
+                        bit: bbit,
+                        left,
+                        right,
+                        hash,
+                    });
                 }
                 let _ = hash;
                 if bit(key, bp) == 0 {
@@ -249,7 +304,10 @@ pub struct CompressedTrie {
 
 impl CompressedTrie {
     pub fn new() -> Self {
-        Self { root: None, entries: HashMap::new() }
+        Self {
+            root: None,
+            entries: HashMap::new(),
+        }
     }
     pub fn insert(&mut self, key: &Key, value: &[u8]) {
         self.entries.insert(*key, value.to_vec());
@@ -266,8 +324,12 @@ impl CompressedTrie {
         }
         Some(v)
     }
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
     /// Root hash (computed on demand — O(n); call once per block, not per insert).
     pub fn root_hash(&self) -> H {
         match &self.root {
@@ -287,7 +349,13 @@ impl CompressedTrie {
                     return Some((path, leaf_hash(k, &self.entries[k])));
                 }
                 Node::Leaf(_, _) => return None,
-                Node::Branch { skip, bit: bbit, left, right, .. } => {
+                Node::Branch {
+                    skip,
+                    bit: bbit,
+                    left,
+                    right,
+                    ..
+                } => {
                     let bp = depth + *skip as usize;
                     if bp >= 256 {
                         return None;
@@ -297,8 +365,17 @@ impl CompressedTrie {
                         return None;
                     }
                     let go_right = bit(key, bp) == 1;
-                    let (sib, sib_right) = if go_right { (left, false) } else { (right, true) };
-                    path.push(Step { sibling_right: sib_right, sibling_hash: node_hash(sib), skip: *skip, bit: *bbit });
+                    let (sib, sib_right) = if go_right {
+                        (left, false)
+                    } else {
+                        (right, true)
+                    };
+                    path.push(Step {
+                        sibling_right: sib_right,
+                        sibling_hash: node_hash(sib),
+                        skip: *skip,
+                        bit: *bbit,
+                    });
                     node = if go_right { right } else { left };
                     depth = bp + 1;
                 }
@@ -308,16 +385,28 @@ impl CompressedTrie {
 
     pub fn proof(&self, key: &Key) -> Option<Proof> {
         let (path, lh) = self.walk(key)?;
-        Some(Proof { key: *key, path, leaf_hash: lh })
+        Some(Proof {
+            key: *key,
+            path,
+            leaf_hash: lh,
+        })
     }
 
     pub fn verify(root: &H, key: &Key, value: &[u8], p: &Proof) -> bool {
-        if &p.key != key { return false; }
+        if &p.key != key {
+            return false;
+        }
         let lh = leaf_hash(key, value);
-        if p.leaf_hash != lh { return false; }
+        if p.leaf_hash != lh {
+            return false;
+        }
         let mut cur = lh;
         for s in &p.path {
-            let (l, r) = if s.sibling_right { (cur, s.sibling_hash) } else { (s.sibling_hash, cur) };
+            let (l, r) = if s.sibling_right {
+                (cur, s.sibling_hash)
+            } else {
+                (s.sibling_hash, cur)
+            };
             cur = branch_hash(s.skip, s.bit, &l, &r);
         }
         &cur == root
@@ -361,7 +450,11 @@ impl CompressedTrie {
         let (path, witness) = self.prove(key)?;
         match witness {
             Witness::Inclusion { .. } => None,
-            Witness::ExclusionLeaf { key: wkey, value, leaf_hash } => Some(MerkleProof {
+            Witness::ExclusionLeaf {
+                key: wkey,
+                value,
+                leaf_hash,
+            } => Some(MerkleProof {
                 key: *key,
                 value,
                 leaf_hash,
@@ -370,7 +463,12 @@ impl CompressedTrie {
                 witness_key: Some(wkey),
                 divergence: Some(Divergence::Leaf),
             }),
-            Witness::ExclusionBranch { step, key: wkey, value, leaf_hash } => Some(MerkleProof {
+            Witness::ExclusionBranch {
+                step,
+                key: wkey,
+                value,
+                leaf_hash,
+            } => Some(MerkleProof {
                 key: *key,
                 value,
                 leaf_hash,
@@ -411,13 +509,32 @@ impl CompressedTrie {
                 Node::Leaf(k, v) => {
                     let lh = leaf_hash(k, v);
                     if k == key {
-                        return Some((steps.into_iter().rev().collect(), Witness::Inclusion { value: v.clone(), leaf_hash: lh }));
+                        return Some((
+                            steps.into_iter().rev().collect(),
+                            Witness::Inclusion {
+                                value: v.clone(),
+                                leaf_hash: lh,
+                            },
+                        ));
                     }
                     // Divergence at the leaf: the path leads to a leaf whose key
                     // differs, which witnesses the absence of `key`.
-                    return Some((steps.into_iter().rev().collect(), Witness::ExclusionLeaf { key: *k, value: v.clone(), leaf_hash: lh }));
+                    return Some((
+                        steps.into_iter().rev().collect(),
+                        Witness::ExclusionLeaf {
+                            key: *k,
+                            value: v.clone(),
+                            leaf_hash: lh,
+                        },
+                    ));
                 }
-                Node::Branch { skip, bit: bbit, left, right, .. } => {
+                Node::Branch {
+                    skip,
+                    bit: bbit,
+                    left,
+                    right,
+                    ..
+                } => {
                     let bp = depth + *skip as usize;
                     if bp >= 256 {
                         return None; // cannot descend any further
@@ -438,17 +555,39 @@ impl CompressedTrie {
                         let div_step = path.len();
                         // The branch itself: we descend into its LEFT child, so
                         // the sibling sits on the right.
-                        path.push(Step { sibling_right: true, sibling_hash: node_hash(right), skip: *skip, bit: *bbit });
+                        path.push(Step {
+                            sibling_right: true,
+                            sibling_hash: node_hash(right),
+                            skip: *skip,
+                            bit: *bbit,
+                        });
                         // Then the ancestors, root-most last (path is leaf → root).
                         for s in steps.into_iter().rev() {
                             path.push(s);
                         }
-                        return Some((path, Witness::ExclusionBranch { step: div_step, key: wkey, value: wval, leaf_hash: lh }));
+                        return Some((
+                            path,
+                            Witness::ExclusionBranch {
+                                step: div_step,
+                                key: wkey,
+                                value: wval,
+                                leaf_hash: lh,
+                            },
+                        ));
                     }
                     // The skipped bits match: descend on the queried key's bit.
                     let go_right = bit(key, bp) == 1;
-                    let (sib, sib_right) = if go_right { (left, false) } else { (right, true) };
-                    steps.push(Step { sibling_right: sib_right, sibling_hash: node_hash(sib), skip: *skip, bit: *bbit });
+                    let (sib, sib_right) = if go_right {
+                        (left, false)
+                    } else {
+                        (right, true)
+                    };
+                    steps.push(Step {
+                        sibling_right: sib_right,
+                        sibling_hash: node_hash(sib),
+                        skip: *skip,
+                        bit: *bbit,
+                    });
                     node = if go_right { right } else { left };
                     depth = bp + 1;
                 }
@@ -462,10 +601,19 @@ enum Witness {
     /// The queried key is in the trie.
     Inclusion { value: Vec<u8>, leaf_hash: H },
     /// The path ends at a leaf whose key differs from the queried key.
-    ExclusionLeaf { key: Key, value: Vec<u8>, leaf_hash: H },
+    ExclusionLeaf {
+        key: Key,
+        value: Vec<u8>,
+        leaf_hash: H,
+    },
     /// The path crosses a branch whose skipped prefix diverges from the
     /// queried key; `step` indexes that branch inside the (leaf → root) path.
-    ExclusionBranch { step: usize, key: Key, value: Vec<u8>, leaf_hash: H },
+    ExclusionBranch {
+        step: usize,
+        key: Key,
+        value: Vec<u8>,
+        leaf_hash: H,
+    },
 }
 
 /// The leftmost leaf under `node` (every subtree here holds at least one key).
@@ -482,18 +630,35 @@ fn leftmost_leaf(node: &Node) -> &Node {
 fn collect_path_up(node: &Node, depth: usize, target: &Key) -> Option<Vec<Step>> {
     match node {
         Node::Leaf(k, _) => {
-            if k == target { Some(Vec::new()) } else { None }
+            if k == target {
+                Some(Vec::new())
+            } else {
+                None
+            }
         }
-        Node::Branch { skip, bit: bbit, left, right, .. } => {
+        Node::Branch {
+            skip,
+            bit: bbit,
+            left,
+            right,
+            ..
+        } => {
             let bp = depth + *skip as usize;
-            if bp >= 256 { return None; }
+            if bp >= 256 {
+                return None;
+            }
             let (child, sib, sib_right) = if bit(target, bp) == 0 {
                 (left, right, true)
             } else {
                 (right, left, false)
             };
             let mut path = collect_path_up(child, bp + 1, target)?;
-            path.push(Step { sibling_right: sib_right, sibling_hash: node_hash(sib), skip: *skip, bit: *bbit });
+            path.push(Step {
+                sibling_right: sib_right,
+                sibling_hash: node_hash(sib),
+                skip: *skip,
+                bit: *bbit,
+            });
             Some(path)
         }
     }
@@ -636,8 +801,9 @@ impl MerkleProof {
                 nodes.len()
             ));
         }
-        let leaf = hex::decode(&nodes[0]).map_err(|_| "proof leaf node is not valid hex".to_string())?;
-if leaf.len() < 105 {
+        let leaf =
+            hex::decode(&nodes[0]).map_err(|_| "proof leaf node is not valid hex".to_string())?;
+        if leaf.len() < 105 {
             return Err("proof leaf node is truncated".to_string());
         }
         if leaf[0] != NODE_LEAF {
@@ -664,7 +830,8 @@ if leaf.len() < 105 {
 
         let mut path = Vec::with_capacity(nodes.len() - 1);
         for node in &nodes[1..] {
-            let b = hex::decode(node).map_err(|_| "proof branch node is not valid hex".to_string())?;
+            let b =
+                hex::decode(node).map_err(|_| "proof branch node is not valid hex".to_string())?;
             if b.len() != 37 {
                 return Err("proof branch node has the wrong length".to_string());
             }
@@ -676,7 +843,12 @@ if leaf.len() < 105 {
             let sibling_right = b[4] & 1 == 1;
             let mut sibling_hash = [0u8; 32];
             sibling_hash.copy_from_slice(&b[5..37]);
-            path.push(Step { sibling_right, sibling_hash, skip, bit });
+            path.push(Step {
+                sibling_right,
+                sibling_hash,
+                skip,
+                bit,
+            });
         }
 
         let (witness_key, divergence) = match kind {
@@ -684,13 +856,23 @@ if leaf.len() < 105 {
             ProofKind::Exclusion => {
                 let divergence = match div_kind {
                     DIV_LEAF => Divergence::Leaf,
-                    DIV_BRANCH => Divergence::Branch { step: div_step as usize },
+                    DIV_BRANCH => Divergence::Branch {
+                        step: div_step as usize,
+                    },
                     other => return Err(format!("unknown divergence kind {other}")),
                 };
                 (Some(witness_key), Some(divergence))
             }
         };
-        Ok(MerkleProof { key, value, leaf_hash, path, kind, witness_key, divergence })
+        Ok(MerkleProof {
+            key,
+            value,
+            leaf_hash,
+            path,
+            kind,
+            witness_key,
+            divergence,
+        })
     }
 
     /// Verify an inclusion claim against `root`.
@@ -756,7 +938,11 @@ fn path_follows_key(path: &[Step], key: &Key) -> bool {
 fn fold_path(leaf: &H, path: &[Step]) -> H {
     let mut cur = *leaf;
     for s in path {
-        let (l, r) = if s.sibling_right { (cur, s.sibling_hash) } else { (s.sibling_hash, cur) };
+        let (l, r) = if s.sibling_right {
+            (cur, s.sibling_hash)
+        } else {
+            (s.sibling_hash, cur)
+        };
         cur = branch_hash(s.skip, s.bit, &l, &r);
     }
     cur
@@ -868,7 +1054,6 @@ pub fn verify_exclusion_proof(root: &[u8; 32], key: &Key, proof: &MerkleProof) -
         None => false,
     }
 }
-
 
 /// Canonical length of a legacy / dormant account leaf (balance: 8B || nonce: 8B)
 pub const ACCOUNT_LEAF_LEN_LEGACY: usize = 16;
@@ -1016,7 +1201,8 @@ impl ArchiveProof {
             .or_else(|| v.get("stateRoot"))
             .and_then(|s| s.as_str())
             .ok_or_else(|| "archive proof has no state root".to_string())?;
-        let root_raw = hex::decode(root_hex).map_err(|_| "archive proof state root is not hex".to_string())?;
+        let root_raw =
+            hex::decode(root_hex).map_err(|_| "archive proof state root is not hex".to_string())?;
         if root_raw.len() != 32 {
             return Err("archive proof state root is not 32 bytes".to_string());
         }
@@ -1067,7 +1253,14 @@ impl ArchiveProof {
                 }
             }
         };
-        Ok(Self { height, state_root, key, value, proof_nodes, proof_type })
+        Ok(Self {
+            height,
+            state_root,
+            key,
+            value,
+            proof_nodes,
+            proof_type,
+        })
     }
 }
 
@@ -1275,7 +1468,9 @@ mod tests {
         let root = trie.root_hash();
 
         let missing = [0x22u8; 32];
-        let proof = trie.generate_exclusion_proof(&missing).expect("exclusion proof");
+        let proof = trie
+            .generate_exclusion_proof(&missing)
+            .expect("exclusion proof");
         assert_eq!(proof.kind, ProofKind::Exclusion);
         assert_eq!(proof.key, missing);
         assert_ne!(proof.witness_key, Some(missing));
@@ -1300,7 +1495,9 @@ mod tests {
         let root = trie.root_hash();
 
         let missing = [0x22u8; 32];
-        let mut proof = trie.generate_exclusion_proof(&missing).expect("exclusion proof");
+        let mut proof = trie
+            .generate_exclusion_proof(&missing)
+            .expect("exclusion proof");
         proof.key = present;
         assert!(!verify_exclusion_proof(&root, &present, &proof));
     }
@@ -1312,7 +1509,9 @@ mod tests {
         trie.insert(&present, b"value");
         let root = trie.root_hash();
         let missing = [0x22u8; 32];
-        let proof = trie.generate_exclusion_proof(&missing).expect("exclusion proof");
+        let proof = trie
+            .generate_exclusion_proof(&missing)
+            .expect("exclusion proof");
 
         // Another root: the proof is not about that state.
         assert!(!verify_exclusion_proof(&[0xFFu8; 32], &missing, &proof));
@@ -1373,7 +1572,10 @@ mod tests {
             }
             checked += 1;
         }
-        assert!(checked > 100, "expected many absent keys to check, got {checked}");
+        assert!(
+            checked > 100,
+            "expected many absent keys to check, got {checked}"
+        );
     }
 
     #[test]
@@ -1394,7 +1596,9 @@ mod tests {
         // Differs from both inside the shared prefix region.
         let mut missing = [0u8; 32];
         missing[0] = 0x0F;
-        let proof = trie.generate_exclusion_proof(&missing).expect("exclusion proof");
+        let proof = trie
+            .generate_exclusion_proof(&missing)
+            .expect("exclusion proof");
         assert!(verify_exclusion_proof(&root, &missing, &proof));
         // The divergence really is inside a skipped prefix.
         assert!(matches!(proof.divergence, Some(Divergence::Branch { .. })));
@@ -1417,7 +1621,9 @@ mod tests {
 
         let mut missing = [0u8; 32];
         missing[0] = 0x0F;
-        let proof = trie.generate_exclusion_proof(&missing).expect("exclusion proof");
+        let proof = trie
+            .generate_exclusion_proof(&missing)
+            .expect("exclusion proof");
         assert!(matches!(proof.divergence, Some(Divergence::Branch { .. })));
 
         let mut forged = proof.clone();
@@ -1501,7 +1707,12 @@ mod tests {
 
         // Merkle proofs for 32-byte commitment
         let p_comm = trie.proof(&k3_commitment).unwrap();
-        assert!(CompressedTrie::verify(&root, &k3_commitment, &commitment_32, &p_comm));
+        assert!(CompressedTrie::verify(
+            &root,
+            &k3_commitment,
+            &commitment_32,
+            &p_comm
+        ));
 
         // Merkle proof for 16-byte legacy leaf
         let p_16 = trie.proof(&k1).unwrap();
@@ -1805,7 +2016,9 @@ mod tests {
     #[test]
     fn test_archive_proof_exclusion_verifies() {
         let (trie, root, _, _, missing) = archive_trie();
-        let proof = trie.generate_exclusion_proof(&missing).expect("exclusion proof");
+        let proof = trie
+            .generate_exclusion_proof(&missing)
+            .expect("exclusion proof");
         let archive = ArchiveProof::exclusion(41, root, missing, &proof).expect("archive proof");
         assert_eq!(archive.proof_type, ArchiveProofType::Exclusion);
         assert_eq!(archive.value, None);
@@ -1816,7 +2029,8 @@ mod tests {
     fn test_archive_proof_rejects_tampering() {
         let (trie, root, present, _, missing) = archive_trie();
         let proof = trie.generate_proof(&present).expect("inclusion proof");
-        let mut archive = ArchiveProof::inclusion(41, root, present, &proof).expect("archive proof");
+        let mut archive =
+            ArchiveProof::inclusion(41, root, present, &proof).expect("archive proof");
 
         // Wrong root: the proof is not about that state.
         archive.state_root = [0xFFu8; 32];
@@ -1828,13 +2042,16 @@ mod tests {
         assert!(!archive.verify());
 
         // Inclusion proof relabeled as exclusion must not verify.
-        let mut relabeled = ArchiveProof::inclusion(41, root, present, &proof).expect("archive proof");
+        let mut relabeled =
+            ArchiveProof::inclusion(41, root, present, &proof).expect("archive proof");
         relabeled.proof_type = ArchiveProofType::Exclusion;
         relabeled.value = None;
         assert!(!relabeled.verify());
 
         // An exclusion proof served as an inclusion proof must not verify.
-        let excl = trie.generate_exclusion_proof(&missing).expect("exclusion proof");
+        let excl = trie
+            .generate_exclusion_proof(&missing)
+            .expect("exclusion proof");
         let mut forged = ArchiveProof::exclusion(41, root, missing, &excl).expect("archive proof");
         forged.proof_type = ArchiveProofType::Inclusion;
         forged.value = Some(b"made-up".to_vec());
@@ -1865,7 +2082,9 @@ mod tests {
             41,
             root,
             missing,
-            &trie.generate_exclusion_proof(&missing).expect("exclusion proof"),
+            &trie
+                .generate_exclusion_proof(&missing)
+                .expect("exclusion proof"),
         )
         .expect("archive proof");
         let parsed_excl = ArchiveProof::from_json(&excl.to_json()).expect("parse");

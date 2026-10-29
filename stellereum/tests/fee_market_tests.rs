@@ -35,5 +35,8 @@ async fn proposer_collects_transaction_fees_and_value_is_conserved() {
     assert_eq!(sender.balance, 1_000_000 - 100 - 1_000);
     assert_eq!(recipient.balance, 100);
     // Value conservation: everything that left the sender arrived somewhere.
-    assert_eq!(proposer.balance + sender.balance + recipient.balance, 1_000_000);
+    assert_eq!(
+        proposer.balance + sender.balance + recipient.balance,
+        1_000_000
+    );
 }

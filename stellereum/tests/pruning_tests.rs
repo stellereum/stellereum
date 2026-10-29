@@ -64,7 +64,10 @@ fn chain(store: &Storage, n: u64) -> Vec<stellereum::storage::BlockHash> {
 #[test]
 fn archive_is_the_default_so_nothing_is_destroyed_by_accident() {
     let d = RetentionConfig::default();
-    assert!(d.archive, "dropping a block body is irreversible; opt in, don't default in");
+    assert!(
+        d.archive,
+        "dropping a block body is irreversible; opt in, don't default in"
+    );
     assert!(d.keep_blocks > 0);
 }
 
@@ -74,18 +77,28 @@ fn every_block_writes_a_header_record() {
     let store = Storage::open(&dir).expect("open");
     let hashes = chain(&store, 12);
 
-    assert_eq!(store.header_count().expect("count"), 12, "one header per block");
+    assert_eq!(
+        store.header_count().expect("count"),
+        12,
+        "one header per block"
+    );
     for h in 0..12u64 {
         let rec = store.header_at(h).expect("read").expect("header exists");
         assert_eq!(rec.height, h);
-        assert_eq!(rec.block_hash, hashes[h as usize], "header must carry the real block hash");
+        assert_eq!(
+            rec.block_hash, hashes[h as usize],
+            "header must carry the real block hash"
+        );
         assert_eq!(rec.tx_count, 1);
     }
     // The header must chain: each record's prev_hash is the one before it.
     for h in 1..12u64 {
         let prev_rec = store.header_at(h - 1).unwrap().unwrap();
         let rec = store.header_at(h).unwrap().unwrap();
-        assert_eq!(rec.prev_hash, prev_rec.block_hash, "headers must link at height {h}");
+        assert_eq!(
+            rec.prev_hash, prev_rec.block_hash,
+            "headers must link at height {h}"
+        );
     }
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -97,13 +110,19 @@ fn header_record_survives_pruning_of_the_body() {
     chain(&store, 20);
 
     store.prune_blocks_below(10).expect("prune");
-    assert!(store.block_count().expect("blocks") < 20, "bodies must actually go");
+    assert!(
+        store.block_count().expect("blocks") < 20,
+        "bodies must actually go"
+    );
     assert_eq!(
         store.header_count().expect("headers"),
         20,
         "the chain must still be walkable after the bodies are gone"
     );
-    assert!(store.header_at(0).expect("read").is_some(), "oldest header must remain");
+    assert!(
+        store.header_at(0).expect("read").is_some(),
+        "oldest header must remain"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -120,7 +139,10 @@ fn pruning_never_orphans_the_retained_suffix() {
     store.prune_blocks_below(5).expect("prune");
     for h in 4..20u64 {
         let rec = store.header_at(h).unwrap().unwrap();
-        assert!(store.get_block(&rec.block_hash).expect("read").is_some(), "body at {h} must survive");
+        assert!(
+            store.get_block(&rec.block_hash).expect("read").is_some(),
+            "body at {h} must survive"
+        );
     }
     assert!(
         store.get_block(&hashes[0]).expect("read").is_none(),
@@ -129,7 +151,10 @@ fn pruning_never_orphans_the_retained_suffix() {
     // The retained window starts at 4, and 4's predecessor is 3, so 4 is the
     // boundary: everything from 4 up is intact and walks back to 3.
     let boundary = store.header_at(4).unwrap().unwrap();
-    assert_eq!(boundary.prev_hash, hashes[3], "boundary block keeps a resolvable parent link");
+    assert_eq!(
+        boundary.prev_hash, hashes[3],
+        "boundary block keeps a resolvable parent link"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -142,8 +167,14 @@ fn pruning_is_idempotent_and_bounded() {
     let a = store.prune_blocks_below(5).expect("prune");
     let b = store.prune_blocks_below(5).expect("prune again");
     assert!(a > 0, "the first pass must do the work");
-    assert_eq!(b, 0, "a second pass with the same cursor must remove nothing");
-    assert!(!store.has_blocks_below(5).expect("check"), "nothing should remain eligible");
+    assert_eq!(
+        b, 0,
+        "a second pass with the same cursor must remove nothing"
+    );
+    assert!(
+        !store.has_blocks_below(5).expect("check"),
+        "nothing should remain eligible"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -154,12 +185,18 @@ fn pruning_reports_whether_more_remains() {
     let dir = tmpdir("more");
     let store = Storage::open(&dir).expect("open");
     chain(&store, 30);
-    assert!(store.has_blocks_below(20).expect("check"), "30 blocks, cursor 20");
+    assert!(
+        store.has_blocks_below(20).expect("check"),
+        "30 blocks, cursor 20"
+    );
 
     // A cursor beyond the tip makes every body removable, including the tip's:
     // the boundary rule only requires that a block's CHILD survives, and the tip
     // has none. Headers still describe the whole chain.
-    assert!(store.has_blocks_below(31).expect("check"), "cursor 31 > tip 29");
+    assert!(
+        store.has_blocks_below(31).expect("check"),
+        "cursor 31 > tip 29"
+    );
     assert_eq!(
         store.prune_blocks_below(31).expect("prune"),
         30,
@@ -173,8 +210,16 @@ fn pruning_reports_whether_more_remains() {
         !store.has_blocks_below(1).expect("check"),
         "cursor 1 leaves only the boundary, so there is nothing to do"
     );
-    assert_eq!(store.prune_blocks_below(1).expect("prune"), 0, "and pruning is a no-op");
-    assert_eq!(store.header_count().expect("headers"), 30, "the chain is still walkable");
+    assert_eq!(
+        store.prune_blocks_below(1).expect("prune"),
+        0,
+        "and pruning is a no-op"
+    );
+    assert_eq!(
+        store.header_count().expect("headers"),
+        30,
+        "the chain is still walkable"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -194,11 +239,26 @@ fn state_snapshots_keep_a_ring_and_never_the_newest() {
     store.prune_state_below(keep).expect("prune state");
     store.prune_domains_below(keep).expect("prune domains");
 
-    let (newest_state, _) = store.latest_state().expect("latest state").expect("present");
-    let (newest_domains, _) = store.latest_domains().expect("latest domains").expect("present");
-    assert_eq!(newest_state, 500, "the newest state snapshot must survive pruning");
-    assert_eq!(newest_domains, 500, "the newest domain snapshot must survive pruning");
-    assert!(newest_domains > keep, "pruning must be strictly below the cursor");
+    let (newest_state, _) = store
+        .latest_state()
+        .expect("latest state")
+        .expect("present");
+    let (newest_domains, _) = store
+        .latest_domains()
+        .expect("latest domains")
+        .expect("present");
+    assert_eq!(
+        newest_state, 500,
+        "the newest state snapshot must survive pruning"
+    );
+    assert_eq!(
+        newest_domains, 500,
+        "the newest domain snapshot must survive pruning"
+    );
+    assert!(
+        newest_domains > keep,
+        "pruning must be strictly below the cursor"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -216,7 +276,11 @@ fn block_store_survives_a_reopen() {
     let (height, hash) = store.finalized().expect("read finalized").expect("present");
     assert_eq!(height, 5);
     assert_eq!(hash, store.header_at(5).unwrap().unwrap().block_hash);
-    assert_eq!(store.header_count().expect("headers"), 6, "headers persist across restart");
+    assert_eq!(
+        store.header_count().expect("headers"),
+        6,
+        "headers persist across restart"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

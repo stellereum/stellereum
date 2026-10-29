@@ -32,8 +32,8 @@ use stellereum::bridge::{
     WITHDRAWAL_TIME_LOCK_SECS,
 };
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
-use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::staking::{MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
+use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::svm::{OpCode, GAS_BRIDGE_INTENT};
 
 /// Fixed, realistic block timestamp. Never 0.
@@ -184,7 +184,10 @@ async fn bridge_replay_set_survives_snapshot_and_restore() {
     assert_eq!(out.status, vec![true], "the deposit applies");
     assert_eq!(balance(&e, &recipient).await, amount);
     assert!(
-        e.bridge_read().await.processed_source_txs.contains(&[0x71u8; 32]),
+        e.bridge_read()
+            .await
+            .processed_source_txs
+            .contains(&[0x71u8; 32]),
         "precondition: the replay set holds the credited source tx"
     );
     let root = e.get_state_root().await;
@@ -238,10 +241,12 @@ async fn bridge_replay_set_survives_snapshot_and_restore() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     anchor.sign_block(&sk);
     let anchor_hash = store.put_block(&anchor).expect("anchor");
-    store.set_finalized(NEXT_H, &anchor_hash).expect("finalized");
+    store
+        .set_finalized(NEXT_H, &anchor_hash)
+        .expect("finalized");
     store.flush().expect("flush");
     drop(ap);
     drop(store);
@@ -255,9 +260,7 @@ async fn bridge_replay_set_survives_snapshot_and_restore() {
                     opened = Some(s);
                     break;
                 }
-                Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await
-                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
             }
         }
         std::sync::Arc::new(opened.expect("the store must reopen after the writer exits"))
@@ -452,8 +455,7 @@ async fn withdrawal_queue_and_rate_window_survive_the_restore() {
             "the id counter is carried, so ids stay stable across restarts"
         );
         assert_eq!(
-            restored.hourly_withdrawn,
-            LARGE_WITHDRAWAL_THRESHOLD_NANO,
+            restored.hourly_withdrawn, LARGE_WITHDRAWAL_THRESHOLD_NANO,
             "the rate window came back"
         );
         assert_eq!(

@@ -18,12 +18,26 @@ use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
 struct Rng(u64);
 impl Rng {
-    fn next(&mut self) -> u64 { let mut x=self.0; x^=x<<13; x^=x>>7; x^=x<<17; self.0=x; x }
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
 }
 
-fn banner(s: &str) { println!("\n\x1b[1;36m=== {s} ===\x1b[0m"); }
-fn ok(s: &str) { println!("  \x1b[32m✓\x1b[0m {s}"); }
-fn bad(s: &str) { println!("  \x1b[41m✗ BROKEN:\x1b[0m {s}"); std::process::exit(1); }
+fn banner(s: &str) {
+    println!("\n\x1b[1;36m=== {s} ===\x1b[0m");
+}
+fn ok(s: &str) {
+    println!("  \x1b[32m✓\x1b[0m {s}");
+}
+fn bad(s: &str) {
+    println!("  \x1b[41m✗ BROKEN:\x1b[0m {s}");
+    std::process::exit(1);
+}
 
 #[tokio::main]
 async fn main() {
@@ -37,7 +51,9 @@ async fn main() {
         let mut rng = Rng(0x1111);
         for trial in 0..100 {
             let nkeys = 1 + (rng.next() % 30) as usize;
-            let keys: Vec<SigningKey> = (0..nkeys).map(|_| SigningKey::generate(&mut OsRng)).collect();
+            let keys: Vec<SigningKey> = (0..nkeys)
+                .map(|_| SigningKey::generate(&mut OsRng))
+                .collect();
             let e_seq = InMemoryStateEngine::new();
             let e_par = InMemoryStateEngine::new();
             for sk in &keys {
@@ -46,19 +62,24 @@ async fn main() {
                 e_par.update_account(AccountState::new(a, 1_000_000)).await;
             }
             // build per-sender ordered nonces
-            let mut nonce: std::collections::HashMap<[u8;32], u64> = std::collections::HashMap::new();
+            let mut nonce: std::collections::HashMap<[u8; 32], u64> =
+                std::collections::HashMap::new();
             let ntx = 1 + (rng.next() % 200) as usize;
             let mut txs = Vec::new();
             for _ in 0..ntx {
                 let sk = &keys[(rng.next() as usize) % keys.len()];
                 let from = sk.verifying_key().to_bytes();
-                let to = keys[(rng.next() as usize) % keys.len()].verifying_key().to_bytes();
+                let to = keys[(rng.next() as usize) % keys.len()]
+                    .verifying_key()
+                    .to_bytes();
                 let n = *nonce.get(&from).unwrap_or(&0);
                 nonce.insert(from, n + 1);
                 txs.push(Transaction::sign(sk, to, 1 + rng.next() % 500, 0, n, 1, 1));
             }
             // sequential
-            for tx in &txs { let _ = e_seq.apply_transaction(tx, 0).await; }
+            for tx in &txs {
+                let _ = e_seq.apply_transaction(tx, 0).await;
+            }
             let (ap, _f) = e_par.apply_block_parallel(&txs, 0).await;
             let r1 = e_seq.get_state_root().await;
             let r2 = e_par.get_state_root().await;
@@ -87,10 +108,14 @@ async fn main() {
         // grouped-by-sender preserves input order within a group: 2,0,1 ->
         // nonce 2 rejected (expected 0), 0 applied, 1 applied => 2 applied, 1 failed
         if applied != 2 || failed != 1 {
-            bad(&format!("nonce ordering expected 2 applied/1 failed, got {applied}/{failed}"));
+            bad(&format!(
+                "nonce ordering expected 2 applied/1 failed, got {applied}/{failed}"
+            ));
         }
         let acc = e.get_account(&from).await.unwrap();
-        if acc.nonce != 2 { bad(&format!("final nonce should be 2, got {}", acc.nonce)); }
+        if acc.nonce != 2 {
+            bad(&format!("final nonce should be 2, got {}", acc.nonce));
+        }
         ok("shuffled nonces: only in-order ones applied, final nonce correct");
     }
 
@@ -103,10 +128,14 @@ async fn main() {
         e.update_account(AccountState::new(a, 1_000_000)).await;
         let tx = Transaction::sign(&sk, a, 100, 5, 0, 1, 1);
         let (applied, failed) = e.apply_block_parallel(std::slice::from_ref(&tx), 0).await;
-        if applied != 1 || failed != 0 { bad("self-transfer should apply once"); }
+        if applied != 1 || failed != 0 {
+            bad("self-transfer should apply once");
+        }
         // balance: -100 -5 (gas) then +100 => net -5
         let acc = e.get_account(&a).await.unwrap();
-        if acc.balance != 1_000_000 - 5 { bad(&format!("self-transfer balance wrong: {}", acc.balance)); }
+        if acc.balance != 1_000_000 - 5 {
+            bad(&format!("self-transfer balance wrong: {}", acc.balance));
+        }
         ok("self-transfer conserves correctly (net gas only)");
     }
 
@@ -118,10 +147,14 @@ async fn main() {
         let e = InMemoryStateEngine::new();
         e.update_account(AccountState::new(a, 1_000_000)).await;
         let tx = Transaction::sign(&sk, [1u8; 32], 100, 0, 0, 1, 1);
-        let (applied, failed) = e.apply_block_parallel(&[tx.clone(), tx.clone(), tx.clone()], 0).await;
+        let (applied, failed) = e
+            .apply_block_parallel(&[tx.clone(), tx.clone(), tx.clone()], 0)
+            .await;
         // same nonce=0: first applies (nonce->1), rest rejected
         if applied != 1 || failed != 2 {
-            bad(&format!("duplicate handling expected 1/2, got {applied}/{failed}"));
+            bad(&format!(
+                "duplicate handling expected 1/2, got {applied}/{failed}"
+            ));
         }
         ok("duplicates: exactly one applied (nonce guard)");
     }
@@ -131,19 +164,36 @@ async fn main() {
     {
         let keys: Vec<SigningKey> = (0..10).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let e = InMemoryStateEngine::new();
-        for sk in &keys { e.update_account(AccountState::new(sk.verifying_key().to_bytes(), 1_000_000)).await; }
+        for sk in &keys {
+            e.update_account(AccountState::new(sk.verifying_key().to_bytes(), 1_000_000))
+                .await;
+        }
         let mut txs = Vec::new();
         for (i, sk) in keys.iter().enumerate() {
-            txs.push(Transaction::sign(sk, keys[(i+1)%keys.len()].verifying_key().to_bytes(), 10, 0, 0, 1, 1));
+            txs.push(Transaction::sign(
+                sk,
+                keys[(i + 1) % keys.len()].verifying_key().to_bytes(),
+                10,
+                0,
+                0,
+                1,
+                1,
+            ));
         }
         // corrupt half
         for i in (0..txs.len()).step_by(2) {
             txs[i].signature[0] ^= 0xFF;
         }
         let (applied, failed) = e.apply_block_parallel(&txs, 0).await;
-        if applied + failed != txs.len() { bad("lost transactions"); }
-        if applied != 5 { bad(&format!("expected 5 valid applied, got {applied}")); }
-        ok(&format!("mixed batch: {applied} applied, {failed} rejected (no loss)"));
+        if applied + failed != txs.len() {
+            bad("lost transactions");
+        }
+        if applied != 5 {
+            bad(&format!("expected 5 valid applied, got {applied}"));
+        }
+        ok(&format!(
+            "mixed batch: {applied} applied, {failed} rejected (no loss)"
+        ));
     }
 
     // ---- 6. Value conservation across many parallel blocks ----
@@ -152,15 +202,21 @@ async fn main() {
         let keys: Vec<SigningKey> = (0..40).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let e = InMemoryStateEngine::new();
         let mut total = 0u64;
-        for sk in &keys { e.update_account(AccountState::new(sk.verifying_key().to_bytes(), 100_000)).await; total += 100_000; }
+        for sk in &keys {
+            e.update_account(AccountState::new(sk.verifying_key().to_bytes(), 100_000))
+                .await;
+            total += 100_000;
+        }
         let mut rng = Rng(0x9999);
-        let mut nonce: std::collections::HashMap<[u8;32], u64> = std::collections::HashMap::new();
+        let mut nonce: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
         for _ in 0..50 {
             let mut txs = Vec::new();
             for _ in 0..200 {
                 let sk = &keys[(rng.next() as usize) % keys.len()];
                 let from = sk.verifying_key().to_bytes();
-                let to = keys[(rng.next() as usize) % keys.len()].verifying_key().to_bytes();
+                let to = keys[(rng.next() as usize) % keys.len()]
+                    .verifying_key()
+                    .to_bytes();
                 let n = *nonce.get(&from).unwrap_or(&0);
                 nonce.insert(from, n + 1);
                 txs.push(Transaction::sign(sk, to, 1 + rng.next() % 100, 0, n, 1, 1));
@@ -169,10 +225,16 @@ async fn main() {
         }
         let mut sum = 0u64;
         for sk in &keys {
-            if let Some(a) = e.get_account(&sk.verifying_key().to_bytes()).await { sum += a.balance; }
+            if let Some(a) = e.get_account(&sk.verifying_key().to_bytes()).await {
+                sum += a.balance;
+            }
         }
-        if sum > total { bad(&format!("value inflated: {sum} > {total}")); }
-        ok(&format!("50 blocks x200 tx: value conserved ({sum} <= {total})"));
+        if sum > total {
+            bad(&format!("value inflated: {sum} > {total}"));
+        }
+        ok(&format!(
+            "50 blocks x200 tx: value conserved ({sum} <= {total})"
+        ));
     }
 
     // ---- 7. Concurrent blocks on the SAME engine (race safety) ----
@@ -180,7 +242,10 @@ async fn main() {
     {
         let keys: Vec<SigningKey> = (0..20).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let e = Arc::new(InMemoryStateEngine::new());
-        for sk in &keys { e.update_account(AccountState::new(sk.verifying_key().to_bytes(), 1_000_000)).await; }
+        for sk in &keys {
+            e.update_account(AccountState::new(sk.verifying_key().to_bytes(), 1_000_000))
+                .await;
+        }
         let mut handles = Vec::new();
         for t in 0..10 {
             let e = e.clone();
@@ -196,7 +261,9 @@ async fn main() {
                 let _ = e.apply_block_parallel(&txs, 0).await;
             }));
         }
-        for h in handles { let _ = h.await; }
+        for h in handles {
+            let _ = h.await;
+        }
         // must not panic and root must be deterministic given the disjoint senders
         let _ = e.get_state_root().await;
         ok("10 concurrent block applies completed without panic/corruption");
@@ -219,7 +286,9 @@ async fn main() {
             }
             let seq = Transaction::verify_signatures_batch(&txs);
             let par = Transaction::verify_signatures_batch_parallel(&txs);
-            if seq != par { bad("parallel batch != sequential batch"); }
+            if seq != par {
+                bad("parallel batch != sequential batch");
+            }
         }
         ok("300 fuzzed batches: parallel verify always equals sequential");
     }

@@ -65,12 +65,14 @@ async fn largest_power_nil_voter_stalls_the_height() {
 
     // LIVENESS: nothing finalizes — the height is parked.
     assert_eq!(
-        report.best_height, 0,
+        report.best_height,
+        0,
         "no node may finalize while the power-2 holder nils every round.\n{}",
         report.diagnostics()
     );
     assert_eq!(
-        report.common_height, 0,
+        report.common_height,
+        0,
         "the common head must not move.\n{}",
         report.diagnostics()
     );
@@ -86,7 +88,8 @@ async fn largest_power_nil_voter_stalls_the_height() {
             report.diagnostics()
         );
         assert_eq!(
-            n.precommit_qc_round, None,
+            n.precommit_qc_round,
+            None,
             "node {}: no precommit QC may form without a polka.\n{}",
             n.index,
             report.diagnostics()
@@ -143,7 +146,8 @@ async fn skewed_honest_cluster_finalizes_control() {
         report.diagnostics()
     );
     assert_eq!(
-        report.common_height, report.best_height,
+        report.common_height,
+        report.best_height,
         "every node must reach the same height.\n{}",
         report.diagnostics()
     );
@@ -156,7 +160,11 @@ async fn skewed_honest_cluster_finalizes_control() {
         let mut hashes: Vec<_> = entries.iter().map(|(_, x)| *x).collect();
         hashes.sort();
         hashes.dedup();
-        assert_eq!(hashes.len(), 1, "height {h} must have exactly one decided block");
+        assert_eq!(
+            hashes.len(),
+            1,
+            "height {h} must have exactly one decided block"
+        );
     }
 }
 
@@ -195,7 +203,11 @@ async fn byzantine_plus_slow_honest_two_thirds_still_finalize() {
         let mut hashes: Vec<_> = entries.iter().map(|(_, x)| *x).collect();
         hashes.sort();
         hashes.dedup();
-        assert_eq!(hashes.len(), 1, "height {h} must have exactly one decided block");
+        assert_eq!(
+            hashes.len(),
+            1,
+            "height {h} must have exactly one decided block"
+        );
     }
     let roots: Vec<_> = report.nodes.iter().map(|n| n.state_root).collect();
     assert!(

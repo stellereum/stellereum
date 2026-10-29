@@ -133,7 +133,11 @@ impl VrfSecret {
 
     /// The public key for this secret.
     pub fn public_key(&self) -> VrfPublicKey {
-        VrfPublicKey(RistrettoPoint::mul_base(&self.scalar()).compress().to_bytes())
+        VrfPublicKey(
+            RistrettoPoint::mul_base(&self.scalar())
+                .compress()
+                .to_bytes(),
+        )
     }
 }
 
@@ -197,7 +201,12 @@ impl VrfBinding {
         if VrfPublicKey::from_bytes(&self.vrf_pk).is_none() {
             return false;
         }
-        verify_vrf_binding(falcon_pk, &self.validator_id, &self.vrf_pk, &self.falcon_sig)
+        verify_vrf_binding(
+            falcon_pk,
+            &self.validator_id,
+            &self.vrf_pk,
+            &self.falcon_sig,
+        )
     }
 }
 
@@ -212,7 +221,9 @@ pub struct VrfRegistry {
 
 impl VrfRegistry {
     pub fn new() -> Self {
-        Self { keys: BTreeMap::new() }
+        Self {
+            keys: BTreeMap::new(),
+        }
     }
 
     /// Register a VRF key. Refuses unknown-curve keys and bindings whose
@@ -373,7 +384,9 @@ mod tests {
         assert!(VrfPublicKey::from_bytes(&pk.to_bytes()).is_some());
         // Identity is refused.
         assert!(VrfPublicKey::from_bytes(&[0u8; 32]).is_none());
-        let id_pt = RistrettoPoint::mul_base(&Scalar::from(0u64)).compress().to_bytes();
+        let id_pt = RistrettoPoint::mul_base(&Scalar::from(0u64))
+            .compress()
+            .to_bytes();
         assert!(VrfPublicKey::from_bytes(&id_pt).is_none());
     }
 
@@ -384,7 +397,11 @@ mod tests {
         let vrf_pk = vrf.public_key().to_bytes();
         let validator_id = [0x11u8; 32];
         let sig = falcon.sign(&vrf_binding_preimage(&validator_id, &vrf_pk));
-        let binding = VrfBinding { validator_id, vrf_pk, falcon_sig: sig };
+        let binding = VrfBinding {
+            validator_id,
+            vrf_pk,
+            falcon_sig: sig,
+        };
         assert!(binding.verify(falcon.public_key()));
         // Wrong validator id: the Falcon signature was over another preimage.
         let mut wrong = binding.clone();
@@ -395,7 +412,9 @@ mod tests {
         assert!(!binding.verify(other.public_key()));
         // Truncated signature: refuses (length-pinned).
         let mut trunc = binding.clone();
-        trunc.falcon_sig.truncate(crate::post_quantum::FALCON512_SIG_LEN - 1);
+        trunc
+            .falcon_sig
+            .truncate(crate::post_quantum::FALCON512_SIG_LEN - 1);
         assert!(!trunc.verify(falcon.public_key()));
     }
 
@@ -408,7 +427,14 @@ mod tests {
         let sig = falcon.sign(&vrf_binding_preimage(&validator_id, &vrf_pk));
         let mut reg = VrfRegistry::new();
         assert!(reg
-            .register(&VrfBinding { validator_id, vrf_pk, falcon_sig: sig }, falcon.public_key())
+            .register(
+                &VrfBinding {
+                    validator_id,
+                    vrf_pk,
+                    falcon_sig: sig
+                },
+                falcon.public_key()
+            )
             .is_ok());
         assert_eq!(reg.get(&validator_id), Some(vrf_pk));
         // Forged binding (signed by nobody) never stores.
@@ -425,12 +451,24 @@ mod tests {
     fn beacon_chain_is_deterministic_and_chain_id_separated() {
         let g_main = beacon_genesis(5757);
         assert_eq!(g_main, beacon_genesis(5757));
-        assert_ne!(g_main, beacon_genesis(5758), "chain ids must separate seed chains");
+        assert_ne!(
+            g_main,
+            beacon_genesis(5758),
+            "chain ids must separate seed chains"
+        );
         let out = [0xabu8; 32];
         let b1 = beacon_next(&g_main, &out);
         assert_eq!(b1, beacon_next(&g_main, &out));
-        assert_ne!(b1, beacon_next(&g_main, &[0xacu8; 32]), "output must move the beacon");
-        assert_ne!(b1, beacon_next(&beacon_genesis(5758), &out), "prev must move the beacon");
+        assert_ne!(
+            b1,
+            beacon_next(&g_main, &[0xacu8; 32]),
+            "output must move the beacon"
+        );
+        assert_ne!(
+            b1,
+            beacon_next(&beacon_genesis(5758), &out),
+            "prev must move the beacon"
+        );
         assert_ne!(b1, g_main, "update must advance the chain");
     }
 
@@ -458,7 +496,10 @@ mod tests {
         let d = expected_draws_to_include_member(100, 64);
         assert!((d - 1.5625).abs() < 1e-9);
         // At 1e9 draws/s that is ~2ns: grinding one seat is free.
-        assert!(d / 1e9 < 1e-6, "one-seat bias must cost microseconds, not years");
+        assert!(
+            d / 1e9 < 1e-6,
+            "one-seat bias must cost microseconds, not years"
+        );
         // Capturing an EXACT 33-seat slice of a 64-committee from 100
         // validators costs ~1.66e8 draws — 0.17 s on one GPU. Even the
         // "expensive end" of grinding is interactive, not prohibitive.

@@ -8,7 +8,12 @@ use consensus_cluster::{ConsensusCluster, NodeProfile};
 use std::collections::HashMap;
 use std::time::Instant;
 
-const POWERS: [u64; 4] = [1_999_000_000_000, 1_999_000_000_000, 1_968_238_883_635, 1_471_755_052_303];
+const POWERS: [u64; 4] = [
+    1_999_000_000_000,
+    1_999_000_000_000,
+    1_968_238_883_635,
+    1_471_755_052_303,
+];
 const DELAYS: [u64; 4] = [80, 120, 180, 250];
 const TICK: u64 = 50;
 const TIMEOUT: u64 = 3500;
@@ -140,7 +145,11 @@ async fn vel_waste_composition_300() {
     let mut cascade_extra: u64 = 0;
     for (i, dt) in per_height.iter().enumerate() {
         let h = i as u64 + 2;
-        let rounds: Vec<u32> = report.nodes.iter().map(|nd| nd.decide_rounds[i + 1]).collect();
+        let rounds: Vec<u32> = report
+            .nodes
+            .iter()
+            .map(|nd| nd.decide_rounds[i + 1])
+            .collect();
         let mx = *rounds.iter().max().unwrap();
         let mn = *rounds.iter().min().unwrap();
         if mx == 0 {
@@ -162,12 +171,19 @@ async fn vel_waste_composition_300() {
     }
     r0_dts.sort_unstable();
     let baseline = r0_dts[r0_dts.len() / 2];
-    let total_extra_ms: u64 = slow_heights.iter().map(|(_, dt, _)| dt.saturating_sub(baseline)).sum();
+    let total_extra_ms: u64 = slow_heights
+        .iter()
+        .map(|(_, dt, _)| dt.saturating_sub(baseline))
+        .sum();
     let first_miss_ms = (slow_heights.len() as u64).saturating_mul(R0_CAP);
     let total_nils2 = total_nils;
     println!("[vel] heights={HEIGHTS} tick={TICK} timeout={TIMEOUT} delays={DELAYS:?} propose_delays={PROPOSE_DELAYS:?}");
     println!("[vel] virtual_total={}ms mean={mean:.1} p50={p50} p99={p99} max={max} gt1s={gt1} gt2s={gt2} gt5s={gt5} extra_rounds={total_extra} views_per_block={views_per_block:.4} wall={wall:.0}ms", report.virtual_ms);
-    println!("[vel] baseline_r0_median={baseline}ms r0_heights={} slow_heights={}", r0_dts.len(), slow_heights.len());
+    println!(
+        "[vel] baseline_r0_median={baseline}ms r0_heights={} slow_heights={}",
+        r0_dts.len(),
+        slow_heights.len()
+    );
     println!("[vel][waste] proposer-late-first-miss: heights={} ({:.1}% of 300) first_timeout_ms_total={} (cap {R0_CAP}/height)",
         slow_heights.len(), 100.0 * slow_heights.len() as f64 / HEIGHTS as f64, first_miss_ms);
     println!("[vel][waste] votes-late-cascade (rounds>=2): heights={cascade_heights} cascade_extra_ms={cascade_extra} (dt beyond {R0_CAP}+700 one-clean-recovery)");
@@ -236,9 +252,16 @@ async fn vel_waste_composition_300() {
         let (dts_off, rep_off) = run_once(false).await;
         // Determinism: an identical pipelined rerun prints the identical fingerprint.
         let (_, rep_on2) = run_once(true).await;
-        assert_eq!(rep_on.fingerprint(), rep_on2.fingerprint(), "pipeline run must be deterministic");
+        assert_eq!(
+            rep_on.fingerprint(),
+            rep_on2.fingerprint(),
+            "pipeline run must be deterministic"
+        );
         // No honest double vote on either side.
-        assert!(rep_on.double_votes(&[]).is_empty(), "pipeline must not double-vote");
+        assert!(
+            rep_on.double_votes(&[]).is_empty(),
+            "pipeline must not double-vote"
+        );
         assert!(rep_off.double_votes(&[]).is_empty());
         // No fork on either side.
         for (h, entries) in rep_on.finalized_by_height() {
@@ -249,19 +272,41 @@ async fn vel_waste_composition_300() {
         }
         let mean_on = dts_on.iter().sum::<u64>() as f64 / dts_on.len() as f64;
         let mean_off = dts_off.iter().sum::<u64>() as f64 / dts_off.len() as f64;
-        let extra_on: u32 = rep_on.nodes.iter().map(|n| n.decide_rounds.iter().skip(1).sum::<u32>()).sum();
-        let extra_off: u32 = rep_off.nodes.iter().map(|n| n.decide_rounds.iter().skip(1).sum::<u32>()).sum();
+        let extra_on: u32 = rep_on
+            .nodes
+            .iter()
+            .map(|n| n.decide_rounds.iter().skip(1).sum::<u32>())
+            .sum();
+        let extra_off: u32 = rep_off
+            .nodes
+            .iter()
+            .map(|n| n.decide_rounds.iter().skip(1).sum::<u32>())
+            .sum();
         println!("[vel][pipeline] 60h mean_on={mean_on:.1} mean_off={mean_off:.1} extra_on={extra_on} extra_off={extra_off}");
-        assert!(mean_on <= mean_off, "pipeline must not be slower in aggregate ({mean_on:.1} vs {mean_off:.1})");
-        assert!(extra_on <= extra_off, "pipeline must not burn more rounds ({extra_on} vs {extra_off})");
+        assert!(
+            mean_on <= mean_off,
+            "pipeline must not be slower in aggregate ({mean_on:.1} vs {mean_off:.1})"
+        );
+        assert!(
+            extra_on <= extra_off,
+            "pipeline must not burn more rounds ({extra_on} vs {extra_off})"
+        );
     }
     let mut idx: Vec<usize> = (0..per_height.len()).collect();
     idx.sort_by_key(|&i| std::cmp::Reverse(per_height[i]));
     println!("[vel][slowest10]");
     for &i in idx.iter().take(10) {
         let h = i as u64 + 2;
-        let rounds: Vec<u32> = report.nodes.iter().map(|nd| nd.decide_rounds[i + 1]).collect();
-        println!("  h={h} dt={}ms rounds={rounds:?} nils={} slow_r0={}",
-            per_height[i], nil_by_height.get(&h).copied().unwrap_or(0), is_slow_proposer(&vs, h, 0));
+        let rounds: Vec<u32> = report
+            .nodes
+            .iter()
+            .map(|nd| nd.decide_rounds[i + 1])
+            .collect();
+        println!(
+            "  h={h} dt={}ms rounds={rounds:?} nils={} slow_r0={}",
+            per_height[i],
+            nil_by_height.get(&h).copied().unwrap_or(0),
+            is_slow_proposer(&vs, h, 0)
+        );
     }
 }

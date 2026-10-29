@@ -97,8 +97,9 @@ impl From<PqTransferScheme> for PqScheme {
 }
 
 /// Schemes supported for wallet creation and payments
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
-#[derive(Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum, Default,
+)]
 pub enum WalletScheme {
     /// Post-quantum lattice-based Falcon-512 (default)
     #[value(name = "falcon512", alias = "falcon-512", alias = "2")]
@@ -111,7 +112,6 @@ pub enum WalletScheme {
     #[value(name = "ed25519", alias = "1")]
     Ed25519,
 }
-
 
 impl WalletScheme {
     pub const fn id(&self) -> u8 {
@@ -322,7 +322,11 @@ pub fn format_address_with_visual_checksum(address_hex: &str) -> String {
                         format!("0x{clean}").dimmed()
                     );
                 } else {
-                    return format!("{}\n  └─ Raw Hex: {}", stl57.yellow().bold(), format!("0x{clean}").dimmed());
+                    return format!(
+                        "{}\n  └─ Raw Hex: {}",
+                        stl57.yellow().bold(),
+                        format!("0x{clean}").dimmed()
+                    );
                 }
             }
         }
@@ -334,7 +338,12 @@ pub fn format_address_with_visual_checksum(address_hex: &str) -> String {
     let prefix = &address_hex[..8];
     let mid = &address_hex[8..address_hex.len() - 8];
     let suffix = &address_hex[address_hex.len() - 8..];
-    format!("{}{}{}", prefix.cyan().bold(), mid.white(), suffix.green().bold())
+    format!(
+        "{}{}{}",
+        prefix.cyan().bold(),
+        mid.white(),
+        suffix.green().bold()
+    )
 }
 
 /// Formats 32-byte address with visual checksum
@@ -406,7 +415,8 @@ impl PqKeyPair {
                 hasher.update(seed);
                 let falcon_sec = *hasher.finalize().as_bytes();
 
-                let falcon_kp = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&falcon_sec);
+                let falcon_kp =
+                    stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&falcon_sec);
 
                 PqKeyPair {
                     scheme,
@@ -447,7 +457,8 @@ impl PqKeyPair {
                 f_hasher.update(seed);
                 let falcon_sec = *f_hasher.finalize().as_bytes();
 
-                let falcon_kp = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&falcon_sec);
+                let falcon_kp =
+                    stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&falcon_sec);
 
                 let mut pubkey = Vec::with_capacity(HYBRID_PUBKEY_LEN);
                 pubkey.extend_from_slice(&ed_pubkey);
@@ -471,12 +482,18 @@ impl PqKeyPair {
     /// Sign message with secret key according to scheme
     pub fn sign(&self, message: &[u8]) -> Vec<u8> {
         match self.scheme {
-            PqScheme::Falcon512 => sign_falcon512(&self._secret_key.bytes, &self.public_key, message),
+            PqScheme::Falcon512 => {
+                sign_falcon512(&self._secret_key.bytes, &self.public_key, message)
+            }
             PqScheme::Hybrid => sign_hybrid(&self._secret_key.bytes, &self.public_key, message),
             PqScheme::Ed25519 => {
                 use ed25519_dalek::Signer;
                 let sk = ed25519_dalek::SigningKey::from_bytes(
-                    self._secret_key.bytes.as_slice().try_into().expect("32 bytes"),
+                    self._secret_key
+                        .bytes
+                        .as_slice()
+                        .try_into()
+                        .expect("32 bytes"),
                 );
                 sk.sign(message).to_bytes().to_vec()
             }
@@ -655,7 +672,8 @@ pub fn generate_sample_keypair(scheme: PqScheme) -> PqKeyPair {
         PqScheme::Falcon512 => {
             let mut seed = [0u8; 32];
             rng.fill_bytes(&mut seed);
-            let falcon_kp = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed);
+            let falcon_kp =
+                stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed);
             PqKeyPair {
                 scheme,
                 public_key: falcon_kp.public_key.clone(),
@@ -690,7 +708,8 @@ pub fn generate_sample_keypair(scheme: PqScheme) -> PqKeyPair {
 
             let mut pq_seed = [0u8; 32];
             rng.fill_bytes(&mut pq_seed);
-            let falcon_kp = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&pq_seed);
+            let falcon_kp =
+                stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&pq_seed);
 
             let mut pubkey = Vec::with_capacity(HYBRID_PUBKEY_LEN);
             pubkey.extend_from_slice(&ed_pubkey);

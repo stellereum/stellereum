@@ -21,12 +21,12 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use stellereum::consensus::{Vote, VoteKind, ValidatorId, ValidatorSet};
+use std::sync::Arc;
+use stellereum::consensus::{ValidatorId, ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::Block;
+use stellereum::staking::{StakingLedger, MIN_VALIDATOR_BOND};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::staking::{MIN_VALIDATOR_BOND, StakingLedger};
-use std::sync::Arc;
 
 const N: usize = 4;
 
@@ -34,7 +34,11 @@ fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
 }
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
-    ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect())
+    ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    )
 }
 fn ids(ks: &[SigningKey]) -> Vec<ValidatorId> {
     ks.iter().map(|k| k.verifying_key().to_bytes()).collect()
@@ -96,12 +100,20 @@ async fn hunt_finding_10_downtime_verdict_depends_on_which_votes_arrived() {
     // A block may only be decided on a prevote quorum for the SAME block, so the
     // prevotes come first. Both nodes prevote the same block, then precommit.
     for k in ks.iter().take(3) {
-        nodes[0].on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh))).unwrap();
-        nodes[1].on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh))).unwrap();
+        nodes[0]
+            .on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+            .unwrap();
+        nodes[1]
+            .on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+            .unwrap();
     }
     for k in ks.iter().take(3) {
-        nodes[0].on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh))).unwrap();
-        nodes[1].on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh))).unwrap();
+        nodes[0]
+            .on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+            .unwrap();
+        nodes[1]
+            .on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+            .unwrap();
     }
     nodes[0]
         .on_precommit(Vote::sign(&ks[3], 1, 0, VoteKind::Precommit, Some(bh)))
@@ -118,10 +130,17 @@ async fn hunt_finding_10_downtime_verdict_depends_on_which_votes_arrived() {
         cert_a.signatures.len(),
         cert_b.signatures.len()
     );
-    println!("[FINDING 10] both certificates are genuine: {} / {}",
-        cert_a.verify(&nodes[0].validators), cert_b.verify(&nodes[1].validators));
+    println!(
+        "[FINDING 10] both certificates are genuine: {} / {}",
+        cert_a.verify(&nodes[0].validators),
+        cert_b.verify(&nodes[1].validators)
+    );
     assert!(cert_a.verify(&nodes[0].validators) && cert_b.verify(&nodes[1].validators));
-    assert_ne!(cert_a.signatures.len(), cert_b.signatures.len(), "the certificates differ");
+    assert_ne!(
+        cert_a.signatures.len(),
+        cert_b.signatures.len(),
+        "the certificates differ"
+    );
 
     nodes[0].apply_downtime_slashes().await;
     nodes[1].apply_downtime_slashes().await;
@@ -134,8 +153,15 @@ async fn hunt_finding_10_downtime_verdict_depends_on_which_votes_arrived() {
     println!("[FINDING 10] silent validator missed: node0={m0}  node1={m1}");
     assert_eq!(m0, 0, "node 0 saw the 4th precommit and forgave it");
     assert_eq!(m1, 1, "node 1 never heard it and counted a miss");
-    assert_ne!(r0, r1, "SPLIT: same block, same quorum, different state root");
-    println!("[FINDING 10] SPLIT CONFIRMED: {} != {}", hex::encode(&r0[..8]), hex::encode(&r1[..8]));
+    assert_ne!(
+        r0, r1,
+        "SPLIT: same block, same quorum, different state root"
+    );
+    println!(
+        "[FINDING 10] SPLIT CONFIRMED: {} != {}",
+        hex::encode(&r0[..8]),
+        hex::encode(&r1[..8])
+    );
 }
 
 // ===========================================================================
@@ -163,12 +189,14 @@ async fn hunt_finding_11_equivocation_is_no_longer_node_local_in_the_transition(
     // only decided on a prevote quorum for the same block, so both are needed.
     for n in nodes.iter_mut() {
         for k in ks.iter().take(3) {
-            n.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh))).unwrap();
+            n.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+                .unwrap();
         }
     }
     for n in nodes.iter_mut() {
         for k in ks.iter().take(3) {
-            n.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh))).unwrap();
+            n.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+                .unwrap();
         }
     }
     assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh));
@@ -211,8 +239,14 @@ async fn hunt_finding_11_equivocation_is_no_longer_node_local_in_the_transition(
     println!("[FINDING 11 FIXED] double-voter self_bond: node0={s0}  node1={s1}");
     assert_eq!(burn0, 0, "F4 FIX: local evidence must not slash");
     assert_eq!(burn1, 0, "F4 FIX: local evidence must not slash");
-    assert_eq!(s0, s1, "F4 FIX: the two nodes agree about the validator's stake");
-    assert_eq!(r0, r1, "F4 FIX: same block => same root, regardless of gossip");
+    assert_eq!(
+        s0, s1,
+        "F4 FIX: the two nodes agree about the validator's stake"
+    );
+    assert_eq!(
+        r0, r1,
+        "F4 FIX: same block => same root, regardless of gossip"
+    );
     println!("[FINDING 11 FIXED] ROOTS AGREE: {}", hex::encode(&r0[..8]));
     println!("[FINDING 11 FIXED] a Byzantine double-voter can no longer split the network by choosing gossip.");
 }
@@ -230,7 +264,10 @@ async fn hunt_finding_11b_equivocation_evidence_is_never_in_the_block() {
     hc.add_prevote(a).unwrap();
     hc.add_prevote(b).unwrap();
     let ev = hc.equivocations();
-    println!("[FINDING 11b] local equivocation evidence: {} entries", ev.len());
+    println!(
+        "[FINDING 11b] local equivocation evidence: {} entries",
+        ev.len()
+    );
     assert_eq!(ev.len(), 1);
     // The evidence exists only in this process's memory. There is no field on
     // Block (src/sharding.rs:454-464) or QuorumCertificate (src/consensus.rs:292-298)
@@ -264,9 +301,17 @@ fn hunt_finding_12_slash_equivocation_trusts_the_caller_supplied_tuple() {
     // `slash_equivocation` checks only height/round/kind equality and differing
     // block_hash (src/staking.rs:427-432). It never checks
     //   va.voter == vb.voter == `voter`, nor that either signature verifies.
-    let burned = l.slash_equivocation(&(aid, va.clone(), vb.clone())).unwrap();
-    println!("[FINDING 12] burned {burned} from validator {} for a vote it never cast", hex::encode(&aid[..6]));
-    println!("[FINDING 12] A's stake: {before} -> {}", l.total_stake(&aid));
+    let burned = l
+        .slash_equivocation(&(aid, va.clone(), vb.clone()))
+        .unwrap();
+    println!(
+        "[FINDING 12] burned {burned} from validator {} for a vote it never cast",
+        hex::encode(&aid[..6])
+    );
+    println!(
+        "[FINDING 12] A's stake: {before} -> {}",
+        l.total_stake(&aid)
+    );
     assert!(burned > 0, "A was slashed for B's vote");
     assert!(l.total_stake(&aid) < before);
     // And with two UNSIGNED votes entirely:
@@ -298,8 +343,15 @@ fn hunt_finding_13_prevote_precommit_divergence_escapes_all_slashing() {
     let pc = Vote::sign(&ks[0], 1, 0, VoteKind::Precommit, Some([0xBBu8; 32]));
     hc.add_prevote(pv.clone()).unwrap();
     hc.add_precommit(pc.clone()).unwrap();
-    assert_eq!(hc.equivocations().len(), 0, "NO evidence recorded for prevote/precommit split");
-    println!("[FINDING 13] prevote(0xAA..) + precommit(0xBB..) at h=1 r=0 -> {} equivocation records", hc.equivocations().len());
+    assert_eq!(
+        hc.equivocations().len(),
+        0,
+        "NO evidence recorded for prevote/precommit split"
+    );
+    println!(
+        "[FINDING 13] prevote(0xAA..) + precommit(0xBB..) at h=1 r=0 -> {} equivocation records",
+        hc.equivocations().len()
+    );
 
     // And the ledger agrees it is not equivocation, because `kind` differs.
     let mut l = StakingLedger::new();
@@ -322,30 +374,39 @@ async fn hunt_finding_14_a_single_bond_makes_every_prior_certificate_fail() {
     let before = vset(&ks);
     let bh = [0x55u8; 32];
 
-    let mk = |signers: &[usize]| {
-        stellereum::consensus::QuorumCertificate {
-            height: 1,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(bh),
-            signatures: signers
-                .iter()
-                .map(|&i| {
-                    let v = Vote::sign(&ks[i], 1, 0, VoteKind::Precommit, Some(bh));
-                    (v.voter, v.signature)
-                })
-                .collect(),
-        }
+    let mk = |signers: &[usize]| stellereum::consensus::QuorumCertificate {
+        height: 1,
+        round: 0,
+        kind: VoteKind::Precommit,
+        block_hash: Some(bh),
+        signatures: signers
+            .iter()
+            .map(|&i| {
+                let v = Vote::sign(&ks[i], 1, 0, VoteKind::Precommit, Some(bh));
+                (v.voter, v.signature)
+            })
+            .collect(),
     };
     let cert = mk(&[0, 1, 2]);
     assert!(cert.verify(&before), "3 of 4 is a quorum before the bond");
-    println!("[FINDING 14] before: total={} quorum={}", before.total_power(), before.quorum_power());
+    println!(
+        "[FINDING 14] before: total={} quorum={}",
+        before.total_power(),
+        before.quorum_power()
+    );
 
     // A whale bonds and refresh_validator_set_from_staking pulls it in.
     let mut after = before.clone();
     after.add([0xEEu8; 32], 1_000 * MIN_VALIDATOR_BOND);
-    println!("[FINDING 14] after a 1000-STELL bond: total={} quorum={}", after.total_power(), after.quorum_power());
-    assert!(!cert.verify(&after), "the SAME certificate no longer verifies");
+    println!(
+        "[FINDING 14] after a 1000-STELL bond: total={} quorum={}",
+        after.total_power(),
+        after.quorum_power()
+    );
+    assert!(
+        !cert.verify(&after),
+        "the SAME certificate no longer verifies"
+    );
     println!("[FINDING 14] cert.verify(after) = {}", cert.verify(&after));
     assert!(!cert.verify(&after));
 
@@ -353,8 +414,14 @@ async fn hunt_finding_14_a_single_bond_makes_every_prior_certificate_fail() {
     // certificate it already signed stops counting on the next height.
     let mut shrunk = before.clone();
     shrunk.validators.remove(&real_ids[0]);
-    assert!(!cert.verify(&shrunk), "unbonding one signer invalidates the certificate");
-    println!("[FINDING 14] after unbonding signer 0: cert.verify = {}", cert.verify(&shrunk));
+    assert!(
+        !cert.verify(&shrunk),
+        "unbonding one signer invalidates the certificate"
+    );
+    println!(
+        "[FINDING 14] after unbonding signer 0: cert.verify = {}",
+        cert.verify(&shrunk)
+    );
     assert!(!cert.verify(&shrunk));
     println!("[FINDING 14] => quorum is scored with the power at VERIFY time, not at VOTE time.");
     println!("[FINDING 14]    Certificates are not stable across a validator-set change, so");
@@ -369,8 +436,15 @@ async fn hunt_finding_14_a_single_bond_makes_every_prior_certificate_fail() {
     // quorum is unreachable in practice is NOT caught.
     let mut one = ValidatorSet::new();
     one.add([1u8; 32], 1);
-    assert_eq!(one.quorum_power(), 1, "a SINGLE validator satisfies its own quorum alone");
-    println!("[FINDING 14] single-validator set: quorum_power = {} (a node finalises alone)", one.quorum_power());
+    assert_eq!(
+        one.quorum_power(),
+        1,
+        "a SINGLE validator satisfies its own quorum alone"
+    );
+    println!(
+        "[FINDING 14] single-validator set: quorum_power = {} (a node finalises alone)",
+        one.quorum_power()
+    );
 }
 
 // ===========================================================================
@@ -475,5 +549,8 @@ fn hunt_finding_12_fixed_pq_equivocation_verifies_signatures_and_deduplicates() 
     let b_burned = l.slash_pq_equivocation(&b_evidence, true).unwrap();
     assert_eq!(b_burned, 10 * MIN_VALIDATOR_BOND);
     assert_eq!(l.total_stake(&bid), 0);
-    assert!(!l.validators.contains_key(&bid), "Micro-committee equivocator must be evicted");
+    assert!(
+        !l.validators.contains_key(&bid),
+        "Micro-committee equivocator must be evicted"
+    );
 }

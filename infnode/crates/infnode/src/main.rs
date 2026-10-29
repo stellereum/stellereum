@@ -3,13 +3,16 @@ use base64::Engine;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-
 use infnode::config::NodeConfig;
 use infnode::keyring::NodeKeys;
 use infnode::node::Node;
 
 #[derive(Parser)]
-#[command(name = "infnode", version, about = "Lightweight overlay protocol on QUIC + Ed25519")]
+#[command(
+    name = "infnode",
+    version,
+    about = "Lightweight overlay protocol on QUIC + Ed25519"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -316,9 +319,15 @@ enum Cmd {
 
 fn load(cfg: &Path) -> Result<(NodeConfig, NodeKeys, PathBuf, PathBuf)> {
     let cfg_obj = infnode::config::load(cfg)?;
-    let keys_dir = cfg.parent().unwrap_or(std::path::Path::new(".")).join("keys");
+    let keys_dir = cfg
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("keys");
     let keys = NodeKeys::load(&keys_dir)?;
-    let data_dir = cfg.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+    let data_dir = cfg
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
     Ok((cfg_obj, keys, data_dir, cfg.to_path_buf()))
 }
 

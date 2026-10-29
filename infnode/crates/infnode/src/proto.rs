@@ -131,14 +131,19 @@ impl Frame {
         if b.len() < HDR + 64 {
             bail!("frame too short");
         }
-        let plen = u32::from_le_bytes(b[64..68].try_into().map_err(|_| anyhow::anyhow!("plen"))?) as usize;
-        let nlen = u16::from_le_bytes(b[62..64].try_into().map_err(|_| anyhow::anyhow!("nlen"))?) as usize;
+        let plen =
+            u32::from_le_bytes(b[64..68].try_into().map_err(|_| anyhow::anyhow!("plen"))?) as usize;
+        let nlen =
+            u16::from_le_bytes(b[62..64].try_into().map_err(|_| anyhow::anyhow!("nlen"))?) as usize;
         // защита от переполнения usize и out-of-bounds при нечётких/злонамеренных пакетах
         if plen > MAX_FRAME {
             bail!("payload too large");
         }
         // проверяем что сумма длин не переполняет usize и точно совпадает с длиной
-        let total = HDR.checked_add(plen).and_then(|x| x.checked_add(nlen)).and_then(|x| x.checked_add(64));
+        let total = HDR
+            .checked_add(plen)
+            .and_then(|x| x.checked_add(nlen))
+            .and_then(|x| x.checked_add(64));
         let total = match total {
             Some(t) => t,
             None => bail!("frame length overflow"),
@@ -146,7 +151,9 @@ impl Frame {
         if total != b.len() {
             bail!("frame length mismatch");
         }
-        let sig: [u8; 64] = b[b.len() - 64..].try_into().map_err(|_| anyhow::anyhow!("sig"))?;
+        let sig: [u8; 64] = b[b.len() - 64..]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("sig"))?;
         let f = Frame {
             kind: b[1],
             seq: u32::from_le_bytes(b[2..6].try_into().map_err(|_| anyhow::anyhow!("seq"))?),

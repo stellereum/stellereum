@@ -38,7 +38,8 @@ async fn main() {
     let mut seq = 0u64;
     for sk in &keys {
         for nonce in 0..100u64 {
-            pool.add_checked(legacy_tx(sk, RECIP, nonce, seq), BAL).unwrap();
+            pool.add_checked(legacy_tx(sk, RECIP, nonce, seq), BAL)
+                .unwrap();
             seq += 1;
         }
     }
@@ -54,11 +55,15 @@ async fn main() {
         let out = pool.select_for_block_multi(10_000, 30_000_000, |_| true);
         assert_eq!(out.len(), 10_000);
     }
-    println!("select trivial-accept 10k pool: {:.2} ms/pass-set", t.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+    println!(
+        "select trivial-accept 10k pool: {:.2} ms/pass-set",
+        t.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    );
 
     // ---- 2. selection with stateful nonce filter (realistic propose-like) ----
     // snapshot balances like propose does
-    let mut expected: std::collections::HashMap<[u8; 32], (u64, u64)> = std::collections::HashMap::new();
+    let mut expected: std::collections::HashMap<[u8; 32], (u64, u64)> =
+        std::collections::HashMap::new();
     for k in &keys {
         expected.insert(id_of(k), (0, BAL));
     }
@@ -83,7 +88,10 @@ async fn main() {
         });
         assert_eq!(out.len(), 10_000);
     }
-    println!("select nonce-filter 10k pool: {:.2} ms/pass-set", t.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+    println!(
+        "select nonce-filter 10k pool: {:.2} ms/pass-set",
+        t.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    );
 
     // ---- 3. full propose ----
     let funding: Vec<([u8; 32], u64)> = keys.iter().map(|k| (id_of(k), BAL)).collect();
@@ -129,7 +137,10 @@ async fn main() {
         let b = rt.propose(TS).await.unwrap();
         last_block = Some(b);
     }
-    println!("full propose 10k: {:.2} ms/propose", t.elapsed().as_secs_f64() * 1000.0 / piters as f64);
+    println!(
+        "full propose 10k: {:.2} ms/propose",
+        t.elapsed().as_secs_f64() * 1000.0 / piters as f64
+    );
     let block = last_block.unwrap();
 
     // ---- 4. propose assembly pieces: encode / hash / sign ----
@@ -140,13 +151,20 @@ async fn main() {
         let bytes = bincode::serialize(&block).unwrap();
         enc_len = bytes.len();
     }
-    println!("block bincode encode 10k ({} bytes): {:.2} ms", enc_len, t.elapsed().as_secs_f64() * 1000.0 / eiters as f64);
+    println!(
+        "block bincode encode 10k ({} bytes): {:.2} ms",
+        enc_len,
+        t.elapsed().as_secs_f64() * 1000.0 / eiters as f64
+    );
 
     let t = Instant::now();
     for _ in 0..eiters {
         let _ = block.compute_hash();
     }
-    println!("block compute_hash 10k: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / eiters as f64);
+    println!(
+        "block compute_hash 10k: {:.2} ms",
+        t.elapsed().as_secs_f64() * 1000.0 / eiters as f64
+    );
 
     // compute_tx_hash share: hash all txs
     let t = Instant::now();
@@ -158,21 +176,32 @@ async fn main() {
         }
         std::hint::black_box(acc);
     }
-    println!("compute_tx_hash x10k: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / eiters as f64);
+    println!(
+        "compute_tx_hash x10k: {:.2} ms",
+        t.elapsed().as_secs_f64() * 1000.0 / eiters as f64
+    );
 
     // batch sig verify share
     let t = Instant::now();
     let viters = 3;
     for _ in 0..viters {
-        assert!(Transaction::verify_signatures_batch_parallel(&block.transactions));
+        assert!(Transaction::verify_signatures_batch_parallel(
+            &block.transactions
+        ));
     }
-    println!("batch sig verify 10k: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / viters as f64);
+    println!(
+        "batch sig verify 10k: {:.2} ms",
+        t.elapsed().as_secs_f64() * 1000.0 / viters as f64
+    );
     let t = Instant::now();
     for _ in 0..viters {
         let flags = Transaction::verify_signatures_partitioned(&block.transactions);
         assert!(flags.iter().all(|b| *b));
     }
-    println!("partitioned sig verify 10k: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / viters as f64);
+    println!(
+        "partitioned sig verify 10k: {:.2} ms",
+        t.elapsed().as_secs_f64() * 1000.0 / viters as f64
+    );
 
     // ---- 5. apply vs tx count ----
     for n in [1_000usize, 5_000, 10_000] {
@@ -188,7 +217,10 @@ async fn main() {
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(applied, n);
         assert_eq!(failed, 0);
-        println!("apply {n}: {ms:.2} ms ({:.0} tx/s)", n as f64 / (ms / 1000.0));
+        println!(
+            "apply {n}: {ms:.2} ms ({:.0} tx/s)",
+            n as f64 / (ms / 1000.0)
+        );
     }
 
     // ---- 6. e2e: propose + apply + root ----
@@ -204,9 +236,18 @@ async fn main() {
         let b = rt.propose(TS).await.unwrap();
         let t_propose = t.elapsed();
         let t2 = Instant::now();
-        let (a, f, _, _, _) = rt.state.apply_block_parallel_fees(&b.transactions, TS).await;
+        let (a, f, _, _, _) = rt
+            .state
+            .apply_block_parallel_fees(&b.transactions, TS)
+            .await;
         let t_apply = t2.elapsed();
         let root = rt.state.get_state_root().await;
-        println!("e2e propose {:.2} ms + apply {:.2} ms = {:.2} ms; applied={a} failed={f} root={}", t_propose.as_secs_f64()*1000.0, t_apply.as_secs_f64()*1000.0, (t_propose+t_apply).as_secs_f64()*1000.0, hex::encode(&root[..8]));
+        println!(
+            "e2e propose {:.2} ms + apply {:.2} ms = {:.2} ms; applied={a} failed={f} root={}",
+            t_propose.as_secs_f64() * 1000.0,
+            t_apply.as_secs_f64() * 1000.0,
+            (t_propose + t_apply).as_secs_f64() * 1000.0,
+            hex::encode(&root[..8])
+        );
     }
 }

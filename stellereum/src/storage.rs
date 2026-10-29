@@ -236,7 +236,10 @@ pub struct RetentionConfig {
 
 impl Default for RetentionConfig {
     fn default() -> Self {
-        Self { archive: true, keep_blocks: 50_000 }
+        Self {
+            archive: true,
+            keep_blocks: 50_000,
+        }
     }
 }
 
@@ -255,7 +258,10 @@ impl RetentionConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(50_000);
-        Self { archive, keep_blocks }
+        Self {
+            archive,
+            keep_blocks,
+        }
     }
 
     /// Whether this node retains the data needed to serve per-key archive
@@ -279,7 +285,10 @@ pub enum ArchiveSlot {
     /// A native account leaf, keyed by the 32-byte address.
     Account([u8; 32]),
     /// An STS token balance cell.
-    TokenBalance { token_id: [u8; 32], account: [u8; 32] },
+    TokenBalance {
+        token_id: [u8; 32],
+        account: [u8; 32],
+    },
     /// An STS token total-supply cell.
     TokenSupply([u8; 32]),
     /// A contract's committed code hash.
@@ -298,9 +307,7 @@ pub fn archive_slot_key(slot: &ArchiveSlot) -> [u8; 32] {
         ArchiveSlot::TokenBalance { token_id, account } => {
             crate::state_engine::token_balance_key(&token_id, &account)
         }
-        ArchiveSlot::TokenSupply(token_id) => {
-            crate::state_engine::token_supply_key(&token_id)
-        }
+        ArchiveSlot::TokenSupply(token_id) => crate::state_engine::token_supply_key(&token_id),
         ArchiveSlot::ContractCode(addr) => crate::state_engine::contract_key(&addr),
         ArchiveSlot::ContractAbi(addr) => crate::state_engine::contract_abi_key(&addr),
         ArchiveSlot::CommitmentDigest => crate::commitment::commitment_key(),
@@ -349,10 +356,7 @@ pub const DEFAULT_SLED_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Effective page-cache ceiling: `STELL_SLED_CACHE_BYTES`, default 1 GiB.
 pub fn sled_cache_capacity_bytes() -> u64 {
-    crate::state_engine::memory_bounds::env_u64(
-        "STELL_SLED_CACHE_BYTES",
-        DEFAULT_SLED_CACHE_BYTES,
-    )
+    crate::state_engine::memory_bounds::env_u64("STELL_SLED_CACHE_BYTES", DEFAULT_SLED_CACHE_BYTES)
 }
 
 /// Default background-flush cadence in ms: 500, exactly the sled 0.34 default.
@@ -439,7 +443,9 @@ impl Storage {
         };
         let swept = this.sweep_dangling_indexes().unwrap_or(0);
         if swept > 0 {
-            eprintln!("[storage] open: swept {swept} dangling by_height index entries (crash debris)");
+            eprintln!(
+                "[storage] open: swept {swept} dangling by_height index entries (crash debris)"
+            );
         }
         Ok(this)
     }
@@ -543,7 +549,6 @@ impl Storage {
         }
         Ok(out)
     }
-
 
     // ---------- Chain metadata ----------
 
@@ -657,7 +662,11 @@ impl Storage {
 
     /// Persist `block` only if it hashes to `expected_hash`. A body filed under
     /// a hash it does not compute to is discarded (Err, nothing written).
-    pub fn put_verified_block(&self, block: &Block, expected_hash: &BlockHash) -> Result<BlockHash> {
+    pub fn put_verified_block(
+        &self,
+        block: &Block,
+        expected_hash: &BlockHash,
+    ) -> Result<BlockHash> {
         let computed = block.compute_hash();
         if computed != *expected_hash {
             return Err(anyhow!(
@@ -743,10 +752,10 @@ impl Storage {
         let mut n = 0;
         for (i, tx) in txs.iter().enumerate() {
             let success = statuses.get(i).copied().unwrap_or(false);
-            let fee_charged = fees
-                .get(i)
-                .copied()
-                .unwrap_or(if success { tx.gas_limit } else { 0 });
+            let fee_charged =
+                fees.get(i)
+                    .copied()
+                    .unwrap_or(if success { tx.gas_limit } else { 0 });
             let evts = events.get(i).cloned().unwrap_or_default();
             self.put_receipt(&StoredReceipt {
                 tx_hash: tx.compute_tx_hash(),
@@ -947,7 +956,9 @@ impl Storage {
             .keys()
             .filter_map(|k| k.ok())
             .filter(|k| {
-                if k.len() != 8 { return false; }
+                if k.len() != 8 {
+                    return false;
+                }
                 let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
                 h < keep_from && Some(h) != max_h
             })
@@ -999,11 +1010,7 @@ impl Storage {
             .filter(|k| k.len() == 8)
             .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
             .collect();
-        let Some(height) = state_heights
-            .intersection(&domain_heights)
-            .copied()
-            .max()
-        else {
+        let Some(height) = state_heights.intersection(&domain_heights).copied().max() else {
             return Ok(None);
         };
         let Some(bytes) = self.state.get(height.to_be_bytes())? else {
@@ -1041,7 +1048,9 @@ impl Storage {
             .keys()
             .filter_map(|k| k.ok())
             .filter(|k| {
-                if k.len() != 8 { return false; }
+                if k.len() != 8 {
+                    return false;
+                }
                 let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
                 h < keep_from && Some(h) != max_h
             })
@@ -1098,7 +1107,9 @@ impl Storage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .filter(|k| k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from)
+            .filter(|k| {
+                k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from
+            })
             .collect();
         for k in keys {
             self.session_keys.remove(k)?;
@@ -1137,7 +1148,9 @@ impl Storage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .filter(|k| k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from)
+            .filter(|k| {
+                k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from
+            })
             .collect();
         for k in keys {
             self.bridge.remove(k)?;
@@ -1161,7 +1174,10 @@ impl Storage {
     /// so a restored node still refuses an already-spent commitment instead
     /// of minting it a second time.
     pub fn confidential_at(&self, height: u64) -> Result<Option<Vec<u8>>> {
-        Ok(self.confidential.get(height.to_be_bytes())?.map(|v| v.to_vec()))
+        Ok(self
+            .confidential
+            .get(height.to_be_bytes())?
+            .map(|v| v.to_vec()))
     }
 
     /// Drop shielded-ledger snapshots older than `keep_from`. Called from
@@ -1173,7 +1189,9 @@ impl Storage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .filter(|k| k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from)
+            .filter(|k| {
+                k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from
+            })
             .collect();
         for k in keys {
             self.confidential.remove(k)?;
@@ -1193,7 +1211,10 @@ impl Storage {
     /// `None` for older directories means "empty" (zero digest bytes), which
     /// restores to the written root.
     pub fn zkml_models_at(&self, height: u64) -> Result<Option<Vec<u8>>> {
-        Ok(self.zkml_models.get(height.to_be_bytes())?.map(|v| v.to_vec()))
+        Ok(self
+            .zkml_models
+            .get(height.to_be_bytes())?
+            .map(|v| v.to_vec()))
     }
 
     /// Drop registry snapshots older than `keep_from`. Called from
@@ -1205,7 +1226,9 @@ impl Storage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .filter(|k| k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from)
+            .filter(|k| {
+                k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from
+            })
             .collect();
         for k in keys {
             self.zkml_models.remove(k)?;
@@ -1235,7 +1258,10 @@ impl Storage {
     /// installs the FULL snapshot: engine + runtime consumed halves,
     /// produced heights and completed lifecycles).
     pub fn cross_shard_at(&self, height: u64) -> Result<Option<Vec<u8>>> {
-        Ok(self.cross_shard.get(height.to_be_bytes())?.map(|v| v.to_vec()))
+        Ok(self
+            .cross_shard
+            .get(height.to_be_bytes())?
+            .map(|v| v.to_vec()))
     }
 
     /// Drop replay snapshots older than `keep_from`. Called from
@@ -1247,7 +1273,9 @@ impl Storage {
             .iter()
             .keys()
             .filter_map(|k| k.ok())
-            .filter(|k| k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from)
+            .filter(|k| {
+                k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from
+            })
             .collect();
         for k in keys {
             self.cross_shard.remove(k)?;
@@ -1320,7 +1348,9 @@ impl Storage {
         if computed != expected {
             if snapshot_height == 0 {
                 // Stale or un-seeded genesis snapshot: purge it rather than refusing boot.
-                tracing::warn!("stale genesis snapshot at height 0 ignored, falling back to genesis");
+                tracing::warn!(
+                    "stale genesis snapshot at height 0 ignored, falling back to genesis"
+                );
                 let k = 0u64.to_be_bytes();
                 let _ = self.state.remove(k);
                 let _ = self.domains.remove(k);
@@ -1443,7 +1473,10 @@ impl Storage {
             .filter(|k| k.len() == 8)
             .map(|k| u64::from_be_bytes(k.as_ref().try_into().unwrap()))
             .collect();
-        Ok(state_heights.intersection(&domain_heights).copied().collect())
+        Ok(state_heights
+            .intersection(&domain_heights)
+            .copied()
+            .collect())
     }
 
     /// Bounded one-line summary of the archive coverage, for fail-closed
@@ -1763,9 +1796,7 @@ impl Storage {
         k
     }
 
-    fn decode_pq_value(
-        bytes: &[u8],
-    ) -> Option<(crate::post_quantum::PqScheme, Vec<u8>, [u8; 16])> {
+    fn decode_pq_value(bytes: &[u8]) -> Option<(crate::post_quantum::PqScheme, Vec<u8>, [u8; 16])> {
         if let Ok((scheme, pk, salt)) =
             bincode::deserialize::<(crate::post_quantum::PqScheme, Vec<u8>, [u8; 16])>(bytes)
         {
@@ -1796,7 +1827,8 @@ impl Storage {
         salt: &[u8; 16],
     ) -> Result<()> {
         let val = bincode::serialize(&(scheme, pubkey, *salt))?;
-        self.pq_keys.insert(Self::pq_addr_key(address), val.as_slice())?;
+        self.pq_keys
+            .insert(Self::pq_addr_key(address), val.as_slice())?;
         let pk_hash = *blake3::hash(pubkey).as_bytes();
         self.pq_keys.insert(Self::pq_hash_key(&pk_hash), pubkey)?;
         self.pq_keys.flush()?;
@@ -2368,7 +2400,10 @@ pub const VALIDATOR_SET_FRESHNESS_DEFAULT_LAG: u64 = 300;
 /// default [`VALIDATOR_SET_FRESHNESS_DEFAULT_LAG`]. Unparseable/zero values
 /// fall back to the default (zero would mark every paired restore stale).
 pub fn validator_set_freshness_max_lag() -> u64 {
-    for key in ["STELL_VALIDATOR_SET_MAX_LAG", "STELL_LEDGER_FRESHNESS_MAX_LAG"] {
+    for key in [
+        "STELL_VALIDATOR_SET_MAX_LAG",
+        "STELL_LEDGER_FRESHNESS_MAX_LAG",
+    ] {
         if let Ok(raw) = std::env::var(key) {
             if let Ok(v) = raw.trim().parse::<u64>() {
                 if v > 0 {
@@ -2442,7 +2477,13 @@ pub fn check_validator_set_freshness(state_height: u64, ledger_height: u64) -> R
 pub async fn load_full_state_into(
     storage: &Storage,
     engine: &InMemoryStateEngine,
-) -> Result<Option<(u64, crate::staking::StakingLedger, crate::governance::Governance)>> {
+) -> Result<
+    Option<(
+        u64,
+        crate::staking::StakingLedger,
+        crate::governance::Governance,
+    )>,
+> {
     engine.attach_pq_tree(storage.pq_keys.clone());
     storage.hydrate_implicit_pq_keys()?;
     // Take the newest height at which BOTH a state and a domains snapshot exist.
@@ -2608,7 +2649,10 @@ pub struct AsyncPersistence {
 // GATE: Block variant dominates by design; jobs are short-lived queue items, boxing would add alloc overhead.
 pub enum PersistJob {
     Block(Block),
-    State { height: u64, snapshot: Vec<u8> },
+    State {
+        height: u64,
+        snapshot: Vec<u8>,
+    },
     /// Domain + session-key + bridge snapshots of the SAME height, carried in
     /// one job so they are enqueued (and therefore ordered/dropped) together:
     /// two jobs could be split by a full queue or a crash, leaving a registry
@@ -2624,8 +2668,13 @@ pub enum PersistJob {
         cross_shard: Vec<u8>,
     },
     Consensus(Box<ConsensusCheckpoint>),
-    Finalized { height: u64, hash: BlockHash },
-    Prune { keep_from: u64 },
+    Finalized {
+        height: u64,
+        hash: BlockHash,
+    },
+    Prune {
+        keep_from: u64,
+    },
     /// Durable receipts for one applied block. Carries the tx hashes + statuses
     /// from the single real application (never wire data); the worker persists
     /// them alongside the body so an adopter serves receipts after a restart.
@@ -2687,11 +2736,14 @@ impl AsyncPersistence {
                 // Dequeued: one fewer job waiting, even before the write
                 // lands. `saturating` — a missed count must never wrap the
                 // gauge to u64::MAX.
-                let now_depth = depth_worker.fetch_update(
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                    |d| Some(d.saturating_sub(1)),
-                ).unwrap_or(0).saturating_sub(1);
+                let now_depth = depth_worker
+                    .fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |d| Some(d.saturating_sub(1)),
+                    )
+                    .unwrap_or(0)
+                    .saturating_sub(1);
                 crate::metrics::global().set_persist_queue_depth(now_depth);
                 let res = match job {
                     PersistJob::Block(b) => st.put_block(&b).map(|_| ()),
@@ -2725,9 +2777,18 @@ impl AsyncPersistence {
                         .and_then(|()| st.put_zkml_models(height, &zkml_models)),
                     PersistJob::Consensus(cp) => st.set_consensus(&cp),
                     PersistJob::Finalized { height, hash } => st.set_finalized(height, &hash),
-                    PersistJob::Receipts { height, hash, txs, statuses, fees, events } => {
-                        st.put_receipts_for_block_with_events(height, &hash, &txs, &statuses, &fees, &events).map(|_| ())
-                    }
+                    PersistJob::Receipts {
+                        height,
+                        hash,
+                        txs,
+                        statuses,
+                        fees,
+                        events,
+                    } => st
+                        .put_receipts_for_block_with_events(
+                            height, &hash, &txs, &statuses, &fees, &events,
+                        )
+                        .map(|_| ()),
                     // Bounded per job: the flusher is the only writer, so an
                     // unbounded scan here would stall every other write.
                     // Receipts ride the same retention window (audit 2026-10-06).
@@ -2742,7 +2803,11 @@ impl AsyncPersistence {
                 }
             }
         });
-        Self { tx, storage, queue_depth: depth }
+        Self {
+            tx,
+            storage,
+            queue_depth: depth,
+        }
     }
 
     pub fn storage(&self) -> Arc<Storage> {
@@ -2778,7 +2843,10 @@ impl AsyncPersistence {
         let droppable = persist_push_policy(&job) == PersistPushPolicy::DropFirst;
         match self.tx.try_send(job) {
             Ok(()) => {
-                let d = self.queue_depth.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1);
+                let d = self
+                    .queue_depth
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(1);
                 crate::metrics::global().set_persist_queue_depth(d);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
@@ -2803,15 +2871,21 @@ impl AsyncPersistence {
                 // Worst case is a bounded tick delay followed by a counted
                 // drop (whose loss class is documented above), never a hang
                 // and never silent loss.
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_millis(PERSIST_BLOCKING_WAIT_MS);
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(PERSIST_BLOCKING_WAIT_MS);
                 let mut job = Some(job);
                 let mut retry_fn = || {
                     while std::time::Instant::now() < deadline {
                         std::thread::sleep(std::time::Duration::from_millis(PERSIST_RETRY_PACE_MS));
-                        match self.tx.try_send(job.take().expect("job held across retries")) {
+                        match self
+                            .tx
+                            .try_send(job.take().expect("job held across retries"))
+                        {
                             Ok(()) => {
-                                let d = self.queue_depth.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1);
+                                let d = self
+                                    .queue_depth
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    .saturating_add(1);
                                 crate::metrics::global().set_persist_queue_depth(d);
                                 return true;
                             }
@@ -2888,8 +2962,8 @@ impl AsyncPersistence {
     /// with the session-key registry, the bridge domain, the shielded ledger,
     /// the zkML registry and the cross-shard replay snapshot of the same
     /// height.
-#[allow(clippy::too_many_arguments)]
-// GATE: domain-enqueue batches all same-height snapshots in one call; a params struct would churn storage callers.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: domain-enqueue batches all same-height snapshots in one call; a params struct would churn storage callers.
     pub fn enqueue_domains(
         &self,
         height: u64,
@@ -3021,7 +3095,14 @@ impl AsyncPersistence {
         fees: Vec<u64>,
         events: Vec<Vec<crate::contract::ContractEvent>>,
     ) {
-        self.push(PersistJob::Receipts { height, hash, txs, statuses, fees, events });
+        self.push(PersistJob::Receipts {
+            height,
+            hash,
+            txs,
+            statuses,
+            fees,
+            events,
+        });
     }
 
     /// Ask the background writer to drop block bodies below `keep_from`.
@@ -3132,8 +3213,7 @@ pub async fn load_state_into(
                     .await
                     .map_err(|e| anyhow!("restore bridge domain: {e}"))?;
             }
-            let domains_paired =
-                matches!(storage.latest_domains()?, Some((dh, _)) if dh == height);
+            let domains_paired = matches!(storage.latest_domains()?, Some((dh, _)) if dh == height);
             if !domains_paired {
                 storage.verify_restored_root(&tmp, height).await?;
             }
@@ -3197,7 +3277,7 @@ mod tests {
         };
         b.sign_block(signer);
         b
-}
+    }
 
     #[test]
     fn block_store_roundtrip_and_height_index() {
@@ -3289,9 +3369,15 @@ mod tests {
         ap.request_flush();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        assert!(st.get_block(&bh).unwrap().is_some(), "block must be persisted");
+        assert!(
+            st.get_block(&bh).unwrap().is_some(),
+            "block must be persisted"
+        );
         assert_eq!(st.finalized().unwrap().unwrap().0, 0);
-        assert!(st.latest_state().unwrap().is_some(), "state must be persisted");
+        assert!(
+            st.latest_state().unwrap().is_some(),
+            "state must be persisted"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3320,9 +3406,10 @@ mod tests {
 
         // (func (export "double") (param i64) (result i64) local.get 0; i64.const 2; i64.mul)
         const DOUBLE_WASM: &[u8] = &[
-            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x06, 0x01, 0x60, 0x01, 0x7e, 0x01,
-            0x7e, 0x03, 0x02, 0x01, 0x00, 0x07, 0x0a, 0x01, 0x06, 0x64, 0x6f, 0x75, 0x62, 0x6c, 0x65,
-            0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x42, 0x02, 0x7e, 0x0b,
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x06, 0x01, 0x60, 0x01, 0x7e,
+            0x01, 0x7e, 0x03, 0x02, 0x01, 0x00, 0x07, 0x0a, 0x01, 0x06, 0x64, 0x6f, 0x75, 0x62,
+            0x6c, 0x65, 0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x42, 0x02, 0x7e,
+            0x0b,
         ];
 
         let dir = tmp();
@@ -3342,20 +3429,36 @@ mod tests {
             description: String::new(),
         };
         let tid = engine.create_token(who, meta, 1_000).await.unwrap();
-        let caddr = engine.deploy_contract(who, DOUBLE_WASM.to_vec(), 0).await.unwrap();
+        let caddr = engine
+            .deploy_contract(who, DOUBLE_WASM.to_vec(), 0)
+            .await
+            .unwrap();
 
         // Persist accounts + domains at height 9.
         st.put_state(9, &engine.create_snapshot().await).unwrap();
-        let snap = DomainSnapshot::capture(&engine, &crate::staking::StakingLedger::new(), &crate::governance::Governance::new()).await;
-        st.put_domains(9, &bincode::serialize(&snap).unwrap()).unwrap();
+        let snap = DomainSnapshot::capture(
+            &engine,
+            &crate::staking::StakingLedger::new(),
+            &crate::governance::Governance::new(),
+        )
+        .await;
+        st.put_domains(9, &bincode::serialize(&snap).unwrap())
+            .unwrap();
 
         // Restore into a fresh engine.
         let engine2 = InMemoryStateEngine::new();
         let loaded = load_full_state_into(&st, &engine2).await.unwrap().unwrap();
         assert_eq!(loaded.0, 9);
         assert_eq!(engine2.get_account(&who).await.unwrap().balance, 5_000);
-        assert_eq!(engine2.token_balance(&tid, &who).await, 1_000, "token registry restored");
-        assert!(engine2.get_contract(&caddr).await.is_some(), "contract registry restored");
+        assert_eq!(
+            engine2.token_balance(&tid, &who).await,
+            1_000,
+            "token registry restored"
+        );
+        assert!(
+            engine2.get_contract(&caddr).await.is_some(),
+            "contract registry restored"
+        );
         // SPV proof for the restored token balance still verifies against the root.
         assert!(engine2.get_token_balance_proof(&tid, &who).await.is_some());
 
@@ -3364,19 +3467,26 @@ mod tests {
 
     #[test]
     fn pre_e2_domain_snapshot_upgrades_staking_counters_to_zero() {
-        use crate::staking::{StakingLedger, StakingLedgerV1, MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
+        use crate::staking::{
+            StakingLedger, StakingLedgerV1, MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER,
+        };
 
         // A ledger with real content, as a pre-E2 node would have held it.
         let val = [0xA1u8; 32];
         let delegator = [0xB2u8; 32];
         let mut ledger = StakingLedger::new();
-        ledger.bond(val, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0).unwrap();
+        ledger
+            .bond(val, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
+            .unwrap();
         ledger.delegate(delegator, val, 2_000_000_000).unwrap();
         ledger.slash(val, 1_000).unwrap(); // 10%: total_burned is non-zero
         assert!(ledger.total_burned > 0);
 
         // The CURRENT shape round-trips through the primary path untouched.
-        let fresh = DomainSnapshot { staking: ledger.clone(), ..Default::default() };
+        let fresh = DomainSnapshot {
+            staking: ledger.clone(),
+            ..Default::default()
+        };
         let fresh_bytes = bincode::serialize(&fresh).unwrap();
         let back = decode_domain_snapshot(&fresh_bytes).unwrap();
         assert_eq!(back.staking.total_burned, ledger.total_burned);
@@ -3415,19 +3525,34 @@ mod tests {
         // ... but the restore helper upgrades them.
         let up = decode_domain_snapshot(&old_bytes).unwrap();
         assert_eq!(up.staking.validators, ledger.validators, "bonds survive");
-        assert_eq!(up.staking.delegations, ledger.delegations, "positions survive");
+        assert_eq!(
+            up.staking.delegations, ledger.delegations,
+            "positions survive"
+        );
         assert_eq!(
             up.staking.delegator_rewards, ledger.delegator_rewards,
             "reward entries survive"
         );
         assert_eq!(up.staking.unbonding, ledger.unbonding, "unbondings survive");
-        assert_eq!(up.staking.withdrawable, ledger.withdrawable, "matured funds survive");
-        assert_eq!(up.staking.total_burned, ledger.total_burned, "burn history survives");
+        assert_eq!(
+            up.staking.withdrawable, ledger.withdrawable,
+            "matured funds survive"
+        );
+        assert_eq!(
+            up.staking.total_burned, ledger.total_burned,
+            "burn history survives"
+        );
         assert_eq!(up.staking.rewards_pool, 0, "new counter starts at zero");
         assert_eq!(up.staking.rewards_minted, 0, "new counter starts at zero");
         assert!(up.staking.locked_governance.is_empty(), "no phantom locks");
-        assert_eq!(up.governance.next_id, fresh.governance.next_id, "sibling domains survive");
-        assert_eq!(up.governance.quorum_bps, fresh.governance.quorum_bps, "sibling domains survive");
+        assert_eq!(
+            up.governance.next_id, fresh.governance.next_id,
+            "sibling domains survive"
+        );
+        assert_eq!(
+            up.governance.quorum_bps, fresh.governance.quorum_bps,
+            "sibling domains survive"
+        );
         assert_eq!(
             up.governance.proposals.len(),
             fresh.governance.proposals.len(),
@@ -3448,7 +3573,9 @@ mod tests {
         let val = [0xA3u8; 32];
         let delegator = [0xB4u8; 32];
         let mut ledger = StakingLedger::new();
-        ledger.bond(val, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0).unwrap();
+        ledger
+            .bond(val, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
+            .unwrap();
         ledger.delegate(delegator, val, 2_000_000_000).unwrap();
         ledger.distribute_reward(val, 1_000_000_000).unwrap();
         // The lazy path keeps the reward UNSETTLED (that is the whole point):
@@ -3456,10 +3583,17 @@ mod tests {
         assert!(ledger.delegator_rewards.is_empty());
         assert_eq!(ledger.reward_accumulators.len(), 1);
 
-        let fresh = DomainSnapshot { staking: ledger.clone(), ..Default::default() };
+        let fresh = DomainSnapshot {
+            staking: ledger.clone(),
+            ..Default::default()
+        };
         let fresh_bytes = bincode::serialize(&fresh).unwrap();
         let back = decode_domain_snapshot(&fresh_bytes).unwrap();
-        assert_eq!(back.staking.reward_accumulators.len(), 1, "the accumulator survives");
+        assert_eq!(
+            back.staking.reward_accumulators.len(),
+            1,
+            "the accumulator survives"
+        );
 
         // The OLD shape: the ledger WITHOUT the two lazy maps — byte-identical
         // to what a pre-upgrade node wrote.
@@ -3499,8 +3633,14 @@ mod tests {
         // ... but the restore helper upgrades them.
         let up = decode_domain_snapshot(&old_bytes).unwrap();
         assert_eq!(up.staking.validators, ledger.validators, "bonds survive");
-        assert_eq!(up.staking.delegations, ledger.delegations, "positions survive");
-        assert_eq!(up.staking.rewards_minted, ledger.rewards_minted, "the mint counter survives");
+        assert_eq!(
+            up.staking.delegations, ledger.delegations,
+            "positions survive"
+        );
+        assert_eq!(
+            up.staking.rewards_minted, ledger.rewards_minted,
+            "the mint counter survives"
+        );
         assert!(
             up.staking.reward_accumulators.is_empty(),
             "no phantom accumulator: the eager ledger had none"
@@ -3515,7 +3655,7 @@ mod tests {
 
     fn repl_block(height: u64, signer: &SigningKey, tx: Option<Transaction>) -> Block {
         block(height, [height as u8; 32], signer, tx)
-}
+    }
 
     #[test]
     fn verified_body_ingest_rejects_tamper_and_stores_honest() {
@@ -3532,7 +3672,10 @@ mod tests {
         tampered.timestamp ^= 0x01;
         assert!(st.put_verified_block(&tampered, &h).is_err());
         let kept = st.get_block(&h).unwrap().unwrap();
-        assert_eq!(kept.timestamp, b.timestamp, "tamper must not overwrite the committed body");
+        assert_eq!(
+            kept.timestamp, b.timestamp,
+            "tamper must not overwrite the committed body"
+        );
         // Filed under a wrong hash: rejected too.
         assert!(st.put_verified_block(&b, &[0xEEu8; 32]).is_err());
         std::fs::remove_dir_all(&dir).ok();
@@ -3548,11 +3691,22 @@ mod tests {
         let b = repl_block(11, &sk, Some(tx.clone()));
         let bh = b.compute_hash();
         st.put_block(&b).unwrap();
-        let n = st.put_receipts_for_block(11, &bh, &b.transactions, &[true], &[1]).unwrap();
+        let n = st
+            .put_receipts_for_block(11, &bh, &b.transactions, &[true], &[1])
+            .unwrap();
         assert_eq!(n, 1);
-        let got = st.get_receipt(&tx.compute_tx_hash()).unwrap().expect("receipt filed");
-        assert_eq!((got.height, got.block_hash, got.index, got.success), (11, bh, 0, true));
-        assert_eq!(got.fee_charged, 1, "actual charged fee is filed, not just the limit");
+        let got = st
+            .get_receipt(&tx.compute_tx_hash())
+            .unwrap()
+            .expect("receipt filed");
+        assert_eq!(
+            (got.height, got.block_hash, got.index, got.success),
+            (11, bh, 0, true)
+        );
+        assert_eq!(
+            got.fee_charged, 1,
+            "actual charged fee is filed, not just the limit"
+        );
         assert_eq!(st.receipt_count().unwrap(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3576,11 +3730,20 @@ mod tests {
                 .insert(hash, bincode::serialize(&legacy).unwrap())
                 .unwrap();
         }
-        let ok = st.get_receipt(&[1u8; 32]).unwrap().expect("legacy success decodes");
-        assert_eq!(ok.fee_charged, 560, "legacy success charged the declared limit");
+        let ok = st
+            .get_receipt(&[1u8; 32])
+            .unwrap()
+            .expect("legacy success decodes");
+        assert_eq!(
+            ok.fee_charged, 560,
+            "legacy success charged the declared limit"
+        );
         assert_eq!(ok.gas_limit, 560, "limit is preserved");
         assert!(ok.events.is_empty(), "legacy receipt has empty events");
-        let bad = st.get_receipt(&[2u8; 32]).unwrap().expect("legacy failure decodes");
+        let bad = st
+            .get_receipt(&[2u8; 32])
+            .unwrap()
+            .expect("legacy failure decodes");
         assert_eq!(bad.fee_charged, 0, "legacy failure charged nothing");
         assert!(bad.events.is_empty(), "legacy receipt has empty events");
         std::fs::remove_dir_all(&dir).ok();
@@ -3606,7 +3769,10 @@ mod tests {
             .insert(hash, bincode::serialize(&legacy).unwrap())
             .unwrap();
 
-        let r = st.get_receipt(&hash).unwrap().expect("7-field receipt decodes");
+        let r = st
+            .get_receipt(&hash)
+            .unwrap()
+            .expect("7-field receipt decodes");
         assert_eq!(r.height, 4);
         assert_eq!(r.fee_charged, 500);
         assert_eq!(r.gas_limit, 1000);
@@ -3623,18 +3789,28 @@ mod tests {
         let tx = Transaction::sign(&sk, from, 10, 1, 0, 0, 0);
         let bh = [0xCC; 32];
         let contract = [0x55; 32];
-        let events = vec![vec![
-            crate::contract::ContractEvent {
-                contract,
-                topic: 1234,
-                value: 5678,
-            },
-        ]];
+        let events = vec![vec![crate::contract::ContractEvent {
+            contract,
+            topic: 1234,
+            value: 5678,
+        }]];
 
-        let n = st.put_receipts_for_block_with_events(12, &bh, std::slice::from_ref(&tx), &[true], &[100], &events).unwrap();
+        let n = st
+            .put_receipts_for_block_with_events(
+                12,
+                &bh,
+                std::slice::from_ref(&tx),
+                &[true],
+                &[100],
+                &events,
+            )
+            .unwrap();
         assert_eq!(n, 1);
 
-        let r = st.get_receipt(&tx.compute_tx_hash()).unwrap().expect("receipt exists");
+        let r = st
+            .get_receipt(&tx.compute_tx_hash())
+            .unwrap()
+            .expect("receipt exists");
         assert_eq!(r.height, 12);
         assert_eq!(r.events.len(), 1);
         assert_eq!(r.events[0].contract, contract);
@@ -3657,19 +3833,33 @@ mod tests {
         let b = repl_block(21, &sk, Some(tx.clone()));
         let bh = b.compute_hash();
         proposer.put_block(&b).unwrap();
-        proposer.put_receipts_for_block(21, &bh, &b.transactions, &[true], &[1]).unwrap();
+        proposer
+            .put_receipts_for_block(21, &bh, &b.transactions, &[true], &[1])
+            .unwrap();
 
         // Wire-equivalent: proposer bytes -> adopter verifies against committed hash.
         let wire = bincode::serialize(&b).unwrap();
         let fetched: Block = bincode::deserialize(&wire).unwrap();
         adopter.put_verified_block(&fetched, &bh).unwrap();
-        adopter.put_receipts_for_block(21, &bh, &fetched.transactions, &[true], &[1]).unwrap();
+        adopter
+            .put_receipts_for_block(21, &bh, &fetched.transactions, &[true], &[1])
+            .unwrap();
 
         let pb = proposer.get_block(&bh).unwrap().unwrap();
-        let ab = adopter.committed_body(21, &bh).unwrap().expect("adopter holds the body");
-        assert_eq!(bincode::serialize(&pb).unwrap(), bincode::serialize(&ab).unwrap(), "byte equality");
+        let ab = adopter
+            .committed_body(21, &bh)
+            .unwrap()
+            .expect("adopter holds the body");
+        assert_eq!(
+            bincode::serialize(&pb).unwrap(),
+            bincode::serialize(&ab).unwrap(),
+            "byte equality"
+        );
         assert_eq!(ab.transactions.len(), 1, "no txs=0 view on the adopter");
-        let pr = proposer.get_receipt(&tx.compute_tx_hash()).unwrap().unwrap();
+        let pr = proposer
+            .get_receipt(&tx.compute_tx_hash())
+            .unwrap()
+            .unwrap();
         let ar = adopter.get_receipt(&tx.compute_tx_hash()).unwrap().unwrap();
         assert_eq!(pr, ar, "identical receipts");
         std::fs::remove_dir_all(&dir_p).ok();
@@ -3684,13 +3874,22 @@ mod tests {
         let who = [8u8; 32];
         engine.update_account(AccountState::new(who, 10_000)).await;
         st.put_state(1, &engine.create_snapshot().await).unwrap();
-        let snap = DomainSnapshot::capture(&engine, &crate::staking::StakingLedger::new(), &crate::governance::Governance::new()).await;
-        st.put_domains(1, &bincode::serialize(&snap).unwrap()).unwrap();
+        let snap = DomainSnapshot::capture(
+            &engine,
+            &crate::staking::StakingLedger::new(),
+            &crate::governance::Governance::new(),
+        )
+        .await;
+        st.put_domains(1, &bincode::serialize(&snap).unwrap())
+            .unwrap();
 
         let engine2 = InMemoryStateEngine::new();
         assert!(engine2.pq_tree.read().unwrap().is_none());
         load_full_state_into(&st, &engine2).await.unwrap().unwrap();
-        assert!(engine2.pq_tree.read().unwrap().is_some(), "load_full_state_into must attach pq_keys tree");
+        assert!(
+            engine2.pq_tree.read().unwrap().is_some(),
+            "load_full_state_into must attach pq_keys tree"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3720,7 +3919,9 @@ mod tests {
         assert_eq!(st.pq_key_count(), 2); // address and pk_hash entries
 
         // Setup snapshot so load_full_state_into succeeds
-        engine.update_account(AccountState::new(address, 100_000)).await;
+        engine
+            .update_account(AccountState::new(address, 100_000))
+            .await;
         st.put_state(1, &engine.create_snapshot().await).unwrap();
         let snap = DomainSnapshot::capture(
             &engine,
@@ -3728,7 +3929,8 @@ mod tests {
             &crate::governance::Governance::new(),
         )
         .await;
-        st.put_domains(1, &bincode::serialize(&snap).unwrap()).unwrap();
+        st.put_domains(1, &bincode::serialize(&snap).unwrap())
+            .unwrap();
 
         let engine2 = InMemoryStateEngine::new();
         let (height, _, _) = load_full_state_into(&st, &engine2)
@@ -3765,7 +3967,8 @@ mod tests {
         let pubkey = crate::sharding::Transaction::sample_falcon512_pubkey(0x4B);
         let address = derive_pq_address(scheme, &pubkey, &DEFAULT_SALT);
 
-        st1.put_pq_key(&address, scheme, &pubkey, &DEFAULT_SALT).unwrap();
+        st1.put_pq_key(&address, scheme, &pubkey, &DEFAULT_SALT)
+            .unwrap();
         assert_eq!(st1.pq_key_count(), 2);
 
         let exported = st1.export_pq_keys().unwrap();
@@ -3802,12 +4005,7 @@ mod archive_proof_tests {
         ))
     }
 
-    fn test_block(
-        height: u64,
-        prev: [u8; 32],
-        state_root: [u8; 32],
-        signer: &SigningKey,
-    ) -> Block {
+    fn test_block(height: u64, prev: [u8; 32], state_root: [u8; 32], signer: &SigningKey) -> Block {
         let order_merkle_root = crate::mev::compute_order_merkle_root(&[]);
         let mut b = Block {
             shard_id: MASTERCHAIN_SHARD,
@@ -3852,13 +4050,17 @@ mod archive_proof_tests {
         let engine = InMemoryStateEngine::new();
         let account_a = [0xA1u8; 32];
         let account_b = [0xB2u8; 32];
-        engine.update_account(AccountState::new(account_a, 1_000)).await;
+        engine
+            .update_account(AccountState::new(account_a, 1_000))
+            .await;
         engine.update_account(AccountState::new(account_b, 7)).await;
         let root = engine.get_state_root().await;
 
         let height = 10u64;
         let tip = height + 1;
-        store.put_state(height, &engine.create_snapshot().await).unwrap();
+        store
+            .put_state(height, &engine.create_snapshot().await)
+            .unwrap();
         let domains = DomainSnapshot::capture(
             &engine,
             &crate::staking::StakingLedger::new(),
@@ -3871,7 +4073,9 @@ mod archive_proof_tests {
         store
             .put_session_keys(height, &engine.session_keys_snapshot().await)
             .unwrap();
-        store.put_bridge(height, &engine.bridge_snapshot().await).unwrap();
+        store
+            .put_bridge(height, &engine.bridge_snapshot().await)
+            .unwrap();
         store
             .put_confidential(height, &engine.confidential_snapshot().await)
             .unwrap();
@@ -3916,7 +4120,10 @@ mod archive_proof_tests {
         let token = [0x22u8; 32];
         assert_eq!(archive_slot_key(&ArchiveSlot::Account(addr)), addr);
         assert_eq!(
-            archive_slot_key(&ArchiveSlot::TokenBalance { token_id: token, account: addr }),
+            archive_slot_key(&ArchiveSlot::TokenBalance {
+                token_id: token,
+                account: addr
+            }),
             crate::state_engine::token_balance_key(&token, &addr)
         );
         assert_eq!(
@@ -3960,10 +4167,16 @@ mod archive_proof_tests {
         }
         let store = store.expect("storage must reopen after restart (retried 2s)");
 
-        let proof = store.serve_archive_proof(height, &account_a, tip).await.unwrap();
+        let proof = store
+            .serve_archive_proof(height, &account_a, tip)
+            .await
+            .unwrap();
         assert_eq!(proof.height, height);
         assert_eq!(proof.state_root, root);
-        assert!(proof.verify(), "archive proof must verify against the historical root");
+        assert!(
+            proof.verify(),
+            "archive proof must verify against the historical root"
+        );
         // The proven leaf carries the account that was snapshotted.
         let value = proof.value.expect("inclusion proof carries the value");
         assert!(value.len() >= 16);
@@ -3975,11 +4188,18 @@ mod archive_proof_tests {
     #[tokio::test]
     async fn archive_exclusion_proof_verifies_for_a_key_absent_at_that_height() {
         let f = fixture().await;
-        let proof = f.store.serve_archive_proof(f.height, &f.missing, f.tip).await.unwrap();
+        let proof = f
+            .store
+            .serve_archive_proof(f.height, &f.missing, f.tip)
+            .await
+            .unwrap();
         assert_eq!(proof.proof_type, crate::cpat2::ArchiveProofType::Exclusion);
         assert_eq!(proof.value, None);
         assert_eq!(proof.state_root, f.root);
-        assert!(proof.verify(), "exclusion proof must verify against the historical root");
+        assert!(
+            proof.verify(),
+            "exclusion proof must verify against the historical root"
+        );
         std::fs::remove_dir_all(&f.dir).ok();
     }
 
@@ -3990,9 +4210,13 @@ mod archive_proof_tests {
         // (Pruning never drops the LATEST snapshot, so the prune must have
         // something newer to keep.)
         let engine = InMemoryStateEngine::new();
-        engine.update_account(AccountState::new([0x77u8; 32], 5)).await;
+        engine
+            .update_account(AccountState::new([0x77u8; 32], 5))
+            .await;
         let later = f.height + 10;
-        f.store.put_state(later, &engine.create_snapshot().await).unwrap();
+        f.store
+            .put_state(later, &engine.create_snapshot().await)
+            .unwrap();
         let domains = DomainSnapshot::capture(
             &engine,
             &crate::staking::StakingLedger::new(),

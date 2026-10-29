@@ -45,13 +45,22 @@ async fn setup() -> (InMemoryStateEngine, [u8; 32], [u8; 32], [u8; 32]) {
     };
     let usdt = engine.create_token(minter, meta, 0).await.unwrap();
     engine
-        .token_execute(&usdt, minter, TokenOp::Mint { to: buyer, amount: 10_000_000 })
+        .token_execute(
+            &usdt,
+            minter,
+            TokenOp::Mint {
+                to: buyer,
+                amount: 10_000_000,
+            },
+        )
         .await
         .unwrap();
     *engine.pmm_usdt_token_write().await = Some(usdt);
 
     // Seller holds native STELL.
-    engine.update_account(AccountState::new(seller, 100 * STELL)).await;
+    engine
+        .update_account(AccountState::new(seller, 100 * STELL))
+        .await;
     engine.update_account(AccountState::new(buyer, 0)).await;
     (engine, seller, buyer, usdt)
 }
@@ -62,14 +71,30 @@ async fn matched_trade_moves_stell_and_wusdt_between_parties() {
 
     // Seller rests a sell: 4 STELL @ $0.25.
     let (_, trades) = engine
-        .place_order_settled(PAIR_STELL_USDT, seller, OrderSide::Sell, OrderType::Limit, 250_000, 4 * STELL, 1)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            seller,
+            OrderSide::Sell,
+            OrderType::Limit,
+            250_000,
+            4 * STELL,
+            1,
+        )
         .await
         .unwrap();
     assert_eq!(trades, 0, "no counterparty yet -> rests");
 
     // Buyer crosses: 4 STELL @ $0.25 => pays 1.00 wUSDT.
     let (_, trades) = engine
-        .place_order_settled(PAIR_STELL_USDT, buyer, OrderSide::Buy, OrderType::Limit, 250_000, 4 * STELL, 2)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            buyer,
+            OrderSide::Buy,
+            OrderType::Limit,
+            250_000,
+            4 * STELL,
+            2,
+        )
         .await
         .unwrap();
     assert_eq!(trades, 1, "one match must settle");
@@ -79,8 +104,16 @@ async fn matched_trade_moves_stell_and_wusdt_between_parties() {
     assert_eq!(seller_native, 96 * STELL, "seller paid 4 STELL");
     assert_eq!(buyer_native, 4 * STELL, "buyer received 4 STELL");
 
-    assert_eq!(engine.token_balance(&usdt, &seller).await, 1_000_000, "seller received 1.00 wUSDT");
-    assert_eq!(engine.token_balance(&usdt, &buyer).await, 9_000_000, "buyer paid 1.00 wUSDT");
+    assert_eq!(
+        engine.token_balance(&usdt, &seller).await,
+        1_000_000,
+        "seller received 1.00 wUSDT"
+    );
+    assert_eq!(
+        engine.token_balance(&usdt, &buyer).await,
+        9_000_000,
+        "buyer paid 1.00 wUSDT"
+    );
 }
 
 #[tokio::test]
@@ -89,48 +122,106 @@ async fn unfunded_counterparty_aborts_settlement_without_state_change() {
     // Drain the buyer's wUSDT so it cannot pay.
     let bal = engine.token_balance(&usdt, &buyer).await;
     engine
-        .token_execute(&usdt, buyer, TokenOp::Burn { from: buyer, amount: bal })
+        .token_execute(
+            &usdt,
+            buyer,
+            TokenOp::Burn {
+                from: buyer,
+                amount: bal,
+            },
+        )
         .await
         .unwrap();
 
     engine
-        .place_order_settled(PAIR_STELL_USDT, seller, OrderSide::Sell, OrderType::Limit, 250_000, 4 * STELL, 1)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            seller,
+            OrderSide::Sell,
+            OrderType::Limit,
+            250_000,
+            4 * STELL,
+            1,
+        )
         .await
         .unwrap();
 
     let res = engine
-        .place_order_settled(PAIR_STELL_USDT, buyer, OrderSide::Buy, OrderType::Limit, 250_000, 4 * STELL, 2)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            buyer,
+            OrderSide::Buy,
+            OrderType::Limit,
+            250_000,
+            4 * STELL,
+            2,
+        )
         .await;
     assert!(res.is_err(), "buyer without wUSDT must not settle");
 
     // Seller's order is still resting in escrow (4 STELL locked, 96 live):
-    assert_eq!(engine.get_account(&seller).await.unwrap().balance, 96 * STELL);
+    assert_eq!(
+        engine.get_account(&seller).await.unwrap().balance,
+        96 * STELL
+    );
     assert_eq!(engine.get_account(&buyer).await.unwrap().balance, 0);
     assert_eq!(engine.token_balance(&usdt, &buyer).await, 0);
 
     // Canceling refunds the 4 STELL back to 100 STELL:
-    engine.cancel_order_settled(PAIR_STELL_USDT, 1, seller).await.unwrap();
-    assert_eq!(engine.get_account(&seller).await.unwrap().balance, 100 * STELL);
+    engine
+        .cancel_order_settled(PAIR_STELL_USDT, 1, seller)
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.get_account(&seller).await.unwrap().balance,
+        100 * STELL
+    );
 }
 
 #[tokio::test]
 async fn self_trade_is_skipped_and_never_partially_settles() {
     let (engine, who, _, usdt) = setup().await;
-    engine.update_account(AccountState::new(who, 100 * STELL)).await;
+    engine
+        .update_account(AccountState::new(who, 100 * STELL))
+        .await;
 
     // Same address rests a sell and then buys it: a self-trade nets to zero and
     // must not move any funds or error mid-settlement.
     engine
-        .place_order_settled(PAIR_STELL_USDT, who, OrderSide::Sell, OrderType::Limit, 250_000, 4 * STELL, 1)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            who,
+            OrderSide::Sell,
+            OrderType::Limit,
+            250_000,
+            4 * STELL,
+            1,
+        )
         .await
         .unwrap();
     let (_, trades) = engine
-        .place_order_settled(PAIR_STELL_USDT, who, OrderSide::Buy, OrderType::Limit, 250_000, 4 * STELL, 2)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            who,
+            OrderSide::Buy,
+            OrderType::Limit,
+            250_000,
+            4 * STELL,
+            2,
+        )
         .await
         .unwrap();
     assert_eq!(trades, 1, "sides crossed");
-    assert_eq!(engine.get_account(&who).await.unwrap().balance, 100 * STELL, "self-trade nets to zero");
-    assert_eq!(engine.token_balance(&usdt, &who).await, 0, "wUSDT unchanged");
+    assert_eq!(
+        engine.get_account(&who).await.unwrap().balance,
+        100 * STELL,
+        "self-trade nets to zero"
+    );
+    assert_eq!(
+        engine.token_balance(&usdt, &who).await,
+        0,
+        "wUSDT unchanged"
+    );
 }
 
 #[tokio::test]
@@ -138,26 +229,61 @@ async fn dust_quote_rejected_before_any_settlement() {
     let (engine, seller, buyer, _) = setup().await;
     // Tiny price*amount -> quote value rounds to zero.
     engine
-        .place_order_settled(PAIR_STELL_USDT, seller, OrderSide::Sell, OrderType::Limit, 1, 1, 1)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            seller,
+            OrderSide::Sell,
+            OrderType::Limit,
+            1,
+            1,
+            1,
+        )
         .await
         .unwrap();
     let res = engine
-        .place_order_settled(PAIR_STELL_USDT, buyer, OrderSide::Buy, OrderType::Limit, 1, 1, 2)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            buyer,
+            OrderSide::Buy,
+            OrderType::Limit,
+            1,
+            1,
+            2,
+        )
         .await;
     assert!(res.is_err(), "zero-value quote must be rejected");
     // Seller has 1 nano in escrow, cancel restores exact 100 STELL:
-    assert_eq!(engine.get_account(&seller).await.unwrap().balance, 100 * STELL - 1);
-    engine.cancel_order_settled(PAIR_STELL_USDT, 1, seller).await.unwrap();
-    assert_eq!(engine.get_account(&seller).await.unwrap().balance, 100 * STELL);
+    assert_eq!(
+        engine.get_account(&seller).await.unwrap().balance,
+        100 * STELL - 1
+    );
+    engine
+        .cancel_order_settled(PAIR_STELL_USDT, 1, seller)
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.get_account(&seller).await.unwrap().balance,
+        100 * STELL
+    );
     assert_eq!(engine.get_account(&buyer).await.unwrap().balance, 0);
 }
 
 #[tokio::test]
 async fn clob_requires_a_configured_quote_token() {
     let engine = InMemoryStateEngine::new();
-    engine.update_account(AccountState::new([1u8; 32], 10 * STELL)).await;
+    engine
+        .update_account(AccountState::new([1u8; 32], 10 * STELL))
+        .await;
     let res = engine
-        .place_order_settled(PAIR_STELL_USDT, [1u8; 32], OrderSide::Sell, OrderType::Limit, 250_000, STELL, 0)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            [1u8; 32],
+            OrderSide::Sell,
+            OrderType::Limit,
+            250_000,
+            STELL,
+            0,
+        )
         .await;
     assert!(res.is_err(), "no quote token configured -> reject");
 }
@@ -168,39 +294,90 @@ async fn resting_order_locks_escrow_and_cancel_refunds_fully() {
 
     // 1) Resting SELL locks native STELL into escrow:
     let (order_id, _) = engine
-        .place_order_settled(PAIR_STELL_USDT, seller, OrderSide::Sell, OrderType::Limit, 250_000, 10 * STELL, 1)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            seller,
+            OrderSide::Sell,
+            OrderType::Limit,
+            250_000,
+            10 * STELL,
+            1,
+        )
         .await
         .unwrap();
     // 100 STELL - 10 STELL locked = 90 STELL:
-    assert_eq!(engine.get_account(&seller).await.unwrap().balance, 90 * STELL);
     assert_eq!(
-        engine.order_escrow_read().await.get(&(PAIR_STELL_USDT, order_id)).unwrap().locked_base_stell,
+        engine.get_account(&seller).await.unwrap().balance,
+        90 * STELL
+    );
+    assert_eq!(
+        engine
+            .order_escrow_read()
+            .await
+            .get(&(PAIR_STELL_USDT, order_id))
+            .unwrap()
+            .locked_base_stell,
         10 * STELL
     );
 
     // Cancel and verify full refund:
-    let cancelled = engine.cancel_order_settled(PAIR_STELL_USDT, order_id, seller).await.unwrap();
+    let cancelled = engine
+        .cancel_order_settled(PAIR_STELL_USDT, order_id, seller)
+        .await
+        .unwrap();
     assert!(cancelled.is_some());
-    assert_eq!(engine.get_account(&seller).await.unwrap().balance, 100 * STELL, "fully refunded");
-    assert!(engine.order_escrow_read().await.get(&(PAIR_STELL_USDT, order_id)).is_none());
+    assert_eq!(
+        engine.get_account(&seller).await.unwrap().balance,
+        100 * STELL,
+        "fully refunded"
+    );
+    assert!(engine
+        .order_escrow_read()
+        .await
+        .get(&(PAIR_STELL_USDT, order_id))
+        .is_none());
 
     // 2) Resting BUY locks wUSDT into escrow:
     let (buy_id, _) = engine
-        .place_order_settled(PAIR_STELL_USDT, buyer, OrderSide::Buy, OrderType::Limit, 250_000, 8 * STELL, 2)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            buyer,
+            OrderSide::Buy,
+            OrderType::Limit,
+            250_000,
+            8 * STELL,
+            2,
+        )
         .await
         .unwrap();
     // 8 STELL @ $0.25 = 2.00 wUSDT locked (2_000_000 units):
     assert_eq!(engine.token_balance(&usdt, &buyer).await, 8_000_000);
     assert_eq!(
-        engine.order_escrow_read().await.get(&(PAIR_STELL_USDT, buy_id)).unwrap().locked_quote_wusdt,
+        engine
+            .order_escrow_read()
+            .await
+            .get(&(PAIR_STELL_USDT, buy_id))
+            .unwrap()
+            .locked_quote_wusdt,
         2_000_000
     );
 
     // Cancel and verify full refund of wUSDT:
-    let cancelled_buy = engine.cancel_order_settled(PAIR_STELL_USDT, buy_id, buyer).await.unwrap();
+    let cancelled_buy = engine
+        .cancel_order_settled(PAIR_STELL_USDT, buy_id, buyer)
+        .await
+        .unwrap();
     assert!(cancelled_buy.is_some());
-    assert_eq!(engine.token_balance(&usdt, &buyer).await, 10_000_000, "wUSDT fully refunded");
-    assert!(engine.order_escrow_read().await.get(&(PAIR_STELL_USDT, buy_id)).is_none());
+    assert_eq!(
+        engine.token_balance(&usdt, &buyer).await,
+        10_000_000,
+        "wUSDT fully refunded"
+    );
+    assert!(engine
+        .order_escrow_read()
+        .await
+        .get(&(PAIR_STELL_USDT, buy_id))
+        .is_none());
 }
 
 // ==================== SVM path: the live escrow lifecycle ====================
@@ -228,7 +405,9 @@ fn order_tx(
     payload: Vec<stellereum::svm::OpCode>,
 ) -> stellereum::sharding::Transaction {
     let from = key.verifying_key().to_bytes();
-    stellereum::sharding::Transaction::sign_with_payload(key, from, 0, gas_limit, nonce, 1, 1, payload)
+    stellereum::sharding::Transaction::sign_with_payload(
+        key, from, 0, gas_limit, nonce, 1, 1, payload,
+    )
 }
 
 async fn native_of(engine: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
@@ -251,7 +430,10 @@ async fn assert_escrow_invariants(engine: &InMemoryStateEngine, pair: u32) {
                 rec.locked_base_stell, rec.locked_quote_wusdt, rec.locked_quote_native, key.1
             )
         });
-        assert_eq!(order.trader, rec.trader, "escrow belongs to the order's trader");
+        assert_eq!(
+            order.trader, rec.trader,
+            "escrow belongs to the order's trader"
+        );
         assert!(
             rec.locked_base_stell + rec.locked_quote_wusdt + rec.locked_quote_native > 0,
             "every escrow record must lock something for order {}",
@@ -260,11 +442,21 @@ async fn assert_escrow_invariants(engine: &InMemoryStateEngine, pair: u32) {
         let remaining = order.amount - order.filled;
         assert!(remaining > 0, "a fully filled order must not keep a record");
         if matches!(order.side, OrderSide::Sell) {
-            assert_eq!(rec.locked_base_stell, remaining, "a sell locks its unfilled base");
-            assert_eq!(rec.locked_quote_wusdt + rec.locked_quote_native, 0, "and no quote");
+            assert_eq!(
+                rec.locked_base_stell, remaining,
+                "a sell locks its unfilled base"
+            );
+            assert_eq!(
+                rec.locked_quote_wusdt + rec.locked_quote_native,
+                0,
+                "and no quote"
+            );
         } else {
             assert_eq!(rec.locked_base_stell, 0, "a buy locks no base");
-            assert!(rec.locked_quote_wusdt > 0 || rec.locked_quote_native > 0, "a buy locks quote");
+            assert!(
+                rec.locked_quote_wusdt > 0 || rec.locked_quote_native > 0,
+                "a buy locks quote"
+            );
             let native = native_quote(order.price, remaining);
             let wusdt = wusdt_quote(order.price, remaining);
             assert!(
@@ -292,8 +484,8 @@ async fn assert_escrow_invariants(engine: &InMemoryStateEngine, pair: u32) {
                 order.order_id
             );
         } else {
-            let needs_lock = native_quote(order.price, remaining) > 0
-                || wusdt_quote(order.price, remaining) > 0;
+            let needs_lock =
+                native_quote(order.price, remaining) > 0 || wusdt_quote(order.price, remaining) > 0;
             if needs_lock {
                 assert!(
                     rec.is_some(),
@@ -317,13 +509,30 @@ async fn svm_place_partial_fill_and_cancel_move_value_end_to_end() {
 
     // 1) PLACE: 10 STELL of collateral goes into escrow.
     let (order_id, fills) = engine
-        .place_order_settled(PAIR_STELL_USDT, seller, OrderSide::Sell, OrderType::Limit, price, 10 * STELL, 1)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            seller,
+            OrderSide::Sell,
+            OrderType::Limit,
+            price,
+            10 * STELL,
+            1,
+        )
         .await
         .unwrap();
     assert_eq!(fills, 0);
-    assert_eq!(native_of(&engine, &seller).await, 90 * STELL, "place locks 10 STELL");
     assert_eq!(
-        engine.order_escrow_read().await.get(&(PAIR_STELL_USDT, order_id)).unwrap().locked_base_stell,
+        native_of(&engine, &seller).await,
+        90 * STELL,
+        "place locks 10 STELL"
+    );
+    assert_eq!(
+        engine
+            .order_escrow_read()
+            .await
+            .get(&(PAIR_STELL_USDT, order_id))
+            .unwrap()
+            .locked_base_stell,
         10 * STELL
     );
     assert_escrow_invariants(&engine, PAIR_STELL_USDT).await;
@@ -334,7 +543,9 @@ async fn svm_place_partial_fill_and_cancel_move_value_end_to_end() {
     let taker_addr = taker.verifying_key().to_bytes();
     let cost = native_quote(price, 4 * STELL);
     assert_eq!(cost, STELL, "4 STELL at $0.25 is 1.00 of quote");
-    engine.update_account(AccountState::new(taker_addr, 10 * STELL)).await;
+    engine
+        .update_account(AccountState::new(taker_addr, 10 * STELL))
+        .await;
 
     let gas = stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL;
     let t = order_tx(
@@ -348,7 +559,10 @@ async fn svm_place_partial_fill_and_cancel_move_value_end_to_end() {
             amount: 4 * STELL,
         }],
     );
-    engine.apply_transaction(&t, 1).await.expect("the fill must settle");
+    engine
+        .apply_transaction(&t, 1)
+        .await
+        .expect("the fill must settle");
 
     assert_eq!(
         native_of(&engine, &seller).await,
@@ -356,7 +570,12 @@ async fn svm_place_partial_fill_and_cancel_move_value_end_to_end() {
         "the maker was paid 1 STELL of quote for 4 STELL of collateral"
     );
     assert_eq!(
-        engine.order_escrow_read().await.get(&(PAIR_STELL_USDT, order_id)).unwrap().locked_base_stell,
+        engine
+            .order_escrow_read()
+            .await
+            .get(&(PAIR_STELL_USDT, order_id))
+            .unwrap()
+            .locked_base_stell,
         6 * STELL,
         "only the unfilled 6 STELL stay locked"
     );
@@ -373,9 +592,20 @@ async fn svm_place_partial_fill_and_cancel_move_value_end_to_end() {
         .await
         .unwrap();
     assert!(cancelled.is_some());
-    assert_eq!(native_of(&engine, &seller).await, 97 * STELL, "90 live + 1 paid + 6 refunded");
-    assert!(engine.order_escrow_read().await.get(&(PAIR_STELL_USDT, order_id)).is_none());
-    assert_eq!(engine.orderbooks_read().await.books[&PAIR_STELL_USDT].depth(), (0, 0));
+    assert_eq!(
+        native_of(&engine, &seller).await,
+        97 * STELL,
+        "90 live + 1 paid + 6 refunded"
+    );
+    assert!(engine
+        .order_escrow_read()
+        .await
+        .get(&(PAIR_STELL_USDT, order_id))
+        .is_none());
+    assert_eq!(
+        engine.orderbooks_read().await.books[&PAIR_STELL_USDT].depth(),
+        (0, 0)
+    );
 
     // Native value is conserved up to the burned fee.
     let total = native_of(&engine, &seller).await + native_of(&engine, &taker_addr).await;
@@ -402,7 +632,15 @@ async fn under_reserved_svm_taker_cannot_touch_the_book_or_the_escrow() {
     let (engine, seller, _buyer, _usdt) = setup().await;
     let price = 250_000u64;
     let (order_id, _) = engine
-        .place_order_settled(PAIR_STELL_USDT, seller, OrderSide::Sell, OrderType::Limit, price, 10 * STELL, 1)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            seller,
+            OrderSide::Sell,
+            OrderType::Limit,
+            price,
+            10 * STELL,
+            1,
+        )
         .await
         .unwrap();
 
@@ -415,10 +653,17 @@ async fn under_reserved_svm_taker_cannot_touch_the_book_or_the_escrow() {
     // 500 remain, which cannot pay the fee - the settlement must refuse.
     let taker = SigningKey::generate(&mut OsRng);
     let taker_addr = taker.verifying_key().to_bytes();
-    engine.update_account(AccountState::new(taker_addr, cost + 500)).await;
+    engine
+        .update_account(AccountState::new(taker_addr, cost + 500))
+        .await;
 
     let maker_before = native_of(&engine, &seller).await;
-    let book_before = engine.orderbooks_read().await.books.get(&PAIR_STELL_USDT).cloned();
+    let book_before = engine
+        .orderbooks_read()
+        .await
+        .books
+        .get(&PAIR_STELL_USDT)
+        .cloned();
     let escrow_before = engine.order_escrow_read().await.clone();
     let root_before = engine.get_state_root().await;
     let digest_before = committed_digest(&engine).await;
@@ -442,7 +687,12 @@ async fn under_reserved_svm_taker_cannot_touch_the_book_or_the_escrow() {
         "a lock that would eat the fee reserve must be refused before it happens"
     );
 
-    let book_after = engine.orderbooks_read().await.books.get(&PAIR_STELL_USDT).cloned();
+    let book_after = engine
+        .orderbooks_read()
+        .await
+        .books
+        .get(&PAIR_STELL_USDT)
+        .cloned();
     assert_eq!(
         bincode::serialize(&book_after).unwrap(),
         bincode::serialize(&book_before).unwrap(),
@@ -453,7 +703,11 @@ async fn under_reserved_svm_taker_cannot_touch_the_book_or_the_escrow() {
         escrow_before,
         "neither escrow changed"
     );
-    assert_eq!(native_of(&engine, &seller).await, maker_before, "the maker was not paid");
+    assert_eq!(
+        native_of(&engine, &seller).await,
+        maker_before,
+        "the maker was not paid"
+    );
     // F-01: the taker pays the failure fee (its declared limit) and its
     // nonce is consumed - but the ORDER COST did not move: the escrow lock
     // was refused before it happened.
@@ -475,9 +729,13 @@ async fn under_reserved_svm_taker_cannot_touch_the_book_or_the_escrow() {
          is byte-identical"
     );
     assert_eq!(
-        engine.order_escrow_read().await.get(&(PAIR_STELL_USDT, order_id)).unwrap().locked_base_stell,
+        engine
+            .order_escrow_read()
+            .await
+            .get(&(PAIR_STELL_USDT, order_id))
+            .unwrap()
+            .locked_base_stell,
         10 * STELL
-
     );
 }
 
@@ -491,11 +749,27 @@ async fn escrow_records_and_resting_orders_stay_in_lockstep() {
     let price = 250_000u64;
 
     engine
-        .place_order_settled(PAIR_STELL_USDT, seller, OrderSide::Sell, OrderType::Limit, price, 5 * STELL, 1)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            seller,
+            OrderSide::Sell,
+            OrderType::Limit,
+            price,
+            5 * STELL,
+            1,
+        )
         .await
         .unwrap();
     engine
-        .place_order_settled(PAIR_STELL_USDT, buyer, OrderSide::Buy, OrderType::Limit, price, 3 * STELL, 2)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            buyer,
+            OrderSide::Buy,
+            OrderType::Limit,
+            price,
+            3 * STELL,
+            2,
+        )
         .await
         .unwrap();
 
@@ -503,7 +777,9 @@ async fn escrow_records_and_resting_orders_stay_in_lockstep() {
     let bot = SigningKey::generate(&mut OsRng);
     let bot_addr = bot.verifying_key().to_bytes();
     let gas = stellereum::svm::GAS_ORDER_PLACE;
-    engine.update_account(AccountState::new(bot_addr, 4 * STELL + gas)).await;
+    engine
+        .update_account(AccountState::new(bot_addr, 4 * STELL + gas))
+        .await;
     let cost = native_quote(price - 1, 4 * STELL);
     engine
         .apply_transaction(
@@ -523,7 +799,13 @@ async fn escrow_records_and_resting_orders_stay_in_lockstep() {
         .await
         .expect("resting bid");
     assert_eq!(
-        engine.order_escrow_read().await.values().find(|r| r.trader == bot_addr).unwrap().locked_quote_native,
+        engine
+            .order_escrow_read()
+            .await
+            .values()
+            .find(|r| r.trader == bot_addr)
+            .unwrap()
+            .locked_quote_native,
         cost,
         "the SVM bid locked its native order_cost"
     );
@@ -531,7 +813,9 @@ async fn escrow_records_and_resting_orders_stay_in_lockstep() {
     // An SVM sell that rests: base lock.
     let bot2 = SigningKey::generate(&mut OsRng);
     let bot2_addr = bot2.verifying_key().to_bytes();
-    engine.update_account(AccountState::new(bot2_addr, 6 * STELL + gas)).await;
+    engine
+        .update_account(AccountState::new(bot2_addr, 6 * STELL + gas))
+        .await;
     engine
         .apply_transaction(
             &order_tx(
@@ -555,7 +839,9 @@ async fn escrow_records_and_resting_orders_stay_in_lockstep() {
     let crosser = SigningKey::generate(&mut OsRng);
     let crosser_addr = crosser.verifying_key().to_bytes();
     let fill_gas = stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL;
-    engine.update_account(AccountState::new(crosser_addr, 10 * STELL)).await;
+    engine
+        .update_account(AccountState::new(crosser_addr, 10 * STELL))
+        .await;
     engine
         .apply_transaction(
             &order_tx(
@@ -603,7 +889,11 @@ async fn escrow_records_and_resting_orders_stay_in_lockstep() {
         .await
         .expect("owner cancel")
         .expect("order exists");
-    assert_eq!(native_of(&engine, &bot_addr).await, bot_before + cost, "the native lock came back");
+    assert_eq!(
+        native_of(&engine, &bot_addr).await,
+        bot_before + cost,
+        "the native lock came back"
+    );
     assert_escrow_invariants(&engine, PAIR_STELL_USDT).await;
 
     // wUSDT only ever shrank (locks burned) and never grew.

@@ -208,9 +208,7 @@ async fn state_snapshot_published_is_retrievable_via_production_fetch() {
 
     let bytes = multi_chunk_bytes(0xC0FFEE);
     assert!(
-        adapter
-            .persist_state_snapshot(SHARD, HEIGHT, &bytes)
-            .await,
+        adapter.persist_state_snapshot(SHARD, HEIGHT, &bytes).await,
         "local publish must land"
     );
 
@@ -218,7 +216,10 @@ async fn state_snapshot_published_is_retrievable_via_production_fetch() {
         .fetch_latest_snapshot(SHARD)
         .await
         .expect("pointer must name the published height");
-    assert_eq!(latest, HEIGHT, "pointer must advance to the landed snapshot");
+    assert_eq!(
+        latest, HEIGHT,
+        "pointer must advance to the landed snapshot"
+    );
 
     let got = adapter
         .fetch_state_snapshot(SHARD, HEIGHT)

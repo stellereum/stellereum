@@ -57,13 +57,22 @@ fn v2_ledger_bytes_decode_with_empty_new_sets() {
     );
     // The migration path accepts them.
     let back = decode_domain_snapshot(&bytes).expect("V2 migration must succeed");
-    assert!(back.staking.to_validator_set().contains(&v), "bond survives");
+    assert!(
+        back.staking.to_validator_set().contains(&v),
+        "bond survives"
+    );
     assert_eq!(
         back.staking.validators[&v].self_bond, MIN_VALIDATOR_BOND,
         "power byte-identical"
     );
-    assert!(back.staking.equivocation_dedup.is_empty(), "dedup starts empty");
-    assert!(back.staking.vesting_schedules.is_empty(), "vesting starts empty");
+    assert!(
+        back.staking.equivocation_dedup.is_empty(),
+        "dedup starts empty"
+    );
+    assert!(
+        back.staking.vesting_schedules.is_empty(),
+        "vesting starts empty"
+    );
 }
 
 #[test]

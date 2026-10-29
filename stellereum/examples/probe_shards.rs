@@ -34,7 +34,10 @@ fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<se
     if let Some(err) = resp.get("error") {
         return Err(anyhow!("node rejected {method}: {err}"));
     }
-    Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    Ok(resp
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
 }
 
 #[allow(clippy::too_many_arguments)] // GATE: example builder mirrors Transaction field order
@@ -75,7 +78,11 @@ fn build_pq_tx(
 }
 
 /// Poll up to `budget_secs` for a receipt; returns (status, full_receipt_json).
-fn wait_for_tx_verbose(rpc_url: &str, tx_hash: &str, budget_secs: u64) -> Result<(String, serde_json::Value)> {
+fn wait_for_tx_verbose(
+    rpc_url: &str,
+    tx_hash: &str,
+    budget_secs: u64,
+) -> Result<(String, serde_json::Value)> {
     print!("    Waiting {budget_secs}s for tx {tx_hash:.16}... ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let polls = budget_secs / 2;
@@ -111,36 +118,58 @@ fn tip(rpc_url: &str) -> String {
 }
 
 fn main() -> Result<()> {
-    let rpc_url = std::env::var("STELL_RPC_URL").unwrap_or("https://rpc.stellereum.org".to_string());
-    let faucet_token = std::env::var("STELL_FAUCET_TOKEN").unwrap_or_else(|_| "REPLACE-ME".to_string());
+    let rpc_url =
+        std::env::var("STELL_RPC_URL").unwrap_or("https://rpc.stellereum.org".to_string());
+    let faucet_token =
+        std::env::var("STELL_FAUCET_TOKEN").unwrap_or_else(|_| "REPLACE-ME".to_string());
     let rpc_url = rpc_url.as_str();
     let faucet_token = faucet_token.as_str();
     println!("tip before: {}", tip(rpc_url));
 
     let k1 = FalconKeypair::generate();
-    let a1 = stellereum::post_quantum::derive_pq_address(PqScheme::Falcon512, k1.public_key(), &DEFAULT_SALT);
+    let a1 = stellereum::post_quantum::derive_pq_address(
+        PqScheme::Falcon512,
+        k1.public_key(),
+        &DEFAULT_SALT,
+    );
     let a1_hex = hex::encode(a1);
     println!("[1/4] Drip 5 STELL to probe account {a1_hex}...");
-    let f1 = rpc_call(rpc_url, "stell_faucet", serde_json::json!({
-        "address": a1_hex,
-        "token": faucet_token,
-        "amount": 5_000_000_000u64,
-    }))?;
+    let f1 = rpc_call(
+        rpc_url,
+        "stell_faucet",
+        serde_json::json!({
+            "address": a1_hex,
+            "token": faucet_token,
+            "amount": 5_000_000_000u64,
+        }),
+    )?;
     println!("    faucet response: {f1}");
     let fhash = f1["tx_hash"].as_str().unwrap();
     let (st, receipt) = wait_for_tx_verbose(rpc_url, fhash, 600)?;
     println!("    drip receipt status={st} body={receipt}");
 
-    let bal = rpc_call(rpc_url, "stell_getBalance", serde_json::json!({ "address": a1_hex }))?;
+    let bal = rpc_call(
+        rpc_url,
+        "stell_getBalance",
+        serde_json::json!({ "address": a1_hex }),
+    )?;
     println!("[2/4] balance on served chain: {bal}");
     let nonce: u64 = bal["nonce"].as_u64().unwrap_or(0);
 
     println!("[3/4] Tiny self-transfer shard 0->0 ...");
     let tx0 = build_pq_tx(&k1, a1, 1_000_000u64, 350_000, nonce, false, vec![], 0, 0);
     let raw0 = hex::encode(bincode::serialize(&tx0)?);
-    match rpc_call(rpc_url, "stell_sendRawTransaction", serde_json::json!({ "tx": raw0 })) {
+    match rpc_call(
+        rpc_url,
+        "stell_sendRawTransaction",
+        serde_json::json!({ "tx": raw0 }),
+    ) {
         Ok(res) => {
-            let h = res["hash"].as_str().or_else(|| res.as_str()).unwrap().to_string();
+            let h = res["hash"]
+                .as_str()
+                .or_else(|| res.as_str())
+                .unwrap()
+                .to_string();
             println!("    admitted: {h}");
             let (st, receipt) = wait_for_tx_verbose(rpc_url, &h, 600)?;
             println!("    shard0 receipt status={st} body={receipt}");
@@ -148,16 +177,28 @@ fn main() -> Result<()> {
         Err(e) => println!("    shard0 SUBMIT REJECTED: {e}"),
     }
 
-    let bal2 = rpc_call(rpc_url, "stell_getBalance", serde_json::json!({ "address": a1_hex }))?;
+    let bal2 = rpc_call(
+        rpc_url,
+        "stell_getBalance",
+        serde_json::json!({ "address": a1_hex }),
+    )?;
     println!("    balance now: {bal2}");
     let nonce2: u64 = bal2["nonce"].as_u64().unwrap_or(nonce + 1);
 
     println!("[4/4] Tiny self-transfer shard 1->1 ...");
     let tx1 = build_pq_tx(&k1, a1, 1_000_000u64, 350_000, nonce2, false, vec![], 1, 1);
     let raw1 = hex::encode(bincode::serialize(&tx1)?);
-    match rpc_call(rpc_url, "stell_sendRawTransaction", serde_json::json!({ "tx": raw1 })) {
+    match rpc_call(
+        rpc_url,
+        "stell_sendRawTransaction",
+        serde_json::json!({ "tx": raw1 }),
+    ) {
         Ok(res) => {
-            let h = res["hash"].as_str().or_else(|| res.as_str()).unwrap().to_string();
+            let h = res["hash"]
+                .as_str()
+                .or_else(|| res.as_str())
+                .unwrap()
+                .to_string();
             println!("    admitted: {h}");
             let (st, receipt) = wait_for_tx_verbose(rpc_url, &h, 300)?;
             println!("    shard1 receipt status={st} body={receipt}");

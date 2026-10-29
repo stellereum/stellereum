@@ -29,7 +29,10 @@ use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::Block;
 use stellereum::state_engine::InMemoryStateEngine;
-use stellereum::sync::{is_live_adoptable, should_defer_catchup_for_live, should_defer_catchup_for_live_flow, LIVE_ADOPT_GAP_THRESHOLD};
+use stellereum::sync::{
+    is_live_adoptable, should_defer_catchup_for_live, should_defer_catchup_for_live_flow,
+    LIVE_ADOPT_GAP_THRESHOLD,
+};
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
@@ -58,7 +61,9 @@ async fn live_block_for(
 ) -> (Block, QuorumCertificate) {
     let vs = rt.validators.clone();
     let round = rt.hc.round;
-    let proposer = vs.proposer_for(h, round).expect("non-empty set has a proposer");
+    let proposer = vs
+        .proposer_for(h, round)
+        .expect("non-empty set has a proposer");
     let pk = ks.iter().find(|k| id(k) == proposer).unwrap();
     let mut b = Block {
         shard_id: stellereum::sharding::MASTERCHAIN_SHARD,
@@ -131,7 +136,10 @@ fn catchup_defers_only_for_live_gaps_with_queued_traffic() {
     // Живой трафик + маленький гэп — drain владеет высотами, DHT молчит.
     assert!(should_defer_catchup_for_live(0, true));
     assert!(should_defer_catchup_for_live(1, true));
-    assert!(should_defer_catchup_for_live(LIVE_ADOPT_GAP_THRESHOLD, true));
+    assert!(should_defer_catchup_for_live(
+        LIVE_ADOPT_GAP_THRESHOLD,
+        true
+    ));
     // Далеко позади — tip-коммиты не adopt'ятся (height mismatch), нужен walk.
     assert!(!should_defer_catchup_for_live(
         LIVE_ADOPT_GAP_THRESHOLD + 1,

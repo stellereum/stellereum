@@ -60,8 +60,8 @@ impl HardenedNotesStore {
         OsRng.fill_bytes(&mut nonce);
         let xnonce = XNonce::from_slice(&nonce);
 
-        let plaintext = serde_json::to_vec(notes)
-            .map_err(|e| format!("Failed to serialize notes: {e}"))?;
+        let plaintext =
+            serde_json::to_vec(notes).map_err(|e| format!("Failed to serialize notes: {e}"))?;
 
         let payload = Payload {
             msg: &plaintext,
@@ -98,8 +98,10 @@ impl HardenedNotesStore {
 
         let salt = hex::decode(&self.salt_hex).map_err(|e| format!("Corrupted salt: {e}"))?;
         let nonce = hex::decode(&self.nonce_hex).map_err(|e| format!("Corrupted nonce: {e}"))?;
-        let ct_body = hex::decode(&self.ciphertext_hex).map_err(|e| format!("Corrupted ciphertext: {e}"))?;
-        let auth_tag = hex::decode(&self.auth_tag_hex).map_err(|e| format!("Corrupted auth tag: {e}"))?;
+        let ct_body =
+            hex::decode(&self.ciphertext_hex).map_err(|e| format!("Corrupted ciphertext: {e}"))?;
+        let auth_tag =
+            hex::decode(&self.auth_tag_hex).map_err(|e| format!("Corrupted auth tag: {e}"))?;
 
         let params = argon2::Params::new(65536, 3, 4, Some(32))
             .map_err(|e| format!("Argon2 params error: {e:?}"))?;
@@ -122,9 +124,9 @@ impl HardenedNotesStore {
             aad: NOTES_AAD,
         };
 
-        let decrypted = cipher
-            .decrypt(xnonce, payload)
-            .map_err(|_| "Decryption failed: incorrect password or tampered notes container!".to_string())?;
+        let decrypted = cipher.decrypt(xnonce, payload).map_err(|_| {
+            "Decryption failed: incorrect password or tampered notes container!".to_string()
+        })?;
 
         derived_key.zeroize();
         serde_json::from_slice(&decrypted)
@@ -146,8 +148,8 @@ impl HardenedNotesStore {
         OsRng.fill_bytes(&mut nonce);
         let xnonce = XNonce::from_slice(&nonce);
 
-        let plaintext = serde_json::to_vec(notes)
-            .map_err(|e| format!("Failed to serialize notes: {e}"))?;
+        let plaintext =
+            serde_json::to_vec(notes).map_err(|e| format!("Failed to serialize notes: {e}"))?;
 
         let payload = Payload {
             msg: &plaintext,
@@ -183,8 +185,10 @@ impl HardenedNotesStore {
 
         let salt = hex::decode(&self.salt_hex).map_err(|e| format!("Corrupted salt: {e}"))?;
         let nonce = hex::decode(&self.nonce_hex).map_err(|e| format!("Corrupted nonce: {e}"))?;
-        let ct_body = hex::decode(&self.ciphertext_hex).map_err(|e| format!("Corrupted ciphertext: {e}"))?;
-        let auth_tag = hex::decode(&self.auth_tag_hex).map_err(|e| format!("Corrupted auth tag: {e}"))?;
+        let ct_body =
+            hex::decode(&self.ciphertext_hex).map_err(|e| format!("Corrupted ciphertext: {e}"))?;
+        let auth_tag =
+            hex::decode(&self.auth_tag_hex).map_err(|e| format!("Corrupted auth tag: {e}"))?;
 
         let mut material = [0u8; 48];
         material[..32].copy_from_slice(secret);
@@ -203,9 +207,9 @@ impl HardenedNotesStore {
             aad: NOTES_AAD,
         };
 
-        let decrypted = cipher
-            .decrypt(xnonce, payload)
-            .map_err(|_| "Decryption failed: incorrect secret or tampered notes container!".to_string())?;
+        let decrypted = cipher.decrypt(xnonce, payload).map_err(|_| {
+            "Decryption failed: incorrect secret or tampered notes container!".to_string()
+        })?;
 
         serde_json::from_slice(&decrypted)
             .map_err(|e| format!("Failed to parse decrypted notes JSON: {e}"))
@@ -240,7 +244,10 @@ pub fn derive_blinding_factor(seed: &[u8; 32], note_counter: u64) -> [u8; 32] {
             material.extend_from_slice(&attempt.to_le_bytes());
         }
         let derived = blake3::derive_key("STELL_BLINDING_V1", &material);
-        if curve25519_dalek::scalar::Scalar::from_canonical_bytes(derived).into_option().is_some() {
+        if curve25519_dalek::scalar::Scalar::from_canonical_bytes(derived)
+            .into_option()
+            .is_some()
+        {
             return derived;
         }
         attempt += 1;
@@ -307,10 +314,7 @@ fn derive_storage_key(path: &Path, salt: &[u8; 16]) -> Result<[u8; 32], String> 
     let mut material = Vec::with_capacity(wallet_bytes.len() + salt.len());
     material.extend_from_slice(&wallet_bytes);
     material.extend_from_slice(salt);
-    Ok(blake3::derive_key(
-        "STELL_NOTES_STORAGE_KEY_V1",
-        &material,
-    ))
+    Ok(blake3::derive_key("STELL_NOTES_STORAGE_KEY_V1", &material))
 }
 
 /// Derives an encryption key for the stealth-outputs store bound to the local wallet.
@@ -440,7 +444,10 @@ pub fn load_notes(path: &Path) -> Result<Vec<ShieldedNote>, String> {
     // Try parsing as encrypted HardenedNotesStore container
     if let Ok(store) = serde_json::from_str::<HardenedNotesStore>(trimmed) {
         if store.version != NOTES_STORE_VERSION {
-            return Err(format!("Unsupported notes store version: {}", store.version));
+            return Err(format!(
+                "Unsupported notes store version: {}",
+                store.version
+            ));
         }
         if store.cipher != NOTES_STORE_CIPHER {
             return Err(format!("Unsupported notes store cipher: {}", store.cipher));
@@ -448,8 +455,10 @@ pub fn load_notes(path: &Path) -> Result<Vec<ShieldedNote>, String> {
 
         let salt = hex::decode(&store.salt_hex).map_err(|e| format!("Corrupted salt: {e}"))?;
         let nonce = hex::decode(&store.nonce_hex).map_err(|e| format!("Corrupted nonce: {e}"))?;
-        let ct_body = hex::decode(&store.ciphertext_hex).map_err(|e| format!("Corrupted ciphertext: {e}"))?;
-        let auth_tag = hex::decode(&store.auth_tag_hex).map_err(|e| format!("Corrupted auth tag: {e}"))?;
+        let ct_body =
+            hex::decode(&store.ciphertext_hex).map_err(|e| format!("Corrupted ciphertext: {e}"))?;
+        let auth_tag =
+            hex::decode(&store.auth_tag_hex).map_err(|e| format!("Corrupted auth tag: {e}"))?;
 
         if salt.len() != 16 {
             return Err("Invalid salt length in notes store".to_string());
@@ -470,9 +479,9 @@ pub fn load_notes(path: &Path) -> Result<Vec<ShieldedNote>, String> {
             aad: NOTES_AAD,
         };
 
-        let decrypted = cipher
-            .decrypt(xnonce, payload)
-            .map_err(|_| "Decryption failed: corrupted notes store or tampering detected!".to_string())?;
+        let decrypted = cipher.decrypt(xnonce, payload).map_err(|_| {
+            "Decryption failed: corrupted notes store or tampering detected!".to_string()
+        })?;
 
         serde_json::from_slice(&decrypted)
             .map_err(|e| format!("Failed to parse decrypted notes JSON: {e}"))
@@ -501,8 +510,8 @@ pub fn save_notes(path: &Path, notes: &[ShieldedNote]) -> Result<(), String> {
     OsRng.fill_bytes(&mut nonce);
     let xnonce = XNonce::from_slice(&nonce);
 
-    let plaintext = serde_json::to_vec(notes)
-        .map_err(|e| format!("Failed to serialize notes: {e}"))?;
+    let plaintext =
+        serde_json::to_vec(notes).map_err(|e| format!("Failed to serialize notes: {e}"))?;
 
     let payload = Payload {
         msg: &plaintext,
@@ -555,7 +564,11 @@ pub fn load_notes_with_password(path: &Path, password: &str) -> Result<Vec<Shiel
 }
 
 /// Saves shielded notes to disk encrypted with password using Argon2id + XChaCha20-Poly1305.
-pub fn save_notes_with_password(path: &Path, notes: &[ShieldedNote], password: &str) -> Result<(), String> {
+pub fn save_notes_with_password(
+    path: &Path,
+    notes: &[ShieldedNote],
+    password: &str,
+) -> Result<(), String> {
     let store = HardenedNotesStore::encrypt(notes, password)?;
     store.save(path)
 }
@@ -583,7 +596,11 @@ pub fn load_notes_with_secret(path: &Path, secret: &[u8; 32]) -> Result<Vec<Shie
 }
 
 /// Saves shielded notes to disk encrypted with a 32-byte master secret using Blake3 KDF + XChaCha20-Poly1305.
-pub fn save_notes_with_secret(path: &Path, notes: &[ShieldedNote], secret: &[u8; 32]) -> Result<(), String> {
+pub fn save_notes_with_secret(
+    path: &Path,
+    notes: &[ShieldedNote],
+    secret: &[u8; 32],
+) -> Result<(), String> {
     let store = HardenedNotesStore::encrypt_with_secret(notes, secret)?;
     store.save(path)
 }
@@ -668,7 +685,10 @@ pub fn calculate_shielded_balance(notes: &[ShieldedNote]) -> u64 {
 
 /// Selects unspent notes matching `target_amount` (nano-STELL).
 /// Prefers a single exact-match note; otherwise finds a subset whose sum matches `target_amount`.
-pub fn select_notes_for_unshield(path: &Path, target_amount: u64) -> Result<Vec<ShieldedNote>, String> {
+pub fn select_notes_for_unshield(
+    path: &Path,
+    target_amount: u64,
+) -> Result<Vec<ShieldedNote>, String> {
     let unspent = get_unspent_notes(path)?;
     select_from_unspent(&unspent, target_amount)
 }
@@ -693,7 +713,10 @@ pub fn select_notes_for_unshield_with_password(
     select_from_unspent(&unspent, target_amount)
 }
 
-fn select_from_unspent(unspent: &[ShieldedNote], target_amount: u64) -> Result<Vec<ShieldedNote>, String> {
+fn select_from_unspent(
+    unspent: &[ShieldedNote],
+    target_amount: u64,
+) -> Result<Vec<ShieldedNote>, String> {
     if unspent.is_empty() {
         return Err("No unspent shielded notes found in wallet".to_string());
     }
@@ -731,7 +754,13 @@ fn select_from_unspent(unspent: &[ShieldedNote], target_amount: u64) -> Result<V
 
         // Try including notes[idx]
         chosen.push(idx);
-        if find_subset(notes, idx + 1, current_sum + notes[idx].amount, target, chosen) {
+        if find_subset(
+            notes,
+            idx + 1,
+            current_sum + notes[idx].amount,
+            target,
+            chosen,
+        ) {
             return true;
         }
         chosen.pop();
@@ -742,7 +771,10 @@ fn select_from_unspent(unspent: &[ShieldedNote], target_amount: u64) -> Result<V
 
     let mut chosen_indices = Vec::new();
     if find_subset(unspent, 0, 0, target_amount, &mut chosen_indices) {
-        let selected = chosen_indices.into_iter().map(|i| unspent[i].clone()).collect();
+        let selected = chosen_indices
+            .into_iter()
+            .map(|i| unspent[i].clone())
+            .collect();
         return Ok(selected);
     }
 
@@ -758,7 +790,10 @@ fn select_from_unspent(unspent: &[ShieldedNote], target_amount: u64) -> Result<V
 pub fn mark_notes_spent(path: &Path, commitments: &[String]) -> Result<(), String> {
     let mut notes = load_notes(path)?;
     for note in &mut notes {
-        if commitments.iter().any(|c| c.eq_ignore_ascii_case(&note.commitment)) {
+        if commitments
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&note.commitment))
+        {
             note.spent = true;
         }
     }
@@ -773,7 +808,10 @@ pub fn mark_notes_spent_with_secret(
 ) -> Result<(), String> {
     let mut notes = load_notes_with_secret(path, secret)?;
     for note in &mut notes {
-        if commitments.iter().any(|c| c.eq_ignore_ascii_case(&note.commitment)) {
+        if commitments
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&note.commitment))
+        {
             note.spent = true;
         }
     }
@@ -788,7 +826,10 @@ pub fn mark_notes_spent_with_password(
 ) -> Result<(), String> {
     let mut notes = load_notes_with_password(path, password)?;
     for note in &mut notes {
-        if commitments.iter().any(|c| c.eq_ignore_ascii_case(&note.commitment)) {
+        if commitments
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&note.commitment))
+        {
             note.spent = true;
         }
     }
@@ -880,7 +921,10 @@ impl HardenedStealthStore {
     /// Decrypt stealth outputs with a user password.
     pub fn decrypt(&self, password: &str) -> Result<Vec<StealthOutput>, String> {
         if self.version != STEALTH_STORE_VERSION {
-            return Err(format!("Unsupported stealth store version: {}", self.version));
+            return Err(format!(
+                "Unsupported stealth store version: {}",
+                self.version
+            ));
         }
         if self.cipher != STEALTH_STORE_CIPHER {
             return Err(format!("Unsupported stealth store cipher: {}", self.cipher));
@@ -910,11 +954,9 @@ impl HardenedStealthStore {
             msg: &full_ct,
             aad: STEALTH_AAD,
         };
-        let decrypted = cipher
-            .decrypt(xnonce, payload)
-            .map_err(|_| {
-                "Decryption failed: incorrect password or tampered stealth container!".to_string()
-            })?;
+        let decrypted = cipher.decrypt(xnonce, payload).map_err(|_| {
+            "Decryption failed: incorrect password or tampered stealth container!".to_string()
+        })?;
         derived_key.zeroize();
         serde_json::from_slice(&decrypted)
             .map_err(|e| format!("Failed to parse decrypted stealth JSON: {e}"))
@@ -964,7 +1006,10 @@ impl HardenedStealthStore {
     /// Decrypt stealth outputs with a 32-byte master secret.
     pub fn decrypt_with_secret(&self, secret: &[u8; 32]) -> Result<Vec<StealthOutput>, String> {
         if self.version != STEALTH_STORE_VERSION {
-            return Err(format!("Unsupported stealth store version: {}", self.version));
+            return Err(format!(
+                "Unsupported stealth store version: {}",
+                self.version
+            ));
         }
         if self.cipher != STEALTH_STORE_CIPHER {
             return Err(format!("Unsupported stealth store cipher: {}", self.cipher));
@@ -990,11 +1035,9 @@ impl HardenedStealthStore {
             msg: &full_ct,
             aad: STEALTH_AAD,
         };
-        let decrypted = cipher
-            .decrypt(xnonce, payload)
-            .map_err(|_| {
-                "Decryption failed: incorrect secret or tampered stealth container!".to_string()
-            })?;
+        let decrypted = cipher.decrypt(xnonce, payload).map_err(|_| {
+            "Decryption failed: incorrect secret or tampered stealth container!".to_string()
+        })?;
         serde_json::from_slice(&decrypted)
             .map_err(|e| format!("Failed to parse decrypted stealth JSON: {e}"))
     }
@@ -1083,9 +1126,9 @@ fn decrypt_stealth_store_with_storage_key(
         msg: &full_ct,
         aad: STEALTH_AAD,
     };
-    let decrypted = cipher
-        .decrypt(xnonce, payload)
-        .map_err(|_| "Decryption failed: corrupted stealth store or tampering detected!".to_string())?;
+    let decrypted = cipher.decrypt(xnonce, payload).map_err(|_| {
+        "Decryption failed: corrupted stealth store or tampering detected!".to_string()
+    })?;
     serde_json::from_slice(&decrypted)
         .map_err(|e| format!("Failed to parse decrypted stealth JSON: {e}"))
 }
@@ -1338,17 +1381,18 @@ mod tests {
             .unwrap_or("");
         // Mirror `bound_wallet_bytes` inference: per-wallet stores bind to
         // `<stem>.json`, legacy stores bind to `wallet.json`.
-        let wallet_name = if fname.starts_with("shielded_notes_") || fname.starts_with("stealth_outputs_") {
-            let stem = fname
-                .strip_prefix("shielded_notes_")
-                .or_else(|| fname.strip_prefix("stealth_outputs_"))
-                .and_then(|s| s.strip_suffix(".json"))
-                .filter(|s| !s.is_empty())
-                .unwrap_or("wallet");
-            format!("{stem}.json")
-        } else {
-            "wallet.json".to_string()
-        };
+        let wallet_name =
+            if fname.starts_with("shielded_notes_") || fname.starts_with("stealth_outputs_") {
+                let stem = fname
+                    .strip_prefix("shielded_notes_")
+                    .or_else(|| fname.strip_prefix("stealth_outputs_"))
+                    .and_then(|s| s.strip_suffix(".json"))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("wallet");
+                format!("{stem}.json")
+            } else {
+                "wallet.json".to_string()
+            };
         let wallet_path = parent.join(wallet_name);
         if !wallet_path.exists() {
             let _ = fs::write(&wallet_path, b"{\"dummy\":\"wallet-binding-for-tests\"}");
@@ -1357,7 +1401,8 @@ mod tests {
 
     #[test]
     fn test_stealth_outputs_store_lifecycle() {
-        let temp_dir = std::env::temp_dir().join(format!("stell_stealth_test_{}", rand::random::<u64>()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("stell_stealth_test_{}", rand::random::<u64>()));
         let _ = fs::create_dir_all(&temp_dir);
         let stealth_file = temp_dir.join("stealth_outputs.json");
         write_dummy_wallet_binding(&stealth_file);
@@ -1387,11 +1432,26 @@ mod tests {
         // File on disk must be an encrypted XChaCha20-Poly1305 container, atomically
         // persisted (no lingering .tmp), with 0600 permissions and no cleartext secrets.
         let raw_disk = fs::read_to_string(&stealth_file).unwrap();
-        assert!(raw_disk.contains("XChaCha20-Poly1305"), "stealth file must be encrypted");
-        assert!(raw_disk.contains("ciphertext_hex"), "stealth file must carry ciphertext");
-        assert!(!raw_disk.contains("15000000000"), "amounts must NOT appear in cleartext");
-        assert!(!raw_disk.contains(&out1.shared_secret), "shared secrets must NOT appear in cleartext");
-        assert!(!temp_dir.join("stealth_outputs.json.tmp").exists(), ".tmp must be renamed");
+        assert!(
+            raw_disk.contains("XChaCha20-Poly1305"),
+            "stealth file must be encrypted"
+        );
+        assert!(
+            raw_disk.contains("ciphertext_hex"),
+            "stealth file must carry ciphertext"
+        );
+        assert!(
+            !raw_disk.contains("15000000000"),
+            "amounts must NOT appear in cleartext"
+        );
+        assert!(
+            !raw_disk.contains(&out1.shared_secret),
+            "shared secrets must NOT appear in cleartext"
+        );
+        assert!(
+            !temp_dir.join("stealth_outputs.json.tmp").exists(),
+            ".tmp must be renamed"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1404,7 +1464,8 @@ mod tests {
 
     #[test]
     fn test_storage_key_fail_closed_without_wallet_binding() {
-        let temp_dir = std::env::temp_dir().join(format!("stell_nobind_test_{}", rand::random::<u64>()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("stell_nobind_test_{}", rand::random::<u64>()));
         let _ = fs::create_dir_all(&temp_dir);
         // Deliberately NO wallet.json here.
         let notes_file = temp_dir.join("shielded_notes.json");
@@ -1418,8 +1479,14 @@ mod tests {
             spent: false,
         };
         let save_err = save_notes(&notes_file, &[note]).unwrap_err();
-        assert!(save_err.contains("not bound to any wallet"), "must fail closed, got: {save_err}");
-        assert!(!notes_file.exists(), "failed save must not leave a file behind");
+        assert!(
+            save_err.contains("not bound to any wallet"),
+            "must fail closed, got: {save_err}"
+        );
+        assert!(
+            !notes_file.exists(),
+            "failed save must not leave a file behind"
+        );
 
         let out = StealthOutput {
             one_time_pub: "11".repeat(32),
@@ -1431,30 +1498,54 @@ mod tests {
             spent: false,
         };
         let s_err = save_stealth_outputs(&stealth_file, &[out]).unwrap_err();
-        assert!(s_err.contains("not bound to any wallet"), "must fail closed, got: {s_err}");
+        assert!(
+            s_err.contains("not bound to any wallet"),
+            "must fail closed, got: {s_err}"
+        );
         assert!(!stealth_file.exists());
 
         // Secret-bound paths do NOT need a wallet file and keep working.
         let secret = [0x5Au8; 32];
         let secret_notes = temp_dir.join("secret_notes.json");
-        save_notes_with_secret(&secret_notes, &[ShieldedNote {
-            commitment: "s1".to_string(), amount: 9, blinding: "sb".to_string(), height: 1, spent: false,
-        }], &secret).unwrap();
-        assert_eq!(load_notes_with_secret(&secret_notes, &secret).unwrap().len(), 1);
+        save_notes_with_secret(
+            &secret_notes,
+            &[ShieldedNote {
+                commitment: "s1".to_string(),
+                amount: 9,
+                blinding: "sb".to_string(),
+                height: 1,
+                spent: false,
+            }],
+            &secret,
+        )
+        .unwrap();
+        assert_eq!(
+            load_notes_with_secret(&secret_notes, &secret)
+                .unwrap()
+                .len(),
+            1
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_per_wallet_notes_and_stealth_path_isolation() {
-        let base = std::env::temp_dir().join(format!("stell_isolation_test_{}", rand::random::<u64>()));
+        let base =
+            std::env::temp_dir().join(format!("stell_isolation_test_{}", rand::random::<u64>()));
         let wallets_dir = base.join("wallets");
         let _ = fs::create_dir_all(&wallets_dir);
 
         // Legacy wallet keeps historic sibling names.
         let legacy_wallet = base.join("wallet.json");
-        assert_eq!(notes_path_for_wallet(&legacy_wallet), base.join("shielded_notes.json"));
-        assert_eq!(stealth_path_for_wallet(&legacy_wallet), base.join("stealth_outputs.json"));
+        assert_eq!(
+            notes_path_for_wallet(&legacy_wallet),
+            base.join("shielded_notes.json")
+        );
+        assert_eq!(
+            stealth_path_for_wallet(&legacy_wallet),
+            base.join("stealth_outputs.json")
+        );
 
         // Named wallets get isolated per-wallet stores.
         let trading = wallets_dir.join("trading.json");
@@ -1467,25 +1558,35 @@ mod tests {
             notes_path_for_wallet(&savings),
             wallets_dir.join("shielded_notes_savings.json")
         );
-        assert_ne!(notes_path_for_wallet(&trading), notes_path_for_wallet(&savings));
+        assert_ne!(
+            notes_path_for_wallet(&trading),
+            notes_path_for_wallet(&savings)
+        );
         assert_eq!(
             stealth_path_for_wallet(&trading),
             wallets_dir.join("stealth_outputs_trading.json")
         );
-        assert_ne!(stealth_path_for_wallet(&trading), stealth_path_for_wallet(&savings));
+        assert_ne!(
+            stealth_path_for_wallet(&trading),
+            stealth_path_for_wallet(&savings)
+        );
 
         // Backward compatibility: legacy shared file is reused when per-wallet is absent.
         let _ = fs::write(&legacy_wallet, b"dummy");
         let other = base.join("other.json");
         let _ = fs::write(base.join("shielded_notes.json"), b"[]");
-        assert_eq!(notes_path_for_wallet(&other), base.join("shielded_notes.json"));
+        assert_eq!(
+            notes_path_for_wallet(&other),
+            base.join("shielded_notes.json")
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn test_stealth_secret_and_password_roundtrip_with_tamper_rejection() {
-        let temp_dir = std::env::temp_dir().join(format!("stell_stealth_sec_{}", rand::random::<u64>()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("stell_stealth_sec_{}", rand::random::<u64>()));
         let _ = fs::create_dir_all(&temp_dir);
 
         let out = StealthOutput {
@@ -1515,9 +1616,16 @@ mod tests {
         let f = temp_dir.join("stealth_outputs.json");
         assert!(add_stealth_output_with_secret(&f, out.clone(), &secret).unwrap());
         assert!(!add_stealth_output_with_secret(&f, out.clone(), &secret).unwrap());
-        assert_eq!(get_unspent_stealth_outputs_with_secret(&f, &secret).unwrap().len(), 1);
+        assert_eq!(
+            get_unspent_stealth_outputs_with_secret(&f, &secret)
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(mark_stealth_output_spent_with_secret(&f, &out.one_time_pub, &secret).unwrap());
-        assert!(get_unspent_stealth_outputs_with_secret(&f, &secret).unwrap().is_empty());
+        assert!(get_unspent_stealth_outputs_with_secret(&f, &secret)
+            .unwrap()
+            .is_empty());
         assert!(get_unspent_stealth_outputs_with_secret(&f, &[0x72u8; 32]).is_err());
         let raw = fs::read_to_string(&f).unwrap();
         assert!(raw.contains("XChaCha20-Poly1305"));
@@ -1526,24 +1634,46 @@ mod tests {
         // Legacy plaintext stealth file migrates transparently into the secret loader.
         let legacy = temp_dir.join("legacy_stealth.json");
         fs::write(&legacy, serde_json::to_string_pretty(&outputs).unwrap()).unwrap();
-        assert_eq!(load_stealth_outputs_with_secret(&legacy, &secret).unwrap(), outputs);
+        assert_eq!(
+            load_stealth_outputs_with_secret(&legacy, &secret).unwrap(),
+            outputs
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_notes_secret_helpers_roundtrip() {
-        let temp_dir = std::env::temp_dir().join(format!("stell_notes_sec_{}", rand::random::<u64>()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("stell_notes_sec_{}", rand::random::<u64>()));
         let _ = fs::create_dir_all(&temp_dir);
         let f = temp_dir.join("shielded_notes.json");
         let secret = [0x33u8; 32];
 
-        add_note_with_secret(&f, ShieldedNote {
-            commitment: "k1".to_string(), amount: 5_000_000_000, blinding: "x".to_string(), height: 1, spent: false,
-        }, &secret).unwrap();
-        add_note_with_secret(&f, ShieldedNote {
-            commitment: "k2".to_string(), amount: 10_000_000_000, blinding: "y".to_string(), height: 2, spent: false,
-        }, &secret).unwrap();
+        add_note_with_secret(
+            &f,
+            ShieldedNote {
+                commitment: "k1".to_string(),
+                amount: 5_000_000_000,
+                blinding: "x".to_string(),
+                height: 1,
+                spent: false,
+            },
+            &secret,
+        )
+        .unwrap();
+        add_note_with_secret(
+            &f,
+            ShieldedNote {
+                commitment: "k2".to_string(),
+                amount: 10_000_000_000,
+                blinding: "y".to_string(),
+                height: 2,
+                spent: false,
+            },
+            &secret,
+        )
+        .unwrap();
         assert_eq!(get_unspent_notes_with_secret(&f, &secret).unwrap().len(), 2);
         let sel = select_notes_for_unshield_with_secret(&f, 15_000_000_000, &secret).unwrap();
         assert_eq!(sel.len(), 2);
@@ -1556,7 +1686,8 @@ mod tests {
 
     #[test]
     fn test_note_selection_exact_and_combination() {
-        let temp_dir = std::env::temp_dir().join(format!("stell_notes_test_{}", rand::random::<u64>()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("stell_notes_test_{}", rand::random::<u64>()));
         let _ = fs::create_dir_all(&temp_dir);
         let notes_file = temp_dir.join("shielded_notes.json");
         write_dummy_wallet_binding(&notes_file);
@@ -1593,10 +1724,22 @@ mod tests {
 
         // Verify the file on disk is encrypted (XChaCha20-Poly1305 HardenedNotesStore)
         let raw_disk = fs::read_to_string(&notes_file).unwrap();
-        assert!(raw_disk.contains("XChaCha20-Poly1305"), "On-disk file must be encrypted container");
-        assert!(raw_disk.contains("ciphertext_hex"), "On-disk file must have ciphertext");
-        assert!(!raw_disk.contains("5000000000"), "Amounts must NOT appear in cleartext");
-        assert!(!raw_disk.contains("\"b1\""), "Blindings must NOT appear in cleartext");
+        assert!(
+            raw_disk.contains("XChaCha20-Poly1305"),
+            "On-disk file must be encrypted container"
+        );
+        assert!(
+            raw_disk.contains("ciphertext_hex"),
+            "On-disk file must have ciphertext"
+        );
+        assert!(
+            !raw_disk.contains("5000000000"),
+            "Amounts must NOT appear in cleartext"
+        );
+        assert!(
+            !raw_disk.contains("\"b1\""),
+            "Blindings must NOT appear in cleartext"
+        );
 
         // Exact single match
         let sel10 = select_notes_for_unshield(&notes_file, 10_000_000_000).unwrap();
@@ -1656,8 +1799,11 @@ mod tests {
 
         // 2. Secret-based encryption
         let secret = [0x55u8; 32];
-        let secret_store = HardenedNotesStore::encrypt_with_secret(&notes, &secret).expect("Encrypt secret");
-        let secret_decrypted = secret_store.decrypt_with_secret(&secret).expect("Decrypt secret");
+        let secret_store =
+            HardenedNotesStore::encrypt_with_secret(&notes, &secret).expect("Encrypt secret");
+        let secret_decrypted = secret_store
+            .decrypt_with_secret(&secret)
+            .expect("Decrypt secret");
         assert_eq!(secret_decrypted, notes);
 
         // Wrong secret fails
@@ -1686,7 +1832,8 @@ mod tests {
 
     #[test]
     fn test_atomic_save_file_scheme_and_permissions() {
-        let temp_dir = std::env::temp_dir().join(format!("stell_atomic_test_{}", rand::random::<u64>()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("stell_atomic_test_{}", rand::random::<u64>()));
         let _ = fs::create_dir_all(&temp_dir);
         let target = temp_dir.join("atomic_notes.json");
 
@@ -1713,7 +1860,10 @@ mod tests {
 
     #[test]
     fn test_legacy_plaintext_notes_migration_and_compatibility() {
-        let temp_dir = std::env::temp_dir().join(format!("stell_legacy_migration_test_{}", rand::random::<u64>()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "stell_legacy_migration_test_{}",
+            rand::random::<u64>()
+        ));
         let _ = fs::create_dir_all(&temp_dir);
         let notes_file = temp_dir.join("shielded_notes.json");
 
@@ -1743,21 +1893,30 @@ mod tests {
         assert_eq!(loaded, legacy_notes);
 
         // 3. load_notes_with_password gracefully reads legacy unencrypted JSON
-        let loaded_pw = load_notes_with_password(&notes_file, "AnyPassword123").expect("Must migrate legacy with password");
+        let loaded_pw = load_notes_with_password(&notes_file, "AnyPassword123")
+            .expect("Must migrate legacy with password");
         assert_eq!(loaded_pw, legacy_notes);
 
         // 4. load_notes_with_secret gracefully reads legacy unencrypted JSON
         let secret = [0x77u8; 32];
-        let loaded_sec = load_notes_with_secret(&notes_file, &secret).expect("Must migrate legacy with secret");
+        let loaded_sec =
+            load_notes_with_secret(&notes_file, &secret).expect("Must migrate legacy with secret");
         assert_eq!(loaded_sec, legacy_notes);
 
         // 5. Encrypt with password and save
-        save_notes_with_password(&notes_file, &legacy_notes, "SecretPass#2026").expect("Save with password");
+        save_notes_with_password(&notes_file, &legacy_notes, "SecretPass#2026")
+            .expect("Save with password");
 
         let raw_disk = fs::read_to_string(&notes_file).unwrap();
         assert!(raw_disk.contains("XChaCha20-Poly1305"));
-        assert!(!raw_disk.contains("12345000000"), "Amounts must NOT appear in cleartext");
-        assert!(!raw_disk.contains("legacy_b1"), "Blinding must NOT appear in cleartext");
+        assert!(
+            !raw_disk.contains("12345000000"),
+            "Amounts must NOT appear in cleartext"
+        );
+        assert!(
+            !raw_disk.contains("legacy_b1"),
+            "Blinding must NOT appear in cleartext"
+        );
 
         // Decrypt with correct password
         let decrypted_pw = load_notes_with_password(&notes_file, "SecretPass#2026").unwrap();

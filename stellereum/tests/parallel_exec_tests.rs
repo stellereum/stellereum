@@ -78,9 +78,25 @@ fn parallel_block_rejects_bad_nonce_and_bad_sig() {
     let (e, keys) = funded_engine(5, 1_000_000);
     let mut txs = Vec::new();
     // valid
-    txs.push(Transaction::sign(&keys[0], keys[1].verifying_key().to_bytes(), 10, 0, 0, 1, 1));
+    txs.push(Transaction::sign(
+        &keys[0],
+        keys[1].verifying_key().to_bytes(),
+        10,
+        0,
+        0,
+        1,
+        1,
+    ));
     // bad nonce (should be 1 after the above if same sender; use wrong nonce)
-    txs.push(Transaction::sign(&keys[0], keys[1].verifying_key().to_bytes(), 10, 0, 5, 1, 1));
+    txs.push(Transaction::sign(
+        &keys[0],
+        keys[1].verifying_key().to_bytes(),
+        10,
+        0,
+        5,
+        1,
+        1,
+    ));
     // bad signature
     let mut bad = Transaction::sign(&keys[2], keys[3].verifying_key().to_bytes(), 10, 0, 0, 1, 1);
     bad.signature[0] ^= 0xFF;
@@ -97,7 +113,11 @@ fn parallel_block_conserves_total_value() {
     let total_before: u64 = run_rt(async {
         let mut s = 0;
         for sk in &keys {
-            s += e.get_account(&sk.verifying_key().to_bytes()).await.unwrap().balance;
+            s += e
+                .get_account(&sk.verifying_key().to_bytes())
+                .await
+                .unwrap()
+                .balance;
         }
         s
     });
@@ -148,24 +168,48 @@ fn rejected_tx_payload_is_not_executed() {
     let thief = [0x77u8; 32];
 
     let token_id = rt.block_on(async {
-        engine.update_account(AccountState::new(victim_addr, 1_000_000)).await;
-        let id = engine.create_token(minter_addr, token_meta(), 1_000).await.unwrap();
         engine
-            .token_execute(&id, minter_addr, TokenOp::Transfer { to: victim_addr, amount: 100 })
+            .update_account(AccountState::new(victim_addr, 1_000_000))
+            .await;
+        let id = engine
+            .create_token(minter_addr, token_meta(), 1_000)
+            .await
+            .unwrap();
+        engine
+            .token_execute(
+                &id,
+                minter_addr,
+                TokenOp::Transfer {
+                    to: victim_addr,
+                    amount: 100,
+                },
+            )
             .await
             .unwrap();
         id
     });
 
     // Valid payload (steals the victim's tokens) but WRONG nonce (5, actual 0).
-    let payload = vec![OpCode::SysCallTokenTransfer { token_id, to: thief, amount: 100 }];
+    let payload = vec![OpCode::SysCallTokenTransfer {
+        token_id,
+        to: thief,
+        amount: 100,
+    }];
     let tx = Transaction::sign_with_payload(&victim, [9u8; 32], 0, 10_000, 5, 1, 1, payload);
 
     let (applied, failed) = rt.block_on(engine.apply_block_parallel(&[tx], 0));
     assert_eq!(applied, 0, "bad-nonce tx must not be applied");
     assert_eq!(failed, 1);
-    assert_eq!(rt.block_on(engine.token_balance(&token_id, &victim_addr)), 100, "victim tokens untouched");
-    assert_eq!(rt.block_on(engine.token_balance(&token_id, &thief)), 0, "no tokens reach the thief");
+    assert_eq!(
+        rt.block_on(engine.token_balance(&token_id, &victim_addr)),
+        100,
+        "victim tokens untouched"
+    );
+    assert_eq!(
+        rt.block_on(engine.token_balance(&token_id, &thief)),
+        0,
+        "no tokens reach the thief"
+    );
 }
 
 #[test]
@@ -180,23 +224,47 @@ fn underfunded_tx_payload_is_not_executed() {
 
     let token_id = rt.block_on(async {
         // NO native balance -> cannot pay gas -> admission must fail.
-        engine.update_account(AccountState::new(victim_addr, 0)).await;
-        let id = engine.create_token(minter_addr, token_meta(), 1_000).await.unwrap();
         engine
-            .token_execute(&id, minter_addr, TokenOp::Transfer { to: victim_addr, amount: 100 })
+            .update_account(AccountState::new(victim_addr, 0))
+            .await;
+        let id = engine
+            .create_token(minter_addr, token_meta(), 1_000)
+            .await
+            .unwrap();
+        engine
+            .token_execute(
+                &id,
+                minter_addr,
+                TokenOp::Transfer {
+                    to: victim_addr,
+                    amount: 100,
+                },
+            )
             .await
             .unwrap();
         id
     });
 
-    let payload = vec![OpCode::SysCallTokenTransfer { token_id, to: thief, amount: 100 }];
+    let payload = vec![OpCode::SysCallTokenTransfer {
+        token_id,
+        to: thief,
+        amount: 100,
+    }];
     let tx = Transaction::sign_with_payload(&victim, [9u8; 32], 0, 10_000, 0, 1, 1, payload);
 
     let (applied, failed) = rt.block_on(engine.apply_block_parallel(&[tx], 0));
     assert_eq!(applied, 0, "unfunded tx must not be applied");
     assert_eq!(failed, 1);
-    assert_eq!(rt.block_on(engine.token_balance(&token_id, &victim_addr)), 100, "victim tokens untouched");
-    assert_eq!(rt.block_on(engine.token_balance(&token_id, &thief)), 0, "no tokens reach the thief");
+    assert_eq!(
+        rt.block_on(engine.token_balance(&token_id, &victim_addr)),
+        100,
+        "victim tokens untouched"
+    );
+    assert_eq!(
+        rt.block_on(engine.token_balance(&token_id, &thief)),
+        0,
+        "no tokens reach the thief"
+    );
 }
 
 #[test]
@@ -210,16 +278,32 @@ fn admitted_tx_payload_is_executed() {
     let dest = [0x55u8; 32];
 
     let token_id = rt.block_on(async {
-        engine.update_account(AccountState::new(sender_addr, 1_000_000)).await;
-        let id = engine.create_token(minter_addr, token_meta(), 1_000).await.unwrap();
         engine
-            .token_execute(&id, minter_addr, TokenOp::Transfer { to: sender_addr, amount: 100 })
+            .update_account(AccountState::new(sender_addr, 1_000_000))
+            .await;
+        let id = engine
+            .create_token(minter_addr, token_meta(), 1_000)
+            .await
+            .unwrap();
+        engine
+            .token_execute(
+                &id,
+                minter_addr,
+                TokenOp::Transfer {
+                    to: sender_addr,
+                    amount: 100,
+                },
+            )
             .await
             .unwrap();
         id
     });
 
-    let payload = vec![OpCode::SysCallTokenTransfer { token_id, to: dest, amount: 100 }];
+    let payload = vec![OpCode::SysCallTokenTransfer {
+        token_id,
+        to: dest,
+        amount: 100,
+    }];
     // The gas limit must cover the token operation: the token table is priced
     // at the native floor (audit W6.6, item 4), so a token transfer costs
     // 280_000 gas like a native transfer.
@@ -228,7 +312,10 @@ fn admitted_tx_payload_is_executed() {
     let (applied, failed) = rt.block_on(engine.apply_block_parallel(&[tx], 0));
     assert_eq!(applied, 1, "valid tx must be applied");
     assert_eq!(failed, 0);
-    assert_eq!(rt.block_on(engine.token_balance(&token_id, &sender_addr)), 0);
+    assert_eq!(
+        rt.block_on(engine.token_balance(&token_id, &sender_addr)),
+        0
+    );
     assert_eq!(rt.block_on(engine.token_balance(&token_id, &dest)), 100);
 }
 

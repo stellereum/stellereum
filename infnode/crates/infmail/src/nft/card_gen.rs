@@ -81,13 +81,37 @@ fn hsla(h: f64, s: f64, l: f64, a: f64) -> String {
 
 /// 5 layouts — порт RANDOM_LAYOUTS из designs.ts:261-304.
 #[allow(clippy::type_complexity)] // GATE: layout table type is local to the designer
-fn layouts() -> Vec<(Vec<(ShapeKind, f64, f64, f64, f64, f64, bool, f64, f64)>, (f64, f64, f64, f64), bool)> {
+fn layouts() -> Vec<(
+    Vec<(ShapeKind, f64, f64, f64, f64, f64, bool, f64, f64)>,
+    (f64, f64, f64, f64),
+    bool,
+)> {
     vec![
         // coral-like
         (
             vec![
-                (ShapeKind::Circle, 0.14, 0.86, 260.0, 0.0, 0.0, false, 0.32, 6.0),
-                (ShapeKind::Circle, 0.92, 0.10, 200.0, 0.0, 0.0, true, 0.30, 8.0),
+                (
+                    ShapeKind::Circle,
+                    0.14,
+                    0.86,
+                    260.0,
+                    0.0,
+                    0.0,
+                    false,
+                    0.32,
+                    6.0,
+                ),
+                (
+                    ShapeKind::Circle,
+                    0.92,
+                    0.10,
+                    200.0,
+                    0.0,
+                    0.0,
+                    true,
+                    0.30,
+                    8.0,
+                ),
             ],
             (0.0, 0.0, 0.0, 1.0),
             false,
@@ -95,8 +119,28 @@ fn layouts() -> Vec<(Vec<(ShapeKind, f64, f64, f64, f64, f64, bool, f64, f64)>, 
         // citrus-like
         (
             vec![
-                (ShapeKind::Circle, 0.16, 0.18, 300.0, 0.0, 0.0, true, 0.28, 10.0),
-                (ShapeKind::Circle, 0.90, 0.92, 170.0, 0.0, 0.0, false, 0.30, 6.0),
+                (
+                    ShapeKind::Circle,
+                    0.16,
+                    0.18,
+                    300.0,
+                    0.0,
+                    0.0,
+                    true,
+                    0.28,
+                    10.0,
+                ),
+                (
+                    ShapeKind::Circle,
+                    0.90,
+                    0.92,
+                    170.0,
+                    0.0,
+                    0.0,
+                    false,
+                    0.30,
+                    6.0,
+                ),
             ],
             (0.0, 0.0, 1.0, 1.0),
             true,
@@ -104,8 +148,28 @@ fn layouts() -> Vec<(Vec<(ShapeKind, f64, f64, f64, f64, f64, bool, f64, f64)>, 
         // grape-like
         (
             vec![
-                (ShapeKind::Arc, 0.50, 1.05, 480.0, std::f64::consts::PI, 0.0, false, 0.22, 0.0),
-                (ShapeKind::Circle, 0.22, 0.28, 140.0, 0.0, 0.0, true, 0.18, 8.0),
+                (
+                    ShapeKind::Arc,
+                    0.50,
+                    1.05,
+                    480.0,
+                    std::f64::consts::PI,
+                    0.0,
+                    false,
+                    0.22,
+                    0.0,
+                ),
+                (
+                    ShapeKind::Circle,
+                    0.22,
+                    0.28,
+                    140.0,
+                    0.0,
+                    0.0,
+                    true,
+                    0.18,
+                    8.0,
+                ),
             ],
             (0.0, 0.0, 1.0, 0.2),
             false,
@@ -113,8 +177,28 @@ fn layouts() -> Vec<(Vec<(ShapeKind, f64, f64, f64, f64, f64, bool, f64, f64)>, 
         // ocean-like
         (
             vec![
-                (ShapeKind::Arc, 0.50, -0.05, 460.0, 0.0, std::f64::consts::PI, true, 0.16, 0.0),
-                (ShapeKind::Circle, 0.85, 0.80, 130.0, 0.0, 0.0, false, 0.32, 6.0),
+                (
+                    ShapeKind::Arc,
+                    0.50,
+                    -0.05,
+                    460.0,
+                    0.0,
+                    std::f64::consts::PI,
+                    true,
+                    0.16,
+                    0.0,
+                ),
+                (
+                    ShapeKind::Circle,
+                    0.85,
+                    0.80,
+                    130.0,
+                    0.0,
+                    0.0,
+                    false,
+                    0.32,
+                    6.0,
+                ),
             ],
             (0.0, 1.0, 1.0, 0.0),
             true,
@@ -122,8 +206,28 @@ fn layouts() -> Vec<(Vec<(ShapeKind, f64, f64, f64, f64, f64, bool, f64, f64)>, 
         // blush-like
         (
             vec![
-                (ShapeKind::Circle, 0.78, 0.22, 260.0, 0.0, 0.0, true, 0.30, 8.0),
-                (ShapeKind::Circle, 0.20, 0.90, 200.0, 0.0, 0.0, false, 0.28, 5.0),
+                (
+                    ShapeKind::Circle,
+                    0.78,
+                    0.22,
+                    260.0,
+                    0.0,
+                    0.0,
+                    true,
+                    0.30,
+                    8.0,
+                ),
+                (
+                    ShapeKind::Circle,
+                    0.20,
+                    0.90,
+                    200.0,
+                    0.0,
+                    0.0,
+                    false,
+                    0.28,
+                    5.0,
+                ),
             ],
             (0.0, 0.0, 0.3, 1.0),
             false,

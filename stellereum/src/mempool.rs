@@ -63,7 +63,8 @@ impl PendingActivationBuffer {
     /// misleading verdict that hid a global DoS behind a per-sender error
     /// (audit: activation buffer exhaustion).
     pub fn buffer_tx(&mut self, tx: Transaction, min_fee: u64) -> Result<TxHash, MempoolError> {
-        self.buffer_tx_with_timestamp(tx, min_fee, crate::zkml::now_secs()).map(|(h, _)| h)
+        self.buffer_tx_with_timestamp(tx, min_fee, crate::zkml::now_secs())
+            .map(|(h, _)| h)
     }
 
     /// Buffer an out-of-order transaction with an explicit wall-clock timestamp.
@@ -160,7 +161,11 @@ impl PendingActivationBuffer {
     }
 
     /// Drain transactions for an account that form a contiguous sequence starting from `start_nonce`.
-    pub fn drain_contiguous(&mut self, account: &[u8; 32], mut start_nonce: u64) -> Vec<Transaction> {
+    pub fn drain_contiguous(
+        &mut self,
+        account: &[u8; 32],
+        mut start_nonce: u64,
+    ) -> Vec<Transaction> {
         let mut ready = Vec::new();
         if let Some(map) = self.buffered.get_mut(account) {
             while let Some(tx) = map.remove(&start_nonce) {
@@ -181,7 +186,10 @@ impl PendingActivationBuffer {
     pub fn remove_by_hash(&mut self, hash: &TxHash) -> Option<Transaction> {
         self.inserted_at.remove(hash);
         let (sender, nonce) = self.by_hash.remove(hash)?;
-        let tx = self.buffered.get_mut(&sender).and_then(|m| m.remove(&nonce));
+        let tx = self
+            .buffered
+            .get_mut(&sender)
+            .and_then(|m| m.remove(&nonce));
         if self.buffered.get(&sender).is_some_and(|m| m.is_empty()) {
             self.buffered.remove(&sender);
         }
@@ -263,7 +271,12 @@ pub struct AdmissionCtx {
 
 impl AdmissionCtx {
     pub fn new(now: u64) -> Self {
-        Self { now, onchain_nonce: None, shard: None, sponsor_balance: None }
+        Self {
+            now,
+            onchain_nonce: None,
+            shard: None,
+            sponsor_balance: None,
+        }
     }
 
     /// Admission against the local wall clock. Used by the live admission
@@ -319,7 +332,10 @@ pub enum MempoolError {
     /// empty heights behind them, because nothing rejected them at admission
     /// and nothing evicted them later). Fail fast with a clear reason instead
     /// of clogging the pool: the sender must fill the gap first.
-    NonceGap { expected: u64, got: u64 },
+    NonceGap {
+        expected: u64,
+        got: u64,
+    },
     /// The session-key delegation is past `valid_until` at admission time.
     SessionExpired,
     /// The session-key delegation cannot authorize this spend: its remaining
@@ -369,11 +385,17 @@ pub enum MempoolError {
     /// no honest packing can ever include it, so admitting it would only let it
     /// occupy pool space (and fee-evict honest transactions) forever. Fail
     /// closed at admission.
-    TxTooLarge { wire_bytes: usize, cap: usize },
+    TxTooLarge {
+        wire_bytes: usize,
+        cap: usize,
+    },
     /// The transaction alone exceeds the block proof-unit cap
     /// (`MAX_BLOCK_PROOF_UNITS`): packing skips it at every height, so it could
     /// never execute. Fail closed at admission.
-    TxTooManyProofs { proof_units: usize, cap: usize },
+    TxTooManyProofs {
+        proof_units: usize,
+        cap: usize,
+    },
 }
 
 impl std::fmt::Display for MempoolError {
@@ -409,16 +431,12 @@ impl std::fmt::Display for MempoolError {
             }
             MempoolError::SponsorBadGrant => "invalid sponsor grant",
             MempoolError::SponsorBadSignature => "invalid sponsor signature",
-            MempoolError::SponsorInsufficientBalance => {
-                "sponsor cannot pay the transaction fee"
-            }
+            MempoolError::SponsorInsufficientBalance => "sponsor cannot pay the transaction fee",
             MempoolError::Malformed(reason) => return write!(f, "malformed transaction: {reason}"),
-            MempoolError::TxTooLarge { wire_bytes, cap } => {
-                return write!(
-                    f,
-                    "transaction too large: estimated {wire_bytes} wire bytes exceeds block cap {cap}"
-                )
-            }
+            MempoolError::TxTooLarge { wire_bytes, cap } => return write!(
+                f,
+                "transaction too large: estimated {wire_bytes} wire bytes exceeds block cap {cap}"
+            ),
             MempoolError::TxTooManyProofs { proof_units, cap } => {
                 return write!(
                     f,
@@ -717,7 +735,8 @@ impl Mempool {
     /// sender is carrying (D2). The proposer filter snapshots this per sender
     /// so pooled retries of a failing sender are skipped until they over-post.
     pub fn effective_floor(&self, sender: &[u8; 32]) -> u64 {
-        self.base_fee.saturating_add(self.failed_penalty.get(sender).copied().unwrap_or(0))
+        self.base_fee
+            .saturating_add(self.failed_penalty.get(sender).copied().unwrap_or(0))
     }
 
     /// Full admission cost of one transaction: `amount + gas_limit`, plus the
@@ -731,11 +750,13 @@ impl Mempool {
     /// covers the fee. `tx_cost` is kept for the legacy path and as the
     /// arithmetic both legs add up from.
     pub fn tx_cost(tx: &Transaction) -> u64 {
-        tx.amount.saturating_add(tx.gas_limit).saturating_add(if tx.is_pq_activation() {
-            PQ_ACTIVATION_SURCHARGE_GAS
-        } else {
-            0
-        })
+        tx.amount
+            .saturating_add(tx.gas_limit)
+            .saturating_add(if tx.is_pq_activation() {
+                PQ_ACTIVATION_SURCHARGE_GAS
+            } else {
+                0
+            })
     }
 
     /// PAYMASTER: the fee execution will actually charge for `tx` —
@@ -1001,9 +1022,11 @@ impl Mempool {
         if self.reserved_for(&tx.from).saturating_add(cost) > sender_balance {
             return Err(MempoolError::InsufficientBalance);
         }
-        let (hash, old_tx) = self
-            .activation_buffer
-            .buffer_tx_with_timestamp(tx.clone(), floor, crate::zkml::now_secs())?;
+        let (hash, old_tx) = self.activation_buffer.buffer_tx_with_timestamp(
+            tx.clone(),
+            floor,
+            crate::zkml::now_secs(),
+        )?;
         if let Some(ref old) = old_tx {
             // The replaced transaction leaves the buffer: its claim ends here.
             self.release_reservation(old);
@@ -1127,7 +1150,8 @@ impl Mempool {
     /// re-verified against the plaintext after the unseal, so a lying
     /// metadata field can buy priority only at the cost of being dropped.
     pub fn sealed_candidates(&self) -> Vec<crate::mev_epoch::SealedEnvelope> {
-        let mut out: Vec<crate::mev_epoch::SealedEnvelope> = self.sealed.values().cloned().collect();
+        let mut out: Vec<crate::mev_epoch::SealedEnvelope> =
+            self.sealed.values().cloned().collect();
         out.sort_by(|a, b| {
             b.meta
                 .priority_fee_per_gas
@@ -1392,31 +1416,27 @@ impl Mempool {
             base_fee: u64,
         }
 
-        let saved: Mempool =
-            if let Ok(s) = bincode::deserialize::<Mempool>(body) {
-                s
-            } else if let Ok(old) = bincode::deserialize::<Mp02Mempool>(body) {
-                let mut m = Mempool::new(old.max_size, old.per_sender_limit)
-                    .with_base_fee(old.base_fee);
-                m.txs = old.txs.into_iter().map(|(h, t)| (h, t.into())).collect();
-                m.per_sender = old.per_sender;
-                m.inserted_at = old.inserted_at;
-                m
-            } else if let Ok(legacy) = bincode::deserialize::<LegacyMempool>(body) {
-                let mut m = Mempool::new(
-                    legacy.max_size,
-                    legacy.per_sender_limit,
-                )
+        let saved: Mempool = if let Ok(s) = bincode::deserialize::<Mempool>(body) {
+            s
+        } else if let Ok(old) = bincode::deserialize::<Mp02Mempool>(body) {
+            let mut m =
+                Mempool::new(old.max_size, old.per_sender_limit).with_base_fee(old.base_fee);
+            m.txs = old.txs.into_iter().map(|(h, t)| (h, t.into())).collect();
+            m.per_sender = old.per_sender;
+            m.inserted_at = old.inserted_at;
+            m
+        } else if let Ok(legacy) = bincode::deserialize::<LegacyMempool>(body) {
+            let mut m = Mempool::new(legacy.max_size, legacy.per_sender_limit)
                 .with_base_fee(legacy.base_fee);
-                m.txs = legacy.txs.into_iter().map(|(h, t)| (h, t.into())).collect();
-                m.per_sender = legacy.per_sender;
-                // `order` is rebuilt by the re-admission loop below (with the
-                // CURRENT `(priority, fee, hash)` key), so the legacy index is
-                // deliberately not carried over.
-                m
-            } else {
-                return 0;
-            };
+            m.txs = legacy.txs.into_iter().map(|(h, t)| (h, t.into())).collect();
+            m.per_sender = legacy.per_sender;
+            // `order` is rebuilt by the re-admission loop below (with the
+            // CURRENT `(priority, fee, hash)` key), so the legacy index is
+            // deliberately not carried over.
+            m
+        } else {
+            return 0;
+        };
         let mut kept = 0usize;
         let mut order: Vec<_> = saved.txs.values().cloned().collect();
         // Oldest-nonce-first per sender so a contiguous sequence re-admits in
@@ -1464,7 +1484,9 @@ impl Mempool {
     }
 
     pub fn get(&self, hash: &TxHash) -> Option<&Transaction> {
-        self.txs.get(hash).or_else(|| self.activation_buffer.get_by_hash(hash))
+        self.txs
+            .get(hash)
+            .or_else(|| self.activation_buffer.get_by_hash(hash))
     }
 
     /// Add a transaction. Validates the signature, rejects duplicates, enforces
@@ -1619,7 +1641,8 @@ impl Mempool {
                 // gap, so an aged future nonce is pool pollution, not a
                 // pending payment.
                 let head = heads.get(&tx.from).copied().unwrap_or(nonce);
-                let aged_future = tx.nonce > head && self.tx_age_secs(now_secs, tx) >= Self::FUTURE_NONCE_TTL_SECS;
+                let aged_future = tx.nonce > head
+                    && self.tx_age_secs(now_secs, tx) >= Self::FUTURE_NONCE_TTL_SECS;
                 if stale_nonce || unaffordable || aged_future {
                     Some(tx.compute_tx_hash())
                 } else {
@@ -1663,7 +1686,8 @@ impl Mempool {
             };
             if !env.scheme.is_post_quantum() {
                 return Err(MempoolError::Malformed(
-                    "Pure PQ mode: scheme must be post-quantum (Falcon-512, ML-DSA-44, or Hybrid)".to_string(),
+                    "Pure PQ mode: scheme must be post-quantum (Falcon-512, ML-DSA-44, or Hybrid)"
+                        .to_string(),
                 ));
             }
         }
@@ -1793,18 +1817,14 @@ impl Mempool {
             let fee = self.sponsor_fee_cost(&tx);
             if let Err(e) = tx.check_sponsor_policy(ctx.now, fee) {
                 return Err(match e {
-                    crate::sharding::SponsorPolicyError::Expired => {
-                        MempoolError::SponsorExpired
-                    }
+                    crate::sharding::SponsorPolicyError::Expired => MempoolError::SponsorExpired,
                     crate::sharding::SponsorPolicyError::OutOfScope => {
                         MempoolError::SponsorOutOfScope
                     }
                     crate::sharding::SponsorPolicyError::CapExceeded => {
                         MempoolError::SponsorCapExceeded
                     }
-                    crate::sharding::SponsorPolicyError::BadGrant => {
-                        MempoolError::SponsorBadGrant
-                    }
+                    crate::sharding::SponsorPolicyError::BadGrant => MempoolError::SponsorBadGrant,
                 });
             }
             Some(fee)
@@ -1853,11 +1873,15 @@ impl Mempool {
                 // refuse rather than hand out free buffer slots.
                 return Err(MempoolError::InsufficientBalance);
             }
-            if sender_balance < cost || self.reserved_for(&tx.from).saturating_add(cost) > sender_balance {
+            if sender_balance < cost
+                || self.reserved_for(&tx.from).saturating_add(cost) > sender_balance
+            {
                 return Err(MempoolError::InsufficientBalance);
             }
             let floor = self.required_fee_for_tx(&tx);
-            let (hash, old_tx) = self.activation_buffer.buffer_tx_with_timestamp(tx.clone(), floor, ctx.now)?;
+            let (hash, old_tx) =
+                self.activation_buffer
+                    .buffer_tx_with_timestamp(tx.clone(), floor, ctx.now)?;
             if let Some(ref old) = old_tx {
                 // The replaced transaction leaves the buffer: its claim ends here.
                 self.release_reservation(old);
@@ -1997,8 +2021,9 @@ impl Mempool {
             *self.reserved.entry(sponsor).or_insert(0) =
                 self.reserved_for(&sponsor).saturating_add(sponsor_cost);
         } else {
-            *self.reserved.entry(sender).or_insert(0) =
-                self.reserved_for(&sender).saturating_add(Self::tx_cost(&tx));
+            *self.reserved.entry(sender).or_insert(0) = self
+                .reserved_for(&sender)
+                .saturating_add(Self::tx_cost(&tx));
         }
         self.inserted_at.insert(hash, ctx.now);
         self.txs.insert(hash, tx);
@@ -2079,7 +2104,10 @@ impl Mempool {
             }
         }
         if nonce > want.saturating_add(Self::NONCE_FUTURE_WINDOW) {
-            Some(MempoolError::NonceGap { expected: want, got: nonce })
+            Some(MempoolError::NonceGap {
+                expected: want,
+                got: nonce,
+            })
         } else {
             None
         }
@@ -2124,7 +2152,12 @@ impl Mempool {
             .txs
             .values()
             .filter_map(|tx| {
-                let age = now_secs.saturating_sub(*self.inserted_at.get(&tx.compute_tx_hash()).unwrap_or(&now_secs));
+                let age = now_secs.saturating_sub(
+                    *self
+                        .inserted_at
+                        .get(&tx.compute_tx_hash())
+                        .unwrap_or(&now_secs),
+                );
                 if age < Self::STUCK_TX_TTL_SECS {
                     return None;
                 }
@@ -2160,7 +2193,9 @@ impl Mempool {
         for h in &doomed {
             self.evict(h);
         }
-        let expired_activation = self.activation_buffer.drain_stale(now_secs, Self::STUCK_TX_TTL_SECS);
+        let expired_activation = self
+            .activation_buffer
+            .drain_stale(now_secs, Self::STUCK_TX_TTL_SECS);
         for tx in &expired_activation {
             // A swept buffered transaction leaves the buffer: its claim ends
             // with it (audit W6.6: the sweep must release the reservation).
@@ -2177,11 +2212,8 @@ impl Mempool {
         self.mev.drop_envelope(hash);
         self.inserted_at.remove(hash);
         if let Some(tx) = self.txs.remove(hash) {
-            self.order.remove(&(
-                tx.priority_fee_per_gas,
-                Self::effective_fee(&tx),
-                *hash,
-            ));
+            self.order
+                .remove(&(tx.priority_fee_per_gas, Self::effective_fee(&tx), *hash));
             if let Some(c) = self.per_sender.get_mut(&tx.from) {
                 *c = c.saturating_sub(1);
                 if *c == 0 {
@@ -2262,7 +2294,11 @@ impl Mempool {
     /// Select up to `max_txs` highest-fee transactions that pass `accept`.
     /// Used by the block producer to skip txs with stale/future nonces, so a
     /// flood of invalid-nonce txs cannot waste block space.
-    pub fn select_filtered<F: Fn(&Transaction) -> bool>(&self, max_txs: usize, accept: F) -> Vec<Transaction> {
+    pub fn select_filtered<F: Fn(&Transaction) -> bool>(
+        &self,
+        max_txs: usize,
+        accept: F,
+    ) -> Vec<Transaction> {
         let mut out = Vec::with_capacity(max_txs);
         for (_, h) in self.order.iter().rev() {
             if out.len() >= max_txs {
@@ -2399,17 +2435,20 @@ impl Mempool {
     pub fn estimate_tx_wire_bytes(tx: &Transaction) -> usize {
         use crate::svm::OpCode;
         let mut n = 256usize; // envelope: sigs, hashes, nonces, shards
-        // Phase-2 EVM settlement carries the canonical raw (up to 128 KiB) in
-        // `signature`: account it honestly so packing still respects the block
-        // gossip cap (the base 256 above only covers ~64-byte signatures).
+                              // Phase-2 EVM settlement carries the canonical raw (up to 128 KiB) in
+                              // `signature`: account it honestly so packing still respects the block
+                              // gossip cap (the base 256 above only covers ~64-byte signatures).
         n += tx.signature.len();
         for op in &tx.payload {
             n += match op {
-                OpCode::SysCallConfidentialTransfer2 { input_ranges, output_ranges, .. } => {
-                    200 + (input_ranges.len() + output_ranges.len()) * 10_250
-                }
+                OpCode::SysCallConfidentialTransfer2 {
+                    input_ranges,
+                    output_ranges,
+                    ..
+                } => 200 + (input_ranges.len() + output_ranges.len()) * 10_250,
                 OpCode::SysCallConfidentialTransfer { transfer, .. } => {
-                    200 + (transfer.input_commitments.len() + transfer.output_commitments.len()) * 32
+                    200 + (transfer.input_commitments.len() + transfer.output_commitments.len())
+                        * 32
                 }
                 OpCode::SysCallConfidentialShield { .. } => 150,
                 OpCode::SysCallConfidentialUnshield { inputs } => 100 + inputs.len() * 96,
@@ -2422,16 +2461,12 @@ impl Mempool {
                 // default would under-count it by more than an order of
                 // magnitude and let a producer pack a block past the gossip
                 // cap.
-                OpCode::SysCallReportPqEquivocation { evidence } => {
-                    200 + evidence.wire_len()
-                }
+                OpCode::SysCallReportPqEquivocation { evidence } => 200 + evidence.wire_len(),
                 // A proposal equivocation report carries TWO FULL BLOCKS, so
                 // the flat default would under-count it by up to four orders
                 // of magnitude. Count it honestly for the same reason: the
                 // estimator is what keeps packing under the gossip cap.
-                OpCode::SysCallReportProposalEquivocation { evidence } => {
-                    200 + evidence.wire_len()
-                }
+                OpCode::SysCallReportProposalEquivocation { evidence } => 200 + evidence.wire_len(),
                 _ => 200,
             };
         }
@@ -2446,11 +2481,13 @@ impl Mempool {
         tx.payload
             .iter()
             .map(|op| match op {
-                OpCode::SysCallConfidentialTransfer2 { input_ranges, output_ranges, .. } => {
-                    input_ranges.len() + output_ranges.len()
-                }
+                OpCode::SysCallConfidentialTransfer2 {
+                    input_ranges,
+                    output_ranges,
+                    ..
+                } => input_ranges.len() + output_ranges.len(),
                 OpCode::SysCallVerifyZkMlAttestation { .. } => 64, // ~one 64-bit proof of work
-                OpCode::SysCallVerifyZkMlReexec { .. } => 16,   // re-execution, model-bounded
+                OpCode::SysCallVerifyZkMlReexec { .. } => 16,      // re-execution, model-bounded
                 _ => 0,
             })
             .sum()
@@ -2498,7 +2535,12 @@ impl Mempool {
     /// Drop txs already present in a finalized block (by hash).
     pub fn prune_confirmed(&mut self, confirmed: &[TxHash]) {
         let set: HashSet<TxHash> = confirmed.iter().copied().collect();
-        let to_remove: Vec<TxHash> = self.txs.keys().filter(|h| set.contains(*h)).copied().collect();
+        let to_remove: Vec<TxHash> = self
+            .txs
+            .keys()
+            .filter(|h| set.contains(*h))
+            .copied()
+            .collect();
         for h in to_remove {
             self.evict(&h);
         }
@@ -2552,8 +2594,11 @@ mod tests {
         let me = sk.verifying_key().to_bytes();
         let mut mp = Mempool::new(100, 100);
         for i in 0..10u64 {
-            mp.add_checked(Transaction::sign(&sk, [1u8; 32], 10, 1_000, i, 1, 1), 1_000_000)
-                .unwrap();
+            mp.add_checked(
+                Transaction::sign(&sk, [1u8; 32], 10, 1_000, i, 1, 1),
+                1_000_000,
+            )
+            .unwrap();
         }
         let expected = std::cell::Cell::new(0u64);
         let out = mp.select_for_block_multi(100, u64::MAX, |t| {
@@ -2580,8 +2625,11 @@ mod tests {
         let me = sk.verifying_key().to_bytes();
         let mut mp = Mempool::new(300, 300);
         for i in 0..50u64 {
-            mp.add_checked(Transaction::sign(&sk, [1u8; 32], 10, 1_000, i, 1, 1), 1_000_000)
-                .unwrap();
+            mp.add_checked(
+                Transaction::sign(&sk, [1u8; 32], 10, 1_000, i, 1, 1),
+                1_000_000,
+            )
+            .unwrap();
         }
         let expected = std::cell::Cell::new(0u64);
         let out = mp.select_for_block_multi(300, u64::MAX, |t| {
@@ -2618,12 +2666,13 @@ mod tests {
 
         // Now the account is at nonce 1 (so nonce 0 is consumed) and can only
         // afford 5_000 (so the 9_000 one is dead); the nonce-3 one must survive.
-        let dropped = mp.evict_unexecutable(|s| {
-            if *s == me { Some((1, 5_000)) } else { None }
-        });
+        let dropped = mp.evict_unexecutable(|s| if *s == me { Some((1, 5_000)) } else { None });
         assert_eq!(dropped, 2, "stale nonce and unaffordable tx must go");
         assert_eq!(mp.len(), 1);
-        assert!(mp.contains(&queued_hash), "a future, affordable tx must survive");
+        assert!(
+            mp.contains(&queued_hash),
+            "a future, affordable tx must survive"
+        );
         // Evicting must not leak the per-sender quota.
         assert_eq!(mp.per_sender.get(&me).copied().unwrap_or(0), 1);
     }
@@ -2650,10 +2699,16 @@ mod tests {
         let me = sk.verifying_key().to_bytes();
         let mut mp = Mempool::new(100, 10);
         for n in 0..3u64 {
-            mp.add_checked(Transaction::sign(&sk, [2u8; 32], 100, 1_000, n, 1, 1), 10_000)
-                .unwrap();
+            mp.add_checked(
+                Transaction::sign(&sk, [2u8; 32], 100, 1_000, n, 1, 1),
+                10_000,
+            )
+            .unwrap();
         }
-        assert_eq!(mp.evict_unexecutable(|s| if *s == me { Some((0, 10_000)) } else { None }), 0);
+        assert_eq!(
+            mp.evict_unexecutable(|s| if *s == me { Some((0, 10_000)) } else { None }),
+            0
+        );
         assert_eq!(mp.len(), 3, "nothing valid may be dropped");
     }
 
@@ -2737,13 +2792,19 @@ mod tests {
         let tx = Transaction::sign_with_priority(&sk, [1; 32], 10, 100, 0, 1, 1, 777);
         let bytes = bincode::serialize(&tx).expect("serialize");
         let back: Transaction = bincode::deserialize(&bytes).expect("deserialize");
-        assert_eq!(back.priority_fee_per_gas, 777, "the bid must survive the wire");
+        assert_eq!(
+            back.priority_fee_per_gas, 777,
+            "the bid must survive the wire"
+        );
         assert_eq!(
             back.compute_tx_hash(),
             tx.compute_tx_hash(),
             "the decoded transaction must keep its identity"
         );
-        assert!(back.verify_signature(), "the decoded transaction must verify");
+        assert!(
+            back.verify_signature(),
+            "the decoded transaction must verify"
+        );
 
         // Only the bid differs -> a different hash.
         let other = Transaction::sign_with_priority(&sk, [1; 32], 10, 100, 0, 1, 1, 778);
@@ -2872,12 +2933,11 @@ mod tests {
         };
         let msg = tx.signing_message();
         let sig = Transaction::create_falcon512_test_signature(pk, &msg, seed);
-        tx.signature =
-            crate::post_quantum::PqSignatureEnvelope::new_implicit(
-                crate::post_quantum::PqScheme::Falcon512,
-                sig,
-            )
-            .encode();
+        tx.signature = crate::post_quantum::PqSignatureEnvelope::new_implicit(
+            crate::post_quantum::PqScheme::Falcon512,
+            sig,
+        )
+        .encode();
         tx
     }
 
@@ -2986,7 +3046,10 @@ mod tests {
         for n in 0..3 {
             mp.add(tx(&sk, [1; 32], 10, n)).unwrap();
         }
-        assert_eq!(mp.add(tx(&sk, [1; 32], 10, 3)), Err(MempoolError::TooManyFromSender));
+        assert_eq!(
+            mp.add(tx(&sk, [1; 32], 10, 3)),
+            Err(MempoolError::TooManyFromSender)
+        );
     }
 
     #[test]
@@ -3004,7 +3067,10 @@ mod tests {
         assert_eq!(mp.len(), 2);
         assert!(!mp.contains(&low_hash), "lowest-fee tx must be evicted");
         // a lower-fee tx is rejected when full
-        assert_eq!(mp.add_checked(tx(&sk, [1; 32], 1, 3), bal), Err(MempoolError::Full));
+        assert_eq!(
+            mp.add_checked(tx(&sk, [1; 32], 1, 3), bal),
+            Err(MempoolError::Full)
+        );
     }
 
     #[test]
@@ -3053,7 +3119,10 @@ mod tests {
         mp.add(tx(&sk, [1; 32], 5, 0)).unwrap();
         mp.add(tx(&sk, [1; 32], 10, 1)).unwrap();
         // unchecked `add` cannot evict even with a huge declared fee
-        assert_eq!(mp.add(tx(&sk, [1; 32], u64::MAX, 2)), Err(MempoolError::Full));
+        assert_eq!(
+            mp.add(tx(&sk, [1; 32], u64::MAX, 2)),
+            Err(MempoolError::Full)
+        );
         // add_checked rejects a sender that cannot pay amount + gas_limit
         assert_eq!(
             mp.add_checked(tx(&sk, [1; 32], 10, 1), 0),
@@ -3070,7 +3139,10 @@ mod tests {
         // free while the checked path and the proposer filter refused it.
         assert_eq!(mp.add(tx(&sk, [1; 32], 1, 0)), Err(MempoolError::FeeTooLow));
         // The checked/network path enforces it.
-        assert_eq!(mp.add_checked(tx(&sk, [1; 32], 5, 1), 1_000), Err(MempoolError::FeeTooLow));
+        assert_eq!(
+            mp.add_checked(tx(&sk, [1; 32], 5, 1), 1_000),
+            Err(MempoolError::FeeTooLow)
+        );
         assert!(mp.add_checked(tx(&sk, [1; 32], 10, 1), 1_000).is_ok());
     }
 
@@ -3107,7 +3179,10 @@ mod tests {
         let mut mp = Mempool::new(10, 2);
         let h = mp.add(tx(&sk, [1; 32], 10, 0)).unwrap();
         mp.add(tx(&sk, [1; 32], 10, 1)).unwrap();
-        assert_eq!(mp.add(tx(&sk, [1; 32], 10, 2)), Err(MempoolError::TooManyFromSender));
+        assert_eq!(
+            mp.add(tx(&sk, [1; 32], 10, 2)),
+            Err(MempoolError::TooManyFromSender)
+        );
         mp.remove(&h);
         // after freeing a slot the sender can add again
         assert!(mp.add(tx(&sk, [1; 32], 10, 2)).is_ok());
@@ -3190,7 +3265,10 @@ mod tests {
         };
         let new_bytes = bincode::serialize(&mp).unwrap();
         let legacy_bytes = bincode::serialize(&legacy).unwrap();
-        assert_ne!(new_bytes, legacy_bytes, "inserted_at must change the encoding");
+        assert_ne!(
+            new_bytes, legacy_bytes,
+            "inserted_at must change the encoding"
+        );
 
         // New bytes (bare, no magic) decode into the new struct directly...
         let back: Mempool = bincode::deserialize(&new_bytes).unwrap();
@@ -3203,7 +3281,10 @@ mod tests {
         // (skipped fields), then re-seals on the next admission.
         let mut back: Mempool = bincode::deserialize(&new_bytes).unwrap();
         assert_eq!(back.len(), 2);
-        assert!(back.mev.pool_envelopes.is_empty(), "skipped field decodes as default");
+        assert!(
+            back.mev.pool_envelopes.is_empty(),
+            "skipped field decodes as default"
+        );
         let t = tx(&sk, [1; 32], 30, 2);
         back.add(t.clone()).unwrap();
         assert_eq!(back.mev.verify_pool_tx(&t), crate::mev::SealVerdict::Match);
@@ -3216,17 +3297,26 @@ mod tests {
         let h = mp.add(tx(&sk, [1; 32], 10, 0)).unwrap();
         assert!(mp.mev.pool_envelopes.contains_key(&h), "admission seals");
         mp.remove(&h);
-        assert!(!mp.mev.pool_envelopes.contains_key(&h), "removal drops the envelope");
+        assert!(
+            !mp.mev.pool_envelopes.contains_key(&h),
+            "removal drops the envelope"
+        );
 
         let h2 = mp.add(tx(&sk, [1; 32], 10, 5)).unwrap();
         assert!(mp.mev.pool_envelopes.contains_key(&h2));
         mp.prune_confirmed(&[h2]);
-        assert!(mp.mev.pool_envelopes.is_empty(), "pruning drops envelopes too");
+        assert!(
+            mp.mev.pool_envelopes.is_empty(),
+            "pruning drops envelopes too"
+        );
 
         let h3 = mp.add(tx(&sk, [1; 32], 10, 6)).unwrap();
         assert!(mp.mev.pool_envelopes.contains_key(&h3));
         mp.evict_unexecutable(|_| Some((u64::MAX, 0))); // stale nonce for everything
-        assert!(mp.mev.pool_envelopes.is_empty(), "eviction drops envelopes too");
+        assert!(
+            mp.mev.pool_envelopes.is_empty(),
+            "eviction drops envelopes too"
+        );
     }
 
     #[test]
@@ -3281,7 +3371,9 @@ mod tests {
         assert_eq!(mp.sweep_expired(now, |_| Some((4, 1_000_000))), 0);
         assert_eq!(mp.len(), 3);
         assert_eq!(
-            mp.sweep_expired(now + Mempool::STUCK_TX_TTL_SECS + 1, |_| Some((4, 1_000_000))),
+            mp.sweep_expired(now + Mempool::STUCK_TX_TTL_SECS + 1, |_| Some((
+                4, 1_000_000
+            ))),
             1
         );
         assert_eq!(mp.len(), 2);
@@ -3330,16 +3422,13 @@ mod tests {
 
         // Aged past the future-nonce TTL: reclaimed.
         assert_eq!(
-            mp.evict_unexecutable_at(
-                now + Mempool::FUTURE_NONCE_TTL_SECS,
-                |s| {
-                    if *s == me {
-                        Some((0, 1_000_000))
-                    } else {
-                        None
-                    }
+            mp.evict_unexecutable_at(now + Mempool::FUTURE_NONCE_TTL_SECS, |s| {
+                if *s == me {
+                    Some((0, 1_000_000))
+                } else {
+                    None
                 }
-            ),
+            }),
             1,
             "an aged future nonce must be reclaimed"
         );
@@ -3372,7 +3461,10 @@ mod tests {
             }];
             Transaction::sign_with_payload(&sk, [1u8; 32], 0, 100_000_000, 0, 1, 1, ops)
         };
-        assert!(Mempool::estimate_tx_wire_bytes(&one) > 100_000, "fat tx estimates big");
+        assert!(
+            Mempool::estimate_tx_wire_bytes(&one) > 100_000,
+            "fat tx estimates big"
+        );
         assert_eq!(Mempool::count_tx_proof_units(&one), 16);
         let mut mp2 = Mempool::new(1000, 1000);
         for i in 0..150u64 {
@@ -3400,7 +3492,11 @@ mod tests {
         // 150 fat txs x ~164KB = ~24.6MB > 24MB cap: not all selected.
         // (Proof cap 150x16=2400 > 2048 would also bind first — wire wins here
         // only if proofs stay under it; either cap stopping is correct.)
-        assert!(sel.len() < 150, "a packing cap must stop packing: got {}", sel.len());
+        assert!(
+            sel.len() < 150,
+            "a packing cap must stop packing: got {}",
+            sel.len()
+        );
         assert!(!sel.is_empty(), "but small packing still works");
     }
 
@@ -3435,12 +3531,14 @@ mod tests {
         // Unbounded totals exceed both caps (so the test is meaningful).
         let one_wire = {
             let sk = key();
-            let t = Transaction::sign_with_payload(&sk, [1u8; 32], 0, 100_000_000, 0, 1, 1, fat_ops());
+            let t =
+                Transaction::sign_with_payload(&sk, [1u8; 32], 0, 100_000_000, 0, 1, 1, fat_ops());
             Mempool::estimate_tx_wire_bytes(&t)
         };
         let one_proofs = {
             let sk = key();
-            let t = Transaction::sign_with_payload(&sk, [1u8; 32], 0, 100_000_000, 0, 1, 1, fat_ops());
+            let t =
+                Transaction::sign_with_payload(&sk, [1u8; 32], 0, 100_000_000, 0, 1, 1, fat_ops());
             Mempool::count_tx_proof_units(&t)
         };
         assert_eq!(one_proofs, 96, "fixture must carry 96 proof units/tx");
@@ -3458,12 +3556,17 @@ mod tests {
             let mut seed = [0xCBu8; 32];
             seed[..8].copy_from_slice(&i.to_le_bytes());
             let k = SigningKey::from_bytes(&seed);
-            let t = Transaction::sign_with_payload(&k, [1u8; 32], 0, 100_000_000, 0, 1, 1, fat_ops());
+            let t =
+                Transaction::sign_with_payload(&k, [1u8; 32], 0, 100_000_000, 0, 1, 1, fat_ops());
             mp.add(t).expect("unchecked admission must succeed");
         }
         assert_eq!(mp.len(), 200);
         let sel = mp.select_for_block_multi(10_000, u64::MAX, |_| true);
-        assert!(sel.len() < 200, "a packing cap must bind under blast: got {}", sel.len());
+        assert!(
+            sel.len() < 200,
+            "a packing cap must bind under blast: got {}",
+            sel.len()
+        );
         assert!(!sel.is_empty(), "but small packing still works");
         let wire: usize = sel.iter().map(Mempool::estimate_tx_wire_bytes).sum();
         let proofs: usize = sel.iter().map(Mempool::count_tx_proof_units).sum();
@@ -3520,14 +3623,20 @@ mod tests {
         let h2 = mp
             .add_checked(tx2.clone(), BALANCE)
             .expect("Tx2 must be accepted into activation buffer");
-        assert!(mp.is_buffered(&h2), "Tx2 must be buffered pending activation");
+        assert!(
+            mp.is_buffered(&h2),
+            "Tx2 must be buffered pending activation"
+        );
         assert!(mp.contains(&h2), "contains() must find buffered Tx2");
         assert_eq!(mp.len(), 0, "No executable transactions in active pool yet");
         assert_eq!(mp.activation_buffer.count_for_account(&from), 1);
 
         // Proposer packing cannot select Tx2 yet
         let picked = mp.select_for_block(10, u64::MAX, |_| true);
-        assert!(picked.is_empty(), "Unactivated transaction cannot be picked for block");
+        assert!(
+            picked.is_empty(),
+            "Unactivated transaction cannot be picked for block"
+        );
 
         // Now Tx1 arrives: nonce 0, explicit PQ activation carrying raw public key + surcharge gas
         let mut tx1 = Transaction {
@@ -3544,12 +3653,16 @@ mod tests {
         };
         let msg1 = tx1.signing_message();
         let sig1 = Transaction::create_falcon512_test_signature(&pk, &msg1, seed);
-        tx1.signature = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig1).encode();
+        tx1.signature =
+            PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig1).encode();
 
         let h1 = mp
             .add_checked(tx1.clone(), BALANCE)
             .expect("Tx1 activation must succeed");
-        assert!(!mp.is_buffered(&h2), "Tx2 must no longer be in buffer after activation");
+        assert!(
+            !mp.is_buffered(&h2),
+            "Tx2 must no longer be in buffer after activation"
+        );
         assert_eq!(mp.activation_buffer.count_for_account(&from), 0);
         assert_eq!(mp.len(), 2, "Both Tx1 and Tx2 must now be in active pool");
         assert!(mp.contains(&h1));
@@ -3591,7 +3704,9 @@ mod tests {
         };
         let msg = tx_cheap.signing_message();
         let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
-        tx_cheap.signature = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig.clone()).encode();
+        tx_cheap.signature =
+            PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig.clone())
+                .encode();
 
         // Reject if gas_limit does not cover base_fee + PQ_ACTIVATION_SURCHARGE_GAS
         assert_eq!(
@@ -3615,8 +3730,12 @@ mod tests {
         };
         let msg_ok = tx_ok.signing_message();
         let sig_ok = Transaction::create_falcon512_test_signature(&pk, &msg_ok, seed);
-        tx_ok.signature = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk, sig_ok).encode();
-        assert!(mp.add(tx_ok).is_ok(), "Fully paid activation surcharge must succeed");
+        tx_ok.signature =
+            PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk, sig_ok).encode();
+        assert!(
+            mp.add(tx_ok).is_ok(),
+            "Fully paid activation surcharge must succeed"
+        );
     }
 
     #[test]
@@ -3704,7 +3823,8 @@ mod tests {
         };
         let msg_low = tx_low_fee.signing_message();
         let sig_low = Transaction::create_falcon512_test_signature(&pk, &msg_low, seed);
-        tx_low_fee.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig_low).encode();
+        tx_low_fee.signature =
+            PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig_low).encode();
 
         assert_eq!(
             mp.add_checked(tx_low_fee, BALANCE),
@@ -3742,7 +3862,8 @@ mod tests {
         };
         let msg = tx_cheap.signing_message();
         let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
-        tx_cheap.signature = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk, sig).encode();
+        tx_cheap.signature =
+            PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk, sig).encode();
 
         assert!(custom_registry.lookup(&from).is_none());
 
@@ -3831,7 +3952,10 @@ mod tests {
         }
 
         assert_eq!(buffer.len(), 2048);
-        assert_eq!(buffer.len(), PendingActivationBuffer::MAX_GLOBAL_BUFFERED_TXS);
+        assert_eq!(
+            buffer.len(),
+            PendingActivationBuffer::MAX_GLOBAL_BUFFERED_TXS
+        );
 
         // 2049th tx exceeds global buffer cap
         let mut from_extra = [0u8; 32];
@@ -3925,8 +4049,7 @@ mod tests {
 
         // A LEGITIMATE, FUNDED unactivated account still gets in.
         assert!(
-            mp.add_checked(make_implicit(0x22, 1), 1_000_000)
-                .is_ok(),
+            mp.add_checked(make_implicit(0x22, 1), 1_000_000).is_ok(),
             "a funded unactivated account must still be admitted"
         );
         assert_eq!(mp.activation_buffer.len(), 1);
@@ -3973,10 +4096,19 @@ mod tests {
 
         assert_eq!(buffer.buffer_tx(tx2, 50), Ok(h2));
         assert_eq!(buffer.len(), 1);
-        assert!(!buffer.contains_hash(&h1), "Old hash must no longer be in buffer");
-        assert!(!buffer.by_hash.contains_key(&h1), "Old hash must be removed from by_hash");
+        assert!(
+            !buffer.contains_hash(&h1),
+            "Old hash must no longer be in buffer"
+        );
+        assert!(
+            !buffer.by_hash.contains_key(&h1),
+            "Old hash must be removed from by_hash"
+        );
         assert!(buffer.contains_hash(&h2), "New hash must be in buffer");
-        assert!(buffer.by_hash.contains_key(&h2), "New hash must be in by_hash");
+        assert!(
+            buffer.by_hash.contains_key(&h2),
+            "New hash must be in by_hash"
+        );
         assert_eq!(buffer.get(&from, 5).unwrap().amount, 20);
     }
 
@@ -4064,7 +4196,11 @@ mod decoder_fuzz_regressions {
                     let _ = mp.add_checked(tx, u64::MAX);
                 }
             }));
-            assert!(r.is_ok(), "mempool admission panicked on len {}", input.len());
+            assert!(
+                r.is_ok(),
+                "mempool admission panicked on len {}",
+                input.len()
+            );
         }
     }
 }

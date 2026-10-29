@@ -40,7 +40,12 @@ fn node_info(id_byte: u8, ed_pub: &str, endpoints: &[&str]) -> infnode::dht::Nod
     }
 }
 
-fn peer_config(name: &str, node_id_byte: u8, ed_pub: &str, endpoints: &[&str]) -> infnode::config::PeerConfig {
+fn peer_config(
+    name: &str,
+    node_id_byte: u8,
+    ed_pub: &str,
+    endpoints: &[&str],
+) -> infnode::config::PeerConfig {
     infnode::config::PeerConfig {
         name: name.to_string(),
         node_id: format!("inf1:{}", hex::encode([node_id_byte; 20])),
@@ -78,10 +83,18 @@ fn unknown_identity_is_never_admitted_by_the_filter() {
     assert_eq!(kept[0].ed_hex, pinned_ed);
     assert!(kept[0].endpoints.contains(&"10.0.0.9:9410".to_string()));
     // The attacker's endpoint must appear NOWHERE in the output.
-    let all_eps: Vec<&str> =
-        kept.iter().flat_map(|n| n.endpoints.iter().map(String::as_str)).collect();
-    assert!(!all_eps.contains(&"10.9.9.9:9410"), "attacker endpoint admitted!");
-    assert!(!all_eps.contains(&"10.9.9.10:9410"), "keyless gossip admitted!");
+    let all_eps: Vec<&str> = kept
+        .iter()
+        .flat_map(|n| n.endpoints.iter().map(String::as_str))
+        .collect();
+    assert!(
+        !all_eps.contains(&"10.9.9.9:9410"),
+        "attacker endpoint admitted!"
+    );
+    assert!(
+        !all_eps.contains(&"10.9.9.10:9410"),
+        "keyless gossip admitted!"
+    );
 }
 
 #[test]
@@ -92,11 +105,18 @@ fn known_identity_with_a_new_endpoint_is_admitted() {
     let pinned = pinned_identity_set(&peers);
 
     // ...endpoints may come from the network, even in different hex case.
-    let discovered =
-        vec![node_info(0x07, &pinned_ed.to_ascii_uppercase(), &["10.0.0.2:9411"])];
+    let discovered = vec![node_info(
+        0x07,
+        &pinned_ed.to_ascii_uppercase(),
+        &["10.0.0.2:9411"],
+    )];
 
     let kept = filter_discovered_to_pinned(discovered, &pinned);
-    assert_eq!(kept.len(), 1, "new endpoint for a KNOWN identity must be kept");
+    assert_eq!(
+        kept.len(),
+        1,
+        "new endpoint for a KNOWN identity must be kept"
+    );
     assert_eq!(kept[0].endpoints, vec!["10.0.0.2:9411".to_string()]);
 }
 
@@ -114,9 +134,16 @@ fn failure_backoff_caps_memory() {
     let mut table = PeerEndpointTable::with_default_cap();
     assert_eq!(table.cap(), MAX_ENDPOINT_RECORDS);
     for i in 0..MAX_ENDPOINT_RECORDS * 4 {
-        table.record_success(&format!("10.100.{}.{}:9410", i / 256, i % 256), 1_000 + i as u64);
+        table.record_success(
+            &format!("10.100.{}.{}:9410", i / 256, i % 256),
+            1_000 + i as u64,
+        );
     }
-    assert!(table.len() <= MAX_ENDPOINT_RECORDS, "table grew to {}", table.len());
+    assert!(
+        table.len() <= MAX_ENDPOINT_RECORDS,
+        "table grew to {}",
+        table.len()
+    );
 }
 
 #[test]
@@ -131,7 +158,9 @@ fn repeatedly_failing_peer_is_deprioritized_but_not_forgotten() {
     }
 
     // Deprioritized: backed off and sorted after the healthy endpoint...
-    let rec = table.get(bad).expect("failing peer must still be remembered");
+    let rec = table
+        .get(bad)
+        .expect("failing peer must still be remembered");
     assert!(rec.backed_off(), "N failures must back the endpoint off");
     assert_eq!(rec.consecutive_failures, ENDPOINT_BACKOFF_THRESHOLD + 3);
     let order = table.preferred_order();

@@ -11,7 +11,9 @@ use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 async fn main() {
     let engine = Arc::new(InMemoryStateEngine::new());
     let who = [3u8; 32];
-    engine.update_account(AccountState::new(who, 123_450_000_000)).await;
+    engine
+        .update_account(AccountState::new(who, 123_450_000_000))
+        .await;
 
     // Deploy a tiny WASM contract so /api/contracts is non-empty.
     // (func (export "double") (param i64) (result i64) local.get 0; i64.const 2; i64.mul)
@@ -20,18 +22,29 @@ async fn main() {
         0x7e, 0x03, 0x02, 0x01, 0x00, 0x07, 0x0a, 0x01, 0x06, 0x64, 0x6f, 0x75, 0x62, 0x6c, 0x65,
         0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x42, 0x02, 0x7e, 0x0b,
     ];
-    let _ = engine.deploy_contract([1u8; 32], DOUBLE_WASM.to_vec(), 0).await.unwrap();
+    let _ = engine
+        .deploy_contract([1u8; 32], DOUBLE_WASM.to_vec(), 0)
+        .await
+        .unwrap();
 
     let st = Arc::new(RpcState {
         engine,
-        mempool: Arc::new(tokio::sync::RwLock::new(stellereum::mempool::Mempool::default())),
+        mempool: Arc::new(tokio::sync::RwLock::new(
+            stellereum::mempool::Mempool::default(),
+        )),
         height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         node_id: "inf1:demo".to_string(),
         chain_id: stellereum::zkml::DEFAULT_CHAIN_ID,
-        staking: Arc::new(tokio::sync::RwLock::new(stellereum::staking::StakingLedger::new())),
-        governance: Arc::new(tokio::sync::RwLock::new(stellereum::governance::Governance::new())),
+        staking: Arc::new(tokio::sync::RwLock::new(
+            stellereum::staking::StakingLedger::new(),
+        )),
+        governance: Arc::new(tokio::sync::RwLock::new(
+            stellereum::governance::Governance::new(),
+        )),
         recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
-        receipts: Arc::new(tokio::sync::RwLock::new(stellereum::rpc::ReceiptIndex::default())),
+        receipts: Arc::new(tokio::sync::RwLock::new(
+            stellereum::rpc::ReceiptIndex::default(),
+        )),
         auth_token: None,
         tx_broadcast: None,
         faucet: Some(Arc::new(stellereum::rpc::Faucet::new(
@@ -48,7 +61,8 @@ async fn main() {
         shard_registry: stellereum::sharding::ShardRegistry::single(),
     });
     for h in 1..=5u64 {
-        st.record_block(h, [h as u8; 32], (h as usize) * 2, 1_700_000_000 + h).await;
+        st.record_block(h, [h as u8; 32], (h as usize) * 2, 1_700_000_000 + h)
+            .await;
     }
 
     let addr = std::env::var("GATEWAY_LISTEN").unwrap_or_else(|_| "127.0.0.1:18080".to_string());

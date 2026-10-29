@@ -21,7 +21,9 @@
 use curve25519_dalek::scalar::Scalar;
 use sha2::{Digest, Sha256};
 
-use stellereum::commitment::{commitment_digest, commitment_digest_with_confidential, CommitmentSnapshot};
+use stellereum::commitment::{
+    commitment_digest, commitment_digest_with_confidential, CommitmentSnapshot,
+};
 use stellereum::contract::ContractRegistry;
 use stellereum::crypto_privacy::{
     confidential_digest, write_confidential_domain, ConfidentialError, ConfidentialState,
@@ -84,7 +86,10 @@ fn empty_snapshot() -> CommitmentSnapshot {
 #[test]
 fn conservation_holds_and_shielded_balances_move() {
     let tx = balanced_transfer(1_480, 20);
-    assert!(tx.verify_balance_conservation(), "precondition: the equation holds");
+    assert!(
+        tx.verify_balance_conservation(),
+        "precondition: the equation holds"
+    );
 
     let mut state = ConfidentialState::new();
     assert!(state.is_empty());
@@ -107,7 +112,10 @@ fn conservation_holds_and_shielded_balances_move() {
         ZERO_COMMITMENT.add(&tx.output_commitments[0]).unwrap(),
         "recipient is credited by exactly the output commitment"
     );
-    assert_eq!(state.total_fees, 20, "the fee advances the transparent total");
+    assert_eq!(
+        state.total_fees, 20,
+        "the fee advances the transparent total"
+    );
     assert!(state.is_spent(&tx.input_commitments[0].commitment));
     assert!(!state.is_empty());
 }
@@ -171,14 +179,23 @@ fn forged_balance_is_rejected_and_state_is_unchanged() {
         funded,
         "a rejected transfer must not move the shielded digest past funding"
     );
-    assert!(!state.is_empty(), "funding remains; only the transfer was refused");
+    assert!(
+        !state.is_empty(),
+        "funding remains; only the transfer was refused"
+    );
 }
 
 #[test]
 fn malformed_commitment_is_rejected() {
     // A 32-byte string that is not a canonical Ristretto encoding.
-    let junk = PedersenCommitment { commitment: [0xFF; 32] };
-    let tx = ConfidentialTransfer::new(vec![junk], vec![PedersenCommitment::commit(0, &Scalar::from(1u64))], 0);
+    let junk = PedersenCommitment {
+        commitment: [0xFF; 32],
+    };
+    let tx = ConfidentialTransfer::new(
+        vec![junk],
+        vec![PedersenCommitment::commit(0, &Scalar::from(1u64))],
+        0,
+    );
     let mut state = ConfidentialState::new();
     let err = state.apply_transfer(&SENDER, &RECIPIENT, &tx).unwrap_err();
     assert_eq!(err, ConfidentialError::InvalidCommitment([0xFF; 32]));
@@ -274,7 +291,10 @@ fn identical_states_digest_identically_and_every_mutation_changes_it() {
     let mut c = balance_changed.balance(&RECIPIENT);
     c.commitment[0] ^= 0x01;
     balance_changed.balances.insert(RECIPIENT, c);
-    assert_ne!(confidential_digest(&a), confidential_digest(&balance_changed));
+    assert_ne!(
+        confidential_digest(&a),
+        confidential_digest(&balance_changed)
+    );
 
     // And the transfer encoding itself is deterministic + mutation sensitive.
     assert_eq!(tx.encode(), balanced_transfer(700, 30).encode());
@@ -369,9 +389,7 @@ fn empty_confidential_domain_contributes_zero_bytes() {
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use stellereum::crypto_privacy::{
-    msm_backend_name, BitProof, RangeProof, MSM_FOLD_CUTOFF,
-};
+use stellereum::crypto_privacy::{msm_backend_name, BitProof, RangeProof, MSM_FOLD_CUTOFF};
 
 fn prize_rng() -> StdRng {
     StdRng::seed_from_u64(0x9E3779B9_7F4A7C15)
@@ -380,7 +398,10 @@ fn prize_rng() -> StdRng {
 #[test]
 fn batch_openings_match_scalar_randomized() {
     let mut rng = prize_rng();
-    assert!(msm_backend_name().contains("dalek"), "backend label must name dalek");
+    assert!(
+        msm_backend_name().contains("dalek"),
+        "backend label must name dalek"
+    );
     assert!(
         (1..=64).contains(&MSM_FOLD_CUTOFF),
         "fold cutoff must be sane"
@@ -405,7 +426,10 @@ fn batch_openings_match_scalar_randomized() {
         assert_eq!(PedersenCommitment::batch_verify(&ops), scalar);
         if n > 0 {
             assert!(scalar[0], "honest opening must verify");
-            assert!(scalar[n..].iter().all(|&b| !b), "forged openings must reject");
+            assert!(
+                scalar[n..].iter().all(|&b| !b),
+                "forged openings must reject"
+            );
         }
     }
     assert!(PedersenCommitment::batch_verify(&[]).is_empty());
@@ -422,7 +446,10 @@ fn batch_conservation_matches_scalar_randomized() {
             rng.gen_range(0..10_000u64),
             rng.gen_range(0..100u64),
         );
-        let (r1, r2) = (Scalar::from(rng.gen::<u64>()), Scalar::from(rng.gen::<u64>()));
+        let (r1, r2) = (
+            Scalar::from(rng.gen::<u64>()),
+            Scalar::from(rng.gen::<u64>()),
+        );
         // sum_in - sum_out = (a+fee+b - (a+b))*G = fee*G exactly.
         let c1 = PedersenCommitment::commit(a + fee, &r1);
         let c2 = PedersenCommitment::commit(b, &r2);
@@ -439,14 +466,25 @@ fn batch_conservation_matches_scalar_randomized() {
         ));
         txs.push(ConfidentialTransfer::new(vec![], vec![], 0));
         txs.push(ConfidentialTransfer::new(
-            vec![PedersenCommitment { commitment: [0xFF; 32] }],
+            vec![PedersenCommitment {
+                commitment: [0xFF; 32],
+            }],
             vec![PedersenCommitment::commit(0, &r)],
             0,
         ));
     }
-    let scalar: Vec<bool> = txs.iter().map(|t| t.verify_balance_conservation()).collect();
-    assert!(scalar[..8].iter().all(|&b| b), "honest transfers must verify");
-    assert!(!scalar[8..].iter().any(|&b| b), "forged transfers must reject");
+    let scalar: Vec<bool> = txs
+        .iter()
+        .map(|t| t.verify_balance_conservation())
+        .collect();
+    assert!(
+        scalar[..8].iter().all(|&b| b),
+        "honest transfers must verify"
+    );
+    assert!(
+        !scalar[8..].iter().any(|&b| b),
+        "forged transfers must reject"
+    );
     assert_eq!(
         ConfidentialTransfer::batch_verify_balance_conservation(&txs),
         scalar,
@@ -461,7 +499,11 @@ fn batch_range_proofs_match_scalar_randomized() {
     let mut pairs: Vec<(PedersenCommitment, RangeProof)> = Vec::new();
     for i in 0..24 {
         let bits = [8u8, 16, 32][i % 3];
-        let max = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let max = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
         let v = rng.gen_range(0..=max.min(1_000_000));
         let r = Scalar::from(rng.gen::<u64>());
         let c = PedersenCommitment::commit(v, &r);
@@ -494,8 +536,7 @@ fn batch_range_proofs_match_scalar_randomized() {
         tb.bit_proofs[0].s0[0] ^= 0xFF;
         pairs.push((c, tb));
     }
-    let refs: Vec<(&PedersenCommitment, &RangeProof)> =
-        pairs.iter().map(|(c, p)| (c, p)).collect();
+    let refs: Vec<(&PedersenCommitment, &RangeProof)> = pairs.iter().map(|(c, p)| (c, p)).collect();
     let scalar: Vec<bool> = refs.iter().map(|(c, p)| RangeProof::verify(c, p)).collect();
     assert!(scalar[..24].iter().all(|&b| b), "honest proofs must verify");
     assert!(
@@ -530,7 +571,10 @@ fn bitproof_msm_matches_scalar_randomized() {
             };
             dst[rng.gen_range(0..32)] ^= 1 << rng.gen_range(0..8);
         }
-        let (a, b) = (BitProof::verify(&c, &proof), BitProof::verify_scalar(&c, &proof));
+        let (a, b) = (
+            BitProof::verify(&c, &proof),
+            BitProof::verify_scalar(&c, &proof),
+        );
         assert_eq!(a, b, "MSM/scalar BitProof diverged at case {i}");
         if a {
             trues += 1;
@@ -538,11 +582,16 @@ fn bitproof_msm_matches_scalar_randomized() {
             falses += 1;
         }
         // And against a junk commitment both must reject.
-        let junk = PedersenCommitment { commitment: [0xFF; 32] };
+        let junk = PedersenCommitment {
+            commitment: [0xFF; 32],
+        };
         assert!(!BitProof::verify(&junk, &proof));
         assert!(!BitProof::verify_scalar(&junk, &proof));
     }
-    assert!(trues > 0 && falses > 0, "need both outcomes: {trues}/{falses}");
+    assert!(
+        trues > 0 && falses > 0,
+        "need both outcomes: {trues}/{falses}"
+    );
 }
 
 // ===========================================================================
@@ -558,7 +607,10 @@ fn unowned_inputs_are_rejected_and_move_nothing() {
     let err = state
         .apply_transfer(&SENDER, &RECIPIENT, &tx)
         .expect_err("unowned inputs must be rejected");
-    assert_eq!(err, ConfidentialError::NotOwner(tx.input_commitments[0].commitment));
+    assert_eq!(
+        err,
+        ConfidentialError::NotOwner(tx.input_commitments[0].commitment)
+    );
     assert_eq!(confidential_digest(&state), before);
     assert!(state.is_empty());
 }
@@ -573,7 +625,10 @@ fn others_commitment_is_rejected_even_when_funded() {
     let err = state
         .apply_transfer(&SENDER, &RECIPIENT, &tx)
         .expect_err("another account's commitment must be rejected");
-    assert_eq!(err, ConfidentialError::NotOwner(tx.input_commitments[0].commitment));
+    assert_eq!(
+        err,
+        ConfidentialError::NotOwner(tx.input_commitments[0].commitment)
+    );
 }
 
 #[test]
@@ -588,7 +643,9 @@ fn ownership_map_tracks_spend_and_fund() {
     );
     state.apply_transfer(&SENDER, &RECIPIENT, &tx).unwrap();
     assert!(
-        !state.owned.contains_key(&tx.input_commitments[0].commitment),
+        !state
+            .owned
+            .contains_key(&tx.input_commitments[0].commitment),
         "spend clears ownership"
     );
     assert_eq!(
@@ -599,7 +656,10 @@ fn ownership_map_tracks_spend_and_fund() {
     // A spent input is gone from ownership: replay now fails as double-spend
     // (spent check precedes ownership), never as a fresh spend.
     let err = state.apply_transfer(&SENDER, &RECIPIENT, &tx).unwrap_err();
-    assert_eq!(err, ConfidentialError::DoubleSpend(tx.input_commitments[0].commitment));
+    assert_eq!(
+        err,
+        ConfidentialError::DoubleSpend(tx.input_commitments[0].commitment)
+    );
 }
 
 // ===========================================================================
@@ -608,8 +668,8 @@ fn ownership_map_tracks_spend_and_fund() {
 
 #[test]
 fn v1_snapshot_upgrades_with_frozen_unowned_outputs() {
-    use stellereum::crypto_privacy::{ConfidentialStateV1, PedersenCommitment};
     use curve25519_dalek::scalar::Scalar;
+    use stellereum::crypto_privacy::{ConfidentialStateV1, PedersenCommitment};
     // Old-shape state with history but no ownership map.
     let v1 = ConfidentialStateV1 {
         balances: [(SENDER, PedersenCommitment::commit(100, &Scalar::from(1u64)))]
@@ -634,14 +694,20 @@ fn v1_snapshot_upgrades_with_frozen_unowned_outputs() {
     assert_eq!(upgraded.balances, v1.balances);
     assert_eq!(upgraded.spent, v1.spent);
     assert_eq!(upgraded.total_fees, 7);
-    assert!(upgraded.owned.is_empty(), "pre-fix outputs are unattributed");
+    assert!(
+        upgraded.owned.is_empty(),
+        "pre-fix outputs are unattributed"
+    );
     // ...and therefore unspendable (frozen, not stealable).
     let tx = balanced_transfer(10, 1);
     let err = upgraded
         .clone()
         .apply_transfer(&SENDER, &RECIPIENT, &tx)
         .unwrap_err();
-    assert_eq!(err, ConfidentialError::NotOwner(tx.input_commitments[0].commitment));
+    assert_eq!(
+        err,
+        ConfidentialError::NotOwner(tx.input_commitments[0].commitment)
+    );
 }
 
 #[test]
@@ -649,8 +715,8 @@ fn pre_ownership_digest_is_byte_identical_after_upgrade() {
     // Upgrade compat (deploy lesson 2026-10-06): a restored pre-fix state
     // (no owned map) must digest EXACTLY as before, or the node refuses to
     // start on restore-root mismatch. The owned section is self-conditional.
-    use stellereum::crypto_privacy::{ConfidentialStateV1, PedersenCommitment};
     use curve25519_dalek::scalar::Scalar;
+    use stellereum::crypto_privacy::{ConfidentialStateV1, PedersenCommitment};
     let v1 = ConfidentialStateV1 {
         balances: [(SENDER, PedersenCommitment::commit(100, &Scalar::from(1u64)))]
             .into_iter()

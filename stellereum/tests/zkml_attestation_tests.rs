@@ -28,18 +28,17 @@ use stellereum::commitment::{
 };
 use stellereum::mempool::Mempool;
 use stellereum::sharding::Transaction;
-use stellereum::zkml_attestation::{
-    prove_attestation, model_spec_with_attestation, model_spec_test_only, verify_attestation,
-    ModelSpec, AttestationProof, ATTEST_MAX_INPUT, ATTEST_PROOF_BYTES, TEST_SETUP_ATTESTATION,
-};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{
-    opcode_gas, attestation_verify_gas, spec_register_gas, OpCode, GAS_ATTESTATION_PER_PUBLIC_INPUT,
-    GAS_ZKML_REEXEC_PER_PARAM,
-    GAS_ATTESTATION_VERIFY_BASE, GAS_ZKML_PROOF_PER_BYTE, GAS_ZKML_SPEC_PER_BYTE,
-    GAS_ZKML_SPEC_REGISTER_BASE,
+    attestation_verify_gas, opcode_gas, spec_register_gas, OpCode,
+    GAS_ATTESTATION_PER_PUBLIC_INPUT, GAS_ATTESTATION_VERIFY_BASE, GAS_ZKML_PROOF_PER_BYTE,
+    GAS_ZKML_REEXEC_PER_PARAM, GAS_ZKML_SPEC_PER_BYTE, GAS_ZKML_SPEC_REGISTER_BASE,
 };
 use stellereum::zkml::{QuantizedLayer, QuantizedLinearModel, ZkMlProof};
+use stellereum::zkml_attestation::{
+    model_spec_test_only, model_spec_with_attestation, prove_attestation, verify_attestation,
+    AttestationProof, ModelSpec, ATTEST_MAX_INPUT, ATTEST_PROOF_BYTES, TEST_SETUP_ATTESTATION,
+};
 
 const BLOCK_TS: u64 = 1_760_000_000;
 const GAS: u64 = 5_000_000;
@@ -55,11 +54,21 @@ fn key(seed: u8) -> SigningKey {
 /// inputs fit u16, worst-case accumulator is tiny: this model IS
 /// SNARK-compatible (the common case must stay provable).
 fn tiny_model() -> QuantizedLinearModel {
-    QuantizedLinearModel::new(vec![QuantizedLayer::new(2, 2, vec![2, -1, 1, 3], vec![1, -2])])
+    QuantizedLinearModel::new(vec![QuantizedLayer::new(
+        2,
+        2,
+        vec![2, -1, 1, 3],
+        vec![1, -2],
+    )])
 }
 
 fn other_model() -> QuantizedLinearModel {
-    QuantizedLinearModel::new(vec![QuantizedLayer::new(2, 2, vec![1, 1, 1, 1], vec![0, 0])])
+    QuantizedLinearModel::new(vec![QuantizedLayer::new(
+        2,
+        2,
+        vec![1, 1, 1, 1],
+        vec![0, 0],
+    )])
 }
 
 /// Legacy-format model: unbounded i64 weights. Registers and re-executes
@@ -77,7 +86,8 @@ async fn funded() -> (InMemoryStateEngine, SigningKey, [u8; 32]) {
     let e = InMemoryStateEngine::new();
     let sk = key(0x71);
     let addr = sk.verifying_key().to_bytes();
-    e.update_account(AccountState::new(addr, 1_000_000_000_000)).await;
+    e.update_account(AccountState::new(addr, 1_000_000_000_000))
+        .await;
     (e, sk, addr)
 }
 
@@ -96,11 +106,20 @@ fn register_model_tx(
         nonce,
         1,
         1,
-        vec![OpCode::SysCallRegisterZkMlModel { model_id: id, model: Box::new(m.clone()) }],
+        vec![OpCode::SysCallRegisterZkMlModel {
+            model_id: id,
+            model: Box::new(m.clone()),
+        }],
     )
 }
 
-fn register_vk_tx(sk: &SigningKey, to: [u8; 32], nonce: u64, id: [u8; 32], vk: &ModelSpec) -> Transaction {
+fn register_vk_tx(
+    sk: &SigningKey,
+    to: [u8; 32],
+    nonce: u64,
+    id: [u8; 32],
+    vk: &ModelSpec,
+) -> Transaction {
     Transaction::sign_with_payload(
         sk,
         to,
@@ -109,11 +128,20 @@ fn register_vk_tx(sk: &SigningKey, to: [u8; 32], nonce: u64, id: [u8; 32], vk: &
         nonce,
         1,
         1,
-        vec![OpCode::SysCallRegisterZkMlSpec { model_id: id, spec: Box::new(vk.clone()) }],
+        vec![OpCode::SysCallRegisterZkMlSpec {
+            model_id: id,
+            spec: Box::new(vk.clone()),
+        }],
     )
 }
 
-fn verify_snark_tx(sk: &SigningKey, to: [u8; 32], nonce: u64, id: [u8; 32], p: &AttestationProof) -> Transaction {
+fn verify_snark_tx(
+    sk: &SigningKey,
+    to: [u8; 32],
+    nonce: u64,
+    id: [u8; 32],
+    p: &AttestationProof,
+) -> Transaction {
     Transaction::sign_with_payload(
         sk,
         to,
@@ -122,7 +150,10 @@ fn verify_snark_tx(sk: &SigningKey, to: [u8; 32], nonce: u64, id: [u8; 32], p: &
         nonce,
         1,
         1,
-        vec![OpCode::SysCallVerifyZkMlAttestation { model_id: id, proof: Box::new(p.clone()) }],
+        vec![OpCode::SysCallVerifyZkMlAttestation {
+            model_id: id,
+            proof: Box::new(p.clone()),
+        }],
     )
 }
 
@@ -147,17 +178,32 @@ async fn register_model_and_vk(
 ) -> (Vec<u8>, ModelSpec) {
     let (pk_bytes, vk) = test_setup(m, seed);
     let rtx = register_model_tx(sk, addr, nonce0, id, m);
-    let (a, f, _, _, _) = e.apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS).await;
+    let (a, f, _, _, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (1, 0), "model registration must apply");
     let vtx = register_vk_tx(sk, addr, nonce0 + 1, id, &vk);
-    let (a, f, _, _, _) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
+    let (a, f, _, _, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (1, 0), "VK registration must apply");
     (pk_bytes, vk)
 }
 
-fn prove_for(m: &QuantizedLinearModel, inputs: &[i64], pk: &[u8], vk: &ModelSpec) -> (Vec<i64>, AttestationProof) {
-    prove_attestation(&m.attestation_view(), m.compute_model_hash(), inputs, pk, vk.spec_hash)
-        .expect("honest prove must succeed")
+fn prove_for(
+    m: &QuantizedLinearModel,
+    inputs: &[i64],
+    pk: &[u8],
+    vk: &ModelSpec,
+) -> (Vec<i64>, AttestationProof) {
+    prove_attestation(
+        &m.attestation_view(),
+        m.compute_model_hash(),
+        inputs,
+        pk,
+        vk.spec_hash,
+    )
+    .expect("honest prove must succeed")
 }
 
 // ---------------------------------------------------------------------------
@@ -169,16 +215,33 @@ async fn snark_honest_proof_verifies_end_to_end() {
     let m = tiny_model();
     assert!(m.is_attestation_compatible());
     let (e, sk, addr) = funded().await;
-    let (pk_bytes, vk) = register_model_and_vk(&e, &sk, addr, MODEL_A, &m, ATTEST_TEST_SEED, 0).await;
+    let (pk_bytes, vk) =
+        register_model_and_vk(&e, &sk, addr, MODEL_A, &m, ATTEST_TEST_SEED, 0).await;
 
     let (out, proof) = prove_for(&m, &[3, 4], &pk_bytes, &vk);
-    assert_eq!(out, vec![11, 7], "SNARK outputs must match the forward pass");
-    assert!(!proof.proof_bytes.is_empty() && proof.proof_bytes.len() <= stellereum::zkml_attestation::MAX_ATTESTATION_PROOF_BYTES);
-    assert!(verify_attestation(&vk.spec_bytes, &proof), "must verify off chain");
+    assert_eq!(
+        out,
+        vec![11, 7],
+        "SNARK outputs must match the forward pass"
+    );
+    assert!(
+        !proof.proof_bytes.is_empty()
+            && proof.proof_bytes.len() <= stellereum::zkml_attestation::MAX_ATTESTATION_PROOF_BYTES
+    );
+    assert!(
+        verify_attestation(&vk.spec_bytes, &proof),
+        "must verify off chain"
+    );
 
     let vtx = verify_snark_tx(&sk, addr, 2, MODEL_A, &proof);
-    let (a, f, _, s, _) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
-    assert_eq!((a, f), (1, 0), "honest SNARK proof must apply on the live path");
+    let (a, f, _, s, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
+    assert_eq!(
+        (a, f),
+        (1, 0),
+        "honest SNARK proof must apply on the live path"
+    );
     assert_eq!(s, vec![true]);
 }
 
@@ -189,7 +252,10 @@ fn snark_ref_model_measurements() {
     let view = m.attestation_view();
     let n = InferenceCostModel::constraint_count_for(&view).expect("countable");
     println!("[measure][snark] ref model constraints: {n}");
-    assert!(n > 0 && n < 100_000, "ref model must be a small circuit, got {n}");
+    assert!(
+        n > 0 && n < 100_000,
+        "ref model must be a small circuit, got {n}"
+    );
 
     let t0 = std::time::Instant::now();
     let (pk_bytes, vk) = test_setup(&m, ATTEST_TEST_SEED);
@@ -212,7 +278,10 @@ fn snark_ref_model_measurements() {
         pk_bytes.len(),
         vk.n_public_inputs,
     );
-    assert!(!proof.proof_bytes.is_empty() && proof.proof_bytes.len() <= stellereum::zkml_attestation::MAX_ATTESTATION_PROOF_BYTES);
+    assert!(
+        !proof.proof_bytes.is_empty()
+            && proof.proof_bytes.len() <= stellereum::zkml_attestation::MAX_ATTESTATION_PROOF_BYTES
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +292,8 @@ fn snark_ref_model_measurements() {
 async fn snark_forged_trace_proof_rejected() {
     let m = tiny_model();
     let (e, sk, addr) = funded().await;
-    let (pk_bytes, vk) = register_model_and_vk(&e, &sk, addr, MODEL_A, &m, ATTEST_TEST_SEED, 0).await;
+    let (pk_bytes, vk) =
+        register_model_and_vk(&e, &sk, addr, MODEL_A, &m, ATTEST_TEST_SEED, 0).await;
 
     // (a) The legacy forgery (ReLU-consistent invented trace, lying outputs)
     // repackaged as SNARK proof bytes: not even parseable as Groth16.
@@ -237,8 +307,14 @@ async fn snark_forged_trace_proof_rejected() {
     };
     assert!(!verify_attestation(&vk.spec_bytes, &bogus));
     let vtx = verify_snark_tx(&sk, addr, 2, MODEL_A, &bogus);
-    let (a, f, _, s, _) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
-    assert_eq!((a, f), (0, 1), "legacy-forgery bytes must NOT apply as a SNARK proof");
+    let (a, f, _, s, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
+    assert_eq!(
+        (a, f),
+        (0, 1),
+        "legacy-forgery bytes must NOT apply as a SNARK proof"
+    );
     assert_eq!(s, vec![false]);
 
     // (b) A REAL proof with a tampered claimed output: the pairing check
@@ -248,7 +324,9 @@ async fn snark_forged_trace_proof_rejected() {
     proof.public_outputs[0] = 999;
     assert!(!verify_attestation(&vk.spec_bytes, &proof));
     let vtx = verify_snark_tx(&sk, addr, 2, MODEL_A, &proof);
-    let (a, f, _, s, _) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
+    let (a, f, _, s, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (0, 1), "tampered outputs must NOT apply");
     assert_eq!(s, vec![false]);
 
@@ -274,9 +352,19 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     // Register `other` under MODEL_B (with its own VK) for cross-checks.
     {
         let rtx = register_model_tx(&sk, addr, 2, MODEL_B, &other);
-        assert_eq!(e.apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS).await.0, 1);
+        assert_eq!(
+            e.apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS)
+                .await
+                .0,
+            1
+        );
         let vtx = register_vk_tx(&sk, addr, 3, MODEL_B, &vk_b);
-        assert_eq!(e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await.0, 1);
+        assert_eq!(
+            e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+                .await
+                .0,
+            1
+        );
     }
 
     // F-01 (fail-closed fee floor): admitted txs that FAIL at apply now PAY
@@ -316,14 +404,36 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
-    let (a, f, _, s, fees) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
-    assert_eq!((a, f), (0, 1), "proof for another model must NOT apply under MODEL_A");
+    let (a, f, _, s, fees) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
+    assert_eq!(
+        (a, f),
+        (0, 1),
+        "proof for another model must NOT apply under MODEL_A"
+    );
     assert_eq!(s, vec![false]);
-    assert_eq!(fees, vec![expected_fee], "failed tx must pay max(declared, floor)");
+    assert_eq!(
+        fees,
+        vec![expected_fee],
+        "failed tx must pay max(declared, floor)"
+    );
     let acct = e.get_account(&addr).await.unwrap();
-    assert_eq!(acct.balance, bal_before - expected_fee, "balance delta == the failure fee");
-    assert_eq!(acct.nonce, nonce_before + 1, "a paid failure consumes its nonce");
-    assert_ne!(e.get_state_root().await, root_before, "a paid failure moves root via fee");
+    assert_eq!(
+        acct.balance,
+        bal_before - expected_fee,
+        "balance delta == the failure fee"
+    );
+    assert_eq!(
+        acct.nonce,
+        nonce_before + 1,
+        "a paid failure consumes its nonce"
+    );
+    assert_ne!(
+        e.get_state_root().await,
+        root_before,
+        "a paid failure moves root via fee"
+    );
     floor_mirror.note_apply_feedback(&[addr], &[]);
     nonce = e.get_account(&addr).await.unwrap().nonce;
 
@@ -339,14 +449,32 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
-    let (a, f, _, s, fees) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
+    let (a, f, _, s, fees) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (0, 1), "wrong VK hash must NOT apply");
     assert_eq!(s, vec![false]);
-    assert_eq!(fees, vec![expected_fee], "failed tx must pay max(declared, floor)");
+    assert_eq!(
+        fees,
+        vec![expected_fee],
+        "failed tx must pay max(declared, floor)"
+    );
     let acct = e.get_account(&addr).await.unwrap();
-    assert_eq!(acct.balance, bal_before - expected_fee, "balance delta == the failure fee");
-    assert_eq!(acct.nonce, nonce_before + 1, "a paid failure consumes its nonce");
-    assert_ne!(e.get_state_root().await, root_before, "a paid failure moves root via fee");
+    assert_eq!(
+        acct.balance,
+        bal_before - expected_fee,
+        "balance delta == the failure fee"
+    );
+    assert_eq!(
+        acct.nonce,
+        nonce_before + 1,
+        "a paid failure consumes its nonce"
+    );
+    assert_ne!(
+        e.get_state_root().await,
+        root_before,
+        "a paid failure moves root via fee"
+    );
     floor_mirror.note_apply_feedback(&[addr], &[]);
     nonce = e.get_account(&addr).await.unwrap().nonce;
 
@@ -362,14 +490,32 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
-    let (a, f, _, s, fees) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
+    let (a, f, _, s, fees) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (0, 1), "wrong model hash must NOT apply");
     assert_eq!(s, vec![false]);
-    assert_eq!(fees, vec![expected_fee], "failed tx must pay max(declared, floor)");
+    assert_eq!(
+        fees,
+        vec![expected_fee],
+        "failed tx must pay max(declared, floor)"
+    );
     let acct = e.get_account(&addr).await.unwrap();
-    assert_eq!(acct.balance, bal_before - expected_fee, "balance delta == the failure fee");
-    assert_eq!(acct.nonce, nonce_before + 1, "a paid failure consumes its nonce");
-    assert_ne!(e.get_state_root().await, root_before, "a paid failure moves root via fee");
+    assert_eq!(
+        acct.balance,
+        bal_before - expected_fee,
+        "balance delta == the failure fee"
+    );
+    assert_eq!(
+        acct.nonce,
+        nonce_before + 1,
+        "a paid failure consumes its nonce"
+    );
+    assert_ne!(
+        e.get_state_root().await,
+        root_before,
+        "a paid failure moves root via fee"
+    );
     floor_mirror.note_apply_feedback(&[addr], &[]);
     nonce = e.get_account(&addr).await.unwrap().nonce;
 
@@ -385,14 +531,32 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
-    let (a, f, _, s, fees) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
+    let (a, f, _, s, fees) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (0, 1), "shape mismatch must NOT apply");
     assert_eq!(s, vec![false]);
-    assert_eq!(fees, vec![expected_fee], "failed tx must pay max(declared, floor)");
+    assert_eq!(
+        fees,
+        vec![expected_fee],
+        "failed tx must pay max(declared, floor)"
+    );
     let acct = e.get_account(&addr).await.unwrap();
-    assert_eq!(acct.balance, bal_before - expected_fee, "balance delta == the failure fee");
-    assert_eq!(acct.nonce, nonce_before + 1, "a paid failure consumes its nonce");
-    assert_ne!(e.get_state_root().await, root_before, "a paid failure moves root via fee");
+    assert_eq!(
+        acct.balance,
+        bal_before - expected_fee,
+        "balance delta == the failure fee"
+    );
+    assert_eq!(
+        acct.nonce,
+        nonce_before + 1,
+        "a paid failure consumes its nonce"
+    );
+    assert_ne!(
+        e.get_state_root().await,
+        root_before,
+        "a paid failure moves root via fee"
+    );
     floor_mirror.note_apply_feedback(&[addr], &[]);
     nonce = e.get_account(&addr).await.unwrap().nonce;
 
@@ -408,14 +572,32 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
-    let (a, f, _, s, fees) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
+    let (a, f, _, s, fees) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (0, 1), "out-of-range input must NOT apply");
     assert_eq!(s, vec![false]);
-    assert_eq!(fees, vec![expected_fee], "failed tx must pay max(declared, floor)");
+    assert_eq!(
+        fees,
+        vec![expected_fee],
+        "failed tx must pay max(declared, floor)"
+    );
     let acct = e.get_account(&addr).await.unwrap();
-    assert_eq!(acct.balance, bal_before - expected_fee, "balance delta == the failure fee");
-    assert_eq!(acct.nonce, nonce_before + 1, "a paid failure consumes its nonce");
-    assert_ne!(e.get_state_root().await, root_before, "a paid failure moves root via fee");
+    assert_eq!(
+        acct.balance,
+        bal_before - expected_fee,
+        "balance delta == the failure fee"
+    );
+    assert_eq!(
+        acct.nonce,
+        nonce_before + 1,
+        "a paid failure consumes its nonce"
+    );
+    assert_ne!(
+        e.get_state_root().await,
+        root_before,
+        "a paid failure moves root via fee"
+    );
     floor_mirror.note_apply_feedback(&[addr], &[]);
     nonce = e.get_account(&addr).await.unwrap().nonce;
 
@@ -425,17 +607,34 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     let no_vk_id = [0x53; 32];
     let rtx = register_model_tx(&sk, addr, nonce, no_vk_id, &m);
     let expected_floor = floor_mirror.effective_floor_for_tx(&rtx);
-    assert!(GAS >= expected_floor, "registration declares above the floor");
+    assert!(
+        GAS >= expected_floor,
+        "registration declares above the floor"
+    );
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let root_before = e.get_state_root().await;
-    let (a, f, _, s, fees) = e.apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS).await;
+    let (a, f, _, s, fees) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (1, 0), "model registration must apply");
     assert_eq!(s, vec![true]);
-    assert_eq!(fees, vec![GAS], "success pays the declared gas (floor does not bind here)");
+    assert_eq!(
+        fees,
+        vec![GAS],
+        "success pays the declared gas (floor does not bind here)"
+    );
     let acct = e.get_account(&addr).await.unwrap();
-    assert_eq!(acct.balance, bal_before - GAS, "success balance delta == declared gas");
+    assert_eq!(
+        acct.balance,
+        bal_before - GAS,
+        "success balance delta == declared gas"
+    );
     assert_eq!(acct.nonce, nonce + 1);
-    assert_ne!(e.get_state_root().await, root_before, "registration is committed");
+    assert_ne!(
+        e.get_state_root().await,
+        root_before,
+        "registration is committed"
+    );
     floor_mirror.note_apply_feedback(&[], &[addr]);
     nonce = acct.nonce;
     let (_, proof_nvk) = prove_for(&m, &[3, 4], &pk_a, &vk_a);
@@ -448,14 +647,36 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
-    let (a, f, _, s, fees) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
-    assert_eq!((a, f), (0, 1), "verify without a registered VK must NOT apply");
+    let (a, f, _, s, fees) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
+    assert_eq!(
+        (a, f),
+        (0, 1),
+        "verify without a registered VK must NOT apply"
+    );
     assert_eq!(s, vec![false]);
-    assert_eq!(fees, vec![expected_fee], "failed tx must pay max(declared, floor)");
+    assert_eq!(
+        fees,
+        vec![expected_fee],
+        "failed tx must pay max(declared, floor)"
+    );
     let acct = e.get_account(&addr).await.unwrap();
-    assert_eq!(acct.balance, bal_before - expected_fee, "balance delta == the failure fee");
-    assert_eq!(acct.nonce, nonce_before + 1, "a paid failure consumes its nonce");
-    assert_ne!(e.get_state_root().await, root_before, "a paid failure moves root via fee");
+    assert_eq!(
+        acct.balance,
+        bal_before - expected_fee,
+        "balance delta == the failure fee"
+    );
+    assert_eq!(
+        acct.nonce,
+        nonce_before + 1,
+        "a paid failure consumes its nonce"
+    );
+    assert_ne!(
+        e.get_state_root().await,
+        root_before,
+        "a paid failure moves root via fee"
+    );
     floor_mirror.note_apply_feedback(&[addr], &[]);
     nonce = e.get_account(&addr).await.unwrap().nonce;
 
@@ -469,14 +690,32 @@ async fn snark_wrong_model_vk_shape_input_rejected() {
     let bal_before = e.get_account(&addr).await.unwrap().balance;
     let nonce_before = e.get_account(&addr).await.unwrap().nonce;
     let root_before = e.get_state_root().await;
-    let (a, f, _, s, fees) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
+    let (a, f, _, s, fees) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (0, 1), "unknown model must NOT apply");
     assert_eq!(s, vec![false]);
-    assert_eq!(fees, vec![expected_fee], "failed tx must pay max(declared, floor)");
+    assert_eq!(
+        fees,
+        vec![expected_fee],
+        "failed tx must pay max(declared, floor)"
+    );
     let acct = e.get_account(&addr).await.unwrap();
-    assert_eq!(acct.balance, bal_before - expected_fee, "balance delta == the failure fee");
-    assert_eq!(acct.nonce, nonce_before + 1, "a paid failure consumes its nonce");
-    assert_ne!(e.get_state_root().await, root_before, "a paid failure moves root via fee");
+    assert_eq!(
+        acct.balance,
+        bal_before - expected_fee,
+        "balance delta == the failure fee"
+    );
+    assert_eq!(
+        acct.nonce,
+        nonce_before + 1,
+        "a paid failure consumes its nonce"
+    );
+    assert_ne!(
+        e.get_state_root().await,
+        root_before,
+        "a paid failure moves root via fee"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +732,9 @@ async fn snark_tampered_vk_rejected() {
     let mut tampered = honest_vk.clone();
     tampered.spec_bytes[10] ^= 0xFF;
     tampered.spec_hash = stellereum::zkml_attestation::spec_hash_of(&tampered.spec_bytes);
-    assert!(stellereum::zkml::ZkMlModelRegistry::default().models.is_empty());
+    assert!(stellereum::zkml::ZkMlModelRegistry::default()
+        .models
+        .is_empty());
     {
         let mut reg = stellereum::zkml::ZkMlModelRegistry::default();
         reg.register(MODEL_A, m.clone()).unwrap();
@@ -502,7 +743,9 @@ async fn snark_tampered_vk_rejected() {
         let (_, proof) = prove_for(
             &m,
             &[3, 4],
-            &model_spec_test_only(&m.attestation_view(), ATTEST_TEST_SEED).unwrap().0,
+            &model_spec_test_only(&m.attestation_view(), ATTEST_TEST_SEED)
+                .unwrap()
+                .0,
             &honest_vk,
         );
         assert!(!verify_attestation(&tampered.spec_bytes, &proof));
@@ -519,12 +762,15 @@ async fn snark_tampered_vk_rejected() {
 
     // (c) Tampered PROOF byte with a valid hash binding: pairing fails.
     let (e, sk, addr) = funded().await;
-    let (pk_bytes, vk) = register_model_and_vk(&e, &sk, addr, MODEL_A, &m, ATTEST_TEST_SEED, 0).await;
+    let (pk_bytes, vk) =
+        register_model_and_vk(&e, &sk, addr, MODEL_A, &m, ATTEST_TEST_SEED, 0).await;
     let (_, mut proof) = prove_for(&m, &[3, 4], &pk_bytes, &vk);
     proof.proof_bytes[0] ^= 0x01;
     assert!(!verify_attestation(&vk.spec_bytes, &proof));
     let vtx = verify_snark_tx(&sk, addr, 2, MODEL_A, &proof);
-    let (a, f, _, s, _) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
+    let (a, f, _, s, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (0, 1), "tampered proof bytes must NOT apply");
     assert_eq!(s, vec![false]);
 
@@ -540,7 +786,9 @@ async fn snark_tampered_vk_rejected() {
     // The helper now produces production attestations (F2: test-prefixed
     // keys are refused on-chain, so on-chain tests must not use them).
     assert!(
-        !honest_vk.setup_attestation.starts_with(TEST_SETUP_ATTESTATION),
+        !honest_vk
+            .setup_attestation
+            .starts_with(TEST_SETUP_ATTESTATION),
         "on-chain test VKs must carry production attestations"
     );
 }
@@ -563,31 +811,63 @@ async fn snark_vk_registry_is_append_only_and_clone_committed() {
     // gate instead of the SNARK check under test.
     // VK for an unknown id reverts (and burns nonce 0 -> the nonce is 1).
     let vtx = register_vk_tx(&sk, addr, 0, MODEL_A, &vk);
-    let (a, f, _, _, _) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
+    let (a, f, _, _, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (0, 1), "VK for unknown model must revert");
     assert_eq!(e.get_account(&addr).await.unwrap().nonce, 1);
 
     // Register model, then VK: applies (nonces 1, 2).
     let rtx = register_model_tx(&sk, addr, 1, MODEL_A, &m);
-    assert_eq!(e.apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS).await.0, 1);
+    assert_eq!(
+        e.apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS)
+            .await
+            .0,
+        1
+    );
     let vtx = register_vk_tx(&sk, addr, 2, MODEL_A, &vk);
-    assert_eq!(e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await.0, 1);
+    assert_eq!(
+        e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+            .await
+            .0,
+        1
+    );
 
     // Second VK under the same id reverts (first writer wins - no rebinding
     // the weights a proof is checked against; the refusal burns nonce 3).
     let vtx2 = register_vk_tx(&sk, addr, 3, MODEL_A, &vk_other_seed);
-    let (a, f, _, s, _) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx2), BLOCK_TS).await;
-    assert_eq!((a, f), (0, 1), "re-registering a VK must revert (append-only)");
+    let (a, f, _, s, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx2), BLOCK_TS)
+        .await;
+    assert_eq!(
+        (a, f),
+        (0, 1),
+        "re-registering a VK must revert (append-only)"
+    );
     assert_eq!(s, vec![false]);
     assert_eq!(e.get_account(&addr).await.unwrap().nonce, 4);
-    assert_eq!(e.zkml_models_read().await.get(&MODEL_A).unwrap().spec.as_ref().unwrap(), &vk);
+    assert_eq!(
+        e.zkml_models_read()
+            .await
+            .get(&MODEL_A)
+            .unwrap()
+            .spec
+            .as_ref()
+            .unwrap(),
+        &vk
+    );
 
     // Clone-commit: a VK registration in a transaction that later reverts
     // leaves nothing behind. Payload = [register VK under MODEL_B's model,
     // ...] - build directly: register MODEL_B + its VK, then a failing
     // SNARK verify in the same payload.
     let rtx_b = register_model_tx(&sk, addr, 4, MODEL_B, &m);
-    assert_eq!(e.apply_block_parallel_fees(std::slice::from_ref(&rtx_b), BLOCK_TS).await.0, 1);
+    assert_eq!(
+        e.apply_block_parallel_fees(std::slice::from_ref(&rtx_b), BLOCK_TS)
+            .await
+            .0,
+        1
+    );
     let (_, vk_b) = test_setup(&m, ATTEST_TEST_SEED + 5);
     let (_, proof_for_b) = {
         let (pk_b, _) = test_setup(&m, ATTEST_TEST_SEED + 5);
@@ -604,15 +884,28 @@ async fn snark_vk_registry_is_append_only_and_clone_committed() {
         1,
         1,
         vec![
-            OpCode::SysCallRegisterZkMlSpec { model_id: MODEL_B, spec: Box::new(vk_b) },
-            OpCode::SysCallVerifyZkMlAttestation { model_id: MODEL_B, proof: Box::new(bad_proof) },
+            OpCode::SysCallRegisterZkMlSpec {
+                model_id: MODEL_B,
+                spec: Box::new(vk_b),
+            },
+            OpCode::SysCallVerifyZkMlAttestation {
+                model_id: MODEL_B,
+                proof: Box::new(bad_proof),
+            },
         ],
     );
-    let (a, f, _, s, _) = e.apply_block_parallel_fees(std::slice::from_ref(&both), BLOCK_TS).await;
+    let (a, f, _, s, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&both), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (0, 1), "the void verify reverts the whole tx");
     assert_eq!(s, vec![false]);
     assert!(
-        e.zkml_models_read().await.get(&MODEL_B).unwrap().spec.is_none(),
+        e.zkml_models_read()
+            .await
+            .get(&MODEL_B)
+            .unwrap()
+            .spec
+            .is_none(),
         "revert discards the VK registration"
     );
 }
@@ -627,11 +920,18 @@ fn snark_gas_schedule_shape() {
     let (_, vk) = test_setup(&m, ATTEST_TEST_SEED);
     let (_, proof) = prove_for(&m, &[3, 4], &test_setup(&m, ATTEST_TEST_SEED).0, &vk);
     let n = proof.public_inputs.len() + proof.public_outputs.len();
-    let op = OpCode::SysCallVerifyZkMlAttestation { model_id: MODEL_A, proof: Box::new(proof.clone()) };
+    let op = OpCode::SysCallVerifyZkMlAttestation {
+        model_id: MODEL_A,
+        proof: Box::new(proof.clone()),
+    };
     let want = GAS_ATTESTATION_VERIFY_BASE
         + (n as u64) * GAS_ATTESTATION_PER_PUBLIC_INPUT
         + (proof.wire_len() as u64) * GAS_ZKML_PROOF_PER_BYTE;
-    assert_eq!(opcode_gas(&op), want, "verify gas = base + inputs + wire bytes");
+    assert_eq!(
+        opcode_gas(&op),
+        want,
+        "verify gas = base + inputs + wire bytes"
+    );
     assert_eq!(opcode_gas(&op), attestation_verify_gas(n, proof.wire_len()));
 
     // A bigger statement costs more than a small one.
@@ -642,11 +942,17 @@ fn snark_gas_schedule_shape() {
         public_outputs: vec![2; 64],
         proof_bytes: vec![0u8; ATTEST_PROOF_BYTES],
     };
-    let big_op = OpCode::SysCallVerifyZkMlAttestation { model_id: MODEL_A, proof: Box::new(big) };
+    let big_op = OpCode::SysCallVerifyZkMlAttestation {
+        model_id: MODEL_A,
+        proof: Box::new(big),
+    };
     assert!(opcode_gas(&big_op) > opcode_gas(&op));
 
     // VK registration scales with the bytes stored.
-    let rsmall = OpCode::SysCallRegisterZkMlSpec { model_id: MODEL_A, spec: Box::new(vk.clone()) };
+    let rsmall = OpCode::SysCallRegisterZkMlSpec {
+        model_id: MODEL_A,
+        spec: Box::new(vk.clone()),
+    };
     assert_eq!(
         opcode_gas(&rsmall),
         GAS_ZKML_SPEC_REGISTER_BASE
@@ -659,7 +965,8 @@ fn snark_gas_schedule_shape() {
 async fn snark_gas_exhaustion_reverts() {
     let m = tiny_model();
     let (e, sk, addr) = funded().await;
-    let (pk_bytes, vk) = register_model_and_vk(&e, &sk, addr, MODEL_A, &m, ATTEST_TEST_SEED, 0).await;
+    let (pk_bytes, vk) =
+        register_model_and_vk(&e, &sk, addr, MODEL_A, &m, ATTEST_TEST_SEED, 0).await;
     let (_, proof) = prove_for(&m, &[3, 4], &pk_bytes, &vk);
     let n = proof.public_inputs.len() + proof.public_outputs.len();
     // The attestation path RE-EXECUTES the registered model (audit W8.3), so
@@ -681,9 +988,14 @@ async fn snark_gas_exhaustion_reverts() {
         2,
         1,
         1,
-        vec![OpCode::SysCallVerifyZkMlAttestation { model_id: MODEL_A, proof: Box::new(proof.clone()) }],
+        vec![OpCode::SysCallVerifyZkMlAttestation {
+            model_id: MODEL_A,
+            proof: Box::new(proof.clone()),
+        }],
     );
-    let (a, f, _, s, _) = e.apply_block_parallel_fees(std::slice::from_ref(&starved), BLOCK_TS).await;
+    let (a, f, _, s, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&starved), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (0, 1), "gas-starved SNARK verify must fail");
     assert_eq!(s, vec![false]);
     assert_eq!(
@@ -703,9 +1015,14 @@ async fn snark_gas_exhaustion_reverts() {
         3,
         1,
         1,
-        vec![OpCode::SysCallVerifyZkMlAttestation { model_id: MODEL_A, proof: Box::new(proof) }],
+        vec![OpCode::SysCallVerifyZkMlAttestation {
+            model_id: MODEL_A,
+            proof: Box::new(proof),
+        }],
     );
-    let (a, f, _, s, _) = e.apply_block_parallel_fees(std::slice::from_ref(&exact), BLOCK_TS).await;
+    let (a, f, _, s, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&exact), BLOCK_TS)
+        .await;
     assert_eq!((a, f), (1, 0), "exact-fuel SNARK verify must apply");
     assert_eq!(s, vec![true]);
 }
@@ -726,22 +1043,48 @@ async fn snark_two_nodes_agree_and_verify_is_read_only() {
     let (pk_bytes, vk) = test_setup(&m, ATTEST_TEST_SEED);
     for engine in [&a, &b] {
         let rtx = register_model_tx(&ska, addra, 0, MODEL_A, &m);
-        assert_eq!(engine.apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS).await.0, 1);
+        assert_eq!(
+            engine
+                .apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS)
+                .await
+                .0,
+            1
+        );
         let vtx = register_vk_tx(&ska, addra, 1, MODEL_A, &vk);
-        assert_eq!(engine.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await.0, 1);
+        assert_eq!(
+            engine
+                .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+                .await
+                .0,
+            1
+        );
     }
-    assert_eq!(a.get_state_root().await, b.get_state_root().await, "same VK payload, same root");
+    assert_eq!(
+        a.get_state_root().await,
+        b.get_state_root().await,
+        "same VK payload, same root"
+    );
 
     // One proof, applied on both: same verdict, same root.
     let (_, proof) = prove_for(&m, &[3, 4], &pk_bytes, &vk);
     let before_a = zkml_vks_digest(&a.zkml_models_read().await.clone());
     for (engine, nonce) in [(&a, 2u64), (&b, 2u64)] {
         let vtx = verify_snark_tx(&ska, addra, nonce, MODEL_A, &proof);
-        assert_eq!(engine.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await.0, 1);
+        assert_eq!(
+            engine
+                .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+                .await
+                .0,
+            1
+        );
     }
     let after_a = zkml_vks_digest(&a.zkml_models_read().await.clone());
     assert_eq!(before_a, after_a, "verify does not mutate the key set");
-    assert_eq!(a.get_state_root().await, b.get_state_root().await, "same verify payload, same root");
+    assert_eq!(
+        a.get_state_root().await,
+        b.get_state_root().await,
+        "same verify payload, same root"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -757,8 +1100,14 @@ fn snark_bit_width_edges() {
     assert!(w_neg_ok.is_attestation_compatible());
     for w in [128i64, -129, 1_000_000] {
         let bad = QuantizedLinearModel::new(vec![QuantizedLayer::new(1, 1, vec![w], vec![0])]);
-        assert!(bad.validate(), "legacy validate stays permissive (old format works)");
-        assert!(!bad.is_attestation_compatible(), "weight {w} must be refused by the SNARK gate");
+        assert!(
+            bad.validate(),
+            "legacy validate stays permissive (old format works)"
+        );
+        assert!(
+            !bad.is_attestation_compatible(),
+            "weight {w} must be refused by the SNARK gate"
+        );
         assert!(!bad.layers[0].validate_constrained_bounds());
     }
     assert!(tiny_model().layers[0].validate_constrained_bounds());
@@ -767,14 +1116,27 @@ fn snark_bit_width_edges() {
     let m1 = QuantizedLinearModel::new(vec![QuantizedLayer::new(1, 1, vec![1], vec![0])]);
     let (pk1, vk1) = test_setup(&m1, ATTEST_TEST_SEED + 9);
     for good in [0i64, 1, 65_535] {
-        let (out, proof) = prove_attestation(&m1.attestation_view(), m1.compute_model_hash(), &[good], &pk1, vk1.spec_hash)
-            .expect("boundary input must prove");
+        let (out, proof) = prove_attestation(
+            &m1.attestation_view(),
+            m1.compute_model_hash(),
+            &[good],
+            &pk1,
+            vk1.spec_hash,
+        )
+        .expect("boundary input must prove");
         assert_eq!(out, vec![good]);
         assert!(verify_attestation(&vk1.spec_bytes, &proof));
     }
     for bad_in in [-1i64, 65_536, i64::MAX] {
         assert!(
-            prove_attestation(&m1.attestation_view(), m1.compute_model_hash(), &[bad_in], &pk1, vk1.spec_hash).is_err(),
+            prove_attestation(
+                &m1.attestation_view(),
+                m1.compute_model_hash(),
+                &[bad_in],
+                &pk1,
+                vk1.spec_hash
+            )
+            .is_err(),
             "input {bad_in} must fail closed at prove time"
         );
     }
@@ -788,7 +1150,10 @@ fn snark_bit_width_edges() {
         QuantizedLayer::new(8, 1, vec![127; 8], vec![0]),
     ]);
     assert!(deep.validate());
-    assert!(!deep.is_attestation_compatible(), "accumulator-blowing model must be refused");
+    assert!(
+        !deep.is_attestation_compatible(),
+        "accumulator-blowing model must be refused"
+    );
     {
         let mut reg = stellereum::zkml::ZkMlModelRegistry::default();
         reg.register(MODEL_A, deep).unwrap();
@@ -843,7 +1208,12 @@ async fn snark_legacy_big_model_keeps_reexec_but_refuses_vk() {
     // Live level: re-execution path works, VK attach reverts.
     let (e, sk, addr) = funded().await;
     let rtx = register_model_tx(&sk, addr, 0, MODEL_A, &big);
-    assert_eq!(e.apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS).await.0, 1);
+    assert_eq!(
+        e.apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS)
+            .await
+            .0,
+        1
+    );
     let (_, legacy_proof) = ZkMlProof::prove_reexec(&big, &[3, 4]);
     assert!(legacy_proof.verify_inference_against(&big));
     let vtx = Transaction::sign_with_payload(
@@ -859,13 +1229,25 @@ async fn snark_legacy_big_model_keeps_reexec_but_refuses_vk() {
             proof: Box::new(legacy_proof),
         }],
     );
-    let (a, f, _, _, _) = e.apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS).await;
-    assert_eq!((a, f), (1, 0), "legacy re-execution path unchanged for big models");
+    let (a, f, _, _, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&vtx), BLOCK_TS)
+        .await;
+    assert_eq!(
+        (a, f),
+        (1, 0),
+        "legacy re-execution path unchanged for big models"
+    );
 
     let (_, vk) = test_setup(&tiny_model(), ATTEST_TEST_SEED + 13);
     let kvtx = register_vk_tx(&sk, addr, 2, MODEL_A, &vk);
-    let (a, f, _, _, _) = e.apply_block_parallel_fees(std::slice::from_ref(&kvtx), BLOCK_TS).await;
-    assert_eq!((a, f), (0, 1), "VK attach to a non-compatible model must revert");
+    let (a, f, _, _, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&kvtx), BLOCK_TS)
+        .await;
+    assert_eq!(
+        (a, f),
+        (0, 1),
+        "VK attach to a non-compatible model must revert"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -879,12 +1261,21 @@ fn snark_discriminants_appended_legacy_encodings_unchanged() {
     let (_, vk) = test_setup(&m, ATTEST_TEST_SEED);
     let (_, proof) = prove_for(&m, &[3, 4], &test_setup(&m, ATTEST_TEST_SEED).0, &vk);
 
-    let reg = OpCode::SysCallRegisterZkMlSpec { model_id: MODEL_A, spec: Box::new(vk) };
-    let ver = OpCode::SysCallVerifyZkMlAttestation { model_id: MODEL_A, proof: Box::new(proof) };
+    let reg = OpCode::SysCallRegisterZkMlSpec {
+        model_id: MODEL_A,
+        spec: Box::new(vk),
+    };
+    let ver = OpCode::SysCallVerifyZkMlAttestation {
+        model_id: MODEL_A,
+        proof: Box::new(proof),
+    };
     for (op, want) in [(reg, 37u32), (ver, 38u32)] {
         let bytes = bincode::serialize(&op).expect("opcode serializes");
         let got = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-        assert_eq!(got, want, "new opcode discriminant must be appended, got {got}");
+        assert_eq!(
+            got, want,
+            "new opcode discriminant must be appended, got {got}"
+        );
     }
     // Spot-check the pinned prefix did not move.
     for (op, want) in [
@@ -908,8 +1299,14 @@ fn snark_pre_node_fails_closed_on_new_discriminant() {
     let (_, vk) = test_setup(&m, ATTEST_TEST_SEED);
     let (_, proof) = prove_for(&m, &[3, 4], &test_setup(&m, ATTEST_TEST_SEED).0, &vk);
     for payload in [
-        vec![OpCode::SysCallRegisterZkMlSpec { model_id: MODEL_A, spec: Box::new(vk.clone()) }],
-        vec![OpCode::SysCallVerifyZkMlAttestation { model_id: MODEL_A, proof: Box::new(proof.clone()) }],
+        vec![OpCode::SysCallRegisterZkMlSpec {
+            model_id: MODEL_A,
+            spec: Box::new(vk.clone()),
+        }],
+        vec![OpCode::SysCallVerifyZkMlAttestation {
+            model_id: MODEL_A,
+            proof: Box::new(proof.clone()),
+        }],
     ] {
         let bytes = bincode::serialize(&payload).unwrap();
         let first = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
@@ -942,19 +1339,29 @@ fn snark_tx_hash_commits_the_proof() {
             0,
             1,
             1,
-            vec![OpCode::SysCallVerifyZkMlAttestation { model_id: MODEL_A, proof: Box::new(p.clone()) }],
+            vec![OpCode::SysCallVerifyZkMlAttestation {
+                model_id: MODEL_A,
+                proof: Box::new(p.clone()),
+            }],
         )
     };
     let a = mk(&proof);
     let b = mk(&other_proof);
-    assert_ne!(a.compute_tx_hash(), b.compute_tx_hash(), "different proofs, different txs");
+    assert_ne!(
+        a.compute_tx_hash(),
+        b.compute_tx_hash(),
+        "different proofs, different txs"
+    );
     assert_ne!(a.signing_message(), b.signing_message());
     let mut tampered = a.clone();
     tampered.payload = vec![OpCode::SysCallVerifyZkMlAttestation {
         model_id: MODEL_A,
         proof: Box::new(other_proof),
     }];
-    assert!(!tampered.verify_signature(), "payload (hence proof) is signed");
+    assert!(
+        !tampered.verify_signature(),
+        "payload (hence proof) is signed"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -963,6 +1370,7 @@ fn snark_tx_hash_commits_the_proof() {
 
 #[tokio::test]
 async fn snark_vk_domain_is_conditional_and_version_stays_4() {
+    use std::collections::HashMap;
     use stellereum::bridge::BridgeState;
     use stellereum::contract::ContractRegistry;
     use stellereum::governance::Governance;
@@ -972,7 +1380,6 @@ async fn snark_vk_domain_is_conditional_and_version_stays_4() {
     use stellereum::staking::StakingLedger;
     use stellereum::token::TokenRegistry;
     use stellereum::zkml::{SessionKeyRegistry, ZkMlModelRegistry};
-    use std::collections::HashMap;
 
     assert_eq!(COMMITMENT_VERSION, 5, "Genesis v5 version");
     let snap = stellereum::commitment::CommitmentSnapshot {
@@ -997,14 +1404,20 @@ async fn snark_vk_domain_is_conditional_and_version_stays_4() {
     // (genesis KAT property - no version bump).
     let empty = ZkMlModelRegistry::default();
     assert!(!empty.has_any_spec());
-    assert_eq!(commitment_digest_with_zkml(&snap, &empty), commitment_digest(&snap));
+    assert_eq!(
+        commitment_digest_with_zkml(&snap, &empty),
+        commitment_digest(&snap)
+    );
 
     // Models but no VK: the VK domain still writes zero bytes (keys, not
     // models, gate it) - the domain digest equals the empty preimage.
     let mut models_only = ZkMlModelRegistry::default();
     models_only.register(MODEL_A, tiny_model()).unwrap();
     assert!(!models_only.has_any_spec());
-    assert_eq!(zkml_vks_digest(&models_only), zkml_vks_digest(&ZkMlModelRegistry::default()));
+    assert_eq!(
+        zkml_vks_digest(&models_only),
+        zkml_vks_digest(&ZkMlModelRegistry::default())
+    );
 
     // One VK moves the full digest relative to the same models without it
     // (isolates the VK domain's contribution from the models domain's).
@@ -1031,10 +1444,24 @@ async fn snark_vk_domain_is_conditional_and_version_stays_4() {
     let (e, sk, addr) = funded().await;
     let before = e.get_state_root().await;
     let rtx = register_model_tx(&sk, addr, 0, MODEL_A, &tiny_model());
-    assert_eq!(e.apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS).await.0, 1);
+    assert_eq!(
+        e.apply_block_parallel_fees(std::slice::from_ref(&rtx), BLOCK_TS)
+            .await
+            .0,
+        1
+    );
     let kvtx = register_vk_tx(&sk, addr, 1, MODEL_A, &vk);
-    assert_eq!(e.apply_block_parallel_fees(std::slice::from_ref(&kvtx), BLOCK_TS).await.0, 1);
-    assert_ne!(e.get_state_root().await, before, "VK set is consensus state");
+    assert_eq!(
+        e.apply_block_parallel_fees(std::slice::from_ref(&kvtx), BLOCK_TS)
+            .await
+            .0,
+        1
+    );
+    assert_ne!(
+        e.get_state_root().await,
+        before,
+        "VK set is consensus state"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,7 +1497,10 @@ async fn snark_direct_vm_without_registry_fails_closed() {
         oracle: None,
     };
     let r = Svm::execute(
-        &[OpCode::SysCallRegisterZkMlSpec { model_id: MODEL_A, spec: Box::new(vk) }],
+        &[OpCode::SysCallRegisterZkMlSpec {
+            model_id: MODEL_A,
+            spec: Box::new(vk),
+        }],
         10_000_000,
         &mut ctx,
     );
@@ -1098,7 +1528,10 @@ async fn snark_direct_vm_without_registry_fails_closed() {
         oracle: None,
     };
     let r = Svm::execute(
-        &[OpCode::SysCallVerifyZkMlAttestation { model_id: MODEL_A, proof: Box::new(proof) }],
+        &[OpCode::SysCallVerifyZkMlAttestation {
+            model_id: MODEL_A,
+            proof: Box::new(proof),
+        }],
         10_000_000,
         &mut ctx2,
     );
@@ -1113,9 +1546,11 @@ fn snark_production_single_party_setup_marks_attestation() {
     // handling story (documented in `snark`, pinned here by the attestation
     // bytes, which must NOT carry the test-only tag).
     let m = tiny_model();
-    let attestation = b"ceremony:powers-of-tau/AleO-test-transcript-sha256=deadbeef:participants=1:DESTROY-WASTE".to_vec();
-    let (pk_bytes, vk) =
-        model_spec_with_attestation(&m.attestation_view(), attestation.clone()).expect("setup works");
+    let attestation =
+        b"ceremony:powers-of-tau/AleO-test-transcript-sha256=deadbeef:participants=1:DESTROY-WASTE"
+            .to_vec();
+    let (pk_bytes, vk) = model_spec_with_attestation(&m.attestation_view(), attestation.clone())
+        .expect("setup works");
     assert_eq!(vk.setup_attestation, attestation);
     assert!(!vk.setup_attestation.starts_with(TEST_SETUP_ATTESTATION));
     let (_, proof) = prove_for(&m, &[3, 4], &pk_bytes, &vk);

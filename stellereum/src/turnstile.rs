@@ -68,14 +68,10 @@ pub enum CaptchaVerdict {
     /// `{"success":false,...}` — Cloudflare rejected the token. `error_codes`
     /// carries the `error-codes` array (e.g. `invalid-input-response`,
     /// `timeout-or-duplicate`); safe to log and to echo, unlike the token.
-    Rejected {
-        error_codes: Vec<String>,
-    },
+    Rejected { error_codes: Vec<String> },
     /// Transport failure, timeout, or an unparseable response: we do not know
     /// whether the token was valid, so the faucet must NOT dispense.
-    Unavailable {
-        reason: String,
-    },
+    Unavailable { reason: String },
 }
 
 /// Captcha configuration derived from the environment. The secret is never
@@ -117,7 +113,10 @@ impl CaptchaConfig {
         let site = non_empty_env(TURNSTILE_SITE_KEY_ENV);
         let secret = non_empty_env(TURNSTILE_SECRET_KEY_ENV);
         match (site, secret) {
-            (Some(site_key), Some(secret_key)) => Self::Enabled { site_key, secret_key },
+            (Some(site_key), Some(secret_key)) => Self::Enabled {
+                site_key,
+                secret_key,
+            },
             (None, None) => Self::Disabled,
             // Partial config (site key only OR secret only) is refused: the
             // operator clearly meant to turn the captcha on, so failing closed
@@ -161,7 +160,12 @@ pub trait CaptchaVerifier: Send + Sync {
     /// server-side config and must never be logged; `token` is the client-
     /// supplied `cf-turnstile-response` value and must never be logged either
     /// (it is a single-use credential).
-    fn verify(&self, secret: &str, token: &str, remote_ip: Option<std::net::IpAddr>) -> CaptchaVerdict;
+    fn verify(
+        &self,
+        secret: &str,
+        token: &str,
+        remote_ip: Option<std::net::IpAddr>,
+    ) -> CaptchaVerdict;
 }
 
 /// Production verifier: form-encoded POST to Cloudflare `siteverify` via the
@@ -172,7 +176,12 @@ pub trait CaptchaVerifier: Send + Sync {
 pub struct TurnstileVerifier;
 
 impl CaptchaVerifier for TurnstileVerifier {
-    fn verify(&self, secret: &str, token: &str, remote_ip: Option<std::net::IpAddr>) -> CaptchaVerdict {
+    fn verify(
+        &self,
+        secret: &str,
+        token: &str,
+        remote_ip: Option<std::net::IpAddr>,
+    ) -> CaptchaVerdict {
         let agent = ureq::AgentBuilder::new()
             .timeout(SITEVERIFY_TIMEOUT)
             .redirects(0)
@@ -407,14 +416,23 @@ mod tests {
             secret_key: "super-secret".to_string(),
         };
         let rendered = format!("{cfg:?}");
-        assert!(!rendered.contains("super-secret"), "secret must not leak via Debug: {rendered}");
-        assert!(rendered.contains("site-abc"), "site key is public and may appear: {rendered}");
+        assert!(
+            !rendered.contains("super-secret"),
+            "secret must not leak via Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("site-abc"),
+            "site key is public and may appear: {rendered}"
+        );
     }
 
     #[test]
     fn gate_without_secret_fails_closed() {
         let gate = CaptchaGate::new(CaptchaConfig::Disabled, Arc::new(TurnstileVerifier));
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let verdict = rt.block_on(gate.verify("tok", None));
         assert!(
             matches!(verdict, CaptchaVerdict::Unavailable { .. }),

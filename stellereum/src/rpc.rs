@@ -248,7 +248,7 @@ impl FinalizedHeaderRecord {
 
 /// Testnet-only token faucet.
 ///
-    /// Faucet funds are **not** written straight into the state engine: that would be
+/// Faucet funds are **not** written straight into the state engine: that would be
 /// node-local and therefore non-deterministic across a multi-node network. The
 /// faucet instead signs ordinary transfers from a dedicated, pre-funded genesis
 /// account and submits them to the mempool, so the value movement is decided by
@@ -384,8 +384,12 @@ pub fn load_faucet_seed_from_file(path: &std::path::Path) -> Result<[u8; 32], St
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let meta =
-            std::fs::metadata(path).map_err(|e| format!("[faucet] cannot stat faucet key file {}: {e}", path.display()))?;
+        let meta = std::fs::metadata(path).map_err(|e| {
+            format!(
+                "[faucet] cannot stat faucet key file {}: {e}",
+                path.display()
+            )
+        })?;
         if !meta.is_file() {
             return Err(format!(
                 "[faucet] REFUSING: faucet key path {} is not a file",
@@ -412,15 +416,21 @@ pub fn load_faucet_seed_from_file(path: &std::path::Path) -> Result<[u8; 32], St
             ));
         }
     }
-    let mut raw = zeroize::Zeroizing::new(
-        std::fs::read_to_string(path)
-            .map_err(|e| format!("[faucet] cannot read faucet key file {}: {e}", path.display()))?,
-    );
+    let mut raw = zeroize::Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
+        format!(
+            "[faucet] cannot read faucet key file {}: {e}",
+            path.display()
+        )
+    })?);
     // The parsed line is a SECOND copy of the secret (the file buffer above
     // is wiped on the next line): it must be a `Zeroizing` too, or the key
     // hex survives in a plain `String` after this function returns.
     let line = zeroize::Zeroizing::new(
-        raw.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string(),
+        raw.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string(),
     );
     zeroize::Zeroize::zeroize(&mut *raw);
     if line.is_empty() {
@@ -436,9 +446,11 @@ pub fn load_faucet_seed_from_file(path: &std::path::Path) -> Result<[u8; 32], St
 
 /// Helper so the parsed line (not the whole file buffer) is what gets an error
 /// context. Separated for tests.
-fn load_faucet_seed_from_file_content(line: &str, path: &std::path::Path) -> Result<[u8; 32], String> {
-    parse_faucet_seed_hex(line)
-        .map_err(|e| format!("{} (in {})", e, path.display()))
+fn load_faucet_seed_from_file_content(
+    line: &str,
+    path: &std::path::Path,
+) -> Result<[u8; 32], String> {
+    parse_faucet_seed_hex(line).map_err(|e| format!("{} (in {})", e, path.display()))
 }
 
 /// Fail-closed test-key gate: running the faucet with the well-known public
@@ -452,9 +464,7 @@ pub fn check_faucet_seed_allows_startup(seed: &[u8; 32]) -> Result<(), String> {
              money-printing on a guessable key. Set a real {}=/{} (0600 file preferred) \
              with a fresh random seed. Dev-only override (NEVER on a live network): \
              {}=1",
-            FAUCET_KEY_ENV,
-            FAUCET_KEY_FILE_ENV,
-            DEV_UNSAFE_TESTKEY_ENV
+            FAUCET_KEY_ENV, FAUCET_KEY_FILE_ENV, DEV_UNSAFE_TESTKEY_ENV
         ));
     }
     Ok(())
@@ -462,8 +472,12 @@ pub fn check_faucet_seed_allows_startup(seed: &[u8; 32]) -> Result<(), String> {
 
 /// True when either faucet-key source is configured (inline env or key file).
 pub fn faucet_key_present_from_env() -> bool {
-    let inline = std::env::var(FAUCET_KEY_ENV).ok().is_some_and(|s| !s.trim().is_empty());
-    let file = std::env::var(FAUCET_KEY_FILE_ENV).ok().is_some_and(|s| !s.trim().is_empty());
+    let inline = std::env::var(FAUCET_KEY_ENV)
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty());
+    let file = std::env::var(FAUCET_KEY_FILE_ENV)
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty());
     inline || file
 }
 
@@ -475,13 +489,19 @@ pub fn faucet_key_present_from_env() -> bool {
 ///   bad perms / bad hex), bad inline hex, or the public test key without the
 ///   dev override. Callers must refuse to start the faucet on `Err`.
 pub fn load_faucet_seed() -> Result<[u8; 32], String> {
-    if let Some(path) = std::env::var(FAUCET_KEY_FILE_ENV).ok().filter(|s| !s.trim().is_empty()) {
+    if let Some(path) = std::env::var(FAUCET_KEY_FILE_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
         let path_buf = zeroize::Zeroizing::new(path);
         let seed = load_faucet_seed_from_file(std::path::Path::new(path_buf.as_str()))?;
         check_faucet_seed_allows_startup(&seed)?;
         return Ok(seed);
     }
-    if let Some(mut hex_str) = std::env::var(FAUCET_KEY_ENV).ok().filter(|s| !s.trim().is_empty()) {
+    if let Some(mut hex_str) = std::env::var(FAUCET_KEY_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
         let seed = parse_faucet_seed_hex(&hex_str)?;
         use zeroize::Zeroize;
         hex_str.zeroize();
@@ -524,11 +544,17 @@ pub fn load_faucet_seed_for_genesis() -> Result<[u8; 32], String> {
 }
 
 fn load_faucet_seed_for_genesis_inner() -> Result<[u8; 32], String> {
-    if let Some(path) = std::env::var(FAUCET_KEY_FILE_ENV).ok().filter(|s| !s.trim().is_empty()) {
+    if let Some(path) = std::env::var(FAUCET_KEY_FILE_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
         let path_buf = zeroize::Zeroizing::new(path);
         return load_faucet_seed_from_file(std::path::Path::new(path_buf.as_str()));
     }
-    if let Some(mut hex_str) = std::env::var(FAUCET_KEY_ENV).ok().filter(|s| !s.trim().is_empty()) {
+    if let Some(mut hex_str) = std::env::var(FAUCET_KEY_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
         let seed = parse_faucet_seed_hex(&hex_str)?;
         use zeroize::Zeroize;
         hex_str.zeroize();
@@ -644,10 +670,7 @@ impl Faucet {
     /// Attach a durability hook, returning the faucet for builder-style use.
     #[allow(clippy::type_complexity)]
     // GATE: persist callback signature is part of public builder API; boxing/aliasing would break callers.
-    pub fn with_persist(
-        mut self,
-        persist: std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>,
-    ) -> Self {
+    pub fn with_persist(mut self, persist: std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>) -> Self {
         self.persist = Some(persist);
         self
     }
@@ -670,7 +693,8 @@ impl Faucet {
             .map(|d| d.as_secs() / 3600)
             .unwrap_or(0);
         if let Ok(mut st) = bincode::deserialize::<FaucetState>(bytes) {
-            st.ip_buckets.retain(|_, (h, _)| now_hour.saturating_sub(*h) <= 1);
+            st.ip_buckets
+                .retain(|_, (h, _)| now_hour.saturating_sub(*h) <= 1);
             *self.state.lock().await = st;
         } else if let Ok(legacy) = bincode::deserialize::<LegacyFaucetState>(bytes) {
             *self.state.lock().await = FaucetState {
@@ -776,7 +800,8 @@ impl Faucet {
                 from,
                 to: who,
                 amount,
-                gas_limit: crate::svm::GAS_BASIC_TRANSFER + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS,
+                gas_limit: crate::svm::GAS_BASIC_TRANSFER
+                    + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS,
                 nonce,
                 source_shard: self.shard,
                 target_shard: self.shard,
@@ -863,7 +888,13 @@ impl Faucet {
 
     /// Lifetime amount already credited to `who`.
     pub async fn dispensed_to(&self, who: [u8; 32]) -> u64 {
-        self.state.lock().await.dispensed.get(&who).copied().unwrap_or(0)
+        self.state
+            .lock()
+            .await
+            .dispensed
+            .get(&who)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Per-source drip throttle: at most FAUCET_IP_MAX_PER_HOUR drips per UTC
@@ -876,13 +907,16 @@ impl Faucet {
     /// [`FaucetState`] and every granted drip re-persists, so restarts do not
     /// reset budgets (hunt D5).
     pub async fn check_ip_throttle(&self, ip: Option<std::net::IpAddr>, now_secs: u64) -> bool {
-        let key = ip.map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
+        let key = ip
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
         let mut st = self.state.lock().await;
         if st.ip_buckets.len() > 100_000 {
             // Hour-unit comparison: entries store the UTC hour number, not a
             // timestamp (the old seconds-based retain wiped live buckets).
             let now_hour = now_secs / 3600;
-            st.ip_buckets.retain(|_, (h, _)| now_hour.saturating_sub(*h) <= 1);
+            st.ip_buckets
+                .retain(|_, (h, _)| now_hour.saturating_sub(*h) <= 1);
         }
         let hour = now_secs / 3600;
         let ip_max = faucet_ip_max_per_hour();
@@ -1052,8 +1086,7 @@ fn estimate_fee_rate_limit() -> u32 {
 
 /// The process-wide estimate-fee limiter.
 fn estimate_fee_budget() -> &'static crate::explorer::RateLimiter {
-    static LIMITER: std::sync::OnceLock<crate::explorer::RateLimiter> =
-        std::sync::OnceLock::new();
+    static LIMITER: std::sync::OnceLock<crate::explorer::RateLimiter> = std::sync::OnceLock::new();
     LIMITER.get_or_init(|| crate::explorer::RateLimiter::new(estimate_fee_rate_limit()))
 }
 
@@ -1111,7 +1144,6 @@ pub fn estimate_fee_gas_budget(requested_max_gas: Option<u64>) -> Result<u64, St
         Some(v) => Ok(v),
     }
 }
-
 
 /// Max number of events `stell_getEvents` returns for one contract query.///
 /// BOUNDED ANSWER (audit W6.7): the receipt index holds up to
@@ -1215,9 +1247,15 @@ impl RpcState {
 
     /// Record a newly finalized block. Called by the consensus loop.
     pub async fn record_block(&self, height: u64, hash: [u8; 32], tx_count: usize, timestamp: u64) {
-        self.height.store(height, std::sync::atomic::Ordering::Relaxed);
+        self.height
+            .store(height, std::sync::atomic::Ordering::Relaxed);
         let mut rb = self.recent_blocks.write().await;
-        rb.push_front(BlockSummary { height, hash: hex::encode(hash), tx_count, timestamp });
+        rb.push_front(BlockSummary {
+            height,
+            hash: hex::encode(hash),
+            tx_count,
+            timestamp,
+        });
         while rb.len() > MAX_RECENT_BLOCKS {
             rb.pop_back();
         }
@@ -1284,7 +1322,8 @@ impl RpcState {
         statuses: &[bool],
         fees: &[u64],
     ) {
-        self.record_receipts_with_events(height, block_hash, txs, statuses, fees, &[]).await;
+        self.record_receipts_with_events(height, block_hash, txs, statuses, fees, &[])
+            .await;
     }
 
     /// Record inclusion receipts for a finalized block's transactions, including contract events.
@@ -1318,7 +1357,9 @@ impl RpcState {
         for (i, tx) in txs.iter().enumerate() {
             let success = statuses.get(i).copied().unwrap_or(false);
             raw_buf.clear();
-            let raw_tx = bincode::serialize_into(&mut raw_buf, tx).ok().map(|_| hex::encode(&raw_buf));
+            let raw_tx = bincode::serialize_into(&mut raw_buf, tx)
+                .ok()
+                .map(|_| hex::encode(&raw_buf));
             let h = batcher.hash_one(tx);
             hashes.push(h);
             let (rv, gu, ev, ca) = if let Some(existing) = idx.get(&h) {
@@ -1327,7 +1368,12 @@ impl RpcState {
                 } else {
                     events.get(i).cloned().unwrap_or_default()
                 };
-                (existing.return_value, existing.gas_used, evs, existing.contract_address)
+                (
+                    existing.return_value,
+                    existing.gas_used,
+                    evs,
+                    existing.contract_address,
+                )
             } else {
                 (None, None, events.get(i).cloned().unwrap_or_default(), None)
             };
@@ -1395,7 +1441,16 @@ impl RpcState {
         fees: &[u64],
         timestamp: u64,
     ) {
-        self.record_adopted_block_with_events(height, block_hash, txs, statuses, fees, &[], timestamp).await;
+        self.record_adopted_block_with_events(
+            height,
+            block_hash,
+            txs,
+            statuses,
+            fees,
+            &[],
+            timestamp,
+        )
+        .await;
     }
 
     /// Record an adopted block including emitted contract events.
@@ -1411,8 +1466,10 @@ impl RpcState {
         events: &[Vec<crate::contract::ContractEvent>],
         timestamp: u64,
     ) {
-        self.record_receipts_with_events(height, block_hash, txs, statuses, fees, events).await;
-        self.record_block(height, block_hash, txs.len(), timestamp).await;
+        self.record_receipts_with_events(height, block_hash, txs, statuses, fees, events)
+            .await;
+        self.record_block(height, block_hash, txs.len(), timestamp)
+            .await;
     }
 
     /// Import one durably stored receipt (restart hydration). Bounded by the
@@ -1458,13 +1515,16 @@ impl RpcState {
         let rb = self.recent_blocks.read().await;
         if let Some(b) = rb.iter().find(|b| b.height == want) {
             let parent_hash = if b.height > 0 {
-                rb.iter().find(|p| p.height == b.height - 1).map(|p| p.hash.as_str())
+                rb.iter()
+                    .find(|p| p.height == b.height - 1)
+                    .map(|p| p.hash.as_str())
             } else {
                 None
             };
             let idx = self.receipts.read().await;
             let rows = idx.for_height(want);
-            let evm_block = crate::evm_adapter::stell_block_summary_to_evm_full(b, parent_hash, &rows, full_tx);
+            let evm_block =
+                crate::evm_adapter::stell_block_summary_to_evm_full(b, parent_hash, &rows, full_tx);
             Ok(Some(evm_block))
         } else {
             Ok(crate::evm_adapter::global_adapter().get_block_by_number(&tag, full_tx))
@@ -1487,7 +1547,8 @@ impl RpcState {
         hash: &str,
         full_tx: bool,
     ) -> Result<Option<crate::evm_adapter::EvmBlock>, crate::evm_adapter::JsonRpcError> {
-        let norm = crate::evm_adapter::normalize_hash(hash).map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
+        let norm = crate::evm_adapter::normalize_hash(hash)
+            .map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
         let stripped = norm.strip_prefix("0x").unwrap_or(&norm);
         let rb = self.recent_blocks.read().await;
         if let Some(b) = rb.iter().find(|b| {
@@ -1495,13 +1556,16 @@ impl RpcState {
             b_stripped.eq_ignore_ascii_case(stripped)
         }) {
             let parent_hash = if b.height > 0 {
-                rb.iter().find(|p| p.height == b.height - 1).map(|p| p.hash.as_str())
+                rb.iter()
+                    .find(|p| p.height == b.height - 1)
+                    .map(|p| p.hash.as_str())
             } else {
                 None
             };
             let idx = self.receipts.read().await;
             let rows = idx.for_height(b.height);
-            let evm_block = crate::evm_adapter::stell_block_summary_to_evm_full(b, parent_hash, &rows, full_tx);
+            let evm_block =
+                crate::evm_adapter::stell_block_summary_to_evm_full(b, parent_hash, &rows, full_tx);
             Ok(Some(evm_block))
         } else {
             Ok(crate::evm_adapter::global_adapter().get_block_by_hash(&norm, full_tx))
@@ -1529,11 +1593,14 @@ impl RpcState {
         &self,
         tx_hash: &str,
     ) -> Result<Option<crate::evm_adapter::EvmReceipt>, crate::evm_adapter::JsonRpcError> {
-        let norm = crate::evm_adapter::normalize_hash(tx_hash).map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
-        let h_bytes = crate::evm_adapter::parse_hash_bytes(&norm).map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
+        let norm = crate::evm_adapter::normalize_hash(tx_hash)
+            .map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
+        let h_bytes = crate::evm_adapter::parse_hash_bytes(&norm)
+            .map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
         // Resolve EVM intent -> stell tx hash for the lookup, keeping the
         // queried (EVM) hash for the response body.
-        let lookup_bytes: [u8; 32] = crate::evm_adapter::evm_to_stell_hash(&norm).unwrap_or(h_bytes);
+        let lookup_bytes: [u8; 32] =
+            crate::evm_adapter::evm_to_stell_hash(&norm).unwrap_or(h_bytes);
         let is_settled_evm = lookup_bytes != h_bytes;
         let idx = self.receipts.read().await;
         if let Some(r) = idx.get(&lookup_bytes) {
@@ -1587,9 +1654,12 @@ impl RpcState {
         &self,
         tx_hash: &str,
     ) -> Result<Option<crate::evm_adapter::EvmTransaction>, crate::evm_adapter::JsonRpcError> {
-        let norm = crate::evm_adapter::normalize_hash(tx_hash).map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
-        let h_bytes = crate::evm_adapter::parse_hash_bytes(&norm).map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
-        let lookup_bytes: [u8; 32] = crate::evm_adapter::evm_to_stell_hash(&norm).unwrap_or(h_bytes);
+        let norm = crate::evm_adapter::normalize_hash(tx_hash)
+            .map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
+        let h_bytes = crate::evm_adapter::parse_hash_bytes(&norm)
+            .map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
+        let lookup_bytes: [u8; 32] =
+            crate::evm_adapter::evm_to_stell_hash(&norm).unwrap_or(h_bytes);
         let is_settled_evm = lookup_bytes != h_bytes;
         let idx = self.receipts.read().await;
         // Mined view first (settled EVM intents included): pending must not
@@ -1601,14 +1671,17 @@ impl RpcState {
                 {
                     return Ok(Some(evm_tx));
                 }
-            } else if let Some(evm_tx) = crate::evm_adapter::stell_receipt_to_evm_tx_with_chain(r, self.chain_id) {
+            } else if let Some(evm_tx) =
+                crate::evm_adapter::stell_receipt_to_evm_tx_with_chain(r, self.chain_id)
+            {
                 return Ok(Some(evm_tx));
             }
         }
         drop(idx);
         let mp = self.mempool.read().await;
         if let Some(tx) = mp.get(&lookup_bytes) {
-            let mut evm_tx = crate::evm_adapter::stell_tx_to_evm_with_chain(tx, None, None, None, self.chain_id);
+            let mut evm_tx =
+                crate::evm_adapter::stell_tx_to_evm_with_chain(tx, None, None, None, self.chain_id);
             if is_settled_evm {
                 evm_tx.hash = norm.clone();
             }
@@ -1644,13 +1717,16 @@ impl RpcState {
         let rb = self.recent_blocks.read().await;
         if let Some(b) = rb.iter().find(|b| b.height == want) {
             let parent_hash = if b.height > 0 {
-                rb.iter().find(|p| p.height == b.height - 1).map(|p| p.hash.as_str())
+                rb.iter()
+                    .find(|p| p.height == b.height - 1)
+                    .map(|p| p.hash.as_str())
             } else {
                 None
             };
             let idx = self.receipts.read().await;
             let rows = idx.for_height(want);
-            let evm_block = crate::evm_adapter::stell_block_summary_to_evm_full(b, parent_hash, &rows, full);
+            let evm_block =
+                crate::evm_adapter::stell_block_summary_to_evm_full(b, parent_hash, &rows, full);
             Ok(Some(evm_block))
         } else {
             Ok(crate::evm_adapter::global_adapter().get_block_by_number(&tag, full))
@@ -1687,7 +1763,8 @@ impl RpcState {
         &self,
         hash: &str,
     ) -> Result<Option<String>, crate::evm_adapter::JsonRpcError> {
-        let norm = crate::evm_adapter::normalize_hash(hash).map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
+        let norm = crate::evm_adapter::normalize_hash(hash)
+            .map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
         let stripped = norm.strip_prefix("0x").unwrap_or(&norm);
         let rb = self.recent_blocks.read().await;
         if let Some(b) = rb.iter().find(|b| {
@@ -1697,8 +1774,7 @@ impl RpcState {
             return Ok(Some(crate::evm_adapter::format_u64_hex(b.tx_count as u64)));
         }
         drop(rb);
-        crate::evm_adapter::global_adapter()
-            .get_block_transaction_count_by_hash(&norm)
+        crate::evm_adapter::global_adapter().get_block_transaction_count_by_hash(&norm)
     }
 
     /// Number of transactions in a block looked up by tag/number.
@@ -1724,7 +1800,8 @@ impl RpcState {
         hash: &str,
         index: u64,
     ) -> Result<Option<crate::evm_adapter::EvmTransaction>, crate::evm_adapter::JsonRpcError> {
-        let norm = crate::evm_adapter::normalize_hash(hash).map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
+        let norm = crate::evm_adapter::normalize_hash(hash)
+            .map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
         let stripped = norm.strip_prefix("0x").unwrap_or(&norm);
         let (height, block_hash_bytes) = {
             let rb = self.recent_blocks.read().await;
@@ -1758,7 +1835,11 @@ impl RpcState {
             // Fall through to the global adapter only when the block itself is unknown.
             if rows.is_empty() {
                 let rb = self.recent_blocks.read().await;
-                let known_tx_count = rb.iter().find(|b| b.height == h).map(|b| b.tx_count).unwrap_or(0);
+                let known_tx_count = rb
+                    .iter()
+                    .find(|b| b.height == h)
+                    .map(|b| b.tx_count)
+                    .unwrap_or(0);
                 if known_tx_count == 0 {
                     return Ok(None);
                 }
@@ -1767,8 +1848,7 @@ impl RpcState {
             }
             return Ok(None);
         }
-        crate::evm_adapter::global_adapter()
-            .get_transaction_by_block_hash_and_index(&norm, index)
+        crate::evm_adapter::global_adapter().get_transaction_by_block_hash_and_index(&norm, index)
     }
 
     /// Transaction at `index` inside the block looked up by tag/number.
@@ -1797,8 +1877,7 @@ impl RpcState {
             }
             return Ok(None);
         }
-        crate::evm_adapter::global_adapter()
-            .get_transaction_by_block_number_and_index(tag, index)
+        crate::evm_adapter::global_adapter().get_transaction_by_block_number_and_index(tag, index)
     }
 
     /// Uncle count by block hash. Stellereum never produces uncles:
@@ -1807,7 +1886,8 @@ impl RpcState {
         &self,
         hash: &str,
     ) -> Result<Option<String>, crate::evm_adapter::JsonRpcError> {
-        let norm = crate::evm_adapter::normalize_hash(hash).map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
+        let norm = crate::evm_adapter::normalize_hash(hash)
+            .map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
         let stripped = norm.strip_prefix("0x").unwrap_or(&norm);
         let rb = self.recent_blocks.read().await;
         if rb.iter().any(|b| {
@@ -1842,7 +1922,8 @@ impl RpcState {
         hash: &str,
         _index: u64,
     ) -> Result<Option<Value>, crate::evm_adapter::JsonRpcError> {
-        crate::evm_adapter::normalize_hash(hash).map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
+        crate::evm_adapter::normalize_hash(hash)
+            .map_err(crate::evm_adapter::JsonRpcError::invalid_params)?;
         Ok(None)
     }
 
@@ -1860,7 +1941,8 @@ impl RpcState {
         params: &Value,
     ) -> Result<Option<String>, crate::evm_adapter::JsonRpcError> {
         let hash_str = crate::evm_adapter::parse_single_hash_param(params)?;
-        self.eth_get_block_transaction_count_by_hash(&hash_str).await
+        self.eth_get_block_transaction_count_by_hash(&hash_str)
+            .await
     }
 
     pub async fn handle_get_block_transaction_count_by_number(
@@ -1876,7 +1958,8 @@ impl RpcState {
         params: &Value,
     ) -> Result<Option<crate::evm_adapter::EvmTransaction>, crate::evm_adapter::JsonRpcError> {
         let (hash_str, index) = crate::evm_adapter::parse_block_hash_and_index_params(params)?;
-        self.eth_get_transaction_by_block_hash_and_index(&hash_str, index).await
+        self.eth_get_transaction_by_block_hash_and_index(&hash_str, index)
+            .await
     }
 
     pub async fn handle_get_transaction_by_block_number_and_index(
@@ -1884,7 +1967,8 @@ impl RpcState {
         params: &Value,
     ) -> Result<Option<crate::evm_adapter::EvmTransaction>, crate::evm_adapter::JsonRpcError> {
         let (tag, index) = crate::evm_adapter::parse_block_number_and_index_params(params)?;
-        self.eth_get_transaction_by_block_number_and_index(&tag, index).await
+        self.eth_get_transaction_by_block_number_and_index(&tag, index)
+            .await
     }
 
     pub async fn handle_get_uncle_count_by_block_hash(
@@ -1908,7 +1992,8 @@ impl RpcState {
         params: &Value,
     ) -> Result<Option<Value>, crate::evm_adapter::JsonRpcError> {
         let (hash_str, index) = crate::evm_adapter::parse_block_hash_and_index_params(params)?;
-        self.eth_get_uncle_by_block_hash_and_index(&hash_str, index).await
+        self.eth_get_uncle_by_block_hash_and_index(&hash_str, index)
+            .await
     }
 
     pub async fn handle_get_uncle_by_block_number_and_index(
@@ -1916,7 +2001,8 @@ impl RpcState {
         params: &Value,
     ) -> Result<Option<Value>, crate::evm_adapter::JsonRpcError> {
         let (tag, index) = crate::evm_adapter::parse_block_number_and_index_params(params)?;
-        self.eth_get_uncle_by_block_number_and_index(&tag, index).await
+        self.eth_get_uncle_by_block_number_and_index(&tag, index)
+            .await
     }
 
     /// One-shot `eth_getLogs` over the node's committed history.
@@ -1970,8 +2056,8 @@ impl RpcState {
         };
         // Global EVM adapter receipts (EVM intents / bridged logs).
         if out.len() < evm::MAX_GET_LOGS_RESULTS {
-            let mut global =
-                evm::global_adapter().collect_matching_logs(&criteria, block_hash_filter.as_deref());
+            let mut global = evm::global_adapter()
+                .collect_matching_logs(&criteria, block_hash_filter.as_deref());
             out.append(&mut global);
         }
         out.sort_by_key(evm::log_sort_key);
@@ -1995,8 +2081,7 @@ impl RpcState {
         &self,
         params: &Value,
     ) -> Result<String, crate::evm_adapter::JsonRpcError> {
-        crate::evm_adapter::global_adapter()
-            .eth_get_storage_at(params)
+        crate::evm_adapter::global_adapter().eth_get_storage_at(params)
     }
 
     /// Alias matching JSON-RPC casing for `eth_get_storage_at`.
@@ -2010,7 +2095,15 @@ impl RpcState {
 
     /// Programmatic RPC call helper (for testing and embedded harnesses).
     pub async fn call(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
-        let r = dispatch(self, serde_json::Value::from(1), method, &params, None, None).await;
+        let r = dispatch(
+            self,
+            serde_json::Value::from(1),
+            method,
+            &params,
+            None,
+            None,
+        )
+        .await;
         r.0.error
             .map(|e| serde_json::json!({"error": e.message}))
             .unwrap_or(r.0.result.unwrap_or(serde_json::Value::Null))
@@ -2106,7 +2199,12 @@ pub struct RpcError {
 }
 
 fn ok(id: Value, result: Value) -> Json<RpcResponse> {
-    Json(RpcResponse { jsonrpc: "2.0", id, result: Some(result), error: None })
+    Json(RpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result: Some(result),
+        error: None,
+    })
 }
 
 fn err(id: Value, code: i64, message: impl Into<String>) -> Json<RpcResponse> {
@@ -2114,7 +2212,11 @@ fn err(id: Value, code: i64, message: impl Into<String>) -> Json<RpcResponse> {
         jsonrpc: "2.0",
         id,
         result: None,
-        error: Some(RpcError { code, message: message.into(), data: None }),
+        error: Some(RpcError {
+            code,
+            message: message.into(),
+            data: None,
+        }),
     })
 }
 
@@ -2153,7 +2255,10 @@ fn parse_single_getter_arg(val: &Value) -> Result<i64, String> {
         if trimmed.is_empty() {
             return Ok(0);
         }
-        if let Some(hex_part) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        if let Some(hex_part) = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+        {
             if hex_part.is_empty() {
                 return Ok(0);
             }
@@ -2162,8 +2267,8 @@ fn parse_single_getter_arg(val: &Value) -> Result<i64, String> {
                     .map_err(|e| format!("invalid hex argument: {e}"))?;
                 return Ok(n as i64);
             } else {
-                let bytes = hex::decode(hex_part)
-                    .map_err(|e| format!("invalid hex argument: {e}"))?;
+                let bytes =
+                    hex::decode(hex_part).map_err(|e| format!("invalid hex argument: {e}"))?;
                 if bytes.len() <= 8 {
                     let mut buf = [0u8; 8];
                     buf[8 - bytes.len()..].copy_from_slice(&bytes);
@@ -2281,7 +2386,10 @@ fn json_to_abi_value(ty: AbiType, val: &Value, param: &str) -> Result<AbiValue, 
             let s = val
                 .as_str()
                 .ok_or_else(|| format!("parameter '{param}' must be a hex string"))?;
-            let clean = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+            let clean = s
+                .strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X"))
+                .unwrap_or(s);
             let bytes = hex::decode(clean)
                 .map_err(|e| format!("parameter '{param}' is not valid hex: {e}"))?;
             Ok(AbiValue::Bytes(bytes))
@@ -2358,7 +2466,10 @@ fn parse_rpc_address(s: &str) -> Result<[u8; 32], String> {
     if let Ok(addr) = crate::address::parse_address(trimmed) {
         return Ok(addr);
     }
-    if let Some(hex_clean) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    if let Some(hex_clean) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         if hex_clean.len() == 40 {
             if let Ok(evm_b) = hex::decode(hex_clean) {
                 if let Ok(evm_arr) = <[u8; 20]>::try_from(evm_b.as_slice()) {
@@ -2389,7 +2500,9 @@ fn parse_rpc_address(s: &str) -> Result<[u8; 32], String> {
 /// The returned hint is an EXPLICIT pin by the caller. It never overrides
 /// the routing rule by accident: an address with no prefix is routed by the
 /// rule, and the rule never returns the masterchain for a bare address.
-pub(crate) fn parse_rpc_address_with_shard_hint(s: &str) -> Result<([u8; 32], Option<u32>), String> {
+pub(crate) fn parse_rpc_address_with_shard_hint(
+    s: &str,
+) -> Result<([u8; 32], Option<u32>), String> {
     let (shard, rest) = crate::sharding::split_shard_prefix(s);
     let addr = parse_rpc_address(rest)?;
     Ok((addr, shard))
@@ -2477,18 +2590,29 @@ fn parse_opcode_value(val: &Value) -> Result<crate::svm::OpCode, String> {
         for (k, v) in obj {
             match k.as_str() {
                 "SysCallTokenTransfer" | "token_transfer" => {
-                    let token_id = parse_addr_from_val(v.get("token_id").or_else(|| v.get("token")))?;
+                    let token_id =
+                        parse_addr_from_val(v.get("token_id").or_else(|| v.get("token")))?;
                     let to = parse_addr_from_val(v.get("to").or_else(|| v.get("recipient")))?;
-                    let amount = v.get("amount")
-                        .and_then(|a| a.as_u64().or_else(|| a.as_str().and_then(|s| s.parse().ok())))
+                    let amount = v
+                        .get("amount")
+                        .and_then(|a| {
+                            a.as_u64()
+                                .or_else(|| a.as_str().and_then(|s| s.parse().ok()))
+                        })
                         .unwrap_or(0);
-                    return Ok(crate::svm::OpCode::SysCallTokenTransfer { token_id, to, amount });
+                    return Ok(crate::svm::OpCode::SysCallTokenTransfer {
+                        token_id,
+                        to,
+                        amount,
+                    });
                 }
                 "SysCallCallContract" | "call_contract" => {
-                    let contract = parse_addr_from_val(v.get("contract").or_else(|| v.get("address")))?;
+                    let contract =
+                        parse_addr_from_val(v.get("contract").or_else(|| v.get("address")))?;
                     let method = match v.get("method") {
                         Some(m) if m.is_string() => m.as_str().unwrap().as_bytes().to_vec(),
-                        Some(m) if m.is_array() => serde_json::from_value(m.clone()).map_err(|e: serde_json::Error| e.to_string())?,
+                        Some(m) if m.is_array() => serde_json::from_value(m.clone())
+                            .map_err(|e: serde_json::Error| e.to_string())?,
                         _ => return Err("missing contract method".to_string()),
                     };
                     let arg = if let Some(a) = v.get("arg").or_else(|| v.get("args")) {
@@ -2496,7 +2620,11 @@ fn parse_opcode_value(val: &Value) -> Result<crate::svm::OpCode, String> {
                     } else {
                         0i64
                     };
-                    return Ok(crate::svm::OpCode::SysCallCallContract { contract, method, arg });
+                    return Ok(crate::svm::OpCode::SysCallCallContract {
+                        contract,
+                        method,
+                        arg,
+                    });
                 }
                 "SysCallDeployContract" | "deploy_contract" => {
                     let code = match v.get("code") {
@@ -2505,7 +2633,8 @@ fn parse_opcode_value(val: &Value) -> Result<crate::svm::OpCode, String> {
                             let s_clean = s.strip_prefix("0x").unwrap_or(s);
                             hex::decode(s_clean).map_err(|e| e.to_string())?
                         }
-                        Some(c) if c.is_array() => serde_json::from_value(c.clone()).map_err(|e: serde_json::Error| e.to_string())?,
+                        Some(c) if c.is_array() => serde_json::from_value(c.clone())
+                            .map_err(|e: serde_json::Error| e.to_string())?,
                         _ => return Err("missing contract code".to_string()),
                     };
                     return Ok(crate::svm::OpCode::SysCallDeployContract { code });
@@ -2547,7 +2676,8 @@ fn parse_estimate_payload(p: &Value, to_addr: [u8; 32]) -> Result<Vec<crate::svm
             if arr.is_empty() {
                 return Ok(Vec::new());
             }
-            if let Ok(ops) = serde_json::from_value::<Vec<crate::svm::OpCode>>(payload_val.clone()) {
+            if let Ok(ops) = serde_json::from_value::<Vec<crate::svm::OpCode>>(payload_val.clone())
+            {
                 return Ok(ops);
             }
             let mut ops = Vec::with_capacity(arr.len());
@@ -2562,11 +2692,17 @@ fn parse_estimate_payload(p: &Value, to_addr: [u8; 32]) -> Result<Vec<crate::svm
     }
 
     if let Some(tok_val) = p.get("token_id").or_else(|| p.get("token")) {
-        let tok_str = tok_val.as_str().ok_or_else(|| "token_id must be a string".to_string())?;
+        let tok_str = tok_val
+            .as_str()
+            .ok_or_else(|| "token_id must be a string".to_string())?;
         let token_id = parse_rpc_address(tok_str)?;
-        let amount = p.get("amount")
+        let amount = p
+            .get("amount")
             .or_else(|| p.get("value"))
-            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            })
             .unwrap_or(0);
         return Ok(vec![crate::svm::OpCode::SysCallTokenTransfer {
             token_id,
@@ -2578,7 +2714,8 @@ fn parse_estimate_payload(p: &Value, to_addr: [u8; 32]) -> Result<Vec<crate::svm
     if let Some(method_val) = p.get("method") {
         let method = match method_val {
             Value::String(s) => s.as_bytes().to_vec(),
-            Value::Array(_) => serde_json::from_value(method_val.clone()).map_err(|e: serde_json::Error| e.to_string())?,
+            Value::Array(_) => serde_json::from_value(method_val.clone())
+                .map_err(|e: serde_json::Error| e.to_string())?,
             _ => return Err("invalid method in contract call".to_string()),
         };
         let arg = if let Some(a) = p.get("arg").or_else(|| p.get("args")) {
@@ -2596,11 +2733,7 @@ fn parse_estimate_payload(p: &Value, to_addr: [u8; 32]) -> Result<Vec<crate::svm
     Ok(Vec::new())
 }
 
-async fn handle_estimate_fee(
-    st: &RpcState,
-    id: Value,
-    params: &Value,
-) -> Json<RpcResponse> {
+async fn handle_estimate_fee(st: &RpcState, id: Value, params: &Value) -> Json<RpcResponse> {
     let p = if params.is_array() {
         params.get(0).unwrap_or(params)
     } else {
@@ -2629,9 +2762,7 @@ async fn handle_estimate_fee(
     };
 
     // 1. Raw transaction support: { "tx": <raw hex> }
-    let raw_tx_opt = p.get("tx")
-        .and_then(|v| v.as_str())
-        .or_else(|| p.as_str());
+    let raw_tx_opt = p.get("tx").and_then(|v| v.as_str()).or_else(|| p.as_str());
 
     let sim_tx = if let Some(raw_hex) = raw_tx_opt {
         let clean = raw_hex.strip_prefix("0x").unwrap_or(raw_hex);
@@ -2647,7 +2778,11 @@ async fn handle_estimate_fee(
             },
         }
     } else {
-        let from_str = match p.get("from").or_else(|| p.get("sender")).and_then(|v| v.as_str()) {
+        let from_str = match p
+            .get("from")
+            .or_else(|| p.get("sender"))
+            .and_then(|v| v.as_str())
+        {
             Some(s) => s,
             None => return err(id, -32602, "missing 'from' parameter"),
         };
@@ -2656,11 +2791,13 @@ async fn handle_estimate_fee(
             Err(e) => return err(id, -32602, format!("invalid 'from' address: {e}")),
         };
 
-        let to_str = match p.get("to")
+        let to_str = match p
+            .get("to")
             .or_else(|| p.get("recipient"))
             .or_else(|| p.get("contract"))
             .or_else(|| p.get("address"))
-            .and_then(|v| v.as_str()) {
+            .and_then(|v| v.as_str())
+        {
             Some(s) => s,
             None => return err(id, -32602, "missing 'to' parameter"),
         };
@@ -2669,15 +2806,24 @@ async fn handle_estimate_fee(
             Err(e) => return err(id, -32602, format!("invalid 'to' address: {e}")),
         };
 
-        let amount = p.get("amount")
+        let amount = p
+            .get("amount")
             .or_else(|| p.get("value"))
-            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            })
             .unwrap_or(0);
 
-        let source_shard = p.get("source_shard")
+        let source_shard = p
+            .get("source_shard")
             .and_then(|v| v.as_u64().map(|n| n as u32))
             .or(from_shard_hint)
-            .unwrap_or_else(|| st.engine.shard_id.load(std::sync::atomic::Ordering::Relaxed));
+            .unwrap_or_else(|| {
+                st.engine
+                    .shard_id
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            });
 
         // THE address→shard rule (see `crate::sharding::ROUTING_RULE`): an
         // explicit `target_shard` wins, then the shard the caller NAMED in
@@ -2723,24 +2869,32 @@ async fn simulate_and_estimate_fee(
     // Consensus floor and surcharge (e.g. PQ activation or penalties)
     let (floor_base, surcharge) = sim_engine.consensus_floor_parts(&sim_tx).await;
     let pool_floor = st.mempool.read().await.base_fee;
-    let base_fee = pool_floor.max(floor_base).max(crate::svm::GAS_BASIC_TRANSFER);
+    let base_fee = pool_floor
+        .max(floor_base)
+        .max(crate::svm::GAS_BASIC_TRANSFER);
 
     // Provide test/simulation funds for sender in case account is unfunded in simulation
     {
         let mut map = sim_engine.accounts.write().await;
-        let entry = map.entry(sim_tx.from).or_insert_with(|| AccountState::new(sim_tx.from, 0));
+        let entry = map
+            .entry(sim_tx.from)
+            .or_insert_with(|| AccountState::new(sim_tx.from, 0));
         if entry.balance < 100_000_000_000 {
             entry.balance = 100_000_000_000;
         }
     }
     // Also if token transfer, ensure sender has tokens in cloned engine
     for op in &sim_tx.payload {
-        if let crate::svm::OpCode::SysCallTokenTransfer { token_id, amount, .. } = op {
+        if let crate::svm::OpCode::SysCallTokenTransfer {
+            token_id, amount, ..
+        } = op
+        {
             let mut tokens = sim_engine.tokens_write().await;
             if let Some(tok) = tokens.tokens.get_mut(token_id) {
                 let cur = tok.balance_of(&sim_tx.from);
                 if cur < *amount {
-                    tok.balances.insert(sim_tx.from, cur.saturating_add(*amount));
+                    tok.balances
+                        .insert(sim_tx.from, cur.saturating_add(*amount));
                 }
             }
         }
@@ -2772,9 +2926,7 @@ async fn simulate_and_estimate_fee(
         // dead code pretending to be a caller-controllable floor.
         sim_tx.gas_limit = gas_budget;
         match sim_engine.execute_payload(&sim_tx, now).await {
-            Ok((crate::svm::VmExecutionResult::Success { gas_used, .. }, _)) => {
-                gas_used
-            }
+            Ok((crate::svm::VmExecutionResult::Success { gas_used, .. }, _)) => gas_used,
             Ok((crate::svm::VmExecutionResult::OutOfGas, _)) => {
                 return err(id, -32000, "simulation out of gas");
             }
@@ -2791,20 +2943,23 @@ async fn simulate_and_estimate_fee(
     let estimated_fee = effective_gas.saturating_add(surcharge);
     let gas_limit = estimated_fee;
 
-    ok(id, json!({
-        "gas_limit": gas_limit,
-        "estimated_fee": estimated_fee,
-        "base_fee": base_fee,
-        "source_shard": sim_tx.source_shard,
-        "target_shard": sim_tx.target_shard,
-        "is_cross_shard": is_cross_shard,
-        // The gas budget the simulation actually ran with, and the fixed
-        // ceiling it can never exceed (audit W7.2): a caller can see the
-        // bound it is working under instead of guessing it.
-        "gas_budget": gas_budget,
-        "gas_ceiling": ESTIMATE_FEE_GAS_CEILING,
-        "status": "ok"
-    }))
+    ok(
+        id,
+        json!({
+            "gas_limit": gas_limit,
+            "estimated_fee": estimated_fee,
+            "base_fee": base_fee,
+            "source_shard": sim_tx.source_shard,
+            "target_shard": sim_tx.target_shard,
+            "is_cross_shard": is_cross_shard,
+            // The gas budget the simulation actually ran with, and the fixed
+            // ceiling it can never exceed (audit W7.2): a caller can see the
+            // bound it is working under instead of guessing it.
+            "gas_budget": gas_budget,
+            "gas_ceiling": ESTIMATE_FEE_GAS_CEILING,
+            "status": "ok"
+        }),
+    )
 }
 
 /// Shared admission path for the WRITE-shaped `stell_submit*` arms.
@@ -2970,9 +3125,17 @@ pub const MAX_PROOF_STORAGE_KEYS: usize = 32;
 /// `storage_keys` are raw 32-byte state-trie keys (hex). This chain has no
 /// EVM storage trie, so there is nothing else they could mean.
 async fn handle_get_proof(st: &RpcState, id: Value, params: &Value) -> Json<RpcResponse> {
-    let p = if params.is_array() { params.get(0).unwrap_or(params) } else { params };
+    let p = if params.is_array() {
+        params.get(0).unwrap_or(params)
+    } else {
+        params
+    };
 
-    let addr_raw = match p.get("address").and_then(|v| v.as_str()).or_else(|| p.as_str()) {
+    let addr_raw = match p
+        .get("address")
+        .and_then(|v| v.as_str())
+        .or_else(|| p.as_str())
+    {
         Some(a) => a,
         None => return err(id, -32602, "missing address"),
     };
@@ -3062,13 +3225,21 @@ async fn handle_get_proof(st: &RpcState, id: Value, params: &Value) -> Json<RpcR
             // against the root it is serving. A broken proof is worse than
             // no proof, because the client would believe it.
             if !crate::cpat2::verify_proof(&root, &address, &p.value, p) {
-                return err(id, -32000, "internal error: generated account proof does not verify");
+                return err(
+                    id,
+                    -32000,
+                    "internal error: generated account proof does not verify",
+                );
             }
             (p.to_nodes(), b, n, true)
         }
         Some(p) => {
             if !crate::cpat2::verify_exclusion_proof(&root, &address, p) {
-                return err(id, -32000, "internal error: generated exclusion proof does not verify");
+                return err(
+                    id,
+                    -32000,
+                    "internal error: generated exclusion proof does not verify",
+                );
             }
             (p.to_nodes(), 0u64, 0u64, false)
         }
@@ -3085,7 +3256,11 @@ async fn handle_get_proof(st: &RpcState, id: Value, params: &Value) -> Json<RpcR
         match proof {
             Some(p) if p.kind == crate::cpat2::ProofKind::Inclusion => {
                 if !crate::cpat2::verify_proof(&root, k, &p.value, &p) {
-                    return err(id, -32000, "internal error: generated storage proof does not verify");
+                    return err(
+                        id,
+                        -32000,
+                        "internal error: generated storage proof does not verify",
+                    );
                 }
                 storage_proofs.push(json!({
                     "key": hex::encode(k),
@@ -3096,7 +3271,11 @@ async fn handle_get_proof(st: &RpcState, id: Value, params: &Value) -> Json<RpcR
             }
             Some(p) => {
                 if !crate::cpat2::verify_exclusion_proof(&root, k, &p) {
-                    return err(id, -32000, "internal error: generated storage exclusion proof does not verify");
+                    return err(
+                        id,
+                        -32000,
+                        "internal error: generated storage exclusion proof does not verify",
+                    );
                 }
                 storage_proofs.push(json!({
                     "key": hex::encode(k),
@@ -3118,19 +3297,22 @@ async fn handle_get_proof(st: &RpcState, id: Value, params: &Value) -> Json<RpcR
     drop(trie);
 
     let root_hex = hex::encode(root);
-    ok(id, json!({
-        "address": hex::encode(address),
-        "balance": balance,
-        "nonce": nonce,
-        "account_proof": account_nodes,
-        "storage_proofs": storage_proofs,
-        "state_root": root_hex,
-        // Aliases: `stateRoot` matches `stell_getBalanceSpv`, `height` lets a
-        // client line the answer up with the header it trusts.
-        "stateRoot": root_hex,
-        "height": cur_height,
-        "exists": account_exists,
-    }))
+    ok(
+        id,
+        json!({
+            "address": hex::encode(address),
+            "balance": balance,
+            "nonce": nonce,
+            "account_proof": account_nodes,
+            "storage_proofs": storage_proofs,
+            "state_root": root_hex,
+            // Aliases: `stateRoot` matches `stell_getBalanceSpv`, `height` lets a
+            // client line the answer up with the header it trusts.
+            "stateRoot": root_hex,
+            "height": cur_height,
+            "exists": account_exists,
+        }),
+    )
 }
 
 /// Decode `balance` and `nonce` out of a committed account leaf.
@@ -3174,9 +3356,17 @@ fn decode_account_leaf(value: &[u8]) -> (u64, u64) {
 /// a `-32004` error — never an empty answer, never a live-trie proof
 /// relabeled as history.
 async fn handle_get_archive_proof(st: &RpcState, id: Value, params: &Value) -> Json<RpcResponse> {
-    let p = if params.is_array() { params.get(0).unwrap_or(params) } else { params };
+    let p = if params.is_array() {
+        params.get(0).unwrap_or(params)
+    } else {
+        params
+    };
 
-    let addr_raw = match p.get("address").and_then(|v| v.as_str()).or_else(|| p.as_str()) {
+    let addr_raw = match p
+        .get("address")
+        .and_then(|v| v.as_str())
+        .or_else(|| p.as_str())
+    {
         Some(a) => a,
         None => return err(id, -32602, "missing address"),
     };
@@ -3379,16 +3569,21 @@ pub async fn collect_shard_heads(st: &RpcState) -> Vec<ShardHead> {
 
     // 2. The shard this node runs itself, when the registry has no head for it.
     if let std::collections::btree_map::Entry::Vacant(e) = heads.entry(local_shard) {
-        let tip_hash = st.recent_blocks.read().await.front().map(|b| b.hash.clone());
+        let tip_hash = st
+            .recent_blocks
+            .read()
+            .await
+            .front()
+            .map(|b| b.hash.clone());
         let state_root = hex::encode(st.engine.get_state_root().await);
         e.insert(ShardHead {
-                shard_id: local_shard,
-                shard_type: shard_type_of(local_shard).to_string(),
-                tip_height: st.height.load(std::sync::atomic::Ordering::Relaxed),
-                tip_hash,
-                state_root: Some(state_root),
-                local: true,
-            });
+            shard_id: local_shard,
+            shard_type: shard_type_of(local_shard).to_string(),
+            tip_height: st.height.load(std::sync::atomic::Ordering::Relaxed),
+            tip_hash,
+            state_root: Some(state_root),
+            local: true,
+        });
     }
 
     heads.into_values().collect()
@@ -3428,7 +3623,11 @@ fn require_wallet_sign_auth(
             .map(|p| constant_time_eq(p, expected.as_str()))
             .unwrap_or(false)
         {
-            return Some(err(id.clone(), -32001, "unauthorized: missing or invalid API token"));
+            return Some(err(
+                id.clone(),
+                -32001,
+                "unauthorized: missing or invalid API token",
+            ));
         }
     }
     None
@@ -3441,13 +3640,17 @@ fn require_wallet_sign_auth(
 fn wallet_sign_chain_id(st: &RpcState, params: &Value) -> Result<u64, String> {
     match params.get("chain_id") {
         None | Some(Value::Null) => Ok(st.chain_id),
-        Some(v) => crate::wallet_signing::parse_u64_param(v)
-            .map_err(|e| format!("bad chain_id: {e}")),
+        Some(v) => {
+            crate::wallet_signing::parse_u64_param(v).map_err(|e| format!("bad chain_id: {e}"))
+        }
     }
 }
 
 /// Parse the shared typed-data params into a [`crate::wallet_signing::TypedCallData`].
-fn parse_typed_data_params(params: &Value, default_chain_id: u64) -> Result<crate::wallet_signing::TypedCallData, String> {
+fn parse_typed_data_params(
+    params: &Value,
+    default_chain_id: u64,
+) -> Result<crate::wallet_signing::TypedCallData, String> {
     let contract_str = params
         .get("contract")
         .and_then(|v| v.as_str())
@@ -3460,15 +3663,21 @@ fn parse_typed_data_params(params: &Value, default_chain_id: u64) -> Result<crat
     let args = params.get("args").cloned().unwrap_or(Value::Null);
     let value = match params.get("value") {
         None | Some(Value::Null) => 0,
-        Some(v) => crate::wallet_signing::parse_u64_param(v).map_err(|e| format!("bad value: {e}"))?,
+        Some(v) => {
+            crate::wallet_signing::parse_u64_param(v).map_err(|e| format!("bad value: {e}"))?
+        }
     };
     let nonce = match params.get("nonce") {
         None | Some(Value::Null) => 0,
-        Some(v) => crate::wallet_signing::parse_u64_param(v).map_err(|e| format!("bad nonce: {e}"))?,
+        Some(v) => {
+            crate::wallet_signing::parse_u64_param(v).map_err(|e| format!("bad nonce: {e}"))?
+        }
     };
     let chain_id = match params.get("chain_id") {
         None | Some(Value::Null) => default_chain_id,
-        Some(v) => crate::wallet_signing::parse_u64_param(v).map_err(|e| format!("bad chain_id: {e}"))?,
+        Some(v) => {
+            crate::wallet_signing::parse_u64_param(v).map_err(|e| format!("bad chain_id: {e}"))?
+        }
     };
     crate::wallet_signing::TypedCallData::new(&contract, method, args, value, nonce, chain_id)
 }
@@ -3544,8 +3753,9 @@ fn handle_verify_message(st: &RpcState, id: Value, params: &Value) -> Json<RpcRe
         .get("signature")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing signature (standard envelope hex)".to_string())
-        .and_then(|s| crate::wallet_signing::WalletSignature::from_hex(s).map_err(|e| e.to_string()))
-    {
+        .and_then(|s| {
+            crate::wallet_signing::WalletSignature::from_hex(s).map_err(|e| e.to_string())
+        }) {
         Ok(s) => s,
         Err(e) => return err(id, -32602, format!("bad signature envelope: {e}")),
     };
@@ -3623,8 +3833,9 @@ fn handle_verify_typed_data(st: &RpcState, id: Value, params: &Value) -> Json<Rp
         .get("signature")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing signature (standard envelope hex)".to_string())
-        .and_then(|s| crate::wallet_signing::WalletSignature::from_hex(s).map_err(|e| e.to_string()))
-    {
+        .and_then(|s| {
+            crate::wallet_signing::WalletSignature::from_hex(s).map_err(|e| e.to_string())
+        }) {
         Ok(s) => s,
         Err(e) => return err(id, -32602, format!("bad signature envelope: {e}")),
     };
@@ -3670,12 +3881,21 @@ async fn dispatch(
         // height above ours means syncing. Was a hardcoded `false`.
         "eth_syncing" => {
             let ours = st.height.load(std::sync::atomic::Ordering::Relaxed);
-            ok(id, json!(crate::evm_adapter::eth_syncing_for_heights(ours, fresh_peer_height())))
+            ok(
+                id,
+                json!(crate::evm_adapter::eth_syncing_for_heights(
+                    ours,
+                    fresh_peer_height()
+                )),
+            )
         }
         // TESTNET-KNOWN default: the mempool `base_fee` is an admission floor
         // in gas units, not a wei price — mapping it here would mix units.
         "eth_gasPrice" => ok(id, json!(crate::evm_adapter::eth_gas_price())),
-        "eth_maxPriorityFeePerGas" => ok(id, json!(crate::evm_adapter::eth_max_priority_fee_per_gas())),
+        "eth_maxPriorityFeePerGas" => ok(
+            id,
+            json!(crate::evm_adapter::eth_max_priority_fee_per_gas()),
+        ),
         // Floor-aware admission estimate (audit 2026-10-14 F4): the EVM
         // 21k-style figure alone disagrees with the mempool's declared-gas
         // floor (`stell_baseFee`), so wallets are told the max of the two —
@@ -3706,40 +3926,32 @@ async fn dispatch(
             Ok(bal) => ok(id, json!(bal)),
             Err(e) => err(id, e.code, e.message),
         },
-        "eth_getTransactionCount" => match crate::evm_adapter::eth_get_transaction_count(&st.engine, params).await {
-            Ok(cnt) => ok(id, json!(cnt)),
+        "eth_getTransactionCount" => {
+            match crate::evm_adapter::eth_get_transaction_count(&st.engine, params).await {
+                Ok(cnt) => ok(id, json!(cnt)),
+                Err(e) => err(id, e.code, e.message),
+            }
+        }
+        "eth_blockNumber" => ok(id, json!(st.eth_block_number())),
+        "eth_getBlockByNumber" => match st.handle_get_block_by_number(params).await {
+            Ok(Some(b)) => ok(id, json!(b)),
+            Ok(None) => ok(id, Value::Null),
             Err(e) => err(id, e.code, e.message),
         },
-        "eth_blockNumber" => {
-            ok(id, json!(st.eth_block_number()))
-        }
-        "eth_getBlockByNumber" => {
-            match st.handle_get_block_by_number(params).await {
-                Ok(Some(b)) => ok(id, json!(b)),
-                Ok(None) => ok(id, Value::Null),
-                Err(e) => err(id, e.code, e.message),
-            }
-        }
-        "eth_getBlockByHash" => {
-            match st.handle_get_block_by_hash(params).await {
-                Ok(Some(b)) => ok(id, json!(b)),
-                Ok(None) => ok(id, Value::Null),
-                Err(e) => err(id, e.code, e.message),
-            }
-        }
-        "eth_getTransactionReceipt" => {
-            match st.handle_get_transaction_receipt(params).await {
-                Ok(Some(r)) => ok(id, json!(r)),
-                Ok(None) => ok(id, Value::Null),
-                Err(e) => err(id, e.code, e.message),
-            }
-        }
-        "eth_getTransactionByHash" => {
-            match st.handle_get_transaction_by_hash(params).await {
-                Ok(Some(tx)) => ok(id, json!(tx)),
-                Ok(None) => ok(id, Value::Null),
-                Err(e) => err(id, e.code, e.message),
-            }
+        "eth_getBlockByHash" => match st.handle_get_block_by_hash(params).await {
+            Ok(Some(b)) => ok(id, json!(b)),
+            Ok(None) => ok(id, Value::Null),
+            Err(e) => err(id, e.code, e.message),
+        },
+        "eth_getTransactionReceipt" => match st.handle_get_transaction_receipt(params).await {
+            Ok(Some(r)) => ok(id, json!(r)),
+            Ok(None) => ok(id, Value::Null),
+            Err(e) => err(id, e.code, e.message),
+        },
+        "eth_getTransactionByHash" => match st.handle_get_transaction_by_hash(params).await {
+            Ok(Some(tx)) => ok(id, json!(tx)),
+            Ok(None) => ok(id, Value::Null),
+            Err(e) => err(id, e.code, e.message),
         },
         "eth_getBlockTransactionCountByHash" => {
             match st.handle_get_block_transaction_count_by_hash(params).await {
@@ -3749,21 +3961,30 @@ async fn dispatch(
             }
         }
         "eth_getBlockTransactionCountByNumber" => {
-            match st.handle_get_block_transaction_count_by_number(params).await {
+            match st
+                .handle_get_block_transaction_count_by_number(params)
+                .await
+            {
                 Ok(Some(c)) => ok(id, json!(c)),
                 Ok(None) => ok(id, Value::Null),
                 Err(e) => err(id, e.code, e.message),
             }
         }
         "eth_getTransactionByBlockHashAndIndex" => {
-            match st.handle_get_transaction_by_block_hash_and_index(params).await {
+            match st
+                .handle_get_transaction_by_block_hash_and_index(params)
+                .await
+            {
                 Ok(Some(tx)) => ok(id, json!(tx)),
                 Ok(None) => ok(id, Value::Null),
                 Err(e) => err(id, e.code, e.message),
             }
         }
         "eth_getTransactionByBlockNumberAndIndex" => {
-            match st.handle_get_transaction_by_block_number_and_index(params).await {
+            match st
+                .handle_get_transaction_by_block_number_and_index(params)
+                .await
+            {
                 Ok(Some(tx)) => ok(id, json!(tx)),
                 Ok(None) => ok(id, Value::Null),
                 Err(e) => err(id, e.code, e.message),
@@ -3800,9 +4021,10 @@ async fn dispatch(
             Err(e) => err(id, e.code, e.message),
         },
         "eth_newBlockFilter" => ok(id, json!(crate::evm_adapter::eth_new_block_filter())),
-        "eth_newPendingTransactionFilter" => {
-            ok(id, json!(crate::evm_adapter::eth_new_pending_transaction_filter()))
-        }
+        "eth_newPendingTransactionFilter" => ok(
+            id,
+            json!(crate::evm_adapter::eth_new_pending_transaction_filter()),
+        ),
         "eth_newFilter" => match crate::evm_adapter::eth_new_filter(params) {
             Ok(v) => ok(id, json!(v)),
             Err(e) => err(id, e.code, e.message),
@@ -3851,7 +4073,9 @@ async fn dispatch(
                 let mut pool = st.mempool.write().await;
                 // Nonce-gap fail-fast: a far-future EVM nonce would sit in the
                 // pool forever behind an unreachable head.
-                if let Some(gap) = pool.check_nonce_gap(&stell_tx.from, stell_tx.nonce, onchain_nonce) {
+                if let Some(gap) =
+                    pool.check_nonce_gap(&stell_tx.from, stell_tx.nonce, onchain_nonce)
+                {
                     tracing::warn!(
                         "[mempool] rejecting gapped EVM tx from {}: {gap}",
                         hex::encode(&stell_tx.from[..6])
@@ -3904,12 +4128,14 @@ async fn dispatch(
             let rb = st.recent_blocks.read().await;
             let list: Vec<Value> = rb
                 .iter()
-                .map(|b| json!({
-                    "height": b.height,
-                    "hash": b.hash,
-                    "txs": b.tx_count,
-                    "timestamp": b.timestamp,
-                }))
+                .map(|b| {
+                    json!({
+                        "height": b.height,
+                        "hash": b.hash,
+                        "txs": b.tx_count,
+                        "timestamp": b.timestamp,
+                    })
+                })
                 .collect();
             ok(id, json!(list))
         }
@@ -3949,12 +4175,15 @@ async fn dispatch(
             let parameters = topology.parameters();
             let sharding = serde_json::to_value(&parameters).unwrap_or(Value::Null);
             drop(topology);
-            ok(id, json!({
-                "shards": heads,
-                "total_shards": total,
-                "routing_prefix_bits": routing_prefix_bits(total),
-                "sharding": sharding,
-            }))
+            ok(
+                id,
+                json!({
+                    "shards": heads,
+                    "total_shards": total,
+                    "routing_prefix_bits": routing_prefix_bits(total),
+                    "sharding": sharding,
+                }),
+            )
         }
         // The full shard topology: the active shard set with their routing
         // prefixes and account counts, plus the published thresholds and the
@@ -3998,13 +4227,17 @@ async fn dispatch(
                 None => return err(id, -32602, "missing height"),
             };
             // Known height = in the recent window (committed locally or adopted).
-            let known = st.recent_blocks.read().await.iter().any(|b| b.height == want);
+            let known = st
+                .recent_blocks
+                .read()
+                .await
+                .iter()
+                .any(|b| b.height == want);
             if !known {
                 return err(id, -32004, "block transactions not available yet (height not adopted/replicated on this node)");
             }
             let idx = st.receipts.read().await;
-            let mut rows: Vec<&TxReceipt> =
-                idx.map.values().filter(|r| r.height == want).collect();
+            let mut rows: Vec<&TxReceipt> = idx.map.values().filter(|r| r.height == want).collect();
             rows.sort_by_key(|r| r.index);
             let list: Vec<Value> = rows
                 .iter()
@@ -4096,7 +4329,9 @@ async fn dispatch(
         // sealed envelope (the wire frame: MAGIC || bincode(envelope)); the
         // node stores the CIPHERTEXT only.
         "stell_sendSealedTransaction" => {
-            let Some(hex_payload) = params["payload"].as_str().or_else(|| params["data"].as_str())
+            let Some(hex_payload) = params["payload"]
+                .as_str()
+                .or_else(|| params["data"].as_str())
             else {
                 return err(id, -32602, "missing payload");
             };
@@ -4167,7 +4402,10 @@ async fn dispatch(
                 .as_str()
                 .or_else(|| params["apiKey"].as_str())
                 .or(header_token);
-            if !provided.map(|p| constant_time_eq(p, expected)).unwrap_or(false) {
+            if !provided
+                .map(|p| constant_time_eq(p, expected))
+                .unwrap_or(false)
+            {
                 return err(id, -32001, "unauthorized: missing or invalid faucet token");
             }
             // Per-source throttle, same budget as the explorer path (audit
@@ -4233,7 +4471,11 @@ async fn dispatch(
                 .await
                 .map(|acc| acc.balance)
                 .unwrap_or(0);
-            let tx_hash = match st.mempool.write().await.add_checked_ctx(tx.clone(), balance, AdmissionCtx::wall_now()) {
+            let tx_hash = match st.mempool.write().await.add_checked_ctx(
+                tx.clone(),
+                balance,
+                AdmissionCtx::wall_now(),
+            ) {
                 Ok(h) => h,
                 Err(e) => {
                     faucet.rollback(&tx, a, amount).await;
@@ -4244,12 +4486,15 @@ async fn dispatch(
             if let Some(bcast) = &st.tx_broadcast {
                 let _ = bcast.send(tx);
             }
-            ok(id, json!({
-                "credited_nano": amount.to_string(),
-                "recipient": hex::encode(a),
-                "tx_hash": hex::encode(tx_hash),
-                "shard": drip_shard,
-            }))
+            ok(
+                id,
+                json!({
+                    "credited_nano": amount.to_string(),
+                    "recipient": hex::encode(a),
+                    "tx_hash": hex::encode(tx_hash),
+                    "shard": drip_shard,
+                }),
+            )
         }
         "stell_getBalance" => {
             let addr = match params.as_str().or_else(|| params["address"].as_str()) {
@@ -4280,16 +4525,19 @@ async fn dispatch(
             let root_hex = hex::encode(root);
             let proof = st.engine.get_account_proof(&a).await;
             let leaf_data = acc.as_ref().map(|x| hex::encode(x.to_trie_bytes()));
-            ok(id, json!({
-                "address": hex::encode(a),
-                "balance": balance.to_string(),
-                "nonce": nonce,
-                "stateRoot": root_hex,
-                "state_root": root_hex,
-                "leafData": leaf_data,
-                "leaf_data": leaf_data,
-                "proof": proof,
-            }))
+            ok(
+                id,
+                json!({
+                    "address": hex::encode(a),
+                    "balance": balance.to_string(),
+                    "nonce": nonce,
+                    "stateRoot": root_hex,
+                    "state_root": root_hex,
+                    "leafData": leaf_data,
+                    "leaf_data": leaf_data,
+                    "proof": proof,
+                }),
+            )
         }
         // Merkle inclusion/exclusion proofs for an account and any number of
         // state-trie keys, anchored at the state root.
@@ -4435,8 +4683,7 @@ async fn dispatch(
                     ),
                 );
             }
-            let complete =
-                leaves.len() == crate::mmr::MMR_EPOCH_BLOCKS as usize && tip >= end;
+            let complete = leaves.len() == crate::mmr::MMR_EPOCH_BLOCKS as usize && tip >= end;
             let (root, peaks) = crate::mmr::mmr_root_for_leaves(&leaves);
             // The quorum-signed commitment, when this node knows the header
             // that carries it (the first block of the next epoch).
@@ -4491,7 +4738,10 @@ async fn dispatch(
                     ),
                 );
             }
-            let h = match params.as_str().or_else(|| params["source_tx_hash"].as_str()) {
+            let h = match params
+                .as_str()
+                .or_else(|| params["source_tx_hash"].as_str())
+            {
                 Some(a) => a,
                 None => return err(id, -32602, "missing source_tx_hash"),
             };
@@ -4502,15 +4752,18 @@ async fn dispatch(
             let br = st.engine.bridge_read().await;
             match br.deposit_records.get(&hash) {
                 None => ok(id, json!({ "found": false })),
-                Some(r) => ok(id, json!({
-                    "found": true,
-                    "recipient": hex::encode(r.recipient),
-                    "amount": r.amount.to_string(),
-                    "chain": format!("{:?}", r.chain),
-                    "via_quorum": r.via_quorum,
-                    "deposited_at": r.deposited_at,
-                    "disputed": r.disputed,
-                })),
+                Some(r) => ok(
+                    id,
+                    json!({
+                        "found": true,
+                        "recipient": hex::encode(r.recipient),
+                        "amount": r.amount.to_string(),
+                        "chain": format!("{:?}", r.chain),
+                        "via_quorum": r.via_quorum,
+                        "deposited_at": r.deposited_at,
+                        "disputed": r.disputed,
+                    }),
+                ),
             }
         }
         "stell_bridgeDispute" => {
@@ -4527,18 +4780,21 @@ async fn dispatch(
             let br = st.engine.bridge_read().await;
             match br.disputes.get(&did) {
                 None => ok(id, json!({ "found": false })),
-                Some(d) => ok(id, json!({
-                    "found": true,
-                    "dispute_id": did,
-                    "source_tx_hash": hex::encode(d.source_tx_hash),
-                    "challenger": hex::encode(d.challenger),
-                    "recipient": hex::encode(d.recipient),
-                    "amount": d.amount.to_string(),
-                    "bond": d.bond.to_string(),
-                    "deadline": d.deadline,
-                    "resolved": d.resolved,
-                    "confirmed": d.confirmed,
-                })),
+                Some(d) => ok(
+                    id,
+                    json!({
+                        "found": true,
+                        "dispute_id": did,
+                        "source_tx_hash": hex::encode(d.source_tx_hash),
+                        "challenger": hex::encode(d.challenger),
+                        "recipient": hex::encode(d.recipient),
+                        "amount": d.amount.to_string(),
+                        "bond": d.bond.to_string(),
+                        "deadline": d.deadline,
+                        "resolved": d.resolved,
+                        "confirmed": d.confirmed,
+                    }),
+                ),
             }
         }
 
@@ -4559,7 +4815,15 @@ async fn dispatch(
                 Some(t) => t,
                 None => return err(id, -32602, "missing token"),
             };
-            ok(id, json!(st.engine.token_total_supply(&token).await.unwrap_or(0).to_string()))
+            ok(
+                id,
+                json!(st
+                    .engine
+                    .token_total_supply(&token)
+                    .await
+                    .unwrap_or(0)
+                    .to_string()),
+            )
         }
         "stell_tokenResolve" => {
             // Read-only id discovery for tokens created on chain: the
@@ -4591,12 +4855,15 @@ async fn dispatch(
                     let root = st.engine.get_state_root().await;
                     let proof = st.engine.get_token_balance_proof(&t, &a).await;
                     let key = hex::encode(token_balance_key(&t, &a));
-                    ok(id, json!({
-                        "balance": bal.to_string(),
-                        "stateRoot": hex::encode(root),
-                        "key": key,
-                        "proof": proof,
-                    }))
+                    ok(
+                        id,
+                        json!({
+                            "balance": bal.to_string(),
+                            "stateRoot": hex::encode(root),
+                            "key": key,
+                            "proof": proof,
+                        }),
+                    )
                 }
                 _ => err(id, -32602, "missing token/account"),
             }
@@ -4613,9 +4880,17 @@ async fn dispatch(
             // skip/take semantics (and `total`) are unchanged.
             let tokens = st.engine.tokens_read().await;
             let total = tokens.token_count();
-            let ids: Vec<String> =
-                tokens.tokens.keys().skip(offset).take(limit).map(hex::encode).collect();
-            ok(id, json!({ "tokens": ids, "total": total, "offset": offset }))
+            let ids: Vec<String> = tokens
+                .tokens
+                .keys()
+                .skip(offset)
+                .take(limit)
+                .map(hex::encode)
+                .collect();
+            ok(
+                id,
+                json!({ "tokens": ids, "total": total, "offset": offset }),
+            )
         }
 
         // ---- receipts (P0-3) ----
@@ -4656,7 +4931,8 @@ async fn dispatch(
                     }
                     if let Some(ref addr) = r.contract_address {
                         obj["contract_address"] = json!(hex::encode(addr));
-                        obj["contract_address_stl57"] = json!(crate::address::encode_stl57_address(addr));
+                        obj["contract_address_stl57"] =
+                            json!(crate::address::encode_stl57_address(addr));
                     }
                     if r.return_value.is_some() || r.gas_used.is_some() {
                         obj["return_value"] = match r.return_value {
@@ -4665,18 +4941,27 @@ async fn dispatch(
                         };
                         obj["gas_used"] = json!(r.gas_used.unwrap_or(0));
                     }
-                    let events_view: Vec<Value> = r.events.iter().map(|e| json!({
-                        "contract": hex::encode(e.contract),
-                        "contract_stl57": crate::address::encode_stl57_address(&e.contract),
-                        "topic": e.topic,
-                        "value": e.value,
-                    })).collect();
+                    let events_view: Vec<Value> = r
+                        .events
+                        .iter()
+                        .map(|e| {
+                            json!({
+                                "contract": hex::encode(e.contract),
+                                "contract_stl57": crate::address::encode_stl57_address(&e.contract),
+                                "topic": e.topic,
+                                "value": e.value,
+                            })
+                        })
+                        .collect();
                     obj["events"] = json!(events_view);
                     ok(id, obj)
                 }
                 None => {
                     let pending = st.mempool.read().await.contains(&h);
-                    ok(id, json!({ "status": if pending { "pending" } else { "unknown" } }))
+                    ok(
+                        id,
+                        json!({ "status": if pending { "pending" } else { "unknown" } }),
+                    )
                 }
             }
         }
@@ -4687,7 +4972,8 @@ async fn dispatch(
                 params
             };
 
-            let tx_hash_opt = p.get("tx_hash")
+            let tx_hash_opt = p
+                .get("tx_hash")
                 .or_else(|| p.get("txHash"))
                 .or_else(|| p.get("hash"))
                 .and_then(|v| v.as_str())
@@ -4700,12 +4986,18 @@ async fn dispatch(
                 };
                 let idx = st.receipts.read().await;
                 if let Some(r) = idx.get(&h) {
-                    let events_view: Vec<Value> = r.events.iter().map(|e| json!({
-                        "contract": hex::encode(e.contract),
-                        "contract_stl57": crate::address::encode_stl57_address(&e.contract),
-                        "topic": e.topic,
-                        "value": e.value,
-                    })).collect();
+                    let events_view: Vec<Value> = r
+                        .events
+                        .iter()
+                        .map(|e| {
+                            json!({
+                                "contract": hex::encode(e.contract),
+                                "contract_stl57": crate::address::encode_stl57_address(&e.contract),
+                                "topic": e.topic,
+                                "value": e.value,
+                            })
+                        })
+                        .collect();
                     return ok(id, json!(events_view));
                 }
                 return ok(id, json!([]));
@@ -4725,15 +5017,23 @@ async fn dispatch(
                     val.and_then(|v| {
                         v.as_u64().or_else(|| {
                             v.as_str().and_then(|s| {
-                                let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
-                                u64::from_str_radix(s, 16).ok().or_else(|| s.parse::<u64>().ok())
+                                let s = s
+                                    .strip_prefix("0x")
+                                    .or_else(|| s.strip_prefix("0X"))
+                                    .unwrap_or(s);
+                                u64::from_str_radix(s, 16)
+                                    .ok()
+                                    .or_else(|| s.parse::<u64>().ok())
                             })
                         })
                     })
                 };
 
-                let from_block = parse_block_num(p.get("from_block").or_else(|| p.get("fromBlock"))).unwrap_or(0);
-                let to_block = parse_block_num(p.get("to_block").or_else(|| p.get("toBlock"))).unwrap_or(u64::MAX);
+                let from_block =
+                    parse_block_num(p.get("from_block").or_else(|| p.get("fromBlock")))
+                        .unwrap_or(0);
+                let to_block = parse_block_num(p.get("to_block").or_else(|| p.get("toBlock")))
+                    .unwrap_or(u64::MAX);
                 // Optional answer cap. The receipt index holds up to
                 // `MAX_RECEIPTS` (50 000) receipts and every receipt can carry
                 // up to `MAX_CONTRACT_EVENTS` (256) events, so an unfiltered
@@ -4750,7 +5050,9 @@ async fn dispatch(
                     .min(MAX_EVENTS_RETURNED);
 
                 let idx = st.receipts.read().await;
-                let mut matched_receipts: Vec<&TxReceipt> = idx.map.values()
+                let mut matched_receipts: Vec<&TxReceipt> = idx
+                    .map
+                    .values()
                     .filter(|r| r.height >= from_block && r.height <= to_block)
                     .collect();
                 matched_receipts.sort_by_key(|r| (r.height, r.index));
@@ -4806,27 +5108,36 @@ async fn dispatch(
                 (None, true) => json!(0),
                 (None, false) => Value::Null,
             };
-            ok(id, json!({
-                "status": if pending { "pending" } else { status },
-                "height": height,
-                "confirmations": confirmations,
-            }))
+            ok(
+                id,
+                json!({
+                    "status": if pending { "pending" } else { status },
+                    "height": height,
+                    "confirmations": confirmations,
+                }),
+            )
         }
         // ---- staking ----
         // Read from the STATE ENGINE, not from a node-local copy: the validator
         // set is derived from this ledger at every height boundary, so a value
         // that existed only on this node would make it propose a different chain.
         "stell_stakeOf" => {
-            let v = match params["validator"].as_str().and_then(|s| parse_hash(s).ok()) {
+            let v = match params["validator"]
+                .as_str()
+                .and_then(|s| parse_hash(s).ok())
+            {
                 Some(v) => v,
                 None => return err(id, -32602, "missing validator"),
             };
             let l = st.engine.staking_read().await;
-            ok(id, json!({
-                "total": l.total_stake(&v).to_string(),
-                "self_bond": l.validators.get(&v).map(|x| x.self_bond).unwrap_or(0).to_string(),
-                "delegated": l.validators.get(&v).map(|x| x.delegated).unwrap_or(0).to_string(),
-            }))
+            ok(
+                id,
+                json!({
+                    "total": l.total_stake(&v).to_string(),
+                    "self_bond": l.validators.get(&v).map(|x| x.self_bond).unwrap_or(0).to_string(),
+                    "delegated": l.validators.get(&v).map(|x| x.delegated).unwrap_or(0).to_string(),
+                }),
+            )
         }
         // ---- zkML capability statement (audit W8.3 / blocker A5) ----
         //
@@ -4835,11 +5146,12 @@ async fn dispatch(
         // that from DATA instead of from a marketing name, so the chain
         // states it: every flag is the conservative truth, and the per-opcode
         // detail says what each one really does.
-        "stell_zkmlCapabilities" => {
-            ok(id, serde_json::to_value(crate::zkml::zkml_capabilities()).unwrap_or_else(|e| {
-                json!({ "error": format!("capability statement unavailable: {e}") })
-            }))
-        }
+        "stell_zkmlCapabilities" => ok(
+            id,
+            serde_json::to_value(crate::zkml::zkml_capabilities()).unwrap_or_else(
+                |e| json!({ "error": format!("capability statement unavailable: {e}") }),
+            ),
+        ),
 
         "stell_getValidators" => {
             let ledger = st.engine.staking_read().await;
@@ -4854,60 +5166,79 @@ async fn dispatch(
             // so any single halt stops the chain. Advisory only (fail-open);
             // `fragile_reason` explains, null when healthy.
             let fragility = ledger.quorum_fragility();
-            ok(id, json!({ "validators": list, "total_power": vs.total_power().to_string(), "quorum": vs.quorum_power().to_string(), "fragile": fragility.is_some(), "fragile_reason": fragility }))
+            ok(
+                id,
+                json!({ "validators": list, "total_power": vs.total_power().to_string(), "quorum": vs.quorum_power().to_string(), "fragile": fragility.is_some(), "fragile_reason": fragility }),
+            )
         }
 
         // ---- governance ----
         "stell_proposal" => {
             let pid = match params["id"].as_u64().or_else(|| params.as_u64()) {
                 Some(p) => p,
-                None => return err(id, -32602, "missing or invalid proposal id (must be an unsigned integer)"),
+                None => {
+                    return err(
+                        id,
+                        -32602,
+                        "missing or invalid proposal id (must be an unsigned integer)",
+                    )
+                }
             };
             let g = st.governance.read().await;
             match g.get(pid) {
-                Some(p) => ok(id, json!({
-                    "id": p.id,
-                    "title": p.title,
-                    "action": format!("{:?}", p.action),
-                    // The CANONICAL action string of the proposal (the same
-                    // `type` `stell_submitProposal` accepts) — audit W7.2.
-                    "action_type": p.action.action_type(),
-                    "status": format!("{:?}", p.status),
-                    "voting_end": p.voting_end,
-                    "yes": p.yes.to_string(),
-                    "no": p.no.to_string(),
-                    "abstain": p.abstain.to_string(),
-                    "turnout": p.turnout().to_string(),
-                })),
+                Some(p) => ok(
+                    id,
+                    json!({
+                        "id": p.id,
+                        "title": p.title,
+                        "action": format!("{:?}", p.action),
+                        // The CANONICAL action string of the proposal (the same
+                        // `type` `stell_submitProposal` accepts) — audit W7.2.
+                        "action_type": p.action.action_type(),
+                        "status": format!("{:?}", p.status),
+                        "voting_end": p.voting_end,
+                        "yes": p.yes.to_string(),
+                        "no": p.no.to_string(),
+                        "abstain": p.abstain.to_string(),
+                        "turnout": p.turnout().to_string(),
+                    }),
+                ),
                 None => err(id, -32004, "proposal not found"),
             }
         }
         "stell_listProposals" => {
             let g = st.governance.read().await;
-            let mut list: Vec<serde_json::Value> = g.proposals.values().map(|p| {
-                json!({
-                    "id": p.id,
-                    "title": p.title,
-                    "action": format!("{:?}", p.action),
-                    "action_type": p.action.action_type(),
-                    "status": format!("{:?}", p.status),
-                    "voting_end": p.voting_end,
-                    "turnout": p.turnout().to_string(),
-                    "yes": p.yes.to_string(),
-                    "no": p.no.to_string(),
-                    "abstain": p.abstain.to_string(),
+            let mut list: Vec<serde_json::Value> = g
+                .proposals
+                .values()
+                .map(|p| {
+                    json!({
+                        "id": p.id,
+                        "title": p.title,
+                        "action": format!("{:?}", p.action),
+                        "action_type": p.action.action_type(),
+                        "status": format!("{:?}", p.status),
+                        "voting_end": p.voting_end,
+                        "turnout": p.turnout().to_string(),
+                        "yes": p.yes.to_string(),
+                        "no": p.no.to_string(),
+                        "abstain": p.abstain.to_string(),
+                    })
                 })
-            }).collect();
+                .collect();
             list.sort_by_key(|p| p["id"].as_u64().unwrap_or(0));
             ok(id, json!(list))
         }
         "stell_governanceParams" => {
             let g = st.governance.read().await;
-            ok(id, json!({
-                "quorum_bps": g.quorum_bps,
-                "next_id": g.next_id,
-                "applied": g.applied,
-            }))
+            ok(
+                id,
+                json!({
+                    "quorum_bps": g.quorum_bps,
+                    "next_id": g.next_id,
+                    "applied": g.applied,
+                }),
+            )
         }
         "stell_submitProposal" => {
             if let Some(expected) = &st.auth_token {
@@ -4926,10 +5257,15 @@ async fn dispatch(
                 Some(t) => t.to_string(),
                 None => return err(id, -32602, "missing proposal title"),
             };
-            let action_type = match params["type"].as_str() {
-                Some(t) => t,
-                None => return err(id, -32602, "missing action type (e.g. software_upgrade, set_min_gas_limit, signal)"),
-            };
+            let action_type =
+                match params["type"].as_str() {
+                    Some(t) => t,
+                    None => return err(
+                        id,
+                        -32602,
+                        "missing action type (e.g. software_upgrade, set_min_gas_limit, signal)",
+                    ),
+                };
             // EXPLICIT, TYPED ACTIONS (audit W7.2): every `GovAction` variant
             // has exactly one canonical action string, and the mapping lives
             // next to the enum (`crate::governance::gov_action_from_params`).
@@ -4948,7 +5284,10 @@ async fn dispatch(
                 .unwrap_or(0);
             let mut g = st.governance.write().await;
             let ledger = st.engine.staking_read().await;
-            let proposer = params["proposer"].as_str().and_then(|s| parse_addr(s).ok()).unwrap_or([1u8; 32]);
+            let proposer = params["proposer"]
+                .as_str()
+                .and_then(|s| parse_addr(s).ok())
+                .unwrap_or([1u8; 32]);
             match g.propose(&ledger, proposer, title, action, now) {
                 Ok(pid) => ok(id, json!({ "proposal_id": pid, "status": "Open" })),
                 Err(e) => err(id, -32000, format!("propose failed: {:?}", e)),
@@ -4975,7 +5314,12 @@ async fn dispatch(
                 Some(v) => v,
                 None => return err(id, -32602, "missing or invalid voter address"),
             };
-            let choice = match params["choice"].as_str().unwrap_or("yes").to_lowercase().as_str() {
+            let choice = match params["choice"]
+                .as_str()
+                .unwrap_or("yes")
+                .to_lowercase()
+                .as_str()
+            {
                 "yes" | "y" | "1" => crate::governance::VoteChoice::Yes,
                 "no" | "n" | "0" => crate::governance::VoteChoice::No,
                 _ => crate::governance::VoteChoice::Abstain,
@@ -4987,7 +5331,10 @@ async fn dispatch(
             let mut g = st.governance.write().await;
             let mut ledger = st.engine.staking_write().await;
             match g.vote(&mut ledger, voter, pid, choice, now) {
-                Ok(weight) => ok(id, json!({ "voted": true, "proposal_id": pid, "weight": weight.to_string() })),
+                Ok(weight) => ok(
+                    id,
+                    json!({ "voted": true, "proposal_id": pid, "weight": weight.to_string() }),
+                ),
                 Err(e) => err(id, -32000, format!("vote failed: {:?}", e)),
             }
         }
@@ -5020,7 +5367,10 @@ async fn dispatch(
                 Some(p) => p,
                 None => return err(id, -32602, "missing proposal id"),
             };
-            let executor = params["executor"].as_str().and_then(|s| parse_addr(s).ok()).unwrap_or_default();
+            let executor = params["executor"]
+                .as_str()
+                .and_then(|s| parse_addr(s).ok())
+                .unwrap_or_default();
             let mut g = st.governance.write().await;
             match g.execute(executor, pid) {
                 Ok(applied) => ok(id, json!({ "executed": true, "applied": applied })),
@@ -5069,13 +5419,20 @@ async fn dispatch(
         // caller. (The send paths stay OPEN — see the module docs.)
         "stell_mempoolDump" => {
             let Some(expected) = &st.auth_token else {
-                return err(id, -32001, "unauthorized: stell_mempoolDump is disabled when auth_token is not configured");
+                return err(
+                    id,
+                    -32001,
+                    "unauthorized: stell_mempoolDump is disabled when auth_token is not configured",
+                );
             };
             let provided = params["token"]
                 .as_str()
                 .or_else(|| params["apiKey"].as_str())
                 .or(header_token);
-            if !provided.map(|p| constant_time_eq(p, expected)).unwrap_or(false) {
+            if !provided
+                .map(|p| constant_time_eq(p, expected))
+                .unwrap_or(false)
+            {
                 return err(id, -32001, "unauthorized: missing or invalid API token");
             }
             let list: Vec<Value> = st
@@ -5161,7 +5518,9 @@ async fn dispatch(
                     if let Some(bcast) = &st.tx_broadcast {
                         let _ = bcast.send(tx);
                     }
-                    crate::evm_adapter::notify_pending_tx(crate::evm_adapter::stell_hash_to_evm(&hash));
+                    crate::evm_adapter::notify_pending_tx(crate::evm_adapter::stell_hash_to_evm(
+                        &hash,
+                    ));
                     st.save_mempool_throttled().await;
                     ok(id, json!(hex::encode(hash)))
                 }
@@ -5187,18 +5546,16 @@ async fn dispatch(
         // `OpCode::SysCallSubmitPriceFeed` against `block.timestamp`. Writing
         // here would make the price node-local (non-deterministic), which is
         // exactly the bug the block-time commit path exists to prevent.
-        "stell_submitPriceFeed" => {
-            admit_signed_payload_tx(
-                st,
-                id,
-                params,
-                header_token,
-                method,
-                |op| matches!(op, crate::svm::OpCode::SysCallSubmitPriceFeed(feed) if feed.verify()),
-                "payload does not carry a validly signed price feed",
-            )
-            .await
-        }
+        "stell_submitPriceFeed" => admit_signed_payload_tx(
+            st,
+            id,
+            params,
+            header_token,
+            method,
+            |op| matches!(op, crate::svm::OpCode::SysCallSubmitPriceFeed(feed) if feed.verify()),
+            "payload does not carry a validly signed price feed",
+        )
+        .await,
 
         // ---- Primary Market Maker -------------------------------------
         // Both swap arms are the same THIN admission path as
@@ -5245,17 +5602,20 @@ async fn dispatch(
                 .applied
                 .pmm_redemption_buffer_bps
                 .unwrap_or(crate::pmm::PMM_REDEMPTION_BUFFER_BPS);
-            ok(id, json!({
-                "price_micro_usd": pmm.price_micro_usd(),
-                "minted_nano": pmm.minted_nano.to_string(),
-                "reserve_micro": pmm.reserve_micro.to_string(),
-                "redemption_buffer_micro": pmm.redemption_buffer_micro.to_string(),
-                "usable_reserve_micro": pmm.usable_reserve_micro().to_string(),
-                "max_redeemable_stell": pmm.max_redeemable_stell().to_string(),
-                "quote_token": quote_token.map(hex::encode),
-                "treasury": hex::encode(treasury),
-                "governed_buffer_bps": governed_buffer_bps,
-            }))
+            ok(
+                id,
+                json!({
+                    "price_micro_usd": pmm.price_micro_usd(),
+                    "minted_nano": pmm.minted_nano.to_string(),
+                    "reserve_micro": pmm.reserve_micro.to_string(),
+                    "redemption_buffer_micro": pmm.redemption_buffer_micro.to_string(),
+                    "usable_reserve_micro": pmm.usable_reserve_micro().to_string(),
+                    "max_redeemable_stell": pmm.max_redeemable_stell().to_string(),
+                    "quote_token": quote_token.map(hex::encode),
+                    "treasury": hex::encode(treasury),
+                    "governed_buffer_bps": governed_buffer_bps,
+                }),
+            )
         }
 
         // ---- orderbook (read-only) ------------------------------------
@@ -5268,11 +5628,19 @@ async fn dispatch(
             } else {
                 let raw = match params["pair"].as_u64().or_else(|| params.as_u64()) {
                     Some(p) => p,
-                    None => return err(id, -32602, "missing or invalid pair id (must be an integer)"),
+                    None => {
+                        return err(
+                            id,
+                            -32602,
+                            "missing or invalid pair id (must be an integer)",
+                        )
+                    }
                 };
                 match u32::try_from(raw) {
                     Ok(p) => p,
-                    Err(_) => return err(id, -32602, format!("pair id {raw} out of bounds for u32")),
+                    Err(_) => {
+                        return err(id, -32602, format!("pair id {raw} out of bounds for u32"))
+                    }
                 }
             };
             let books = st.engine.orderbooks_read().await;
@@ -5314,18 +5682,21 @@ async fn dispatch(
             // placement only and is kept for id assignment.
             let version = book.version;
             let next_order_id = book.next_order_id;
-            ok(id, json!({
-                "pair": pair,
-                "version": version,
-                "seq": version,
-                "best_bid_micro_usd": best_bid,
-                "best_ask_micro_usd": best_ask,
-                "bid_levels": bid_levels,
-                "ask_levels": ask_levels,
-                "bids": bids,
-                "asks": asks,
-                "next_order_id": next_order_id,
-            }))
+            ok(
+                id,
+                json!({
+                    "pair": pair,
+                    "version": version,
+                    "seq": version,
+                    "best_bid_micro_usd": best_bid,
+                    "best_ask_micro_usd": best_ask,
+                    "bid_levels": bid_levels,
+                    "ask_levels": ask_levels,
+                    "bids": bids,
+                    "asks": asks,
+                    "next_order_id": next_order_id,
+                }),
+            )
         }
 
         // ---- session-key budget (read-only) ----------------------------
@@ -5357,28 +5728,34 @@ async fn dispatch(
             };
             let reg = st.engine.session_keys_read().await;
             match reg.get(&pk) {
-                None => ok(id, json!({
-                    "registered": false,
-                    "revoked": false,
-                    "valid_until": 0,
-                    "scope": 0,
-                    "max_gas_spend": 0,
-                    "spent": 0,
-                    "remaining_gas": 0,
-                    "master": "0".repeat(64),
-                    "chain_id": st.chain_id,
-                })),
-                Some(rec) => ok(id, json!({
-                    "registered": true,
-                    "revoked": rec.revoked,
-                    "valid_until": rec.valid_until,
-                    "scope": rec.scope,
-                    "max_gas_spend": rec.max_gas_spend,
-                    "spent": rec.gas_spent,
-                    "remaining_gas": rec.max_gas_spend.saturating_sub(rec.gas_spent),
-                    "master": hex::encode(rec.master),
-                    "chain_id": st.chain_id,
-                })),
+                None => ok(
+                    id,
+                    json!({
+                        "registered": false,
+                        "revoked": false,
+                        "valid_until": 0,
+                        "scope": 0,
+                        "max_gas_spend": 0,
+                        "spent": 0,
+                        "remaining_gas": 0,
+                        "master": "0".repeat(64),
+                        "chain_id": st.chain_id,
+                    }),
+                ),
+                Some(rec) => ok(
+                    id,
+                    json!({
+                        "registered": true,
+                        "revoked": rec.revoked,
+                        "valid_until": rec.valid_until,
+                        "scope": rec.scope,
+                        "max_gas_spend": rec.max_gas_spend,
+                        "spent": rec.gas_spent,
+                        "remaining_gas": rec.max_gas_spend.saturating_sub(rec.gas_spent),
+                        "master": hex::encode(rec.master),
+                        "chain_id": st.chain_id,
+                    }),
+                ),
             }
         }
 
@@ -5395,42 +5772,54 @@ async fn dispatch(
                         match u64::from_str_radix(hex_part, 16) {
                             Ok(u) => Some(u),
                             Err(e) => {
-                                return ok(id, json!({
-                                    "success": false,
-                                    "error": format!("invalid height parameter: {e}"),
-                                    "fuel_used": 0,
-                                }));
+                                return ok(
+                                    id,
+                                    json!({
+                                        "success": false,
+                                        "error": format!("invalid height parameter: {e}"),
+                                        "fuel_used": 0,
+                                    }),
+                                );
                             }
                         }
                     } else {
                         match s.parse::<u64>() {
                             Ok(u) => Some(u),
                             Err(e) => {
-                                return ok(id, json!({
-                                    "success": false,
-                                    "error": format!("invalid height parameter: {e}"),
-                                    "fuel_used": 0,
-                                }));
+                                return ok(
+                                    id,
+                                    json!({
+                                        "success": false,
+                                        "error": format!("invalid height parameter: {e}"),
+                                        "fuel_used": 0,
+                                    }),
+                                );
                             }
                         }
                     }
                 } else {
-                    return ok(id, json!({
-                        "success": false,
-                        "error": "invalid height parameter: must be an unsigned integer or hex string",
-                        "fuel_used": 0,
-                    }));
+                    return ok(
+                        id,
+                        json!({
+                            "success": false,
+                            "error": "invalid height parameter: must be an unsigned integer or hex string",
+                            "fuel_used": 0,
+                        }),
+                    );
                 }
             } else if let Some(arr) = params.as_array() {
                 if arr.len() > 3 && !arr[3].is_null() {
                     match arr[3].as_u64() {
                         Some(u) => Some(u),
                         None => {
-                            return ok(id, json!({
-                                "success": false,
-                                "error": "invalid height parameter: must be an unsigned integer",
-                                "fuel_used": 0,
-                            }));
+                            return ok(
+                                id,
+                                json!({
+                                    "success": false,
+                                    "error": "invalid height parameter: must be an unsigned integer",
+                                    "fuel_used": 0,
+                                }),
+                            );
                         }
                     }
                 } else {
@@ -5443,11 +5832,14 @@ async fn dispatch(
             if let Some(pin) = height_pin {
                 let current_h = st.height.load(std::sync::atomic::Ordering::Relaxed);
                 if pin > current_h {
-                    return ok(id, json!({
-                        "success": false,
-                        "error": format!("pinned block height {pin} exceeds current finalized height {current_h}"),
-                        "fuel_used": 0,
-                    }));
+                    return ok(
+                        id,
+                        json!({
+                            "success": false,
+                            "error": format!("pinned block height {pin} exceeds current finalized height {current_h}"),
+                            "fuel_used": 0,
+                        }),
+                    );
                 }
             }
 
@@ -5466,11 +5858,14 @@ async fn dispatch(
             let addr_str = match addr_val.and_then(|v| v.as_str()) {
                 Some(s) => s,
                 None => {
-                    return ok(id, json!({
-                        "success": false,
-                        "error": "missing or invalid address",
-                        "fuel_used": 0,
-                    }));
+                    return ok(
+                        id,
+                        json!({
+                            "success": false,
+                            "error": "missing or invalid address",
+                            "fuel_used": 0,
+                        }),
+                    );
                 }
             };
 
@@ -5487,15 +5882,21 @@ async fn dispatch(
             let (contract_addr, shard_hint) = match parse_rpc_address_with_shard_hint(addr_str) {
                 Ok(v) => v,
                 Err(e) => {
-                    return ok(id, json!({
-                        "success": false,
-                        "error": e,
-                        "fuel_used": 0,
-                    }));
+                    return ok(
+                        id,
+                        json!({
+                            "success": false,
+                            "error": e,
+                            "fuel_used": 0,
+                        }),
+                    );
                 }
             };
             let resolved_shard = resolve_shard_for_address(st, contract_addr, shard_hint).await;
-            let local_shard = st.engine.shard_id.load(std::sync::atomic::Ordering::Relaxed);
+            let local_shard = st
+                .engine
+                .shard_id
+                .load(std::sync::atomic::Ordering::Relaxed);
             let _shard_is_local = resolved_shard == local_shard;
 
             let method_val = params.get("method").or_else(|| {
@@ -5513,11 +5914,14 @@ async fn dispatch(
             let method_str = match method_val.and_then(|v| v.as_str()) {
                 Some(m) => m,
                 None => {
-                    return ok(id, json!({
-                        "success": false,
-                        "error": "missing or invalid method name",
-                        "fuel_used": 0,
-                    }));
+                    return ok(
+                        id,
+                        json!({
+                            "success": false,
+                            "error": "missing or invalid method name",
+                            "fuel_used": 0,
+                        }),
+                    );
                 }
             };
 
@@ -5543,36 +5947,59 @@ async fn dispatch(
                 let typed_args = match parse_abi_args(&abi, method_str, args_val) {
                     Ok(a) => a,
                     Err(e) => {
-                        return ok(id, json!({
-                            "success": false,
-                            "error": e,
-                            "fuel_used": 0,
-                        }));
+                        return ok(
+                            id,
+                            json!({
+                                "success": false,
+                                "error": e,
+                                "fuel_used": 0,
+                            }),
+                        );
                     }
                 };
                 let res = st
                     .engine
                     .run_get_method_typed(&contract_addr, method_str, &typed_args, fuel_limit)
                     .await;
-                return ok(id, with_shard_info(serde_json::to_value(res).unwrap_or(Value::Null), resolved_shard, local_shard));
+                return ok(
+                    id,
+                    with_shard_info(
+                        serde_json::to_value(res).unwrap_or(Value::Null),
+                        resolved_shard,
+                        local_shard,
+                    ),
+                );
             }
 
             let parsed_args = match args_val {
                 Some(v) => match parse_get_method_args(v) {
                     Ok(a) => a,
                     Err(e) => {
-                        return ok(id, json!({
-                            "success": false,
-                            "error": e,
-                            "fuel_used": 0,
-                        }));
+                        return ok(
+                            id,
+                            json!({
+                                "success": false,
+                                "error": e,
+                                "fuel_used": 0,
+                            }),
+                        );
                     }
                 },
                 None => Vec::new(),
             };
 
-            let res = st.engine.run_get_method(&contract_addr, method_str, &parsed_args, fuel_limit).await;
-            ok(id, with_shard_info(serde_json::to_value(res).unwrap_or(Value::Null), resolved_shard, local_shard))
+            let res = st
+                .engine
+                .run_get_method(&contract_addr, method_str, &parsed_args, fuel_limit)
+                .await;
+            ok(
+                id,
+                with_shard_info(
+                    serde_json::to_value(res).unwrap_or(Value::Null),
+                    resolved_shard,
+                    local_shard,
+                ),
+            )
         }
 
         // ---- contract deployment (TON StateInit / deterministic BLAKE3) ----
@@ -5601,10 +6028,11 @@ async fn dispatch(
 
             // Check if wrapped in signed raw tx wrapper
             if let Some(raw_tx_str) = p.get("tx").and_then(|v| v.as_str()) {
-                let raw_bytes = match hex::decode(raw_tx_str.strip_prefix("0x").unwrap_or(raw_tx_str)) {
-                    Ok(b) => b,
-                    Err(e) => return err(id, -32602, format!("invalid raw tx hex: {e}")),
-                };
+                let raw_bytes =
+                    match hex::decode(raw_tx_str.strip_prefix("0x").unwrap_or(raw_tx_str)) {
+                        Ok(b) => b,
+                        Err(e) => return err(id, -32602, format!("invalid raw tx hex: {e}")),
+                    };
                 let tx: Transaction = match bincode::deserialize(&raw_bytes) {
                     Ok(t) => t,
                     Err(e) => return err(id, -32602, format!("failed to decode transaction: {e}")),
@@ -5624,9 +6052,16 @@ async fn dispatch(
                 });
                 let code = match deploy_code {
                     Some(c) => c,
-                    None => return err(id, -32602, "transaction does not contain SysCallDeployContract payload"),
+                    None => {
+                        return err(
+                            id,
+                            -32602,
+                            "transaction does not contain SysCallDeployContract payload",
+                        )
+                    }
                 };
-                let salt = p.get("init_data")
+                let salt = p
+                    .get("init_data")
                     .or_else(|| p.get("salt"))
                     .and_then(|v| v.as_str())
                     .map(|s| {
@@ -5640,7 +6075,11 @@ async fn dispatch(
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
 
-                let outcome = match st.engine.deploy_contract_deterministic(tx.from, code.clone(), &salt, now).await {
+                let outcome = match st
+                    .engine
+                    .deploy_contract_deterministic(tx.from, code.clone(), &salt, now)
+                    .await
+                {
                     Ok(o) => o,
                     Err(e) => return err(id, -32000, format!("deploy contract failed: {e}")),
                 };
@@ -5668,12 +6107,15 @@ async fn dispatch(
                     contract_address: Some(outcome.contract_address),
                 });
 
-                return ok(id, json!({
-                    "contract_address": hex::encode(outcome.contract_address),
-                    "contract_address_stl57": outcome.contract_address_stl57,
-                    "code_hash": hex::encode(outcome.code_hash),
-                    "tx_hash": hex::encode(tx_hash),
-                }));
+                return ok(
+                    id,
+                    json!({
+                        "contract_address": hex::encode(outcome.contract_address),
+                        "contract_address_stl57": outcome.contract_address_stl57,
+                        "code_hash": hex::encode(outcome.code_hash),
+                        "tx_hash": hex::encode(tx_hash),
+                    }),
+                );
             }
 
             // Direct parameters:
@@ -5687,7 +6129,8 @@ async fn dispatch(
                 Err(e) => return err(id, -32602, format!("invalid code hex: {e}")),
             };
 
-            let salt = p.get("init_data")
+            let salt = p
+                .get("init_data")
                 .or_else(|| p.get("salt"))
                 .and_then(|v| v.as_str())
                 .map(|s| {
@@ -5696,8 +6139,12 @@ async fn dispatch(
                 })
                 .unwrap_or_default();
 
-            let gas_limit = p.get("gas_limit")
-                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())))
+            let gas_limit = p
+                .get("gas_limit")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                })
                 .unwrap_or(crate::contract::MAX_CONTRACT_FUEL);
 
             let signing_key = if let Some(pk_str) = p.get("private_key").and_then(|v| v.as_str()) {
@@ -5728,7 +6175,11 @@ async fn dispatch(
             // creator must be the signer; otherwise a caller deploys as the
             // victim. Enforced fail-closed here, at admission.
             if from_addr != signing_key.verifying_key().to_bytes() {
-                return err(id, -32602, "from must be the transaction signer (must match private_key)");
+                return err(
+                    id,
+                    -32602,
+                    "from must be the transaction signer (must match private_key)",
+                );
             }
 
             let now = std::time::SystemTime::now()
@@ -5810,12 +6261,15 @@ async fn dispatch(
                 contract_address: Some(outcome.contract_address),
             });
 
-            ok(id, json!({
-                "contract_address": hex::encode(outcome.contract_address),
-                "contract_address_stl57": outcome.contract_address_stl57,
-                "code_hash": hex::encode(outcome.code_hash),
-                "tx_hash": hex::encode(tx_hash),
-            }))
+            ok(
+                id,
+                json!({
+                    "contract_address": hex::encode(outcome.contract_address),
+                    "contract_address_stl57": outcome.contract_address_stl57,
+                    "code_hash": hex::encode(outcome.code_hash),
+                    "tx_hash": hex::encode(tx_hash),
+                }),
+            )
         }
 
         // ---- contract execution (TON / Near receipt model) ----
@@ -5841,7 +6295,11 @@ async fn dispatch(
                 params
             };
 
-            let contract_str = match p.get("contract").or_else(|| p.get("address")).and_then(|v| v.as_str()) {
+            let contract_str = match p
+                .get("contract")
+                .or_else(|| p.get("address"))
+                .and_then(|v| v.as_str())
+            {
                 Some(s) => s,
                 None => return err(id, -32602, "missing 'contract' parameter"),
             };
@@ -5876,12 +6334,20 @@ async fn dispatch(
                 None => vec![0i64],
             };
 
-            let value = p.get("value")
-                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())))
+            let value = p
+                .get("value")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                })
                 .unwrap_or(0);
 
-            let gas_limit = p.get("gas_limit")
-                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())))
+            let gas_limit = p
+                .get("gas_limit")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                })
                 .unwrap_or(crate::contract::MAX_CONTRACT_FUEL);
 
             let signing_key = if let Some(pk_str) = p.get("private_key").and_then(|v| v.as_str()) {
@@ -5912,7 +6378,11 @@ async fn dispatch(
             // from=victim + attacker private_key drained the victim straight
             // into the contract. The debited account must be the signer.
             if from_addr != signing_key.verifying_key().to_bytes() {
-                return err(id, -32602, "from must be the transaction signer (must match private_key)");
+                return err(
+                    id,
+                    -32602,
+                    "from must be the transaction signer (must match private_key)",
+                );
             }
 
             // Execute the contract call. When the contract carries an ABI
@@ -5958,12 +6428,7 @@ async fn dispatch(
             let outcome = match &typed_args {
                 Some(args) => {
                     st.engine
-                        .call_contract_abi_structured(
-                            &contract_addr,
-                            method_str,
-                            args,
-                            gas_limit,
-                        )
+                        .call_contract_abi_structured(&contract_addr, method_str, args, gas_limit)
                         .await
                 }
                 None => {
@@ -6019,12 +6484,18 @@ async fn dispatch(
             }
 
             let is_success = outcome.status == "success";
-            let events_view: Vec<Value> = outcome.events.iter().map(|e| json!({
-                "contract": hex::encode(e.contract),
-                "contract_stl57": crate::address::encode_stl57_address(&e.contract),
-                "topic": e.topic,
-                "value": e.value,
-            })).collect();
+            let events_view: Vec<Value> = outcome
+                .events
+                .iter()
+                .map(|e| {
+                    json!({
+                        "contract": hex::encode(e.contract),
+                        "contract_stl57": crate::address::encode_stl57_address(&e.contract),
+                        "topic": e.topic,
+                        "value": e.value,
+                    })
+                })
+                .collect();
 
             // Record receipt in receipt index
             st.receipts.write().await.insert(TxReceipt {
@@ -6042,20 +6513,23 @@ async fn dispatch(
                 contract_address: Some(contract_addr),
             });
 
-            ok(id, json!({
-                "tx_hash": hex::encode(tx_hash),
-                "status": outcome.status,
-                "return_value": outcome.return_value.map(|v| json!(v)).unwrap_or(Value::Null),
-                "gas_used": outcome.gas_used,
-                "events": events_view,
-                "outcome": {
+            ok(
+                id,
+                json!({
+                    "tx_hash": hex::encode(tx_hash),
                     "status": outcome.status,
                     "return_value": outcome.return_value.map(|v| json!(v)).unwrap_or(Value::Null),
                     "gas_used": outcome.gas_used,
                     "events": events_view,
-                    "error": outcome.error
-                }
-            }))
+                    "outcome": {
+                        "status": outcome.status,
+                        "return_value": outcome.return_value.map(|v| json!(v)).unwrap_or(Value::Null),
+                        "gas_used": outcome.gas_used,
+                        "events": events_view,
+                        "error": outcome.error
+                    }
+                }),
+            )
         }
 
         // ---- the ABI manifest of a contract (typed interface discovery) ----
@@ -6185,19 +6659,22 @@ async fn dispatch(
                 flags,
             );
             let registered = st.engine.get_contract_source_hash(&contract_addr).await;
-            ok(id, json!({
-                "contract": hex::encode(contract_addr),
-                "contract_stl57": crate::address::encode_stl57_address(&contract_addr),
-                "verified": v.verified,
-                "onchain_code_hash": v.onchain_code_hash,
-                "rebuilt_code_hash": v.rebuilt_code_hash,
-                "source_hash": v.source_hash,
-                "compiler": v.compiler,
-                "compiler_flags": v.compiler_flags,
-                "reason": v.reason,
-                "registered": registered.is_some(),
-                "registered_source_hash": registered.map(hex::encode).unwrap_or_default(),
-            }))
+            ok(
+                id,
+                json!({
+                    "contract": hex::encode(contract_addr),
+                    "contract_stl57": crate::address::encode_stl57_address(&contract_addr),
+                    "verified": v.verified,
+                    "onchain_code_hash": v.onchain_code_hash,
+                    "rebuilt_code_hash": v.rebuilt_code_hash,
+                    "source_hash": v.source_hash,
+                    "compiler": v.compiler,
+                    "compiler_flags": v.compiler_flags,
+                    "reason": v.reason,
+                    "registered": registered.is_some(),
+                    "registered_source_hash": registered.map(hex::encode).unwrap_or_default(),
+                }),
+            )
         }
 
         // Read the registered source fingerprint of a contract (`null` =
@@ -6227,13 +6704,16 @@ async fn dispatch(
                 None => return err(id, -32602, "contract not found"),
             };
             let registered = st.engine.get_contract_source_hash(&contract_addr).await;
-            ok(id, json!({
-                "contract": hex::encode(contract_addr),
-                "contract_stl57": crate::address::encode_stl57_address(&contract_addr),
-                "code_hash": hex::encode(onchain),
-                "source_hash": registered.map(hex::encode).unwrap_or_default(),
-                "verified": registered.is_some(),
-            }))
+            ok(
+                id,
+                json!({
+                    "contract": hex::encode(contract_addr),
+                    "contract_stl57": crate::address::encode_stl57_address(&contract_addr),
+                    "code_hash": hex::encode(onchain),
+                    "source_hash": registered.map(hex::encode).unwrap_or_default(),
+                    "verified": registered.is_some(),
+                }),
+            )
         }
 
         // Register a verified-source fingerprint. The ONLY state-changing half
@@ -6266,7 +6746,10 @@ async fn dispatch(
                 Some(s) => s,
                 None => return err(id, -32602, "missing 'source_hash' parameter"),
             };
-            let clean = hash_str.trim().strip_prefix("0x").unwrap_or(hash_str.trim());
+            let clean = hash_str
+                .trim()
+                .strip_prefix("0x")
+                .unwrap_or(hash_str.trim());
             let shash: [u8; 32] = match hex::decode(clean) {
                 Ok(b) if b.len() == 32 => {
                     let mut a = [0u8; 32];
@@ -6277,7 +6760,11 @@ async fn dispatch(
             };
             let sig_str = match p.get("signature").and_then(|v| v.as_str()) {
                 Some(s) => s,
-                None => return err(id, -32602, "missing 'signature' parameter: registration requires the creator's signature"),
+                None => return err(
+                    id,
+                    -32602,
+                    "missing 'signature' parameter: registration requires the creator's signature",
+                ),
             };
             let creator = match st.engine.contracts_read().await.get(&contract_addr) {
                 Some(c) => c.creator,
@@ -6298,13 +6785,16 @@ async fn dispatch(
             {
                 return err(id, -32602, e.to_string());
             }
-            ok(id, json!({
-                "contract": hex::encode(contract_addr),
-                "contract_stl57": crate::address::encode_stl57_address(&contract_addr),
-                "source_hash": hex::encode(shash),
-                "registered": true,
-                "verified": true,
-            }))
+            ok(
+                id,
+                json!({
+                    "contract": hex::encode(contract_addr),
+                    "contract_stl57": crate::address::encode_stl57_address(&contract_addr),
+                    "source_hash": hex::encode(shash),
+                    "registered": true,
+                    "verified": true,
+                }),
+            )
         }
 
         // Explicit receipt endpoint for contract calls (Near / TON receipt fetching)
@@ -6320,23 +6810,35 @@ async fn dispatch(
             let idx = st.receipts.read().await;
             match idx.get(&h) {
                 Some(r) => {
-                    let events_view: Vec<Value> = r.events.iter().map(|e| json!({
-                        "contract": hex::encode(e.contract),
-                        "contract_stl57": crate::address::encode_stl57_address(&e.contract),
-                        "topic": e.topic,
-                        "value": e.value,
-                    })).collect();
-                    ok(id, json!({
-                        "status": if r.success { "success" } else { "failed" },
-                        "return_value": r.return_value.map(|v| json!(v)).unwrap_or(Value::Null),
-                        "gas_used": r.gas_used.unwrap_or(0),
-                        "events": events_view,
-                        "tx_hash": hex::encode(r.tx_hash),
-                    }))
+                    let events_view: Vec<Value> = r
+                        .events
+                        .iter()
+                        .map(|e| {
+                            json!({
+                                "contract": hex::encode(e.contract),
+                                "contract_stl57": crate::address::encode_stl57_address(&e.contract),
+                                "topic": e.topic,
+                                "value": e.value,
+                            })
+                        })
+                        .collect();
+                    ok(
+                        id,
+                        json!({
+                            "status": if r.success { "success" } else { "failed" },
+                            "return_value": r.return_value.map(|v| json!(v)).unwrap_or(Value::Null),
+                            "gas_used": r.gas_used.unwrap_or(0),
+                            "events": events_view,
+                            "tx_hash": hex::encode(r.tx_hash),
+                        }),
+                    )
                 }
                 None => {
                     let pending = st.mempool.read().await.contains(&h);
-                    ok(id, json!({ "status": if pending { "pending" } else { "unknown" } }))
+                    ok(
+                        id,
+                        json!({ "status": if pending { "pending" } else { "unknown" } }),
+                    )
                 }
             }
         }
@@ -6360,10 +6862,13 @@ async fn dispatch(
                 .unwrap_or(0) as usize;
             let sigs = recent_invalidations(limit);
             let list: Vec<Value> = sigs.iter().map(invalidation_to_json).collect();
-            ok(id, json!({
-                "invalidations": list,
-                "count": list.len(),
-            }))
+            ok(
+                id,
+                json!({
+                    "invalidations": list,
+                    "count": list.len(),
+                }),
+            )
         }
 
         // ---- streaming subscriptions (WebSocket / SSE) ----
@@ -6565,12 +7070,15 @@ pub struct SubscriptionHub {
     /// blocks it named earlier are not on the chain. The window is the
     /// read-side of that promise (`stell_getInvalidations`), the fan-out is
     /// the push side (`stell_subscribe` with the `invalidations` topic).
-    invalidations: Arc<std::sync::Mutex<std::collections::VecDeque<crate::chain::InvalidationSignal>>>,
+    invalidations:
+        Arc<std::sync::Mutex<std::collections::VecDeque<crate::chain::InvalidationSignal>>>,
 }
 
 impl std::fmt::Debug for SubscriptionHub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SubscriptionHub").field("live", &self.len()).finish()
+        f.debug_struct("SubscriptionHub")
+            .field("live", &self.len())
+            .finish()
     }
 }
 
@@ -6650,7 +7158,10 @@ impl SubscriptionHub {
             ));
         }
         if let Some(client) = client {
-            let held = reg.values().filter(|s| s.client.as_deref() == Some(client)).count();
+            let held = reg
+                .values()
+                .filter(|s| s.client.as_deref() == Some(client))
+                .count();
             if held >= MAX_SUBSCRIPTIONS_PER_CLIENT {
                 return Err(format!(
                     "per-client subscription limit reached ({MAX_SUBSCRIPTIONS_PER_CLIENT} live subscriptions for this client)"
@@ -6746,7 +7257,10 @@ impl SubscriptionHub {
         for id in targets {
             // `send` fails only when nobody listens; the registry entry
             // survives, so a client may attach a transport later.
-            let _ = self.tx.send(Notification { subscription: id, result: result.clone() });
+            let _ = self.tx.send(Notification {
+                subscription: id,
+                result: result.clone(),
+            });
         }
         addressed
     }
@@ -6849,13 +7363,16 @@ fn topic_matches(filter: &SubscriptionTopic, event: &SubscriptionTopic) -> bool 
     match (filter, event) {
         (SubscriptionTopic::NewHeads, SubscriptionTopic::NewHeads) => true,
         (SubscriptionTopic::NewTxs, SubscriptionTopic::NewTxs) => true,
+        (SubscriptionTopic::Invalidations, SubscriptionTopic::Invalidations) => true,
         (
-            SubscriptionTopic::Invalidations,
-            SubscriptionTopic::Invalidations,
-        ) => true,
-        (
-            SubscriptionTopic::Events { contract: want_contract, topics: want_topics },
-            SubscriptionTopic::Events { contract: ev_contract, topics: ev_topics },
+            SubscriptionTopic::Events {
+                contract: want_contract,
+                topics: want_topics,
+            },
+            SubscriptionTopic::Events {
+                contract: ev_contract,
+                topics: ev_topics,
+            },
         ) => {
             if let Some(want) = want_contract {
                 match ev_contract {
@@ -6939,7 +7456,10 @@ pub fn publish_contract_event(
     let topics = vec![event.topic.to_string()];
     let data = hex::encode((event.value as u64).to_be_bytes());
     hub().publish(
-        &SubscriptionTopic::Events { contract: Some(contract.clone()), topics: topics.clone() },
+        &SubscriptionTopic::Events {
+            contract: Some(contract.clone()),
+            topics: topics.clone(),
+        },
         json!({
             "contract": contract,
             "topics": topics,
@@ -7004,7 +7524,10 @@ fn parse_subscribe_params(params: &Value) -> Result<SubscriptionTopic, String> {
                 .first()
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "missing subscription type".to_string())?;
-            (kind.to_string(), items.get(1).cloned().unwrap_or(Value::Null))
+            (
+                kind.to_string(),
+                items.get(1).cloned().unwrap_or(Value::Null),
+            )
         }
         Value::Object(_) => {
             let kind = params
@@ -7040,7 +7563,8 @@ fn parse_events_filter(filter: &Value) -> Result<SubscriptionTopic, String> {
             let s = v
                 .as_str()
                 .ok_or_else(|| "invalid contract parameter: must be a string".to_string())?;
-            let addr = parse_rpc_address(s).map_err(|e| format!("invalid contract address: {e}"))?;
+            let addr =
+                parse_rpc_address(s).map_err(|e| format!("invalid contract address: {e}"))?;
             contract = Some(hex::encode(addr));
         }
     }
@@ -7151,7 +7675,11 @@ impl Drop for SubscriptionGuard {
 
 /// The SSE body type: a stream of `text/event-stream` frames.
 type SseStream = std::pin::Pin<
-    Box<dyn futures::stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send>,
+    Box<
+        dyn futures::stream::Stream<
+                Item = Result<axum::response::sse::Event, std::convert::Infallible>,
+            > + Send,
+    >,
 >;
 
 /// SSE transport: the same notifications as the WebSocket, framed as
@@ -7221,8 +7749,9 @@ pub async fn sse_handler(
             }
         }
     });
-    let sse = axum::response::sse::Sse::new(Box::pin(stream) as SseStream)
-        .keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)));
+    let sse = axum::response::sse::Sse::new(Box::pin(stream) as SseStream).keep_alive(
+        axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+    );
     let mut resp = sse.into_response();
     if !ids.is_empty() {
         if let Ok(v) = axum::http::HeaderValue::from_str(&ids.join(",")) {
@@ -7286,22 +7815,40 @@ async fn handle_ws(
         match next {
             WsIn::Message(Some(Ok(m))) => match m {
                 axum::extract::ws::Message::Text(t) => {
-                    if !ws_handle_text(&st, &t, &mut owned, &mut socket, header_token.as_deref(), peer_ip)
-                        .await
+                    if !ws_handle_text(
+                        &st,
+                        &t,
+                        &mut owned,
+                        &mut socket,
+                        header_token.as_deref(),
+                        peer_ip,
+                    )
+                    .await
                     {
                         break;
                     }
                 }
                 axum::extract::ws::Message::Binary(b) => {
                     let t = String::from_utf8_lossy(&b).to_string();
-                    if !ws_handle_text(&st, &t, &mut owned, &mut socket, header_token.as_deref(), peer_ip)
-                        .await
+                    if !ws_handle_text(
+                        &st,
+                        &t,
+                        &mut owned,
+                        &mut socket,
+                        header_token.as_deref(),
+                        peer_ip,
+                    )
+                    .await
                     {
                         break;
                     }
                 }
                 axum::extract::ws::Message::Ping(p) => {
-                    if socket.send(axum::extract::ws::Message::Pong(p)).await.is_err() {
+                    if socket
+                        .send(axum::extract::ws::Message::Pong(p))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -7319,12 +7866,19 @@ async fn handle_ws(
                     continue;
                 }
                 let payload = serde_json::to_string(&note).unwrap_or_else(|_| "{}".to_string());
-                if socket.send(axum::extract::ws::Message::Text(payload)).await.is_err() {
+                if socket
+                    .send(axum::extract::ws::Message::Text(payload))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
             WsIn::Note(Err(broadcast::error::RecvError::Lagged(skipped))) => {
-                tracing::warn!(skipped, "WebSocket subscriber lagged behind the stream fan-out");
+                tracing::warn!(
+                    skipped,
+                    "WebSocket subscriber lagged behind the stream fan-out"
+                );
                 continue;
             }
             WsIn::Note(Err(broadcast::error::RecvError::Closed)) => break,
@@ -7361,7 +7915,10 @@ async fn ws_handle_text(
                 }),
             };
             let out = serde_json::to_string(&resp).unwrap_or_default();
-            return socket.send(axum::extract::ws::Message::Text(out)).await.is_ok();
+            return socket
+                .send(axum::extract::ws::Message::Text(out))
+                .await
+                .is_ok();
         }
     };
     let req: RpcRequest = match serde_json::from_value(parsed) {
@@ -7378,7 +7935,10 @@ async fn ws_handle_text(
                 }),
             };
             let out = serde_json::to_string(&resp).unwrap_or_default();
-            return socket.send(axum::extract::ws::Message::Text(out)).await.is_ok();
+            return socket
+                .send(axum::extract::ws::Message::Text(out))
+                .await
+                .is_ok();
         }
     };
     let id = req.id.clone().unwrap_or(Value::Null);
@@ -7398,7 +7958,10 @@ async fn ws_handle_text(
         }
     }
     let out = serde_json::to_string(&resp.0).unwrap_or_default();
-    socket.send(axum::extract::ws::Message::Text(out)).await.is_ok()
+    socket
+        .send(axum::extract::ws::Message::Text(out))
+        .await
+        .is_ok()
 }
 /// axum handler for the JSON-RPC endpoint.
 async fn rpc_handler(
@@ -7457,7 +8020,11 @@ pub(crate) fn extract_header_token(headers: &axum::http::HeaderMap) -> Option<&s
             }
         }
     }
-    let auth = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .trim();
     for prefix in ["Bearer ", "Stell ", "Token "] {
         if let Some(rest) = auth.strip_prefix(prefix) {
             let rest = rest.trim();
@@ -7547,7 +8114,9 @@ pub async fn serve(addr: &str, state: Arc<RpcState>) -> anyhow::Result<()> {
             .layer(axum::error_handling::HandleErrorLayer::new(
                 |_: axum::BoxError| async { axum::http::StatusCode::REQUEST_TIMEOUT },
             ))
-            .layer(tower::timeout::TimeoutLayer::new(std::time::Duration::from_secs(30)))
+            .layer(tower::timeout::TimeoutLayer::new(
+                std::time::Duration::from_secs(30),
+            ))
             .layer(tower::limit::ConcurrencyLimitLayer::new(512)),
     );
     axum::serve(
@@ -7605,7 +8174,9 @@ mod tests {
         let faucet_key = ed25519_dalek::SigningKey::from_bytes(&key_seed);
         let faucet_addr = faucet_key.verifying_key().to_bytes();
         let st = test_state().await;
-        st.engine.update_account(AccountState::new(faucet_addr, 1_000_000)).await;
+        st.engine
+            .update_account(AccountState::new(faucet_addr, 1_000_000))
+            .await;
         Arc::new(RpcState {
             faucet: Some(Arc::new(Faucet::new(key_seed, 1, drip, cap))),
             faucet_token: None,
@@ -7631,7 +8202,9 @@ mod tests {
         let faucet_key = ed25519_dalek::SigningKey::from_bytes(&key_seed);
         let faucet_addr = faucet_key.verifying_key().to_bytes();
         let st = test_state().await;
-        st.engine.update_account(AccountState::new(faucet_addr, 1_000_000)).await;
+        st.engine
+            .update_account(AccountState::new(faucet_addr, 1_000_000))
+            .await;
         Arc::new(RpcState {
             faucet: Some(Arc::new(Faucet::new(key_seed, 1, drip, cap))),
             faucet_token: Some(FAUCET_TOKEN.to_string()),
@@ -7654,7 +8227,9 @@ mod tests {
 
     async fn call(st: &Arc<RpcState>, method: &str, params: Value) -> Value {
         let r = dispatch(st, Value::from(1), method, &params, None, None).await;
-        r.0.error.map(|e| json!({"error": e.message})).unwrap_or(r.0.result.unwrap_or(Value::Null))
+        r.0.error
+            .map(|e| json!({"error": e.message}))
+            .unwrap_or(r.0.result.unwrap_or(Value::Null))
     }
 
     /// `test_state` with the node message-signing key configured (seed 0x42)
@@ -7684,7 +8259,12 @@ mod tests {
     #[tokio::test]
     async fn sign_and_verify_message_round_trip() {
         let st = signing_state(None).await;
-        let signed = call(&st, "stell_signMessage", json!({"message": "hello stellereum"})).await;
+        let signed = call(
+            &st,
+            "stell_signMessage",
+            json!({"message": "hello stellereum"}),
+        )
+        .await;
         assert!(signed.get("error").is_none(), "sign must succeed: {signed}");
         // The node signs with its own key: seed 0x42, whose address is pinned
         // by the wallet_signing test vector.
@@ -7695,7 +8275,10 @@ mod tests {
         assert_eq!(signed["scheme"], json!("Ed25519"));
         assert_eq!(signed["scheme_id"], json!(1));
         assert_eq!(signed["chain_id"], json!(777));
-        let sig = signed["signature"].as_str().expect("signature hex").to_string();
+        let sig = signed["signature"]
+            .as_str()
+            .expect("signature hex")
+            .to_string();
         let verified = call(
             &st,
             "stell_verifyMessage",
@@ -7706,7 +8289,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(verified["valid"], json!(true), "round trip must verify: {verified}");
+        assert_eq!(
+            verified["valid"],
+            json!(true),
+            "round trip must verify: {verified}"
+        );
         // Same bytes, hex form.
         let verified_hex = call(
             &st,
@@ -7729,8 +8316,16 @@ mod tests {
             denied.get("error").is_some(),
             "sign without a token must be refused: {denied}"
         );
-        let signed = call(&st, "stell_signMessage", json!({"message": "hi", "token": "secret"})).await;
-        assert!(signed.get("error").is_none(), "sign with a token must succeed: {signed}");
+        let signed = call(
+            &st,
+            "stell_signMessage",
+            json!({"message": "hi", "token": "secret"}),
+        )
+        .await;
+        assert!(
+            signed.get("error").is_none(),
+            "sign with a token must succeed: {signed}"
+        );
         // VERIFY stays public even on a token-gated node.
         let verified = call(
             &st,
@@ -7757,7 +8352,10 @@ mod tests {
             json!({"contract": hex::encode([0x01u8; 32]), "method": "ping", "token": "secret"}),
         )
         .await;
-        assert!(typed.get("error").is_none(), "typed sign with token: {typed}");
+        assert!(
+            typed.get("error").is_none(),
+            "typed sign with token: {typed}"
+        );
         let tverified = call(
             &st,
             "stell_verifyTypedData",
@@ -7779,7 +8377,10 @@ mod tests {
         let st = test_state().await;
         let r = call(&st, "stell_signMessage", json!({"message": "hi"})).await;
         assert!(r.get("error").is_some(), "keyless sign must fail: {r}");
-        assert!(r["error"].as_str().unwrap().contains("not configured"), "{r}");
+        assert!(
+            r["error"].as_str().unwrap().contains("not configured"),
+            "{r}"
+        );
         let t = call(
             &st,
             "stell_signTypedData",
@@ -7801,8 +8402,14 @@ mod tests {
                 "chain_id": chain,
             })
         };
-        assert_eq!(call(&st, "stell_verifyMessage", params(777)).await["valid"], json!(true));
-        assert_eq!(call(&st, "stell_verifyMessage", params(778)).await["valid"], json!(false));
+        assert_eq!(
+            call(&st, "stell_verifyMessage", params(777)).await["valid"],
+            json!(true)
+        );
+        assert_eq!(
+            call(&st, "stell_verifyMessage", params(778)).await["valid"],
+            json!(false)
+        );
     }
 
     #[tokio::test]
@@ -7940,20 +8547,42 @@ mod tests {
     async fn receipt_reports_height_block_index_and_status() {
         let st = test_state().await;
         let txs = vec![receipt_tx([1u8; 32], 0), receipt_tx([2u8; 32], 0)];
-        st.record_receipts(77, [0xAB; 32], &txs, &[true, false], &[1, 0]).await;
+        st.record_receipts(77, [0xAB; 32], &txs, &[true, false], &[1, 0])
+            .await;
 
-        let ok_tx = call(&st, "stell_getTransactionReceipt", json!(hex::encode(txs[0].compute_tx_hash()))).await;
+        let ok_tx = call(
+            &st,
+            "stell_getTransactionReceipt",
+            json!(hex::encode(txs[0].compute_tx_hash())),
+        )
+        .await;
         assert_eq!(ok_tx["height"], json!(77));
         assert_eq!(ok_tx["block_hash"], json!(hex::encode([0xABu8; 32])));
         assert_eq!(ok_tx["index"], json!(0));
         assert_eq!(ok_tx["status"], json!("success"));
-        assert_eq!(ok_tx["fee_charged"], json!("1"), "receipt files the actual charge");
-        assert!(ok_tx["gas_limit"].as_str().is_some(), "limit is kept alongside");
+        assert_eq!(
+            ok_tx["fee_charged"],
+            json!("1"),
+            "receipt files the actual charge"
+        );
+        assert!(
+            ok_tx["gas_limit"].as_str().is_some(),
+            "limit is kept alongside"
+        );
 
-        let bad_tx = call(&st, "stell_getTransactionReceipt", json!(hex::encode(txs[1].compute_tx_hash()))).await;
+        let bad_tx = call(
+            &st,
+            "stell_getTransactionReceipt",
+            json!(hex::encode(txs[1].compute_tx_hash())),
+        )
+        .await;
         assert_eq!(bad_tx["status"], json!("failed"));
         assert_eq!(bad_tx["index"], json!(1));
-        assert_eq!(bad_tx["fee_charged"], json!("0"), "a failed tx paid nothing");
+        assert_eq!(
+            bad_tx["fee_charged"],
+            json!("0"),
+            "a failed tx paid nothing"
+        );
     }
 
     #[tokio::test]
@@ -7972,7 +8601,8 @@ mod tests {
             json!("pending")
         );
 
-        st.record_receipts(5, [0x01; 32], std::slice::from_ref(&tx), &[true], &[1]).await;
+        st.record_receipts(5, [0x01; 32], std::slice::from_ref(&tx), &[true], &[1])
+            .await;
         let done = call(&st, "stell_getTransactionStatus", json!(h)).await;
         assert_eq!(done["status"], json!("success"));
         assert_eq!(done["height"], json!(5));
@@ -7989,12 +8619,21 @@ mod tests {
         engine.update_account(AccountState::new(from, 1_000)).await;
 
         let tx = crate::sharding::Transaction::sign(&key, [0xEE; 32], 100, 1, 0, 0, 0);
-        let (applied, _failed, _fees, statuses, tx_fees) =
-            engine.apply_block_parallel_fees(std::slice::from_ref(&tx), 0).await;
+        let (applied, _failed, _fees, statuses, tx_fees) = engine
+            .apply_block_parallel_fees(std::slice::from_ref(&tx), 0)
+            .await;
 
         assert_eq!(applied, 1);
-        assert_eq!(statuses, vec![true], "one status per transaction, in block order");
-        assert_eq!(tx_fees, vec![1], "the receipt files what commit_native charged");
+        assert_eq!(
+            statuses,
+            vec![true],
+            "one status per transaction, in block order"
+        );
+        assert_eq!(
+            tx_fees,
+            vec![1],
+            "the receipt files what commit_native charged"
+        );
 
         let balance_after = engine.get_account(&from).await.unwrap().balance;
         assert_eq!(balance_after, 1_000 - 101, "value moved exactly once");
@@ -8002,10 +8641,19 @@ mod tests {
         // Statuses must describe the block, not a second execution: re-running
         // admission against post-state makes the spent nonce fail, so a naive
         // recompute would flip this successful tx to "failed".
-        let (_a2, _f2, _fees2, again, again_fees) =
-            engine.apply_block_parallel_fees(std::slice::from_ref(&tx), 0).await;
-        assert_eq!(again, vec![false], "replay of a spent nonce is rejected, as it must be");
-        assert_eq!(again_fees, vec![0], "a refused transaction is charged nothing");
+        let (_a2, _f2, _fees2, again, again_fees) = engine
+            .apply_block_parallel_fees(std::slice::from_ref(&tx), 0)
+            .await;
+        assert_eq!(
+            again,
+            vec![false],
+            "replay of a spent nonce is rejected, as it must be"
+        );
+        assert_eq!(
+            again_fees,
+            vec![0],
+            "a refused transaction is charged nothing"
+        );
     }
 
     #[tokio::test]
@@ -8028,7 +8676,11 @@ mod tests {
                 contract_address: None,
             });
         }
-        assert_eq!(idx.len(), MAX_RECEIPTS, "a busy chain cannot exhaust memory");
+        assert_eq!(
+            idx.len(),
+            MAX_RECEIPTS,
+            "a busy chain cannot exhaust memory"
+        );
         let oldest: [u8; 32] = blake3::hash(&0u64.to_be_bytes()).into();
         assert!(idx.get(&oldest).is_none(), "oldest receipts are evicted");
         let newest: [u8; 32] = blake3::hash(&(MAX_RECEIPTS as u64 + 9).to_be_bytes()).into();
@@ -8039,7 +8691,10 @@ mod tests {
     async fn receipt_rejects_malformed_hash() {
         let st = test_state().await;
         let r = call(&st, "stell_getTransactionReceipt", json!("not-a-hash")).await;
-        assert!(r.get("error").is_some(), "garbage hash is a client error, not a panic");
+        assert!(
+            r.get("error").is_some(),
+            "garbage hash is a client error, not a panic"
+        );
     }
 
     #[tokio::test]
@@ -8047,7 +8702,10 @@ mod tests {
         let st = test_state().await;
         assert_eq!(call(&st, "eth_chainId", json!([])).await, json!("0x167d"));
         assert_eq!(call(&st, "net_version", json!([])).await, json!("5757"));
-        assert_eq!(call(&st, "web3_clientVersion", json!([])).await, json!("Stellereum/v5.0.0-evm-adapter"));
+        assert_eq!(
+            call(&st, "web3_clientVersion", json!([])).await,
+            json!("Stellereum/v5.0.0-evm-adapter")
+        );
         assert_eq!(call(&st, "net_listening", json!([])).await, json!(true));
         assert_eq!(call(&st, "net_peerCount", json!([])).await, json!("0x2"));
         // LIVE: same rule as `stell_syncing` — a recent verified peer height
@@ -8055,15 +8713,27 @@ mod tests {
         // monotonic, so the expectation is computed, not hardcoded.
         let ours = st.height.load(std::sync::atomic::Ordering::Relaxed);
         let expect_syncing = crate::evm_adapter::eth_syncing_for_heights(ours, fresh_peer_height());
-        assert_eq!(call(&st, "eth_syncing", json!([])).await, json!(expect_syncing));
+        assert_eq!(
+            call(&st, "eth_syncing", json!([])).await,
+            json!(expect_syncing)
+        );
         assert_eq!(
             call(&st, "stell_syncing", json!([])).await,
             json!(expect_syncing),
             "eth_syncing and stell_syncing must agree on the same heights"
         );
-        assert_eq!(call(&st, "eth_gasPrice", json!([])).await, json!("0x3eb2788000"));
-        assert_eq!(call(&st, "eth_maxPriorityFeePerGas", json!([])).await, json!("0x3b9aca00"));
-        assert_eq!(call(&st, "eth_estimateGas", json!([])).await, json!("0x5208"));
+        assert_eq!(
+            call(&st, "eth_gasPrice", json!([])).await,
+            json!("0x3eb2788000")
+        );
+        assert_eq!(
+            call(&st, "eth_maxPriorityFeePerGas", json!([])).await,
+            json!("0x3b9aca00")
+        );
+        assert_eq!(
+            call(&st, "eth_estimateGas", json!([])).await,
+            json!("0x5208")
+        );
         let fh = call(&st, "eth_feeHistory", json!([4, "latest", [25.0, 75.0]])).await;
         assert_eq!(fh["oldestBlock"], json!("0x27"));
         assert_eq!(fh["baseFeePerGas"].as_array().unwrap().len(), 5);
@@ -8076,7 +8746,12 @@ mod tests {
         use crate::bridge::{DepositRecord, Dispute, SupportedChain};
         let st = test_state().await;
         let hash = hex::encode([0x77u8; 32]);
-        let r = call(&st, "stell_bridgeDeposit", json!({ "source_tx_hash": hash })).await;
+        let r = call(
+            &st,
+            "stell_bridgeDeposit",
+            json!({ "source_tx_hash": hash }),
+        )
+        .await;
         assert_eq!(r["found"], false, "no record on a fresh engine");
         let r = call(&st, "stell_bridgeDispute", json!({ "dispute_id": "0" })).await;
         assert_eq!(r["found"], false, "no dispute on a fresh engine");
@@ -8108,7 +8783,12 @@ mod tests {
                 },
             );
         }
-        let r = call(&st, "stell_bridgeDeposit", json!({ "source_tx_hash": hash })).await;
+        let r = call(
+            &st,
+            "stell_bridgeDeposit",
+            json!({ "source_tx_hash": hash }),
+        )
+        .await;
         assert_eq!(r["found"], true);
         assert_eq!(r["amount"], "100");
         assert_eq!(r["via_quorum"], true);
@@ -8193,7 +8873,10 @@ mod tests {
                 .cloned()
         };
         let read = find("stell_bridgeDeposit");
-        assert!(read.is_none(), "the record read is not part of the native namespace");
+        assert!(
+            read.is_none(),
+            "the record read is not part of the native namespace"
+        );
         let prep = find("stell_bridgeDepositPrepare").expect("the prepare is advertised");
         assert_eq!(prep["kind"], "prepare");
         // No name in the namespace may be advertised twice.
@@ -8260,23 +8943,28 @@ mod tests {
         {
             let mut ledger = st.engine.staking_write().await;
             ledger
-                .bond(
-                    [0xA1u8; 32],
-                    crate::governance::PROPOSAL_MIN_STAKE_NANO,
-                    0,
-                )
+                .bond([0xA1u8; 32], crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
                 .unwrap();
         }
         let cases: Vec<(&str, serde_json::Value)> = vec![
-            ("set_min_validator_bond", json!({ "value": 20_000_000_000_000u64 })),
+            (
+                "set_min_validator_bond",
+                json!({ "value": 20_000_000_000_000u64 }),
+            ),
             ("set_equivocation_slash_bps", json!({ "value": 500 })),
             ("set_default_commission_bps", json!({ "value": 100 })),
             ("set_block_reward", json!({ "value": 1_000_000_000 })),
             ("set_pmm_redemption_buffer_bps", json!({ "value": 250 })),
             ("set_governance_quorum_bps", json!({ "value": 5_000 })),
             ("signal", json!({ "text": "hello governance" })),
-            ("register_oracle_publisher", json!({ "publisher": hex::encode([0xB2u8; 32]) })),
-            ("unregister_oracle_publisher", json!({ "publisher": hex::encode([0xB3u8; 32]) })),
+            (
+                "register_oracle_publisher",
+                json!({ "publisher": hex::encode([0xB2u8; 32]) }),
+            ),
+            (
+                "unregister_oracle_publisher",
+                json!({ "publisher": hex::encode([0xB3u8; 32]) }),
+            ),
             ("reset_oracle_breaker", json!({})),
             ("set_min_gas_limit", json!({ "value": 21_000 })),
             (
@@ -8324,12 +9012,20 @@ mod tests {
     #[tokio::test]
     async fn faucet_is_disabled_by_default() {
         let st = test_state().await;
-        let r = call(&st, "stell_faucet", json!({ "address": hex::encode([0x42u8; 32]) })).await;
+        let r = call(
+            &st,
+            "stell_faucet",
+            json!({ "address": hex::encode([0x42u8; 32]) }),
+        )
+        .await;
         assert!(
             r["error"].as_str().unwrap_or_default().contains("disabled"),
             "faucet must be off unless explicitly enabled: {r}"
         );
-        assert!(st.engine.get_account(&[0x42u8; 32]).await.is_none(), "no account may be created");
+        assert!(
+            st.engine.get_account(&[0x42u8; 32]).await.is_none(),
+            "no account may be created"
+        );
     }
 
     #[tokio::test]
@@ -8356,14 +9052,21 @@ mod tests {
         assert!(old.build_transfer(who, None, None).await.is_some());
         assert!(old.build_transfer(who, None, None).await.is_some());
         assert_eq!(old.dispensed_to(who).await, 25);
-        assert!(old.build_transfer(who, None, None).await.is_none(), "capped");
+        assert!(
+            old.build_transfer(who, None, None).await.is_none(),
+            "capped"
+        );
 
         // "Restart": a fresh Faucet over the persisted bytes.
         let bytes = saved.lock().unwrap().clone();
         assert!(!bytes.is_empty(), "every drip must have persisted state");
         let new = Faucet::new(key_seed, 1, 10, 25);
         new.load_bytes(&bytes).await;
-        assert_eq!(new.dispensed_to(who).await, 25, "cap must survive the restart");
+        assert_eq!(
+            new.dispensed_to(who).await,
+            25,
+            "cap must survive the restart"
+        );
         assert!(
             new.build_transfer(who, None, None).await.is_none(),
             "a capped address must stay capped after a restart"
@@ -8383,22 +9086,36 @@ mod tests {
         let hexa = hex::encode(who);
 
         // Requesting more than a drip can never exceed the drip amount.
-        let r = call(&st, "stell_faucet", json!({ "address": hexa.clone(), "amount": u64::MAX, "token": FAUCET_TOKEN })).await;
+        let r = call(
+            &st,
+            "stell_faucet",
+            json!({ "address": hexa.clone(), "amount": u64::MAX, "token": FAUCET_TOKEN }),
+        )
+        .await;
         assert_eq!(r["credited_nano"], "10");
-        assert_eq!(call(&st, "stell_faucet", drip_req(&hexa)).await["credited_nano"], "10");
+        assert_eq!(
+            call(&st, "stell_faucet", drip_req(&hexa)).await["credited_nano"],
+            "10"
+        );
         // 3rd call is clamped by the lifetime cap to the remaining 5.
         let r3 = call(&st, "stell_faucet", drip_req(&hexa)).await;
         assert_eq!(r3["credited_nano"], "5");
         // 4th call: exhausted.
         let r4 = call(&st, "stell_faucet", drip_req(&hexa)).await;
-        assert!(r4["error"].as_str().unwrap_or_default().contains("limit"), "{r4}");
+        assert!(
+            r4["error"].as_str().unwrap_or_default().contains("limit"),
+            "{r4}"
+        );
 
         // Every drip is a real, correctly signed transfer from the faucet account
         // sitting in the mempool — nothing was written straight into state.
         let pending = st.mempool.read().await.len();
         assert_eq!(pending, 3);
         for tx in st.mempool.read().await.all() {
-            assert!(tx.verify_signature(), "faucet tx must carry a valid signature");
+            assert!(
+                tx.verify_signature(),
+                "faucet tx must carry a valid signature"
+            );
             assert_eq!(tx.to, [0x42u8; 32]);
         }
     }
@@ -8418,7 +9135,10 @@ mod tests {
         assert_eq!(amount1, PUBLIC_DRIP_NANO);
         assert_eq!(amount1, 5 * 1_000_000_000);
         assert_eq!(tx1.to, who);
-        assert!(tx1.verify_signature(), "public drip must carry a valid signature");
+        assert!(
+            tx1.verify_signature(),
+            "public drip must carry a valid signature"
+        );
 
         // Immediate retry is cooling down with seconds remaining.
         let err = faucet
@@ -8457,7 +9177,14 @@ mod tests {
         let st = test_state_with_faucet(10, 100).await;
         call(&st, "stell_faucet", drip_req(&hex::encode([1u8; 32]))).await;
         call(&st, "stell_faucet", drip_req(&hex::encode([2u8; 32]))).await;
-        let mut nonces: Vec<u64> = st.mempool.read().await.all().iter().map(|t| t.nonce).collect();
+        let mut nonces: Vec<u64> = st
+            .mempool
+            .read()
+            .await
+            .all()
+            .iter()
+            .map(|t| t.nonce)
+            .collect();
         nonces.sort_unstable();
         assert_eq!(nonces, vec![0, 1], "faucet txs must not reuse a nonce");
     }
@@ -8473,7 +9200,10 @@ mod tests {
         // No token at all.
         let r = call(&st, "stell_faucet", json!({ "address": who.clone() })).await;
         assert!(
-            r["error"].as_str().unwrap_or_default().contains("unauthorized"),
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unauthorized"),
             "a tokenless faucet request must be refused: {r}"
         );
         // Wrong token.
@@ -8484,11 +9214,18 @@ mod tests {
         )
         .await;
         assert!(
-            r2["error"].as_str().unwrap_or_default().contains("unauthorized"),
+            r2["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unauthorized"),
             "a wrong token must be refused: {r2}"
         );
         // Neither attempt may have touched the mempool or the recipient.
-        assert_eq!(st.mempool.read().await.len(), 0, "no unsigned tx may be queued");
+        assert_eq!(
+            st.mempool.read().await.len(),
+            0,
+            "no unsigned tx may be queued"
+        );
         assert!(st.engine.get_account(&[0x42u8; 32]).await.is_none());
 
         // And with the right token it works, so this is auth and not a freeze.
@@ -8503,7 +9240,10 @@ mod tests {
         let st = test_state_with_untokened_faucet(10, 25).await;
         let r = call(&st, "stell_faucet", drip_req(&hex::encode([0x42u8; 32]))).await;
         assert!(
-            r["error"].as_str().unwrap_or_default().contains("refusing to dispense"),
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("refusing to dispense"),
             "a faucet with no token must refuse even a well-formed request: {r}"
         );
         assert_eq!(st.mempool.read().await.len(), 0);
@@ -8512,7 +9252,12 @@ mod tests {
     #[tokio::test]
     async fn faucet_rejects_malformed_address() {
         let st = test_state_with_faucet(10, 25).await;
-        let r = call(&st, "stell_faucet", json!({ "address": "zz", "token": FAUCET_TOKEN })).await;
+        let r = call(
+            &st,
+            "stell_faucet",
+            json!({ "address": "zz", "token": FAUCET_TOKEN }),
+        )
+        .await;
         assert!(r["error"].is_string());
         let r2 = call(&st, "stell_faucet", json!({ "token": FAUCET_TOKEN })).await;
         assert!(r2["error"].is_string());
@@ -8527,7 +9272,9 @@ mod tests {
         let faucet_addr = faucet_key.verifying_key().to_bytes();
         let st = test_state().await;
         st.engine.set_shard_id(shard);
-        st.engine.update_account(AccountState::new(faucet_addr, 1_000_000)).await;
+        st.engine
+            .update_account(AccountState::new(faucet_addr, 1_000_000))
+            .await;
         Arc::new(RpcState {
             faucet: Some(Arc::new(Faucet::new(key_seed, shard, drip, cap))),
             faucet_token: Some(FAUCET_TOKEN.to_string()),
@@ -8555,15 +9302,26 @@ mod tests {
     async fn faucet_masterchain_drip_finalizes_on_shard_0() {
         let st = test_state_with_faucet_on_shard(10, 100, 0).await;
         let who = [0x42u8; 32];
-        let r = call(&st, "stell_faucet", drip_req(&format!("-1:{}", hex::encode(who)))).await;
-        assert_eq!(r["credited_nano"], "10", "masterchain drip must be served: {r}");
+        let r = call(
+            &st,
+            "stell_faucet",
+            drip_req(&format!("-1:{}", hex::encode(who))),
+        )
+        .await;
+        assert_eq!(
+            r["credited_nano"], "10",
+            "masterchain drip must be served: {r}"
+        );
         assert_eq!(r["shard"], 0);
         {
             let pool = st.mempool.read().await;
             assert_eq!(pool.len(), 1);
             let tx = &pool.all()[0];
             assert_eq!(tx.to, who);
-            assert_eq!(tx.source_shard, 0, "drip must execute where the recipient lives");
+            assert_eq!(
+                tx.source_shard, 0,
+                "drip must execute where the recipient lives"
+            );
             assert_eq!(tx.target_shard, 0);
             assert_eq!(tx.nonce, 0);
             assert!(tx.verify_signature(), "drip must carry a valid signature");
@@ -8588,7 +9346,11 @@ mod tests {
         let outcome = st.engine.apply_block_transition(&block, 0).await;
         assert_eq!(outcome.applied, 1, "the drip must apply on shard 0");
         assert_eq!(outcome.failed, 0);
-        let acc = st.engine.get_account(&who).await.expect("recipient must exist");
+        let acc = st
+            .engine
+            .get_account(&who)
+            .await
+            .expect("recipient must exist");
         assert_eq!(acc.balance, 10, "recipient must be credited the drip");
     }
 
@@ -8599,14 +9361,23 @@ mod tests {
         let st = test_state_with_faucet_on_shard(10, 100, 1).await;
         let who = [0x43u8; 32];
         let r = call(&st, "stell_faucet", drip_req(&hex::encode(who))).await;
-        assert_eq!(r["credited_nano"], "10", "workchain drip must be served: {r}");
-        assert_eq!(r["shard"], 1, "bare address must route to the workchain shard: {r}");
+        assert_eq!(
+            r["credited_nano"], "10",
+            "workchain drip must be served: {r}"
+        );
+        assert_eq!(
+            r["shard"], 1,
+            "bare address must route to the workchain shard: {r}"
+        );
         {
             let pool = st.mempool.read().await;
             assert_eq!(pool.len(), 1);
             let tx = &pool.all()[0];
             assert_eq!(tx.to, who);
-            assert_eq!(tx.source_shard, 1, "drip must execute where the recipient lives");
+            assert_eq!(
+                tx.source_shard, 1,
+                "drip must execute where the recipient lives"
+            );
             assert_eq!(tx.target_shard, 1);
         }
         let block = crate::sharding::Block {
@@ -8628,7 +9399,11 @@ mod tests {
         };
         let outcome = st.engine.apply_block_transition(&block, 0).await;
         assert_eq!(outcome.applied, 1, "the drip must apply on shard 1");
-        let acc = st.engine.get_account(&who).await.expect("recipient must exist");
+        let acc = st
+            .engine
+            .get_account(&who)
+            .await
+            .expect("recipient must exist");
         assert_eq!(acc.balance, 10, "recipient must be credited the drip");
     }
 
@@ -8644,13 +9419,19 @@ mod tests {
         let st = test_state_with_faucet_on_shard(10, 100, 0).await;
         let faucet = st.faucet.clone().expect("faucet enabled");
         let r = call(&st, "stell_faucet", drip_req(&hex::encode([0x42u8; 32]))).await;
-        let err = r["error"].as_str().expect("shard-mismatched drip must be refused");
+        let err = r["error"]
+            .as_str()
+            .expect("shard-mismatched drip must be refused");
         assert!(
             err.contains("shard 1") && err.contains("shard 0"),
             "refusal must name both shards, not just fail: {err}"
         );
         // Nothing queued, nothing reserved, nonce untouched.
-        assert_eq!(st.mempool.read().await.len(), 0, "refused drip must not pend");
+        assert_eq!(
+            st.mempool.read().await.len(),
+            0,
+            "refused drip must not pend"
+        );
         assert_eq!(faucet.dispensed_to([0x42u8; 32]).await, 0);
         // The next servable drips take nonces 0 and 1 — the refusal burned none.
         let ok = call(
@@ -8667,7 +9448,14 @@ mod tests {
         )
         .await;
         assert_eq!(ok2["credited_nano"], "10", "{ok2}");
-        let mut nonces: Vec<u64> = st.mempool.read().await.all().iter().map(|t| t.nonce).collect();
+        let mut nonces: Vec<u64> = st
+            .mempool
+            .read()
+            .await
+            .all()
+            .iter()
+            .map(|t| t.nonce)
+            .collect();
         nonces.sort_unstable();
         assert_eq!(nonces, vec![0, 1], "refused drip must not burn a nonce");
     }
@@ -8711,7 +9499,11 @@ mod tests {
         // Full RPC path: the refused shape reserves nothing.
         let r = call(&st1, "stell_faucet", drip_req(&format!("-1:{addr}"))).await;
         assert!(r["error"].is_string(), "refused drip must error: {r}");
-        assert_eq!(st1.mempool.read().await.len(), 0, "refused drip must not pend");
+        assert_eq!(
+            st1.mempool.read().await.len(),
+            0,
+            "refused drip must not pend"
+        );
         assert_eq!(faucet1.dispensed_to([0x42u8; 32]).await, 0);
         // ...while the servable shape on the matching faucet still works.
         let ok = call(&st0, "stell_faucet", drip_req(&format!("-1:{addr}"))).await;
@@ -8741,7 +9533,9 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         // fund the sender so the balance check at admission passes
         let from = sk.verifying_key().to_bytes();
-        st.engine.update_account(AccountState::new(from, 1_000_000)).await;
+        st.engine
+            .update_account(AccountState::new(from, 1_000_000))
+            .await;
         let tx = Transaction::sign(&sk, [1u8; 32], 10, 5, 0, 1, 1);
         let raw = hex::encode(bincode::serialize(&tx).unwrap());
         let r = call(&st, "stell_sendRawTransaction", json!({ "tx": raw })).await;
@@ -8754,7 +9548,11 @@ mod tests {
         let raw_bad = hex::encode(bincode::serialize(&bad).unwrap());
         let r2 = call(&st, "stell_sendRawTransaction", json!({ "tx": raw_bad })).await;
         assert!(r2["error"].as_str().unwrap().contains("signature"));
-        assert_eq!(st.mempool.read().await.len(), 1, "forged tx must not enter mempool");
+        assert_eq!(
+            st.mempool.read().await.len(),
+            1,
+            "forged tx must not enter mempool"
+        );
     }
 
     /// A14 phase 1: an UNBOUND admission is still accepted, but it is
@@ -8770,19 +9568,27 @@ mod tests {
         // UNBOUND: admitted, metered.
         let sk = SigningKey::generate(&mut OsRng);
         let from = sk.verifying_key().to_bytes();
-        st.engine.update_account(AccountState::new(from, 10_000_000)).await;
+        st.engine
+            .update_account(AccountState::new(from, 10_000_000))
+            .await;
         let before = meter();
         let tx = Transaction::sign(&sk, [1u8; 32], 10, 100_000, 0, 1, 1);
         assert!(tx.chain_id().is_none(), "legacy constructor is unbound");
         let raw = hex::encode(bincode::serialize(&tx).unwrap());
         let r = call(&st, "stell_sendRawTransaction", json!({ "tx": raw })).await;
         assert!(r.as_str().is_some(), "phase 1 still admits unbound: {r}");
-        assert_eq!(meter(), before + 1, "one unbound admission meters exactly once");
+        assert_eq!(
+            meter(),
+            before + 1,
+            "one unbound admission meters exactly once"
+        );
 
         // BOUND (CH1 envelope): admitted, meter silent.
         let sk2 = SigningKey::generate(&mut OsRng);
         let from2 = sk2.verifying_key().to_bytes();
-        st.engine.update_account(AccountState::new(from2, 10_000_000)).await;
+        st.engine
+            .update_account(AccountState::new(from2, 10_000_000))
+            .await;
         let before2 = meter();
         let bound = Transaction::sign_with_chain_id(&sk2, [1u8; 32], 10, 100_000, 0, 1, 1, 5757);
         assert!(bound.is_chain_id_bound());
@@ -8805,7 +9611,10 @@ mod tests {
         // Unknown: null confirmations.
         let unknown = call(&st, "stell_getTransactionStatus", json!(h)).await;
         assert_eq!(unknown["status"], json!("unknown"));
-        assert!(unknown["confirmations"].is_null(), "unknown has no depth: {unknown}");
+        assert!(
+            unknown["confirmations"].is_null(),
+            "unknown has no depth: {unknown}"
+        );
 
         // Pending: 0 confirmations.
         st.mempool.write().await.add(tx.clone()).unwrap();
@@ -8814,7 +9623,8 @@ mod tests {
         assert_eq!(pending["confirmations"], json!(0));
 
         // Included at 5, head at 7 -> 3 confirmations, on both methods.
-        st.record_receipts(5, [0x01; 32], std::slice::from_ref(&tx), &[true], &[1]).await;
+        st.record_receipts(5, [0x01; 32], std::slice::from_ref(&tx), &[true], &[1])
+            .await;
         st.height.store(7, std::sync::atomic::Ordering::Relaxed);
         let done = call(&st, "stell_getTransactionStatus", json!(h)).await;
         assert_eq!(done["status"], json!("success"));
@@ -8854,7 +9664,9 @@ mod tests {
         });
         let sk = SigningKey::generate(&mut OsRng);
         let from = sk.verifying_key().to_bytes();
-        st.engine.update_account(AccountState::new(from, 1_000_000)).await;
+        st.engine
+            .update_account(AccountState::new(from, 1_000_000))
+            .await;
         let tx = Transaction::sign(&sk, [1u8; 32], 10, 5, 0, 1, 1);
         let raw = hex::encode(bincode::serialize(&tx).unwrap());
 
@@ -8942,7 +9754,10 @@ mod tests {
 
         let st = test_state().await;
         st.engine
-            .update_account(AccountState::new(sender32, wei_to_nano(value_wei) + 1_000_000))
+            .update_account(AccountState::new(
+                sender32,
+                wei_to_nano(value_wei) + 1_000_000,
+            ))
             .await;
 
         // 1. Funded sender: admitted to the real mempool, EVM hash returned.
@@ -8960,8 +9775,16 @@ mod tests {
 
         // 2. Wrong chain (chain-1 vector) is rejected, pool unchanged.
         let chain1 = "f86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
-        let r2 = call(&st, "eth_sendRawTransaction", json!([format!("0x{chain1}")])).await;
-        assert!(r2.get("error").is_some(), "foreign chain must be rejected: {r2}");
+        let r2 = call(
+            &st,
+            "eth_sendRawTransaction",
+            json!([format!("0x{chain1}")]),
+        )
+        .await;
+        assert!(
+            r2.get("error").is_some(),
+            "foreign chain must be rejected: {r2}"
+        );
         assert_eq!(st.mempool.read().await.len(), 1);
 
         // 3. Unfunded sender is rejected by the balance gate, pool unchanged.
@@ -9002,12 +9825,22 @@ mod tests {
         });
         let sk = SigningKey::generate(&mut OsRng);
         let from = sk.verifying_key().to_bytes();
-        st.engine.update_account(AccountState::new(from, 1_000_000)).await;
+        st.engine
+            .update_account(AccountState::new(from, 1_000_000))
+            .await;
         let tx = Transaction::sign(&sk, [1u8; 32], 10, 5, 0, 1, 1);
         let raw = hex::encode(bincode::serialize(&tx).unwrap());
 
-        let r = call(&st, "stell_sendRawTransaction", json!({ "tx": raw.clone() })).await;
-        assert!(r.as_str().is_some(), "public signed transaction must succeed without auth token");
+        let r = call(
+            &st,
+            "stell_sendRawTransaction",
+            json!({ "tx": raw.clone() }),
+        )
+        .await;
+        assert!(
+            r.as_str().is_some(),
+            "public signed transaction must succeed without auth token"
+        );
 
         // Admin methods like mempool dump still require the token
         let r_dump = call(&st, "stell_mempoolDump", json!({})).await;
@@ -9053,24 +9886,36 @@ mod tests {
         // gate at all).
         let r_deploy = call(&st, "stell_deployContract", json!({})).await;
         assert!(
-            r_deploy["error"].as_str().unwrap_or_default().contains("unauthorized"),
+            r_deploy["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unauthorized"),
             "deploy without token must be refused: {r_deploy}"
         );
         let r_call = call(&st, "stell_callContract", json!({})).await;
         assert!(
-            r_call["error"].as_str().unwrap_or_default().contains("unauthorized"),
+            r_call["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unauthorized"),
             "call without token must be refused: {r_call}"
         );
         // Wrong token: same refusal (constant-time comparison, no oracle).
         let r_bad = call(&st, "stell_deployContract", json!({ "token": "nope" })).await;
         assert!(
-            r_bad["error"].as_str().unwrap_or_default().contains("unauthorized"),
+            r_bad["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unauthorized"),
             "deploy with wrong token must be refused: {r_bad}"
         );
         // Correct token: passes the gate (fails later on params, not on auth).
         let r_ok = call(&st, "stell_deployContract", json!({ "token": "secret" })).await;
         assert!(
-            !r_ok["error"].as_str().unwrap_or_default().contains("unauthorized"),
+            !r_ok["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unauthorized"),
             "deploy with correct token must pass the gate: {r_ok}"
         );
     }
@@ -9087,10 +9932,17 @@ mod tests {
         let st = test_state().await;
         let victim = SigningKey::from_bytes(&[0x51u8; 32]);
         let victim_addr = victim.verifying_key().to_bytes();
-        st.engine.update_account(AccountState::new(victim_addr, 1_000_000)).await;
+        st.engine
+            .update_account(AccountState::new(victim_addr, 1_000_000))
+            .await;
         let attacker = SigningKey::from_bytes(&[0xA7u8; 32]);
         let contract = [0x99u8; 32];
-        let before = st.engine.get_account(&victim_addr).await.map(|a| a.balance).unwrap_or(0);
+        let before = st
+            .engine
+            .get_account(&victim_addr)
+            .await
+            .map(|a| a.balance)
+            .unwrap_or(0);
         assert_eq!(before, 1_000_000);
         let r = call(
             &st,
@@ -9105,11 +9957,22 @@ mod tests {
         )
         .await;
         assert!(
-            r["error"].as_str().unwrap_or_default().contains("must be the transaction signer"),
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("must be the transaction signer"),
             "mismatched from/signer must be refused: {r}"
         );
-        let after = st.engine.get_account(&victim_addr).await.map(|a| a.balance).unwrap_or(0);
-        assert_eq!(after, before, "victim balance must be untouched by the refused call");
+        let after = st
+            .engine
+            .get_account(&victim_addr)
+            .await
+            .map(|a| a.balance)
+            .unwrap_or(0);
+        assert_eq!(
+            after, before,
+            "victim balance must be untouched by the refused call"
+        );
         // Sanity: signer calling as itself is still admitted past the check
         // (fails later on the unknown contract, never on signer binding).
         let r_self = call(
@@ -9125,7 +9988,10 @@ mod tests {
         )
         .await;
         assert!(
-            !r_self["error"].as_str().unwrap_or_default().contains("must be the transaction signer"),
+            !r_self["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("must be the transaction signer"),
             "self-signed call must pass the signer check: {r_self}"
         );
     }
@@ -9158,9 +10024,13 @@ mod tests {
         });
         let victim = SigningKey::from_bytes(&[0x51u8; 32]);
         let victim_addr = victim.verifying_key().to_bytes();
-        st.engine.update_account(AccountState::new(victim_addr, 1_000_000)).await;
-        let code = wat::parse_str(r#"(module (memory 1) (func (export "get") (param i64) (result i64) (local.get 0)))"#)
-            .expect("test wat compiles");
+        st.engine
+            .update_account(AccountState::new(victim_addr, 1_000_000))
+            .await;
+        let code = wat::parse_str(
+            r#"(module (memory 1) (func (export "get") (param i64) (result i64) (local.get 0)))"#,
+        )
+        .expect("test wat compiles");
         let mut forged = Transaction::sign_with_payload(
             &victim,
             victim_addr,
@@ -9175,9 +10045,17 @@ mod tests {
         // signature. Pre-fix this deployed as [0x52; 32] with no complaint.
         forged.from = [0x52u8; 32];
         let raw = hex::encode(bincode::serialize(&forged).unwrap());
-        let r = call(&st, "stell_deployContract", json!({ "tx": raw, "token": "secret" })).await;
+        let r = call(
+            &st,
+            "stell_deployContract",
+            json!({ "tx": raw, "token": "secret" }),
+        )
+        .await;
         assert!(
-            r["error"].as_str().unwrap_or_default().contains("signature"),
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("signature"),
             "forged wrapped deploy must fail signature verification: {r}"
         );
         assert_eq!(
@@ -9214,9 +10092,12 @@ mod tests {
         });
         let sender = SigningKey::from_bytes(&[0x07u8; 32]);
         let from = sender.verifying_key().to_bytes();
-        st.engine.update_account(AccountState::new(from, 1_000_000)).await;
+        st.engine
+            .update_account(AccountState::new(from, 1_000_000))
+            .await;
         let publisher = SigningKey::from_bytes(&[0x42u8; 32]);
-        let feed = crate::oracle::PriceFeedUpdate::sign("STELL", 250_000, 1_700_000_000, &publisher);
+        let feed =
+            crate::oracle::PriceFeedUpdate::sign("STELL", 250_000, 1_700_000_000, &publisher);
         let tx = Transaction::sign_with_payload(
             &sender,
             from,
@@ -9232,14 +10113,31 @@ mod tests {
         // Gated by the SAME token as sendRawTransaction.
         let denied = call(&st, "stell_submitPriceFeed", json!({ "tx": raw.clone() })).await;
         assert!(denied["error"].as_str().unwrap().contains("unauthorized"));
-        let denied2 = call(&st, "stell_submitPriceFeed", json!({ "tx": raw.clone(), "token": "nope" })).await;
+        let denied2 = call(
+            &st,
+            "stell_submitPriceFeed",
+            json!({ "tx": raw.clone(), "token": "nope" }),
+        )
+        .await;
         assert!(denied2["error"].as_str().unwrap().contains("unauthorized"));
 
         // Thin: admitted, gossiped, and NOT written into state.
         let root_before = st.engine.get_state_root().await;
-        let ok = call(&st, "stell_submitPriceFeed", json!({ "tx": raw.clone(), "token": "secret" })).await;
-        assert!(ok.as_str().is_some(), "authorized submission must be admitted: {ok}");
-        assert_eq!(st.mempool.read().await.len(), 1, "it belongs in the mempool");
+        let ok = call(
+            &st,
+            "stell_submitPriceFeed",
+            json!({ "tx": raw.clone(), "token": "secret" }),
+        )
+        .await;
+        assert!(
+            ok.as_str().is_some(),
+            "authorized submission must be admitted: {ok}"
+        );
+        assert_eq!(
+            st.mempool.read().await.len(),
+            1,
+            "it belongs in the mempool"
+        );
         assert_eq!(
             st.engine.get_state_root().await,
             root_before,
@@ -9291,9 +10189,12 @@ mod tests {
         let st = test_state().await;
         let sender = SigningKey::from_bytes(&[0x07u8; 32]);
         let from = sender.verifying_key().to_bytes();
-        st.engine.update_account(AccountState::new(from, 1_000_000)).await;
+        st.engine
+            .update_account(AccountState::new(from, 1_000_000))
+            .await;
         let publisher = SigningKey::from_bytes(&[0x42u8; 32]);
-        let feed = crate::oracle::PriceFeedUpdate::sign("STELL", 250_000, 1_700_000_000, &publisher);
+        let feed =
+            crate::oracle::PriceFeedUpdate::sign("STELL", 250_000, 1_700_000_000, &publisher);
         let gapped = Transaction::sign_with_payload(
             &sender,
             from,
@@ -9311,10 +10212,17 @@ mod tests {
         )
         .await;
         assert!(
-            r["error"].as_str().unwrap_or_default().contains("nonce gap"),
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("nonce gap"),
             "far-future-nonce payload tx must be refused: {r}"
         );
-        assert_eq!(st.mempool.read().await.len(), 0, "gapped tx must not enter mempool");
+        assert_eq!(
+            st.mempool.read().await.len(),
+            0,
+            "gapped tx must not enter mempool"
+        );
     }
 
     #[tokio::test]
@@ -9340,7 +10248,10 @@ mod tests {
         });
         let r = call(&st, "stell_mempoolDump", json!({})).await;
         assert!(
-            r["error"].as_str().unwrap_or_default().contains("unauthorized"),
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unauthorized"),
             "anonymous mempool dump must be refused: {r}"
         );
         let r2 = call(&st, "stell_mempoolDump", json!({ "token": "secret" })).await;
@@ -9350,7 +10261,10 @@ mod tests {
         let st_no_token = test_state().await;
         let r_fail_closed = call(&st_no_token, "stell_mempoolDump", json!({})).await;
         assert!(
-            r_fail_closed["error"].as_str().unwrap_or_default().contains("unauthorized"),
+            r_fail_closed["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unauthorized"),
             "mempool dump must fail closed when auth_token is None: {r_fail_closed}"
         );
     }
@@ -9385,7 +10299,7 @@ mod tests {
     /// A light client that trusts `state_root` — the same root the node
     /// serves — so the node's answer can be checked against a trusted header.
     fn light_client_for(state_root: [u8; 32]) -> crate::light_client::LightClient {
-        use crate::consensus::{QuorumCertificate, Vote, VoteKind, ValidatorSet};
+        use crate::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
         let signer = ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]);
         let validators = ValidatorSet::from_list(vec![(signer.verifying_key().to_bytes(), 1)]);
         let block_hash = [0x88u8; 32];
@@ -9406,9 +10320,16 @@ mod tests {
     async fn get_proof_serves_an_account_proof_that_a_light_client_verifies() {
         let st = test_state().await;
         let who = [0x42u8; 32];
-        st.engine.update_account(AccountState::new(who, 1_000_000_000_000)).await;
+        st.engine
+            .update_account(AccountState::new(who, 1_000_000_000_000))
+            .await;
 
-        let r = call(&st, "stell_getProof", json!({ "address": hex::encode(who) })).await;
+        let r = call(
+            &st,
+            "stell_getProof",
+            json!({ "address": hex::encode(who) }),
+        )
+        .await;
         assert!(r.get("error").is_none(), "proof request must succeed: {r}");
         assert_eq!(r["address"], json!(hex::encode(who)));
         assert_eq!(r["balance"], json!(1_000_000_000_000u64));
@@ -9432,7 +10353,12 @@ mod tests {
 
         // It verifies against the root the node reported ...
         let root: [u8; 32] = hex::decode(root_hex).unwrap().try_into().unwrap();
-        assert!(crate::cpat2::verify_proof(&root, &who, &proof.value, &proof));
+        assert!(crate::cpat2::verify_proof(
+            &root,
+            &who,
+            &proof.value,
+            &proof
+        ));
 
         // ... and a light client that trusts that root reaches the same
         // conclusion from the same answer.
@@ -9451,7 +10377,12 @@ mod tests {
         let known = [0x42u8; 32];
         st.engine.update_account(AccountState::new(known, 7)).await;
 
-        let r = call(&st, "stell_getProof", json!({ "address": hex::encode([0x99u8; 32]) })).await;
+        let r = call(
+            &st,
+            "stell_getProof",
+            json!({ "address": hex::encode([0x99u8; 32]) }),
+        )
+        .await;
         assert!(r.get("error").is_none(), "proof request must succeed: {r}");
         assert_eq!(r["balance"], json!(0u64));
         assert_eq!(r["nonce"], json!(0u64));
@@ -9459,17 +10390,27 @@ mod tests {
 
         // The absence is PROVEN, not merely reported: the proof is an
         // exclusion proof and it verifies against the served root.
-        let root: [u8; 32] = hex::decode(r["state_root"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let root: [u8; 32] = hex::decode(r["state_root"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
         let nodes: Vec<String> = r["account_proof"]
             .as_array()
             .unwrap()
             .iter()
             .map(|n| n.as_str().unwrap().to_string())
             .collect();
-        assert!(!nodes.is_empty(), "an absent key still gets an exclusion proof");
+        assert!(
+            !nodes.is_empty(),
+            "an absent key still gets an exclusion proof"
+        );
         let proof = crate::cpat2::MerkleProof::from_nodes(&nodes).expect("proof parses");
         assert_eq!(proof.kind, crate::cpat2::ProofKind::Exclusion);
-        assert!(crate::cpat2::verify_exclusion_proof(&root, &[0x99u8; 32], &proof));
+        assert!(crate::cpat2::verify_exclusion_proof(
+            &root,
+            &[0x99u8; 32],
+            &proof
+        ));
 
         // And the light client agrees: the account is absent, with a proven
         // zero rather than a shrug.
@@ -9488,7 +10429,10 @@ mod tests {
         let branded = crate::address::encode_stl57_address(&who);
 
         let r = call(&st, "stell_getProof", json!({ "address": branded })).await;
-        assert!(r.get("error").is_none(), "branded address must be accepted: {r}");
+        assert!(
+            r.get("error").is_none(),
+            "branded address must be accepted: {r}"
+        );
         assert_eq!(r["address"], json!(hex::encode(who)));
         assert_eq!(r["balance"], json!(5u64));
     }
@@ -9496,7 +10440,12 @@ mod tests {
     #[tokio::test]
     async fn get_proof_rejects_a_bad_address() {
         let st = test_state().await;
-        let r = call(&st, "stell_getProof", json!({ "address": "not-an-address" })).await;
+        let r = call(
+            &st,
+            "stell_getProof",
+            json!({ "address": "not-an-address" }),
+        )
+        .await;
         assert!(r["error"].as_str().unwrap().contains("bad address"));
         let r2 = call(&st, "stell_getProof", json!({})).await;
         assert!(r2["error"].as_str().unwrap().contains("missing address"));
@@ -9509,7 +10458,11 @@ mod tests {
         st.engine.update_account(AccountState::new(who, 1)).await;
         // A raw state-trie key, the way a caller would name a storage slot.
         let slot = [0x5Au8; 32];
-        st.engine.state_trie.write().await.insert(&slot, b"slot-value");
+        st.engine
+            .state_trie
+            .write()
+            .await
+            .insert(&slot, b"slot-value");
 
         let r = call(
             &st,
@@ -9523,7 +10476,10 @@ mod tests {
         assert_eq!(sp["exists"], json!(true));
         assert_eq!(sp["value"], json!(hex::encode(b"slot-value")));
 
-        let root: [u8; 32] = hex::decode(r["state_root"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let root: [u8; 32] = hex::decode(r["state_root"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
         let lc = light_client_for(root);
         let answer = crate::light_client::ProofAnswer::from_json(&r).expect("answer parses");
         let proven = lc.verify_proof_answer(&answer).expect("answer must verify");
@@ -9548,7 +10504,10 @@ mod tests {
         let sp = &r["storage_proofs"][0];
         assert_eq!(sp["exists"], json!(false));
         assert!(sp["value"].is_null());
-        assert!(!sp["proof"].as_array().unwrap().is_empty(), "absence is proven");
+        assert!(
+            !sp["proof"].as_array().unwrap().is_empty(),
+            "absence is proven"
+        );
     }
 
     #[tokio::test]
@@ -9570,7 +10529,10 @@ mod tests {
             json!({ "address": hex::encode([0x42u8; 32]), "block_height": 42 }),
         )
         .await;
-        assert!(ok_r.get("error").is_none(), "current height must be served: {ok_r}");
+        assert!(
+            ok_r.get("error").is_none(),
+            "current height must be served: {ok_r}"
+        );
         assert_eq!(ok_r["height"], json!(42u64));
     }
 
@@ -9586,7 +10548,10 @@ mod tests {
             json!({ "address": hex::encode([0x42u8; 32]), "storage_keys": keys }),
         )
         .await;
-        assert!(r["error"].as_str().unwrap().contains("too many storage keys"));
+        assert!(r["error"]
+            .as_str()
+            .unwrap()
+            .contains("too many storage keys"));
     }
 
     #[tokio::test]
@@ -9615,9 +10580,19 @@ mod tests {
             description: String::new(),
         };
         let id = st.engine.create_token(who, meta, 1000).await.unwrap();
-        let r = call(&st, "stell_tokenSupply", json!({ "token": hex::encode(id) })).await;
+        let r = call(
+            &st,
+            "stell_tokenSupply",
+            json!({ "token": hex::encode(id) }),
+        )
+        .await;
         assert_eq!(r, "1000");
-        let rb = call(&st, "stell_tokenBalance", json!({ "token": hex::encode(id), "account": hex::encode(who) })).await;
+        let rb = call(
+            &st,
+            "stell_tokenBalance",
+            json!({ "token": hex::encode(id), "account": hex::encode(who) }),
+        )
+        .await;
         assert_eq!(rb, "1000");
     }
 
@@ -9627,10 +10602,16 @@ mod tests {
         // later drips: reconcile takes mex(on-chain, pending).
         let f = Faucet::new([9u8; 32], 1, 10, 25);
         // Gap: on-chain 5, pending {7} (5,6 lost) -> must take 5, then 6.
-        let (t1, _) = f.build_transfer([1u8; 32], None, Some((5, vec![7]))).await.unwrap();
+        let (t1, _) = f
+            .build_transfer([1u8; 32], None, Some((5, vec![7])))
+            .await
+            .unwrap();
         assert_eq!(t1.nonce, 5);
         // Pending {5} now (just built, pretend admitted): next is 6.
-        let (t2, _) = f.build_transfer([2u8; 32], None, Some((5, vec![5, 7]))).await.unwrap();
+        let (t2, _) = f
+            .build_transfer([2u8; 32], None, Some((5, vec![5, 7])))
+            .await
+            .unwrap();
         assert_eq!(t2.nonce, 6);
         // No reconcile info: pure increment (legacy behavior preserved).
         let (t3, _) = f.build_transfer([3u8; 32], None, None).await.unwrap();
@@ -9665,7 +10646,9 @@ mod tests {
         });
         let sender = SigningKey::from_bytes(&[0x07u8; 32]);
         let from = sender.verifying_key().to_bytes();
-        st.engine.update_account(AccountState::new(from, 1_000_000)).await;
+        st.engine
+            .update_account(AccountState::new(from, 1_000_000))
+            .await;
 
         let buy = Transaction::sign_with_payload(
             &sender,
@@ -9675,23 +10658,40 @@ mod tests {
             0,
             1,
             1,
-            vec![crate::svm::OpCode::SysCallPmmBuy { usdt_micro: 250_000 }],
+            vec![crate::svm::OpCode::SysCallPmmBuy {
+                usdt_micro: 250_000,
+            }],
         );
         let buy_raw = hex::encode(bincode::serialize(&buy).unwrap());
 
         // Gated by the SAME token as sendRawTransaction.
         let denied = call(&st, "stell_pmmBuy", json!({ "tx": buy_raw.clone() })).await;
         assert!(denied["error"].as_str().unwrap().contains("unauthorized"));
-        let denied2 =
-            call(&st, "stell_pmmBuy", json!({ "tx": buy_raw.clone(), "token": "nope" })).await;
+        let denied2 = call(
+            &st,
+            "stell_pmmBuy",
+            json!({ "tx": buy_raw.clone(), "token": "nope" }),
+        )
+        .await;
         assert!(denied2["error"].as_str().unwrap().contains("unauthorized"));
 
         // Thin: admitted and NOT written into state - the curve has not moved.
         let root_before = st.engine.get_state_root().await;
-        let ok =
-            call(&st, "stell_pmmBuy", json!({ "tx": buy_raw.clone(), "token": "secret" })).await;
-        assert!(ok.as_str().is_some(), "authorized buy must be admitted: {ok}");
-        assert_eq!(st.mempool.read().await.len(), 1, "it belongs in the mempool");
+        let ok = call(
+            &st,
+            "stell_pmmBuy",
+            json!({ "tx": buy_raw.clone(), "token": "secret" }),
+        )
+        .await;
+        assert!(
+            ok.as_str().is_some(),
+            "authorized buy must be admitted: {ok}"
+        );
+        assert_eq!(
+            st.mempool.read().await.len(),
+            1,
+            "it belongs in the mempool"
+        );
         assert_eq!(
             st.engine.get_state_root().await,
             root_before,
@@ -9704,13 +10704,21 @@ mod tests {
         );
 
         // A buy payload under the sell method is refused by its own predicate.
-        let wrong =
-            call(&st, "stell_pmmSell", json!({ "tx": buy_raw.clone(), "token": "secret" })).await;
+        let wrong = call(
+            &st,
+            "stell_pmmSell",
+            json!({ "tx": buy_raw.clone(), "token": "secret" }),
+        )
+        .await;
         assert!(
             wrong["error"].as_str().unwrap().contains("SysCallPmmSell"),
             "a non-sell transaction must not be admitted under stell_pmmSell: {wrong}"
         );
-        assert_eq!(st.mempool.read().await.len(), 1, "the wrong arm admitted nothing");
+        assert_eq!(
+            st.mempool.read().await.len(),
+            1,
+            "the wrong arm admitted nothing"
+        );
 
         // The matching sell payload is admitted the same thin way.
         let sell = Transaction::sign_with_payload(
@@ -9729,7 +10737,10 @@ mod tests {
             json!({ "tx": hex::encode(bincode::serialize(&sell).unwrap()), "token": "secret" }),
         )
         .await;
-        assert!(ok2.as_str().is_some(), "authorized sell must be admitted: {ok2}");
+        assert!(
+            ok2.as_str().is_some(),
+            "authorized sell must be admitted: {ok2}"
+        );
         assert_eq!(st.mempool.read().await.len(), 2);
 
         // `stell_pmmState` is a pure read: it reports the committed curve and
@@ -9756,32 +10767,62 @@ mod tests {
         let adopter = test_state().await;
         let txs = vec![receipt_tx([11u8; 32], 0), receipt_tx([12u8; 32], 1)];
         let bh = [0xBBu8; 32];
-        proposer.record_receipts(77, bh, &txs, &[true, false], &[1, 0]).await;
+        proposer
+            .record_receipts(77, bh, &txs, &[true, false], &[1, 0])
+            .await;
         proposer.record_block(77, bh, txs.len(), 1_000).await;
         // Adopter path (verified body + single-apply statuses, behind finalization).
-        adopter.record_adopted_block(77, bh, &txs, &[true, false], &[1, 0], 1_000).await;
+        adopter
+            .record_adopted_block(77, bh, &txs, &[true, false], &[1, 0], 1_000)
+            .await;
 
         for st in [&proposer, &adopter] {
             let blk = call(st, "stell_getBlock", json!({ "height": 77 })).await;
             assert_eq!(blk["txs"], json!(2), "no txs=0 view on either node");
             assert_eq!(blk["hash"], json!(hex::encode(bh)));
-            let r0 =
-                call(st, "stell_getTransactionReceipt", json!(hex::encode(txs[0].compute_tx_hash())))
-                    .await;
-            assert_eq!((r0["height"].as_u64(), r0["status"].as_str()), (Some(77), Some("success")));
+            let r0 = call(
+                st,
+                "stell_getTransactionReceipt",
+                json!(hex::encode(txs[0].compute_tx_hash())),
+            )
+            .await;
+            assert_eq!(
+                (r0["height"].as_u64(), r0["status"].as_str()),
+                (Some(77), Some("success"))
+            );
             let txs_r = call(st, "stell_getBlockTransactions", json!({ "height": 77 })).await;
             assert_eq!(txs_r["txs"].as_array().map(|a| a.len()), Some(2));
         }
         // Byte-level receipt equality between the two nodes.
-        let p = proposer.receipts.read().await.get(&txs[1].compute_tx_hash()).unwrap().clone();
-        let a = adopter.receipts.read().await.get(&txs[1].compute_tx_hash()).unwrap().clone();
+        let p = proposer
+            .receipts
+            .read()
+            .await
+            .get(&txs[1].compute_tx_hash())
+            .unwrap()
+            .clone();
+        let a = adopter
+            .receipts
+            .read()
+            .await
+            .get(&txs[1].compute_tx_hash())
+            .unwrap()
+            .clone();
         assert_eq!(p.height, a.height);
         assert_eq!(p.block_hash, a.block_hash);
         assert_eq!((p.index, p.success), (a.index, a.success));
-        assert_eq!((p.fee_charged, a.fee_charged), (0, 0), "failed txs carry a zero charge on both");
         assert_eq!(
-            call(&proposer, "stell_getTransactionReceipt", json!(hex::encode(txs[0].compute_tx_hash())))
-                .await["fee_charged"],
+            (p.fee_charged, a.fee_charged),
+            (0, 0),
+            "failed txs carry a zero charge on both"
+        );
+        assert_eq!(
+            call(
+                &proposer,
+                "stell_getTransactionReceipt",
+                json!(hex::encode(txs[0].compute_tx_hash()))
+            )
+            .await["fee_charged"],
             json!("1"),
             "block-txs and receipt views agree on the charge"
         );
@@ -9795,7 +10836,11 @@ mod tests {
         assert_eq!(r["base_fee"], json!("0"), "library default floor is 0: {r}");
         st.mempool.write().await.base_fee = 560;
         let r = call(&st, "stell_baseFee", json!({})).await;
-        assert_eq!(r["base_fee"], json!("560"), "floor tracks the live mempool: {r}");
+        assert_eq!(
+            r["base_fee"],
+            json!("560"),
+            "floor tracks the live mempool: {r}"
+        );
     }
 
     #[tokio::test]
@@ -9808,20 +10853,36 @@ mod tests {
 
         let r = call(&st, "stell_getShards", json!({})).await;
         assert_eq!(r["total_shards"], json!(1), "one chain => one shard: {r}");
-        assert_eq!(r["routing_prefix_bits"], json!(0), "a single shard needs no routing bit");
+        assert_eq!(
+            r["routing_prefix_bits"],
+            json!(0),
+            "a single shard needs no routing bit"
+        );
         let shards = r["shards"].as_array().expect("shards array").clone();
         assert_eq!(shards.len(), 1);
         let s0 = &shards[0];
         assert_eq!(s0["shard_id"], json!(0));
         assert_eq!(s0["type"], json!("masterchain"));
-        assert_eq!(s0["tip_height"], json!(42), "the tip height is the node's own height");
-        assert_eq!(s0["tip_hash"], json!(hex::encode([0xAAu8; 32])), "the tip hash is the committed head");
+        assert_eq!(
+            s0["tip_height"],
+            json!(42),
+            "the tip height is the node's own height"
+        );
+        assert_eq!(
+            s0["tip_hash"],
+            json!(hex::encode([0xAAu8; 32])),
+            "the tip hash is the committed head"
+        );
         assert_eq!(
             s0["state_root"],
             json!(hex::encode(st.engine.get_state_root().await)),
             "the state root is the live trie root"
         );
-        assert_eq!(s0["local"], json!(true), "the shard this node runs is marked local");
+        assert_eq!(
+            s0["local"],
+            json!(true),
+            "the shard this node runs is marked local"
+        );
     }
 
     #[tokio::test]
@@ -9853,8 +10914,16 @@ mod tests {
         }
 
         let r = call(&st, "stell_getShards", json!({})).await;
-        assert_eq!(r["total_shards"], json!(2), "both committed shards are listed: {r}");
-        assert_eq!(r["routing_prefix_bits"], json!(1), "two shards need exactly one routing bit");
+        assert_eq!(
+            r["total_shards"],
+            json!(2),
+            "both committed shards are listed: {r}"
+        );
+        assert_eq!(
+            r["routing_prefix_bits"],
+            json!(1),
+            "two shards need exactly one routing bit"
+        );
         let shards = r["shards"].as_array().expect("shards array").clone();
         assert_eq!(shards.len(), 2);
 
@@ -9871,10 +10940,14 @@ mod tests {
         assert_eq!(wc["tip_height"], json!(63_400));
         assert_eq!(wc["tip_hash"], json!(hex::encode([0x33u8; 32])));
         assert_eq!(wc["state_root"], json!(hex::encode([0x44u8; 32])));
-        assert_eq!(wc["local"], json!(false), "the sibling shard is not the local one");
+        assert_eq!(
+            wc["local"],
+            json!(false),
+            "the sibling shard is not the local one"
+        );
     }
 
-        #[tokio::test]
+    #[tokio::test]
     async fn get_shards_refuses_a_height_above_the_tip() {
         // Never fabricate: a height this node has not reached is a miss, not
         // an answer with the current head pasted into it.
@@ -9882,14 +10955,26 @@ mod tests {
         st.record_block(42, [0xAAu8; 32], 0, 1_000).await;
 
         let bad = call(&st, "stell_getShards", json!({ "height": 999_999 })).await;
-        let msg = bad["error"].as_str().unwrap_or_else(|| panic!("expected an error, got {bad}"));
-        assert!(msg.contains("above this node's tip"), "unexpected message: {msg}");
+        let msg = bad["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected an error, got {bad}"));
+        assert!(
+            msg.contains("above this node's tip"),
+            "unexpected message: {msg}"
+        );
 
         // A height at or below the tip is accepted and answered with the
         // current topology.
         let ok_r = call(&st, "stell_getShards", json!({ "height": 42 })).await;
-        assert_eq!(ok_r["total_shards"], json!(1), "the topology is still served: {ok_r}");
-        assert!(ok_r.get("error").is_none(), "no error for a reachable height");
+        assert_eq!(
+            ok_r["total_shards"],
+            json!(1),
+            "the topology is still served: {ok_r}"
+        );
+        assert!(
+            ok_r.get("error").is_none(),
+            "no error for a reachable height"
+        );
     }
 
     /// A finalized two-height chain with a full snapshot at `H`: the state
@@ -9919,24 +11004,40 @@ mod tests {
 
         let engine = Arc::new(InMemoryStateEngine::new());
         let account = [0xA1u8; 32];
-        engine.update_account(AccountState::new(account, 1_000)).await;
-        engine.update_account(AccountState::new([0xB2u8; 32], 7)).await;
+        engine
+            .update_account(AccountState::new(account, 1_000))
+            .await;
+        engine
+            .update_account(AccountState::new([0xB2u8; 32], 7))
+            .await;
         let root = engine.get_state_root().await;
 
         let height = 10u64;
         let tip = height + 1;
-        store.put_state(height, &engine.create_snapshot().await).unwrap();
+        store
+            .put_state(height, &engine.create_snapshot().await)
+            .unwrap();
         let domains = crate::storage::DomainSnapshot::capture(
             &engine,
             &crate::staking::StakingLedger::new(),
             &crate::governance::Governance::new(),
         )
         .await;
-        store.put_domains(height, &bincode::serialize(&domains).unwrap()).unwrap();
-        store.put_session_keys(height, &engine.session_keys_snapshot().await).unwrap();
-        store.put_bridge(height, &engine.bridge_snapshot().await).unwrap();
-        store.put_confidential(height, &engine.confidential_snapshot().await).unwrap();
-        store.put_zkml_models(height, &engine.zkml_models_snapshot().await).unwrap();
+        store
+            .put_domains(height, &bincode::serialize(&domains).unwrap())
+            .unwrap();
+        store
+            .put_session_keys(height, &engine.session_keys_snapshot().await)
+            .unwrap();
+        store
+            .put_bridge(height, &engine.bridge_snapshot().await)
+            .unwrap();
+        store
+            .put_confidential(height, &engine.confidential_snapshot().await)
+            .unwrap();
+        store
+            .put_zkml_models(height, &engine.zkml_models_snapshot().await)
+            .unwrap();
 
         let mk = |h: u64, prev: [u8; 32], state_root: [u8; 32]| {
             let order_root = crate::mev::compute_order_merkle_root(&[]);
@@ -9996,7 +11097,15 @@ mod tests {
         });
         (
             st,
-            ArchiveFixture { dir, store, height, tip, root, account, signer },
+            ArchiveFixture {
+                dir,
+                store,
+                height,
+                tip,
+                root,
+                account,
+                signer,
+            },
         )
     }
 
@@ -10014,12 +11123,18 @@ mod tests {
             json!({ "address": hex::encode(f.account), "height": f.height }),
         )
         .await;
-        assert!(r.get("error").is_none(), "archive proof must be served: {r}");
+        assert!(
+            r.get("error").is_none(),
+            "archive proof must be served: {r}"
+        );
         assert_eq!(r["height"], json!(f.height));
         assert_eq!(r["state_root"], json!(hex::encode(f.root)));
         assert_eq!(r["proof_type"], json!("inclusion"));
         let proof = crate::cpat2::ArchiveProof::from_json(&r).expect("parse");
-        assert!(proof.verify(), "served proof must verify against the historical root");
+        assert!(
+            proof.verify(),
+            "served proof must verify against the historical root"
+        );
 
         // Exclusion proof for an absent key, via the explicit `key` slot.
         let missing = [0xEEu8; 32];
@@ -10033,22 +11148,35 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(r["proof_type"], json!("exclusion"), "absent key proves absence: {r}");
+        assert_eq!(
+            r["proof_type"],
+            json!("exclusion"),
+            "absent key proves absence: {r}"
+        );
         let proof = crate::cpat2::ArchiveProof::from_json(&r).expect("parse");
         assert!(proof.verify());
 
         // The historical root, authenticated by the anchoring QC: parse into
         // a checkpoint, verify under OUR OWN validator set, adopt it, then
         // verify the archive proof against it — the full client path.
-        let r = call(&st, "stell_getHistoricalRoot", json!({ "height": f.height })).await;
-        assert!(r.get("error").is_none(), "historical root must be served: {r}");
+        let r = call(
+            &st,
+            "stell_getHistoricalRoot",
+            json!({ "height": f.height }),
+        )
+        .await;
+        assert!(
+            r.get("error").is_none(),
+            "historical root must be served: {r}"
+        );
         assert_eq!(r["height"], json!(f.height));
         assert_eq!(r["state_root"], json!(hex::encode(f.root)));
         assert_eq!(r["finalized"], json!(true));
         let cp = Checkpoint::from_historical_root_json(&r).expect("parse checkpoint");
         let val_id = f.signer.verifying_key().to_bytes();
         let vset = ValidatorSet::from_list(vec![(val_id, 1)]);
-        cp.verify(&vset).expect("the QC must verify under our own set");
+        cp.verify(&vset)
+            .expect("the QC must verify under our own set");
         let lc = LightClient::new(vset, cp).expect("anchor");
         let proven = lc
             .verify_archive_proof_json(
@@ -10078,9 +11206,20 @@ mod tests {
             json!({ "address": hex::encode(f.account), "height": f.height }),
         )
         .await;
-        assert!(r["error"].as_str().unwrap_or_default().contains("no durable store"));
-        let r = call(&bare, "stell_getHistoricalRoot", json!({ "height": f.height })).await;
-        assert!(r["error"].as_str().unwrap_or_default().contains("no durable store"));
+        assert!(r["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no durable store"));
+        let r = call(
+            &bare,
+            "stell_getHistoricalRoot",
+            json!({ "height": f.height }),
+        )
+        .await;
+        assert!(r["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no durable store"));
 
         // Above the tip: refused, never fabricated.
         let r = call(
@@ -10089,13 +11228,38 @@ mod tests {
             json!({ "address": hex::encode(f.account), "height": f.tip + 100 }),
         )
         .await;
-        assert!(r["error"].as_str().unwrap_or_default().contains("above the tip"), "{r}");
-        let r = call(&st, "stell_getHistoricalRoot", json!({ "height": f.tip + 100 })).await;
-        assert!(r["error"].as_str().unwrap_or_default().contains("above the tip"), "{r}");
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("above the tip"),
+            "{r}"
+        );
+        let r = call(
+            &st,
+            "stell_getHistoricalRoot",
+            json!({ "height": f.tip + 100 }),
+        )
+        .await;
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("above the tip"),
+            "{r}"
+        );
 
         // Unknown height (never snapshotted, nothing retained): refused.
-        let r = call(&st, "stell_getHistoricalRoot", json!({ "height": f.tip + 1 })).await;
-        assert!(r["error"].is_string(), "an unanchored height must be an error: {r}");
+        let r = call(
+            &st,
+            "stell_getHistoricalRoot",
+            json!({ "height": f.tip + 1 }),
+        )
+        .await;
+        assert!(
+            r["error"].is_string(),
+            "an unanchored height must be an error: {r}"
+        );
 
         std::fs::remove_dir_all(&f.dir).ok();
     }
@@ -10108,16 +11272,22 @@ mod tests {
         // Age the chain past the fixture snapshot, then prune below the new
         // snapshot: the old height's data is gone for good.
         let engine = InMemoryStateEngine::new();
-        engine.update_account(AccountState::new([0x77u8; 32], 5)).await;
+        engine
+            .update_account(AccountState::new([0x77u8; 32], 5))
+            .await;
         let later = f.height + 10;
-        f.store.put_state(later, &engine.create_snapshot().await).unwrap();
+        f.store
+            .put_state(later, &engine.create_snapshot().await)
+            .unwrap();
         let domains = crate::storage::DomainSnapshot::capture(
             &engine,
             &crate::staking::StakingLedger::new(),
             &crate::governance::Governance::new(),
         )
         .await;
-        f.store.put_domains(later, &bincode::serialize(&domains).unwrap()).unwrap();
+        f.store
+            .put_domains(later, &bincode::serialize(&domains).unwrap())
+            .unwrap();
         f.store.prune_state_below(later).unwrap();
         f.store.prune_domains_below(later).unwrap();
 
@@ -10127,7 +11297,9 @@ mod tests {
             json!({ "address": hex::encode(f.account), "height": f.height }),
         )
         .await;
-        let msg = r["error"].as_str().unwrap_or_else(|| panic!("a pruned height must be refused, got {r}"));
+        let msg = r["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a pruned height must be refused, got {r}"));
         assert!(
             msg.contains("pruned") || msg.contains("no state snapshot"),
             "refusal must say the height is pruned, got: {msg}"
@@ -10159,13 +11331,41 @@ mod tests {
         let st = test_state().await;
         let h_before = st.height.load(std::sync::atomic::Ordering::Relaxed);
         let blk = call(&st, "stell_getBlock", json!({ "height": 999_999 })).await;
-        assert!(blk["error"].as_str().unwrap_or_default().contains("not available yet"), "{blk}");
-        let txs = call(&st, "stell_getBlockTransactions", json!({ "height": 999_999 })).await;
-        assert!(txs["error"].as_str().unwrap_or_default().contains("not available yet"), "{txs}");
-        let rcpt =
-            call(&st, "stell_getTransactionReceipt", json!(hex::encode([0xDDu8; 32]))).await;
-        assert_eq!(rcpt["status"], json!("unknown"), "unknown tx is honestly unknown");
-        assert_eq!(st.height.load(std::sync::atomic::Ordering::Relaxed), h_before);
+        assert!(
+            blk["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not available yet"),
+            "{blk}"
+        );
+        let txs = call(
+            &st,
+            "stell_getBlockTransactions",
+            json!({ "height": 999_999 }),
+        )
+        .await;
+        assert!(
+            txs["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not available yet"),
+            "{txs}"
+        );
+        let rcpt = call(
+            &st,
+            "stell_getTransactionReceipt",
+            json!(hex::encode([0xDDu8; 32])),
+        )
+        .await;
+        assert_eq!(
+            rcpt["status"],
+            json!("unknown"),
+            "unknown tx is honestly unknown"
+        );
+        assert_eq!(
+            st.height.load(std::sync::atomic::Ordering::Relaxed),
+            h_before
+        );
     }
 
     #[tokio::test]
@@ -10202,14 +11402,28 @@ mod tests {
         b.sign_block(&sk);
         let bh = b.compute_hash();
         store.put_block(&b).unwrap();
-        store.put_receipts_for_block(31, &bh, &b.transactions, &[true], &[1]).unwrap();
+        store
+            .put_receipts_for_block(31, &bh, &b.transactions, &[true], &[1])
+            .unwrap();
 
         let st = test_state().await;
         hydrate_rpc_from_store(&st, &store).await;
-        let r = call(&st, "stell_getTransactionReceipt", json!(hex::encode(tx.compute_tx_hash()))).await;
-        assert_eq!((r["height"].as_u64(), r["status"].as_str()), (Some(31), Some("success")));
+        let r = call(
+            &st,
+            "stell_getTransactionReceipt",
+            json!(hex::encode(tx.compute_tx_hash())),
+        )
+        .await;
+        assert_eq!(
+            (r["height"].as_u64(), r["status"].as_str()),
+            (Some(31), Some("success"))
+        );
         let blk = call(&st, "stell_getBlock", json!({ "height": 31 })).await;
-        assert_eq!(blk["txs"], json!(1), "hydrated window serves the real tx count");
+        assert_eq!(
+            blk["txs"],
+            json!(1),
+            "hydrated window serves the real tx count"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -10347,7 +11561,11 @@ mod tests {
             json!({ "contract": addr_hex, "source_hex": hex::encode(VERIFY_WAT.as_bytes()), "compiler": "wat" }),
         )
         .await;
-        assert_eq!(r_hex["verified"], json!(true), "hex form must verify: {r_hex}");
+        assert_eq!(
+            r_hex["verified"],
+            json!(true),
+            "hex form must verify: {r_hex}"
+        );
         assert_eq!(r_hex["source_hash"], json!(source_hash));
 
         // 2. A tampered source is REFUSED (rebuilt hash mismatches).
@@ -10358,7 +11576,11 @@ mod tests {
             json!({ "contract": addr_hex, "source": tampered, "compiler": "wat2wasm-1.0" }),
         )
         .await;
-        assert_eq!(r["verified"], json!(false), "tampered source must be refused: {r}");
+        assert_eq!(
+            r["verified"],
+            json!(false),
+            "tampered source must be refused: {r}"
+        );
 
         // 3. A wrong-compiler claim is REFUSED (fail-closed, never guessed).
         let r = call(
@@ -10367,10 +11589,19 @@ mod tests {
             json!({ "contract": addr_hex, "source": VERIFY_WAT, "compiler": "solc-0.8.24" }),
         )
         .await;
-        assert_eq!(r["verified"], json!(false), "foreign compiler must be refused: {r}");
+        assert_eq!(
+            r["verified"],
+            json!(false),
+            "foreign compiler must be refused: {r}"
+        );
 
         // 4. Fresh contract: no source registered yet (absent = unverified).
-        let r = call(&st, "stell_getContractSource", json!({ "contract": addr_hex })).await;
+        let r = call(
+            &st,
+            "stell_getContractSource",
+            json!({ "contract": addr_hex }),
+        )
+        .await;
         assert_eq!(r["verified"], json!(false), "nothing registered yet: {r}");
 
         // 5. Registration without (or with a wrong) signature is refused.
@@ -10380,7 +11611,10 @@ mod tests {
             json!({ "contract": addr_hex, "source_hash": source_hash }),
         )
         .await;
-        assert!(r["error"].is_string(), "missing signature must be refused: {r}");
+        assert!(
+            r["error"].is_string(),
+            "missing signature must be refused: {r}"
+        );
         let bad_sig = hex::encode([0u8; 64]);
         let r = call(
             &st,
@@ -10388,7 +11622,10 @@ mod tests {
             json!({ "contract": addr_hex, "source_hash": source_hash, "signature": bad_sig }),
         )
         .await;
-        assert!(r["error"].is_string(), "forged signature must be refused: {r}");
+        assert!(
+            r["error"].is_string(),
+            "forged signature must be refused: {r}"
+        );
 
         // 6. The creator's signature registers the fingerprint.
         let shash_bytes = hex::decode(&source_hash).unwrap();
@@ -10402,12 +11639,25 @@ mod tests {
             json!({ "contract": addr_hex, "source_hash": source_hash, "signature": hex::encode(sig.to_bytes()) }),
         )
         .await;
-        assert_eq!(r["registered"], json!(true), "signed registration must land: {r}");
+        assert_eq!(
+            r["registered"],
+            json!(true),
+            "signed registration must land: {r}"
+        );
 
         // 7. The label is now readable; verification itself never set it
         // (it was `false` in step 4 before any registration).
-        let r = call(&st, "stell_getContractSource", json!({ "contract": addr_hex })).await;
-        assert_eq!(r["verified"], json!(true), "registered source reads back: {r}");
+        let r = call(
+            &st,
+            "stell_getContractSource",
+            json!({ "contract": addr_hex }),
+        )
+        .await;
+        assert_eq!(
+            r["verified"],
+            json!(true),
+            "registered source reads back: {r}"
+        );
         assert_eq!(r["source_hash"], json!(source_hash));
 
         // 8. Hash-only check against the registered fingerprint.
@@ -10417,14 +11667,22 @@ mod tests {
             json!({ "contract": addr_hex, "source_hash": source_hash }),
         )
         .await;
-        assert_eq!(r["verified"], json!(true), "registered hash must match: {r}");
+        assert_eq!(
+            r["verified"],
+            json!(true),
+            "registered hash must match: {r}"
+        );
         let r = call(
             &st,
             "stell_verifyContractSource",
             json!({ "contract": addr_hex, "source_hash": hex::encode([9u8; 32]) }),
         )
         .await;
-        assert_eq!(r["verified"], json!(false), "foreign hash must not match: {r}");
+        assert_eq!(
+            r["verified"],
+            json!(false),
+            "foreign hash must not match: {r}"
+        );
     }
 
     #[tokio::test]
@@ -10436,7 +11694,11 @@ mod tests {
             json!({ "contract": hex::encode([9u8; 32]), "source": VERIFY_WAT }),
         )
         .await;
-        assert_eq!(r["error"], json!("contract not found"), "unknown contract: {r}");
+        assert_eq!(
+            r["error"],
+            json!("contract not found"),
+            "unknown contract: {r}"
+        );
 
         let sk = ed25519_dalek::SigningKey::from_bytes(&[0xCDu8; 32]);
         let creator = sk.verifying_key().to_bytes();
@@ -10448,7 +11710,11 @@ mod tests {
             json!({ "contract": hex::encode(addr), "source": VERIFY_WAT, "compiler_flags": "--lto=fat" }),
         )
         .await;
-        assert_eq!(r["verified"], json!(false), "unreproducible flags refused: {r}");
+        assert_eq!(
+            r["verified"],
+            json!(false),
+            "unreproducible flags refused: {r}"
+        );
     }
 
     #[tokio::test]
@@ -10457,23 +11723,13 @@ mod tests {
         let creator = [0x44u8; 32];
         let addr = st
             .engine
-            .deploy_contract_with_abi(
-                creator,
-                abi_contract_wasm(),
-                0,
-                abi_contract_manifest(),
-            )
+            .deploy_contract_with_abi(creator, abi_contract_wasm(), 0, abi_contract_manifest())
             .await
             .unwrap();
         let addr_hex = hex::encode(addr);
 
         // The manifest is discoverable.
-        let res = call(
-            &st,
-            "stell_getContractAbi",
-            json!({ "contract": addr_hex }),
-        )
-        .await;
+        let res = call(&st, "stell_getContractAbi", json!({ "contract": addr_hex })).await;
         assert_eq!(res["abi"]["methods"].as_array().unwrap().len(), 2);
 
         // A two-argument method is callable and the return value is typed.
@@ -10505,7 +11761,10 @@ mod tests {
         )
         .await;
         assert_eq!(res["success"], json!(false));
-        assert!(res["error"].as_str().unwrap().contains("expects 2 argument"));
+        assert!(res["error"]
+            .as_str()
+            .unwrap()
+            .contains("expects 2 argument"));
 
         // So is an unknown method.
         let res = call(
@@ -10521,7 +11780,11 @@ mod tests {
     async fn call_contract_with_multi_argument_method() {
         let st = test_state().await;
         let creator = [0x55u8; 32];
-        let addr = st.engine.deploy_contract(creator, abi_contract_wasm(), 0).await.unwrap();
+        let addr = st
+            .engine
+            .deploy_contract(creator, abi_contract_wasm(), 0)
+            .await
+            .unwrap();
         let addr_hex = hex::encode(addr);
 
         // Three arguments reach a three-parameter method.
@@ -10548,7 +11811,11 @@ mod tests {
     async fn run_get_method_basic_execution_and_arg_formats() {
         let st = test_state().await;
         let creator = [0x11u8; 32];
-        let addr = st.engine.deploy_contract(creator, sample_getter_wasm(), 0).await.unwrap();
+        let addr = st
+            .engine
+            .deploy_contract(creator, sample_getter_wasm(), 0)
+            .await
+            .unwrap();
         let addr_hex = hex::encode(addr);
         let addr_stl57 = crate::address::encode_stl57_address(&addr);
 
@@ -10674,13 +11941,19 @@ mod tests {
     async fn run_get_method_zero_state_changes_and_zero_gas_fees() {
         let st = test_state().await;
         let creator = [0x22u8; 32];
-        let addr = st.engine.deploy_contract(creator, counter_getter_wasm(), 0).await.unwrap();
+        let addr = st
+            .engine
+            .deploy_contract(creator, counter_getter_wasm(), 0)
+            .await
+            .unwrap();
         let addr_hex = hex::encode(addr);
 
         // Account balance setup to verify zero gas fees
         let caller_acc = [0x33u8; 32];
         let initial_balance = 5_000_000_000u64;
-        st.engine.update_account(AccountState::new(caller_acc, initial_balance)).await;
+        st.engine
+            .update_account(AccountState::new(caller_acc, initial_balance))
+            .await;
 
         // 1. First getMethod call invokes inc(10)
         let r1 = call(
@@ -10722,14 +11995,21 @@ mod tests {
         )
         .await;
         assert_eq!(r2["success"], json!(true));
-        assert_eq!(r2["return_value"], json!(1), "state must not have persisted from call 1");
+        assert_eq!(
+            r2["return_value"],
+            json!(1),
+            "state must not have persisted from call 1"
+        );
 
         // Verify storage in engine is still empty
         let contract2 = st.engine.get_contract(&addr).await.unwrap();
         assert!(contract2.storage.is_empty());
 
         // 3. Mutate consensus state deliberately via real call_contract
-        st.engine.call_contract(&addr, "inc", 10, 50_000).await.unwrap();
+        st.engine
+            .call_contract(&addr, "inc", 10, 50_000)
+            .await
+            .unwrap();
         let contract3 = st.engine.get_contract(&addr).await.unwrap();
         assert_eq!(contract3.storage.get(&10), Some(&1));
 
@@ -10770,7 +12050,11 @@ mod tests {
     async fn run_get_method_events_and_no_receipt_storage() {
         let st = test_state().await;
         let creator = [0x44u8; 32];
-        let addr = st.engine.deploy_contract(creator, event_getter_wasm(), 0).await.unwrap();
+        let addr = st
+            .engine
+            .deploy_contract(creator, event_getter_wasm(), 0)
+            .await
+            .unwrap();
         let addr_hex = hex::encode(addr);
 
         let res = call(
@@ -10801,8 +12085,16 @@ mod tests {
     async fn run_get_method_safety_fuel_limit_and_error_handling() {
         let st = test_state().await;
         let creator = [0x55u8; 32];
-        let sample_addr = st.engine.deploy_contract(creator, sample_getter_wasm(), 0).await.unwrap();
-        let loop_addr = st.engine.deploy_contract(creator, loop_getter_wasm(), 0).await.unwrap();
+        let sample_addr = st
+            .engine
+            .deploy_contract(creator, sample_getter_wasm(), 0)
+            .await
+            .unwrap();
+        let loop_addr = st
+            .engine
+            .deploy_contract(creator, loop_getter_wasm(), 0)
+            .await
+            .unwrap();
 
         // 1. Infinite loop is bounded by safety fuel limit (5,000,000)
         let loop_res = call(
@@ -10818,7 +12110,10 @@ mod tests {
         assert_eq!(loop_res["success"], json!(false));
         assert_eq!(loop_res["error"], json!("contract ran out of fuel"));
         assert!(loop_res["fuel_used"].as_u64().unwrap() >= 4_999_000);
-        assert!(loop_res["fuel_used"].as_u64().unwrap() <= crate::contract::GET_METHOD_SAFETY_FUEL_LIMIT);
+        assert!(
+            loop_res["fuel_used"].as_u64().unwrap()
+                <= crate::contract::GET_METHOD_SAFETY_FUEL_LIMIT
+        );
 
         // 2. Trapping contract (unreachable)
         let trap_res = call(
@@ -10832,7 +12127,10 @@ mod tests {
         )
         .await;
         assert_eq!(trap_res["success"], json!(false));
-        assert_eq!(trap_res["error"], json!("contract trapped during execution"));
+        assert_eq!(
+            trap_res["error"],
+            json!("contract trapped during execution")
+        );
         assert!(trap_res["fuel_used"].as_u64().unwrap() > 0);
 
         // 3. Unknown contract
@@ -10869,7 +12167,11 @@ mod tests {
         assert_eq!(no_method_res["fuel_used"], json!(0));
 
         // 5. Paused contract cannot be called
-        st.engine.contracts_write().await.pause(&sample_addr, creator).unwrap();
+        st.engine
+            .contracts_write()
+            .await
+            .pause(&sample_addr, creator)
+            .unwrap();
         let paused_res = call(
             &st,
             "stell_runGetMethod",
@@ -10896,7 +12198,10 @@ mod tests {
         )
         .await;
         assert_eq!(invalid_addr_res["success"], json!(false));
-        assert!(invalid_addr_res["error"].as_str().unwrap().contains("invalid address"));
+        assert!(invalid_addr_res["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid address"));
         assert_eq!(invalid_addr_res["fuel_used"], json!(0));
 
         // 7. Missing address
@@ -10910,7 +12215,10 @@ mod tests {
         )
         .await;
         assert_eq!(missing_addr_res["success"], json!(false));
-        assert!(missing_addr_res["error"].as_str().unwrap().contains("missing"));
+        assert!(missing_addr_res["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing"));
         assert_eq!(missing_addr_res["fuel_used"], json!(0));
     }
 
@@ -10918,7 +12226,11 @@ mod tests {
     async fn run_get_method_block_height_pinning() {
         let st = test_state().await;
         let creator = [0x66u8; 32];
-        let addr = st.engine.deploy_contract(creator, sample_getter_wasm(), 0).await.unwrap();
+        let addr = st
+            .engine
+            .deploy_contract(creator, sample_getter_wasm(), 0)
+            .await
+            .unwrap();
         let addr_hex = hex::encode(addr);
 
         // Height in test_state() is 42
@@ -10987,7 +12299,8 @@ mod tests {
 
         // Calculate expected deterministic address: BLAKE3("STELL_CONTRACT" || code_hash || salt)
         let expected_code_hash = *blake3::hash(&code).as_bytes();
-        let expected_addr = crate::state_engine::compute_contract_address(&expected_code_hash, &salt);
+        let expected_addr =
+            crate::state_engine::compute_contract_address(&expected_code_hash, &salt);
         let expected_stl57 = crate::address::encode_stl57_address(&expected_addr);
 
         let res = call(
@@ -11012,9 +12325,17 @@ mod tests {
         assert_eq!(trie_code, Some(code));
 
         // Verify receipt is recorded in st.receipts
-        let receipt = call(&st, "stell_getTransactionReceipt", json!({ "hash": tx_hash })).await;
+        let receipt = call(
+            &st,
+            "stell_getTransactionReceipt",
+            json!({ "hash": tx_hash }),
+        )
+        .await;
         assert_eq!(receipt["status"], json!("success"));
-        assert_eq!(receipt["contract_address"], json!(hex::encode(expected_addr)));
+        assert_eq!(
+            receipt["contract_address"],
+            json!(hex::encode(expected_addr))
+        );
         assert_eq!(receipt["contract_address_stl57"], json!(expected_stl57));
     }
 
@@ -11024,7 +12345,8 @@ mod tests {
         let code = counter_getter_wasm();
         let salt = vec![0xAB, 0xCD];
         let expected_code_hash = *blake3::hash(&code).as_bytes();
-        let expected_addr = crate::state_engine::compute_contract_address(&expected_code_hash, &salt);
+        let expected_addr =
+            crate::state_engine::compute_contract_address(&expected_code_hash, &salt);
 
         let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
         let tx = Transaction::sign_with_payload(
@@ -11123,7 +12445,12 @@ mod tests {
         let tx_hash = call1["tx_hash"].as_str().unwrap();
 
         // 2. Fetch receipt via stell_getTransactionReceipt
-        let receipt = call(&st, "stell_getTransactionReceipt", json!({ "hash": tx_hash })).await;
+        let receipt = call(
+            &st,
+            "stell_getTransactionReceipt",
+            json!({ "hash": tx_hash }),
+        )
+        .await;
         assert_eq!(receipt["status"], json!("success"));
         assert_eq!(receipt["return_value"], json!(42));
         assert!(receipt["gas_used"].as_u64().unwrap() > 0);
@@ -11266,7 +12593,12 @@ mod tests {
 
         // Verify events in receipt
         let tx_hash = emit_call["tx_hash"].as_str().unwrap();
-        let receipt = call(&st, "stell_getTransactionReceipt", json!({ "hash": tx_hash })).await;
+        let receipt = call(
+            &st,
+            "stell_getTransactionReceipt",
+            json!({ "hash": tx_hash }),
+        )
+        .await;
         let r_events = receipt["events"].as_array().expect("receipt events array");
         assert_eq!(r_events.len(), 1);
         assert_eq!(r_events[0]["topic"], json!(777));
@@ -11300,7 +12632,12 @@ mod tests {
         assert_eq!(trap_res["status"], json!("failed"));
         assert_eq!(trap_res["return_value"], Value::Null);
         let trap_hash = trap_res["tx_hash"].as_str().unwrap();
-        let trap_receipt = call(&st, "stell_getTransactionReceipt", json!({ "hash": trap_hash })).await;
+        let trap_receipt = call(
+            &st,
+            "stell_getTransactionReceipt",
+            json!({ "hash": trap_hash }),
+        )
+        .await;
         assert_eq!(trap_receipt["status"], json!("failed"));
 
         // 2. Unknown method failure
@@ -11315,7 +12652,10 @@ mod tests {
         )
         .await;
         assert_eq!(unknown_res["status"], json!("failed"));
-        assert!(unknown_res["outcome"]["error"].as_str().unwrap().contains("does not export"));
+        assert!(unknown_res["outcome"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("does not export"));
 
         // 3. Unknown contract address failure
         let unknown_c = call(
@@ -11329,7 +12669,10 @@ mod tests {
         )
         .await;
         assert_eq!(unknown_c["status"], json!("failed"));
-        assert!(unknown_c["outcome"]["error"].as_str().unwrap().contains("not found"));
+        assert!(unknown_c["outcome"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not found"));
 
         // 4. Out of fuel failure
         let deploy_loop = call(
@@ -11354,7 +12697,10 @@ mod tests {
         .await;
         assert_eq!(oof_res["status"], json!("failed"));
         assert_eq!(oof_res["gas_used"], json!(500));
-        assert!(oof_res["outcome"]["error"].as_str().unwrap().contains("ran out of fuel"));
+        assert!(oof_res["outcome"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("ran out of fuel"));
     }
 
     /// The estimate's gas ceiling is FIXED and the budget is HONEST (audit W7.2).
@@ -11367,10 +12713,7 @@ mod tests {
     #[test]
     fn estimate_fee_gas_budget_is_fixed_and_honoured_downwards() {
         // No request: the full (fixed) ceiling.
-        assert_eq!(
-            estimate_fee_gas_budget(None),
-            Ok(ESTIMATE_FEE_GAS_CEILING)
-        );
+        assert_eq!(estimate_fee_gas_budget(None), Ok(ESTIMATE_FEE_GAS_CEILING));
         // A caller may lower it, and the request is HONOURED (not clamped up
         // to the ceiling).
         assert_eq!(
@@ -11527,12 +12870,7 @@ mod tests {
         let key = ed25519_dalek::SigningKey::from_bytes(&from);
         let raw_tx = crate::sharding::Transaction::sign(&key, to, 1000, 280000, 0, 0, 0);
         let tx_hex = hex::encode(bincode::serialize(&raw_tx).unwrap());
-        let res_raw = call(
-            &st,
-            "stell_estimateFee",
-            json!({ "tx": tx_hex }),
-        )
-        .await;
+        let res_raw = call(&st, "stell_estimateFee", json!({ "tx": tx_hex })).await;
         assert_eq!(res_raw["gas_limit"], json!(280000));
         assert_eq!(res_raw["estimated_fee"], json!(280000));
         assert_eq!(res_raw["base_fee"], json!(280000));
@@ -11615,7 +12953,11 @@ mod tests {
     async fn test_estimate_fee_contract_call() {
         let st = test_state().await;
         let creator = [0x11u8; 32];
-        let contract_addr = st.engine.deploy_contract(creator, sample_getter_wasm(), 0).await.unwrap();
+        let contract_addr = st
+            .engine
+            .deploy_contract(creator, sample_getter_wasm(), 0)
+            .await
+            .unwrap();
         let caller = [0x99u8; 32];
 
         // 1. Estimate fee with OpCode array
@@ -11705,12 +13047,20 @@ mod tests {
         ];
 
         // Record receipts on block path (height 10)
-        st.record_receipts_with_events(10, [0xAA; 32], &txs, &[true, true], &[1000, 500], &events).await;
+        st.record_receipts_with_events(10, [0xAA; 32], &txs, &[true, true], &[1000, 500], &events)
+            .await;
 
         // 1. stell_getTransactionReceipt includes events array
-        let receipt = call(&st, "stell_getTransactionReceipt", json!({ "hash": tx_hash_hex })).await;
+        let receipt = call(
+            &st,
+            "stell_getTransactionReceipt",
+            json!({ "hash": tx_hash_hex }),
+        )
+        .await;
         assert_eq!(receipt["status"], json!("success"));
-        let r_events = receipt["events"].as_array().expect("events must be an array");
+        let r_events = receipt["events"]
+            .as_array()
+            .expect("events must be an array");
         assert_eq!(r_events.len(), 2);
         assert_eq!(r_events[0]["contract"], json!(contract_hex));
         assert_eq!(r_events[0]["topic"], json!(1001));
@@ -11720,7 +13070,12 @@ mod tests {
         assert_eq!(r_events[1]["value"], json!(2004));
 
         // Plain tx receipt also has empty events array
-        let plain_receipt = call(&st, "stell_getTransactionReceipt", json!({ "hash": plain_tx_hex })).await;
+        let plain_receipt = call(
+            &st,
+            "stell_getTransactionReceipt",
+            json!({ "hash": plain_tx_hex }),
+        )
+        .await;
         assert_eq!(plain_receipt["events"], json!([]));
 
         // 2. stell_getEvents by tx_hash
@@ -11733,34 +13088,54 @@ mod tests {
         assert_eq!(arr[1]["value"], json!(2004));
 
         // Unknown tx_hash returns empty array
-        let unknown = call(&st, "stell_getEvents", json!({ "tx_hash": hex::encode([0xFFu8; 32]) })).await;
+        let unknown = call(
+            &st,
+            "stell_getEvents",
+            json!({ "tx_hash": hex::encode([0xFFu8; 32]) }),
+        )
+        .await;
         assert_eq!(unknown, json!([]));
 
         // 3. stell_getEvents by contract and block range
-        let evs_by_contract = call(&st, "stell_getEvents", json!({
-            "contract": contract_hex,
-            "from_block": 5,
-            "to_block": 15
-        })).await;
+        let evs_by_contract = call(
+            &st,
+            "stell_getEvents",
+            json!({
+                "contract": contract_hex,
+                "from_block": 5,
+                "to_block": 15
+            }),
+        )
+        .await;
         let arr_contract = evs_by_contract.as_array().expect("must return event array");
         assert_eq!(arr_contract.len(), 2);
         assert_eq!(arr_contract[0]["topic"], json!(1001));
         assert_eq!(arr_contract[0]["value"], json!(2002));
 
         // Outside block range (e.g. from 20 to 30) returns empty array
-        let evs_out_of_range = call(&st, "stell_getEvents", json!({
-            "contract": contract_hex,
-            "from_block": 20,
-            "to_block": 30
-        })).await;
+        let evs_out_of_range = call(
+            &st,
+            "stell_getEvents",
+            json!({
+                "contract": contract_hex,
+                "from_block": 20,
+                "to_block": 30
+            }),
+        )
+        .await;
         assert_eq!(evs_out_of_range, json!([]));
 
         // Non-matching contract address returns empty array
-        let evs_other_contract = call(&st, "stell_getEvents", json!({
-            "contract": hex::encode([0x88u8; 32]),
-            "from_block": 0,
-            "to_block": 100
-        })).await;
+        let evs_other_contract = call(
+            &st,
+            "stell_getEvents",
+            json!({
+                "contract": hex::encode([0x88u8; 32]),
+                "from_block": 0,
+                "to_block": 100
+            }),
+        )
+        .await;
         assert_eq!(evs_other_contract, json!([]));
 
         // Missing parameters returns error
@@ -11775,8 +13150,15 @@ mod tests {
     /// A subscription id is 16 random bytes, hex-encoded.
     fn assert_is_subscription_id(v: &Value) -> String {
         let s = v.as_str().expect("subscription id must be a string");
-        assert_eq!(s.len(), SUBSCRIPTION_ID_BYTES * 2, "subscription id must be 16 bytes hex");
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit()), "subscription id must be hex");
+        assert_eq!(
+            s.len(),
+            SUBSCRIPTION_ID_BYTES * 2,
+            "subscription id must be 16 bytes hex"
+        );
+        assert!(
+            s.chars().all(|c| c.is_ascii_hexdigit()),
+            "subscription id must be hex"
+        );
         s.to_string()
     }
 
@@ -11785,7 +13167,10 @@ mod tests {
         let st = test_state().await;
         let id = call(&st, "stell_subscribe", json!(["newHeads"])).await;
         let sub_id = assert_is_subscription_id(&id);
-        assert!(hub().get(&sub_id).is_some(), "subscription must be in the registry");
+        assert!(
+            hub().get(&sub_id).is_some(),
+            "subscription must be in the registry"
+        );
         let sub = hub().get(&sub_id).expect("subscription");
         assert_eq!(sub.topic, SubscriptionTopic::NewHeads);
         // Every subscribe returns a DISTINCT id.
@@ -11799,11 +13184,18 @@ mod tests {
     #[tokio::test]
     async fn unsubscribe_removes_the_subscription_and_is_idempotent() {
         let st = test_state().await;
-        let sub_id = assert_is_subscription_id(&call(&st, "stell_subscribe", json!(["newHeads"])).await);
-        assert_eq!(call(&st, "stell_unsubscribe", json!([sub_id])).await, json!(true));
+        let sub_id =
+            assert_is_subscription_id(&call(&st, "stell_subscribe", json!(["newHeads"])).await);
+        assert_eq!(
+            call(&st, "stell_unsubscribe", json!([sub_id])).await,
+            json!(true)
+        );
         assert!(hub().get(&sub_id).is_none(), "subscription must be gone");
         // Unsubscribing again is not an error, it just reports "not there".
-        assert_eq!(call(&st, "stell_unsubscribe", json!([sub_id])).await, json!(false));
+        assert_eq!(
+            call(&st, "stell_unsubscribe", json!([sub_id])).await,
+            json!(false)
+        );
         // A missing id is a parameter error.
         assert!(call(&st, "stell_unsubscribe", json!([])).await["error"].is_string());
     }
@@ -11812,9 +13204,15 @@ mod tests {
     async fn subscribe_rejects_an_unknown_type() {
         let st = test_state().await;
         let r = call(&st, "stell_subscribe", json!(["notAThing"])).await;
-        assert!(r["error"].is_string(), "unknown subscription type must be refused");
+        assert!(
+            r["error"].is_string(),
+            "unknown subscription type must be refused"
+        );
         let r = call(&st, "stell_subscribe", json!([])).await;
-        assert!(r["error"].is_string(), "missing subscription type must be refused");
+        assert!(
+            r["error"].is_string(),
+            "missing subscription type must be refused"
+        );
     }
 
     #[tokio::test]
@@ -11836,7 +13234,12 @@ mod tests {
             other => panic!("expected an events subscription, got {other:?}"),
         }
         // A broken contract address is refused, not silently ignored.
-        let bad = call(&st, "stell_subscribe", json!(["events", { "contract": "not-an-address" }])).await;
+        let bad = call(
+            &st,
+            "stell_subscribe",
+            json!(["events", { "contract": "not-an-address" }]),
+        )
+        .await;
         assert!(bad["error"].is_string());
         hub().unsubscribe(&sub_id);
     }
@@ -11869,7 +13272,11 @@ mod tests {
         assert_eq!(addressed, 1, "exactly one `newHeads` subscriber");
 
         // A contract event addresses the subscribers whose filter matches.
-        let ev = crate::contract::ContractEvent { contract: [0x11u8; 32], topic: 7, value: 9 };
+        let ev = crate::contract::ContractEvent {
+            contract: [0x11u8; 32],
+            topic: 7,
+            value: 9,
+        };
         let addressed = h.publish(
             &SubscriptionTopic::Events {
                 contract: Some(hex::encode(ev.contract)),
@@ -11912,7 +13319,13 @@ mod tests {
             topics: vec!["7".to_string()],
         };
         // No filter: matches everything.
-        assert!(topic_matches(&SubscriptionTopic::Events { contract: None, topics: vec![] }, &ev));
+        assert!(topic_matches(
+            &SubscriptionTopic::Events {
+                contract: None,
+                topics: vec![]
+            },
+            &ev
+        ));
         // Same contract, same topic.
         assert!(topic_matches(
             &SubscriptionTopic::Events {
@@ -11963,7 +13376,10 @@ mod tests {
         let heads = h.subscribe(SubscriptionTopic::NewHeads).expect("subscribe");
         let txs = h.subscribe(SubscriptionTopic::NewTxs).expect("subscribe");
         let evs = h
-            .subscribe(SubscriptionTopic::Events { contract: None, topics: vec![] })
+            .subscribe(SubscriptionTopic::Events {
+                contract: None,
+                topics: vec![],
+            })
             .expect("subscribe");
         let mut rx = h.notifications();
 
@@ -11995,7 +13411,11 @@ mod tests {
         assert_eq!(note.result, payload);
 
         // events
-        let ev = crate::contract::ContractEvent { contract: [0x77u8; 32], topic: 3, value: 4 };
+        let ev = crate::contract::ContractEvent {
+            contract: [0x77u8; 32],
+            topic: 3,
+            value: 4,
+        };
         let payload = json!({
             "contract": hex::encode(ev.contract),
             "topics": vec!["3".to_string()],
@@ -12025,10 +13445,17 @@ mod tests {
         // subscriber sees the finalized head and the included transaction.
         let st = test_state().await;
         let mut rx = hub().notifications();
-        let head_sub = hub().subscribe(SubscriptionTopic::NewHeads).expect("subscribe");
-        let tx_sub = hub().subscribe(SubscriptionTopic::NewTxs).expect("subscribe");
+        let head_sub = hub()
+            .subscribe(SubscriptionTopic::NewHeads)
+            .expect("subscribe");
+        let tx_sub = hub()
+            .subscribe(SubscriptionTopic::NewTxs)
+            .expect("subscribe");
         let ev_sub = hub()
-            .subscribe(SubscriptionTopic::Events { contract: None, topics: vec![] })
+            .subscribe(SubscriptionTopic::Events {
+                contract: None,
+                topics: vec![],
+            })
             .expect("subscribe");
 
         let tx = receipt_tx([7u8; 32], 0);
@@ -12039,7 +13466,11 @@ mod tests {
             std::slice::from_ref(&tx),
             &[true],
             &[1],
-            &[vec![crate::contract::ContractEvent { contract: [0x99u8; 32], topic: 1, value: 2 }]],
+            &[vec![crate::contract::ContractEvent {
+                contract: [0x99u8; 32],
+                topic: 1,
+                value: 2,
+            }]],
         )
         .await;
         st.record_block(77, [0xAB; 32], 1, 1_700_000_000).await;
@@ -12047,9 +13478,8 @@ mod tests {
         // Collect the notifications addressed to OUR subscriptions. The hub is
         // process-wide, so a concurrent test may publish other heads/txs on
         // it: pick the ones that carry OUR payload, never "the first one".
-        let is_head = |r: &Value| {
-            r["height"] == json!(77) && r["hash"] == json!(hex::encode([0xAB; 32]))
-        };
+        let is_head =
+            |r: &Value| r["height"] == json!(77) && r["hash"] == json!(hex::encode([0xAB; 32]));
         let is_tx = |r: &Value| r["hash"] == json!(hex::encode(tx_hash));
         let is_event = |r: &Value| r["contract"] == json!(hex::encode([0x99u8; 32]));
         let mut head: Option<Value> = None;
@@ -12059,11 +13489,8 @@ mod tests {
         while std::time::Instant::now() < deadline
             && (head.is_none() || tx_notif.is_none() || ev_notif.is_none())
         {
-            let note = match tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                rx.recv(),
-            )
-            .await
+            let note = match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
             {
                 Ok(Ok(n)) => n,
                 _ => continue,
@@ -12118,7 +13545,9 @@ mod tests {
         .await
         .expect("sse handler");
         assert_eq!(
-            resp.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
             Some("text/event-stream")
         );
         let sub_id = resp
@@ -12130,7 +13559,11 @@ mod tests {
         let mut body = resp.into_body().into_data_stream();
 
         publish_contract_event(
-            &crate::contract::ContractEvent { contract: [0xEEu8; 32], topic: 7, value: 42 },
+            &crate::contract::ContractEvent {
+                contract: [0xEEu8; 32],
+                topic: 7,
+                value: 42,
+            },
             100,
             [0x11; 32],
         );
@@ -12161,7 +13594,9 @@ mod tests {
         use tokio_tungstenite::tungstenite::Message;
 
         let st = test_state().await;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("addr");
         let app = router(st.clone());
         let server = tokio::spawn(async move {
@@ -12259,8 +13694,14 @@ mod tests {
             .expect("the published signal must be served");
         assert_eq!(found["height"], json!(7));
         assert_eq!(found["orphaned_count"], json!(2));
-        assert_eq!(found["orphaned_blocks"][0], json!(hex::encode([0xA1u8; 32])));
-        assert_eq!(found["orphaned_blocks"][1], json!(hex::encode([0xA2u8; 32])));
+        assert_eq!(
+            found["orphaned_blocks"][0],
+            json!(hex::encode([0xA1u8; 32]))
+        );
+        assert_eq!(
+            found["orphaned_blocks"][1],
+            json!(hex::encode([0xA2u8; 32]))
+        );
         // The window is the read side of the same promise the fan-out makes.
         assert_eq!(h.recent_invalidations(0).len(), 1);
     }
@@ -12411,7 +13852,10 @@ mod tests {
         .await
         .expect("push timeout");
         assert_eq!(note.result["height"], json!(3));
-        assert_eq!(note.result["orphaned_blocks"][0], json!(hex::encode([0xB1u8; 32])));
+        assert_eq!(
+            note.result["orphaned_blocks"][0],
+            json!(hex::encode([0xB1u8; 32]))
+        );
         assert_eq!(note.result["orphaned_count"], json!(1));
         hub().unsubscribe(&sub_id);
     }
@@ -12451,7 +13895,7 @@ mod tests {
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-};
+            };
             b.sign_block(&key);
             b
         };
@@ -12485,10 +13929,18 @@ mod tests {
             .as_array()
             .expect("array")
             .iter()
-            .map(|s| s["orphaned_blocks"][0].as_str().unwrap_or_default().to_string())
+            .map(|s| {
+                s["orphaned_blocks"][0]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
             .collect();
         hashes.sort();
-        let mut expected = vec![hex::encode(c1.compute_hash()), hex::encode(c2.compute_hash())];
+        let mut expected = vec![
+            hex::encode(c1.compute_hash()),
+            hex::encode(c2.compute_hash()),
+        ];
         expected.sort();
         assert_eq!(hashes, expected);
         assert_eq!(r["invalidations"][0]["height"], json!(2));
@@ -12542,9 +13994,7 @@ mod tests {
         assert_eq!(v["version"], crate::native_api::NATIVE_API_VERSION);
         let methods = v["methods"].as_array().expect("methods array");
         assert!(methods.len() >= 21);
-        assert!(methods
-            .iter()
-            .any(|m| m["name"] == "stell_tokenTransfer"));
+        assert!(methods.iter().any(|m| m["name"] == "stell_tokenTransfer"));
         assert!(methods.iter().any(|m| m["name"] == "stell_oracleFeeds"));
 
         // A read method answers with its documented shape.
@@ -12584,7 +14034,10 @@ mod tests {
         assert_eq!(v["submit_with"], "stell_sendRawTransaction");
 
         let after = st.engine.get_state_root().await;
-        assert_eq!(before, after, "a prepared transaction must not touch the state");
+        assert_eq!(
+            before, after,
+            "a prepared transaction must not touch the state"
+        );
     }
 
     /// `stell_runGetMethod` must be bounded in BOTH fuel and arity: the
@@ -12595,7 +14048,11 @@ mod tests {
     async fn run_get_method_refuses_an_unbounded_argument_list() {
         let st = test_state().await;
         let creator = [0x55u8; 32];
-        let addr = st.engine.deploy_contract(creator, abi_contract_wasm(), 0).await.unwrap();
+        let addr = st
+            .engine
+            .deploy_contract(creator, abi_contract_wasm(), 0)
+            .await
+            .unwrap();
         let addr_hex = hex::encode(addr);
         let many: Vec<i64> = (0..(crate::contract::MAX_CONTRACT_CALL_ARGS as i64 + 50)).collect();
         let r = call(
@@ -12627,7 +14084,9 @@ mod tests {
         ip: std::net::IpAddr,
     ) -> Value {
         let r = dispatch(st, Value::from(1), method, &params, None, Some(ip)).await;
-        r.0.error.map(|e| json!({"error": e.message})).unwrap_or(r.0.result.unwrap_or(Value::Null))
+        r.0.error
+            .map(|e| json!({"error": e.message}))
+            .unwrap_or(r.0.result.unwrap_or(Value::Null))
     }
 
     /// `stell_executeProposal` applies the action of a PASSED proposal — and
@@ -12693,8 +14152,17 @@ mod tests {
         );
 
         // WITH the token: executed.
-        let r = call(&st, "stell_executeProposal", json!({ "id": 7, "token": "secret" })).await;
-        assert_eq!(r["executed"], json!(true), "an authorized execution must run: {r}");
+        let r = call(
+            &st,
+            "stell_executeProposal",
+            json!({ "id": 7, "token": "secret" }),
+        )
+        .await;
+        assert_eq!(
+            r["executed"],
+            json!(true),
+            "an authorized execution must run: {r}"
+        );
         assert_eq!(
             st.governance.read().await.get(7).map(|p| p.status),
             Some(crate::governance::ProposalStatus::Executed)
@@ -12767,7 +14235,10 @@ mod tests {
         let err = hub
             .subscribe_for(SubscriptionTopic::NewHeads, Some("10.0.0.1"))
             .expect_err("the per-client cap must refuse the next one");
-        assert!(err.contains("per-client"), "the error must name the cap: {err}");
+        assert!(
+            err.contains("per-client"),
+            "the error must name the cap: {err}"
+        );
         // A DIFFERENT client is unaffected.
         hub.subscribe_for(SubscriptionTopic::NewHeads, Some("10.0.0.2"))
             .expect("another client must not be starved by the first one");
@@ -12793,7 +14264,11 @@ mod tests {
                 ip,
             )
             .await;
-            if r["error"].as_str().unwrap_or("").contains("budget exhausted") {
+            if r["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("budget exhausted")
+            {
                 refused = true;
                 break;
             }
@@ -12855,7 +14330,12 @@ mod tests {
                 } else {
                     events.get(i).cloned().unwrap_or_default()
                 };
-                (existing.return_value, existing.gas_used, evs, existing.contract_address)
+                (
+                    existing.return_value,
+                    existing.gas_used,
+                    evs,
+                    existing.contract_address,
+                )
             } else {
                 (None, None, events.get(i).cloned().unwrap_or_default(), None)
             };
@@ -12908,16 +14388,18 @@ mod tests {
         assert_eq!(a.return_value, b.return_value, "{ctx}: return_value");
         assert_eq!(a.gas_used, b.gas_used, "{ctx}: gas_used");
         assert_eq!(a.events, b.events, "{ctx}: events");
-        assert_eq!(a.contract_address, b.contract_address, "{ctx}: contract_address");
+        assert_eq!(
+            a.contract_address, b.contract_address,
+            "{ctx}: contract_address"
+        );
     }
 
     fn receipt_batch_txs(n: usize) -> Vec<crate::sharding::Transaction> {
         (0..n)
             .map(|i| {
                 let mut from = [0u8; 32];
-                from[0..8].copy_from_slice(
-                    &(i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes(),
-                );
+                from[0..8]
+                    .copy_from_slice(&(i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
                 receipt_tx(from, i as u64)
             })
             .collect()
@@ -12980,8 +14462,12 @@ mod tests {
         assert_eq!(b.len(), r.len(), "same number of receipts filed");
         for tx in &txs {
             let h = tx.compute_tx_hash();
-            let rb = b.get(&h).unwrap_or_else(|| panic!("batched missing {}", hex::encode(h)));
-            let rr = r.get(&h).unwrap_or_else(|| panic!("reference missing {}", hex::encode(h)));
+            let rb = b
+                .get(&h)
+                .unwrap_or_else(|| panic!("batched missing {}", hex::encode(h)));
+            let rr = r
+                .get(&h)
+                .unwrap_or_else(|| panic!("reference missing {}", hex::encode(h)));
             assert_receipts_equal(rb, rr, &hex::encode(h));
         }
         // The pre-existing receipt's carried fields survive on both paths.
@@ -13009,7 +14495,8 @@ mod tests {
         for _ in 0..5 {
             let ref_st = test_state().await;
             let t0 = std::time::Instant::now();
-            reference_record_receipts(&ref_st, 77, [0xAB; 32], &txs, &statuses, &fees, &events).await;
+            reference_record_receipts(&ref_st, 77, [0xAB; 32], &txs, &statuses, &fees, &events)
+                .await;
             best_reference = best_reference.min(t0.elapsed().as_secs_f64() * 1000.0);
 
             let batched_st = test_state().await;

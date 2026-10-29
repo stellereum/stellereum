@@ -147,8 +147,7 @@ pub fn decode_source_bytes(
         if clean.is_empty() || clean.len() % 2 != 0 {
             return Err("invalid source_hex: expected even-length hex".to_string());
         }
-        let bytes =
-            hex::decode(clean).map_err(|e| format!("invalid source_hex: {e}"))?;
+        let bytes = hex::decode(clean).map_err(|e| format!("invalid source_hex: {e}"))?;
         if bytes.is_empty() {
             return Err("empty source".to_string());
         }
@@ -304,10 +303,12 @@ pub fn verify_register_signature(
     let arr: [u8; 64] = bytes
         .try_into()
         .map_err(|_| "invalid signature: expected 64 bytes".to_string())?;
-    let key =
-        VerifyingKey::from_bytes(creator).map_err(|e| format!("invalid creator key: {e}"))?;
-    key.verify(&register_message(contract, source_hash), &Signature::from_bytes(&arr))
-        .map_err(|_| "signature does not verify against the contract creator".to_string())
+    let key = VerifyingKey::from_bytes(creator).map_err(|e| format!("invalid creator key: {e}"))?;
+    key.verify(
+        &register_message(contract, source_hash),
+        &Signature::from_bytes(&arr),
+    )
+    .map_err(|_| "signature does not verify against the contract creator".to_string())
 }
 
 #[cfg(test)]
@@ -342,7 +343,10 @@ mod tests {
             "default",
         );
         assert!(v.verified, "known source must verify: {}", v.reason);
-        assert_eq!(v.source_hash, hex::encode(source_hash(KNOWN_WAT.as_bytes())));
+        assert_eq!(
+            v.source_hash,
+            hex::encode(source_hash(KNOWN_WAT.as_bytes()))
+        );
         assert_eq!(v.onchain_code_hash, hex::encode(c.code_hash));
         assert_eq!(v.reason, "ok");
     }
@@ -353,12 +357,7 @@ mod tests {
         let c = reg.get(&addr).expect("contract");
         let tampered = KNOWN_WAT.replace("i64.const 0", "i64.const 1");
         assert_ne!(tampered, KNOWN_WAT);
-        let v = verify_source_for_code_hash(
-            &c.code_hash,
-            tampered.as_bytes(),
-            "wat2wasm-1.0",
-            "",
-        );
+        let v = verify_source_for_code_hash(&c.code_hash, tampered.as_bytes(), "wat2wasm-1.0", "");
         assert!(!v.verified, "tampered source must NOT verify");
         assert!(v.reason.contains("does not match"));
     }
@@ -368,12 +367,7 @@ mod tests {
         let (reg, addr) = deploy_known();
         let c = reg.get(&addr).expect("contract");
         for compiler in ["solc-0.8.24", "rustc-1.75", "tinygo-0.30", ""] {
-            let v = verify_source_for_code_hash(
-                &c.code_hash,
-                KNOWN_WAT.as_bytes(),
-                compiler,
-                "",
-            );
+            let v = verify_source_for_code_hash(&c.code_hash, KNOWN_WAT.as_bytes(), compiler, "");
             assert!(!v.verified, "compiler '{compiler}' must be refused");
             assert!(v.reason.contains("unsupported compiler"), "{}", v.reason);
         }
@@ -390,7 +384,11 @@ mod tests {
             "-O3 --fake-flag",
         );
         assert!(!v.verified);
-        assert!(v.reason.contains("unsupported compiler_flags"), "{}", v.reason);
+        assert!(
+            v.reason.contains("unsupported compiler_flags"),
+            "{}",
+            v.reason
+        );
     }
 
     #[test]
@@ -416,8 +414,8 @@ mod tests {
 
     #[test]
     fn register_signature_round_trip() {
-        use ed25519_dalek::SigningKey;
         use ed25519_dalek::Signer;
+        use ed25519_dalek::SigningKey;
         let sk = SigningKey::from_bytes(&[9u8; 32]);
         let creator = sk.verifying_key().to_bytes();
         let contract = [1u8; 32];

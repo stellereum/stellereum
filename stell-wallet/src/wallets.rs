@@ -149,7 +149,10 @@ fn maybe_migrate_legacy(base_dir: Option<&Path>) {
 /// 3. Recorded active wallet from `~/.stellereum/active_wallet`
 /// 4. `~/.stellereum/wallets/default.json`
 /// 5. Fallback `~/.stellereum/wallet.json`
-pub fn resolve_active_wallet_path(cli_override: Option<PathBuf>, base_dir: Option<&Path>) -> PathBuf {
+pub fn resolve_active_wallet_path(
+    cli_override: Option<PathBuf>,
+    base_dir: Option<&Path>,
+) -> PathBuf {
     if let Some(p) = cli_override {
         return p;
     }
@@ -297,9 +300,9 @@ pub fn switch_wallet(
     let keystore = HardenedKeystore::load(&entry.path)
         .map_err(|e| format!("Failed to read wallet vault: {e}"))?;
 
-    let _secret = keystore
-        .decrypt(password)
-        .map_err(|_| "Access denied: incorrect password! Active wallet was NOT changed.".to_string())?;
+    let _secret = keystore.decrypt(password).map_err(|_| {
+        "Access denied: incorrect password! Active wallet was NOT changed.".to_string()
+    })?;
 
     // Password verified! Set as active wallet
     set_active_wallet_name(&entry.name, base_dir)?;

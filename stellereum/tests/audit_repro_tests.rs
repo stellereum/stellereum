@@ -109,7 +109,9 @@ fn repro_2_activation_gas_surcharge_bypass_is_strictly_blocked() {
 
     let msg = cheap_tx.signing_message();
     let sig = keypair.sign(&msg);
-    cheap_tx.signature = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, keypair.public_key.clone(), sig).encode();
+    cheap_tx.signature =
+        PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, keypair.public_key.clone(), sig)
+            .encode();
 
     // 1. Submit underpaid transaction
     let res = mp.add(cheap_tx);
@@ -140,7 +142,8 @@ fn repro_2_activation_gas_surcharge_bypass_is_strictly_blocked() {
     };
     let imp_msg = implicit_tx.signing_message();
     let imp_sig = keypair.sign(&imp_msg);
-    implicit_tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, imp_sig).encode();
+    implicit_tx.signature =
+        PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, imp_sig).encode();
 
     // Must be diverted to buffer because account is unactivated
     assert!(
@@ -193,7 +196,9 @@ fn repro_3_pure_pq_mode_rejects_envelope_wrapped_ed25519() {
                 "Error message must specify that wrapped classical scheme is rejected: {msg}"
             );
         }
-        other => panic!("Expected Malformed error rejecting non-PQ scheme in pure PQ mode, got: {other:?}"),
+        other => panic!(
+            "Expected Malformed error rejecting non-PQ scheme in pure PQ mode, got: {other:?}"
+        ),
     }
 
     set_pure_pq_override(None);
@@ -216,7 +221,8 @@ fn repro_4_light_client_spv_accepts_both_16b_and_49b_leaves() {
     let pubkey_hash = [0x77u8; 32];
 
     // Build a 49-byte pinned leaf
-    let pinned_leaf = stellereum::cpat2::AccountLeaf::new_pinned(balance, nonce, scheme, pubkey_hash).encode();
+    let pinned_leaf =
+        stellereum::cpat2::AccountLeaf::new_pinned(balance, nonce, scheme, pubkey_hash).encode();
     assert_eq!(pinned_leaf.len(), ACCOUNT_LEAF_LEN_PQ);
 
     let mut trie = PatriciaTrie::new();

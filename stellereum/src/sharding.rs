@@ -6,8 +6,8 @@
 
 use crate::cell::{CellHash, MerkleProof, PatriciaTrie};
 use crate::post_quantum::{
-    derive_pq_address, verify_pq_signature, PqScheme,
-    StatefulImplicitKeyRegistry, DEFAULT_SALT, PQ_ENVELOPE_MAGIC,
+    derive_pq_address, verify_pq_signature, PqScheme, StatefulImplicitKeyRegistry, DEFAULT_SALT,
+    PQ_ENVELOPE_MAGIC,
 };
 use crate::zkml::SessionKeyAuthorization;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -153,7 +153,13 @@ impl PqSignatureEnvelope {
     /// Wire byte length for legacy envelopes without salt.
     pub fn legacy_encode_len(&self) -> usize {
         let chain_len = if self.chain_id.is_some() { 8 } else { 0 };
-        3 + 1 + 1 + 2 + self.pubkey.as_ref().map_or(0, |k| k.len()) + 2 + self.signature_bytes.len() + chain_len
+        3 + 1
+            + 1
+            + 2
+            + self.pubkey.as_ref().map_or(0, |k| k.len())
+            + 2
+            + self.signature_bytes.len()
+            + chain_len
     }
 
     /// Decodes envelope from byte slice.
@@ -774,7 +780,7 @@ pub struct SponsorAuthorization {
 }
 
 pub const SHARD_SPLIT_LOAD_THRESHOLD: u64 = 500; // txs per block window triggers auto-split
-pub const SHARD_MERGE_LOAD_THRESHOLD: u64 = 50;  // low load triggers auto-merge
+pub const SHARD_MERGE_LOAD_THRESHOLD: u64 = 50; // low load triggers auto-merge
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardDescriptor {
@@ -899,7 +905,10 @@ impl DynamicShardManager {
     /// The manager owns the PREFIX ARITHMETIC and the ID ALLOCATION; the
     /// account re-assignment that makes the split real is performed by
     /// [`ShardTopology::check_and_split`], which drives this function.
-    pub fn check_and_split(&mut self, shard_id: ShardId) -> Option<(ShardDescriptor, ShardDescriptor)> {
+    pub fn check_and_split(
+        &mut self,
+        shard_id: ShardId,
+    ) -> Option<(ShardDescriptor, ShardDescriptor)> {
         let s = self.shards.get(&shard_id)?;
         if shard_id == MASTERCHAIN_SHARD
             || s.tx_load < SHARD_SPLIT_LOAD_THRESHOLD
@@ -1275,10 +1284,7 @@ impl MigrationManifest {
     /// Record that `key` is owned by `owner`. Re-recording a key replaces the
     /// owner (last write wins, deterministically).
     pub fn own(&mut self, key: [u8; 32], owner: [u8; 32]) {
-        match self
-            .entries
-            .binary_search_by(|probe| probe.0.cmp(&key))
-        {
+        match self.entries.binary_search_by(|probe| probe.0.cmp(&key)) {
             Ok(i) => self.entries[i].1 = owner,
             Err(i) => self.entries.insert(i, (key, owner)),
         }
@@ -1348,7 +1354,11 @@ impl std::fmt::Display for MigrationError {
         match self {
             Self::BadSplitBit(b) => write!(f, "split bit {b} is outside the address prefix"),
             Self::UnclassifiedKey(k) => {
-                write!(f, "trie key {} is not classified by the manifest", hex::encode(k))
+                write!(
+                    f,
+                    "trie key {} is not classified by the manifest",
+                    hex::encode(k)
+                )
             }
             Self::MissingKey(k) => write!(f, "manifest key {} is not in the trie", hex::encode(k)),
             Self::DuplicateAssignment(k) => {
@@ -1356,9 +1366,14 @@ impl std::fmt::Display for MigrationError {
             }
             Self::LostKey(k) => write!(f, "trie key {} landed in neither child", hex::encode(k)),
             Self::ValueChanged(k) => write!(f, "trie key {} changed value", hex::encode(k)),
-            Self::ForeignKey(k) => write!(f, "trie key {} is not in the parent trie", hex::encode(k)),
+            Self::ForeignKey(k) => {
+                write!(f, "trie key {} is not in the parent trie", hex::encode(k))
+            }
             Self::BalanceMismatch { expected, actual } => {
-                write!(f, "balance did not conserve: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "balance did not conserve: expected {expected}, got {actual}"
+                )
             }
         }
     }
@@ -1625,13 +1640,19 @@ impl std::fmt::Display for SplitRefusal {
                 write!(f, "load {load} is below the split threshold {threshold}")
             }
             Self::TooFewAccounts { accounts, minimum } => {
-                write!(f, "{accounts} accounts is below the split minimum {minimum}")
+                write!(
+                    f,
+                    "{accounts} accounts is below the split minimum {minimum}"
+                )
             }
             Self::ShardCapReached { shards, cap } => {
                 write!(f, "shard cap {cap} reached ({shards} active)")
             }
             Self::PrefixTooDeep { prefix_len, max } => {
-                write!(f, "routing prefix {prefix_len} bits is already at the maximum {max}")
+                write!(
+                    f,
+                    "routing prefix {prefix_len} bits is already at the maximum {max}"
+                )
             }
         }
     }
@@ -1720,7 +1741,10 @@ impl std::fmt::Display for TopologyError {
                 hex::encode(address)
             ),
             Self::BalanceMismatch { expected, actual } => {
-                write!(f, "balance did not conserve: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "balance did not conserve: expected {expected}, got {actual}"
+                )
             }
         }
     }
@@ -2007,7 +2031,10 @@ impl ShardTopology {
         let parent_load = parent_desc.tx_load;
         let parent_accounts = self.accounts_of(shard_id).to_vec();
         let source_digest = account_set_digest(&parent_accounts);
-        let source_balance = parent_accounts.iter().map(|a| a.balance as u128).sum::<u128>();
+        let source_balance = parent_accounts
+            .iter()
+            .map(|a| a.balance as u128)
+            .sum::<u128>();
 
         let (child0, child1) = self.manager.check_and_split(shard_id)?;
         let split_bit = child0.prefix_len - 1;
@@ -2401,7 +2428,8 @@ impl Serialize for Transaction {
 impl<'de> Deserialize<'de> for Transaction {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let wire = TransactionWire::deserialize(d)?;
-        let (signature, priority_fee_per_gas) = Transaction::split_priority_envelope(&wire.signature);
+        let (signature, priority_fee_per_gas) =
+            Transaction::split_priority_envelope(&wire.signature);
         Ok(Transaction {
             from: wire.from,
             to: wire.to,
@@ -2463,7 +2491,16 @@ impl Transaction {
         source_shard: ShardId,
         target_shard: ShardId,
     ) -> Self {
-        Self::sign_with_payload(from_key, to, amount, gas_limit, nonce, source_shard, target_shard, Vec::new())
+        Self::sign_with_payload(
+            from_key,
+            to,
+            amount,
+            gas_limit,
+            nonce,
+            source_shard,
+            target_shard,
+            Vec::new(),
+        )
     }
 
     /// Sign a transaction that carries an EXPLICIT MEMPOOL PRIORITY BID.
@@ -2834,7 +2871,9 @@ impl Transaction {
             return None;
         }
         let offset = 64 + CHAIN_SIG_TAG.len();
-        let bytes: [u8; 8] = self.sponsor_inner_sig()[offset..offset + 8].try_into().ok()?;
+        let bytes: [u8; 8] = self.sponsor_inner_sig()[offset..offset + 8]
+            .try_into()
+            .ok()?;
         Some(u64::from_be_bytes(bytes))
     }
 
@@ -2843,8 +2882,7 @@ impl Transaction {
     /// pre-EV1 verifier fails it closed at `Signature::from_slice`.
     pub fn is_evm(&self) -> bool {
         let sig = self.sponsor_inner_sig();
-        sig.len() > EVM_SIG_TAG.len()
-            && sig[..EVM_SIG_TAG.len()] == EVM_SIG_TAG[..]
+        sig.len() > EVM_SIG_TAG.len() && sig[..EVM_SIG_TAG.len()] == EVM_SIG_TAG[..]
     }
 
     /// Raw canonical EVM bytes carried by the envelope (`None` for non-EVM
@@ -3142,7 +3180,8 @@ impl Transaction {
         salt: &[u8; 16],
     ) -> Self {
         let from = derive_pq_address(scheme, &pubkey, salt);
-        let envelope = PqSignatureEnvelope::new_explicit_with_salt(scheme, pubkey, signature_bytes, *salt);
+        let envelope =
+            PqSignatureEnvelope::new_explicit_with_salt(scheme, pubkey, signature_bytes, *salt);
         Self {
             from,
             to,
@@ -3240,7 +3279,8 @@ impl Transaction {
         payload: Vec<crate::svm::OpCode>,
         chain_id: u64,
     ) -> Self {
-        let envelope = PqSignatureEnvelope::new_implicit_with_chain(scheme, signature_bytes, chain_id);
+        let envelope =
+            PqSignatureEnvelope::new_implicit_with_chain(scheme, signature_bytes, chain_id);
         Self {
             from,
             to,
@@ -3290,7 +3330,9 @@ impl Transaction {
     /// Generate a sample Falcon-512 public key with canonical header byte.
     #[cfg(any(test, debug_assertions))]
     pub fn sample_falcon512_pubkey(seed: u8) -> Vec<u8> {
-        crate::post_quantum::FalconKeypair::generate_from_seed(seed).public_key.clone()
+        crate::post_quantum::FalconKeypair::generate_from_seed(seed)
+            .public_key
+            .clone()
     }
 
     /// Envelope-aware signature verification.
@@ -3424,12 +3466,7 @@ impl Transaction {
                         &env.signature_bytes,
                     )
                 } else {
-                    verify_pq_signature(
-                        scheme,
-                        &pk,
-                        &self.signing_message(),
-                        &env.signature_bytes,
-                    )
+                    verify_pq_signature(scheme, &pk, &self.signing_message(), &env.signature_bytes)
                 }
             }
         } else {
@@ -3449,7 +3486,10 @@ impl Transaction {
                     } else {
                         inner_sig
                     };
-                    if let (Ok(vk), Ok(sig)) = (VerifyingKey::from_bytes(&self.from), Signature::from_slice(sig_slice)) {
+                    if let (Ok(vk), Ok(sig)) = (
+                        VerifyingKey::from_bytes(&self.from),
+                        Signature::from_slice(sig_slice),
+                    ) {
                         if vk.verify(&self.signing_message(), &sig).is_ok() {
                             return true;
                         }
@@ -3664,9 +3704,12 @@ impl Transaction {
             return (blob.len(), None, false);
         }
         let len_off = blob.len() - tag_len - 4;
-        let auth_len =
-            u32::from_be_bytes([blob[len_off], blob[len_off + 1], blob[len_off + 2], blob[len_off + 3]])
-                as usize;
+        let auth_len = u32::from_be_bytes([
+            blob[len_off],
+            blob[len_off + 1],
+            blob[len_off + 2],
+            blob[len_off + 3],
+        ]) as usize;
         if auth_len == 0 || auth_len > SPONSOR_AUTH_MAX_BYTES || len_off < auth_len {
             return (blob.len(), None, true);
         }
@@ -3679,8 +3722,7 @@ impl Transaction {
         match bincode::deserialize::<SponsorAuthorization>(auth_bytes) {
             Ok(auth) => {
                 // DoS bounds, enforced at parse (fail closed, never truncate).
-                if auth.sponsor_sig.len() != 64
-                    || auth.allowed_targets.len() > SPONSOR_MAX_TARGETS
+                if auth.sponsor_sig.len() != 64 || auth.allowed_targets.len() > SPONSOR_MAX_TARGETS
                 {
                     return (blob.len(), None, true);
                 }
@@ -4046,16 +4088,17 @@ impl Transaction {
             let Ok(vk) = VerifyingKey::from_bytes(&key_bytes) else {
                 return false;
             };
-            let sig_bytes: &[u8] = if delegation.is_some() || tx.is_chain_id_bound() || sponsor_auth.is_some() {
-                // Envelope: only the leading 64 bytes are the user / session /
-                // Ed25519 signature.
-                match inner_sig.get(..64) {
-                    Some(s) => s,
-                    None => return false,
-                }
-            } else {
-                inner_sig
-            };
+            let sig_bytes: &[u8] =
+                if delegation.is_some() || tx.is_chain_id_bound() || sponsor_auth.is_some() {
+                    // Envelope: only the leading 64 bytes are the user / session /
+                    // Ed25519 signature.
+                    match inner_sig.get(..64) {
+                        Some(s) => s,
+                        None => return false,
+                    }
+                } else {
+                    inner_sig
+                };
             let Ok(sig) = Signature::from_slice(sig_bytes) else {
                 return false;
             };
@@ -4079,8 +4122,7 @@ impl Transaction {
         if txs.len() <= CHUNK {
             return Self::verify_signatures_batch(txs);
         }
-        txs.par_chunks(CHUNK)
-            .all(Self::verify_signatures_batch)
+        txs.par_chunks(CHUNK).all(Self::verify_signatures_batch)
     }
 
     /// Per-transaction validity for a batch of transactions (Ed25519 batch verify
@@ -4159,8 +4201,7 @@ impl Transaction {
                     continue;
                 }
             }
-            let key_bytes: [u8; 32] =
-                delegation.as_ref().map_or(tx.from, |d| d.session_pubkey);
+            let key_bytes: [u8; 32] = delegation.as_ref().map_or(tx.from, |d| d.session_pubkey);
             let Ok(vk) = VerifyingKey::from_bytes(&key_bytes) else {
                 out[i] = false;
                 continue;
@@ -4180,7 +4221,12 @@ impl Transaction {
                 out[i] = false;
                 continue;
             };
-            staged.push(Staged { idx: i, msg: tx.signing_message(), sig, key: vk });
+            staged.push(Staged {
+                idx: i,
+                msg: tx.signing_message(),
+                sig,
+                key: vk,
+            });
         }
         if staged.is_empty() {
             return out;
@@ -4365,7 +4411,14 @@ impl CrossShardMessage {
         source_state_root: CellHash,
         finalized_in_block: [u8; 32],
     ) -> Self {
-        let mut m = Self::new(source_shard, target_shard, tx, source_state_root, finalized_in_block, None);
+        let mut m = Self::new(
+            source_shard,
+            target_shard,
+            tx,
+            source_state_root,
+            finalized_in_block,
+            None,
+        );
         m.trusted = true;
         m
     }
@@ -4403,14 +4456,15 @@ impl CrossShardMessage {
     /// (skip embedding / refuse the carrying block and retry after catching
     /// up), never as verified. `None` registry (single-shard contexts,
     /// unit tests) also fails closed.
-    pub fn verify_anchored(
-        &self,
-        registry: Option<&FinalizedHeaderRegistry>,
-    ) -> bool {
+    pub fn verify_anchored(&self, registry: Option<&FinalizedHeaderRegistry>) -> bool {
         let Some(reg) = registry else {
             return false;
         };
-        if !reg.anchor_holds(self.source_shard, &self.finalized_in_block, &self.source_state_root) {
+        if !reg.anchor_holds(
+            self.source_shard,
+            &self.finalized_in_block,
+            &self.source_state_root,
+        ) {
             return false;
         }
         self.verify_inclusion_untrusted()
@@ -4588,7 +4642,12 @@ pub struct FinalizedHeaderRegistry {
 
 impl FinalizedHeaderRegistry {
     /// Record a finalized block. Idempotent (same hash = same header).
-    pub fn note_finalized(&mut self, shard: ShardId, block_hash: [u8; 32], state_root: crate::cell::CellHash) {
+    pub fn note_finalized(
+        &mut self,
+        shard: ShardId,
+        block_hash: [u8; 32],
+        state_root: crate::cell::CellHash,
+    ) {
         self.headers.insert((shard, block_hash), state_root);
     }
 
@@ -5557,10 +5616,8 @@ impl Block {
     pub fn sign_block(&mut self, validator_key: &SigningKey) {
         let block_hash = self.compute_hash();
         let sig = validator_key.sign(&block_hash);
-        self.validator_signatures.push((
-            validator_key.verifying_key().to_bytes(),
-            sig.to_vec(),
-        ));
+        self.validator_signatures
+            .push((validator_key.verifying_key().to_bytes(), sig.to_vec()));
     }
 
     /// Verify the block carries a valid signature by its DECLARED proposer.
@@ -5575,8 +5632,12 @@ impl Block {
             if *pubkey != self.proposer {
                 continue;
             }
-            let Ok(vk) = VerifyingKey::from_bytes(pubkey) else { continue };
-            let Ok(sig) = Signature::from_slice(sig_bytes) else { continue };
+            let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
+                continue;
+            };
+            let Ok(sig) = Signature::from_slice(sig_bytes) else {
+                continue;
+            };
             if vk.verify(&hash, &sig).is_ok() {
                 return true;
             }
@@ -5618,8 +5679,12 @@ impl Block {
             if vp == 0 {
                 continue;
             }
-            let Ok(vk) = VerifyingKey::from_bytes(pubkey) else { continue };
-            let Ok(sig) = Signature::from_slice(sig_bytes) else { continue };
+            let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
+                continue;
+            };
+            let Ok(sig) = Signature::from_slice(sig_bytes) else {
+                continue;
+            };
             candidates.push((vk, sig, vp));
         }
         if candidates.is_empty() {
@@ -5667,8 +5732,12 @@ impl Block {
             if !seen.insert(*pubkey) {
                 continue; // duplicate signer -> ignore
             }
-            let Ok(vk) = VerifyingKey::from_bytes(pubkey) else { continue };
-            let Ok(sig) = Signature::from_slice(sig_bytes) else { continue };
+            let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
+                continue;
+            };
+            let Ok(sig) = Signature::from_slice(sig_bytes) else {
+                continue;
+            };
             candidates.push((vk, sig));
         }
         if candidates.is_empty() {
@@ -5899,7 +5968,7 @@ mod tests {
         let b = Block {
             height: 7,
             ..Default::default()
-};
+        };
         assert_eq!(b.height, 7);
         assert_eq!(b.shard_id, MASTERCHAIN_SHARD);
         assert!(b.transactions.is_empty());
@@ -5928,7 +5997,10 @@ mod tests {
         // A single non-masterchain shard is still one chain in this process.
         assert!(!ShardRegistry::from_ids([BASE_WORKCHAIN_SHARD_INITIAL]).is_sharded());
         // An empty set can never produce a process with no chain at all.
-        assert_eq!(ShardRegistry::from_ids([]).ids().collect::<Vec<_>>(), vec![MASTERCHAIN_SHARD]);
+        assert_eq!(
+            ShardRegistry::from_ids([]).ids().collect::<Vec<_>>(),
+            vec![MASTERCHAIN_SHARD]
+        );
     }
 
     #[test]
@@ -5960,20 +6032,31 @@ mod tests {
         let tx_cross = Transaction::sign(&key, [2u8; 32], 100, 1000, 0, 0, 1);
 
         assert!(tx_belongs_to_shard(&tx0, 0));
-        assert!(!tx_belongs_to_shard(&tx0, 1), "shard 1 must not own shard 0 tx");
+        assert!(
+            !tx_belongs_to_shard(&tx0, 1),
+            "shard 1 must not own shard 0 tx"
+        );
 
         assert!(tx_belongs_to_shard(&tx1, 1));
-        assert!(!tx_belongs_to_shard(&tx1, 0), "shard 0 must not own shard 1 tx");
+        assert!(
+            !tx_belongs_to_shard(&tx1, 0),
+            "shard 0 must not own shard 1 tx"
+        );
 
         assert!(tx_belongs_to_shard(&tx_cross, 0));
-        assert!(!tx_belongs_to_shard(&tx_cross, 1), "outbound cross-shard tx belongs strictly to source shard");
+        assert!(
+            !tx_belongs_to_shard(&tx_cross, 1),
+            "outbound cross-shard tx belongs strictly to source shard"
+        );
     }
 
     #[test]
     fn route_address_is_deterministic_and_most_specific() {
         let mut m = DynamicShardManager::new();
         m.record_tx_load(BASE_WORKCHAIN_SHARD_INITIAL, SHARD_SPLIT_LOAD_THRESHOLD);
-        let (c0, c1) = m.check_and_split(BASE_WORKCHAIN_SHARD_INITIAL).expect("split");
+        let (c0, c1) = m
+            .check_and_split(BASE_WORKCHAIN_SHARD_INITIAL)
+            .expect("split");
         assert_eq!((c0.prefix_len, c1.prefix_len), (1, 1));
 
         let mut a0 = [0u8; 32];
@@ -6024,7 +6107,9 @@ mod tests {
 
         // Verification against isolated registry succeeds and auto-registers the key
         assert!(tx.verify_signature_with_registry(&registry));
-        let registered = registry.lookup(&from).expect("Address must be registered after explicit verify");
+        let registered = registry
+            .lookup(&from)
+            .expect("Address must be registered after explicit verify");
         assert_eq!(registered.0, PqScheme::Falcon512);
         assert_eq!(registered.1, pk);
 
@@ -6049,7 +6134,8 @@ mod tests {
         };
         let ed_msg = ed_tx.signing_message();
         let ed_sig = ed_sk.sign(&ed_msg).to_bytes().to_vec();
-        ed_tx.signature = PqSignatureEnvelope::new_explicit(PqScheme::Ed25519, ed_pk, ed_sig).encode();
+        ed_tx.signature =
+            PqSignatureEnvelope::new_explicit(PqScheme::Ed25519, ed_pk, ed_sig).encode();
         assert!(ed_tx.verify_signature());
     }
 
@@ -6087,7 +6173,9 @@ mod tests {
         assert!(!tx2.verify_signature_with_registry(&registry));
 
         // Now register address in registry (e.g. from Tx1 activation)
-        registry.register(from, PqScheme::Falcon512, &pk, &salt).expect("Register");
+        registry
+            .register(from, PqScheme::Falcon512, &pk, &salt)
+            .expect("Register");
 
         // After registration, implicit verification MUST succeed!
         assert!(tx2.verify_signature_with_registry(&registry));
@@ -6127,7 +6215,8 @@ mod tests {
         };
         let msg = tx.signing_message();
         let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
-        let envelope = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig.clone());
+        let envelope =
+            PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig.clone());
         tx.signature = envelope.encode();
 
         // Baseline: original transaction verifies
@@ -6136,49 +6225,75 @@ mod tests {
         // 1. Tampered amount
         let mut tampered_amt = tx.clone();
         tampered_amt.amount += 1;
-        assert!(!tampered_amt.verify_signature_with_registry(&registry), "Tampered amount must fail");
+        assert!(
+            !tampered_amt.verify_signature_with_registry(&registry),
+            "Tampered amount must fail"
+        );
 
         // 2. Tampered recipient
         let mut tampered_to = tx.clone();
         tampered_to.to[0] ^= 0x01;
-        assert!(!tampered_to.verify_signature_with_registry(&registry), "Tampered recipient must fail");
+        assert!(
+            !tampered_to.verify_signature_with_registry(&registry),
+            "Tampered recipient must fail"
+        );
 
         // 3. Tampered sender address (does not match derived address from pk)
         let mut tampered_from = tx.clone();
         tampered_from.from[0] ^= 0x01;
-        assert!(!tampered_from.verify_signature_with_registry(&registry), "Tampered sender must fail");
+        assert!(
+            !tampered_from.verify_signature_with_registry(&registry),
+            "Tampered sender must fail"
+        );
 
         // 4. Tampered signature bytes inside envelope
         let mut tampered_sig_bytes = sig.clone();
         tampered_sig_bytes[50] ^= 0xAA;
-        let bad_env = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), tampered_sig_bytes);
+        let bad_env =
+            PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), tampered_sig_bytes);
         let mut tx_bad_sig = tx.clone();
         tx_bad_sig.signature = bad_env.encode();
-        assert!(!tx_bad_sig.verify_signature_with_registry(&registry), "Corrupted signature bytes must fail");
+        assert!(
+            !tx_bad_sig.verify_signature_with_registry(&registry),
+            "Corrupted signature bytes must fail"
+        );
 
         // 5. Tampered public key bytes inside envelope
         let mut bad_pk = pk.clone();
         bad_pk[10] ^= 0x55;
-        let bad_pk_env = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, bad_pk, sig.clone());
+        let bad_pk_env =
+            PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, bad_pk, sig.clone());
         let mut tx_bad_pk = tx.clone();
         tx_bad_pk.signature = bad_pk_env.encode();
-        assert!(!tx_bad_pk.verify_signature_with_registry(&registry), "Corrupted pubkey must fail");
+        assert!(
+            !tx_bad_pk.verify_signature_with_registry(&registry),
+            "Corrupted pubkey must fail"
+        );
 
         // 6. Envelope header corruption (magic mismatch)
         let mut corrupted_magic = tx.clone();
         corrupted_magic.signature[0] = b'X';
-        assert!(!corrupted_magic.verify_signature_with_registry(&registry), "Corrupted envelope magic must fail");
+        assert!(
+            !corrupted_magic.verify_signature_with_registry(&registry),
+            "Corrupted envelope magic must fail"
+        );
 
         // 7. Trailing junk attached to envelope
         let mut trailing_junk = tx.clone();
         trailing_junk.signature.push(0xDE);
         trailing_junk.signature.push(0xAD);
-        assert!(!trailing_junk.verify_signature_with_registry(&registry), "Trailing bytes must fail exact-fit check");
+        assert!(
+            !trailing_junk.verify_signature_with_registry(&registry),
+            "Trailing bytes must fail exact-fit check"
+        );
 
         // 8. Truncated envelope
         let mut truncated = tx.clone();
         truncated.signature.truncate(tx.signature.len() - 10);
-        assert!(!truncated.verify_signature_with_registry(&registry), "Truncated envelope must fail");
+        assert!(
+            !truncated.verify_signature_with_registry(&registry),
+            "Truncated envelope must fail"
+        );
     }
 
     #[test]
@@ -6207,7 +6322,8 @@ mod tests {
         };
         let msg = tx.signing_message();
         let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
-        let envelope = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig.clone());
+        let envelope =
+            PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig.clone());
         tx.signature = envelope.encode();
 
         // Sender has a 49-byte pinned leaf in the source shard trie
@@ -6217,7 +6333,8 @@ mod tests {
             nonce,
             PqScheme::Falcon512.id(),
             *pk_hash.as_bytes(),
-        ).encode();
+        )
+        .encode();
         assert_eq!(leaf_49.len(), crate::cpat2::ACCOUNT_LEAF_LEN_PQ);
 
         let mut trie = PatriciaTrie::new();
@@ -6233,11 +6350,18 @@ mod tests {
             source_state_root,
             finalized_in_block,
             Some(proof.clone()),
-        ).with_source_balance(source_balance);
+        )
+        .with_source_balance(source_balance);
 
         // 1. Inclusion verification succeeds on 49-byte pinned leaf
-        assert!(cross_msg.verify_inclusion(), "49-byte pinned leaf inclusion proof must verify");
-        assert!(cross_msg.verify_inclusion_strict(), "Strict inclusion must verify");
+        assert!(
+            cross_msg.verify_inclusion(),
+            "49-byte pinned leaf inclusion proof must verify"
+        );
+        assert!(
+            cross_msg.verify_inclusion_strict(),
+            "Strict inclusion must verify"
+        );
 
         // 2. Fund loss prevention: underfunded transfer (source_balance < amount) fails closed
         let underfunded_msg = CrossShardMessage::new(
@@ -6247,8 +6371,12 @@ mod tests {
             source_state_root,
             finalized_in_block,
             Some(proof.clone()),
-        ).with_source_balance(amount - 1);
-        assert!(!underfunded_msg.verify_inclusion(), "Underfunded transfer must be rejected");
+        )
+        .with_source_balance(amount - 1);
+        assert!(
+            !underfunded_msg.verify_inclusion(),
+            "Underfunded transfer must be rejected"
+        );
 
         // 3. Fund loss prevention: tampered source_balance fails proof verification
         let tampered_balance_msg = CrossShardMessage::new(
@@ -6258,8 +6386,12 @@ mod tests {
             source_state_root,
             finalized_in_block,
             Some(proof.clone()),
-        ).with_source_balance(source_balance + 1_000);
-        assert!(!tampered_balance_msg.verify_inclusion(), "Tampered balance must fail proof verification");
+        )
+        .with_source_balance(source_balance + 1_000);
+        assert!(
+            !tampered_balance_msg.verify_inclusion(),
+            "Tampered balance must fail proof verification"
+        );
 
         // 4. Implicit PQ cross-shard transaction verification
         let implicit_envelope = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig);
@@ -6277,8 +6409,12 @@ mod tests {
             source_state_root,
             finalized_in_block,
             Some(proof.clone()),
-        ).with_source_balance(source_balance);
-        assert!(implicit_cross_msg.verify_inclusion(), "Implicit PQ cross-shard message must verify");
+        )
+        .with_source_balance(source_balance);
+        assert!(
+            implicit_cross_msg.verify_inclusion(),
+            "Implicit PQ cross-shard message must verify"
+        );
 
         // 5. Also verify legacy 16-byte leaf cross-shard transfer works cleanly
         let legacy_from = [0x88u8; 32];
@@ -6287,7 +6423,9 @@ mod tests {
         let mut legacy_trie = PatriciaTrie::new();
         legacy_trie.insert(&legacy_from, &legacy_leaf);
         let legacy_root = legacy_trie.root_hash();
-        let legacy_proof = legacy_trie.generate_merkle_proof(&legacy_from).expect("proof");
+        let legacy_proof = legacy_trie
+            .generate_merkle_proof(&legacy_from)
+            .expect("proof");
 
         let legacy_tx = Transaction {
             from: legacy_from,
@@ -6308,8 +6446,12 @@ mod tests {
             legacy_root,
             finalized_in_block,
             Some(legacy_proof),
-        ).with_source_balance(10_000);
-        assert!(legacy_cross_msg.verify_inclusion(), "Legacy 16B leaf cross-shard message must verify");
+        )
+        .with_source_balance(10_000);
+        assert!(
+            legacy_cross_msg.verify_inclusion(),
+            "Legacy 16B leaf cross-shard message must verify"
+        );
     }
 
     /// AUDIT W6.5 (signature malleability): the PQ1 wire envelope must have
@@ -6386,7 +6528,10 @@ mod tests {
 
         let from = derive_pq_address(PqScheme::Falcon512, &pk, &custom_salt);
         let default_from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
-        assert_ne!(from, default_from, "Custom salt must derive disjoint address from default salt");
+        assert_ne!(
+            from, default_from,
+            "Custom salt must derive disjoint address from default salt"
+        );
 
         let tx_probe = Transaction {
             from,
@@ -6429,7 +6574,9 @@ mod tests {
             tx.verify_signature_with_registry(&registry),
             "Explicit PQ tx carrying custom non-zero salt must verify"
         );
-        let registered = registry.lookup(&from).expect("Address must be registered with custom salt");
+        let registered = registry
+            .lookup(&from)
+            .expect("Address must be registered with custom salt");
         assert_eq!(registered.0, PqScheme::Falcon512);
         assert_eq!(registered.1, pk);
 
@@ -6467,7 +6614,8 @@ mod tests {
 
         // Wrong salt envelope fails closed (e.g. envelope with DEFAULT_SALT does not match `from`)
         let mut bad_salt_tx = tx.clone();
-        let bad_env = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk, env.signature_bytes);
+        let bad_env =
+            PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk, env.signature_bytes);
         bad_salt_tx.signature = bad_env.encode();
         assert!(
             !bad_salt_tx.verify_signature_with_registry(&registry),
@@ -6562,7 +6710,10 @@ mod tests {
         manual_hasher.update(b"PQ_ENV");
         manual_hasher.update(&tx.signature);
         let expected_hash: [u8; 32] = manual_hasher.finalize().into();
-        assert_eq!(baseline_hash, expected_hash, "compute_tx_hash must bind b\"PQ_ENV\" and &self.signature");
+        assert_eq!(
+            baseline_hash, expected_hash,
+            "compute_tx_hash must bind b\"PQ_ENV\" and &self.signature"
+        );
     }
 
     #[test]
@@ -6575,7 +6726,15 @@ mod tests {
         let source_shard = 0;
         let target_shard = 0;
 
-        let tx = Transaction::sign(&sk, to, amount, gas_limit, nonce, source_shard, target_shard);
+        let tx = Transaction::sign(
+            &sk,
+            to,
+            amount,
+            gas_limit,
+            nonce,
+            source_shard,
+            target_shard,
+        );
         assert!(!tx.is_pq(), "Legacy transaction must not be marked as PQ");
         assert_eq!(tx.signature.len(), 64);
 
@@ -6657,7 +6816,8 @@ mod tests {
             nonce,
             PqScheme::Falcon512.id(),
             *pk_hash.as_bytes(),
-        ).encode();
+        )
+        .encode();
         assert_eq!(leaf_49.len(), crate::cpat2::ACCOUNT_LEAF_LEN_PQ);
 
         let mut trie = PatriciaTrie::new();
@@ -6678,7 +6838,8 @@ mod tests {
             source_state_root,
             finalized_in_block,
             Some(proof.clone()),
-        ).with_source_balance(source_balance);
+        )
+        .with_source_balance(source_balance);
 
         // Verify that CrossShardMessage::new automatically populated sender_pubkey_hash and sender_scheme
         assert_eq!(cross_msg.sender_scheme, Some(PqScheme::Falcon512.id()));
@@ -6686,7 +6847,8 @@ mod tests {
 
         // 3. Simulate wire transmission to Shard 2 via bincode serialization/deserialization
         let wire_bytes = bincode::serialize(&cross_msg).expect("serialize CrossShardMessage");
-        let received_msg: CrossShardMessage = bincode::deserialize(&wire_bytes).expect("deserialize CrossShardMessage");
+        let received_msg: CrossShardMessage =
+            bincode::deserialize(&wire_bytes).expect("deserialize CrossShardMessage");
 
         assert_eq!(received_msg.sender_scheme, Some(PqScheme::Falcon512.id()));
         assert_eq!(received_msg.sender_pubkey_hash, Some(*pk_hash.as_bytes()));
@@ -6719,7 +6881,8 @@ mod tests {
         );
 
         // (c) Explicit PQ envelope cross-shard message
-        let explicit_env = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), vec![0u8; 666]);
+        let explicit_env =
+            PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), vec![0u8; 666]);
         let mut explicit_tx = tx_probe.clone();
         explicit_tx.signature = explicit_env.encode();
         let explicit_msg = CrossShardMessage::new(
@@ -6729,7 +6892,8 @@ mod tests {
             source_state_root,
             finalized_in_block,
             Some(proof.clone()),
-        ).with_source_balance(source_balance);
+        )
+        .with_source_balance(source_balance);
         assert_eq!(explicit_msg.sender_scheme, Some(PqScheme::Falcon512.id()));
         assert_eq!(explicit_msg.sender_pubkey_hash, Some(*pk_hash.as_bytes()));
         assert!(explicit_msg.verify_inclusion());
@@ -6743,18 +6907,12 @@ mod tests {
         let chain_id_main = 5757u64;
         let chain_id_alt = 777u64;
 
-        let tx = Transaction::sign_with_chain_id(
-            &sk,
-            to,
-            1_000,
-            50_000,
-            0,
-            1,
-            1,
-            chain_id_main,
-        );
+        let tx = Transaction::sign_with_chain_id(&sk, to, 1_000, 50_000, 0, 1, 1, chain_id_main);
 
-        assert!(tx.is_chain_id_bound(), "Transaction must carry CH1 envelope");
+        assert!(
+            tx.is_chain_id_bound(),
+            "Transaction must carry CH1 envelope"
+        );
         assert_eq!(tx.chain_id(), Some(chain_id_main));
         assert!(tx.verify_signature(), "Self verification must pass");
         assert!(
@@ -6769,7 +6927,8 @@ mod tests {
         // Tampering with chain_id in envelope invalidates cryptographic signature
         let mut tampered_envelope = tx.clone();
         let offset = 64 + CHAIN_SIG_TAG.len();
-        tampered_envelope.signature[offset..offset + 8].copy_from_slice(&chain_id_alt.to_be_bytes());
+        tampered_envelope.signature[offset..offset + 8]
+            .copy_from_slice(&chain_id_alt.to_be_bytes());
         assert_eq!(tampered_envelope.chain_id(), Some(chain_id_alt));
         assert!(
             !tampered_envelope.verify_signature(),
@@ -6786,14 +6945,16 @@ mod tests {
         );
 
         // State engine cross-chain replay rejection
-        let engine_main = crate::state_engine::InMemoryStateEngine::new().with_chain_id(chain_id_main);
+        let engine_main =
+            crate::state_engine::InMemoryStateEngine::new().with_chain_id(chain_id_main);
         engine_main.credit_native(&from, 100_000).await.unwrap();
         assert!(
             engine_main.apply_transaction(&tx, 1_000).await.is_ok(),
             "Transaction must apply on matching chain engine"
         );
 
-        let engine_alt = crate::state_engine::InMemoryStateEngine::new().with_chain_id(chain_id_alt);
+        let engine_alt =
+            crate::state_engine::InMemoryStateEngine::new().with_chain_id(chain_id_alt);
         engine_alt.credit_native(&from, 100_000).await.unwrap();
         let err = engine_alt
             .apply_transaction(&tx, 1_000)
@@ -7008,10 +7169,7 @@ mod topology_tests {
     fn the_masterchain_address_form_is_parsed_in_one_place() {
         // `-1:` is the masterchain; `0:` is the masterchain too (shard 0 IS
         // the masterchain id); `N:` names a workchain shard explicitly.
-        assert_eq!(
-            split_shard_prefix("-1:abc").0,
-            Some(MASTERCHAIN_SHARD)
-        );
+        assert_eq!(split_shard_prefix("-1:abc").0, Some(MASTERCHAIN_SHARD));
         assert_eq!(split_shard_prefix("0:abc").0, Some(MASTERCHAIN_SHARD));
         assert_eq!(split_shard_prefix("7:abc").0, Some(7));
         assert_eq!(split_shard_prefix("abc").0, None);
@@ -7040,9 +7198,13 @@ mod topology_tests {
         assert!(!t.accounts_of(c0.shard_id).is_empty());
         assert!(!t.accounts_of(c1.shard_id).is_empty());
         // The invariants hold.
-        t.verify_invariants().expect("invariants hold after the split");
+        t.verify_invariants()
+            .expect("invariants hold after the split");
         // The total balance is conserved.
-        assert_eq!(t.total_balance(), t.shard_balance(c0.shard_id) + t.shard_balance(c1.shard_id));
+        assert_eq!(
+            t.total_balance(),
+            t.shard_balance(c0.shard_id) + t.shard_balance(c1.shard_id)
+        );
     }
 
     #[test]
@@ -7078,10 +7240,7 @@ mod topology_tests {
         );
 
         // An unknown shard never splits.
-        assert_eq!(
-            t.split_preconditions(9999),
-            Err(SplitRefusal::UnknownShard)
-        );
+        assert_eq!(t.split_preconditions(9999), Err(SplitRefusal::UnknownShard));
     }
 
     #[test]
@@ -7178,7 +7337,8 @@ mod topology_tests {
         // The routing prefix is restored to the parent's depth.
         assert_eq!(merge.parent.prefix_len, 0);
         // The invariants hold.
-        t.verify_invariants().expect("invariants hold after the merge");
+        t.verify_invariants()
+            .expect("invariants hold after the merge");
     }
 
     #[test]
@@ -7203,7 +7363,9 @@ mod topology_tests {
     fn non_sibling_shards_never_merge() {
         let mut t = topology_with(1000);
         t.record_tx_load(BASE_WORKCHAIN_SHARD_INITIAL, 600);
-        let split = t.check_and_split(BASE_WORKCHAIN_SHARD_INITIAL).expect("split");
+        let split = t
+            .check_and_split(BASE_WORKCHAIN_SHARD_INITIAL)
+            .expect("split");
         let [c0, _c1] = split.children;
 
         // The masterchain is never a merge partner.
@@ -7222,7 +7384,9 @@ mod topology_tests {
     fn the_routing_rule_follows_the_split() {
         let mut t = topology_with(200);
         t.record_tx_load(BASE_WORKCHAIN_SHARD_INITIAL, 600);
-        let split = t.check_and_split(BASE_WORKCHAIN_SHARD_INITIAL).expect("split");
+        let split = t
+            .check_and_split(BASE_WORKCHAIN_SHARD_INITIAL)
+            .expect("split");
         let [c0, c1] = split.children;
 
         for acct in t.all_accounts() {
@@ -7269,14 +7433,29 @@ mod topology_tests {
     fn the_topology_report_publishes_the_thresholds() {
         let t = topology_with(1000);
         let report = t.report();
-        assert_eq!(report.parameters.min_accounts_per_shard, MIN_ACCOUNTS_PER_SHARD);
+        assert_eq!(
+            report.parameters.min_accounts_per_shard,
+            MIN_ACCOUNTS_PER_SHARD
+        );
         assert_eq!(report.parameters.max_shards, MAX_SHARDS);
-        assert_eq!(report.parameters.split_load_threshold, SHARD_SPLIT_LOAD_THRESHOLD);
-        assert_eq!(report.parameters.merge_load_threshold, SHARD_MERGE_LOAD_THRESHOLD);
+        assert_eq!(
+            report.parameters.split_load_threshold,
+            SHARD_SPLIT_LOAD_THRESHOLD
+        );
+        assert_eq!(
+            report.parameters.merge_load_threshold,
+            SHARD_MERGE_LOAD_THRESHOLD
+        );
         assert_eq!(report.parameters.max_prefix_bits, MAX_PREFIX_BITS);
-        assert_eq!(report.parameters.max_workchain_shard_space, MAX_WORKCHAIN_SHARD_SPACE);
+        assert_eq!(
+            report.parameters.max_workchain_shard_space,
+            MAX_WORKCHAIN_SHARD_SPACE
+        );
         assert_eq!(report.parameters.masterchain_shard, MASTERCHAIN_SHARD);
-        assert_eq!(report.parameters.base_workchain_shard, BASE_WORKCHAIN_SHARD_INITIAL);
+        assert_eq!(
+            report.parameters.base_workchain_shard,
+            BASE_WORKCHAIN_SHARD_INITIAL
+        );
         assert_eq!(report.parameters.masterchain_address_form, "-1:<addr>");
         assert_eq!(report.total_accounts, 1000);
         assert_eq!(report.shards.len(), 2);
@@ -7494,7 +7673,12 @@ impl CrossShardMessage {
                 _ => CrossShardKind::Unknown,
             };
         }
-        match (self.source_shard, self.target_shard, self.bounced, self.bounce) {
+        match (
+            self.source_shard,
+            self.target_shard,
+            self.bounced,
+            self.bounce,
+        ) {
             (a, b, false, _) if a == s && b == t => CrossShardKind::Transfer,
             (a, b, false, false) if a == t && b == s => CrossShardKind::Ack,
             (a, b, true, false) if a == t && b == s => CrossShardKind::Bounce,
@@ -7661,7 +7845,11 @@ impl CrossShardMessage {
         let Some(reg) = registry else {
             return false;
         };
-        if !reg.anchor_holds(self.source_shard, &self.finalized_in_block, &self.source_state_root) {
+        if !reg.anchor_holds(
+            self.source_shard,
+            &self.finalized_in_block,
+            &self.source_state_root,
+        ) {
             return false;
         }
         self.verify_xpc_proof(phases)
@@ -7724,13 +7912,20 @@ impl SharedSequencer {
     /// assignments from identical chains. Returns the assignments in global
     /// order.
     pub fn assign_from_block(&mut self, block: &Block) -> Vec<(u64, CrossShardKey)> {
-        let mut keys: Vec<CrossShardKey> = block.cross_shard_out.iter().map(CrossShardKey::of).collect();
+        let mut keys: Vec<CrossShardKey> = block
+            .cross_shard_out
+            .iter()
+            .map(CrossShardKey::of)
+            .collect();
         // Total order, independent of the carrier vec's order (KV enumeration
         // order must never leak into consensus-adjacent numbering).
         keys.sort_by(|a, b| {
             // `block.height` is common; order by (source_shard, msg_id, carrier).
-            (a.source_shard, a.msg_id, a.finalized_in_block)
-                .cmp(&(b.source_shard, b.msg_id, b.finalized_in_block))
+            (a.source_shard, a.msg_id, a.finalized_in_block).cmp(&(
+                b.source_shard,
+                b.msg_id,
+                b.finalized_in_block,
+            ))
         });
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
@@ -7835,7 +8030,12 @@ impl L2Batch {
     /// Build a batch, computing the binding payload hash.
     pub fn new(l2_id: u32, batch_index: u64, txs: Vec<Transaction>) -> Self {
         let payload_hash = Self::payload_hash_of(&txs);
-        Self { l2_id, batch_index, txs, payload_hash }
+        Self {
+            l2_id,
+            batch_index,
+            txs,
+            payload_hash,
+        }
     }
 
     /// The binding commitment: `sha256(count || tx_hash_0 || tx_hash_1 || ..)`.
@@ -7903,7 +8103,8 @@ impl L2Sequencer {
                 batch.l2_id, batch.batch_index
             ));
         }
-        self.pending.insert((batch.l2_id, batch.batch_index), batch.clone());
+        self.pending
+            .insert((batch.l2_id, batch.batch_index), batch.clone());
         self.expected.insert(batch.l2_id, next + 1);
         Ok(())
     }
@@ -7936,7 +8137,8 @@ impl L2Sequencer {
             return;
         }
         self.included_through.insert(l2_id, want);
-        self.pending.retain(|(id, idx), _| !(*id == l2_id && *idx <= through_index));
+        self.pending
+            .retain(|(id, idx), _| !(*id == l2_id && *idx <= through_index));
     }
 
     /// How many batches of `l2_id` have been marked included (0 if none).
@@ -7980,7 +8182,7 @@ mod shard_header_commitment_tests {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         }
-}
+    }
 
     #[test]
     fn block_hash_commits_the_shard_heads() {
@@ -8137,7 +8339,10 @@ mod shard_header_commitment_tests {
         crate::consensus::set_consensus_chain_id_for_tests(TESTNET);
         block.sign_block(&key);
         let testnet_hash = block.compute_hash();
-        assert!(block.verify_proposer_signature(), "the signature verifies on its own chain");
+        assert!(
+            block.verify_proposer_signature(),
+            "the signature verifies on its own chain"
+        );
 
         // On the MAINNET the very same body has a different hash...
         crate::consensus::set_consensus_chain_id_for_tests(MAINNET);
@@ -8330,7 +8535,8 @@ mod shard_header_commitment_tests {
         let mut txs = Vec::with_capacity(n);
         for i in 0..n {
             let mut seed = [0u8; 32];
-            seed[0..8].copy_from_slice(&(i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
+            seed[0..8]
+                .copy_from_slice(&(i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
             seed[8] = 0xB7;
             let sk = SigningKey::from_bytes(&seed);
             // Vary the payload shape (empty / small / multi-op) and the bid

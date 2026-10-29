@@ -24,8 +24,8 @@ use stellereum::bridge::{
     RESOLVE_DEFER_SECS,
 };
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
-use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::staking::{MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
+use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::svm::{OpCode, GAS_BASIC_TRANSFER, GAS_BRIDGE_INTENT};
 
 /// Fixed, realistic block timestamp. Never 0: 0 is exactly the bug I12 pins.
@@ -152,8 +152,8 @@ fn bridge_block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
-            order_merkle_root,
-            epoch_key_commitment: [0u8; 32],
+        order_merkle_root,
+        epoch_key_commitment: [0u8; 32],
     }
 }
 
@@ -300,20 +300,32 @@ async fn failing_evidence_past_deadline_never_pays_reward() {
             0,
         )
         .await;
-    assert_eq!(out.status, vec![true], "resolve with unverified evidence defers");
+    assert_eq!(
+        out.status,
+        vec![true],
+        "resolve with unverified evidence defers"
+    );
     // Challenger is STILL down the bond and nets ZERO reward!
     assert_eq!(
         balance(&e, &challenger_pk).await,
         10 * STELL - bond,
         "challenger still down the bond: ZERO profit from fabricated failing evidence"
     );
-    assert_eq!(balance(&e, &recipient).await, 0, "credit still parked while open");
+    assert_eq!(
+        balance(&e, &recipient).await,
+        0,
+        "credit still parked while open"
+    );
     {
         let br = e.bridge_read().await;
         let d = br.disputes.get(&0).unwrap();
         assert!(!d.resolved, "dispute deferred, NOT resolved as fraud");
         let escrow = balance(&e, &stellereum::bridge::BRIDGE_ESCROW).await;
-        assert_eq!(escrow, amount + bond, "escrow still holds both deposit and bond");
+        assert_eq!(
+            escrow,
+            amount + bond,
+            "escrow still holds both deposit and bond"
+        );
     }
 }
 
@@ -347,10 +359,7 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
         }]),
     );
     let out = e
-        .apply_block_transition(
-            &bridge_block(2, challenge_at, vec![tx_c], challenger_pk),
-            0,
-        )
+        .apply_block_transition(&bridge_block(2, challenge_at, vec![tx_c], challenger_pk), 0)
         .await;
     assert_eq!(out.status, vec![true]);
     let d0 = challenge_at + DISPUTE_WINDOW_SECS;
@@ -463,7 +472,10 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
         ]),
     );
     let out = e
-        .apply_block_transition(&bridge_block(height + 1, now + 1, vec![tx_rec], resolver_pk), 0)
+        .apply_block_transition(
+            &bridge_block(height + 1, now + 1, vec![tx_rec], resolver_pk),
+            0,
+        )
         .await;
     assert_eq!(out.status, vec![true], "late truth still confirms");
     assert_eq!(
@@ -567,7 +579,11 @@ async fn honest_relay_unaffected_by_the_truth_gate() {
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
-    assert_eq!(out.status, vec![true], "honest quorum deposit still credits");
+    assert_eq!(
+        out.status,
+        vec![true],
+        "honest quorum deposit still credits"
+    );
     assert_eq!(balance(&e, &recipient_q).await, amount_q);
 
     // Evidence path, no challenge: credits exactly as before.
@@ -585,7 +601,11 @@ async fn honest_relay_unaffected_by_the_truth_gate() {
     let out = e
         .apply_block_transition(&bridge_block(2, TS + 1, vec![tx], payer_pk), 0)
         .await;
-    assert_eq!(out.status, vec![true], "honest evidence deposit still credits");
+    assert_eq!(
+        out.status,
+        vec![true],
+        "honest evidence deposit still credits"
+    );
     assert_eq!(balance(&e, &recipient_e).await, amount_e);
 
     assert!(

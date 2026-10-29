@@ -218,7 +218,9 @@ async fn unilateral_finalization_with_only_the_joiner_power_is_refused() {
     // The adopt path refuses it loudly (never finalize, never apply).
     // Parent linkage: the runtime has finalized height H (empty body parent),
     // so the candidate must chain to it with a compatible timestamp.
-    let proposer = in_force.proposer_for(H + 1, 0).expect("non-empty set schedules");
+    let proposer = in_force
+        .proposer_for(H + 1, 0)
+        .expect("non-empty set schedules");
     let proposer_key = [&ka, &kb, &kc]
         .into_iter()
         .find(|k| k.verifying_key().to_bytes() == proposer)
@@ -244,7 +246,11 @@ async fn unilateral_finalization_with_only_the_joiner_power_is_refused() {
         err.contains("quorum"),
         "refusal must name the quorum shortfall, got: {err}"
     );
-    assert_eq!(r.hc.height, H + 1, "a refused adopt must not advance the height");
+    assert_eq!(
+        r.hc.height,
+        H + 1,
+        "a refused adopt must not advance the height"
+    );
 
     // The quorate QC (A+C = 3F >= floor(8F/3)+1) IS accepted on the same path.
     let mut blk = empty_block(H + 1, parent_hash, root, proposer, Some(parent_qc));

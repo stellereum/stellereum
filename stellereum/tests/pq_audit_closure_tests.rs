@@ -22,8 +22,14 @@ static SERIAL: Mutex<()> = Mutex::new(());
 fn mldsa_scheme_byte_refused_at_admission() {
     use stellereum::post_quantum::PqScheme;
     let err = PqScheme::from_id(3).expect_err("0x03 must be refused");
-    assert!(err.contains("ML-DSA-44"), "loud refusal names scheme: {err}");
-    assert!(err.contains("DISABLED"), "loud refusal says DISABLED: {err}");
+    assert!(
+        err.contains("ML-DSA-44"),
+        "loud refusal names scheme: {err}"
+    );
+    assert!(
+        err.contains("DISABLED"),
+        "loud refusal says DISABLED: {err}"
+    );
     assert!(err.contains("0x03"), "loud refusal names id: {err}");
     // Neighbouring ids still work; unknown ids still rejected.
     assert_eq!(PqScheme::from_id(2).unwrap(), PqScheme::Falcon512);
@@ -49,7 +55,7 @@ fn mldsa_verify_refuses_even_audit_forgery() {
     let msg = b"forge me with public key alone";
     let mut sig = vec![0x22u8; MLDSA44_SIG_LEN];
     sig[0] = 0x01; // not 0xFF
-    // Trailer per the public binding formula over attacker-chosen bytes.
+                   // Trailer per the public binding formula over attacker-chosen bytes.
     let mut h = blake3::Hasher::new_derive_key("MLDSA44_VERIFY_V4");
     h.update(&pk[..32]);
     h.update(&pk[32..]);
@@ -74,7 +80,7 @@ fn mldsa_verify_refuses_even_audit_forgery() {
 #[test]
 fn mldsa_envelope_and_registry_refuse_pinning() {
     use stellereum::post_quantum::{
-        derive_pq_address, PqSignatureEnvelope, PqScheme, StatefulImplicitKeyRegistry,
+        derive_pq_address, PqScheme, PqSignatureEnvelope, StatefulImplicitKeyRegistry,
         DEFAULT_SALT, MLDSA44_PUBKEY_LEN, MLDSA44_SIG_LEN,
     };
     // Envelope admission: encode still frames 0x03 (wire honesty), decode refuses.
@@ -105,7 +111,12 @@ fn falcon_only_canonical_0x29_verifies() {
     let msg = b"canonical framing closure";
     let sig = kp.sign(msg);
     assert_eq!(sig[0], 0x29, "signer emits canonical framing");
-    assert!(verify_pq_signature(PqScheme::Falcon512, kp.pubkey(), msg, &sig));
+    assert!(verify_pq_signature(
+        PqScheme::Falcon512,
+        kp.pubkey(),
+        msg,
+        &sig
+    ));
 
     // 0x29 -> 0x39 relabel (same body) MUST refuse: the old parser accepted
     // it with the trailer unchecked — distinct bytes verifying for one
@@ -135,7 +146,12 @@ fn falcon_only_canonical_0x29_verifies() {
     bad_pad[stellereum::post_quantum::FALCON512_SIG_LEN - 1] ^= 0x01;
     // (If the canonical encoding already fills the buffer, this flips a real
     // bit and must fail as forgery; either way it must not verify.)
-    assert!(!verify_pq_signature(PqScheme::Falcon512, kp.pubkey(), msg, &bad_pad));
+    assert!(!verify_pq_signature(
+        PqScheme::Falcon512,
+        kp.pubkey(),
+        msg,
+        &bad_pad
+    ));
 }
 
 #[test]
@@ -179,7 +195,12 @@ fn falcon_verifier_rejects_check_digest_forgery() {
     for (i, b) in forged.iter_mut().enumerate().skip(1).take(40) {
         *b = (i as u8).wrapping_mul(37).wrapping_add(11);
     }
-    for (i, b) in forged.iter_mut().enumerate().skip(41).take(FALCON512_SIG_LEN - 42) {
+    for (i, b) in forged
+        .iter_mut()
+        .enumerate()
+        .skip(41)
+        .take(FALCON512_SIG_LEN - 42)
+    {
         *b = (i as u8).wrapping_mul(53).wrapping_add(7);
     }
     if forged.iter().skip(1).take(40).all(|&b| b == 0) {
@@ -199,7 +220,12 @@ fn falcon_verifier_rejects_check_digest_forgery() {
         "F-HIGH-3: keyless check-digest forgery must NOT verify here"
     );
     // And the genuine signature still verifies (no over-refusal).
-    assert!(verify_pq_signature(PqScheme::Falcon512, &pk, msg, &kp.sign(msg)));
+    assert!(verify_pq_signature(
+        PqScheme::Falcon512,
+        &pk,
+        msg,
+        &kp.sign(msg)
+    ));
 }
 
 // ============================================================================
@@ -209,7 +235,7 @@ fn falcon_verifier_rejects_check_digest_forgery() {
 #[test]
 fn pq_envelope_strict_single_layout() {
     use stellereum::post_quantum::{
-        FalconKeypair, PqSignatureEnvelope, PqScheme, ED25519_PUBKEY_LEN, ED25519_SIG_LEN,
+        FalconKeypair, PqScheme, PqSignatureEnvelope, ED25519_PUBKEY_LEN, ED25519_SIG_LEN,
         FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN,
     };
     let kp = FalconKeypair::generate_from_seed(0xD4);
@@ -226,12 +252,18 @@ fn pq_envelope_strict_single_layout() {
     // Trailing byte refused (no silent re-framing).
     let mut trailing = exp.encode();
     trailing.push(0x00);
-    assert!(PqSignatureEnvelope::decode(&trailing).is_err(), "trailing byte must refuse");
+    assert!(
+        PqSignatureEnvelope::decode(&trailing).is_err(),
+        "trailing byte must refuse"
+    );
 
     // Flag byte outside {0,1} refused.
     let mut bad_flag = exp.encode();
     bad_flag[4] = 0x02;
-    assert!(PqSignatureEnvelope::decode(&bad_flag).is_err(), "flag 0x02 must refuse");
+    assert!(
+        PqSignatureEnvelope::decode(&bad_flag).is_err(),
+        "flag 0x02 must refuse"
+    );
 
     // Implicit envelope carrying key bytes refused.
     let mut implicit_with_key = imp.encode();
@@ -265,7 +297,10 @@ fn pq_envelope_strict_single_layout() {
     assert_eq!(ed_pk.len(), ED25519_PUBKEY_LEN);
     assert_eq!(ed_sig.len(), ED25519_SIG_LEN);
     let ed_env = PqSignatureEnvelope::new_explicit(PqScheme::Ed25519, ed_pk, ed_sig);
-    assert_eq!(PqSignatureEnvelope::decode(&ed_env.encode()).unwrap(), ed_env);
+    assert_eq!(
+        PqSignatureEnvelope::decode(&ed_env.encode()).unwrap(),
+        ed_env
+    );
 }
 
 // ============================================================================
@@ -274,7 +309,9 @@ fn pq_envelope_strict_single_layout() {
 
 #[test]
 fn bls_signature_identity_rejected_at_parse() {
-    use stellereum::bls::{aggregate_signatures, verify_aggregate_signature, BlsSecretKey, BlsSignature, SIGNATURE_LEN};
+    use stellereum::bls::{
+        aggregate_signatures, verify_aggregate_signature, BlsSecretKey, BlsSignature, SIGNATURE_LEN,
+    };
     // The identity G2 point must not parse (mirrors the G1 key check).
     let id_bytes: [u8; SIGNATURE_LEN] = G2Affine::identity().to_compressed();
     assert!(
@@ -285,7 +322,11 @@ fn bls_signature_identity_rejected_at_parse() {
     let keys: Vec<BlsSecretKey> = (0..4).map(|_| BlsSecretKey::generate()).collect();
     let pks: Vec<_> = keys.iter().map(|k| k.public_key()).collect();
     let msg = b"qc quorum";
-    let sigs: Vec<_> = keys.iter().enumerate().map(|(i, k)| (i, k.sign(msg))).collect();
+    let sigs: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (i, k.sign(msg)))
+        .collect();
     let agg = aggregate_signatures(&sigs, 4).expect("genuine aggregate builds");
     assert!(verify_aggregate_signature(&pks, msg, &agg));
     assert!(!verify_aggregate_signature(&pks, b"other", &agg));
@@ -336,7 +377,10 @@ fn bls_config_debug_redacts_seed() {
     };
     let dbg = format!("{cfg:?}");
     assert!(!dbg.contains("abab"), "Debug must not print the seed bytes");
-    assert!(dbg.contains("redacted"), "Debug must show presence only: {dbg}");
+    assert!(
+        dbg.contains("redacted"),
+        "Debug must show presence only: {dbg}"
+    );
     // Zeroize wipes the seed.
     let mut cfg2 = cfg.clone();
     zeroize::Zeroize::zeroize(&mut cfg2);
@@ -355,8 +399,8 @@ fn vote_single_batch_parity_under_pure_pq() {
         ValidatorSet, Vote, VoteKind, VoteSet,
     };
     use stellereum::post_quantum::{
-        derive_pq_address, is_pure_pq_enforced, set_pure_pq_override, FalconKeypair,
-        PqScheme, DEFAULT_SALT,
+        derive_pq_address, is_pure_pq_enforced, set_pure_pq_override, FalconKeypair, PqScheme,
+        DEFAULT_SALT,
     };
     let _g = SERIAL.lock().unwrap();
     clear_validator_pq_keys_for_tests();
@@ -368,11 +412,14 @@ fn vote_single_batch_parity_under_pure_pq() {
     let msg = |v: &Vote| vote_sign_bytes(v.height, v.round, v.kind, &v.block_hash);
 
     // Two Ed validators (one honest Ed-only vote each) + one Falcon voter.
-    let ed_sks: Vec<SigningKey> =
-        (1u8..=2).map(|i| SigningKey::from_bytes(&[i; 32])).collect();
+    let ed_sks: Vec<SigningKey> = (1u8..=2)
+        .map(|i| SigningKey::from_bytes(&[i; 32]))
+        .collect();
     let fk = FalconKeypair::generate_from_seed(0xE5);
-    let ed_voters: Vec<[u8; 32]> =
-        ed_sks.iter().map(|k| k.verifying_key().to_bytes()).collect();
+    let ed_voters: Vec<[u8; 32]> = ed_sks
+        .iter()
+        .map(|k| k.verifying_key().to_bytes())
+        .collect();
 
     let mut ed_votes = Vec::new();
     for (sk, voter) in ed_sks.iter().zip(ed_voters.iter()) {
@@ -384,8 +431,7 @@ fn vote_single_batch_parity_under_pure_pq() {
     let falcon_sk = SigningKey::from_bytes(&[0xF0; 32]);
     let falcon_voter = falcon_sk.verifying_key().to_bytes();
     register_validator_pq_key(falcon_voter, PqScheme::Falcon512, fk.public_key().to_vec());
-    let falcon_vote =
-        Vote::sign_with_falcon(&falcon_sk, &fk, height, round, kind, bh);
+    let falcon_vote = Vote::sign_with_falcon(&falcon_sk, &fk, height, round, kind, bh);
     assert_eq!(falcon_vote.voter, falcon_voter);
 
     let mut vs = ValidatorSet::new();
@@ -399,26 +445,48 @@ fn vote_single_batch_parity_under_pure_pq() {
     set_pure_pq_override(Some(true));
     assert!(is_pure_pq_enforced());
     for v in &ed_votes {
-        assert!(!v.verify(), "single verify must reject Ed-only under pure-PQ");
+        assert!(
+            !v.verify(),
+            "single verify must reject Ed-only under pure-PQ"
+        );
     }
-    assert!(falcon_vote.verify(), "Falcon vote must verify under pure-PQ");
-    assert!(!Vote::verify_batch(&ed_votes), "batch must reject Ed-only under pure-PQ");
+    assert!(
+        falcon_vote.verify(),
+        "Falcon vote must verify under pure-PQ"
+    );
+    assert!(
+        !Vote::verify_batch(&ed_votes),
+        "batch must reject Ed-only under pure-PQ"
+    );
     assert!(Vote::verify_batch(std::slice::from_ref(&falcon_vote)));
     let flags = Vote::partition_valid(&ed_votes);
-    assert_eq!(flags, vec![false; ed_votes.len()], "partition must mirror single");
-    assert_eq!(Vote::partition_valid(std::slice::from_ref(&falcon_vote)), vec![true]);
+    assert_eq!(
+        flags,
+        vec![false; ed_votes.len()],
+        "partition must mirror single"
+    );
+    assert_eq!(
+        Vote::partition_valid(std::slice::from_ref(&falcon_vote)),
+        vec![true]
+    );
     // Mixed batch: all-or-nothing fails, partition keeps exactly the good one.
     let mut mixed = ed_votes.clone();
     mixed.push(falcon_vote.clone());
     assert!(!Vote::verify_batch(&mixed));
     let mflags = Vote::partition_valid(&mixed);
-    assert_eq!(mflags, vec![false, false, true], "partition keeps only the Falcon vote");
+    assert_eq!(
+        mflags,
+        vec![false, false, true],
+        "partition keeps only the Falcon vote"
+    );
     // add_batch parity with add: Ed-only refused with bad-signature, Falcon admitted.
     let mut set_single = VoteSet::new();
     for v in &ed_votes {
         assert!(set_single.add(v.clone(), &vs, height, round, kind).is_err());
     }
-    assert!(set_single.add(falcon_vote.clone(), &vs, height, round, kind).is_ok());
+    assert!(set_single
+        .add(falcon_vote.clone(), &vs, height, round, kind)
+        .is_ok());
     let mut set_batch = VoteSet::new();
     let results = set_batch.add_batch(mixed, &vs, height, round, kind);
     assert!(results[0].is_err() && results[1].is_err() && results[2].is_ok());
@@ -445,8 +513,8 @@ fn vote_single_batch_parity_under_pure_pq() {
 #[test]
 fn node_key_files_enforce_perms_and_roundtrip() {
     use stellereum::node_keys::{
-        decrypt_bytes, load_or_generate_falcon_key, load_or_generate_node_keys,
-        write_private_file, ENV_PASSPHRASE,
+        decrypt_bytes, load_or_generate_falcon_key, load_or_generate_node_keys, write_private_file,
+        ENV_PASSPHRASE,
     };
     let _g = SERIAL.lock().unwrap();
     let prior = std::env::var(ENV_PASSPHRASE).ok();
@@ -480,7 +548,11 @@ fn node_key_files_enforce_perms_and_roundtrip() {
         write_private_file(&lax, b"secret").unwrap();
         let mode = std::fs::metadata(&lax).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "writer must tighten pre-existing files");
-        let mode = std::fs::metadata(&falcon_path).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&falcon_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600);
         let dmode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dmode, 0o700);
@@ -488,7 +560,10 @@ fn node_key_files_enforce_perms_and_roundtrip() {
 
     // Wrong passphrase fails closed; plaintext path warns but loads.
     std::env::set_var(ENV_PASSPHRASE, "wrong-passphrase");
-    assert!(load_or_generate_node_keys(&dir).is_err(), "wrong passphrase must fail");
+    assert!(
+        load_or_generate_node_keys(&dir).is_err(),
+        "wrong passphrase must fail"
+    );
     std::env::remove_var(ENV_PASSPHRASE);
     let raw_plain = b"plain-key-material";
     let out = decrypt_bytes(raw_plain, None).expect("plaintext fallback loads");
@@ -519,9 +594,7 @@ fn remote_signer_local_path_is_secret_free_and_strict() {
     assert!(!signer.verify(b"other", &sig));
     assert_eq!(
         signer.sign(&[]).expect_err("empty refused"),
-        SignerError::SigningFailed(
-            stellereum::remote_signer::SigningFailureKind::EmptyMessage
-        )
+        SignerError::SigningFailed(stellereum::remote_signer::SigningFailureKind::EmptyMessage)
     );
     let dbg = format!("{signer:?}");
     assert!(!dbg.contains("01234567"), "Debug must not leak the seed");
@@ -548,7 +621,10 @@ fn remote_signer_pins_key_and_never_falls_back() {
     }
     impl Fake {
         fn new(key: LocalSigner) -> Self {
-            Self { key, mode: Mutex::new(Mode::Honest) }
+            Self {
+                key,
+                mode: Mutex::new(Mode::Honest),
+            }
         }
         fn set(&self, m: Mode) {
             *self.mode.lock().unwrap() = m;
@@ -586,11 +662,17 @@ fn remote_signer_pins_key_and_never_falls_back() {
 
     // Transport failure propagates — there is no local key to fall back to.
     transport.set(Mode::Fail);
-    assert!(remote.sign(msg).is_err(), "unreachable signer must error, not sign");
+    assert!(
+        remote.sign(msg).is_err(),
+        "unreachable signer must error, not sign"
+    );
 
     // Foreign signature from a hijacked endpoint is rejected at re-verification.
     transport.set(Mode::Foreign);
-    assert!(remote.sign(msg).is_err(), "foreign signature must be rejected");
+    assert!(
+        remote.sign(msg).is_err(),
+        "foreign signature must be rejected"
+    );
 
     // ...while the honest path keeps working once the endpoint recovers.
     transport.set(Mode::Honest);

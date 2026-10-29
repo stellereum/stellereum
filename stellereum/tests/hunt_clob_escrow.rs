@@ -33,20 +33,18 @@ use rand::rngs::OsRng;
 
 use stellereum::orderbook::{OrderSide, OrderType};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::token::{TokenMetadata, TokenOp};
 use stellereum::svm::OpCode;
+use stellereum::token::{TokenMetadata, TokenOp};
 
 fn stell(n: u64) -> u64 {
     n * 1_000_000_000
 }
 
-fn tx_of(
-    key: &SigningKey,
-    nonce: u64,
-    payload: Vec<OpCode>,
-) -> stellereum::sharding::Transaction {
+fn tx_of(key: &SigningKey, nonce: u64, payload: Vec<OpCode>) -> stellereum::sharding::Transaction {
     let from = key.verifying_key().to_bytes();
-    stellereum::sharding::Transaction::sign_with_payload(key, from, 0, 100_000, nonce, 1, 1, payload)
+    stellereum::sharding::Transaction::sign_with_payload(
+        key, from, 0, 100_000, nonce, 1, 1, payload,
+    )
 }
 
 /// The exact `order_cost` the VM computes for a buy (`src/svm.rs`), so a test
@@ -107,13 +105,29 @@ async fn svm_crossing_settles_a_makers_escrow() {
 
     // 1. Victim posts a resting sell: 1,000 STELL are debited into escrow.
     let (order_id, fills) = engine
-        .place_order_settled(1, victim_addr, OrderSide::Sell, OrderType::Limit, price, amount, 100)
+        .place_order_settled(
+            1,
+            victim_addr,
+            OrderSide::Sell,
+            OrderType::Limit,
+            price,
+            amount,
+            100,
+        )
         .await
         .unwrap();
-    let escrowed = engine.order_escrow_read().await.get(&(1, order_id)).cloned();
+    let escrowed = engine
+        .order_escrow_read()
+        .await
+        .get(&(1, order_id))
+        .cloned();
     println!("victim placed order {order_id}, fills={fills}, escrow={escrowed:?}");
     let after_lock = engine.get_account(&victim_addr).await.unwrap().balance;
-    assert_eq!(after_lock, victim_before - amount, "STELL moved into escrow");
+    assert_eq!(
+        after_lock,
+        victim_before - amount,
+        "STELL moved into escrow"
+    );
     assert_eq!(escrowed.as_ref().unwrap().locked_base_stell, amount);
 
     // 2. Attacker crosses it through the SVM.
@@ -124,9 +138,17 @@ async fn svm_crossing_settles_a_makers_escrow() {
     let t = tx_of(
         &attacker,
         0,
-        vec![OpCode::SysCallPlaceOrder { pair_id: 1, is_buy: true, price, amount }],
+        vec![OpCode::SysCallPlaceOrder {
+            pair_id: 1,
+            is_buy: true,
+            price,
+            amount,
+        }],
     );
-    engine.apply_transaction(&t, 0).await.expect("cross must succeed");
+    engine
+        .apply_transaction(&t, 0)
+        .await
+        .expect("cross must succeed");
     let attacker_after = engine.get_account(&attacker_addr).await.unwrap().balance;
 
     // The taker paid the quote and received the 1,000 STELL collateral.
@@ -147,16 +169,33 @@ async fn svm_crossing_settles_a_makers_escrow() {
         "the maker's collateral converted into the quote it was sold for"
     );
     assert!(
-        engine.order_escrow_read().await.get(&(1, order_id)).is_none(),
+        engine
+            .order_escrow_read()
+            .await
+            .get(&(1, order_id))
+            .is_none(),
         "the escrow record died with the order it secured"
     );
 
     // 4. The order is consumed, so the victim can no longer cancel it - which
     //    is correct now: there is nothing left to refund.
-    let book_empty = engine.orderbooks_read().await.books.get(&1).map(|b| b.depth()).unwrap_or((0, 0));
-    assert_eq!(book_empty, (0, 0), "the victim's order was consumed and deleted");
+    let book_empty = engine
+        .orderbooks_read()
+        .await
+        .books
+        .get(&1)
+        .map(|b| b.depth())
+        .unwrap_or((0, 0));
+    assert_eq!(
+        book_empty,
+        (0, 0),
+        "the victim's order was consumed and deleted"
+    );
     let cancel = engine.cancel_order_settled(1, order_id, victim_addr).await;
-    assert!(cancel.unwrap().is_none(), "the order can no longer be found");
+    assert!(
+        cancel.unwrap().is_none(),
+        "the order can no longer be found"
+    );
     assert!(
         engine.order_escrow_read().await.is_empty(),
         "no escrow survives the fill"
@@ -181,7 +220,15 @@ async fn one_tx_settles_many_maker_escrows() {
             .update_account(AccountState::new(a, per_order + 100_000))
             .await;
         let (oid, _) = engine
-            .place_order_settled(1, a, OrderSide::Sell, OrderType::Limit, price, per_order, 100)
+            .place_order_settled(
+                1,
+                a,
+                OrderSide::Sell,
+                OrderType::Limit,
+                price,
+                per_order,
+                100,
+            )
             .await
             .unwrap();
         victims.push((a, oid));
@@ -202,7 +249,12 @@ async fn one_tx_settles_many_maker_escrows() {
         .await;
     let before = engine.get_account(&attacker_addr).await.unwrap().balance;
     let payload: Vec<OpCode> = (0..n)
-        .map(|_| OpCode::SysCallPlaceOrder { pair_id: 1, is_buy: true, price, amount: per_order })
+        .map(|_| OpCode::SysCallPlaceOrder {
+            pair_id: 1,
+            is_buy: true,
+            price,
+            amount: per_order,
+        })
         .collect();
     let t = tx_of(&attacker, 0, payload);
     engine.apply_transaction(&t, 0).await.unwrap();
@@ -235,7 +287,11 @@ async fn one_tx_settles_many_maker_escrows() {
             "victim {} received exactly the quote for its fill",
             hex::encode(&a[..3])
         );
-        assert!(engine.cancel_order_settled(1, *oid, *a).await.unwrap().is_none());
+        assert!(engine
+            .cancel_order_settled(1, *oid, *a)
+            .await
+            .unwrap()
+            .is_none());
     }
 }
 
@@ -261,9 +317,17 @@ async fn svm_place_order_cost_is_locked_into_escrow() {
     let t = tx_of(
         &trader,
         0,
-        vec![OpCode::SysCallPlaceOrder { pair_id: 1, is_buy: true, price, amount }],
+        vec![OpCode::SysCallPlaceOrder {
+            pair_id: 1,
+            is_buy: true,
+            price,
+            amount,
+        }],
     );
-    engine.apply_transaction(&t, 0).await.expect("order must be accepted");
+    engine
+        .apply_transaction(&t, 0)
+        .await
+        .expect("order must be accepted");
     let after = engine.get_account(&trader_addr).await.unwrap().balance;
     assert_eq!(
         after,
@@ -280,7 +344,13 @@ async fn svm_place_order_cost_is_locked_into_escrow() {
     assert_eq!(rec.locked_base_stell, 0);
     assert_eq!(rec.locked_quote_wusdt, 0);
 
-    let book = engine.orderbooks_read().await.books.get(&1).cloned().unwrap();
+    let book = engine
+        .orderbooks_read()
+        .await
+        .books
+        .get(&1)
+        .cloned()
+        .unwrap();
     assert_eq!(book.depth().0, 1, "the bid is live in consensus state");
     assert_eq!(book.get_best_bid_ask().0, Some(price));
     let resting = book.find_order(key.1).expect("the order is in the book");
@@ -317,7 +387,14 @@ async fn control_clob_self_trade_nets_to_zero() {
     // Give the account wUSDT so the escrow can be locked.
     let minter = [0x11u8; 32];
     engine
-        .token_execute(&usdt, minter, TokenOp::Mint { to: a, amount: 1_000_000_000 })
+        .token_execute(
+            &usdt,
+            minter,
+            TokenOp::Mint {
+                to: a,
+                amount: 1_000_000_000,
+            },
+        )
         .await
         .unwrap();
     let before = engine.get_account(&a).await.unwrap().balance;

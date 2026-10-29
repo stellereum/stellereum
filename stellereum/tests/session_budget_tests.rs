@@ -35,12 +35,18 @@ async fn rpc_state_with_token(token: Option<&str>) -> Arc<RpcState> {
     let engine = Arc::new(InMemoryStateEngine::new());
     Arc::new(RpcState {
         engine,
-        mempool: Arc::new(tokio::sync::RwLock::new(stellereum::mempool::Mempool::default())),
+        mempool: Arc::new(tokio::sync::RwLock::new(
+            stellereum::mempool::Mempool::default(),
+        )),
         height: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         node_id: "inf1:budget-test".to_string(),
         chain_id: CHAIN_ID,
-        staking: Arc::new(tokio::sync::RwLock::new(stellereum::staking::StakingLedger::new())),
-        governance: Arc::new(tokio::sync::RwLock::new(stellereum::governance::Governance::new())),
+        staking: Arc::new(tokio::sync::RwLock::new(
+            stellereum::staking::StakingLedger::new(),
+        )),
+        governance: Arc::new(tokio::sync::RwLock::new(
+            stellereum::governance::Governance::new(),
+        )),
         recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
         receipts: Arc::new(tokio::sync::RwLock::new(ReceiptIndex::default())),
         auth_token: token.map(|t| t.to_string()),
@@ -98,10 +104,7 @@ fn rpc_body(method: &str, params: serde_json::Value) -> String {
     serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string()
 }
 
-async fn budget_query(
-    addr: std::net::SocketAddr,
-    params: serde_json::Value,
-) -> serde_json::Value {
+async fn budget_query(addr: std::net::SocketAddr, params: serde_json::Value) -> serde_json::Value {
     let (_, body) = http_post(addr, "/rpc", &rpc_body("stell_sessionBudget", params)).await;
     serde_json::from_str(&body).expect("rpc must return JSON")
 }
@@ -151,17 +154,19 @@ async fn register_session(
 async fn budget_registered_key_reports_remaining_math() {
     let st = rpc_state().await;
     let addr = spawn(st.clone()).await;
-    let (_master, session, grant) =
-        register_session(&st, 5_000, 100).await;
+    let (_master, session, grant) = register_session(&st, 5_000, 100).await;
     let session_hex = hex::encode(session.verifying_key().to_bytes());
 
     // Object params.
-    let resp =
-        budget_query(addr, serde_json::json!({"session": session_hex})).await;
+    let resp = budget_query(addr, serde_json::json!({"session": session_hex})).await;
     let r = resp["result"].clone();
     assert_eq!(r["registered"], serde_json::json!(true), "{resp}");
     assert_eq!(r["revoked"], serde_json::json!(false), "{resp}");
-    assert_eq!(r["valid_until"], serde_json::json!(grant.valid_until), "{resp}");
+    assert_eq!(
+        r["valid_until"],
+        serde_json::json!(grant.valid_until),
+        "{resp}"
+    );
     assert_eq!(r["scope"], serde_json::json!(grant.scope), "{resp}");
     assert_eq!(r["max_gas_spend"], serde_json::json!(5_000), "{resp}");
     // Empty-payload transfer charges the declared gas_limit.
@@ -177,10 +182,17 @@ async fn budget_registered_key_reports_remaining_math() {
 
     // Bare hex string params (also with 0x prefix).
     let resp2 = budget_query(addr, serde_json::json!(session_hex)).await;
-    assert_eq!(resp2["result"]["remaining_gas"], serde_json::json!(4_900), "{resp2}");
-    let resp3 =
-        budget_query(addr, serde_json::json!(format!("0x{session_hex}"))).await;
-    assert_eq!(resp3["result"]["registered"], serde_json::json!(true), "{resp3}");
+    assert_eq!(
+        resp2["result"]["remaining_gas"],
+        serde_json::json!(4_900),
+        "{resp2}"
+    );
+    let resp3 = budget_query(addr, serde_json::json!(format!("0x{session_hex}"))).await;
+    assert_eq!(
+        resp3["result"]["registered"],
+        serde_json::json!(true),
+        "{resp3}"
+    );
 }
 
 #[tokio::test]
@@ -209,7 +221,11 @@ async fn budget_revoked_key_reports_revoked() {
         .await
         .expect("revoke must apply");
 
-    let resp = budget_query(addr, serde_json::json!({"session": hex::encode(session_pub)})).await;
+    let resp = budget_query(
+        addr,
+        serde_json::json!({"session": hex::encode(session_pub)}),
+    )
+    .await;
     let r = &resp["result"];
     assert_eq!(r["registered"], serde_json::json!(true), "{resp}");
     assert_eq!(r["revoked"], serde_json::json!(true), "{resp}");
@@ -242,9 +258,15 @@ async fn budget_rejects_missing_or_malformed_session() {
     let st = rpc_state().await;
     let addr = spawn(st.clone()).await;
     let resp = budget_query(addr, serde_json::json!({})).await;
-    assert!(resp.get("error").is_some(), "missing session must error: {resp}");
+    assert!(
+        resp.get("error").is_some(),
+        "missing session must error: {resp}"
+    );
     let resp2 = budget_query(addr, serde_json::json!({"session": "zz"})).await;
-    assert!(resp2.get("error").is_some(), "malformed hex must error: {resp2}");
+    assert!(
+        resp2.get("error").is_some(),
+        "malformed hex must error: {resp2}"
+    );
 }
 
 #[tokio::test]
@@ -395,12 +417,12 @@ async fn gateway_tx_endpoint_renders_confidential_not_raw_hex() {
     let token = "gateway-token";
     let st_auth = rpc_state_with_token(Some(token)).await;
     let addr_auth = spawn(st_auth.clone()).await;
-    st_auth.engine
+    st_auth
+        .engine
         .update_account(AccountState::new(from, 1_000_000_000_000))
         .await;
     st_auth.mempool.write().await.add(tx).unwrap();
-    let (status, body) =
-        http_get(addr_auth, &format!("/api/tx/{hash_hex}?token={token}")).await;
+    let (status, body) = http_get(addr_auth, &format!("/api/tx/{hash_hex}?token={token}")).await;
     assert!(status.contains("200"), "{status} {body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["kind"], serde_json::json!("confidential"), "{v}");
@@ -412,8 +434,7 @@ async fn gateway_tx_endpoint_renders_confidential_not_raw_hex() {
     assert_eq!(v["status"], serde_json::json!("pending"));
 
     // A WRONG token is treated exactly like no token: the body stays redacted.
-    let (status, body) =
-        http_get(addr_auth, &format!("/api/tx/{hash_hex}?token=wrong")).await;
+    let (status, body) = http_get(addr_auth, &format!("/api/tx/{hash_hex}?token=wrong")).await;
     assert!(status.contains("200"), "{status} {body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(

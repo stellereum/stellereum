@@ -57,8 +57,8 @@ fn mk_block(height: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> Block {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
-            order_merkle_root,
-            epoch_key_commitment: [0u8; 32],
+        order_merkle_root,
+        epoch_key_commitment: [0u8; 32],
     }
 }
 
@@ -86,7 +86,10 @@ async fn holding_a_signed_tx_moves_nothing() {
     // Build the transaction (this is what a node in the mempool would hold).
     let tx = actor_tx(&sk, recipient, 4_242);
     assert!(tx.verify_signature(), "sanity: it is a valid transaction");
-    assert!(tx.check_session_policy(TS).is_ok(), "sanity: legacy passes policy");
+    assert!(
+        tx.check_session_policy(TS).is_ok(),
+        "sanity: legacy passes policy"
+    );
     let _hash = tx.compute_tx_hash();
     let _bytes = bincode::serialize(&tx).expect("serializes");
 
@@ -159,12 +162,14 @@ async fn same_block_produces_the_same_root_on_two_engines() {
     let recipient = [0x8Au8; 32];
 
     let e1 = InMemoryStateEngine::new();
-    e1.update_account(AccountState::new(sender, 10_000_000)).await;
+    e1.update_account(AccountState::new(sender, 10_000_000))
+        .await;
     e1.update_account(AccountState::new(recipient, 0)).await;
 
     let e2 = InMemoryStateEngine::new();
     e2.update_account(AccountState::new(recipient, 0)).await;
-    e2.update_account(AccountState::new(sender, 10_000_000)).await;
+    e2.update_account(AccountState::new(sender, 10_000_000))
+        .await;
 
     let root0_1 = e1.get_state_root().await;
     let root0_2 = e2.get_state_root().await;

@@ -14,8 +14,10 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
+use stellereum::staking::{
+    MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS,
+};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::staking::{MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS};
 use stellereum::svm::{OpCode, GAS_STAKE_CLAIM, GAS_STAKE_UNBOND};
 
 mod support;
@@ -63,21 +65,34 @@ async fn stranger_cannot_force_unbond_an_honest_validator() {
         &honest,
         0,
         20_000,
-        vec![OpCode::SysCallStake { validator: honest_addr, amount: floor() }],
+        vec![OpCode::SysCallStake {
+            validator: honest_addr,
+            amount: floor(),
+        }],
     );
     engine.apply_transaction(&bond, 0).await.unwrap();
     assert!(
-        engine.staking_read().await.to_validator_set().validators.contains_key(&honest_addr),
+        engine
+            .staking_read()
+            .await
+            .to_validator_set()
+            .validators
+            .contains_key(&honest_addr),
         "precondition: honest validator is in the set"
     );
 
     // The attacker holds 20,000 nano-STELL (0.00002 STELL) and nothing else.
-    engine.update_account(AccountState::new(attacker_addr, 20_000)).await;
+    engine
+        .update_account(AccountState::new(attacker_addr, 20_000))
+        .await;
     let t = tx_of(
         &attacker,
         0,
         20_000,
-        vec![OpCode::SysCallUnbond { validator: honest_addr, amount: floor() }],
+        vec![OpCode::SysCallUnbond {
+            validator: honest_addr,
+            amount: floor(),
+        }],
     );
     // FIXED: SysCallUnbond is owner-only, so the grief is refused.
     let err = engine
@@ -107,7 +122,10 @@ async fn stranger_cannot_force_unbond_an_honest_validator() {
         &honest,
         1,
         2_000,
-        vec![OpCode::SysCallUnbond { validator: honest_addr, amount: floor() }],
+        vec![OpCode::SysCallUnbond {
+            validator: honest_addr,
+            amount: floor(),
+        }],
     );
     engine
         .apply_transaction(&owner_tx, 0)
@@ -139,7 +157,10 @@ async fn one_tx_cannot_capture_the_validator_set() {
             &k,
             0,
             20_000,
-            vec![OpCode::SysCallStake { validator: a, amount: floor() }],
+            vec![OpCode::SysCallStake {
+                validator: a,
+                amount: floor(),
+            }],
         );
         engine.apply_transaction(&t, 0).await.unwrap();
         honest.push(a);
@@ -152,19 +173,28 @@ async fn one_tx_cannot_capture_the_validator_set() {
         &attacker,
         0,
         4_000_000,
-        vec![OpCode::SysCallStake { validator: attacker_addr, amount: floor() }],
+        vec![OpCode::SysCallStake {
+            validator: attacker_addr,
+            amount: floor(),
+        }],
     );
     engine.apply_transaction(&t, 0).await.unwrap();
 
     let vs = engine.staking_read().await.to_validator_set();
-    println!("validator set before the attack: {} members", vs.validators.len());
+    println!(
+        "validator set before the attack: {} members",
+        vs.validators.len()
+    );
     assert_eq!(vs.validators.len(), 11);
 
     // ONE transaction, 10 syscalls, 800 gas each. The attacker unbonds all 10
     // honest validators. No signature of theirs is needed, no stake of theirs.
     let payload: Vec<OpCode> = honest
         .iter()
-        .map(|v| OpCode::SysCallUnbond { validator: *v, amount: floor() })
+        .map(|v| OpCode::SysCallUnbond {
+            validator: *v,
+            amount: floor(),
+        })
         .collect();
     let gas = 10 * 800 + 10_000;
     let t = tx_of(&attacker, 1, gas, payload);
@@ -177,7 +207,10 @@ async fn one_tx_cannot_capture_the_validator_set() {
     println!("batch force-unbond of 10 validators rejected: {err}");
 
     let vs = engine.staking_read().await.to_validator_set();
-    println!("validator set after the attempt: {} members", vs.validators.len());
+    println!(
+        "validator set after the attempt: {} members",
+        vs.validators.len()
+    );
     assert_eq!(vs.validators.len(), 11, "the honest set is intact");
     assert!(
         !vs.validators.contains_key(&attacker_addr) || vs.validators.len() == 11,
@@ -222,14 +255,21 @@ async fn delegated_stake_exits_through_begin_then_withdraw() {
     engine
         .update_account(AccountState::new(funder_addr, floor() + 20_000))
         .await;
-    engine.apply_transaction(&tx_of(
-        &funder,
-        0,
-        20_000,
-        vec![OpCode::SysCallStake { validator, amount: floor() }],
-    ), 0)
-    .await
-    .unwrap();
+    engine
+        .apply_transaction(
+            &tx_of(
+                &funder,
+                0,
+                20_000,
+                vec![OpCode::SysCallStake {
+                    validator,
+                    amount: floor(),
+                }],
+            ),
+            0,
+        )
+        .await
+        .unwrap();
 
     // The delegator delegates 5,000 STELL.
     engine
@@ -239,7 +279,10 @@ async fn delegated_stake_exits_through_begin_then_withdraw() {
         &delegator,
         0,
         100_000,
-        vec![OpCode::SysCallDelegate { validator, amount: stell(5_000) }],
+        vec![OpCode::SysCallDelegate {
+            validator,
+            amount: stell(5_000),
+        }],
     );
     engine.apply_transaction(&d, 0).await.unwrap();
     let after_delegate = bal(&engine, &delegator_addr).await;
@@ -252,9 +295,15 @@ async fn delegated_stake_exits_through_begin_then_withdraw() {
         &delegator,
         nonce,
         100_000,
-        vec![OpCode::SysCallBeginUndelegate { validator, amount: stell(5_000) }],
+        vec![OpCode::SysCallBeginUndelegate {
+            validator,
+            amount: stell(5_000),
+        }],
     );
-    engine.apply_transaction(&t, 0).await.expect("begin unbonding works");
+    engine
+        .apply_transaction(&t, 0)
+        .await
+        .expect("begin unbonding works");
     nonce += 1;
     // Withdrawing BEFORE maturity must refuse (nothing matured yet).
     //
@@ -280,7 +329,10 @@ async fn delegated_stake_exits_through_begin_then_withdraw() {
         .await
         .process_unbonding(UNBONDING_PERIOD_SECS + 1);
     assert_eq!(
-        engine.staking_read().await.withdrawable_delegator(&validator, &delegator_addr),
+        engine
+            .staking_read()
+            .await
+            .withdrawable_delegator(&validator, &delegator_addr),
         stell(5_000),
         "cooldown matured the full position"
     );
@@ -291,7 +343,10 @@ async fn delegated_stake_exits_through_begin_then_withdraw() {
         100_000,
         vec![OpCode::SysCallUndelegate { validator }],
     );
-    engine.apply_transaction(&t, 0).await.expect("withdraw works");
+    engine
+        .apply_transaction(&t, 0)
+        .await
+        .expect("withdraw works");
     nonce += 1;
     // Second withdraw: entry consumed, must refuse (single-claim). It is a
     // refusal like any other, so it costs the failure fee too.
@@ -311,7 +366,10 @@ async fn delegated_stake_exits_through_begin_then_withdraw() {
 
     let l = engine.staking_read().await;
     assert_eq!(
-        l.delegations.get(&(validator, delegator_addr)).copied().unwrap_or(0),
+        l.delegations
+            .get(&(validator, delegator_addr))
+            .copied()
+            .unwrap_or(0),
         0,
         "position fully exited"
     );
@@ -368,7 +426,10 @@ async fn test_only_snark_vk_registration_reverts() {
         &key,
         0,
         100_000,
-        vec![OpCode::SysCallRegisterZkMlSpec { model_id, spec: mk_vk(b"TEST-ONLY-DETERMINISTIC-SETUP:v1:test".to_vec()) }],
+        vec![OpCode::SysCallRegisterZkMlSpec {
+            model_id,
+            spec: mk_vk(b"TEST-ONLY-DETERMINISTIC-SETUP:v1:test".to_vec()),
+        }],
     );
     let err = engine
         .apply_transaction(&t, 0)
@@ -386,7 +447,10 @@ async fn test_only_snark_vk_registration_reverts() {
         &key,
         0,
         100_000,
-        vec![OpCode::SysCallRegisterZkMlSpec { model_id, spec: mk_vk(b"ceremony:powers-of-tau/test".to_vec()) }],
+        vec![OpCode::SysCallRegisterZkMlSpec {
+            model_id,
+            spec: mk_vk(b"ceremony:powers-of-tau/test".to_vec()),
+        }],
     );
     let err = engine
         .apply_transaction(&t, 0)
@@ -412,28 +476,42 @@ async fn delegator_rewards_claim_through_opcode() {
     engine
         .update_account(AccountState::new(funder_addr, floor() + 20_000))
         .await;
-    engine.apply_transaction(&tx_of(
-        &funder,
-        0,
-        20_000,
-        vec![OpCode::SysCallStake { validator, amount: floor() }],
-    ), 0)
-    .await
-    .unwrap();
+    engine
+        .apply_transaction(
+            &tx_of(
+                &funder,
+                0,
+                20_000,
+                vec![OpCode::SysCallStake {
+                    validator,
+                    amount: floor(),
+                }],
+            ),
+            0,
+        )
+        .await
+        .unwrap();
 
     let delegator = SigningKey::generate(&mut OsRng);
     let delegator_addr = delegator.verifying_key().to_bytes();
     engine
         .update_account(AccountState::new(delegator_addr, stell(1_000) + 5_000_000))
         .await;
-    engine.apply_transaction(&tx_of(
-        &delegator,
-        0,
-        100_000,
-        vec![OpCode::SysCallDelegate { validator, amount: stell(1_000) }],
-    ), 0)
-    .await
-    .unwrap();
+    engine
+        .apply_transaction(
+            &tx_of(
+                &delegator,
+                0,
+                100_000,
+                vec![OpCode::SysCallDelegate {
+                    validator,
+                    amount: stell(1_000),
+                }],
+            ),
+            0,
+        )
+        .await
+        .unwrap();
 
     // Accrue rewards (block rewards credit this; here the test drives it).
     // E2: the ledger accrual is only half of a mint — the block path also
@@ -458,14 +536,18 @@ async fn delegator_rewards_claim_through_opcode() {
 
     // Claim: exact payout minus exactly the claim gas.
     let before = bal(&engine, &delegator_addr).await;
-    engine.apply_transaction(&tx_of(
-        &delegator,
-        1,
-        100_000,
-        vec![OpCode::SysCallClaimDelegatorRewards { validator }],
-    ), 0)
-    .await
-    .expect("delegator claim works");
+    engine
+        .apply_transaction(
+            &tx_of(
+                &delegator,
+                1,
+                100_000,
+                vec![OpCode::SysCallClaimDelegatorRewards { validator }],
+            ),
+            0,
+        )
+        .await
+        .expect("delegator claim works");
     assert_eq!(
         bal(&engine, &delegator_addr).await,
         before + expect - GAS_STAKE_CLAIM,
@@ -488,14 +570,18 @@ async fn delegator_rewards_claim_through_opcode() {
     engine
         .update_account(AccountState::new(stranger_addr, 5_000_000))
         .await;
-    let err = engine.apply_transaction(&tx_of(
-        &stranger,
-        0,
-        100_000,
-        vec![OpCode::SysCallClaimDelegatorRewards { validator }],
-    ), 0)
-    .await
-    .expect_err("no rewards must refuse");
+    let err = engine
+        .apply_transaction(
+            &tx_of(
+                &stranger,
+                0,
+                100_000,
+                vec![OpCode::SysCallClaimDelegatorRewards { validator }],
+            ),
+            0,
+        )
+        .await
+        .expect_err("no rewards must refuse");
     assert!(
         err.contains("no delegator rewards"),
         "the refusal must name the reason, got: {err}"
@@ -513,7 +599,8 @@ fn withdrawal_cannot_be_replayed_or_double_matured() {
     let mut l = stellereum::staking::StakingLedger::new();
     let val = [0x91u8; 32];
     let del = [0x92u8; 32];
-    l.bond(val, MIN_VALIDATOR_BOND * 2 + STELL_MIN_BOND_BUFFER, 0).unwrap();
+    l.bond(val, MIN_VALIDATOR_BOND * 2 + STELL_MIN_BOND_BUFFER, 0)
+        .unwrap();
     l.delegate(del, val, stell(1_000)).unwrap();
 
     // Self-bond unbond + delegator undelegation, matured in the same instant.
@@ -524,9 +611,20 @@ fn withdrawal_cannot_be_replayed_or_double_matured() {
     // Maturing AGAIN at a later time must not re-credit anything.
     l.process_unbonding(UNBONDING_PERIOD_SECS * 2 + 5);
     l.process_unbonding(u64::MAX / 2);
-    println!("unbonding entries after the first maturity: {pending_after_first}, later: {}", l.unbonding.len());
-    assert_eq!(l.withdrawable_of(&val), MIN_VALIDATOR_BOND, "credited exactly once");
-    assert_eq!(l.withdrawable_delegator(&val, &del), stell(1_000), "credited exactly once");
+    println!(
+        "unbonding entries after the first maturity: {pending_after_first}, later: {}",
+        l.unbonding.len()
+    );
+    assert_eq!(
+        l.withdrawable_of(&val),
+        MIN_VALIDATOR_BOND,
+        "credited exactly once"
+    );
+    assert_eq!(
+        l.withdrawable_delegator(&val, &del),
+        stell(1_000),
+        "credited exactly once"
+    );
 
     // Withdraw repeatedly.
     let first = l.withdraw(val).unwrap();

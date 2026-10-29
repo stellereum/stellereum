@@ -87,9 +87,7 @@ fn serve_sequence(
 }
 
 fn find_headers_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
 
 fn serve_results(results: Vec<serde_json::Value>) -> String {
@@ -136,7 +134,10 @@ fn rpc_url_parsing_ok_and_rejects_non_http() {
     assert_eq!(host, "127.0.0.1:8545");
     assert_eq!(path, "/");
     let (host2, path2) = rpc::parse_http_url("http://node.local:9999/rpc").unwrap();
-    assert_eq!((host2.as_str(), path2.as_str()), ("node.local:9999", "/rpc"));
+    assert_eq!(
+        (host2.as_str(), path2.as_str()),
+        ("node.local:9999", "/rpc")
+    );
     let (host3, path3) = rpc::parse_http_url("https://127.0.0.1:8545/").unwrap();
     assert_eq!((host3.as_str(), path3.as_str()), ("127.0.0.1:8545", "/"));
     assert!(rpc::parse_http_url("ftp://127.0.0.1:8545/").is_err());
@@ -158,13 +159,20 @@ fn receipt_status_parsing_success_failed_pending_unknown() {
     let ok = serde_json::json!({"status": "success", "height": 41, "block_hash": "aa", "index": 2});
     assert!(matches!(
         rpc::parse_receipt_status(&ok),
-        TxFinality::Confirmed { height: 41, index: 2, .. }
+        TxFinality::Confirmed {
+            height: 41,
+            index: 2,
+            ..
+        }
     ));
     let failed =
         serde_json::json!({"status": "failed", "height": 42, "block_hash": "bb", "index": 0});
     assert!(matches!(
         rpc::parse_receipt_status(&failed),
-        TxFinality::Failed { height: Some(42), .. }
+        TxFinality::Failed {
+            height: Some(42),
+            ..
+        }
     ));
     assert_eq!(
         rpc::parse_receipt_status(&serde_json::json!({"status": "pending"})),
@@ -175,7 +183,10 @@ fn receipt_status_parsing_success_failed_pending_unknown() {
         TxFinality::Unknown
     );
     // A receipt with no recognizable status must NEVER read as confirmed.
-    assert_eq!(rpc::parse_receipt_status(&serde_json::json!({})), TxFinality::Unknown);
+    assert_eq!(
+        rpc::parse_receipt_status(&serde_json::json!({})),
+        TxFinality::Unknown
+    );
 }
 
 #[test]
@@ -222,7 +233,10 @@ fn rpc_call_posts_json_and_forwards_auth_header() {
     assert_eq!(v["balance"], "123");
     let reqs = captured.lock().unwrap();
     assert_eq!(reqs.len(), 1);
-    assert!(reqs[0].contains("X-Api-Key: secret-token"), "auth header missing");
+    assert!(
+        reqs[0].contains("X-Api-Key: secret-token"),
+        "auth header missing"
+    );
     assert!(reqs[0].contains("stell_getBalance"), "method missing");
 }
 
@@ -236,7 +250,8 @@ fn rpc_call_maps_node_error_to_err() {
         };
         let mut buf = [0u8; 4096];
         let _ = stream.read(&mut buf);
-        let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"unauthorized: nope"}}"#;
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"unauthorized: nope"}}"#;
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
@@ -244,8 +259,12 @@ fn rpc_call_maps_node_error_to_err() {
         );
         let _ = stream.write_all(resp.as_bytes());
     });
-    let err = rpc::rpc_call(&cfg_for(&url), "stell_sendRawTransaction", serde_json::json!({}))
-        .unwrap_err();
+    let err = rpc::rpc_call(
+        &cfg_for(&url),
+        "stell_sendRawTransaction",
+        serde_json::json!({}),
+    )
+    .unwrap_err();
     assert!(err.contains("unauthorized"), "unexpected: {err}");
 }
 
@@ -267,7 +286,10 @@ fn poll_receipt_returns_confirmed_on_success() {
         serde_json::json!({"status": "success", "height": 7, "block_hash": "cc", "index": 1}),
     ]);
     let f = rpc::poll_receipt(&cfg_for(&url), &"ab".repeat(32), 15, 1);
-    assert!(matches!(f, TxFinality::Confirmed { height: 7, .. }), "got {f:?}");
+    assert!(
+        matches!(f, TxFinality::Confirmed { height: 7, .. }),
+        "got {f:?}"
+    );
 }
 
 #[test]
@@ -307,17 +329,26 @@ fn spv_balance_proof_from_node_verifies_locally() {
     let cfg = cfg_for(&url);
     let answer = rpc::get_balance_spv(&cfg, &hex::encode(address)).unwrap();
     assert_eq!((answer.balance, answer.nonce), (balance, nonce));
-    assert_eq!(rpc::verify_spv_balance_answer(&address, &answer), rpc::SpvVerdict::Verified);
+    assert_eq!(
+        rpc::verify_spv_balance_answer(&address, &answer),
+        rpc::SpvVerdict::Verified
+    );
 
     // Same proof, spoofed balance claim -> local verification must fail.
     let mut spoofed = answer.clone();
     spoofed.balance = balance + 1_000_000;
-    assert_eq!(rpc::verify_spv_balance_answer(&address, &spoofed), rpc::SpvVerdict::Failed);
+    assert_eq!(
+        rpc::verify_spv_balance_answer(&address, &spoofed),
+        rpc::SpvVerdict::Failed
+    );
 
     // Server omits the proof -> absence is reported, never balance zero.
     let mut noproof = answer.clone();
     noproof.proof = None;
-    assert_eq!(rpc::verify_spv_balance_answer(&address, &noproof), rpc::SpvVerdict::Failed);
+    assert_eq!(
+        rpc::verify_spv_balance_answer(&address, &noproof),
+        rpc::SpvVerdict::Failed
+    );
 }
 
 #[test]
@@ -339,8 +370,8 @@ fn token_spv_proof_key_is_recomputed_not_trusted() {
         "proof": serde_json::to_value(&proof).unwrap(),
     })]);
     let cfg = cfg_for(&url);
-    let answer = rpc::get_token_balance_spv(&cfg, &hex::encode(token_id), &hex::encode(account))
-        .unwrap();
+    let answer =
+        rpc::get_token_balance_spv(&cfg, &hex::encode(token_id), &hex::encode(account)).unwrap();
     assert!(rpc::verify_token_spv_answer(&token_id, &account, &answer));
 
     // Lying server swaps the key field: recomputation must catch it.
@@ -370,16 +401,33 @@ async fn local_broadcast_is_pending_never_confirmed() {
     let (hash, finality) = client.broadcast_tx(&tx).await.expect("broadcast");
     assert_eq!(hash, tx.compute_tx_hash());
     assert_eq!(finality, TxFinality::Pending);
-    assert!(!finality.is_confirmed(), "local sim must never report Confirmed");
+    assert!(
+        !finality.is_confirmed(),
+        "local sim must never report Confirmed"
+    );
 
     let history = client.get_tx_history();
-    let row = history.iter().find(|r| r.tx_hash == hex::encode(hash)).unwrap();
-    assert!(!row.status.contains("Confirmed"), "dishonest history: {}", row.status);
-    assert!(row.status.contains("NOT chain-finalized"), "missing honesty note: {}", row.status);
+    let row = history
+        .iter()
+        .find(|r| r.tx_hash == hex::encode(hash))
+        .unwrap();
+    assert!(
+        !row.status.contains("Confirmed"),
+        "dishonest history: {}",
+        row.status
+    );
+    assert!(
+        row.status.contains("NOT chain-finalized"),
+        "missing honesty note: {}",
+        row.status
+    );
 
     // Local effects still applied (self-consistent simulation).
     let (bal, nonce, _) = client.get_balance_spv(&sender.address, 1).await.unwrap();
-    assert_eq!(bal, 10_000_000_000 - 1_000_000_000 - stellereum::svm::GAS_BASIC_TRANSFER);
+    assert_eq!(
+        bal,
+        10_000_000_000 - 1_000_000_000 - stellereum::svm::GAS_BASIC_TRANSFER
+    );
     assert_eq!(nonce, 1);
     let (tobal, _, _) = client.get_balance_spv(&to, 1).await.unwrap();
     assert_eq!(tobal, 1_000_000_000);
@@ -427,7 +475,13 @@ async fn token_transfer_tx_shape_and_local_execution() {
         .create_token(owner.address, test_metadata(), 1_000_000)
         .await
         .expect("create token");
-    assert_eq!(client.token_balance(&token_id, &owner.address).await.unwrap(), 1_000_000);
+    assert_eq!(
+        client
+            .token_balance(&token_id, &owner.address)
+            .await
+            .unwrap(),
+        1_000_000
+    );
 
     // Builder shape: SysCallTokenTransfer, zero native amount, gas >= base fee.
     let tx = LightClient::build_token_transfer_tx(
@@ -449,8 +503,20 @@ async fn token_transfer_tx_shape_and_local_execution() {
 
     let (hash, finality) = client.broadcast_tx(&tx).await.expect("token send");
     assert_eq!(finality, TxFinality::Pending);
-    assert_eq!(client.token_balance(&token_id, &owner.address).await.unwrap(), 600_000);
-    assert_eq!(client.token_balance(&token_id, &recipient.address).await.unwrap(), 400_000);
+    assert_eq!(
+        client
+            .token_balance(&token_id, &owner.address)
+            .await
+            .unwrap(),
+        600_000
+    );
+    assert_eq!(
+        client
+            .token_balance(&token_id, &recipient.address)
+            .await
+            .unwrap(),
+        400_000
+    );
     let row = client
         .get_tx_history()
         .into_iter()
@@ -503,7 +569,10 @@ async fn token_approve_then_transfer_from_local() {
         )
         .await
         .expect("allowance must cover TransferFrom");
-    assert_eq!(client.token_balance(&token_id, &third).await.unwrap(), 30_000);
+    assert_eq!(
+        client.token_balance(&token_id, &third).await.unwrap(),
+        30_000
+    );
 }
 
 // ------------------------------------------------------------ confidential
@@ -520,8 +589,14 @@ async fn confidential_tx_conserves_and_stays_simulated_locally() {
     let recipient = addr(52);
     let (hash, finality) = client
         .broadcast_confidential_tx(
-            &sender.signing_key, recipient, transfer, 2_000_000_000, 1_500,
-            blinding.to_bytes(), 0, 1,
+            &sender.signing_key,
+            recipient,
+            transfer,
+            2_000_000_000,
+            1_500,
+            blinding.to_bytes(),
+            0,
+            1,
         )
         .await
         .expect("confidential broadcast");
@@ -550,7 +625,14 @@ async fn confidential_broken_conservation_is_rejected_before_signing() {
     assert!(!forged.verify_balance_conservation());
     assert!(client
         .broadcast_confidential_tx(
-            &sender.signing_key, addr(54), forged, 100, 0, r.to_bytes(), 0, 1,
+            &sender.signing_key,
+            addr(54),
+            forged,
+            100,
+            0,
+            r.to_bytes(),
+            0,
+            1,
         )
         .await
         .is_err());
@@ -633,5 +715,8 @@ async fn token_create_tx_shape_and_local_execution() {
         .token_resolve(&owner.address, "Test Token", "TST")
         .await
         .expect("created token must resolve");
-    assert_eq!(client.token_balance(&found, &owner.address).await.unwrap(), 1_000_000);
+    assert_eq!(
+        client.token_balance(&found, &owner.address).await.unwrap(),
+        1_000_000
+    );
 }

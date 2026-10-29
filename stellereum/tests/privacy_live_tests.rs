@@ -31,14 +31,12 @@ use stellereum::commitment::{
     commitment_digest, commitment_digest_with_confidential, commitment_key,
 };
 use stellereum::crypto_privacy::{
-    confidential_digest, ConfidentialState, ConfidentialTransfer, PedersenCommitment,
-    RangeProof, ZERO_COMMITMENT,
+    confidential_digest, ConfidentialState, ConfidentialTransfer, PedersenCommitment, RangeProof,
+    ZERO_COMMITMENT,
 };
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::svm::{
-    OpCode, Svm, VmContext, VmExecutionResult,
-};
+use stellereum::svm::{OpCode, Svm, VmContext, VmExecutionResult};
 
 mod support;
 use support::{assert_refused_tx_paid_failure_fee, failure_fee};
@@ -166,8 +164,8 @@ fn block(proposer: [u8; 32], height: u64, txs: Vec<Transaction>) -> Block {
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
-            order_merkle_root,
-            epoch_key_commitment: [0u8; 32],
+        order_merkle_root,
+        epoch_key_commitment: [0u8; 32],
     }
 }
 
@@ -185,7 +183,9 @@ const PROPOSER: [u8; 32] = [0xF1; 32];
 async fn funded_engine(seed: u8, balance: u64) -> (InMemoryStateEngine, [u8; 32]) {
     let engine = InMemoryStateEngine::new();
     let addr = sender_of(seed);
-    engine.update_account(AccountState::new(addr, balance)).await;
+    engine
+        .update_account(AccountState::new(addr, balance))
+        .await;
     (engine, addr)
 }
 
@@ -217,7 +217,15 @@ async fn valid_confidential_transfer_applies_on_the_live_block_path() {
     let transfer = balanced_transfer(1_480, 20);
     let input = transfer.input_commitments[0];
     let output = transfer.output_commitments[0];
-    let tx = confidential_tx(&key(0x11), RECIPIENT, transfer.clone(), 1_480 + 20, 1_480, Scalar::from(0x5EED_u64), 0);
+    let tx = confidential_tx(
+        &key(0x11),
+        RECIPIENT,
+        transfer.clone(),
+        1_480 + 20,
+        1_480,
+        Scalar::from(0x5EED_u64),
+        0,
+    );
 
     let out = engine
         .apply_block_transition(&block(sender, 1, vec![tx]), 0)
@@ -241,7 +249,10 @@ async fn valid_confidential_transfer_applies_on_the_live_block_path() {
         ZERO_COMMITMENT.add(&output).unwrap(),
         "the recipient is credited by exactly the output commitment"
     );
-    assert!(state.is_spent(&input.commitment), "the input joins the spent set");
+    assert!(
+        state.is_spent(&input.commitment),
+        "the input joins the spent set"
+    );
     assert_eq!(state.total_fees, 20, "the fee total advances");
     drop(state);
 
@@ -250,7 +261,10 @@ async fn valid_confidential_transfer_applies_on_the_live_block_path() {
     // fold: the trie's commitment leaf must now be the CONFIDENTIAL-aware
     // digest, and must differ from the digest of every other subsystem alone.
     let root_after = engine.get_state_root().await;
-    assert_ne!(root_after, genesis_root, "a shielded transfer must move the root");
+    assert_ne!(
+        root_after, genesis_root,
+        "a shielded transfer must move the root"
+    );
 
     let leaf = committed_digest(&engine).await;
     let shielded = engine.confidential_read().await.clone();
@@ -282,7 +296,15 @@ async fn forged_confidential_transfer_is_rejected_without_moving_state() {
     // Proofs over the FORGED blinding (r=3): individually valid (both values
     // fit 32 bits) — the equation itself must fail, not the proofs.
     let forged = forged_transfer();
-    let tx = confidential_tx(&key(0x22), RECIPIENT, forged, 100, 1000, Scalar::from(3u64), 0);
+    let tx = confidential_tx(
+        &key(0x22),
+        RECIPIENT,
+        forged,
+        100,
+        1000,
+        Scalar::from(3u64),
+        0,
+    );
     let fee = failure_fee(&engine, &tx).await;
     let out = engine
         .apply_block_transition(&block(PROPOSER, 1, vec![tx.clone()]), 0)
@@ -298,7 +320,10 @@ async fn forged_confidential_transfer_is_rejected_without_moving_state() {
     // conservation check refused it), so the sender pays the failure fee -
     // its DECLARED limit on this path - and its nonce is consumed. A free
     // failure is a free DoS and a free replay.
-    assert_eq!(out.fees_collected, fee, "a rejected transaction pays the failure fee");
+    assert_eq!(
+        out.fees_collected, fee,
+        "a rejected transaction pays the failure fee"
+    );
     assert_ne!(fee, 0, "a refusal is never free");
 
     let state = engine.confidential_read().await;
@@ -352,7 +377,15 @@ async fn double_spend_is_rejected_across_blocks() {
     // get its own fee back and the "a refusal is not free" policy would be
     // invisible. Every block here uses a distinct proposer so the fee the
     // sender pays is directly observable in its balance.
-    let first = confidential_tx(&key(0x33), RECIPIENT, balanced_transfer(500, 10), 500 + 10, 500, Scalar::from(0x5EED_u64), 0);
+    let first = confidential_tx(
+        &key(0x33),
+        RECIPIENT,
+        balanced_transfer(500, 10),
+        500 + 10,
+        500,
+        Scalar::from(0x5EED_u64),
+        0,
+    );
     let out1 = engine
         .apply_block_transition(&block(PROPOSER, 1, vec![first]), 0)
         .await;
@@ -368,7 +401,15 @@ async fn double_spend_is_rejected_across_blocks() {
     // Block 2: the SAME transfer, one nonce later. The commitments are
     // deterministic, so this really is the same input commitment being offered
     // again - the nullifier set must catch it.
-    let replay = confidential_tx(&key(0x33), RECIPIENT, balanced_transfer(500, 10), 500 + 10, 500, Scalar::from(0x5EED_u64), 1);
+    let replay = confidential_tx(
+        &key(0x33),
+        RECIPIENT,
+        balanced_transfer(500, 10),
+        500 + 10,
+        500,
+        Scalar::from(0x5EED_u64),
+        1,
+    );
     let fee = failure_fee(&engine, &replay).await;
     let balance_after_block1 = engine.get_account(&sender).await.unwrap().balance;
     let proposer_after_block1 = engine.get_account(&PROPOSER).await.unwrap().balance;
@@ -427,7 +468,15 @@ async fn holding_a_transaction_without_a_block_does_not_move_the_root() {
 
     // Signed, verified, sitting in hand - and nothing about it has touched
     // consensus state. A transaction is a claim, not an effect.
-    let tx = confidential_tx(&key(0x44), RECIPIENT, balanced_transfer(900, 5), 900 + 5, 900, Scalar::from(0x5EED_u64), 0);
+    let tx = confidential_tx(
+        &key(0x44),
+        RECIPIENT,
+        balanced_transfer(900, 5),
+        900 + 5,
+        900,
+        Scalar::from(0x5EED_u64),
+        0,
+    );
     assert!(tx.verify_signature(), "the held transaction is valid");
 
     assert_eq!(
@@ -467,15 +516,19 @@ async fn two_nodes_applying_the_same_payload_reach_the_same_root() {
 
     // Deterministic signing + deterministic commitments: building the block
     // twice yields the same bytes, exactly like two nodes gossiping one block.
-    let block_a = block(sender, 1, vec![confidential_tx(
-        &key(0x55),
-        RECIPIENT,
-        balanced_transfer(1_234, 56),
-        1_234 + 56,
-        1_234,
-        Scalar::from(0x5EED_u64),
-        0,
-    )]);
+    let block_a = block(
+        sender,
+        1,
+        vec![confidential_tx(
+            &key(0x55),
+            RECIPIENT,
+            balanced_transfer(1_234, 56),
+            1_234 + 56,
+            1_234,
+            Scalar::from(0x5EED_u64),
+            0,
+        )],
+    );
     let block_b = block_a.clone();
 
     let out_a = node_a.apply_block_transition(&block_a, 0).await;
@@ -500,7 +553,10 @@ async fn two_nodes_applying_the_same_payload_reach_the_same_root() {
         let s = node_b.confidential_read().await.clone();
         confidential_digest(&s)
     };
-    assert_eq!(shielded_a, shielded_b, "same payload => same shielded digest");
+    assert_eq!(
+        shielded_a, shielded_b,
+        "same payload => same shielded digest"
+    );
     assert_eq!(
         committed_digest(&node_a).await,
         committed_digest(&node_b).await,
@@ -531,7 +587,15 @@ async fn the_committed_digest_folds_the_shielded_domain_conditionally() {
 
     // ...and the moment it is used, the leaf becomes the confidential-aware
     // digest - the fold point is live, not merely present in the source.
-    let tx = confidential_tx(&key(0x66), RECIPIENT, balanced_transfer(1, 1), 1 + 1, 1, Scalar::from(0x5EED_u64), 0);
+    let tx = confidential_tx(
+        &key(0x66),
+        RECIPIENT,
+        balanced_transfer(1, 1),
+        1 + 1,
+        1,
+        Scalar::from(0x5EED_u64),
+        0,
+    );
     let out = engine
         .apply_block_transition(&block(sender, 1, vec![tx]), 0)
         .await;
@@ -587,10 +651,9 @@ fn direct_svm_execution_without_a_ledger_reverts() {
     // V1 is DISABLED (audit 2026-10-06 F-A): fail closed with the migration
     // pointer, ledger or not.
     match Svm::execute(&ops, 1_000_000, &mut ctx) {
-        VmExecutionResult::Reverted(msg) => assert!(
-            msg.contains("disabled"),
-            "unexpected revert reason: {msg}"
-        ),
+        VmExecutionResult::Reverted(msg) => {
+            assert!(msg.contains("disabled"), "unexpected revert reason: {msg}")
+        }
         other => panic!("expected a revert, got {other:?}"),
     }
 
@@ -622,7 +685,15 @@ async fn single_tx_path_and_block_path_agree_on_the_shielded_ledger() {
     // per build, so two builds are different txs with different hashes —
     // identical INPUTS is the premise being pinned, not identical builds).
     let transfer = balanced_transfer(777, 33);
-    let tx = confidential_tx(&key(0x88), RECIPIENT, transfer, 777 + 33, 777, Scalar::from(0x5EED_u64), 0);
+    let tx = confidential_tx(
+        &key(0x88),
+        RECIPIENT,
+        transfer,
+        777 + 33,
+        777,
+        Scalar::from(0x5EED_u64),
+        0,
+    );
 
     let single = InMemoryStateEngine::new();
     let live = InMemoryStateEngine::new();
@@ -683,12 +754,23 @@ fn unshield_tx(sk: &SigningKey, openings: Vec<(u64, Scalar)>, nonce: u64) -> Tra
         .iter()
         .map(|(amount, b)| {
             let c = PedersenCommitment::commit(*amount, b);
-            UnshieldInput { commitment: c.commitment, amount: *amount, blinding: b.to_bytes() }
+            UnshieldInput {
+                commitment: c.commitment,
+                amount: *amount,
+                blinding: b.to_bytes(),
+            }
         })
         .collect();
-    Transaction::sign_with_payload(sk, [0xEE; 32], 0, 50_000, nonce, 1, 1, vec![
-        OpCode::SysCallConfidentialUnshield { inputs },
-    ])
+    Transaction::sign_with_payload(
+        sk,
+        [0xEE; 32],
+        0,
+        50_000,
+        nonce,
+        1,
+        1,
+        vec![OpCode::SysCallConfidentialUnshield { inputs }],
+    )
 }
 
 #[tokio::test]
@@ -699,7 +781,10 @@ async fn enforced_loop_shield_transfer_unshield_moves_native_both_ways() {
 
     // 1. Shield 100k native -> owned commitment. Escrow credited.
     let out = engine
-        .apply_block_transition(&block(sender, 1, vec![shield_tx(&key(0x71), 100_000, r, 0)]), 0)
+        .apply_block_transition(
+            &block(sender, 1, vec![shield_tx(&key(0x71), 100_000, r, 0)]),
+            0,
+        )
         .await;
     assert_eq!((out.applied, out.failed), (1, 0), "{out:?}");
     assert_eq!(
@@ -707,7 +792,10 @@ async fn enforced_loop_shield_transfer_unshield_moves_native_both_ways() {
         Some(&sender),
         "shield records ownership to the sender"
     );
-    let escrow = engine.get_account(&stellereum::crypto_privacy::SHIELD_ESCROW).await.unwrap();
+    let escrow = engine
+        .get_account(&stellereum::crypto_privacy::SHIELD_ESCROW)
+        .await
+        .unwrap();
     assert_eq!(escrow.balance, 100_000, "escrow backs the shielded coin");
 
     // 2. Transfer the shielded coin to RECIPIENT (fresh outputs, proven).
@@ -732,18 +820,30 @@ async fn enforced_loop_shield_transfer_unshield_moves_native_both_ways() {
             output_ranges: or_,
         }],
     );
-    let out = engine.apply_block_transition(&block(sender, 2, vec![ttx]), 0).await;
+    let out = engine
+        .apply_block_transition(&block(sender, 2, vec![ttx]), 0)
+        .await;
     assert_eq!((out.applied, out.failed), (1, 0), "{out:?}");
     assert_eq!(
-        engine.confidential_read().await.owned.get(&c_out.commitment),
+        engine
+            .confidential_read()
+            .await
+            .owned
+            .get(&c_out.commitment),
         Some(&RECIPIENT),
         "output owned by the recipient"
     );
 
     // 3. Unshield is impossible for the sender now (it owns nothing).
     let bad = unshield_tx(&key(0x71), vec![(99_900, r)], 2);
-    let out = engine.apply_block_transition(&block(sender, 3, vec![bad]), 0).await;
-    assert_eq!((out.applied, out.failed), (0, 1), "sender owns nothing: {out:?}");
+    let out = engine
+        .apply_block_transition(&block(sender, 3, vec![bad]), 0)
+        .await;
+    assert_eq!(
+        (out.applied, out.failed),
+        (0, 1),
+        "sender owns nothing: {out:?}"
+    );
 }
 
 #[tokio::test]
@@ -778,8 +878,14 @@ async fn shield_rejects_wrong_opening_and_unshield_rejects_strangers() {
     // proposer the fee the sender pays is directly observable.
     let lie_fee = failure_fee(&engine, &lie).await;
     let before_lie = engine.get_account(&sender).await.unwrap().balance;
-    let out = engine.apply_block_transition(&block(PROPOSER, 1, vec![lie.clone()]), 0).await;
-    assert_eq!((out.applied, out.failed), (0, 1), "opening must match: {out:?}");
+    let out = engine
+        .apply_block_transition(&block(PROPOSER, 1, vec![lie.clone()]), 0)
+        .await;
+    assert_eq!(
+        (out.applied, out.failed),
+        (0, 1),
+        "opening must match: {out:?}"
+    );
     assert_refused_tx_paid_failure_fee(&engine, &lie, lie_fee, before_lie, 0).await;
     assert_eq!(
         engine.get_account(&PROPOSER).await.unwrap().balance,
@@ -789,25 +895,31 @@ async fn shield_rejects_wrong_opening_and_unshield_rejects_strangers() {
 
     // Honest shield, then a STRANGER tries to unshield it by naming it.
     let ok = shield_tx(&key(0x72), 5_000, r, 1);
-    let out = engine.apply_block_transition(&block(PROPOSER, 1, vec![ok]), 0).await;
+    let out = engine
+        .apply_block_transition(&block(PROPOSER, 1, vec![ok]), 0)
+        .await;
     assert_eq!((out.applied, out.failed), (1, 0), "{out:?}");
     let stranger = unshield_tx(&key(0x73), vec![(5_000, r)], 0);
     // Fund the stranger natively so admission passes and the PAYLOAD refuses.
-    engine.update_account(stellereum::state_engine::AccountState::new(sender_of(0x73), 1_000_000)).await;
+    engine
+        .update_account(stellereum::state_engine::AccountState::new(
+            sender_of(0x73),
+            1_000_000,
+        ))
+        .await;
     let stranger_fee = failure_fee(&engine, &stranger).await;
     let before_stranger = engine.get_account(&sender_of(0x73)).await.unwrap().balance;
-    let out = engine.apply_block_transition(&block(PROPOSER, 2, vec![stranger.clone()]), 0).await;
-    assert_eq!((out.applied, out.failed), (0, 1), "stranger cannot exit another's coin: {out:?}");
+    let out = engine
+        .apply_block_transition(&block(PROPOSER, 2, vec![stranger.clone()]), 0)
+        .await;
+    assert_eq!(
+        (out.applied, out.failed),
+        (0, 1),
+        "stranger cannot exit another's coin: {out:?}"
+    );
     // The stranger's refusal is not free either - it pays its failure fee and
     // burns its nonce, and takes nothing of the shielded coin.
-    assert_refused_tx_paid_failure_fee(
-        &engine,
-        &stranger,
-        stranger_fee,
-        before_stranger,
-        0,
-    )
-    .await;
+    assert_refused_tx_paid_failure_fee(&engine, &stranger, stranger_fee, before_stranger, 0).await;
     assert_eq!(
         engine.get_account(&sender_of(0x73)).await.unwrap().balance,
         before_stranger - stranger_fee,
@@ -823,16 +935,27 @@ async fn unshield_releases_exact_native_and_drains_escrow() {
 
     // Shield 50k.
     let out = engine
-        .apply_block_transition(&block(sender, 1, vec![shield_tx(&key(0x74), 50_000, r, 0)]), 0)
+        .apply_block_transition(
+            &block(sender, 1, vec![shield_tx(&key(0x74), 50_000, r, 0)]),
+            0,
+        )
         .await;
     assert_eq!((out.applied, out.failed), (1, 0), "{out:?}");
 
     // Exit the same coin: exact native back, escrow drained.
     let exit = unshield_tx(&key(0x74), vec![(50_000, r)], 1);
-    let out = engine.apply_block_transition(&block(sender, 2, vec![exit]), 0).await;
+    let out = engine
+        .apply_block_transition(&block(sender, 2, vec![exit]), 0)
+        .await;
     assert_eq!((out.applied, out.failed), (1, 0), "{out:?}");
-    let escrow = engine.get_account(&stellereum::crypto_privacy::SHIELD_ESCROW).await.unwrap();
-    assert_eq!(escrow.balance, 0, "every shielded coin exited: escrow empty");
+    let escrow = engine
+        .get_account(&stellereum::crypto_privacy::SHIELD_ESCROW)
+        .await
+        .unwrap();
+    assert_eq!(
+        escrow.balance, 0,
+        "every shielded coin exited: escrow empty"
+    );
     let after = engine.get_account(&sender).await.unwrap().balance;
     // Exact round-trip: -50k shield +50k exit -100k gas +100k proposer reward
     // (the test proposer IS the sender, so fees come back). No creation, no
@@ -841,8 +964,14 @@ async fn unshield_releases_exact_native_and_drains_escrow() {
 
     // The coin is spent: exiting again fails.
     let again = unshield_tx(&key(0x74), vec![(50_000, r)], 2);
-    let out = engine.apply_block_transition(&block(sender, 3, vec![again]), 0).await;
-    assert_eq!((out.applied, out.failed), (0, 1), "double-exit refused: {out:?}");
+    let out = engine
+        .apply_block_transition(&block(sender, 3, vec![again]), 0)
+        .await;
+    assert_eq!(
+        (out.applied, out.failed),
+        (0, 1),
+        "double-exit refused: {out:?}"
+    );
 }
 
 #[tokio::test]
@@ -858,7 +987,10 @@ async fn engine_restore_upgrades_v1_confidential_snapshot() {
     };
     let bytes = bincode::serialize(&v1).expect("v1 serializes");
     let engine = InMemoryStateEngine::new();
-    engine.restore_confidential(&bytes).await.expect("upgrade restore");
+    engine
+        .restore_confidential(&bytes)
+        .await
+        .expect("upgrade restore");
     let state = engine.confidential_read().await;
     assert!(state.owned.is_empty());
     assert_eq!(state.total_fees, 0);
@@ -871,14 +1003,31 @@ async fn unshield_rejects_duplicate_inputs_without_paying_double() {
     let (engine, sender) = funded_engine(0x75, 10_000_000).await;
     let r = Scalar::from(0xD9u64);
     let out = engine
-        .apply_block_transition(&block(sender, 1, vec![shield_tx(&key(0x75), 50_000, r, 0)]), 0)
+        .apply_block_transition(
+            &block(sender, 1, vec![shield_tx(&key(0x75), 50_000, r, 0)]),
+            0,
+        )
         .await;
     assert_eq!((out.applied, out.failed), (1, 0), "{out:?}");
-    let esc_before = engine.get_account(&stellereum::crypto_privacy::SHIELD_ESCROW).await.unwrap().balance;
+    let esc_before = engine
+        .get_account(&stellereum::crypto_privacy::SHIELD_ESCROW)
+        .await
+        .unwrap()
+        .balance;
     let dbl = unshield_tx(&key(0x75), vec![(50_000, r), (50_000, r)], 1);
-    let out = engine.apply_block_transition(&block(sender, 2, vec![dbl]), 0).await;
-    assert_eq!((out.applied, out.failed), (0, 1), "duplicate inputs must revert: {out:?}");
-    let esc_after = engine.get_account(&stellereum::crypto_privacy::SHIELD_ESCROW).await.unwrap().balance;
+    let out = engine
+        .apply_block_transition(&block(sender, 2, vec![dbl]), 0)
+        .await;
+    assert_eq!(
+        (out.applied, out.failed),
+        (0, 1),
+        "duplicate inputs must revert: {out:?}"
+    );
+    let esc_after = engine
+        .get_account(&stellereum::crypto_privacy::SHIELD_ESCROW)
+        .await
+        .unwrap()
+        .balance;
     assert_eq!(esc_after, esc_before, "no double-pay from escrow");
 }
 
@@ -888,12 +1037,20 @@ async fn reshield_live_commitment_is_refused() {
     let (engine, sender) = funded_engine(0x76, 10_000_000).await;
     let r = Scalar::from(0xBE5_u64);
     let ok = shield_tx(&key(0x76), 50_000, r, 0);
-    let out = engine.apply_block_transition(&block(sender, 1, vec![ok]), 0).await;
+    let out = engine
+        .apply_block_transition(&block(sender, 1, vec![ok]), 0)
+        .await;
     assert_eq!((out.applied, out.failed), (1, 0), "{out:?}");
     // Same opening again: already shielded, not a second coin.
     let dup = shield_tx(&key(0x76), 50_000, r, 1);
-    let out = engine.apply_block_transition(&block(sender, 2, vec![dup]), 0).await;
-    assert_eq!((out.applied, out.failed), (0, 1), "re-shield must revert: {out:?}");
+    let out = engine
+        .apply_block_transition(&block(sender, 2, vec![dup]), 0)
+        .await;
+    assert_eq!(
+        (out.applied, out.failed),
+        (0, 1),
+        "re-shield must revert: {out:?}"
+    );
 }
 
 #[tokio::test]
@@ -906,7 +1063,9 @@ async fn transfer2_to_protocol_account_is_refused() {
     let c_out = PedersenCommitment::commit(777, &r);
     // Fund first via shield so only the recipient rule fires.
     let s = shield_tx(&key(0x77), 810, r, 0);
-    let out = engine.apply_block_transition(&block(sender, 1, vec![s]), 0).await;
+    let out = engine
+        .apply_block_transition(&block(sender, 1, vec![s]), 0)
+        .await;
     assert_eq!((out.applied, out.failed), (1, 0), "{out:?}");
     let t = stellereum::crypto_privacy::ConfidentialTransfer::new(vec![c_in], vec![c_out], 33);
     let ir = vec![RangeProof::prove(&c_in, 810, &r, 64)];
@@ -926,6 +1085,12 @@ async fn transfer2_to_protocol_account_is_refused() {
             output_ranges: or_,
         }],
     );
-    let out = engine.apply_block_transition(&block(sender, 2, vec![tx]), 0).await;
-    assert_eq!((out.applied, out.failed), (0, 1), "vault recipient must revert: {out:?}");
+    let out = engine
+        .apply_block_transition(&block(sender, 2, vec![tx]), 0)
+        .await;
+    assert_eq!(
+        (out.applied, out.failed),
+        (0, 1),
+        "vault recipient must revert: {out:?}"
+    );
 }

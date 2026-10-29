@@ -26,8 +26,8 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
-use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STAKING_POOL, STELL_MIN_BOND_BUFFER};
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
 use stellereum::token::TokenMetadata;
 
@@ -73,21 +73,39 @@ async fn free_validator_bond_from_a_rejected_transaction() {
         [0x99u8; 32],
         100,
         2_000,
-        vec![OpCode::SysCallStake { validator, amount: MIN_VALIDATOR_BOND }],
+        vec![OpCode::SysCallStake {
+            validator,
+            amount: MIN_VALIDATOR_BOND,
+        }],
     );
     let res = engine.apply_transaction(&t, 0).await;
     println!("apply_transaction -> {res:?}");
 
     let l = engine.staking_read().await;
-    let bonded = l.validators.get(&validator).map(|v| v.self_bond).unwrap_or(0);
+    let bonded = l
+        .validators
+        .get(&validator)
+        .map(|v| v.self_bond)
+        .unwrap_or(0);
     let in_set = l.to_validator_set().validators.contains_key(&validator);
     let power = l.to_validator_set().power_of(&validator);
     drop(l);
     let attacker_bal = engine.get_account(&attacker_addr).await.unwrap().balance;
-    let pool = engine.get_account(&STAKING_POOL).await.map(|a| a.balance).unwrap_or(0);
-    let recipient = engine.get_account(&[0x99u8; 32]).await.map(|a| a.balance).unwrap_or(0);
+    let pool = engine
+        .get_account(&STAKING_POOL)
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0);
+    let recipient = engine
+        .get_account(&[0x99u8; 32])
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0);
 
-    println!("rejected tx, yet: bonded = {bonded} ({} STELL)", bonded / 1_000_000_000);
+    println!(
+        "rejected tx, yet: bonded = {bonded} ({} STELL)",
+        bonded / 1_000_000_000
+    );
     println!("in validator set = {in_set}, voting power = {power}");
     println!("attacker balance {balance} -> {attacker_bal} (unchanged: it cost nothing)");
     println!("staking pool balance = {pool}");
@@ -149,8 +167,15 @@ async fn rejected_transaction_still_commits_a_token_mint() {
         9_000,
         300_000,
         vec![
-            OpCode::SysCallTokenMint { token_id: token, to: victim_addr, amount: 1_000_000_000 },
-            OpCode::Transfer { recipient: [0x55u8; 32], amount: 20_000 },
+            OpCode::SysCallTokenMint {
+                token_id: token,
+                to: victim_addr,
+                amount: 1_000_000_000,
+            },
+            OpCode::Transfer {
+                recipient: [0x55u8; 32],
+                amount: 20_000,
+            },
         ],
     );
     let res = engine.apply_transaction(&t, 0).await;
@@ -158,10 +183,15 @@ async fn rejected_transaction_still_commits_a_token_mint() {
     let supply1 = engine.token_total_supply(&token).await;
     let victim_tok = engine.token_balance(&token, &victim_addr).await;
     let minter_bal = engine.get_account(&minter_addr).await.unwrap().balance;
-    println!("supply {supply0:?} -> {supply1:?}; victim got {victim_tok}; minter balance {minter_bal}");
+    println!(
+        "supply {supply0:?} -> {supply1:?}; victim got {victim_tok}; minter balance {minter_bal}"
+    );
 
     assert!(res.is_err(), "the transaction is rejected");
-    assert_eq!(victim_tok, 0, "FIXED: no tokens minted by a rejected transaction");
+    assert_eq!(
+        victim_tok, 0,
+        "FIXED: no tokens minted by a rejected transaction"
+    );
     assert_eq!(supply1, supply0, "supply unchanged");
     // The failure fee is charged (the declared gas limit, 300k): the MINT
     // itself moved nothing.
@@ -181,14 +211,20 @@ async fn rejected_payout_still_debits_the_sender_and_burns_the_nonce() {
 
     // A validator bond small enough that the pool cannot cover the reward.
     engine
-        .update_account(AccountState::new(validator_addr, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER + 20_000))
+        .update_account(AccountState::new(
+            validator_addr,
+            MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER + 20_000,
+        ))
         .await;
     let b = tx_of(
         &validator,
         validator_addr,
         0,
         20_000,
-        vec![OpCode::SysCallStake { validator: validator_addr, amount: MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER }],
+        vec![OpCode::SysCallStake {
+            validator: validator_addr,
+            amount: MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER,
+        }],
     );
     engine.apply_transaction(&b, 0).await.unwrap();
     {
@@ -209,12 +245,17 @@ async fn rejected_payout_still_debits_the_sender_and_burns_the_nonce() {
         // this reaches the payout stage the atomicity property is about. Using
         // someone else's id no longer gets that far: the opcode rejects it
         // outright, which is the reward-theft fix.
-        vec![OpCode::SysCallClaimRewards { validator: attacker_addr }],
+        vec![OpCode::SysCallClaimRewards {
+            validator: attacker_addr,
+        }],
     );
     let res = engine.apply_transaction(&t, 0).await;
     let acc = engine.get_account(&attacker_addr).await.unwrap();
     println!("apply_transaction -> {res:?}");
-    println!("attacker: balance {} -> {}, nonce {}", start, acc.balance, acc.nonce);
+    println!(
+        "attacker: balance {} -> {}, nonce {}",
+        start, acc.balance, acc.nonce
+    );
     println!(
         "validator pending_rewards now {} (was 5000000000000)",
         engine.staking_read().await.validators[&validator_addr].pending_rewards

@@ -187,7 +187,15 @@ impl OrderbookActor {
         amount: u64,
         timestamp: u64,
     ) -> (Order, Vec<TradeExecution>) {
-        self.submit_order_bounded(trader, side, order_type, price, amount, timestamp, usize::MAX)
+        self.submit_order_bounded(
+            trader,
+            side,
+            order_type,
+            price,
+            amount,
+            timestamp,
+            usize::MAX,
+        )
     }
 
     /// Like `submit_order_ext`, but caps how many price levels one order may
@@ -294,10 +302,7 @@ impl OrderbookActor {
                     let can_rest = self.bids.contains_key(&std::cmp::Reverse(price))
                         || self.bids.len() < self.max_depth;
                     if can_rest {
-                        let level = self
-                            .bids
-                            .entry(std::cmp::Reverse(price))
-                            .or_default();
+                        let level = self.bids.entry(std::cmp::Reverse(price)).or_default();
                         Self::insert_time_priority(level, &order);
                     }
                 }

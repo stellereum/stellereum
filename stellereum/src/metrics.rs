@@ -170,11 +170,13 @@ pub const DEFAULT_BLOCK_INTERVAL_BUCKETS: &[f64] =
     &[0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 60.0];
 
 /// Same-clock round-trip (ms) through to a five-second outlier.
-pub const DEFAULT_PEER_LATENCY_BUCKETS: &[f64] =
-    &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
+pub const DEFAULT_PEER_LATENCY_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
 
 /// Empty block through a very large one.
-pub const DEFAULT_BLOCK_TXS_BUCKETS: &[f64] = &[0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
+pub const DEFAULT_BLOCK_TXS_BUCKETS: &[f64] =
+    &[0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
 
 // ============================================================================
 // Internal model
@@ -222,7 +224,11 @@ enum Value {
     /// far inside the range where `f64` is exact, so nothing is lost.
     Scalar(f64),
     /// Per-bucket (NOT cumulative) counts, plus the running total and sum.
-    Histogram { counts: Vec<u64>, sum: f64, count: u64 },
+    Histogram {
+        counts: Vec<u64>,
+        sum: f64,
+        count: u64,
+    },
 }
 
 impl Value {
@@ -231,7 +237,11 @@ impl Value {
     }
 
     fn histogram(bucket_count: usize) -> Self {
-        Self::Histogram { counts: vec![0; bucket_count], sum: 0.0, count: 0 }
+        Self::Histogram {
+            counts: vec![0; bucket_count],
+            sum: 0.0,
+            count: 0,
+        }
     }
 
     /// Fold one observation (or `n` units of a counter) into this sample.
@@ -267,14 +277,26 @@ impl Value {
                     let mut with_le = labels.to_vec();
                     with_le.push((LABEL_LE.to_string(), fmt_f64(def.buckets[i])));
                     sort_labels(&mut with_le);
-                    let _ = writeln!(out, "{}_bucket{} {}", def.name, render_labels(&with_le), cumulative);
+                    let _ = writeln!(
+                        out,
+                        "{}_bucket{} {}",
+                        def.name,
+                        render_labels(&with_le),
+                        cumulative
+                    );
                 }
                 // The `+Inf` bucket is required by the format and is by
                 // definition the total number of observations.
                 let mut with_inf = labels.to_vec();
                 with_inf.push((LABEL_LE.to_string(), "+Inf".to_string()));
                 sort_labels(&mut with_inf);
-                let _ = writeln!(out, "{}_bucket{} {}", def.name, render_labels(&with_inf), count);
+                let _ = writeln!(
+                    out,
+                    "{}_bucket{} {}",
+                    def.name,
+                    render_labels(&with_inf),
+                    count
+                );
                 let suffix = labels_suffix(labels);
                 let _ = writeln!(out, "{}_sum{} {}", def.name, suffix, fmt_f64(*sum));
                 let _ = writeln!(out, "{}_count{} {}", def.name, suffix, count);
@@ -656,7 +678,10 @@ impl Registry {
             );
         }
 
-        let reg = Self { defs, series: Mutex::new(BTreeMap::new()) };
+        let reg = Self {
+            defs,
+            series: Mutex::new(BTreeMap::new()),
+        };
 
         // Pre-seed every series whose label set is known up front, so the first
         // scrape already describes the whole node. Pre-seeding both vote kinds
@@ -668,13 +693,37 @@ impl Registry {
         // discovered at runtime, and inventing a placeholder peer would put a
         // series in the scrape that no peer can ever match. The family still
         // declares itself (see `render`).
-        for name in [CONSENSUS_ROUND, CONSENSUS_HEIGHT, BLOCK_INTERVAL_SECONDS, FORK_TOTAL, DIVERGENCE_TOTAL, WEAK_QC_REFUSED_TOTAL, MEMPOOL_SIZE, BLOCK_TXS, STATE_ROOT_COMMITS_TOTAL, VALIDATOR_SET_SIZE, VALIDATOR_POWER_TOTAL, VALIDATOR_QUORUM_POWER, VALIDATOR_SET_FRAGILE, DATA_DIR_BYTES, SNAPSHOT_COUNT, STATE_ENTRIES, PERSIST_QUEUE_DEPTH, PERSIST_QUEUE_DROPPED_TOTAL, UNBOUND_TX_TOTAL] {
+        for name in [
+            CONSENSUS_ROUND,
+            CONSENSUS_HEIGHT,
+            BLOCK_INTERVAL_SECONDS,
+            FORK_TOTAL,
+            DIVERGENCE_TOTAL,
+            WEAK_QC_REFUSED_TOTAL,
+            MEMPOOL_SIZE,
+            BLOCK_TXS,
+            STATE_ROOT_COMMITS_TOTAL,
+            VALIDATOR_SET_SIZE,
+            VALIDATOR_POWER_TOTAL,
+            VALIDATOR_QUORUM_POWER,
+            VALIDATOR_SET_FRAGILE,
+            DATA_DIR_BYTES,
+            SNAPSHOT_COUNT,
+            STATE_ENTRIES,
+            PERSIST_QUEUE_DEPTH,
+            PERSIST_QUEUE_DROPPED_TOTAL,
+            UNBOUND_TX_TOTAL,
+        ] {
             reg.seed(name, &[]);
         }
         // Build identity is a singleton series: exactly one sample whose labels
         // carry the version. Seeded here from compile-time values; the gateway
         // re-sets it with runtime-resolved values (git fallback) on each scrape.
-        reg.set_build_info(BUILD_VERSION, build_hash_compile_time(), build_dirty_compile_time());
+        reg.set_build_info(
+            BUILD_VERSION,
+            build_hash_compile_time(),
+            build_dirty_compile_time(),
+        );
         for kind in [VoteKind::Prevote, VoteKind::Precommit] {
             reg.seed(CONSENSUS_VOTES_TOTAL, &[(LABEL_KIND, kind.as_str())]);
         }
@@ -693,7 +742,10 @@ impl Registry {
     /// wrong metric — which would be invisible in the code and obvious in a
     /// dashboard, in that order of how long it takes to notice.
     fn idx(&self, name: &str) -> usize {
-        self.defs.iter().position(|d| d.name == name).expect("unknown metric family")
+        self.defs
+            .iter()
+            .position(|d| d.name == name)
+            .expect("unknown metric family")
     }
 
     fn seed(&self, name: &str, labels: &[(&str, &str)]) {
@@ -733,7 +785,9 @@ impl Registry {
         let key = (idx, normalize_labels(labels));
         let mut series = self.lock();
         match series.entry(key) {
-            std::collections::btree_map::Entry::Occupied(mut slot) => *slot.get_mut() = Value::Scalar(v),
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                *slot.get_mut() = Value::Scalar(v)
+            }
             std::collections::btree_map::Entry::Vacant(slot) => {
                 slot.insert(Value::Scalar(v));
             }
@@ -745,7 +799,11 @@ impl Registry {
         let idx = self.idx(name);
         let def = &self.defs[idx];
         debug_assert_eq!(labels.len(), def.labels.len(), "{name}: wrong label arity");
-        debug_assert_ne!(def.kind, MetricKind::Gauge, "{name} is a gauge: use an assignment, not a sum");
+        debug_assert_ne!(
+            def.kind,
+            MetricKind::Gauge,
+            "{name} is a gauge: use an assignment, not a sum"
+        );
         let key = (idx, normalize_labels(labels));
         let mut series = self.lock();
         let slot = series.entry(key).or_insert_with(|| match def.kind {
@@ -794,7 +852,13 @@ impl Registry {
     }
 
     /// Whole validator-set story in one call (size, power, quorum, fragile).
-    pub fn set_validator_set_full(&self, size: u64, total_power: u64, quorum_power: u64, fragile: bool) {
+    pub fn set_validator_set_full(
+        &self,
+        size: u64,
+        total_power: u64,
+        quorum_power: u64,
+        fragile: bool,
+    ) {
         self.set_validator_set_size(size);
         self.set_validator_power_total(total_power);
         self.set_validator_quorum_power(quorum_power);
@@ -835,7 +899,11 @@ impl Registry {
 
     /// `n` votes of `kind`.
     pub fn add_votes(&self, kind: VoteKind, n: u64) {
-        self.add(CONSENSUS_VOTES_TOTAL, &[(LABEL_KIND, kind.as_str())], n as f64);
+        self.add(
+            CONSENSUS_VOTES_TOTAL,
+            &[(LABEL_KIND, kind.as_str())],
+            n as f64,
+        );
     }
 
     /// The sealed/plain split of the mempool.
@@ -979,7 +1047,11 @@ impl Registry {
     /// fallback) never leaves two `stell_build_info` samples behind.
     pub fn set_build_info(&self, version: &str, hash: &str, dirty: &str) {
         let idx = self.idx(BUILD_INFO);
-        let labels = normalize_labels(&[(LABEL_VERSION, version), (LABEL_HASH, hash), (LABEL_DIRTY, dirty)]);
+        let labels = normalize_labels(&[
+            (LABEL_VERSION, version),
+            (LABEL_HASH, hash),
+            (LABEL_DIRTY, dirty),
+        ]);
         let mut series = self.lock();
         series.retain(|(i, _), _| *i != idx);
         series.insert((idx, labels), Value::Scalar(1.0));
@@ -1010,7 +1082,9 @@ impl Registry {
                 if sample_idx != idx {
                     break;
                 }
-                let Some(((_, labels), value)) = it.next() else { break };
+                let Some(((_, labels), value)) = it.next() else {
+                    break;
+                };
                 value.render(def, labels, &mut out);
             }
         }
@@ -1160,7 +1234,11 @@ pub fn build_hash_resolved() -> String {
                 build_hash_compile_time().to_string()
             } else if let Ok(env_hash) = std::env::var("STELL_BUILD_HASH") {
                 let trimmed = env_hash.trim().to_string();
-                if trimmed.is_empty() { "unknown".to_string() } else { trimmed }
+                if trimmed.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    trimmed
+                }
             } else {
                 std::process::Command::new("git")
                     .args(["rev-parse", "--short", "HEAD"])
@@ -1172,7 +1250,12 @@ pub fn build_hash_resolved() -> String {
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "unknown".to_string())
             };
-            tracing::info!("[build] version={} hash={} dirty={}", BUILD_VERSION, hash, build_dirty_resolved());
+            tracing::info!(
+                "[build] version={} hash={} dirty={}",
+                BUILD_VERSION,
+                hash,
+                build_dirty_resolved()
+            );
             hash
         })
         .clone()
@@ -1302,8 +1385,17 @@ impl SizeRotatingWriter {
             }
         }
         let written = std::fs::metadata(&base).map(|m| m.len()).unwrap_or(0);
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(&base)?;
-        Ok(Self { base, max_bytes, max_files, file, written })
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&base)?;
+        Ok(Self {
+            base,
+            max_bytes,
+            max_files,
+            file,
+            written,
+        })
     }
 
     /// Open with env-tuned thresholds (`STELL_LOG_MAX_BYTES`,
@@ -1360,7 +1452,10 @@ impl SizeRotatingWriter {
         if self.base.exists() {
             std::fs::rename(&self.base, self.rotated_path(1))?;
         }
-        self.file = std::fs::OpenOptions::new().create(true).append(true).open(&self.base)?;
+        self.file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.base)?;
         self.written = 0;
         Ok(())
     }
@@ -1430,22 +1525,34 @@ impl RotatingLog {
         max_bytes: u64,
         max_files: usize,
     ) -> std::io::Result<Self> {
-        Ok(Self { inner: Arc::new(Mutex::new(SizeRotatingWriter::new(base, max_bytes, max_files)?)) })
+        Ok(Self {
+            inner: Arc::new(Mutex::new(SizeRotatingWriter::new(
+                base, max_bytes, max_files,
+            )?)),
+        })
     }
 
     /// Env-tuned constructor; see [`SizeRotatingWriter::from_env`].
     pub fn from_env(base: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
-        Ok(Self { inner: Arc::new(Mutex::new(SizeRotatingWriter::from_env(base)?)) })
+        Ok(Self {
+            inner: Arc::new(Mutex::new(SizeRotatingWriter::from_env(base)?)),
+        })
     }
 
     /// Append one whole line (never split across a rotation).
     pub fn write_line(&self, line: &str) -> std::io::Result<()> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).write_line(line)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write_line(line)
     }
 
     /// Rotate on demand.
     pub fn rotate(&self) -> std::io::Result<()> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).rotate()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rotate()
     }
 }
 
@@ -1466,9 +1573,16 @@ mod tests {
 
     #[test]
     fn buckets_are_sorted_and_finite() {
-        for set in [DEFAULT_BLOCK_INTERVAL_BUCKETS, DEFAULT_PEER_LATENCY_BUCKETS, DEFAULT_BLOCK_TXS_BUCKETS] {
+        for set in [
+            DEFAULT_BLOCK_INTERVAL_BUCKETS,
+            DEFAULT_PEER_LATENCY_BUCKETS,
+            DEFAULT_BLOCK_TXS_BUCKETS,
+        ] {
             assert!(!set.is_empty());
-            assert!(set.windows(2).all(|w| w[0] < w[1]), "bucket bounds must strictly ascend");
+            assert!(
+                set.windows(2).all(|w| w[0] < w[1]),
+                "bucket bounds must strictly ascend"
+            );
             assert!(set.iter().all(|b| b.is_finite() && *b >= 0.0));
         }
     }
@@ -1504,7 +1618,8 @@ mod tests {
         assert!(r.snapshot().to_json().contains("\"divergences\":2"));
         let text = r.render();
         assert!(
-            text.lines().any(|l| l.starts_with("stell_divergence_total ")),
+            text.lines()
+                .any(|l| l.starts_with("stell_divergence_total ")),
             "stell_divergence_total must be scraped:\n{text}"
         );
     }

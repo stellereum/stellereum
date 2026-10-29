@@ -93,24 +93,34 @@ pub extern "C" fn init(owner_id: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn get_owner(_arg: i64) -> i64 { sload(SLOT_OWNER) }
+pub extern "C" fn get_owner(_arg: i64) -> i64 {
+    sload(SLOT_OWNER)
+}
 
 #[no_mangle]
-pub extern "C" fn get_guardian(_arg: i64) -> i64 { sload(SLOT_GUARDIAN) }
+pub extern "C" fn get_guardian(_arg: i64) -> i64 {
+    sload(SLOT_GUARDIAN)
+}
 
 #[no_mangle]
-pub extern "C" fn get_pending_owner(_arg: i64) -> i64 { sload(SLOT_PENDING_OWNER) }
+pub extern "C" fn get_pending_owner(_arg: i64) -> i64 {
+    sload(SLOT_PENDING_OWNER)
+}
 
 /// Transfer Account Object to a new wallet owner
 /// packed: caller_id * 10_000_000_000 + new_owner
 #[no_mangle]
 pub extern "C" fn transfer_ownership(packed: i64) -> i64 {
-    if packed <= 0 { panic!("invalid packed argument"); }
+    if packed <= 0 {
+        panic!("invalid packed argument");
+    }
     let caller_id = packed / 10_000_000_000;
     let new_owner = packed % 10_000_000_000;
 
     require_owner(caller_id);
-    if new_owner <= 0 { panic!("invalid new owner"); }
+    if new_owner <= 0 {
+        panic!("invalid new owner");
+    }
 
     sstore(SLOT_OWNER, new_owner);
     sstore(SLOT_PENDING_OWNER, 0);
@@ -126,12 +136,16 @@ pub extern "C" fn transfer_ownership(packed: i64) -> i64 {
 /// packed: caller_id * 10_000_000_000 + new_guardian
 #[no_mangle]
 pub extern "C" fn rotate_guardian(packed: i64) -> i64 {
-    if packed <= 0 { panic!("invalid packed argument"); }
+    if packed <= 0 {
+        panic!("invalid packed argument");
+    }
     let caller_id = packed / 10_000_000_000;
     let new_guardian = packed % 10_000_000_000;
 
     require_owner(caller_id);
-    if new_guardian <= 0 { panic!("invalid guardian"); }
+    if new_guardian <= 0 {
+        panic!("invalid guardian");
+    }
 
     sstore(SLOT_GUARDIAN, new_guardian);
     emit(TOPIC_GUARDIAN_ROTATED, new_guardian);
@@ -142,7 +156,9 @@ pub extern "C" fn rotate_guardian(packed: i64) -> i64 {
 /// packed: caller_id * 10_000_000_000 + new_owner
 #[no_mangle]
 pub extern "C" fn initiate_recovery(packed: i64) -> i64 {
-    if packed <= 0 { panic!("invalid packed argument"); }
+    if packed <= 0 {
+        panic!("invalid packed argument");
+    }
     let caller_id = packed / 10_000_000_000;
     let new_owner = packed % 10_000_000_000;
 
@@ -150,7 +166,9 @@ pub extern "C" fn initiate_recovery(packed: i64) -> i64 {
     if guardian <= 0 || caller_id != guardian {
         panic!("unauthorized: caller is not designated guardian");
     }
-    if new_owner <= 0 { panic!("invalid recovery owner"); }
+    if new_owner <= 0 {
+        panic!("invalid recovery owner");
+    }
 
     sstore(SLOT_PENDING_OWNER, new_owner);
     let current_ref = 1_750_000_000;
@@ -174,7 +192,9 @@ pub extern "C" fn cancel_recovery(caller_id: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn finalize_recovery(now_timestamp: i64) -> i64 {
     let pending = sload(SLOT_PENDING_OWNER);
-    if pending <= 0 { panic!("no pending recovery"); }
+    if pending <= 0 {
+        panic!("no pending recovery");
+    }
 
     let init_time = sload(SLOT_RECOVERY_TIMESTAMP);
     if now_timestamp < init_time + RECOVERY_TIMELOCK_SECS {
@@ -195,7 +215,9 @@ pub extern "C" fn finalize_recovery(now_timestamp: i64) -> i64 {
 /// packed: caller_id * 10_000_000_000 + tenant_id * 10_000 + duration_hours
 #[no_mangle]
 pub extern "C" fn set_tenant(packed: i64) -> i64 {
-    if packed <= 0 { return ERR_INVALID_ARGUMENT; }
+    if packed <= 0 {
+        return ERR_INVALID_ARGUMENT;
+    }
     let caller_id = packed / 10_000_000_000;
     let rem = packed % 10_000_000_000;
     let tenant_id = rem / 10_000;
@@ -237,14 +259,20 @@ pub extern "C" fn get_active_tenant(now_timestamp: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn is_rental_active(now_timestamp: i64) -> i64 {
-    if get_active_tenant(now_timestamp) > 0 { 1 } else { 0 }
+    if get_active_tenant(now_timestamp) > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Create a new session with strict bounds and authorization
 /// packed: (session_id * 10_000_000_000) + (service_id * 100_000) + budget
 #[no_mangle]
 pub extern "C" fn create_session(packed: i64) -> i64 {
-    if packed <= 0 { panic!("invalid packed argument"); }
+    if packed <= 0 {
+        panic!("invalid packed argument");
+    }
     let session_id = packed / 10_000_000_000;
     let rem1 = packed % 10_000_000_000;
     let service_id = rem1 / 100_000;
@@ -259,8 +287,12 @@ pub extern "C" fn create_session(packed: i64) -> i64 {
     }
 
     let base = session_base(session_id);
-    if sload(base + 1) != 0 { panic!("session already exists"); }
-    if sload(base + 6) != 0 { panic!("session revoked: terminal tombstone"); }
+    if sload(base + 1) != 0 {
+        panic!("session already exists");
+    }
+    if sload(base + 6) != 0 {
+        panic!("session revoked: terminal tombstone");
+    }
 
     sstore(base, service_id);
     sstore(base + 1, session_id);
@@ -281,7 +313,9 @@ pub extern "C" fn create_session(packed: i64) -> i64 {
 /// packed: (session_id * 10_000_000_000) + new_budget
 #[no_mangle]
 pub extern "C" fn update_session_budget(packed: i64) -> i64 {
-    if packed <= 0 { panic!("invalid packed argument"); }
+    if packed <= 0 {
+        panic!("invalid packed argument");
+    }
     let session_id = packed / 10_000_000_000;
     let new_budget = packed % 10_000_000_000;
 
@@ -290,8 +324,12 @@ pub extern "C" fn update_session_budget(packed: i64) -> i64 {
     }
 
     let base = session_base(session_id);
-    if sload(base + 1) == 0 { panic!("session does not exist"); }
-    if sload(base + 6) != 0 { panic!("cannot update revoked session"); }
+    if sload(base + 1) == 0 {
+        panic!("session does not exist");
+    }
+    if sload(base + 6) != 0 {
+        panic!("cannot update revoked session");
+    }
 
     let old_budget = sload(base + 4);
     let spent = sload(base + 5);
@@ -313,7 +351,9 @@ pub extern "C" fn update_session_budget(packed: i64) -> i64 {
 /// packed: (session_id * 1_000_000) + amount
 #[no_mangle]
 pub extern "C" fn spend_with_session(packed: i64) -> i64 {
-    if packed <= 0 { panic!("invalid packed argument"); }
+    if packed <= 0 {
+        panic!("invalid packed argument");
+    }
     let session_id = packed / 1_000_000;
     let amount = packed % 1_000_000;
 
@@ -326,8 +366,12 @@ pub extern "C" fn spend_with_session(packed: i64) -> i64 {
     }
 
     let base = session_base(session_id);
-    if sload(base + 1) == 0 { panic!("session does not exist"); }
-    if sload(base + 6) != 0 { panic!("session revoked"); }
+    if sload(base + 1) == 0 {
+        panic!("session does not exist");
+    }
+    if sload(base + 6) != 0 {
+        panic!("session revoked");
+    }
 
     let budget = sload(base + 4);
     let spent = sload(base + 5);
@@ -364,23 +408,35 @@ pub extern "C" fn revoke_session(session_id: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn is_session_active(session_id: i64) -> i64 {
-    if session_id <= 0 || session_id > MAX_SESSIONS { return 0; }
+    if session_id <= 0 || session_id > MAX_SESSIONS {
+        return 0;
+    }
     let base = session_base(session_id);
-    if sload(base + 1) == 0 || sload(base + 6) != 0 { return 0; }
+    if sload(base + 1) == 0 || sload(base + 6) != 0 {
+        return 0;
+    }
     let budget = sload(base + 4);
     let spent = sload(base + 5);
-    if spent >= budget { return 0; }
+    if spent >= budget {
+        return 0;
+    }
     1
 }
 
 #[no_mangle]
 pub extern "C" fn get_session_budget(session_id: i64) -> i64 {
-    if session_id <= 0 || session_id > MAX_SESSIONS { return 0; }
+    if session_id <= 0 || session_id > MAX_SESSIONS {
+        return 0;
+    }
     let base = session_base(session_id);
-    if sload(base + 6) != 0 { return 0; }
+    if sload(base + 6) != 0 {
+        return 0;
+    }
     let budget = sload(base + 4);
     let spent = sload(base + 5);
-    if spent >= budget { return 0; }
+    if spent >= budget {
+        return 0;
+    }
     budget - spent
 }
 

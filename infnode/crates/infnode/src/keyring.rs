@@ -1,11 +1,11 @@
+use crate::proto::NODEID_LEN;
 use anyhow::{anyhow, bail, Result};
-use rand::RngCore;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
+use rand::RngCore;
 use std::path::Path;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
-use crate::proto::NODEID_LEN;
 
 /// Параметры KDF (memory-hard Argon2id): 64 MiB, 3 прохода, 4 линии.
 const KDF_MEM_KIB: u32 = 65_536;
@@ -214,27 +214,35 @@ impl NodeKeys {
                 .map_err(|e| anyhow!("keystore dir {}: {e}", dir.display()))?;
             let dir_mode = dir_meta.permissions().mode() & 0o777;
             if dir_mode != 0o700 {
-                bail!("keystore dir {} has insecure permissions 0o{:03o}, expected 0o700", dir.display(), dir_mode);
+                bail!(
+                    "keystore dir {} has insecure permissions 0o{:03o}, expected 0o700",
+                    dir.display(),
+                    dir_mode
+                );
             }
             let id_path = dir.join("identity.key");
-            let id_meta = std::fs::metadata(&id_path)
-                .map_err(|e| anyhow!("identity.key: {e}"))?;
+            let id_meta = std::fs::metadata(&id_path).map_err(|e| anyhow!("identity.key: {e}"))?;
             let id_mode = id_meta.permissions().mode() & 0o777;
             if id_mode != 0o600 {
-                bail!("identity.key has insecure permissions 0o{:03o}, expected 0o600", id_mode);
+                bail!(
+                    "identity.key has insecure permissions 0o{:03o}, expected 0o600",
+                    id_mode
+                );
             }
             let e2e_path = dir.join("e2e.key");
-            let e2e_meta = std::fs::metadata(&e2e_path)
-                .map_err(|e| anyhow!("e2e.key: {e}"))?;
+            let e2e_meta = std::fs::metadata(&e2e_path).map_err(|e| anyhow!("e2e.key: {e}"))?;
             let e2e_mode = e2e_meta.permissions().mode() & 0o777;
             if e2e_mode != 0o600 {
-                bail!("e2e.key has insecure permissions 0o{:03o}, expected 0o600", e2e_mode);
+                bail!(
+                    "e2e.key has insecure permissions 0o{:03o}, expected 0o600",
+                    e2e_mode
+                );
             }
         }
         let id = std::fs::read_to_string(dir.join("identity.key"))
             .map_err(|e| anyhow!("identity.key: {e}"))?;
-        let e2e = std::fs::read_to_string(dir.join("e2e.key"))
-            .map_err(|e| anyhow!("e2e.key: {e}"))?;
+        let e2e =
+            std::fs::read_to_string(dir.join("e2e.key")).map_err(|e| anyhow!("e2e.key: {e}"))?;
         let mut id_plain = unprotect(id.trim())?;
         let mut e2e_plain = unprotect(e2e.trim())?;
         let id_bytes: [u8; 32] = hex::decode(id_plain.trim())?

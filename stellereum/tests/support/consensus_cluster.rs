@@ -680,8 +680,9 @@ impl ConsensusCluster {
     /// [`Self::with_powers`] or [`Self::with_profiles`].
     pub fn new(n_validators: usize, skew: &[u64]) -> Self {
         let profiles = (0..n_validators)
-            .map(|i| {
-                NodeProfile { round_timeout_factor: skew.get(i).copied().unwrap_or(1).max(1), ..Default::default() }
+            .map(|i| NodeProfile {
+                round_timeout_factor: skew.get(i).copied().unwrap_or(1).max(1),
+                ..Default::default()
             })
             .collect();
         Self::with_profiles(n_validators, profiles)
@@ -1182,7 +1183,10 @@ impl ConsensusCluster {
                     if let Err(e) = &res {
                         self.members[i].stats.proposals_refused += 1;
                         if std::env::var("CLUSTER_DEBUG").as_deref() == Ok("1") {
-                            eprintln!("[dbg] node{i} refused proposal h={} r={round}: {e}", self.members[i].rt.hc.height);
+                            eprintln!(
+                                "[dbg] node{i} refused proposal h={} r={round}: {e}",
+                                self.members[i].rt.hc.height
+                            );
                         }
                     }
                     // The proposal path can phase-align the node (a bounded

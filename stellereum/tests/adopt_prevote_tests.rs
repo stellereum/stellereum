@@ -11,11 +11,11 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::sync::Arc;
 use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::Block;
 use stellereum::state_engine::InMemoryStateEngine;
-use std::sync::Arc;
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
@@ -90,7 +90,11 @@ async fn precommit_without_any_local_prevote_is_accepted_gap_pinned() {
     assert!(cert.verify(&rt.validators));
     assert!(rt.hc.prevote_set(0).is_none(), "fresh node saw no prevotes");
     let r = rt.adopt_committed(1, blk, cert).await;
-    assert_eq!(r, Ok(bh), "catch-up with empty prevote sets must still work; gap pinned, not closed");
+    assert_eq!(
+        r,
+        Ok(bh),
+        "catch-up with empty prevote sets must still work; gap pinned, not closed"
+    );
 }
 
 /// Matching prevote quorum + precommit QC is accepted.
@@ -101,7 +105,8 @@ async fn matching_prevote_and_precommit_is_accepted() {
     let blk = good_block(&rt, &ks).await;
     let bh = blk.compute_hash();
     for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh))).unwrap();
+        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+            .unwrap();
     }
     let cert = precommit_cert(&ks, bh);
     let r = rt.adopt_committed(1, blk, cert).await;
@@ -118,12 +123,16 @@ async fn conflicting_local_prevote_quorum_refuses_adoption() {
     let other = [0xEEu8; 32];
     assert_ne!(other, bh);
     for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(other))).unwrap();
+        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(other)))
+            .unwrap();
     }
     let cert = precommit_cert(&ks, bh);
     assert!(cert.verify(&rt.validators), "precommit QC itself is valid");
     let r = rt.adopt_committed(1, blk, cert).await;
-    assert!(r.is_err(), "contradicting observed prevote quorum must refuse");
+    assert!(
+        r.is_err(),
+        "contradicting observed prevote quorum must refuse"
+    );
     assert!(
         r.unwrap_err().contains("prevote quorum"),
         "refusal must name the prevote quorum"

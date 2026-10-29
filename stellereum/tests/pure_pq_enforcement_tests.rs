@@ -105,11 +105,7 @@ fn make_pq_uqc() -> (ValidatorSet, QuorumCertificate) {
             &DEFAULT_SALT,
         );
         vs.add(id, 10);
-        register_validator_pq_key(
-            id,
-            stellereum::post_quantum::PqScheme::Falcon512,
-            pk,
-        );
+        register_validator_pq_key(id, stellereum::post_quantum::PqScheme::Falcon512, pk);
         falcon_keys.push((id, fk));
     }
 

@@ -26,8 +26,8 @@
 use ed25519_dalek::{Signer, SigningKey};
 use stellereum::consensus::VoteKind;
 use stellereum::sharding::Transaction;
-use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::staking::{CompactPqEquivocationEvidence, EQUIVOCATION_SLASH_BPS, STAKING_POOL};
+use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::svm::OpCode;
 
 mod support;
@@ -96,14 +96,21 @@ fn report_tx(
 /// staking pool (the pool holds the bonded principal).
 async fn engine_with(victim: [u8; 32], reporter: [u8; 32]) -> InMemoryStateEngine {
     let e = InMemoryStateEngine::new();
-    e.credit_native(&reporter, BAL).await.expect("reporter funded");
-    e.credit_native(&STAKING_POOL, 10 * BOND).await.expect("pool funded");
+    e.credit_native(&reporter, BAL)
+        .await
+        .expect("reporter funded");
+    e.credit_native(&STAKING_POOL, 10 * BOND)
+        .await
+        .expect("pool funded");
     e.staking_write().await.bond(victim, BOND, 0).unwrap();
     e
 }
 
 async fn pool_of(e: &InMemoryStateEngine) -> u64 {
-    e.get_account(&STAKING_POOL).await.map(|a| a.balance).unwrap_or(0)
+    e.get_account(&STAKING_POOL)
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0)
 }
 
 // ===========================================================================
@@ -168,7 +175,8 @@ async fn invalid_pq_evidence_is_refused_fail_closed() {
 
     // (a) A signature by somebody else.
     let mut forged = good.clone();
-    let msg_b = stellereum::consensus::vote_sign_bytes(1, 0, VoteKind::Prevote, &Some([0x22u8; 32]));
+    let msg_b =
+        stellereum::consensus::vote_sign_bytes(1, 0, VoteKind::Prevote, &Some([0x22u8; 32]));
     forged.signature_b = stranger.sign(&msg_b).to_bytes().to_vec();
 
     // (b) The SAME target twice (not an equivocation at all).

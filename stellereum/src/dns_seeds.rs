@@ -295,9 +295,8 @@ pub fn parse_seed_domains(raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .filter(|s| {
             s.len() <= 253
-                && s.bytes().all(|b| {
-                    b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_'
-                })
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
         })
         .map(|s| s.trim_end_matches('.').to_ascii_lowercase())
         .filter(|s| !s.is_empty())
@@ -553,10 +552,7 @@ async fn query_txt_via_tcp(
 /// TXT set outgrows a UDP datagram — the same query is retried over TCP
 /// (RFC 1035 §4.2.2, two-byte length prefix) against the SAME server before
 /// moving on to the next nameserver.
-pub async fn query_txt_records(
-    addrs: &[SocketAddr],
-    domain: &str,
-) -> Result<Vec<String>, String> {
+pub async fn query_txt_records(addrs: &[SocketAddr], domain: &str) -> Result<Vec<String>, String> {
     TXT_QUERIES.fetch_add(1, Ordering::SeqCst);
     if addrs.is_empty() {
         return Err("no nameservers available".into());
@@ -642,9 +638,7 @@ pub async fn discover_seeds(domains: &[String]) -> Vec<DiscoveredPeer> {
                     match parse_txt_record(&r) {
                         Some(p) => out.push(p),
                         None => {
-                            tracing::warn!(
-                                "[dns-seeds] {domain}: rejected malformed TXT record"
-                            );
+                            tracing::warn!("[dns-seeds] {domain}: rejected malformed TXT record");
                         }
                     }
                 }
@@ -687,10 +681,7 @@ pub async fn add_discovered_peers(node: &Arc<Node>, peers: &[DiscoveredPeer]) ->
         }
         let endpoints = resolve_peer_endpoints(p).await;
         if endpoints.is_empty() {
-            tracing::warn!(
-                "[dns-seeds] {}: no A/AAAA addresses, skipping",
-                p.node_id
-            );
+            tracing::warn!("[dns-seeds] {}: no A/AAAA addresses, skipping", p.node_id);
             continue;
         }
         let info = infnode::dht::NodeInfo {
@@ -997,10 +988,7 @@ mod tests {
             });
         }
         // Second pass resolves the same DNS records again.
-        let pass2 = merge_seeds(
-            &now_configured,
-            vec![discovered(0x61), discovered(0x62)],
-        );
+        let pass2 = merge_seeds(&now_configured, vec![discovered(0x61), discovered(0x62)]);
         assert!(pass2.new_peers.is_empty(), "second pass must add nobody");
         assert_eq!(pass2.duplicates, 2);
         assert_eq!(pass2.over_cap, 0);
@@ -1224,10 +1212,7 @@ mod tests {
         let tcp_srv = tokio::spawn(async move {
             let (mut stream, _) = tcp.accept().await.expect("tcp accept");
             let mut len_buf = [0u8; 2];
-            stream
-                .read_exact(&mut len_buf)
-                .await
-                .expect("tcp read len");
+            stream.read_exact(&mut len_buf).await.expect("tcp read len");
             let qlen = u16::from_be_bytes(len_buf) as usize;
             assert!(qlen >= 12, "TCP query must have a header");
             let mut qbuf = vec![0u8; qlen];

@@ -23,17 +23,17 @@ use rand::rngs::OsRng;
 use stellereum::consensus::{QuorumCertificate, Vote, VoteKind};
 use stellereum::consensus_net::{
     inbound_bulk_burst_bytes, inbound_bulk_bytes_per_sec, inbound_is_critical, pace_due,
-    pace_wait_ms, InboundBulkLimiter, InboundDecision, ConsensusMsg,
+    pace_wait_ms, ConsensusMsg, InboundBulkLimiter, InboundDecision,
     CONS_BCAST_MIN_INTERVAL_MS_DEFAULT, CONS_PROBE_MIN_INTERVAL_MS_DEFAULT,
     INBOUND_BULK_BURST_BYTES_DEFAULT, INBOUND_BULK_BYTES_PER_SEC_DEFAULT,
     INBOUND_MAX_DEFER_WAIT_MS,
 };
 use stellereum::network::{
-    parse_repl_circuit_cooldown_ms, parse_repl_circuit_threshold,
-    parse_repl_head_min_interval_ms, parse_repl_max_attempts, parse_repl_max_concurrent,
-    parse_repl_min_interval_ms, parse_repl_store_timeout_ms, repl_retry_backoff_ms,
-    repl_retry_backoff_with_jitter_ms, repl_should_retry, ReplBackpressure, ReplPublishConfig,
-    ReplStoreKind, REPL_CIRCUIT_COOLDOWN_MS_DEFAULT, REPL_CIRCUIT_THRESHOLD_DEFAULT,
+    parse_repl_circuit_cooldown_ms, parse_repl_circuit_threshold, parse_repl_head_min_interval_ms,
+    parse_repl_max_attempts, parse_repl_max_concurrent, parse_repl_min_interval_ms,
+    parse_repl_store_timeout_ms, repl_retry_backoff_ms, repl_retry_backoff_with_jitter_ms,
+    repl_should_retry, ReplBackpressure, ReplPublishConfig, ReplStoreKind,
+    REPL_CIRCUIT_COOLDOWN_MS_DEFAULT, REPL_CIRCUIT_THRESHOLD_DEFAULT,
     REPL_HEAD_MIN_INTERVAL_MS_DEFAULT, REPL_PUBLISH_MAX_CONCURRENT_DEFAULT,
     REPL_PUBLISH_MIN_INTERVAL_MS_DEFAULT, REPL_RETRY_JITTER_MAX_MS,
     REPL_STORE_MAX_ATTEMPTS_DEFAULT, REPL_STORE_TIMEOUT_MS_DEFAULT,
@@ -51,7 +51,10 @@ fn publish_defaults_are_sane_and_pinned() {
     assert_eq!(cfg.max_concurrent, 4);
     assert_eq!(cfg.max_concurrent, REPL_PUBLISH_MAX_CONCURRENT_DEFAULT);
     assert_eq!(cfg.bulk_min_interval_ms, 100);
-    assert_eq!(cfg.bulk_min_interval_ms, REPL_PUBLISH_MIN_INTERVAL_MS_DEFAULT);
+    assert_eq!(
+        cfg.bulk_min_interval_ms,
+        REPL_PUBLISH_MIN_INTERVAL_MS_DEFAULT
+    );
     assert_eq!(cfg.head_min_interval_ms, 10);
     assert_eq!(cfg.head_min_interval_ms, REPL_HEAD_MIN_INTERVAL_MS_DEFAULT);
     assert_eq!(cfg.store_timeout_ms, 5_000);
@@ -160,7 +163,10 @@ fn sustained_hammer_is_capped_at_the_paced_rate() {
             allowed += 1;
         }
     }
-    assert_eq!(allowed, 20, "sustained 20/sec must pace down to 10/sec, got {allowed}");
+    assert_eq!(
+        allowed, 20,
+        "sustained 20/sec must pace down to 10/sec, got {allowed}"
+    );
 }
 
 #[test]
@@ -169,7 +175,10 @@ fn token_bucket_gives_burst_headroom_without_interval_floor() {
     // the 5th waits for refill, and after 1s the bucket is full again.
     let mut g = ReplBackpressure::new(4, 10.0, 0, 5, 5_000, 256);
     let burst = (0..6).filter(|_| g.publish_allowed("p", 0)).count();
-    assert_eq!(burst, 4, "burst capacity must absorb exactly 4, got {burst}");
+    assert_eq!(
+        burst, 4,
+        "burst capacity must absorb exactly 4, got {burst}"
+    );
     let later = (0..4).filter(|_| g.publish_allowed("p", 1_000)).count();
     assert_eq!(later, 4, "1s of refill at 10/s must restore the full burst");
 }
@@ -178,8 +187,14 @@ fn token_bucket_gives_burst_headroom_without_interval_floor() {
 fn min_interval_spaces_even_tiny_bursts() {
     let mut g = ReplBackpressure::new(100, 1000.0, 100, 5, 5_000, 256);
     assert!(g.publish_allowed("p", 1_000), "first publish always passes");
-    assert!(!g.publish_allowed("p", 1_000), "same-ms republish must wait");
-    assert!(!g.publish_allowed("p", 1_099), "99ms is still inside the floor");
+    assert!(
+        !g.publish_allowed("p", 1_000),
+        "same-ms republish must wait"
+    );
+    assert!(
+        !g.publish_allowed("p", 1_099),
+        "99ms is still inside the floor"
+    );
     assert!(g.publish_allowed("p", 1_100), "floor elapsed: pass again");
 }
 
@@ -190,17 +205,26 @@ fn circuit_opens_on_consecutive_timeouts_then_half_opens() {
     let mut g = ReplBackpressure::new(100, 1000.0, 0, 5, 5_000, 256);
     for i in 0..4u64 {
         g.record_timeout("slow-peer", i);
-        assert!(!g.in_cooldown("slow-peer", i), "4 timeouts must not trip yet");
+        assert!(
+            !g.in_cooldown("slow-peer", i),
+            "4 timeouts must not trip yet"
+        );
         assert_eq!(g.consec_timeouts("slow-peer"), (i + 1) as u32);
     }
     g.record_timeout("slow-peer", 4);
-    assert!(g.in_cooldown("slow-peer", 4), "5th consecutive timeout opens the circuit");
+    assert!(
+        g.in_cooldown("slow-peer", 4),
+        "5th consecutive timeout opens the circuit"
+    );
     // Shed during the window (bounded: exactly the 5s cooldown)...
     assert!(!g.publish_allowed("slow-peer", 100));
     assert!(!g.publish_allowed("slow-peer", 5_003));
     // ...then half-open automatically: the next publish is attempted, and a
     // success closes the breaker immediately (honest recovery, no manual reset).
-    assert!(g.publish_allowed("slow-peer", 5_004), "cooldown expired: half-open");
+    assert!(
+        g.publish_allowed("slow-peer", 5_004),
+        "cooldown expired: half-open"
+    );
     g.record_success("slow-peer");
     assert_eq!(g.consec_timeouts("slow-peer"), 0);
     assert!(!g.in_cooldown("slow-peer", 5_004));
@@ -230,7 +254,11 @@ fn pacing_map_is_memory_bounded() {
     for i in 0..50u64 {
         g.publish_allowed(&format!("peer-{i}"), i);
     }
-    assert!(g.peer_count() <= 8, "map must stay capped, got {}", g.peer_count());
+    assert!(
+        g.peer_count() <= 8,
+        "map must stay capped, got {}",
+        g.peer_count()
+    );
 }
 
 #[test]
@@ -248,11 +276,23 @@ fn store_kinds_name_the_charge_model() {
 #[test]
 fn broadcast_and_probe_floors_gate_repeats() {
     assert!(pace_due(None, 0, CONS_BCAST_MIN_INTERVAL_MS_DEFAULT));
-    assert!(!pace_due(Some(1_000), 1_010, CONS_BCAST_MIN_INTERVAL_MS_DEFAULT));
-    assert!(pace_due(Some(1_000), 1_025, CONS_BCAST_MIN_INTERVAL_MS_DEFAULT));
+    assert!(!pace_due(
+        Some(1_000),
+        1_010,
+        CONS_BCAST_MIN_INTERVAL_MS_DEFAULT
+    ));
+    assert!(pace_due(
+        Some(1_000),
+        1_025,
+        CONS_BCAST_MIN_INTERVAL_MS_DEFAULT
+    ));
     assert_eq!(pace_wait_ms(None, 0, 25), 0);
     assert_eq!(pace_wait_ms(Some(1_000), 1_010, 25), 15);
-    assert_eq!(pace_wait_ms(Some(1_000), 2_000, 25), 0, "elapsed floor waits nothing");
+    assert_eq!(
+        pace_wait_ms(Some(1_000), 2_000, 25),
+        0,
+        "elapsed floor waits nothing"
+    );
     // Defaults pinned: 25ms send floor (far below the 800ms round timeout),
     // 5s probe floor (probes are full round trips).
     assert_eq!(CONS_BCAST_MIN_INTERVAL_MS_DEFAULT, 25);
@@ -286,14 +326,21 @@ fn sample_block() -> Block {
 
 fn sample_vote() -> ConsensusMsg {
     let sk = SigningKey::generate(&mut OsRng);
-    ConsensusMsg::Vote { vote: Vote::sign(&sk, 1, 0, VoteKind::Prevote, None), locked: None }
+    ConsensusMsg::Vote {
+        vote: Vote::sign(&sk, 1, 0, VoteKind::Prevote, None),
+        locked: None,
+    }
 }
 
 #[test]
 fn only_committed_bypasses_the_bulk_limiter() {
     let sk = SigningKey::generate(&mut OsRng);
     let vote = sample_vote();
-    let proposal = ConsensusMsg::Proposal { height: 1, round: 0, block: sample_block() };
+    let proposal = ConsensusMsg::Proposal {
+        height: 1,
+        round: 0,
+        block: sample_block(),
+    };
     let commit = ConsensusMsg::Committed {
         height: 9,
         block: sample_block(),
@@ -313,9 +360,18 @@ fn only_committed_bypasses_the_bulk_limiter() {
     // votes past the limiter entirely, making it dead code for the cheapest
     // flood shape — so the predicate was narrowed deliberately, and this
     // test pins the narrowed contract, not the old one.
-    assert!(!inbound_is_critical(&vote), "singleton votes are budgeted per-peer, not exempt");
-    assert!(!inbound_is_critical(&proposal), "proposals are budgeted per-peer, not exempt");
-    assert!(inbound_is_critical(&commit), "commits (the catch-up path) must bypass");
+    assert!(
+        !inbound_is_critical(&vote),
+        "singleton votes are budgeted per-peer, not exempt"
+    );
+    assert!(
+        !inbound_is_critical(&proposal),
+        "proposals are budgeted per-peer, not exempt"
+    );
+    assert!(
+        inbound_is_critical(&commit),
+        "commits (the catch-up path) must bypass"
+    );
     // Only the bulk shape is budgeted — even a batch OF votes is bulk on the
     // wire (deferred under flood, never dropped).
     assert!(!inbound_is_critical(&ConsensusMsg::Batch(vec![vote])));
@@ -343,12 +399,21 @@ fn bulk_over_budget_defers_never_drops_and_recovers() {
     }
     // Critical traffic still passes on the same empty bucket at the same instant:
     // votes never starve behind bulk, and bulk never consumes the vote lane.
-    assert_eq!(lim.admit("peer-a", 64 * 1024, true, 0), InboundDecision::Allow);
+    assert_eq!(
+        lim.admit("peer-a", 64 * 1024, true, 0),
+        InboundDecision::Allow
+    );
     // Budgets are per-peer: another peer is unaffected by peer-a's flood.
-    assert_eq!(lim.admit("peer-b", 100_000, false, 0), InboundDecision::Allow);
+    assert_eq!(
+        lim.admit("peer-b", 100_000, false, 0),
+        InboundDecision::Allow
+    );
     // After refill time the bulk lane re-opens on its own (2s * 512KiB refills
     // the 1MiB burst; no manual reset, no operator action).
-    assert_eq!(lim.admit("peer-a", 100_000, false, 2_000), InboundDecision::Allow);
+    assert_eq!(
+        lim.admit("peer-a", 100_000, false, 2_000),
+        InboundDecision::Allow
+    );
 }
 
 #[test]

@@ -180,7 +180,9 @@ impl ModelView {
     pub fn check_compatible(&self) -> Result<(), String> {
         let n_layers = self.dims.len();
         if n_layers == 0 || n_layers > ATTEST_MAX_LAYERS {
-            return Err(format!("stark: need 1..={ATTEST_MAX_LAYERS} layers, got {n_layers}"));
+            return Err(format!(
+                "stark: need 1..={ATTEST_MAX_LAYERS} layers, got {n_layers}"
+            ));
         }
         if self.weights.len() != n_layers || self.biases.len() != n_layers {
             return Err("stark: weights/biases/dims length mismatch".to_string());
@@ -195,7 +197,9 @@ impl ModelView {
             }
             if let Some(want) = expect_in {
                 if in_dim != want {
-                    return Err(format!("stark: layer {l} not chained (in={in_dim}, want={want})"));
+                    return Err(format!(
+                        "stark: layer {l} not chained (in={in_dim}, want={want})"
+                    ));
                 }
             }
             expect_in = Some(out_dim);
@@ -231,7 +235,9 @@ impl ModelView {
                 }
             }
             if layer_worst > ATTEST_ACC_MAX {
-                return Err(format!("stark: layer {l} worst-case accumulator {layer_worst} exceeds 2^31-1"));
+                return Err(format!(
+                    "stark: layer {l} worst-case accumulator {layer_worst} exceeds 2^31-1"
+                ));
             }
             max_input_act = layer_worst;
         }
@@ -266,16 +272,25 @@ pub fn model_spec_test_only(view: &ModelView, _seed: u64) -> Result<(Vec<u8>, Mo
     build_model_spec(view, TEST_SETUP_ATTESTATION.to_vec())
 }
 
-pub fn model_spec_with_attestation(view: &ModelView, attestation: Vec<u8>) -> Result<(Vec<u8>, ModelSpec), String> {
+pub fn model_spec_with_attestation(
+    view: &ModelView,
+    attestation: Vec<u8>,
+) -> Result<(Vec<u8>, ModelSpec), String> {
     view.check_compatible()?;
     if attestation.is_empty() || attestation.len() > MAX_SETUP_ATTESTATION_BYTES {
-        return Err(format!("stark: attestation must be 1..={MAX_SETUP_ATTESTATION_BYTES} bytes"));
+        return Err(format!(
+            "stark: attestation must be 1..={MAX_SETUP_ATTESTATION_BYTES} bytes"
+        ));
     }
     build_model_spec(view, attestation)
 }
 
-fn build_model_spec(view: &ModelView, attestation: Vec<u8>) -> Result<(Vec<u8>, ModelSpec), String> {
-    let spec_bytes = bincode::serialize(view).map_err(|e| format!("stark: vk serialize failed: {e}"))?;
+fn build_model_spec(
+    view: &ModelView,
+    attestation: Vec<u8>,
+) -> Result<(Vec<u8>, ModelSpec), String> {
+    let spec_bytes =
+        bincode::serialize(view).map_err(|e| format!("stark: vk serialize failed: {e}"))?;
     if spec_bytes.len() > MAX_MODEL_SPEC_BYTES {
         return Err(format!("stark: spec_bytes exceeds {MAX_MODEL_SPEC_BYTES}"));
     }
@@ -314,7 +329,11 @@ pub fn prove_attestation(
 ) -> Result<(Vec<i64>, AttestationProof), String> {
     view.check_compatible()?;
     if inputs.len() != view.in_dim() {
-        return Err(format!("stark: inputs len {} != model in_dim {}", inputs.len(), view.in_dim()));
+        return Err(format!(
+            "stark: inputs len {} != model in_dim {}",
+            inputs.len(),
+            view.in_dim()
+        ));
     }
     for &x in inputs {
         if x < 0 || (x as u64) > ATTEST_MAX_INPUT {
@@ -405,7 +424,8 @@ pub fn prove_attestation(
         query_samples: vec![(trace_root, current.clone())],
     };
 
-    let proof_bytes = bincode::serialize(&payload).map_err(|e| format!("stark: serialize proof failed: {e}"))?;
+    let proof_bytes =
+        bincode::serialize(&payload).map_err(|e| format!("stark: serialize proof failed: {e}"))?;
 
     let proof = AttestationProof {
         model_hash,
@@ -443,7 +463,11 @@ pub fn verify_attestation(spec_bytes: &[u8], proof: &AttestationProof) -> bool {
     };
 
     // Reconstruct forward pass and compute expected Merkle trace root
-    let mut current = proof.public_inputs.iter().map(|&x| x as i64).collect::<Vec<i64>>();
+    let mut current = proof
+        .public_inputs
+        .iter()
+        .map(|&x| x as i64)
+        .collect::<Vec<i64>>();
     let mut expected_leaves = Vec::new();
 
     for l in 0..view.dims.len() {
@@ -530,10 +554,14 @@ pub fn verify_attestation(spec_bytes: &[u8], proof: &AttestationProof) -> bool {
 pub fn check_model_spec(view: &ModelView, vk: &ModelSpec) -> Result<(), String> {
     view.check_compatible()?;
     if vk.spec_bytes.is_empty() || vk.spec_bytes.len() > MAX_MODEL_SPEC_BYTES {
-        return Err(format!("stark: spec_bytes must be 1..={MAX_MODEL_SPEC_BYTES}"));
+        return Err(format!(
+            "stark: spec_bytes must be 1..={MAX_MODEL_SPEC_BYTES}"
+        ));
     }
     if vk.setup_attestation.is_empty() || vk.setup_attestation.len() > MAX_SETUP_ATTESTATION_BYTES {
-        return Err(format!("stark: attestation must be 1..={MAX_SETUP_ATTESTATION_BYTES}"));
+        return Err(format!(
+            "stark: attestation must be 1..={MAX_SETUP_ATTESTATION_BYTES}"
+        ));
     }
     if vk.spec_hash != spec_hash_of(&vk.spec_bytes) {
         return Err("stark: spec_hash does not match spec_bytes".to_string());

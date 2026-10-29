@@ -34,9 +34,9 @@ use stellereum::mempool::{
     Mempool, MempoolError, PendingActivationBuffer, PQ_ACTIVATION_SURCHARGE_GAS,
 };
 use stellereum::post_quantum::{
-    derive_pq_address, is_pure_pq_enforced, set_pure_pq_override, verify_pq_signature,
-    PqScheme, PqSignatureEnvelope, StatefulImplicitKeyRegistry, DEFAULT_SALT,
-    FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN,
+    derive_pq_address, is_pure_pq_enforced, set_pure_pq_override, verify_pq_signature, PqScheme,
+    PqSignatureEnvelope, StatefulImplicitKeyRegistry, DEFAULT_SALT, FALCON512_PUBKEY_LEN,
+    FALCON512_SIG_LEN,
 };
 use stellereum::sharding::{Block, CrossShardMessage, Transaction};
 use stellereum::state_engine::InMemoryStateEngine;
@@ -53,13 +53,23 @@ fn audit_test_falcon512_cryptographic_soundness() {
 
     // 1. Valid Falcon signature from FalconKeypair passes
     assert!(
-        verify_pq_signature(PqScheme::Falcon512, &keypair.public_key, message, &signature),
+        verify_pq_signature(
+            PqScheme::Falcon512,
+            &keypair.public_key,
+            message,
+            &signature
+        ),
         "Valid Falcon-512 signature from FalconKeypair must pass"
     );
 
     // 2. Tampered message FAILS
     assert!(
-        !verify_pq_signature(PqScheme::Falcon512, &keypair.public_key, b"Tampered Message", &signature),
+        !verify_pq_signature(
+            PqScheme::Falcon512,
+            &keypair.public_key,
+            b"Tampered Message",
+            &signature
+        ),
         "Tampered message must fail"
     );
     assert!(
@@ -85,7 +95,12 @@ fn audit_test_falcon512_cryptographic_soundness() {
     let mut zeroed_nonce = signature.clone();
     zeroed_nonce[..40].fill(0);
     assert!(
-        !verify_pq_signature(PqScheme::Falcon512, keypair.pubkey(), message, &zeroed_nonce),
+        !verify_pq_signature(
+            PqScheme::Falcon512,
+            keypair.pubkey(),
+            message,
+            &zeroed_nonce
+        ),
         "Degenerate zero nonce must fail"
     );
 
@@ -106,21 +121,36 @@ fn audit_test_falcon512_cryptographic_soundness() {
     let mut truncated_sig = signature.clone();
     truncated_sig.truncate(FALCON512_SIG_LEN - 1);
     assert!(
-        !verify_pq_signature(PqScheme::Falcon512, keypair.pubkey(), message, &truncated_sig),
+        !verify_pq_signature(
+            PqScheme::Falcon512,
+            keypair.pubkey(),
+            message,
+            &truncated_sig
+        ),
         "Truncated signature must fail"
     );
 
     let mut oversized_sig = signature.clone();
     oversized_sig.push(0x00);
     assert!(
-        !verify_pq_signature(PqScheme::Falcon512, &keypair.public_key, message, &oversized_sig),
+        !verify_pq_signature(
+            PqScheme::Falcon512,
+            &keypair.public_key,
+            message,
+            &oversized_sig
+        ),
         "Oversized signature must fail"
     );
 
     // 4. Wrong public key FAILS
     let wrong_keypair = FalconKeypair::generate_from_seed(0x89);
     assert!(
-        !verify_pq_signature(PqScheme::Falcon512, &wrong_keypair.public_key, message, &signature),
+        !verify_pq_signature(
+            PqScheme::Falcon512,
+            &wrong_keypair.public_key,
+            message,
+            &signature
+        ),
         "Wrong public key must fail"
     );
 
@@ -150,7 +180,12 @@ fn audit_test_falcon512_cryptographic_soundness() {
     for invalid_sig_len in [0, 1, 32, 64, 128, 512, 665, 667, 1024] {
         let noise_sig = vec![0x77; invalid_sig_len];
         assert!(
-            !verify_pq_signature(PqScheme::Falcon512, &keypair.public_key, message, &noise_sig),
+            !verify_pq_signature(
+                PqScheme::Falcon512,
+                &keypair.public_key,
+                message,
+                &noise_sig
+            ),
             "Invalid length signature noise must fail"
         );
     }
@@ -274,7 +309,8 @@ fn audit_test_activation_gas_surcharge_bypass_prevented() {
     };
     let msg = tx_cheap.signing_message();
     let sig = keypair.sign(&msg);
-    tx_cheap.signature = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig).encode();
+    tx_cheap.signature =
+        PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig).encode();
     assert!(tx_cheap.is_pq_activation());
 
     let res = mp.add(tx_cheap);
@@ -309,9 +345,13 @@ fn audit_test_activation_gas_surcharge_bypass_prevented() {
     };
     let msg_paid = tx_paid.signing_message();
     let sig_paid = keypair.sign(&msg_paid);
-    tx_paid.signature = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig_paid).encode();
+    tx_paid.signature =
+        PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig_paid).encode();
 
-    assert!(mp.add(tx_paid).is_ok(), "Fully paid activation transaction must succeed");
+    assert!(
+        mp.add(tx_paid).is_ok(),
+        "Fully paid activation transaction must succeed"
+    );
     assert!(
         custom_registry.lookup(&from).is_some(),
         "Public key must be registered in implicit registry after fully paid activation succeeds"
@@ -344,11 +384,16 @@ fn audit_test_activation_buffer_global_capacity_and_prune() {
             payload: Vec::new(),
             priority_fee_per_gas: 0,
         };
-        let hash = buffer.buffer_tx(tx, min_fee).expect("Buffering within capacity must succeed");
+        let hash = buffer
+            .buffer_tx(tx, min_fee)
+            .expect("Buffering within capacity must succeed");
         assert!(buffer.contains_hash(&hash));
     }
 
-    assert_eq!(buffer.len(), PendingActivationBuffer::MAX_GLOBAL_BUFFERED_TXS);
+    assert_eq!(
+        buffer.len(),
+        PendingActivationBuffer::MAX_GLOBAL_BUFFERED_TXS
+    );
 
     // 2. Assert buffer rejects flood when global capacity is reached
     let mut overflow_sender = [0xFFu8; 32];
@@ -375,7 +420,10 @@ fn audit_test_activation_buffer_global_capacity_and_prune() {
         Err(MempoolError::Full),
         "Buffer must reject flood when global capacity is reached"
     );
-    assert_eq!(buffer.len(), PendingActivationBuffer::MAX_GLOBAL_BUFFERED_TXS);
+    assert_eq!(
+        buffer.len(),
+        PendingActivationBuffer::MAX_GLOBAL_BUFFERED_TXS
+    );
 
     // 3. Assert overwriting nonce removes old hash from index
     let mut fresh_buffer = PendingActivationBuffer::new();
@@ -394,7 +442,9 @@ fn audit_test_activation_buffer_global_capacity_and_prune() {
         priority_fee_per_gas: 0,
     };
     let hash_v1 = tx_v1.compute_tx_hash();
-    let res_v1 = fresh_buffer.buffer_tx(tx_v1, min_fee).expect("Buffer tx_v1");
+    let res_v1 = fresh_buffer
+        .buffer_tx(tx_v1, min_fee)
+        .expect("Buffer tx_v1");
     assert_eq!(res_v1, hash_v1);
     assert!(fresh_buffer.contains_hash(&hash_v1));
     assert_eq!(fresh_buffer.len(), 1);
@@ -415,17 +465,29 @@ fn audit_test_activation_buffer_global_capacity_and_prune() {
     let hash_v2 = tx_v2.compute_tx_hash();
     assert_ne!(hash_v1, hash_v2, "Hashes must differ on overwritten tx");
 
-    let res_v2 = fresh_buffer.buffer_tx(tx_v2, min_fee).expect("Buffer tx_v2");
+    let res_v2 = fresh_buffer
+        .buffer_tx(tx_v2, min_fee)
+        .expect("Buffer tx_v2");
     assert_eq!(res_v2, hash_v2);
 
-    assert!(fresh_buffer.contains_hash(&hash_v2), "New hash must be indexed");
+    assert!(
+        fresh_buffer.contains_hash(&hash_v2),
+        "New hash must be indexed"
+    );
     assert!(
         !fresh_buffer.contains_hash(&hash_v1),
         "Overwriting nonce must remove old hash from index"
     );
-    assert!(fresh_buffer.get_by_hash(&hash_v1).is_none(), "Old hash lookup must be None");
+    assert!(
+        fresh_buffer.get_by_hash(&hash_v1).is_none(),
+        "Old hash lookup must be None"
+    );
     assert_eq!(fresh_buffer.get_by_hash(&hash_v2).unwrap().amount, 300);
-    assert_eq!(fresh_buffer.len(), 1, "Buffer len must remain 1 after nonce overwrite");
+    assert_eq!(
+        fresh_buffer.len(),
+        1,
+        "Buffer len must remain 1 after nonce overwrite"
+    );
 }
 
 #[tokio::test]
@@ -444,21 +506,38 @@ async fn audit_test_state_pinning_durability_across_storage_reopen() {
 
     let snap_bytes = {
         let engine1 = InMemoryStateEngine::new();
-        engine1.open_pq_storage(&temp_dir).expect("Engine 1 open_pq_storage");
+        engine1
+            .open_pq_storage(&temp_dir)
+            .expect("Engine 1 open_pq_storage");
 
-        engine1.credit_native(&address, 25_000_000).await.expect("credit native");
-        engine1.pin_pubkey(address, scheme, &pubkey, &salt).await.expect("pin_pubkey");
+        engine1
+            .credit_native(&address, 25_000_000)
+            .await
+            .expect("credit native");
+        engine1
+            .pin_pubkey(address, scheme, &pubkey, &salt)
+            .await
+            .expect("pin_pubkey");
 
         let retrieved1 = engine1.get_pinned_pubkey(&address);
-        assert_eq!(retrieved1, Some((scheme, pubkey.clone())), "Engine 1 must have pinned key");
+        assert_eq!(
+            retrieved1,
+            Some((scheme, pubkey.clone())),
+            "Engine 1 must have pinned key"
+        );
         engine1.create_snapshot().await
     };
 
     // Engine 1 is dropped and storage closed. Reopen with Engine 2 pointing to the same storage
     {
         let engine2 = InMemoryStateEngine::new();
-        engine2.open_pq_storage(&temp_dir).expect("Engine 2 open_pq_storage");
-        engine2.restore_snapshot(&snap_bytes).await.expect("restore_snapshot");
+        engine2
+            .open_pq_storage(&temp_dir)
+            .expect("Engine 2 open_pq_storage");
+        engine2
+            .restore_snapshot(&snap_bytes)
+            .await
+            .expect("restore_snapshot");
 
         // Assert get_pinned_pubkey returns exact key!
         let retrieved2 = engine2.get_pinned_pubkey(&address);
@@ -472,7 +551,10 @@ async fn audit_test_state_pinning_durability_across_storage_reopen() {
         assert_eq!(acc.scheme, scheme);
         assert_eq!(acc.pubkey_hash, Some(*blake3::hash(&pubkey).as_bytes()));
         assert_eq!(acc.balance, 25_000_000);
-        assert_eq!(acc.to_trie_bytes().len(), stellereum::cpat2::ACCOUNT_LEAF_LEN_PQ);
+        assert_eq!(
+            acc.to_trie_bytes().len(),
+            stellereum::cpat2::ACCOUNT_LEAF_LEN_PQ
+        );
     }
 
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -488,11 +570,24 @@ async fn audit_test_cross_shard_pinned_account_inclusion() {
     let from = derive_pq_address(scheme, &pk, &salt);
 
     let initial_balance = 80_000_000u64;
-    source_engine.credit_native(&from, initial_balance).await.expect("credit source");
-    source_engine.pin_pubkey(from, scheme, &pk, &salt).await.expect("pin pubkey");
+    source_engine
+        .credit_native(&from, initial_balance)
+        .await
+        .expect("credit source");
+    source_engine
+        .pin_pubkey(from, scheme, &pk, &salt)
+        .await
+        .expect("pin pubkey");
 
-    let source_acc = source_engine.get_account(&from).await.expect("source acc exists");
-    assert_eq!(source_acc.to_trie_bytes().len(), 49, "Account must be 49-byte leaf");
+    let source_acc = source_engine
+        .get_account(&from)
+        .await
+        .expect("source acc exists");
+    assert_eq!(
+        source_acc.to_trie_bytes().len(),
+        49,
+        "Account must be 49-byte leaf"
+    );
 
     let source_state_root = source_engine.get_state_root().await;
     let proof = source_engine
@@ -522,14 +617,8 @@ async fn audit_test_cross_shard_pinned_account_inclusion() {
     tx.signature = envelope.encode();
 
     let block_hash = [0xB0u8; 32];
-    let cross_msg = CrossShardMessage::new(
-        1,
-        2,
-        tx,
-        source_state_root,
-        block_hash,
-        Some(proof),
-    ).with_source_balance(initial_balance);
+    let cross_msg = CrossShardMessage::new(1, 2, tx, source_state_root, block_hash, Some(proof))
+        .with_source_balance(initial_balance);
 
     // Verify inclusion for pinned 49-byte account
     assert!(
@@ -570,18 +659,20 @@ async fn audit_test_cross_shard_pinned_account_inclusion() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-};
+    };
 
     let credited = target_engine.apply_cross_shard_consumptions(&block).await;
-    assert_eq!(credited, 1, "Exactly 1 cross-shard inbound message must be credited");
+    assert_eq!(
+        credited, 1,
+        "Exactly 1 cross-shard inbound message must be credited"
+    );
     let balance_after = target_engine
         .get_account(&recipient)
         .await
         .map(|a| a.balance)
         .unwrap_or(0);
     assert_eq!(
-        balance_after,
-        transfer_amount,
+        balance_after, transfer_amount,
         "Recipient must be credited exact transfer amount"
     );
 }
@@ -593,7 +684,8 @@ fn audit_test_hard_invariants() {
         "HARD INVARIANT: COMMITMENT_VERSION must be 5 (Genesis v5)"
     );
     assert_eq!(
-        stellereum::mev_v4::COMMITMENT_VERSION, 5,
+        stellereum::mev_v4::COMMITMENT_VERSION,
+        5,
         "HARD INVARIANT: mev_v4 COMMITMENT_VERSION must be 5 (Genesis v5)"
     );
 }

@@ -10,7 +10,9 @@ use stellereum::bridge::{SupportedChain, TeleportBridgeEngine};
 use stellereum::cell::PatriciaTrie;
 use stellereum::mev::MevPreemptionEngine;
 use stellereum::orderbook::{OrderSide, OrderbookActor};
-use stellereum::sharding::{Block, CrossShardMessage, SharedLiquidityHub, Transaction, MASTERCHAIN_SHARD};
+use stellereum::sharding::{
+    Block, CrossShardMessage, SharedLiquidityHub, Transaction, MASTERCHAIN_SHARD,
+};
 use stellereum::state_engine::{token_balance_key, InMemoryStateEngine};
 use stellereum::token::{TokenMetadata, TokenOp, ZERO_ADDRESS};
 use stellereum::tokenomics::GenesisVault;
@@ -54,7 +56,7 @@ fn consensus_zero_quorum_must_not_accept_unsigned_block() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     assert!(
         !block.verify_signatures(0),
         "an unsigned block must NEVER pass a zero quorum (footgun)"
@@ -91,13 +93,25 @@ fn bridge_cumulative_rate_limit() {
     // 5 x 100k = 500k == hourly limit
     for _ in 0..5 {
         bridge
-            .request_withdrawal(addr(1), SupportedChain::Arbitrum, "0xabc".to_string(), each, now)
+            .request_withdrawal(
+                addr(1),
+                SupportedChain::Arbitrum,
+                "0xabc".to_string(),
+                each,
+                now,
+            )
             .unwrap();
     }
     // The 6th exceeds the hourly cap
     assert!(
         bridge
-            .request_withdrawal(addr(1), SupportedChain::Arbitrum, "0xabc".to_string(), each, now)
+            .request_withdrawal(
+                addr(1),
+                SupportedChain::Arbitrum,
+                "0xabc".to_string(),
+                each,
+                now
+            )
             .is_err(),
         "cumulative hourly rate limit must be enforced"
     );
@@ -113,7 +127,10 @@ fn orderbook_fifo_price_time_priority() {
     let (_s2, _) = book.submit_order(addr(2), OrderSide::Sell, 100, 5, 2);
     let (_buy, trades) = book.submit_order(addr(3), OrderSide::Buy, 100, 5, 3);
     assert_eq!(trades.len(), 1);
-    assert_eq!(trades[0].maker_order_id, s1.order_id, "earlier order must fill first (FIFO)");
+    assert_eq!(
+        trades[0].maker_order_id, s1.order_id,
+        "earlier order must fill first (FIFO)"
+    );
 }
 
 // ============================================================================
@@ -159,7 +176,10 @@ fn mev_cross_round_shares_rejected() {
 #[test]
 fn trie_non_inclusion_returns_none() {
     let mut trie = PatriciaTrie::new();
-    assert!(trie.generate_merkle_proof(&addr(1)).is_none(), "empty trie has no proofs");
+    assert!(
+        trie.generate_merkle_proof(&addr(1)).is_none(),
+        "empty trie has no proofs"
+    );
 
     trie.insert(&addr(1), b"v1");
     assert!(trie.generate_merkle_proof(&addr(1)).is_some());
@@ -190,7 +210,10 @@ fn session_key_cross_master_replay_rejected() {
 
     // Tamper the master address -> signature no longer matches
     auth.master_address = addr(0xAB);
-    assert!(!auth.verify(), "delegation must be bound to the master address");
+    assert!(
+        !auth.verify(),
+        "delegation must be bound to the master address"
+    );
 }
 
 // ============================================================================
@@ -203,7 +226,10 @@ fn deserialization_length_bomb_safe() {
     let mut bytes = vec![0u8; 32 + 32 + 8 + 8 + 8 + 4 + 4];
     bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // signature length = huge
     let res = bincode::deserialize::<Transaction>(&bytes);
-    assert!(res.is_err(), "length bomb must fail gracefully, not allocate/OOM");
+    assert!(
+        res.is_err(),
+        "length bomb must fail gracefully, not allocate/OOM"
+    );
 }
 
 // ============================================================================
@@ -214,13 +240,36 @@ async fn token_state_root_consistent_after_many_ops() {
     let engine = InMemoryStateEngine::new();
     let a = addr(1);
     let b = addr(2);
-    let id = engine.create_token(a, meta("T", "T"), 1_000_000).await.unwrap();
+    let id = engine
+        .create_token(a, meta("T", "T"), 1_000_000)
+        .await
+        .unwrap();
 
     for i in 0..51u64 {
         if i % 2 == 0 {
-            engine.token_execute(&id, a, TokenOp::Transfer { to: b, amount: 1_000 }).await.unwrap();
+            engine
+                .token_execute(
+                    &id,
+                    a,
+                    TokenOp::Transfer {
+                        to: b,
+                        amount: 1_000,
+                    },
+                )
+                .await
+                .unwrap();
         } else {
-            engine.token_execute(&id, b, TokenOp::Transfer { to: a, amount: 1_000 }).await.unwrap();
+            engine
+                .token_execute(
+                    &id,
+                    b,
+                    TokenOp::Transfer {
+                        to: a,
+                        amount: 1_000,
+                    },
+                )
+                .await
+                .unwrap();
         }
     }
     let root = engine.get_state_root().await;
@@ -231,7 +280,11 @@ async fn token_state_root_consistent_after_many_ops() {
         PatriciaTrie::verify_merkle_proof(&root, &key, &bal.to_be_bytes(), &proof),
         "SPV proof must hold after many operations"
     );
-    assert_eq!(engine.token_total_supply(&id).await, Some(1_000_000), "supply conserved");
+    assert_eq!(
+        engine.token_total_supply(&id).await,
+        Some(1_000_000),
+        "supply conserved"
+    );
 }
 
 // ============================================================================
@@ -254,10 +307,15 @@ async fn duplicate_signed_tx_rejected() {
     let sk = SigningKey::generate(&mut OsRng);
     let from = sk.verifying_key().to_bytes();
     let to = addr(2);
-    engine.update_account(stellereum::state_engine::AccountState::new(from, 10_000)).await;
+    engine
+        .update_account(stellereum::state_engine::AccountState::new(from, 10_000))
+        .await;
 
     let tx = Transaction::sign(&sk, to, 1_000, 0, 0, 1, 1);
     assert!(engine.apply_transaction(&tx, 0).await.is_ok());
     // Same tx again -> nonce already advanced
-    assert!(engine.apply_transaction(&tx, 0).await.is_err(), "duplicate tx must be rejected");
+    assert!(
+        engine.apply_transaction(&tx, 0).await.is_err(),
+        "duplicate tx must be rejected"
+    );
 }

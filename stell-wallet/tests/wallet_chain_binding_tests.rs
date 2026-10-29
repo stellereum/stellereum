@@ -51,7 +51,10 @@ fn bound_pq_transfer_verifies_only_on_its_chain() {
     let from_addr = kp.derive_address(&DEFAULT_SALT);
     assert_eq!(tx.from, from_addr);
     assert_eq!(tx.chain_id(), Some(CHAIN), "the bound builder must bind");
-    assert!(tx.verify_signature(), "a bound PQ tx must verify on its chain");
+    assert!(
+        tx.verify_signature(),
+        "a bound PQ tx must verify on its chain"
+    );
     assert!(
         tx.verify_signature_for_chain(CHAIN, true),
         "strict check passes on the bound chain"
@@ -70,9 +73,8 @@ fn bound_pq_payload_carries_stake_and_binds() {
         validator: val,
         amount: 2_000_000_000_000,
     }];
-    let tx = LightClient::build_pq_payload_tx_bound(
-        &kp, val, 0, 500_000, 3, 0, 0, true, payload, CHAIN,
-    );
+    let tx =
+        LightClient::build_pq_payload_tx_bound(&kp, val, 0, 500_000, 3, 0, 0, true, payload, CHAIN);
     assert_eq!(tx.chain_id(), Some(CHAIN));
     assert!(tx.verify_signature());
     assert!(tx.verify_signature_for_chain(CHAIN, true));

@@ -144,15 +144,14 @@ async fn replay_sets_move_the_commitment_digest() {
     let e2b = funded(addr, 1_000_000).await;
     let tx2 = Transaction::sign(&key(90), [0x99; 32], 50, 10, 0, SHARD0, SHARD1);
     assert_eq!(tx2.compute_tx_hash(), tx_hash);
-    e2b
-        .restore_cross_shard_replay(&CrossShardReplaySnapshot {
-            engine_consumed: vec![],
-            runtime_consumed: vec![],
-            produced: vec![(tx_hash, tx2, 9)],
-            completed: vec![],
+    e2b.restore_cross_shard_replay(&CrossShardReplaySnapshot {
+        engine_consumed: vec![],
+        runtime_consumed: vec![],
+        produced: vec![(tx_hash, tx2, 9)],
+        completed: vec![],
         xpc: vec![],
     })
-        .await;
+    .await;
     assert_ne!(
         e2b.get_state_root().await,
         d_produced,
@@ -219,9 +218,12 @@ async fn snapshot_install_with_missing_blob_is_refused() {
         "precondition: replay state moves the target root"
     );
 
-    let res = fast_sync_state(&target, root, || async { Some(snap.clone()) }, |_| async {
-        None
-    })
+    let res = fast_sync_state(
+        &target,
+        root,
+        || async { Some(snap.clone()) },
+        |_| async { None },
+    )
     .await;
     let err = res.expect_err("a snapshot without the cross_shard blob must be refused");
     assert!(
@@ -248,9 +250,14 @@ async fn snapshot_install_with_missing_blob_is_refused() {
     // Control: a replay-empty target still fast-syncs without the blob (the
     // never-cross-sharded chain is unaffected by the gate).
     let clean = funded(user, 777_000).await;
-    fast_sync_state(&clean, root, || async { Some(snap.clone()) }, |_| async { None })
-        .await
-        .expect("replay-empty target must sync without the blob");
+    fast_sync_state(
+        &clean,
+        root,
+        || async { Some(snap.clone()) },
+        |_| async { None },
+    )
+    .await
+    .expect("replay-empty target must sync without the blob");
     assert_eq!(clean.get_state_root().await, root);
 }
 
@@ -362,7 +369,10 @@ async fn snapshot_install_with_short_set_is_refused() {
     let err = sync_with_blob(&target, &fx, None)
         .await
         .expect_err("short incoming set must be refused");
-    assert!(err.contains("cross_shard"), "refusal must name the domain: {err}");
+    assert!(
+        err.contains("cross_shard"),
+        "refusal must name the domain: {err}"
+    );
     assert_eq!(target.cross_shard_consumed_len().await, 1);
     assert!(target.is_cross_shard_consumed(&extra).await);
     assert_eq!(target.get_state_root().await, before);
@@ -376,20 +386,26 @@ async fn snapshot_install_with_short_set_is_refused() {
             runtime_consumed: vec![fx.consumed_key],
             produced: vec![(fx.tx_hash, fx.tx.clone(), fx.produce_height + 100)],
             completed: vec![fx.completed_hash],
-        xpc: vec![],
-    })
+            xpc: vec![],
+        })
         .await;
     let err = sync_with_blob(&conflicted, &fx, None)
         .await
         .expect_err("conflicting produce height must be refused");
-    assert!(err.contains("cross_shard"), "refusal must name the domain: {err}");
+    assert!(
+        err.contains("cross_shard"),
+        "refusal must name the domain: {err}"
+    );
 
     // Corrupt blob: fail closed, never installed as empty.
     let corrupt_target = funded([0x66u8; 32], 1_000_000).await;
     let err = sync_with_blob(&corrupt_target, &fx, Some(vec![0xDE, 0xAD, 0xBE, 0xEF]))
         .await
         .expect_err("corrupt replay blob must be refused");
-    assert!(err.contains("cross-shard"), "refusal must name the domain: {err}");
+    assert!(
+        err.contains("cross-shard"),
+        "refusal must name the domain: {err}"
+    );
     assert_eq!(corrupt_target.cross_shard_consumed_len().await, 0);
 }
 
@@ -471,7 +487,7 @@ async fn double_apply_refused_after_snapshot_install() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     let credited = fresh.apply_cross_shard_consumptions(&carrier).await;
     assert_eq!(credited, 0, "replayed receipt must credit nothing");
     assert_eq!(

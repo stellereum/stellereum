@@ -51,23 +51,37 @@ mod tests {
         assert_ne!(root1, root2);
 
         // Test Cryptographic Merkle Inclusion Proof
-        let proof1 = trie.generate_merkle_proof(&key1).expect("Failed to generate Merkle proof");
-        assert!(PatriciaTrie::verify_merkle_proof(&root2, &key1, val1, &proof1));
+        let proof1 = trie
+            .generate_merkle_proof(&key1)
+            .expect("Failed to generate Merkle proof");
+        assert!(PatriciaTrie::verify_merkle_proof(
+            &root2, &key1, val1, &proof1
+        ));
 
         // Test tamper detection in Merkle proof
-        assert!(!PatriciaTrie::verify_merkle_proof(&root2, &key1, b"tampered_value", &proof1));
+        assert!(!PatriciaTrie::verify_merkle_proof(
+            &root2,
+            &key1,
+            b"tampered_value",
+            &proof1
+        ));
 
         // Test Canonical BoC DAG chunking & binary serialization
         let large_payload = vec![42u8; 350]; // Spans across multiple 128-byte cells
         let (boc, root_cell) = Cell::from_bytes(&large_payload);
         assert!(boc.cells.len() >= 3);
 
-        let reconstructed = boc.read_bytes(&root_cell).expect("Failed to read cell chain");
+        let reconstructed = boc
+            .read_bytes(&root_cell)
+            .expect("Failed to read cell chain");
         assert_eq!(reconstructed, large_payload);
 
         let boc_bytes = boc.to_boc_bytes();
-        let deserialized_boc = BagOfCells::from_boc_bytes(&boc_bytes).expect("Failed to deserialize BoC bytes");
-        let roundtrip = deserialized_boc.read_bytes(&root_cell).expect("Failed to read deserialized BoC");
+        let deserialized_boc =
+            BagOfCells::from_boc_bytes(&boc_bytes).expect("Failed to deserialize BoC bytes");
+        let roundtrip = deserialized_boc
+            .read_bytes(&root_cell)
+            .expect("Failed to read deserialized BoC");
         assert_eq!(roundtrip, large_payload);
     }
 
@@ -78,7 +92,9 @@ mod tests {
         let bob = [102u8; 32];
         let non_existent = [255u8; 32];
 
-        state_engine.update_account(AccountState::new(alice, 10_000)).await;
+        state_engine
+            .update_account(AccountState::new(alice, 10_000))
+            .await;
         state_engine.update_account(AccountState::new(bob, 0)).await;
 
         // 1. Send message from Alice to Bob
@@ -117,14 +133,20 @@ mod tests {
 
         // After send: value is in-flight inside the bounce message (not yet credited)
         let alice_mid = state_engine.get_account(&alice).await.unwrap();
-        assert_eq!(alice_mid.balance, 4_500, "value is in-flight until the bounce is processed");
+        assert_eq!(
+            alice_mid.balance, 4_500,
+            "value is in-flight until the bounce is processed"
+        );
         assert_eq!(alice_mid.inbox.len(), 1);
         assert!(alice_mid.inbox[0].bounced);
 
         // Processing the bounce credits the value back exactly once
         state_engine.step_actor_execution().await.unwrap();
         let alice_after_bounce = state_engine.get_account(&alice).await.unwrap();
-        assert_eq!(alice_after_bounce.balance, 7_500, "bounce returns funds exactly once");
+        assert_eq!(
+            alice_after_bounce.balance, 7_500,
+            "bounce returns funds exactly once"
+        );
     }
 
     #[test]
@@ -149,7 +171,7 @@ mod tests {
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
 
         // Sign with 2 validators out of 3
         block.sign_block(&val1);
@@ -236,14 +258,12 @@ mod tests {
         let trader_b = [11u8; 32];
 
         // Trader A places limit sell: 10 units @ price 100
-        let (sell_order, trades) =
-            book.submit_order(trader_a, OrderSide::Sell, 100, 10, 1000);
+        let (sell_order, trades) = book.submit_order(trader_a, OrderSide::Sell, 100, 10, 1000);
         assert_eq!(trades.len(), 0);
         assert_eq!(sell_order.filled, 0);
 
         // Trader B places buy order: 6 units @ price 100
-        let (buy_order, trades) =
-            book.submit_order(trader_b, OrderSide::Buy, 100, 6, 1005);
+        let (buy_order, trades) = book.submit_order(trader_b, OrderSide::Buy, 100, 6, 1005);
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].amount, 6);
         assert_eq!(trades[0].price, 100);
@@ -337,7 +357,9 @@ mod tests {
         // Viewing Key Audit test
         let auditor_vk = ViewingKey::generate();
         let blind_audit = PedersenCommitment::random_blinding();
-        let enc_payload = ViewingKey::encrypt_amount_for_auditor(&auditor_vk.view_pub, 12_500, &blind_audit).unwrap();
+        let enc_payload =
+            ViewingKey::encrypt_amount_for_auditor(&auditor_vk.view_pub, 12_500, &blind_audit)
+                .unwrap();
         let (dec_val, dec_blind) = auditor_vk.decrypt_amount(&enc_payload).unwrap();
         assert_eq!(dec_val, 12_500);
         assert_eq!(dec_blind, blind_audit);
@@ -379,8 +401,9 @@ mod tests {
         // Team Vesting test: 12m cliff, 24m linear
         let vesting = TeamVestingSchedule::new(1000);
         assert_eq!(vesting.unlocked_amount(1000 + 100), 0); // Before cliff
-        // 12 months after cliff + half of 24m vesting = 50% unlocked
-        let half_vesting_time = 1000 + vesting.cliff_duration_secs + vesting.vesting_duration_secs / 2;
+                                                            // 12 months after cliff + half of 24m vesting = 50% unlocked
+        let half_vesting_time =
+            1000 + vesting.cliff_duration_secs + vesting.vesting_duration_secs / 2;
         let unlocked = vesting.unlocked_amount(half_vesting_time);
         assert_eq!(unlocked, vesting.total_allocation / 2);
     }
@@ -424,10 +447,7 @@ mod tests {
             recipient,
             asset,
             amount,
-            validator_signatures: vec![
-                (v1_pub, sig1.to_vec()),
-                (v2_pub, sig2.to_vec()),
-            ],
+            validator_signatures: vec![(v1_pub, sig1.to_vec()), (v2_pub, sig2.to_vec())],
             zk_proof: None,
         };
 
@@ -467,7 +487,8 @@ mod tests {
         let tx_data = b"raw_high_frequency_arb_tx";
         let envelope = MevPreemptionEngine::seal_transaction(1, &round_key, tx_data).unwrap();
 
-        let commit = mev.commit_blind_round(1, std::slice::from_ref(&envelope), &[val1, val2, val3]);
+        let commit =
+            mev.commit_blind_round(1, std::slice::from_ref(&envelope), &[val1, val2, val3]);
         assert!(MevPreemptionEngine::verify_round_commitment(&commit, 2));
 
         // Reconstruct key with only 2 shares (shares[0] and shares[2])
@@ -520,13 +541,7 @@ mod tests {
             priority_fee_per_gas: 0,
         };
 
-        let cross_msg = CrossShardMessage::new_trusted(
-            0,
-            1,
-            tx,
-            root,
-            [2u8; 32],
-        );
+        let cross_msg = CrossShardMessage::new_trusted(0, 1, tx, root, [2u8; 32]);
 
         let seq = hub.route_cross_shard_message(cross_msg);
         assert_eq!(seq, 1);

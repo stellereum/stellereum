@@ -39,7 +39,10 @@ fn d1_proof_heavy_tx_rejected_at_admission() {
     let tx = payload_tx((0..33).map(|_| snark_op()).collect(), 0);
     assert_eq!(Mempool::count_tx_proof_units(&tx), 33 * 64);
     let r = mp.add_checked(tx, u64::MAX);
-    assert!(r.is_err(), "proof-poison tx (2112 units > 2048 cap) must be rejected");
+    assert!(
+        r.is_err(),
+        "proof-poison tx (2112 units > 2048 cap) must be rejected"
+    );
 }
 
 // D1: a single tx whose estimated wire exceeds the whole block wire cap must
@@ -69,10 +72,16 @@ fn d1_boundary_and_honest_tx_still_admit() {
     let mut mp = Mempool::new(10_000, 256);
     let at_cap = payload_tx((0..32).map(|_| snark_op()).collect(), 0);
     assert_eq!(Mempool::count_tx_proof_units(&at_cap), 2048);
-    assert!(mp.add_checked(at_cap, u64::MAX).is_ok(), "tx exactly at cap must admit");
+    assert!(
+        mp.add_checked(at_cap, u64::MAX).is_ok(),
+        "tx exactly at cap must admit"
+    );
     let key = ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]);
     let honest = Transaction::sign(&key, [0x99u8; 32], 10, 1_000, 1, 1, 1);
-    assert!(mp.add_checked(honest, u64::MAX).is_ok(), "honest tx must admit");
+    assert!(
+        mp.add_checked(honest, u64::MAX).is_ok(),
+        "honest tx must admit"
+    );
 }
 
 // D5: exhausting a source's hourly budget, then "restarting" (fresh Faucet over
@@ -83,9 +92,15 @@ async fn d5_ip_budget_survives_restart() {
     let t: u64 = 1_800_000_000;
     let old = Faucet::new([0x11u8; 32], 1, 10, 25);
     for _ in 0..stellereum::rpc::FAUCET_IP_MAX_PER_HOUR {
-        assert!(old.check_ip_throttle(Some(ip), t).await, "budget should allow the first 20");
+        assert!(
+            old.check_ip_throttle(Some(ip), t).await,
+            "budget should allow the first 20"
+        );
     }
-    assert!(!old.check_ip_throttle(Some(ip), t).await, "21st drip in the hour must be refused");
+    assert!(
+        !old.check_ip_throttle(Some(ip), t).await,
+        "21st drip in the hour must be refused"
+    );
 
     let bytes = old.save_bytes().await;
     let new = Faucet::new([0x11u8; 32], 1, 10, 25);
@@ -96,7 +111,10 @@ async fn d5_ip_budget_survives_restart() {
     );
     // A different source is unaffected by the exhausted one.
     let other: std::net::IpAddr = "198.51.100.9".parse().unwrap();
-    assert!(new.check_ip_throttle(Some(other), t).await, "unrelated source keeps its budget");
+    assert!(
+        new.check_ip_throttle(Some(other), t).await,
+        "unrelated source keeps its budget"
+    );
 }
 
 // D5: callers without an attributable source share one fallback budget — they
@@ -108,7 +126,10 @@ async fn d5_unknown_source_uses_shared_fallback_bucket() {
     for _ in 0..stellereum::rpc::FAUCET_IP_MAX_PER_HOUR {
         assert!(f.check_ip_throttle(None, t).await);
     }
-    assert!(!f.check_ip_throttle(None, t).await, "unknown source must also cap out");
+    assert!(
+        !f.check_ip_throttle(None, t).await,
+        "unknown source must also cap out"
+    );
 }
 
 // D5: a record written before the rate buckets existed must still enforce its
@@ -159,9 +180,12 @@ async fn d5_stale_buckets_pruned_on_load() {
     let stale = CurrentState {
         next_nonce: 0,
         dispensed: Default::default(),
-        ip_buckets: [("203.0.113.7".to_string(), (now_hour.saturating_sub(48), 20u32))]
-            .into_iter()
-            .collect(),
+        ip_buckets: [(
+            "203.0.113.7".to_string(),
+            (now_hour.saturating_sub(48), 20u32),
+        )]
+        .into_iter()
+        .collect(),
     };
     let bytes = bincode::serialize(&stale).unwrap();
     let f = Faucet::new([0x11u8; 32], 1, 10, 25);
@@ -169,9 +193,15 @@ async fn d5_stale_buckets_pruned_on_load() {
     // The dead entry must be gone immediately after the load (before any new
     // drip re-adds a live bucket for the same key).
     let re = f.save_bytes().await;
-    assert!(re.len() < bytes.len(), "pruned state must be smaller than the stale blob");
+    assert!(
+        re.len() < bytes.len(),
+        "pruned state must be smaller than the stale blob"
+    );
     // ...and the source itself still works going forward.
     let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
     let t = (now_hour + 1) * 3600;
-    assert!(f.check_ip_throttle(Some(ip), t).await, "source keeps a live budget");
+    assert!(
+        f.check_ip_throttle(Some(ip), t).await,
+        "source keeps a live budget"
+    );
 }

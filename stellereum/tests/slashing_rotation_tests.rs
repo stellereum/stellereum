@@ -11,12 +11,12 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::sync::Arc;
 use stellereum::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
-use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STAKING_POOL, STELL_MIN_BOND_BUFFER};
-use std::sync::Arc;
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
 const BAL: u64 = 10_000_000_000_000;
 
@@ -30,7 +30,11 @@ fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
 }
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
-    ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect())
+    ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    )
 }
 fn ids(ks: &[SigningKey]) -> Vec<ValidatorId> {
     ks.iter().map(|k| k.verifying_key().to_bytes()).collect()
@@ -77,7 +81,10 @@ fn proposer_key<'a>(ks: &'a [SigningKey], vs: &ValidatorSet, h: u64, r: u32) -> 
 }
 
 async fn pool_of(st: &Arc<InMemoryStateEngine>) -> u64 {
-    st.get_account(&STAKING_POOL).await.map(|a| a.balance).unwrap_or(0)
+    st.get_account(&STAKING_POOL)
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0)
 }
 
 /// Preset one engine for the downtime-threshold test: silent validator sits at
@@ -146,7 +153,9 @@ async fn test1_downtime_parity_local_vs_adopt() {
     assert_eq!(c1[0].try_finalize().await, Some(bh1));
     // Path B adopts height 1.
     assert_eq!(
-        c2[0].adopt_committed(1, block1.clone(), cert1.clone()).await,
+        c2[0]
+            .adopt_committed(1, block1.clone(), cert1.clone())
+            .await,
         Ok(bh1),
         "precondition: adopt must accept the genuine cert"
     );
@@ -199,7 +208,11 @@ async fn test1_downtime_parity_local_vs_adopt() {
     assert_eq!(c1[0].hc.try_precommit_quorum(), Some(bh2));
     c1[0].blocks.insert(bh2, block2.clone());
     let decided = c1[0].try_finalize().await;
-    assert_eq!(decided, Some(bh2), "precondition: local path must finalize height 2");
+    assert_eq!(
+        decided,
+        Some(bh2),
+        "precondition: local path must finalize height 2"
+    );
     let burn_local = c1[0].state.staking_read().await.total_burned - burn_before_l;
     let pool_after_l = pool_of(&c1[0].state).await;
     let pool_debit_local = pool_before_l.saturating_sub(pool_after_l);
@@ -209,8 +222,14 @@ async fn test1_downtime_parity_local_vs_adopt() {
     // ---- Catch-up path: adopt height 2 with the genuine decision QC. ----
     let burn_before_c = c2[0].state.staking_read().await.total_burned;
     let pool_before_c = pool_of(&c2[0].state).await;
-    let r = c2[0].adopt_committed(2, block2.clone(), cert2.clone()).await;
-    assert_eq!(r, Ok(bh2), "precondition: adopt must accept the height-2 cert: {r:?}");
+    let r = c2[0]
+        .adopt_committed(2, block2.clone(), cert2.clone())
+        .await;
+    assert_eq!(
+        r,
+        Ok(bh2),
+        "precondition: adopt must accept the height-2 cert: {r:?}"
+    );
     let burn_catchup = c2[0].state.staking_read().await.total_burned - burn_before_c;
     let pool_after_c = pool_of(&c2[0].state).await;
     let pool_debit_catchup = pool_before_c.saturating_sub(pool_after_c);
@@ -283,7 +302,10 @@ async fn test2_equivocation_parity_local_vs_adopt() {
     }
     let root_before_1 = c1[0].state.get_state_root().await;
     let root_before_2 = c2[0].state.get_state_root().await;
-    assert_eq!(root_before_1, root_before_2, "precondition: identical engines");
+    assert_eq!(
+        root_before_1, root_before_2,
+        "precondition: identical engines"
+    );
 
     let pkey = proposer_key(&ks, &vs, 1, 0).clone();
     let block = mkblock(&pkey, 1, [0u8; 32], root_before_1);
@@ -368,8 +390,7 @@ async fn test2_equivocation_parity_local_vs_adopt() {
         "F4 FIX: local path must NOT slash on local evidence (genesis bonds at bare MIN)"
     );
     assert_eq!(
-        bond_catchup,
-        MIN_VALIDATOR_BOND,
+        bond_catchup, MIN_VALIDATOR_BOND,
         "F4 FIX: catch-up bond must be untouched (genesis bonds at bare MIN)"
     );
     assert_eq!(pool_debit_local, 0, "F4 FIX: no local burn, no pool debit");
@@ -378,14 +399,18 @@ async fn test2_equivocation_parity_local_vs_adopt() {
         "F4 FIX: no catch-up burn, no pool debit"
     );
     assert_eq!(
-        root_local, root_catchup,
+        root_local,
+        root_catchup,
         "F4 PARITY FAILURE: local finalize root {} != adopt root {}. Equivocation \
          slashing must be a function of block content, not of which votes this \
          node happened to receive.",
         hex::encode(&root_local[..8]),
         hex::encode(&root_catchup[..8]),
     );
-    let _ = (hex::encode(&root_local[..8]), hex::encode(&root_catchup[..8]));
+    let _ = (
+        hex::encode(&root_local[..8]),
+        hex::encode(&root_catchup[..8]),
+    );
 }
 
 // ============================================================================
@@ -441,7 +466,10 @@ async fn test3_bond_new_validator_mid_chain() {
         .pending_validators
         .clone()
         .expect("the rotation must be staged, not installed");
-    assert_eq!(activation, 3, "a change derived at height 2 takes effect at height 3");
+    assert_eq!(
+        activation, 3,
+        "a change derived at height 2 takes effect at height 3"
+    );
     assert_eq!(
         nodes[0].validators.len(),
         len_before,
@@ -453,7 +481,11 @@ async fn test3_bond_new_validator_mid_chain() {
     // needed for quorum).
     let pkey2 = proposer_key(&ks, &nodes[0].validators, 2, 0).clone();
     let root2 = nodes[0].state.get_state_root().await;
-    let prev2 = nodes[0].finalized.last().map(|(_, h)| *h).unwrap_or([0u8; 32]);
+    let prev2 = nodes[0]
+        .finalized
+        .last()
+        .map(|(_, h)| *h)
+        .unwrap_or([0u8; 32]);
     let b2 = mkblock(&pkey2, 2, prev2, root2);
     let bh2 = b2.compute_hash();
     for k in ks.iter() {
@@ -502,8 +534,7 @@ async fn test3_bond_new_validator_mid_chain() {
         "new validator must own slots in the new schedule"
     );
     assert_ne!(
-        before_seq,
-        after_seq,
+        before_seq, after_seq,
         "adding a member must change the rotation"
     );
 }
@@ -555,7 +586,11 @@ async fn test4_full_unbond_drops_validator_at_boundary() {
     // needed — only the 3 survivors vote below, and the quorum they form
     // (3 of 4 in-force power) is what finalizes.
     let root = nodes[0].state.get_state_root().await;
-    let prev = nodes[0].finalized.last().map(|(_, h)| *h).unwrap_or([0u8; 32]);
+    let prev = nodes[0]
+        .finalized
+        .last()
+        .map(|(_, h)| *h)
+        .unwrap_or([0u8; 32]);
     let blk = mkblock(&pkey, h, prev, root);
     let bh = blk.compute_hash();
     // Only the 3 remaining validators vote; the victim is silent/absent.
@@ -576,8 +611,15 @@ async fn test4_full_unbond_drops_validator_at_boundary() {
     );
     nodes[0].blocks.insert(bh, blk);
     let fin = nodes[0].try_finalize().await;
-    println!("[test4] finalized height {h} without victim vote: {:?}", fin.map(|x| hex::encode(&x[..4])));
-    assert_eq!(fin, Some(bh), "later block must finalize without the victim");
+    println!(
+        "[test4] finalized height {h} without victim vote: {:?}",
+        fin.map(|x| hex::encode(&x[..4]))
+    );
+    assert_eq!(
+        fin,
+        Some(bh),
+        "later block must finalize without the victim"
+    );
     assert!(!nodes[0].validators.contains(&victim), "victim stays out");
 }
 
@@ -618,7 +660,11 @@ async fn test5_downtime_slash_ejects_below_min_and_remainder_quorate() {
             .unwrap();
     }
     assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh));
-    let cert1 = nodes[0].hc.precommit_qc.clone().expect("height-1 QC exists");
+    let cert1 = nodes[0]
+        .hc
+        .precommit_qc
+        .clone()
+        .expect("height-1 QC exists");
     nodes[0].blocks.insert(bh, blk);
     assert_eq!(
         nodes[0].try_finalize().await,
@@ -653,7 +699,11 @@ async fn test5_downtime_slash_ejects_below_min_and_remainder_quorate() {
     assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh2));
     nodes[0].blocks.insert(bh2, blk2);
     let fin = nodes[0].try_finalize().await;
-    assert_eq!(fin, Some(bh2), "height 2 must finalize on the 3 honest votes");
+    assert_eq!(
+        fin,
+        Some(bh2),
+        "height 2 must finalize on the 3 honest votes"
+    );
 
     let bond = nodes[0].state.staking_read().await.validators[&victim].self_bond;
     println!("[test5] victim bond after slash: {bond} (MIN={MIN_VALIDATOR_BOND})");

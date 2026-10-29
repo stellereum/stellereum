@@ -41,7 +41,10 @@ async fn setup(usdt_to_buyer: u64, reserve: u64) -> (InMemoryStateEngine, [u8; 3
         .token_execute(
             &usdt,
             MINTER,
-            stellereum::token::TokenOp::Mint { to: buyer, amount: usdt_to_buyer },
+            stellereum::token::TokenOp::Mint {
+                to: buyer,
+                amount: usdt_to_buyer,
+            },
         )
         .await
         .unwrap();
@@ -74,7 +77,10 @@ async fn concurrent_sells_bypass_the_ring_fenced_reserve_cap() {
 
     // The attacker holds plenty of STELL to redeem `max` N times over.
     engine
-        .update_account(AccountState::new(buyer, max.saturating_mul(200) + 10_000_000))
+        .update_account(AccountState::new(
+            buyer,
+            max.saturating_mul(200) + 10_000_000,
+        ))
         .await;
     let usdt_before = engine.token_balance(&usdt, &buyer).await;
 
@@ -97,7 +103,10 @@ async fn concurrent_sells_bypass_the_ring_fenced_reserve_cap() {
     let reserve_after = engine.pmm_read().await.reserve_micro;
     println!("{ok}/{n} concurrent redemptions SUCCEEDED");
     println!("wUSDT received: {}", usdt_after - usdt_before);
-    println!("reserve: {reserve_before} -> {reserve_after} (delta {})", reserve_before - reserve_after);
+    println!(
+        "reserve: {reserve_before} -> {reserve_after} (delta {})",
+        reserve_before - reserve_after
+    );
     println!("PLEDGED buffer that was supposed to make this impossible: {usable_before}");
 
     assert!(ok > 1, "the race did not land this run; ok={ok}");
@@ -137,7 +146,9 @@ async fn concurrent_buys_all_price_off_the_same_stale_supply() {
     let mut handles = Vec::new();
     for _ in 0..n {
         let e = engine.clone();
-        handles.push(tokio::spawn(async move { e.pmm_buy(buyer, notional).await }));
+        handles.push(tokio::spawn(
+            async move { e.pmm_buy(buyer, notional).await },
+        ));
     }
     let mut minted = 0u64;
     let mut paid = 0u64;
@@ -151,7 +162,11 @@ async fn concurrent_buys_all_price_off_the_same_stale_supply() {
     let _reserve_after = engine.pmm_read().await.reserve_micro;
     println!("price before {price_before}, minted_nano {supply_before} -> {supply_after}");
     println!("{n} buyers each paid {notional} micro ({paid} total), received {minted} nano STELL");
-    println!("curve only advanced by {} nano but {} nano were minted", supply_after - supply_before, minted);
+    println!(
+        "curve only advanced by {} nano but {} nano were minted",
+        supply_after - supply_before,
+        minted
+    );
     let fair = (minted as u128) * (price_before as u128) / 1_000_000_000;
     println!("fair value at the pre-race price: {fair} micro vs {paid} paid");
     assert!(minted > 0 && paid > 0);
@@ -200,9 +215,14 @@ fn control_pmm_curve_is_sound() {
         let back = q2.sell_stell(m).unwrap();
         println!(
             "  redeemable {m} of {} -> {} micro back of {} paid",
-            r2.stell_minted, back.usdt_paid, usd * 1_000_000
+            r2.stell_minted,
+            back.usdt_paid,
+            usd * 1_000_000
         );
-        assert!(back.usdt_paid <= usd * 1_000_000, "a round trip must not profit");
+        assert!(
+            back.usdt_paid <= usd * 1_000_000,
+            "a round trip must not profit"
+        );
     }
     // 2. The reserve cap is respected SERIALLY: only one max-size sell fits.
     let mut q = p.clone();
@@ -210,16 +230,24 @@ fn control_pmm_curve_is_sound() {
     let max = q.max_redeemable_stell();
     let first = q.sell_stell(max);
     let second = q.sell_stell(max);
-    println!("serial: first sell ok={}, second sell ok={}", first.is_ok(), second.is_ok());
+    println!(
+        "serial: first sell ok={}, second sell ok={}",
+        first.is_ok(),
+        second.is_ok()
+    );
     assert!(first.is_ok());
-    assert!(second.is_err(), "serially the buffer does block the second redemption");
+    assert!(
+        second.is_err(),
+        "serially the buffer does block the second redemption"
+    );
     // 3. minted_nano cannot go negative and the buffer cannot go negative.
     assert!(q.minted_nano > 0, "minted_nano never goes negative");
     assert!(q.redemption_buffer_micro <= q.reserve_micro);
     assert!(
         matches!(
             q.sell_stell(1),
-            Err(stellereum::pmm::PmmError::InsufficientReserve) | Err(stellereum::pmm::PmmError::Dust)
+            Err(stellereum::pmm::PmmError::InsufficientReserve)
+                | Err(stellereum::pmm::PmmError::Dust)
         ),
         "1 nano cannot be redeemed once the reserve is empty: {:?}",
         q.sell_stell(1).err()

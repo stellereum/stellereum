@@ -283,7 +283,9 @@ fn parse_args() -> Args {
             "--shards" => a.shards = it.next().unwrap_or_else(|| die("--shards needs a value")),
             "--shard-id" => {
                 let v = it.next().unwrap_or_else(|| die("--shard-id needs a value"));
-                a.shard_id = v.parse().unwrap_or_else(|_| die("--shard-id needs a number"));
+                a.shard_id = v
+                    .parse()
+                    .unwrap_or_else(|_| die("--shard-id needs a number"));
             }
             "--text" => a.text = true,
             "--force" | "-f" | "--yes" => a.force = true,
@@ -336,10 +338,9 @@ fn cmd_checkpoint(args: &Args) -> ExitCode {
             println!("NO_CHECKPOINT");
             ExitCode::SUCCESS
         }
-        Some(bytes) => {
-            match decode_checkpoint(&bytes) {
-                Some(cp) => {
-                    println!("height={} round={} locked_hash={} locked_round={} finalized_height={} finalized_hash={} bytes={}",
+        Some(bytes) => match decode_checkpoint(&bytes) {
+            Some(cp) => {
+                println!("height={} round={} locked_hash={} locked_round={} finalized_height={} finalized_hash={} bytes={}",
                         cp.height,
                         cp.round,
                         cp.locked_hash.map(|h| hex_of(&h)).unwrap_or_else(|| "none".to_string()),
@@ -348,14 +349,13 @@ fn cmd_checkpoint(args: &Args) -> ExitCode {
                         hex_of(&cp.finalized_hash),
                         cp.raw_len
                     );
-                    ExitCode::SUCCESS
-                }
-                None => {
-                    println!("UNPARSEABLE bytes={} hex={}", bytes.len(), hex_of(&bytes));
-                    ExitCode::from(1)
-                }
+                ExitCode::SUCCESS
             }
-        }
+            None => {
+                println!("UNPARSEABLE bytes={} hex={}", bytes.len(), hex_of(&bytes));
+                ExitCode::from(1)
+            }
+        },
     }
 }
 
@@ -410,7 +410,10 @@ fn cmd_doctor(args: &Args) -> ExitCode {
         None => Vec::new(),
     };
     let own_topic = match (&epoch, is_sharded) {
-        (Some(e), true) => Some(format!("{CONSENSUS_TOPIC_BASE}/{e}/shard/{}", args.shard_id)),
+        (Some(e), true) => Some(format!(
+            "{CONSENSUS_TOPIC_BASE}/{e}/shard/{}",
+            args.shard_id
+        )),
         (Some(e), false) => Some(format!("{CONSENSUS_TOPIC_BASE}/{e}")),
         _ => None,
     };
@@ -436,11 +439,17 @@ fn cmd_doctor(args: &Args) -> ExitCode {
                 .map(|h| hex_of(&h))
                 .unwrap_or_else(|| "n/a".to_string())
         );
-        println!("epoch            : {}", epoch.clone().unwrap_or_else(|| "n/a".to_string()));
+        println!(
+            "epoch            : {}",
+            epoch.clone().unwrap_or_else(|| "n/a".to_string())
+        );
         println!("shards           : {:?}", shards);
         println!("is_sharded       : {}", is_sharded);
         println!("topics           : {}", topics.join(" "));
-        println!("own_topic        : {}", own_topic.clone().unwrap_or_else(|| "n/a".to_string()));
+        println!(
+            "own_topic        : {}",
+            own_topic.clone().unwrap_or_else(|| "n/a".to_string())
+        );
         match &cp {
             Some(c) => {
                 println!("checkpoint height: {}", c.height);
@@ -448,7 +457,7 @@ fn cmd_doctor(args: &Args) -> ExitCode {
                 println!(
                     "lock             : {}",
                     c.locked_hash
-                .map(|h| hex_of(&h)) // GATE: h is [u8; N] by value; &h coerces to &[u8], bare h does not
+                        .map(|h| hex_of(&h)) // GATE: h is [u8; N] by value; &h coerces to &[u8], bare h does not
                         .unwrap_or_else(|| "none".to_string())
                 );
                 println!("lock round       : {}", c.locked_round);
@@ -666,7 +675,10 @@ fn cmd_diverge(args: &Args) -> ExitCode {
                 );
             }
             if a.genesis_root != b.genesis_root {
-                println!("DIVERGENCE shard={}: genesis roots differ (different chains/networks)", shard);
+                println!(
+                    "DIVERGENCE shard={}: genesis roots differ (different chains/networks)",
+                    shard
+                );
             }
             if a.snapshot_height == b.snapshot_height && a.snapshot_digest != b.snapshot_digest {
                 println!(
@@ -688,7 +700,8 @@ fn cmd_diverge(args: &Args) -> ExitCode {
     }
 }
 
-fn cmd_clear_lock(args: &Args) -> ExitCode {    let dir = store_dir(args);
+fn cmd_clear_lock(args: &Args) -> ExitCode {
+    let dir = store_dir(args);
     if !args.force {
         eprintln!(
             "stelops: clear-lock REFUSES without --force.\n\
@@ -722,7 +735,10 @@ fn cmd_clear_lock(args: &Args) -> ExitCode {    let dir = store_dir(args);
     let stamped = backup_dir.join(format!("consensus-checkpoint.bak.{stamp}"));
     let _ = std::fs::copy(&backup, &stamped);
     if let Err(e) = std::fs::write(&stamped, &raw) {
-        eprintln!("stelops: could not write the backup {}: {e}", stamped.display());
+        eprintln!(
+            "stelops: could not write the backup {}: {e}",
+            stamped.display()
+        );
         return ExitCode::from(1);
     }
     meta.remove(b"consensus").expect("remove consensus key");
@@ -734,7 +750,9 @@ fn cmd_clear_lock(args: &Args) -> ExitCode {    let dir = store_dir(args);
             "removed: height={} round={} locked_hash={} locked_round={}",
             c.height,
             c.round,
-            c.locked_hash.map(|h| hex_of(&h)).unwrap_or_else(|| "none".to_string()),
+            c.locked_hash
+                .map(|h| hex_of(&h))
+                .unwrap_or_else(|| "none".to_string()),
             c.locked_round
         ),
         None => println!("removed: unparseable checkpoint ({} bytes)", raw.len()),

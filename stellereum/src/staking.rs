@@ -94,13 +94,19 @@ pub const DEFAULT_MIN_BOND_BUFFER_NANO: u64 = 100 * 1_000_000_000;
 /// default [`DEFAULT_SLASH_EJECT_WARN_GAP_NANO`]). Unparseable/missing -> default.
 /// `0` disables the approach WARN (the actual-eject WARN always fires).
 pub fn slash_eject_warn_gap_nano() -> u64 {
-    parse_nano_env(std::env::var(SLASH_EJECT_WARN_GAP_ENV).ok(), DEFAULT_SLASH_EJECT_WARN_GAP_NANO)
+    parse_nano_env(
+        std::env::var(SLASH_EJECT_WARN_GAP_ENV).ok(),
+        DEFAULT_SLASH_EJECT_WARN_GAP_NANO,
+    )
 }
 
 /// Effective minimum-bond buffer in nano-STELL (`STELL_MIN_BOND_BUFFER`,
 /// default [`DEFAULT_MIN_BOND_BUFFER_NANO`]). Unparseable/missing -> default.
 pub fn min_bond_buffer_nano() -> u64 {
-    parse_nano_env(std::env::var(MIN_BOND_BUFFER_ENV).ok(), DEFAULT_MIN_BOND_BUFFER_NANO)
+    parse_nano_env(
+        std::env::var(MIN_BOND_BUFFER_ENV).ok(),
+        DEFAULT_MIN_BOND_BUFFER_NANO,
+    )
 }
 
 /// Parse a nano-STELL env value: trimmed integer, fallback to `default` on
@@ -117,8 +123,7 @@ pub fn parse_nano_env(raw: Option<String>, default: u64) -> u64 {
 /// deterministic without touching env; production passes
 /// [`slash_eject_warn_gap_nano`].)
 pub fn self_bond_within_eject_gap_for(self_bond: u64, gap: u64) -> bool {
-    self_bond >= MIN_VALIDATOR_BOND
-        && self_bond.saturating_sub(MIN_VALIDATOR_BOND) < gap
+    self_bond >= MIN_VALIDATOR_BOND && self_bond.saturating_sub(MIN_VALIDATOR_BOND) < gap
 }
 
 /// Pure predicate: `self_bond` lacks the recommended MIN+`buffer` cushion.
@@ -132,7 +137,12 @@ pub fn self_bond_lacks_buffer_for(self_bond: u64, buffer: u64) -> bool {
 /// `Some` when `MIN <= self_bond < MIN + gap` (approaching eject).
 /// The actual-eject case (`self_bond < MIN`) is reported by
 /// [`eject_message_for`], not here.
-pub fn eject_warn_message_for(validator: &ValidatorId, self_bond: u64, burned: u64, gap: u64) -> Option<String> {
+pub fn eject_warn_message_for(
+    validator: &ValidatorId,
+    self_bond: u64,
+    burned: u64,
+    gap: u64,
+) -> Option<String> {
     if !self_bond_within_eject_gap_for(self_bond, gap) {
         return None;
     }
@@ -334,8 +344,12 @@ impl std::fmt::Display for StakingError {
             StakingError::RewardsPoolShortfall => "rewards pool cannot cover the claim",
             StakingError::LockedInGovernanceVote => "stake is locked in an open governance vote",
             StakingError::InvalidSignature => "invalid signature",
-            StakingError::ArithmeticOverflow => "stake amount overflows u64: refusing instead of saturating",
-            StakingError::ZeroAddress => "the zero address cannot hold a delegation (self-bond key is reserved)",
+            StakingError::ArithmeticOverflow => {
+                "stake amount overflows u64: refusing instead of saturating"
+            }
+            StakingError::ZeroAddress => {
+                "the zero address cannot hold a delegation (self-bond key is reserved)"
+            }
         };
         write!(f, "{s}")
     }
@@ -981,11 +995,7 @@ impl StakingLedger {
     /// already is one (rotation must never merge two records: amounts would
     /// mix and delegator accounting would become ambiguous). Auth (caller ==
     /// `old`) is enforced by the opcode handler, not here.
-    pub fn rotate_key(
-        &mut self,
-        old: ValidatorId,
-        new: ValidatorId,
-    ) -> Result<(), StakingError> {
+    pub fn rotate_key(&mut self, old: ValidatorId, new: ValidatorId) -> Result<(), StakingError> {
         if old == new {
             return Err(StakingError::AlreadyValidator);
         }
@@ -998,7 +1008,10 @@ impl StakingLedger {
         if self.locked_governance.get(&old).copied().unwrap_or(0) > 0 {
             return Err(StakingError::LockedInGovernanceVote);
         }
-        let record = self.validators.remove(&old).ok_or(StakingError::NotValidator)?;
+        let record = self
+            .validators
+            .remove(&old)
+            .ok_or(StakingError::NotValidator)?;
         self.validators.insert(new, record);
         // Every keyed map follows the record. Collect-then-write (no
         // in-place mutation during iteration): HashMap order differs between
@@ -1139,7 +1152,14 @@ impl StakingLedger {
                 .validators
                 .get(&validator)
                 .ok_or(StakingError::NotValidator)?;
-            (v.self_bond, v.delegated, self.delegations.get(&(validator, delegator)).copied().unwrap_or(0))
+            (
+                v.self_bond,
+                v.delegated,
+                self.delegations
+                    .get(&(validator, delegator))
+                    .copied()
+                    .unwrap_or(0),
+            )
         };
         if self_bond < MIN_VALIDATOR_BOND {
             return Err(StakingError::NotValidator);
@@ -1290,7 +1310,10 @@ impl StakingLedger {
 
     /// Total bonded (self + delegated) for a validator.
     pub fn total_stake(&self, validator: &ValidatorId) -> u64 {
-        self.validators.get(validator).map(|v| v.total()).unwrap_or(0)
+        self.validators
+            .get(validator)
+            .map(|v| v.total())
+            .unwrap_or(0)
     }
 
     /// Lock `amount` of `owner`'s stake for an open governance vote (E7).
@@ -1770,7 +1793,10 @@ impl StakingLedger {
     /// Retrieve the registered post-quantum key and scheme for a validator, if any,
     /// falling back to Ed25519 (with the 32-byte `ValidatorId` as public key) if the
     /// validator exists in the ledger.
-    pub fn get_pq_key(&self, validator: &ValidatorId) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)> {
+    pub fn get_pq_key(
+        &self,
+        validator: &ValidatorId,
+    ) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)> {
         if let Some((s, pk)) = self.validator_pq_keys.get(validator) {
             Some((*s, pk.clone()))
         } else if self.validators.contains_key(validator) {
@@ -1835,7 +1861,10 @@ impl StakingLedger {
         let (scheme, pubkey) = if let Some((s, pk)) = self.validator_pq_keys.get(&evidence.voter) {
             (*s, pk.clone())
         } else {
-            (crate::post_quantum::PqScheme::Ed25519, evidence.voter.to_vec())
+            (
+                crate::post_quantum::PqScheme::Ed25519,
+                evidence.voter.to_vec(),
+            )
         };
 
         // 4. Construct vote sign message preimages:
@@ -1853,12 +1882,16 @@ impl StakingLedger {
         );
 
         // Strip vote BLS envelope when present on standard Ed25519 signatures
-        let sig_a = if scheme == crate::post_quantum::PqScheme::Ed25519 && evidence.signature_a.len() != 64 {
+        let sig_a = if scheme == crate::post_quantum::PqScheme::Ed25519
+            && evidence.signature_a.len() != 64
+        {
             crate::consensus::ed25519_sig_bytes(&evidence.signature_a)
         } else {
             evidence.signature_a.as_slice()
         };
-        let sig_b = if scheme == crate::post_quantum::PqScheme::Ed25519 && evidence.signature_b.len() != 64 {
+        let sig_b = if scheme == crate::post_quantum::PqScheme::Ed25519
+            && evidence.signature_b.len() != 64
+        {
             crate::consensus::ed25519_sig_bytes(&evidence.signature_b)
         } else {
             evidence.signature_b.as_slice()
@@ -1959,8 +1992,7 @@ impl StakingLedger {
             // value, the cooldown reads as satisfied, and the penalty fires again
             // while moving the stamp backwards -- so the documented "keyed on the
             // height, so re-applying an old certificate is a no-op" did not hold.
-            let cooled = (rec.last_downtime_penalty == 0
-                || height >= rec.last_downtime_penalty)
+            let cooled = (rec.last_downtime_penalty == 0 || height >= rec.last_downtime_penalty)
                 && (rec.last_downtime_penalty == 0
                     || height - rec.last_downtime_penalty >= DOWNTIME_PENALTY_COOLDOWN);
             if rec.missed >= DOWNTIME_MISS_THRESHOLD && cooled {
@@ -2211,11 +2243,7 @@ impl StakingLedger {
     /// or the pool cannot cover it — the entry is left intact and 0 is
     /// returned (callers revert on 0), so a shortfall can never reach
     /// principal.
-    pub fn claim_delegator_rewards(
-        &mut self,
-        delegator: [u8; 32],
-        validator: ValidatorId,
-    ) -> u64 {
+    pub fn claim_delegator_rewards(&mut self, delegator: [u8; 32], validator: ValidatorId) -> u64 {
         let key = (validator, delegator);
         let amount = self.delegator_rewards_of(delegator, validator);
         if amount == 0 || amount > self.rewards_pool {
@@ -2502,18 +2530,34 @@ mod tests {
     fn bond_enforces_minimum_plus_buffer_and_commission() {
         let mut l = StakingLedger::new();
         // Below MIN: refused.
-        assert_eq!(l.bond(vid(1), stell(999), DEFAULT_COMMISSION_BPS), Err(StakingError::BondBelowMinimum));
+        assert_eq!(
+            l.bond(vid(1), stell(999), DEFAULT_COMMISSION_BPS),
+            Err(StakingError::BondBelowMinimum)
+        );
         // Bare MIN (no buffer): refused — one downtime slash from ejection.
-        assert_eq!(l.bond(vid(1), stell(1000), DEFAULT_COMMISSION_BPS), Err(StakingError::BondBelowMinimum));
+        assert_eq!(
+            l.bond(vid(1), stell(1000), DEFAULT_COMMISSION_BPS),
+            Err(StakingError::BondBelowMinimum)
+        );
         // Just under the floor: refused, and the error names the requirement.
-        assert_eq!(l.bond(vid(1), stell(1099), DEFAULT_COMMISSION_BPS), Err(StakingError::BondBelowMinimum));
-        assert!(format!("{}", StakingError::BondBelowMinimum).contains(&required_bond_floor_nano().to_string()));
+        assert_eq!(
+            l.bond(vid(1), stell(1099), DEFAULT_COMMISSION_BPS),
+            Err(StakingError::BondBelowMinimum)
+        );
+        assert!(format!("{}", StakingError::BondBelowMinimum)
+            .contains(&required_bond_floor_nano().to_string()));
         // Commission is checked after the floor: bad commission on a good bond.
-        assert_eq!(l.bond(vid(1), stell(1100), 10_001), Err(StakingError::BadCommission));
+        assert_eq!(
+            l.bond(vid(1), stell(1100), 10_001),
+            Err(StakingError::BadCommission)
+        );
         l.bond(vid(1), stell(1100), DEFAULT_COMMISSION_BPS).unwrap();
         assert_eq!(l.total_stake(&vid(1)), stell(1100));
         // double registration rejected
-        assert_eq!(l.bond(vid(1), stell(1100), DEFAULT_COMMISSION_BPS), Err(StakingError::AlreadyValidator));
+        assert_eq!(
+            l.bond(vid(1), stell(1100), DEFAULT_COMMISSION_BPS),
+            Err(StakingError::AlreadyValidator)
+        );
     }
 
     #[test]
@@ -2536,9 +2580,15 @@ mod tests {
         let mut l = StakingLedger::new();
         l.bond(vid(1), stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
         // leaving 500 (< floor 1100) is rejected
-        assert_eq!(l.unbond(vid(1), stell(1500), 0), Err(StakingError::BondBelowMinimum));
+        assert_eq!(
+            l.unbond(vid(1), stell(1500), 0),
+            Err(StakingError::BondBelowMinimum)
+        );
         // leaving 1000 (< floor 1100) is also rejected (retaining the 100 STELL buffer floor)
-        assert_eq!(l.unbond(vid(1), stell(1000), 0), Err(StakingError::BondBelowMinimum));
+        assert_eq!(
+            l.unbond(vid(1), stell(1000), 0),
+            Err(StakingError::BondBelowMinimum)
+        );
         // full exit is allowed
         assert!(l.unbond(vid(1), stell(2000), 0).is_ok());
     }
@@ -2547,12 +2597,18 @@ mod tests {
     fn delegation_and_undelegation() {
         let mut l = StakingLedger::new();
         l.bond(vid(1), stell(1100), DEFAULT_COMMISSION_BPS).unwrap();
-        assert_eq!(l.delegate(del(1), vid(1), stell(0)), Err(StakingError::DelegationBelowMinimum));
+        assert_eq!(
+            l.delegate(del(1), vid(1), stell(0)),
+            Err(StakingError::DelegationBelowMinimum)
+        );
         l.delegate(del(1), vid(1), stell(500)).unwrap();
         assert_eq!(l.total_stake(&vid(1)), stell(1600));
         l.undelegate(del(1), vid(1), stell(200), 0).unwrap();
         assert_eq!(l.total_stake(&vid(1)), stell(1400));
-        assert_eq!(l.undelegate(del(1), vid(1), stell(999), 0), Err(StakingError::InsufficientDelegation));
+        assert_eq!(
+            l.undelegate(del(1), vid(1), stell(999), 0),
+            Err(StakingError::InsufficientDelegation)
+        );
     }
 
     #[test]
@@ -2605,7 +2661,8 @@ mod tests {
         let mut l = StakingLedger::new();
         let sk = SigningKey::generate(&mut OsRng);
         let offender = sk.verifying_key().to_bytes();
-        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         let a = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
         let b = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
         let ev = EquivocationEvidence::new(offender, a, b);
@@ -2623,7 +2680,8 @@ mod tests {
         let mut l = StakingLedger::new();
         let sk = SigningKey::generate(&mut OsRng);
         let offender = sk.verifying_key().to_bytes();
-        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         let a = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
         let b = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
         let ev = EquivocationEvidence::new(offender, a.clone(), b.clone());
@@ -2650,7 +2708,8 @@ mod tests {
         let mut l = StakingLedger::new();
         let sk = SigningKey::generate(&mut OsRng);
         let offender = sk.verifying_key().to_bytes();
-        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         let other = SigningKey::generate(&mut OsRng);
         let a = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
         // Framing with another key's vote burns nothing (Finding 12 fixed).
@@ -2710,8 +2769,15 @@ mod tests {
         assert!(!l.validators.contains_key(&vid(1)), "old key is gone");
         let v = &l.validators[&vid(2)];
         assert_eq!(v.commission_bps, DEFAULT_COMMISSION_BPS);
-        assert_eq!(v.total_slashed, slashed_before, "slash history carries over");
-        assert_eq!(l.total_stake(&vid(2)), total_before, "stake preserved exactly");
+        assert_eq!(
+            v.total_slashed, slashed_before,
+            "slash history carries over"
+        );
+        assert_eq!(
+            l.total_stake(&vid(2)),
+            total_before,
+            "stake preserved exactly"
+        );
         assert_eq!(
             l.delegations.get(&(vid(2), del(1))).copied(),
             Some(stell(300)),
@@ -2719,7 +2785,9 @@ mod tests {
         );
         assert!(!l.delegations.contains_key(&(vid(1), del(1))));
         assert!(
-            l.unbonding.iter().any(|u| u.validator == vid(2) && u.amount == stell(200)),
+            l.unbonding
+                .iter()
+                .any(|u| u.validator == vid(2) && u.amount == stell(200)),
             "pending unbonding follows the record"
         );
         assert!(
@@ -2764,7 +2832,10 @@ mod tests {
         // slash 10% of 3100 = 310; self 1100 covers all 310 -> delegators untouched
         l.slash(vid(1), 1_000).unwrap();
         assert_eq!(l.total_stake(&vid(1)), stell(2790));
-        assert_eq!(l.delegations.get(&(vid(1), del(1))).copied(), Some(stell(1000)));
+        assert_eq!(
+            l.delegations.get(&(vid(1), del(1))).copied(),
+            Some(stell(1000))
+        );
     }
 
     #[test]
@@ -2814,7 +2885,9 @@ mod tests {
         let alice_addr = alice.verifying_key().to_bytes();
         let validator = [0x77u8; 32];
         let start = 10_000 * 1_000_000_000u64;
-        engine.update_account(AccountState::new(alice_addr, start)).await;
+        engine
+            .update_account(AccountState::new(alice_addr, start))
+            .await;
 
         let tx = crate::sharding::Transaction::sign_with_payload(
             &alice,
@@ -2824,12 +2897,22 @@ mod tests {
             0,
             1,
             1,
-            vec![OpCode::SysCallStake { validator, amount: required_bond_floor_nano() }],
+            vec![OpCode::SysCallStake {
+                validator,
+                amount: required_bond_floor_nano(),
+            }],
         );
-        engine.apply_transaction(&tx, 0).await.expect("bond must be accepted");
+        engine
+            .apply_transaction(&tx, 0)
+            .await
+            .expect("bond must be accepted");
 
         let alice_balance = engine.get_account(&alice_addr).await.unwrap().balance;
-        let pool_balance = engine.get_account(&STAKING_POOL).await.map(|a| a.balance).unwrap_or(0);
+        let pool_balance = engine
+            .get_account(&STAKING_POOL)
+            .await
+            .map(|a| a.balance)
+            .unwrap_or(0);
         // Only the gas actually consumed is charged (GAS_STAKE_BOND), not the
         // declared gas_limit, so the exact debit is knowable.
         assert_eq!(
@@ -2837,10 +2920,18 @@ mod tests {
             start - required_bond_floor_nano() - crate::svm::GAS_STAKE_BOND,
             "bond + gas actually used must be debited"
         );
-        assert_eq!(pool_balance, required_bond_floor_nano(), "bonded value must be in the pool");
+        assert_eq!(
+            pool_balance,
+            required_bond_floor_nano(),
+            "bonded value must be in the pool"
+        );
 
         let vs = engine.staking_read().await.to_validator_set();
-        assert_eq!(vs.power_of(&validator), required_bond_floor_nano(), "bond must buy voting power");
+        assert_eq!(
+            vs.power_of(&validator),
+            required_bond_floor_nano(),
+            "bond must buy voting power"
+        );
     }
 
     /// You cannot bond what you do not have, and the attempt must leave no trace.
@@ -2865,11 +2956,20 @@ mod tests {
             0,
             1,
             1,
-            vec![OpCode::SysCallStake { validator, amount: required_bond_floor_nano() }],
+            vec![OpCode::SysCallStake {
+                validator,
+                amount: required_bond_floor_nano(),
+            }],
         );
-        assert!(engine.apply_transaction(&tx, 0).await.is_err(), "must not bond what you lack");
+        assert!(
+            engine.apply_transaction(&tx, 0).await.is_err(),
+            "must not bond what you lack"
+        );
         let vs = engine.staking_read().await.to_validator_set();
-        assert!(!vs.validators.contains_key(&validator), "no phantom validator");
+        assert!(
+            !vs.validators.contains_key(&validator),
+            "no phantom validator"
+        );
     }
 
     /// A thin (below-MIN+buffer) bond is rejected, and the attempt moves
@@ -2885,7 +2985,9 @@ mod tests {
         let dave = SigningKey::generate(&mut OsRng);
         let dave_addr = dave.verifying_key().to_bytes();
         let validator = [0x7Au8; 32];
-        engine.update_account(AccountState::new(dave_addr, 10_000 * 1_000_000_000)).await;
+        engine
+            .update_account(AccountState::new(dave_addr, 10_000 * 1_000_000_000))
+            .await;
 
         // Bare MIN is affordable but below the MIN+buffer floor: refused.
         let tx = crate::sharding::Transaction::sign_with_payload(
@@ -2896,11 +2998,20 @@ mod tests {
             0,
             1,
             1,
-            vec![OpCode::SysCallStake { validator, amount: MIN_VALIDATOR_BOND }],
+            vec![OpCode::SysCallStake {
+                validator,
+                amount: MIN_VALIDATOR_BOND,
+            }],
         );
-        assert!(engine.apply_transaction(&tx, 0).await.is_err(), "bare-MIN bond must be refused");
+        assert!(
+            engine.apply_transaction(&tx, 0).await.is_err(),
+            "bare-MIN bond must be refused"
+        );
         let vs = engine.staking_read().await.to_validator_set();
-        assert!(!vs.validators.contains_key(&validator), "no phantom validator");
+        assert!(
+            !vs.validators.contains_key(&validator),
+            "no phantom validator"
+        );
     }
 
     /// A bond is atomic with the rest of the payload: if the transaction reverts
@@ -2916,7 +3027,9 @@ mod tests {
         let carol = SigningKey::generate(&mut OsRng);
         let carol_addr = carol.verifying_key().to_bytes();
         let validator = [0x79u8; 32];
-        engine.update_account(AccountState::new(carol_addr, 10_000 * 1_000_000_000)).await;
+        engine
+            .update_account(AccountState::new(carol_addr, 10_000 * 1_000_000_000))
+            .await;
 
         let tx = crate::sharding::Transaction::sign_with_payload(
             &carol,
@@ -2927,16 +3040,24 @@ mod tests {
             1,
             1,
             vec![
-                OpCode::SysCallStake { validator, amount: required_bond_floor_nano() },
+                OpCode::SysCallStake {
+                    validator,
+                    amount: required_bond_floor_nano(),
+                },
                 // More than remains after the bond -> reverts the whole payload.
-                OpCode::Transfer { recipient: [0x01u8; 32], amount: 9_500_000_000_000 },
+                OpCode::Transfer {
+                    recipient: [0x01u8; 32],
+                    amount: 9_500_000_000_000,
+                },
             ],
         );
         assert!(engine.apply_transaction(&tx, 0).await.is_err());
         let vs = engine.staking_read().await.to_validator_set();
-        assert!(!vs.validators.contains_key(&validator), "a reverted bond must not create a validator");
+        assert!(
+            !vs.validators.contains_key(&validator),
+            "a reverted bond must not create a validator"
+        );
     }
-
 
     /// Downtime is punished from block evidence: a validator that keeps missing
     /// the quorum certificate is slashed, an honest one never is.
@@ -2962,7 +3083,8 @@ mod tests {
             "exactly one slash when the threshold is reached"
         );
         assert_eq!(
-            l.validators[&honest].self_bond, stell(1100),
+            l.validators[&honest].self_bond,
+            stell(1100),
             "an honest validator must never be punished"
         );
         assert_eq!(
@@ -2984,7 +3106,10 @@ mod tests {
             let both_signed = |_: &ValidatorId| true;
             assert_eq!(l.note_missed_heights(height, &both_signed, &both), 0);
         }
-        assert_eq!(l.validators[&offline].missed, 0, "signing again clears the streak");
+        assert_eq!(
+            l.validators[&offline].missed, 0,
+            "signing again clears the streak"
+        );
     }
 
     /// The same evidence replayed must not slash twice: the cooldown keys on the
@@ -3025,11 +3150,18 @@ mod tests {
         // reward_split test for the exact integer math).
         let v_amt = l.claim_validator_rewards(vid(1)).unwrap();
         assert_eq!(v_amt, 114_285_714_285);
-        assert_eq!(l.rewards_pool, 85_714_285_715, "validator claim consumes pool");
+        assert_eq!(
+            l.rewards_pool, 85_714_285_715,
+            "validator claim consumes pool"
+        );
         let d_amt = l.claim_delegator_rewards(del(1), vid(1));
         assert_eq!(d_amt, 85_714_285_715);
         assert_eq!(l.rewards_pool, 0, "pool fully consumed by claims");
-        assert_eq!(l.rewards_minted, stell(200), "cumulative mint never decreases");
+        assert_eq!(
+            l.rewards_minted,
+            stell(200),
+            "cumulative mint never decreases"
+        );
         // Nothing left: both paths are now empty, fail-closed.
         assert_eq!(l.claim_validator_rewards(vid(1)).unwrap(), 0);
         assert_eq!(l.claim_delegator_rewards(del(1), vid(1)), 0);
@@ -3051,7 +3183,11 @@ mod tests {
         // reduced stake earns nothing extra, and the pool balances exactly.
         l.undelegate(del(1), vid(1), stell(1000), 0).unwrap();
         assert_eq!(l.claim_delegator_rewards(del(1), vid(1)), 85_714_285_715);
-        assert_eq!(l.claim_delegator_rewards(del(1), vid(1)), 0, "second claim pays nothing");
+        assert_eq!(
+            l.claim_delegator_rewards(del(1), vid(1)),
+            0,
+            "second claim pays nothing"
+        );
         // Exit queue: nothing matured yet (cooldown not elapsed).
         l.process_unbonding(1);
         assert_eq!(l.withdrawable_delegator(&vid(1), &del(1)), 0);
@@ -3094,7 +3230,8 @@ mod tests {
         assert_eq!(l.rewards_minted, REWARDS_EMISSION_CAP, "no partial mint");
         assert_eq!(l.rewards_pool, 150, "pool untouched by refused mint");
         assert_eq!(
-            l.validators[&vid(1)].pending_rewards, 100,
+            l.validators[&vid(1)].pending_rewards,
+            100,
             "refused mint credits no phantom rewards"
         );
         // Zero rewards are a no-op even at the cap (heartbeat blocks stay cheap).
@@ -3118,7 +3255,8 @@ mod tests {
             Err(StakingError::RewardsPoolShortfall)
         );
         assert_eq!(
-            l.validators[&vid(1)].pending_rewards, owed,
+            l.validators[&vid(1)].pending_rewards,
+            owed,
             "refused claim leaves the entry intact"
         );
         assert_eq!(
@@ -3207,7 +3345,10 @@ mod tests {
                     progressed = true;
                 }
             }
-            assert!(progressed, "cannot shrink the stake set to the target total");
+            assert!(
+                progressed,
+                "cannot shrink the stake set to the target total"
+            );
         }
         let last = out.len() - 1;
         out[last] += total - sum;
@@ -3227,7 +3368,12 @@ mod tests {
         const N: usize = 1000;
         let mut l = StakingLedger::new();
         l.bond(vid(1), stell(1100), 1_000).unwrap();
-        let stakes = delegator_set(N, 10_000 * 1_000_000_000, 1_000_000_000, 0x2545_F491_4F6C_DD1D);
+        let stakes = delegator_set(
+            N,
+            10_000 * 1_000_000_000,
+            1_000_000_000,
+            0x2545_F491_4F6C_DD1D,
+        );
         for (i, s) in stakes.iter().enumerate() {
             l.delegate(delegator_addr(i), vid(1), *s).unwrap();
         }
@@ -3267,7 +3413,10 @@ mod tests {
                 "delegator {i}: the lazy accumulator must match the eager split exactly"
             );
             let claimed = l.claim_delegator_rewards(addr, vid(1));
-            assert_eq!(claimed, eager, "delegator {i}: the claim pays the eager amount");
+            assert_eq!(
+                claimed, eager,
+                "delegator {i}: the claim pays the eager amount"
+            );
             lazy_total += claimed;
         }
         assert_eq!(
@@ -3301,7 +3450,12 @@ mod tests {
         let mut l = StakingLedger::new();
         l.bond(vid(1), stell(1100), 1_000).unwrap();
         // 1 STELL granularity but a total that does NOT divide 1e18.
-        let stakes = delegator_set(N, 10_003 * 1_000_000_000 + 7, 1_000_000_000, 0x9E37_79B9_7F4A_7C15);
+        let stakes = delegator_set(
+            N,
+            10_003 * 1_000_000_000 + 7,
+            1_000_000_000,
+            0x9E37_79B9_7F4A_7C15,
+        );
         for (i, s) in stakes.iter().enumerate() {
             l.delegate(delegator_addr(i), vid(1), *s).unwrap();
         }
@@ -3471,8 +3625,7 @@ mod tests {
                 return;
             }
             self.minted = self.minted.saturating_add(reward);
-            let delegated_share =
-                (reward as u128 * val.delegated as u128 / total as u128) as u64;
+            let delegated_share = (reward as u128 * val.delegated as u128 / total as u128) as u64;
             let commission = (delegated_share as u128 * val.commission_bps as u128
                 / BPS_DENOMINATOR as u128) as u64;
             let validator_reward = reward - delegated_share + commission;
@@ -3617,7 +3770,12 @@ mod tests {
             l.bond(id, bond, commission).unwrap();
             eager.validators.insert(
                 id,
-                EagerVal { self_bond: bond, delegated: 0, commission_bps: commission, pending_rewards: 0 },
+                EagerVal {
+                    self_bond: bond,
+                    delegated: 0,
+                    commission_bps: commission,
+                    pending_rewards: 0,
+                },
             );
         }
 
@@ -3726,14 +3884,22 @@ mod tests {
             );
             for (vid_, val) in &eager.validators {
                 let lv = &l.validators[vid_];
-                assert_eq!(lv.delegated, val.delegated, "step {step}: delegated aggregate");
+                assert_eq!(
+                    lv.delegated, val.delegated,
+                    "step {step}: delegated aggregate"
+                );
                 assert_eq!(lv.self_bond, val.self_bond, "step {step}: self bond");
             }
 
             // ---- INVARIANTS 2/3: the lifetime entitlements agree. ----
             let mut _lazy_lifetime_total: u128 = 0;
             let mut _eager_lifetime_total: u128 = 0;
-            for key in eager.delegations.keys().chain(eager.rewards.keys()).chain(eager.claimed.keys()) {
+            for key in eager
+                .delegations
+                .keys()
+                .chain(eager.rewards.keys())
+                .chain(eager.claimed.keys())
+            {
                 let lazy_now = l.delegator_rewards_of(key.1, key.0) as u128;
                 let lazy_claimed = eager.claimed.get(key).copied().unwrap_or(0) as u128;
                 let lazy_lifetime = lazy_now + lazy_claimed;
@@ -3762,7 +3928,10 @@ mod tests {
                 .values()
                 .map(|v| *v as u128)
                 .sum::<u128>()
-                + l.validators.values().map(|v| v.pending_rewards as u128).sum::<u128>();
+                + l.validators
+                    .values()
+                    .map(|v| v.pending_rewards as u128)
+                    .sum::<u128>();
             assert!(
                 outstanding <= minted as u128,
                 "step {step}: outstanding rewards ({outstanding}) exceed the minted total ({minted})"
@@ -3779,9 +3948,15 @@ mod tests {
         }
 
         // The run must have exercised the interesting paths.
-        assert!(distributions > 20, "the run must include many distributions");
+        assert!(
+            distributions > 20,
+            "the run must include many distributions"
+        );
         assert!(claimed_total > 0, "the run must include claims");
-        assert!(validator_claimed > 0, "the run must include validator claims");
+        assert!(
+            validator_claimed > 0,
+            "the run must include validator claims"
+        );
     }
 
     /// A delegator that fully undelegated earns NOTHING from the
@@ -3930,7 +4105,12 @@ mod tests {
     }
 
     /// Build two conflicting bodies for one height, both signed by `sk`.
-    fn proposal_pair(sk: &SigningKey, height: u64, t1: u64, t2: u64) -> crate::consensus::ProposalEquivocationEvidence {
+    fn proposal_pair(
+        sk: &SigningKey,
+        height: u64,
+        t1: u64,
+        t2: u64,
+    ) -> crate::consensus::ProposalEquivocationEvidence {
         use crate::consensus::ProposalEquivocationEvidence;
         let mk = |ts: u64| {
             let mut b = crate::sharding::Block {
@@ -3950,7 +4130,8 @@ mod tests {
         let mut l = StakingLedger::new();
         let sk = SigningKey::generate(&mut OsRng);
         let offender = sk.verifying_key().to_bytes();
-        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         let ev = proposal_pair(&sk, 5, 1_000, 2_000);
         assert_ne!(
             ev.block_a.compute_hash(),
@@ -3970,7 +4151,8 @@ mod tests {
         let mut l = StakingLedger::new();
         let sk = SigningKey::generate(&mut OsRng);
         let offender = sk.verifying_key().to_bytes();
-        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         let ev = proposal_pair(&sk, 5, 1_000, 2_000);
         let first = l.slash_proposal_equivocation_verified(&ev).unwrap();
         assert!(first > 0);
@@ -3996,7 +4178,8 @@ mod tests {
         let mut l = StakingLedger::new();
         let sk = SigningKey::generate(&mut OsRng);
         let offender = sk.verifying_key().to_bytes();
-        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         // Same block twice burns nothing (single proposal repeated).
         let same = proposal_pair(&sk, 5, 1_000, 1_000);
         assert_eq!(l.slash_proposal_equivocation_verified(&same).unwrap(), 0);
@@ -4297,7 +4480,11 @@ mod tests {
         // Replay of same evidence is deduplicated -> returns Ok(0)
         let burned2 = l.slash_pq_equivocation(&evidence, false).unwrap();
         assert_eq!(burned2, 0, "Duplicate evidence must return 0 burned");
-        assert_eq!(l.total_stake(&vid), stell(1900), "Stake must not compound burn");
+        assert_eq!(
+            l.total_stake(&vid),
+            stell(1900),
+            "Stake must not compound burn"
+        );
         assert_eq!(l.total_burned, stell(100));
 
         // Third vote on the same (voter, height, round, kind) is also deduplicated
@@ -4315,7 +4502,10 @@ mod tests {
             signature_b: sig_c,
         };
         let burned3 = l.slash_pq_equivocation(&evidence_c, false).unwrap();
-        assert_eq!(burned3, 0, "Deduplication key BLAKE3(voter || height || round || kind) prevents compounding");
+        assert_eq!(
+            burned3, 0,
+            "Deduplication key BLAKE3(voter || height || round || kind) prevents compounding"
+        );
         assert_eq!(l.total_stake(&vid), stell(1900));
     }
 
@@ -4331,7 +4521,12 @@ mod tests {
         // rejected as InvalidSignature.
         let fk = crate::post_quantum::FalconKeypair::generate_from_seed(77);
         let falcon_pk = fk.public_key().to_vec();
-        l.register_pq_key(vid, crate::post_quantum::PqScheme::Falcon512, falcon_pk.clone()).unwrap();
+        l.register_pq_key(
+            vid,
+            crate::post_quantum::PqScheme::Falcon512,
+            falcon_pk.clone(),
+        )
+        .unwrap();
 
         assert_eq!(
             l.get_pq_key(&vid),
@@ -4432,8 +4627,12 @@ mod tests {
         assert!(eject_warn_message_for(&v, stell(1300), stell(1), gap).is_none());
         assert!(eject_message_for(&v, stell(1300), stell(1)).is_none());
         // Inside [MIN, MIN+gap): approach WARN with the required wording.
-        let msg = eject_warn_message_for(&v, stell(1045), stell(55), gap).expect("must warn in gap");
-        assert!(msg.contains("будет выкинут через"), "message must say: {msg}");
+        let msg =
+            eject_warn_message_for(&v, stell(1045), stell(55), gap).expect("must warn in gap");
+        assert!(
+            msg.contains("будет выкинут через"),
+            "message must say: {msg}"
+        );
         assert!(msg.contains("SLASH-EJECT-WARN"), "message must say: {msg}");
         // Below MIN: eject WARN, not approach WARN.
         assert!(eject_warn_message_for(&v, stell(999), stell(1), gap).is_none());
@@ -4443,29 +4642,43 @@ mod tests {
         // Live: slash landing inside the default 100 STELL gap WARNs loudly.
         let logs = capture_warns(|| {
             let mut l = StakingLedger::new();
-            l.bond(vid(11), stell(1100), DEFAULT_COMMISSION_BPS).unwrap();
+            l.bond(vid(11), stell(1100), DEFAULT_COMMISSION_BPS)
+                .unwrap();
             // 5% of 1100 = 55 -> 1045, i.e. 45 STELL above MIN: inside the gap.
             let burned = l.slash(vid(11), 500).unwrap();
             assert_eq!(burned, stell(55));
             assert_eq!(l.validators[&vid(11)].self_bond, stell(1045));
         });
-        assert!(logs.contains("будет выкинут через"), "slash must WARN in gap, got: {logs}");
-        assert!(logs.contains("SLASH-EJECT-WARN"), "slash must WARN in gap, got: {logs}");
+        assert!(
+            logs.contains("будет выкинут через"),
+            "slash must WARN in gap, got: {logs}"
+        );
+        assert!(
+            logs.contains("SLASH-EJECT-WARN"),
+            "slash must WARN in gap, got: {logs}"
+        );
 
         // Live: validator C case, modern shape — floor bond (1100) + a slash
         // that actually ejects + WARNs. (Bare-MIN bonds can no longer be
         // created: `bond` refuses them, see bond_enforces_minimum_plus_buffer.)
         let logs = capture_warns(|| {
             let mut l = StakingLedger::new();
-            l.bond(vid(12), stell(1100), DEFAULT_COMMISSION_BPS).unwrap();
+            l.bond(vid(12), stell(1100), DEFAULT_COMMISSION_BPS)
+                .unwrap();
             // 10% of 1100 = 110 -> 990 < MIN: ejected.
             let burned = l.slash(vid(12), 1_000).unwrap();
             assert_eq!(burned, stell(110));
             assert!(l.validators[&vid(12)].self_bond < MIN_VALIDATOR_BOND);
             assert!(!l.to_validator_set().validators.contains_key(&vid(12)));
         });
-        assert!(logs.contains("EJECTED"), "eject must WARN loudly, got: {logs}");
-        assert!(logs.contains("SLASH-EJECT"), "eject must WARN loudly, got: {logs}");
+        assert!(
+            logs.contains("EJECTED"),
+            "eject must WARN loudly, got: {logs}"
+        );
+        assert!(
+            logs.contains("SLASH-EJECT"),
+            "eject must WARN loudly, got: {logs}"
+        );
     }
 
     #[test]
@@ -4480,43 +4693,62 @@ mod tests {
         assert_eq!(parse_nano_env(None, stell(100)), stell(100));
         assert_eq!(parse_nano_env(Some("123".to_string()), stell(100)), 123);
         assert_eq!(parse_nano_env(Some("  456  ".to_string()), stell(100)), 456);
-        assert_eq!(parse_nano_env(Some("garbage".to_string()), stell(100)), stell(100));
+        assert_eq!(
+            parse_nano_env(Some("garbage".to_string()), stell(100)),
+            stell(100)
+        );
         assert_eq!(DEFAULT_SLASH_EJECT_WARN_GAP_NANO, stell(100));
         assert_eq!(DEFAULT_MIN_BOND_BUFFER_NANO, stell(100));
 
         // Live: bare-MIN bond is REFUSED (fail-closed floor, not a WARN).
         let logs = capture_warns(|| {
             let mut l = StakingLedger::new();
-            assert_eq!(l.bond(vid(21), stell(1000), DEFAULT_COMMISSION_BPS), Err(StakingError::BondBelowMinimum));
+            assert_eq!(
+                l.bond(vid(21), stell(1000), DEFAULT_COMMISSION_BPS),
+                Err(StakingError::BondBelowMinimum)
+            );
         });
-        assert!(!logs.contains("MIN-BOND-BUFFER"), "refused bond needs no cushion WARN, got: {logs}");
+        assert!(
+            !logs.contains("MIN-BOND-BUFFER"),
+            "refused bond needs no cushion WARN, got: {logs}"
+        );
 
         // Live: cushioned bond is silent on the buffer channel.
         let logs = capture_warns(|| {
             let mut l = StakingLedger::new();
             assert!(l.bond(vid(22), stell(1200), DEFAULT_COMMISSION_BPS).is_ok());
         });
-        assert!(!logs.contains("MIN-BOND-BUFFER"), "cushioned bond must not buffer-WARN, got: {logs}");
+        assert!(
+            !logs.contains("MIN-BOND-BUFFER"),
+            "cushioned bond must not buffer-WARN, got: {logs}"
+        );
 
         // Live: add_bond below MIN+buffer WARNs, above it does not; never refused.
         let logs = capture_warns(|| {
             let mut l = StakingLedger::new();
-            l.bond(vid(23), stell(1200), DEFAULT_COMMISSION_BPS).unwrap();
+            l.bond(vid(23), stell(1200), DEFAULT_COMMISSION_BPS)
+                .unwrap();
             // Slash down into the buffer-less zone, then top up insufficiently.
             l.slash(vid(23), 500).unwrap(); // 5% of 1200 = 60 -> 1140 (has buffer)
             assert!(l.add_bond(vid(23), stell(10)).is_ok());
         });
-        assert!(!logs.contains("MIN-BOND-BUFFER") || logs.contains("SLASH-EJECT-WARN"),
-            "1140+10=1150 keeps the cushion-or-slash WARNs only, got: {logs}");
+        assert!(
+            !logs.contains("MIN-BOND-BUFFER") || logs.contains("SLASH-EJECT-WARN"),
+            "1140+10=1150 keeps the cushion-or-slash WARNs only, got: {logs}"
+        );
 
         let logs = capture_warns(|| {
             let mut l = StakingLedger::new();
-            l.bond(vid(24), stell(1100), DEFAULT_COMMISSION_BPS).unwrap();
+            l.bond(vid(24), stell(1100), DEFAULT_COMMISSION_BPS)
+                .unwrap();
             l.slash(vid(24), 500).unwrap(); // 5% of 1100 = 55 -> 1045 (no cushion)
             assert!(l.add_bond(vid(24), stell(50)).is_ok()); // 1095 < 1100 -> WARN
             assert_eq!(l.validators[&vid(24)].self_bond, stell(1095));
         });
-        assert!(logs.contains("MIN-BOND-BUFFER"), "under-cushion top-up must WARN, got: {logs}");
+        assert!(
+            logs.contains("MIN-BOND-BUFFER"),
+            "under-cushion top-up must WARN, got: {logs}"
+        );
     }
 
     #[test]

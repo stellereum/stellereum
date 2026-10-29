@@ -10,10 +10,8 @@
 //!   * unbond/undelegate + process move funds between bonded/unbonding/
 //!     withdrawable buckets WITHOUT leaving the pool.
 
-use stellereum::staking::{
-    StakingLedger, DOWNTIME_SLASH_BPS, UNBONDING_PERIOD_SECS,
-};
 use std::collections::HashMap;
+use stellereum::staking::{StakingLedger, DOWNTIME_SLASH_BPS, UNBONDING_PERIOD_SECS};
 
 fn stell(n: u64) -> u64 {
     n * 1_000_000_000
@@ -60,7 +58,8 @@ fn assert_map_aggregate_in_step(l: &StakingLedger, vs: &[[u8; 32]], ctx: &str) {
         let agg = l.validators.get(v).map(|r| r.delegated).unwrap_or(0);
         let sum = map_sum(l, v);
         assert_eq!(
-            agg, sum,
+            agg,
+            sum,
             "map/aggregate divergence {ctx}: validator {:02x?} aggregate={agg} map_sum={sum}",
             &v[..2],
         );
@@ -94,10 +93,23 @@ fn load_50_delegators_map_aggregate_and_pool_solvency() {
     assert_map_aggregate_in_step(&l, &vs, "post-delegation");
 
     // 50 distinct map entries, correctly partitioned.
-    assert_eq!(l.delegations.len(), 50, "all 50 delegations must be tracked");
-    assert_eq!(l.delegations.keys().filter(|(v, _)| *v == vid(0)).count(), 17);
-    assert_eq!(l.delegations.keys().filter(|(v, _)| *v == vid(1)).count(), 17);
-    assert_eq!(l.delegations.keys().filter(|(v, _)| *v == vid(2)).count(), 16);
+    assert_eq!(
+        l.delegations.len(),
+        50,
+        "all 50 delegations must be tracked"
+    );
+    assert_eq!(
+        l.delegations.keys().filter(|(v, _)| *v == vid(0)).count(),
+        17
+    );
+    assert_eq!(
+        l.delegations.keys().filter(|(v, _)| *v == vid(1)).count(),
+        17
+    );
+    assert_eq!(
+        l.delegations.keys().filter(|(v, _)| *v == vid(2)).count(),
+        16
+    );
 
     // Pool solvency: every bonded nano sits in the pool; nothing burned yet.
     let bonded_total: u64 = vs.iter().map(|v| l.total_stake(v)).sum();
@@ -179,13 +191,24 @@ fn load_rewards_exactly_pro_rata_over_heights() {
     let v = validator_of(0); // del 0 -> 100 STELL; del 3 -> 400 STELL (same validator: 0%3==0, 3%3==0)
     assert_eq!(validator_of(3), v);
     l2.distribute_reward(v, l2.total_stake(&v)).unwrap();
-    let r_small = l2.delegator_rewards.get(&(v, del_addr(0))).copied().unwrap_or(0);
-    let r_big = l2.delegator_rewards.get(&(v, del_addr(3))).copied().unwrap_or(0);
+    let r_small = l2
+        .delegator_rewards
+        .get(&(v, del_addr(0)))
+        .copied()
+        .unwrap_or(0);
+    let r_big = l2
+        .delegator_rewards
+        .get(&(v, del_addr(3)))
+        .copied()
+        .unwrap_or(0);
     assert_eq!(r_big, 4 * r_small, "rewards must scale exactly with stake");
 
     // Rewards are minted accounting: the staking pool is untouched.
     let bonded_total: u64 = vs.iter().map(|v| l.total_stake(v)).sum();
-    assert_eq!(pool_before, bonded_total, "rewards must not move pool funds");
+    assert_eq!(
+        pool_before, bonded_total,
+        "rewards must not move pool funds"
+    );
 }
 
 /// Test 3: unbond half the delegators (25) at staggered heights, process,
@@ -212,16 +235,23 @@ fn load_staggered_unbond_withdraw_recovers_post_slash_exactly() {
     for j in 0..50u8 {
         post_slash.insert(
             j,
-            l.delegations.get(&(validator_of(j), del_addr(j))).copied().unwrap_or(0),
+            l.delegations
+                .get(&(validator_of(j), del_addr(j)))
+                .copied()
+                .unwrap_or(0),
         );
     }
     // V0 delegators were actually haircut; others untouched.
     assert!(
-        (0..50u8).filter(|j| j % 3 == 0).all(|j| post_slash[&j] < del_amount(j)),
+        (0..50u8)
+            .filter(|j| j % 3 == 0)
+            .all(|j| post_slash[&j] < del_amount(j)),
         "V0 delegators must show the post-slash haircut"
     );
     assert!(
-        (0..50u8).filter(|j| j % 3 != 0).all(|j| post_slash[&j] == del_amount(j)),
+        (0..50u8)
+            .filter(|j| j % 3 != 0)
+            .all(|j| post_slash[&j] == del_amount(j)),
         "other validators' delegators must be untouched"
     );
 
@@ -233,14 +263,19 @@ fn load_staggered_unbond_withdraw_recovers_post_slash_exactly() {
     assert_eq!(exiting.len(), 25);
     for (k, j) in exiting.iter().enumerate() {
         let now = BASE + (k as u64) * STEP;
-        l.undelegate(del_addr(*j), validator_of(*j), post_slash[j], now).unwrap();
+        l.undelegate(del_addr(*j), validator_of(*j), post_slash[j], now)
+            .unwrap();
         assert_map_aggregate_in_step(&l, &vs, "during staggered undelegate");
     }
     // Unbonding moves nothing out of the pool.
     let bonded: u64 = vs.iter().map(|v| l.total_stake(v)).sum();
     let in_flight: u64 = l.unbonding.iter().map(|e| e.amount).sum();
     let ready: u64 = l.withdrawable.values().sum();
-    assert_eq!(pool, bonded + in_flight + ready, "pool still holds unbonding funds");
+    assert_eq!(
+        pool,
+        bonded + in_flight + ready,
+        "pool still holds unbonding funds"
+    );
 
     // Staggered maturation: at BASE + PERIOD only the first (k=0) entry is due.
     l.process_unbonding(BASE + UNBONDING_PERIOD_SECS);
@@ -267,7 +302,9 @@ fn load_staggered_unbond_withdraw_recovers_post_slash_exactly() {
     l.process_unbonding(BASE + 24 * STEP + UNBONDING_PERIOD_SECS);
     assert!(l.unbonding.is_empty(), "all staggered entries must mature");
     for j in &exiting {
-        let got = l.withdraw_delegator(del_addr(*j), validator_of(*j)).unwrap();
+        let got = l
+            .withdraw_delegator(del_addr(*j), validator_of(*j))
+            .unwrap();
         pool -= got;
         assert_eq!(
             got, post_slash[j],
@@ -278,7 +315,8 @@ fn load_staggered_unbond_withdraw_recovers_post_slash_exactly() {
     // Exited map entries are gone; stayers are intact.
     for j in &exiting {
         assert!(
-            !l.delegations.contains_key(&(validator_of(*j), del_addr(*j))),
+            !l.delegations
+                .contains_key(&(validator_of(*j), del_addr(*j))),
             "exited delegator {j} must leave no map residue"
         );
     }
@@ -294,7 +332,10 @@ fn load_staggered_unbond_withdraw_recovers_post_slash_exactly() {
     let bonded_end: u64 = vs.iter().map(|v| l.total_stake(v)).sum();
     let ready_end: u64 = l.withdrawable.values().sum();
     assert_eq!(ready_end, 0, "all matured funds were withdrawn");
-    assert_eq!(pool, bonded_end, "pool must exactly cover remaining bonded stake");
+    assert_eq!(
+        pool, bonded_end,
+        "pool must exactly cover remaining bonded stake"
+    );
 }
 
 /// Test 4: a downtime slash debits the delegation map AND the aggregate AND
@@ -341,7 +382,10 @@ fn load_downtime_slash_debits_map_aggregate_and_pool() {
         .filter(|e| e.validator == target && e.owner.is_none())
         .map(|e| e.amount)
         .sum();
-    assert_eq!(in_flight_before, self_bond, "the self-bond is in the unbonding queue");
+    assert_eq!(
+        in_flight_before, self_bond,
+        "the self-bond is in the unbonding queue"
+    );
 
     // Drive 10 missed heights (threshold) with everyone else signing.
     let eligible = vs.clone();
@@ -350,7 +394,10 @@ fn load_downtime_slash_debits_map_aggregate_and_pool() {
     for h in 1..=stellereum::staking::DOWNTIME_MISS_THRESHOLD as u64 {
         burned_total += l.note_missed_heights(h, &signer, &eligible);
     }
-    assert!(burned_total > 0, "downtime slash must fire at the threshold");
+    assert!(
+        burned_total > 0,
+        "downtime slash must fire at the threshold"
+    );
     pool -= burned_total;
 
     // Nominal 0.1% burn over the WHOLE remaining stake (self 0 + delegated +
@@ -403,7 +450,10 @@ fn load_downtime_slash_debits_map_aggregate_and_pool() {
     // the map MUST move with it.
     l.process_unbonding(UNBONDING_PERIOD_SECS);
     let matured: u64 = l.withdrawable.values().sum();
-    assert_eq!(matured, in_flight_after, "the matured unbond is withdrawable");
+    assert_eq!(
+        matured, in_flight_after,
+        "the matured unbond is withdrawable"
+    );
     assert_eq!(
         l.unbonding.iter().filter(|e| e.validator == target).count(),
         0,
@@ -417,7 +467,10 @@ fn load_downtime_slash_debits_map_aggregate_and_pool() {
     for h in 11..=(10 + stellereum::staking::DOWNTIME_PENALTY_COOLDOWN) {
         burned_total2 += l.note_missed_heights(h, &signer, &eligible);
     }
-    assert!(burned_total2 > 0, "the second downtime streak must slash too");
+    assert!(
+        burned_total2 > 0,
+        "the second downtime streak must slash too"
+    );
     pool -= burned_total2;
 
     // Nominal 0.1% burn of the delegations, modulo per-delegator floor dust
@@ -431,7 +484,8 @@ fn load_downtime_slash_debits_map_aggregate_and_pool() {
     // Aggregate, map, burn ledger, and pool all agree on the same figure.
     let agg_after = l.validators[&target].delegated;
     assert_eq!(
-        agg_before - agg_after, burned_total2,
+        agg_before - agg_after,
+        burned_total2,
         "aggregate debit must equal the burn"
     );
     let map_after = map_sum(&l, &target);

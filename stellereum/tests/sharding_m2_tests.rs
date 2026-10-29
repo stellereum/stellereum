@@ -65,7 +65,12 @@ async fn sharded_pair(
 }
 
 async fn balance(cluster: &Cluster, addr: &[u8; 32]) -> u64 {
-    cluster.nodes[0].state.get_account(addr).await.map(|a| a.balance).unwrap_or(0)
+    cluster.nodes[0]
+        .state
+        .get_account(addr)
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0)
 }
 
 /// The value transfer at the heart of M2.
@@ -94,9 +99,7 @@ async fn cross_shard_transfer_debits_source_credits_target_and_conserves_supply(
 
     // 1. Source block: debit + emit the committed outbound message.
     let src_bh = sc.run_height(SHARD0, 1).await;
-    let src_block = sc
-        .shard(SHARD0)
-        .nodes[0]
+    let src_block = sc.shard(SHARD0).nodes[0]
         .blocks
         .get(&src_bh)
         .cloned()
@@ -104,17 +107,30 @@ async fn cross_shard_transfer_debits_source_credits_target_and_conserves_supply(
 
     assert_eq!(src_block.shard_id, SHARD0);
     assert!(
-        src_block.transactions.iter().any(|t| t.compute_tx_hash() == tx.compute_tx_hash()),
+        src_block
+            .transactions
+            .iter()
+            .any(|t| t.compute_tx_hash() == tx.compute_tx_hash()),
         "the cross-shard tx must be applied on its source shard"
     );
-    assert_eq!(src_block.cross_shard_out.len(), 1, "source must emit one outbound message");
+    assert_eq!(
+        src_block.cross_shard_out.len(),
+        1,
+        "source must emit one outbound message"
+    );
     let msg = src_block.cross_shard_out[0].clone();
     assert!(msg.is_outbound_for(SHARD0));
-    assert!(!msg.trusted, "a block-carried message must never be locally trusted");
+    assert!(
+        !msg.trusted,
+        "a block-carried message must never be locally trusted"
+    );
 
     // Sender debited amount + gas; the amount is burned off-source; the gas is
     // the proposer fee. The recipient does NOT exist on the source shard.
-    assert_eq!(balance(sc.shard(SHARD0), &sender_addr).await, 1_000 - amount - gas);
+    assert_eq!(
+        balance(sc.shard(SHARD0), &sender_addr).await,
+        1_000 - amount - gas
+    );
     assert_eq!(balance(sc.shard(SHARD0), &validator_addr).await, gas);
     assert!(sc.shard(SHARD0).nodes[0]
         .state
@@ -124,9 +140,7 @@ async fn cross_shard_transfer_debits_source_credits_target_and_conserves_supply(
 
     // 2. Target block: consume the inbound message and credit the recipient.
     let tgt_bh = sc.run_height(SHARD1, 2).await;
-    let tgt_block = sc
-        .shard(SHARD1)
-        .nodes[0]
+    let tgt_block = sc.shard(SHARD1).nodes[0]
         .blocks
         .get(&tgt_bh)
         .cloned()
@@ -154,7 +168,10 @@ async fn cross_shard_transfer_debits_source_credits_target_and_conserves_supply(
     let supply_after = balance(sc.shard(SHARD0), &sender_addr).await
         + balance(sc.shard(SHARD0), &validator_addr).await
         + balance(sc.shard(SHARD1), &recipient_addr).await;
-    assert_eq!(supply_after, supply_before, "cross-shard transfer must conserve supply");
+    assert_eq!(
+        supply_after, supply_before,
+        "cross-shard transfer must conserve supply"
+    );
 
     // Determinism: a block's cross-shard records are bound into its identity.
     let mut tampered = tgt_block.clone();
@@ -184,8 +201,16 @@ async fn replaying_a_consumed_message_is_credited_only_once() {
     let tx = Transaction::sign(&sender, recipient_addr, 250, 5, 0, SHARD0, SHARD1);
     sc.shard_mut(SHARD0).broadcast_tx(tx).await;
     let src_bh = sc.run_height(SHARD0, 1).await;
-    let msg = sc.shard(SHARD0).nodes[0].blocks.get(&src_bh).unwrap().cross_shard_out[0].clone();
-    assert!(msg.verify_inclusion_strict(), "the emitted message must carry a valid proof");
+    let msg = sc.shard(SHARD0).nodes[0]
+        .blocks
+        .get(&src_bh)
+        .unwrap()
+        .cross_shard_out[0]
+        .clone();
+    assert!(
+        msg.verify_inclusion_strict(),
+        "the emitted message must carry a valid proof"
+    );
 
     // A pristine target engine (what a rebuilding node starts from).
     let engine = Arc::new(InMemoryStateEngine::new());
@@ -206,11 +231,14 @@ async fn replaying_a_consumed_message_is_credited_only_once() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
 
     let first = engine.apply_cross_shard_consumptions(&block).await;
     assert_eq!(first, 1, "the first application must credit");
-    assert_eq!(engine.get_account(&recipient_addr).await.unwrap().balance, 250);
+    assert_eq!(
+        engine.get_account(&recipient_addr).await.unwrap().balance,
+        250
+    );
 
     // Replaying the identical consumption record (as a Byzantine proposer
     // might) must be a no-op.
@@ -222,7 +250,11 @@ async fn replaying_a_consumed_message_is_credited_only_once() {
         "replay must not mint a second time"
     );
     assert_eq!(engine.cross_shard_consumed_len().await, 1);
-    assert!(engine.is_cross_shard_consumed(&CrossShardKey::of(&msg)).await);
+    assert!(
+        engine
+            .is_cross_shard_consumed(&CrossShardKey::of(&msg))
+            .await
+    );
 }
 
 /// The runtime-level replay proof: a duplicate lingering in the KV is filtered
@@ -240,7 +272,12 @@ async fn target_filters_and_rejects_a_replayed_inbound_message() {
     let tx = Transaction::sign(&sender, recipient_addr, 300, 5, 0, SHARD0, SHARD1);
     sc.shard_mut(SHARD0).broadcast_tx(tx).await;
     let src_bh = sc.run_height(SHARD0, 1).await;
-    let msg = sc.shard(SHARD0).nodes[0].blocks.get(&src_bh).unwrap().cross_shard_out[0].clone();
+    let msg = sc.shard(SHARD0).nodes[0]
+        .blocks
+        .get(&src_bh)
+        .unwrap()
+        .cross_shard_out[0]
+        .clone();
 
     // First target height consumes it.
     sc.run_height(SHARD1, 2).await;
@@ -252,7 +289,10 @@ async fn target_filters_and_rejects_a_replayed_inbound_message() {
     let bh2 = sc.run_height(SHARD1, 3).await;
     let block2 = sc.shard(SHARD1).nodes[0].blocks.get(&bh2).cloned().unwrap();
     assert!(
-        block2.cross_shard_out.iter().all(|m| m.msg_id != msg.msg_id),
+        block2
+            .cross_shard_out
+            .iter()
+            .all(|m| m.msg_id != msg.msg_id),
         "a consumed message must not be re-included"
     );
     assert_eq!(balance(sc.shard(SHARD1), &recipient_addr).await, 300);
@@ -280,7 +320,7 @@ async fn target_filters_and_rejects_a_replayed_inbound_message() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     forged.sign_block(&validator);
     let err = node
         .validate_proposal(&forged, root)
@@ -304,7 +344,12 @@ async fn two_independent_target_shards_derive_the_same_root() {
     let tx = Transaction::sign(&sender, recipient_addr, 123, 7, 0, SHARD0, SHARD1);
     sc.shard_mut(SHARD0).broadcast_tx(tx).await;
     let src_bh = sc.run_height(SHARD0, 1).await;
-    let msg = sc.shard(SHARD0).nodes[0].blocks.get(&src_bh).unwrap().cross_shard_out[0].clone();
+    let msg = sc.shard(SHARD0).nodes[0]
+        .blocks
+        .get(&src_bh)
+        .unwrap()
+        .cross_shard_out[0]
+        .clone();
 
     // Two independent target shards with identical genesis. Each gets its own
     // node-local transport seeded with the SAME message.
@@ -354,13 +399,30 @@ async fn a_rebuilding_target_reproduces_the_same_root_and_rejects_replay() {
     let tx = Transaction::sign(&sender, recipient_addr, 400, 5, 0, SHARD0, SHARD1);
     sc.shard_mut(SHARD0).broadcast_tx(tx).await;
     let src_bh = sc.run_height(SHARD0, 1).await;
-    let _msg = sc.shard(SHARD0).nodes[0].blocks.get(&src_bh).unwrap().cross_shard_out[0].clone();
+    let _msg = sc.shard(SHARD0).nodes[0]
+        .blocks
+        .get(&src_bh)
+        .unwrap()
+        .cross_shard_out[0]
+        .clone();
 
     // Live target: consume it through the runtime.
     let tgt_bh = sc.run_height(SHARD1, 2).await;
     let live_root = sc.shard(SHARD1).nodes[0].state_root().await;
-    let live_block = sc.shard(SHARD1).nodes[0].blocks.get(&tgt_bh).cloned().unwrap();
-    assert_eq!(sc.shard(SHARD1).nodes[0].state.get_account(&recipient_addr).await.unwrap().balance, 400);
+    let live_block = sc.shard(SHARD1).nodes[0]
+        .blocks
+        .get(&tgt_bh)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        sc.shard(SHARD1).nodes[0]
+            .state
+            .get_account(&recipient_addr)
+            .await
+            .unwrap()
+            .balance,
+        400
+    );
 
     // Rebuilding target: identical genesis, applies the SAME committed record.
     let engine = Arc::new(InMemoryStateEngine::new());
@@ -381,9 +443,12 @@ async fn a_rebuilding_target_reproduces_the_same_root_and_rejects_replay() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     engine.apply_block_transition(&rebuild_block, 0).await;
-    assert_eq!(engine.get_account(&recipient_addr).await.unwrap().balance, 400);
+    assert_eq!(
+        engine.get_account(&recipient_addr).await.unwrap().balance,
+        400
+    );
     assert_eq!(
         engine.get_state_root().await,
         live_root,
@@ -393,5 +458,8 @@ async fn a_rebuilding_target_reproduces_the_same_root_and_rejects_replay() {
     // Replaying the same committed record on the rebuilt engine is refused.
     let again = engine.apply_cross_shard_consumptions(&rebuild_block).await;
     assert_eq!(again, 0, "replay must credit nothing");
-    assert_eq!(engine.get_account(&recipient_addr).await.unwrap().balance, 400);
+    assert_eq!(
+        engine.get_account(&recipient_addr).await.unwrap().balance,
+        400
+    );
 }

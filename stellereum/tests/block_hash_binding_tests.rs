@@ -23,9 +23,9 @@ fn mk(sk: &SigningKey, txs: Vec<Transaction>, cross: Vec<CrossShardMessage>) -> 
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
-            order_merkle_root,
-            epoch_key_commitment: [0u8; 32],
-        };
+        order_merkle_root,
+        epoch_key_commitment: [0u8; 32],
+    };
     b.sign_block(sk);
     b
 }
@@ -73,7 +73,10 @@ fn block_hash_binds_payload_nonce_gas_and_shards() {
     );
 
     // deterministic for identical content
-    assert_eq!(b0.compute_hash(), mk(&sk, vec![base], vec![]).compute_hash());
+    assert_eq!(
+        b0.compute_hash(),
+        mk(&sk, vec![base], vec![]).compute_hash()
+    );
 }
 
 #[test]
@@ -102,5 +105,9 @@ fn block_hash_is_independent_of_validator_signatures() {
     let h1 = b.compute_hash();
     b.sign_block(&sk);
     b.sign_block(&sk);
-    assert_eq!(h1, b.compute_hash(), "hash must not change when signatures are added");
+    assert_eq!(
+        h1,
+        b.compute_hash(),
+        "hash must not change when signatures are added"
+    );
 }

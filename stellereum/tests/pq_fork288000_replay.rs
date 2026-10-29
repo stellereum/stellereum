@@ -54,7 +54,6 @@ const RAW_TX_HEX: &str = concat!(
     "6d1d49c3d255cc4898c22516f5df5f27400000000000000000000000000000000000",
 );
 
-
 const FAUCET_HEX: &str = "eff75acfeb416b7e7c48f0c2db79462073e20f86bbd34d2fba03158d80443ea3";
 const PROPOSER_HEX: &str = "9c675ebc6cd20c9226da2fcbf6c167647e4e948b78368f038058b6b419175fcd";
 const BLOCK_TIMESTAMP: u64 = 1792705388;
@@ -86,7 +85,11 @@ fn decode_live_tx() -> Transaction {
         tx.is_pq_activation(),
         "explicit envelope => activation path (the pin check)"
     );
-    assert_eq!(tx.from, faucet(), "dust self-transfer from the faucet account");
+    assert_eq!(
+        tx.from,
+        faucet(),
+        "dust self-transfer from the faucet account"
+    );
     assert_eq!(tx.to, faucet());
     assert_eq!(tx.amount, 1);
     assert_eq!(tx.gas_limit, 350_000);
@@ -166,8 +169,14 @@ async fn fork288000_replay_of_exact_bytes_is_a_success_charging_395000() {
     assert_eq!(out.fees_collected, CANONICAL_FEE);
 
     let acc = engine.get_account(&faucet()).await.unwrap();
-    assert_eq!(acc.balance, POST_BALANCE, "matches live post balance on BOTH nodes");
-    assert_eq!(acc.nonce, POST_NONCE, "matches live post nonce on BOTH nodes");
+    assert_eq!(
+        acc.balance, POST_BALANCE,
+        "matches live post balance on BOTH nodes"
+    );
+    assert_eq!(
+        acc.nonce, POST_NONCE,
+        "matches live post nonce on BOTH nodes"
+    );
     // The exact 49-byte pinned leaf both nodes serve for the faucet.
     assert_eq!(
         hex::encode(acc.to_trie_bytes()),
@@ -189,15 +198,23 @@ async fn fork288000_identical_prestate_gives_identical_verdicts_and_roots() {
     for parallel in [true, false] {
         let engine = InMemoryStateEngine::new().with_parallel_exec(parallel);
         install_live_prestate(&engine, &tx).await;
-        engine.update_account(AccountState::new(proposer(), 0)).await;
+        engine
+            .update_account(AccountState::new(proposer(), 0))
+            .await;
         let block = mk_block(tx.clone(), proposer());
         let out = engine.apply_block_transition(&block, 0).await;
         verdicts.push((out.applied, out.failed, out.tx_fees.clone()));
         roots.push(hex::encode(engine.get_state_root().await));
     }
-    assert_eq!(verdicts[0], verdicts[1], "verdicts must not depend on the exec path");
+    assert_eq!(
+        verdicts[0], verdicts[1],
+        "verdicts must not depend on the exec path"
+    );
     assert_eq!(verdicts[0], (1, 0, vec![CANONICAL_FEE]));
-    assert_eq!(roots[0], roots[1], "DIVERGENCE: same pre-state, same block, different roots");
+    assert_eq!(
+        roots[0], roots[1],
+        "DIVERGENCE: same pre-state, same block, different roots"
+    );
 }
 
 /// A conflicting PQ pin still refuses (fail-closed), and the refusal is
@@ -223,7 +240,11 @@ async fn fork288000_conflicting_pin_refuses_with_failure_fee() {
     let block = mk_block(tx, proposer());
     let out = engine.apply_block_transition(&block, 0).await;
     assert_eq!((out.applied, out.failed), (0, 1));
-    assert_eq!(out.tx_fees, vec![CANONICAL_FEE], "attributable failure pays the floor");
+    assert_eq!(
+        out.tx_fees,
+        vec![CANONICAL_FEE],
+        "attributable failure pays the floor"
+    );
 }
 
 /// An unpinned pre-state still succeeds: the activation pins the live key.
@@ -259,13 +280,18 @@ async fn fork288000_verdict_is_deterministic_across_runs() {
         &stellereum::post_quantum::DEFAULT_SALT,
     );
     for i in 0..25 {
-        let engine =
-            InMemoryStateEngine::new().with_parallel_exec(i % 2 == 0);
+        let engine = InMemoryStateEngine::new().with_parallel_exec(i % 2 == 0);
         install_live_prestate(&engine, &tx).await;
-        engine.update_account(AccountState::new(proposer(), 0)).await;
+        engine
+            .update_account(AccountState::new(proposer(), 0))
+            .await;
         let block = mk_block(tx.clone(), proposer());
         let out = engine.apply_block_transition(&block, 0).await;
         assert_eq!((out.applied, out.failed), (1, 0), "flip on iteration {i}");
-        assert_eq!(out.tx_fees, vec![CANONICAL_FEE], "fee flip on iteration {i}");
+        assert_eq!(
+            out.tx_fees,
+            vec![CANONICAL_FEE],
+            "fee flip on iteration {i}"
+        );
     }
 }

@@ -100,7 +100,11 @@ fn breaker_never_fires_before_the_timeout_or_without_a_peer() {
     let ks = keys(3);
     let mut hc = HeightConsensus::new(H, vset(&ks));
     hc.round = 100;
-    assert_eq!(hc.deadlock_breaker_target(299, 300), None, "no fire before timeout");
+    assert_eq!(
+        hc.deadlock_breaker_target(299, 300),
+        None,
+        "no fire before timeout"
+    );
     assert_eq!(
         hc.deadlock_breaker_target(400, 300),
         None,
@@ -116,7 +120,10 @@ fn rephase_widens_the_scan_window_and_never_rewinds() {
     let mut hc = HeightConsensus::new(H, vset(&ks));
     hc.round = 412;
     hc.locked = Some(([7u8; 32], 400));
-    assert_eq!(hc.scan_lookback, ROUND_LOOKBACK, "the normal window is narrow");
+    assert_eq!(
+        hc.scan_lookback, ROUND_LOOKBACK,
+        "the normal window is narrow"
+    );
 
     assert!(hc.apply_deadlock_local_reset(false));
     assert_eq!(
@@ -124,7 +131,10 @@ fn rephase_widens_the_scan_window_and_never_rewinds() {
         "the re-phase must move FORWARD: rewinding re-votes an already-used round"
     );
     assert_eq!(hc.scan_lookback, REPHASE_SCAN_WINDOW);
-    assert_eq!(hc.locked, None, "a bodyless lock with no QC behind it is dropped");
+    assert_eq!(
+        hc.locked, None,
+        "a bodyless lock with no QC behind it is dropped"
+    );
     assert_eq!(hc.height, H, "the re-phase never moves the height");
 }
 
@@ -216,7 +226,10 @@ fn rephase_is_idempotent_per_height() {
     hc.locked = Some(([7u8; 32], 400));
     assert!(hc.apply_deadlock_local_reset(false));
     let after = hc.round;
-    assert!(!hc.apply_deadlock_local_reset(false), "the second re-phase is a no-op");
+    assert!(
+        !hc.apply_deadlock_local_reset(false),
+        "the second re-phase is a no-op"
+    );
     assert_eq!(hc.round, after, "a no-op must not move the round");
 }
 
@@ -238,8 +251,15 @@ fn rephase_never_touches_height_decided_or_the_qc() {
     hc.round = 412;
     assert!(hc.apply_deadlock_local_reset(false));
     assert_eq!(hc.height, H);
-    assert_eq!(hc.decided, Some(block), "the re-phase never clears a decision");
-    assert_eq!(hc.precommit_qc, qc, "the re-phase never clears the deciding QC");
+    assert_eq!(
+        hc.decided,
+        Some(block),
+        "the re-phase never clears a decision"
+    );
+    assert_eq!(
+        hc.precommit_qc, qc,
+        "the re-phase never clears the deciding QC"
+    );
     assert_eq!(
         hc.locked,
         Some((block, 5)),

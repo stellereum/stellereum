@@ -15,8 +15,8 @@ use stellereum::bridge::{
     CHALLENGE_BOND_NANO, DISPUTE_WINDOW_SECS,
 };
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
-use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::staking::{MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
+use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::svm::{OpCode, GAS_BRIDGE_INTENT};
 
 /// Fixed, realistic block timestamp. Never 0: 0 is exactly the bug I12 pins.
@@ -193,7 +193,11 @@ async fn challenge_freezes_quorum_deposit() {
     let out = e
         .apply_block_transition(&bridge_block(2, TS + 10, vec![tx], challenger_pk), 0)
         .await;
-    assert_eq!(out.status, vec![true], "a fresh quorum deposit challenges cleanly");
+    assert_eq!(
+        out.status,
+        vec![true],
+        "a fresh quorum deposit challenges cleanly"
+    );
     assert_eq!(balance(&e, &recipient).await, 0, "full amount clawed back");
     assert_eq!(
         balance(&e, &challenger_pk).await,
@@ -238,7 +242,12 @@ async fn double_challenge_is_refused() {
     );
     let out = e
         .apply_block_transition(
-            &bridge_block(2, TS + 10, vec![tx_a], challenger.verifying_key().to_bytes()),
+            &bridge_block(
+                2,
+                TS + 10,
+                vec![tx_a],
+                challenger.verifying_key().to_bytes(),
+            ),
             0,
         )
         .await;
@@ -253,18 +262,31 @@ async fn double_challenge_is_refused() {
     let settled = e.get_state_root().await;
     let out = e
         .apply_block_transition(
-            &bridge_block(3, TS + 20, vec![tx_b], challenger.verifying_key().to_bytes()),
+            &bridge_block(
+                3,
+                TS + 20,
+                vec![tx_b],
+                challenger.verifying_key().to_bytes(),
+            ),
             0,
         )
         .await;
-    assert_eq!(out.status, vec![false], "second challenge of one hash refuses");
+    assert_eq!(
+        out.status,
+        vec![false],
+        "second challenge of one hash refuses"
+    );
     // The refusal moves NO BRIDGE COIN: the deposit stays clawed back, the
     // bond stays locked in escrow, and the dispute stays open. (The state
     // ROOT does move: a refused transaction is an attributable failure, so it
     // pays the D2 floor step and consumes its nonce - the engine's
     // fail-closed rule, not a bridge effect. Payer == proposer here, so the
     // fee self-rebates and no balance changes.)
-    assert_eq!(balance(&e, &recipient).await, 0, "the credit stays clawed back");
+    assert_eq!(
+        balance(&e, &recipient).await,
+        0,
+        "the credit stays clawed back"
+    );
     assert_eq!(
         balance(&e, &stellereum::bridge::BRIDGE_ESCROW).await,
         100 * STELL + CHALLENGE_BOND_NANO,
@@ -326,7 +348,11 @@ async fn challenge_stale_deposit_is_refused() {
     let out = e
         .apply_block_transition(&bridge_block(2, TS + 25 * 3600, vec![tx], payer_pk), 0)
         .await;
-    assert_eq!(out.status, vec![false], "stale deposits are outside the window");
+    assert_eq!(
+        out.status,
+        vec![false],
+        "stale deposits are outside the window"
+    );
     assert_eq!(balance(&e, &recipient).await, 100 * STELL, "untouched");
 }
 
@@ -354,10 +380,7 @@ async fn resolve_confirms_with_evidence_and_slashes_bond_to_recipient() {
         }]),
     );
     let out = e
-        .apply_block_transition(
-            &bridge_block(2, TS + 10, vec![tx_c], challenger_pk),
-            0,
-        )
+        .apply_block_transition(&bridge_block(2, TS + 10, vec![tx_c], challenger_pk), 0)
         .await;
     assert_eq!(out.status, vec![true]);
 
@@ -449,10 +472,7 @@ async fn resolve_before_deadline_without_evidence_is_refused() {
         }]),
     );
     let out = e
-        .apply_block_transition(
-            &bridge_block(2, TS + 10, vec![tx_c], challenger_pk),
-            0,
-        )
+        .apply_block_transition(&bridge_block(2, TS + 10, vec![tx_c], challenger_pk), 0)
         .await;
     assert_eq!(out.status, vec![true]);
 
@@ -462,10 +482,7 @@ async fn resolve_before_deadline_without_evidence_is_refused() {
         ops_list(vec![BridgeIntent::Resolve { dispute_id: 0 }]),
     );
     let out = e
-        .apply_block_transition(
-            &bridge_block(3, TS + 20, vec![tx_r], challenger_pk),
-            0,
-        )
+        .apply_block_transition(&bridge_block(3, TS + 20, vec![tx_r], challenger_pk), 0)
         .await;
     assert_eq!(
         out.status,
@@ -527,11 +544,18 @@ async fn resolve_revokes_after_expiry_and_rewards_challenger() {
         10 * STELL - bond,
         "challenger remains down the bond during deferrals: zero unearned profit"
     );
-    assert_eq!(balance(&e, &recipient).await, 0, "credit stays parked while in deferral");
+    assert_eq!(
+        balance(&e, &recipient).await,
+        0,
+        "credit stays parked while in deferral"
+    );
     {
         let br = e.bridge_read().await;
         let d = br.disputes.get(&0).unwrap();
-        assert!(!d.resolved && !d.confirmed, "dispute deferred, not confirmed");
+        assert!(
+            !d.resolved && !d.confirmed,
+            "dispute deferred, not confirmed"
+        );
     }
 }
 
@@ -632,7 +656,10 @@ async fn verified_fraud_proof_revokes_pays_the_finder_and_burns_the_rest() {
     {
         let br = e.bridge_read().await;
         let d = br.disputes.get(&0).unwrap();
-        assert!(d.resolved && !d.confirmed, "the dispute settled as a revoke");
+        assert!(
+            d.resolved && !d.confirmed,
+            "the dispute settled as a revoke"
+        );
         assert_eq!(
             br.total_minted, reward,
             "the mint counter unwinds by the burned amount only; the finder keeps the reward"
@@ -717,8 +744,19 @@ async fn challenge_without_bond_cover_is_refused() {
         .apply_block_transition(&bridge_block(2, TS + 10, vec![tx], payer_pk), 0)
         .await;
     assert_eq!(out.status, vec![false], "bond uncovered: whole tx fails");
-    assert_eq!(e.get_state_root().await, settled, "fail closed, nothing moves");
-    assert!(!e.bridge_read().await.deposit_records.get(&hash).unwrap().disputed);
+    assert_eq!(
+        e.get_state_root().await,
+        settled,
+        "fail closed, nothing moves"
+    );
+    assert!(
+        !e.bridge_read()
+            .await
+            .deposit_records
+            .get(&hash)
+            .unwrap()
+            .disputed
+    );
 }
 
 // ===========================================================================

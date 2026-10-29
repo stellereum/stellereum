@@ -45,7 +45,10 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(per_sec: u32) -> Self {
-        Self { per_sec: per_sec.max(1), inner: Mutex::new(HashMap::new()) }
+        Self {
+            per_sec: per_sec.max(1),
+            inner: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Returns true if the request is allowed (and counts it).
@@ -112,7 +115,10 @@ pub struct ReadinessConfig {
 
 impl Default for ReadinessConfig {
     fn default() -> Self {
-        Self { max_stall_secs: 30, min_peers: 1 }
+        Self {
+            max_stall_secs: 30,
+            min_peers: 1,
+        }
     }
 }
 
@@ -128,7 +134,10 @@ impl ReadinessConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(base.min_peers);
-        Self { max_stall_secs, min_peers }
+        Self {
+            max_stall_secs,
+            min_peers,
+        }
     }
 }
 
@@ -158,7 +167,10 @@ pub struct ReadinessState {
 
 impl ReadinessState {
     pub fn new(config: ReadinessConfig) -> Self {
-        Self { config, inner: Mutex::new(ReadinessInner::default()) }
+        Self {
+            config,
+            inner: Mutex::new(ReadinessInner::default()),
+        }
     }
 
     pub fn config(&self) -> ReadinessConfig {
@@ -459,8 +471,14 @@ async fn index(State(st): State<Arc<GatewayState>>) -> (HeaderMap, Html<String>)
     let mut headers = HeaderMap::new();
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     headers.insert("x-frame-options", "SAMEORIGIN".parse().unwrap());
-    headers.insert("referrer-policy", "strict-origin-when-cross-origin".parse().unwrap());
-    headers.insert("permissions-policy", "geolocation=(), microphone=(), camera=()".parse().unwrap());
+    headers.insert(
+        "referrer-policy",
+        "strict-origin-when-cross-origin".parse().unwrap(),
+    );
+    headers.insert(
+        "permissions-policy",
+        "geolocation=(), microphone=(), camera=()".parse().unwrap(),
+    );
     (headers, Html(render_index(st.captcha.site_key())))
 }
 
@@ -560,10 +578,19 @@ async fn api_faucet(
     if query.contains_key("token") || query.contains_key("apiKey") {
         // Tokens in URLs land in access/proxy logs and browser history;
         // headers are the safe path (audit 2026-10-06). Still accepted.
-        tracing::warn!("[faucet] token passed via URL query from {}; prefer Authorization header", client_ip);
+        tracing::warn!(
+            "[faucet] token passed via URL query from {}; prefer Authorization header",
+            client_ip
+        );
     }
-    if !provided.map(|p| constant_time_eq(p, expected)).unwrap_or(false) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized: missing or invalid faucet token")
+    if !provided
+        .map(|p| constant_time_eq(p, expected))
+        .unwrap_or(false)
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "unauthorized: missing or invalid faucet token",
+        )
             .into_response();
     }
     // Per-IP drip throttle (shared with the RPC path's token gate).
@@ -586,16 +613,16 @@ async fn api_faucet(
     // as `stell_faucet`): on a sharded node a recipient that routes to another
     // shard is refused here — the drip could never execute there, and queuing
     // it would only burn the faucet's nonce sequence.
-    let (a, drip_shard) = match crate::rpc::resolve_faucet_recipient(&st.rpc, &faucet, &addr_param).await
-    {
-        Ok(v) => v,
-        Err(e) if e.starts_with("invalid address") => {
-            return (StatusCode::BAD_REQUEST, e).into_response();
-        }
-        Err(e) => {
-            return (StatusCode::SERVICE_UNAVAILABLE, e).into_response();
-        }
-    };
+    let (a, drip_shard) =
+        match crate::rpc::resolve_faucet_recipient(&st.rpc, &faucet, &addr_param).await {
+            Ok(v) => v,
+            Err(e) if e.starts_with("invalid address") => {
+                return (StatusCode::BAD_REQUEST, e).into_response();
+            }
+            Err(e) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, e).into_response();
+            }
+        };
     let faucet_addr = faucet.account();
     let onchain = st
         .rpc
@@ -614,17 +641,28 @@ async fn api_faucet(
         .filter(|t| t.from == faucet_addr)
         .map(|t| t.nonce)
         .collect();
-    let Some((tx, amount)) = faucet.build_transfer(a, None, Some((onchain, pending))).await else {
-        return (StatusCode::TOO_MANY_REQUESTS, "faucet limit reached for this address").into_response();
-    };
-    let balance = st.rpc.engine.get_account(&faucet.account()).await.map(|acc| acc.balance).unwrap_or(0);
-    let tx_hash = match st
-        .rpc
-        .mempool
-        .write()
+    let Some((tx, amount)) = faucet
+        .build_transfer(a, None, Some((onchain, pending)))
         .await
-        .add_checked_ctx(tx.clone(), balance, crate::mempool::AdmissionCtx::wall_now())
-    {
+    else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "faucet limit reached for this address",
+        )
+            .into_response();
+    };
+    let balance = st
+        .rpc
+        .engine
+        .get_account(&faucet.account())
+        .await
+        .map(|acc| acc.balance)
+        .unwrap_or(0);
+    let tx_hash = match st.rpc.mempool.write().await.add_checked_ctx(
+        tx.clone(),
+        balance,
+        crate::mempool::AdmissionCtx::wall_now(),
+    ) {
         Ok(h) => h,
         Err(e) => {
             faucet.rollback(&tx, a, amount).await;
@@ -701,16 +739,16 @@ async fn api_faucet_public(
     // siteverify call, and a recipient that routes to another shard is refused
     // here (same rule as `stell_faucet`) — the drip could never execute there,
     // and queuing it would only burn the faucet's nonce sequence.
-    let (a, drip_shard) = match crate::rpc::resolve_faucet_recipient(&st.rpc, &faucet, &addr_param).await
-    {
-        Ok(v) => v,
-        Err(e) if e.starts_with("invalid address") => {
-            return (StatusCode::BAD_REQUEST, e).into_response();
-        }
-        Err(e) => {
-            return (StatusCode::SERVICE_UNAVAILABLE, e).into_response();
-        }
-    };
+    let (a, drip_shard) =
+        match crate::rpc::resolve_faucet_recipient(&st.rpc, &faucet, &addr_param).await {
+            Ok(v) => v,
+            Err(e) if e.starts_with("invalid address") => {
+                return (StatusCode::BAD_REQUEST, e).into_response();
+            }
+            Err(e) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, e).into_response();
+            }
+        };
     // Real client IP behind a trusted proxy (see crate::client_ip): feeds the
     // per-IP faucet budget and Turnstile `remoteip` below.
     let client_ip = crate::client_ip::resolve_client_ip(&headers, addr.ip());
@@ -807,21 +845,23 @@ async fn api_faucet_public(
         Err(wait_secs) => {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
-                format!(
-                    "public drip cooling down for this address, retry in {wait_secs} seconds"
-                ),
+                format!("public drip cooling down for this address, retry in {wait_secs} seconds"),
             )
                 .into_response();
         }
     };
-    let balance = st.rpc.engine.get_account(&faucet.account()).await.map(|acc| acc.balance).unwrap_or(0);
-    let tx_hash = match st
+    let balance = st
         .rpc
-        .mempool
-        .write()
+        .engine
+        .get_account(&faucet.account())
         .await
-        .add_checked_ctx(tx.clone(), balance, crate::mempool::AdmissionCtx::wall_now())
-    {
+        .map(|acc| acc.balance)
+        .unwrap_or(0);
+    let tx_hash = match st.rpc.mempool.write().await.add_checked_ctx(
+        tx.clone(),
+        balance,
+        crate::mempool::AdmissionCtx::wall_now(),
+    ) {
         Ok(h) => h,
         Err(e) => {
             faucet.rollback(&tx, a, amount).await;
@@ -851,7 +891,8 @@ async fn api_balance(
     };
     let acc = st.rpc.engine.get_account(&a).await;
     let (balance, nonce) = acc.map(|x| (x.balance, x.nonce)).unwrap_or((0, 0));
-    Json(json!({ "address": hex::encode(a), "balance": balance.to_string(), "nonce": nonce })).into_response()
+    Json(json!({ "address": hex::encode(a), "balance": balance.to_string(), "nonce": nonce }))
+        .into_response()
 }
 
 async fn api_spv(
@@ -886,14 +927,22 @@ async fn api_contracts(
         .and_then(|s| s.parse().ok())
         .map(|n: usize| n.min(1000))
         .unwrap_or(100);
-    let offset: usize = query.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let offset: usize = query
+        .get("offset")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     // Bounded iteration like stell_listTokens (audit 2026-10-06): walk the
     // registry directly and stop after offset+limit instead of materializing
     // every address; skip/take semantics (and `total`) are unchanged.
     let contracts = st.rpc.engine.contracts_read().await;
     let total = contracts.contracts.len();
-    let addrs: Vec<String> =
-        contracts.contracts.keys().skip(offset).take(limit).map(hex::encode).collect();
+    let addrs: Vec<String> = contracts
+        .contracts
+        .keys()
+        .skip(offset)
+        .take(limit)
+        .map(hex::encode)
+        .collect();
     Json(json!({ "contracts": addrs, "total": total, "offset": offset }))
 }
 
@@ -971,7 +1020,11 @@ pub fn describe_transaction(
 ) -> serde_json::Value {
     let tx_hash = hex::encode(tx.compute_tx_hash());
     for op in &tx.payload {
-        if let crate::svm::OpCode::SysCallConfidentialTransfer { recipient, transfer } = op {
+        if let crate::svm::OpCode::SysCallConfidentialTransfer {
+            recipient,
+            transfer,
+        } = op
+        {
             let mut inner =
                 describe_confidential_transfer(&tx.from, recipient, transfer, confidential);
             inner["tx_hash"] = json!(tx_hash);
@@ -982,7 +1035,12 @@ pub fn describe_transaction(
         }
         // V2 enforced transfer renders through the same viewer (proofs are
         // verification material, not display data).
-        if let crate::svm::OpCode::SysCallConfidentialTransfer2 { recipient, transfer, .. } = op {
+        if let crate::svm::OpCode::SysCallConfidentialTransfer2 {
+            recipient,
+            transfer,
+            ..
+        } = op
+        {
             let mut inner =
                 describe_confidential_transfer(&tx.from, recipient, transfer, confidential);
             inner["tx_hash"] = json!(tx_hash);
@@ -992,7 +1050,10 @@ pub fn describe_transaction(
             inner["enforced"] = json!(true);
             return inner;
         }
-        if let crate::svm::OpCode::SysCallConfidentialShield { commitment, amount, .. } = op {
+        if let crate::svm::OpCode::SysCallConfidentialShield {
+            commitment, amount, ..
+        } = op
+        {
             return json!({
                 "kind": "confidential-shield",
                 "sender": hex::encode(tx.from),
@@ -1005,7 +1066,10 @@ pub fn describe_transaction(
             });
         }
         if let crate::svm::OpCode::SysCallConfidentialUnshield { inputs } = op {
-            let total: u64 = inputs.iter().map(|i| i.amount).fold(0u64, |a, b| a.saturating_add(b));
+            let total: u64 = inputs
+                .iter()
+                .map(|i| i.amount)
+                .fold(0u64, |a, b| a.saturating_add(b));
             return json!({
                 "kind": "confidential-unshield",
                 "sender": hex::encode(tx.from),
@@ -1081,7 +1145,9 @@ async fn api_tx(
                         .or_else(|| query.get("apiKey"))
                         .map(|s| s.as_str())
                         .or_else(|| extract_header_token(&headers));
-                    provided.map(|p| constant_time_eq(p, expected)).unwrap_or(false)
+                    provided
+                        .map(|p| constant_time_eq(p, expected))
+                        .unwrap_or(false)
                 }
             };
             if !authed {
@@ -1129,14 +1195,20 @@ async fn api_confidential_spent(
 }
 
 async fn health_check() -> (StatusCode, Json<serde_json::Value>) {
-    (StatusCode::OK, Json(json!({ "status": "ok", "service": "stellereum-gateway" })))
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "ok", "service": "stellereum-gateway" })),
+    )
 }
 
 /// Liveness probe: the process is up and answering HTTP. Deliberately cheap —
 /// no locks, no state reads — so a wedged subsystem cannot fail it. Use
 /// `/readyz` to ask whether the node is actually useful.
 async fn healthz() -> (StatusCode, Json<serde_json::Value>) {
-    (StatusCode::OK, Json(json!({ "status": "ok", "service": "stellereum-gateway" })))
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "ok", "service": "stellereum-gateway" })),
+    )
 }
 
 /// Readiness probe: 200 when the node has finalized recently, holds peers and
@@ -1145,7 +1217,11 @@ async fn healthz() -> (StatusCode, Json<serde_json::Value>) {
 /// `height_zero`, `height_stalled`).
 async fn readyz(State(st): State<Arc<GatewayState>>) -> (StatusCode, Json<serde_json::Value>) {
     let rep = st.readiness.evaluate();
-    let code = if rep.ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let code = if rep.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     (
         code,
         Json(json!({
@@ -1262,12 +1338,16 @@ pub fn data_dir_stats(dir: &std::path::Path) -> (u64, u64) {
     let mut visited = 0usize;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(path) = stack.pop() {
-        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
         if meta.is_symlink() {
             continue;
         }
         if meta.is_dir() {
-            let Ok(entries) = std::fs::read_dir(&path) else { continue };
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 if visited >= DATA_DIR_SCAN_FILE_CAP {
                     return (bytes, snaps);
@@ -1304,7 +1384,9 @@ async fn api_version(State(st): State<Arc<GatewayState>>) -> Json<serde_json::Va
     Json(v)
 }
 
-async fn prometheus_metrics(State(st): State<Arc<GatewayState>>) -> (StatusCode, [(&'static str, &'static str); 1], String) {
+async fn prometheus_metrics(
+    State(st): State<Arc<GatewayState>>,
+) -> (StatusCode, [(&'static str, &'static str); 1], String) {
     let height = st.rpc.height.load(std::sync::atomic::Ordering::Relaxed);
     let mempool = st.rpc.mempool.read().await.len();
     let contracts = st.rpc.engine.contract_count().await;
@@ -1324,14 +1406,21 @@ async fn prometheus_metrics(State(st): State<Arc<GatewayState>>) -> (StatusCode,
         let ledger = st.rpc.engine.staking_read().await;
         let vs = ledger.to_validator_set();
         let fragile = ledger.quorum_fragility().is_some();
-        st.metrics.set_validator_set_full(vs.len() as u64, vs.total_power(), vs.quorum_power(), fragile);
+        st.metrics.set_validator_set_full(
+            vs.len() as u64,
+            vs.total_power(),
+            vs.quorum_power(),
+            fragile,
+        );
     }
     // State-entries estimate: live accounts plus the two committed registries
     // that already have their own gauges above.
     {
         let accounts = st.rpc.engine.accounts.read().await.len() as u64;
         st.metrics.set_state_entries(
-            accounts.saturating_add(contracts as u64).saturating_add(tokens as u64),
+            accounts
+                .saturating_add(contracts as u64)
+                .saturating_add(tokens as u64),
         );
     }
     // Disk footprint (best-effort scan, capped; non-blocking spawn_blocking off Tokio worker thread).
@@ -1353,16 +1442,29 @@ async fn prometheus_metrics(State(st): State<Arc<GatewayState>>) -> (StatusCode,
         &crate::metrics::build_dirty_resolved(),
     );
     let ready = st.readiness.evaluate().ready;
-    let text = render_metrics_with_readiness(&st.metrics, height, mempool, contracts, tokens, ready);
-    (StatusCode::OK, [("content-type", crate::metrics::CONTENT_TYPE)], text)
+    let text =
+        render_metrics_with_readiness(&st.metrics, height, mempool, contracts, tokens, ready);
+    (
+        StatusCode::OK,
+        [("content-type", crate::metrics::CONTENT_TYPE)],
+        text,
+    )
 }
 
 async fn cors_middleware(req: Request, next: Next) -> Response {
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
     headers.insert("access-control-allow-origin", "*".parse().unwrap());
-    headers.insert("access-control-allow-methods", "GET, POST, OPTIONS".parse().unwrap());
-    headers.insert("access-control-allow-headers", "content-type, authorization, x-requested-with, cf-turnstile-response, x-turnstile-token".parse().unwrap());
+    headers.insert(
+        "access-control-allow-methods",
+        "GET, POST, OPTIONS".parse().unwrap(),
+    );
+    headers.insert(
+        "access-control-allow-headers",
+        "content-type, authorization, x-requested-with, cf-turnstile-response, x-turnstile-token"
+            .parse()
+            .unwrap(),
+    );
     resp
 }
 
@@ -1375,7 +1477,10 @@ pub fn router(gateway: Arc<GatewayState>) -> Router {
     // layer here, never zero, never double-counted on the shared bucket.
     let rpc_router = crate::rpc::router(gateway.rpc.clone())
         .layer(middleware::from_fn(cors_middleware))
-        .layer(middleware::from_fn_with_state(gateway.clone(), nested_rpc_rate_limit));
+        .layer(middleware::from_fn_with_state(
+            gateway.clone(),
+            nested_rpc_rate_limit,
+        ));
     Router::new()
         .route("/", get(index))
         .route("/health", get(health_check))
@@ -1391,11 +1496,17 @@ pub fn router(gateway: Arc<GatewayState>) -> Router {
         // State-changing on GET is a crawler/prefetch/CSRF footgun (audit
         // 2026-10-06): the faucet mints money, so it is POST-only. GET keeps
         // a 405 with a hint instead of silently minting.
-        .route("/api/faucet/:address", post(api_faucet).get(faucet_get_hint))
+        .route(
+            "/api/faucet/:address",
+            post(api_faucet).get(faucet_get_hint),
+        )
         // Public testnet drip (TON-style, tokenless): POST-only, 5 STELL per
         // address per 45 minutes. Separate route so the token gate on the
         // operator faucet above is never weakened.
-        .route("/api/faucet-public/:address", post(api_faucet_public).get(faucet_get_hint))
+        .route(
+            "/api/faucet-public/:address",
+            post(api_faucet_public).get(faucet_get_hint),
+        )
         .route("/api/spv/:address", get(api_spv))
         .route("/api/contracts", get(api_contracts))
         // SSE transport of the streaming subscriptions (`text/event-stream`).
@@ -1411,7 +1522,9 @@ pub fn router(gateway: Arc<GatewayState>) -> Router {
                 .layer(axum::error_handling::HandleErrorLayer::new(
                     |_: axum::BoxError| async { axum::http::StatusCode::REQUEST_TIMEOUT },
                 ))
-                .layer(tower::timeout::TimeoutLayer::new(std::time::Duration::from_secs(30)))
+                .layer(tower::timeout::TimeoutLayer::new(
+                    std::time::Duration::from_secs(30),
+                ))
                 .layer(tower::limit::ConcurrencyLimitLayer::new(512)),
         )
         .with_state(gateway)
@@ -1442,7 +1555,10 @@ mod tests {
         let t = 1_700_000_000u64;
         assert!(rl.check_at(ip, t));
         assert!(rl.check_at(ip, t));
-        assert!(!rl.check_at(ip, t), "third request in the same second must be rejected");
+        assert!(
+            !rl.check_at(ip, t),
+            "third request in the same second must be rejected"
+        );
         // a different IP has its own bucket
         assert!(rl.check_at("5.6.7.8".parse().unwrap(), t));
         // next second resets the window

@@ -49,7 +49,7 @@ use ed25519_dalek::SigningKey;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use stellereum::consensus::{BlockHash, HeightConsensus, Vote, VoteKind, ValidatorSet};
+use stellereum::consensus::{BlockHash, HeightConsensus, ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction};
 use stellereum::state_engine::InMemoryStateEngine;
@@ -76,7 +76,10 @@ fn effective_round_timeout_ms(base_ms: u64, round: u32) -> u64 {
 
 #[derive(Clone, Debug)]
 enum Msg {
-    Proposal { round: u32, block: Block },
+    Proposal {
+        round: u32,
+        block: Block,
+    },
     Vote(Vote),
     /// A decided height, with the certificate that decided it (production
     /// broadcasts `ConsensusMsg::Committed`).
@@ -261,15 +264,7 @@ impl Sim {
     /// proposal is a NEW block (not a byte-identical re-proposal).
     async fn seed_tx(&mut self) {
         self.tx_nonce += 1;
-        let tx = Transaction::sign(
-            &self.tx_key,
-            [7u8; 32],
-            1,
-            1_000,
-            self.tx_nonce,
-            0,
-            0,
-        );
+        let tx = Transaction::sign(&self.tx_key, [7u8; 32], 1, 1_000, self.tx_nonce, 0, 0);
         for n in self.nodes.iter_mut() {
             n.rt.add_tx(tx.clone()).await;
         }
@@ -344,9 +339,7 @@ impl Sim {
                 {
                     if let Some(v) = self.nodes[i].rt.make_prevote() {
                         self.nodes[i].last_prevoted = Some((height, r));
-                        self.nodes[i]
-                            .prevotes_cast
-                            .push((v.round, v.block_hash));
+                        self.nodes[i].prevotes_cast.push((v.round, v.block_hash));
                         // Production adds OUR OWN vote to OUR OWN vote set.
                         let v2 = v.clone();
                         let _ = self.nodes[i].rt.on_prevote(v2.clone());
@@ -363,10 +356,7 @@ impl Sim {
                 match msg {
                     Msg::Proposal { round, block } => {
                         let proposer = block.proposer;
-                        let _ = self.nodes[to]
-                            .rt
-                            .on_proposal(proposer, block, round)
-                            .await;
+                        let _ = self.nodes[to].rt.on_proposal(proposer, block, round).await;
                     }
                     Msg::Committed {
                         height: ch,
@@ -411,9 +401,7 @@ impl Sim {
                 if let Some(v) = self.nodes[i].rt.make_precommit() {
                     if self.nodes[i].last_precommitted != Some((height, v.round)) {
                         self.nodes[i].last_precommitted = Some((height, v.round));
-                        self.nodes[i]
-                            .precommits_cast
-                            .push((v.round, v.block_hash));
+                        self.nodes[i].precommits_cast.push((v.round, v.block_hash));
                         let v2 = v.clone();
                         let _ = self.nodes[i].rt.on_precommit(v2.clone());
                         self.last_vote_ms = now;
@@ -762,7 +750,9 @@ async fn a_nil_precommit_does_not_suppress_the_real_one() {
             .unwrap();
     }
 
-    let pc = rt.make_precommit().expect("the polka must produce a precommit");
+    let pc = rt
+        .make_precommit()
+        .expect("the polka must produce a precommit");
     assert_eq!(pc.block_hash, Some(block));
     assert_eq!(pc.round, 0);
 }
@@ -890,7 +880,10 @@ async fn a_vote_for_an_old_round_never_rewinds_us() {
     }
     let v = Vote::sign(&ks[1], 1, 3, VoteKind::Prevote, None);
     rt.on_prevote(v).unwrap();
-    assert_eq!(rt.hc.round, 50, "the round counter must never move backwards");
+    assert_eq!(
+        rt.hc.round, 50,
+        "the round counter must never move backwards"
+    );
 }
 
 /// Every verified vote — accepted or not — must teach us where the network
@@ -947,7 +940,9 @@ async fn the_lock_refuses_a_conflicting_precommit() {
         rt.on_prevote(Vote::sign(k, 1, 10, VoteKind::Prevote, Some(a)))
             .unwrap();
     }
-    let pc = rt.make_precommit().expect("the polka must produce a precommit");
+    let pc = rt
+        .make_precommit()
+        .expect("the polka must produce a precommit");
     assert_eq!(pc.block_hash, Some(a));
     assert_eq!(rt.hc.locked, Some((a, 10)));
 
@@ -958,7 +953,9 @@ async fn the_lock_refuses_a_conflicting_precommit() {
     }
     // (The vote set keeps the FIRST vote per validator, so the polka for A
     // is still the one in the set: the lock and the polka agree.)
-    let again = rt.make_precommit().expect("the same polka must still precommit");
+    let again = rt
+        .make_precommit()
+        .expect("the same polka must still precommit");
     assert_eq!(again.block_hash, Some(a));
     assert_eq!(again.round, 10);
 }
@@ -980,7 +977,9 @@ async fn a_higher_round_polka_releases_the_lock() {
         rt.on_prevote(Vote::sign(k, 1, 10, VoteKind::Prevote, Some(a)))
             .unwrap();
     }
-    let _ = rt.make_precommit().expect("the polka must produce a precommit");
+    let _ = rt
+        .make_precommit()
+        .expect("the polka must produce a precommit");
     assert_eq!(rt.hc.locked, Some((a, 10)));
 
     // A polka for B at round 12 (higher): the lock is released and the
@@ -1013,7 +1012,9 @@ async fn a_nil_quorum_never_unlocks_the_lock() {
         rt.on_prevote(Vote::sign(k, 1, 10, VoteKind::Prevote, Some(a)))
             .unwrap();
     }
-    let _ = rt.make_precommit().expect("the polka must produce a precommit");
+    let _ = rt
+        .make_precommit()
+        .expect("the polka must produce a precommit");
     assert_eq!(rt.hc.locked, Some((a, 10)));
 
     // A nil quorum in a LATER round must not release the lock.
@@ -1068,4 +1069,3 @@ fn the_backoff_counts_this_heights_failures_not_the_round_number() {
         "a failed round must lengthen the timeout"
     );
 }
-

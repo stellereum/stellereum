@@ -5,17 +5,16 @@
 //! Syscalls for fast Patricia trie traversal, Orderbook matching, and zkML verification.
 
 use crate::cell::{CellHash, PatriciaTrie};
+pub use crate::contract::{
+    Contract, ContractCallContext, ContractError, ContractEvent, ContractOutcome, ContractRegistry,
+    FUEL_BLAKE3_BASE, FUEL_BLAKE3_PER_BYTE, FUEL_BLOCK_HASH, FUEL_BLOCK_TIME, FUEL_CALLER,
+    FUEL_ED25519_VERIFY, FUEL_EMIT, FUEL_RETURN_DATA_BASE, FUEL_RETURN_DATA_PER_BYTE,
+    FUEL_SHA256_BASE, FUEL_SHA256_PER_BYTE, FUEL_SLOAD, FUEL_SSTORE, FUEL_VALUE,
+};
 use crate::orderbook::{ClobEvent, OrderSide, OrderType, OrderbookActor, TradeExecution};
 pub use crate::token::{
     TokenEvent, TokenOp, TokenRegistry, GAS_TOKEN_APPROVE, GAS_TOKEN_BURN, GAS_TOKEN_CREATE,
     GAS_TOKEN_MINT, GAS_TOKEN_TRANSFER,
-};
-pub use crate::contract::{
-    Contract, ContractCallContext, ContractError, ContractEvent, ContractOutcome,
-    ContractRegistry, FUEL_BLAKE3_BASE, FUEL_BLAKE3_PER_BYTE, FUEL_BLOCK_HASH, FUEL_BLOCK_TIME,
-    FUEL_CALLER, FUEL_ED25519_VERIFY, FUEL_EMIT, FUEL_RETURN_DATA_BASE,
-    FUEL_RETURN_DATA_PER_BYTE, FUEL_SHA256_BASE, FUEL_SHA256_PER_BYTE, FUEL_SLOAD, FUEL_SSTORE,
-    FUEL_VALUE,
 };
 use crate::zkml::{SessionKeyAuthorization, ZkMlProof};
 use serde::{Deserialize, Serialize};
@@ -214,7 +213,8 @@ pub fn contract_deploy_gas(code_len: usize) -> u64 {
 /// Variable half of `SysCallVerifyZkMlReexec`: base + per byte of proof carried.
 #[inline(always)]
 pub fn zkml_verify_in_gas(proof_wire_len: usize) -> u64 {
-    GAS_ZKML_VERIFY_IN.saturating_add((proof_wire_len as u64).saturating_mul(GAS_ZKML_PROOF_PER_BYTE))
+    GAS_ZKML_VERIFY_IN
+        .saturating_add((proof_wire_len as u64).saturating_mul(GAS_ZKML_PROOF_PER_BYTE))
 }
 
 /// Variable half of `SysCallRegisterZkMlModel`: base + per parameter written.
@@ -276,7 +276,10 @@ pub fn attestation_verify_gas(n_public_inputs: usize, proof_wire_len: usize) -> 
 #[inline(always)]
 pub fn spec_register_gas(spec: &crate::zkml_attestation::ModelSpec) -> u64 {
     GAS_ZKML_SPEC_REGISTER_BASE.saturating_add(
-        (spec.spec_bytes.len().saturating_add(spec.setup_attestation.len()) as u64)
+        (spec
+            .spec_bytes
+            .len()
+            .saturating_add(spec.setup_attestation.len()) as u64)
             .saturating_mul(GAS_ZKML_SPEC_PER_BYTE),
     )
 }
@@ -340,21 +343,20 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         OpCode::SysCallTokenBurn { .. } => GAS_TOKEN_BURN,
         OpCode::SysCallTokenApprove { .. } => GAS_TOKEN_APPROVE,
         OpCode::SysCallTokenCreate { .. } => GAS_TOKEN_CREATE,
-        OpCode::SysCallConfidentialTransfer2 { input_ranges, output_ranges, .. } => {
-            confidential_transfer2_gas(input_ranges, output_ranges)
-        }
+        OpCode::SysCallConfidentialTransfer2 {
+            input_ranges,
+            output_ranges,
+            ..
+        } => confidential_transfer2_gas(input_ranges, output_ranges),
         OpCode::SysCallConfidentialShield { .. } => GAS_CONFIDENTIAL_SHIELD,
-        OpCode::SysCallConfidentialUnshield { inputs } => {
-            GAS_CONFIDENTIAL_UNSHIELD
-                .saturating_add((inputs.len() as u64).saturating_mul(GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT))
-        }
+        OpCode::SysCallConfidentialUnshield { inputs } => GAS_CONFIDENTIAL_UNSHIELD.saturating_add(
+            (inputs.len() as u64).saturating_mul(GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT),
+        ),
         OpCode::SysCallTokenBalanceOf { .. } => GAS_TOKEN_BALANCE,
         OpCode::SysCallDeployContract { code } => contract_deploy_gas(code.len()),
         OpCode::SysCallCallContract { .. } => GAS_CONTRACT_CALL,
-        OpCode::SysCallCallContractArgs { args, .. } => GAS_CONTRACT_CALL.saturating_add(
-            (args.len() as u64)
-                .saturating_mul(GAS_CONTRACT_CALL_PER_ARG),
-        ),
+        OpCode::SysCallCallContractArgs { args, .. } => GAS_CONTRACT_CALL
+            .saturating_add((args.len() as u64).saturating_mul(GAS_CONTRACT_CALL_PER_ARG)),
         OpCode::SysCallStake { .. } | OpCode::SysCallDelegate { .. } => GAS_STAKE_BOND,
         OpCode::SysCallUnbond { .. } | OpCode::SysCallUndelegate { .. } => GAS_STAKE_UNBOND,
         OpCode::SysCallBeginUndelegate { .. } => GAS_STAKE_UNBOND,
@@ -374,20 +376,24 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         // (the model half is charged in the handler - `opcode_gas` cannot see
         // the registry). Registration is priced per parameter written.
         OpCode::SysCallVerifyZkMlReexec { proof, .. } => zkml_verify_in_gas(proof.wire_len()),
-        OpCode::SysCallRegisterZkMlModel { model, .. } => {
-            zkml_register_gas(model.param_count())
-        }
+        OpCode::SysCallRegisterZkMlModel { model, .. } => zkml_register_gas(model.param_count()),
         // §2 succinct halves: fully priced here (everything is visible on
         // the proof/key the opcode carries - no registry-sized remainder
         // for the handler, unlike the re-execution verify).
         OpCode::SysCallRegisterZkMlSpec { spec, .. } => spec_register_gas(spec),
         OpCode::SysCallVerifyZkMlAttestation { proof, .. } => attestation_verify_gas(
-            proof.public_inputs.len().saturating_add(proof.public_outputs.len()),
+            proof
+                .public_inputs
+                .len()
+                .saturating_add(proof.public_outputs.len()),
             proof.wire_len(),
         ),
-        OpCode::SysCallVerifyPqSignature { pubkey, message, signature, .. } => {
-            pq_verify_gas(pubkey.len(), message.len(), signature.len())
-        }
+        OpCode::SysCallVerifyPqSignature {
+            pubkey,
+            message,
+            signature,
+            ..
+        } => pq_verify_gas(pubkey.len(), message.len(), signature.len()),
         OpCode::SysCallReportEquivocation { evidence } => {
             equivocation_report_gas(evidence.wire_len())
         }
@@ -426,10 +432,20 @@ pub enum OpCode {
     Div,
     // Storage & Account
     LoadBalance,
-    Transfer { recipient: [u8; 32], amount: u64 },
+    Transfer {
+        recipient: [u8; 32],
+        amount: u64,
+    },
     // Orderbook Syscalls
-    SysCallPlaceOrder { pair_id: u32, is_buy: bool, price: u64, amount: u64 },
-    SysCallCancelOrder { order_id: u64 },
+    SysCallPlaceOrder {
+        pair_id: u32,
+        is_buy: bool,
+        price: u64,
+        amount: u64,
+    },
+    SysCallCancelOrder {
+        order_id: u64,
+    },
     // AI zkML Syscall
     //
     // LEGACY. Structural-only (`ZkMlProof::verify_inference`, explicitly NOT
@@ -444,28 +460,71 @@ pub enum OpCode {
     // Patricia Tree Traversal
     SysCallPatriciaLookup(CellHash),
     // Fungible Token Syscalls (STS standard)
-    SysCallTokenTransfer { token_id: [u8; 32], to: [u8; 32], amount: u64 },
-    SysCallTokenTransferFrom { token_id: [u8; 32], from: [u8; 32], to: [u8; 32], amount: u64 },
-    SysCallTokenMint { token_id: [u8; 32], to: [u8; 32], amount: u64 },
-    SysCallTokenBurn { token_id: [u8; 32], from: [u8; 32], amount: u64 },
-    SysCallTokenApprove { token_id: [u8; 32], spender: [u8; 32], amount: u64 },
-    SysCallTokenBalanceOf { token_id: [u8; 32], account: [u8; 32] },
+    SysCallTokenTransfer {
+        token_id: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+    },
+    SysCallTokenTransferFrom {
+        token_id: [u8; 32],
+        from: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+    },
+    SysCallTokenMint {
+        token_id: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+    },
+    SysCallTokenBurn {
+        token_id: [u8; 32],
+        from: [u8; 32],
+        amount: u64,
+    },
+    SysCallTokenApprove {
+        token_id: [u8; 32],
+        spender: [u8; 32],
+        amount: u64,
+    },
+    SysCallTokenBalanceOf {
+        token_id: [u8; 32],
+        account: [u8; 32],
+    },
     // WASM smart-contract syscalls (validated, sandboxed, fuel-metered)
-    SysCallDeployContract { code: Vec<u8> },
-    SysCallCallContract { contract: [u8; 32], method: Vec<u8>, arg: i64 },
+    SysCallDeployContract {
+        code: Vec<u8>,
+    },
+    SysCallCallContract {
+        contract: [u8; 32],
+        method: Vec<u8>,
+        arg: i64,
+    },
     // Staking (P0-1). These are what make the validator set reachable: bonds
     // are applied through blocks, so every node derives the same validator set,
     // instead of trusting whatever one node was told over RPC.
     /// Bond (or add to the bond of) a validator. The amount leaves the sender.
-    SysCallStake { validator: [u8; 32], amount: u64 },
+    SysCallStake {
+        validator: [u8; 32],
+        amount: u64,
+    },
     /// Start unbonding from a validator; returns to the sender after cooldown.
-    SysCallUnbond { validator: [u8; 32], amount: u64 },
+    SysCallUnbond {
+        validator: [u8; 32],
+        amount: u64,
+    },
     /// Delegate stake to a validator.
-    SysCallDelegate { validator: [u8; 32], amount: u64 },
+    SysCallDelegate {
+        validator: [u8; 32],
+        amount: u64,
+    },
     /// Withdraw matured delegations.
-    SysCallUndelegate { validator: [u8; 32] },
+    SysCallUndelegate {
+        validator: [u8; 32],
+    },
     /// Claim accrued rewards for a validator the sender is bonded to.
-    SysCallClaimRewards { validator: [u8; 32] },
+    SysCallClaimRewards {
+        validator: [u8; 32],
+    },
     Halt,
     // APPENDED, never inserted above: `OpCode` is bincode-serialized into
     // every transaction's signature preimage and tx hash, so adding a variant
@@ -488,7 +547,9 @@ pub enum OpCode {
     /// every admission path, the proposer filter and execution itself refuse
     /// transactions under that key. Callable only by the delegator
     /// (`ctx.sender`, i.e. `tx.from`, must equal the key's registered master).
-    SysCallRevokeSession { session_pubkey: [u8; 32] },
+    SysCallRevokeSession {
+        session_pubkey: [u8; 32],
+    },
     // APPEND, never insert above: same bincode-discriminant rule as every
     // variant above (see the comment on `SysCallSubmitPriceFeed`). The three
     // variants below make the passport's remaining domains reachable from a
@@ -501,9 +562,13 @@ pub enum OpCode {
     // engine's account map + trie - both apply paths therefore move the same
     // coins.
     /// Buy STELL from the PMM with exactly `usdt_micro` wUSDT (6-decimals).
-    SysCallPmmBuy { usdt_micro: u64 },
+    SysCallPmmBuy {
+        usdt_micro: u64,
+    },
     /// Sell exactly `stell_nano` STELL back to the PMM for wUSDT.
-    SysCallPmmSell { stell_nano: u64 },
+    SysCallPmmSell {
+        stell_nano: u64,
+    },
     /// Publish a master-signed session-key grant on chain.
     ///
     /// The grant itself rides inside every session transaction's signature
@@ -823,7 +888,9 @@ pub enum OpCode {
     /// (removed, not zeroed-in-place) and moves once. Nothing claimable (or
     /// no staking ledger wired in) reverts with a clear reason instead of a
     /// silent no-op.
-    SysCallClaimDelegatorRewards { validator: [u8; 32] },
+    SysCallClaimDelegatorRewards {
+        validator: [u8; 32],
+    },
     // APPEND, never insert above: same bincode-discriminant rule.
     /// Verify a post-quantum or hybrid signature (Falcon-512, ML-DSA-44, Hybrid).
     /// Discriminant 46 (appended, never inserted above).
@@ -851,7 +918,9 @@ pub enum OpCode {
     /// `release_at` passes — immature funds revert here (fail-closed)
     /// instead of paying early. Nothing withdrawable reverts with a clear
     /// reason instead of a silent no-op.
-    SysCallWithdrawSelfBond { validator: [u8; 32] },
+    SysCallWithdrawSelfBond {
+        validator: [u8; 32],
+    },
     // APPEND, never insert above: same bincode-discriminant rule as every
     // variant above (see the comment on `SysCallSubmitPriceFeed`). Appending
     // is what keeps every already-signed payload and every pinned tx hash
@@ -1175,7 +1244,8 @@ fn ensure_working<T: Clone>(slot: &mut Option<T>, src: Option<&T>) {
 
 pub struct Svm;
 
-impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
+impl Svm {
+    /// Execute `instructions` against every domain wired into `ctx`.
     ///
     /// The shielded ledger is deliberately NOT one of them: this entry point
     /// passes `None`, so a payload carrying `SysCallConfidentialTransfer`
@@ -1237,7 +1307,15 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
         sends: &mut Vec<ActorSendRequest>,
         zkml_models: Option<&mut crate::zkml::ZkMlModelRegistry>,
     ) -> VmExecutionResult {
-        Self::execute_inner(instructions, gas_limit, ctx, confidential, Some(sends), zkml_models, None)
+        Self::execute_inner(
+            instructions,
+            gas_limit,
+            ctx,
+            confidential,
+            Some(sends),
+            zkml_models,
+            None,
+        )
     }
 
     /// The block-path VM with a range-proof pre-verification cache: the same
@@ -1413,7 +1491,12 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     current_balance -= *amount;
                     ctx.transfers.push((*recipient, *amount));
                 }
-                OpCode::SysCallPlaceOrder { pair_id, is_buy, price, amount } => {
+                OpCode::SysCallPlaceOrder {
+                    pair_id,
+                    is_buy,
+                    price,
+                    amount,
+                } => {
                     charge!(GAS_ORDER_PLACE);
                     // Priority gates, checked BEFORE the order is accepted:
                     // breaker latch, USDT peg and deviation of the limit price
@@ -1427,7 +1510,11 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                             return VmExecutionResult::Reverted(e);
                         }
                     }
-                    let side = if *is_buy { OrderSide::Buy } else { OrderSide::Sell };
+                    let side = if *is_buy {
+                        OrderSide::Buy
+                    } else {
+                        OrderSide::Sell
+                    };
                     let order_cost = if *is_buy {
                         let prod = (*price as u128) * (*amount as u128);
                         (prod / 1_000_000u128).min(u64::MAX as u128) as u64
@@ -1436,14 +1523,18 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     };
 
                     if order_cost > current_balance {
-                        return VmExecutionResult::Reverted("Insufficient balance for order".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Insufficient balance for order".to_string(),
+                        );
                     }
 
                     // First order op clones the book map; payloads without order
                     // ops never pay for it (see `ensure_working`).
                     ensure_working(&mut working_books, ctx.orderbooks.as_deref());
                     if let Some(books) = working_books.as_mut() {
-                        let book = books.entry(*pair_id).or_insert_with(|| OrderbookActor::new(*pair_id, 1000));
+                        let book = books
+                            .entry(*pair_id)
+                            .or_insert_with(|| OrderbookActor::new(*pair_id, 1000));
                         let (placed_order, trade_events) = book.submit_order_bounded(
                             ctx.sender,
                             side.clone(),
@@ -1575,81 +1666,172 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     };
                     state.stack.push(if found { 1 } else { 0 });
                 }
-                OpCode::SysCallTokenTransfer { token_id, to, amount } => {
+                OpCode::SysCallTokenTransfer {
+                    token_id,
+                    to,
+                    amount,
+                } => {
                     charge!(GAS_TOKEN_TRANSFER);
                     ensure_working(&mut working_tokens, ctx.token_registry.as_deref());
                     let Some(reg) = working_tokens.as_mut() else {
-                        return VmExecutionResult::Reverted("Token registry not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Token registry not available".to_string(),
+                        );
                     };
-                    match reg.execute(token_id, ctx.sender, TokenOp::Transfer { to: *to, amount: *amount }) {
+                    match reg.execute(
+                        token_id,
+                        ctx.sender,
+                        TokenOp::Transfer {
+                            to: *to,
+                            amount: *amount,
+                        },
+                    ) {
                         Ok(ev) => {
                             ctx.token_events.push(ev);
                             state.stack.push(1);
                         }
-                        Err(e) => return VmExecutionResult::Reverted(format!("token transfer failed: {e}")),
+                        Err(e) => {
+                            return VmExecutionResult::Reverted(format!(
+                                "token transfer failed: {e}"
+                            ))
+                        }
                     }
                 }
-                OpCode::SysCallTokenTransferFrom { token_id, from, to, amount } => {
+                OpCode::SysCallTokenTransferFrom {
+                    token_id,
+                    from,
+                    to,
+                    amount,
+                } => {
                     charge!(GAS_TOKEN_TRANSFER);
                     ensure_working(&mut working_tokens, ctx.token_registry.as_deref());
                     let Some(reg) = working_tokens.as_mut() else {
-                        return VmExecutionResult::Reverted("Token registry not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Token registry not available".to_string(),
+                        );
                     };
-                    match reg.execute(token_id, ctx.sender, TokenOp::TransferFrom { from: *from, to: *to, amount: *amount }) {
+                    match reg.execute(
+                        token_id,
+                        ctx.sender,
+                        TokenOp::TransferFrom {
+                            from: *from,
+                            to: *to,
+                            amount: *amount,
+                        },
+                    ) {
                         Ok(ev) => {
                             ctx.token_events.push(ev);
                             state.stack.push(1);
                         }
-                        Err(e) => return VmExecutionResult::Reverted(format!("token transferFrom failed: {e}")),
+                        Err(e) => {
+                            return VmExecutionResult::Reverted(format!(
+                                "token transferFrom failed: {e}"
+                            ))
+                        }
                     }
                 }
-                OpCode::SysCallTokenMint { token_id, to, amount } => {
+                OpCode::SysCallTokenMint {
+                    token_id,
+                    to,
+                    amount,
+                } => {
                     charge!(GAS_TOKEN_MINT);
                     ensure_working(&mut working_tokens, ctx.token_registry.as_deref());
                     let Some(reg) = working_tokens.as_mut() else {
-                        return VmExecutionResult::Reverted("Token registry not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Token registry not available".to_string(),
+                        );
                     };
-                    match reg.execute(token_id, ctx.sender, TokenOp::Mint { to: *to, amount: *amount }) {
+                    match reg.execute(
+                        token_id,
+                        ctx.sender,
+                        TokenOp::Mint {
+                            to: *to,
+                            amount: *amount,
+                        },
+                    ) {
                         Ok(ev) => {
                             ctx.token_events.push(ev);
                             state.stack.push(1);
                         }
-                        Err(e) => return VmExecutionResult::Reverted(format!("token mint failed: {e}")),
+                        Err(e) => {
+                            return VmExecutionResult::Reverted(format!("token mint failed: {e}"))
+                        }
                     }
                 }
-                OpCode::SysCallTokenBurn { token_id, from, amount } => {
+                OpCode::SysCallTokenBurn {
+                    token_id,
+                    from,
+                    amount,
+                } => {
                     charge!(GAS_TOKEN_BURN);
                     ensure_working(&mut working_tokens, ctx.token_registry.as_deref());
                     let Some(reg) = working_tokens.as_mut() else {
-                        return VmExecutionResult::Reverted("Token registry not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Token registry not available".to_string(),
+                        );
                     };
-                    match reg.execute(token_id, ctx.sender, TokenOp::Burn { from: *from, amount: *amount }) {
+                    match reg.execute(
+                        token_id,
+                        ctx.sender,
+                        TokenOp::Burn {
+                            from: *from,
+                            amount: *amount,
+                        },
+                    ) {
                         Ok(ev) => {
                             ctx.token_events.push(ev);
                             state.stack.push(1);
                         }
-                        Err(e) => return VmExecutionResult::Reverted(format!("token burn failed: {e}")),
+                        Err(e) => {
+                            return VmExecutionResult::Reverted(format!("token burn failed: {e}"))
+                        }
                     }
                 }
-                OpCode::SysCallTokenApprove { token_id, spender, amount } => {
+                OpCode::SysCallTokenApprove {
+                    token_id,
+                    spender,
+                    amount,
+                } => {
                     charge!(GAS_TOKEN_APPROVE);
                     ensure_working(&mut working_tokens, ctx.token_registry.as_deref());
                     let Some(reg) = working_tokens.as_mut() else {
-                        return VmExecutionResult::Reverted("Token registry not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Token registry not available".to_string(),
+                        );
                     };
-                    match reg.execute(token_id, ctx.sender, TokenOp::Approve { spender: *spender, amount: *amount }) {
+                    match reg.execute(
+                        token_id,
+                        ctx.sender,
+                        TokenOp::Approve {
+                            spender: *spender,
+                            amount: *amount,
+                        },
+                    ) {
                         Ok(ev) => {
                             ctx.token_events.push(ev);
                             state.stack.push(1);
                         }
-                        Err(e) => return VmExecutionResult::Reverted(format!("token approve failed: {e}")),
+                        Err(e) => {
+                            return VmExecutionResult::Reverted(format!(
+                                "token approve failed: {e}"
+                            ))
+                        }
                     }
                 }
-                OpCode::SysCallTokenCreate { name, symbol, decimals, initial_supply, max_supply } => {
+                OpCode::SysCallTokenCreate {
+                    name,
+                    symbol,
+                    decimals,
+                    initial_supply,
+                    max_supply,
+                } => {
                     charge!(GAS_TOKEN_CREATE);
                     ensure_working(&mut working_tokens, ctx.token_registry.as_deref());
                     let Some(reg) = working_tokens.as_mut() else {
-                        return VmExecutionResult::Reverted("Token registry not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Token registry not available".to_string(),
+                        );
                     };
                     // `create_token` sets minter = caller and credits it the
                     // full initial supply; any metadata violation reverts.
@@ -1675,7 +1857,9 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                             }
                             state.stack.push(1);
                         }
-                        Err(e) => return VmExecutionResult::Reverted(format!("token create failed: {e}")),
+                        Err(e) => {
+                            return VmExecutionResult::Reverted(format!("token create failed: {e}"))
+                        }
                     }
                 }
                 OpCode::SysCallTokenBalanceOf { token_id, account } => {
@@ -1685,7 +1869,9 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     } else if let Some(reg) = ctx.token_registry.as_ref() {
                         reg.balance_of(token_id, account)
                     } else {
-                        return VmExecutionResult::Reverted("Token registry not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Token registry not available".to_string(),
+                        );
                     };
                     state.stack.push(bal);
                 }
@@ -1706,7 +1892,11 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                         }
                     }
                 }
-                OpCode::SysCallCallContract { contract, method, arg } => {
+                OpCode::SysCallCallContract {
+                    contract,
+                    method,
+                    arg,
+                } => {
                     charge!(GAS_CONTRACT_CALL);
                     ensure_working(&mut working_contracts, ctx.contracts.as_deref());
                     let Some(reg) = working_contracts.as_mut() else {
@@ -1730,7 +1920,13 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                         block_time: ctx.timestamp,
                         block_hash: [0u8; 32],
                     };
-                    match reg.call_with_context(contract, method, *arg, state.gas_remaining, &call_ctx) {
+                    match reg.call_with_context(
+                        contract,
+                        method,
+                        *arg,
+                        state.gas_remaining,
+                        &call_ctx,
+                    ) {
                         Ok(outcome) => {
                             if state.gas_remaining < outcome.fuel_used {
                                 return VmExecutionResult::OutOfGas;
@@ -1750,7 +1946,12 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                         }
                     }
                 }
-                OpCode::SysCallCallContractArgs { contract, method, args, calldata } => {
+                OpCode::SysCallCallContractArgs {
+                    contract,
+                    method,
+                    args,
+                    calldata,
+                } => {
                     charge!(GAS_CONTRACT_CALL.saturating_add(
                         (args.len() as u64).saturating_mul(GAS_CONTRACT_CALL_PER_ARG),
                     ));
@@ -1807,15 +2008,21 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     charge!(GAS_STAKE_BOND);
                     ensure_working(&mut working_staking, ctx.staking.as_deref());
                     let Some(ledger) = working_staking.as_mut() else {
-                        return VmExecutionResult::Reverted("Staking ledger not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
                     };
                     // The bond must be paid for out of the sender's real balance,
                     // otherwise anyone could claim validator power for free.
                     if *amount == 0 {
-                        return VmExecutionResult::Reverted("stake amount must be positive".to_string());
+                        return VmExecutionResult::Reverted(
+                            "stake amount must be positive".to_string(),
+                        );
                     }
                     if *amount > current_balance {
-                        return VmExecutionResult::Reverted("Insufficient balance to stake".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Insufficient balance to stake".to_string(),
+                        );
                     }
                     // The bond IS the registration: an address that has never
                     // bonded becomes a validator here, and an existing one just
@@ -1829,7 +2036,7 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     // absolute minimum underneath.
                     if *amount < ctx.min_validator_bond {
                         return VmExecutionResult::Reverted(
-                            "stake below the governed minimum".to_string()
+                            "stake below the governed minimum".to_string(),
                         );
                     }
                     let applied = if ledger.validators.contains_key(validator) {
@@ -1846,19 +2053,29 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     ctx.transfers.push((crate::staking::STAKING_POOL, *amount));
                     state.stack.push(1);
                 }
-                OpCode::SysCallStakeWithCommission { validator, amount, commission_bps } => {
+                OpCode::SysCallStakeWithCommission {
+                    validator,
+                    amount,
+                    commission_bps,
+                } => {
                     charge!(GAS_STAKE_BOND);
                     ensure_working(&mut working_staking, ctx.staking.as_deref());
                     let Some(ledger) = working_staking.as_mut() else {
-                        return VmExecutionResult::Reverted("Staking ledger not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
                     };
                     // Same funding discipline as `SysCallStake`: free power
                     // is never minted, and the governed floor gates entry.
                     if *amount == 0 {
-                        return VmExecutionResult::Reverted("stake amount must be positive".to_string());
+                        return VmExecutionResult::Reverted(
+                            "stake amount must be positive".to_string(),
+                        );
                     }
                     if *amount > current_balance {
-                        return VmExecutionResult::Reverted("Insufficient balance to stake".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Insufficient balance to stake".to_string(),
+                        );
                     }
                     if *commission_bps > crate::staking::BPS_DENOMINATOR {
                         return VmExecutionResult::Reverted(format!(
@@ -1868,7 +2085,7 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     }
                     if *amount < ctx.min_validator_bond {
                         return VmExecutionResult::Reverted(
-                            "stake below the governed minimum".to_string()
+                            "stake below the governed minimum".to_string(),
                         );
                     }
                     // IMMUTABILITY: a new validator bonds with the
@@ -1903,7 +2120,9 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     }
                     ensure_working(&mut working_staking, ctx.staking.as_deref());
                     let Some(ledger) = working_staking.as_mut() else {
-                        return VmExecutionResult::Reverted("Staking ledger not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
                     };
                     if let Err(e) = ledger.unbond(*validator, *amount, ctx.timestamp) {
                         return VmExecutionResult::Reverted(format!("unbond failed: {e}"));
@@ -1930,7 +2149,9 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     }
                     ensure_working(&mut working_staking, ctx.staking.as_deref());
                     let Some(ledger) = working_staking.as_mut() else {
-                        return VmExecutionResult::Reverted("Staking ledger not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
                     };
                     if let Err(e) = ledger.rotate_key(*old_validator, *new_validator) {
                         return VmExecutionResult::Reverted(format!("rotate failed: {e}"));
@@ -1941,13 +2162,19 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     charge!(GAS_STAKE_BOND);
                     ensure_working(&mut working_staking, ctx.staking.as_deref());
                     let Some(ledger) = working_staking.as_mut() else {
-                        return VmExecutionResult::Reverted("Staking ledger not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
                     };
                     if *amount == 0 {
-                        return VmExecutionResult::Reverted("delegate amount must be positive".to_string());
+                        return VmExecutionResult::Reverted(
+                            "delegate amount must be positive".to_string(),
+                        );
                     }
                     if *amount > current_balance {
-                        return VmExecutionResult::Reverted("Insufficient balance to delegate".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Insufficient balance to delegate".to_string(),
+                        );
                     }
                     if let Err(e) = ledger.delegate(ctx.sender, *validator, *amount) {
                         return VmExecutionResult::Reverted(format!("delegate failed: {e}"));
@@ -1960,7 +2187,9 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     charge!(GAS_STAKE_UNBOND);
                     ensure_working(&mut working_staking, ctx.staking.as_deref());
                     let Some(ledger) = working_staking.as_mut() else {
-                        return VmExecutionResult::Reverted("Staking ledger not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
                     };
                     // Withdraw MATURED delegation (E1 fix): consume the
                     // withdrawable entry and pay it out, exactly once. The
@@ -1989,7 +2218,9 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     charge!(GAS_STAKE_UNBOND);
                     ensure_working(&mut working_staking, ctx.staking.as_deref());
                     let Some(ledger) = working_staking.as_mut() else {
-                        return VmExecutionResult::Reverted("Staking ledger not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
                     };
                     // Anyone may begin unbonding ONLY their own position:
                     // `undelegate` keys by (validator, caller-as-delegator),
@@ -2002,7 +2233,9 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                             "begin unbond amount must be positive".to_string(),
                         );
                     }
-                    if let Err(e) = ledger.undelegate(ctx.sender, *validator, *amount, ctx.timestamp) {
+                    if let Err(e) =
+                        ledger.undelegate(ctx.sender, *validator, *amount, ctx.timestamp)
+                    {
                         return VmExecutionResult::Reverted(format!("begin unbonding failed: {e}"));
                     }
                     state.stack.push(*amount);
@@ -2022,13 +2255,13 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     }
                     ensure_working(&mut working_staking, ctx.staking.as_deref());
                     let Some(ledger) = working_staking.as_mut() else {
-                        return VmExecutionResult::Reverted("Staking ledger not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
                     };
                     let amount = match ledger.claim_validator_rewards(*validator) {
                         Ok(a) => a,
-                        Err(e) => {
-                            return VmExecutionResult::Reverted(format!("claim failed: {e}"))
-                        }
+                        Err(e) => return VmExecutionResult::Reverted(format!("claim failed: {e}")),
                     };
                     // Rewards are backed by the minted rewards pool, never by
                     // bonded principal: pay them out of REWARDS_POOL (funded by
@@ -2045,7 +2278,9 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     charge!(GAS_STAKE_CLAIM);
                     ensure_working(&mut working_staking, ctx.staking.as_deref());
                     let Some(ledger) = working_staking.as_mut() else {
-                        return VmExecutionResult::Reverted("Staking ledger not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
                     };
                     // Withdraw accrued DELEGATOR rewards (E8): consume the
                     // sender's claimable amount for this validator and pay it
@@ -2078,7 +2313,9 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     }
                     ensure_working(&mut working_staking, ctx.staking.as_deref());
                     let Some(ledger) = working_staking.as_mut() else {
-                        return VmExecutionResult::Reverted("Staking ledger not available".to_string());
+                        return VmExecutionResult::Reverted(
+                            "Staking ledger not available".to_string(),
+                        );
                     };
                     // Withdraw MATURED self-bond (M1): consume the
                     // withdrawable entry and pay it out of STAKING_POOL,
@@ -2129,9 +2366,7 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     match oracle.commit_feed(feed, ctx.timestamp) {
                         Ok(price) => state.stack.push(price),
                         Err(e) => {
-                            return VmExecutionResult::Reverted(format!(
-                                "price feed rejected: {e}"
-                            ))
+                            return VmExecutionResult::Reverted(format!("price feed rejected: {e}"))
                         }
                     }
                 }
@@ -2229,9 +2464,7 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     ) {
                         Ok(ev) => ctx.token_events.push(ev),
                         Err(e) => {
-                            return VmExecutionResult::Reverted(format!(
-                                "wUSDT debit failed: {e}"
-                            ))
+                            return VmExecutionResult::Reverted(format!("wUSDT debit failed: {e}"))
                         }
                     }
                     // Mirror the mint into the local balance so a later opcode
@@ -2255,11 +2488,7 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                             "PMM USDT token not initialised".to_string(),
                         );
                     };
-                    let treasury = ctx
-                        .pmm
-                        .as_ref()
-                        .map(|p| p.treasury)
-                        .unwrap_or([0u8; 32]);
+                    let treasury = ctx.pmm.as_ref().map(|p| p.treasury).unwrap_or([0u8; 32]);
                     // The seller pays native STELL out of the same running
                     // balance every other opcode is checked against, so a
                     // payload cannot sell coins it then also transfers.
@@ -2297,9 +2526,7 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     ) {
                         Ok(ev) => ctx.token_events.push(ev),
                         Err(e) => {
-                            return VmExecutionResult::Reverted(format!(
-                                "wUSDT payout failed: {e}"
-                            ))
+                            return VmExecutionResult::Reverted(format!("wUSDT payout failed: {e}"))
                         }
                     }
                     current_balance -= *stell_nano;
@@ -2364,7 +2591,12 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                             .to_string(),
                     );
                 }
-                OpCode::SysCallConfidentialTransfer2 { recipient, transfer, input_ranges, output_ranges } => {
+                OpCode::SysCallConfidentialTransfer2 {
+                    recipient,
+                    transfer,
+                    input_ranges,
+                    output_ranges,
+                } => {
                     // Recipient sanity (audit follow-up): protocol-owned
                     // accounts (escrow, pools) can sign for nothing, so outputs
                     // to them freeze forever. Burn-by-design stays possible
@@ -2374,7 +2606,8 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                         || *recipient == crate::bridge::BRIDGE_ESCROW
                     {
                         return VmExecutionResult::Reverted(
-                            "confidential transfer rejected: recipient is a protocol account".to_string(),
+                            "confidential transfer rejected: recipient is a protocol account"
+                                .to_string(),
                         );
                     }
                     // IO-count cap (audit: blocks troubles): uncapped proofs
@@ -2406,11 +2639,13 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     // pure function of the bundled bytes, so the same digest
                     // always verifies the same way on every node.
                     let ranges_ok = match range_preverify.and_then(|m| {
-                        m.get(&crate::crypto_privacy::confidential_transfer2_preverify_digest(
-                            transfer,
-                            input_ranges,
-                            output_ranges,
-                        ))
+                        m.get(
+                            &crate::crypto_privacy::confidential_transfer2_preverify_digest(
+                                transfer,
+                                input_ranges,
+                                output_ranges,
+                            ),
+                        )
                         .copied()
                     }) {
                         Some(preverified) => preverified,
@@ -2449,7 +2684,11 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     }
                     state.stack.push(1);
                 }
-                OpCode::SysCallConfidentialShield { commitment, amount, blinding } => {
+                OpCode::SysCallConfidentialShield {
+                    commitment,
+                    amount,
+                    blinding,
+                } => {
                     charge!(GAS_CONFIDENTIAL_SHIELD);
                     if *amount == 0 {
                         return VmExecutionResult::Reverted(
@@ -2491,12 +2730,14 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     // SHIELD_ESCROW credited, atomically with everything else
                     // in commit_native). A sender that cannot cover `amount`
                     // fails there and the recording above dies with the tx.
-                    ctx.transfers.push((crate::crypto_privacy::SHIELD_ESCROW, *amount));
+                    ctx.transfers
+                        .push((crate::crypto_privacy::SHIELD_ESCROW, *amount));
                     state.stack.push(1);
                 }
                 OpCode::SysCallConfidentialUnshield { inputs } => {
-                    charge!(GAS_CONFIDENTIAL_UNSHIELD
-                        .saturating_add((inputs.len() as u64).saturating_mul(GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT)));
+                    charge!(GAS_CONFIDENTIAL_UNSHIELD.saturating_add(
+                        (inputs.len() as u64).saturating_mul(GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT)
+                    ));
                     if inputs.is_empty() {
                         return VmExecutionResult::Reverted(
                             "unshield needs at least one input".to_string(),
@@ -2519,9 +2760,7 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     let total = match shielded.retire_for_unshield(&ctx.sender, inputs) {
                         Ok(t) => t,
                         Err(e) => {
-                            return VmExecutionResult::Reverted(format!(
-                                "unshield rejected: {e}"
-                            ))
+                            return VmExecutionResult::Reverted(format!("unshield rejected: {e}"))
                         }
                     };
                     if total == 0 {
@@ -2531,11 +2770,8 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     }
                     // Native leg via payouts (SHIELD_ESCROW pays the sender;
                     // escrow insufficiency fails the whole tx in commit_native).
-                    ctx.payouts.push((
-                        crate::crypto_privacy::SHIELD_ESCROW,
-                        ctx.sender,
-                        total,
-                    ));
+                    ctx.payouts
+                        .push((crate::crypto_privacy::SHIELD_ESCROW, ctx.sender, total));
                     state.stack.push(total);
                 }
                 OpCode::SysCallActorSend {
@@ -2618,16 +2854,15 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                     };
                     if rec.model_hash != proof.model_hash {
                         return VmExecutionResult::Reverted(
-                            "zkML proof model hash does not match the registered model"
-                                .to_string(),
+                            "zkML proof model hash does not match the registered model".to_string(),
                         );
                     }
                     // In-handler re-execution charge: linear in the REGISTERED
                     // model's parameters (the work every verifier actually
                     // does). `opcode_gas` already charged the fixed half plus
                     // the proof bytes; this is the model half it cannot see.
-                    let reexec = (rec.model.param_count() as u64)
-                        .saturating_mul(GAS_ZKML_REEXEC_PER_PARAM);
+                    let reexec =
+                        (rec.model.param_count() as u64).saturating_mul(GAS_ZKML_REEXEC_PER_PARAM);
                     if state.gas_remaining < reexec {
                         return VmExecutionResult::OutOfGas;
                     }
@@ -2665,7 +2900,7 @@ impl Svm {    /// Execute `instructions` against every domain wired into `ctx`.
                         }
                     }
                 }
-OpCode::SysCallRegisterZkMlSpec { model_id, spec } => {
+                OpCode::SysCallRegisterZkMlSpec { model_id, spec } => {
                     charge!(spec_register_gas(spec));
                     // Test-setup refusal (audit F2, HIGH): test-only setups
                     // (deterministic, waste-derivable) must never anchor any
@@ -2705,7 +2940,10 @@ OpCode::SysCallRegisterZkMlSpec { model_id, spec } => {
                 }
                 OpCode::SysCallVerifyZkMlAttestation { model_id, proof } => {
                     charge!(attestation_verify_gas(
-                        proof.public_inputs.len().saturating_add(proof.public_outputs.len()),
+                        proof
+                            .public_inputs
+                            .len()
+                            .saturating_add(proof.public_outputs.len()),
                         proof.wire_len()
                     ));
                     // §2 ATTESTATION verify: the proof rides in the payload, the
@@ -2748,7 +2986,6 @@ OpCode::SysCallRegisterZkMlSpec { model_id, spec } => {
                     }
                     if proof.public_inputs.len() as u64 != spec.in_dim
                         || proof.public_outputs.len() as u64 != spec.out_dim
-
                     {
                         return VmExecutionResult::Reverted(
                             "zkML attestation I/O shape does not match the registered spec"
@@ -2758,7 +2995,11 @@ OpCode::SysCallRegisterZkMlSpec { model_id, spec } => {
                     // Cheap fail-fast with a clear error: the circuit's input
                     // gadget only admits u16. (A larger value would fail the
                     // pairing check anyway; this names the reason.)
-                    if proof.public_inputs.iter().any(|x| *x > crate::zkml_attestation::ATTEST_MAX_INPUT) {
+                    if proof
+                        .public_inputs
+                        .iter()
+                        .any(|x| *x > crate::zkml_attestation::ATTEST_MAX_INPUT)
+                    {
                         return VmExecutionResult::Reverted(
                             "zkML attestation input outside u16 (constrained format)".to_string(),
                         );
@@ -2778,8 +3019,8 @@ OpCode::SysCallRegisterZkMlSpec { model_id, spec } => {
                     // the "attestation" opcode was priced BELOW the
                     // re-execution opcode while doing the same CPU work, so a
                     // proof flood was cheaper than the block space it burned.
-                    let reexec = (rec.model.param_count() as u64)
-                        .saturating_mul(GAS_ZKML_REEXEC_PER_PARAM);
+                    let reexec =
+                        (rec.model.param_count() as u64).saturating_mul(GAS_ZKML_REEXEC_PER_PARAM);
                     if state.gas_remaining < reexec {
                         return VmExecutionResult::OutOfGas;
                     }
@@ -2801,14 +3042,9 @@ OpCode::SysCallRegisterZkMlSpec { model_id, spec } => {
                 } => {
                     charge!(pq_verify_gas(pubkey.len(), message.len(), signature.len()));
                     let valid = match crate::post_quantum::PqScheme::from_id(*scheme_id) {
-                        Ok(scheme) => {
-                            crate::post_quantum::verify_pq_signature(
-                                scheme,
-                                pubkey,
-                                message,
-                                signature,
-                            )
-                        }
+                        Ok(scheme) => crate::post_quantum::verify_pq_signature(
+                            scheme, pubkey, message, signature,
+                        ),
                         Err(_) => false,
                     };
                     state.stack.push(if valid { 1 } else { 0 });
@@ -2837,17 +3073,15 @@ OpCode::SysCallRegisterZkMlSpec { model_id, spec } => {
                     // report reverts like every other staking-gated syscall.
                     let verified = match ctx.staking.as_deref() {
                         Some(ledger) => {
-                            crate::consensus::verify_equivocation_evidence(
-                                evidence,
-                                &|v| ledger.validators.contains_key(v),
-                            )
+                            crate::consensus::verify_equivocation_evidence(evidence, &|v| {
+                                ledger.validators.contains_key(v)
+                            })
                         }
                         None => false,
                     };
                     if !verified {
                         return VmExecutionResult::Reverted(
-                            "equivocation evidence rejected: envelope does not verify"
-                                .to_string(),
+                            "equivocation evidence rejected: envelope does not verify".to_string(),
                         );
                     }
                     state.stack.push(1);
@@ -2947,12 +3181,10 @@ OpCode::SysCallRegisterZkMlSpec { model_id, spec } => {
                     // membership against, so the report reverts like every
                     // other staking-gated syscall.
                     let verified = match ctx.staking.as_deref() {
-                        Some(ledger) => {
-                            crate::consensus::verify_proposal_equivocation_evidence(
-                                evidence,
-                                &|v| ledger.validators.contains_key(v),
-                            )
-                        }
+                        Some(ledger) => crate::consensus::verify_proposal_equivocation_evidence(
+                            evidence,
+                            &|v| ledger.validators.contains_key(v),
+                        ),
                         None => false,
                     };
                     if !verified {
@@ -3119,7 +3351,8 @@ OpCode::SysCallRegisterZkMlSpec { model_id, spec } => {
                         accounts.insert(msg.sender, sender_acc);
                     }
                 } else {
-                    let mut recipient_acc = crate::state_engine::AccountState::new(msg.recipient, 0);
+                    let mut recipient_acc =
+                        crate::state_engine::AccountState::new(msg.recipient, 0);
                     recipient_acc.inbox.push_back(actor_msg);
                     accounts.insert(msg.recipient, recipient_acc);
                 }
@@ -3173,13 +3406,11 @@ mod tests {
             oracle: None,
         };
 
-        let instructions = vec![
-            OpCode::SysCallCallContract {
-                contract: addr,
-                method: b"check_env".to_vec(),
-                arg: 0,
-            },
-        ];
+        let instructions = vec![OpCode::SysCallCallContract {
+            contract: addr,
+            method: b"check_env".to_vec(),
+            arg: 0,
+        }];
 
         let res = Svm::execute(&instructions, 100_000, &mut ctx);
         match res {
@@ -3279,7 +3510,8 @@ mod tests {
     }
 
     #[test]
-    fn test_svm_contract_call_collects_emitted_events() {        let code = wat::parse_str(
+    fn test_svm_contract_call_collects_emitted_events() {
+        let code = wat::parse_str(
             r#"(module
                  (import "host" "emit" (func $emit (param i64 i64)))
                  (func (export "trigger_event") (param $val i64) (result i64)
@@ -3316,17 +3548,19 @@ mod tests {
             oracle: None,
         };
 
-        let instructions = vec![
-            OpCode::SysCallCallContract {
-                contract: addr,
-                method: b"trigger_event".to_vec(),
-                arg: 555,
-            },
-        ];
+        let instructions = vec![OpCode::SysCallCallContract {
+            contract: addr,
+            method: b"trigger_event".to_vec(),
+            arg: 555,
+        }];
 
         let res = Svm::execute(&instructions, 100_000, &mut ctx);
         match res {
-            VmExecutionResult::Success { ref events, return_value, .. } => {
+            VmExecutionResult::Success {
+                ref events,
+                return_value,
+                ..
+            } => {
                 assert_eq!(return_value, Some(555));
                 assert_eq!(events.len(), 2);
                 assert_eq!(events[0].contract, addr);
@@ -3782,7 +4016,10 @@ mod tests {
         }];
         match Svm::execute(&ops, 1_000_000, &mut ctx) {
             VmExecutionResult::Success { transfers, .. } => {
-                assert_eq!(transfers, vec![(crate::staking::STAKING_POOL, 2_000 * NANO)]);
+                assert_eq!(
+                    transfers,
+                    vec![(crate::staking::STAKING_POOL, 2_000 * NANO)]
+                );
             }
             other => panic!("expected Success, got {other:?}"),
         }
@@ -3805,14 +4042,20 @@ mod tests {
             amount: 2_000 * NANO,
             commission_bps: 1_000,
         }];
-        assert!(matches!(Svm::execute(&first, 1_000_000, &mut ctx), VmExecutionResult::Success { .. }));
+        assert!(matches!(
+            Svm::execute(&first, 1_000_000, &mut ctx),
+            VmExecutionResult::Success { .. }
+        ));
         // A top-up naming a DIFFERENT commission must not move the rate.
         let top_up = vec![OpCode::SysCallStakeWithCommission {
             validator: val,
             amount: 500 * NANO,
             commission_bps: 9_999,
         }];
-        assert!(matches!(Svm::execute(&top_up, 1_000_000, &mut ctx), VmExecutionResult::Success { .. }));
+        assert!(matches!(
+            Svm::execute(&top_up, 1_000_000, &mut ctx),
+            VmExecutionResult::Success { .. }
+        ));
         assert_eq!(ledger.validators[&val].commission_bps, 1_000);
         assert_eq!(ledger.validators[&val].self_bond, 2_500 * NANO);
     }
@@ -3825,7 +4068,12 @@ mod tests {
         let mut ledger = crate::staking::StakingLedger::new();
         let val = [0x53u8; 32];
         for (label, amount, commission, expect) in [
-            ("commission over 100%", 2_000 * NANO, 10_001u64, "commission must be <="),
+            (
+                "commission over 100%",
+                2_000 * NANO,
+                10_001u64,
+                "commission must be <=",
+            ),
             ("zero amount", 0u64, 500u64, "must be positive"),
             ("below-floor amount", 999u64, 500u64, "governed minimum"),
         ] {

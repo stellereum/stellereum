@@ -41,7 +41,10 @@ fn unsigned_block_rejected() {
 
     let mut unsigned = block(1, g, 1, &signer);
     unsigned.validator_signatures.clear(); // strip signature
-    assert!(cm.insert_validated(unsigned).is_err(), "unsigned block must be rejected");
+    assert!(
+        cm.insert_validated(unsigned).is_err(),
+        "unsigned block must be rejected"
+    );
 }
 
 /// A block with a tampered proposer signature must be rejected.
@@ -54,7 +57,10 @@ fn tampered_block_signature_rejected() {
     let mut b = block(1, g, 1, &signer);
     // tamper the block (changes the hash) after signing
     b.timestamp = 999;
-    assert!(cm.insert_validated(b).is_err(), "tampered block must be rejected");
+    assert!(
+        cm.insert_validated(b).is_err(),
+        "tampered block must be rejected"
+    );
 }
 
 /// A block whose parent is unknown (orphan) must be rejected.
@@ -63,7 +69,10 @@ fn orphan_block_rejected() {
     let signer = sk();
     let mut cm = ChainManager::new(block(0, [0u8; 32], 0, &signer));
     let orphan = block(5, [0xEE; 32], 5, &signer);
-    assert!(cm.insert_validated(orphan).is_err(), "orphan must be rejected");
+    assert!(
+        cm.insert_validated(orphan).is_err(),
+        "orphan must be rejected"
+    );
 }
 
 /// A block skipping a height must be rejected.
@@ -73,7 +82,10 @@ fn height_gap_block_rejected() {
     let mut cm = ChainManager::new(block(0, [0u8; 32], 0, &signer));
     let g = cm.best_head();
     let skip = block(3, g, 3, &signer);
-    assert!(cm.insert_validated(skip).is_err(), "height gap must be rejected");
+    assert!(
+        cm.insert_validated(skip).is_err(),
+        "height gap must be rejected"
+    );
 }
 
 // ============================================================================
@@ -96,7 +108,10 @@ fn select_filtered_skips_rejected_txs() {
     // Accept only nonce >= 1 (simulating "expected nonce is 1")
     let picked = mp.select_filtered(10, |t| t.nonce >= 1);
     assert_eq!(picked.len(), 2);
-    assert!(picked.iter().all(|t| t.nonce >= 1), "invalid-nonce txs must be skipped");
+    assert!(
+        picked.iter().all(|t| t.nonce >= 1),
+        "invalid-nonce txs must be skipped"
+    );
     assert_eq!(picked[0].gas_limit, 50, "still fee-ordered among accepted");
 }
 
@@ -140,5 +155,8 @@ fn fee_priority_displaces_low_fee() {
     assert_eq!(mp.len(), 3);
     // the evicted hash is one of the original low-fee ones
     let remaining = mp.hashes();
-    assert!(low_hashes.iter().any(|h| !remaining.contains(h)), "a low-fee tx must be evicted");
+    assert!(
+        low_hashes.iter().any(|h| !remaining.contains(h)),
+        "a low-fee tx must be evicted"
+    );
 }

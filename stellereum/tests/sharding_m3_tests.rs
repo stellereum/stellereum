@@ -79,7 +79,12 @@ fn block_of(sc: &ShardedCluster, shard: u32, bh: [u8; 32]) -> Block {
 }
 
 /// Produce one outbound transfer on the source shard and return its tx hash.
-async fn produce_transfer(sc: &mut ShardedCluster, sender: &SigningKey, to: [u8; 32], ts: u64) -> [u8; 32] {
+async fn produce_transfer(
+    sc: &mut ShardedCluster,
+    sender: &SigningKey,
+    to: [u8; 32],
+    ts: u64,
+) -> [u8; 32] {
     let tx = Transaction::sign(sender, to, 100, 10, 0, SHARD0, SHARD1);
     let txh = tx.compute_tx_hash();
     sc.shard_mut(SHARD0).broadcast_tx(tx.clone()).await;
@@ -88,7 +93,10 @@ async fn produce_transfer(sc: &mut ShardedCluster, sender: &SigningKey, to: [u8;
     let blk = block_of(sc, SHARD0, bh);
     assert_eq!(blk.cross_shard_out.len(), 1);
     assert!(blk.cross_shard_out[0].is_transfer());
-    assert_eq!(sc.shard(SHARD0).nodes[0].produced_cross_shard_height(&txh), Some(1));
+    assert_eq!(
+        sc.shard(SHARD0).nodes[0].produced_cross_shard_height(&txh),
+        Some(1)
+    );
     txh
 }
 
@@ -112,17 +120,30 @@ async fn message_kinds_come_from_direction_and_flags_only() {
     let a = key(21);
     let b = key(22);
     let tx = Transaction::sign(&a, b.verifying_key().to_bytes(), 10, 1, 0, SHARD0, SHARD1);
-    let transfer = stellereum::sharding::CrossShardMessage::new(SHARD0, SHARD1, tx.clone(), [0u8; 32], [1u8; 32], None);
+    let transfer = stellereum::sharding::CrossShardMessage::new(
+        SHARD0,
+        SHARD1,
+        tx.clone(),
+        [0u8; 32],
+        [1u8; 32],
+        None,
+    );
     assert!(transfer.is_transfer());
     assert!(!transfer.is_ack() && !transfer.is_bounce());
     let ack = stellereum::sharding::CrossShardMessage::new_ack(tx.clone(), [2u8; 32]);
     assert!(ack.is_ack());
     assert!(!ack.is_transfer() && !ack.is_bounce());
-    assert!(ack.merkle_inclusion_proof.is_none(), "control records carry no proof");
+    assert!(
+        ack.merkle_inclusion_proof.is_none(),
+        "control records carry no proof"
+    );
     let bounce = stellereum::sharding::CrossShardMessage::new_bounce(tx.clone(), [3u8; 32]);
     assert!(bounce.is_bounce());
     assert!(!bounce.is_transfer() && !bounce.is_ack());
-    assert!(bounce.merkle_inclusion_proof.is_none(), "control records carry no proof");
+    assert!(
+        bounce.merkle_inclusion_proof.is_none(),
+        "control records carry no proof"
+    );
     // A transfer-shaped record with flags set is Unknown (fail closed).
     let mut weird = transfer.clone();
     weird.bounced = true;
@@ -155,13 +176,19 @@ async fn ack_flow_completes_transfer_and_blocks_any_later_bounce() {
     let bh = sc.run_height(SHARD0, 3).await;
     let blk = block_of(&sc, SHARD0, bh);
     assert!(
-        blk.cross_shard_out.iter().any(|m| m.is_ack() && m.tx.compute_tx_hash() == txh),
+        blk.cross_shard_out
+            .iter()
+            .any(|m| m.is_ack() && m.tx.compute_tx_hash() == txh),
         "source must commit the ack record"
     );
     assert!(sc.shard(SHARD0).nodes[0].is_transfer_completed(&txh));
     assert_eq!(balance(&sc, SHARD0, &sender_addr).await, 1_000 - 100 - 10);
     // Consumed KV entries are pruned: nothing lingers for the source shard.
-    assert!(sc.transport.fetch_cross_shard_inbound(SHARD0).await.is_empty());
+    assert!(sc
+        .transport
+        .fetch_cross_shard_inbound(SHARD0)
+        .await
+        .is_empty());
 
     // Past the timeout, no bounce may be constructed for a completed transfer.
     let mut saw_bounce = false;
@@ -176,11 +203,16 @@ async fn ack_flow_completes_transfer_and_blocks_any_later_bounce() {
 
     // Replaying the consumed ack is refused at proposal (filtered) and at
     // validation (forged block rejected).
-    sc.transport.broadcast_cross_shard(&ack_bytes).await.unwrap();
+    sc.transport
+        .broadcast_cross_shard(&ack_bytes)
+        .await
+        .unwrap();
     let bh = sc.run_height(SHARD0, 999).await;
     let blk = block_of(&sc, SHARD0, bh);
     assert!(
-        blk.cross_shard_out.iter().all(|m| m.msg_id != ack_bytes.msg_id),
+        blk.cross_shard_out
+            .iter()
+            .all(|m| m.msg_id != ack_bytes.msg_id),
         "a consumed ack must not be re-included"
     );
     let node = &sc.shard(SHARD0).nodes[0];
@@ -201,10 +233,15 @@ async fn ack_flow_completes_transfer_and_blocks_any_later_bounce() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     forged.sign_block(&validator);
-    let err = node.validate_proposal(&forged, root).expect_err("replayed ack must be refused");
-    assert!(err.contains("replayed") || err.contains("completed"), "{err}");
+    let err = node
+        .validate_proposal(&forged, root)
+        .expect_err("replayed ack must be refused");
+    assert!(
+        err.contains("replayed") || err.contains("completed"),
+        "{err}"
+    );
     let _ = CrossShardKey::of(&ack_bytes);
 }
 
@@ -237,7 +274,9 @@ async fn bounce_on_failure_refunds_sender_after_timeout_exactly_once() {
 
     // Height 65 == 1 + TIMEOUT: the bounce commits and refunds the amount
     // (gas stays with the source proposer — only `amount` is refunded).
-    let bh = sc.run_height(SHARD0, 10 + 1 + CROSS_SHARD_TIMEOUT_HEIGHTS).await;
+    let bh = sc
+        .run_height(SHARD0, 10 + 1 + CROSS_SHARD_TIMEOUT_HEIGHTS)
+        .await;
     let blk = block_of(&sc, SHARD0, bh);
     let bounce = blk
         .cross_shard_out
@@ -281,10 +320,15 @@ async fn bounce_on_failure_refunds_sender_after_timeout_exactly_once() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     forged.sign_block(&validator);
-    let err = node.validate_proposal(&forged, root).expect_err("second bounce must be refused");
-    assert!(err.contains("completed") || err.contains("replayed") || err.contains("linkage"), "{err}");
+    let err = node
+        .validate_proposal(&forged, root)
+        .expect_err("second bounce must be refused");
+    assert!(
+        err.contains("completed") || err.contains("replayed") || err.contains("linkage"),
+        "{err}"
+    );
 }
 
 /// A proof-carrying control record is refused: the engine would credit
@@ -301,10 +345,15 @@ async fn proof_carrying_ack_or_bounce_is_refused() {
     let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000)], &[]).await;
     produce_transfer(&mut sc, &sender, recipient_addr, 1).await;
     // Steal the genuine transfer's proof onto a bounce-shaped record.
-    let src_bh = sc.shard(SHARD0).nodes[0].finalized.last().map(|(_, h)| *h).unwrap();
+    let src_bh = sc.shard(SHARD0).nodes[0]
+        .finalized
+        .last()
+        .map(|(_, h)| *h)
+        .unwrap();
     let transfer = block_of(&sc, SHARD0, src_bh).cross_shard_out[0].clone();
     assert!(transfer.merkle_inclusion_proof.is_some());
-    let mut evil = stellereum::sharding::CrossShardMessage::new_bounce(transfer.tx.clone(), [7u8; 32]);
+    let mut evil =
+        stellereum::sharding::CrossShardMessage::new_bounce(transfer.tx.clone(), [7u8; 32]);
     evil.merkle_inclusion_proof = transfer.merkle_inclusion_proof.clone();
     assert!(evil.is_bounce(), "shape must still classify as bounce");
 
@@ -335,7 +384,7 @@ async fn proof_carrying_ack_or_bounce_is_refused() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     forged.sign_block(&validator);
     assert!(node.validate_proposal(&forged, root).is_err());
     // No mint happened on the source shard either way.
@@ -364,7 +413,13 @@ async fn two_independent_sources_applying_the_same_bounce_derive_the_same_root()
             .find(|b| b.cross_shard_out.iter().any(|m| m.is_bounce()))
             .expect("bounce must have committed");
         assert_eq!(balance(&sc, SHARD0, &sender_addr).await, 1_000 - 10);
-        roots.push((sc.shard(SHARD0).nodes[0].state_root().await, bounce_block.compute_hash()));
+        roots.push((
+            sc.shard(SHARD0).nodes[0].state_root().await,
+            bounce_block.compute_hash(),
+        ));
     }
-    assert_eq!(roots[0], roots[1], "independent shards must converge on root AND bounce block hash");
+    assert_eq!(
+        roots[0], roots[1],
+        "independent shards must converge on root AND bounce block hash"
+    );
 }

@@ -7,8 +7,8 @@ use base64::Engine;
 use serde_json::json;
 use std::sync::Arc;
 
-use infnode::node::Node;
 use crate::web::AccountsDb;
+use infnode::node::Node;
 
 fn extract_header(raw: &[u8], name: &str) -> Option<String> {
     let text = String::from_utf8_lossy(raw);
@@ -180,7 +180,10 @@ fn parse_params(s: &str) -> (String, Vec<(String, String)>) {
                 return None;
             }
             match p.split_once('=') {
-                Some((k, v)) => Some((k.trim().to_ascii_lowercase(), v.trim().trim_matches('"').to_string())),
+                Some((k, v)) => Some((
+                    k.trim().to_ascii_lowercase(),
+                    v.trim().trim_matches('"').to_string(),
+                )),
                 None => Some((p.to_ascii_lowercase(), String::new())),
             }
         })
@@ -189,7 +192,10 @@ fn parse_params(s: &str) -> (String, Vec<(String, String)>) {
 }
 
 fn param(params: &[(String, String)], name: &str) -> Option<String> {
-    params.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+    params
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.clone())
 }
 
 /// RFC 2231: filename*=UTF-8''<percent-encoded>
@@ -306,7 +312,11 @@ fn decode_cte(cte: &str, body: &[u8]) -> Option<Vec<u8>> {
         base64::engine::general_purpose::STANDARD
             .decode(&compact)
             .ok()
-            .or_else(|| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&compact).ok())
+            .or_else(|| {
+                base64::engine::general_purpose::STANDARD_NO_PAD
+                    .decode(&compact)
+                    .ok()
+            })
     } else if cte.contains("quoted-printable") {
         Some(quoted_printable_bytes(body))
     } else {
@@ -329,7 +339,12 @@ fn parse_part(raw: &[u8], ctx: &mut PartCtx) {
     let (mime, params) = parse_params(&ct);
     let cd = header_val(headers, "Content-Disposition").unwrap_or_default();
     let (_, cd_params) = parse_params(&cd);
-    let disposition = cd.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let disposition = cd
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     let cte = header_val(headers, "Content-Transfer-Encoding").unwrap_or_default();
 
     if let Some(boundary) = param(&params, "boundary") {
@@ -385,7 +400,9 @@ fn parse_part(raw: &[u8], ctx: &mut PartCtx) {
         body.len()
     };
     if est > remain {
-        eprintln!("[inbound] вложение {name} слишком большое ({est} Б > остаток {remain} Б), пропущено");
+        eprintln!(
+            "[inbound] вложение {name} слишком большое ({est} Б > остаток {remain} Б), пропущено"
+        );
         return;
     }
     if let Some(decoded) = decode_cte(&cte, body) {
@@ -505,8 +522,8 @@ pub fn sync_account_imap(
         tls_builder.danger_accept_invalid_certs(true);
     }
     let tls = tls_builder.build()?;
-    let client = imap::connect((host, port), host, &tls)
-        .map_err(|e| anyhow!("imap connect: {e:?}"))?;
+    let client =
+        imap::connect((host, port), host, &tls).map_err(|e| anyhow!("imap connect: {e:?}"))?;
     let mut session = client
         .login(email, smtp_pass)
         .map_err(|(e, _)| anyhow!("imap login: {e}"))?;
@@ -519,135 +536,158 @@ pub fn sync_account_imap(
         }
         // UID, а не sequence numbers (seq съезжают при expunge -> дубли/чужие флаги).
         // Лимит на цикл против флуда (HIGH-3): больше — следующим циклом.
-        let mut ids: Vec<u32> = session.uid_search("UNSEEN").unwrap_or_default().into_iter().collect();
+        let mut ids: Vec<u32> = session
+            .uid_search("UNSEEN")
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         ids.sort_unstable();
         const MAX_PER_CYCLE: usize = 100;
         if ids.len() > MAX_PER_CYCLE {
-            eprintln!("[inbound] {email}/{folder}: {} unseen, беру первые {MAX_PER_CYCLE}", ids.len());
+            eprintln!(
+                "[inbound] {email}/{folder}: {} unseen, беру первые {MAX_PER_CYCLE}",
+                ids.len()
+            );
             ids.truncate(MAX_PER_CYCLE);
         }
         for id in ids {
-        let uid = id.to_string();
-        if let Ok(fetch) = session.uid_fetch(&uid, "(RFC822)") {
-            if let Some(msg) = fetch.iter().next() {
-                if let Some(raw) = msg.body() {
-                    // защита от OOM: пропускаем письма больше лимита целиком (raw ≤ max + запас)
-                    if raw.len() > max_attach_total() + 8 * 1024 * 1024 {
-                        // ВАЖНО: полный флаг "+FLAGS (\\Seen)" — голый "+FLAGS" сервер
-                        // отвергает, письмо перечитывалось вечно (дубли + флуд квоты).
-                        if let Err(e) = session.uid_store(&uid, "+FLAGS (\\Seen)") {
-                            eprintln!("[inbound] {email}: uid_store Seen failed: {e:?}");
+            let uid = id.to_string();
+            if let Ok(fetch) = session.uid_fetch(&uid, "(RFC822)") {
+                if let Some(msg) = fetch.iter().next() {
+                    if let Some(raw) = msg.body() {
+                        // защита от OOM: пропускаем письма больше лимита целиком (raw ≤ max + запас)
+                        if raw.len() > max_attach_total() + 8 * 1024 * 1024 {
+                            // ВАЖНО: полный флаг "+FLAGS (\\Seen)" — голый "+FLAGS" сервер
+                            // отвергает, письмо перечитывалось вечно (дубли + флуд квоты).
+                            if let Err(e) = session.uid_store(&uid, "+FLAGS (\\Seen)") {
+                                eprintln!("[inbound] {email}: uid_store Seen failed: {e:?}");
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    let parsed = parse_inbound(raw);
-                    let at = infnode::proto::now_ms();
-                    // СТАБИЛЬНЫЙ mid: хэш содержимого, а не времени. Раньше в mid входило
-                    // at=now_ms -> каждое перечитывание давало новый id: дубли в индексе
-                    // и бесконечный рост квоты при неснятом SEEN.
-                    let mid = hex::encode(
-                        blake3::hash(format!("{email}:in:{}", hex::encode(blake3::hash(raw).as_bytes())).as_bytes()).as_bytes(),
-                    );
-                    // сначала вложения (конверт не должен ссылаться на отсутствующие блобы)
-                    let mut att_meta: Vec<serde_json::Value> = Vec::new();
-                    let mut att_bytes = 0u64;
-                    for a in parsed.attachments.iter() {
-                        att_meta.push(json!({
-                            "name": a.name,
-                            "mime": a.mime,
-                            "size": a.data.len(),
-                        }));
-                        att_bytes += a.data.len() as u64;
-                    }
-                    // Proton-модель: если у получателя есть публичный X25519 — тело и html
-                    // шифруются случайным ключом, ключ box-заворачивается на x_pub получателя.
-                    // Сервер/ноды видят только метаданные (sender/subject/date), прочитать
-                    // тело может только владелец приватного X25519 (браузер).
-                    let (body_field, html_field) = match &owner_x_pub {
-                        Some(xpub) if !xpub.is_empty() => {
-                            let body_enc = infnode::node::proton_box_body(xpub, &parsed.body);
-                            let html_enc = parsed.html.as_deref()
-                                .map(|h| infnode::node::proton_box_body(xpub, h));
-                            (
-                                body_enc.unwrap_or_else(|| json!(parsed.body.clone()).to_string()),
-                                html_enc.map(|s| s.unwrap_or_else(|| json!(parsed.html.clone().unwrap_or_default()).to_string())),
+                        let parsed = parse_inbound(raw);
+                        let at = infnode::proto::now_ms();
+                        // СТАБИЛЬНЫЙ mid: хэш содержимого, а не времени. Раньше в mid входило
+                        // at=now_ms -> каждое перечитывание давало новый id: дубли в индексе
+                        // и бесконечный рост квоты при неснятом SEEN.
+                        let mid = hex::encode(
+                            blake3::hash(
+                                format!("{email}:in:{}", hex::encode(blake3::hash(raw).as_bytes()))
+                                    .as_bytes(),
                             )
+                            .as_bytes(),
+                        );
+                        // сначала вложения (конверт не должен ссылаться на отсутствующие блобы)
+                        let mut att_meta: Vec<serde_json::Value> = Vec::new();
+                        let mut att_bytes = 0u64;
+                        for a in parsed.attachments.iter() {
+                            att_meta.push(json!({
+                                "name": a.name,
+                                "mime": a.mime,
+                                "size": a.data.len(),
+                            }));
+                            att_bytes += a.data.len() as u64;
                         }
-                        _ => (
-                            json!(parsed.body.clone()).to_string(),
-                            parsed.html.as_deref().map(|h| json!(h).to_string()),
-                        ),
-                    };
-                    let envelope = json!({
-                        "sender": parsed.sender,
-                        "to": email,
-                        "at": at,
-                        "subject": parsed.subject,
-                        "body": body_field,
-                        "html": html_field,
-                        "attachments": att_meta,
-                    })
-                    .to_string()
-                    .into_bytes();
-                    let msg_bytes = envelope.len() as u64 + att_bytes;
-                    // квота: не превышать лимит почты аккаунта (письмо остаётся в MTA UNSEEN)
-                    if injected_bytes + msg_bytes > max_bytes {
-                        eprintln!(
+                        // Proton-модель: если у получателя есть публичный X25519 — тело и html
+                        // шифруются случайным ключом, ключ box-заворачивается на x_pub получателя.
+                        // Сервер/ноды видят только метаданные (sender/subject/date), прочитать
+                        // тело может только владелец приватного X25519 (браузер).
+                        let (body_field, html_field) = match &owner_x_pub {
+                            Some(xpub) if !xpub.is_empty() => {
+                                let body_enc = infnode::node::proton_box_body(xpub, &parsed.body);
+                                let html_enc = parsed
+                                    .html
+                                    .as_deref()
+                                    .map(|h| infnode::node::proton_box_body(xpub, h));
+                                (
+                                    body_enc
+                                        .unwrap_or_else(|| json!(parsed.body.clone()).to_string()),
+                                    html_enc.map(|s| {
+                                        s.unwrap_or_else(|| {
+                                            json!(parsed.html.clone().unwrap_or_default())
+                                                .to_string()
+                                        })
+                                    }),
+                                )
+                            }
+                            _ => (
+                                json!(parsed.body.clone()).to_string(),
+                                parsed.html.as_deref().map(|h| json!(h).to_string()),
+                            ),
+                        };
+                        let envelope = json!({
+                            "sender": parsed.sender,
+                            "to": email,
+                            "at": at,
+                            "subject": parsed.subject,
+                            "body": body_field,
+                            "html": html_field,
+                            "attachments": att_meta,
+                        })
+                        .to_string()
+                        .into_bytes();
+                        let msg_bytes = envelope.len() as u64 + att_bytes;
+                        // квота: не превышать лимит почты аккаунта (письмо остаётся в MTA UNSEEN)
+                        if injected_bytes + msg_bytes > max_bytes {
+                            eprintln!(
                             "[inbound] {email}: пропуск письма {mid} (квота исчерпана, {}+{}>{} байт)",
                             injected_bytes, msg_bytes, max_bytes
                         );
-                        continue;
-                    }
-                    let name = format!("mail:{mid}");
-                    injected_bytes += msg_bytes;
-                    let node_c = node.clone();
-                    let name_c = name.clone();
-                    let blob_c = envelope.clone();
-                    handle.block_on(async move {
-                        node_c.store_blob("mail", &name_c, &blob_c).await;
-                    });
-                    // вложения пишем после проверки квоты (иначе orphan-блобы при отказе).
-                    // Proton-модель: если у получателя есть x_pub — вложение шифруется (XSalsa20,
-                    // ключ box на x_pub), сервер/ноды видят только шифротекст; браузер расшифрует.
-                    for (i, a) in parsed.attachments.iter().enumerate() {
-                        let aname = format!("mail:{mid}:att:{i}");
+                            continue;
+                        }
+                        let name = format!("mail:{mid}");
+                        injected_bytes += msg_bytes;
                         let node_c = node.clone();
-                        let aname_c = aname.clone();
-                        let data = if let Some(xpub) = owner_x_pub.as_ref().filter(|p| !p.is_empty()) {
-                            infnode::node::proton_box_data(xpub, &a.data)
-                                .map(|s| s.into_bytes())
-                                .unwrap_or_else(|| a.data.clone())
-                        } else {
-                            a.data.clone()
-                        };
+                        let name_c = name.clone();
+                        let blob_c = envelope.clone();
                         handle.block_on(async move {
-                            node_c.store_blob("mail", &aname_c, &data).await;
+                            node_c.store_blob("mail", &name_c, &blob_c).await;
                         });
-                    }
-                    // Junk (спам-фильтр MTA) → папка Spam, а не Inbox. Индексы раздельные.
-                    let key = if folder == "Junk" {
-                        format!("mail:{email}:spam-index")
-                    } else {
-                        format!("mail:{email}:index")
-                    };
-                    let mut ids_list: Vec<String> = handle
-                        .block_on(node.get_local_kv(&key))
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_default();
-                    if !ids_list.iter().any(|x| x == &mid) {
-                        ids_list.push(mid.clone());
-                    }
-                    let serialized = serde_json::to_string(&ids_list).unwrap_or("[]".into());
-                    let node_c = node.clone();
-                    let key_c = key.clone();
-                    handle.block_on(async move { node_c.kv_store_local(&key_c, &serialized).await });
-                    injected += 1;
-                    if let Err(e) = session.uid_store(&uid, "+FLAGS (\\Seen)") {
-                        eprintln!("[inbound] {email}: uid_store Seen failed: {e:?}");
+                        // вложения пишем после проверки квоты (иначе orphan-блобы при отказе).
+                        // Proton-модель: если у получателя есть x_pub — вложение шифруется (XSalsa20,
+                        // ключ box на x_pub), сервер/ноды видят только шифротекст; браузер расшифрует.
+                        for (i, a) in parsed.attachments.iter().enumerate() {
+                            let aname = format!("mail:{mid}:att:{i}");
+                            let node_c = node.clone();
+                            let aname_c = aname.clone();
+                            let data = if let Some(xpub) =
+                                owner_x_pub.as_ref().filter(|p| !p.is_empty())
+                            {
+                                infnode::node::proton_box_data(xpub, &a.data)
+                                    .map(|s| s.into_bytes())
+                                    .unwrap_or_else(|| a.data.clone())
+                            } else {
+                                a.data.clone()
+                            };
+                            handle.block_on(async move {
+                                node_c.store_blob("mail", &aname_c, &data).await;
+                            });
+                        }
+                        // Junk (спам-фильтр MTA) → папка Spam, а не Inbox. Индексы раздельные.
+                        let key = if folder == "Junk" {
+                            format!("mail:{email}:spam-index")
+                        } else {
+                            format!("mail:{email}:index")
+                        };
+                        let mut ids_list: Vec<String> = handle
+                            .block_on(node.get_local_kv(&key))
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_default();
+                        if !ids_list.iter().any(|x| x == &mid) {
+                            ids_list.push(mid.clone());
+                        }
+                        let serialized = serde_json::to_string(&ids_list).unwrap_or("[]".into());
+                        let node_c = node.clone();
+                        let key_c = key.clone();
+                        handle.block_on(
+                            async move { node_c.kv_store_local(&key_c, &serialized).await },
+                        );
+                        injected += 1;
+                        if let Err(e) = session.uid_store(&uid, "+FLAGS (\\Seen)") {
+                            eprintln!("[inbound] {email}: uid_store Seen failed: {e:?}");
+                        }
                     }
                 }
             }
-        }
         }
     }
     session.logout().map_err(|_| anyhow!("imap logout"))?;
@@ -656,7 +696,13 @@ pub fn sync_account_imap(
 
 /// Мгновенный синк одного аккаунта (при открытии ящика). Не блокирует дольше таймаута.
 /// Возвращает (кол-во инжектированных писем, добавленные байты) — для однократного учёта квоты.
-pub async fn inbound_sync_one(node: &Arc<Node>, email: &str, smtp_pass: &str, max_bytes: u64, owner_x_pub: Option<String>) -> (usize, u64) {
+pub async fn inbound_sync_one(
+    node: &Arc<Node>,
+    email: &str,
+    smtp_pass: &str,
+    max_bytes: u64,
+    owner_x_pub: Option<String>,
+) -> (usize, u64) {
     let host = std::env::var("INFNODE_IMAP_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = std::env::var("INFNODE_IMAP_PORT")
         .ok()
@@ -670,7 +716,16 @@ pub async fn inbound_sync_one(node: &Arc<Node>, email: &str, smtp_pass: &str, ma
     match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::task::spawn_blocking(move || {
-            sync_account_imap(&email, &sp, &node, handle, &host, port, max_bytes, owner_x_pub)
+            sync_account_imap(
+                &email,
+                &sp,
+                &node,
+                handle,
+                &host,
+                port,
+                max_bytes,
+                owner_x_pub,
+            )
         }),
     )
     .await
@@ -681,7 +736,10 @@ pub async fn inbound_sync_one(node: &Arc<Node>, email: &str, smtp_pass: &str, ma
 }
 
 /// Синхронизировать входящие письма ВСЕХ аккаунтов с ящиком в MTA.
-pub async fn inbound_sync_all(node: &Arc<Node>, db: &AccountsDb) -> Result<(Vec<(String, u64)>, Vec<String>)> {
+pub async fn inbound_sync_all(
+    node: &Arc<Node>,
+    db: &AccountsDb,
+) -> Result<(Vec<(String, u64)>, Vec<String>)> {
     let host = std::env::var("INFNODE_IMAP_HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = std::env::var("INFNODE_IMAP_PORT")
         .ok()
@@ -801,7 +859,11 @@ mod tests {
                    --B--\r\n";
         let m = parse_inbound(raw.as_bytes());
         assert!(m.body.contains("<!DOCTYPE html"));
-        assert!(m.html.as_deref().unwrap_or("").contains("<!DOCTYPE html><html>"));
+        assert!(m
+            .html
+            .as_deref()
+            .unwrap_or("")
+            .contains("<!DOCTYPE html><html>"));
     }
 
     #[test]

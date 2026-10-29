@@ -11,7 +11,11 @@ pub fn resolve_address_variants(address: &str) -> (String, String, String) {
             full
         }
     } else {
-        address.strip_prefix("0x").or_else(|| address.strip_prefix("0X")).unwrap_or(address).to_string()
+        address
+            .strip_prefix("0x")
+            .or_else(|| address.strip_prefix("0X"))
+            .unwrap_or(address)
+            .to_string()
     };
     let with_0x = format!("0x{}", clean.to_lowercase());
     let clean_lower = clean.to_lowercase();
@@ -20,7 +24,10 @@ pub fn resolve_address_variants(address: &str) -> (String, String, String) {
 }
 
 pub fn to_stl57(addr: &str) -> Option<String> {
-    let clean = addr.strip_prefix("0x").or_else(|| addr.strip_prefix("0X")).unwrap_or(addr);
+    let clean = addr
+        .strip_prefix("0x")
+        .or_else(|| addr.strip_prefix("0X"))
+        .unwrap_or(addr);
     if let Ok(b) = stellereum::address::parse_address(addr) {
         Some(stellereum::address::encode_stl57_address(&b))
     } else if let Ok(decoded) = hex::decode(clean) {
@@ -270,11 +277,14 @@ impl Database {
                   code_hash TEXT NOT NULL,
                   verified_at INTEGER NOT NULL
               );
-             "
+             ",
         )?;
 
         // Auto-migration: ensure shard_id column exists if table was created in an earlier version
-        let _ = conn.execute("ALTER TABLE blocks ADD COLUMN shard_id INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE blocks ADD COLUMN shard_id INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -552,8 +562,8 @@ impl Database {
     /// How many distinct contracts emitted at least one indexed event.
     pub fn count_contracts(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT COUNT(DISTINCT LOWER(contract)) FROM contract_events")?;
+        let mut stmt =
+            conn.prepare("SELECT COUNT(DISTINCT LOWER(contract)) FROM contract_events")?;
         let count: u64 = stmt.query_row([], |row| row.get(0))?;
         Ok(count)
     }
@@ -610,7 +620,8 @@ impl Database {
         }
     }
 
-    pub fn get_blocks(&self, limit: u32, offset: u32) -> Result<Vec<BlockRecord>> {        let conn = self.conn.lock().unwrap();
+    pub fn get_blocks(&self, limit: u32, offset: u32) -> Result<Vec<BlockRecord>> {
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT shard_id, height, hash, timestamp, tx_count, proposer, state_root
              FROM blocks ORDER BY height DESC, shard_id ASC LIMIT ?1 OFFSET ?2",
@@ -664,7 +675,11 @@ impl Database {
         }
     }
 
-    pub fn get_block_by_shard_and_height(&self, shard_id: u32, height: u64) -> Result<Option<BlockRecord>> {
+    pub fn get_block_by_shard_and_height(
+        &self,
+        shard_id: u32,
+        height: u64,
+    ) -> Result<Option<BlockRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT shard_id, height, hash, timestamp, tx_count, proposer, state_root
@@ -831,26 +846,29 @@ impl Database {
              ORDER BY block_height DESC, tx_index DESC
              LIMIT ?4 OFFSET ?5",
         )?;
-        let rows = stmt.query_map(params![with_0x, clean_lower, pattern, limit, offset], |row| {
-            let from_addr: String = row.get(3)?;
-            let to_addr: String = row.get(4)?;
-            let from_stl57 = to_stl57(&from_addr);
-            let to_stl57 = to_stl57(&to_addr);
-            Ok(TxRecord {
-                tx_hash: row.get(0)?,
-                block_height: row.get(1)?,
-                tx_index: row.get(2)?,
-                from_addr,
-                to_addr,
-                from_stl57,
-                to_stl57,
-                amount: row.get(5)?,
-                fee_charged: row.get(6)?,
-                gas_limit: row.get(7)?,
-                status: row.get(8)?,
-                timestamp: row.get(9)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![with_0x, clean_lower, pattern, limit, offset],
+            |row| {
+                let from_addr: String = row.get(3)?;
+                let to_addr: String = row.get(4)?;
+                let from_stl57 = to_stl57(&from_addr);
+                let to_stl57 = to_stl57(&to_addr);
+                Ok(TxRecord {
+                    tx_hash: row.get(0)?,
+                    block_height: row.get(1)?,
+                    tx_index: row.get(2)?,
+                    from_addr,
+                    to_addr,
+                    from_stl57,
+                    to_stl57,
+                    amount: row.get(5)?,
+                    fee_charged: row.get(6)?,
+                    gas_limit: row.get(7)?,
+                    status: row.get(8)?,
+                    timestamp: row.get(9)?,
+                })
+            },
+        )?;
         let mut res = Vec::new();
         for r in rows {
             res.push(r?);
@@ -868,16 +886,22 @@ impl Database {
                 OR LOWER(from_addr) = ?2 OR LOWER(to_addr) = ?2
                 OR LOWER(from_addr) LIKE ?3 OR LOWER(to_addr) LIKE ?3",
         )?;
-        let count: u64 = stmt.query_row(params![with_0x, clean_lower, pattern], |row| row.get(0))?;
+        let count: u64 =
+            stmt.query_row(params![with_0x, clean_lower, pattern], |row| row.get(0))?;
         Ok(count)
     }
 
     pub fn get_stats(&self) -> Result<NetworkStats> {
         let conn = self.conn.lock().unwrap();
-        let tip_height: u64 = conn.query_row("SELECT COALESCE(MAX(height), 0) FROM blocks", [], |r| r.get(0))?;
+        let tip_height: u64 =
+            conn.query_row("SELECT COALESCE(MAX(height), 0) FROM blocks", [], |r| {
+                r.get(0)
+            })?;
         let total_blocks: u64 = conn.query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get(0))?;
-        let total_transactions: u64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))?;
-        let total_accounts: u64 = conn.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))?;
+        let total_transactions: u64 =
+            conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))?;
+        let total_accounts: u64 =
+            conn.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))?;
 
         // Calculate avg block time and current TPS over last 100 blocks (shard 0)
         let mut stmt = conn.prepare("SELECT timestamp, tx_count FROM blocks WHERE shard_id = 0 ORDER BY height DESC LIMIT 100")?;
@@ -988,9 +1012,7 @@ mod event_tests {
         let e = event("0xaa", 100, 0, "cc");
         db.insert_event(&e).unwrap();
 
-        let rows = db
-            .get_events(&EventFilter::default(), 10, 0)
-            .unwrap();
+        let rows = db.get_events(&EventFilter::default(), 10, 0).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tx_hash, "0xaa");
         assert_eq!(rows[0].block_height, 100);
@@ -1101,4 +1123,3 @@ mod event_tests {
         assert_ne!(page[0].tx_hash, page2[0].tx_hash);
     }
 }
-

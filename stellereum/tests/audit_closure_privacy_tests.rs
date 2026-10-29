@@ -14,8 +14,8 @@ use stellereum::crypto_privacy::{
 };
 use stellereum::zkml::{
     QuantizedLayer, QuantizedLinearModel, SessionKeyAuthorization, SessionKeyRecord,
-    SessionKeyRegistry, SessionSpendSim, SCOPE_ACTOR_SEND, SCOPE_SVM_PAYLOAD, SCOPE_TRANSFER,
-    MAX_ZKML_MODEL_PARAMS,
+    SessionKeyRegistry, SessionSpendSim, MAX_ZKML_MODEL_PARAMS, SCOPE_ACTOR_SEND,
+    SCOPE_SVM_PAYLOAD, SCOPE_TRANSFER,
 };
 
 fn funded(sender: [u8; 32], value: u64, blind: &Scalar) -> (ConfidentialState, PedersenCommitment) {
@@ -108,11 +108,7 @@ fn atomic_rejects_unowned_spent_duplicate_and_unbalanced() {
         Err(ConfidentialError::NotOwner(c_in.commitment))
     );
     // Duplicate input inside one transfer.
-    let dup = ConfidentialTransfer::new(
-        vec![c_in, c_in],
-        vec![tx.output_commitments[0]],
-        20,
-    );
+    let dup = ConfidentialTransfer::new(vec![c_in, c_in], vec![tx.output_commitments[0]], 20);
     let dup_in = vec![
         RangeProof::prove(&c_in, 1_000, &r, 32),
         RangeProof::prove(&c_in, 1_000, &r, 32),
@@ -122,11 +118,7 @@ fn atomic_rejects_unowned_spent_duplicate_and_unbalanced() {
         Err(ConfidentialError::DuplicateInput(c_in.commitment))
     );
     // Conservation violated (fee mismatch).
-    let bad_fee = ConfidentialTransfer::new(
-        vec![c_in],
-        vec![tx.output_commitments[0]],
-        21,
-    );
+    let bad_fee = ConfidentialTransfer::new(vec![c_in], vec![tx.output_commitments[0]], 21);
     assert_eq!(
         st.verify_transfer_with_ranges(&sender, &bad_fee, &in_r, &out_r),
         Err(ConfidentialError::ConservationViolated)
@@ -166,24 +158,30 @@ fn handler_shape_matches_atomic_on_a_battery_of_inputs() {
     let (good, good_in, good_out) = sound_tx(&c_in, 1_000, &r, 980, 20);
     let wrong_c = PedersenCommitment::commit(5, &r);
     let wrong_proof = RangeProof::prove(&wrong_c, 5, &r, 32);
-    let unbalanced = ConfidentialTransfer::new(
-        vec![c_in],
-        vec![good.output_commitments[0]],
-        999,
-    );
-#[allow(clippy::type_complexity)]
-// GATE: table-driven test cases enumerate full mutator/case tuples inline for readability.
-    let cases: Vec<(ConfidentialTransfer, Vec<RangeProof>, Vec<RangeProof>, [u8; 32])> = vec![
+    let unbalanced = ConfidentialTransfer::new(vec![c_in], vec![good.output_commitments[0]], 999);
+    #[allow(clippy::type_complexity)]
+    // GATE: table-driven test cases enumerate full mutator/case tuples inline for readability.
+    let cases: Vec<(
+        ConfidentialTransfer,
+        Vec<RangeProof>,
+        Vec<RangeProof>,
+        [u8; 32],
+    )> = vec![
         (good.clone(), good_in.clone(), good_out.clone(), sender),
         (good.clone(), vec![], good_out.clone(), sender),
-        (good.clone(), vec![wrong_proof.clone()], good_out.clone(), sender),
+        (
+            good.clone(),
+            vec![wrong_proof.clone()],
+            good_out.clone(),
+            sender,
+        ),
         (good.clone(), good_in.clone(), good_out.clone(), stranger),
         (unbalanced, good_in.clone(), good_out.clone(), sender),
     ];
     for (tx, in_r, out_r, who) in &cases {
         let mut a = base.clone();
-        let handler_ok =
-            tx.verify_balanced_with_ranges(in_r, out_r) && a.apply_transfer(who, &recipient, tx).is_ok();
+        let handler_ok = tx.verify_balanced_with_ranges(in_r, out_r)
+            && a.apply_transfer(who, &recipient, tx).is_ok();
         let mut b = base.clone();
         let atomic_ok = b
             .apply_transfer_with_ranges(who, &recipient, tx, in_r, out_r)
@@ -300,8 +298,8 @@ fn viewing_key_audit_is_opt_in_and_key_bound() {
     let auditor = ViewingKey::generate();
     let stranger = ViewingKey::generate();
     let r = Scalar::random(&mut OsRng);
-    let payload = ViewingKey::encrypt_amount_for_auditor(&auditor.view_pub, 12_345, &r)
-        .expect("encrypt");
+    let payload =
+        ViewingKey::encrypt_amount_for_auditor(&auditor.view_pub, 12_345, &r).expect("encrypt");
     let (v, b) = auditor.decrypt_amount(&payload).expect("decrypt");
     assert_eq!(v, 12_345);
     assert_eq!(b, r);
@@ -319,11 +317,24 @@ fn viewing_key_audit_is_opt_in_and_key_bound() {
 // Session keys: scope / expiry / cap enforcement (registry half)
 // ===========================================================================
 
-fn test_grant(scope: u64, max_gas: u64, max_value: u64, valid_until: u64) -> (SigningKey, SessionKeyAuthorization, [u8; 32]) {
+fn test_grant(
+    scope: u64,
+    max_gas: u64,
+    max_value: u64,
+    valid_until: u64,
+) -> (SigningKey, SessionKeyAuthorization, [u8; 32]) {
     let master = SigningKey::from_bytes(&[0x11u8; 32]);
     let session = SigningKey::from_bytes(&[0x22u8; 32]);
     let spk = session.verifying_key().to_bytes();
-    let g = SessionKeyAuthorization::sign_delegation(&master, spk, valid_until, max_gas, scope, max_value, 5757);
+    let g = SessionKeyAuthorization::sign_delegation(
+        &master,
+        spk,
+        valid_until,
+        max_gas,
+        scope,
+        max_value,
+        5757,
+    );
     (session, g, spk)
 }
 
@@ -331,7 +342,10 @@ fn test_grant(scope: u64, max_gas: u64, max_value: u64, valid_until: u64) -> (Si
 fn session_grant_scope_expiry_and_signature_are_enforced() {
     let (_sess, g, _spk) = test_grant(SCOPE_TRANSFER, 1_000, 50, 10_000);
     assert!(g.grants_scope(SCOPE_TRANSFER));
-    assert!(!g.grants_scope(SCOPE_SVM_PAYLOAD), "transfer-only grant covers no payload");
+    assert!(
+        !g.grants_scope(SCOPE_SVM_PAYLOAD),
+        "transfer-only grant covers no payload"
+    );
     assert!(!g.grants_scope(SCOPE_TRANSFER | SCOPE_SVM_PAYLOAD));
     assert!(!g.grants_scope(SCOPE_ACTOR_SEND));
     assert!(g.verify_at(10_000), "valid at the boundary");
@@ -354,11 +368,20 @@ fn session_gas_budget_is_capped_and_saturating() {
     let (_sess, mut g, _spk) = test_grant(SCOPE_TRANSFER, 100, 50, 10_000);
     g.verify_and_spend_gas(60, 1).expect("within budget");
     assert_eq!(g.remaining_gas(), 40);
-    assert!(g.verify_and_spend_gas(41, 1).is_err(), "over budget refused");
+    assert!(
+        g.verify_and_spend_gas(41, 1).is_err(),
+        "over budget refused"
+    );
     g.verify_and_spend_gas(40, 1).expect("exact remainder ok");
     assert_eq!(g.remaining_gas(), 0);
-    assert!(g.verify_and_spend_gas(1, 1).is_err(), "empty budget refuses");
-    assert!(g.verify_and_spend_gas(1, 99_999).is_err(), "expiry checked with block time");
+    assert!(
+        g.verify_and_spend_gas(1, 1).is_err(),
+        "empty budget refuses"
+    );
+    assert!(
+        g.verify_and_spend_gas(1, 99_999).is_err(),
+        "expiry checked with block time"
+    );
 }
 
 #[test]
@@ -367,8 +390,12 @@ fn session_registry_enforces_every_dimension() {
     let reg = SessionKeyRegistry::default();
     let mut sim = SessionSpendSim::default();
     // Lazy first use: the carried grant is the ceiling, in-flight sim counts.
-    reg.check(&g, 10, 60, SCOPE_TRANSFER, 1, &mut sim).expect("first use ok");
-    assert!(reg.check(&g, 10, 41, SCOPE_TRANSFER, 1, &mut sim).is_err(), "sim accumulates: 60+41 > 100");
+    reg.check(&g, 10, 60, SCOPE_TRANSFER, 1, &mut sim)
+        .expect("first use ok");
+    assert!(
+        reg.check(&g, 10, 41, SCOPE_TRANSFER, 1, &mut sim).is_err(),
+        "sim accumulates: 60+41 > 100"
+    );
 }
 
 #[test]
@@ -412,7 +439,13 @@ fn session_registry_record_never_widens_and_flags_terminal_states() {
     // Master binding: another master's grant for the same session key.
     let other_master = SigningKey::from_bytes(&[0x33u8; 32]);
     let mut foreign = SessionKeyAuthorization::sign_delegation(
-        &other_master, spk, 10_000, 100, SCOPE_TRANSFER, 50, 5757,
+        &other_master,
+        spk,
+        10_000,
+        100,
+        SCOPE_TRANSFER,
+        50,
+        5757,
     );
     let _ = &mut foreign;
     assert_eq!(
@@ -424,7 +457,14 @@ fn session_registry_record_never_widens_and_flags_terminal_states() {
     reg2.note_tombstone(spk, g.master_address);
     assert!(reg2.is_revoked(&spk));
     assert_eq!(
-        reg2.check(&g, 10, 10, SCOPE_TRANSFER, 1, &mut SessionSpendSim::default()),
+        reg2.check(
+            &g,
+            10,
+            10,
+            SCOPE_TRANSFER,
+            1,
+            &mut SessionSpendSim::default()
+        ),
         Err(SessionRegistryError::Revoked)
     );
     // Tombstones never overwrite an existing record.
@@ -440,7 +480,12 @@ fn session_registry_record_never_widens_and_flags_terminal_states() {
 // ===========================================================================
 
 fn tiny_model() -> QuantizedLinearModel {
-    QuantizedLinearModel::new(vec![QuantizedLayer::new(2, 2, vec![2, -1, 1, 3], vec![1, -2])])
+    QuantizedLinearModel::new(vec![QuantizedLayer::new(
+        2,
+        2,
+        vec![2, -1, 1, 3],
+        vec![1, -2],
+    )])
 }
 
 #[test]
@@ -448,12 +493,16 @@ fn model_registry_is_first_wins_validated_and_bounded() {
     use stellereum::zkml::ZkMlModelRegistry;
     let mut reg = ZkMlModelRegistry::default();
     // Anyone (no auth parameter) with a sound model registers.
-    let h = reg.register([0x01u8; 32], tiny_model()).expect("first writer wins");
+    let h = reg
+        .register([0x01u8; 32], tiny_model())
+        .expect("first writer wins");
     assert_eq!(reg.get(&[0x01u8; 32]).unwrap().model_hash, h);
     // Second writer for the same id is refused — weights cannot be swapped.
     assert!(reg.register([0x01u8; 32], tiny_model()).is_err());
     // Malformed models never join: re-execution only ever sees valid shapes.
-    assert!(reg.register([0x02u8; 32], QuantizedLinearModel::new(vec![])).is_err());
+    assert!(reg
+        .register([0x02u8; 32], QuantizedLinearModel::new(vec![]))
+        .is_err());
     // Oversize models are refused (param cap), even when well-formed.
     let big = QuantizedLinearModel::new(vec![QuantizedLayer::new(
         200,
@@ -466,8 +515,12 @@ fn model_registry_is_first_wins_validated_and_bounded() {
     assert!(reg.register([0x03u8; 32], big).is_err());
     // Proofs bind by hash: a forgery against the registered model fails.
     let rec = reg.get(&[0x01u8; 32]).unwrap();
-    let forged = stellereum::zkml::ZkMlProof::forge_structural_proof(&tiny_model(), &[3, 4], &[999, 999]);
-    assert!(forged.verify_inference(), "premise: structural check fooled");
+    let forged =
+        stellereum::zkml::ZkMlProof::forge_structural_proof(&tiny_model(), &[3, 4], &[999, 999]);
+    assert!(
+        forged.verify_inference(),
+        "premise: structural check fooled"
+    );
     assert!(!forged.verify_inference_against(&rec.model));
     let (_out, honest) = stellereum::zkml::ZkMlProof::prove_reexec(&tiny_model(), &[3, 4]);
     assert!(honest.verify_inference_against(&rec.model));

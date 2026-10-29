@@ -51,8 +51,14 @@ fn test_envelope_sealing_and_unsealing() {
     assert_eq!(envelope.max_fee_per_gas, max_fee);
     assert_eq!(envelope.fee(), max_fee);
     assert_eq!(envelope.nonce, nonce);
-    assert_eq!(envelope.encrypted_symmetric_key.len(), MLKEM768_CIPHERTEXT_SIZE);
-    assert!(envelope.verify_hash(), "Precomputed hash must match computed hash");
+    assert_eq!(
+        envelope.encrypted_symmetric_key.len(),
+        MLKEM768_CIPHERTEXT_SIZE
+    );
+    assert!(
+        envelope.verify_hash(),
+        "Precomputed hash must match computed hash"
+    );
 
     // 3. Unseal using engine's active master state
     let unsealed = engine
@@ -98,12 +104,8 @@ fn test_blake3_order_chain_immutability() {
 
     // A. Swapping two envelopes MUST change the order chain root
     let swapped_sequence = vec![env2.clone(), env1.clone(), env3.clone()];
-    let root_swapped = SequentialBlake3HashChain::compute_order_chain(
-        height,
-        slot,
-        &prev_hash,
-        &swapped_sequence,
-    );
+    let root_swapped =
+        SequentialBlake3HashChain::compute_order_chain(height, slot, &prev_hash, &swapped_sequence);
     assert_ne!(
         root, root_swapped,
         "Swapping two envelopes MUST change the order chain root"
@@ -140,7 +142,8 @@ fn test_blake3_order_chain_immutability() {
     );
 
     // D. Commit order and verify commitment
-    let commitment: PqOrderCommitment = engine.commit_order(height, slot, &prev_hash, &original_sequence);
+    let commitment: PqOrderCommitment =
+        engine.commit_order(height, slot, &prev_hash, &original_sequence);
     assert_eq!(commitment.order_root, root);
     assert_eq!(commitment.root(), root);
     assert_eq!(commitment.version, COMMITMENT_VERSION);
@@ -164,7 +167,14 @@ fn test_order_chain_1000_envelopes_benchmark_speed() {
             let mut sender = [0u8; 32];
             sender[..4].copy_from_slice(&(i as u32).to_le_bytes());
             engine
-                .seal_transaction(slot, sender, 21_000, 100 + i as u64, i as u64, b"clob_match")
+                .seal_transaction(
+                    slot,
+                    sender,
+                    21_000,
+                    100 + i as u64,
+                    i as u64,
+                    b"clob_match",
+                )
                 .unwrap()
         })
         .collect();
@@ -278,11 +288,20 @@ fn test_threshold_share_combination_and_decryption_recovery() {
     }
 
     // Direct test of standalone combine_lagrange_shares helper
-    let scalar_1_3_5 = combine_lagrange_shares(&[shares[0].clone(), shares[2].clone(), shares[4].clone()], threshold)
-        .expect("combine_lagrange_shares must succeed for valid threshold subset");
-    let scalar_2_3_4 = combine_lagrange_shares(&[shares[1].clone(), shares[2].clone(), shares[3].clone()], threshold)
-        .expect("combine_lagrange_shares must succeed for alternative threshold subset");
-    assert_eq!(scalar_1_3_5, scalar_2_3_4, "Any T shares must interpolate identical slot scalar");
+    let scalar_1_3_5 = combine_lagrange_shares(
+        &[shares[0].clone(), shares[2].clone(), shares[4].clone()],
+        threshold,
+    )
+    .expect("combine_lagrange_shares must succeed for valid threshold subset");
+    let scalar_2_3_4 = combine_lagrange_shares(
+        &[shares[1].clone(), shares[2].clone(), shares[3].clone()],
+        threshold,
+    )
+    .expect("combine_lagrange_shares must succeed for alternative threshold subset");
+    assert_eq!(
+        scalar_1_3_5, scalar_2_3_4,
+        "Any T shares must interpolate identical slot scalar"
+    );
 
     // A. Combine exact threshold: Validators {1, 3, 5}
     let subset_1_3_5 = vec![shares[0].clone(), shares[2].clone(), shares[4].clone()];
@@ -324,10 +343,7 @@ fn test_threshold_share_combination_and_decryption_recovery() {
     let wrong_slot_share = engine.produce_slotted_share(1, 1, slot + 1).unwrap();
     let mixed_slot = vec![wrong_slot_share, shares[1].clone(), shares[2].clone()];
     let err_slot = engine.unseal_with_shares(&envelope, &mixed_slot);
-    assert!(
-        err_slot.is_err(),
-        "Shares from mismatched slots MUST fail"
-    );
+    assert!(err_slot.is_err(), "Shares from mismatched slots MUST fail");
 
     // G. Corrupted share payload fails
     let mut corrupted = subset_1_3_5.clone();

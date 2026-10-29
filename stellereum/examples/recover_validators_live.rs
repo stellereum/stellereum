@@ -44,7 +44,10 @@ fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<se
     if let Some(err) = resp.get("error") {
         return Err(anyhow!("node rejected {method}: {err}"));
     }
-    Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    Ok(resp
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
 }
 
 fn build_pq_tx(
@@ -56,8 +59,7 @@ fn build_pq_tx(
     payload: Vec<OpCode>,
 ) -> Transaction {
     let scheme = PqScheme::Falcon512;
-    let from =
-        stellereum::post_quantum::derive_pq_address(scheme, key.public_key(), &DEFAULT_SALT);
+    let from = stellereum::post_quantum::derive_pq_address(scheme, key.public_key(), &DEFAULT_SALT);
     let mut tx = Transaction {
         from,
         to,
@@ -74,8 +76,7 @@ fn build_pq_tx(
     let sig_bytes = key.sign(&msg);
     // Explicit envelope (same as the faucet's own drips): registers the key
     // on first use, verifies fine afterwards.
-    let envelope =
-        PqSignatureEnvelope::new_explicit(scheme, key.public_key().to_vec(), sig_bytes);
+    let envelope = PqSignatureEnvelope::new_explicit(scheme, key.public_key().to_vec(), sig_bytes);
     tx.signature = envelope.encode();
     tx
 }
@@ -121,9 +122,7 @@ fn wait_for_tx(rpc_url: &str, tx_hash: &str, budget_secs: u64) -> Result<serde_j
                     return Ok(val);
                 } else if status == "failed" {
                     println!(" FAILED");
-                    return Err(anyhow!(
-                        "tx {tx_hash} FAILED on-chain. receipt={val}"
-                    ));
+                    return Err(anyhow!("tx {tx_hash} FAILED on-chain. receipt={val}"));
                 }
             }
         }
@@ -207,9 +206,20 @@ fn main() -> Result<()> {
     println!("== BEFORE ==");
     show_set(&rpc_url)?;
     let (bal0, nonce0) = faucet_balance(&rpc_url, &faucet_hex)?;
-    println!("    faucet: balance={} nonce={nonce0}", bal0 as f64 / STELL as f64);
-    let a0 = rpc_call(&rpc_url, "stell_stakeOf", serde_json::json!({ "validator": VAL_A }))?;
-    let d0 = rpc_call(&rpc_url, "stell_stakeOf", serde_json::json!({ "validator": VAL_D }))?;
+    println!(
+        "    faucet: balance={} nonce={nonce0}",
+        bal0 as f64 / STELL as f64
+    );
+    let a0 = rpc_call(
+        &rpc_url,
+        "stell_stakeOf",
+        serde_json::json!({ "validator": VAL_A }),
+    )?;
+    let d0 = rpc_call(
+        &rpc_url,
+        "stell_stakeOf",
+        serde_json::json!({ "validator": VAL_D }),
+    )?;
     println!("    stakeOf(A)={a0} stakeOf(D)={d0}");
 
     // STEP 0 — path validation: dust self-transfer from the faucet nonce head.
@@ -223,7 +233,7 @@ fn main() -> Result<()> {
     println!("    step 0 took {:.0}s", t0.elapsed().as_secs_f64());
 
     // STEP 1 — re-bond Node A: top-up 1000 STELL (999 + 1000 = 1999).
-    let ( _, nonce1) = faucet_balance(&rpc_url, &faucet_hex)?;
+    let (_, nonce1) = faucet_balance(&rpc_url, &faucet_hex)?;
     if nonce1 != nonce0 + 1 {
         return Err(anyhow!(
             "nonce moved unexpectedly (want {}, got {nonce1}); aborting to avoid a gap",
@@ -239,14 +249,21 @@ fn main() -> Result<()> {
         0,
         500_000,
         nonce1,
-        vec![OpCode::SysCallStake { validator: val_a, amount: 1_000 * STELL }],
+        vec![OpCode::SysCallStake {
+            validator: val_a,
+            amount: 1_000 * STELL,
+        }],
     );
     let h1 = submit(&rpc_url, &stake_a)?;
     println!("    submitted {h1}");
     let r1 = wait_for_tx(&rpc_url, &h1, 600)?;
     println!("    receipt: {r1}");
     println!("    step 1 took {:.0}s", t1.elapsed().as_secs_f64());
-    let a1 = rpc_call(&rpc_url, "stell_stakeOf", serde_json::json!({ "validator": VAL_A }))?;
+    let a1 = rpc_call(
+        &rpc_url,
+        "stell_stakeOf",
+        serde_json::json!({ "validator": VAL_A }),
+    )?;
     println!("    stakeOf(A) after: {a1}");
     show_set(&rpc_url)?;
     wait_for_power(&rpc_url, VAL_A, 1_999 * STELL, 180)?;
@@ -268,7 +285,10 @@ fn main() -> Result<()> {
         0,
         500_000,
         nonce2,
-        vec![OpCode::SysCallStake { validator: val_d, amount: 2_000 * STELL }],
+        vec![OpCode::SysCallStake {
+            validator: val_d,
+            amount: 2_000 * STELL,
+        }],
     );
     let h2 = submit(&rpc_url, &stake_d)?;
     println!("    submitted {h2}");
@@ -277,8 +297,16 @@ fn main() -> Result<()> {
     println!("    step 2 took {:.0}s", t2.elapsed().as_secs_f64());
 
     println!("== AFTER ==");
-    let a3 = rpc_call(&rpc_url, "stell_stakeOf", serde_json::json!({ "validator": VAL_A }))?;
-    let d3 = rpc_call(&rpc_url, "stell_stakeOf", serde_json::json!({ "validator": VAL_D }))?;
+    let a3 = rpc_call(
+        &rpc_url,
+        "stell_stakeOf",
+        serde_json::json!({ "validator": VAL_A }),
+    )?;
+    let d3 = rpc_call(
+        &rpc_url,
+        "stell_stakeOf",
+        serde_json::json!({ "validator": VAL_D }),
+    )?;
     println!("    stakeOf(A)={a3} stakeOf(D)={d3}");
     show_set(&rpc_url)?;
     wait_for_power(&rpc_url, VAL_D, 2_000 * STELL, 180)?;

@@ -29,9 +29,7 @@ use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
-use stellereum::zkml::{
-    SessionKeyAuthorization, SessionKeyRecord, SCOPE_ALL, SCOPE_TRANSFER,
-};
+use stellereum::zkml::{SessionKeyAuthorization, SessionKeyRecord, SCOPE_ALL, SCOPE_TRANSFER};
 
 const CHAIN_ID: u64 = 5757;
 /// Block clock for every test here. Deterministic: never wall time.
@@ -72,15 +70,7 @@ fn session_tx(
     payload: Vec<OpCode>,
 ) -> Transaction {
     Transaction::sign_with_session(
-        session,
-        delegation,
-        [1u8; 32],
-        amount,
-        gas_limit,
-        nonce,
-        1,
-        1,
-        payload,
+        session, delegation, [1u8; 32], amount, gas_limit, nonce, 1, 1, payload,
     )
 }
 
@@ -123,7 +113,10 @@ async fn registry_persists_across_snapshot_and_restore() {
         assert_eq!(reg.len(), 1, "first use registers the key");
         let rec = reg.get(&session_pub).expect("record");
         assert_eq!(rec.master, master_pub, "the grant's master is recorded");
-        assert_eq!(rec.gas_spent, 1_000, "an empty-payload transfer charges its declared limit");
+        assert_eq!(
+            rec.gas_spent, 1_000,
+            "an empty-payload transfer charges its declared limit"
+        );
         assert!(!rec.revoked);
     }
     let root = engine.get_state_root().await;
@@ -187,10 +180,12 @@ async fn registry_persists_across_snapshot_and_restore() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     anchor.sign_block(&sk);
     let anchor_hash = store.put_block(&anchor).expect("anchor");
-    store.set_finalized(NEXT_H, &anchor_hash).expect("finalized");
+    store
+        .set_finalized(NEXT_H, &anchor_hash)
+        .expect("finalized");
     store.flush().expect("flush");
     drop(ap);
 
@@ -209,8 +204,14 @@ async fn registry_persists_across_snapshot_and_restore() {
         assert_eq!(reg.len(), 1, "the registry must come back from disk");
         let rec = reg.get(&session_pub).expect("restored record");
         assert_eq!(rec.master, master_pub);
-        assert_eq!(rec.gas_spent, 1_000, "spend is part of the persisted record");
-        assert_eq!(rec.max_gas_spend, 10_000, "the copied ceilings come back too");
+        assert_eq!(
+            rec.gas_spent, 1_000,
+            "spend is part of the persisted record"
+        );
+        assert_eq!(
+            rec.max_gas_spend, 10_000,
+            "the copied ceilings come back too"
+        );
         assert_eq!(rec.scope, SCOPE_ALL);
         assert!(!rec.revoked);
     }
@@ -275,8 +276,9 @@ async fn budget_exhaustion_blocks_the_next_tx_on_the_live_path() {
 
     // The NEXT transaction on the live path is refused - both live entry
     // points, and it moves nothing.
-    let (applied, failed, _, status, _) =
-        state.apply_block_parallel_fees(std::slice::from_ref(&tx3), TS).await;
+    let (applied, failed, _, status, _) = state
+        .apply_block_parallel_fees(std::slice::from_ref(&tx3), TS)
+        .await;
     assert_eq!(status, vec![false], "an exhausted grant must not execute");
     assert_eq!((applied, failed), (0, 1));
     let err = state
@@ -318,9 +320,7 @@ async fn in_block_budget_accumulates_across_two_txs_of_one_grant() {
     // ONE block, three transactions, budget for two: the admission pass
     // carries the in-block overlay, execution charges for real as each one
     // applies, and the third is refused on both counts.
-    let (_, _, _, status, _) = state
-        .apply_block_parallel_fees(&[tx1, tx2, tx3], TS)
-        .await;
+    let (_, _, _, status, _) = state.apply_block_parallel_fees(&[tx1, tx2, tx3], TS).await;
     assert_eq!(
         status,
         vec![true, true, false],
@@ -333,13 +333,20 @@ async fn in_block_budget_accumulates_across_two_txs_of_one_grant() {
     }
     // Exactly two transfers' worth of value moved, not three.
     let acct = state.get_account(&master_pub).await.unwrap();
-    assert_eq!(acct.nonce, 2, "only the two applied transactions bumped the nonce");
+    assert_eq!(
+        acct.nonce, 2,
+        "only the two applied transactions bumped the nonce"
+    );
     assert_eq!(state.get_account(&[1u8; 32]).await.unwrap().balance, 20);
 
     // The accumulation is durable: a LATER block still sees a full budget.
     let tx4 = session_tx(&session, g(), 10, 1_000, 3, vec![]);
     let (_, _, _, later, _) = state.apply_block_parallel_fees(&[tx4], TS).await;
-    assert_eq!(later, vec![false], "the budget spent in-block is spent for good");
+    assert_eq!(
+        later,
+        vec![false],
+        "the budget spent in-block is spent for good"
+    );
 }
 
 // ============================================================================
@@ -355,7 +362,10 @@ async fn revoke_lands_in_a_block_and_blocks_subsequent_admissions_on_all_paths()
     let session_pub = session.verifying_key().to_bytes();
     let state = funded_state(master_pub, BALANCE).await;
     state
-        .update_account(AccountState::new(attacker.verifying_key().to_bytes(), BALANCE))
+        .update_account(AccountState::new(
+            attacker.verifying_key().to_bytes(),
+            BALANCE,
+        ))
         .await;
 
     let g = || grant(&master, &session, 100_000, SCOPE_ALL, u64::MAX);
@@ -437,7 +447,7 @@ async fn revoke_lands_in_a_block_and_blocks_subsequent_admissions_on_all_paths()
         mmr_epoch_root: [0u8; 32],
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-};
+    };
     let outcome = state.apply_block_transition(&block, 0).await;
     assert_eq!(
         outcome.status,
@@ -497,8 +507,9 @@ async fn revoke_lands_in_a_block_and_blocks_subsequent_admissions_on_all_paths()
     );
 
     // (c) execution, both apply paths, on the very engine that revoked it.
-    let (applied, failed, _, status, _) =
-        state.apply_block_parallel_fees(std::slice::from_ref(&blocked), TS).await;
+    let (applied, failed, _, status, _) = state
+        .apply_block_parallel_fees(std::slice::from_ref(&blocked), TS)
+        .await;
     assert_eq!(status, vec![false], "the block path must refuse it");
     assert_eq!((applied, failed), (0, 1));
     let err = state
@@ -584,18 +595,24 @@ async fn session_authorized_revoke_of_another_key_is_rejected() {
         10,
         5_000,
         2,
-        vec![OpCode::SysCallRevokeSession { session_pubkey: other_pub }],
+        vec![OpCode::SysCallRevokeSession {
+            session_pubkey: other_pub,
+        }],
     );
     assert!(attack.is_session_keyed());
-    let (applied, failed, _, status, _) =
-        state.apply_block_parallel_fees(std::slice::from_ref(&attack), TS).await;
+    let (applied, failed, _, status, _) = state
+        .apply_block_parallel_fees(std::slice::from_ref(&attack), TS)
+        .await;
     assert_eq!(status, vec![false], "a delegated key may not revoke");
     assert_eq!((applied, failed), (0, 1));
     let err = state
         .apply_transaction(&attack, TS)
         .await
         .expect_err("the single-tx path must reject it too");
-    assert!(err.contains("revoke"), "the refusal names revocation: {err}");
+    assert!(
+        err.contains("revoke"),
+        "the refusal names revocation: {err}"
+    );
     assert!(
         !state.session_keys_read().await.is_revoked(&other_pub),
         "the OTHER key must survive a delegated revoke"
@@ -616,7 +633,9 @@ async fn session_authorized_revoke_of_another_key_is_rejected() {
         3,
         1,
         1,
-        vec![OpCode::SysCallRevokeSession { session_pubkey: other_pub }],
+        vec![OpCode::SysCallRevokeSession {
+            session_pubkey: other_pub,
+        }],
     );
     let (_, _, _, s2, _) = state.apply_block_parallel_fees(&[real], TS).await;
     assert_eq!(s2, vec![true], "the master's legacy revoke must still land");
@@ -650,7 +669,9 @@ async fn preventive_revocation_tombstones_an_unused_grant() {
         0,
         1,
         1,
-        vec![OpCode::SysCallRevokeSession { session_pubkey: session_pub }],
+        vec![OpCode::SysCallRevokeSession {
+            session_pubkey: session_pub,
+        }],
     );
     let (_, _, _, su, _) = state.apply_block_parallel_fees(&[unproven], TS).await;
     assert_eq!(su, vec![false], "unknown key: nothing to revoke");
@@ -671,7 +692,9 @@ async fn preventive_revocation_tombstones_an_unused_grant() {
         1,
         vec![
             OpCode::SysCallPublishSessionGrant(Box::new(g.clone())),
-            OpCode::SysCallRevokeSession { session_pubkey: session_pub },
+            OpCode::SysCallRevokeSession {
+                session_pubkey: session_pub,
+            },
         ],
     );
     let (_, _, _, s0, _) = state.apply_block_parallel_fees(&[revoke], TS).await;
@@ -690,8 +713,14 @@ async fn preventive_revocation_tombstones_an_unused_grant() {
         Ok(()),
         "the grant the agent later presents is still valid on its own"
     );
-    let (_, _, _, s1, _) = state.apply_block_parallel_fees(std::slice::from_ref(&later), TS).await;
-    assert_eq!(s1, vec![false], "the tombstone blocks the later presentation");
+    let (_, _, _, s1, _) = state
+        .apply_block_parallel_fees(std::slice::from_ref(&later), TS)
+        .await;
+    assert_eq!(
+        s1,
+        vec![false],
+        "the tombstone blocks the later presentation"
+    );
     assert!(state.apply_transaction(&later, TS).await.is_err());
 
     // ...and a brand-new, larger grant cannot resurrect the key either.
@@ -751,7 +780,9 @@ async fn admission_is_deterministic_and_registry_is_enforced_at_consensus() {
         1,
         1,
         1,
-        vec![OpCode::SysCallRevokeSession { session_pubkey: session_pub }],
+        vec![OpCode::SysCallRevokeSession {
+            session_pubkey: session_pub,
+        }],
     );
     let (_, _, _, s1, _) = state.apply_block_parallel_fees(&[revoke], TS).await;
     assert_eq!(s1, vec![true]);
@@ -811,12 +842,20 @@ async fn node_rejects_grants_minted_for_another_chain_and_digest_is_unchanged() 
 
     // This node is chain 42; the network's default is 5757.
     let state = InMemoryStateEngine::new().with_chain_id(42);
-    state.update_account(AccountState::new(master_pub, BALANCE)).await;
+    state
+        .update_account(AccountState::new(master_pub, BALANCE))
+        .await;
 
     // A grant minted for the default chain is well-signed but foreign: the
     // domain binds chain_id and the node now COMPARES it.
     let foreign = SessionKeyAuthorization::sign_delegation(
-        &master, session_pub, VALID_UNTIL, 100_000, SCOPE_ALL, u64::MAX, 5757,
+        &master,
+        session_pub,
+        VALID_UNTIL,
+        100_000,
+        SCOPE_ALL,
+        u64::MAX,
+        5757,
     );
     let foreign_tx = session_tx(&session, foreign, 10, 1_000, 0, vec![]);
     assert!(foreign_tx.verify_signature(), "the grant is well-formed");
@@ -824,7 +863,10 @@ async fn node_rejects_grants_minted_for_another_chain_and_digest_is_unchanged() 
         .apply_transaction(&foreign_tx, TS)
         .await
         .expect_err("a foreign-chain grant must be refused");
-    assert!(err.contains("chain id"), "the refusal names the chain id: {err}");
+    assert!(
+        err.contains("chain id"),
+        "the refusal names the chain id: {err}"
+    );
     assert_eq!(
         state.get_account(&master_pub).await.unwrap().balance,
         BALANCE,
@@ -834,10 +876,19 @@ async fn node_rejects_grants_minted_for_another_chain_and_digest_is_unchanged() 
     // The SAME grant for this node's chain applies (nonce 0). A second
     // transaction (nonce 1) confirms the window is open, not a fluke.
     let native = SessionKeyAuthorization::sign_delegation(
-        &master, session_pub, VALID_UNTIL, 100_000, SCOPE_ALL, u64::MAX, 42,
+        &master,
+        session_pub,
+        VALID_UNTIL,
+        100_000,
+        SCOPE_ALL,
+        u64::MAX,
+        42,
     );
     state
-        .apply_transaction(&session_tx(&session, native.clone(), 10, 1_000, 0, vec![]), TS)
+        .apply_transaction(
+            &session_tx(&session, native.clone(), 10, 1_000, 0, vec![]),
+            TS,
+        )
         .await
         .expect("a native-chain grant must apply");
     state
@@ -886,8 +937,7 @@ async fn conditional_session_domain_leaves_the_root_unchanged_when_empty() {
     }
     let after = e.get_state_root().await;
     assert_ne!(
-        before,
-        after,
+        before, after,
         "a registered session key IS committed - otherwise two nodes that
          disagreed about revocation or budget would share a state root"
     );
@@ -933,24 +983,77 @@ fn old_node_fails_closed_on_the_revoke_opcode() {
         Mul,
         Div,
         LoadBalance,
-        Transfer { recipient: [u8; 32], amount: u64 },
-        SysCallPlaceOrder { pair_id: u32, is_buy: bool, price: u64, amount: u64 },
-        SysCallCancelOrder { order_id: u64 },
+        Transfer {
+            recipient: [u8; 32],
+            amount: u64,
+        },
+        SysCallPlaceOrder {
+            pair_id: u32,
+            is_buy: bool,
+            price: u64,
+            amount: u64,
+        },
+        SysCallCancelOrder {
+            order_id: u64,
+        },
         SysCallVerifyZkMl,
         SysCallPatriciaLookup(stellereum::cell::CellHash),
-        SysCallTokenTransfer { token_id: [u8; 32], to: [u8; 32], amount: u64 },
-        SysCallTokenTransferFrom { token_id: [u8; 32], from: [u8; 32], to: [u8; 32], amount: u64 },
-        SysCallTokenMint { token_id: [u8; 32], to: [u8; 32], amount: u64 },
-        SysCallTokenBurn { token_id: [u8; 32], from: [u8; 32], amount: u64 },
-        SysCallTokenApprove { token_id: [u8; 32], spender: [u8; 32], amount: u64 },
-        SysCallTokenBalanceOf { token_id: [u8; 32], account: [u8; 32] },
-        SysCallDeployContract { code: Vec<u8> },
-        SysCallCallContract { contract: [u8; 32], method: Vec<u8>, arg: i64 },
-        SysCallStake { validator: [u8; 32], amount: u64 },
-        SysCallUnbond { validator: [u8; 32], amount: u64 },
-        SysCallDelegate { validator: [u8; 32], amount: u64 },
-        SysCallUndelegate { validator: [u8; 32] },
-        SysCallClaimRewards { validator: [u8; 32] },
+        SysCallTokenTransfer {
+            token_id: [u8; 32],
+            to: [u8; 32],
+            amount: u64,
+        },
+        SysCallTokenTransferFrom {
+            token_id: [u8; 32],
+            from: [u8; 32],
+            to: [u8; 32],
+            amount: u64,
+        },
+        SysCallTokenMint {
+            token_id: [u8; 32],
+            to: [u8; 32],
+            amount: u64,
+        },
+        SysCallTokenBurn {
+            token_id: [u8; 32],
+            from: [u8; 32],
+            amount: u64,
+        },
+        SysCallTokenApprove {
+            token_id: [u8; 32],
+            spender: [u8; 32],
+            amount: u64,
+        },
+        SysCallTokenBalanceOf {
+            token_id: [u8; 32],
+            account: [u8; 32],
+        },
+        SysCallDeployContract {
+            code: Vec<u8>,
+        },
+        SysCallCallContract {
+            contract: [u8; 32],
+            method: Vec<u8>,
+            arg: i64,
+        },
+        SysCallStake {
+            validator: [u8; 32],
+            amount: u64,
+        },
+        SysCallUnbond {
+            validator: [u8; 32],
+            amount: u64,
+        },
+        SysCallDelegate {
+            validator: [u8; 32],
+            amount: u64,
+        },
+        SysCallUndelegate {
+            validator: [u8; 32],
+        },
+        SysCallClaimRewards {
+            validator: [u8; 32],
+        },
         Halt,
         SysCallSubmitPriceFeed(Box<stellereum::oracle::PriceFeedUpdate>),
     }
@@ -986,16 +1089,8 @@ fn old_node_fails_closed_on_the_revoke_opcode() {
         "an old node must fail closed on a payload carrying the revoke opcode"
     );
 
-    let revoke_tx = Transaction::sign_with_payload(
-        &sk,
-        [1u8; 32],
-        10,
-        5_000,
-        0,
-        1,
-        1,
-        revoke_payload,
-    );
+    let revoke_tx =
+        Transaction::sign_with_payload(&sk, [1u8; 32], 10, 5_000, 0, 1, 1, revoke_payload);
     let tx_bytes = bincode::serialize(&revoke_tx).expect("tx serializes");
     let old_tx: Result<OldTransaction, _> = bincode::deserialize(&tx_bytes);
     assert!(

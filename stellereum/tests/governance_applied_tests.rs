@@ -21,12 +21,14 @@ use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use stellereum::consensus::ValidatorSet;
 use stellereum::governance::{
-    GovAction, GovError, Governance, ProposalStatus, VoteChoice,
-    GOVERNANCE_VOTING_PERIOD_SECS, PROPOSAL_MIN_STAKE_NANO,
+    GovAction, GovError, Governance, ProposalStatus, VoteChoice, GOVERNANCE_VOTING_PERIOD_SECS,
+    PROPOSAL_MIN_STAKE_NANO,
 };
 use stellereum::orderbook::OrderSide;
 use stellereum::runtime::Cluster;
-use stellereum::staking::{StakingError, StakingLedger, DEFAULT_COMMISSION_BPS, MIN_VALIDATOR_BOND};
+use stellereum::staking::{
+    StakingError, StakingLedger, DEFAULT_COMMISSION_BPS, MIN_VALIDATOR_BOND,
+};
 use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::token::TokenMetadata;
 
@@ -43,7 +45,8 @@ fn ledger_with(n: u8, bond_stell: u64) -> (StakingLedger, Vec<[u8; 32]>) {
     let mut l = StakingLedger::new();
     let ids: Vec<[u8; 32]> = (0..n).map(|i| vid(i + 1)).collect();
     for id in &ids {
-        l.bond(*id, stell(bond_stell), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(*id, stell(bond_stell), DEFAULT_COMMISSION_BPS)
+            .unwrap();
     }
     (l, ids)
 }
@@ -61,7 +64,8 @@ fn pass_and_execute(
         .propose(ledger, proposer, "t".into(), action, 0)
         .expect("propose");
     for v in voters {
-        gov.vote(&mut *ledger, *v, id, VoteChoice::Yes, 1).expect("vote");
+        gov.vote(&mut *ledger, *v, id, VoteChoice::Yes, 1)
+            .expect("vote");
     }
     let status = gov
         .finalize(&mut *ledger, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
@@ -107,7 +111,10 @@ async fn governed_block_reward_is_what_the_produced_block_pays() {
     // Governed value: distinct from BOTH the runtime default (0) and the
     // main.rs wiring (317M), so passing proves the governed value drove it.
     let governed: u64 = 777_000_000;
-    assert_ne!(governed, 0, "test bug: governed must differ from runtime default");
+    assert_ne!(
+        governed, 0,
+        "test bug: governed must differ from runtime default"
+    );
     assert_ne!(
         governed, HARDCODED_MAIN_REWARD,
         "test bug: governed must differ from the hardcoded main.rs reward"
@@ -116,7 +123,10 @@ async fn governed_block_reward_is_what_the_produced_block_pays() {
     let key = SigningKey::from_bytes(&[11; 32]);
     let proposer = key.verifying_key().to_bytes();
     let engine = Arc::new(InMemoryStateEngine::new());
-    engine.credit_native(&proposer, stell(100_000)).await.expect("fund");
+    engine
+        .credit_native(&proposer, stell(100_000))
+        .await
+        .expect("fund");
     engine
         .staking_write()
         .await
@@ -127,9 +137,16 @@ async fn governed_block_reward_is_what_the_produced_block_pays() {
     let mut ledger = engine.staking_read().await.clone();
     let mut gov = engine.governance_write().await;
     let id = gov
-        .propose(&ledger, proposer, "raise reward".into(), GovAction::SetBlockReward(governed), 0)
+        .propose(
+            &ledger,
+            proposer,
+            "raise reward".into(),
+            GovAction::SetBlockReward(governed),
+            0,
+        )
         .expect("propose");
-    gov.vote(&mut ledger, proposer, id, VoteChoice::Yes, 1).expect("vote");
+    gov.vote(&mut ledger, proposer, id, VoteChoice::Yes, 1)
+        .expect("vote");
     let status = gov
         .finalize(&mut ledger, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
         .expect("finalize");
@@ -185,7 +202,13 @@ fn governed_min_bond_rejects_below_and_accepts_above() {
     let (mut ledger, ids) = ledger_with(2, 20_000);
     let mut gov = Governance::new();
     let new_min = stell(50_000);
-    pass_and_execute(&mut ledger, &mut gov, ids[0], &ids, GovAction::SetMinValidatorBond(new_min));
+    pass_and_execute(
+        &mut ledger,
+        &mut gov,
+        ids[0],
+        &ids,
+        GovAction::SetMinValidatorBond(new_min),
+    );
     assert_eq!(gov.applied.min_validator_bond, Some(new_min));
 
     // Below the governed minimum (but above the hardcoded 1,000 STELL):
@@ -241,7 +264,9 @@ fn governed_default_commission_drives_reward_splits() {
         ledger.validators[&val].commission_bps, governed_bps,
         "param=default_commission_bps governed={governed_bps}"
     );
-    ledger.delegate(depositor, val, stell(10_000)).expect("delegate");
+    ledger
+        .delegate(depositor, val, stell(10_000))
+        .expect("delegate");
 
     // 50/50 self/delegated split of a 2 STELL reward.
     let reward: u64 = 2 * stell(1);
@@ -293,9 +318,15 @@ async fn each_domain_mutation_moves_state_root() {
     let creator = vid(0xD1);
     let trader = vid(0xD2);
     let gov_val = vid(0xD3);
-    e.credit_native(&creator, stell(1_000_000)).await.expect("fund");
-    e.credit_native(&trader, stell(1_000_000)).await.expect("fund");
-    e.credit_native(&gov_val, stell(1_000_000)).await.expect("fund");
+    e.credit_native(&creator, stell(1_000_000))
+        .await
+        .expect("fund");
+    e.credit_native(&trader, stell(1_000_000))
+        .await
+        .expect("fund");
+    e.credit_native(&gov_val, stell(1_000_000))
+        .await
+        .expect("fund");
 
     let mut prev = e.get_state_root().await;
 
@@ -317,7 +348,10 @@ async fn each_domain_mutation_moves_state_root() {
             .submit_order(trader, OrderSide::Buy, 100, 10, 0);
     }
     let now = e.get_state_root().await;
-    assert_ne!(prev, now, "domain=orderbook: submit_order must move the root");
+    assert_ne!(
+        prev, now,
+        "domain=orderbook: submit_order must move the root"
+    );
     prev = now;
 
     // 3) PMM domain.
@@ -342,15 +376,23 @@ async fn each_domain_mutation_moves_state_root() {
     // 5) Governance domain: full propose flow (needs stake for the proposer).
     {
         let mut staking = e.staking_write().await;
-        staking.bond(gov_val, stell(20_000), DEFAULT_COMMISSION_BPS).expect("bond");
+        staking
+            .bond(gov_val, stell(20_000), DEFAULT_COMMISSION_BPS)
+            .expect("bond");
     }
     // Re-baseline: the bond itself is a staking-domain mutation, not counted.
     prev = e.get_state_root().await;
     {
         let ledger = e.staking_read().await.clone();
         let mut gov = e.governance_write().await;
-        gov.propose(&ledger, gov_val, "g".into(), GovAction::Signal("s".into()), 0)
-            .expect("propose");
+        gov.propose(
+            &ledger,
+            gov_val,
+            "g".into(),
+            GovAction::Signal("s".into()),
+            0,
+        )
+        .expect("propose");
     }
     let now = e.get_state_root().await;
     assert_ne!(prev, now, "domain=governance: propose must move the root");
@@ -363,7 +405,13 @@ fn executing_passed_proposal_twice_is_noop() {
     let (mut ledger, ids) = ledger_with(3, 10_000);
     let mut gov = Governance::new();
     let reward = stell(9);
-    let id = pass_and_execute(&mut ledger, &mut gov, ids[0], &ids, GovAction::SetBlockReward(reward));
+    let id = pass_and_execute(
+        &mut ledger,
+        &mut gov,
+        ids[0],
+        &ids,
+        GovAction::SetBlockReward(reward),
+    );
     assert_eq!(gov.get(id).unwrap().status, ProposalStatus::Executed);
     let snapshot = gov.applied.clone();
 
@@ -373,7 +421,10 @@ fn executing_passed_proposal_twice_is_noop() {
         Err(GovError::AlreadyExecuted),
         "second execute must be refused"
     );
-    assert_eq!(gov.applied, snapshot, "second execute must leave applied params untouched");
+    assert_eq!(
+        gov.applied, snapshot,
+        "second execute must leave applied params untouched"
+    );
     assert_eq!(gov.get(id).unwrap().status, ProposalStatus::Executed);
     assert_eq!(gov.applied.block_reward, Some(reward));
 }
@@ -408,9 +459,7 @@ fn proposal_floor_sanity() {
 ///     write) still fails closed and applies nothing.
 #[test]
 fn gov_param_bounds_reject_chain_breaking_values() {
-    use stellereum::governance::{
-        MAX_BLOCK_REWARD_NANO, MAX_VALIDATOR_BOND,
-    };
+    use stellereum::governance::{MAX_BLOCK_REWARD_NANO, MAX_VALIDATOR_BOND};
     let (mut ledger, ids) = ledger_with(3, 100_000);
     // (1) PROPOSE-TIME refusal: every chain-breaking value is refused BEFORE it
     // becomes a proposal, so it can never be voted on.
@@ -453,7 +502,8 @@ fn gov_param_bounds_reject_chain_breaking_values() {
             .expect("propose");
         gov.proposals.get_mut(&id).expect("proposal").action = action;
         for v in &ids {
-            gov.vote(&mut ledger, *v, id, VoteChoice::Yes, 1).expect("vote");
+            gov.vote(&mut ledger, *v, id, VoteChoice::Yes, 1)
+                .expect("vote");
         }
         let status = gov
             .finalize(&mut ledger, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
@@ -489,7 +539,8 @@ fn gov_param_bounds_accept_sane_values() {
             .propose(&ledger, ids[0], "t".into(), action, 0)
             .expect("propose");
         for v in &ids {
-            gov.vote(&mut ledger, *v, id, VoteChoice::Yes, 1).expect("vote");
+            gov.vote(&mut ledger, *v, id, VoteChoice::Yes, 1)
+                .expect("vote");
         }
         gov.finalize(&mut ledger, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
             .expect("finalize");
@@ -521,7 +572,13 @@ fn governed_min_gas_limit_validates_bounds_and_applies() {
         let (ledger, ids) = ledger_with(2, 20_000);
         let mut gov = Governance::new();
         assert_eq!(
-            gov.propose(&ledger, ids[0], "t".into(), GovAction::SetMinGasLimit(bad), 0),
+            gov.propose(
+                &ledger,
+                ids[0],
+                "t".into(),
+                GovAction::SetMinGasLimit(bad),
+                0
+            ),
             Err(GovError::InvalidAction),
             "gas floor {bad} must be refused"
         );
@@ -531,7 +588,13 @@ fn governed_min_gas_limit_validates_bounds_and_applies() {
     let (mut ledger, ids) = ledger_with(2, 20_000);
     let mut gov = Governance::new();
     let floor = GAS_BASIC_TRANSFER * 2;
-    pass_and_execute(&mut ledger, &mut gov, ids[0], &ids, GovAction::SetMinGasLimit(floor));
+    pass_and_execute(
+        &mut ledger,
+        &mut gov,
+        ids[0],
+        &ids,
+        GovAction::SetMinGasLimit(floor),
+    );
     assert_eq!(gov.applied.min_gas_limit, Some(floor));
 }
 
@@ -546,7 +609,13 @@ fn quorum_floor_3333_and_anyone_can_execute() {
     for bad in [1u64, 3_332] {
         let mut gov = Governance::new();
         let err = gov
-            .propose(&ledger, ids[0], "t".into(), GovAction::SetGovernanceQuorumBps(bad), 0)
+            .propose(
+                &ledger,
+                ids[0],
+                "t".into(),
+                GovAction::SetGovernanceQuorumBps(bad),
+                0,
+            )
             .expect_err("sub-floor quorum must be refused at propose");
         assert_eq!(err, GovError::InvalidAction);
         assert!(
@@ -580,7 +649,9 @@ fn quorum_floor_3333_and_anyone_can_execute() {
                 weights: HashMap::new(),
             },
         );
-        let err = gov.execute(ids[1], id).expect_err("sub-floor must fail closed");
+        let err = gov
+            .execute(ids[1], id)
+            .expect_err("sub-floor must fail closed");
         assert_eq!(err, GovError::InvalidAction);
         assert!(format!("{err}").contains("3333"));
         assert_eq!(gov.get(id).unwrap().status, ProposalStatus::Passed);
@@ -589,10 +660,17 @@ fn quorum_floor_3333_and_anyone_can_execute() {
     {
         let mut gov = Governance::new();
         let id = gov
-            .propose(&ledger, ids[0], "t".into(), GovAction::SetGovernanceQuorumBps(3_333), 0)
+            .propose(
+                &ledger,
+                ids[0],
+                "t".into(),
+                GovAction::SetGovernanceQuorumBps(3_333),
+                0,
+            )
             .expect("floor must be accepted");
         for v in &ids {
-            gov.vote(&mut ledger, *v, id, VoteChoice::Yes, 1).expect("vote");
+            gov.vote(&mut ledger, *v, id, VoteChoice::Yes, 1)
+                .expect("vote");
         }
         gov.finalize(&mut ledger, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
             .expect("finalize");
@@ -603,10 +681,17 @@ fn quorum_floor_3333_and_anyone_can_execute() {
     {
         let mut gov = Governance::new();
         let id = gov
-            .propose(&ledger, ids[0], "t".into(), GovAction::Signal("t".into()), 0)
+            .propose(
+                &ledger,
+                ids[0],
+                "t".into(),
+                GovAction::Signal("t".into()),
+                0,
+            )
             .expect("propose");
         for v in &ids {
-            gov.vote(&mut ledger, *v, id, VoteChoice::Yes, 1).expect("vote");
+            gov.vote(&mut ledger, *v, id, VoteChoice::Yes, 1)
+                .expect("vote");
         }
         gov.finalize(&mut ledger, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
             .expect("finalize");

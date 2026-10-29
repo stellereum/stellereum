@@ -72,10 +72,18 @@ impl std::fmt::Display for PmmError {
 pub enum PmmEvent {
     /// The buyer's `usdt_micro` wUSDT was burned and the curve advanced;
     /// `stell_minted` native STELL must now be credited to `buyer`.
-    Buy { buyer: [u8; 32], usdt_micro: u64, stell_minted: u64 },
+    Buy {
+        buyer: [u8; 32],
+        usdt_micro: u64,
+        stell_minted: u64,
+    },
     /// `stell_nano` native STELL must be debited from `seller`; their
     /// `usdt_paid` wUSDT was already minted to them from the PMM treasury.
-    Sell { seller: [u8; 32], stell_nano: u64, usdt_paid: u64 },
+    Sell {
+        seller: [u8; 32],
+        stell_nano: u64,
+        usdt_paid: u64,
+    },
 }
 
 /// The PMM wiring carried inside `VmContext` for `SysCallPmmBuy`/`SysCallPmmSell`.
@@ -171,7 +179,8 @@ impl PrimaryMarketMaker {
     /// USDT that can actually be paid for redemptions: the buffer is ring-fenced,
     /// the rest of the reserve is usable once it exceeds the buffer.
     pub fn usable_reserve_micro(&self) -> u128 {
-        self.reserve_micro.saturating_sub(self.redemption_buffer_micro)
+        self.reserve_micro
+            .saturating_sub(self.redemption_buffer_micro)
     }
 
     /// Integer square root (Newton). Deterministic, panic-free.
@@ -383,7 +392,10 @@ mod tests {
         let before = pmm.price_micro_usd();
         // buy $1M -> supply grows, price rises above base
         pmm.buy_with_usdt(usdt(1_000_000)).unwrap();
-        assert!(pmm.price_micro_usd() > before, "price must rise after buying");
+        assert!(
+            pmm.price_micro_usd() > before,
+            "price must rise after buying"
+        );
         assert!(pmm.reserve_micro == usdt(1_000_000) as u128);
     }
 
@@ -396,7 +408,10 @@ mod tests {
         // impossible; redeem the maximum allowed and check it never profits.
         let max = pmm.max_redeemable_stell();
         assert!(max > 0, "some redemption must be possible");
-        assert!(max < r.stell_minted, "a full instant drain is blocked by the buffer");
+        assert!(
+            max < r.stell_minted,
+            "a full instant drain is blocked by the buffer"
+        );
         let sell = pmm.sell_stell(max).unwrap();
         assert!(sell.usdt_paid <= usdt(10_000), "redemption cannot profit");
         assert!(sell.usdt_paid > 0);
@@ -408,7 +423,10 @@ mod tests {
         // Buy to mint supply but a tiny reserve relative to a big sell.
         pmm.buy_with_usdt(usdt(100)).unwrap();
         // Try to sell far more than the PMM minted -> rejected.
-        assert_eq!(pmm.sell_stell(stell(1_000_000)), Err(PmmError::InsufficientReserve));
+        assert_eq!(
+            pmm.sell_stell(stell(1_000_000)),
+            Err(PmmError::InsufficientReserve)
+        );
     }
 
     #[test]
@@ -442,7 +460,10 @@ mod tests {
         let mut b = PrimaryMarketMaker::new();
         let r1 = a.buy_with_usdt(usdt(12_345)).unwrap();
         let r2 = b.buy_with_usdt(usdt(12_345)).unwrap();
-        assert_eq!(r1, r2, "same input must yield identical output (consensus determinism)");
+        assert_eq!(
+            r1, r2,
+            "same input must yield identical output (consensus determinism)"
+        );
     }
 
     #[test]
@@ -494,6 +515,9 @@ mod tests {
         let mut pmm = PrimaryMarketMaker::new();
         pmm.buy_with_buffer(usdt(1_000), u64::MAX).unwrap();
         assert!(pmm.redemption_buffer_micro <= pmm.reserve_micro);
-        assert_eq!(pmm.redemption_buffer_micro, pmm.reserve_micro, "clamped at 100%");
+        assert_eq!(
+            pmm.redemption_buffer_micro, pmm.reserve_micro,
+            "clamped at 100%"
+        );
     }
 }

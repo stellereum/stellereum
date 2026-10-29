@@ -1060,7 +1060,11 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600, "the atomic write must keep 0600, got {mode:o}");
         }
         // No temp file is left behind.
@@ -1089,14 +1093,20 @@ mod tests {
         let err = atomic_write_private(&target, b"NEW").expect_err("must fail");
         assert!(format!("{err:#}").contains("atomic replace"));
         // The target is still the directory it was — nothing was clobbered.
-        assert!(target.is_dir(), "the failed write must not clobber the target");
+        assert!(
+            target.is_dir(),
+            "the failed write must not clobber the target"
+        );
         // And no temp file is left in the directory.
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with(".target"))
             .collect();
-        assert!(leftovers.is_empty(), "a failed write must clean up its temp file");
+        assert!(
+            leftovers.is_empty(),
+            "a failed write must clean up its temp file"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1128,9 +1138,15 @@ mod tests {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::symlink_metadata(dir.join(f)).unwrap().permissions().mode()
+                let mode = std::fs::symlink_metadata(dir.join(f))
+                    .unwrap()
+                    .permissions()
+                    .mode()
                     & 0o777;
-                assert_eq!(mode, 0o600, "{f} must stay 0600 after the migration, got {mode:o}");
+                assert_eq!(
+                    mode, 0o600,
+                    "{f} must stay 0600 after the migration, got {mode:o}"
+                );
             }
             // No temp file survived the migration.
             let leftovers: Vec<_> = std::fs::read_dir(&dir)
@@ -1138,7 +1154,10 @@ mod tests {
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
                 .collect();
-            assert!(leftovers.is_empty(), "the migration left a temp file behind");
+            assert!(
+                leftovers.is_empty(),
+                "the migration left a temp file behind"
+            );
         }
 
         // And the migrated identity still loads.
@@ -1166,8 +1185,14 @@ mod tests {
         assert_ne!(salt_a, salt_b, "the KDF salt must be random per encryption");
         assert_eq!(salt_a.len(), 32, "the salt is 16 bytes, hex-encoded");
         // Both decrypt with the same passphrase.
-        assert_eq!(decrypt_bytes(a.as_bytes(), Some("same-passphrase")).unwrap(), secret);
-        assert_eq!(decrypt_bytes(b.as_bytes(), Some("same-passphrase")).unwrap(), secret);
+        assert_eq!(
+            decrypt_bytes(a.as_bytes(), Some("same-passphrase")).unwrap(),
+            secret
+        );
+        assert_eq!(
+            decrypt_bytes(b.as_bytes(), Some("same-passphrase")).unwrap(),
+            secret
+        );
     }
 
     /// A world-readable key file is REFUSED (fail-closed on the mode).

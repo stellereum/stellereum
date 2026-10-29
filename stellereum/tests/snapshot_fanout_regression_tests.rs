@@ -91,7 +91,10 @@ async fn weak_node_pulls_large_snapshot_serially_without_storm() {
     assert_eq!(chunk_batch_for_blob(n), 1, "large blobs must be serial");
     let (assembled, max) = assemble_blob(n, 5).await;
     assert_eq!(assembled, n, "every chunk arrives: convergence");
-    assert_eq!(max, 1, "serial assembly must never hold >1 chunk stream (max={max})");
+    assert_eq!(
+        max, 1,
+        "serial assembly must never hold >1 chunk stream (max={max})"
+    );
     assert!(max < 256, "stream ceiling respected");
 }
 
@@ -141,7 +144,10 @@ async fn overlapping_snapshot_pulls_share_the_narrow_lane() {
         "lane max {max} exceeds {} (storm)",
         SNAPSHOT_FETCH_MAX_CONCURRENCY
     );
-    assert!(max > 1, "test must actually exercise lane sharing (max={max})");
+    assert!(
+        max > 1,
+        "test must actually exercise lane sharing (max={max})"
+    );
 }
 
 /// The weak-node snapshot pull shape end to end: `fast_sync_state` over a
@@ -153,7 +159,9 @@ async fn weak_node_snapshot_pull_via_fast_sync_stays_sequential() {
 
     let source = InMemoryStateEngine::new();
     let user = [0x77u8; 32];
-    source.update_account(AccountState::new(user, 424_242)).await;
+    source
+        .update_account(AccountState::new(user, 424_242))
+        .await;
     let root = source.get_state_root().await;
     let snap = source.create_snapshot().await;
 
@@ -256,7 +264,10 @@ fn jitter_spreads_retries_without_breaking_bounds() {
         .iter()
         .map(|d| fetch_retry_backoff_with_jitter_ms(3, *d))
         .collect();
-    assert!(distinct.len() > 1, "jitter must spread same-attempt retries");
+    assert!(
+        distinct.len() > 1,
+        "jitter must spread same-attempt retries"
+    );
 }
 
 /// Retro-push pacing stays ~5ms with a small de-phasing draw: bursts spread

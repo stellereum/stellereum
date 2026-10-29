@@ -15,7 +15,7 @@
 
 use serde_json::json;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -80,7 +80,14 @@ pub fn set_level(l: u8) {
     LEVEL.store(l, Ordering::Relaxed);
 }
 
-pub fn emit(level: u8, level_s: &str, node: &str, trace: u64, event: &str, fields: serde_json::Value) {
+pub fn emit(
+    level: u8,
+    level_s: &str,
+    node: &str,
+    trace: u64,
+    event: &str,
+    fields: serde_json::Value,
+) {
     if level > LEVEL.load(Ordering::Relaxed) {
         return;
     }

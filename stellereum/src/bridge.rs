@@ -82,8 +82,7 @@ pub const CHALLENGE_BOND_BPS: u64 = 100;
 /// exactly). Capping the reward below the bond, or paying it to a governance
 /// pot instead of the finder, needs an economic decision.
 pub fn challenge_bond_for(amount: u64) -> u64 {
-    let scaled =
-        ((amount as u128 * CHALLENGE_BOND_BPS as u128) / 10_000) as u64;
+    let scaled = ((amount as u128 * CHALLENGE_BOND_BPS as u128) / 10_000) as u64;
     CHALLENGE_BOND_NANO.max(scaled)
 }
 
@@ -95,8 +94,7 @@ pub fn challenge_bond_for(amount: u64) -> u64 {
 /// out of the escrowed deposit: the reward is a redistribution of the
 /// clawed-back coins, never a mint.
 pub fn dispute_reward_for(amount: u64) -> u64 {
-    let scaled =
-        ((amount as u128 * DISPUTE_REWARD_BPS as u128) / 10_000) as u64;
+    let scaled = ((amount as u128 * DISPUTE_REWARD_BPS as u128) / 10_000) as u64;
     scaled.max(1).min(amount)
 }
 /// Dispute window: a challenged deposit confirms by evidence within this many
@@ -387,7 +385,9 @@ impl BridgeIntent {
     /// hand - the VM has neither.
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            BridgeIntent::Deposit { recipient, amount, .. } => {
+            BridgeIntent::Deposit {
+                recipient, amount, ..
+            } => {
                 if *amount == 0 {
                     return Err("bridge deposit amount must be positive".to_string());
                 }
@@ -672,7 +672,10 @@ impl TeleportBridgeEngine {
 
     /// Look up the registered model for a deposit's route (`None` = unknown
     /// route; the proof gate fails closed on `None`).
-    pub fn teleport_zk_model_for(&self, event: &TeleportDepositEvent) -> Option<&QuantizedLinearModel> {
+    pub fn teleport_zk_model_for(
+        &self,
+        event: &TeleportDepositEvent,
+    ) -> Option<&QuantizedLinearModel> {
         self.teleport_zk_models
             .get(&Self::teleport_route_id(event.source_chain, &event.asset))
     }
@@ -779,7 +782,10 @@ impl TeleportBridgeEngine {
     /// The signature count runs through [`verify_quorum_signatures`] - the
     /// same helper the adapter's quorum-attested evidence uses.
     pub fn process_deposit(&mut self, event: &TeleportDepositEvent) -> Result<u64, String> {
-        if self.processed_source_txs.contains_key(&event.source_tx_hash) {
+        if self
+            .processed_source_txs
+            .contains_key(&event.source_tx_hash)
+        {
             return Err("Duplicate teleport deposit tx".to_string());
         }
 
@@ -1274,8 +1280,8 @@ impl BridgeState {
         // Attestations first: a deposit may only claim signatures carried by
         // THIS payload, paired by source tx hash (several bundles for the same
         // hash merge, so a payload cannot be split into quorum halves).
-#[allow(clippy::type_complexity)]
-// GATE: attestation index maps tx-hash to (signer, sig) lists; the nested shape mirrors the payload.
+        #[allow(clippy::type_complexity)]
+        // GATE: attestation index maps tx-hash to (signer, sig) lists; the nested shape mirrors the payload.
         let mut attest: HashMap<[u8; 32], Vec<([u8; 32], Vec<u8>)>> = HashMap::new();
         for intent in intents {
             if let BridgeIntent::Attest {
@@ -1318,10 +1324,7 @@ impl BridgeState {
                     recipient,
                     ..
                 } => {
-                    let signatures = attest
-                        .get(source_tx_hash)
-                        .cloned()
-                        .unwrap_or_default();
+                    let signatures = attest.get(source_tx_hash).cloned().unwrap_or_default();
                     let event = intent
                         .deposit_event(signatures)
                         .expect("deposit_event on a Deposit always yields an event");
@@ -1446,7 +1449,10 @@ impl BridgeState {
                     let amount = engine
                         .refund_withdrawal(*req_id, payer, now)
                         .map_err(|e| format!("bridge refund rejected: {e}"))?;
-                    effects.push(BridgeEffect::Unpark { recipient: payer, amount });
+                    effects.push(BridgeEffect::Unpark {
+                        recipient: payer,
+                        amount,
+                    });
                 }
                 BridgeIntent::Challenge { source_tx_hash } => {
                     // Freeze a quorum-path deposit: claw its full amount back
@@ -1465,18 +1471,21 @@ impl BridgeState {
                     }
                     if record.disputed {
                         return Err(
-                            "bridge challenge rejected: hash already disputed (once, ever)".to_string(),
+                            "bridge challenge rejected: hash already disputed (once, ever)"
+                                .to_string(),
                         );
                     }
                     if now.saturating_sub(record.deposited_at) > CHALLENGE_MAX_AGE_SECS {
                         return Err(
-                            "bridge challenge rejected: deposit older than the challenge window".to_string(),
+                            "bridge challenge rejected: deposit older than the challenge window"
+                                .to_string(),
                         );
                     }
                     for d in disputes_map.values() {
                         if !d.resolved && d.source_tx_hash == *source_tx_hash {
                             return Err(
-                                "bridge challenge rejected: dispute already open for this hash".to_string(),
+                                "bridge challenge rejected: dispute already open for this hash"
+                                    .to_string(),
                             );
                         }
                     }
@@ -1505,9 +1514,7 @@ impl BridgeState {
                     // checks in settlement fail the whole tx if EITHER the
                     // challenger cannot cover the bond or the recipient
                     // already moved the funds — fail closed, never partial.
-                    effects.push(BridgeEffect::Park {
-                        amount: bond,
-                    });
+                    effects.push(BridgeEffect::Park { amount: bond });
                     effects.push(BridgeEffect::Clawback {
                         account: recipient,
                         amount,
@@ -1528,18 +1535,26 @@ impl BridgeState {
                     // An empty resolve past the deadline DEFERS (reschedules,
                     // bounded, no coin moves) and, past the bound, REFUSES
                     // LOUDLY with no payout - never pays on missing evidence.
-                    let dispute = disputes_map.get_mut(dispute_id).ok_or_else(|| {
-                        "bridge resolve rejected: unknown dispute".to_string()
-                    })?;
+                    let dispute = disputes_map
+                        .get_mut(dispute_id)
+                        .ok_or_else(|| "bridge resolve rejected: unknown dispute".to_string())?;
                     if dispute.resolved {
                         return Err(
-                            "bridge resolve rejected: dispute already resolved (terminal)".to_string(),
+                            "bridge resolve rejected: dispute already resolved (terminal)"
+                                .to_string(),
                         );
                     }
-                    let bundles = proof.get(&dispute.source_tx_hash).cloned().unwrap_or_default();
-                    let record = records_map.get(&dispute.source_tx_hash).cloned().ok_or_else(|| {
-                        "bridge resolve rejected: deposit record vanished (impossible)".to_string()
-                    })?;
+                    let bundles = proof
+                        .get(&dispute.source_tx_hash)
+                        .cloned()
+                        .unwrap_or_default();
+                    let record = records_map
+                        .get(&dispute.source_tx_hash)
+                        .cloned()
+                        .ok_or_else(|| {
+                            "bridge resolve rejected: deposit record vanished (impossible)"
+                                .to_string()
+                        })?;
                     let claim = bridge_adapters::DepositClaim {
                         chain: record.chain,
                         source_tx_hash: dispute.source_tx_hash,
@@ -1697,8 +1712,7 @@ impl BridgeState {
                                     .saturating_mul(1 + MAX_RESOLVE_DEFERRALS as u64),
                             );
                         if dispute.deadline.saturating_add(RESOLVE_DEFER_SECS) <= cap {
-                            dispute.deadline =
-                                dispute.deadline.saturating_add(RESOLVE_DEFER_SECS);
+                            dispute.deadline = dispute.deadline.saturating_add(RESOLVE_DEFER_SECS);
                             let msg = format!(
                                 "BRIDGE DISPUTE DEFER dispute={dispute_id} amount={} new_deadline={} reason=evidence-unconfirmed-past-deadline (rescheduled, no payout)",
                                 dispute.amount, dispute.deadline,
@@ -2176,7 +2190,10 @@ mod tests {
         let msg = TeleportBridgeEngine::deposit_signing_message(&ev);
         // same signer twice
         ev.validator_signatures = vec![sig(&a, &msg), sig(&a, &msg)];
-        assert!(engine.process_deposit(&ev).is_err(), "one signer must not reach quorum");
+        assert!(
+            engine.process_deposit(&ev).is_err(),
+            "one signer must not reach quorum"
+        );
 
         // two DISTINCT signers pass
         ev.validator_signatures = vec![sig(&a, &msg), sig(&b, &msg)];
@@ -2200,8 +2217,7 @@ mod tests {
         const BRIDGE: [usize; 8] = [1, 2, 2, 3, 4, 4, 5, 6];
         const CONSENSUS: [usize; 8] = [1, 2, 3, 3, 4, 5, 5, 6];
 
-        for (i, (&want_bridge, &want_consensus)) in
-            BRIDGE.iter().zip(CONSENSUS.iter()).enumerate()
+        for (i, (&want_bridge, &want_consensus)) in BRIDGE.iter().zip(CONSENSUS.iter()).enumerate()
         {
             let n = i + 1;
             assert_eq!(
@@ -2256,7 +2272,10 @@ mod tests {
         let msg = TeleportBridgeEngine::deposit_signing_message(&ev);
         ev.validator_signatures = vec![sig(&a, &msg), sig(&b, &msg)];
         assert!(engine.process_deposit(&ev).is_ok());
-        assert!(engine.process_deposit(&ev).is_err(), "replay must be rejected");
+        assert!(
+            engine.process_deposit(&ev).is_err(),
+            "replay must be rejected"
+        );
     }
 
     #[test]
@@ -2291,11 +2310,17 @@ mod tests {
         let op = [9u8; 32];
         let msg = b"release 100 STELL to TON";
         // duplicate signer -> only 1 distinct -> rejected
-        assert!(relayer.try_release(op, msg, &[sig(&keys[0], msg), sig(&keys[0], msg)]).is_err());
+        assert!(relayer
+            .try_release(op, msg, &[sig(&keys[0], msg), sig(&keys[0], msg)])
+            .is_err());
         // 2 distinct -> released
-        assert!(relayer.try_release(op, msg, &[sig(&keys[0], msg), sig(&keys[1], msg)]).is_ok());
+        assert!(relayer
+            .try_release(op, msg, &[sig(&keys[0], msg), sig(&keys[1], msg)])
+            .is_ok());
         // idempotent guard
-        assert!(relayer.try_release(op, msg, &[sig(&keys[0], msg), sig(&keys[1], msg)]).is_err());
+        assert!(relayer
+            .try_release(op, msg, &[sig(&keys[0], msg), sig(&keys[1], msg)])
+            .is_err());
     }
 
     #[test]
@@ -2305,19 +2330,27 @@ mod tests {
         // list would have released every operation.
         let mut empty = MultisigRelayer::new(vec![]);
         assert!(empty.threshold >= 1, "threshold must never be zero");
-        assert!(empty.try_release([1u8; 32], b"msg", &[]).is_err(), "no signers, no release");
+        assert!(
+            empty.try_release([1u8; 32], b"msg", &[]).is_err(),
+            "no signers, no release"
+        );
 
         // A single validator must still require that validator's signature.
         let k = SigningKey::generate(&mut OsRng);
         let mut one = MultisigRelayer::new(vec![k.verifying_key().to_bytes()]);
         let msg = b"release";
-        assert!(one.try_release([2u8; 32], msg, &[]).is_err(), "unsigned release must fail");
+        assert!(
+            one.try_release([2u8; 32], msg, &[]).is_err(),
+            "unsigned release must fail"
+        );
         assert!(one.try_release([2u8; 32], msg, &[sig(&k, msg)]).is_ok());
 
         // A signature from outside the relayer set does not count either.
         let outsider = SigningKey::generate(&mut OsRng);
         let mut one2 = MultisigRelayer::new(vec![k.verifying_key().to_bytes()]);
-        assert!(one2.try_release([3u8; 32], msg, &[sig(&outsider, msg)]).is_err());
+        assert!(one2
+            .try_release([3u8; 32], msg, &[sig(&outsider, msg)])
+            .is_err());
     }
 
     #[test]
@@ -2333,7 +2366,9 @@ mod tests {
         assert_eq!(e.total_minted, 100);
         assert_eq!(e.last_deposit_reset, 0);
         // Hourly breach (same window): refused, counters untouched.
-        assert!(e.note_deposit_mint(HOURLY_DEPOSIT_LIMIT_NANO, 1_001).is_err());
+        assert!(e
+            .note_deposit_mint(HOURLY_DEPOSIT_LIMIT_NANO, 1_001)
+            .is_err());
         assert_eq!(e.hourly_deposited, 100);
         assert_eq!(e.total_minted, 100);
         // Window rolls over on the block clock: same amount now fits.
@@ -2346,7 +2381,10 @@ mod tests {
         e.last_deposit_reset = 9_999_999;
         assert!(e.note_deposit_mint(50, 9_999_999).is_ok());
         assert_eq!(e.total_minted, BRIDGE_MINT_CAP_NANO);
-        assert!(e.note_deposit_mint(1, 9_999_999).is_err(), "at the cap, even 1 more mints nothing");
+        assert!(
+            e.note_deposit_mint(1, 9_999_999).is_err(),
+            "at the cap, even 1 more mints nothing"
+        );
         assert_eq!(e.total_minted, BRIDGE_MINT_CAP_NANO);
     }
 
@@ -2371,10 +2409,17 @@ mod tests {
         // Fraud-proven revoke: burn = d - reward, unwind by the burn only.
         let reward = dispute_reward_for(d);
         let burn = d.saturating_sub(reward);
-        assert!(burn < d, "a non-dust revoke always pays a reward, so burn < deposit");
+        assert!(
+            burn < d,
+            "a non-dust revoke always pays a reward, so burn < deposit"
+        );
         e.note_revoke(burn);
         assert_eq!(e.total_minted, BRIDGE_MINT_CAP_NANO - burn);
-        assert_eq!(e.hourly_deposited, d - burn, "hourly window unwinds by the burn only");
+        assert_eq!(
+            e.hourly_deposited,
+            d - burn,
+            "hourly window unwinds by the burn only"
+        );
         // The cycle: re-minting the SAME full deposit is refused — the cap
         // still binds because the finder reward stayed counted.
         assert!(
@@ -2399,7 +2444,13 @@ mod tests {
         let mut engine = TeleportBridgeEngine::new(vec![[1u8; 32]]);
         // A gigantic amount must be rejected by the rate limit, not wrap around.
         assert!(engine
-            .request_withdrawal([1u8; 32], SupportedChain::Arbitrum, "0x1".into(), u64::MAX, 0)
+            .request_withdrawal(
+                [1u8; 32],
+                SupportedChain::Arbitrum,
+                "0x1".into(),
+                u64::MAX,
+                0
+            )
             .is_err());
     }
 
@@ -2516,11 +2567,17 @@ mod tests {
     fn dispute_economics_scale_with_floor() {
         // C5: 1% of the disputed value, floored at 1 STELL.
         assert_eq!(challenge_bond_for(100 * 1_000_000_000), 1_000_000_000);
-        assert_eq!(challenge_bond_for(500_000 * 1_000_000_000), 5_000 * 1_000_000_000);
+        assert_eq!(
+            challenge_bond_for(500_000 * 1_000_000_000),
+            5_000 * 1_000_000_000
+        );
         assert_eq!(challenge_bond_for(1), CHALLENGE_BOND_NANO);
         assert_eq!(challenge_bond_for(0), CHALLENGE_BOND_NANO);
         // No overflow at the top of u64 (u128 math inside).
-        assert_eq!(challenge_bond_for(u64::MAX), CHALLENGE_BOND_NANO.max(((u64::MAX as u128 * 100) / 10_000) as u64));
+        assert_eq!(
+            challenge_bond_for(u64::MAX),
+            CHALLENGE_BOND_NANO.max(((u64::MAX as u128 * 100) / 10_000) as u64)
+        );
         // C9: 10% reward, dust floor of 1 nano, never above the amount.
         assert_eq!(dispute_reward_for(100 * 1_000_000_000), 10 * 1_000_000_000);
         assert_eq!(dispute_reward_for(5), 1);

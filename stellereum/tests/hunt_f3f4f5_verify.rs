@@ -25,8 +25,8 @@ use std::sync::Arc;
 use stellereum::consensus::{ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
-use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::staking::MIN_VALIDATOR_BOND;
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::sync::{collect_missing_blocks, validate_sync_chain, walked_head_anchor};
 
 // ---------------------------------------------------------------------------
@@ -256,22 +256,17 @@ async fn f4_fixed_no_path_slashes_on_local_equivocation_evidence() {
     assert_eq!(nodes[1].try_finalize().await, Some(bh));
     let burn0 = nodes[0].state.staking_read().await.total_burned - burn0_before;
     let burn1 = nodes[1].state.staking_read().await.total_burned - burn1_before;
-    let s0 = nodes[0].state.staking_read().await.validators
-        [&ks[3].verifying_key().to_bytes()]
-    .self_bond;
-    let s1 = nodes[1].state.staking_read().await.validators
-        [&ks[3].verifying_key().to_bytes()]
-    .self_bond;
+    let s0 =
+        nodes[0].state.staking_read().await.validators[&ks[3].verifying_key().to_bytes()].self_bond;
+    let s1 =
+        nodes[1].state.staking_read().await.validators[&ks[3].verifying_key().to_bytes()].self_bond;
     let r0 = nodes[0].state.get_state_root().await;
     let r1 = nodes[1].state.get_state_root().await;
 
     assert_eq!(burn0, 0, "F4: local evidence must not slash on finalize");
     assert_eq!(burn1, 0, "F4: no-evidence path burns nothing");
     assert_eq!(s0, s1, "F4: both nodes agree on the double-voter's bond");
-    assert_eq!(
-        r0, r1,
-        "F4: same block => same root regardless of gossip"
-    );
+    assert_eq!(r0, r1, "F4: same block => same root regardless of gossip");
     println!("[F4 FIXED] burn 0/0, roots agree {}", hex::encode(&r0[..8]));
 }
 

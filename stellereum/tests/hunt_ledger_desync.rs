@@ -18,10 +18,11 @@
 //! This is the "two balance representations reconciled with a bad write-back"
 //! shape of the August 2026 Cosmos EVM account/balance incident.
 
-use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::staking::{
-    StakingLedger, DOWNTIME_MISS_THRESHOLD, DOWNTIME_PENALTY_COOLDOWN, MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER,
+    StakingLedger, DOWNTIME_MISS_THRESHOLD, DOWNTIME_PENALTY_COOLDOWN, MIN_VALIDATOR_BOND,
+    STELL_MIN_BOND_BUFFER,
 };
+use stellereum::state_engine::InMemoryStateEngine;
 
 const NANO: u64 = 1_000_000_000;
 
@@ -68,7 +69,8 @@ fn downtime_slash_decrements_the_aggregate_but_not_the_per_delegator_map() {
     let v = [0x01; 32];
     let d = [0xD1; 32];
 
-    l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0).unwrap();
+    l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
+        .unwrap();
     let delegated = 100 * NANO; // 100 STELL delegated
     l.delegate(d, v, delegated).unwrap();
 
@@ -85,7 +87,10 @@ fn downtime_slash_decrements_the_aggregate_but_not_the_per_delegator_map() {
     println!("  sum(delegations)       = {per}");
     println!("  self_bond              = {}", l.validators[&v].self_bond);
     println!("  total_burned (global)  = {}", l.total_burned);
-    println!("  validators[.total_slashed] = {}", l.validators[&v].total_slashed);
+    println!(
+        "  validators[.total_slashed] = {}",
+        l.validators[&v].total_slashed
+    );
 
     // FIXED: this used to assert the two representations DISAGREE. The downtime
     // slash decremented `ValidatorStake.delegated` without touching
@@ -110,7 +115,8 @@ fn downtime_slash_decrements_the_aggregate_but_not_the_per_delegator_map() {
 fn total_burned_ignores_every_downtime_slash() {
     let mut l = StakingLedger::new();
     let v = [0x02; 32];
-    l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0).unwrap();
+    l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
+        .unwrap();
 
     let never = |_: &[u8; 32]| false;
     let one = vec![v];
@@ -119,7 +125,10 @@ fn total_burned_ignores_every_downtime_slash() {
         returned += l.note_missed_heights(height, &never, &one);
     }
     println!("downtime slash burned    = {returned}");
-    println!("validators[.total_slashed] = {}", l.validators[&v].total_slashed);
+    println!(
+        "validators[.total_slashed] = {}",
+        l.validators[&v].total_slashed
+    );
     println!("ledger.total_burned      = {}", l.total_burned);
     assert!(returned > 0, "the slash did burn something");
     assert_eq!(
@@ -146,7 +155,8 @@ fn desync_inflates_delegator_rewards() {
     let v = [0x03; 32];
     let d = [0xD3; 32];
 
-    l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0).unwrap();
+    l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
+        .unwrap();
     let delegated = 100 * NANO; // 100 STELL
     l.delegate(d, v, delegated).unwrap();
 
@@ -200,17 +210,24 @@ async fn inflated_rewards_become_spendable_native_stell() {
     let delegator_addr = delegator.verifying_key().to_bytes();
 
     // Fund the staking pool so the setup is realistic.
-    engine.credit_native(&stellereum::staking::STAKING_POOL, 10_000_000 * NANO).await.unwrap();
+    engine
+        .credit_native(&stellereum::staking::STAKING_POOL, 10_000_000 * NANO)
+        .await
+        .unwrap();
 
     {
         let mut l = engine.staking_write().await;
-        l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0).unwrap();
+        l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
+            .unwrap();
         let delegated = 100 * NANO;
         l.delegate(delegator_addr, v, delegated).unwrap();
         let burned = grind_delegated_to_zero(&mut l, v, 200_000_000);
         println!("downtime burned from the pool = {burned}");
-        println!("delegated_agg = {}, delegations_map = {}",
-            l.validators[&v].delegated, sum_delegations(&l, v));
+        println!(
+            "delegated_agg = {}, delegations_map = {}",
+            l.validators[&v].delegated,
+            sum_delegations(&l, v)
+        );
     }
 
     let key = SigningKey::generate(&mut OsRng);
@@ -218,11 +235,18 @@ async fn inflated_rewards_become_spendable_native_stell() {
     rt = rt.with_block_reward(1_000_000_000);
 
     // The delegator starts with NOTHING.
-    let start_bal = engine.get_account(&delegator_addr).await.map(|a| a.balance).unwrap_or(0);
+    let start_bal = engine
+        .get_account(&delegator_addr)
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0);
     assert_eq!(start_bal, 0, "the delegator starts empty");
 
     // A block is finalised and the proposer (validator `v`) earns a reward.
-    rt.staking_write().await.distribute_reward(v, 1_000_000_000).unwrap();
+    rt.staking_write()
+        .await
+        .distribute_reward(v, 1_000_000_000)
+        .unwrap();
     engine
         .credit_native(&stellereum::staking::REWARDS_POOL, 1_000_000_000)
         .await
@@ -231,7 +255,11 @@ async fn inflated_rewards_become_spendable_native_stell() {
     // The delegator claims. `stake_claim_delegator_rewards` calls
     // `credit_native` -- there is no debit of any pool anywhere on this path.
     let claimed = rt.stake_claim_delegator_rewards(delegator_addr, v).await;
-    let end_bal = engine.get_account(&delegator_addr).await.map(|a| a.balance).unwrap_or(0);
+    let end_bal = engine
+        .get_account(&delegator_addr)
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0);
 
     println!("block reward      = 1000000000");
     println!("claimed           = {claimed}");
@@ -249,15 +277,10 @@ async fn inflated_rewards_become_spendable_native_stell() {
     assert!(end_bal > start_bal, "the delegator ends up with real STELL");
     // And the STELL is spendable: it can be moved by an ordinary transaction.
     engine
-        .apply_transaction(&Transaction::sign(
-            &delegator,
-            [0xAB; 32],
-            end_bal,
+        .apply_transaction(
+            &Transaction::sign(&delegator, [0xAB; 32], end_bal, 0, 0, 0, 1),
             0,
-            0,
-            0,
-            1,
-        ), 0)
+        )
         .await
         .expect("the inflated balance must be spendable");
     println!("ATTACKER GOAL MET: {end_bal} nano-STELL of unbacked value is spendable");

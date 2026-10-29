@@ -17,11 +17,11 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::sync::Arc;
 use stellereum::consensus::ValidatorSet;
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
-use std::sync::Arc;
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
@@ -78,11 +78,18 @@ async fn proposal_phase_align_accepts_next_round_and_votes() {
     // so search forward (P(miss in 64 tries) ~ 2^-64).
     let mut tries = 0;
     while !(rt.hc.proposer().unwrap() == id(&us)
-        && rt.validators.proposer_for(rt.hc.height, rt.hc.round + 1).unwrap() == id(&peer))
+        && rt
+            .validators
+            .proposer_for(rt.hc.height, rt.hc.round + 1)
+            .unwrap()
+            == id(&peer))
     {
         rt.hc.next_round();
         tries += 1;
-        assert!(tries < 64, "schedule must hand us a round followed by the peer's");
+        assert!(
+            tries < 64,
+            "schedule must hand us a round followed by the peer's"
+        );
     }
     let r = rt.hc.round;
     assert_ne!(rt.hc.proposer().unwrap(), id(&peer));
@@ -90,9 +97,16 @@ async fn proposal_phase_align_accepts_next_round_and_votes() {
     let block = genuine_block(&rt, &peer).await;
     let bh = block.compute_hash();
     let res = rt.on_proposal(id(&peer), block, r + 1).await;
-    assert!(res.is_ok(), "genuine next-round proposal must align, not reject: {res:?}");
+    assert!(
+        res.is_ok(),
+        "genuine next-round proposal must align, not reject: {res:?}"
+    );
     assert_eq!(res.unwrap(), bh);
-    assert_eq!(rt.hc.round, r + 1, "must have phase-aligned to the peer's round");
+    assert_eq!(
+        rt.hc.round,
+        r + 1,
+        "must have phase-aligned to the peer's round"
+    );
     assert!(rt.hc.proposal.is_some(), "proposal must be held for voting");
 
     // And the whole point: the follower now VOTES instead of chasing.
@@ -182,7 +196,10 @@ async fn far_vote_syncs_despite_live_proposal() {
         r + budget_cap,
         "one verified far vote converges within the per-round jump budget"
     );
-    assert!(rt.hc.proposal.is_none(), "dead proposal must be dropped on a far jump");
+    assert!(
+        rt.hc.proposal.is_none(),
+        "dead proposal must be dropped on a far jump"
+    );
     // The budget is spent: a further far vote moves nothing until our own
     // view change refills it (this is the round-DoS bound).
     assert!(!rt.note_peer_vote_round(rt.hc.height, r + 200));
@@ -226,8 +243,20 @@ async fn forged_proposal_never_moves_round() {
 async fn lock_on(rt: &mut ValidatorRuntime, us: &SigningKey, peer: &SigningKey, bh: [u8; 32]) {
     let h = rt.hc.height;
     let r = rt.hc.round;
-    let mine = stellereum::consensus::Vote::sign(us, h, r, stellereum::consensus::VoteKind::Prevote, Some(bh));
-    let theirs = stellereum::consensus::Vote::sign(peer, h, r, stellereum::consensus::VoteKind::Prevote, Some(bh));
+    let mine = stellereum::consensus::Vote::sign(
+        us,
+        h,
+        r,
+        stellereum::consensus::VoteKind::Prevote,
+        Some(bh),
+    );
+    let theirs = stellereum::consensus::Vote::sign(
+        peer,
+        h,
+        r,
+        stellereum::consensus::VoteKind::Prevote,
+        Some(bh),
+    );
     rt.on_prevote(mine).unwrap();
     rt.on_prevote(theirs).unwrap();
     let qc = rt.hc.try_prevote_quorum();
@@ -237,7 +266,11 @@ async fn lock_on(rt: &mut ValidatorRuntime, us: &SigningKey, peer: &SigningKey, 
     // Production records the node's own precommit via on_precommit right
     // after make_precommit (main loop); mirror that here.
     rt.on_precommit(pc.unwrap()).unwrap();
-    assert_eq!(rt.hc.locked.map(|(b, _)| b), Some(bh), "must lock on precommit");
+    assert_eq!(
+        rt.hc.locked.map(|(b, _)| b),
+        Some(bh),
+        "must lock on precommit"
+    );
 }
 
 #[tokio::test]
@@ -257,7 +290,10 @@ async fn locked_proposer_reproposes_locked_value() {
     while rt.hc.proposer().unwrap() != id(&us) {
         rt.hc.next_round();
     }
-    let again = rt.propose(1).await.expect("locked proposer must still propose");
+    let again = rt
+        .propose(1)
+        .await
+        .expect("locked proposer must still propose");
     assert_eq!(
         again.compute_hash(),
         xh,
@@ -268,7 +304,9 @@ async fn locked_proposer_reproposes_locked_value() {
     // unlocked peer votes X too, QC forms, finalize).
     rt.hc.proposal = None;
     let er = rt.hc.round;
-    rt.on_proposal(id(&us), again, er).await.expect("own re-proposal must be accepted");
+    rt.on_proposal(id(&us), again, er)
+        .await
+        .expect("own re-proposal must be accepted");
     let v = rt.make_prevote().expect("must vote");
     assert_eq!(v.block_hash, Some(xh), "locked node votes its locked value");
 }
@@ -291,12 +329,21 @@ async fn polka_for_other_value_at_higher_round_unlocks() {
     assert_eq!(rt.hc.round, r + 1);
     let h = rt.hc.height;
     for k in [&us, &peer] {
-        let v = stellereum::consensus::Vote::sign(k, h, r + 1, stellereum::consensus::VoteKind::Prevote, Some(yh));
+        let v = stellereum::consensus::Vote::sign(
+            k,
+            h,
+            r + 1,
+            stellereum::consensus::VoteKind::Prevote,
+            Some(yh),
+        );
         rt.on_prevote(v).unwrap();
     }
     let qc = rt.hc.try_prevote_quorum();
     assert_eq!(qc, Some(Some(yh)));
-    assert!(rt.hc.locked.is_none(), "higher-round polka for another value must unlock");
+    assert!(
+        rt.hc.locked.is_none(),
+        "higher-round polka for another value must unlock"
+    );
 
     // A quorum for NIL at a higher round must NOT unlock (audit F-01).
     //
@@ -314,7 +361,13 @@ async fn polka_for_other_value_at_higher_round_unlocks() {
     let h = rt.hc.height;
     let r2 = rt.hc.round;
     for k in [&us, &peer] {
-        let v = stellereum::consensus::Vote::sign(k, h, r2, stellereum::consensus::VoteKind::Prevote, None);
+        let v = stellereum::consensus::Vote::sign(
+            k,
+            h,
+            r2,
+            stellereum::consensus::VoteKind::Prevote,
+            None,
+        );
         rt.on_prevote(v).unwrap();
     }
     assert_eq!(rt.hc.try_prevote_quorum(), Some(None));
@@ -330,11 +383,20 @@ async fn polka_for_other_value_at_higher_round_unlocks() {
     let h = rt.hc.height;
     let r3 = rt.hc.round;
     for k in [&us, &peer] {
-        let v = stellereum::consensus::Vote::sign(k, h, r3, stellereum::consensus::VoteKind::Prevote, Some(xh));
+        let v = stellereum::consensus::Vote::sign(
+            k,
+            h,
+            r3,
+            stellereum::consensus::VoteKind::Prevote,
+            Some(xh),
+        );
         rt.on_prevote(v).unwrap();
     }
     assert_eq!(rt.hc.try_prevote_quorum(), Some(Some(xh)));
-    assert!(rt.hc.locked.is_some(), "polka for our own value must keep the lock");
+    assert!(
+        rt.hc.locked.is_some(),
+        "polka for our own value must keep the lock"
+    );
 }
 
 // ===========================================================================
@@ -348,13 +410,21 @@ async fn polka_for_other_value_at_higher_round_unlocks() {
 #[tokio::test]
 async fn stale_envelope_is_rejected_but_timely_aligns() {
     let (mut rt, _us, peer) = two_node().await;
-    while rt.validators.proposer_for(rt.hc.height, rt.hc.round).unwrap() != id(&peer) {
+    while rt
+        .validators
+        .proposer_for(rt.hc.height, rt.hc.round)
+        .unwrap()
+        != id(&peer)
+    {
         rt.hc.next_round();
     }
     let r = rt.hc.round;
     // Timely envelope for our round: accepted.
     let er = rt.hc.round;
-    assert!(rt.on_proposal(id(&peer), genuine_block(&rt, &peer).await, er).await.is_ok());
+    assert!(rt
+        .on_proposal(id(&peer), genuine_block(&rt, &peer).await, er)
+        .await
+        .is_ok());
     assert!(rt.hc.has_live_proposal());
 
     // Same genuine body re-presented with an OLD envelope (delayed duplicate):
@@ -365,13 +435,19 @@ async fn stale_envelope_is_rejected_but_timely_aligns() {
         .on_proposal(id(&peer), genuine_block(&rt, &peer).await, r)
         .await
         .expect_err("stale envelope must be rejected");
-    assert!(err.contains("stale round"), "must name the reason, got: {err}");
+    assert!(
+        err.contains("stale round"),
+        "must name the reason, got: {err}"
+    );
     assert!(!rt.hc.has_live_proposal(), "round advanced, nothing live");
 
     // Liveness gate still retires nothing early: timely accept, then a FAR
     // vote still syncs (stale holds never pin).
     let er = rt.hc.round;
-    assert!(rt.on_proposal(id(&peer), genuine_block(&rt, &peer).await, er).await.is_ok());
+    assert!(rt
+        .on_proposal(id(&peer), genuine_block(&rt, &peer).await, er)
+        .await
+        .is_ok());
     assert!(rt.note_peer_vote_round(rt.hc.height, r + 100));
 }
 
@@ -411,11 +487,14 @@ async fn lock_hint_rescue_converges() {
     let xh = x.compute_hash();
     let era = a.hc.round;
     let ea = a.hc.round;
-    a.on_proposal(bid, x, ea).await.expect("A accepts B's block");
+    a.on_proposal(bid, x, ea)
+        .await
+        .expect("A accepts B's block");
     assert!(a.hc.round >= era, "A aligns forward to the proposal");
     let ra = a.hc.round;
     for k in [&ks[0], &ks[1]] {
-        a.on_prevote(Vote::sign(k, 1, ra, VoteKind::Prevote, Some(xh))).unwrap();
+        a.on_prevote(Vote::sign(k, 1, ra, VoteKind::Prevote, Some(xh)))
+            .unwrap();
     }
     assert_eq!(a.hc.try_prevote_quorum(), Some(Some(xh)));
     assert!(a.make_precommit().is_some());
@@ -435,7 +514,9 @@ async fn lock_hint_rescue_converges() {
         a.hc.next_round();
     }
     let ea2 = a.hc.round;
-    a.on_proposal(bid, y, ea2).await.expect("A accepts Y structurally");
+    a.on_proposal(bid, y, ea2)
+        .await
+        .expect("A accepts Y structurally");
     let nil = a.make_prevote().expect("A votes");
     assert_eq!(nil.block_hash, None, "locked A nils the fresh block");
 
@@ -453,9 +534,15 @@ async fn lock_hint_rescue_converges() {
         a.hc.next_round();
     }
     let ea3 = a.hc.round;
-    a.on_proposal(bid, rescue, ea3).await.expect("A accepts re-proposal");
+    a.on_proposal(bid, rescue, ea3)
+        .await
+        .expect("A accepts re-proposal");
     let v = a.make_prevote().expect("A votes");
-    assert_eq!(v.block_hash, Some(xh), "locked A votes the re-proposed lock");
+    assert_eq!(
+        v.block_hash,
+        Some(xh),
+        "locked A votes the re-proposed lock"
+    );
 }
 
 #[tokio::test]
@@ -480,7 +567,7 @@ async fn lock_hint_ignores_foreign_and_missing_bodies() {
     // Demands for OUR body are kept; the rest never-generic.
     rt.note_lock_hint(rt.hc.height, VoteKind::Prevote, None, Some(mh));
     rt.note_lock_hint(rt.hc.height, VoteKind::Prevote, None, Some(mh)); // dedup
-    // Wrong height / block-vote / precommit hints: ignored.
+                                                                        // Wrong height / block-vote / precommit hints: ignored.
     rt.note_lock_hint(rt.hc.height + 1, VoteKind::Prevote, None, Some(mh));
     rt.note_lock_hint(rt.hc.height, VoteKind::Prevote, Some(mh), Some(mh));
     rt.note_lock_hint(rt.hc.height, VoteKind::Precommit, None, Some(mh));
@@ -490,7 +577,11 @@ async fn lock_hint_ignores_foreign_and_missing_bodies() {
         rt.hc.next_round();
     }
     let served = rt.propose(1).await.expect("must propose");
-    assert_eq!(served.compute_hash(), mh, "serves our demanded body verbatim");
+    assert_eq!(
+        served.compute_hash(),
+        mh,
+        "serves our demanded body verbatim"
+    );
 }
 
 // ===========================================================================
@@ -624,8 +715,15 @@ async fn batch_vote_then_proposal_accepts_and_hints_recorded() {
     let r = rt.hc.round;
     let peer_nil = Vote::sign(&ks[1], h, r, VoteKind::Prevote, None);
     let bytes = ConsensusMsg::batch_encode(&[
-        ConsensusMsg::Vote { vote: peer_nil, locked: Some(ours_h) },
-        ConsensusMsg::Proposal { height: h, round: r, block: peer_block },
+        ConsensusMsg::Vote {
+            vote: peer_nil,
+            locked: Some(ours_h),
+        },
+        ConsensusMsg::Proposal {
+            height: h,
+            round: r,
+            block: peer_block,
+        },
     ])
     .unwrap();
     let decoded = ConsensusMsg::decode(&bytes).unwrap();
@@ -650,13 +748,20 @@ async fn batch_vote_then_proposal_accepts_and_hints_recorded() {
             ConsensusMsg::Committed { .. } => {}
         }
     }
-    assert!(accepted, "vote-then-proposal batch must accept the proposal");
+    assert!(
+        accepted,
+        "vote-then-proposal batch must accept the proposal"
+    );
     // And the batched nil hint was recorded as demand for OUR body.
     while rt.hc.proposer().unwrap() != aid {
         rt.hc.next_round();
     }
     let served = rt.propose(1).await.expect("must serve the demand");
-    assert_eq!(served.compute_hash(), ours_h, "batched nil hint must be recorded");
+    assert_eq!(
+        served.compute_hash(),
+        ours_h,
+        "batched nil hint must be recorded"
+    );
 }
 
 // ===========================================================================

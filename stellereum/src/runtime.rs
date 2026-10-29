@@ -8,7 +8,6 @@
 use crate::consensus::{
     FalconKeypair, Height, HeightConsensus, Round, Step, ValidatorId, ValidatorSet, Vote, VoteKind,
 };
-use futures::FutureExt as _;
 use crate::mempool::Mempool;
 use crate::sharding::{
     Block, CrossShardKey, CrossShardMessage, MasterStakingLedger, ShardId, ShardRegistry,
@@ -16,6 +15,7 @@ use crate::sharding::{
 };
 use crate::state_engine::InMemoryStateEngine;
 use ed25519_dalek::{Signer as _, SigningKey};
+use futures::FutureExt as _;
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -119,11 +119,7 @@ pub const DKG_REPUBLISH_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// balance. The validator set is a `BTreeMap` (sorted), so every node with the
 /// same config credits the same accounts in the same order and derives an
 /// identical genesis state root.
-pub async fn fund_genesis(
-    engine: &InMemoryStateEngine,
-    validators: &ValidatorSet,
-    balance: u64,
-) {
+pub async fn fund_genesis(engine: &InMemoryStateEngine, validators: &ValidatorSet, balance: u64) {
     for v in validators.validators.keys() {
         engine
             .update_account(crate::state_engine::AccountState::new(*v, balance))
@@ -164,7 +160,9 @@ pub async fn fund_genesis(
             // so genesis stake is fully backed and STAKING_POOL is solvent.
             if std::env::var("STELL_LEGACY_GENESIS_ROOT").as_deref() != Ok("1") {
                 let _ = engine.debit_native(v, bond).await;
-                let _ = engine.credit_native(&crate::staking::STAKING_POOL, bond).await;
+                let _ = engine
+                    .credit_native(&crate::staking::STAKING_POOL, bond)
+                    .await;
             }
         }
     }
@@ -186,11 +184,7 @@ pub const GENESIS_VALIDATOR_BOND: u64 = crate::staking::MIN_VALIDATOR_BOND;
 /// config-defined validator set and both shards agree on one P2P namespace and
 /// one validator schedule. Only the dev account may move value on that shard in
 /// M1; cross-shard value flow is a later milestone.
-pub async fn fund_shard_genesis(
-    engine: &InMemoryStateEngine,
-    dev_account: [u8; 32],
-    balance: u64,
-) {
+pub async fn fund_shard_genesis(engine: &InMemoryStateEngine, dev_account: [u8; 32], balance: u64) {
     engine
         .update_account(crate::state_engine::AccountState::new(dev_account, balance))
         .await;
@@ -341,10 +335,7 @@ fn block_actor_sends_exceed_cap(block: &Block) -> bool {
 struct ApplyJob {
     block: Block,
     reward: u64,
-    done: tokio::sync::oneshot::Sender<(
-        crate::state_engine::BlockTransitionOutcome,
-        [u8; 32],
-    )>,
+    done: tokio::sync::oneshot::Sender<(crate::state_engine::BlockTransitionOutcome, [u8; 32])>,
 }
 
 /// A quiescent state capture: every root-committed domain cloned at a FIFO
@@ -409,35 +400,36 @@ impl ApplyLane {
             while let Some(job) = rx.recv().await {
                 match job {
                     LaneJob::Apply(job) => {
-                // Panic guard (audit follow-up): a DETERMINISTIC panic (same
-                // block bytes => same panic on every node) bricks finality
-                // identically everywhere across restarts. Never synthesize an
-                // outcome and never advance past an unapplied block — park
-                // LOUDLY (the Closed branch below already parks on worker
-                // death; this covers the panic itself). No outcome is
-                // reported, so `try_poll_apply` sees Closed and parks.
-                let outcome = std::panic::AssertUnwindSafe(async {
-                    let outcome = state.apply_block_transition(&job.block, job.reward).await;
-                    // Captured HERE, on the worker, so the submitter learns the
-                    // certified post-H root without recomputing the commitment a
-                    // second time on the tick.
-                    let root = state.get_state_root().await;
-                    (outcome, root)
-                });
-                let result = outcome.catch_unwind().await;
-                match result {
-                    Ok((outcome, root)) => {
-                        let _ = job.done.send((outcome, root));
-                    }
-                    Err(_) => {
-                        tracing::error!(
+                        // Panic guard (audit follow-up): a DETERMINISTIC panic (same
+                        // block bytes => same panic on every node) bricks finality
+                        // identically everywhere across restarts. Never synthesize an
+                        // outcome and never advance past an unapplied block — park
+                        // LOUDLY (the Closed branch below already parks on worker
+                        // death; this covers the panic itself). No outcome is
+                        // reported, so `try_poll_apply` sees Closed and parks.
+                        let outcome = std::panic::AssertUnwindSafe(async {
+                            let outcome =
+                                state.apply_block_transition(&job.block, job.reward).await;
+                            // Captured HERE, on the worker, so the submitter learns the
+                            // certified post-H root without recomputing the commitment a
+                            // second time on the tick.
+                            let root = state.get_state_root().await;
+                            (outcome, root)
+                        });
+                        let result = outcome.catch_unwind().await;
+                        match result {
+                            Ok((outcome, root)) => {
+                                let _ = job.done.send((outcome, root));
+                            }
+                            Err(_) => {
+                                tracing::error!(
                             height = job.block.height,
                             "apply worker PANICKED — parking height, never advancing past an unapplied block"
                         );
-                        // `done` is dropped unsent: `try_recv` sees Closed and
-                        // parks (fail-closed, same as worker death).
-                    }
-                }
+                                // `done` is dropped unsent: `try_recv` sees Closed and
+                                // parks (fail-closed, same as worker death).
+                            }
+                        }
                     }
                     LaneJob::Snapshot(job) => {
                         // Quiescent capture (audit 2026-10-06, chain-down
@@ -464,13 +456,11 @@ impl ApplyLane {
                         // cloning, where the worker could slip an apply
                         // between the separate clone calls. Read locks only;
                         // uncontended (nothing else mutates mid-capture).
-                        let accounts =
-                            crate::storage::clone_account_snapshot(&state).await;
+                        let accounts = crate::storage::clone_account_snapshot(&state).await;
                         let ledger = state.staking_read().await.clone();
                         let gov = state.governance_read().await.clone();
                         let domains =
-                            crate::storage::DomainSnapshot::capture(&state, &ledger, &gov)
-                                .await;
+                            crate::storage::DomainSnapshot::capture(&state, &ledger, &gov).await;
                         let session_keys = state.session_keys_snapshot().await;
                         let bridge = state.bridge_snapshot().await;
                         let confidential = state.confidential_snapshot().await;
@@ -500,10 +490,7 @@ struct ApplyInflight {
     height: Height,
     hash: BlockHash,
     block: Block,
-    done: tokio::sync::oneshot::Receiver<(
-        crate::state_engine::BlockTransitionOutcome,
-        [u8; 32],
-    )>,
+    done: tokio::sync::oneshot::Receiver<(crate::state_engine::BlockTransitionOutcome, [u8; 32])>,
 }
 
 /// What the worker reported back once its outcome is installed: the executed
@@ -1129,10 +1116,7 @@ impl ValidatorRuntime {
     /// Attach the node-local cross-shard transport (shared with the process's
     /// other shard runtimes). Without one, a sharded runtime produces and
     /// consumes no cross-shard messages.
-    pub fn with_cross_shard(
-        mut self,
-        transport: Arc<crate::network::CrossShardTransport>,
-    ) -> Self {
+    pub fn with_cross_shard(mut self, transport: Arc<crate::network::CrossShardTransport>) -> Self {
         self.cross_shard = Some(transport);
         self
     }
@@ -1320,9 +1304,7 @@ impl ValidatorRuntime {
         }
         match crate::light_client::LightClient::new(vs, cp) {
             Ok(fresh) => {
-                tracing::warn!(
-                    "[light-client] rebuilt the anchor at snapshot boundary {boundary}"
-                );
+                tracing::warn!("[light-client] rebuilt the anchor at snapshot boundary {boundary}");
                 self.light = Some(fresh);
             }
             Err(e) => {
@@ -1472,10 +1454,7 @@ impl ValidatorRuntime {
     /// both "forged" and "not finalized here yet" — callers treat it as
     /// not-ready (skip/refuse + retry after catching up), never as verified.
     pub fn verify_cross_shard_anchored(&self, msg: &CrossShardMessage) -> bool {
-        let guard = self
-            .finalized_headers
-            .as_ref()
-            .and_then(|r| r.read().ok());
+        let guard = self.finalized_headers.as_ref().and_then(|r| r.read().ok());
         let Some(reg) = guard.as_deref() else {
             return false;
         };
@@ -1556,7 +1535,10 @@ impl ValidatorRuntime {
                 return false;
             }
             return msg.verify_xpc_anchored(
-                self.finalized_headers.as_ref().and_then(|r| r.read().ok()).as_deref(),
+                self.finalized_headers
+                    .as_ref()
+                    .and_then(|r| r.read().ok())
+                    .as_deref(),
                 &[XpcPhase::Prepared],
             );
         }
@@ -1595,7 +1577,13 @@ impl ValidatorRuntime {
         if msg.source_state_root != block.state_root {
             return false;
         }
-        msg.verify_xpc_anchored(self.finalized_headers.as_ref().and_then(|r| r.read().ok()).as_deref(), &[phase])
+        msg.verify_xpc_anchored(
+            self.finalized_headers
+                .as_ref()
+                .and_then(|r| r.read().ok())
+                .as_deref(),
+            &[phase],
+        )
     }
 
     /// §5 M3: linkage rule for ack/bounce control records, checked at a given
@@ -1684,10 +1672,7 @@ impl ValidatorRuntime {
     pub fn xpc_admissible(&self, msg: &CrossShardMessage) -> bool {
         use crate::sharding::CrossShardKind;
         use crate::xshard2pc::XpcPhase;
-        let guard = self
-            .finalized_headers
-            .as_ref()
-            .and_then(|r| r.read().ok());
+        let guard = self.finalized_headers.as_ref().and_then(|r| r.read().ok());
         let Some(reg) = guard.as_deref() else {
             // No anchor registry: fail closed (the C1 rule).
             return false;
@@ -1700,15 +1685,11 @@ impl ValidatorRuntime {
                 msg.verify_anchored(Some(reg))
                     || msg.verify_xpc_anchored(Some(reg), &[XpcPhase::Prepared])
             }
-            CrossShardKind::PrepareAck => {
-                msg.verify_xpc_anchored(Some(reg), &[XpcPhase::Prepared])
-            }
+            CrossShardKind::PrepareAck => msg.verify_xpc_anchored(Some(reg), &[XpcPhase::Prepared]),
             CrossShardKind::Commit | CrossShardKind::AbortRequest => {
                 msg.verify_xpc_anchored(Some(reg), &[XpcPhase::Prepared, XpcPhase::Committed])
             }
-            CrossShardKind::AbortAck => {
-                msg.verify_xpc_anchored(Some(reg), &[XpcPhase::Aborted])
-            }
+            CrossShardKind::AbortAck => msg.verify_xpc_anchored(Some(reg), &[XpcPhase::Aborted]),
             _ => false,
         }
     }
@@ -1729,9 +1710,7 @@ impl ValidatorRuntime {
     /// for deterministic bytes. Called where the runtime is alive (periodic
     /// snapshot block); a fresh runtime snapshots empty sets, which is correct
     /// (nothing committed yet to protect).
-    pub async fn cross_shard_replay_snapshot(
-        &self,
-    ) -> crate::sharding::CrossShardReplaySnapshot {
+    pub async fn cross_shard_replay_snapshot(&self) -> crate::sharding::CrossShardReplaySnapshot {
         let mut engine_consumed = self.state.cross_shard_consumed_snapshot().await;
         engine_consumed.sort();
         let mut runtime_consumed: Vec<crate::sharding::CrossShardKey> =
@@ -1743,8 +1722,7 @@ impl ValidatorRuntime {
             .map(|(h, (tx, height))| (*h, tx.clone(), *height))
             .collect();
         produced.sort_by_key(|(h, _, _)| *h);
-        let mut completed: Vec<[u8; 32]> =
-            self.completed_cross_shard.iter().copied().collect();
+        let mut completed: Vec<[u8; 32]> = self.completed_cross_shard.iter().copied().collect();
         completed.sort();
         // §9 2PC: the committed two-phase-commit records travel with the
         // replay state, so a node that restarts mid-2PC resumes to the SAME
@@ -1764,10 +1742,7 @@ impl ValidatorRuntime {
     /// snapshot was taken). The engine half travels separately through the
     /// load paths (`restore_cross_shard_consumed`); calling both with the
     /// same blob is idempotent.
-    pub fn restore_cross_shard_sets(
-        &mut self,
-        snap: &crate::sharding::CrossShardReplaySnapshot,
-    ) {
+    pub fn restore_cross_shard_sets(&mut self, snap: &crate::sharding::CrossShardReplaySnapshot) {
         self.consumed_cross_shard
             .extend(snap.runtime_consumed.iter().copied());
         for (h, tx, height) in &snap.produced {
@@ -1777,7 +1752,9 @@ impl ValidatorRuntime {
             .extend(snap.completed.iter().copied());
         // §9 2PC: the mirror of the committed 2PC records.
         for rec in &snap.xpc {
-            self.xpc_records.entry(rec.tx_hash).or_insert_with(|| rec.clone());
+            self.xpc_records
+                .entry(rec.tx_hash)
+                .or_insert_with(|| rec.clone());
         }
     }
 
@@ -2035,9 +2012,7 @@ impl ValidatorRuntime {
         // Only a STRICTLY deeper branch reorgs. A branch of the same
         // length is still alive (the quorum decides), so it must not be
         // invalidated here.
-        let current_height = current
-            .map(|h| self.chain.height_of(&h))
-            .unwrap_or(0);
+        let current_height = current.map(|h| self.chain.height_of(&h)).unwrap_or(0);
         let new_height = self.chain.height_of(&new_head);
         if new_height <= current_height {
             return None;
@@ -2063,7 +2038,10 @@ impl ValidatorRuntime {
             vec![signal]
         };
         self.publish_invalidations(&invalidations);
-        Some(crate::chain::ReorgOutcome { plan, invalidations })
+        Some(crate::chain::ReorgOutcome {
+            plan,
+            invalidations,
+        })
     }
 
     /// Check whether disjoint wave parallel execution is enabled.
@@ -2143,9 +2121,7 @@ impl ValidatorRuntime {
     /// in the staking ledger — so a re-included (already-slashed) offense
     /// burns 0 and the feed needs no ledger access. Fail-closed: anything
     /// unverifiable never leaves this function.
-    pub fn equivocation_feed_evidence(
-        &self,
-    ) -> Vec<crate::consensus::EquivocationEvidence> {
+    pub fn equivocation_feed_evidence(&self) -> Vec<crate::consensus::EquivocationEvidence> {
         let pairs = self.hc.equivocations();
         if pairs.is_empty() {
             return Vec::new();
@@ -2194,7 +2170,10 @@ impl ValidatorRuntime {
             // M2: the ledger refused AFTER the pool was credited — remove the
             // pool credit symmetrically (fail-closed) before refunding the
             // validator, or the pool keeps coins no ledger entry backs (mint).
-            let _ = self.state.debit_native(&crate::staking::STAKING_POOL, amount).await;
+            let _ = self
+                .state
+                .debit_native(&crate::staking::STAKING_POOL, amount)
+                .await;
             let _ = self.state.credit_native(&validator, amount).await;
             return Err(e);
         }
@@ -2252,7 +2231,10 @@ impl ValidatorRuntime {
             .await
             .delegate(delegator, validator, amount);
         if let Err(e) = res {
-            let _ = self.state.debit_native(&crate::staking::STAKING_POOL, amount).await;
+            let _ = self
+                .state
+                .debit_native(&crate::staking::STAKING_POOL, amount)
+                .await;
             let _ = self.state.credit_native(&delegator, amount).await;
             return Err(e);
         }
@@ -2286,7 +2268,10 @@ impl ValidatorRuntime {
     /// consumed ledger entry is restored and nothing is paid); if the final
     /// credit then fails, the pool debit is refunded AND the ledger entry is
     /// restored, so a failed withdrawal moves no coins anywhere.
-    pub async fn stake_withdraw(&mut self, validator: ValidatorId) -> Result<u64, crate::staking::StakingError> {
+    pub async fn stake_withdraw(
+        &mut self,
+        validator: ValidatorId,
+    ) -> Result<u64, crate::staking::StakingError> {
         use crate::staking::StakingError;
         let amount = self.state.staking_write().await.withdraw(validator)?;
         if self
@@ -2297,7 +2282,12 @@ impl ValidatorRuntime {
         {
             let mut l = self.state.staking_write().await;
             let key = (validator, [0u8; 32]);
-            let back = l.withdrawable.get(&key).copied().unwrap_or(0).saturating_add(amount);
+            let back = l
+                .withdrawable
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(amount);
             l.withdrawable.insert(key, back);
             return Err(StakingError::NothingToWithdraw);
         }
@@ -2308,7 +2298,12 @@ impl ValidatorRuntime {
                 .await;
             let mut l = self.state.staking_write().await;
             let key = (validator, [0u8; 32]);
-            let back = l.withdrawable.get(&key).copied().unwrap_or(0).saturating_add(amount);
+            let back = l
+                .withdrawable
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(amount);
             l.withdrawable.insert(key, back);
             return Err(StakingError::NothingToWithdraw);
         }
@@ -2339,7 +2334,12 @@ impl ValidatorRuntime {
         {
             let mut l = self.state.staking_write().await;
             let key = (validator, delegator);
-            let back = l.withdrawable.get(&key).copied().unwrap_or(0).saturating_add(amount);
+            let back = l
+                .withdrawable
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(amount);
             l.withdrawable.insert(key, back);
             return Err(StakingError::NothingToWithdraw);
         }
@@ -2350,7 +2350,12 @@ impl ValidatorRuntime {
                 .await;
             let mut l = self.state.staking_write().await;
             let key = (validator, delegator);
-            let back = l.withdrawable.get(&key).copied().unwrap_or(0).saturating_add(amount);
+            let back = l
+                .withdrawable
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(amount);
             l.withdrawable.insert(key, back);
             return Err(StakingError::NothingToWithdraw);
         }
@@ -2364,7 +2369,10 @@ impl ValidatorRuntime {
     /// already consumed the pool backing; the native leg debits the pool
     /// first (fail-closed on shortfall) and restores the ledger entry if
     /// either native leg fails.
-    pub async fn stake_claim_rewards(&mut self, validator: ValidatorId) -> Result<u64, crate::staking::StakingError> {
+    pub async fn stake_claim_rewards(
+        &mut self,
+        validator: ValidatorId,
+    ) -> Result<u64, crate::staking::StakingError> {
         let amount = self
             .state
             .staking_write()
@@ -2406,7 +2414,11 @@ impl ValidatorRuntime {
     ///
     /// E2: same funding discipline as [`Self::stake_claim_rewards`] — the
     /// native leg debits [`crate::staking::REWARDS_POOL`], never principal.
-    pub async fn stake_claim_delegator_rewards(&mut self, delegator: [u8; 32], validator: ValidatorId) -> u64 {
+    pub async fn stake_claim_delegator_rewards(
+        &mut self,
+        delegator: [u8; 32],
+        validator: ValidatorId,
+    ) -> u64 {
         let amount = self
             .state
             .staking_write()
@@ -2422,12 +2434,14 @@ impl ValidatorRuntime {
                 // Restore pool backing + the consumed entry: nothing was paid.
                 let mut l = self.state.staking_write().await;
                 l.rewards_pool = l.rewards_pool.saturating_add(amount);
-                *l.delegator_rewards.entry((validator, delegator)).or_insert(0) =
-                    l.delegator_rewards
-                        .get(&(validator, delegator))
-                        .copied()
-                        .unwrap_or(0)
-                        .saturating_add(amount);
+                *l.delegator_rewards
+                    .entry((validator, delegator))
+                    .or_insert(0) = l
+                    .delegator_rewards
+                    .get(&(validator, delegator))
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(amount);
                 return 0;
             }
             if self.state.credit_native(&delegator, amount).await.is_err() {
@@ -2439,12 +2453,14 @@ impl ValidatorRuntime {
                 {
                     let mut l = self.state.staking_write().await;
                     l.rewards_pool = l.rewards_pool.saturating_add(amount);
-                    *l.delegator_rewards.entry((validator, delegator)).or_insert(0) =
-                        l.delegator_rewards
-                            .get(&(validator, delegator))
-                            .copied()
-                            .unwrap_or(0)
-                            .saturating_add(amount);
+                    *l.delegator_rewards
+                        .entry((validator, delegator))
+                        .or_insert(0) = l
+                        .delegator_rewards
+                        .get(&(validator, delegator))
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(amount);
                 }
                 return 0;
             }
@@ -2453,25 +2469,22 @@ impl ValidatorRuntime {
     }
 
     /// Whether a sealed transaction's transparent metadata matches the
-/// transaction it was sealed from.
-///
-/// The metadata is what the mempool ordered by, so a wallet that lies about
-/// it could buy priority for free. The check happens right after the
-/// unseal, BEFORE the transaction can enter a block: a mismatch drops the
-/// transaction (fail closed).
-pub fn sealed_meta_matches(
-    tx: &Transaction,
-    meta: &crate::mev_epoch::TransparentMeta,
-) -> bool {
-    tx.from == meta.from
-        && tx.nonce == meta.nonce
-        && tx.gas_limit == meta.gas_limit
-        && tx.priority_fee_per_gas == meta.priority_fee_per_gas
-        && tx.source_shard == meta.source_shard
-        && tx.target_shard == meta.target_shard
-}
+    /// transaction it was sealed from.
+    ///
+    /// The metadata is what the mempool ordered by, so a wallet that lies about
+    /// it could buy priority for free. The check happens right after the
+    /// unseal, BEFORE the transaction can enter a block: a mismatch drops the
+    /// transaction (fail closed).
+    pub fn sealed_meta_matches(tx: &Transaction, meta: &crate::mev_epoch::TransparentMeta) -> bool {
+        tx.from == meta.from
+            && tx.nonce == meta.nonce
+            && tx.gas_limit == meta.gas_limit
+            && tx.priority_fee_per_gas == meta.priority_fee_per_gas
+            && tx.source_shard == meta.source_shard
+            && tx.target_shard == meta.target_shard
+    }
 
-// ==================== Governance (on-chain) ====================
+    // ==================== Governance (on-chain) ====================
 
     /// Submit a governance proposal.
     pub fn gov_propose(
@@ -2481,8 +2494,14 @@ pub fn sealed_meta_matches(
         action: crate::governance::GovAction,
         now: u64,
     ) -> Result<u64, crate::governance::GovError> {
-        let ledger = self.staking.try_read().map_err(|_| crate::governance::GovError::NotStaker)?;
-        let g = self.governance.as_mut().ok_or(crate::governance::GovError::NotStaker)?;
+        let ledger = self
+            .staking
+            .try_read()
+            .map_err(|_| crate::governance::GovError::NotStaker)?;
+        let g = self
+            .governance
+            .as_mut()
+            .ok_or(crate::governance::GovError::NotStaker)?;
         g.propose(&ledger, proposer, title, action, now)
     }
 
@@ -2502,7 +2521,10 @@ pub fn sealed_meta_matches(
             .state
             .try_staking_write()
             .ok_or(crate::governance::GovError::NotStaker)?;
-        let g = self.governance.as_mut().ok_or(crate::governance::GovError::NotStaker)?;
+        let g = self
+            .governance
+            .as_mut()
+            .ok_or(crate::governance::GovError::NotStaker)?;
         g.vote(&mut ledger, voter, proposal_id, choice, now)
     }
 
@@ -2518,7 +2540,10 @@ pub fn sealed_meta_matches(
             .state
             .try_staking_write()
             .ok_or(crate::governance::GovError::NotStaker)?;
-        let g = self.governance.as_mut().ok_or(crate::governance::GovError::NotStaker)?;
+        let g = self
+            .governance
+            .as_mut()
+            .ok_or(crate::governance::GovError::NotStaker)?;
         g.finalize(&mut ledger, proposal_id, now)
     }
 
@@ -2528,7 +2553,10 @@ pub fn sealed_meta_matches(
         executor: [u8; 32],
         proposal_id: u64,
     ) -> Result<crate::governance::AppliedParams, crate::governance::GovError> {
-        let g = self.governance.as_mut().ok_or(crate::governance::GovError::NotStaker)?;
+        let g = self
+            .governance
+            .as_mut()
+            .ok_or(crate::governance::GovError::NotStaker)?;
         let applied = g.execute(executor, proposal_id).cloned()?;
         if let Some(min_bond) = applied.min_validator_bond {
             if let Ok(mut st) = self.staking.try_write() {
@@ -2570,15 +2598,7 @@ pub fn sealed_meta_matches(
         if self.shard_registry.is_sharded() {
             ctx = ctx.with_shard(self.shard_id);
         }
-        let _ = self
-            .mempool
-            .write()
-            .await
-            .add_checked_ctx(
-                tx,
-                balance,
-                ctx,
-            );
+        let _ = self.mempool.write().await.add_checked_ctx(tx, balance, ctx);
     }
 
     /// Plain-path pack admissibility: the exact predicate `propose` passes to
@@ -2601,8 +2621,7 @@ pub fn sealed_meta_matches(
             ctx.rej_shard.set(ctx.rej_shard.get() + 1);
             return false;
         }
-        let is_cross =
-            ctx.sharded && crate::sharding::tx_is_outbound_cross_shard(t, ctx.my_shard);
+        let is_cross = ctx.sharded && crate::sharding::tx_is_outbound_cross_shard(t, ctx.my_shard);
         if is_cross && ctx.used_senders.borrow().contains(&t.from) {
             ctx.rej_shard.set(ctx.rej_shard.get() + 1);
             return false;
@@ -2732,10 +2751,8 @@ pub fn sealed_meta_matches(
         let mut keep = 0usize;
         for t in txs.iter() {
             let g = gas.saturating_add(t.gas_limit);
-            let w = wire
-                .saturating_add(crate::mempool::Mempool::estimate_tx_wire_bytes(t));
-            let p = proofs
-                .saturating_add(crate::mempool::Mempool::count_tx_proof_units(t));
+            let w = wire.saturating_add(crate::mempool::Mempool::estimate_tx_wire_bytes(t));
+            let p = proofs.saturating_add(crate::mempool::Mempool::count_tx_proof_units(t));
             if keep >= MAX_BLOCK_TXS
                 || g > MAX_BLOCK_GAS
                 || w > crate::mempool::Mempool::MAX_BLOCK_WIRE_BYTES
@@ -2808,15 +2825,18 @@ pub fn sealed_meta_matches(
         let Some(ctx) = self.pack_filter_ctx(timestamp).await else {
             return;
         };
-        let txs = self
-            .mempool
-            .read()
-            .await
-            .select_for_block_multi(MAX_BLOCK_TXS, MAX_BLOCK_GAS, |t| {
-                Self::pack_filter_accept(&ctx, t)
-            });
+        let txs =
+            self.mempool
+                .read()
+                .await
+                .select_for_block_multi(MAX_BLOCK_TXS, MAX_BLOCK_GAS, |t| {
+                    Self::pack_filter_accept(&ctx, t)
+                });
         if let Ok(mut g) = self.prebuilt_selection.lock() {
-            *g = Some(PrebuiltSelection { for_height: target, txs });
+            *g = Some(PrebuiltSelection {
+                for_height: target,
+                txs,
+            });
         }
     }
 
@@ -2825,16 +2845,9 @@ pub fn sealed_meta_matches(
     /// back to a fresh build path that reports the miss.
     async fn pack_filter_ctx(&self, timestamp: u64) -> Option<PackFilterCtx> {
         let state_root = self.state.get_state_root().await;
-        let senders: Vec<[u8; 32]> = self
-            .mempool
-            .read()
-            .await
-            .fee_payers()
-            .into_iter()
-            .collect();
+        let senders: Vec<[u8; 32]> = self.mempool.read().await.fee_payers().into_iter().collect();
         let guard = self.state.accounts.read().await;
-        let mut accounts: HashMap<[u8; 32], (u64, u64)> =
-            HashMap::with_capacity(senders.len());
+        let mut accounts: HashMap<[u8; 32], (u64, u64)> = HashMap::with_capacity(senders.len());
         for a in &senders {
             if let Some(acct) = guard.get(a) {
                 accounts.insert(*a, (acct.nonce, acct.balance));
@@ -2846,13 +2859,7 @@ pub fn sealed_meta_matches(
         // revalidation/top-up (every kept tx is re-checked tx-by-tx below),
         // so no store gate is needed here.
         let _ = state_root;
-        let fresh: Vec<[u8; 32]> = self
-            .mempool
-            .read()
-            .await
-            .fee_payers()
-            .into_iter()
-            .collect();
+        let fresh: Vec<[u8; 32]> = self.mempool.read().await.fee_payers().into_iter().collect();
         for s in missing_sender_accounts(&accounts, &fresh) {
             if let Some(acct) = self.state.get_account(&s).await {
                 accounts.insert(s, (acct.nonce, acct.balance));
@@ -2922,8 +2929,9 @@ pub fn sealed_meta_matches(
                         // Ingest OUR OWN contribution locally: the epoch key
                         // is the aggregate over the WHOLE contributor set,
                         // and our own evaluation is one of its terms.
-                        if let Err(e) =
-                            pool.mev_seal.ingest_contribution(contribution.clone(), &seed)
+                        if let Err(e) = pool
+                            .mev_seal
+                            .ingest_contribution(contribution.clone(), &seed)
                         {
                             tracing::debug!("[mev-seal] our own dkg contribution refused: {e}");
                         }
@@ -3033,9 +3041,9 @@ pub fn sealed_meta_matches(
                         return;
                     }
                     let material = pool.mev_seal.material().cloned();
-                    let announcement = material.as_ref().and_then(|_| {
-                        pool.mev_seal.build_announcement(&self.key).ok()
-                    });
+                    let announcement = material
+                        .as_ref()
+                        .and_then(|_| pool.mev_seal.build_announcement(&self.key).ok());
                     (material, announcement)
                 };
                 if let Some(material) = material {
@@ -3048,10 +3056,8 @@ pub fn sealed_meta_matches(
                 // Announce the epoch key: the committee's agreement, signed by
                 // us, so a light client can check the key against the chain.
                 if let Some(announcement) = announcement {
-                    self.gossip_mev_frame(crate::mev_epoch::MevFrame::Announcement(
-                        announcement,
-                    ))
-                    .await;
+                    self.gossip_mev_frame(crate::mev_epoch::MevFrame::Announcement(announcement))
+                        .await;
                 }
             }
             crate::mev_epoch::MevFrame::OrderCommit(commitment) => {
@@ -3090,10 +3096,7 @@ pub fn sealed_meta_matches(
     ///
     /// The release happens ONLY after the order commitment has been seen:
     /// that is the property the whole scheme exists for.
-    async fn release_sealed_partials(
-        &mut self,
-        commitment: &crate::mev_epoch::OrderCommitment,
-    ) {
+    async fn release_sealed_partials(&mut self, commitment: &crate::mev_epoch::OrderCommitment) {
         let height = commitment.height;
         let round = commitment.round;
         let epoch = commitment.epoch;
@@ -3184,8 +3187,7 @@ pub fn sealed_meta_matches(
                     (commitment, ordered)
                 }
                 None => {
-                    let tx_hashes: Vec<[u8; 32]> =
-                        candidates.iter().map(|c| c.tx_hash).collect();
+                    let tx_hashes: Vec<[u8; 32]> = candidates.iter().map(|c| c.tx_hash).collect();
                     match pool
                         .mev_seal
                         .commit_order(height, round, tx_hashes, &self.key)
@@ -3399,7 +3401,7 @@ pub fn sealed_meta_matches(
                     );
                 }
                 // Self-record like the fresh path: without this the section-1
-                    // gate (`!has_live_proposal`) refires every tick and
+                // gate (`!has_live_proposal`) refires every tick and
                 // rebroadcasts the identical hash all round (refire spam).
                 self.hc.receive_proposal(self.id, locked_hash).ok()?;
                 return Some(body);
@@ -3433,27 +3435,27 @@ pub fn sealed_meta_matches(
                     if self.validate_proposal_unaligned(&body, root).is_ok()
                         && self.check_actor_cap(&body).await.is_ok()
                     {
-                    let pool_len = self.mempool.read().await.len();
-                    if pool_len > 0 {
-                        tracing::info!(
+                        let pool_len = self.mempool.read().await.len();
+                        if pool_len > 0 {
+                            tracing::info!(
                             "propose h={} r={}: path=demanded txs={} mempool={} (bypasses fresh selection)",
                             self.hc.height,
                             self.hc.round,
                             body.transactions.len(),
                             pool_len,
                         );
-                    } else {
-                        tracing::debug!(
-                            "propose h={} r={}: path=demanded txs={} mempool=0",
-                            self.hc.height,
-                            self.hc.round,
-                            body.transactions.len(),
-                        );
-                    }
-                    // Self-record like the fresh path (see the locked path).
-                    let bh = body.compute_hash();
-                    self.blocks.insert(bh, body.clone());
-                    self.hc.receive_proposal(self.id, bh).ok()?;
+                        } else {
+                            tracing::debug!(
+                                "propose h={} r={}: path=demanded txs={} mempool=0",
+                                self.hc.height,
+                                self.hc.round,
+                                body.transactions.len(),
+                            );
+                        }
+                        // Self-record like the fresh path (see the locked path).
+                        let bh = body.compute_hash();
+                        self.blocks.insert(bh, body.clone());
+                        self.hc.receive_proposal(self.id, bh).ok()?;
                         // Served: consume one-shot (a still-stuck peer re-hints).
                         self.demanded.remove(&h);
                         return Some(body);
@@ -3487,15 +3489,11 @@ pub fn sealed_meta_matches(
         // identical to a fresh scan for the same (state, mempool) —
         // proposer-local only.
         let mut accounts: std::collections::HashMap<[u8; 32], (u64, u64)> =
-            match self
-                .pack_snapshot
-                .lock()
-                .ok()
-                .and_then(|g| {
-                    g.as_ref()
-                        .filter(|(h, r, _)| *h == self.hc.height && *r == state_root)
-                        .map(|(_, _, m)| m.clone())
-                }) {
+            match self.pack_snapshot.lock().ok().and_then(|g| {
+                g.as_ref()
+                    .filter(|(h, r, _)| *h == self.hc.height && *r == state_root)
+                    .map(|(_, _, m)| m.clone())
+            }) {
                 Some(cached) => cached,
                 None => {
                     // PAYMASTER: snapshot every fee payer — each sender PLUS
@@ -3504,13 +3502,8 @@ pub fn sealed_meta_matches(
                     // from the sponsor. A sponsor missing from the snapshot
                     // reads as unfunded below (SKIP-only, like every other
                     // filter condition).
-                    let senders: Vec<[u8; 32]> = self
-                        .mempool
-                        .read()
-                        .await
-                        .fee_payers()
-                        .into_iter()
-                        .collect();
+                    let senders: Vec<[u8; 32]> =
+                        self.mempool.read().await.fee_payers().into_iter().collect();
                     // ONE guard, no awaits inside the loop: the snapshot is
                     // mutually consistent AND atomic against concurrent
                     // writers (a writer would move the root and miss the
@@ -3547,13 +3540,7 @@ pub fn sealed_meta_matches(
         {
             // PAYMASTER: same fee-payer set as the snapshot above, so a
             // sponsor that arrived mid-build is fetched, not skipped.
-            let fresh: Vec<[u8; 32]> = self
-                .mempool
-                .read()
-                .await
-                .fee_payers()
-                .into_iter()
-                .collect();
+            let fresh: Vec<[u8; 32]> = self.mempool.read().await.fee_payers().into_iter().collect();
             for s in missing_sender_accounts(&accounts, &fresh) {
                 if let Some(acct) = self.state.get_account(&s).await {
                     accounts.insert(s, (acct.nonce, acct.balance));
@@ -3684,7 +3671,9 @@ pub fn sealed_meta_matches(
                     rej_funds.set(rej_funds.get() + 1);
                     continue;
                 }
-                let Some(&(sponsor_nonce, sponsor_balance)) = next_nonce.borrow().get(&auth.sponsor) else {
+                let Some(&(sponsor_nonce, sponsor_balance)) =
+                    next_nonce.borrow().get(&auth.sponsor)
+                else {
                     rej_funds.set(rej_funds.get() + 1);
                     continue;
                 };
@@ -3692,8 +3681,12 @@ pub fn sealed_meta_matches(
                     rej_funds.set(rej_funds.get() + 1);
                     continue;
                 }
-                next_nonce.borrow_mut().insert(t.from, (expected + 1, user_balance - t.amount));
-                next_nonce.borrow_mut().insert(auth.sponsor, (sponsor_nonce, sponsor_balance - fee));
+                next_nonce
+                    .borrow_mut()
+                    .insert(t.from, (expected + 1, user_balance - t.amount));
+                next_nonce
+                    .borrow_mut()
+                    .insert(auth.sponsor, (sponsor_nonce, sponsor_balance - fee));
                 used_senders.borrow_mut().insert(t.from);
                 sealed_kept.push(t);
                 continue;
@@ -3718,16 +3711,21 @@ pub fn sealed_meta_matches(
                 rej_basefee.set(rej_basefee.get() + 1);
                 continue;
             }
-            let cost = t.amount.saturating_add(t.gas_limit).saturating_add(if t.is_pq_activation() {
-                crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS
-            } else {
-                0
-            });
+            let cost =
+                t.amount
+                    .saturating_add(t.gas_limit)
+                    .saturating_add(if t.is_pq_activation() {
+                        crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS
+                    } else {
+                        0
+                    });
             if balance < cost {
                 rej_funds.set(rej_funds.get() + 1);
                 continue;
             }
-            next_nonce.borrow_mut().insert(t.from, (expected + 1, balance - cost));
+            next_nonce
+                .borrow_mut()
+                .insert(t.from, (expected + 1, balance - cost));
             used_senders.borrow_mut().insert(t.from);
             sealed_kept.push(t);
         }
@@ -3755,16 +3753,11 @@ pub fn sealed_meta_matches(
         // receivers re-verify everything, so the worst case is a bounded
         // O(cached) revalidation before a fresh-equivalent build.
         let plain_txs: Vec<Transaction> = if sealed_kept.is_empty() {
-            if let Some(cached) = self
-                .prebuilt_selection
-                .lock()
-                .ok()
-                .and_then(|g| {
-                    g.as_ref()
-                        .filter(|c| c.for_height == self.hc.height)
-                        .map(|c| c.txs.clone())
-                })
-            {
+            if let Some(cached) = self.prebuilt_selection.lock().ok().and_then(|g| {
+                g.as_ref()
+                    .filter(|c| c.for_height == self.hc.height)
+                    .map(|c| c.txs.clone())
+            }) {
                 let mut kept: Vec<Transaction> = Vec::with_capacity(cached.len());
                 {
                     let pool = self.mempool.read().await;
@@ -3785,19 +3778,16 @@ pub fn sealed_meta_matches(
                     .map(|t| t.gas_limit)
                     .fold(0u64, |a, g| a.saturating_add(g));
                 let mut new_txs = if kept.len() < MAX_BLOCK_TXS {
-                    self.mempool
-                        .read()
-                        .await
-                        .select_for_block_multi(
-                            MAX_BLOCK_TXS - kept.len(),
-                            MAX_BLOCK_GAS.saturating_sub(kept_gas),
-                            |t| {
-                                if kept_hashes.contains(&t.compute_tx_hash()) {
-                                    return false;
-                                }
-                                Self::pack_filter_accept(&fctx, t)
-                            },
-                        )
+                    self.mempool.read().await.select_for_block_multi(
+                        MAX_BLOCK_TXS - kept.len(),
+                        MAX_BLOCK_GAS.saturating_sub(kept_gas),
+                        |t| {
+                            if kept_hashes.contains(&t.compute_tx_hash()) {
+                                return false;
+                            }
+                            Self::pack_filter_accept(&fctx, t)
+                        },
+                    )
                 } else {
                     Vec::new()
                 };
@@ -3811,12 +3801,11 @@ pub fn sealed_meta_matches(
                 // `prebuild_next_proposal` (never here), so a future-height
                 // prebuild cached during this height's voting is never
                 // evicted by a round retry at the current height.
-                self.mempool
-                    .read()
-                    .await
-                    .select_for_block_multi(MAX_BLOCK_TXS, MAX_BLOCK_GAS, |t| {
-                        Self::pack_filter_accept(&fctx, t)
-                    })
+                self.mempool.read().await.select_for_block_multi(
+                    MAX_BLOCK_TXS,
+                    MAX_BLOCK_GAS,
+                    |t| Self::pack_filter_accept(&fctx, t),
+                )
             }
         } else {
             // The sealed path conditions plain selection on its own effects,
@@ -4038,7 +4027,7 @@ pub fn sealed_meta_matches(
                 };
                 cross_shard_out.push(msg);
             }
-                if let Some(transport) = &self.cross_shard {
+            if let Some(transport) = &self.cross_shard {
                 let mut inbound = transport.fetch_cross_shard_inbound(my_shard).await;
                 // Deterministic order, independent of KV enumeration order.
                 inbound.sort_by_key(CrossShardKey::of);
@@ -4096,7 +4085,10 @@ pub fn sealed_meta_matches(
                     }
                     // Stale after completion: the transaction already acked or
                     // bounced (e.g. a late duplicate lingering in the KV).
-                    if self.completed_cross_shard.contains(&msg.tx.compute_tx_hash()) {
+                    if self
+                        .completed_cross_shard
+                        .contains(&msg.tx.compute_tx_hash())
+                    {
                         continue;
                     }
                     if cross_shard_out.iter().any(|m| m.msg_id == msg.msg_id) {
@@ -4153,10 +4145,7 @@ pub fn sealed_meta_matches(
                                     // PREPARED leaf (the escrow), not the
                                     // sender's account leaf (which the
                                     // escrow already invalidated).
-                                    if !crate::xshard2pc::should_reprepare(
-                                        &rec,
-                                        self.hc.height,
-                                    ) {
+                                    if !crate::xshard2pc::should_reprepare(&rec, self.hc.height) {
                                         continue;
                                     }
                                     (
@@ -4255,8 +4244,7 @@ pub fn sealed_meta_matches(
                         None
                     }
                 })
-            })
-        {
+            }) {
             timestamp
                 .min(parent_ts.saturating_add(MAX_TIMESTAMP_JUMP_SECS))
                 .max(parent_ts)
@@ -4386,7 +4374,7 @@ pub fn sealed_meta_matches(
                     let probe = Block {
                         transactions: kept,
                         ..block.clone()
-};
+                    };
                     encoded_len = crate::consensus_net::ConsensusMsg::Proposal {
                         height: self.hc.height,
                         round: self.hc.round,
@@ -4428,9 +4416,9 @@ pub fn sealed_meta_matches(
                 // nobody able to claim it (validate rejects tx-without-record
                 // only in the outbound direction; the reverse — record without
                 // tx — is equally unclaimable). Prune them with the txs.
-                block.cross_shard_out.retain(|m| {
-                    !dropped_hashes.contains(&m.tx.compute_tx_hash())
-                });
+                block
+                    .cross_shard_out
+                    .retain(|m| !dropped_hashes.contains(&m.tx.compute_tx_hash()));
                 // The body changed, so the ORDER COMMITMENT must be recomputed
                 // over the surviving (still ordered) list BEFORE the block is
                 // re-signed below: the root is inside the signed hash, so a
@@ -4628,11 +4616,16 @@ pub fn sealed_meta_matches(
         h.finalize().into()
     }
     fn check_order_commitment(&self, block: &Block) -> Result<(), String> {
-    // STAB: per-block-hash cache — the root is a pure function of the body,
-    // so repeat validations of the same block (round retries, demanded
-    // re-propose, adopt) hit O(1) instead of re-hashing O(txs).
+        // STAB: per-block-hash cache — the root is a pure function of the body,
+        // so repeat validations of the same block (round retries, demanded
+        // re-propose, adopt) hit O(1) instead of re-hashing O(txs).
         let bh = block.compute_hash();
-        if let Some(cached) = self.order_root_cache.lock().ok().and_then(|g| g.get(&bh).copied()) {
+        if let Some(cached) = self
+            .order_root_cache
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&bh).copied())
+        {
             if block.order_merkle_root != cached {
                 return Err(format!(
                     "proposal: transaction order does not match the committed order root (block {} != recomputed {})",
@@ -4688,9 +4681,10 @@ pub fn sealed_meta_matches(
             return Ok(());
         };
         let Some(qc) = &block.last_qc else {
-            let knows_parent_decision = self.last_decision.as_ref().is_some_and(|(h, b, _)| {
-                *h == parent_h && b.compute_hash() == block.prev_hash
-            });
+            let knows_parent_decision = self
+                .last_decision
+                .as_ref()
+                .is_some_and(|(h, b, _)| *h == parent_h && b.compute_hash() == block.prev_hash);
             if knows_parent_decision {
                 return Err(format!(
                     "proposal: block at height {} omits the downtime evidence for decided height {parent_h}",
@@ -4717,7 +4711,12 @@ pub fn sealed_meta_matches(
         // verify-grade `signers_set` crypto. Failures are NOT cached (a
         // history advance could turn a weak QC into a passing one).
         let bh = block.compute_hash();
-        if let Some((ok, _)) = self.qc_power_cache.lock().ok().and_then(|g| g.get(&bh).copied()) {
+        if let Some((ok, _)) = self
+            .qc_power_cache
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&bh).copied())
+        {
             if ok {
                 return Ok(());
             }
@@ -4881,7 +4880,10 @@ pub fn sealed_meta_matches(
                             hex::encode(&msg.msg_id[..8])
                         ));
                     }
-                    if self.completed_cross_shard.contains(&msg.tx.compute_tx_hash()) {
+                    if self
+                        .completed_cross_shard
+                        .contains(&msg.tx.compute_tx_hash())
+                    {
                         return Err(format!(
                             "proposal: cross-shard message {} is for a completed transfer",
                             hex::encode(&msg.msg_id[..8])
@@ -4979,7 +4981,11 @@ pub fn sealed_meta_matches(
         // instead of re-verifying the same Ed25519/Falcon signature.
         {
             let bh = Self::proposer_sig_cache_key(block);
-            let cached = self.proposer_sig_cache.lock().ok().and_then(|g| g.get(&bh).copied());
+            let cached = self
+                .proposer_sig_cache
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&bh).copied());
             let ok = match cached {
                 Some(v) => v,
                 None => {
@@ -5029,7 +5035,11 @@ pub fn sealed_meta_matches(
         // below becomes an O(1) HashMap hit with a byte-identical verdict.
         {
             let bh = Self::batch_verify_cache_key(block);
-            let cached = self.batch_verify_cache.lock().ok().and_then(|g| g.get(&bh).copied());
+            let cached = self
+                .batch_verify_cache
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&bh).copied());
             let ok = match cached {
                 Some(v) => v,
                 None => {
@@ -5462,7 +5472,9 @@ pub fn sealed_meta_matches(
         }
         let no_progress_secs = self.last_progress_at.elapsed().as_secs();
         let timeout_secs = timeout.as_secs().max(1);
-        let target = self.hc.deadlock_breaker_target(no_progress_secs, timeout_secs)?;
+        let target = self
+            .hc
+            .deadlock_breaker_target(no_progress_secs, timeout_secs)?;
         let from = self.hc.round;
         if !self.hc.apply_deadlock_jump(target) {
             return None;
@@ -5574,7 +5586,9 @@ pub fn sealed_meta_matches(
             // the body is signature-authenticated before this point, so only
             // the slot owner can pull us to their own slots.
             let mut target = None;
-            for r in (self.hc.round.saturating_add(1))..=(self.hc.round.saturating_add(PROPOSAL_ALIGN_WINDOW_ROUNDS)) {
+            for r in (self.hc.round.saturating_add(1))
+                ..=(self.hc.round.saturating_add(PROPOSAL_ALIGN_WINDOW_ROUNDS))
+            {
                 if self.validators.proposer_for(self.hc.height, r) == Some(block.proposer) {
                     target = Some(r);
                     break;
@@ -5983,10 +5997,7 @@ pub fn sealed_meta_matches(
         &mut self,
         block: &Block,
         reward: u64,
-    ) -> (
-        crate::state_engine::BlockTransitionOutcome,
-        [u8; 32],
-    ) {
+    ) -> (crate::state_engine::BlockTransitionOutcome, [u8; 32]) {
         let lane = self.ensure_apply_lane();
         let (tx, rx) = tokio::sync::oneshot::channel();
         lane.tx
@@ -6009,10 +6020,7 @@ pub fn sealed_meta_matches(
     async fn apply_decided(
         &mut self,
         block: &Block,
-    ) -> (
-        crate::state_engine::BlockTransitionOutcome,
-        [u8; 32],
-    ) {
+    ) -> (crate::state_engine::BlockTransitionOutcome, [u8; 32]) {
         // `block.timestamp` is the VM's "now" for every payload in this block:
         // unbonding maturity, contract creation time, order stamps. Every node
         // applying this block passes the SAME value, so the resulting state is
@@ -6044,7 +6052,11 @@ pub fn sealed_meta_matches(
         // re-proposed. The mempool is not consensus state and is not part of
         // the state root, so the reorg path (which has no mempool) diverges
         // here without forking - see `ChainState::apply_block`.
-        let included: Vec<[u8; 32]> = block.transactions.iter().map(|t| t.compute_tx_hash()).collect();
+        let included: Vec<[u8; 32]> = block
+            .transactions
+            .iter()
+            .map(|t| t.compute_tx_hash())
+            .collect();
         self.mempool.write().await.prune_confirmed(&included);
         // D2 free-failure gate: an included transaction that FAILED at apply
         // paid nothing (the native commit is atomic) while its bytes occupied
@@ -6065,7 +6077,10 @@ pub fn sealed_meta_matches(
                     failed.push(tx.from);
                 }
             }
-            self.mempool.write().await.note_apply_feedback(&failed, &succeeded);
+            self.mempool
+                .write()
+                .await
+                .note_apply_feedback(&failed, &succeeded);
         }
         // M2 cross-shard bookkeeping, all a pure function of the block:
         //   * remember every INBOUND message this block credited, so a replay
@@ -6146,10 +6161,7 @@ pub fn sealed_meta_matches(
                         // Newly consumed: tell the source shard with an ack.
                         // Transport-local only; the committed form is the ack
                         // record the source includes in its own block.
-                        let ack = CrossShardMessage::new_ack(
-                            msg.tx.clone(),
-                            block.compute_hash(),
-                        );
+                        let ack = CrossShardMessage::new_ack(msg.tx.clone(), block.compute_hash());
                         if let Some(transport) = &self.cross_shard {
                             if let Err(e) = transport.broadcast_cross_shard(&ack).await {
                                 tracing::warn!(
@@ -6183,7 +6195,8 @@ pub fn sealed_meta_matches(
                         // is not refunded. `credit_native` creates the account
                         // if it vanished, and commits to the trie, so every
                         // node applying this block derives the same root.
-                        if let Err(e) = self.state.credit_native(&msg.tx.from, msg.tx.amount).await {
+                        if let Err(e) = self.state.credit_native(&msg.tx.from, msg.tx.amount).await
+                        {
                             tracing::warn!(
                                 "cross-shard bounce refund failed for {}: {e}",
                                 hex::encode(&msg.msg_id[..8])
@@ -6343,9 +6356,11 @@ pub fn sealed_meta_matches(
         // change fixed).
         if block.proposer == self.id {
             let pool = self.mempool.read().await;
-            match pool.mev.verify_block_order(block.height, bh, &block.transactions) {
-                crate::mev::OrderVerdict::NoCommit
-                | crate::mev::OrderVerdict::Match => {}
+            match pool
+                .mev
+                .verify_block_order(block.height, bh, &block.transactions)
+            {
+                crate::mev::OrderVerdict::NoCommit | crate::mev::OrderVerdict::Match => {}
                 verdict => {
                     tracing::warn!(
                         height,
@@ -6576,7 +6591,15 @@ pub fn sealed_meta_matches(
         }
         let lane = self.ensure_apply_lane();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if lane.tx.send(LaneJob::Snapshot(SnapshotJob { height, expected_root, done: tx })).is_err() {
+        if lane
+            .tx
+            .send(LaneJob::Snapshot(SnapshotJob {
+                height,
+                expected_root,
+                done: tx,
+            }))
+            .is_err()
+        {
             return false;
         }
         self.snapshot_in_flight = Some(rx);
@@ -6635,7 +6658,10 @@ pub fn sealed_meta_matches(
             ));
         };
         if qc.kind != crate::consensus::VoteKind::Precommit {
-            return Err(format!("block {} decision proof is not a precommit quorum", block.height));
+            return Err(format!(
+                "block {} decision proof is not a precommit quorum",
+                block.height
+            ));
         }
         if qc.height != block.height {
             return Err(format!(
@@ -6825,7 +6851,12 @@ pub fn sealed_meta_matches(
 
     /// Mark the set STALE (fail-closed to observer). LOUD on both channels;
     /// records both heights so the operator sees how far the ledger lags.
-    pub fn mark_validator_set_stale(&mut self, state_height: u64, ledger_height: u64, reason: String) {
+    pub fn mark_validator_set_stale(
+        &mut self,
+        state_height: u64,
+        ledger_height: u64,
+        reason: String,
+    ) {
         self.validator_set_stale = true;
         self.validator_set_stale_reason = Some(reason.clone());
         self.validator_set_state_height = Some(state_height);
@@ -7053,7 +7084,8 @@ pub fn sealed_meta_matches(
         // ancient QC, never accept a quorum that was not one). Heights at or
         // above the first recorded activation are exact either way.
         if self.validator_set_history.is_empty() {
-            self.validator_set_history.push_back((0, self.validators.clone()));
+            self.validator_set_history
+                .push_back((0, self.validators.clone()));
         }
         let fmt = |m: &std::collections::BTreeMap<ValidatorId, u64>| {
             m.iter()
@@ -7209,7 +7241,8 @@ pub fn sealed_meta_matches(
         ledger: &crate::staking::StakingLedger,
         height: u64,
     ) -> bool {
-        self.install_validator_set_from_ledger(ledger, height, height).await
+        self.install_validator_set_from_ledger(ledger, height, height)
+            .await
     }
 
     /// The MASTERCHAIN registry, when this runtime must take its consensus
@@ -7289,8 +7322,9 @@ pub fn sealed_meta_matches(
                 .refresh_validator_set_from_master_ledger(&ledger, self.hc.height)
                 .await);
         }
-        let snap = crate::storage::decode_domain_snapshot(domain_bytes)
-            .map_err(|e| format!("validator-set refresh: domain snapshot at {ledger_height} undecodable: {e}"))?;
+        let snap = crate::storage::decode_domain_snapshot(domain_bytes).map_err(|e| {
+            format!("validator-set refresh: domain snapshot at {ledger_height} undecodable: {e}")
+        })?;
         Ok(self
             .refresh_validator_set_from_ledger(&snap.staking, state_height, ledger_height)
             .await)
@@ -7410,7 +7444,10 @@ pub fn sealed_meta_matches(
         // accepts quorums H never had and refuses quorums H genuinely reached.)
         let validators = self.validator_set_for_height(height);
         if height != self.hc.height {
-            return Err(format!("height mismatch (ours {}, peer {height})", self.hc.height));
+            return Err(format!(
+                "height mismatch (ours {}, peer {height})",
+                self.hc.height
+            ));
         }
         if block.height != height {
             return Err("block height does not match the commit".to_string());
@@ -7750,10 +7787,9 @@ impl Cluster {
         // C1 anchor: one registry per CLUSTER (not per process): every shard
         // in this process shares it (like production), but independent test
         // clusters never collide (a process-global would mix their geneses).
-        let hdrs: Arc<std::sync::RwLock<crate::sharding::FinalizedHeaderRegistry>> =
-            Arc::new(std::sync::RwLock::new(
-                crate::sharding::FinalizedHeaderRegistry::default(),
-            ));
+        let hdrs: Arc<std::sync::RwLock<crate::sharding::FinalizedHeaderRegistry>> = Arc::new(
+            std::sync::RwLock::new(crate::sharding::FinalizedHeaderRegistry::default()),
+        );
         for n in &mut c.nodes {
             n.cross_shard = Some(transport.clone());
             n.finalized_headers = Some(hdrs.clone());
@@ -7807,7 +7843,11 @@ impl Cluster {
         }
 
         // 4. collect and distribute precommits (locking happens here)
-        let precommits: Vec<Vote> = self.nodes.iter_mut().filter_map(|n| n.make_precommit()).collect();
+        let precommits: Vec<Vote> = self
+            .nodes
+            .iter_mut()
+            .filter_map(|n| n.make_precommit())
+            .collect();
         for v in &precommits {
             for n in self.nodes.iter_mut() {
                 let _ = n.on_precommit(v.clone());
@@ -7858,10 +7898,9 @@ impl ShardedCluster {
         // C1 anchor: ONE registry for the whole multi-shard process (both
         // shards read what either finalized). Per-Cluster registries from the
         // constructor above are replaced by the shared one.
-        let hdrs: Arc<std::sync::RwLock<crate::sharding::FinalizedHeaderRegistry>> =
-            Arc::new(std::sync::RwLock::new(
-                crate::sharding::FinalizedHeaderRegistry::default(),
-            ));
+        let hdrs: Arc<std::sync::RwLock<crate::sharding::FinalizedHeaderRegistry>> = Arc::new(
+            std::sync::RwLock::new(crate::sharding::FinalizedHeaderRegistry::default()),
+        );
         for c in map.values_mut() {
             for n in &mut c.nodes {
                 n.finalized_headers = Some(hdrs.clone());
@@ -8020,7 +8059,10 @@ impl ChainState {
 
     /// Prune included transactions from this pool on apply, exactly as
     /// `apply_block_fees_rewards` does for the live path.
-    pub fn with_mempool(mut self, mempool: Arc<tokio::sync::RwLock<crate::mempool::Mempool>>) -> Self {
+    pub fn with_mempool(
+        mut self,
+        mempool: Arc<tokio::sync::RwLock<crate::mempool::Mempool>>,
+    ) -> Self {
         self.mempool = Some(mempool);
         self
     }
@@ -8070,7 +8112,10 @@ impl ChainState {
                 if msg.merkle_inclusion_proof.is_some() || msg.trusted {
                     continue;
                 }
-                if self.completed_cross_shard.contains(&msg.tx.compute_tx_hash()) {
+                if self
+                    .completed_cross_shard
+                    .contains(&msg.tx.compute_tx_hash())
+                {
                     continue;
                 }
                 let linked = self
@@ -8097,8 +8142,11 @@ impl ChainState {
             }
         }
         if let Some(mp) = &self.mempool {
-            let included: Vec<[u8; 32]> =
-                block.transactions.iter().map(|t| t.compute_tx_hash()).collect();
+            let included: Vec<[u8; 32]> = block
+                .transactions
+                .iter()
+                .map(|t| t.compute_tx_hash())
+                .collect();
             mp.write().await.prune_confirmed(&included);
         }
     }
@@ -8190,8 +8238,17 @@ mod tests {
         let (timed, stages) = rt.validate_proposal_timed(&block, root);
         assert_eq!(plain.is_ok(), timed.is_ok(), "verdicts must agree");
         let names: Vec<&str> = stages.iter().map(|(s, _)| s.as_str()).collect();
-        for want in ["proposer_sig_verify", "state_root_check", "order_commit", "tx_batch_verify", "fee_floor_mempool"] {
-            assert!(names.contains(&want), "stage {want} must be attributed, got {names:?}");
+        for want in [
+            "proposer_sig_verify",
+            "state_root_check",
+            "order_commit",
+            "tx_batch_verify",
+            "fee_floor_mempool",
+        ] {
+            assert!(
+                names.contains(&want),
+                "stage {want} must be attributed, got {names:?}"
+            );
         }
         // A corrupt block is refused by BOTH paths identically.
         let mut bad = block.clone();
@@ -8209,7 +8266,10 @@ mod tests {
         let mut rt = ValidatorRuntime::new(key, validators, funded_state(me).await, 1);
         assert_eq!(rt.slow_validation_total, 0);
         // Fast validation: no meter.
-        rt.note_validation_timing(&[("proposer_sig_verify".into(), 5), ("tx_batch_verify".into(), 10)]);
+        rt.note_validation_timing(&[
+            ("proposer_sig_verify".into(), 5),
+            ("tx_batch_verify".into(), 10),
+        ]);
         assert_eq!(rt.slow_validation_total, 0);
         // Slow validation: meter + names the slow stage (trie vs sigs vs mempool).
         rt.note_validation_timing(&[
@@ -8220,7 +8280,11 @@ mod tests {
         ]);
         assert_eq!(rt.slow_validation_total, 1);
         assert_eq!(rt.validation_last_stages.len(), 4);
-        let slowest = rt.validation_last_stages.iter().max_by_key(|(_, ms)| *ms).unwrap();
+        let slowest = rt
+            .validation_last_stages
+            .iter()
+            .max_by_key(|(_, ms)| *ms)
+            .unwrap();
         assert_eq!(slowest.0, "state_root_check");
     }
 
@@ -8239,14 +8303,28 @@ mod tests {
         // Deterministic keys: same harness, same schedule, every run.
         let seeds: [u8; 4] = [0x0C, 0x0B, 0x0A, 0x0D]; // C, B, A, D
         let powers: [u64; 4] = [1470, 1999, 1999, 2000];
-        let keys: Vec<SigningKey> = seeds.iter().map(|s| SigningKey::from_bytes(&[*s; 32])).collect();
+        let keys: Vec<SigningKey> = seeds
+            .iter()
+            .map(|s| SigningKey::from_bytes(&[*s; 32]))
+            .collect();
         let ids: Vec<ValidatorId> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
         let slow_id = ids[3]; // D: largest power, 1 vCPU, historically nil-voting
-        let validators = ValidatorSet::from_list(ids.iter().zip(powers.iter()).map(|(id, p)| (*id, *p)).collect());
+        let validators = ValidatorSet::from_list(
+            ids.iter()
+                .zip(powers.iter())
+                .map(|(id, p)| (*id, *p))
+                .collect(),
+        );
         assert_eq!(validators.total_power(), 7468);
         assert_eq!(validators.quorum_power(), 4979); // floor(2*7468/3)+1
-        assert!(7468 - 2000 >= validators.quorum_power(), "any single nil-voter is survivable");
-        assert!(2000 + 1999 < validators.quorum_power(), "any TWO nil-voters stall (needs >=3 of 4)");
+        assert!(
+            7468 - 2000 >= validators.quorum_power(),
+            "any single nil-voter is survivable"
+        );
+        assert!(
+            2000 + 1999 < validators.quorum_power(),
+            "any TWO nil-voters stall (needs >=3 of 4)"
+        );
 
         let mut nodes: Vec<ValidatorRuntime> = Vec::new();
         for k in &keys {
@@ -8264,12 +8342,19 @@ mod tests {
         let mut ts: u64 = 1_700_000_000;
         for h in 1u64..=20 {
             ts += 1;
-            debug_assert!(nodes.iter().all(|n| n.hc.height == h), "heights must stay in lockstep");
+            debug_assert!(
+                nodes.iter().all(|n| n.hc.height == h),
+                "heights must stay in lockstep"
+            );
             let mut view_changes: u32 = 0;
             // If the slot proposer is the slow member, burn exactly ONE nil
             // round first (its 5x-slow proposal cannot land in time), then
             // finalize in the next round under the adaptive timeout.
-            let proposer0 = nodes[0].hc.validators.proposer_for(h, nodes[0].hc.round).unwrap();
+            let proposer0 = nodes[0]
+                .hc
+                .validators
+                .proposer_for(h, nodes[0].hc.round)
+                .unwrap();
             let slow_slot = proposer0 == slow_id;
             if slow_slot {
                 for n in nodes.iter_mut() {
@@ -8279,13 +8364,21 @@ mod tests {
             }
             // Propose at the (possibly advanced) round.
             let r = nodes[0].hc.round;
-            let pidx = nodes.iter().position(|n| n.validators.proposer_for(h, r) == Some(n.id)).expect("proposer");
-            let block = nodes[pidx].propose(ts).await.expect("proposer failed to propose");
+            let pidx = nodes
+                .iter()
+                .position(|n| n.validators.proposer_for(h, r) == Some(n.id))
+                .expect("proposer");
+            let block = nodes[pidx]
+                .propose(ts)
+                .await
+                .expect("proposer failed to propose");
             let bh = block.compute_hash();
             let pid = nodes[pidx].id;
             for (i, n) in nodes.iter_mut().enumerate() {
                 if i != pidx {
-                    n.on_proposal(pid, block.clone(), r).await.expect("proposal rejected");
+                    n.on_proposal(pid, block.clone(), r)
+                        .await
+                        .expect("proposal rejected");
                 }
             }
             let prevotes: Vec<Vote> = nodes.iter().filter_map(|n| n.make_prevote()).collect();
@@ -8295,8 +8388,14 @@ mod tests {
                     let _ = n.on_prevote(v.clone());
                 }
             }
-            let precommits: Vec<Vote> = nodes.iter_mut().filter_map(|n| n.make_precommit()).collect();
-            assert!(!precommits.is_empty(), "polka must yield precommits at h={h}");
+            let precommits: Vec<Vote> = nodes
+                .iter_mut()
+                .filter_map(|n| n.make_precommit())
+                .collect();
+            assert!(
+                !precommits.is_empty(),
+                "polka must yield precommits at h={h}"
+            );
             for v in &precommits {
                 for n in nodes.iter_mut() {
                     let _ = n.on_precommit(v.clone());
@@ -8306,7 +8405,11 @@ mod tests {
                 let got = n.try_finalize().await;
                 assert_eq!(got, Some(bh), "all 4 nodes must finalize h={h}");
             }
-            assert!(view_changes <= 2, "h={h}: {} view changes (>2)", view_changes);
+            assert!(
+                view_changes <= 2,
+                "h={h}: {} view changes (>2)",
+                view_changes
+            );
             table.push((h, view_changes));
         }
         // Measured acceptance table (also printed for the report).
@@ -8317,12 +8420,16 @@ mod tests {
         assert_eq!(table.len(), 20);
         assert!(table.iter().all(|(_, vc)| *vc <= 2));
         let slow_slots = table.iter().filter(|(_, vc)| *vc == 1).count();
-        assert!(slow_slots >= 1, "the slow member must own slots in 20 heights (hash schedule)");
+        assert!(
+            slow_slots >= 1,
+            "the slow member must own slots in 20 heights (hash schedule)"
+        );
     }
 
     async fn funded_state(owner: [u8; 32]) -> Arc<InMemoryStateEngine> {
         let st = Arc::new(InMemoryStateEngine::new());
-        st.update_account(AccountState::new(owner, 10_000_000)).await;
+        st.update_account(AccountState::new(owner, 10_000_000))
+            .await;
         st
     }
 
@@ -8364,10 +8471,17 @@ mod tests {
         rt.blocks.insert(parent_hash, parent);
 
         // Same timestamp: monotone OK.
-        assert!(rt.check_block_timestamp(&gate_block(2, parent_hash, 1_000_000, me)).is_ok());
+        assert!(rt
+            .check_block_timestamp(&gate_block(2, parent_hash, 1_000_000, me))
+            .is_ok());
         // Exactly one max jump ahead: OK (the envelope's edge).
         assert!(rt
-            .check_block_timestamp(&gate_block(2, parent_hash, 1_000_000 + MAX_TIMESTAMP_JUMP_SECS, me))
+            .check_block_timestamp(&gate_block(
+                2,
+                parent_hash,
+                1_000_000 + MAX_TIMESTAMP_JUMP_SECS,
+                me
+            ))
             .is_ok());
         // One second past the envelope: refused.
         assert!(rt
@@ -8379,11 +8493,17 @@ mod tests {
             ))
             .is_err());
         // Backwards: refused.
-        assert!(rt.check_block_timestamp(&gate_block(2, parent_hash, 999_999, me)).is_err());
+        assert!(rt
+            .check_block_timestamp(&gate_block(2, parent_hash, 999_999, me))
+            .is_err());
         // Missing timestamp: refused.
-        assert!(rt.check_block_timestamp(&gate_block(2, parent_hash, 0, me)).is_err());
+        assert!(rt
+            .check_block_timestamp(&gate_block(2, parent_hash, 0, me))
+            .is_err());
         // Unknown parent: fail-closed, never skipped.
-        assert!(rt.check_block_timestamp(&gate_block(2, [0xEE; 32], 1_000_000, me)).is_err());
+        assert!(rt
+            .check_block_timestamp(&gate_block(2, [0xEE; 32], 1_000_000, me))
+            .is_err());
     }
 
     #[tokio::test]
@@ -8394,8 +8514,12 @@ mod tests {
         let rt = ValidatorRuntime::new(key, validators, funded_state(me).await, 1);
         // Height 1 off the zero parent: any non-zero timestamp is past the
         // anchor (the forward-jump bound does not apply to genesis).
-        assert!(rt.check_block_timestamp(&gate_block(1, [0u8; 32], 1_700_000_000, me)).is_ok());
-        assert!(rt.check_block_timestamp(&gate_block(1, [0u8; 32], 0, me)).is_err());
+        assert!(rt
+            .check_block_timestamp(&gate_block(1, [0u8; 32], 1_700_000_000, me))
+            .is_ok());
+        assert!(rt
+            .check_block_timestamp(&gate_block(1, [0u8; 32], 0, me))
+            .is_err());
     }
 
     /// Regression: the RPC layer and the consensus loop once had SEPARATE
@@ -8412,25 +8536,48 @@ mod tests {
 
         // This is the handle the RPC layer writes to.
         let shared = Arc::new(tokio::sync::RwLock::new(crate::mempool::Mempool::default()));
-        let rt = ValidatorRuntime::new(key.clone(), validators, state, 1)
-            .with_mempool(shared.clone());
+        let rt =
+            ValidatorRuntime::new(key.clone(), validators, state, 1).with_mempool(shared.clone());
 
         let tx = crate::sharding::Transaction::sign(&key, [1u8; 32], 10, 1_000, 0, 1, 1);
-        let balance = rt.state.get_account(&me).await.map(|a| a.balance).unwrap_or(0);
+        let balance = rt
+            .state
+            .get_account(&me)
+            .await
+            .map(|a| a.balance)
+            .unwrap_or(0);
 
         // Submit exactly the way the RPC handler does...
-        shared.write().await.add_checked(tx.clone(), balance).unwrap();
-        assert_eq!(shared.read().await.len(), 1, "the RPC's mempool must hold it");
+        shared
+            .write()
+            .await
+            .add_checked(tx.clone(), balance)
+            .unwrap();
+        assert_eq!(
+            shared.read().await.len(),
+            1,
+            "the RPC's mempool must hold it"
+        );
 
         // ...and the proposer must select that very same transaction.
         let selected = rt.mempool.read().await.select_bounded(100, 30_000_000);
-        assert_eq!(selected.len(), 1, "proposer must see the transaction submitted over RPC");
+        assert_eq!(
+            selected.len(),
+            1,
+            "proposer must see the transaction submitted over RPC"
+        );
         assert_eq!(selected[0].compute_tx_hash(), tx.compute_tx_hash());
 
         // And a confirmed transaction leaves both views empty.
-        rt.mempool.write().await.prune_confirmed(&[tx.compute_tx_hash()]);
+        rt.mempool
+            .write()
+            .await
+            .prune_confirmed(&[tx.compute_tx_hash()]);
         assert!(rt.mempool.read().await.is_empty());
-        assert!(shared.read().await.is_empty(), "RPC view must not keep a confirmed tx");
+        assert!(
+            shared.read().await.is_empty(),
+            "RPC view must not keep a confirmed tx"
+        );
     }
 
     #[test]
@@ -8440,7 +8587,10 @@ mod tests {
         let mut snap = std::collections::HashMap::new();
         snap.insert([1u8; 32], (0u64, 100u64));
         let pool = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
-        assert_eq!(missing_sender_accounts(&snap, &pool), vec![[2u8; 32], [3u8; 32]]);
+        assert_eq!(
+            missing_sender_accounts(&snap, &pool),
+            vec![[2u8; 32], [3u8; 32]]
+        );
         assert!(missing_sender_accounts(&snap, &[[1u8; 32]]).is_empty());
         assert!(missing_sender_accounts(&std::collections::HashMap::new(), &[]).is_empty());
     }
@@ -8469,7 +8619,10 @@ mod tests {
         rt.note_lock_hint(rt.hc.height, VoteKind::Prevote, None, Some(h));
         assert!(rt.demanded.contains(&h), "hint must record the demand");
         // Corrupt the stored copy so the serve-time re-validation fails.
-        rt.blocks.get_mut(&h).expect("body must be stored").state_root = [9u8; 32];
+        rt.blocks
+            .get_mut(&h)
+            .expect("body must be stored")
+            .state_root = [9u8; 32];
         rt.hc.proposal = None;
         let _ = rt.propose(1_000).await;
         assert!(
@@ -8478,11 +8631,21 @@ mod tests {
         );
         // Repair the stored copy: the still-queued demand serves exactly once.
         let root = rt.state.get_state_root().await;
-        rt.blocks.get_mut(&h).expect("body must be stored").state_root = root;
+        rt.blocks
+            .get_mut(&h)
+            .expect("body must be stored")
+            .state_root = root;
         rt.hc.proposal = None;
         let served = rt.propose(1_000).await.expect("repaired demand must serve");
-        assert_eq!(served.compute_hash(), h, "must re-propose the demanded body verbatim");
-        assert!(rt.demanded.is_empty(), "successful serve consumes the demand one-shot");
+        assert_eq!(
+            served.compute_hash(),
+            h,
+            "must re-propose the demanded body verbatim"
+        );
+        assert!(
+            rt.demanded.is_empty(),
+            "successful serve consumes the demand one-shot"
+        );
     }
 
     /// The `lock_hint` envelope is SIGNATURE-EXTERNAL (review dim 5): it
@@ -8529,7 +8692,10 @@ mod tests {
         // A hint for a WRONG height is dropped (and must not wipe this
         // height's demands — the scope reset only runs for the live height).
         rt.note_lock_hint(h, VoteKind::Prevote, None, Some(ours));
-        assert!(rt.demanded.contains(&ours), "genuine hint must record the demand");
+        assert!(
+            rt.demanded.contains(&ours),
+            "genuine hint must record the demand"
+        );
         rt.note_lock_hint(h + 1, VoteKind::Prevote, None, Some(ours));
         assert!(
             rt.demanded.contains(&ours),
@@ -8588,12 +8754,15 @@ mod tests {
         for _ in 0..5 {
             let sk = SigningKey::generate(&mut OsRng);
             let from = sk.verifying_key().to_bytes();
-            rt.state.update_account(AccountState::new(from, 100_000_000)).await;
+            rt.state
+                .update_account(AccountState::new(from, 100_000_000))
+                .await;
             senders.push(sk);
         }
         for sk in &senders {
             for i in 0..10u64 {
-                rt.add_tx(Transaction::sign(sk, [1u8; 32], 10, 280_000, i, 1, 1)).await;
+                rt.add_tx(Transaction::sign(sk, [1u8; 32], 10, 280_000, i, 1, 1))
+                    .await;
             }
         }
         assert_eq!(rt.mempool.read().await.len(), 50);
@@ -8606,10 +8775,16 @@ mod tests {
         );
         // Deterministic rebuild: the same pool yields the same ordered set.
         let second = rt.propose(1_000).await.expect("rebuild must also propose");
-        let h1: Vec<[u8; 32]> =
-            first.transactions.iter().map(|t| t.compute_tx_hash()).collect();
-        let h2: Vec<[u8; 32]> =
-            second.transactions.iter().map(|t| t.compute_tx_hash()).collect();
+        let h1: Vec<[u8; 32]> = first
+            .transactions
+            .iter()
+            .map(|t| t.compute_tx_hash())
+            .collect();
+        let h2: Vec<[u8; 32]> = second
+            .transactions
+            .iter()
+            .map(|t| t.compute_tx_hash())
+            .collect();
         assert_eq!(h1, h2, "packing snapshot must be deterministic");
     }
 
@@ -8653,7 +8828,10 @@ mod tests {
             }
             v
         };
-        assert!(roots.windows(2).all(|w| w[0] == w[1]), "nodes diverged on state root");
+        assert!(
+            roots.windows(2).all(|w| w[0] == w[1]),
+            "nodes diverged on state root"
+        );
 
         for n in &cluster.nodes {
             assert_eq!(n.applied_txs, 3, "each node applied 3 txs");
@@ -8696,14 +8874,24 @@ mod tests {
         }
 
         // only the first 3 (a quorum) vote
-        let prevotes: Vec<Vote> = cluster.nodes.iter().take(3).filter_map(|n| n.make_prevote()).collect();
+        let prevotes: Vec<Vote> = cluster
+            .nodes
+            .iter()
+            .take(3)
+            .filter_map(|n| n.make_prevote())
+            .collect();
         assert_eq!(prevotes.len(), 3);
         for v in &prevotes {
             for n in cluster.nodes.iter_mut() {
                 let _ = n.on_prevote(v.clone());
             }
         }
-        let precommits: Vec<Vote> = cluster.nodes.iter_mut().take(3).filter_map(|n| n.make_precommit()).collect();
+        let precommits: Vec<Vote> = cluster
+            .nodes
+            .iter_mut()
+            .take(3)
+            .filter_map(|n| n.make_precommit())
+            .collect();
         assert_eq!(precommits.len(), 3);
         for v in &precommits {
             for n in cluster.nodes.iter_mut() {
@@ -8744,20 +8932,34 @@ mod tests {
             }
         }
         // only 2 of 4 vote -> below quorum 3
-        let prevotes: Vec<Vote> = cluster.nodes.iter().take(2).filter_map(|n| n.make_prevote()).collect();
+        let prevotes: Vec<Vote> = cluster
+            .nodes
+            .iter()
+            .take(2)
+            .filter_map(|n| n.make_prevote())
+            .collect();
         for v in &prevotes {
             for n in cluster.nodes.iter_mut() {
                 let _ = n.on_prevote(v.clone());
             }
         }
-        let precommits: Vec<Vote> = cluster.nodes.iter_mut().take(2).filter_map(|n| n.make_precommit()).collect();
+        let precommits: Vec<Vote> = cluster
+            .nodes
+            .iter_mut()
+            .take(2)
+            .filter_map(|n| n.make_precommit())
+            .collect();
         for v in &precommits {
             for n in cluster.nodes.iter_mut() {
                 let _ = n.on_precommit(v.clone());
             }
         }
         for n in cluster.nodes.iter_mut() {
-            assert_eq!(n.try_finalize().await, None, "must not finalize without quorum");
+            assert_eq!(
+                n.try_finalize().await,
+                None,
+                "must not finalize without quorum"
+            );
         }
     }
 
@@ -8796,19 +8998,28 @@ mod tests {
         // wrong height
         let mut b1 = block.clone();
         b1.height = 999;
-        assert!(receiver.validate_proposal(&b1, root).is_err(), "wrong height must be rejected");
+        assert!(
+            receiver.validate_proposal(&b1, root).is_err(),
+            "wrong height must be rejected"
+        );
 
         // wrong proposer
         let mut b2 = block.clone();
         b2.proposer = [0xEE; 32];
-        assert!(receiver.validate_proposal(&b2, root).is_err(), "wrong proposer must be rejected");
+        assert!(
+            receiver.validate_proposal(&b2, root).is_err(),
+            "wrong proposer must be rejected"
+        );
 
         // tampered tx signature
         let mut b3 = block.clone();
         if let Some(t) = b3.transactions.first_mut() {
             t.signature[0] ^= 0xFF;
         }
-        assert!(receiver.validate_proposal(&b3, root).is_err(), "bad tx signature must be rejected");
+        assert!(
+            receiver.validate_proposal(&b3, root).is_err(),
+            "bad tx signature must be rejected"
+        );
 
         // oversized block (count check happens before signatures)
         let mut b4 = block.clone();
@@ -8826,7 +9037,10 @@ mod tests {
                 priority_fee_per_gas: 0,
             })
             .collect();
-        assert!(receiver.validate_proposal(&b4, root).is_err(), "oversized block must be rejected");
+        assert!(
+            receiver.validate_proposal(&b4, root).is_err(),
+            "oversized block must be rejected"
+        );
 
         // forged proposer signature: correct proposer FIELD, but the block is
         // signed by an attacker key -> authenticity check must reject it.
@@ -8984,7 +9198,9 @@ mod tests {
         let c_addr = [0xC0u8; 32];
 
         let state = Arc::new(InMemoryStateEngine::new());
-        state.update_account(AccountState::new(from, 1_000_000)).await;
+        state
+            .update_account(AccountState::new(from, 1_000_000))
+            .await;
 
         let mk = |height: u64, prev: [u8; 32], txs: Vec<Transaction>, sk: &SigningKey| {
             let order_merkle_root = crate::mev::compute_order_merkle_root(&txs);
@@ -9004,7 +9220,7 @@ mod tests {
                 order_merkle_root,
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-};
+            };
             blk.sign_block(sk);
             blk
         };
@@ -9019,9 +9235,19 @@ mod tests {
         cs.save_checkpoint().await;
 
         // Canonical chain A: two transfers of 100 to B.
-        let blk1 = mk(1, g, vec![Transaction::sign(&user, b_addr, 100, 0, 0, 1, 1)], &user);
+        let blk1 = mk(
+            1,
+            g,
+            vec![Transaction::sign(&user, b_addr, 100, 0, 0, 1, 1)],
+            &user,
+        );
         let b1 = cm.insert(blk1.clone());
-        let blk2 = mk(2, b1, vec![Transaction::sign(&user, b_addr, 100, 0, 1, 1, 1)], &user);
+        let blk2 = mk(
+            2,
+            b1,
+            vec![Transaction::sign(&user, b_addr, 100, 0, 1, 1, 1)],
+            &user,
+        );
         let b2 = cm.insert(blk2.clone());
         cm.recompute_canonical();
         assert_eq!(cm.best_head(), b2);
@@ -9031,11 +9257,26 @@ mod tests {
         assert_eq!(state.get_account(&b_addr).await.unwrap().balance, 200);
 
         // Longer fork B: three transfers of 50 to C.
-        let f1 = mk(1, g, vec![Transaction::sign(&user, c_addr, 50, 0, 0, 1, 1)], &user);
+        let f1 = mk(
+            1,
+            g,
+            vec![Transaction::sign(&user, c_addr, 50, 0, 0, 1, 1)],
+            &user,
+        );
         let fb1 = cm.insert(f1.clone());
-        let f2 = mk(2, fb1, vec![Transaction::sign(&user, c_addr, 50, 0, 1, 1, 1)], &user);
+        let f2 = mk(
+            2,
+            fb1,
+            vec![Transaction::sign(&user, c_addr, 50, 0, 1, 1, 1)],
+            &user,
+        );
         let fb2 = cm.insert(f2.clone());
-        let f3 = mk(3, fb2, vec![Transaction::sign(&user, c_addr, 50, 0, 2, 1, 1)], &user);
+        let f3 = mk(
+            3,
+            fb2,
+            vec![Transaction::sign(&user, c_addr, 50, 0, 2, 1, 1)],
+            &user,
+        );
         let fb3 = cm.insert(f3.clone());
 
         // Plan from canonical (b2) to the longer fork head (fb3).
@@ -9045,8 +9286,16 @@ mod tests {
 
         // Apply the reorg: state must reflect the new chain, not the old one.
         cs.reorg(&cm.tree, &plan).await;
-        assert_eq!(state.get_account(&from).await.unwrap().balance, 999_850, "from: -150 only");
-        assert_eq!(state.get_account(&c_addr).await.unwrap().balance, 150, "C has the new transfers");
+        assert_eq!(
+            state.get_account(&from).await.unwrap().balance,
+            999_850,
+            "from: -150 only"
+        );
+        assert_eq!(
+            state.get_account(&c_addr).await.unwrap().balance,
+            150,
+            "C has the new transfers"
+        );
         assert!(
             state.get_account(&b_addr).await.is_none(),
             "B's rolled-back transfers must be gone"
@@ -9081,7 +9330,7 @@ mod tests {
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-};
+            };
             blk.sign_block(&user);
             blk
         };
@@ -9099,7 +9348,10 @@ mod tests {
 
         let mut cs = ChainState::new(state);
         let signal = cs.reorg_with_signal(&cm.tree, &plan).await;
-        assert_eq!(signal.orphaned_blocks, plan.rollback, "the rolled-back blocks");
+        assert_eq!(
+            signal.orphaned_blocks, plan.rollback,
+            "the rolled-back blocks"
+        );
         assert_eq!(signal.height, 1, "the first invalidated height");
         assert!(signal.reason.contains("reorg"));
     }
@@ -9145,7 +9397,7 @@ mod tests {
         };
         b.sign_block(sk);
         b
-}
+    }
 
     /// A runtime with an invalidation sink that collects what is published.
     fn runtime_with_sink(
@@ -9188,7 +9440,10 @@ mod tests {
         // finalized head.
         let c1 = fork_block(2, f1h, 0xC1, &key);
         let c2 = fork_block(2, f1h, 0xC2, &key);
-        assert!(rt.record_candidate_block(&c1), "a valid candidate must be recorded");
+        assert!(
+            rt.record_candidate_block(&c1),
+            "a valid candidate must be recorded"
+        );
         assert!(rt.record_candidate_block(&c2));
         assert_eq!(rt.chain.candidates_at(2).len(), 2);
 
@@ -9211,7 +9466,10 @@ mod tests {
             !orphaned.contains(&w.compute_hash()),
             "the finalized block was applied, it is not orphaned"
         );
-        assert!(rt.chain.candidates.is_empty(), "the lost branches are pruned");
+        assert!(
+            rt.chain.candidates.is_empty(),
+            "the lost branches are pruned"
+        );
     }
 
     /// A LONGER candidate branch wins the fork-choice: the reorg plan is
@@ -9232,7 +9490,9 @@ mod tests {
         let a1h = a1.compute_hash();
         assert!(rt.record_candidate_block(&a1));
         // The fork-choice adopts the first candidate (nothing to roll back).
-        let first = rt.run_fork_choice().expect("the first candidate is adopted");
+        let first = rt
+            .run_fork_choice()
+            .expect("the first candidate is adopted");
         assert!(first.plan.rollback.is_empty());
         assert!(first.invalidations.is_empty(), "nothing was orphaned yet");
 
@@ -9250,7 +9510,10 @@ mod tests {
         assert_eq!(outcome.plan.apply, vec![b1h, b2h], "branch B is applied");
         assert_eq!(outcome.invalidations.len(), 1);
         assert_eq!(outcome.invalidations[0].orphaned_blocks, vec![a1h]);
-        assert_eq!(outcome.invalidations[0].height, 2, "the first invalidated height");
+        assert_eq!(
+            outcome.invalidations[0].height, 2,
+            "the first invalidated height"
+        );
         // The signal reached the transport.
         assert_eq!(seen.lock().unwrap().len(), 1);
         // The state is untouched: a candidate was never applied.
@@ -9307,7 +9570,10 @@ mod tests {
 
         // A block at the finalized height (it lost the fork-choice).
         let late = fork_block(1, [0u8; 32], 0xA1, &key);
-        assert!(!rt.record_candidate_block(&late), "it must not become a candidate");
+        assert!(
+            !rt.record_candidate_block(&late),
+            "it must not become a candidate"
+        );
         let published = seen.lock().unwrap().clone();
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].orphaned_blocks, vec![late.compute_hash()]);
@@ -9352,12 +9618,20 @@ mod tests {
             let mut ledger = engine.staking_write().await;
             for k in &historical {
                 ledger
-                    .bond(k.verifying_key().to_bytes(), MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
+                    .bond(
+                        k.verifying_key().to_bytes(),
+                        MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER,
+                        0,
+                    )
                     .unwrap();
             }
         }
         let historical_vs = engine.staking_read().await.to_validator_set();
-        assert_eq!(historical_vs.len(), 3, "precondition: ledger holds the height's set");
+        assert_eq!(
+            historical_vs.len(),
+            3,
+            "precondition: ledger holds the height's set"
+        );
 
         // The runtime's current set is DIFFERENT. If replay verified against this
         // one it would reject a genuine historical certificate.
@@ -9387,7 +9661,7 @@ mod tests {
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-};
+        };
         block.sign_block(&historical[0]);
         let bh = block.compute_hash();
         let sigs = historical
@@ -9447,7 +9721,10 @@ mod tests {
         let pc_old = rt
             .make_precommit()
             .expect("a polka behind us must still be precommitted");
-        assert_eq!(pc_old.round, 0, "precommit is stamped with the POLKA's round");
+        assert_eq!(
+            pc_old.round, 0,
+            "precommit is stamped with the POLKA's round"
+        );
         assert_eq!(pc_old.block_hash, Some(target));
         assert_eq!(
             rt.hc.locked,
@@ -9466,7 +9743,9 @@ mod tests {
             rt.on_prevote(Vote::sign(k, h, 1, VoteKind::Prevote, Some(target)))
                 .unwrap();
         }
-        let pc = rt.make_precommit().expect("current-round QC must precommit");
+        let pc = rt
+            .make_precommit()
+            .expect("current-round QC must precommit");
         assert_eq!(pc.round, 1);
         assert_eq!(pc.block_hash, Some(target));
     }
@@ -9481,7 +9760,10 @@ mod tests {
         let mut rt = ValidatorRuntime::new(ks[0].clone(), vs, state.clone(), 1);
         assert!(!rt.parallel_exec, "default parallel_exec is false");
         assert!(!rt.is_parallel_exec_enabled(), "default is disabled");
-        assert!(!rt.state.is_parallel_exec_enabled(), "state default is disabled");
+        assert!(
+            !rt.state.is_parallel_exec_enabled(),
+            "state default is disabled"
+        );
 
         // Enable parallel execution
         rt = rt.with_parallel_exec(true);
@@ -9491,9 +9773,15 @@ mod tests {
 
         // Temporarily clear on state directly; runtime preserves / restores it on propose
         rt.state.set_parallel_exec(false);
-        assert!(!rt.state.parallel_exec.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!rt
+            .state
+            .parallel_exec
+            .load(std::sync::atomic::Ordering::Acquire));
         let _ = rt.propose(1_000_000).await;
-        assert!(rt.state.is_parallel_exec_enabled(), "propose preserves parallel exec on state");
+        assert!(
+            rt.state.is_parallel_exec_enabled(),
+            "propose preserves parallel exec on state"
+        );
 
         // Set to false via runtime
         rt.set_parallel_exec(false);
@@ -9520,9 +9808,12 @@ mod tests {
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-};
+        };
         rt.apply_and_advance(blk.compute_hash(), &blk).await;
-        assert!(rt.state.is_parallel_exec_enabled(), "apply_and_advance preserves parallel exec on state");
+        assert!(
+            rt.state.is_parallel_exec_enabled(),
+            "apply_and_advance preserves parallel exec on state"
+        );
     }
 
     #[tokio::test]
@@ -9556,7 +9847,9 @@ mod tests {
             Some(block.compute_hash()),
             "the prevote must be for the proposal we just made"
         );
-        let falcon_sig = prevote.falcon_signature().expect("vote must carry Falcon signature");
+        let falcon_sig = prevote
+            .falcon_signature()
+            .expect("vote must carry Falcon signature");
         assert_eq!(falcon_sig.len(), crate::post_quantum::FALCON512_SIG_LEN);
 
         let msg = crate::consensus::vote_sign_bytes(1, 0, VoteKind::Prevote, &prevote.block_hash);
@@ -9589,8 +9882,11 @@ mod tests {
         // 4. make_precommit with polka produces precommit with Falcon signature
         assert!(rt.on_prevote(prevote).is_ok());
         let precommit = rt.make_precommit().expect("precommit must be produced");
-        let pc_falcon_sig = precommit.falcon_signature().expect("precommit must carry Falcon signature");
-        let pc_msg = crate::consensus::vote_sign_bytes(1, 0, VoteKind::Precommit, &precommit.block_hash);
+        let pc_falcon_sig = precommit
+            .falcon_signature()
+            .expect("precommit must carry Falcon signature");
+        let pc_msg =
+            crate::consensus::vote_sign_bytes(1, 0, VoteKind::Precommit, &precommit.block_hash);
         assert!(crate::post_quantum::verify_pq_signature(
             crate::post_quantum::PqScheme::Falcon512,
             &fk.public_key,
@@ -9624,19 +9920,28 @@ mod tests {
             .enumerate()
             .map(|(i, (k, st))| {
                 let fk = FalconKeypair::generate_from_seed((i + 1) as u8);
-                ValidatorRuntime::new(k, validators.clone(), st, 1)
-                    .with_falcon_key(fk)
+                ValidatorRuntime::new(k, validators.clone(), st, 1).with_falcon_key(fk)
             })
             .collect();
 
         let tx = Transaction::sign(&user, to, 1_000, 280_000, 0, 1, 1);
         for rt in &runtimes {
-            rt.mempool.write().await.add_checked(tx.clone(), 10_000_000).unwrap();
+            rt.mempool
+                .write()
+                .await
+                .add_checked(tx.clone(), 10_000_000)
+                .unwrap();
         }
 
         // 1. Propose from designated proposer
-        let proposer_idx = runtimes.iter().position(|rt| rt.is_proposer()).expect("must have proposer");
-        let block = runtimes[proposer_idx].propose(1_000).await.expect("propose must succeed");
+        let proposer_idx = runtimes
+            .iter()
+            .position(|rt| rt.is_proposer())
+            .expect("must have proposer");
+        let block = runtimes[proposer_idx]
+            .propose(1_000)
+            .await
+            .expect("propose must succeed");
         let bh = block.compute_hash();
 
         // Ingest proposal on all nodes
@@ -9659,9 +9964,16 @@ mod tests {
             }
             let (polka_round, target) = rt.hc.try_prevote_quorum_at().expect("polka must form");
             assert_eq!(target, Some(bh));
-            let prevote_qc = rt.hc.prevote_qc.get(&polka_round).expect("prevote QC must exist");
+            let prevote_qc = rt
+                .hc
+                .prevote_qc
+                .get(&polka_round)
+                .expect("prevote QC must exist");
             assert!(
-                prevote_qc.signatures.iter().any(|(voter, _)| *voter == crate::consensus::PQ_UQC_MARKER_ID),
+                prevote_qc
+                    .signatures
+                    .iter()
+                    .any(|(voter, _)| *voter == crate::consensus::PQ_UQC_MARKER_ID),
                 "prevote QC must contain PQ_UQC_MARKER_ID"
             );
             assert!(prevote_qc.verify_unified(&validators));
@@ -9679,11 +9991,21 @@ mod tests {
             for v in &precommits {
                 assert!(rt.on_precommit(v.clone()).is_ok());
             }
-            let decided = rt.hc.try_precommit_quorum().expect("precommit quorum must decide");
+            let decided = rt
+                .hc
+                .try_precommit_quorum()
+                .expect("precommit quorum must decide");
             assert_eq!(decided, bh);
-            let precommit_qc = rt.hc.precommit_qc.as_ref().expect("precommit QC must exist");
+            let precommit_qc = rt
+                .hc
+                .precommit_qc
+                .as_ref()
+                .expect("precommit QC must exist");
             assert!(
-                precommit_qc.signatures.iter().any(|(voter, _)| *voter == crate::consensus::PQ_UQC_MARKER_ID),
+                precommit_qc
+                    .signatures
+                    .iter()
+                    .any(|(voter, _)| *voter == crate::consensus::PQ_UQC_MARKER_ID),
                 "precommit QC must contain PQ_UQC_MARKER_ID"
             );
             assert!(precommit_qc.verify_unified(&validators));
@@ -9702,13 +10024,20 @@ mod tests {
     async fn test_sec01_adopt_lock_superseded_by_equal_or_higher_round_qc() {
         let ks = signer_keys(4);
         let me = ks[0].verifying_key().to_bytes();
-        let vs = ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect());
+        let vs = ValidatorSet::from_list(
+            ks.iter()
+                .map(|k| (k.verifying_key().to_bytes(), 1))
+                .collect(),
+        );
         let st = funded_state(me).await;
         let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), st, 1);
 
         let make_block = |round: Round, root: [u8; 32]| -> Block {
             let proposer = vs.proposer_for(1, round).unwrap();
-            let pk = ks.iter().find(|k| k.verifying_key().to_bytes() == proposer).unwrap();
+            let pk = ks
+                .iter()
+                .find(|k| k.verifying_key().to_bytes() == proposer)
+                .unwrap();
             let mut b = Block {
                 shard_id: MASTERCHAIN_SHARD,
                 height: 1,
@@ -9728,7 +10057,7 @@ mod tests {
             };
             b.sign_block(pk);
             b
-};
+        };
 
         let make_qc = |round: Round, bh: BlockHash| -> crate::consensus::QuorumCertificate {
             crate::consensus::QuorumCertificate {
@@ -9767,7 +10096,10 @@ mod tests {
         rt.hc.locked = Some((locked_block, 1));
         let cert_same = make_qc(1, bh0);
         let res = rt.adopt_committed(1, blk0.clone(), cert_same).await;
-        assert!(res.is_err(), "same-round conflicting certificate must be refused");
+        assert!(
+            res.is_err(),
+            "same-round conflicting certificate must be refused"
+        );
         assert!(res.unwrap_err().contains("lock"));
 
         // 3. A certificate from a STRICTLY LATER round proves the network moved
@@ -9816,9 +10148,10 @@ mod tests {
         let config_set = ValidatorSet::from_list(vec![(me, 1)]);
         let key = SigningKey::generate(&mut OsRng);
 
-        let master = ValidatorRuntime::new(key.clone(), config_set.clone(), master_engine.clone(), 1)
-            .with_shard(MASTERCHAIN_SHARD, registry.clone())
-            .with_master_staking(master_handle.clone());
+        let master =
+            ValidatorRuntime::new(key.clone(), config_set.clone(), master_engine.clone(), 1)
+                .with_shard(MASTERCHAIN_SHARD, registry.clone())
+                .with_master_staking(master_handle.clone());
         let workchain = ValidatorRuntime::new(key, config_set, workchain_engine.clone(), 1)
             .with_shard(1, registry)
             .with_master_staking(master_handle.clone());
@@ -9826,7 +10159,11 @@ mod tests {
         // The workchain's own registry is empty BY DESIGN — the masterchain
         // owns the staking registry. This is the state the audit found.
         assert!(
-            workchain_engine.staking_read().await.to_validator_set().is_empty(),
+            workchain_engine
+                .staking_read()
+                .await
+                .to_validator_set()
+                .is_empty(),
             "a workchain must not seed a staking ledger of its own"
         );
         let _ = newcomer;
@@ -9880,9 +10217,15 @@ mod tests {
         );
         // ... and the set in force is height-pinned: H still votes the old
         // set, H+1 the new one.
-        assert_eq!(workchain.validator_set_for_height(h).validators.get(&me), Some(&1));
         assert_eq!(
-            workchain.validator_set_for_height(h + 1).validators.get(&me),
+            workchain.validator_set_for_height(h).validators.get(&me),
+            Some(&1)
+        );
+        assert_eq!(
+            workchain
+                .validator_set_for_height(h + 1)
+                .validators
+                .get(&me),
             Some(&bond)
         );
         // Across the boundary the staged set becomes in-force — consensus
@@ -9893,7 +10236,10 @@ mod tests {
         // The masterchain itself derives exactly the same set.
         assert!(master.refresh_validator_set_from_staking().await);
         advance_test_height(&mut master);
-        assert_eq!(master.validators.validators, workchain.validators.validators);
+        assert_eq!(
+            master.validators.validators,
+            workchain.validators.validators
+        );
 
         // 2. A NEW validator bonds on the masterchain: the workchain stages
         //    it, with the bonded stake as its voting power, in force next.
@@ -9912,16 +10258,25 @@ mod tests {
             "the newcomer must not join mid-flight"
         );
         assert_eq!(
-            workchain.validator_set_for_height(h + 1).validators.get(&newcomer),
+            workchain
+                .validator_set_for_height(h + 1)
+                .validators
+                .get(&newcomer),
             Some(&bond)
         );
         advance_test_height(&mut workchain);
         assert_eq!(workchain.validators.validators.get(&newcomer), Some(&bond));
-        assert_eq!(workchain.hc.validators.validators.get(&newcomer), Some(&bond));
+        assert_eq!(
+            workchain.hc.validators.validators.get(&newcomer),
+            Some(&bond)
+        );
         assert_eq!(workchain.validators.total_power(), 2 * bond);
         assert!(master.refresh_validator_set_from_staking().await);
         advance_test_height(&mut master);
-        assert_eq!(master.validators.validators, workchain.validators.validators);
+        assert_eq!(
+            master.validators.validators,
+            workchain.validators.validators
+        );
 
         // 3. The newcomer unbonds on the masterchain: the workchain drops it
         //    from its set (and from the consensus view) at the next boundary.
@@ -10070,7 +10425,9 @@ mod tests {
             "the boundary installs the master set the repair staged"
         );
         assert_eq!(
-            workchain.validator_set_for_height(wedged_height + 1).validators,
+            workchain
+                .validator_set_for_height(wedged_height + 1)
+                .validators,
             workchain.validators.validators,
         );
 
@@ -10176,7 +10533,7 @@ mod shard_header_commitment_tests {
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
         }
-}
+    }
 
     /// A masterchain block must commit to the latest finalized header of
     /// every workchain shard: the shard id, the height, the block hash, the
@@ -10211,7 +10568,10 @@ mod shard_header_commitment_tests {
             });
         }
 
-        let block = rt.propose(1_700_000_100).await.expect("propose must succeed");
+        let block = rt
+            .propose(1_700_000_100)
+            .await
+            .expect("propose must succeed");
         assert_eq!(block.shard_id, MASTERCHAIN_SHARD);
         assert_eq!(
             block.shard_headers.len(),
@@ -10266,7 +10626,10 @@ mod shard_header_commitment_tests {
             .with_shard(SHARD1, shard_registry)
             .with_finalized_headers(hdrs);
 
-        let block = rt.propose(1_700_000_100).await.expect("propose must succeed");
+        let block = rt
+            .propose(1_700_000_100)
+            .await
+            .expect("propose must succeed");
         assert_eq!(block.shard_id, SHARD1);
         assert!(
             block.shard_headers.is_empty(),
@@ -10303,7 +10666,10 @@ mod shard_header_commitment_tests {
         }
 
         let root = rt.state.get_state_root().await;
-        let good = rt.propose(1_700_000_100).await.expect("propose must succeed");
+        let good = rt
+            .propose(1_700_000_100)
+            .await
+            .expect("propose must succeed");
         assert!(rt.validate_proposal(&good, root).is_ok());
 
         // A head that contradicts the header we finalized at the same height
@@ -10352,7 +10718,10 @@ mod shard_header_commitment_tests {
         let state = funded_state(me).await;
         let validators = ValidatorSet::from_list(vec![(me, 1)]);
         let mut rt = ValidatorRuntime::new(key.clone(), validators, state, 1);
-        let block = rt.propose(1_700_000_100).await.expect("propose must succeed");
+        let block = rt
+            .propose(1_700_000_100)
+            .await
+            .expect("propose must succeed");
         assert!(block.shard_headers.is_empty());
     }
 
@@ -10367,11 +10736,7 @@ mod shard_header_commitment_tests {
     async fn snapshot_jump_reanchors_light_client_for_tail_walk() {
         use crate::consensus::{QuorumCertificate, Vote, VoteKind};
 
-        fn qc_for(
-            ks: &[SigningKey],
-            height: u64,
-            bh: [u8; 32],
-        ) -> QuorumCertificate {
+        fn qc_for(ks: &[SigningKey], height: u64, bh: [u8; 32]) -> QuorumCertificate {
             QuorumCertificate {
                 height,
                 round: 0,
@@ -10409,8 +10774,7 @@ mod shard_header_commitment_tests {
 
         let ks: Vec<SigningKey> = (0..3).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let ids: Vec<[u8; 32]> = ks.iter().map(|k| k.verifying_key().to_bytes()).collect();
-        let vs =
-            ValidatorSet::from_list(ids.iter().map(|id| (*id, 1_000_000)).collect());
+        let vs = ValidatorSet::from_list(ids.iter().map(|id| (*id, 1_000_000)).collect());
         let me = ids[0];
         let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), funded_state(me).await, 1);
         let genesis_root = rt.state.get_state_root().await;
@@ -10452,8 +10816,7 @@ mod shard_header_commitment_tests {
         // ...and accepted after it. (The strict per-header check still
         // refuses the single-proposer block signature — pinning the protocol
         // reality the finality-only probe path works around.)
-        let strict = crate::light_client::LightHeader::of_block(&tail)
-            .expect("tail carries a QC");
+        let strict = crate::light_client::LightHeader::of_block(&tail).expect("tail carries a QC");
         assert!(
             strict.verify(&vs).is_err(),
             "a single proposer signature must not pass the block-signature quorum"
@@ -10473,8 +10836,7 @@ mod shard_header_commitment_tests {
 
         // Fail-closed: a boundary block without a QC leaves the anchor alone.
         let mut rt2 = ValidatorRuntime::new(ks[0].clone(), vs.clone(), funded_state(me).await, 1);
-        rt2
-            .set_light_client(vs.clone(), genesis_root)
+        rt2.set_light_client(vs.clone(), genesis_root)
             .expect("anchor at genesis");
         rt2.finalized.push((boundary, bh));
         let bare = empty_block(boundary, [0x11; 32], genesis_root, ids[0]);
@@ -10490,10 +10852,7 @@ mod shard_header_commitment_tests {
     // VEL-1 bounded proposer-prebuild: reuse ≡ fresh, staleness fail-safe
     // ========================================================================
 
-    async fn vel1_runtime_with_pool(
-        key: &SigningKey,
-        ntxs: u64,
-    ) -> (ValidatorRuntime, [u8; 32]) {
+    async fn vel1_runtime_with_pool(key: &SigningKey, ntxs: u64) -> (ValidatorRuntime, [u8; 32]) {
         let me = key.verifying_key().to_bytes();
         let validators = ValidatorSet::from_list(vec![(me, 1)]);
         let state = Arc::new(InMemoryStateEngine::new());
@@ -10530,12 +10889,21 @@ mod shard_header_commitment_tests {
         let h = a.hc.height;
         assert!(!a.has_prebuild_for(h), "no prebuild before the idle window");
         a.prebuild_next_proposal(TS).await;
-        assert!(a.has_prebuild_for(h), "idle-window prebuild must cache this height");
-        let ba = a.propose(TS).await.expect("reuse-path propose must succeed");
+        assert!(
+            a.has_prebuild_for(h),
+            "idle-window prebuild must cache this height"
+        );
+        let ba = a
+            .propose(TS)
+            .await
+            .expect("reuse-path propose must succeed");
         // B: no prebuild, straight to propose (fresh path).
         let (mut b, _) = vel1_runtime_with_pool(&key, 8).await;
         assert!(!b.has_prebuild_for(h));
-        let bb = b.propose(TS).await.expect("fresh-path propose must succeed");
+        let bb = b
+            .propose(TS)
+            .await
+            .expect("fresh-path propose must succeed");
         // Same inputs ⇒ same selection, same header, same block hash.
         // (Ed25519 signing is deterministic, so even the proposer signature
         // agrees; any divergence here is a reuse bug, not nondeterminism.)
@@ -10561,7 +10929,10 @@ mod shard_header_commitment_tests {
             "reuse block must be byte-identical to the fresh block"
         );
         // The cache is height-scoped: a different height never reuses.
-        assert!(!a.has_prebuild_for(h + 1), "no cross-height reuse without a prebuild");
+        assert!(
+            !a.has_prebuild_for(h + 1),
+            "no cross-height reuse without a prebuild"
+        );
     }
 
     /// Staleness fail-safe: state that moved under the prebuild (funds spent
@@ -10580,7 +10951,10 @@ mod shard_header_commitment_tests {
         rt.state
             .update_account(crate::state_engine::AccountState::new(me, 0))
             .await;
-        let b = rt.propose(TS).await.expect("stale prebuild must still propose");
+        let b = rt
+            .propose(TS)
+            .await
+            .expect("stale prebuild must still propose");
         let root = rt.state.get_state_root().await;
         assert!(
             b.transactions.is_empty(),
@@ -10627,7 +11001,10 @@ mod shard_header_commitment_tests {
             crate::sharding::MASTERCHAIN_SHARD,
             crate::sharding::MASTERCHAIN_SHARD,
         );
-        assert!(ValidatorRuntime::pack_filter_accept(&ctx, &good), "funded nonce-0 tx must pass");
+        assert!(
+            ValidatorRuntime::pack_filter_accept(&ctx, &good),
+            "funded nonce-0 tx must pass"
+        );
         // Consumed: the same tx re-checked now fails the nonce (state moved).
         let gap = crate::sharding::Transaction::sign(
             &key,
@@ -10638,7 +11015,10 @@ mod shard_header_commitment_tests {
             crate::sharding::MASTERCHAIN_SHARD,
             crate::sharding::MASTERCHAIN_SHARD,
         );
-        assert!(!ValidatorRuntime::pack_filter_accept(&ctx, &gap), "nonce gap must be skipped");
+        assert!(
+            !ValidatorRuntime::pack_filter_accept(&ctx, &gap),
+            "nonce gap must be skipped"
+        );
         let _ = state_root;
     }
 
@@ -10648,7 +11028,9 @@ mod shard_header_commitment_tests {
     #[tokio::test]
     async fn vel1_prebuild_loaded_pool_reuse_matches_fresh() {
         const TS: u64 = 1_700_000_004;
-        let senders: Vec<SigningKey> = (0..10u8).map(|s| SigningKey::from_bytes(&[s; 32])).collect();
+        let senders: Vec<SigningKey> = (0..10u8)
+            .map(|s| SigningKey::from_bytes(&[s; 32]))
+            .collect();
         let me = senders[0].verifying_key().to_bytes();
         let validators = ValidatorSet::from_list(vec![(me, 1)]);
         let mk = || {
@@ -10693,7 +11075,11 @@ mod shard_header_commitment_tests {
             bb.transactions.len()
         );
         assert_eq!(ba.transactions.len(), bb.transactions.len());
-        assert_eq!(ba.compute_hash(), bb.compute_hash(), "loaded reuse must match fresh");
+        assert_eq!(
+            ba.compute_hash(),
+            bb.compute_hash(),
+            "loaded reuse must match fresh"
+        );
         assert!(!bb.transactions.is_empty(), "loaded pool must pack");
     }
 
@@ -10724,7 +11110,11 @@ mod shard_header_commitment_tests {
         txs[8].gas_limit = u64::MAX / 2;
         let mut over = txs.clone();
         ValidatorRuntime::truncate_to_block_caps(&mut over);
-        assert_eq!(over.len(), 8, "over-cap selection must truncate to the fitting prefix");
+        assert_eq!(
+            over.len(),
+            8,
+            "over-cap selection must truncate to the fitting prefix"
+        );
         assert_eq!(
             over[0].compute_tx_hash(),
             txs[0].compute_tx_hash(),

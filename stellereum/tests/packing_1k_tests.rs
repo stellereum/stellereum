@@ -34,12 +34,17 @@ fn packing_plain_transfers_fit_max_gas() {
     for i in 0..1800u64 {
         let sk = det_key(310_000 + i);
         let tx = Transaction::sign(&sk, RECIPIENT, 1, GAS_BASIC_TRANSFER, 0, 1, 1);
-        pool.add_checked(tx, BAL).expect("funded admission must succeed");
+        pool.add_checked(tx, BAL)
+            .expect("funded admission must succeed");
     }
     assert_eq!(pool.len(), 1800);
 
     let sel = pool.select_for_block_multi(MAX_BLOCK_TXS, MAX_BLOCK_GAS, |_| true);
-    assert_eq!(sel.len(), expect, "gas cap must pack exactly {expect} plain txs");
+    assert_eq!(
+        sel.len(),
+        expect,
+        "gas cap must pack exactly {expect} plain txs"
+    );
 
     // The 429th genuinely does not fit: packed gas is within one tx of full.
     let gas: u64 = sel.iter().map(|t| t.gas_limit).sum();

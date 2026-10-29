@@ -8,11 +8,11 @@
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use std::collections::HashMap;
+use stellereum::consensus::ValidatorSet;
 use stellereum::contract::{
     ContractError, ContractRegistry, MAX_CONTRACT_EVENTS, MAX_CONTRACT_STORAGE_KEYS,
 };
 use stellereum::rpc::Faucet;
-use stellereum::consensus::ValidatorSet;
 use stellereum::sharding::{ShardId, Transaction};
 
 struct Report {
@@ -58,7 +58,11 @@ fn contract_host_sandbox(r: &mut Report) {
     r.check(
         "#1 undeclared host import rejected",
         deployed.is_err() && uncallable,
-        &format!("deploy -> {:?}, callable -> {}", deployed.map(|_| "accepted"), !uncallable),
+        &format!(
+            "deploy -> {:?}, callable -> {}",
+            deployed.map(|_| "accepted"),
+            !uncallable
+        ),
     );
 
     // #1b importing a *real* host function with the wrong signature is refused too.
@@ -96,7 +100,11 @@ fn contract_host_sandbox(r: &mut Report) {
                 "memory writes stay in the sandbox",
             );
         }
-        Err(e) => r.check("#2 linear memory cannot forge host storage", true, &format!("rejected: {e}")),
+        Err(e) => r.check(
+            "#2 linear memory cannot forge host storage",
+            true,
+            &format!("rejected: {e}"),
+        ),
     }
 
     // #3 Fuel is mandatory: an unbounded loop must trap, never hang or abort.
@@ -118,10 +126,17 @@ fn contract_host_sandbox(r: &mut Report) {
             r.check(
                 "#3 unbounded loop bounded by fuel",
                 out.is_err(),
-                &format!("1e9 iterations on 200k fuel -> {:?}", out.map(|_| "completed")),
+                &format!(
+                    "1e9 iterations on 200k fuel -> {:?}",
+                    out.map(|_| "completed")
+                ),
             );
         }
-        Err(e) => r.check("#3 unbounded loop bounded by fuel", true, &format!("rejected: {e}")),
+        Err(e) => r.check(
+            "#3 unbounded loop bounded by fuel",
+            true,
+            &format!("rejected: {e}"),
+        ),
     }
 }
 
@@ -190,7 +205,11 @@ fn contract_state_safety(r: &mut Report) {
     r.check(
         "#7 host operations consume fuel",
         starved.is_err() && reg3.get(&addr3).unwrap().storage.is_empty(),
-        &format!("tiny budget -> {:?}, slots {}", starved.is_err(), reg3.get(&addr3).unwrap().storage.len()),
+        &format!(
+            "tiny budget -> {:?}, slots {}",
+            starved.is_err(),
+            reg3.get(&addr3).unwrap().storage.len()
+        ),
     );
 }
 
@@ -212,7 +231,11 @@ fn stack_exhaustion(r: &mut Report) {
     );
 
     for (label, stack_kb, iterations) in [
-        ("#8 1 MiB stack (tokio task), 300k iterations", 1024, 300_000i64),
+        (
+            "#8 1 MiB stack (tokio task), 300k iterations",
+            1024,
+            300_000i64,
+        ),
         ("#9 2 MiB stack, 1M iterations", 2 * 1024, 1_000_000),
         ("#10 deep host-call recursion", 1024, 2_000_000),
     ] {
@@ -257,7 +280,11 @@ fn stack_exhaustion(r: &mut Report) {
                 &format!("100000-deep recursion -> {:?}", out.map(|_| "completed")),
             );
         }
-        Err(e) => r.check("#11 unbounded wasm recursion trapped", true, &format!("rejected: {e}")),
+        Err(e) => r.check(
+            "#11 unbounded wasm recursion trapped",
+            true,
+            &format!("rejected: {e}"),
+        ),
     }
 }
 
@@ -288,7 +315,10 @@ fn faucet_abuse(r: &mut Report) {
 
         // #13 an explicit huge amount cannot exceed the per-request drip.
         let f2 = std::sync::Arc::new(Faucet::new(seed, 1, 10, 1_000_000));
-        let (_tx, amt) = f2.build_transfer([1u8; 32], Some(u64::MAX), None).await.unwrap();
+        let (_tx, amt) = f2
+            .build_transfer([1u8; 32], Some(u64::MAX), None)
+            .await
+            .unwrap();
         r.check(
             "#13 requested amount clamped to drip",
             amt == 10,
@@ -342,8 +372,8 @@ fn faucet_abuse(r: &mut Report) {
 fn gateway_surface(r: &mut Report) {
     println!("\n[5] Gateway and RPC surface");
 
-    use stellereum::explorer::{parse_addr, RateLimiter};
     use std::net::IpAddr;
+    use stellereum::explorer::{parse_addr, RateLimiter};
 
     // #17 rate limiter actually rejects over-limit traffic.
     let rl = RateLimiter::new(3);
@@ -361,7 +391,11 @@ fn gateway_surface(r: &mut Report) {
     for i in 0..5000u32 {
         rl2.check(std::net::IpAddr::from([10, 0, (i >> 8) as u8, i as u8]));
     }
-    r.check("#18 rate-limiter map is bounded", true, "prunes at 100k distinct IPs");
+    r.check(
+        "#18 rate-limiter map is bounded",
+        true,
+        "prunes at 100k distinct IPs",
+    );
 
     // #19 malformed addresses are rejected everywhere.
     let bad = ["", "0x", "zz", "00", &"f".repeat(63), &"f".repeat(65)];
@@ -376,13 +410,18 @@ fn gateway_surface(r: &mut Report) {
     let good = hex::encode([0xABu8; 32]);
     r.check(
         "#20 valid address parses exactly",
-        parse_addr(&good) == Some([0xABu8; 32]) && parse_addr(&format!("0x{good}")) == Some([0xABu8; 32]),
+        parse_addr(&good) == Some([0xABu8; 32])
+            && parse_addr(&format!("0x{good}")) == Some([0xABu8; 32]),
         "with and without 0x prefix",
     );
 
     // #21 address parsing must be side-effect free / case tolerant.
     let upper = hex::encode_upper([0xABu8; 32]);
-    r.check("#21 hex parsing is case tolerant", parse_addr(&upper).is_some(), "uppercase accepted");
+    r.check(
+        "#21 hex parsing is case tolerant",
+        parse_addr(&upper).is_some(),
+        "uppercase accepted",
+    );
 }
 
 /// #22-#26: replay, ordering and determinism of the new tx paths
@@ -392,7 +431,11 @@ fn transaction_safety(r: &mut Report) {
     // #22 a tampered amount invalidates the signature.
     let sk = SigningKey::generate(&mut OsRng);
     let mut tx = Transaction::sign(&sk, [1u8; 32], 100, 21_000, 0, 1, 1);
-    r.check("#22 untampered tx verifies", tx.verify_signature(), "baseline");
+    r.check(
+        "#22 untampered tx verifies",
+        tx.verify_signature(),
+        "baseline",
+    );
     tx.amount = 100_000;
     r.check(
         "#22 tampered amount rejected",
@@ -465,7 +508,8 @@ fn invariants(r: &mut Report) {
     );
 
     // #28 two registries built identically agree on every address and code hash.
-    let code = wat_or_panic(r#"(module (func (export "f") (param i64) (result i64) (local.get 0)))"#);
+    let code =
+        wat_or_panic(r#"(module (func (export "f") (param i64) (result i64) (local.get 0)))"#);
     let mut a = ContractRegistry::new();
     let mut b = ContractRegistry::new();
     let mut same = true;
@@ -474,7 +518,11 @@ fn invariants(r: &mut Report) {
         let bd = b.deploy([i; 32], code.clone(), 1_000).unwrap();
         same &= ad == bd && a.get(&ad).unwrap().code_hash == b.get(&bd).unwrap().code_hash;
     }
-    r.check("#28 deploys are deterministic", same, "same creator+nonce -> same address");
+    r.check(
+        "#28 deploys are deterministic",
+        same,
+        "same creator+nonce -> same address",
+    );
 
     // #29 a call result is identical across repeated executions.
     let counter = wat_or_panic(
@@ -506,7 +554,11 @@ fn invariants(r: &mut Report) {
     let seq2: Vec<i64> = (0..10)
         .map(|_| reg2.call(&addr2, "inc", 5, 1_000_000).unwrap().0)
         .collect();
-    r.check("#30 replay from genesis matches", seq == seq2, "consensus-safe re-execution");
+    r.check(
+        "#30 replay from genesis matches",
+        seq == seq2,
+        "consensus-safe re-execution",
+    );
 }
 
 /// #31-#36: block sync must not be steerable by a malicious peer
@@ -584,8 +636,10 @@ fn sync_poisoning(r: &mut Report) {
         b.sign_block(&proposer);
         let hash = b.compute_hash();
         for k in &peers {
-            b.validator_signatures
-                .push((k.verifying_key().to_bytes(), k.sign(&hash).to_bytes().to_vec()));
+            b.validator_signatures.push((
+                k.verifying_key().to_bytes(),
+                k.sign(&hash).to_bytes().to_vec(),
+            ));
         }
     }
     r.check(
@@ -626,17 +680,24 @@ fn bridge_release(r: &mut Report) {
     r.check(
         "#37 empty relayer set cannot release",
         empty.threshold >= 1 && empty.try_release([1u8; 32], b"msg", &[]).is_err(),
-        &format!("threshold {} (was 0), unsigned release refused", empty.threshold),
+        &format!(
+            "threshold {} (was 0), unsigned release refused",
+            empty.threshold
+        ),
     );
 
     // #38: a lone validator still has to actually sign.
     let k = SigningKey::generate(&mut OsRng);
     let mut one = MultisigRelayer::new(vec![k.verifying_key().to_bytes()]);
     let msg = b"release 100 STELL";
-    let sig = (k.verifying_key().to_bytes(), ed25519_dalek::Signer::sign(&k, msg).to_bytes().to_vec());
+    let sig = (
+        k.verifying_key().to_bytes(),
+        ed25519_dalek::Signer::sign(&k, msg).to_bytes().to_vec(),
+    );
     r.check(
         "#38 lone validator must sign",
-        one.try_release([2u8; 32], msg, &[]).is_err() && one.try_release([2u8; 32], msg, &[sig]).is_ok(),
+        one.try_release([2u8; 32], msg, &[]).is_err()
+            && one.try_release([2u8; 32], msg, &[sig]).is_ok(),
         "unsigned refused, signed accepted",
     );
 
@@ -645,7 +706,9 @@ fn bridge_release(r: &mut Report) {
     let mut one2 = MultisigRelayer::new(vec![k.verifying_key().to_bytes()]);
     let osig = (
         outsider.verifying_key().to_bytes(),
-        ed25519_dalek::Signer::sign(&outsider, msg).to_bytes().to_vec(),
+        ed25519_dalek::Signer::sign(&outsider, msg)
+            .to_bytes()
+            .to_vec(),
     );
     r.check(
         "#39 outsider signature rejected",
@@ -656,7 +719,10 @@ fn bridge_release(r: &mut Report) {
 
 fn main() {
     println!("=== Stellereum vulnerability hunt, round 5 ===");
-    let mut r = Report { blocked: 0, vulnerable: Vec::new() };
+    let mut r = Report {
+        blocked: 0,
+        vulnerable: Vec::new(),
+    };
 
     contract_host_sandbox(&mut r);
     contract_state_safety(&mut r);
@@ -668,7 +734,11 @@ fn main() {
     sync_poisoning(&mut r);
     bridge_release(&mut r);
 
-    println!("\n=== {} attacks blocked, {} vulnerabilities ===", r.blocked, r.vulnerable.len());
+    println!(
+        "\n=== {} attacks blocked, {} vulnerabilities ===",
+        r.blocked,
+        r.vulnerable.len()
+    );
     if r.vulnerable.is_empty() {
         println!("ALL BLOCKED");
     } else {

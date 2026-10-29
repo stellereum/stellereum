@@ -23,8 +23,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::post_quantum::{
-    derive_pq_address, verify_pq_signature, FalconKeypair, DEFAULT_SALT, FALCON512_PUBKEY_LEN,
-    HYBRID_PUBKEY_LEN, HYBRID_SIG_LEN, PqScheme,
+    derive_pq_address, verify_pq_signature, FalconKeypair, PqScheme, DEFAULT_SALT,
+    FALCON512_PUBKEY_LEN, HYBRID_PUBKEY_LEN, HYBRID_SIG_LEN,
 };
 
 // ===========================================================================
@@ -123,7 +123,8 @@ pub fn zkml_capabilities() -> ZkMlCapabilities {
                 succinct: false,
                 hiding: false,
                 verifier_work: "linear in the registered model's parameter count".to_string(),
-                trusted_setup: "the committed model registry (append-only, hash-matched)".to_string(),
+                trusted_setup: "the committed model registry (append-only, hash-matched)"
+                    .to_string(),
             },
             ZkMlOpcodeCapability {
                 opcode: "SysCallVerifyZkMlAttestation".to_string(),
@@ -495,18 +496,24 @@ impl<'de> Deserialize<'de> for SessionKeyAuthorization {
                         match master_scheme_id {
                             None => (PqScheme::Ed25519, PqScheme::Ed25519, None, None),
                             Some(mid) => {
-                                let master_scheme = PqScheme::from_id(mid)
-                                    .map_err(serde::de::Error::custom)?;
-                                let session_scheme_id: u8 = seq
-                                    .next_element()?
-                                    .ok_or_else(|| serde::de::Error::custom("missing session_scheme"))?;
+                                let master_scheme =
+                                    PqScheme::from_id(mid).map_err(serde::de::Error::custom)?;
+                                let session_scheme_id: u8 =
+                                    seq.next_element()?.ok_or_else(|| {
+                                        serde::de::Error::custom("missing session_scheme")
+                                    })?;
                                 let session_scheme = PqScheme::from_id(session_scheme_id)
                                     .map_err(serde::de::Error::custom)?;
                                 let master_pubkey: Option<Vec<u8>> =
                                     seq.next_element()?.unwrap_or(None);
                                 let session_pubkey_bytes: Option<Vec<u8>> =
                                     seq.next_element()?.unwrap_or(None);
-                                (master_scheme, session_scheme, master_pubkey, session_pubkey_bytes)
+                                (
+                                    master_scheme,
+                                    session_scheme,
+                                    master_pubkey,
+                                    session_pubkey_bytes,
+                                )
                             }
                         };
 
@@ -567,12 +574,16 @@ impl SessionKeyAuthorization {
 
     /// Master public key bytes (or 32-byte address for Ed25519).
     pub fn master_pubkey(&self) -> &[u8] {
-        self.master_pubkey.as_deref().unwrap_or(&self.master_address)
+        self.master_pubkey
+            .as_deref()
+            .unwrap_or(&self.master_address)
     }
 
     /// Session public key bytes (or 32-byte session pubkey for Ed25519).
     pub fn session_pubkey_bytes(&self) -> &[u8] {
-        self.session_pubkey_bytes.as_deref().unwrap_or(&self.session_pubkey)
+        self.session_pubkey_bytes
+            .as_deref()
+            .unwrap_or(&self.session_pubkey)
     }
 
     /// The exact bytes the master signs: domain separator, chain id, then the
@@ -652,11 +663,7 @@ impl SessionKeyAuthorization {
         chain_id: u64,
     ) -> Self {
         let master_pubkey = master_fk.public_key();
-        let master_address = derive_pq_address(
-            PqScheme::Falcon512,
-            master_pubkey,
-            &DEFAULT_SALT,
-        );
+        let master_address = derive_pq_address(PqScheme::Falcon512, master_pubkey, &DEFAULT_SALT);
         let (session_pubkey, session_pubkey_bytes) = if session_scheme == PqScheme::Ed25519 {
             let addr = <[u8; 32]>::try_from(session_pubkey_raw)
                 .expect("Ed25519 session pubkey must be 32 bytes");
@@ -709,11 +716,7 @@ impl SessionKeyAuthorization {
     ) -> Self {
         let ed_pk = master_ed_sk.verifying_key().to_bytes();
         let hybrid_pk = make_hybrid_pubkey(&ed_pk, master_fk.public_key());
-        let master_address = derive_pq_address(
-            PqScheme::Hybrid,
-            &hybrid_pk,
-            &DEFAULT_SALT,
-        );
+        let master_address = derive_pq_address(PqScheme::Hybrid, &hybrid_pk, &DEFAULT_SALT);
         let (session_pubkey, session_pubkey_bytes) = if session_scheme == PqScheme::Ed25519 {
             let addr = <[u8; 32]>::try_from(session_pubkey_raw)
                 .expect("Ed25519 session pubkey must be 32 bytes");
@@ -870,20 +873,11 @@ impl SessionKeyAuthorization {
                 let Some(pk) = &self.master_pubkey else {
                     return false;
                 };
-                let expected_addr = derive_pq_address(
-                    self.master_scheme,
-                    pk,
-                    &DEFAULT_SALT,
-                );
+                let expected_addr = derive_pq_address(self.master_scheme, pk, &DEFAULT_SALT);
                 if expected_addr != self.master_address {
                     return false;
                 }
-                verify_pq_signature(
-                    self.master_scheme,
-                    pk,
-                    &msg,
-                    &self.master_signature,
-                )
+                verify_pq_signature(self.master_scheme, pk, &msg, &self.master_signature)
             }
         }
     }
@@ -914,7 +908,11 @@ impl SessionKeyAuthorization {
     /// SECURITY: expiry is evaluated against the caller-supplied `current_time`
     /// (the block timestamp in consensus), NOT the local wall clock, so every
     /// node makes the same decision.
-    pub fn verify_and_spend_gas(&mut self, gas_amount: u64, current_time: u64) -> Result<(), String> {
+    pub fn verify_and_spend_gas(
+        &mut self,
+        gas_amount: u64,
+        current_time: u64,
+    ) -> Result<(), String> {
         if current_time > self.valid_until {
             return Err("Session key has expired".to_string());
         }
@@ -955,20 +953,11 @@ impl SessionKeyAuthorization {
                 let Some(pk) = &self.session_pubkey_bytes else {
                     return false;
                 };
-                let expected_addr = derive_pq_address(
-                    self.session_scheme,
-                    pk,
-                    &DEFAULT_SALT,
-                );
+                let expected_addr = derive_pq_address(self.session_scheme, pk, &DEFAULT_SALT);
                 if expected_addr != self.session_pubkey {
                     return false;
                 }
-                verify_pq_signature(
-                    self.session_scheme,
-                    pk,
-                    message,
-                    signature_bytes,
-                )
+                verify_pq_signature(self.session_scheme, pk, message, signature_bytes)
             }
         }
     }
@@ -1133,15 +1122,17 @@ impl SessionKeyRegistry {
     /// same legacy (master-signed) payload carries a matching
     /// `SysCallPublishSessionGrant` signed by that master.
     pub fn note_tombstone(&mut self, session_pubkey: [u8; 32], master: [u8; 32]) {
-        self.entries.entry(session_pubkey).or_insert(SessionKeyRecord {
-            master,
-            valid_until: 0,
-            max_gas_spend: 0,
-            gas_spent: 0,
-            scope: 0,
-            max_value_per_tx: 0,
-            revoked: true,
-        });
+        self.entries
+            .entry(session_pubkey)
+            .or_insert(SessionKeyRecord {
+                master,
+                valid_until: 0,
+                max_gas_spend: 0,
+                gas_spent: 0,
+                scope: 0,
+                max_value_per_tx: 0,
+                revoked: true,
+            });
     }
 
     /// The registry half of the session gate: revocation, master binding,
@@ -1323,7 +1314,8 @@ impl QuantizedLayer {
             return false;
         }
         self.weights.iter().all(|w| {
-            *w >= crate::zkml_attestation::ATTEST_MIN_WEIGHT && *w <= crate::zkml_attestation::ATTEST_MAX_WEIGHT
+            *w >= crate::zkml_attestation::ATTEST_MIN_WEIGHT
+                && *w <= crate::zkml_attestation::ATTEST_MAX_WEIGHT
         })
     }
 
@@ -1387,7 +1379,10 @@ impl QuantizedLinearModel {
     /// arms price: registration writes them into committed state and
     /// verification re-executes them.
     pub fn param_count(&self) -> usize {
-        self.layers.iter().map(|l| l.weights.len() + l.biases.len()).sum()
+        self.layers
+            .iter()
+            .map(|l| l.weights.len() + l.biases.len())
+            .sum()
     }
 
     pub fn compute_model_hash(&self) -> [u8; 32] {
@@ -1437,11 +1432,7 @@ impl QuantizedLinearModel {
         crate::zkml_attestation::ModelView {
             weights: self.layers.iter().map(|l| l.weights.clone()).collect(),
             biases: self.layers.iter().map(|l| l.biases.clone()).collect(),
-            dims: self
-                .layers
-                .iter()
-                .map(|l| (l.in_dim, l.out_dim))
-                .collect(),
+            dims: self.layers.iter().map(|l| (l.in_dim, l.out_dim)).collect(),
         }
     }
 }
@@ -1743,7 +1734,11 @@ impl ZkMlProof {
         if last_trace.post_activations.len() != self.public_outputs.len() {
             return false;
         }
-        for (a, &pub_out) in last_trace.post_activations.iter().zip(self.public_outputs.iter()) {
+        for (a, &pub_out) in last_trace
+            .post_activations
+            .iter()
+            .zip(self.public_outputs.iter())
+        {
             if (*a as u64) != pub_out {
                 return false;
             }
@@ -1862,7 +1857,14 @@ impl ZkMlModelRegistry {
             ));
         }
         let model_hash = model.compute_model_hash();
-        self.models.insert(model_id, ZkMlModelRecord { model_hash, model, spec: None });
+        self.models.insert(
+            model_id,
+            ZkMlModelRecord {
+                model_hash,
+                model,
+                spec: None,
+            },
+        );
         Ok(model_hash)
     }
 
@@ -1902,12 +1904,10 @@ impl ZkMlModelRegistry {
             return Err("spec already registered (registry is append-only)".to_string());
         }
         if !rec.model.is_attestation_compatible() {
-            return Err(
-                "model is not in the constrained format (i8 weights, \
+            return Err("model is not in the constrained format (i8 weights, \
                   u16 inputs, bounded accumulator, capped dims); the re-execution \
                   path still accepts it, the attestation path does not"
-                    .to_string(),
-            );
+                .to_string());
         }
         let view = rec.model.attestation_view();
         crate::zkml_attestation::check_model_spec(&view, &spec)?;
@@ -1937,10 +1937,16 @@ mod tests {
     #[test]
     fn capability_statement_is_honest_and_machine_readable() {
         let caps = zkml_capabilities();
-        assert!(!caps.zero_knowledge, "the chain must not claim zero-knowledge");
+        assert!(
+            !caps.zero_knowledge,
+            "the chain must not claim zero-knowledge"
+        );
         assert!(!caps.succinct, "the chain must not claim succinctness");
         assert!(!caps.hiding, "the chain must not claim hiding");
-        assert!(!caps.trusted_setup, "there is no ceremony, so there is no setup");
+        assert!(
+            !caps.trusted_setup,
+            "there is no ceremony, so there is no setup"
+        );
         assert!(caps.sound, "the re-execution check IS sound — say so");
         assert!(
             caps.protocol.contains("re-execution"),
@@ -1965,7 +1971,11 @@ mod tests {
         );
         for o in &caps.opcodes {
             assert!(o.sound, "{} must be reported as sound", o.opcode);
-            assert!(!o.zero_knowledge, "{} must not claim zero-knowledge", o.opcode);
+            assert!(
+                !o.zero_knowledge,
+                "{} must not claim zero-knowledge",
+                o.opcode
+            );
             assert!(!o.succinct, "{} must not claim succinctness", o.opcode);
             assert!(!o.hiding, "{} must not claim hiding", o.opcode);
             assert!(
@@ -1981,7 +1991,12 @@ mod tests {
     }
 
     fn model() -> QuantizedLinearModel {
-        QuantizedLinearModel::new(vec![QuantizedLayer::new(2, 2, vec![2, -1, 1, 3], vec![1, -2])])
+        QuantizedLinearModel::new(vec![QuantizedLayer::new(
+            2,
+            2,
+            vec![2, -1, 1, 3],
+            vec![1, -2],
+        )])
     }
 
     #[test]
@@ -2033,7 +2048,10 @@ mod tests {
             proof_bytes,
         };
 
-        assert!(forged.verify_inference(), "structural check is fooled by the forgery");
+        assert!(
+            forged.verify_inference(),
+            "structural check is fooled by the forgery"
+        );
         assert!(
             !forged.verify_inference_against(&m),
             "sound check against the known model must reject the forgery"

@@ -13,6 +13,8 @@
 //! crate's items.
 
 use ed25519_dalek::SigningKey;
+use std::path::PathBuf;
+use std::sync::Arc;
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::storage::{
@@ -20,8 +22,6 @@ use stellereum::storage::{
 };
 use stellereum::svm::OpCode;
 use stellereum::token::TokenMetadata;
-use std::path::PathBuf;
-use std::sync::Arc;
 
 fn tmp() -> PathBuf {
     std::env::temp_dir().join(format!(

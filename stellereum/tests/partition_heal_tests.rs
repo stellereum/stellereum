@@ -96,7 +96,10 @@ fn quorum_sign(b: &mut Block, ks: &[SigningKey], round: u32) {
 }
 
 fn store(blocks: &[Block]) -> HashMap<[u8; 32], Block> {
-    blocks.iter().map(|b| (b.compute_hash(), b.clone())).collect()
+    blocks
+        .iter()
+        .map(|b| (b.compute_hash(), b.clone()))
+        .collect()
 }
 
 /// The catch-up sequence as the node performs it: walk `prev_hash` back to our
@@ -135,7 +138,9 @@ async fn catch_up(
                 hex::encode(root_before)
             ));
         }
-        let (applied, failed, _, _, _) = our_state.apply_block_parallel_fees(&b.transactions, b.timestamp).await;
+        let (applied, failed, _, _, _) = our_state
+            .apply_block_parallel_fees(&b.transactions, b.timestamp)
+            .await;
         if failed != 0 || applied != b.transactions.len() {
             return Err(format!(
                 "block {} applied {applied}/{} txs ({} failed)",
@@ -188,7 +193,9 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
 
     // The proposer's block is disseminated just before the split, so both
     // sides vote on the SAME value; only the votes are partitioned.
-    let proposer_idx = vs.proposer_for(1, 0).map(|p| ks.iter().position(|k| id(k) == p).unwrap());
+    let proposer_idx = vs
+        .proposer_for(1, 0)
+        .map(|p| ks.iter().position(|k| id(k) == p).unwrap());
     let proposer_idx = proposer_idx.expect("non-empty set has a proposer");
     let pre_root = eng_a.get_state_root().await;
     assert_eq!(pre_root, eng_b.get_state_root().await);
@@ -199,11 +206,11 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
     quorum_sign(&mut block, &ks, 0);
     let bh = block.compute_hash();
     {
-        let qc = block.precommit_qc.as_ref().expect("quorum_sign attaches a QC");
-        assert!(
-            qc.verify(&vs),
-            "the reunited votes must form a real quorum"
-        );
+        let qc = block
+            .precommit_qc
+            .as_ref()
+            .expect("quorum_sign attaches a QC");
+        assert!(qc.verify(&vs), "the reunited votes must form a real quorum");
     }
 
     let mut side_a = HeightConsensus::new(1, vs.clone());
@@ -231,8 +238,16 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
     }
 
     // NEITHER side may finalize: 2 of 4 is below the quorum of 3.
-    assert_eq!(side_a.try_prevote_quorum(), None, "2 prevotes are not a quorum");
-    assert_eq!(side_b.try_prevote_quorum(), None, "2 prevotes are not a quorum");
+    assert_eq!(
+        side_a.try_prevote_quorum(),
+        None,
+        "2 prevotes are not a quorum"
+    );
+    assert_eq!(
+        side_b.try_prevote_quorum(),
+        None,
+        "2 prevotes are not a quorum"
+    );
     assert_eq!(side_a.try_precommit_quorum(), None, "side A must stall");
     assert_eq!(side_b.try_precommit_quorum(), None, "side B must stall");
     assert_eq!(side_a.decided, None);
@@ -259,7 +274,11 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
     assert_eq!(side_a.try_precommit_quorum(), Some(bh));
     assert_eq!(side_b.try_precommit_quorum(), Some(bh));
     assert_eq!(side_a.decided, Some(bh), "side A converges");
-    assert_eq!(side_b.decided, Some(bh), "side B converges on the SAME hash");
+    assert_eq!(
+        side_b.decided,
+        Some(bh),
+        "side B converges on the SAME hash"
+    );
 
     // Both sides apply the reunited block after the F3.2 root check.
     // The block already carries the reunited 4-of-4 QC attached above; re-assert
@@ -271,7 +290,9 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
             block.state_root,
             "side {name} header must commit to its pre-apply root"
         );
-        let (applied, failed, _, _, _) = eng.apply_block_parallel_fees(&block.transactions, block.timestamp).await;
+        let (applied, failed, _, _, _) = eng
+            .apply_block_parallel_fees(&block.transactions, block.timestamp)
+            .await;
         assert_eq!((applied, failed), (1, 0), "side {name} must apply the tx");
     }
     assert_eq!(
@@ -313,7 +334,10 @@ async fn asymmetric_partition_three_plus_one_heals_via_block_sync() {
         // past it with view changes until one of its own must propose.
         let mut round: u32 = 0;
         let mut maj_hc = HeightConsensus::new(h, vs.clone());
-        while !majority.iter().any(|k| id(k) == vs.proposer_for(h, round).unwrap()) {
+        while !majority
+            .iter()
+            .any(|k| id(k) == vs.proposer_for(h, round).unwrap())
+        {
             maj_hc.next_round();
             round += 1;
         }
@@ -323,7 +347,11 @@ async fn asymmetric_partition_three_plus_one_heals_via_block_sync() {
         // REAL block: links to the majority head, commits to the pre-apply root.
         let pre_root = maj_engines[0].get_state_root().await;
         for e in &maj_engines[1..] {
-            assert_eq!(e.get_state_root().await, pre_root, "majority stays in lockstep");
+            assert_eq!(
+                e.get_state_root().await,
+                pre_root,
+                "majority stays in lockstep"
+            );
         }
         let tx = Transaction::sign(&payer_key, recipient, 1_000, 0, h - 1, 1, 1);
         let mut b = mkblock(h, prev, pre_root, &proposer, vec![tx], 1_000 + h);
@@ -352,12 +380,18 @@ async fn asymmetric_partition_three_plus_one_heals_via_block_sync() {
         );
         for e in &maj_engines {
             assert_eq!(e.get_state_root().await, b.state_root, "F3.2 root check");
-            let (applied, failed, _, _, _) = e.apply_block_parallel_fees(&b.transactions, b.timestamp).await;
+            let (applied, failed, _, _, _) = e
+                .apply_block_parallel_fees(&b.transactions, b.timestamp)
+                .await;
             assert_eq!((applied, failed), (1, 0));
         }
 
         // The 1-side sees nothing and stalls: no proposal, no votes, no decision.
-        assert_eq!(lone_hc.try_precommit_quorum(), None, "the isolated node stalls");
+        assert_eq!(
+            lone_hc.try_precommit_quorum(),
+            None,
+            "the isolated node stalls"
+        );
         assert_eq!(lone_hc.decided, None);
 
         prev = bh;
@@ -379,7 +413,10 @@ async fn asymmetric_partition_three_plus_one_heals_via_block_sync() {
     let n = catch_up(&map, head, [0u8; 32], 1, &vs, &lone_engine)
         .await
         .expect("heal must succeed");
-    assert_eq!(n, HEIGHTS, "exactly the {HEIGHTS} missed blocks are replayed");
+    assert_eq!(
+        n, HEIGHTS,
+        "exactly the {HEIGHTS} missed blocks are replayed"
+    );
     assert_eq!(
         lone_engine.get_state_root().await,
         majority_root,
@@ -413,7 +450,9 @@ async fn long_gap_replays_exactly_n_and_a_hole_is_an_error() {
         let tx = Transaction::sign(&payer_key, recipient, 1_000, 0, h - 1, 1, 1);
         let mut b = mkblock(h, prev, pre_root, &proposer, vec![tx], 2_000 + h);
         quorum_sign(&mut b, &ks, 0);
-        let (applied, failed, _, _, _) = builder.apply_block_parallel_fees(&b.transactions, b.timestamp).await;
+        let (applied, failed, _, _, _) = builder
+            .apply_block_parallel_fees(&b.transactions, b.timestamp)
+            .await;
         assert_eq!((applied, failed), (1, 0), "build tx {h} must execute");
         prev = b.compute_hash();
         chain.push(b);
@@ -490,7 +529,9 @@ async fn forked_history_with_a_foreign_quorum_is_refused() {
         let tx = Transaction::sign(&payer_key, [0xAAu8; 32], 1_000, 0, h - 1, 1, 1);
         let mut b = mkblock(h, prev, pre_root, &proposer, vec![tx], 3_000 + h);
         quorum_sign(&mut b, &ks, 0);
-        let (applied, failed, _, _, _) = ours.apply_block_parallel_fees(&b.transactions, b.timestamp).await;
+        let (applied, failed, _, _, _) = ours
+            .apply_block_parallel_fees(&b.transactions, b.timestamp)
+            .await;
         assert_eq!((applied, failed), (1, 0));
         prev = b.compute_hash();
         own.push(b);
@@ -504,7 +545,9 @@ async fn forked_history_with_a_foreign_quorum_is_refused() {
     // quorum that is genuine -- but from the FOREIGN set.
     let fork_state = funded(payer, 1_000_000_000).await;
     for b in own.iter().take(3) {
-        let (applied, failed, _, _, _) = fork_state.apply_block_parallel_fees(&b.transactions, b.timestamp).await;
+        let (applied, failed, _, _, _) = fork_state
+            .apply_block_parallel_fees(&b.transactions, b.timestamp)
+            .await;
         assert_eq!((applied, failed), (1, 0));
     }
     assert_eq!(fork_state.get_state_root().await, own[3].state_root);
@@ -517,7 +560,9 @@ async fn forked_history_with_a_foreign_quorum_is_refused() {
         let tx = Transaction::sign(&payer_key, [0xBBu8; 32], 9_999, 0, h - 1, 1, 1);
         let mut b = mkblock(h, fprev, pre_root, &proposer, vec![tx], 9_000 + h);
         quorum_sign(&mut b, &foreign_keys, 0);
-        let (applied, failed, _, _, _) = fork_state.apply_block_parallel_fees(&b.transactions, b.timestamp).await;
+        let (applied, failed, _, _, _) = fork_state
+            .apply_block_parallel_fees(&b.transactions, b.timestamp)
+            .await;
         assert_eq!((applied, failed), (1, 0));
         fprev = b.compute_hash();
         fork.push(b);
@@ -542,7 +587,9 @@ async fn forked_history_with_a_foreign_quorum_is_refused() {
     );
     let node = funded(payer, 1_000_000_000).await;
     for b in &own {
-        let (applied, failed, _, _, _) = node.apply_block_parallel_fees(&b.transactions, b.timestamp).await;
+        let (applied, failed, _, _, _) = node
+            .apply_block_parallel_fees(&b.transactions, b.timestamp)
+            .await;
         assert_eq!((applied, failed), (1, 0));
     }
     assert_eq!(
@@ -594,9 +641,14 @@ async fn stale_round_returnee_accepts_the_network_proposal_and_converges() {
     quorum_sign(&mut b1, &ks[..3], round1);
     let bh1 = b1.compute_hash();
     hc_net.receive_proposal(prop1, bh1).unwrap();
-    assert_eq!(decide_with(&mut hc_net, &ks[..3], 1, round1, bh1), Some(bh1));
+    assert_eq!(
+        decide_with(&mut hc_net, &ks[..3], 1, round1, bh1),
+        Some(bh1)
+    );
     assert_eq!(net_state.get_state_root().await, b1.state_root);
-    net_state.apply_block_parallel_fees(&b1.transactions, b1.timestamp).await;
+    net_state
+        .apply_block_parallel_fees(&b1.transactions, b1.timestamp)
+        .await;
 
     // Meanwhile the returnee's round counter ran far ahead of the network's.
     // Pick the far-ahead round so it names a DIFFERENT proposer than the
@@ -610,7 +662,8 @@ async fn stale_round_returnee_accepts_the_network_proposal_and_converges() {
     for _ in 0..ret_round {
         hc_ret.next_round();
     }
-    assert!(hc_ret.round >= 500, "the returnee is far ahead on rounds");    assert_eq!(hc_ret.decided, None, "it decided nothing while partitioned");
+    assert!(hc_ret.round >= 500, "the returnee is far ahead on rounds");
+    assert_eq!(hc_ret.decided, None, "it decided nothing while partitioned");
     // At round 500 it expects a different proposer, so the network's old
     // proposal is (correctly) not for its round -- the wedge pressure.
     assert!(hc_ret.receive_proposal(prop1, bh1).is_err());
@@ -625,9 +678,19 @@ async fn stale_round_returnee_accepts_the_network_proposal_and_converges() {
     );
     // And a stale far-round vote stored on arrival does not wedge the round
     // the network is actually running.
-    let stale = Vote::sign(&ks[3], 2, hc_ret.round, VoteKind::Prevote, Some([0xFEu8; 32]));
+    let stale = Vote::sign(
+        &ks[3],
+        2,
+        hc_ret.round,
+        VoteKind::Prevote,
+        Some([0xFEu8; 32]),
+    );
     hc_cap.add_prevote(stale).unwrap();
-    assert_eq!(hc_cap.try_prevote_quorum(), None, "a stray far-round vote forms no quorum");
+    assert_eq!(
+        hc_cap.try_prevote_quorum(),
+        None,
+        "a stray far-round vote forms no quorum"
+    );
 
     // HEAL: the returnee syncs height 1 (block body sync closes the height
     // skew instead of wedging on "wrong height")...
@@ -662,13 +725,20 @@ async fn stale_round_returnee_accepts_the_network_proposal_and_converges() {
     let bh2 = b2.compute_hash();
     // The returnee accepts the network's proposal for the current height/round.
     hc_net2.receive_proposal(prop2, bh2).unwrap();
-    hc_ret2.receive_proposal(prop2, bh2).expect("the returnee must accept the network proposal, not wedge");
+    hc_ret2
+        .receive_proposal(prop2, bh2)
+        .expect("the returnee must accept the network proposal, not wedge");
     assert_eq!(decide_with(&mut hc_net2, &ks, 2, 0, bh2), Some(bh2));
     assert_eq!(decide_with(&mut hc_ret2, &ks, 2, 0, bh2), Some(bh2));
-    assert_eq!(hc_net2.decided, hc_ret2.decided, "both sides decide the same block");
+    assert_eq!(
+        hc_net2.decided, hc_ret2.decided,
+        "both sides decide the same block"
+    );
     for st in [&net_state, &ret_state] {
         assert_eq!(st.get_state_root().await, b2.state_root);
-        let (applied, failed, _, _, _) = st.apply_block_parallel_fees(&b2.transactions, b2.timestamp).await;
+        let (applied, failed, _, _, _) = st
+            .apply_block_parallel_fees(&b2.transactions, b2.timestamp)
+            .await;
         assert_eq!((applied, failed), (1, 0));
     }
     assert_eq!(

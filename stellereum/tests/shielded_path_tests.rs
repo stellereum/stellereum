@@ -71,7 +71,9 @@ fn block(proposer: [u8; 32], height: u64, txs: Vec<Transaction>) -> Block {
 async fn funded_engine(seed: u8, balance: u64) -> (InMemoryStateEngine, [u8; 32]) {
     let engine = InMemoryStateEngine::new();
     let addr = sender_of(seed);
-    engine.update_account(AccountState::new(addr, balance)).await;
+    engine
+        .update_account(AccountState::new(addr, balance))
+        .await;
     (engine, addr)
 }
 
@@ -81,7 +83,9 @@ fn parse_range_proof(v: &Value) -> RangeProof {
         .as_array()
         .expect("bit_commitments")
         .iter()
-        .map(|h| PedersenCommitment { commitment: hex32(h.as_str().expect("hex")) })
+        .map(|h| PedersenCommitment {
+            commitment: hex32(h.as_str().expect("hex")),
+        })
         .collect();
     let bit_proofs = v["bit_proofs"]
         .as_array()
@@ -94,7 +98,11 @@ fn parse_range_proof(v: &Value) -> RangeProof {
             s1: hex32(b["s1"].as_str().expect("s1")),
         })
         .collect();
-    RangeProof { bits, bit_commitments, bit_proofs }
+    RangeProof {
+        bits,
+        bit_commitments,
+        bit_proofs,
+    }
 }
 
 /// Rebuild the EXACT executable payload a `stell_shieldedTransfer` prepare
@@ -112,13 +120,17 @@ fn transfer_tx_from_prepare(sk: &SigningKey, prep: &Value, nonce: u64) -> Transa
             .as_array()
             .expect("ins")
             .iter()
-            .map(|h| PedersenCommitment { commitment: hex32(h.as_str().expect("hex")) })
+            .map(|h| PedersenCommitment {
+                commitment: hex32(h.as_str().expect("hex")),
+            })
             .collect(),
         t["output_commitments"]
             .as_array()
             .expect("outs")
             .iter()
-            .map(|h| PedersenCommitment { commitment: hex32(h.as_str().expect("hex")) })
+            .map(|h| PedersenCommitment {
+                commitment: hex32(h.as_str().expect("hex")),
+            })
             .collect(),
         t["fee"].as_u64().expect("fee"),
     );
@@ -192,7 +204,9 @@ fn unshield_tx_from_prepare(sk: &SigningKey, prep: &Value, nonce: u64) -> Transa
 async fn shield_balance_unshield_round_trip_on_the_state_engine() {
     let (engine, sender) = funded_engine(0x71, 10_000_000).await;
     let (recipient, recipient_addr) = (key(0x72), sender_of(0x72));
-    engine.update_account(AccountState::new(recipient_addr, 1_000_000)).await;
+    engine
+        .update_account(AccountState::new(recipient_addr, 1_000_000))
+        .await;
 
     // --- prepare the shielded transfer (fee shown BEFORE signing) ---
     let prep = dispatch(
@@ -217,7 +231,9 @@ async fn shield_balance_unshield_round_trip_on_the_state_engine() {
 
     // --- apply EXACTLY what the prepare built ---
     let tx = transfer_tx_from_prepare(&key(0x71), &prep, 0);
-    let out = engine.apply_block_transition(&block(sender, 1, vec![tx]), 0).await;
+    let out = engine
+        .apply_block_transition(&block(sender, 1, vec![tx]), 0)
+        .await;
     assert_eq!((out.applied, out.failed), (1, 0), "{out:?}");
 
     // Sender paid shield_total (50_100); self-proposed so gas came back.
@@ -227,7 +243,10 @@ async fn shield_balance_unshield_round_trip_on_the_state_engine() {
         "sender loses exactly the shielded total"
     );
     let shielded = engine.confidential_read().await;
-    assert_eq!(shielded.total_fees, 100, "inner fee burned to the shielded total");
+    assert_eq!(
+        shielded.total_fees, 100,
+        "inner fee burned to the shielded total"
+    );
     assert_eq!(shielded.spent.len(), 1, "the shield input is now spent");
     drop(shielded);
     let escrow = engine
@@ -242,9 +261,8 @@ async fn shield_balance_unshield_round_trip_on_the_state_engine() {
             .as_str()
             .unwrap(),
     );
-    let blinding = Scalar::from_bytes_mod_order(hex32(
-        prep["openings"][1]["blinding"].as_str().unwrap(),
-    ));
+    let blinding =
+        Scalar::from_bytes_mod_order(hex32(prep["openings"][1]["blinding"].as_str().unwrap()));
     let vk = ViewingKey::derive_from_seed(&[0xABu8; 32]);
     let enc = ViewingKey::encrypt_amount_for_auditor(&vk.view_pub, 50_000, &blinding).unwrap();
     let bal = dispatch(
@@ -264,7 +282,10 @@ async fn shield_balance_unshield_round_trip_on_the_state_engine() {
     assert_eq!(bal["spendable_sum"], "50000");
     assert_eq!(bal["coin_count"], 1);
     assert_eq!(bal["undecryptable"], 0);
-    assert_eq!(bal["coins"][0]["commitment"], hex::encode(output_commitment));
+    assert_eq!(
+        bal["coins"][0]["commitment"],
+        hex::encode(output_commitment)
+    );
     assert_eq!(bal["coins"][0]["spent"], false);
     assert_eq!(bal["coins"][0]["spendable"], true);
     assert_eq!(bal["coins"][0]["owner"], hex::encode(recipient_addr));
@@ -360,15 +381,23 @@ async fn double_spend_of_a_shielded_note_is_refused() {
     .await
     .unwrap();
     let tx = transfer_tx_from_prepare(&key(0x75), &prep, 0);
-    let out = engine.apply_block_transition(&block(sender, 1, vec![tx]), 0).await;
+    let out = engine
+        .apply_block_transition(&block(sender, 1, vec![tx]), 0)
+        .await;
     assert_eq!((out.applied, out.failed), (1, 0), "{out:?}");
     assert_eq!(engine.confidential_read().await.spent.len(), 1);
 
     // Replay the SAME shield+transfer: the shield input commitment is already
     // in `spent` — the nullifier set refuses it before anything mutates.
     let replay = transfer_tx_from_prepare(&key(0x75), &prep, 1);
-    let out = engine.apply_block_transition(&block(sender, 2, vec![replay]), 0).await;
-    assert_eq!((out.applied, out.failed), (0, 1), "replay must be refused: {out:?}");
+    let out = engine
+        .apply_block_transition(&block(sender, 2, vec![replay]), 0)
+        .await;
+    assert_eq!(
+        (out.applied, out.failed),
+        (0, 1),
+        "replay must be refused: {out:?}"
+    );
     assert_eq!(
         engine.confidential_read().await.spent.len(),
         1,
@@ -380,7 +409,10 @@ async fn double_spend_of_a_shielded_note_is_refused() {
         .as_str()
         .unwrap()
         .to_string();
-    let blinding = prep["openings"][1]["blinding"].as_str().unwrap().to_string();
+    let blinding = prep["openings"][1]["blinding"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let exit_prep = dispatch(
         &engine,
         "stell_unshield",
@@ -400,12 +432,20 @@ async fn double_spend_of_a_shielded_note_is_refused() {
     // The refused replay consumed nonce 1 (F-01: attributable failures burn
     // the nonce), so the exit rides nonce 2.
     let exit = unshield_tx_from_prepare(&key(0x75), &exit_prep, 2);
-    let out = engine.apply_block_transition(&block(sender, 2, vec![exit]), 0).await;
+    let out = engine
+        .apply_block_transition(&block(sender, 2, vec![exit]), 0)
+        .await;
     assert_eq!((out.applied, out.failed), (1, 0), "{out:?}");
     // Exit once more with a fresh nonce: DoubleSpend on chain...
     let exit2 = unshield_tx_from_prepare(&key(0x75), &exit_prep, 3);
-    let out = engine.apply_block_transition(&block(sender, 3, vec![exit2]), 0).await;
-    assert_eq!((out.applied, out.failed), (0, 1), "double exit refused: {out:?}");
+    let out = engine
+        .apply_block_transition(&block(sender, 3, vec![exit2]), 0)
+        .await;
+    assert_eq!(
+        (out.applied, out.failed),
+        (0, 1),
+        "double exit refused: {out:?}"
+    );
     assert_eq!(engine.confidential_read().await.spent.len(), 2);
     // ...and refused at prepare time too (the read sees the same state the
     // chain enforces: the exited coin left `owned` at exit — `retire_for_unshield`
@@ -430,7 +470,11 @@ async fn double_spend_of_a_shielded_note_is_refused() {
     .await
     .unwrap_err();
     assert_eq!(err.code(), -32003);
-    assert!(err.message().contains("not owned"), "unexpected: {}", err.message());
+    assert!(
+        err.message().contains("not owned"),
+        "unexpected: {}",
+        err.message()
+    );
     assert!(
         engine
             .confidential_read()
@@ -460,12 +504,13 @@ async fn wrong_viewing_key_sees_nothing() {
     .await
     .unwrap();
     let tx = transfer_tx_from_prepare(&key(0x71), &prep, 0);
-    let out = engine.apply_block_transition(&block(sender, 1, vec![tx]), 0).await;
+    let out = engine
+        .apply_block_transition(&block(sender, 1, vec![tx]), 0)
+        .await;
     assert_eq!((out.applied, out.failed), (1, 0), "{out:?}");
 
-    let blinding = Scalar::from_bytes_mod_order(hex32(
-        prep["openings"][1]["blinding"].as_str().unwrap(),
-    ));
+    let blinding =
+        Scalar::from_bytes_mod_order(hex32(prep["openings"][1]["blinding"].as_str().unwrap()));
     let right_vk = ViewingKey::derive_from_seed(&[0x01u8; 32]);
     let wrong_vk = ViewingKey::derive_from_seed(&[0x02u8; 32]);
     let enc = ViewingKey::encrypt_amount_for_auditor(&right_vk.view_pub, 777, &blinding).unwrap();
@@ -486,8 +531,7 @@ async fn wrong_viewing_key_sees_nothing() {
     assert_eq!(wrong["undecryptable"], 1);
     assert_eq!(wrong["coins"][0]["decrypted"], false);
     assert!(
-        wrong["coins"][0].get("amount").is_none()
-            && wrong["coins"][0].get("commitment").is_none(),
+        wrong["coins"][0].get("amount").is_none() && wrong["coins"][0].get("commitment").is_none(),
         "no amount or commitment may leak to the wrong key: {wrong}"
     );
 
@@ -577,13 +621,21 @@ async fn fee_accounting_is_exact_and_v1_stays_refused() {
             transfer: Box::new(v1),
         }],
     );
-    let out = engine.apply_block_transition(&block(sender, 1, vec![v1tx]), 0).await;
-    assert_eq!((out.applied, out.failed), (0, 1), "V1 must stay refused: {out:?}");
+    let out = engine
+        .apply_block_transition(&block(sender, 1, vec![v1tx]), 0)
+        .await;
+    assert_eq!(
+        (out.applied, out.failed),
+        (0, 1),
+        "V1 must stay refused: {out:?}"
+    );
     assert!(engine.confidential_read().await.is_empty());
 
     // Fail-closed shapes: missing params, bad recipient, protocol recipient,
     // unshield amount mismatch, unshield pays-the-signer rule.
-    let err = dispatch(&engine, "stell_shieldedTransfer", &json!({})).await.unwrap_err();
+    let err = dispatch(&engine, "stell_shieldedTransfer", &json!({}))
+        .await
+        .unwrap_err();
     assert_eq!(err.code(), -32602);
     let err = dispatch(
         &engine,
@@ -617,5 +669,10 @@ async fn fee_accounting_is_exact_and_v1_stays_refused() {
     )
     .await
     .unwrap_err();
-    assert_eq!(err.code(), -32602, "to != signer is a caller error: {}", err.message());
+    assert_eq!(
+        err.code(),
+        -32602,
+        "to != signer is a caller error: {}",
+        err.message()
+    );
 }

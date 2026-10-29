@@ -18,7 +18,9 @@ fn test_sqlite_db_lifecycle_and_queries() -> Result<()> {
         tx_count: 2,
         proposer: Some("proposer1".to_string()),
         proposer_stl57: None,
-        state_root: Some("0x2222222222222222222222222222222222222222222222222222222222222222".to_string()),
+        state_root: Some(
+            "0x2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+        ),
     };
     db.insert_block(&block)?;
 
@@ -82,7 +84,13 @@ fn test_sqlite_db_lifecycle_and_queries() -> Result<()> {
 #[test]
 fn test_sqlite_wal_mode_on_file() -> Result<()> {
     let tmp_dir = std::env::temp_dir();
-    let db_path = tmp_dir.join(format!("test_wal_{}.db", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let db_path = tmp_dir.join(format!(
+        "test_wal_{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     let db_path_str = db_path.to_str().unwrap();
 
     let db = Database::open(db_path_str)?;
@@ -90,7 +98,11 @@ fn test_sqlite_wal_mode_on_file() -> Result<()> {
     // Verify WAL mode is persistent in the database file
     let conn = rusqlite::Connection::open(db_path_str)?;
     let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
-    assert_eq!(journal_mode.to_lowercase(), "wal", "SQLite must operate in WAL journal mode");
+    assert_eq!(
+        journal_mode.to_lowercase(),
+        "wal",
+        "SQLite must operate in WAL journal mode"
+    );
 
     drop(db);
     drop(conn);
@@ -145,7 +157,11 @@ async fn test_gram_api_schema_conformance_and_search() {
     let base = format!("http://{addr}");
 
     // 1. /api/overview schema conformance
-    let res = client.get(format!("{base}/api/overview")).send().await.unwrap();
+    let res = client
+        .get(format!("{base}/api/overview"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     let v: Value = res.json().await.unwrap();
     assert!(v["supply"]["total"].is_string());
@@ -165,7 +181,11 @@ async fn test_gram_api_schema_conformance_and_search() {
     assert!(v["total_accounts"].is_number());
 
     // 2. /api/stats schema conformance
-    let res = client.get(format!("{base}/api/stats")).send().await.unwrap();
+    let res = client
+        .get(format!("{base}/api/stats"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     let v: Value = res.json().await.unwrap();
     assert_eq!(v["chain_id"], 5757);
@@ -186,7 +206,11 @@ async fn test_gram_api_schema_conformance_and_search() {
     assert!(v["total_accounts"].is_number());
 
     // 3. /api/validators schema conformance
-    let res = client.get(format!("{base}/api/validators")).send().await.unwrap();
+    let res = client
+        .get(format!("{base}/api/validators"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     let v: Value = res.json().await.unwrap();
     assert!(v["limits"]["min_stake"].is_string());
@@ -197,7 +221,11 @@ async fn test_gram_api_schema_conformance_and_search() {
     assert!(val_list[0]["uptime"].is_number());
 
     // 4. /api/tokens schema conformance
-    let res = client.get(format!("{base}/api/tokens")).send().await.unwrap();
+    let res = client
+        .get(format!("{base}/api/tokens"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     let v: Value = res.json().await.unwrap();
     assert_eq!(v["source"], "Stellereum Token Registry");
@@ -207,7 +235,11 @@ async fn test_gram_api_schema_conformance_and_search() {
     assert!(tokens[0]["verified"].as_bool().unwrap());
 
     // 5. /api/verified schema conformance
-    let res = client.get(format!("{base}/api/verified")).send().await.unwrap();
+    let res = client
+        .get(format!("{base}/api/verified"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     let v: Value = res.json().await.unwrap();
     let items = v["items"].as_array().expect("verified items array");
@@ -217,7 +249,11 @@ async fn test_gram_api_schema_conformance_and_search() {
 
     // 6. /api/search tests
     // Search by block height
-    let res = client.get(format!("{base}/api/search?q=500")).send().await.unwrap();
+    let res = client
+        .get(format!("{base}/api/search?q=500"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     let v: Value = res.json().await.unwrap();
     assert_eq!(v["type"], "block");
@@ -237,7 +273,11 @@ async fn test_gram_api_schema_conformance_and_search() {
     assert_eq!(v["type"], "account");
 
     // Search non-existent
-    let res = client.get(format!("{base}/api/search?q=9999999")).send().await.unwrap();
+    let res = client
+        .get(format!("{base}/api/search?q=9999999"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
@@ -299,7 +339,9 @@ fn test_smooth_block_time_stats_and_charts() -> Result<()> {
     );
 
     let charts = db.get_charts()?;
-    let recent = charts["recent_block_times"].as_array().expect("recent_block_times array");
+    let recent = charts["recent_block_times"]
+        .as_array()
+        .expect("recent_block_times array");
     assert_eq!(recent.len(), 49, "50 blocks query produces 49 intervals");
 
     // Index 0: height 350 vs height 345 (5-block window)
@@ -336,9 +378,7 @@ fn seed_events(db: &Database) {
             topics_json: "[]".to_string(),
             data: "{\"value\":1000}".to_string(),
             event_name: Some("Transfer".to_string()),
-            decoded_json: Some(
-                "{\"topics\":{},\"data\":{\"amount\":\"1000\"}}".to_string(),
-            ),
+            decoded_json: Some("{\"topics\":{},\"data\":{\"amount\":\"1000\"}}".to_string()),
         },
         EventRecord {
             tx_hash: tx_b.to_string(),
@@ -349,9 +389,7 @@ fn seed_events(db: &Database) {
             topics_json: "[]".to_string(),
             data: "{\"value\":2000}".to_string(),
             event_name: Some("Transfer".to_string()),
-            decoded_json: Some(
-                "{\"topics\":{},\"data\":{\"amount\":\"2000\"}}".to_string(),
-            ),
+            decoded_json: Some("{\"topics\":{},\"data\":{\"amount\":\"2000\"}}".to_string()),
         },
         EventRecord {
             tx_hash: tx_b.to_string(),
@@ -600,7 +638,10 @@ async fn test_event_filters_are_applied_in_the_database() {
     let rows = db
         .get_events(
             &EventFilter {
-                tx_hash: Some("0x1111111111111111111111111111111111111111111111111111111111111111".to_string()),
+                tx_hash: Some(
+                    "0x1111111111111111111111111111111111111111111111111111111111111111"
+                        .to_string(),
+                ),
                 ..Default::default()
             },
             10,
@@ -684,8 +725,8 @@ async fn test_contract_source_verify_round_trip() {
     // The "on-chain" code hash: a real deploy of the compiled `.wat` into a
     // real registry (the legacy sha256-hash deploy path — the node accepts
     // both historical algorithms, so this exercises that branch too).
-    let wasm = stellereum::contract_source::compile_wat_source(VERIFY_WAT)
-        .expect("test wat compiles");
+    let wasm =
+        stellereum::contract_source::compile_wat_source(VERIFY_WAT).expect("test wat compiles");
     let mut reg = stellereum::contract::ContractRegistry::new();
     let addr = reg.deploy([5u8; 32], wasm, 0).expect("deploy");
     let addr_hex = hex::encode(addr);
@@ -772,7 +813,10 @@ async fn test_contract_source_verify_round_trip() {
         .await
         .unwrap();
     let v: Value = res.json().await.unwrap();
-    assert_eq!(v["verified"], false, "foreign compiler must be refused: {v}");
+    assert_eq!(
+        v["verified"], false,
+        "foreign compiler must be refused: {v}"
+    );
 
     // 8. The stored row still carries the original verified source.
     let res = client

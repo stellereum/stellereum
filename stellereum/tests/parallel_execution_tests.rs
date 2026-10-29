@@ -32,7 +32,9 @@ fn new_engine(parallel: bool) -> InMemoryStateEngine {
 async fn fund_engine(engine: &InMemoryStateEngine, keys: &[SigningKey], initial_bal: u64) {
     for sk in keys {
         let addr = sk.verifying_key().to_bytes();
-        engine.update_account(AccountState::new(addr, initial_bal)).await;
+        engine
+            .update_account(AccountState::new(addr, initial_bal))
+            .await;
     }
 }
 
@@ -126,7 +128,10 @@ async fn test_equivalence_400_tx_block() {
 
     let root_seq = engine_seq.get_state_root().await;
     let root_par = engine_par.get_state_root().await;
-    assert_eq!(root_seq, root_par, "state roots must be bit-identical for 400-tx block");
+    assert_eq!(
+        root_seq, root_par,
+        "state roots must be bit-identical for 400-tx block"
+    );
 }
 
 #[tokio::test]
@@ -144,8 +149,12 @@ async fn test_mixed_workload_concurrency() {
 
     // Fund zero-bal account with 0 balance
     let zero_addr = zero_bal.verifying_key().to_bytes();
-    engine_seq.update_account(AccountState::new(zero_addr, 0)).await;
-    engine_par.update_account(AccountState::new(zero_addr, 0)).await;
+    engine_seq
+        .update_account(AccountState::new(zero_addr, 0))
+        .await;
+    engine_par
+        .update_account(AccountState::new(zero_addr, 0))
+        .await;
 
     // Create a fungible token on both engines
     let token_creator = keys[0].verifying_key().to_bytes();
@@ -167,19 +176,51 @@ async fn test_mixed_workload_concurrency() {
     let recipient_b = keys[2].verifying_key().to_bytes();
 
     // Alice -> Bob
-    txs.push(Transaction::sign(&keys[0], recipient_a, 1000, 10, nonce_tracker[0], 1, 1));
+    txs.push(Transaction::sign(
+        &keys[0],
+        recipient_a,
+        1000,
+        10,
+        nonce_tracker[0],
+        1,
+        1,
+    ));
     nonce_tracker[0] += 1;
 
     // Bob -> Charlie (chain)
-    txs.push(Transaction::sign(&keys[1], recipient_b, 500, 10, nonce_tracker[1], 1, 1));
+    txs.push(Transaction::sign(
+        &keys[1],
+        recipient_b,
+        500,
+        10,
+        nonce_tracker[1],
+        1,
+        1,
+    ));
     nonce_tracker[1] += 1;
 
     // Alice -> Bob again (sender conflict)
-    txs.push(Transaction::sign(&keys[0], recipient_a, 200, 10, nonce_tracker[0], 1, 1));
+    txs.push(Transaction::sign(
+        &keys[0],
+        recipient_a,
+        200,
+        10,
+        nonce_tracker[0],
+        1,
+        1,
+    ));
     nonce_tracker[0] += 1;
 
     // Dave -> Bob (recipient conflict)
-    txs.push(Transaction::sign(&keys[3], recipient_a, 300, 10, nonce_tracker[3], 1, 1));
+    txs.push(Transaction::sign(
+        &keys[3],
+        recipient_a,
+        300,
+        10,
+        nonce_tracker[3],
+        1,
+        1,
+    ));
     nonce_tracker[3] += 1;
 
     // 2. Token transfers
@@ -253,7 +294,15 @@ async fn test_mixed_workload_concurrency() {
     // More independent transfers
     for i in 6..10 {
         let to = keys[(i + 1) % keys.len()].verifying_key().to_bytes();
-        txs.push(Transaction::sign(&keys[i], to, 50, 10, nonce_tracker[i], 1, 1));
+        txs.push(Transaction::sign(
+            &keys[i],
+            to,
+            50,
+            10,
+            nonce_tracker[i],
+            1,
+            1,
+        ));
         nonce_tracker[i] += 1;
     }
 
@@ -261,15 +310,27 @@ async fn test_mixed_workload_concurrency() {
     let res_seq = engine_seq.apply_block_parallel_fees(&txs, timestamp).await;
     let res_par = engine_par.apply_block_parallel_fees(&txs, timestamp).await;
 
-    assert_eq!(res_seq.0, res_par.0, "applied count must match in mixed workload");
-    assert_eq!(res_seq.1, res_par.1, "failed count must match in mixed workload");
-    assert_eq!(res_seq.2, res_par.2, "fees_collected must match in mixed workload");
+    assert_eq!(
+        res_seq.0, res_par.0,
+        "applied count must match in mixed workload"
+    );
+    assert_eq!(
+        res_seq.1, res_par.1,
+        "failed count must match in mixed workload"
+    );
+    assert_eq!(
+        res_seq.2, res_par.2,
+        "fees_collected must match in mixed workload"
+    );
     assert_eq!(res_seq.3, res_par.3, "status must match in mixed workload");
     assert_eq!(res_seq.4, res_par.4, "fees must match in mixed workload");
 
     let root_seq = engine_seq.get_state_root().await;
     let root_par = engine_par.get_state_root().await;
-    assert_eq!(root_seq, root_par, "state roots must match in mixed workload");
+    assert_eq!(
+        root_seq, root_par,
+        "state roots must match in mixed workload"
+    );
 }
 
 #[tokio::test]
@@ -279,7 +340,9 @@ async fn test_micro_benchmark_throughput_gain() {
     let txs_per_sender = 20;
     let total_txs = num_senders * txs_per_sender;
 
-    let senders: Vec<SigningKey> = (0..num_senders).map(|_| SigningKey::generate(&mut rng)).collect();
+    let senders: Vec<SigningKey> = (0..num_senders)
+        .map(|_| SigningKey::generate(&mut rng))
+        .collect();
     let recipients: Vec<[u8; 32]> = (0..num_senders)
         .map(|_| SigningKey::generate(&mut rng).verifying_key().to_bytes())
         .collect();
@@ -294,7 +357,9 @@ async fn test_micro_benchmark_throughput_gain() {
             Transaction::sign(&senders[0], recipients[0], 10, 10, 0, 1, 1),
             Transaction::sign(&senders[1], recipients[1], 10, 10, 0, 1, 1),
         ];
-        let _ = warmup_engine.apply_block_parallel_fees(&warmup_txs, 1000).await;
+        let _ = warmup_engine
+            .apply_block_parallel_fees(&warmup_txs, 1000)
+            .await;
     }
 
     let mut txs = Vec::with_capacity(total_txs);
@@ -317,14 +382,18 @@ async fn test_micro_benchmark_throughput_gain() {
         fund_engine(&engine_p, &senders, initial_balance).await;
 
         let start_seq = Instant::now();
-        let res_seq = engine_s.apply_block_parallel_fees(&txs, timestamp + iter).await;
+        let res_seq = engine_s
+            .apply_block_parallel_fees(&txs, timestamp + iter)
+            .await;
         let dur_seq = start_seq.elapsed();
         if dur_seq < best_seq {
             best_seq = dur_seq;
         }
 
         let start_par = Instant::now();
-        let res_par = engine_p.apply_block_parallel_fees(&txs, timestamp + iter).await;
+        let res_par = engine_p
+            .apply_block_parallel_fees(&txs, timestamp + iter)
+            .await;
         let dur_par = start_par.elapsed();
         if dur_par < best_par {
             best_par = dur_par;

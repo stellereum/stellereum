@@ -52,8 +52,14 @@ fn merkle_proof_rejects_forged_value() {
     let proof = trie.generate_merkle_proof(&k).unwrap();
 
     assert!(PatriciaTrie::verify_merkle_proof(&root, &k, b"v7", &proof));
-    assert!(!PatriciaTrie::verify_merkle_proof(&root, &k, b"v8", &proof), "forged value accepted!");
-    assert!(!PatriciaTrie::verify_merkle_proof(&root, &k, b"", &proof), "empty forged value accepted!");
+    assert!(
+        !PatriciaTrie::verify_merkle_proof(&root, &k, b"v8", &proof),
+        "forged value accepted!"
+    );
+    assert!(
+        !PatriciaTrie::verify_merkle_proof(&root, &k, b"", &proof),
+        "empty forged value accepted!"
+    );
 }
 
 /// A proof for one key must not verify for a different key.
@@ -68,7 +74,10 @@ fn merkle_proof_rejects_wrong_key() {
     let proof = trie.generate_merkle_proof(&k1).unwrap();
 
     let k2 = key_for(4);
-    assert!(!PatriciaTrie::verify_merkle_proof(&root, &k2, b"v3", &proof), "wrong key accepted!");
+    assert!(
+        !PatriciaTrie::verify_merkle_proof(&root, &k2, b"v3", &proof),
+        "wrong key accepted!"
+    );
 }
 
 /// Proofs must survive trie mutation (remove + insert) as long as the root is current.

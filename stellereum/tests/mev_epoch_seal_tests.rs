@@ -27,13 +27,13 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use stellereum::mempool::Mempool;
 use stellereum::mev_epoch::{
     combine_partials, compute_partial, decode_sealed_payload, encryption_public_key_from_ed25519,
     encryption_secret_from_ed25519, epoch_key_commitment, seal_transaction, DecryptionPartial,
     EpochCommittee, EpochDkg, EpochSealManager, MevFrame, OrderCommitment, SealedEnvelope,
     TransparentMeta,
 };
-use stellereum::mempool::Mempool;
 use stellereum::sharding::Transaction;
 
 // ===========================================================================
@@ -171,19 +171,12 @@ fn a_sealed_transaction_is_gossiped_as_ciphertext() {
     let (plaintext, tx_hash) = signed_tx(&members[0].signing, 0);
     let marker = MARKER.as_slice();
     assert!(
-        plaintext
-            .windows(marker.len())
-            .any(|w| w == marker),
+        plaintext.windows(marker.len()).any(|w| w == marker),
         "the test payload must actually contain the marker"
     );
 
-    let envelope = seal_transaction(
-        &key,
-        &plaintext,
-        tx_hash,
-        meta_for(members[0].id, 0),
-    )
-    .expect("sealing succeeds");
+    let envelope = seal_transaction(&key, &plaintext, tx_hash, meta_for(members[0].id, 0))
+        .expect("sealing succeeds");
 
     // (a) The wire frame (what the tx-gossip channel carries).
     let wire = stellereum::mev_epoch::encode_sealed_payload(&envelope).expect("the frame encodes");
@@ -192,22 +185,26 @@ fn a_sealed_transaction_is_gossiped_as_ciphertext() {
         "the gossiped bytes must not contain the plaintext"
     );
     assert!(
-        !wire.windows(plaintext.len()).any(|w| w == plaintext.as_slice()),
+        !wire
+            .windows(plaintext.len())
+            .any(|w| w == plaintext.as_slice()),
         "the gossiped bytes must not contain the serialized transaction"
     );
     // The frame is recognisable as a sealed payload and decodes back to the
     // same envelope.
     assert!(stellereum::mev_epoch::is_sealed_payload(&wire));
-    assert!(!stellereum::mev_epoch::is_mev_frame(&bincode::serialize(&Transaction::sign(
-        &members[0].signing,
-        [0x11; 32],
-        1_000,
-        0,
-        0,
-        1,
-        1
-    ))
-    .unwrap()));
+    assert!(!stellereum::mev_epoch::is_mev_frame(
+        &bincode::serialize(&Transaction::sign(
+            &members[0].signing,
+            [0x11; 32],
+            1_000,
+            0,
+            0,
+            1,
+            1
+        ))
+        .unwrap()
+    ));
     let decoded = decode_sealed_payload(&wire).expect("the frame decodes");
     assert_eq!(decoded, envelope);
 
@@ -215,14 +212,15 @@ fn a_sealed_transaction_is_gossiped_as_ciphertext() {
     //     in it.
     let mut pool = Mempool::new(64, 16);
     pool.set_sealed_epoch(1);
-    let hash = pool.add_sealed(envelope.clone()).expect("the sealed tx is admitted");
+    let hash = pool
+        .add_sealed(envelope.clone())
+        .expect("the sealed tx is admitted");
     assert_eq!(hash, tx_hash);
     assert_eq!(pool.sealed_count(), 1);
-    let stored = pool.sealed_envelope(&tx_hash).expect("the envelope is stored");
-    assert!(!stored
-        .ciphertext
-        .windows(marker.len())
-        .any(|w| w == marker));
+    let stored = pool
+        .sealed_envelope(&tx_hash)
+        .expect("the envelope is stored");
+    assert!(!stored.ciphertext.windows(marker.len()).any(|w| w == marker));
     // The plain pool holds nothing: the plaintext never entered the pool.
     assert_eq!(pool.len(), 0, "the plaintext must not be in the plain pool");
     let _ = committee;
@@ -284,7 +282,10 @@ fn the_proposer_unseals_only_after_the_order_is_committed() {
     let commitment = manager
         .commit_order(10, 0, vec![tx_hash], &members[0].signing)
         .expect("the commitment is made");
-    assert_eq!(commitment.order_root, stellereum::mev::order_merkle_root_of_hashes(&[tx_hash]));
+    assert_eq!(
+        commitment.order_root,
+        stellereum::mev::order_merkle_root_of_hashes(&[tx_hash])
+    );
     // The commitment verifies against the proposer's key.
     assert!(commitment.verify().is_ok());
 
@@ -292,7 +293,10 @@ fn the_proposer_unseals_only_after_the_order_is_committed() {
     let partial = manager
         .release_partial(10, 0, &envelope)
         .expect("the release is allowed once the order is committed");
-    assert_eq!(partial.validator_index, committee.index_of(&members[0].id).unwrap());
+    assert_eq!(
+        partial.validator_index,
+        committee.index_of(&members[0].id).unwrap()
+    );
 
     // The partial alone is not enough (the threshold is 3 of 4): the
     // content stays hidden until enough members release.
@@ -511,10 +515,7 @@ fn a_stale_epoch_seal_is_refused_at_admission() {
         .add_sealed(envelope)
         .expect_err("a stale seal must be refused");
     let text = format!("{err:?}").to_lowercase();
-    assert!(
-        text.contains("epoch"),
-        "the refusal must say why: {err:?}"
-    );
+    assert!(text.contains("epoch"), "the refusal must say why: {err:?}");
     assert_eq!(pool.sealed_count(), 0);
 }
 
@@ -579,10 +580,7 @@ fn a_malformed_seal_is_rejected_fail_closed() {
         &materials[0].committee_hash,
     );
     assert!(
-        matches!(
-            outcome,
-            stellereum::mev_epoch::UnsealOutcome::Undecryptable
-        ),
+        matches!(outcome, stellereum::mev_epoch::UnsealOutcome::Undecryptable),
         "a tampered ciphertext must not authenticate"
     );
 
@@ -647,7 +645,10 @@ fn the_epoch_key_is_committed_to_the_block() {
     let without = block.compute_hash();
     block.epoch_key_commitment = commitment;
     let with = block.compute_hash();
-    assert_ne!(without, with, "the epoch key commitment must be in the block hash");
+    assert_ne!(
+        without, with,
+        "the epoch key commitment must be in the block hash"
+    );
 
     // The commitment is bound to the epoch, the key, the committee and the
     // threshold: a commitment from one epoch cannot be replayed into
@@ -717,13 +718,15 @@ fn the_plain_path_still_works_alongside_the_sealed_one() {
     // A plain transaction: the historical path.
     let plain = Transaction::sign(&members[0].signing, [0x22; 32], 500, 0, 0, 1, 1);
     let plain_hash = plain.compute_tx_hash();
-    pool.add_checked(plain, 1_000_000).expect("the plain tx is admitted");
+    pool.add_checked(plain, 1_000_000)
+        .expect("the plain tx is admitted");
     assert_eq!(pool.len(), 1);
 
     // A sealed transaction: the private path.
     let (plaintext, tx_hash) = signed_tx(&members[1].signing, 0);
     let envelope = seal_transaction(&key, &plaintext, tx_hash, meta_for(members[1].id, 0)).unwrap();
-    pool.add_sealed(envelope).expect("the sealed tx is admitted");
+    pool.add_sealed(envelope)
+        .expect("the sealed tx is admitted");
 
     assert_eq!(pool.len(), 1, "one plain transaction");
     assert_eq!(pool.sealed_count(), 1, "one sealed transaction");
@@ -756,7 +759,11 @@ fn the_committee_agrees_on_one_epoch_key() {
     let mut shares: Vec<[u8; 32]> = materials.iter().map(|m| m.share).collect();
     shares.sort();
     shares.dedup();
-    assert_eq!(shares.len(), members.len(), "every member holds a different share");
+    assert_eq!(
+        shares.len(),
+        members.len(),
+        "every member holds a different share"
+    );
 
     // The contributor set is DERIVED, so every node computes the same one.
     let again = committee(15, &members);
@@ -937,8 +944,12 @@ fn a_contribution_from_a_non_contributor_is_refused() {
 
     let mut dkg = EpochDkg::new(committee.clone(), non_contributor.id);
     assert!(
-        dkg.contribution(non_contributor.id, &non_contributor.secret, &non_contributor.enc_secret)
-            .is_err(),
+        dkg.contribution(
+            non_contributor.id,
+            &non_contributor.secret,
+            &non_contributor.enc_secret
+        )
+        .is_err(),
         "a non-contributor must not be able to contribute"
     );
 }
@@ -984,7 +995,9 @@ fn the_epoch_announcement_carries_the_committee_signatures() {
             .merge_announcement(theirs)
             .expect("a matching announcement is merged");
     }
-    let merged = managers[0].announcement().expect("the announcement is held");
+    let merged = managers[0]
+        .announcement()
+        .expect("the announcement is held");
     assert_eq!(merged.valid_signature_count(), 4);
     assert!(
         merged.has_quorum(committee.threshold),
@@ -1022,8 +1035,14 @@ fn the_order_of_a_height_is_committed_once() {
         .expect("the same order is idempotent");
     assert_eq!(first.order_root, second.order_root);
     assert_eq!(second.tx_hashes.len(), 1, "the order did not change");
-    assert_eq!(manager.height_commitment(30).map(|c| c.order_root), Some(first.order_root));
-    assert!(manager.height_commitment(31).is_none(), "another height has none");
+    assert_eq!(
+        manager.height_commitment(30).map(|c| c.order_root),
+        Some(first.order_root)
+    );
+    assert!(
+        manager.height_commitment(31).is_none(),
+        "another height has none"
+    );
 
     // A DIFFERENT order for the same height is refused (the proposer's
     // equivocation). The proposer therefore re-uses the commitment it
@@ -1062,7 +1081,11 @@ fn an_included_sealed_transaction_leaves_the_pool() {
 
     // The block that carries it is applied: the envelope goes with it.
     pool.prune_confirmed(&[tx_hash]);
-    assert_eq!(pool.sealed_count(), 0, "the included seal must leave the pool");
+    assert_eq!(
+        pool.sealed_count(),
+        0,
+        "the included seal must leave the pool"
+    );
     assert!(pool.sealed_envelope(&tx_hash).is_none());
 }
 
@@ -1086,7 +1109,10 @@ fn the_per_sender_quota_covers_the_sealed_path() {
             admitted += 1;
         }
     }
-    assert_eq!(admitted, 2, "the per-sender quota must bound the sealed path");
+    assert_eq!(
+        admitted, 2,
+        "the per-sender quota must bound the sealed path"
+    );
     assert_eq!(pool.sealed_count(), 2);
 }
 
@@ -1131,7 +1157,9 @@ fn the_wallet_path_seals_submits_and_unseals_end_to_end() {
     let wire = hex::decode(&payload_hex).expect("the payload is hex");
     assert!(stellereum::mev_epoch::is_sealed_payload(&wire));
     assert!(
-        !wire.windows(plaintext.len()).any(|w| w == plaintext.as_slice()),
+        !wire
+            .windows(plaintext.len())
+            .any(|w| w == plaintext.as_slice()),
         "the submit payload must not contain the plaintext transaction"
     );
     let envelope = decode_sealed_payload(&wire).expect("the payload decodes");
@@ -1140,7 +1168,9 @@ fn the_wallet_path_seals_submits_and_unseals_end_to_end() {
     //    malformed input, which the wire decoder already enforced).
     let mut pool = Mempool::new(64, 16);
     pool.set_sealed_epoch(30);
-    let hash = pool.add_sealed(envelope.clone()).expect("the sealed tx is admitted");
+    let hash = pool
+        .add_sealed(envelope.clone())
+        .expect("the sealed tx is admitted");
     assert_eq!(hash, tx.compute_tx_hash());
 
     // 5. The proposer commits the ORDER first. The commitment is what
@@ -1169,13 +1199,8 @@ fn the_wallet_path_seals_submits_and_unseals_end_to_end() {
 
     // 7. The threshold unseals to EXACTLY the wallet's transaction bytes,
     //    and the transparent metadata matches the transaction itself.
-    let unsealed = unseal_transaction(
-        &envelope,
-        &partials,
-        committee.threshold,
-        &committee.hash,
-    )
-    .expect("a threshold of partials unseals");
+    let unsealed = unseal_transaction(&envelope, &partials, committee.threshold, &committee.hash)
+        .expect("a threshold of partials unseals");
     assert_eq!(unsealed, plaintext);
     let recovered: Transaction = bincode::deserialize(&unsealed).expect("a transaction");
     assert_eq!(recovered.compute_tx_hash(), hash);

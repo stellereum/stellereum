@@ -440,7 +440,11 @@ pub fn should_reprepare(record: &XpcRecord, height: u64) -> bool {
     if record.phase != XpcPhase::Prepared {
         return false;
     }
-    if height >= record.prepared_height.saturating_add(XPC_PREPARE_TIMEOUT_HEIGHTS) {
+    if height
+        >= record
+            .prepared_height
+            .saturating_add(XPC_PREPARE_TIMEOUT_HEIGHTS)
+    {
         return false;
     }
     // The first re-publication is one height after the prepare, then every
@@ -494,15 +498,7 @@ mod tests {
 
     fn rec(phase: XpcPhase) -> XpcRecord {
         let signer = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-        let tx = crate::sharding::Transaction::sign(
-            &signer,
-            [3u8; 32],
-            100,
-            280_000,
-            0,
-            0,
-            1,
-        );
+        let tx = crate::sharding::Transaction::sign(&signer, [3u8; 32], 100, 280_000, 0, 0, 1);
         let mut r = XpcRecord::prepared(tx, 0, 1, 10);
         r.phase = phase;
         r
@@ -570,7 +566,7 @@ mod tests {
     #[test]
     fn the_reprepare_cadence_is_deterministic_and_bounded() {
         let r = rec(XpcPhase::Prepared); // prepared at height 10
-        // The first re-publication is one height after the prepare...
+                                         // The first re-publication is one height after the prepare...
         assert!(!should_reprepare(&r, 10), "the prepare height itself");
         assert!(should_reprepare(&r, 11));
         // ... then every XPC_REPREPARE_INTERVAL heights.

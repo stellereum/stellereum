@@ -22,9 +22,17 @@ fn keystore_hardening_roundtrip() {
     let id_hex = keys.id_hex();
     keys.save(&dir).unwrap();
 
-    let file_mode = std::fs::metadata(dir.join("identity.key")).unwrap().permissions().mode() & 0o777;
+    let file_mode = std::fs::metadata(dir.join("identity.key"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(file_mode, 0o600, "identity.key must be owner-only (0600)");
-    let e2e_mode = std::fs::metadata(dir.join("e2e.key")).unwrap().permissions().mode() & 0o777;
+    let e2e_mode = std::fs::metadata(dir.join("e2e.key"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
     assert_eq!(e2e_mode, 0o600, "e2e.key must be owner-only (0600)");
     let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(dir_mode, 0o700, "keystore dir must be owner-only (0700)");
@@ -39,8 +47,14 @@ fn keystore_hardening_roundtrip() {
     keys2.save(&dir).unwrap();
 
     let raw = std::fs::read_to_string(dir.join("identity.key")).unwrap();
-    assert!(raw.starts_with("enc2:"), "encrypted key must use the Argon2id enc2 format");
-    assert!(!raw.contains(&id2), "plaintext must never leak into the encrypted file");
+    assert!(
+        raw.starts_with("enc2:"),
+        "encrypted key must use the Argon2id enc2 format"
+    );
+    assert!(
+        !raw.contains(&id2),
+        "plaintext must never leak into the encrypted file"
+    );
 
     let loaded2 = infnode::keyring::NodeKeys::load(&dir).unwrap();
     assert_eq!(loaded2.id_hex(), id2, "encrypted identity must round-trip");
@@ -90,11 +104,16 @@ fn legacy_enc_format_still_readable() {
     use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
     let nonce = [7u8; 24];
     let c = XChaCha20Poly1305::new(Key::from_slice(&key));
-    let ct = c.encrypt(XNonce::from_slice(&nonce), b"deadbeef".as_ref()).unwrap();
+    let ct = c
+        .encrypt(XNonce::from_slice(&nonce), b"deadbeef".as_ref())
+        .unwrap();
     let mut blob = Vec::new();
     blob.extend_from_slice(&nonce);
     blob.extend_from_slice(&ct);
-    let legacy = format!("enc:{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &blob));
+    let legacy = format!(
+        "enc:{}",
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &blob)
+    );
 
     let out = infnode::keyring::unprotect(&legacy).unwrap();
     assert_eq!(out, "deadbeef", "legacy enc: files must remain readable");

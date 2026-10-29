@@ -38,8 +38,8 @@ use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::sync::{
-    collect_missing_blocks, fast_sync_state, validate_sync_chain_for_shard,
-    verify_snapshot_anchor, verify_snapshot_anchor_tail, HeaderLink,
+    collect_missing_blocks, fast_sync_state, validate_sync_chain_for_shard, verify_snapshot_anchor,
+    verify_snapshot_anchor_tail, HeaderLink,
 };
 
 // Масштаб уменьшен против живых 77k/93k, но отношения сохранены:
@@ -138,7 +138,7 @@ async fn build_live_chain(
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         b.sign_block(&proposer);
         let bh = b.compute_hash();
         attach_quorum(&mut b, ks, h, bh);
@@ -164,13 +164,17 @@ async fn build_live_chain(
             snapshots.insert(h, engine.create_snapshot().await);
             let staking = engine.staking_read().await.clone();
             let gov = engine.governance_read().await.clone();
-            let dom =
-                stellereum::storage::DomainSnapshot::capture(&engine, &staking, &gov).await;
+            let dom = stellereum::storage::DomainSnapshot::capture(&engine, &staking, &gov).await;
             domains.insert(h, bincode::serialize(&dom).unwrap());
         }
     }
     (
-        LiveChain { blocks, snapshots, domains, roots },
+        LiveChain {
+            blocks,
+            snapshots,
+            domains,
+            roots,
+        },
         engine,
     )
 }
@@ -321,14 +325,20 @@ async fn stale_observer_returns_via_protocol_only_no_copy() {
     );
     // Старый блоб реален и до-бондов: без бонда внутри.
     {
-        let stale_bytes = chain.domains.get(&STALE_LEDGER_HEIGHT).expect("stale boundary snapshot");
+        let stale_bytes = chain
+            .domains
+            .get(&STALE_LEDGER_HEIGHT)
+            .expect("stale boundary snapshot");
         let snap: stellereum::storage::DomainSnapshot =
             bincode::deserialize(stale_bytes).expect("stale blob decodes");
         assert!(
             snap.staking.to_validator_set().power_of(&bonded_id) == 0,
             "стартовая точка обязана быть БЕЗ бонда (как C: леджер старее 81821)"
         );
-        let fresh_bytes = chain.domains.get(&BOUNDARY).expect("fresh boundary snapshot");
+        let fresh_bytes = chain
+            .domains
+            .get(&BOUNDARY)
+            .expect("fresh boundary snapshot");
         let fresh: stellereum::storage::DomainSnapshot =
             bincode::deserialize(fresh_bytes).expect("fresh blob decodes");
         assert!(
@@ -432,17 +442,10 @@ async fn stale_observer_returns_via_protocol_only_no_copy() {
     // от генезиса ОБЯЗАН упасть (история принирована: gap 650 > KEEP 150) —
     // иначе tail-окно не нужно было бы. Окно 8 высот целиком внутри ретеншна.
     // ---
-    let full = verify_snapshot_anchor(
-        None,
-        [0u8; 32],
-        boundary + 1,
-        &vs,
-        1_000_000,
-        |h| {
-            let l = peers.link_at(h);
-            async move { l }
-        },
-    )
+    let full = verify_snapshot_anchor(None, [0u8; 32], boundary + 1, &vs, 1_000_000, |h| {
+        let l = peers.link_at(h);
+        async move { l }
+    })
     .await;
     assert!(
         full.is_err(),
@@ -521,7 +524,10 @@ async fn stale_observer_returns_via_protocol_only_no_copy() {
         consecutive_stale >= 1,
         "fast-sync обязан был встретить и отвергнуть stale-бандл до успеха"
     );
-    assert_eq!(observer_engine.get_state_root().await, chain.roots[&BOUNDARY]);
+    assert_eq!(
+        observer_engine.get_state_root().await,
+        chain.roots[&BOUNDARY]
+    );
     // ЛЕДЖЕР ПРИЕХАЛ С БЛОБОМ: бонд виден на наблюдателе без единой копии.
     assert!(
         observer_engine
@@ -552,14 +558,25 @@ async fn stale_observer_returns_via_protocol_only_no_copy() {
             break;
         }
     }
-    let walked = walked.expect("пост-снапшотные тела внутри ретеншн-окна: проход обязан завершиться");
-    validate_sync_chain_for_shard(&walked, committed + 1, boundary_hash, &vs, MASTERCHAIN_SHARD)
-        .expect("остаток несёт настоящий кворум на каждой высоте");
+    let walked =
+        walked.expect("пост-снапшотные тела внутри ретеншн-окна: проход обязан завершиться");
+    validate_sync_chain_for_shard(
+        &walked,
+        committed + 1,
+        boundary_hash,
+        &vs,
+        MASTERCHAIN_SHARD,
+    )
+    .expect("остаток несёт настоящий кворум на каждой высоте");
     assert_eq!(walked.first().unwrap().height, committed + 1);
     assert_eq!(walked.last().unwrap().height, TIP);
     for b in &walked {
         let ours = observer_engine.get_state_root().await;
-        assert_eq!(b.state_root, ours, "блок {} обязан продолжать наш стейт", b.height);
+        assert_eq!(
+            b.state_root, ours,
+            "блок {} обязан продолжать наш стейт",
+            b.height
+        );
         observer_engine
             .update_account(AccountState::new(
                 effect_account(b.height),
@@ -571,7 +588,8 @@ async fn stale_observer_returns_via_protocol_only_no_copy() {
     // стейт — ТОЧНО тип источника: ни одного байта мимо протокола. ---
     assert_eq!(walked.last().unwrap().compute_hash(), tip_hash);
     assert_eq!(
-        observer_engine.get_state_root().await, source_tip_root,
+        observer_engine.get_state_root().await,
+        source_tip_root,
         "наблюдатель сходится на тип источника ТОЧНО — без ручных копий"
     );
 
@@ -603,7 +621,10 @@ fn bootstrap_plan_pins_the_return_procedure() {
     // Gap ≤100 — только walk, снапшот не нужен (зеркало `> 100` в try_catch_up).
     assert_eq!(bootstrap::select_bootstrap_boundary(50, 0, None), None);
     // Живой масштаб: тип 93k с чистой даты — новейшая граница под типом.
-    assert_eq!(bootstrap::select_bootstrap_boundary(93_000, 0, None), Some(93_000));
+    assert_eq!(
+        bootstrap::select_bootstrap_boundary(93_000, 0, None),
+        Some(93_000)
+    );
     // Точный pointer побеждает, когда санитарен (воркерные высоты).
     assert_eq!(
         bootstrap::select_bootstrap_boundary(93_000, 77_000, Some(92_900)),
@@ -615,7 +636,10 @@ fn bootstrap_plan_pins_the_return_procedure() {
         Some(93_000)
     );
     // Stale-бюджет: ретрай той же границы, затем шаг старше, затем громкий отказ.
-    assert_eq!(bootstrap::next_boundary_after_stale(93_000, 1, 77_000), Some(93_000));
+    assert_eq!(
+        bootstrap::next_boundary_after_stale(93_000, 1, 77_000),
+        Some(93_000)
+    );
     assert_eq!(
         bootstrap::next_boundary_after_stale(93_000, 3, 77_000),
         Some(92_900)

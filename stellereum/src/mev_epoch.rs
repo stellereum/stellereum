@@ -196,11 +196,7 @@ pub fn contributor_set(
         .map(|(i, m)| {
             let score = hash_parts(
                 CONTRIBUTOR_DOMAIN,
-                &[
-                    &epoch.to_be_bytes(),
-                    committee_hash,
-                    &m.validator_id,
-                ],
+                &[&epoch.to_be_bytes(), committee_hash, &m.validator_id],
             );
             (score, i as u32 + 1)
         })
@@ -219,7 +215,9 @@ pub fn contributor_set(
 /// group element (fail closed: a malformed point must never be accepted
 /// as a key or a partial).
 fn decompress_point(bytes: &[u8; 32]) -> Option<RistrettoPoint> {
-    CompressedRistretto::from_slice(bytes).ok().and_then(|c| c.decompress())
+    CompressedRistretto::from_slice(bytes)
+        .ok()
+        .and_then(|c| c.decompress())
 }
 
 // ===========================================================================
@@ -640,10 +638,7 @@ impl EpochDkg {
     fn epoch_seed(&self) -> [u8; 32] {
         hash_parts(
             EPOCH_SEED_DOMAIN,
-            &[
-                &self.committee.epoch.to_be_bytes(),
-                &self.committee.hash,
-            ],
+            &[&self.committee.epoch.to_be_bytes(), &self.committee.hash],
         )
     }
 
@@ -662,12 +657,7 @@ impl EpochDkg {
             .map(|k| {
                 hash_to_scalar(
                     DKG_POLY_DOMAIN,
-                    &[
-                        &seed,
-                        &index,
-                        &k.to_be_bytes(),
-                        long_term_secret,
-                    ],
+                    &[&seed, &index, &k.to_be_bytes(), long_term_secret],
                 )
             })
             .collect()
@@ -878,7 +868,9 @@ impl EpochDkg {
         // match the published commitments at our index.
         let expected = eval_point(&commitment_points, our_index as u64);
         if expected != RISTRETTO_BASEPOINT_POINT * eval {
-            return Err("dkg share evaluation does not match the published commitments".to_string());
+            return Err(
+                "dkg share evaluation does not match the published commitments".to_string(),
+            );
         }
         self.contributions.insert(contribution.index, contribution);
         self.evaluations.insert(contribution_index, eval);
@@ -1295,7 +1287,9 @@ pub fn seal_transaction(
     Ok(SealedEnvelope {
         epoch: epoch_key.epoch,
         tx_hash,
-        ephemeral_pk: (RISTRETTO_BASEPOINT_POINT * ephemeral).compress().to_bytes(),
+        ephemeral_pk: (RISTRETTO_BASEPOINT_POINT * ephemeral)
+            .compress()
+            .to_bytes(),
         nonce,
         ciphertext,
         meta,
@@ -1337,10 +1331,7 @@ pub struct DecryptionPartial {
 /// `C^x_i` is a group element: publishing it does NOT reveal our share
 /// (discrete log) and does NOT let anyone decrypt a DIFFERENT ciphertext
 /// (the partial is bound to that ciphertext's ephemeral point).
-pub fn compute_partial(
-    share: &[u8; 32],
-    ephemeral_pk: &[u8; 32],
-) -> Result<[u8; 32], String> {
+pub fn compute_partial(share: &[u8; 32], ephemeral_pk: &[u8; 32]) -> Result<[u8; 32], String> {
     let scalar = Option::<Scalar>::from(Scalar::from_canonical_bytes(*share))
         .ok_or_else(|| "epoch share is not a canonical scalar".to_string())?;
     let point = decompress_point(ephemeral_pk)
@@ -1490,12 +1481,8 @@ impl OrderCommitment {
         if self.order_root != crate::mev::order_merkle_root_of_hashes(&self.tx_hashes) {
             return Err("order commitment does not match its transaction list".to_string());
         }
-        let msg = order_commitment_signing_message(
-            self.epoch,
-            self.height,
-            self.round,
-            &self.order_root,
-        );
+        let msg =
+            order_commitment_signing_message(self.epoch, self.height, self.round, &self.order_root);
         let pk = ed25519_dalek::VerifyingKey::from_bytes(&self.proposer)
             .map_err(|e| format!("order commitment proposer key is invalid: {e}"))?;
         let sig = Signature::from_slice(&self.signature)
@@ -2048,11 +2035,7 @@ impl EpochSealManager {
         let contributors: Vec<(u32, [u8; 32])> = committee
             .contributors
             .iter()
-            .filter_map(|idx| {
-                committee
-                    .member_at(*idx)
-                    .map(|m| (*idx, m.validator_id))
-            })
+            .filter_map(|idx| committee.member_at(*idx).map(|m| (*idx, m.validator_id)))
             .collect();
         Ok(EpochKeyAnnouncement::sign(
             material.epoch,
@@ -2262,10 +2245,9 @@ impl EpochSealManager {
         round: u32,
         envelope: &SealedEnvelope,
     ) -> Result<DecryptionPartial, String> {
-        let commitment = self
-            .commitments
-            .get(&(height, round))
-            .ok_or_else(|| "no order commitment for this round: the release is refused".to_string())?;
+        let commitment = self.commitments.get(&(height, round)).ok_or_else(|| {
+            "no order commitment for this round: the release is refused".to_string()
+        })?;
         if !commitment.tx_hashes.contains(&envelope.tx_hash) {
             return Err("the sealed transaction is not part of the committed order".to_string());
         }
@@ -2292,8 +2274,7 @@ impl EpochSealManager {
             point,
         };
         self.roll_partials_to(height);
-        self.released
-            .insert((envelope.tx_hash, index), partial);
+        self.released.insert((envelope.tx_hash, index), partial);
         Ok(partial)
     }
 
@@ -2326,7 +2307,8 @@ impl EpochSealManager {
             if partial.validator_index == 0 {
                 continue;
             }
-            self.received.insert((*tx_hash, partial.validator_index), *partial);
+            self.received
+                .insert((*tx_hash, partial.validator_index), *partial);
             accepted += 1;
         }
         Ok(accepted)
@@ -2414,10 +2396,7 @@ mod tests {
     ///
     /// Only the DERIVED contributors contribute; every member (contributor or
     /// not) ingests every contribution and ends up with a share.
-    fn run_dkg(
-        committee: &EpochCommittee,
-        members: &[TestMember],
-    ) -> Vec<EpochKeyMaterial> {
+    fn run_dkg(committee: &EpochCommittee, members: &[TestMember]) -> Vec<EpochKeyMaterial> {
         let mut dkgs: Vec<EpochDkg> = members
             .iter()
             .map(|m| EpochDkg::new(committee.clone(), m.id))
@@ -2569,10 +2548,15 @@ mod tests {
         let envelope = seal_transaction(&key, &plaintext, [1u8; 32], meta()).unwrap();
         let wire = bincode::serialize(&envelope).unwrap();
         assert!(
-            !wire.windows(plaintext.len()).any(|w| w == plaintext.as_slice()),
+            !wire
+                .windows(plaintext.len())
+                .any(|w| w == plaintext.as_slice()),
             "the sealed wire bytes must not contain the plaintext"
         );
-        assert!(!envelope.ciphertext.windows(plaintext.len()).any(|w| w == plaintext.as_slice()));
+        assert!(!envelope
+            .ciphertext
+            .windows(plaintext.len())
+            .any(|w| w == plaintext.as_slice()));
     }
 
     /// A WALLET (or any holder) of the epoch-e key material CANNOT decrypt a
@@ -2627,7 +2611,10 @@ mod tests {
         // Structural validation.
         let mut broken = seal_transaction(&key, b"x", [5u8; 32], meta()).unwrap();
         broken.ephemeral_pk = [0xffu8; 32];
-        assert!(broken.validate().is_err(), "an invalid ephemeral key is refused");
+        assert!(
+            broken.validate().is_err(),
+            "an invalid ephemeral key is refused"
+        );
         let mut empty = broken.clone();
         empty.ephemeral_pk = materials[0].public_key;
         empty.ciphertext.clear();
@@ -2635,7 +2622,10 @@ mod tests {
         let mut zero_hash = empty.clone();
         zero_hash.ciphertext = vec![1, 2, 3];
         zero_hash.tx_hash = [0u8; 32];
-        assert!(zero_hash.validate().is_err(), "the reserved tx hash is refused");
+        assert!(
+            zero_hash.validate().is_err(),
+            "the reserved tx hash is refused"
+        );
 
         // A tampered DKG contribution is refused (the VSS check fails).
         let mut dkgs: Vec<EpochDkg> = members
@@ -2652,9 +2642,7 @@ mod tests {
         let mut tampered = contributions[1].clone();
         tampered.commitments[0] = materials[0].public_key; // a bogus commitment
         assert!(
-            dkgs[0]
-                .ingest(tampered, &members[0].enc_secret)
-                .is_err(),
+            dkgs[0].ingest(tampered, &members[0].enc_secret).is_err(),
             "a contribution whose evaluation does not match its commitments is refused"
         );
 
@@ -2760,7 +2748,11 @@ mod tests {
         assert_eq!(ann.valid_signature_count(), 1);
         assert!(!ann.has_quorum(2));
         ann.signatures.push(ann.signatures[0].clone());
-        assert_eq!(ann.valid_signature_count(), 1, "duplicates never count twice");
+        assert_eq!(
+            ann.valid_signature_count(),
+            1,
+            "duplicates never count twice"
+        );
         let other = SigningKey::generate(&mut OsRng);
         ann.add_signature(&other);
         assert_eq!(ann.valid_signature_count(), 2);
@@ -2794,7 +2786,10 @@ mod tests {
         let members: Vec<TestMember> = (0..4).map(|_| test_member()).collect();
         let a = build_committee(1, &members);
         let b = build_committee(1, &members);
-        assert_eq!(a.hash, b.hash, "the same validator set yields the same committee");
+        assert_eq!(
+            a.hash, b.hash,
+            "the same validator set yields the same committee"
+        );
         assert_eq!(a.threshold, b.threshold);
         // The epoch number is bound into the committee hash.
         let c = build_committee(2, &members);
@@ -2860,7 +2855,10 @@ mod tests {
                 contributions.push(c);
             }
         }
-        assert!(contributions.len() > 1, "the committee has several contributors");
+        assert!(
+            contributions.len() > 1,
+            "the committee has several contributors"
+        );
         // Feed every member all but the LAST contribution.
         for (i, m) in members.iter().enumerate() {
             for c in contributions.iter().take(contributions.len() - 1) {
@@ -2897,17 +2895,22 @@ mod tests {
         let non_contributors: Vec<usize> = members
             .iter()
             .enumerate()
-            .filter(|(_i, m)| {
-                !committee.is_contributor(committee.index_of(&m.id).unwrap())
-            })
+            .filter(|(_i, m)| !committee.is_contributor(committee.index_of(&m.id).unwrap()))
             .map(|(i, _)| i)
             .collect();
-        assert!(!non_contributors.is_empty(), "the committee has non-contributors");
+        assert!(
+            !non_contributors.is_empty(),
+            "the committee has non-contributors"
+        );
         let idx = non_contributors[0];
         let mut dkg = EpochDkg::new(committee.clone(), members[idx].id);
         assert!(
-            dkg.contribution(members[idx].id, &members[idx].secret, &members[idx].enc_secret)
-                .is_err(),
+            dkg.contribution(
+                members[idx].id,
+                &members[idx].secret,
+                &members[idx].enc_secret
+            )
+            .is_err(),
             "a non-contributor must not contribute"
         );
         // ... but it DOES end up with a share (and can unseal).
@@ -3005,7 +3008,10 @@ mod tests {
             "committee_hash": format!("0x{}", hex::encode(m.committee_hash)),
             "threshold": m.threshold,
         });
-        assert_eq!(EpochPublicKey::from_rpc_json(&prefixed).expect("0x-prefix parses"), key);
+        assert_eq!(
+            EpochPublicKey::from_rpc_json(&prefixed).expect("0x-prefix parses"),
+            key
+        );
     }
 
     /// A MALFORMED `stell_epochKey` ANSWER IS REFUSED, NOT GUESSED AT.
@@ -3030,7 +3036,10 @@ mod tests {
             "threshold": m.threshold,
         });
         assert!(EpochPublicKey::from_rpc_json(&real).is_ok());
-        assert!(EpochPublicKey::from_rpc_json(&good).is_err(), "a non-point key is refused");
+        assert!(
+            EpochPublicKey::from_rpc_json(&good).is_err(),
+            "a non-point key is refused"
+        );
 
         // Every field is required.
         let mut missing_epoch = real.clone();
@@ -3040,10 +3049,16 @@ mod tests {
         missing_key.as_object_mut().unwrap().remove("public_key");
         assert!(EpochPublicKey::from_rpc_json(&missing_key).is_err());
         let mut missing_hash = real.clone();
-        missing_hash.as_object_mut().unwrap().remove("committee_hash");
+        missing_hash
+            .as_object_mut()
+            .unwrap()
+            .remove("committee_hash");
         assert!(EpochPublicKey::from_rpc_json(&missing_hash).is_err());
         let mut missing_threshold = real.clone();
-        missing_threshold.as_object_mut().unwrap().remove("threshold");
+        missing_threshold
+            .as_object_mut()
+            .unwrap()
+            .remove("threshold");
         assert!(EpochPublicKey::from_rpc_json(&missing_threshold).is_err());
 
         // Wrong lengths and non-hex are refused.

@@ -19,11 +19,11 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use stellereum::consensus::{QuorumCertificate, Vote, VoteKind, ValidatorSet};
+use std::sync::Arc;
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::Block;
 use stellereum::state_engine::InMemoryStateEngine;
-use std::sync::Arc;
 
 const N: usize = 4;
 
@@ -31,7 +31,11 @@ fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
 }
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
-    ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect())
+    ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    )
 }
 
 async fn node(ks: &[SigningKey]) -> ValidatorRuntime {
@@ -105,11 +109,19 @@ async fn hunt_finding_15_adopt_committed_refuses_a_prevote_quorum() {
         "[FINDING 15] precommit QC verifies: {}",
         precommits.verify(&rt.validators)
     );
-    assert!(prevotes.verify(&rt.validators), "a 3-of-4 prevote quorum is a real prevote quorum");
+    assert!(
+        prevotes.verify(&rt.validators),
+        "a 3-of-4 prevote quorum is a real prevote quorum"
+    );
 
     let _set = rt.validators.clone();
     let r = rt.adopt_committed(1, blk.clone(), prevotes).await;
-    println!("[FINDING 15] adopt_committed with a PREVOTE quorum -> {:?}", r.as_ref().map(|h| hex::encode(&h[..4])).map_err(|e| e.clone()));
+    println!(
+        "[FINDING 15] adopt_committed with a PREVOTE quorum -> {:?}",
+        r.as_ref()
+            .map(|h| hex::encode(&h[..4]))
+            .map_err(|e| e.clone())
+    );
     // FIXED. `QuorumCertificate::verify` signs over the certificate's OWN fields, so a
     // prevote quorum verified perfectly well while `kind` went unread. Prevotes are
     // broadcast in the clear every round -- including rounds that never finalize --
@@ -128,7 +140,10 @@ async fn hunt_finding_15_adopt_committed_refuses_a_prevote_quorum() {
 
     // The node must not have moved at all.
     let h = rt.height();
-    println!("[FINDING 15] node height is still {h} (was 1); finalized = {:?}", rt.finalized.iter().map(|(hh,_)| *hh).collect::<Vec<_>>());
+    println!(
+        "[FINDING 15] node height is still {h} (was 1); finalized = {:?}",
+        rt.finalized.iter().map(|(hh, _)| *hh).collect::<Vec<_>>()
+    );
     assert_eq!(h, 1, "the node must not advance on a prevote quorum");
     assert!(
         rt.finalized.is_empty(),
@@ -146,17 +161,26 @@ async fn hunt_finding_15b_the_precommit_quorum_is_not_required_at_all() {
     let bh = [0x21u8; 32];
     for n in 1..=N {
         let c = cert_of(&ks, VoteKind::Prevote, bh, n);
-        println!("[FINDING 15b] prevote QC with {n} signature(s) verifies: {}", c.verify(&rt.validators));
+        println!(
+            "[FINDING 15b] prevote QC with {n} signature(s) verifies: {}",
+            c.verify(&rt.validators)
+        );
     }
     for n in 1..=N {
         let c = cert_of(&ks, VoteKind::Precommit, bh, n);
-        println!("[FINDING 15b] precommit QC with {n} signature(s) verifies: {}", c.verify(&rt.validators));
+        println!(
+            "[FINDING 15b] precommit QC with {n} signature(s) verifies: {}",
+            c.verify(&rt.validators)
+        );
     }
     // Both curves are identical: `kind` is not consulted at all.
     for n in 1..=N {
         let p = cert_of(&ks, VoteKind::Prevote, bh, n).verify(&rt.validators);
         let c = cert_of(&ks, VoteKind::Precommit, bh, n).verify(&rt.validators);
-        assert_eq!(p, c, "kind must not change the verdict, yet it must not change finality either");
+        assert_eq!(
+            p, c,
+            "kind must not change the verdict, yet it must not change finality either"
+        );
     }
     println!("[FINDING 15b] `kind` is verified for signing but never for SEMANTICS.");
 }
@@ -189,7 +213,10 @@ async fn hunt_finding_16_adopt_committed_binds_the_certificate_height() {
             })
             .collect(),
     };
-    assert!(far.verify(&rt.validators), "the signatures are genuine over height 99999");
+    assert!(
+        far.verify(&rt.validators),
+        "the signatures are genuine over height 99999"
+    );
     let _set = rt.validators.clone();
     let r = rt.adopt_committed(1, blk, far).await;
     println!("[FINDING 16] a certificate signed at height 99999 round 77, presented for height 1 -> {:?}", r.as_ref().map(|h| hex::encode(&h[..4])).map_err(|e| e.clone()));
@@ -203,7 +230,9 @@ async fn hunt_finding_16_adopt_committed_binds_the_certificate_height() {
         "a certificate for height 99999 must not finalize a block at height 1"
     );
     assert!(
-        r.as_ref().unwrap_err().contains("certificate is for height"),
+        r.as_ref()
+            .unwrap_err()
+            .contains("certificate is for height"),
         "the refusal must name the reason: {:?}",
         r.err()
     );

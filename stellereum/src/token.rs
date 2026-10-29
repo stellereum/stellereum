@@ -133,14 +133,38 @@ impl TokenMetadata {
 /// Operations that can be sent to a token actor
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenOp {
-    Transfer { to: [u8; 32], amount: u64 },
-    TransferFrom { from: [u8; 32], to: [u8; 32], amount: u64 },
-    Approve { spender: [u8; 32], amount: u64 },
-    IncreaseAllowance { spender: [u8; 32], delta: u64 },
-    DecreaseAllowance { spender: [u8; 32], delta: u64 },
-    Mint { to: [u8; 32], amount: u64 },
-    Burn { from: [u8; 32], amount: u64 },
-    SetMinter { new_minter: [u8; 32] },
+    Transfer {
+        to: [u8; 32],
+        amount: u64,
+    },
+    TransferFrom {
+        from: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+    },
+    Approve {
+        spender: [u8; 32],
+        amount: u64,
+    },
+    IncreaseAllowance {
+        spender: [u8; 32],
+        delta: u64,
+    },
+    DecreaseAllowance {
+        spender: [u8; 32],
+        delta: u64,
+    },
+    Mint {
+        to: [u8; 32],
+        amount: u64,
+    },
+    Burn {
+        from: [u8; 32],
+        amount: u64,
+    },
+    SetMinter {
+        new_minter: [u8; 32],
+    },
     RenounceMinter,
     Pause,
     Unpause,
@@ -149,13 +173,40 @@ pub enum TokenOp {
 /// Event emitted by token operations (for off-chain indexers)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenEvent {
-    Transfer { token_id: [u8; 32], from: [u8; 32], to: [u8; 32], amount: u64 },
-    Approval { token_id: [u8; 32], owner: [u8; 32], spender: [u8; 32], amount: u64 },
-    Mint { token_id: [u8; 32], to: [u8; 32], amount: u64, new_total: u64 },
-    Burn { token_id: [u8; 32], from: [u8; 32], amount: u64, new_total: u64 },
-    MinterChanged { token_id: [u8; 32], new_minter: [u8; 32] },
-    Paused { token_id: [u8; 32] },
-    Unpaused { token_id: [u8; 32] },
+    Transfer {
+        token_id: [u8; 32],
+        from: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+    },
+    Approval {
+        token_id: [u8; 32],
+        owner: [u8; 32],
+        spender: [u8; 32],
+        amount: u64,
+    },
+    Mint {
+        token_id: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+        new_total: u64,
+    },
+    Burn {
+        token_id: [u8; 32],
+        from: [u8; 32],
+        amount: u64,
+        new_total: u64,
+    },
+    MinterChanged {
+        token_id: [u8; 32],
+        new_minter: [u8; 32],
+    },
+    Paused {
+        token_id: [u8; 32],
+    },
+    Unpaused {
+        token_id: [u8; 32],
+    },
 }
 
 /// A fungible token contract operating as an isolated Actor
@@ -170,7 +221,11 @@ pub struct TokenActor {
 
 impl TokenActor {
     /// Create a new token actor. `initial_supply` is credited to `metadata.minter`.
-    pub fn new(id: [u8; 32], metadata: TokenMetadata, initial_supply: u64) -> Result<Self, TokenError> {
+    pub fn new(
+        id: [u8; 32],
+        metadata: TokenMetadata,
+        initial_supply: u64,
+    ) -> Result<Self, TokenError> {
         metadata.validate()?;
         if let Some(cap) = metadata.max_supply {
             if initial_supply > cap {
@@ -199,7 +254,10 @@ impl TokenActor {
     }
 
     pub fn allowance(&self, owner: &[u8; 32], spender: &[u8; 32]) -> u64 {
-        self.allowances.get(&(*owner, *spender)).copied().unwrap_or(0)
+        self.allowances
+            .get(&(*owner, *spender))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn is_minter(&self, caller: &[u8; 32]) -> bool {
@@ -213,7 +271,10 @@ impl TokenActor {
     }
 
     fn debit(&mut self, account: &[u8; 32], amount: u64) -> Result<(), TokenError> {
-        let entry = self.balances.get_mut(account).ok_or(TokenError::InsufficientBalance)?;
+        let entry = self
+            .balances
+            .get_mut(account)
+            .ok_or(TokenError::InsufficientBalance)?;
         if *entry < amount {
             return Err(TokenError::InsufficientBalance);
         }
@@ -225,7 +286,12 @@ impl TokenActor {
     }
 
     /// Direct transfer by the token holder
-    pub fn transfer(&mut self, from: [u8; 32], to: [u8; 32], amount: u64) -> Result<TokenEvent, TokenError> {
+    pub fn transfer(
+        &mut self,
+        from: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+    ) -> Result<TokenEvent, TokenError> {
         if amount == 0 {
             return Err(TokenError::ZeroAmount);
         }
@@ -240,7 +306,12 @@ impl TokenActor {
         }
         self.debit(&from, amount)?;
         self.credit(to, amount)?;
-        Ok(TokenEvent::Transfer { token_id: self.id, from, to, amount })
+        Ok(TokenEvent::Transfer {
+            token_id: self.id,
+            from,
+            to,
+            amount,
+        })
     }
 
     /// Approve a spender to move funds on behalf of the owner.
@@ -250,7 +321,12 @@ impl TokenActor {
     /// not allowance bookkeeping (same as ERC-20 Pausable). Consequence to
     /// be aware of: allowances granted before (or during) a pause become
     /// usable the moment the token unpauses. Pinned by test.
-    pub fn approve(&mut self, owner: [u8; 32], spender: [u8; 32], amount: u64) -> Result<TokenEvent, TokenError> {
+    pub fn approve(
+        &mut self,
+        owner: [u8; 32],
+        spender: [u8; 32],
+        amount: u64,
+    ) -> Result<TokenEvent, TokenError> {
         if owner == ZERO_ADDRESS || spender == ZERO_ADDRESS {
             return Err(TokenError::ZeroAddress);
         }
@@ -262,7 +338,12 @@ impl TokenActor {
         } else {
             self.allowances.insert((owner, spender), amount);
         }
-        Ok(TokenEvent::Approval { token_id: self.id, owner, spender, amount })
+        Ok(TokenEvent::Approval {
+            token_id: self.id,
+            owner,
+            spender,
+            amount,
+        })
     }
 
     /// Atomically increase an allowance (mitigates the ERC-20 approve race condition)
@@ -284,7 +365,12 @@ impl TokenActor {
         let current = self.allowance(&owner, &spender);
         let new = current.checked_add(delta).ok_or(TokenError::Overflow)?;
         self.allowances.insert((owner, spender), new);
-        Ok(TokenEvent::Approval { token_id: self.id, owner, spender, amount: new })
+        Ok(TokenEvent::Approval {
+            token_id: self.id,
+            owner,
+            spender,
+            amount: new,
+        })
     }
 
     /// Atomically decrease an allowance (mitigates the ERC-20 approve race condition)
@@ -310,7 +396,12 @@ impl TokenActor {
         } else {
             self.allowances.insert((owner, spender), new);
         }
-        Ok(TokenEvent::Approval { token_id: self.id, owner, spender, amount: new })
+        Ok(TokenEvent::Approval {
+            token_id: self.id,
+            owner,
+            spender,
+            amount: new,
+        })
     }
 
     /// Spend an allowance to move funds.
@@ -354,12 +445,22 @@ impl TokenActor {
         // Debit cannot fail here (balance already verified).
         self.debit(&from, amount)?;
         self.credit(to, amount)?;
-        Ok(TokenEvent::Transfer { token_id: self.id, from, to, amount })
+        Ok(TokenEvent::Transfer {
+            token_id: self.id,
+            from,
+            to,
+            amount,
+        })
     }
 
     /// Mint new tokens. Only callable by the current minter.
     /// Atomicity: supply counter is updated only after the balance credit succeeds.
-    pub fn mint(&mut self, caller: [u8; 32], to: [u8; 32], amount: u64) -> Result<TokenEvent, TokenError> {
+    pub fn mint(
+        &mut self,
+        caller: [u8; 32],
+        to: [u8; 32],
+        amount: u64,
+    ) -> Result<TokenEvent, TokenError> {
         if self.metadata.minter == ZERO_ADDRESS {
             return Err(TokenError::MinterRenounced);
         }
@@ -375,7 +476,11 @@ impl TokenActor {
         if self.metadata.paused {
             return Err(TokenError::Paused);
         }
-        let new_total = self.metadata.total_supply.checked_add(amount).ok_or(TokenError::Overflow)?;
+        let new_total = self
+            .metadata
+            .total_supply
+            .checked_add(amount)
+            .ok_or(TokenError::Overflow)?;
         if let Some(cap) = self.metadata.max_supply {
             if new_total > cap {
                 return Err(TokenError::SupplyCapExceeded);
@@ -384,11 +489,21 @@ impl TokenActor {
         // Credit first; only commit the supply increase if the credit succeeded.
         self.credit(to, amount)?;
         self.metadata.total_supply = new_total;
-        Ok(TokenEvent::Mint { token_id: self.id, to, amount, new_total })
+        Ok(TokenEvent::Mint {
+            token_id: self.id,
+            to,
+            amount,
+            new_total,
+        })
     }
 
     /// Burn tokens. Minter can burn from anyone; a holder can burn their own.
-    pub fn burn(&mut self, caller: [u8; 32], from: [u8; 32], amount: u64) -> Result<TokenEvent, TokenError> {
+    pub fn burn(
+        &mut self,
+        caller: [u8; 32],
+        from: [u8; 32],
+        amount: u64,
+    ) -> Result<TokenEvent, TokenError> {
         if amount == 0 {
             return Err(TokenError::ZeroAmount);
         }
@@ -408,11 +523,20 @@ impl TokenActor {
             .total_supply
             .checked_sub(amount)
             .ok_or(TokenError::Overflow)?;
-        Ok(TokenEvent::Burn { token_id: self.id, from, amount, new_total: self.metadata.total_supply })
+        Ok(TokenEvent::Burn {
+            token_id: self.id,
+            from,
+            amount,
+            new_total: self.metadata.total_supply,
+        })
     }
 
     /// Transfer minter authority (only current minter)
-    pub fn set_minter(&mut self, caller: [u8; 32], new_minter: [u8; 32]) -> Result<TokenEvent, TokenError> {
+    pub fn set_minter(
+        &mut self,
+        caller: [u8; 32],
+        new_minter: [u8; 32],
+    ) -> Result<TokenEvent, TokenError> {
         if self.metadata.minter == ZERO_ADDRESS {
             return Err(TokenError::MinterRenounced);
         }
@@ -426,7 +550,10 @@ impl TokenActor {
             return Err(TokenError::ZeroAddress);
         }
         self.metadata.minter = new_minter;
-        Ok(TokenEvent::MinterChanged { token_id: self.id, new_minter })
+        Ok(TokenEvent::MinterChanged {
+            token_id: self.id,
+            new_minter,
+        })
     }
 
     /// Permanently renounce minting (irreversible)
@@ -435,7 +562,10 @@ impl TokenActor {
             return Err(TokenError::NotMinter);
         }
         self.metadata.minter = ZERO_ADDRESS;
-        Ok(TokenEvent::MinterChanged { token_id: self.id, new_minter: ZERO_ADDRESS })
+        Ok(TokenEvent::MinterChanged {
+            token_id: self.id,
+            new_minter: ZERO_ADDRESS,
+        })
     }
 
     pub fn pause(&mut self, caller: [u8; 32]) -> Result<TokenEvent, TokenError> {
@@ -458,10 +588,16 @@ impl TokenActor {
     pub fn execute(&mut self, caller: [u8; 32], op: TokenOp) -> Result<TokenEvent, TokenError> {
         match op {
             TokenOp::Transfer { to, amount } => self.transfer(caller, to, amount),
-            TokenOp::TransferFrom { from, to, amount } => self.transfer_from(caller, from, to, amount),
+            TokenOp::TransferFrom { from, to, amount } => {
+                self.transfer_from(caller, from, to, amount)
+            }
             TokenOp::Approve { spender, amount } => self.approve(caller, spender, amount),
-            TokenOp::IncreaseAllowance { spender, delta } => self.increase_allowance(caller, spender, delta),
-            TokenOp::DecreaseAllowance { spender, delta } => self.decrease_allowance(caller, spender, delta),
+            TokenOp::IncreaseAllowance { spender, delta } => {
+                self.increase_allowance(caller, spender, delta)
+            }
+            TokenOp::DecreaseAllowance { spender, delta } => {
+                self.decrease_allowance(caller, spender, delta)
+            }
             TokenOp::Mint { to, amount } => self.mint(caller, to, amount),
             TokenOp::Burn { from, amount } => self.burn(caller, from, amount),
             TokenOp::SetMinter { new_minter } => self.set_minter(caller, new_minter),
@@ -520,7 +656,7 @@ impl TokenRegistry {
                 (t.metadata.minter == *creator
                     && t.metadata.name == name
                     && t.metadata.symbol == symbol)
-                .then_some(*id)
+                    .then_some(*id)
             })
             .collect();
         hits.sort_unstable();
@@ -574,13 +710,19 @@ impl TokenRegistry {
         caller: [u8; 32],
         op: TokenOp,
     ) -> Result<TokenEvent, TokenError> {
-        let token = self.tokens.get_mut(token_id).ok_or(TokenError::TokenNotFound)?;
+        let token = self
+            .tokens
+            .get_mut(token_id)
+            .ok_or(TokenError::TokenNotFound)?;
         token.execute(caller, op)
     }
 
     /// Convenience: balance of an account for a token
     pub fn balance_of(&self, token_id: &[u8; 32], account: &[u8; 32]) -> u64 {
-        self.tokens.get(token_id).map(|t| t.balance_of(account)).unwrap_or(0)
+        self.tokens
+            .get(token_id)
+            .map(|t| t.balance_of(account))
+            .unwrap_or(0)
     }
 }
 
@@ -624,7 +766,10 @@ mod tests {
         let a = addr(1);
         let id1 = reg.create_token(a, meta("Token", "TKN"), 0).unwrap();
         let id2 = reg.create_token(a, meta("Token", "TKN"), 0).unwrap();
-        assert_ne!(id1, id2, "same creator+name must yield different ids via nonce");
+        assert_ne!(
+            id1, id2,
+            "same creator+name must yield different ids via nonce"
+        );
         let expected = compute_token_id(&a, "Token", "TKN", 1);
         assert_eq!(id1, expected);
     }
@@ -636,7 +781,15 @@ mod tests {
         let bob = addr(2);
         let id = reg.create_token(alice, meta("T", "T"), 1_000).unwrap();
 
-        reg.execute(&id, alice, TokenOp::Transfer { to: bob, amount: 400 }).unwrap();
+        reg.execute(
+            &id,
+            alice,
+            TokenOp::Transfer {
+                to: bob,
+                amount: 400,
+            },
+        )
+        .unwrap();
         assert_eq!(reg.balance_of(&id, &alice), 600);
         assert_eq!(reg.balance_of(&id, &bob), 400);
     }
@@ -647,7 +800,14 @@ mod tests {
         let alice = addr(1);
         let bob = addr(2);
         let id = reg.create_token(alice, meta("T", "T"), 100).unwrap();
-        let res = reg.execute(&id, alice, TokenOp::Transfer { to: bob, amount: 101 });
+        let res = reg.execute(
+            &id,
+            alice,
+            TokenOp::Transfer {
+                to: bob,
+                amount: 101,
+            },
+        );
         assert_eq!(res, Err(TokenError::InsufficientBalance));
     }
 
@@ -656,8 +816,28 @@ mod tests {
         let mut reg = TokenRegistry::new();
         let alice = addr(1);
         let id = reg.create_token(alice, meta("T", "T"), 100).unwrap();
-        assert_eq!(reg.execute(&id, alice, TokenOp::Transfer { to: addr(2), amount: 0 }), Err(TokenError::ZeroAmount));
-        assert_eq!(reg.execute(&id, alice, TokenOp::Transfer { to: alice, amount: 5 }), Err(TokenError::SelfTransfer));
+        assert_eq!(
+            reg.execute(
+                &id,
+                alice,
+                TokenOp::Transfer {
+                    to: addr(2),
+                    amount: 0
+                }
+            ),
+            Err(TokenError::ZeroAmount)
+        );
+        assert_eq!(
+            reg.execute(
+                &id,
+                alice,
+                TokenOp::Transfer {
+                    to: alice,
+                    amount: 5
+                }
+            ),
+            Err(TokenError::SelfTransfer)
+        );
     }
 
     #[test]
@@ -668,10 +848,28 @@ mod tests {
         let id = reg.create_token(minter, meta("T", "T"), 0).unwrap();
 
         // Attacker cannot mint
-        assert_eq!(reg.execute(&id, attacker, TokenOp::Mint { to: attacker, amount: 1_000_000 }), Err(TokenError::NotMinter));
+        assert_eq!(
+            reg.execute(
+                &id,
+                attacker,
+                TokenOp::Mint {
+                    to: attacker,
+                    amount: 1_000_000
+                }
+            ),
+            Err(TokenError::NotMinter)
+        );
 
         // Minter can mint
-        reg.execute(&id, minter, TokenOp::Mint { to: attacker, amount: 500 }).unwrap();
+        reg.execute(
+            &id,
+            minter,
+            TokenOp::Mint {
+                to: attacker,
+                amount: 500,
+            },
+        )
+        .unwrap();
         assert_eq!(reg.balance_of(&id, &attacker), 500);
         assert_eq!(reg.get(&id).unwrap().metadata.total_supply, 500);
     }
@@ -684,9 +882,27 @@ mod tests {
         m.max_supply = Some(1_000);
         let id = reg.create_token(minter, m, 900).unwrap();
 
-        reg.execute(&id, minter, TokenOp::Mint { to: minter, amount: 100 }).unwrap();
+        reg.execute(
+            &id,
+            minter,
+            TokenOp::Mint {
+                to: minter,
+                amount: 100,
+            },
+        )
+        .unwrap();
         // Next mint exceeds cap
-        assert_eq!(reg.execute(&id, minter, TokenOp::Mint { to: minter, amount: 1 }), Err(TokenError::SupplyCapExceeded));
+        assert_eq!(
+            reg.execute(
+                &id,
+                minter,
+                TokenOp::Mint {
+                    to: minter,
+                    amount: 1
+                }
+            ),
+            Err(TokenError::SupplyCapExceeded)
+        );
     }
 
     #[test]
@@ -695,19 +911,53 @@ mod tests {
         let minter = addr(1);
         let holder = addr(2);
         let id = reg.create_token(minter, meta("T", "T"), 1_000).unwrap();
-        reg.execute(&id, minter, TokenOp::Transfer { to: holder, amount: 300 }).unwrap();
+        reg.execute(
+            &id,
+            minter,
+            TokenOp::Transfer {
+                to: holder,
+                amount: 300,
+            },
+        )
+        .unwrap();
 
         // Holder burns own tokens
-        reg.execute(&id, holder, TokenOp::Burn { from: holder, amount: 100 }).unwrap();
+        reg.execute(
+            &id,
+            holder,
+            TokenOp::Burn {
+                from: holder,
+                amount: 100,
+            },
+        )
+        .unwrap();
         assert_eq!(reg.balance_of(&id, &holder), 200);
         assert_eq!(reg.get(&id).unwrap().metadata.total_supply, 900);
 
         // Admin can burn from anyone
-        reg.execute(&id, minter, TokenOp::Burn { from: holder, amount: 200 }).unwrap();
+        reg.execute(
+            &id,
+            minter,
+            TokenOp::Burn {
+                from: holder,
+                amount: 200,
+            },
+        )
+        .unwrap();
         assert_eq!(reg.balance_of(&id, &holder), 0);
 
         // Non-admin cannot burn someone else's tokens
-        assert_eq!(reg.execute(&id, holder, TokenOp::Burn { from: minter, amount: 1 }), Err(TokenError::NotMinter));
+        assert_eq!(
+            reg.execute(
+                &id,
+                holder,
+                TokenOp::Burn {
+                    from: minter,
+                    amount: 1
+                }
+            ),
+            Err(TokenError::NotMinter)
+        );
     }
 
     #[test]
@@ -718,17 +968,42 @@ mod tests {
         let dest = addr(3);
         let id = reg.create_token(owner, meta("T", "T"), 1_000).unwrap();
 
-        reg.execute(&id, owner, TokenOp::Approve { spender, amount: 500 }).unwrap();
+        reg.execute(
+            &id,
+            owner,
+            TokenOp::Approve {
+                spender,
+                amount: 500,
+            },
+        )
+        .unwrap();
         assert_eq!(reg.get(&id).unwrap().allowance(&owner, &spender), 500);
 
         // Spender moves 300
-        reg.execute(&id, spender, TokenOp::TransferFrom { from: owner, to: dest, amount: 300 }).unwrap();
+        reg.execute(
+            &id,
+            spender,
+            TokenOp::TransferFrom {
+                from: owner,
+                to: dest,
+                amount: 300,
+            },
+        )
+        .unwrap();
         assert_eq!(reg.balance_of(&id, &dest), 300);
         assert_eq!(reg.get(&id).unwrap().allowance(&owner, &spender), 200);
 
         // Spender tries to exceed remaining allowance
         assert_eq!(
-            reg.execute(&id, spender, TokenOp::TransferFrom { from: owner, to: dest, amount: 201 }),
+            reg.execute(
+                &id,
+                spender,
+                TokenOp::TransferFrom {
+                    from: owner,
+                    to: dest,
+                    amount: 201
+                }
+            ),
             Err(TokenError::InsufficientAllowance)
         );
     }
@@ -745,29 +1020,83 @@ mod tests {
         let spender = addr(2);
         let dest = addr(3);
         let id = reg.create_token(owner, meta("T", "T"), 1_000).unwrap();
-        reg.execute(&id, owner, TokenOp::Approve { spender, amount: 500 }).unwrap();
-        reg.execute(&id, spender, TokenOp::TransferFrom { from: owner, to: dest, amount: 500 }).unwrap();
+        reg.execute(
+            &id,
+            owner,
+            TokenOp::Approve {
+                spender,
+                amount: 500,
+            },
+        )
+        .unwrap();
+        reg.execute(
+            &id,
+            spender,
+            TokenOp::TransferFrom {
+                from: owner,
+                to: dest,
+                amount: 500,
+            },
+        )
+        .unwrap();
         assert_eq!(reg.balance_of(&id, &dest), 500);
         assert_eq!(reg.get(&id).unwrap().allowance(&owner, &spender), 0);
         // Replay of the same full-allowance transfer: refused, nothing moves.
         assert_eq!(
-            reg.execute(&id, spender, TokenOp::TransferFrom { from: owner, to: dest, amount: 500 }),
+            reg.execute(
+                &id,
+                spender,
+                TokenOp::TransferFrom {
+                    from: owner,
+                    to: dest,
+                    amount: 500
+                }
+            ),
             Err(TokenError::InsufficientAllowance)
         );
-        assert_eq!(reg.balance_of(&id, &dest), 500, "failed replay must not move funds");
+        assert_eq!(
+            reg.balance_of(&id, &dest),
+            500,
+            "failed replay must not move funds"
+        );
         assert_eq!(reg.balance_of(&id, &owner), 500);
         // The classic approve front-run (approve N -> spend N -> approve M is
         // raced so the spender gets N+M) is inherent to overwriting `approve`;
         // the ledger's answer is the atomic arms — pin that they exist and
         // behave: increase/decrease adjust by delta, and decrease past zero
         // fails instead of wrapping.
-        reg.execute(&id, owner, TokenOp::Approve { spender, amount: 100 }).unwrap();
-        reg.execute(&id, owner, TokenOp::IncreaseAllowance { spender, delta: 50 }).unwrap();
+        reg.execute(
+            &id,
+            owner,
+            TokenOp::Approve {
+                spender,
+                amount: 100,
+            },
+        )
+        .unwrap();
+        reg.execute(
+            &id,
+            owner,
+            TokenOp::IncreaseAllowance { spender, delta: 50 },
+        )
+        .unwrap();
         assert_eq!(reg.get(&id).unwrap().allowance(&owner, &spender), 150);
-        reg.execute(&id, owner, TokenOp::DecreaseAllowance { spender, delta: 50 }).unwrap();
+        reg.execute(
+            &id,
+            owner,
+            TokenOp::DecreaseAllowance { spender, delta: 50 },
+        )
+        .unwrap();
         assert_eq!(reg.get(&id).unwrap().allowance(&owner, &spender), 100);
         assert_eq!(
-            reg.execute(&id, owner, TokenOp::DecreaseAllowance { spender, delta: 101 }),
+            reg.execute(
+                &id,
+                owner,
+                TokenOp::DecreaseAllowance {
+                    spender,
+                    delta: 101
+                }
+            ),
             Err(TokenError::AllowanceUnderflow)
         );
     }
@@ -782,15 +1111,42 @@ mod tests {
         let mut reg = TokenRegistry::new();
         let honest = addr(1);
         let spoof = addr(9);
-        let id_honest = reg.create_token(honest, meta("Stellereum", "STELL"), 1_000).unwrap();
-        let id_spoof = reg.create_token(spoof, meta("Stellereum", "STELL"), 1_000).unwrap();
-        assert_ne!(id_honest, id_spoof, "same symbol must still be distinct token ids");
+        let id_honest = reg
+            .create_token(honest, meta("Stellereum", "STELL"), 1_000)
+            .unwrap();
+        let id_spoof = reg
+            .create_token(spoof, meta("Stellereum", "STELL"), 1_000)
+            .unwrap();
+        assert_ne!(
+            id_honest, id_spoof,
+            "same symbol must still be distinct token ids"
+        );
         assert_eq!(reg.balance_of(&id_honest, &honest), 1_000);
-        assert_eq!(reg.balance_of(&id_spoof, &honest), 0, "victim holds none of the spoof token");
-        assert_eq!(reg.balance_of(&id_honest, &spoof), 0, "spoofer holds none of the real token");
+        assert_eq!(
+            reg.balance_of(&id_spoof, &honest),
+            0,
+            "victim holds none of the spoof token"
+        );
+        assert_eq!(
+            reg.balance_of(&id_honest, &spoof),
+            0,
+            "spoofer holds none of the real token"
+        );
         // A transfer on the spoof token cannot touch the honest one.
-        reg.execute(&id_spoof, spoof, TokenOp::Transfer { to: honest, amount: 10 }).unwrap();
-        assert_eq!(reg.balance_of(&id_honest, &honest), 1_000, "honest balance untouched");
+        reg.execute(
+            &id_spoof,
+            spoof,
+            TokenOp::Transfer {
+                to: honest,
+                amount: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reg.balance_of(&id_honest, &honest),
+            1_000,
+            "honest balance untouched"
+        );
         assert_eq!(reg.balance_of(&id_spoof, &honest), 10);
     }
 
@@ -802,14 +1158,45 @@ mod tests {
         let id = reg.create_token(minter, meta("T", "T"), 1_000).unwrap();
 
         reg.execute(&id, minter, TokenOp::Pause).unwrap();
-        assert_eq!(reg.execute(&id, minter, TokenOp::Transfer { to: user, amount: 10 }), Err(TokenError::Paused));
-        assert_eq!(reg.execute(&id, minter, TokenOp::Mint { to: user, amount: 10 }), Err(TokenError::Paused));
+        assert_eq!(
+            reg.execute(
+                &id,
+                minter,
+                TokenOp::Transfer {
+                    to: user,
+                    amount: 10
+                }
+            ),
+            Err(TokenError::Paused)
+        );
+        assert_eq!(
+            reg.execute(
+                &id,
+                minter,
+                TokenOp::Mint {
+                    to: user,
+                    amount: 10
+                }
+            ),
+            Err(TokenError::Paused)
+        );
 
         // Non-minter cannot unpause
-        assert_eq!(reg.execute(&id, user, TokenOp::Unpause), Err(TokenError::NotMinter));
+        assert_eq!(
+            reg.execute(&id, user, TokenOp::Unpause),
+            Err(TokenError::NotMinter)
+        );
 
         reg.execute(&id, minter, TokenOp::Unpause).unwrap();
-        reg.execute(&id, minter, TokenOp::Transfer { to: user, amount: 10 }).unwrap();
+        reg.execute(
+            &id,
+            minter,
+            TokenOp::Transfer {
+                to: user,
+                amount: 10,
+            },
+        )
+        .unwrap();
         assert_eq!(reg.balance_of(&id, &user), 10);
     }
 
@@ -823,11 +1210,38 @@ mod tests {
         assert_eq!(reg.get(&id).unwrap().metadata.minter, ZERO_ADDRESS);
 
         // No more minting possible
-        assert_eq!(reg.execute(&id, minter, TokenOp::Mint { to: minter, amount: 1 }), Err(TokenError::MinterRenounced));
+        assert_eq!(
+            reg.execute(
+                &id,
+                minter,
+                TokenOp::Mint {
+                    to: minter,
+                    amount: 1
+                }
+            ),
+            Err(TokenError::MinterRenounced)
+        );
         // Cannot set minter either
-        assert_eq!(reg.execute(&id, minter, TokenOp::SetMinter { new_minter: addr(5) }), Err(TokenError::MinterRenounced));
+        assert_eq!(
+            reg.execute(
+                &id,
+                minter,
+                TokenOp::SetMinter {
+                    new_minter: addr(5)
+                }
+            ),
+            Err(TokenError::MinterRenounced)
+        );
         // But transfers still work
-        reg.execute(&id, minter, TokenOp::Transfer { to: addr(2), amount: 100 }).unwrap();
+        reg.execute(
+            &id,
+            minter,
+            TokenOp::Transfer {
+                to: addr(2),
+                amount: 100,
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -837,9 +1251,21 @@ mod tests {
         let new = addr(2);
         let id = reg.create_token(old, meta("T", "T"), 0).unwrap();
 
-        reg.execute(&id, old, TokenOp::SetMinter { new_minter: new }).unwrap();
-        assert_eq!(reg.execute(&id, old, TokenOp::Mint { to: old, amount: 1 }), Err(TokenError::NotMinter));
-        reg.execute(&id, new, TokenOp::Mint { to: new, amount: 42 }).unwrap();
+        reg.execute(&id, old, TokenOp::SetMinter { new_minter: new })
+            .unwrap();
+        assert_eq!(
+            reg.execute(&id, old, TokenOp::Mint { to: old, amount: 1 }),
+            Err(TokenError::NotMinter)
+        );
+        reg.execute(
+            &id,
+            new,
+            TokenOp::Mint {
+                to: new,
+                amount: 42,
+            },
+        )
+        .unwrap();
         assert_eq!(reg.balance_of(&id, &new), 42);
     }
 
@@ -847,18 +1273,34 @@ mod tests {
     fn test_metadata_validation() {
         let mut reg = TokenRegistry::new();
         let creator = addr(1);
-        assert_eq!(reg.create_token(creator, meta("", "T"), 0), Err(TokenError::MetadataInvalid));
-        assert_eq!(reg.create_token(creator, meta("N", ""), 0), Err(TokenError::MetadataInvalid));
+        assert_eq!(
+            reg.create_token(creator, meta("", "T"), 0),
+            Err(TokenError::MetadataInvalid)
+        );
+        assert_eq!(
+            reg.create_token(creator, meta("N", ""), 0),
+            Err(TokenError::MetadataInvalid)
+        );
 
         let mut bad = meta("N", "T");
         bad.decimals = 19;
-        assert_eq!(reg.create_token(creator, bad, 0), Err(TokenError::MetadataInvalid));
+        assert_eq!(
+            reg.create_token(creator, bad, 0),
+            Err(TokenError::MetadataInvalid)
+        );
     }
 
     #[test]
     fn test_execute_on_missing_token_fails() {
         let mut reg = TokenRegistry::new();
-        let res = reg.execute(&addr(99), addr(1), TokenOp::Mint { to: addr(1), amount: 1 });
+        let res = reg.execute(
+            &addr(99),
+            addr(1),
+            TokenOp::Mint {
+                to: addr(1),
+                amount: 1,
+            },
+        );
         assert_eq!(res, Err(TokenError::TokenNotFound));
     }
 }

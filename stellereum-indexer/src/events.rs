@@ -151,8 +151,7 @@ pub fn decode_event(abi: Option<&ContractAbi>, raw: &RawEvent) -> DecodedEvent {
     };
 
     // ---- resolve the ABI event ----
-    let abi_event: Option<&AbiEvent> =
-        abi.and_then(|a| resolve_abi_event(a, raw, &topics, &data));
+    let abi_event: Option<&AbiEvent> = abi.and_then(|a| resolve_abi_event(a, raw, &topics, &data));
 
     let (event_name, args) = match abi_event {
         Some(e) => {
@@ -330,7 +329,10 @@ pub fn coerce(v: &Value, ty: AbiType) -> Value {
 /// value does not fit into a `u64` is NOT silently truncated (the raw string
 /// is kept instead, so a reader sees the truth).
 fn word_to_u64(s: &str) -> Option<u64> {
-    let clean = s.trim().strip_prefix("0x").or_else(|| s.trim().strip_prefix("0X"))?;
+    let clean = s
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| s.trim().strip_prefix("0X"))?;
     if clean.is_empty() || clean.len() % 2 != 0 || clean.len() > 64 {
         return None;
     }

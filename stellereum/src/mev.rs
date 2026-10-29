@@ -706,7 +706,8 @@ impl MevPreemptionEngine {
         };
         // Re-committing the same (height, hash) is the same body — replace.
         // Different builds of the same height are different keys and coexist.
-        self.order_commits.insert((height, block_hash), commitment.clone());
+        self.order_commits
+            .insert((height, block_hash), commitment.clone());
         // Bound memory: heights only move forward, so commitments below the
         // lookback can never be consulted again.
         let min_height = height.saturating_sub(ORDER_COMMIT_LOOKBACK);

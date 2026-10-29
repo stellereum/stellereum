@@ -20,12 +20,12 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::collections::HashMap;
+use std::sync::Arc;
 use stellereum::consensus::ValidatorSet;
 use stellereum::sharding::Block;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::sync::{collect_missing_blocks, validate_sync_chain};
-use std::collections::HashMap;
-use std::sync::Arc;
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
@@ -73,15 +73,24 @@ async fn hunt_finding_6_sync_accepts_a_chain_signed_only_by_throwaway_keys() {
     let vs = vset(&real_keys);
     assert_eq!(vs.len(), 4);
     let quorum_power = vs.quorum_power();
-    assert_eq!(quorum_power, 3, "production power is 1 per validator (main.rs:65-82)");
+    assert_eq!(
+        quorum_power, 3,
+        "production power is 1 per validator (main.rs:65-82)"
+    );
     // main.rs:227 -- a POWER figure is used directly as a SIGNATURE COUNT.
     let required_quorum: usize = quorum_power as usize;
-    println!("[FINDING 6] real set: {} validators, quorum_power = {}", vs.len(), quorum_power);
+    println!(
+        "[FINDING 6] real set: {} validators, quorum_power = {}",
+        vs.len(),
+        quorum_power
+    );
     println!("[FINDING 6] main.rs passes required_quorum = {required_quorum} SIGNATURES");
 
     let engine = Arc::new(InMemoryStateEngine::new());
     let user = real_keys[0].verifying_key().to_bytes();
-    engine.update_account(AccountState::new(user, 1_000_000)).await;
+    engine
+        .update_account(AccountState::new(user, 1_000_000))
+        .await;
     let our_root = engine.get_state_root().await;
     let our_height = 7u64;
     let mut our_finalized: Vec<(u64, [u8; 32])> = vec![];
@@ -91,7 +100,11 @@ async fn hunt_finding_6_sync_accepts_a_chain_signed_only_by_throwaway_keys() {
     // ---- The attacker: 3 throwaway keys, zero stake, not in any validator set. ----
     let attacker_keys = keys(3);
     for k in &attacker_keys {
-        assert_eq!(vs.power_of(&k.verifying_key().to_bytes()), 0, "attacker key has no power");
+        assert_eq!(
+            vs.power_of(&k.verifying_key().to_bytes()),
+            0,
+            "attacker key has no power"
+        );
     }
     println!(
         "[FINDING 6] attacker holds {} keys, total voting power = 0",
@@ -106,8 +119,10 @@ async fn hunt_finding_6_sync_accepts_a_chain_signed_only_by_throwaway_keys() {
         let mut b = block(our_height + 1 + i, prev, our_root, &attacker_keys[0]);
         // Three "co-signatures" from throwaway keys standing in for a validator quorum.
         for k in attacker_keys.iter().skip(1) {
-            b.validator_signatures
-                .push((k.verifying_key().to_bytes(), k.sign(&b.compute_hash()).to_bytes().to_vec()));
+            b.validator_signatures.push((
+                k.verifying_key().to_bytes(),
+                k.sign(&b.compute_hash()).to_bytes().to_vec(),
+            ));
         }
         prev = b.compute_hash();
         chain.push(b);
@@ -116,8 +131,10 @@ async fn hunt_finding_6_sync_accepts_a_chain_signed_only_by_throwaway_keys() {
 
     // ---- main.rs: the node fetches the chain by walking back from the peer's head. ----
     let fetched = {
-        let map: HashMap<[u8; 32], Block> =
-            chain.iter().map(|b| (b.compute_hash(), b.clone())).collect();
+        let map: HashMap<[u8; 32], Block> = chain
+            .iter()
+            .map(|b| (b.compute_hash(), b.clone()))
+            .collect();
         collect_missing_blocks(head, our_last, 200_000, |h| {
             let b = map.get(&h).cloned();
             async move { b }
@@ -159,7 +176,10 @@ fn hunt_finding_7_quorum_power_is_used_as_a_signature_count_so_sync_is_dead() {
     );
     assert_eq!(bonded.total_power(), 4 * MIN_VALIDATOR_BOND);
     let q = bonded.quorum_power();
-    println!("[FINDING 7] bonded 4-validator set: total_power = {}", bonded.total_power());
+    println!(
+        "[FINDING 7] bonded 4-validator set: total_power = {}",
+        bonded.total_power()
+    );
     println!("[FINDING 7] quorum_power = {q}");
     // main.rs would turn this into required_quorum = q, a COUNT of signatures.
     println!("[FINDING 7] main.rs would require {q} distinct Ed25519 signatures per block");
@@ -192,7 +212,10 @@ fn hunt_finding_7_quorum_power_is_used_as_a_signature_count_so_sync_is_dead() {
         block_hash: Some(bh),
         signatures: sigs,
     };
-    assert!(qc.verify(&bonded), "3 of 4 bonded validators is a real quorum");
+    assert!(
+        qc.verify(&bonded),
+        "3 of 4 bonded validators is a real quorum"
+    );
     println!("[FINDING 7] ...yet 3 signatures would be judged a SUFFICIENT but for the count: required_quorum would be {q}");
 }
 
@@ -217,21 +240,38 @@ async fn hunt_finding_8_fund_genesis_silently_leaves_an_empty_validator_set() {
 
     // ...and `let _ = ledger.bond(...)` at src/runtime.rs:60 throws the error away.
     let derived = engine.staking_read().await.to_validator_set();
+    println!("[FINDING 8] balance {poor} < MIN_VALIDATOR_BOND {MIN_VALIDATOR_BOND}");
     println!(
-        "[FINDING 8] balance {poor} < MIN_VALIDATOR_BOND {MIN_VALIDATOR_BOND}");
-    println!("[FINDING 8] ledger.validators = {}", engine.staking_read().await.validators.len());
-    println!("[FINDING 8] to_validator_set() = {} validators, total_power = {}",
-        derived.len(), derived.total_power());
+        "[FINDING 8] ledger.validators = {}",
+        engine.staking_read().await.validators.len()
+    );
+    println!(
+        "[FINDING 8] to_validator_set() = {} validators, total_power = {}",
+        derived.len(),
+        derived.total_power()
+    );
     assert!(derived.is_empty(), "no validator was ever bonded");
-    assert_eq!(derived.quorum_power(), u64::MAX, "quorum is unreachable: the chain stalls");
+    assert_eq!(
+        derived.quorum_power(),
+        u64::MAX,
+        "quorum is unreachable: the chain stalls"
+    );
 
-    let bal = engine.get_account(&ks[0].verifying_key().to_bytes()).await.unwrap().balance;
+    let bal = engine
+        .get_account(&ks[0].verifying_key().to_bytes())
+        .await
+        .unwrap()
+        .balance;
     // Under SEC-ECON-01 (P0-5 fix), the genesis bond is debited to STAKING_POOL.
     if std::env::var("STELL_LEGACY_GENESIS_ROOT").as_deref() == Ok("1") {
         assert_eq!(bal, poor);
     } else {
         assert_eq!(bal, 0);
-        let pool = engine.get_account(&stellereum::staking::STAKING_POOL).await.unwrap().balance;
+        let pool = engine
+            .get_account(&stellereum::staking::STAKING_POOL)
+            .await
+            .unwrap()
+            .balance;
         assert_eq!(pool, poor * 4);
     }
 
@@ -240,7 +280,10 @@ async fn hunt_finding_8_fund_genesis_silently_leaves_an_empty_validator_set() {
     let ok = Arc::new(InMemoryStateEngine::new());
     stellereum::runtime::fund_genesis(&ok, &vs, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER).await;
     let good = ok.staking_read().await.to_validator_set();
-    println!("[FINDING 8] with balance == MIN+buffer: {} validators bonded", good.len());
+    println!(
+        "[FINDING 8] with balance == MIN+buffer: {} validators bonded",
+        good.len()
+    );
     assert_eq!(good.len(), 4);
     let _ = StakingLedger::new();
 }

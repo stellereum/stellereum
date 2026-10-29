@@ -75,7 +75,10 @@ fn shard_gate_pinned_pool_refuses_foreign_on_every_path() {
     for nonce in [1u64, 2, 3, 4] {
         let f = tx(&k, [9u8; 32], 10, 1_000, nonce, 7);
         let r = mp.add_checked_ctx(f, bal, AdmissionCtx::wall_now());
-        assert!(matches!(r, Err(MempoolError::Malformed(_))), "nonce {nonce}: {r:?}");
+        assert!(
+            matches!(r, Err(MempoolError::Malformed(_))),
+            "nonce {nonce}: {r:?}"
+        );
     }
     // unchecked path too
     let f = tx(&k, [9u8; 32], 10, 1_000, 9, 7);
@@ -327,10 +330,21 @@ fn nonce_window_is_four_past_head() {
     let k = sk();
     let mut mp = Mempool::new(100, 100);
     let ctx0 = AdmissionCtx::new(0).with_onchain_nonce(0);
-    assert!(mp.add_checked_ctx(tx(&k, [1u8; 32], 0, 1_000, 4, 1), 50_000, ctx0).is_ok());
+    assert!(mp
+        .add_checked_ctx(tx(&k, [1u8; 32], 0, 1_000, 4, 1), 50_000, ctx0)
+        .is_ok());
     let mut mp2 = Mempool::new(100, 100);
     let r = mp2.add_checked_ctx(tx(&k, [1u8; 32], 0, 1_000, 5, 1), 50_000, ctx0);
-    assert!(matches!(r, Err(MempoolError::NonceGap { expected: 0, got: 5 })), "{r:?}");
+    assert!(
+        matches!(
+            r,
+            Err(MempoolError::NonceGap {
+                expected: 0,
+                got: 5
+            })
+        ),
+        "{r:?}"
+    );
 }
 
 /// Same-(sender, nonce) with a HIGHER fee: NO replacement — coexistence is
@@ -344,10 +358,14 @@ fn nonce_duplicate_no_replacement_coexists_with_full_reservation() {
     let mut mp = Mempool::new(100, 100);
     let bal = 1_000_000u64;
     // incumbent: fee 1000 (amount 0)
-    let h1 = mp.add_checked(tx(&k, [1u8; 32], 0, 1_000, 0, 1), bal).unwrap();
+    let h1 = mp
+        .add_checked(tx(&k, [1u8; 32], 0, 1_000, 0, 1), bal)
+        .unwrap();
     assert_eq!(mp.reserved_for(&addr(&k)), 1_000);
     // same (sender, nonce), HIGHER fee: coexists, not replaced, not refused
-    let h2 = mp.add_checked(tx(&k, [2u8; 32], 0, 1_050, 0, 1), bal).unwrap();
+    let h2 = mp
+        .add_checked(tx(&k, [2u8; 32], 0, 1_050, 0, 1), bal)
+        .unwrap();
     assert_ne!(h1, h2);
     assert!(mp.contains(&h1) && mp.contains(&h2));
     assert_eq!(mp.len(), 2);
@@ -359,7 +377,10 @@ fn nonce_duplicate_no_replacement_coexists_with_full_reservation() {
     // a third duplicate the sender cannot FULLY fund is refused: the
     // reservation ledger (not a replacement rule) is the economic bound
     let huge = tx(&k, [3u8; 32], 999_000, 500, 0, 1); // cost 999_500 > 1M - 2050
-    assert_eq!(mp.add_checked(huge, bal), Err(MempoolError::InsufficientBalance));
+    assert_eq!(
+        mp.add_checked(huge, bal),
+        Err(MempoolError::InsufficientBalance)
+    );
     assert_eq!(mp.len(), 2);
 }
 
@@ -371,13 +392,19 @@ fn reservation_released_exactly_once_on_every_exit() {
     let bal = 1_000_000u64;
     // --- remove ---
     let mut mp = Mempool::new(100, 100);
-    let h = mp.add_checked(tx(&k, [1u8; 32], 900, 100, 0, 1), bal).unwrap(); // cost 1000
+    let h = mp
+        .add_checked(tx(&k, [1u8; 32], 900, 100, 0, 1), bal)
+        .unwrap(); // cost 1000
     assert_eq!(mp.reserved_for(&me), 1_000);
     mp.remove(&h);
     assert_eq!(mp.reserved_for(&me), 0);
     // --- remove_many (pooled) ---
-    let h1 = mp.add_checked(tx(&k, [1u8; 32], 900, 100, 0, 1), bal).unwrap();
-    let h2 = mp.add_checked(tx(&k, [1u8; 32], 900, 100, 1, 1), bal).unwrap();
+    let h1 = mp
+        .add_checked(tx(&k, [1u8; 32], 900, 100, 0, 1), bal)
+        .unwrap();
+    let h2 = mp
+        .add_checked(tx(&k, [1u8; 32], 900, 100, 1, 1), bal)
+        .unwrap();
     assert_eq!(mp.reserved_for(&me), 2_000);
     mp.remove_many(&[h1]);
     assert_eq!(mp.reserved_for(&me), 1_000);
@@ -397,13 +424,17 @@ fn reservation_released_exactly_once_on_every_exit() {
     mp.prune_confirmed(&[bh2]);
     assert_eq!(mp.reserved_for(&me), 0, "buffered prune must release");
     // --- evict_unexecutable (newly broke account) ---
-    let _ = mp.add_checked(tx(&k, [1u8; 32], 900, 100, 0, 1), bal).unwrap();
+    let _ = mp
+        .add_checked(tx(&k, [1u8; 32], 900, 100, 0, 1), bal)
+        .unwrap();
     assert_eq!(mp.reserved_for(&me), 1_000);
     let n = mp.evict_unexecutable_at(1_000, |_| Some((0u64, 0u64)));
     assert_eq!(n, 1);
     assert_eq!(mp.reserved_for(&me), 0);
     // --- sweep_expired (aged + unaffordable) ---
-    let _ = mp.add_checked(tx(&k, [1u8; 32], 900, 100, 0, 1), bal).unwrap();
+    let _ = mp
+        .add_checked(tx(&k, [1u8; 32], 900, 100, 0, 1), bal)
+        .unwrap();
     // age it past STUCK_TTL relative to the REAL admission stamp
     let sweep_at = stellereum::zkml::now_secs() + Mempool::STUCK_TX_TTL_SECS + 5;
     let n = mp.sweep_expired(sweep_at, |_| Some((0u64, 0u64)));
@@ -415,7 +446,11 @@ fn reservation_released_exactly_once_on_every_exit() {
     assert_eq!(mp.reserved_for(&me), 1_000);
     let admitted = mp.process_activation_buffer(&me);
     assert_eq!(admitted.len(), 1);
-    assert_eq!(mp.reserved_for(&me), 1_000, "claim moved buffer->pool, not doubled");
+    assert_eq!(
+        mp.reserved_for(&me),
+        1_000,
+        "claim moved buffer->pool, not doubled"
+    );
     mp.evict_unexecutable_at(3_000, |_| Some((0u64, 0u64)));
     assert_eq!(mp.reserved_for(&me), 0);
     // --- buffer replace releases the old claim once ---
@@ -428,10 +463,12 @@ fn reservation_released_exactly_once_on_every_exit() {
     // --- fee-eviction releases the victim ---
     let mut mp2 = Mempool::new(1, 100);
     let k2 = sk();
-    mp2.add_checked(tx(&k2, [1u8; 32], 900, 100, 0, 1), bal).unwrap(); // cost 1000
+    mp2.add_checked(tx(&k2, [1u8; 32], 900, 100, 0, 1), bal)
+        .unwrap(); // cost 1000
     assert_eq!(mp2.reserved_for(&addr(&k2)), 1_000);
     let k3 = sk();
-    mp2.add_checked(tx(&k3, [1u8; 32], 0, 2_000, 0, 1), bal).unwrap(); // evicts
+    mp2.add_checked(tx(&k3, [1u8; 32], 0, 2_000, 0, 1), bal)
+        .unwrap(); // evicts
     assert_eq!(mp2.len(), 1);
     assert_eq!(mp2.reserved_for(&addr(&k2)), 0, "evicted victim released");
 }
@@ -442,8 +479,10 @@ fn per_sender_quota_enforced() {
     let k = sk();
     let mut mp = Mempool::new(100, 2);
     let bal = 10_000_000u64;
-    mp.add_checked(tx(&k, [1u8; 32], 0, 1_000, 0, 1), bal).unwrap();
-    mp.add_checked(tx(&k, [1u8; 32], 0, 1_000, 1, 1), bal).unwrap();
+    mp.add_checked(tx(&k, [1u8; 32], 0, 1_000, 0, 1), bal)
+        .unwrap();
+    mp.add_checked(tx(&k, [1u8; 32], 0, 1_000, 1, 1), bal)
+        .unwrap();
     // same-nonce replacement does not consume quota; a 3rd DISTINCT nonce refuses
     assert_eq!(
         mp.add_checked(tx(&k, [1u8; 32], 0, 1_000, 2, 1), bal),
@@ -478,8 +517,9 @@ async fn funded_engine(balance: u64, k: &SigningKey) -> (InMemoryStateEngine, [u
 /// Run one tx on the block path; returns (failed, status, fees). Single-tx
 /// agreement is asserted inline per shape below.
 async fn block_outcome(e: &InMemoryStateEngine, t: &Transaction) -> (usize, Vec<bool>, Vec<u64>) {
-    let (_, failed, _fees_collected, status, fees) =
-        e.apply_block_parallel_fees(std::slice::from_ref(t), 1_700_000_000).await;
+    let (_, failed, _fees_collected, status, fees) = e
+        .apply_block_parallel_fees(std::slice::from_ref(t), 1_700_000_000)
+        .await;
     (failed, status, fees)
 }
 
@@ -493,13 +533,24 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
         let k = sk();
         let (e, me) = funded_engine(1_000_000, &k).await;
         let t = Transaction::sign_with_payload(
-            &k, [0x44; 32], 0, 200_000, 0, 1, 1,
+            &k,
+            [0x44; 32],
+            0,
+            200_000,
+            0,
+            1,
+            1,
             vec![stellereum::svm::OpCode::SysCallTokenTransfer {
-                token_id: [0xABu8; 32], to: [0x44; 32], amount: 1,
+                token_id: [0xABu8; 32],
+                to: [0x44; 32],
+                amount: 1,
             }],
         );
         let (failed, status, fees) = block_outcome(&e, &t).await;
-        assert_eq!((failed, status.as_slice(), fees.as_slice()), (1, &[false][..], &[200_000][..]));
+        assert_eq!(
+            (failed, status.as_slice(), fees.as_slice()),
+            (1, &[false][..], &[200_000][..])
+        );
         let acc = e.get_account(&me).await.unwrap();
         assert_eq!((acc.balance, acc.nonce), (800_000, 1));
         // single-tx path agrees
@@ -515,11 +566,23 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
         let tok = e.create_token(me, token_meta(me), 1_000).await.unwrap();
         assert_eq!(e.token_balance(&tok, &me).await, 1_000);
         let t = Transaction::sign_with_payload(
-            &k, me, 0, 200_000, 0, 1, 1,
+            &k,
+            me,
+            0,
+            200_000,
+            0,
+            1,
+            1,
             vec![
-                stellereum::svm::OpCode::SysCallTokenMint { token_id: tok, to: me, amount: 500 },
+                stellereum::svm::OpCode::SysCallTokenMint {
+                    token_id: tok,
+                    to: me,
+                    amount: 500,
+                },
                 stellereum::svm::OpCode::SysCallTokenTransfer {
-                    token_id: [0xBBu8; 32], to: me, amount: 1, // unknown → revert
+                    token_id: [0xBBu8; 32],
+                    to: me,
+                    amount: 1, // unknown → revert
                 },
             ],
         );
@@ -541,7 +604,13 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
         let k = sk();
         let (e, me) = funded_engine(1_000_000, &k).await;
         let t = Transaction::sign_with_payload(
-            &k, me, 0, 300_000, 0, 1, 1,
+            &k,
+            me,
+            0,
+            300_000,
+            0,
+            1,
+            1,
             vec![stellereum::svm::OpCode::SysCallActorSend {
                 recipient: [0x55; 32],
                 value: u64::MAX, // unaffordable → routing fails
@@ -571,9 +640,17 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
         let me = addr(&k);
         e.update_account(AccountState::new(me, 1_000_000)).await;
         let t = Transaction::sign_with_payload(
-            &k, [0x66; 32], 50_000, 200_000, 0, 0, 1, // source 0 -> target 1
+            &k,
+            [0x66; 32],
+            50_000,
+            200_000,
+            0,
+            0,
+            1, // source 0 -> target 1
             vec![stellereum::svm::OpCode::SysCallTokenTransfer {
-                token_id: [0xCCu8; 32], to: [0x66; 32], amount: 1, // revert
+                token_id: [0xCCu8; 32],
+                to: [0x66; 32],
+                amount: 1, // revert
             }],
         );
         let (failed, _, fees) = block_outcome(&e, &t).await;
@@ -593,14 +670,22 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
     }
     // Shape 5/6: sender IS the STAKING_POOL / REWARDS_POOL (unfakeable sig →
     // non-attributable: nothing moves on either path, pools untouched).
-    for pool in [stellereum::staking::STAKING_POOL, stellereum::staking::REWARDS_POOL] {
+    for pool in [
+        stellereum::staking::STAKING_POOL,
+        stellereum::staking::REWARDS_POOL,
+    ] {
         let k = sk(); // signature is FOR k, sender field claims the pool
         let mut t = Transaction::sign(&k, [1u8; 32], 10, 1_000, 0, 1, 1);
         t.from = pool;
         for engine in [InMemoryStateEngine::new(), InMemoryStateEngine::new()] {
-            engine.update_account(AccountState::new(pool, 50_000_000)).await;
+            engine
+                .update_account(AccountState::new(pool, 50_000_000))
+                .await;
             let (failed, status, fees) = block_outcome(&engine, &t).await;
-            assert_eq!((failed, status.as_slice(), fees.as_slice()), (1, &[false][..], &[0][..]));
+            assert_eq!(
+                (failed, status.as_slice(), fees.as_slice()),
+                (1, &[false][..], &[0][..])
+            );
             let acc = engine.get_account(&pool).await.unwrap();
             assert_eq!((acc.balance, acc.nonce), (50_000_000, 0), "pool untouched");
             assert!(engine.apply_transaction(&t, 1_700_000_000).await.is_err());
@@ -614,7 +699,10 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
         let e = InMemoryStateEngine::new();
         let t = tx(&k, [1u8; 32], 10, 1_000, 0, 1);
         let (failed, status, fees) = block_outcome(&e, &t).await;
-        assert_eq!((failed, status.as_slice(), fees.as_slice()), (1, &[false][..], &[0][..]));
+        assert_eq!(
+            (failed, status.as_slice(), fees.as_slice()),
+            (1, &[false][..], &[0][..])
+        );
         assert!(e.apply_transaction(&t, 1_700_000_000).await.is_err());
     }
     // Shape 8: stale-nonce replay.
@@ -622,9 +710,12 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
         let k = sk();
         let (e, me) = funded_engine(1_000_000, &k).await;
         e.update_account(AccountState {
-            address: me, balance: 1_000_000, nonce: 7,
+            address: me,
+            balance: 1_000_000,
+            nonce: 7,
             ..AccountState::new(me, 0)
-        }).await;
+        })
+        .await;
         let t = tx(&k, [1u8; 32], 10, 1_000, 0, 1); // nonce 0, on-chain 7
         let (failed, status, fees) = block_outcome(&e, &t).await;
         assert_eq!((failed, fees.as_slice()), (1, &[0][..]));
@@ -653,35 +744,75 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
         use stellereum::consensus::VoteKind;
         let k = sk();
         let (e, me) = funded_engine(1_000_000, &k).await;
-        e.update_account(AccountState::new(stellereum::staking::STAKING_POOL, 500_000_000)).await;
+        e.update_account(AccountState::new(
+            stellereum::staking::STAKING_POOL,
+            500_000_000,
+        ))
+        .await;
         let ev = stellereum::staking::CompactPqEquivocationEvidence::new(
-            me, 1, 0, VoteKind::Precommit, None, vec![], None, vec![],
+            me,
+            1,
+            0,
+            VoteKind::Precommit,
+            None,
+            vec![],
+            None,
+            vec![],
         );
         let t = Transaction::sign_with_payload(
-            &k, me, 0, 200_000, 0, 1, 1,
+            &k,
+            me,
+            0,
+            200_000,
+            0,
+            1,
+            1,
             vec![stellereum::svm::OpCode::SysCallReportPqEquivocation {
                 evidence: Box::new(ev),
             }],
         );
         let (failed, _, fees) = block_outcome(&e, &t).await;
         assert_eq!((failed, fees.as_slice()), (1, &[200_000][..]));
-        let pool = e.get_account(&stellereum::staking::STAKING_POOL).await.unwrap();
+        let pool = e
+            .get_account(&stellereum::staking::STAKING_POOL)
+            .await
+            .unwrap();
         assert_eq!(pool.balance, 500_000_000, "failed slash burns nothing");
         let acc = e.get_account(&me).await.unwrap();
         assert_eq!((acc.balance, acc.nonce), (800_000, 1));
         let (e2, _) = funded_engine(1_000_000, &k).await;
-        e2.update_account(AccountState::new(stellereum::staking::STAKING_POOL, 500_000_000)).await;
+        e2.update_account(AccountState::new(
+            stellereum::staking::STAKING_POOL,
+            500_000_000,
+        ))
+        .await;
         let ev2 = stellereum::staking::CompactPqEquivocationEvidence::new(
-            me, 1, 0, VoteKind::Precommit, None, vec![], None, vec![],
+            me,
+            1,
+            0,
+            VoteKind::Precommit,
+            None,
+            vec![],
+            None,
+            vec![],
         );
         let t2 = Transaction::sign_with_payload(
-            &k, me, 0, 200_000, 0, 1, 1,
+            &k,
+            me,
+            0,
+            200_000,
+            0,
+            1,
+            1,
             vec![stellereum::svm::OpCode::SysCallReportPqEquivocation {
                 evidence: Box::new(ev2),
             }],
         );
         assert!(e2.apply_transaction(&t2, 1_700_000_000).await.is_err());
-        let pool2 = e2.get_account(&stellereum::staking::STAKING_POOL).await.unwrap();
+        let pool2 = e2
+            .get_account(&stellereum::staking::STAKING_POOL)
+            .await
+            .unwrap();
         assert_eq!(pool2.balance, 500_000_000);
         let acc2 = e2.get_account(&me).await.unwrap();
         assert_eq!((acc2.balance, acc2.nonce), (800_000, 1));
@@ -696,18 +827,33 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
         e.update_account(AccountState::new(m2, 1_000_000)).await;
         let ok = tx(&k1, m2, 100_000, 50_000, 0, 1); // succeeds
         let bad = Transaction::sign_with_payload(
-            &k2, m1, 0, 60_000, 0, 1, 1,
+            &k2,
+            m1,
+            0,
+            60_000,
+            0,
+            1,
+            1,
             vec![stellereum::svm::OpCode::SysCallTokenTransfer {
-                token_id: [0xDDu8; 32], to: m1, amount: 1, // revert
+                token_id: [0xDDu8; 32],
+                to: m1,
+                amount: 1, // revert
             }],
         );
         let before = 2_000_000u64;
         let (applied, failed, collected, status, _fees) =
             e.apply_block_parallel_fees(&[ok, bad], 1_700_000_000).await;
-        assert_eq!((applied, failed, status.as_slice()), (1, 1, &[true, false][..]));
+        assert_eq!(
+            (applied, failed, status.as_slice()),
+            (1, 1, &[true, false][..])
+        );
         let a1 = e.get_account(&m1).await.unwrap().balance;
         let a2 = e.get_account(&m2).await.unwrap().balance;
-        assert_eq!(before - (a1 + a2), collected, "every lost unit is filed as a fee");
+        assert_eq!(
+            before - (a1 + a2),
+            collected,
+            "every lost unit is filed as a fee"
+        );
         assert_eq!(collected, 50_000 + 60_000);
     }
 }
@@ -719,14 +865,21 @@ async fn failure_fee_ten_shapes_conserve_on_both_paths() {
 /// Legacy (unbound) tx verifies and applies on ANY chain id → replay succeeds.
 #[test]
 fn legacy_unbound_replay_succeeds_on_both_chains() {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         let k = sk();
         let me = addr(&k);
         // what the CURRENT wallet builds (no chain binding anywhere)
         let w = stellereum::wallet::WalletAccount::from_seed(&[0x11; 32]);
         let wt = w.create_transaction([0x22; 32], 100, 0, 1, 1);
-        assert_eq!(wt.chain_id(), None, "wallet default carries no chain binding");
+        assert_eq!(
+            wt.chain_id(),
+            None,
+            "wallet default carries no chain binding"
+        );
         assert!(wt.verify_signature());
 
         let t = Transaction::sign(&k, [0x22; 32], 100, 50_000, 0, 1, 1);
@@ -747,7 +900,10 @@ fn legacy_unbound_replay_succeeds_on_both_chains() {
 /// BOUND envelope with the wrong chain id fails; right chain succeeds.
 #[test]
 fn bound_envelope_wrong_chain_fails() {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         let k = sk();
         let me = addr(&k);

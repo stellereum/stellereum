@@ -94,9 +94,7 @@ fn extract_addr_hash_from_stack(first: &Value) -> String {
                 .unwrap_or(0) as usize;
             if let Ok(bytes) = base64::engine::general_purpose::STANDARD
                 .decode(b64.as_bytes())
-                .or_else(|_| {
-                    base64::engine::general_purpose::URL_SAFE.decode(b64.as_bytes())
-                })
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b64.as_bytes()))
             {
                 // биты MSB-first
                 let bit = |i: usize| (bytes[i / 8] >> (7 - (i % 8))) & 1;
@@ -124,10 +122,7 @@ fn extract_addr_hash_from_stack(first: &Value) -> String {
     if arr.first().and_then(|v| v.as_str()) == Some("num") {
         if let Some(s) = arr.get(1).and_then(|v| v.as_str()) {
             let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-            if !s.is_empty()
-                && s.len() <= 64
-                && s.chars().all(|c| c.is_ascii_hexdigit())
-            {
+            if !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
                 return format!("{:0>64}", s.to_lowercase());
             }
         }
@@ -193,7 +188,10 @@ pub fn check_registry_ownership(email: &str, wallet_addr_hash: &str) -> bool {
         return false;
     }
     // нормализуем адрес к 64-hex хэшу (как normalize_ton_address в web.rs)
-    let w = wallet_addr_hash.trim().trim_start_matches("0x").trim_start_matches("0X");
+    let w = wallet_addr_hash
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
     let w = match w.split_once(':') {
         Some((_, h)) => h.trim(),
         None => w,
@@ -217,7 +215,13 @@ pub fn check_registry_ownership(email: &str, wallet_addr_hash: &str) -> bool {
 /// on-chain через UpdatePricing — тогда хардкод врёт в обе стороны (1003 throw
 /// либо вечный pending). Поэтому сначала читаем getPricing контракта (кэш 10 мин),
 /// хардкод — только фолбэк при недоступности chain.
-const DEFAULT_PRICES: [u64; 5] = [1_000_000_000, 1_000_000_000, 700_000_000, 500_000_000, 100_000_000];
+const DEFAULT_PRICES: [u64; 5] = [
+    1_000_000_000,
+    1_000_000_000,
+    700_000_000,
+    500_000_000,
+    100_000_000,
+];
 
 static PRICING_CACHE: std::sync::Mutex<(i64, [u64; 5])> =
     std::sync::Mutex::new((0, DEFAULT_PRICES));
@@ -251,7 +255,12 @@ pub fn onchain_prices(addr: &str) -> [u64; 5] {
                 let s = e.get(1).and_then(|x| x.as_str()).unwrap_or("");
                 let s = s.trim().trim_start_matches("0x");
                 // dec или hex
-                let parsed = if e.get(1).and_then(|x| x.as_str()).unwrap_or("").starts_with("0x") {
+                let parsed = if e
+                    .get(1)
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .starts_with("0x")
+                {
                     u64::from_str_radix(s, 16).ok()
                 } else {
                     s.parse::<u64>().ok()
@@ -378,7 +387,11 @@ fn friendly_to_hash(addr: &str) -> Option<String> {
 /// MED-3: пагинация lt-курсором до 4 страниц (~400 тх) — оплата не должна теряться,
 /// если уползла глубже первых 100.
 pub fn verify_registry_payment(email: &str, addr: &str, wallet_hash: &str) -> bool {
-    let address = if addr.is_empty() { registry_address() } else { addr.to_string() };
+    let address = if addr.is_empty() {
+        registry_address()
+    } else {
+        addr.to_string()
+    };
     if address.is_empty() {
         return false;
     }
@@ -417,7 +430,10 @@ pub fn verify_registry_payment(email: &str, addr: &str, wallet_hash: &str) -> bo
         }
         for t in txs {
             let msg = &t["in_msg"];
-            let value: u64 = msg["value"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let value: u64 = msg["value"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             if value < expected {
                 continue;
             }
@@ -466,7 +482,11 @@ pub fn get_contract_balance(address: &str) -> u64 {
     if j["ok"].as_bool() != Some(true) {
         return 0;
     }
-    j["result"]["balance"].as_str().unwrap_or("0").parse().unwrap_or(0)
+    j["result"]["balance"]
+        .as_str()
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0)
 }
 
 /// Проверка оплаты подписки: баланс Storage-контракта и владелец (admin).
@@ -494,8 +514,12 @@ pub fn scan_nfts_by_wallet(wallet: &str) -> Vec<u64> {
     if res["exit_code"].as_i64().unwrap_or(-1) != 0 {
         return out;
     }
-    let Some(stack) = res["stack"].as_array() else { return out; };
-    let Some(first) = stack.first() else { return out; };
+    let Some(stack) = res["stack"].as_array() else {
+        return out;
+    };
+    let Some(first) = stack.first() else {
+        return out;
+    };
     // [["num","0x..."], ...]
     let idx_val = first
         .as_array()
@@ -507,7 +531,11 @@ pub fn scan_nfts_by_wallet(wallet: &str) -> Vec<u64> {
     // лимит сканирования — защита от DoS (огромный nextItemIndex → N запросов к TON)
     let max_scan = idx_val.min(1000);
     while tid < max_scan {
-        let Some(owner_res) = run_get_method(&addr, "getOwnerByTokenId", json!([["num", format!("0x{tid:x}")]])) else {
+        let Some(owner_res) = run_get_method(
+            &addr,
+            "getOwnerByTokenId",
+            json!([["num", format!("0x{tid:x}")]]),
+        ) else {
             tid += 1;
             continue;
         };
@@ -540,7 +568,9 @@ pub fn scan_nfts_by_wallet(wallet: &str) -> Vec<u64> {
 fn run_get_method_strict(address: &str, method: &str, stack: Value) -> Result<Value, ()> {
     let url = format!("{}/runGetMethod", base_url());
     let body = json!({ "address": address, "method": method, "stack": stack });
-    let resp = with_key(http_agent().post(&url)).send_json(body).map_err(|_| ())?;
+    let resp = with_key(http_agent().post(&url))
+        .send_json(body)
+        .map_err(|_| ())?;
     let j: Value = resp.into_json().map_err(|_| ())?;
     if j["ok"].as_bool() != Some(true) {
         // 429/5xx: состояние chain НЕИЗВЕСТНО — это не ответ «NFT нет».
@@ -562,7 +592,11 @@ pub fn check_nft_status(email: &str) -> Result<Option<u64>, ()> {
     // ВАЖНО: метод на контракте называется getTokenByEmailHash (camelCase).
     // snake_case get_token_by_email_hash не существует → TON возвращает exit_code 11,
     // что давало ложное «NFT нет» у всех аккаунтов.
-    let res = run_get_method_strict(&addr, "getTokenByEmailHash", json!([["num", format!("0x{hash}")]]))?;
+    let res = run_get_method_strict(
+        &addr,
+        "getTokenByEmailHash",
+        json!([["num", format!("0x{hash}")]]),
+    )?;
     // exit_code != 0 => get-метод бросил исключение: это достоверный ответ «NFT нет».
     if res["exit_code"].as_i64().unwrap_or(-1) != 0 {
         return Ok(None);
@@ -571,9 +605,13 @@ pub fn check_nft_status(email: &str) -> Result<Option<u64>, ()> {
     let first = stack.first().ok_or(())?;
     // формат: [["num", "<token_id>"]]
     let val = if let Some(arr) = first.as_array() {
-        arr.get(1).and_then(|v| v.as_str()).map(|s| s.trim_start_matches("0x").to_string())
+        arr.get(1)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim_start_matches("0x").to_string())
     } else {
-        first.as_str().map(|s| s.trim_start_matches("0x").to_string())
+        first
+            .as_str()
+            .map(|s| s.trim_start_matches("0x").to_string())
     };
     // Значения нет вовсе => NFT нет. Строка есть, но не парсится => неожиданный формат,
     // состояние считаем неизвестным, а не «нет NFT».
@@ -594,7 +632,11 @@ pub fn get_nft_owner(token_id: u64) -> Option<String> {
     if addr.is_empty() {
         return None;
     }
-    let res = run_get_method(&addr, "getOwnerByTokenId", json!([["num", format!("0x{token_id:x}")]]))?;
+    let res = run_get_method(
+        &addr,
+        "getOwnerByTokenId",
+        json!([["num", format!("0x{token_id:x}")]]),
+    )?;
     if res["exit_code"].as_i64().unwrap_or(-1) != 0 {
         return None;
     }
@@ -605,7 +647,11 @@ pub fn get_nft_owner(token_id: u64) -> Option<String> {
         return Some(h);
     }
     let h = extract_addr_hash_from_stack(first);
-    if h.is_empty() { None } else { Some(h) }
+    if h.is_empty() {
+        None
+    } else {
+        Some(h)
+    }
 }
 
 /// Разобрать адрес из stack-записи вида ["cell", {"object": {"data": {"b64": ...}}}] (address-slice, 267 бит).
@@ -721,13 +767,19 @@ mod cell_parse_tests {
             "te6cckEBAQEARwAAilJHWkumlanI7cKejA8ytlrlDe7GjBa2WThfByvB8QnhzO1knN4yJF5oyePCfxwIpbz2Y4dDgAQu1Jh6vxfZrHBIi6jgCzLAn84=").unwrap();
         let (op, eh, len) = parse_register_body(&b1).expect("parse b1");
         assert_eq!(op, 0x52475a4b);
-        assert_eq!(eh, "a695a9c8edc29e8c0f32b65ae50deec68c16b659385f072bc1f109e1cced649c");
+        assert_eq!(
+            eh,
+            "a695a9c8edc29e8c0f32b65ae50deec68c16b659385f072bc1f109e1cced649c"
+        );
         assert_eq!(len, 11);
         let b2 = base64::engine::general_purpose::STANDARD.decode(
             "te6cckEBAQEARwAAilJHWksQtE+t+M7roaXyVD9m+ChlOtqwmWzgES6qXFZ2F6T9YmBbaPWufYdRtOg1W2W+Rle4Y76PxLoJQL8DhstR6HQcCc65Wts=").unwrap();
         let (op2, eh2, len2) = parse_register_body(&b2).expect("parse b2");
         assert_eq!(op2, 0x52475a4b);
-        assert_eq!(eh2, "10b44fadf8ceeba1a5f2543f66f828653adab0996ce0112eaa5c567617a4fd62");
+        assert_eq!(
+            eh2,
+            "10b44fadf8ceeba1a5f2543f66f828653adab0996ce0112eaa5c567617a4fd62"
+        );
         assert_eq!(len2, 9);
         // мусор отклоняем
         assert!(parse_register_body(b"te6c").is_none());
@@ -736,7 +788,10 @@ mod cell_parse_tests {
 
     #[test]
     fn extract_hash_from_num() {
-        let entry = json!(["num", "0xca25fd31c3796e5a17bca5ac6aa155def7863f990cde81bb59065ac0a45373a2"]);
+        let entry = json!([
+            "num",
+            "0xca25fd31c3796e5a17bca5ac6aa155def7863f990cde81bb59065ac0a45373a2"
+        ]);
         assert_eq!(
             extract_addr_hash_from_stack(&entry),
             "ca25fd31c3796e5a17bca5ac6aa155def7863f990cde81bb59065ac0a45373a2"

@@ -21,10 +21,10 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::sync::Arc;
 use stellereum::consensus::{ValidatorSet, VoteKind};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::state_engine::InMemoryStateEngine;
-use std::sync::Arc;
 
 /// Single validator: always the proposer at every round, so `propose()` is
 /// always eligible and any refire is purely a gating failure.
@@ -73,11 +73,13 @@ async fn fresh_propose_self_records_and_gate_fires_once() {
 
     // Second call same round without clearing: identical hash or None.
     let b2 = rt.propose(1_000).await;
-    if let Some(b) = b2 { assert_eq!(
-        b.compute_hash(),
-        b1.compute_hash(),
-        "repeat propose must be identical, never a new block"
-    ) }
+    if let Some(b) = b2 {
+        assert_eq!(
+            b.compute_hash(),
+            b1.compute_hash(),
+            "repeat propose must be identical, never a new block"
+        )
+    }
 
     let broadcasts = drive_gate_ticks(&mut rt, 5).await;
     assert!(
@@ -111,7 +113,10 @@ async fn locked_reproposal_records_live_proposal_and_broadcasts_once() {
     );
 
     // Round 1: locked re-proposal serves the identical body...
-    let b1 = rt.propose(1_000).await.expect("locked re-proposal must succeed");
+    let b1 = rt
+        .propose(1_000)
+        .await
+        .expect("locked re-proposal must succeed");
     assert_eq!(
         b1.compute_hash(),
         h,
@@ -127,7 +132,9 @@ async fn locked_reproposal_records_live_proposal_and_broadcasts_once() {
     );
 
     // Repeat call same round: identical or None, never a novel block.
-    if let Some(b) = rt.propose(1_000).await { assert_eq!(b.compute_hash(), h) }
+    if let Some(b) = rt.propose(1_000).await {
+        assert_eq!(b.compute_hash(), h)
+    }
 
     // Full gate simulation: 7 ticks (one round at 100ms/tick with pacing
     // saturated) must yield ZERO further broadcasts, not 7x identical hash.
@@ -226,7 +233,10 @@ async fn round_nudge_reopens_gate_once_not_per_tick() {
     // reopens the gate -- and it reopens ONCE.
     let moved = rt.note_peer_vote_round(rt.hc.height, rt.hc.round + 1);
     assert!(moved, "verified near-peer vote must follow into its round");
-    assert!(!rt.hc.has_live_proposal(), "the nudge is a new round: old proposal retired");
+    assert!(
+        !rt.hc.has_live_proposal(),
+        "the nudge is a new round: old proposal retired"
+    );
 
     // The gate itself drives the single broadcast for the new round; 30 further
     // ticks must not produce a second one.
@@ -241,7 +251,10 @@ async fn round_nudge_reopens_gate_once_not_per_tick() {
 
     // Syncing to our OWN round is a no-op and never clears anything.
     rt.hc.sync_round_to(rt.hc.round);
-    assert!(rt.hc.has_live_proposal(), "sync to the same round must not clear the proposal");
+    assert!(
+        rt.hc.has_live_proposal(),
+        "sync to the same round must not clear the proposal"
+    );
 }
 
 #[tokio::test]
@@ -254,7 +267,10 @@ async fn new_round_reopens_gate_for_a_new_proposal() {
     // cleared) and proposing again is allowed -- liveness preserved.
     rt.next_round();
     assert!(section1_gate(&rt), "gate must reopen after a view change");
-    let b1 = rt.propose(2_000).await.expect("must propose in the new round");
+    let b1 = rt
+        .propose(2_000)
+        .await
+        .expect("must propose in the new round");
     assert!(rt.hc.has_live_proposal());
     let _ = (h0, b1);
 }

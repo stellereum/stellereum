@@ -17,8 +17,8 @@ use stellereum::consensus::{HeightConsensus, QuorumCertificate, ValidatorSet, Vo
 use stellereum::orderbook::{OrderSide, OrderType};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
-use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::staking::{MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER};
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
 use stellereum::sync::{collect_missing_blocks, validate_sync_chain};
 use stellereum::token::{TokenMetadata, TokenOp};
@@ -80,7 +80,12 @@ fn mkblock(signer: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block
     b
 }
 
-fn precommit_qc(ks: &[SigningKey], idx: &[usize], height: u64, hash: [u8; 32]) -> QuorumCertificate {
+fn precommit_qc(
+    ks: &[SigningKey],
+    idx: &[usize],
+    height: u64,
+    hash: [u8; 32],
+) -> QuorumCertificate {
     QuorumCertificate {
         height,
         round: 0,
@@ -109,34 +114,55 @@ async fn adv_stranger_cannot_claim_anothers_rewards() {
     let attacker = SigningKey::generate(&mut OsRng);
     let attacker_addr = id(&attacker);
 
-    e.update_account(AccountState::new(victim_addr, stell(10_000) + 10_000)).await;
-    e.apply_transaction(&svm_tx(
-        &victim,
+    e.update_account(AccountState::new(victim_addr, stell(10_000) + 10_000))
+        .await;
+    e.apply_transaction(
+        &svm_tx(
+            &victim,
+            0,
+            20_000,
+            vec![OpCode::SysCallStake {
+                validator: victim_addr,
+                amount: stell(10_000),
+            }],
+        ),
         0,
-        20_000,
-        vec![OpCode::SysCallStake { validator: victim_addr, amount: stell(10_000) }],
-    ), 0)
+    )
     .await
     .expect("victim bond");
     assert_eq!(bal(&e, &STAKING_POOL).await, stell(10_000));
 
-    e.staking_write().await.distribute_reward(victim_addr, stell(500)).unwrap();
+    e.staking_write()
+        .await
+        .distribute_reward(victim_addr, stell(500))
+        .unwrap();
     // E2: back the accrual the way the block mint does (bare ledger entries
     // with no pool coins must not pay).
-    e.credit_native(&REWARDS_POOL, stell(500)).await.expect("back the accrual");
+    e.credit_native(&REWARDS_POOL, stell(500))
+        .await
+        .expect("back the accrual");
 
-    e.update_account(AccountState::new(attacker_addr, 100_000)).await;
+    e.update_account(AccountState::new(attacker_addr, 100_000))
+        .await;
     let before = bal(&e, &attacker_addr).await;
     let err = e
-        .apply_transaction(&svm_tx(
-            &attacker,
+        .apply_transaction(
+            &svm_tx(
+                &attacker,
+                0,
+                10_000,
+                vec![OpCode::SysCallClaimRewards {
+                    validator: victim_addr,
+                }],
+            ),
             0,
-            10_000,
-            vec![OpCode::SysCallClaimRewards { validator: victim_addr }],
-        ), 0)
+        )
         .await
         .expect_err("stranger claim must be refused");
-    assert!(err.contains("only the validator"), "refusal must be the auth check: {err}");
+    assert!(
+        err.contains("only the validator"),
+        "refusal must be the auth check: {err}"
+    );
 
     // The claim was REFUSED, so the transaction failed: under the anti-DoS
     // policy (SEC-07) a failed transaction still pays its failure fee and
@@ -144,30 +170,48 @@ async fn adv_stranger_cannot_claim_anothers_rewards() {
     // of the policy - but they gain NO rewards and the victim's accrual and
     // the staking pool are untouched.
     let after = bal(&e, &attacker_addr).await;
-    assert!(after < before, "the failed claim must not gain the attacker anything");
+    assert!(
+        after < before,
+        "the failed claim must not gain the attacker anything"
+    );
     assert_eq!(
         before - after,
         10_000,
         "the failure fee is the declared gas limit"
     );
-    assert_eq!(bal(&e, &STAKING_POOL).await, stell(10_000), "pool untouched");
+    assert_eq!(
+        bal(&e, &STAKING_POOL).await,
+        stell(10_000),
+        "pool untouched"
+    );
     assert_eq!(
         e.staking_read().await.validators[&victim_addr].pending_rewards,
         stell(500),
         "victim reward intact"
     );
-    assert!(bal(&e, &STAKING_POOL).await >= stell(10_000), "POOL SOLVENT");
+    assert!(
+        bal(&e, &STAKING_POOL).await >= stell(10_000),
+        "POOL SOLVENT"
+    );
 
     // Positive control: the owner can still claim.
-    e.apply_transaction(&svm_tx(
-        &victim,
-        1,
-        2_000,
-        vec![OpCode::SysCallClaimRewards { validator: victim_addr }],
-    ), 0)
+    e.apply_transaction(
+        &svm_tx(
+            &victim,
+            1,
+            2_000,
+            vec![OpCode::SysCallClaimRewards {
+                validator: victim_addr,
+            }],
+        ),
+        0,
+    )
     .await
     .expect("owner claim works");
-    assert_eq!(e.staking_read().await.validators[&victim_addr].pending_rewards, 0);
+    assert_eq!(
+        e.staking_read().await.validators[&victim_addr].pending_rewards,
+        0
+    );
 }
 
 // ===========================================================================
@@ -182,28 +226,50 @@ async fn adv_stranger_cannot_force_unbond() {
     let attacker = SigningKey::generate(&mut OsRng);
     let attacker_addr = id(&attacker);
 
-    e.update_account(AccountState::new(honest_addr, floor() + 20_000)).await;
-    e.apply_transaction(&svm_tx(
-        &honest,
-        0,
-        20_000,
-        vec![OpCode::SysCallStake { validator: honest_addr, amount: floor() }],
-    ), 0)
-    .await
-    .unwrap();
-    assert!(e.staking_read().await.to_validator_set().validators.contains_key(&honest_addr));
-
-    e.update_account(AccountState::new(attacker_addr, 20_000)).await;
-    let err = e
-        .apply_transaction(&svm_tx(
-            &attacker,
+    e.update_account(AccountState::new(honest_addr, floor() + 20_000))
+        .await;
+    e.apply_transaction(
+        &svm_tx(
+            &honest,
             0,
             20_000,
-            vec![OpCode::SysCallUnbond { validator: honest_addr, amount: floor() }],
-        ), 0)
+            vec![OpCode::SysCallStake {
+                validator: honest_addr,
+                amount: floor(),
+            }],
+        ),
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(e
+        .staking_read()
+        .await
+        .to_validator_set()
+        .validators
+        .contains_key(&honest_addr));
+
+    e.update_account(AccountState::new(attacker_addr, 20_000))
+        .await;
+    let err = e
+        .apply_transaction(
+            &svm_tx(
+                &attacker,
+                0,
+                20_000,
+                vec![OpCode::SysCallUnbond {
+                    validator: honest_addr,
+                    amount: floor(),
+                }],
+            ),
+            0,
+        )
         .await
         .expect_err("force-unbond must be refused");
-    assert!(err.contains("only the validator"), "refusal must be the auth check: {err}");
+    assert!(
+        err.contains("only the validator"),
+        "refusal must be the auth check: {err}"
+    );
 
     let l = e.staking_read().await;
     assert_eq!(l.validators[&honest_addr].self_bond, floor());
@@ -213,12 +279,18 @@ async fn adv_stranger_cannot_force_unbond() {
     assert_eq!(bal(&e, &STAKING_POOL).await, floor(), "pool solvent");
 
     // Positive control: owner may still unbond.
-    e.apply_transaction(&svm_tx(
-        &honest,
-        1,
-        10_000,
-        vec![OpCode::SysCallUnbond { validator: honest_addr, amount: floor() }],
-    ), 0)
+    e.apply_transaction(
+        &svm_tx(
+            &honest,
+            1,
+            10_000,
+            vec![OpCode::SysCallUnbond {
+                validator: honest_addr,
+                amount: floor(),
+            }],
+        ),
+        0,
+    )
     .await
     .expect("owner unbond works");
 }
@@ -238,57 +310,89 @@ async fn adv_stranger_cannot_rotate_anothers_key_but_owner_can() {
     let attacker = SigningKey::generate(&mut OsRng);
     let attacker_addr = id(&attacker);
 
-    e.update_account(AccountState::new(honest_addr, floor() + 100_000)).await;
-    e.apply_transaction(&svm_tx(
-        &honest,
+    e.update_account(AccountState::new(honest_addr, floor() + 100_000))
+        .await;
+    e.apply_transaction(
+        &svm_tx(
+            &honest,
+            0,
+            20_000,
+            vec![OpCode::SysCallStake {
+                validator: honest_addr,
+                amount: floor(),
+            }],
+        ),
         0,
-        20_000,
-        vec![OpCode::SysCallStake { validator: honest_addr, amount: floor() }],
-    ), 0)
+    )
     .await
     .unwrap();
-    assert!(e.staking_read().await.to_validator_set().validators.contains_key(&honest_addr));
+    assert!(e
+        .staking_read()
+        .await
+        .to_validator_set()
+        .validators
+        .contains_key(&honest_addr));
 
     // A delegator rides along, so rotation must carry foreign positions too.
     let delegator = SigningKey::generate(&mut OsRng);
     let delegator_addr = id(&delegator);
-    e.update_account(AccountState::new(delegator_addr, MIN_VALIDATOR_BOND + 20_000)).await;
-    e.apply_transaction(&svm_tx(
-        &delegator,
+    e.update_account(AccountState::new(
+        delegator_addr,
+        MIN_VALIDATOR_BOND + 20_000,
+    ))
+    .await;
+    e.apply_transaction(
+        &svm_tx(
+            &delegator,
+            0,
+            20_000,
+            vec![OpCode::SysCallDelegate {
+                validator: honest_addr,
+                amount: 2_000_000_000,
+            }],
+        ),
         0,
-        20_000,
-        vec![OpCode::SysCallDelegate { validator: honest_addr, amount: 2_000_000_000 }],
-    ), 0)
+    )
     .await
     .unwrap();
 
-    e.update_account(AccountState::new(attacker_addr, 20_000)).await;
+    e.update_account(AccountState::new(attacker_addr, 20_000))
+        .await;
     let err = e
-        .apply_transaction(&svm_tx(
-            &attacker,
+        .apply_transaction(
+            &svm_tx(
+                &attacker,
+                0,
+                20_000,
+                vec![OpCode::SysCallRotateValidatorKey {
+                    old_validator: honest_addr,
+                    new_validator: fresh_addr,
+                }],
+            ),
             0,
+        )
+        .await
+        .expect_err("stranger rotation must be refused");
+    assert!(
+        err.contains("only the old validator key"),
+        "refusal must be the auth check: {err}"
+    );
+    assert!(e.staking_read().await.validators.contains_key(&honest_addr));
+    assert!(!e.staking_read().await.validators.contains_key(&fresh_addr));
+
+    // Owner rotates: record, delegation and validator-set membership move.
+    e.apply_transaction(
+        &svm_tx(
+            &honest,
+            1,
             20_000,
             vec![OpCode::SysCallRotateValidatorKey {
                 old_validator: honest_addr,
                 new_validator: fresh_addr,
             }],
-        ), 0)
-        .await
-        .expect_err("stranger rotation must be refused");
-    assert!(err.contains("only the old validator key"), "refusal must be the auth check: {err}");
-    assert!(e.staking_read().await.validators.contains_key(&honest_addr));
-    assert!(!e.staking_read().await.validators.contains_key(&fresh_addr));
-
-    // Owner rotates: record, delegation and validator-set membership move.
-    e.apply_transaction(&svm_tx(
-        &honest,
-        1,
-        20_000,
-        vec![OpCode::SysCallRotateValidatorKey {
-            old_validator: honest_addr,
-            new_validator: fresh_addr,
-        }],
-    ), 0)
+        ),
+        0,
+    )
     .await
     .expect("owner rotation works");
     {
@@ -307,30 +411,44 @@ async fn adv_stranger_cannot_rotate_anothers_key_but_owner_can() {
     // Rotating onto an existing validator refuses (no merging, ever).
     let other = SigningKey::generate(&mut OsRng);
     let other_addr = id(&other);
-    e.update_account(AccountState::new(other_addr, floor() + 20_000)).await;
-    e.apply_transaction(&svm_tx(
-        &other,
+    e.update_account(AccountState::new(other_addr, floor() + 20_000))
+        .await;
+    e.apply_transaction(
+        &svm_tx(
+            &other,
+            0,
+            20_000,
+            vec![OpCode::SysCallStake {
+                validator: other_addr,
+                amount: floor(),
+            }],
+        ),
         0,
-        20_000,
-        vec![OpCode::SysCallStake { validator: other_addr, amount: floor() }],
-    ), 0)
+    )
     .await
     .unwrap();
     // The rotated key needs gas money of its own to transact.
-    e.update_account(AccountState::new(fresh_addr, 100_000)).await;
+    e.update_account(AccountState::new(fresh_addr, 100_000))
+        .await;
     let err = e
-        .apply_transaction(&svm_tx(
-            &fresh,
+        .apply_transaction(
+            &svm_tx(
+                &fresh,
+                0,
+                20_000,
+                vec![OpCode::SysCallRotateValidatorKey {
+                    old_validator: fresh_addr,
+                    new_validator: other_addr,
+                }],
+            ),
             0,
-            20_000,
-            vec![OpCode::SysCallRotateValidatorKey {
-                old_validator: fresh_addr,
-                new_validator: other_addr,
-            }],
-        ), 0)
+        )
         .await
         .expect_err("rotation onto a live validator must be refused");
-    assert!(err.contains("rotate failed"), "refusal must come from the ledger: {err}");
+    assert!(
+        err.contains("rotate failed"),
+        "refusal must come from the ledger: {err}"
+    );
 }
 
 // ===========================================================================
@@ -365,21 +483,49 @@ async fn adv_stranger_cannot_cancel_anothers_order() {
     let victim_addr = id(&victim);
     let attacker = SigningKey::generate(&mut OsRng);
     let attacker_addr = id(&attacker);
-    e.update_account(AccountState::new(victim_addr, 1_000 * NANO)).await;
-    e.update_account(AccountState::new(attacker_addr, 10 * NANO)).await;
-    e.token_execute(&usdt, minter, TokenOp::Mint { to: victim_addr, amount: 1_000_000_000 })
-        .await
-        .unwrap();
+    e.update_account(AccountState::new(victim_addr, 1_000 * NANO))
+        .await;
+    e.update_account(AccountState::new(attacker_addr, 10 * NANO))
+        .await;
+    e.token_execute(
+        &usdt,
+        minter,
+        TokenOp::Mint {
+            to: victim_addr,
+            amount: 1_000_000_000,
+        },
+    )
+    .await
+    .unwrap();
 
     let pair = 1u32;
     let (order_id, _) = e
-        .place_order_settled(pair, victim_addr, OrderSide::Buy, OrderType::Limit, 250_000, 500 * NANO, 0)
+        .place_order_settled(
+            pair,
+            victim_addr,
+            OrderSide::Buy,
+            OrderType::Limit,
+            250_000,
+            500 * NANO,
+            0,
+        )
         .await
         .expect("victim order");
-    assert!(e.order_escrow_read().await.get(&(pair, order_id)).is_some(), "escrow locked");
+    assert!(
+        e.order_escrow_read().await.get(&(pair, order_id)).is_some(),
+        "escrow locked"
+    );
 
     let res = e
-        .apply_transaction(&svm_tx(&attacker, 0, 1_000_000, vec![OpCode::SysCallCancelOrder { order_id }]), 0)
+        .apply_transaction(
+            &svm_tx(
+                &attacker,
+                0,
+                1_000_000,
+                vec![OpCode::SysCallCancelOrder { order_id }],
+            ),
+            0,
+        )
         .await;
     assert!(res.is_err(), "stranger cancel must be refused: {res:?}");
 
@@ -388,15 +534,25 @@ async fn adv_stranger_cannot_cancel_anothers_order() {
         .await
         .books
         .get(&pair)
-        .map(|b| b.bids.values().flat_map(|v| v.iter()).any(|o| o.order_id == order_id))
+        .map(|b| {
+            b.bids
+                .values()
+                .flat_map(|v| v.iter())
+                .any(|o| o.order_id == order_id)
+        })
         .unwrap_or(false);
     assert!(still, "victim order survives");
-    assert!(e.order_escrow_read().await.get(&(pair, order_id)).is_some(), "escrow untouched");
+    assert!(
+        e.order_escrow_read().await.get(&(pair, order_id)).is_some(),
+        "escrow untouched"
+    );
 
     // Positive control: owner cancel still refunds.
-    assert!(
-        e.cancel_order_settled(pair, order_id, victim_addr).await.expect("owner cancel").is_some()
-    );
+    assert!(e
+        .cancel_order_settled(pair, order_id, victim_addr)
+        .await
+        .expect("owner cancel")
+        .is_some());
 }
 
 // ===========================================================================
@@ -437,7 +593,7 @@ async fn adv_sync_refuses_chain_signed_only_by_non_members() {
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-};
+        };
         b.sign_block(&atk[0]);
         for k in atk.iter().skip(1) {
             use ed25519_dalek::Signer;
@@ -448,7 +604,10 @@ async fn adv_sync_refuses_chain_signed_only_by_non_members() {
         chain_a.push(b);
     }
     let r = validate_sync_chain(&chain_a, 8, our_last, &vs);
-    assert!(r.is_err(), "non-member chain without QC must be refused: {r:?}");
+    assert!(
+        r.is_err(),
+        "non-member chain without QC must be refused: {r:?}"
+    );
 
     // Variant B (literal membership attack): attacker forges its own "QC" whose
     // signers are all non-members. Power counted = 0 < quorum.
@@ -511,7 +670,10 @@ async fn adv_sync_refuses_power_below_quorum() {
     for i in 0..3u64 {
         let h = 8 + i;
         let sched = vs.proposer_for(h, 0).expect("non-empty set has a proposer");
-        let signer = ks.iter().find(|k| id(k) == sched).expect("proposer is a member");
+        let signer = ks
+            .iter()
+            .find(|k| id(k) == sched)
+            .expect("proposer is a member");
         let mut b = mkblock(signer, h, prev, root);
         let bh = b.compute_hash();
         b.precommit_qc = Some(precommit_qc(&ks, &[0, 1, 2], h, bh));
@@ -537,15 +699,27 @@ async fn adv_cannot_finalize_a_block_never_received() {
 
     let phantom = blake3::hash(b"attacker-chosen-block-contents").into();
     for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(phantom))).unwrap();
+        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(phantom)))
+            .unwrap();
     }
-    assert!(rt.hc.try_prevote_quorum().is_some(), "prevote quorum exists");
+    assert!(
+        rt.hc.try_prevote_quorum().is_some(),
+        "prevote quorum exists"
+    );
     for k in ks.iter().take(3) {
-        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(phantom))).unwrap();
+        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(phantom)))
+            .unwrap();
     }
-    assert!(!rt.blocks.contains_key(&phantom), "precondition: no block body");
+    assert!(
+        !rt.blocks.contains_key(&phantom),
+        "precondition: no block body"
+    );
 
-    assert_eq!(rt.try_finalize().await, None, "must not finalize an absent block");
+    assert_eq!(
+        rt.try_finalize().await,
+        None,
+        "must not finalize an absent block"
+    );
     assert!(rt.finalized.is_empty(), "nothing committed");
     assert_eq!(rt.height(), 1, "height does not advance");
     assert_eq!(rt.applied_txs, 0, "nothing applied");
@@ -569,10 +743,15 @@ async fn adv_cannot_decide_on_precommits_with_no_prevotes() {
     rt.blocks.insert(held_hash, held);
     // Three genuine precommits, ZERO prevotes.
     for k in ks.iter().take(3) {
-        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(held_hash))).unwrap();
+        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(held_hash)))
+            .unwrap();
     }
     assert!(rt.hc.prevote_qc.is_empty(), "precondition: zero prevotes");
-    assert_eq!(rt.try_finalize().await, None, "precommits alone must not decide");
+    assert_eq!(
+        rt.try_finalize().await,
+        None,
+        "precommits alone must not decide"
+    );
     assert!(rt.finalized.is_empty());
     assert_eq!(rt.height(), 1);
 }
@@ -592,10 +771,12 @@ async fn adv_cannot_decide_when_prevotes_and_precommits_disagree() {
     let a = bh(0xA1);
     let b = bh(0xB2);
     for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(a))).unwrap();
+        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(a)))
+            .unwrap();
     }
     for k in ks.iter().take(3) {
-        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(b))).unwrap();
+        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(b)))
+            .unwrap();
     }
     let blk = mkblock(&ks[0], 1, [0u8; 32], st.get_state_root().await);
     let blk_hash = blk.compute_hash();
@@ -621,14 +802,20 @@ async fn adv_cannot_decide_against_an_existing_lock() {
     rt.hc.locked = Some((bh(0xA1), 0));
     let b = bh(0xB2);
     for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(b))).unwrap();
+        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(b)))
+            .unwrap();
     }
     for k in ks.iter().take(3) {
-        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(b))).unwrap();
+        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(b)))
+            .unwrap();
     }
     let blk = mkblock(&ks[0], 1, [0u8; 32], st.get_state_root().await);
     rt.blocks.insert(blk.compute_hash(), blk);
-    assert_eq!(rt.try_finalize().await, None, "locked node must not decide a conflict");
+    assert_eq!(
+        rt.try_finalize().await,
+        None,
+        "locked node must not decide a conflict"
+    );
     assert!(rt.finalized.is_empty());
     assert_eq!(rt.height(), 1);
 }
@@ -655,7 +842,10 @@ fn adv_five_hundred_far_future_rounds_buy_at_most_500() {
     for i in 0..500u32 {
         hc.advance_to_round((i + 1) * MAX_ROUND_AHEAD);
     }
-    assert_eq!(hc.round, 500, "one round per message, never 1000 per message");
+    assert_eq!(
+        hc.round, 500,
+        "one round per message, never 1000 per message"
+    );
     assert!(hc.round < 500 * MAX_ROUND_AHEAD);
 
     // The node still follows the honest network at its own round.
@@ -663,7 +853,8 @@ fn adv_five_hundred_far_future_rounds_buy_at_most_500() {
     let proposer = vs.proposer_for(1, r).unwrap();
     hc.receive_proposal(proposer, bh(2)).unwrap();
     for k in ks.iter() {
-        hc.add_prevote(Vote::sign(k, 1, r, VoteKind::Prevote, Some(bh(2)))).unwrap();
+        hc.add_prevote(Vote::sign(k, 1, r, VoteKind::Prevote, Some(bh(2))))
+            .unwrap();
     }
     assert!(hc.try_prevote_quorum().is_some());
 }
@@ -695,10 +886,14 @@ async fn adv_adopt_refuses_prevote_kind_cert() {
         round: 0,
         kind: VoteKind::Prevote,
         block_hash: Some(hash),
-        signatures: ks.iter().take(3).map(|k| {
-            let v = Vote::sign(k, 1, 0, VoteKind::Prevote, Some(hash));
-            (v.voter, v.signature)
-        }).collect(),
+        signatures: ks
+            .iter()
+            .take(3)
+            .map(|k| {
+                let v = Vote::sign(k, 1, 0, VoteKind::Prevote, Some(hash));
+                (v.voter, v.signature)
+            })
+            .collect(),
     };
     assert!(cert.verify(&rt.validators), "prevote QC self-consistent");
     let r = rt.adopt_committed(1, block, cert).await;
@@ -718,10 +913,14 @@ async fn adv_adopt_refuses_wrong_height_cert() {
         round: 0,
         kind: VoteKind::Precommit,
         block_hash: Some(hash),
-        signatures: ks.iter().take(3).map(|k| {
-            let v = Vote::sign(k, 999, 0, VoteKind::Precommit, Some(hash));
-            (v.voter, v.signature)
-        }).collect(),
+        signatures: ks
+            .iter()
+            .take(3)
+            .map(|k| {
+                let v = Vote::sign(k, 999, 0, VoteKind::Precommit, Some(hash));
+                (v.voter, v.signature)
+            })
+            .collect(),
     };
     assert!(cert.verify(&rt.validators));
     let r = rt.adopt_committed(1, block, cert).await;
@@ -790,7 +989,10 @@ async fn adv_adopt_uses_only_the_local_validator_set() {
     let hash = block.compute_hash();
     let v = Vote::sign(&attacker, 1, 0, VoteKind::Precommit, Some(hash));
     let cert = QuorumCertificate {
-        height: 1, round: 0, kind: VoteKind::Precommit, block_hash: Some(hash),
+        height: 1,
+        round: 0,
+        kind: VoteKind::Precommit,
+        block_hash: Some(hash),
         signatures: vec![(v.voter, v.signature)],
     };
     assert!(!cert.verify(&real), "worthless against the real set");
@@ -824,19 +1026,27 @@ async fn adv_equivocation_replay_does_not_compound() {
         rt.on_prevote(a.clone()).unwrap();
         rt.on_prevote(b.clone()).unwrap();
     }
-    assert_eq!(rt.hc.equivocations().len(), 1, "one pair -> one evidence tuple, not 400");
+    assert_eq!(
+        rt.hc.equivocations().len(),
+        1,
+        "one pair -> one evidence tuple, not 400"
+    );
 
     let self_before = st.staking_read().await.validators[&vid].self_bond;
     let burned = rt.apply_equivocation_slashes().await;
     let l = st.staking_read().await;
     assert!(burned > 0, "the single equivocation is still punished once");
-    assert_eq!(l.validators[&vid].total_slashed, burned, "exactly one slash applied");
+    assert_eq!(
+        l.validators[&vid].total_slashed, burned,
+        "exactly one slash applied"
+    );
     assert_eq!(l.total_burned, burned, "global counter agrees");
     // Design intent is 5%: 200 rebroadcasts must not confiscate the bond.
     assert!(
         l.validators[&vid].self_bond > self_before / 2,
         "bond survives a 200x replay: {} -> {}",
-        self_before, l.validators[&vid].self_bond
+        self_before,
+        l.validators[&vid].self_bond
     );
     drop(l);
     let _ = pool_before;
@@ -874,7 +1084,10 @@ fn adv_downtime_slash_cannot_replay_an_old_height() {
     // Replay OLD heights over and over: the documented no-op.
     for _ in 0..50u64 {
         let b = l.note_missed_heights(1, &never, &eligible);
-        assert_eq!(b, 0, "replaying height 1 after a slash at {slash_height} must burn 0");
+        assert_eq!(
+            b, 0,
+            "replaying height 1 after a slash at {slash_height} must burn 0"
+        );
         let b2 = l.note_missed_heights(slash_height, &never, &eligible);
         assert_eq!(b2, 0, "replaying the slash height itself must burn 0");
     }
@@ -892,16 +1105,18 @@ fn adv_downtime_slash_cannot_replay_an_old_height() {
 
 #[tokio::test]
 async fn adv_faucet_without_token_dispenses_nothing() {
+    use std::sync::atomic::AtomicU64;
     use stellereum::mempool::Mempool;
     use stellereum::rpc::{router, Faucet, ReceiptIndex, RpcState};
-    use std::sync::atomic::AtomicU64;
     use tokio::sync::RwLock;
 
     let engine = Arc::new(InMemoryStateEngine::new());
     let key_seed = [0x11u8; 32];
     let faucet = Faucet::new(key_seed, 1, 100, 1_000_000);
     let faucet_addr = faucet.account();
-    engine.update_account(AccountState::new(faucet_addr, 1_000_000)).await;
+    engine
+        .update_account(AccountState::new(faucet_addr, 1_000_000))
+        .await;
 
     // Enabled faucet, but the operator never set STELL_FAUCET_TOKEN.
     let st = Arc::new(RpcState {
@@ -1022,7 +1237,10 @@ async fn adv_grafted_vote_signatures_are_not_a_decision_proof() {
     ordered.sort_by_key(|b| b.height);
     assert_eq!(ordered.len(), 4);
     let r = validate_sync_chain(&ordered, 8, our_last, &vs);
-    assert!(r.is_err(), "grafted chain without QC must be refused: {r:?}");
+    assert!(
+        r.is_err(),
+        "grafted chain without QC must be refused: {r:?}"
+    );
     assert!(r.unwrap_err().contains("no decision proof"));
 
     // collect_missing_blocks still resolves such a chain off the peer (fetch is

@@ -83,12 +83,18 @@ fn snapshot_blob_budget_scales_with_size_and_is_capped() {
     assert!(snapshot_blob_budget_ms(50) > snapshot_blob_budget_ms(8));
     assert!(snapshot_blob_budget_ms(8) > snapshot_blob_budget_ms(1));
     // Capped: a huge blob cannot wedge the tick forever.
-    assert_eq!(snapshot_blob_budget_ms(usize::MAX), SNAPSHOT_BLOB_TIMEOUT_MS);
+    assert_eq!(
+        snapshot_blob_budget_ms(usize::MAX),
+        SNAPSHOT_BLOB_TIMEOUT_MS
+    );
     assert_eq!(snapshot_blob_budget_ms(10_000), SNAPSHOT_BLOB_TIMEOUT_MS);
     // A 50-chunk (~50MB) snapshot budget covers serial 2.5s-RTT movement
     // (~125s) with headroom, inside the cap.
     let b50 = snapshot_blob_budget_ms(50);
-    assert!((120_000..=SNAPSHOT_BLOB_TIMEOUT_MS).contains(&b50), "50-chunk budget {b50}ms");
+    assert!(
+        (120_000..=SNAPSHOT_BLOB_TIMEOUT_MS).contains(&b50),
+        "50-chunk budget {b50}ms"
+    );
 }
 
 /// Weak link pulls a 50MB snapshot (50 × 1MB chunks, 20% drops + jitter) to
@@ -101,16 +107,16 @@ fn snapshot_blob_budget_scales_with_size_and_is_capped() {
 async fn weak_link_pulls_50mb_snapshot_to_completion_with_resume() {
     const N: usize = 50; // 50 chunks ≈ 50MB snapshot
     const CHUNK: usize = 1024 * 1024;
-    let expected: Vec<Vec<u8>> = (0..N)
-        .map(|i| vec![(i & 0xFF) as u8; CHUNK])
-        .collect();
+    let expected: Vec<Vec<u8>> = (0..N).map(|i| vec![(i & 0xFF) as u8; CHUNK]).collect();
 
     let total_calls = Arc::new(AtomicUsize::new(0));
     // Deterministic weak link: LCG, 20% drops, 0..=3ms jitter per attempt.
     let state = Arc::new(std::sync::Mutex::new(0x9E3779B97F4A7C15u64));
     let next_rand = |st: &Arc<std::sync::Mutex<u64>>| {
         let mut g = st.lock().unwrap();
-        *g = g.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *g = g
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *g >> 33
     };
 
@@ -187,7 +193,10 @@ async fn resume_retries_only_the_missing_chunk() {
         if i == 7 {
             assert_eq!(*c, 3, "flaky chunk retried until it arrived");
         } else {
-            assert_eq!(*c, 1, "ready chunk {i} must never be re-ordered (got {c} fetches)");
+            assert_eq!(
+                *c, 1,
+                "ready chunk {i} must never be re-ordered (got {c} fetches)"
+            );
         }
     }
 }
@@ -206,7 +215,10 @@ async fn permanent_chunk_loss_reports_which_chunk_died() {
     assert_eq!(err.timeout_ms, SNAPSHOT_CHUNK_TIMEOUT_MS);
     let msg = err.to_string();
     assert!(msg.contains('0'), "message names the chunk: {msg}");
-    assert!(msg.contains(&N.to_string()), "message names the size class: {msg}");
+    assert!(
+        msg.contains(&N.to_string()),
+        "message names the size class: {msg}"
+    );
     assert!(
         msg.contains(&SNAPSHOT_CHUNK_TIMEOUT_MS.to_string()),
         "message names the budget: {msg}"

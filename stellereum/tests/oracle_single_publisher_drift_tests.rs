@@ -44,7 +44,10 @@ fn feed(key: &SigningKey, price: u64, ts: u64) -> PriceFeedUpdate {
 }
 
 fn committed_price(o: &OracleState) -> u64 {
-    o.feeds.get("STELL").expect("baseline committed").price_micro_usd
+    o.feeds
+        .get("STELL")
+        .expect("baseline committed")
+        .price_micro_usd
 }
 
 // ===========================================================================
@@ -55,7 +58,10 @@ fn committed_price(o: &OracleState) -> u64 {
 fn per_publisher_cap_is_half_the_global_cap() {
     assert_eq!(MAX_PRICE_DEVIATION_BPS, 1000);
     assert_eq!(MAX_SAME_PUBLISHER_DEVIATION_BPS, 500);
-    assert_eq!(MAX_SAME_PUBLISHER_DEVIATION_BPS, MAX_PRICE_DEVIATION_BPS / 2);
+    assert_eq!(
+        MAX_SAME_PUBLISHER_DEVIATION_BPS,
+        MAX_PRICE_DEVIATION_BPS / 2
+    );
 }
 
 #[test]
@@ -88,9 +94,19 @@ fn same_key_walk_is_capped_at_five_percent_per_step() {
     let err = o
         .commit_feed(&feed(&key_a(), 1_102_605, BLOCK_TIME - 5), BLOCK_TIME)
         .expect_err("same-key +501bps must be refused");
-    assert!(err.contains("same-publisher"), "refusal must name the rule: {err}");
-    assert!(!o.breaker_tripped, "a 5%-band refusal must NOT latch the breaker");
-    assert_eq!(committed_price(&o), 1_050_000, "refused feed commits nothing");
+    assert!(
+        err.contains("same-publisher"),
+        "refusal must name the rule: {err}"
+    );
+    assert!(
+        !o.breaker_tripped,
+        "a 5%-band refusal must NOT latch the breaker"
+    );
+    assert_eq!(
+        committed_price(&o),
+        1_050_000,
+        "refused feed commits nothing"
+    );
     // +500 bps over the new baseline (1_102_500): passes.
     o.commit_feed(&feed(&key_a(), 1_102_500, BLOCK_TIME - 5), BLOCK_TIME)
         .expect("same-key +500bps must pass");
@@ -150,7 +166,11 @@ fn breaker_still_latches_past_ten_percent_same_key() {
         .expect_err("same-key +11% must trip the breaker");
     assert!(err.contains("circuit breaker tripped"), "{err}");
     assert!(o.breaker_tripped);
-    assert_eq!(committed_price(&o), 1_000_000, "tripped feed commits nothing");
+    assert_eq!(
+        committed_price(&o),
+        1_000_000,
+        "tripped feed commits nothing"
+    );
     // Latched: everything after is refused until governance resets.
     assert!(o
         .commit_feed(&feed(&key_b(), 1_000_000, BLOCK_TIME - 5), BLOCK_TIME)
@@ -197,7 +217,9 @@ async fn wired_engine() -> InMemoryStateEngine {
         oracle.publishers.insert(key_b().verifying_key().to_bytes());
     }
     let sender = sender_key().verifying_key().to_bytes();
-    e.credit_native(&sender, 1_000_000_000_000).await.expect("fund");
+    e.credit_native(&sender, 1_000_000_000_000)
+        .await
+        .expect("fund");
     e
 }
 
@@ -220,8 +242,7 @@ async fn block_with_same_key_six_percent_feed_fails_open_breaker() {
     let base = feed(&key_a(), 1_000_000, BLOCK_TIME - 20);
     let (ok, _, _) = {
         let tx = feed_tx(base, 0);
-        let (_a, _f, _fees, status, _) =
-            e.apply_block_parallel_fees(&[tx], BLOCK_TIME).await;
+        let (_a, _f, _fees, status, _) = e.apply_block_parallel_fees(&[tx], BLOCK_TIME).await;
         (status[0], _a, _f)
     };
     assert!(ok, "baseline feed must commit");
@@ -240,7 +261,10 @@ async fn block_with_same_key_six_percent_feed_fails_open_breaker() {
     assert_eq!(status, vec![false], "same-key +6% tx must fail");
     {
         let oracle = e.oracle_read().await;
-        assert!(!oracle.breaker_tripped, "refusal must not latch the breaker");
+        assert!(
+            !oracle.breaker_tripped,
+            "refusal must not latch the breaker"
+        );
         assert_eq!(
             oracle.feeds.get("STELL").unwrap().price_micro_usd,
             1_000_000,
@@ -264,7 +288,12 @@ async fn block_with_same_key_six_percent_feed_fails_open_breaker() {
         e.apply_block_parallel_fees(&[tx], BLOCK_TIME).await;
     assert_eq!(status, vec![true], "rotated-key +6% tx must apply");
     assert_eq!(
-        e.oracle_read().await.feeds.get("STELL").unwrap().price_micro_usd,
+        e.oracle_read()
+            .await
+            .feeds
+            .get("STELL")
+            .unwrap()
+            .price_micro_usd,
         1_060_000
     );
 }

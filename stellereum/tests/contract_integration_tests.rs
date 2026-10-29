@@ -20,21 +20,39 @@ async fn funded() -> (InMemoryStateEngine, SigningKey, [u8; 32]) {
     let engine = InMemoryStateEngine::new();
     let sk = SigningKey::generate(&mut OsRng);
     let addr = sk.verifying_key().to_bytes();
-    engine.update_account(AccountState::new(addr, 1_000_000_000_000)).await;
+    engine
+        .update_account(AccountState::new(addr, 1_000_000_000_000))
+        .await;
     (engine, sk, addr)
 }
 
 fn deploy_tx(sk: &SigningKey, nonce: u64, code: Vec<u8>) -> Transaction {
     Transaction::sign_with_payload(
-        sk, [0u8; 32], 0, 5_000_000, nonce, 1, 1,
+        sk,
+        [0u8; 32],
+        0,
+        5_000_000,
+        nonce,
+        1,
+        1,
         vec![OpCode::SysCallDeployContract { code }],
     )
 }
 
 fn call_tx(sk: &SigningKey, nonce: u64, contract: [u8; 32], method: &str, arg: i64) -> Transaction {
     Transaction::sign_with_payload(
-        sk, [0u8; 32], 0, 5_000_000, nonce, 1, 1,
-        vec![OpCode::SysCallCallContract { contract, method: method.as_bytes().to_vec(), arg }],
+        sk,
+        [0u8; 32],
+        0,
+        5_000_000,
+        nonce,
+        1,
+        1,
+        vec![OpCode::SysCallCallContract {
+            contract,
+            method: method.as_bytes().to_vec(),
+            arg,
+        }],
     )
 }
 
@@ -42,7 +60,9 @@ fn call_tx(sk: &SigningKey, nonce: u64, contract: [u8; 32], method: &str, arg: i
 async fn deploy_then_call_onchain() {
     let (engine, sk, _) = funded().await;
 
-    let (applied, failed) = engine.apply_block_parallel(&[deploy_tx(&sk, 0, DOUBLE_WASM.to_vec())], 0).await;
+    let (applied, failed) = engine
+        .apply_block_parallel(&[deploy_tx(&sk, 0, DOUBLE_WASM.to_vec())], 0)
+        .await;
     assert_eq!((applied, failed), (1, 0), "deploy must be applied");
     assert_eq!(engine.contract_count().await, 1);
     let addr = engine.all_contract_addresses().await[0];
@@ -67,7 +87,14 @@ async fn deploy_then_call_onchain() {
         .apply_block_parallel(&[call_tx(&sk, 1, addr, "double", 21)], 0)
         .await;
     assert_eq!((applied, failed), (1, 0), "call must be applied");
-    assert_eq!(engine.call_contract(&addr, "double", 100, 10_000).await.unwrap().0, 200);
+    assert_eq!(
+        engine
+            .call_contract(&addr, "double", 100, 10_000)
+            .await
+            .unwrap()
+            .0,
+        200
+    );
 }
 
 #[tokio::test]
@@ -77,14 +104,24 @@ async fn reverting_payload_discards_the_deploy() {
     let (engine, sk, _) = funded().await;
     let missing_token = [0xABu8; 32];
     let payload = vec![
-        OpCode::SysCallDeployContract { code: DOUBLE_WASM.to_vec() },
-        OpCode::SysCallTokenTransfer { token_id: missing_token, to: [1u8; 32], amount: 1 },
+        OpCode::SysCallDeployContract {
+            code: DOUBLE_WASM.to_vec(),
+        },
+        OpCode::SysCallTokenTransfer {
+            token_id: missing_token,
+            to: [1u8; 32],
+            amount: 1,
+        },
     ];
     let tx = Transaction::sign_with_payload(&sk, [0u8; 32], 0, 5_000_000, 0, 1, 1, payload);
     let (applied, failed) = engine.apply_block_parallel(&[tx], 0).await;
     assert_eq!(applied, 0, "reverting payload must not be applied");
     assert_eq!(failed, 1);
-    assert_eq!(engine.contract_count().await, 0, "deploy must be rolled back (atomicity)");
+    assert_eq!(
+        engine.contract_count().await,
+        0,
+        "deploy must be rolled back (atomicity)"
+    );
 }
 
 #[tokio::test]
@@ -101,13 +138,25 @@ async fn invalid_wasm_is_rejected_onchain() {
 #[tokio::test]
 async fn out_of_fuel_call_reverts() {
     let (engine, sk, _) = funded().await;
-    engine.apply_block_parallel(&[deploy_tx(&sk, 0, DOUBLE_WASM.to_vec())], 0).await;
+    engine
+        .apply_block_parallel(&[deploy_tx(&sk, 0, DOUBLE_WASM.to_vec())], 0)
+        .await;
     let addr = engine.all_contract_addresses().await[0];
 
     // gas_limit barely covers the base call cost -> almost no wasmi fuel left.
     let tx = Transaction::sign_with_payload(
-        &sk, [0u8; 32], 0, 1_050, 1, 1, 1,
-        vec![OpCode::SysCallCallContract { contract: addr, method: b"double".to_vec(), arg: 1 }],
+        &sk,
+        [0u8; 32],
+        0,
+        1_050,
+        1,
+        1,
+        1,
+        vec![OpCode::SysCallCallContract {
+            contract: addr,
+            method: b"double".to_vec(),
+            arg: 1,
+        }],
     );
     let (applied, failed) = engine.apply_block_parallel(&[tx], 0).await;
     assert_eq!(applied, 0, "out-of-fuel call must not be applied");

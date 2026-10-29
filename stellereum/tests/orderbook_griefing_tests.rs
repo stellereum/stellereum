@@ -6,9 +6,9 @@
 //! The defense is to bound the work a single order may perform per VM call
 //! (a "match budget"), charge gas per level crossed, and cap book depth.
 
+use std::collections::HashMap;
 use stellereum::orderbook::{OrderSide, OrderType, OrderbookActor};
 use stellereum::svm::{OpCode, Svm, VmContext, VmExecutionResult, GAS_ORDER_PLACE};
-use std::collections::HashMap;
 
 fn addr(n: u8) -> [u8; 32] {
     [n; 32]
@@ -35,9 +35,15 @@ fn market_order_crosses_many_levels_in_one_call() {
         1000,
     );
     let levels_crossed = trades.len();
-    assert_eq!(levels_crossed, 500, "one order crossed 500 levels — O(levels) work");
+    assert_eq!(
+        levels_crossed, 500,
+        "one order crossed 500 levels — O(levels) work"
+    );
     // Gas for the whole sweep is a FLAT GAS_ORDER_PLACE regardless of 500 levels.
-    assert_eq!(GAS_ORDER_PLACE, 1_200, "flat fee independent of matched levels (griefing)");
+    assert_eq!(
+        GAS_ORDER_PLACE, 1_200,
+        "flat fee independent of matched levels (griefing)"
+    );
 }
 
 /// DEFENSE: gas now scales with the number of levels matched, so a deep sweep
@@ -74,7 +80,12 @@ fn svm_gas_scales_with_match_depth() {
             oracle: None,
         };
         let ops = vec![
-            OpCode::SysCallPlaceOrder { pair_id: 1, is_buy: true, price: u64::MAX, amount: nlevels },
+            OpCode::SysCallPlaceOrder {
+                pair_id: 1,
+                is_buy: true,
+                price: u64::MAX,
+                amount: nlevels,
+            },
             OpCode::Halt,
         ];
         match Svm::execute(&ops, 10_000_000, &mut ctx) {
@@ -123,7 +134,12 @@ fn svm_match_levels_are_capped() {
         oracle: None,
     };
     let ops = vec![
-        OpCode::SysCallPlaceOrder { pair_id: 1, is_buy: true, price: u64::MAX, amount: 500 },
+        OpCode::SysCallPlaceOrder {
+            pair_id: 1,
+            is_buy: true,
+            price: u64::MAX,
+            amount: 500,
+        },
         OpCode::Halt,
     ];
     match Svm::execute(&ops, 10_000_000, &mut ctx) {
@@ -149,5 +165,8 @@ fn depth_cap_bounds_attacker_levels() {
         book.submit_order(addr(1), OrderSide::Sell, 100 + i, 1, i);
     }
     let asks = book.depth().1;
-    assert!(asks <= cap, "depth cap must bound ask levels to {cap}, got {asks}");
+    assert!(
+        asks <= cap,
+        "depth cap must bound ask levels to {cap}, got {asks}"
+    );
 }

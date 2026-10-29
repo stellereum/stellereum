@@ -74,13 +74,32 @@ async fn main() {
 
     println!("  Токен ID:      {}", short(&token_id));
     println!("  Minter (владелец): {}", short(&us));
-    println!("  Total supply:  {}", engine.token_total_supply(&token_id).await.unwrap());
-    println!("  Баланс владельца: {}", engine.token_balance(&token_id, &us).await);
-    println!("  State root:    {}", hex::encode(&engine.get_state_root().await[..6]));
+    println!(
+        "  Total supply:  {}",
+        engine.token_total_supply(&token_id).await.unwrap()
+    );
+    println!(
+        "  Баланс владельца: {}",
+        engine.token_balance(&token_id, &us).await
+    );
+    println!(
+        "  State root:    {}",
+        hex::encode(&engine.get_state_root().await[..6])
+    );
 
     // ==================== ATTACK 1 ====================
     attack("Хакер пытается начеканить себе 1 000 000 токенов (не будучи minter)");
-    match engine.token_execute(&token_id, attacker, TokenOp::Mint { to: attacker, amount: 1_000_000 }).await {
+    match engine
+        .token_execute(
+            &token_id,
+            attacker,
+            TokenOp::Mint {
+                to: attacker,
+                amount: 1_000_000,
+            },
+        )
+        .await
+    {
         Ok(_) => breached("хакер начеканил токены!"),
         Err(e) => {
             defended(&format!("минт отклонён: {e}"));
@@ -95,21 +114,57 @@ async fn main() {
 
     // ==================== ATTACK 2 ====================
     attack("Double-spend: владелец переводит 600 000, затем пытается перевести ещё 600 000");
-    engine.token_execute(&token_id, us, TokenOp::Transfer { to: alice, amount: 600_000 }).await.unwrap();
+    engine
+        .token_execute(
+            &token_id,
+            us,
+            TokenOp::Transfer {
+                to: alice,
+                amount: 600_000,
+            },
+        )
+        .await
+        .unwrap();
     println!("  Первый перевод 600 000 -> {} ✓", short(&alice));
-    match engine.token_execute(&token_id, us, TokenOp::Transfer { to: bob, amount: 600_000 }).await {
+    match engine
+        .token_execute(
+            &token_id,
+            us,
+            TokenOp::Transfer {
+                to: bob,
+                amount: 600_000,
+            },
+        )
+        .await
+    {
         Ok(_) => breached("двойная трата прошла!"),
         Err(e) => {
             defended(&format!("вторая трата отклонена: {e}"));
-            println!("  Баланс владельца: {}", engine.token_balance(&token_id, &us).await);
-            println!("  Баланс bob:       {}", engine.token_balance(&token_id, &bob).await);
+            println!(
+                "  Баланс владельца: {}",
+                engine.token_balance(&token_id, &us).await
+            );
+            println!(
+                "  Баланс bob:       {}",
+                engine.token_balance(&token_id, &bob).await
+            );
         }
     }
 
     // ==================== ATTACK 3 ====================
     attack("Отправка токенов на ZERO_ADDRESS (сжечь в никуда без уменьшения supply)");
     let supply_before = engine.token_total_supply(&token_id).await.unwrap();
-    match engine.token_execute(&token_id, alice, TokenOp::Transfer { to: ZERO_ADDRESS, amount: 100 }).await {
+    match engine
+        .token_execute(
+            &token_id,
+            alice,
+            TokenOp::Transfer {
+                to: ZERO_ADDRESS,
+                amount: 100,
+            },
+        )
+        .await
+    {
         Ok(_) => breached("токены улетели на zero-address!"),
         Err(e) => {
             defended(&format!("перевод на zero-address отклонён: {e}"));
@@ -124,12 +179,36 @@ async fn main() {
 
     // ==================== ATTACK 4 ====================
     attack("Spender пытается потратить больше allowance (approve 5000, тратит 9999)");
-    engine.token_execute(&token_id, us, TokenOp::Approve { spender: attacker, amount: 5_000 }).await.unwrap();
-    match engine.token_execute(&token_id, attacker, TokenOp::TransferFrom { from: us, to: attacker, amount: 9_999 }).await {
+    engine
+        .token_execute(
+            &token_id,
+            us,
+            TokenOp::Approve {
+                spender: attacker,
+                amount: 5_000,
+            },
+        )
+        .await
+        .unwrap();
+    match engine
+        .token_execute(
+            &token_id,
+            attacker,
+            TokenOp::TransferFrom {
+                from: us,
+                to: attacker,
+                amount: 9_999,
+            },
+        )
+        .await
+    {
         Ok(_) => breached("превышение allowance прошло!"),
         Err(e) => {
             defended(&format!("отклонено: {e}"));
-            println!("  Баланс хакера: {}", engine.token_balance(&token_id, &attacker).await);
+            println!(
+                "  Баланс хакера: {}",
+                engine.token_balance(&token_id, &attacker).await
+            );
         }
     }
 
@@ -140,7 +219,17 @@ async fn main() {
         let reg = engine.tokens_read().await;
         reg.get(&token_id).unwrap().allowance(&us, &attacker)
     };
-    let res = engine.token_execute(&token_id, attacker, TokenOp::TransferFrom { from: us, to: attacker, amount: 500_000 }).await;
+    let res = engine
+        .token_execute(
+            &token_id,
+            attacker,
+            TokenOp::TransferFrom {
+                from: us,
+                to: attacker,
+                amount: 500_000,
+            },
+        )
+        .await;
     let allowance_after = {
         let reg = engine.tokens_read().await;
         reg.get(&token_id).unwrap().allowance(&us, &attacker)
@@ -148,32 +237,61 @@ async fn main() {
     if res.is_ok() {
         breached("провальный перевод прошёл!");
     } else if allowance_before == allowance_after {
-        defended(&format!("отклонено ({}) и allowance сохранён: {} == {}", res.unwrap_err(), allowance_before, allowance_after));
+        defended(&format!(
+            "отклонено ({}) и allowance сохранён: {} == {}",
+            res.unwrap_err(),
+            allowance_before,
+            allowance_after
+        ));
     } else {
-        breached(&format!("allowance испорчен: {allowance_before} -> {allowance_after}"));
+        breached(&format!(
+            "allowance испорчен: {allowance_before} -> {allowance_after}"
+        ));
     }
 
     // ==================== ATTACK 6 ====================
     attack("Обход pause: владелец ставит pause, хакер пытается двигать токены");
-    engine.token_execute(&token_id, us, TokenOp::Pause).await.unwrap();
+    engine
+        .token_execute(&token_id, us, TokenOp::Pause)
+        .await
+        .unwrap();
     println!("  Токен поставлен на паузу");
-    match engine.token_execute(&token_id, alice, TokenOp::Transfer { to: bob, amount: 10 }).await {
+    match engine
+        .token_execute(
+            &token_id,
+            alice,
+            TokenOp::Transfer {
+                to: bob,
+                amount: 10,
+            },
+        )
+        .await
+    {
         Ok(_) => breached("перевод прошёл во время паузы!"),
         Err(e) => {
             defended(&format!("перевод заблокирован: {e}"));
             // хакер не может снять паузу
-            match engine.token_execute(&token_id, attacker, TokenOp::Unpause).await {
+            match engine
+                .token_execute(&token_id, attacker, TokenOp::Unpause)
+                .await
+            {
                 Ok(_) => breached("хакер снял паузу!"),
                 Err(e2) => defended(&format!("снятие паузы хакером отклонено: {e2}")),
             }
         }
     }
-    engine.token_execute(&token_id, us, TokenOp::Unpause).await.unwrap();
+    engine
+        .token_execute(&token_id, us, TokenOp::Unpause)
+        .await
+        .unwrap();
 
     // ==================== ATTACK 7 ====================
     attack("Overflow: попытка начеканить больше max_supply (1 000 000)");
     // Сейчас supply = 1 000 000 (cap). Любой минт должен упасть.
-    match engine.token_execute(&token_id, us, TokenOp::Mint { to: us, amount: 1 }).await {
+    match engine
+        .token_execute(&token_id, us, TokenOp::Mint { to: us, amount: 1 })
+        .await
+    {
         Ok(_) => breached("превышение cap прошло!"),
         Err(e) => defended(&format!("минт сверх cap отклонён: {e}")),
     }
@@ -181,14 +299,29 @@ async fn main() {
     // ==================== ATTACK 8 ====================
     attack("Подделка SPV-пруфа: вредоносная нода заявляет ложный баланс");
     // Дадим bob реальный баланс, чтобы запись существовала в три
-    engine.token_execute(&token_id, alice, TokenOp::Transfer { to: bob, amount: 42_000 }).await.unwrap();
+    engine
+        .token_execute(
+            &token_id,
+            alice,
+            TokenOp::Transfer {
+                to: bob,
+                amount: 42_000,
+            },
+        )
+        .await
+        .unwrap();
     let root = engine.get_state_root().await;
     let bob_key = token_balance_key(&token_id, &bob);
-    let proof = engine.get_token_balance_proof(&token_id, &bob).await.unwrap();
+    let proof = engine
+        .get_token_balance_proof(&token_id, &bob)
+        .await
+        .unwrap();
     let real_balance = engine.token_balance(&token_id, &bob).await;
     println!("  Реальный баланс bob: {real_balance}");
-    let real_ok = PatriciaTrie::verify_merkle_proof(&root, &bob_key, &real_balance.to_be_bytes(), &proof);
-    let fake_ok = PatriciaTrie::verify_merkle_proof(&root, &bob_key, &999_999_999u64.to_be_bytes(), &proof);
+    let real_ok =
+        PatriciaTrie::verify_merkle_proof(&root, &bob_key, &real_balance.to_be_bytes(), &proof);
+    let fake_ok =
+        PatriciaTrie::verify_merkle_proof(&root, &bob_key, &999_999_999u64.to_be_bytes(), &proof);
     if real_ok && !fake_ok {
         defended("настоящий баланс подтверждён, поддельный (999 999 999) ОТКЛОНЁН");
     } else {
@@ -197,14 +330,20 @@ async fn main() {
     // Известное ограничение: баланс 0 не хранится в три (запись прунится),
     // поэтому non-inclusion proof для пустого аккаунта не поддерживается.
     let empty = addr(0x77);
-    if engine.get_token_balance_proof(&token_id, &empty).await.is_none() {
+    if engine
+        .get_token_balance_proof(&token_id, &empty)
+        .await
+        .is_none()
+    {
         println!("  \x1b[33mℹ замечание:\x1b[0m для нулевого баланса пруф отсутствует (non-inclusion не реализован)");
     }
 
     // ==================== ATTACK 9 ====================
     attack("Атомарность SVM: токен-перевод + последующий revert");
     let mut registry = TokenRegistry::new();
-    let tid = registry.create_token(alice, meta("Atomic", "ATM"), 1_000).unwrap();
+    let tid = registry
+        .create_token(alice, meta("Atomic", "ATM"), 1_000)
+        .unwrap();
     let mut ctx = VmContext {
         sender: alice,
         balance: 10, // мало нативного баланса -> вторая операция ревертит
@@ -227,17 +366,28 @@ async fn main() {
         oracle: None,
     };
     let ops = vec![
-        OpCode::SysCallTokenTransfer { token_id: tid, to: bob, amount: 400 },
-        OpCode::Transfer { recipient: bob, amount: 9_999 }, // revert
+        OpCode::SysCallTokenTransfer {
+            token_id: tid,
+            to: bob,
+            amount: 400,
+        },
+        OpCode::Transfer {
+            recipient: bob,
+            amount: 9_999,
+        }, // revert
     ];
     let res = Svm::execute(&ops, 100_000, &mut ctx);
     if matches!(res, VmExecutionResult::Reverted(_)) {
         let a = registry.balance_of(&tid, &alice);
         let b = registry.balance_of(&tid, &bob);
         if a == 1_000 && b == 0 {
-            defended(&format!("VM откатился, токены НЕ двинулись (alice={a}, bob={b})"));
+            defended(&format!(
+                "VM откатился, токены НЕ двинулись (alice={a}, bob={b})"
+            ));
         } else {
-            breached(&format!("токены сдвинулись несмотря на revert (alice={a}, bob={b})"));
+            breached(&format!(
+                "токены сдвинулись несмотря на revert (alice={a}, bob={b})"
+            ));
         }
     } else {
         breached("VM не откатился!");
@@ -245,11 +395,17 @@ async fn main() {
 
     // ==================== ATTACK 10 ====================
     attack("Мусорный снапшот: восстановление из битых байт");
-    match engine.restore_token_snapshot(&[0xDE, 0xAD, 0xBE, 0xEF]).await {
+    match engine
+        .restore_token_snapshot(&[0xDE, 0xAD, 0xBE, 0xEF])
+        .await
+    {
         Ok(_) => breached("мусорный снапшот принят!"),
         Err(e) => {
             defended(&format!("снапшот отклонён: {e}"));
-            println!("  Реестр цел: {} токен(ов)", engine.all_token_ids().await.len());
+            println!(
+                "  Реестр цел: {} токен(ов)",
+                engine.all_token_ids().await.len()
+            );
         }
     }
 
@@ -262,7 +418,9 @@ async fn main() {
     let accounts: Vec<[u8; 32]> = (1..=8u8).map(addr).collect();
     let mut seed: u64 = 0xDEADBEEF;
     let mut next = move || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         seed >> 33
     };
     let mut violations = 0u64;
@@ -274,10 +432,39 @@ async fn main() {
         let _ = match op {
             0 => reg.execute(&fid, us, TokenOp::Mint { to: a, amount: amt }),
             1 => reg.execute(&fid, a, TokenOp::Transfer { to: b, amount: amt }),
-            2 => reg.execute(&fid, a, TokenOp::Burn { from: a, amount: amt }),
-            3 => reg.execute(&fid, a, TokenOp::Approve { spender: b, amount: amt }),
-            4 => reg.execute(&fid, b, TokenOp::TransferFrom { from: a, to: b, amount: amt }),
-            _ => reg.execute(&fid, us, TokenOp::Burn { from: a, amount: amt }),
+            2 => reg.execute(
+                &fid,
+                a,
+                TokenOp::Burn {
+                    from: a,
+                    amount: amt,
+                },
+            ),
+            3 => reg.execute(
+                &fid,
+                a,
+                TokenOp::Approve {
+                    spender: b,
+                    amount: amt,
+                },
+            ),
+            4 => reg.execute(
+                &fid,
+                b,
+                TokenOp::TransferFrom {
+                    from: a,
+                    to: b,
+                    amount: amt,
+                },
+            ),
+            _ => reg.execute(
+                &fid,
+                us,
+                TokenOp::Burn {
+                    from: a,
+                    amount: amt,
+                },
+            ),
         };
         let t = reg.get(&fid).unwrap();
         let sum: u64 = t.balances.values().sum();
@@ -288,7 +475,11 @@ async fn main() {
     if violations == 0 {
         defended("10 000 операций, инвариант НИ РАЗУ не нарушен");
         let t = reg.get(&fid).unwrap();
-        println!("  Итог: supply={}, сумма балансов={}", t.metadata.total_supply, t.balances.values().sum::<u64>());
+        println!(
+            "  Итог: supply={}, сумма балансов={}",
+            t.metadata.total_supply,
+            t.balances.values().sum::<u64>()
+        );
     } else {
         breached(&format!("инвариант нарушен {violations} раз!"));
     }

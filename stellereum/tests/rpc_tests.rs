@@ -1,20 +1,20 @@
 //! Targeted tests for RPC hardening, EVM adapter compatibility, and filter manager invariants.
 
-use std::sync::Arc;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 
 use stellereum::evm_adapter::{
-    self as evm, EvmLog, FilterCriteria, FilterManager,
-    CHAIN_ID, CHAIN_ID_HEX, NET_VERSION, STANDARD_TRANSFER_GAS, STANDARD_TRANSFER_GAS_HEX,
-    MAX_PENDING_PER_FILTER, MAX_ACTIVE_FILTERS, FILTER_TTL_SECS,
+    self as evm, EvmLog, FilterCriteria, FilterManager, CHAIN_ID, CHAIN_ID_HEX, FILTER_TTL_SECS,
+    MAX_ACTIVE_FILTERS, MAX_PENDING_PER_FILTER, NET_VERSION, STANDARD_TRANSFER_GAS,
+    STANDARD_TRANSFER_GAS_HEX,
 };
+use stellereum::explorer::{self, GatewayState, ReadinessConfig};
 use stellereum::mempool::Mempool;
 use stellereum::rpc::{self, ReceiptIndex, RpcState};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::explorer::{self, GatewayState, ReadinessConfig};
 use stellereum::turnstile::CaptchaGate;
 
 async fn http_post_with(
@@ -79,10 +79,14 @@ async fn test_evm_chain_id_and_net_version() {
     assert_eq!(evm::net_version(), "5757");
 
     let adapter = evm::EvmAdapter::new();
-    let res_chain = adapter.dispatch("eth_chainId", &Value::Null).expect("eth_chainId");
+    let res_chain = adapter
+        .dispatch("eth_chainId", &Value::Null)
+        .expect("eth_chainId");
     assert_eq!(res_chain, json!("0x167d"));
 
-    let res_net = adapter.dispatch("net_version", &Value::Null).expect("net_version");
+    let res_net = adapter
+        .dispatch("net_version", &Value::Null)
+        .expect("net_version");
     assert_eq!(res_net, json!("5757"));
 }
 
@@ -102,18 +106,24 @@ async fn test_evm_get_balance() {
     let user_bytes = [7u8; 32];
     // 5 STELL = 5_000_000_000 nanoSTELL = 5 * 10^18 Wei
     let nano_bal = 5_000_000_000u64;
-    st.engine.update_account(AccountState::new(user_bytes, nano_bal)).await;
+    st.engine
+        .update_account(AccountState::new(user_bytes, nano_bal))
+        .await;
 
     let hex_addr = format!("0x{}", hex::encode(user_bytes));
     let params = json!([hex_addr, "latest"]);
 
-    let bal_hex = evm::eth_get_balance_rpc(&st, &params).await.expect("get balance");
+    let bal_hex = evm::eth_get_balance_rpc(&st, &params)
+        .await
+        .expect("get balance");
     // 5 * 10^18 = 0x4563918244f40000
     assert_eq!(bal_hex, "0x4563918244f40000");
 
     // Zero balance for unknown account
     let empty_addr = format!("0x{}", hex::encode([9u8; 32]));
-    let empty_bal = evm::eth_get_balance_rpc(&st, &json!([empty_addr, "latest"])).await.expect("empty balance");
+    let empty_bal = evm::eth_get_balance_rpc(&st, &json!([empty_addr, "latest"]))
+        .await
+        .expect("empty balance");
     assert_eq!(empty_bal, "0x0");
 }
 
@@ -124,7 +134,10 @@ async fn test_evm_call_erc20_stubs() {
     // 1. ERC-20 transfer (0xa9059cbb) -> abi encoded true
     let transfer_calldata = format!("0xa9059cbb{:0>64}{:0>64}", "11223344", "100");
     let res_transfer = adapter
-        .dispatch("eth_call", &json!([{ "data": transfer_calldata }, "latest"]))
+        .dispatch(
+            "eth_call",
+            &json!([{ "data": transfer_calldata }, "latest"]),
+        )
         .expect("transfer stub");
     assert_eq!(
         res_transfer,
@@ -144,7 +157,10 @@ async fn test_evm_call_erc20_stubs() {
     // 3. ERC-20 allowance (0xdd62ed3e) -> abi encoded u128::MAX
     let allowance_calldata = format!("0xdd62ed3e{:0>64}{:0>64}", "11223344", "55667788");
     let res_allowance = adapter
-        .dispatch("eth_call", &json!([{ "data": allowance_calldata }, "latest"]))
+        .dispatch(
+            "eth_call",
+            &json!([{ "data": allowance_calldata }, "latest"]),
+        )
         .expect("allowance stub");
     assert_eq!(
         res_allowance,
@@ -167,7 +183,9 @@ async fn test_evm_estimate_gas_21k() {
     let adapter = evm::EvmAdapter::new();
 
     // Standard transfer with empty params or simple object -> 21,000 ("0x5208")
-    let est_empty = adapter.dispatch("eth_estimateGas", &json!([])).expect("empty estimate");
+    let est_empty = adapter
+        .dispatch("eth_estimateGas", &json!([]))
+        .expect("empty estimate");
     assert_eq!(est_empty, json!("0x5208"));
 
     let est_tx = adapter
@@ -237,11 +255,18 @@ async fn test_filter_manager_security_invariants() {
         });
     }
     let log_changes = fm.get_filter_changes(&id3).expect("log changes");
-    assert_eq!(log_changes.as_array().unwrap().len(), 1_000, "pending logs capped to 1000");
+    assert_eq!(
+        log_changes.as_array().unwrap().len(),
+        1_000,
+        "pending logs capped to 1000"
+    );
 
     // 4. Uninstall filter
     assert!(fm.uninstall_filter(&id1));
-    assert!(fm.get_filter_changes(&id1).is_err(), "uninstalled filter must return error");
+    assert!(
+        fm.get_filter_changes(&id1).is_err(),
+        "uninstalled filter must return error"
+    );
 }
 
 #[tokio::test]
@@ -283,7 +308,10 @@ async fn test_rpc_hardening_body_limit_and_batches() {
     // 3. Body exceeding 1 MiB is rejected
     // 1 MiB + 100 bytes payload
     let giant_str = "x".repeat(1024 * 1024 + 100);
-    let giant_req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":["{}"]}}"#, giant_str);
+    let giant_req = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":["{}"]}}"#,
+        giant_str
+    );
     let (head_giant, _) = http_post(addr, "/", &giant_req).await;
     // DefaultBodyLimit in Axum rejects oversized requests before buffering (413 Payload Too Large)
     assert!(
@@ -319,7 +347,10 @@ async fn test_fail_closed_mempool_dump() {
     let res: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(res["error"]["code"], -32001);
     assert!(
-        res["error"]["message"].as_str().unwrap().contains("disabled when auth_token is not configured"),
+        res["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("disabled when auth_token is not configured"),
         "mempoolDump must fail closed without auth_token"
     );
 
@@ -346,7 +377,10 @@ async fn test_fail_closed_mempool_dump() {
     let (_, body_bad) = http_post(addr2, "/", &req_bad.to_string()).await;
     let res_bad: Value = serde_json::from_str(&body_bad).unwrap();
     assert_eq!(res_bad["error"]["code"], -32001);
-    assert!(res_bad["error"]["message"].as_str().unwrap().contains("invalid API token"));
+    assert!(res_bad["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("invalid API token"));
 
     // 3. Authorized request succeeds
     let req_good = json!({
@@ -395,6 +429,10 @@ async fn test_rpc_cors_headers_on_gateway() {
     .await;
 
     assert!(head.starts_with("HTTP/1.1 200 OK"));
-    assert!(head.to_lowercase().contains("access-control-allow-origin: *"));
-    assert!(head.to_lowercase().contains("access-control-allow-headers: content-type"));
+    assert!(head
+        .to_lowercase()
+        .contains("access-control-allow-origin: *"));
+    assert!(head
+        .to_lowercase()
+        .contains("access-control-allow-headers: content-type"));
 }

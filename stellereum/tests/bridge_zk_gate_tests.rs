@@ -114,7 +114,10 @@ fn valid_proof_against_registered_model_accepted() {
 
     let (_out, proof) = ZkMlProof::prove_reexec(&m, &[3, 4]);
     let ev = event_with_proof(&signers, [0xB2; 32], "USDT", 5_000, Some(proof));
-    assert_eq!(engine.process_deposit(&ev).expect("honest proof accepted"), 5_000);
+    assert_eq!(
+        engine.process_deposit(&ev).expect("honest proof accepted"),
+        5_000
+    );
 }
 
 #[test]
@@ -171,11 +174,16 @@ fn no_proof_deposit_behavior_unchanged() {
     let (mut engine, signers) = engine_with_quorum();
     let ev = event_with_proof(&signers, [0xE5; 32], "USDT", 1_000, None);
     assert_eq!(
-        engine.process_deposit(&ev).expect("no-proof + quorum still mints"),
+        engine
+            .process_deposit(&ev)
+            .expect("no-proof + quorum still mints"),
         1_000
     );
     // Replay still rejected.
-    assert!(engine.process_deposit(&ev).is_err(), "replay still rejected");
+    assert!(
+        engine.process_deposit(&ev).is_err(),
+        "replay still rejected"
+    );
 
     // Registering models must not change the no-proof path.
     let (mut engine2, signers2) = engine_with_quorum();
@@ -184,7 +192,9 @@ fn no_proof_deposit_behavior_unchanged() {
         .expect("register");
     let ev2 = event_with_proof(&signers2, [0xE5; 32], "USDT", 1_000, None);
     assert_eq!(
-        engine2.process_deposit(&ev2).expect("no-proof + quorum still mints after registration"),
+        engine2
+            .process_deposit(&ev2)
+            .expect("no-proof + quorum still mints after registration"),
         1_000
     );
 

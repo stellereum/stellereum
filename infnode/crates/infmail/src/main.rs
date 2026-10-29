@@ -16,7 +16,11 @@ use infnode::keyring::NodeKeys;
 use infnode::node::Node;
 
 #[derive(Parser)]
-#[command(name = "infmail-backend", version, about = "InfMail webmail backend (REST API почты/файлов/планов) поверх infnode")]
+#[command(
+    name = "infmail-backend",
+    version,
+    about = "InfMail webmail backend (REST API почты/файлов/планов) поверх infnode"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -33,9 +37,15 @@ enum Cmd {
 
 fn load(cfg: &Path) -> Result<(config::NodeConfig, NodeKeys, PathBuf, PathBuf)> {
     let cfg_obj = config::load(cfg)?;
-    let keys_dir = cfg.parent().unwrap_or(std::path::Path::new(".")).join("keys");
+    let keys_dir = cfg
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("keys");
     let keys = NodeKeys::load(&keys_dir)?;
-    let data_dir = cfg.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+    let data_dir = cfg
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
     Ok((cfg_obj, keys, data_dir, cfg.to_path_buf()))
 }
 
@@ -49,11 +59,11 @@ async fn main() -> Result<()> {
             let node = Node::new(cfg_obj.clone(), keys, data_dir, config_path)
                 .await
                 .context("создание ноды")?;
-            let web_listen = node
-                .cfg
-                .web_listen
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("в конфиге нет web-listen — укажи его (например \"127.0.0.1:3001\")"))?;
+            let web_listen = node.cfg.web_listen.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "в конфиге нет web-listen — укажи его (например \"127.0.0.1:3001\")"
+                )
+            })?;
             let static_dir = node.cfg.web_static.clone().map(PathBuf::from);
             let node_web = node.clone();
             // web-слой в главном потоке, сеть — фоном
@@ -87,7 +97,9 @@ async fn main() -> Result<()> {
                 // migration::run сам создаёт dedicated thread + свой tokio runtime
                 // (не блокирует основной), поэтому здесь просто запускаем его.
                 infnode::migration::run(node.clone(), rewards_dir.clone());
-                eprintln!("migration tracker enabled (chunk migration + integrity, dedicated thread)");
+                eprintln!(
+                    "migration tracker enabled (chunk migration + integrity, dedicated thread)"
+                );
             }
             infmail::web::run(node_web, &web_listen, static_dir)
                 .await

@@ -51,14 +51,16 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::sync::Arc;
 use stellereum::consensus::{ValidatorSet, Vote, VoteKind};
 use stellereum::mempool::Mempool;
 use stellereum::runtime::{fund_genesis, ChainState, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
+use stellereum::staking::{
+    DOWNTIME_MISS_THRESHOLD, MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER,
+};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::staking::{DOWNTIME_MISS_THRESHOLD, MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER};
 use stellereum::svm::{OpCode, GAS_BASIC_TRANSFER};
-use std::sync::Arc;
 
 /// Block reward paid per height on BOTH paths (must be non-zero, or the reward
 /// leg of the transition is never exercised).
@@ -78,7 +80,11 @@ fn keys(n: usize) -> Vec<SigningKey> {
 }
 
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
-    ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect())
+    ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    )
 }
 
 fn id_of(k: &SigningKey) -> [u8; 32] {
@@ -186,10 +192,10 @@ fn mk_block(
         shard_headers: vec![],
         precommit_qc: None,
         last_qc: None,
-            order_merkle_root,
-            epoch_key_commitment: [0u8; 32],
-            mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-        };
+        order_merkle_root,
+        epoch_key_commitment: [0u8; 32],
+        mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+    };
     blk.sign_block(proposer);
     blk
 }
@@ -235,8 +241,7 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
     // gas_limit is DECLARED above the gas the payload actually consumes
     // (GAS_BASIC_TRANSFER) on purpose: that gap is exactly the fee-rule
     // divergence the reorg path used to lose on.
-    let tx_plain =
-        Transaction::sign(&alice, bob, 1_000, 500_000, 0, 1, 1);
+    let tx_plain = Transaction::sign(&alice, bob, 1_000, 500_000, 0, 1, 1);
     let tx_payload = Transaction::sign_with_payload(
         &alice,
         bob,
@@ -306,7 +311,8 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
         vec![tx_bond, tx_order],
         vec![tx_claim, tx_plain2],
     ];
-    let expected_status: Vec<Vec<bool>> = vec![vec![true, true, false], vec![true, true], vec![true, true]];
+    let expected_status: Vec<Vec<bool>> =
+        vec![vec![true, true, false], vec![true, true], vec![true, true]];
 
     let mut prev_hash = [0u8; 32];
     // Canonical downtime evidence (W10.5): every block above the genesis
@@ -351,13 +357,11 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
             "STATE ROOT DIVERGED at height {height}: a reorg would fork here"
         );
         assert_eq!(
-            live.applied_statuses,
-            reorg.applied_statuses,
+            live.applied_statuses, reorg.applied_statuses,
             "RECEIPTS DIVERGED at height {height}"
         );
         assert_eq!(
-            live.applied_statuses,
-            expected_status[i],
+            live.applied_statuses, expected_status[i],
             "unexpected verdicts at height {height}"
         );
         assert_eq!(
@@ -365,8 +369,7 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
             "CHARGED FEES DIVERGED at height {height}"
         );
         assert_eq!(
-            live.applied_txs,
-            reorg.applied_txs,
+            live.applied_txs, reorg.applied_txs,
             "APPLIED TX COUNT DIVERGED at height {height}"
         );
         prev_hash = bh;
@@ -432,7 +435,10 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
             "ledger pool accounting must match the native rewards pool"
         );
         assert_eq!(
-            e.staking_read().await.to_validator_set().power_of(&id_of(&nova)),
+            e.staking_read()
+                .await
+                .to_validator_set()
+                .power_of(&id_of(&nova)),
             floor(),
             "the bond must buy voting power"
         );
@@ -484,8 +490,14 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
     // slashed validator, whose bond fell below the minimum.
     let live_vs = live.validators.clone();
     let reorg_vs = reorg.validator_set().await;
-    assert_eq!(live_vs.validators, reorg_vs.validators, "validator sets diverged");
-    assert!(!live_vs.contains(&silent), "precondition: the slash ejected the silent validator");
+    assert_eq!(
+        live_vs.validators, reorg_vs.validators,
+        "validator sets diverged"
+    );
+    assert!(
+        !live_vs.contains(&silent),
+        "precondition: the slash ejected the silent validator"
+    );
 
     // The order actually landed in consensus state on both paths (the book is
     // part of the committed digest, so equal roots already imply this - this
@@ -549,7 +561,10 @@ async fn single_tx_api_charges_consumed_gas_while_both_block_paths_charge_declar
     single
         .update_account(AccountState::new(id_of(&user), 1_000_000))
         .await;
-    single.apply_transaction(&mk_tx(), TS).await.expect("applies");
+    single
+        .apply_transaction(&mk_tx(), TS)
+        .await
+        .expect("applies");
     let single_sender = balance(&single, &id_of(&user)).await;
     assert_eq!(
         single_sender,
@@ -594,7 +609,10 @@ async fn single_tx_api_charges_consumed_gas_while_both_block_paths_charge_declar
         .await;
     let mut cs = ChainState::new(reorg_e.clone());
     cs.apply_block(&blk).await;
-    assert_eq!(block_e.get_state_root().await, reorg_e.get_state_root().await);
+    assert_eq!(
+        block_e.get_state_root().await,
+        reorg_e.get_state_root().await
+    );
     assert_eq!(cs.applied_statuses, out.status);
     assert_eq!(cs.applied_fees, out.tx_fees);
 }
@@ -630,12 +648,20 @@ async fn mempool_pruning_is_node_local_and_cannot_move_the_state_root() {
     let live_pool: Arc<tokio::sync::RwLock<Mempool>> =
         Arc::new(tokio::sync::RwLock::new(Mempool::default()));
     live = live.with_mempool(live_pool.clone());
-    live_pool.write().await.add_checked(tx.clone(), 1_000_000).unwrap();
+    live_pool
+        .write()
+        .await
+        .add_checked(tx.clone(), 1_000_000)
+        .unwrap();
 
     let reorg_pool: Arc<tokio::sync::RwLock<Mempool>> =
         Arc::new(tokio::sync::RwLock::new(Mempool::default()));
     let mut cs = ChainState::new(e_reorg.clone()).with_mempool(reorg_pool.clone());
-    reorg_pool.write().await.add_checked(tx.clone(), 1_000_000).unwrap();
+    reorg_pool
+        .write()
+        .await
+        .add_checked(tx.clone(), 1_000_000)
+        .unwrap();
 
     // And a third engine with NO mempool at all - the pure state comparison.
     let mut cs_nopool = ChainState::new(e_nopool.clone());

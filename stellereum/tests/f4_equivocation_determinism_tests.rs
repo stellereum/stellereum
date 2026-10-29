@@ -29,7 +29,11 @@ fn keys(n: usize) -> Vec<SigningKey> {
 }
 
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
-    ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect())
+    ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    )
 }
 
 fn ids(ks: &[SigningKey]) -> Vec<ValidatorId> {
@@ -122,8 +126,14 @@ async fn f4_all_routes_reach_identical_state_root_with_equivocation_evidence() {
         a.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
             .unwrap();
     }
-    a.on_prevote(Vote::sign(&cheater, 1, 0, VoteKind::Prevote, Some([0x99u8; 32])))
-        .unwrap();
+    a.on_prevote(Vote::sign(
+        &cheater,
+        1,
+        0,
+        VoteKind::Prevote,
+        Some([0x99u8; 32]),
+    ))
+    .unwrap();
     for k in ks.iter() {
         a.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
             .unwrap();
@@ -147,7 +157,10 @@ async fn f4_all_routes_reach_identical_state_root_with_equivocation_evidence() {
         b.hc.equivocations().is_empty(),
         "precondition: the adopting node never saw the conflicting vote"
     );
-    assert_eq!(b.adopt_committed(1, block.clone(), qc.clone()).await, Ok(bh));
+    assert_eq!(
+        b.adopt_committed(1, block.clone(), qc.clone()).await,
+        Ok(bh)
+    );
 
     // ---- Route C: WALK (main.rs sync path: install the block's QC, advance).
     let mut c = ValidatorRuntime::new(ks[0].clone(), vs.clone(), st_c.clone(), 1);
@@ -184,7 +197,12 @@ async fn f4_all_routes_reach_identical_state_root_with_equivocation_evidence() {
 
     // And the offender was NOT slashed by local gossip on any route, which is the
     // whole point: the verdict no longer depends on who saw the double-vote.
-    for (name, st) in [("local", &st_a), ("adopt", &st_b), ("walk", &st_c), ("replay", &st_d)] {
+    for (name, st) in [
+        ("local", &st_a),
+        ("adopt", &st_b),
+        ("walk", &st_c),
+        ("replay", &st_d),
+    ] {
         let l = st.staking_read().await;
         assert_eq!(l.total_burned, 0, "F4: {name} route burned stake");
         assert_eq!(
@@ -192,7 +210,8 @@ async fn f4_all_routes_reach_identical_state_root_with_equivocation_evidence() {
             "F4: {name} route slashed the double-voter from local evidence"
         );
         assert_eq!(
-            l.validators[&cheater_id].self_bond, BAL.min(stellereum::runtime::GENESIS_VALIDATOR_BOND),
+            l.validators[&cheater_id].self_bond,
+            BAL.min(stellereum::runtime::GENESIS_VALIDATOR_BOND),
             "F4: {name} route altered the offender's bond"
         );
     }
@@ -225,8 +244,14 @@ async fn f4_local_finalize_ignores_observed_equivocation() {
     // ...and the cheater ALSO sends a conflicting second prevote, observed
     // locally. The first prevote stays counted for quorum; the second is
     // recorded as evidence.
-    rt.on_prevote(Vote::sign(&cheater, 1, 0, VoteKind::Prevote, Some([0x77u8; 32])))
-        .unwrap();
+    rt.on_prevote(Vote::sign(
+        &cheater,
+        1,
+        0,
+        VoteKind::Prevote,
+        Some([0x77u8; 32]),
+    ))
+    .unwrap();
     let victim_evidence = rt.hc.equivocations();
     assert_eq!(victim_evidence.len(), 1);
     assert!(victim_evidence[0].1.verify() && victim_evidence[0].2.verify());

@@ -52,8 +52,14 @@ async fn same_validator_set_yields_identical_state_root() {
     // The pool holds exactly the escrowed genesis bonds - one per validator -
     // on BOTH nodes (which is part of why the roots match).
     let expected_pool = ids.len() as u64 * GENESIS_VALIDATOR_BOND;
-    assert_eq!(a.get_account(&STAKING_POOL).await.unwrap().balance, expected_pool);
-    assert_eq!(b.get_account(&STAKING_POOL).await.unwrap().balance, expected_pool);
+    assert_eq!(
+        a.get_account(&STAKING_POOL).await.unwrap().balance,
+        expected_pool
+    );
+    assert_eq!(
+        b.get_account(&STAKING_POOL).await.unwrap().balance,
+        expected_pool
+    );
 }
 
 #[tokio::test]
@@ -62,7 +68,20 @@ async fn different_validator_sets_diverge() {
     let k2 = SigningKey::generate(&mut OsRng);
     let a = Arc::new(InMemoryStateEngine::new());
     let b = Arc::new(InMemoryStateEngine::new());
-    fund_genesis(&a, &ValidatorSet::from_list(vec![(k1.verifying_key().to_bytes(), 1)]), BAL).await;
-    fund_genesis(&b, &ValidatorSet::from_list(vec![(k1.verifying_key().to_bytes(), 1), (k2.verifying_key().to_bytes(), 1)]), BAL).await;
+    fund_genesis(
+        &a,
+        &ValidatorSet::from_list(vec![(k1.verifying_key().to_bytes(), 1)]),
+        BAL,
+    )
+    .await;
+    fund_genesis(
+        &b,
+        &ValidatorSet::from_list(vec![
+            (k1.verifying_key().to_bytes(), 1),
+            (k2.verifying_key().to_bytes(), 1),
+        ]),
+        BAL,
+    )
+    .await;
     assert_ne!(a.get_state_root().await, b.get_state_root().await);
 }

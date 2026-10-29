@@ -121,9 +121,7 @@ async fn persist_and_reopen(
     height: u64,
     tag: &str,
 ) -> (std::path::PathBuf, CrossShardReplaySnapshot) {
-    let snap = sc.shard(shard).nodes[0]
-        .cross_shard_replay_snapshot()
-        .await;
+    let snap = sc.shard(shard).nodes[0].cross_shard_replay_snapshot().await;
     let dir = tmp_store_dir(tag);
     let _ = std::fs::remove_dir_all(&dir);
     let store = Storage::open(&dir).expect("open storage");
@@ -131,9 +129,13 @@ async fn persist_and_reopen(
     store.put_cross_shard(height, &bytes).expect("put");
     drop(store);
     let store = Storage::open(&dir).expect("reopen after close");
-    let back: CrossShardReplaySnapshot =
-        bincode::deserialize(&store.cross_shard_at(height).expect("read").expect("present"))
-            .expect("snapshot decodes");
+    let back: CrossShardReplaySnapshot = bincode::deserialize(
+        &store
+            .cross_shard_at(height)
+            .expect("read")
+            .expect("present"),
+    )
+    .expect("snapshot decodes");
     (dir, back)
 }
 
@@ -273,7 +275,7 @@ async fn restart_replay_refused_at_propose_validate_and_apply() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     forged.sign_block(&validator);
     let err = fnode
         .validate_proposal(&forged, root)
@@ -364,9 +366,11 @@ async fn produced_completed_survive_restore_and_timeout_bounce_fires() {
             .get(&bh)
             .cloned()
             .expect("block retained");
-        if blk.cross_shard_out.iter().any(|m| {
-            m.is_bounce() && m.tx.compute_tx_hash() == tx_hash
-        }) {
+        if blk
+            .cross_shard_out
+            .iter()
+            .any(|m| m.is_bounce() && m.tx.compute_tx_hash() == tx_hash)
+        {
             bounced_at = Some(blk.height);
             break;
         }
@@ -434,10 +438,7 @@ async fn engine_gate_backstops_empty_runtime() {
         shard_id: SHARD1,
         height: 1,
         prev_hash: [0u8; 32],
-        state_root: fresh.shard(SHARD1).nodes[0]
-            .state
-            .get_state_root()
-            .await,
+        state_root: fresh.shard(SHARD1).nodes[0].state.get_state_root().await,
         transactions: vec![],
         cross_shard_out: vec![consumed_msg],
         timestamp: TS,
@@ -449,12 +450,10 @@ async fn engine_gate_backstops_empty_runtime() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     let _ = &mut carrier;
     let engine = &fresh.shard(SHARD1).nodes[0].state;
-    let credited = engine
-        .apply_cross_shard_consumptions(&carrier)
-        .await;
+    let credited = engine.apply_cross_shard_consumptions(&carrier).await;
     assert_eq!(credited, 0, "engine must skip the already-consumed record");
     assert_eq!(
         engine.cross_shard_consumed_len().await,
@@ -484,8 +483,7 @@ async fn absent_means_empty_and_no_digest_impact() {
     assert!(snap.produced.is_empty());
     assert!(snap.completed.is_empty());
     let bytes = bincode::serialize(&snap).expect("snapshot encodes");
-    let back: CrossShardReplaySnapshot =
-        bincode::deserialize(&bytes).expect("snapshot decodes");
+    let back: CrossShardReplaySnapshot = bincode::deserialize(&bytes).expect("snapshot decodes");
     assert!(back.engine_consumed.is_empty() && back.produced.is_empty());
 
     // Restoring empties changes nothing observable.

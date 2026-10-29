@@ -83,7 +83,10 @@ async fn a3_backward_timestamp_refused_without_last_decision() {
 
     let child = signed_block(&k, 2, ph, root, 500);
     let r = rt.validate_proposal(&child, root);
-    assert!(r.is_err(), "BUG (A3): backward timestamp accepted fail-open: {r:?}");
+    assert!(
+        r.is_err(),
+        "BUG (A3): backward timestamp accepted fail-open: {r:?}"
+    );
     assert!(
         r.unwrap_err().contains("backwards"),
         "refusal must name the timestamp rule"
@@ -102,7 +105,10 @@ async fn a3_unknown_parent_timestamp_refused() {
     // ...but no body for `ghost` exists anywhere (no blocks entry, no decision).
     let child = signed_block(&k, 2, ghost, root, 2_000);
     let r = rt.validate_proposal(&child, root);
-    assert!(r.is_err(), "BUG (A3): unknown-parent timestamp accepted fail-open: {r:?}");
+    assert!(
+        r.is_err(),
+        "BUG (A3): unknown-parent timestamp accepted fail-open: {r:?}"
+    );
 }
 
 // A3: unbounded forward skew must be refused deterministically (vs the
@@ -124,7 +130,10 @@ async fn a3_future_jump_refused_vs_parent() {
     );
     let far = signed_block(&k, 2, ph, root, 1_000 + 3_601);
     let r = rt.validate_proposal(&far, root);
-    assert!(r.is_err(), "BUG (A3): unbounded forward skew accepted: {r:?}");
+    assert!(
+        r.is_err(),
+        "BUG (A3): unbounded forward skew accepted: {r:?}"
+    );
 }
 
 // A3: timestamp 0 on a non-genesis block is a missing timestamp and must be
@@ -135,7 +144,10 @@ async fn a3_zero_timestamp_refused() {
     let root = rt.state.get_state_root().await;
     let b = signed_block(&k, 1, [0u8; 32], root, 0);
     let r = rt.validate_proposal(&b, root);
-    assert!(r.is_err(), "BUG (A3): missing (zero) timestamp accepted: {r:?}");
+    assert!(
+        r.is_err(),
+        "BUG (A3): missing (zero) timestamp accepted: {r:?}"
+    );
 }
 
 // A3: validation must not read the wall clock. A child 10s past a far-future
@@ -154,7 +166,10 @@ async fn a3_no_wall_clock_in_timestamp_verdict() {
 
     let child = signed_block(&k, 2, ph, root, parent_ts + 10);
     let r = rt.validate_proposal(&child, root);
-    assert!(r.is_ok(), "BUG (A3): wall-clock drift gate rejects a monotone timestamp: {r:?}");
+    assert!(
+        r.is_ok(),
+        "BUG (A3): wall-clock drift gate rejects a monotone timestamp: {r:?}"
+    );
 }
 
 // D2a: the unchecked admission path must enforce the fee floor too — a
@@ -187,7 +202,10 @@ fn d2_failed_sender_posts_penalty_bond() {
 
     // No penalty yet: the floor admits.
     let t0 = Transaction::sign(&bad_sk, [1u8; 32], 10, 1_000, 0, 1, 1);
-    assert!(mp.add_checked(t0, u64::MAX).is_ok(), "precondition: admits clean");
+    assert!(
+        mp.add_checked(t0, u64::MAX).is_ok(),
+        "precondition: admits clean"
+    );
 
     // One applied-block verdict with this sender failed.
     mp.note_apply_feedback(&[bad_sender], &[]);
@@ -209,7 +227,10 @@ fn d2_failed_sender_posts_penalty_bond() {
         1,
         1,
     );
-    assert!(mp.add_checked(retry_bonded, u64::MAX).is_ok(), "bonded retry admits");
+    assert!(
+        mp.add_checked(retry_bonded, u64::MAX).is_ok(),
+        "bonded retry admits"
+    );
 
     // Escalation is capped, never runaway pricing.
     for _ in 0..100 {
@@ -219,13 +240,19 @@ fn d2_failed_sender_posts_penalty_bond() {
 
     // An unrelated sender is untouched throughout.
     let other = Transaction::sign(&good_sk, [1u8; 32], 10, 1_000, 0, 1, 1);
-    assert!(mp.add_checked(other, u64::MAX).is_ok(), "good senders unaffected");
+    assert!(
+        mp.add_checked(other, u64::MAX).is_ok(),
+        "good senders unaffected"
+    );
 
     // One success clears the failing sender entirely.
     mp.note_apply_feedback(&[], &[bad_sender]);
     assert_eq!(mp.effective_floor(&bad_sender), 0);
     let fresh = Transaction::sign(&bad_sk, [1u8; 32], 10, 1_000, 3, 1, 1);
-    assert!(mp.add_checked(fresh, u64::MAX).is_ok(), "cleared sender re-admits at floor");
+    assert!(
+        mp.add_checked(fresh, u64::MAX).is_ok(),
+        "cleared sender re-admits at floor"
+    );
 }
 #[tokio::test]
 async fn d2_failed_block_tx_pays_nothing() {
@@ -275,7 +302,10 @@ async fn a3_adopt_committed_refuses_backward_timestamp() {
     };
 
     let r = rt.adopt_committed(2, child, cert).await;
-    assert!(r.is_err(), "BUG (A3): backward timestamp accepted on adopt path: {r:?}");
+    assert!(
+        r.is_err(),
+        "BUG (A3): backward timestamp accepted on adopt path: {r:?}"
+    );
     assert!(
         r.unwrap_err().contains("backwards"),
         "adopt_committed refusal must name the timestamp rule"
@@ -290,7 +320,9 @@ async fn d2_runtime_apply_penalizes_failed_sender_and_proposer_skips() {
     let (mut rt, k) = solo_rt().await;
     let bad_sk = key(0xE1);
     let bad_sender = bad_sk.verifying_key().to_bytes();
-    rt.state.update_account(AccountState::new(bad_sender, 10_000_000)).await;
+    rt.state
+        .update_account(AccountState::new(bad_sender, 10_000_000))
+        .await;
 
     // Bad tx: wrong nonce (5 != 0).
     let bad_tx = Transaction::sign(&bad_sk, [1u8; 32], 10, 1_000, 5, 1, 1);
@@ -315,7 +347,10 @@ async fn d2_runtime_apply_penalizes_failed_sender_and_proposer_skips() {
     // Cheap retry (under penalty floor) is rejected by mempool
     let retry_cheap = Transaction::sign(&bad_sk, [1u8; 32], 10, 1_000, 0, 1, 1);
     assert_eq!(
-        rt.mempool.write().await.add_checked(retry_cheap, 10_000_000),
+        rt.mempool
+            .write()
+            .await
+            .add_checked(retry_cheap, 10_000_000),
         Err(MempoolError::FeeTooLow)
     );
 
@@ -329,7 +364,12 @@ async fn d2_runtime_apply_penalizes_failed_sender_and_proposer_skips() {
         1,
         1,
     );
-    assert!(rt.mempool.write().await.add_checked(bonded_tx, 10_000_000).is_ok());
+    assert!(rt
+        .mempool
+        .write()
+        .await
+        .add_checked(bonded_tx, 10_000_000)
+        .is_ok());
 
     // Propose at height 2: proposer packs the bonded transaction
     let proposed = rt.propose(1_010).await.expect("propose must yield a block");
@@ -363,10 +403,15 @@ async fn d2_rpc_rejects_unbonded_retry_from_penalized_sender() {
 
     let bad_sk = key(0xF1);
     let bad_sender = bad_sk.verifying_key().to_bytes();
-    engine.update_account(AccountState::new(bad_sender, 10_000_000)).await;
+    engine
+        .update_account(AccountState::new(bad_sender, 10_000_000))
+        .await;
 
     // Penalize bad_sender via feedback
-    mempool.write().await.note_apply_feedback(&[bad_sender], &[]);
+    mempool
+        .write()
+        .await
+        .note_apply_feedback(&[bad_sender], &[]);
 
     // RPC stell_sendRawTransaction with unbonded fee
     let cheap_tx = Transaction::sign(&bad_sk, [1u8; 32], 10, 1_000, 0, 1, 1);
@@ -379,7 +424,10 @@ async fn d2_rpc_rejects_unbonded_retry_from_penalized_sender() {
         "RPC must reject unbonded retry from penalized sender: {res:?}"
     );
     assert!(
-        res["error"].as_str().unwrap_or_default().contains("below the base fee"),
+        res["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("below the base fee"),
         "error message must reflect fee floor: {res:?}"
     );
 

@@ -14,8 +14,8 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
-use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::staking::{MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER};
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
 
 mod support;
@@ -30,11 +30,7 @@ fn floor() -> u64 {
     MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER
 }
 
-fn tx_of(
-    key: &SigningKey,
-    nonce: u64,
-    payload: Vec<OpCode>,
-) -> stellereum::sharding::Transaction {
+fn tx_of(key: &SigningKey, nonce: u64, payload: Vec<OpCode>) -> stellereum::sharding::Transaction {
     tx_of_gas(key, nonce, 10_000, payload)
 }
 
@@ -45,9 +41,7 @@ fn tx_of_gas(
     payload: Vec<OpCode>,
 ) -> stellereum::sharding::Transaction {
     let from = key.verifying_key().to_bytes();
-    stellereum::sharding::Transaction::sign_with_payload(
-        key, from, 0, gas, nonce, 1, 1, payload,
-    )
+    stellereum::sharding::Transaction::sign_with_payload(key, from, 0, gas, nonce, 1, 1, payload)
 }
 
 async fn bal(engine: &InMemoryStateEngine, a: &[u8; 32]) -> u64 {
@@ -73,9 +67,15 @@ async fn stranger_cannot_steal_validator_rewards_from_pool() {
     let bond = tx_of(
         &victim,
         0,
-        vec![OpCode::SysCallStake { validator: victim_addr, amount: stell(10_000) }],
+        vec![OpCode::SysCallStake {
+            validator: victim_addr,
+            amount: stell(10_000),
+        }],
     );
-    engine.apply_transaction(&bond, 0).await.expect("bond must succeed");
+    engine
+        .apply_transaction(&bond, 0)
+        .await
+        .expect("bond must succeed");
 
     let pool_after_bond = bal(&engine, &STAKING_POOL).await;
     assert_eq!(pool_after_bond, stell(10_000), "bond must sit in the pool");
@@ -89,7 +89,10 @@ async fn stranger_cannot_steal_validator_rewards_from_pool() {
         l.distribute_reward(victim_addr, stell(500)).unwrap();
         assert_eq!(l.validators[&victim_addr].pending_rewards, stell(500));
     }
-    engine.credit_native(&REWARDS_POOL, stell(500)).await.expect("back the accrual");
+    engine
+        .credit_native(&REWARDS_POOL, stell(500))
+        .await
+        .expect("back the accrual");
 
     // The attacker holds NOTHING but gas, and is not the validator, not a
     // delegator, has no bond, no signature over the victim's key. One syscall.
@@ -99,7 +102,13 @@ async fn stranger_cannot_steal_validator_rewards_from_pool() {
     let before = bal(&engine, &attacker_addr).await;
     assert_eq!(before, 10_000);
 
-    let steal = tx_of(&attacker, 0, vec![OpCode::SysCallClaimRewards { validator: victim_addr }]);
+    let steal = tx_of(
+        &attacker,
+        0,
+        vec![OpCode::SysCallClaimRewards {
+            validator: victim_addr,
+        }],
+    );
     // FIXED: ClaimRewards is owner-only, so the theft is refused outright.
     let fee = failure_fee(&engine, &steal).await;
     let err = engine
@@ -154,7 +163,9 @@ async fn stranger_cannot_steal_validator_rewards_from_pool() {
         &victim,
         1,
         2_000,
-        vec![OpCode::SysCallClaimRewards { validator: victim_addr }],
+        vec![OpCode::SysCallClaimRewards {
+            validator: victim_addr,
+        }],
     );
     engine
         .apply_transaction(&owner, 0)
@@ -182,8 +193,17 @@ async fn stranger_cannot_drain_the_pool_by_looping_over_validators() {
     for _i in 0..20u8 {
         let k = SigningKey::generate(&mut OsRng);
         let a = k.verifying_key().to_bytes();
-        engine.update_account(AccountState::new(a, floor() + 10_000)).await;
-        let t = tx_of(&k, 0, vec![OpCode::SysCallStake { validator: a, amount: floor() }]);
+        engine
+            .update_account(AccountState::new(a, floor() + 10_000))
+            .await;
+        let t = tx_of(
+            &k,
+            0,
+            vec![OpCode::SysCallStake {
+                validator: a,
+                amount: floor(),
+            }],
+        );
         engine.apply_transaction(&t, 0).await.unwrap();
         {
             let mut l = engine.staking_write().await;
@@ -268,11 +288,16 @@ async fn failed_claim_does_not_burn_validator_rewards() {
     let attacker = SigningKey::generate(&mut OsRng);
     let attacker_addr = attacker.verifying_key().to_bytes();
 
-    engine.update_account(AccountState::new(victim_addr, floor() + 10_000)).await;
+    engine
+        .update_account(AccountState::new(victim_addr, floor() + 10_000))
+        .await;
     let bond = tx_of(
         &victim,
         0,
-        vec![OpCode::SysCallStake { validator: victim_addr, amount: floor() }],
+        vec![OpCode::SysCallStake {
+            validator: victim_addr,
+            amount: floor(),
+        }],
     );
     engine.apply_transaction(&bond, 0).await.unwrap();
     {
@@ -280,9 +305,17 @@ async fn failed_claim_does_not_burn_validator_rewards() {
         // Reward far larger than the pool: 5,000 STELL earned on a floor bond.
         l.distribute_reward(victim_addr, stell(5_000)).unwrap();
     }
-    engine.update_account(AccountState::new(attacker_addr, 10_000)).await;
+    engine
+        .update_account(AccountState::new(attacker_addr, 10_000))
+        .await;
 
-    let t = tx_of(&attacker, 0, vec![OpCode::SysCallClaimRewards { validator: victim_addr }]);
+    let t = tx_of(
+        &attacker,
+        0,
+        vec![OpCode::SysCallClaimRewards {
+            validator: victim_addr,
+        }],
+    );
     let res = engine.apply_transaction(&t, 0).await;
     println!("apply_transaction result: {res:?}");
     let pending = engine.staking_read().await.validators[&victim_addr].pending_rewards;

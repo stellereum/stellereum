@@ -29,25 +29,39 @@ struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
         let mut x = self.0;
-        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-        self.0 = x; x
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
     }
     fn key(&mut self) -> [u8; 32] {
         let mut k = [0u8; 32];
-        for c in k.chunks_mut(8) { c.copy_from_slice(&self.next().to_be_bytes()); }
+        for c in k.chunks_mut(8) {
+            c.copy_from_slice(&self.next().to_be_bytes());
+        }
         k
     }
     fn val(&mut self, max: usize) -> Vec<u8> {
         let n = (self.next() as usize) % max;
         let mut v = vec![0u8; n];
-        for b in v.iter_mut() { *b = (self.next() & 0xFF) as u8; }
+        for b in v.iter_mut() {
+            *b = (self.next() & 0xFF) as u8;
+        }
         v
     }
 }
 
-fn banner(s: &str) { println!("\n\x1b[1;36m=== {s} ===\x1b[0m"); }
-fn ok(s: &str) { println!("  \x1b[32m✓\x1b[0m {s}"); }
-fn bad(s: &str) { println!("  \x1b[41m✗ INVARIANT BROKEN:\x1b[0m {s}"); std::process::exit(1); }
+fn banner(s: &str) {
+    println!("\n\x1b[1;36m=== {s} ===\x1b[0m");
+}
+fn ok(s: &str) {
+    println!("  \x1b[32m✓\x1b[0m {s}");
+}
+fn bad(s: &str) {
+    println!("  \x1b[41m✗ INVARIANT BROKEN:\x1b[0m {s}");
+    std::process::exit(1);
+}
 
 fn main() {
     println!("\x1b[1;33m############################################################");
@@ -97,7 +111,9 @@ fn section_a_trie_chaos() {
                 let k = pool[(rng.next() as usize) % pool.len()];
                 let a = trie.remove(&k);
                 let b = refm.remove(&k);
-                if a != b { bad(&format!("remove mismatch at step {step}")); }
+                if a != b {
+                    bad(&format!("remove mismatch at step {step}"));
+                }
             }
         } else {
             // get + proof
@@ -108,7 +124,13 @@ fn section_a_trie_chaos() {
                         if trie.get(&k) != Some(v.as_slice()) {
                             bad(&format!("get mismatch at step {step}"));
                         }
-                        let p = match trie.proof(&k) { Some(p) => p, None => { bad(&format!("missing proof step {step}")); return; } };
+                        let p = match trie.proof(&k) {
+                            Some(p) => p,
+                            None => {
+                                bad(&format!("missing proof step {step}"));
+                                return;
+                            }
+                        };
                         if !CompressedTrie::verify(&trie.root_hash(), &k, v, &p) {
                             bad(&format!("proof failed at step {step}"));
                         }
@@ -122,7 +144,11 @@ fn section_a_trie_chaos() {
             }
         }
         if trie.len() != refm.len() {
-            bad(&format!("len mismatch at step {step}: {} vs {}", trie.len(), refm.len()));
+            bad(&format!(
+                "len mismatch at step {step}: {} vs {}",
+                trie.len(),
+                refm.len()
+            ));
         }
     }
 
@@ -130,11 +156,14 @@ fn section_a_trie_chaos() {
     let root = trie.root_hash();
     for (k, v) in &refm {
         let p = trie.proof(k).unwrap();
-        if !CompressedTrie::verify(&root, k, v, &p) { bad("final proof failed"); }
+        if !CompressedTrie::verify(&root, k, v, &p) {
+            bad("final proof failed");
+        }
     }
     ok(&format!(
         "200k ops OK; {} live keys; final state root verifies; {:.2?}",
-        trie.len(), t0.elapsed()
+        trie.len(),
+        t0.elapsed()
     ));
 }
 
@@ -147,9 +176,14 @@ fn section_b_token_chaos() {
     let mut reg = TokenRegistry::new();
     let minter = [1u8; 32];
     let mut meta = TokenMetadata {
-        name: "Chaos".into(), symbol: "CHS".into(), decimals: 6,
-        total_supply: 0, max_supply: Some(1_000_000_000),
-        minter: ZERO_ADDRESS, paused: false, description: String::new(),
+        name: "Chaos".into(),
+        symbol: "CHS".into(),
+        decimals: 6,
+        total_supply: 0,
+        max_supply: Some(1_000_000_000),
+        minter: ZERO_ADDRESS,
+        paused: false,
+        description: String::new(),
     };
     meta.minter = minter;
     let id = reg.create_token(minter, meta, 0).unwrap();
@@ -167,15 +201,40 @@ fn section_b_token_chaos() {
             2 => reg.execute(&id, a, TokenOp::Burn { from: a, amount }),
             3 => reg.execute(&id, minter, TokenOp::Burn { from: a, amount }),
             4 => reg.execute(&id, a, TokenOp::Approve { spender: b, amount }),
-            5 => reg.execute(&id, b, TokenOp::TransferFrom { from: a, to: b, amount }),
-            6 => reg.execute(&id, a, TokenOp::IncreaseAllowance { spender: b, delta: amount }),
-            _ => reg.execute(&id, a, TokenOp::DecreaseAllowance { spender: b, delta: amount }),
+            5 => reg.execute(
+                &id,
+                b,
+                TokenOp::TransferFrom {
+                    from: a,
+                    to: b,
+                    amount,
+                },
+            ),
+            6 => reg.execute(
+                &id,
+                a,
+                TokenOp::IncreaseAllowance {
+                    spender: b,
+                    delta: amount,
+                },
+            ),
+            _ => reg.execute(
+                &id,
+                a,
+                TokenOp::DecreaseAllowance {
+                    spender: b,
+                    delta: amount,
+                },
+            ),
         };
         // INVARIANT
         let token = reg.get(&id).unwrap();
         let sum: u64 = token.balances.values().sum();
         if sum != token.metadata.total_supply {
-            bad(&format!("supply invariant broken step {step}: {sum} != {}", token.metadata.total_supply));
+            bad(&format!(
+                "supply invariant broken step {step}: {sum} != {}",
+                token.metadata.total_supply
+            ));
         }
         if token.metadata.total_supply > 1_000_000_000 {
             bad(&format!("cap exceeded step {step}"));
@@ -200,24 +259,33 @@ fn section_c_mempool_chaos() {
         let tx = Transaction::sign(&sk, [1u8; 32], 10, fee, nonce, 1, 1);
         let hash = tx.compute_tx_hash();
         if mp.add(tx).is_ok() {
-            if mp.len() > mp.max_size { bad("mempool over size"); }
+            if mp.len() > mp.max_size {
+                bad("mempool over size");
+            }
             accepted.push(hash);
         }
         // no duplicate hashes
         let hashes = mp.hashes();
         let mut set = std::collections::HashSet::new();
         for h in &hashes {
-            if !set.insert(*h) { bad("duplicate hash in mempool"); }
+            if !set.insert(*h) {
+                bad("duplicate hash in mempool");
+            }
         }
     }
     // fee-priority: select returns descending fees
     let sel = mp.select(50);
     let mut prev = u64::MAX;
     for t in &sel {
-        if t.gas_limit > prev { bad("fee order violated"); }
+        if t.gas_limit > prev {
+            bad("fee order violated");
+        }
         prev = t.gas_limit;
     }
-    ok(&format!("8k mempool ops OK; {} live; fee order + quota + no dupes", mp.len()));
+    ok(&format!(
+        "8k mempool ops OK; {} live; fee order + quota + no dupes",
+        mp.len()
+    ));
 }
 
 // ============================================================================
@@ -241,15 +309,19 @@ fn section_d_state_conservation() {
         }
         // random transfers
         let mut keys: Vec<SigningKey> = Vec::new();
-        for _ in 0..30 { keys.push(SigningKey::generate(&mut OsRng)); }
+        for _ in 0..30 {
+            keys.push(SigningKey::generate(&mut OsRng));
+        }
         // use the SAME keys as accounts: rebuild
         let engine2 = InMemoryStateEngine::new();
         let mut total2 = 0u64;
-        let mut kp: Vec<(SigningKey, [u8;32], u64)> = Vec::new();
+        let mut kp: Vec<(SigningKey, [u8; 32], u64)> = Vec::new();
         for _ in 0..30 {
             let sk = SigningKey::generate(&mut OsRng);
             let a = sk.verifying_key().to_bytes();
-            engine2.update_account(AccountState::new(a, 1_000_000)).await;
+            engine2
+                .update_account(AccountState::new(a, 1_000_000))
+                .await;
             total2 += 1_000_000;
             kp.push((sk, a, 500_000));
         }
@@ -264,10 +336,17 @@ fn section_d_state_conservation() {
         let mut sum = 0u64;
         let mut n = 0;
         for (_, a, _) in &kp {
-            if let Some(acc) = engine2.get_account(a).await { sum += acc.balance; n += 1; }
+            if let Some(acc) = engine2.get_account(a).await {
+                sum += acc.balance;
+                n += 1;
+            }
         }
-        if sum > total2 { bad(&format!("value created: sum={sum} total={total2}")); }
-        ok(&format!("2k transfers OK; value never inflated (sum {sum} <= {total2}, {n} accts)"));
+        if sum > total2 {
+            bad(&format!("value created: sum={sum} total={total2}"));
+        }
+        ok(&format!(
+            "2k transfers OK; value never inflated (sum {sum} <= {total2}, {n} accts)"
+        ));
     });
 }
 
@@ -285,27 +364,39 @@ fn section_e_proof_forgery() {
     let p1 = t.proof(&k1).unwrap();
 
     // 1. forged value
-    if CompressedTrie::verify(&root, &k1, b"forged", &p1) { bad("accepted forged value"); }
+    if CompressedTrie::verify(&root, &k1, b"forged", &p1) {
+        bad("accepted forged value");
+    }
     // 2. forged key
-    if CompressedTrie::verify(&root, &k2, b"secret1", &p1) { bad("accepted wrong key"); }
+    if CompressedTrie::verify(&root, &k2, b"secret1", &p1) {
+        bad("accepted wrong key");
+    }
     // 3. tampered root
-    if CompressedTrie::verify(&[0u8; 32], &k1, b"secret1", &p1) { bad("accepted wrong root"); }
+    if CompressedTrie::verify(&[0u8; 32], &k1, b"secret1", &p1) {
+        bad("accepted wrong root");
+    }
     // 4. tampered leaf_hash
     let mut p4 = p1.clone();
     p4.leaf_hash = [9u8; 32];
-    if CompressedTrie::verify(&root, &k1, b"secret1", &p4) { bad("accepted tampered leaf_hash"); }
+    if CompressedTrie::verify(&root, &k1, b"secret1", &p4) {
+        bad("accepted tampered leaf_hash");
+    }
     // 5. tampered sibling hash
     let mut p5 = p1.clone();
     if !p5.path.is_empty() {
         p5.path[0].sibling_hash = [7u8; 32];
-        if CompressedTrie::verify(&root, &k1, b"secret1", &p5) { bad("accepted tampered sibling"); }
+        if CompressedTrie::verify(&root, &k1, b"secret1", &p5) {
+            bad("accepted tampered sibling");
+        }
     }
     // 6. truncated path
     let mut p6 = p1.clone();
     p6.path.clear();
     if CompressedTrie::verify(&root, &k1, b"secret1", &p6) && !t.is_empty() {
         // a cleared path only verifies if root == leaf hash, which it won't be
-        if root != p6.leaf_hash { bad("accepted truncated path"); }
+        if root != p6.leaf_hash {
+            bad("accepted truncated path");
+        }
     }
     ok("all 6 forgery attempts rejected");
 }
@@ -321,16 +412,27 @@ fn section_f_extremes() {
     let f = [0xFFu8; 32];
     t.insert(&z, b"");
     t.insert(&f, &vec![0xAAu8; 10_000]); // large value
-    let mut adj = [0u8; 32]; adj[31] = 1;
+    let mut adj = [0u8; 32];
+    adj[31] = 1;
     t.insert(&adj, b"x");
     let root = t.root_hash();
-    for (k, v) in [(&z, &b""[..]), (&f, &vec![0xAAu8; 10_000][..]), (&adj, &b"x"[..])] {
+    for (k, v) in [
+        (&z, &b""[..]),
+        (&f, &vec![0xAAu8; 10_000][..]),
+        (&adj, &b"x"[..]),
+    ] {
         let p = t.proof(k).unwrap();
-        if !CompressedTrie::verify(&root, k, v, &p) { bad("extreme key/value proof failed"); }
+        if !CompressedTrie::verify(&root, k, v, &p) {
+            bad("extreme key/value proof failed");
+        }
     }
     // empty tree
     let et = CompressedTrie::new();
-    if et.root_hash() != [0u8; 32] { bad("empty root not zero"); }
-    if et.proof(&z).is_some() { bad("empty tree returned a proof"); }
+    if et.root_hash() != [0u8; 32] {
+        bad("empty root not zero");
+    }
+    if et.proof(&z).is_some() {
+        bad("empty tree returned a proof");
+    }
     ok("zero key, all-FF key, adjacent keys, 10KB value, empty tree all OK");
 }

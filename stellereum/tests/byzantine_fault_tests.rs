@@ -14,11 +14,11 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::sync::Arc;
 use stellereum::consensus::{ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
-use std::sync::Arc;
 
 const BAL: u64 = 10_000_000_000_000;
 
@@ -67,7 +67,9 @@ fn mkblock(pkey: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
 }
 
 fn idx_of(ks: &[SigningKey], target: [u8; 32]) -> usize {
-    ks.iter().position(|k| id(k) == target).expect("proposer is one of our keys")
+    ks.iter()
+        .position(|k| id(k) == target)
+        .expect("proposer is one of our keys")
 }
 
 /// Drive one consensus round at the recipients' current height:
@@ -144,7 +146,10 @@ async fn drive_round(
             nodes[r].hc.receive_proposal(proposer_id, bh).unwrap();
         } else {
             let er = nodes[r].hc.round;
-            nodes[r].on_proposal(proposer_id, block.clone(), er).await.unwrap();
+            nodes[r]
+                .on_proposal(proposer_id, block.clone(), er)
+                .await
+                .unwrap();
         }
     }
     // Votes from the live subset go to every recipient; the silent ones simply
@@ -261,20 +266,30 @@ async fn bft_partition_heals_and_converges() {
     let ks = keys(4);
     let mut nodes = cluster(&ks).await;
     let proposer = idx_of(&ks, nodes[0].validators.proposer_for(1, 0).unwrap());
-    let back_half: Vec<usize> = (0..4).filter(|&i| i != proposer && i != (proposer + 1) % 4).collect();
+    let back_half: Vec<usize> = (0..4)
+        .filter(|&i| i != proposer && i != (proposer + 1) % 4)
+        .collect();
     let first_half = vec![proposer, (proposer + 1) % 4];
     let all = vec![0usize, 1, 2, 3];
 
     // Partitioned phase: only two vote -> no finalization anywhere.
     let (_bh, got) = drive_round(&mut nodes, &ks, &first_half, &all).await;
-    assert!(got.iter().all(|g| g.is_none()), "partitioned: no quorum yet");
+    assert!(
+        got.iter().all(|g| g.is_none()),
+        "partitioned: no quorum yet"
+    );
     assert!(nodes.iter().all(|n| n.height() == 1));
 
     // Heal: the two silent validators' votes are delivered to everyone.
     // (Same height, same round, same block: no rotation happened anywhere
     // because nothing finalized, so every node's set and root still match.)
     let h = 1u64;
-    let bh = nodes[0].blocks.keys().next().copied().expect("block was proposed");
+    let bh = nodes[0]
+        .blocks
+        .keys()
+        .next()
+        .copied()
+        .expect("block was proposed");
     for &i in &back_half {
         let pv = Vote::sign(&ks[i], h, 0, VoteKind::Prevote, Some(bh));
         let pc = Vote::sign(&ks[i], h, 0, VoteKind::Precommit, Some(bh));
@@ -284,21 +299,34 @@ async fn bft_partition_heals_and_converges() {
         }
     }
     for (i, n) in nodes.iter_mut().enumerate() {
-        assert_eq!(n.try_finalize().await, Some(bh), "node {i} finalizes after heal");
+        assert_eq!(
+            n.try_finalize().await,
+            Some(bh),
+            "node {i} finalizes after heal"
+        );
         assert_eq!(n.height(), 2);
         assert_eq!(n.finalized, vec![(1u64, bh)]);
     }
     let r = roots(&nodes).await;
-    assert!(r.windows(2).all(|w| w[0] == w[1]), "all four converge on one root");
+    assert!(
+        r.windows(2).all(|w| w[0] == w[1]),
+        "all four converge on one root"
+    );
 
     // The chain resumes: a full round finalizes on all four.
     let (bh2, got2) = drive_round(&mut nodes, &ks, &all, &all).await;
-    assert!(got2.iter().all(|g| *g == Some(bh2)), "chain resumes post-heal");
+    assert!(
+        got2.iter().all(|g| *g == Some(bh2)),
+        "chain resumes post-heal"
+    );
     for n in &nodes {
         assert_eq!(n.height(), 3);
     }
     let r2 = roots(&nodes).await;
-    assert!(r2.windows(2).all(|w| w[0] == w[1]), "still converged at height 3");
+    assert!(
+        r2.windows(2).all(|w| w[0] == w[1]),
+        "still converged at height 3"
+    );
 }
 
 // Test 5 — equivocator in a 4-set: one validator double-votes; the honest
@@ -326,7 +354,10 @@ async fn bft_equivocator_does_not_halt_or_multi_slash() {
             nodes[r].hc.receive_proposal(proposer_id, bh).unwrap();
         } else {
             let er = nodes[r].hc.round;
-            nodes[r].on_proposal(proposer_id, block.clone(), er).await.unwrap();
+            nodes[r]
+                .on_proposal(proposer_id, block.clone(), er)
+                .await
+                .unwrap();
         }
     }
     for &i in &honest {

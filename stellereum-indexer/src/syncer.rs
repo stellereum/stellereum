@@ -40,7 +40,10 @@ impl Syncer {
     ) -> Self {
         Self {
             db,
-            client: Client::builder().timeout(Duration::from_secs(5)).build().unwrap(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
             node_url,
             rpc_url,
             abis,
@@ -86,7 +89,11 @@ impl Syncer {
             let shard_id = b["shard_id"].as_u64().unwrap_or(0) as u32;
 
             // Check if we already have this block
-            if self.db.get_block_by_shard_and_height(shard_id, height)?.is_some() {
+            if self
+                .db
+                .get_block_by_shard_and_height(shard_id, height)?
+                .is_some()
+            {
                 continue;
             }
 
@@ -106,7 +113,8 @@ impl Syncer {
 
             // If block carries transactions, fetch and index them
             if tx_count > 0 {
-                self.index_block_transactions(height, &hash, timestamp).await;
+                self.index_block_transactions(height, &hash, timestamp)
+                    .await;
             }
         }
 
@@ -252,7 +260,8 @@ impl Syncer {
             let decoded = crate::events::decode_event(abi.as_ref(), &raw);
             let topics_json =
                 serde_json::to_string(&decoded.topics).unwrap_or_else(|_| "[]".to_string());
-            let data_json = serde_json::to_string(&decoded.data).unwrap_or_else(|_| "null".to_string());
+            let data_json =
+                serde_json::to_string(&decoded.data).unwrap_or_else(|_| "null".to_string());
             let decoded_json = decoded
                 .args
                 .as_ref()

@@ -41,7 +41,11 @@ fn keys(n: usize) -> Vec<SigningKey> {
 }
 
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
-    ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect())
+    ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    )
 }
 
 /// Four byte-identical engines: genesis-funded, staking pool funded (the
@@ -141,7 +145,10 @@ async fn none_evidence_block_reaches_identical_roots_on_all_four_routes() {
     let block = mkblock(&pkey, 1, [0u8; 32], root0);
     let bh = block.compute_hash();
     let qc = three_of_four_qc(&ks, 1, 0, bh);
-    assert!(qc.verify(&vs), "precondition: 3-of-4 certificate is genuine");
+    assert!(
+        qc.verify(&vs),
+        "precondition: 3-of-4 certificate is genuine"
+    );
 
     // ---- Route LIVE: local finalize. ----
     let mut live = ValidatorRuntime::new(ks[0].clone(), vs.clone(), st_live.clone(), 1);
@@ -197,8 +204,14 @@ async fn none_evidence_block_reaches_identical_roots_on_all_four_routes() {
         hex::encode(&rw[..8]),
         hex::encode(&rr[..8]),
     );
-    assert_eq!(rl, ra, "live finalize vs adopt differ on a None-evidence block");
-    assert_eq!(rl, rw, "live finalize vs walk differ on a None-evidence block");
+    assert_eq!(
+        rl, ra,
+        "live finalize vs adopt differ on a None-evidence block"
+    );
+    assert_eq!(
+        rl, rw,
+        "live finalize vs walk differ on a None-evidence block"
+    );
     assert_eq!(
         rl, rr,
         "live finalize vs REPLAY differ on a None-evidence block: \
@@ -213,7 +226,10 @@ async fn none_evidence_block_reaches_identical_roots_on_all_four_routes() {
         ("replay", &st_replay),
     ] {
         let l = st.staking_read().await;
-        assert_eq!(l.total_burned, 0, "{name} route burned stake on None evidence");
+        assert_eq!(
+            l.total_burned, 0,
+            "{name} route burned stake on None evidence"
+        );
         let rec = l.validators.get(&silent_id).expect("silent still bonded");
         assert_eq!(
             rec.missed,

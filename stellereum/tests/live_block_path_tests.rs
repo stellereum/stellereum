@@ -23,8 +23,10 @@
 
 use ed25519_dalek::SigningKey;
 use stellereum::sharding::Transaction;
+use stellereum::staking::{
+    MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS,
+};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::staking::{MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS};
 use stellereum::svm::{
     OpCode, GAS_BASIC_TRANSFER, GAS_STAKE_BOND, GAS_STAKE_CLAIM, GAS_STAKE_UNBOND,
 };
@@ -63,7 +65,9 @@ async fn payload_transfer_moves_native_funds_on_the_live_block_path() {
     let plain_to = [0xAAu8; 32];
     let payload_to = [0xBBu8; 32];
     let start = 1_000_000u64;
-    engine.update_account(AccountState::new(sender, start)).await;
+    engine
+        .update_account(AccountState::new(sender, start))
+        .await;
 
     // gas_limit == the opcode's own cost, so the assertion below is about the
     // value movement and not about which fee rule a path charges.
@@ -75,11 +79,15 @@ async fn payload_transfer_moves_native_funds_on_the_live_block_path() {
         0,
         1,
         1,
-        vec![OpCode::Transfer { recipient: payload_to, amount: 5_000 }],
+        vec![OpCode::Transfer {
+            recipient: payload_to,
+            amount: 5_000,
+        }],
     );
 
-    let (applied, failed, fees, status, _) =
-        engine.apply_block_parallel_fees(std::slice::from_ref(&tx), BLOCK_TS).await;
+    let (applied, failed, fees, status, _) = engine
+        .apply_block_parallel_fees(std::slice::from_ref(&tx), BLOCK_TS)
+        .await;
 
     assert_eq!((applied, failed), (1, 0), "the payload transaction applies");
     assert_eq!(status, vec![true]);
@@ -92,7 +100,11 @@ async fn payload_transfer_moves_native_funds_on_the_live_block_path() {
         5_000,
         "the payload Transfer must credit its recipient"
     );
-    assert_eq!(balance(&engine, &plain_to).await, 1_000, "the plain amount still moves");
+    assert_eq!(
+        balance(&engine, &plain_to).await,
+        1_000,
+        "the plain amount still moves"
+    );
     assert_eq!(
         balance(&engine, &sender).await,
         start - 1_000 - GAS_BASIC_TRANSFER - 5_000,
@@ -111,7 +123,9 @@ async fn sys_call_stake_funds_the_staking_pool_on_the_live_block_path() {
     let sk = key(0x22);
     let validator = sk.verifying_key().to_bytes();
     let start = floor() + GAS_STAKE_BOND + 4_242;
-    engine.update_account(AccountState::new(validator, start)).await;
+    engine
+        .update_account(AccountState::new(validator, start))
+        .await;
     assert_eq!(pool(&engine).await, 0, "the pool starts empty");
 
     let tx = Transaction::sign_with_payload(
@@ -122,11 +136,15 @@ async fn sys_call_stake_funds_the_staking_pool_on_the_live_block_path() {
         0,
         1,
         1,
-        vec![OpCode::SysCallStake { validator, amount: floor() }],
+        vec![OpCode::SysCallStake {
+            validator,
+            amount: floor(),
+        }],
     );
 
-    let (applied, failed, _fees, status, _) =
-        engine.apply_block_parallel_fees(std::slice::from_ref(&tx), BLOCK_TS).await;
+    let (applied, failed, _fees, status, _) = engine
+        .apply_block_parallel_fees(std::slice::from_ref(&tx), BLOCK_TS)
+        .await;
     assert_eq!((applied, failed), (1, 0), "the bond transaction applies");
     assert_eq!(status, vec![true]);
 
@@ -161,7 +179,9 @@ async fn claim_rewards_payout_comes_from_the_rewards_pool_on_the_live_block_path
     let sk = key(0x33);
     let validator = sk.verifying_key().to_bytes();
     let start = floor() + GAS_STAKE_BOND + GAS_STAKE_CLAIM;
-    engine.update_account(AccountState::new(validator, start)).await;
+    engine
+        .update_account(AccountState::new(validator, start))
+        .await;
 
     // Block 1: bond through the live path, so the pool really holds the coins.
     let bond_tx = Transaction::sign_with_payload(
@@ -172,10 +192,14 @@ async fn claim_rewards_payout_comes_from_the_rewards_pool_on_the_live_block_path
         0,
         1,
         1,
-        vec![OpCode::SysCallStake { validator, amount: floor() }],
+        vec![OpCode::SysCallStake {
+            validator,
+            amount: floor(),
+        }],
     );
-    let (applied, failed, _, _, _) =
-        engine.apply_block_parallel_fees(std::slice::from_ref(&bond_tx), BLOCK_TS).await;
+    let (applied, failed, _, _, _) = engine
+        .apply_block_parallel_fees(std::slice::from_ref(&bond_tx), BLOCK_TS)
+        .await;
     assert_eq!((applied, failed), (1, 0));
     let after_bond = balance(&engine, &validator).await;
     assert_eq!(pool(&engine).await, floor());
@@ -184,9 +208,19 @@ async fn claim_rewards_payout_comes_from_the_rewards_pool_on_the_live_block_path
     // the ledger entry AND the backing coins in REWARDS_POOL (a bare ledger
     // accrual with no backing must not pay, by design — E2).
     let reward = 500_000_000_000u64; // 500 STELL
-    engine.staking_write().await.distribute_reward(validator, reward).unwrap();
-    engine.credit_native(&REWARDS_POOL, reward).await.expect("back the accrual");
-    assert_eq!(engine.staking_read().await.validators[&validator].pending_rewards, reward);
+    engine
+        .staking_write()
+        .await
+        .distribute_reward(validator, reward)
+        .unwrap();
+    engine
+        .credit_native(&REWARDS_POOL, reward)
+        .await
+        .expect("back the accrual");
+    assert_eq!(
+        engine.staking_read().await.validators[&validator].pending_rewards,
+        reward
+    );
 
     // Block 2: claim through the live path.
     let claim_tx = Transaction::sign_with_payload(
@@ -199,8 +233,9 @@ async fn claim_rewards_payout_comes_from_the_rewards_pool_on_the_live_block_path
         1,
         vec![OpCode::SysCallClaimRewards { validator }],
     );
-    let (applied, failed, _fees, status, _) =
-        engine.apply_block_parallel_fees(std::slice::from_ref(&claim_tx), BLOCK_TS).await;
+    let (applied, failed, _fees, status, _) = engine
+        .apply_block_parallel_fees(std::slice::from_ref(&claim_tx), BLOCK_TS)
+        .await;
     assert_eq!((applied, failed), (1, 0), "the claim applies");
     assert_eq!(status, vec![true]);
 
@@ -244,7 +279,9 @@ async fn block_timestamp_reaches_the_vm_unbonding_maturity() {
     let sk = key(0x44);
     let validator = sk.verifying_key().to_bytes();
     let start = floor() + GAS_STAKE_BOND + GAS_STAKE_UNBOND;
-    engine.update_account(AccountState::new(validator, start)).await;
+    engine
+        .update_account(AccountState::new(validator, start))
+        .await;
 
     // Block 1: bond so there is something to unbond.
     let bond_tx = Transaction::sign_with_payload(
@@ -255,10 +292,14 @@ async fn block_timestamp_reaches_the_vm_unbonding_maturity() {
         0,
         1,
         1,
-        vec![OpCode::SysCallStake { validator, amount: floor() }],
+        vec![OpCode::SysCallStake {
+            validator,
+            amount: floor(),
+        }],
     );
-    let (applied, failed, _, _, _) =
-        engine.apply_block_parallel_fees(std::slice::from_ref(&bond_tx), BLOCK_TS).await;
+    let (applied, failed, _, _, _) = engine
+        .apply_block_parallel_fees(std::slice::from_ref(&bond_tx), BLOCK_TS)
+        .await;
     assert_eq!((applied, failed), (1, 0));
 
     // Block 2: full exit, applied at BLOCK_TS.
@@ -270,10 +311,14 @@ async fn block_timestamp_reaches_the_vm_unbonding_maturity() {
         1,
         1,
         1,
-        vec![OpCode::SysCallUnbond { validator, amount: floor() }],
+        vec![OpCode::SysCallUnbond {
+            validator,
+            amount: floor(),
+        }],
     );
-    let (applied, failed, _fees, status, _) =
-        engine.apply_block_parallel_fees(std::slice::from_ref(&unbond_tx), BLOCK_TS).await;
+    let (applied, failed, _fees, status, _) = engine
+        .apply_block_parallel_fees(std::slice::from_ref(&unbond_tx), BLOCK_TS)
+        .await;
     assert_eq!((applied, failed), (1, 0), "the unbond applies");
     assert_eq!(status, vec![true]);
 
@@ -285,21 +330,26 @@ async fn block_timestamp_reaches_the_vm_unbonding_maturity() {
         "maturity is measured from the BLOCK timestamp, not from epoch 0"
     );
     assert_ne!(
-        ledger.unbonding[0].release_at,
-        UNBONDING_PERIOD_SECS,
+        ledger.unbonding[0].release_at, UNBONDING_PERIOD_SECS,
         "0 + UNBONDING_PERIOD_SECS is exactly the hardcoded-timestamp bug"
     );
     drop(ledger);
 
     // The maturity clock is real: the entry must NOT be withdrawable yet, and
     // must be once the block timestamp has advanced past the release time.
-    engine.staking_write().await.process_unbonding(BLOCK_TS + UNBONDING_PERIOD_SECS - 1);
+    engine
+        .staking_write()
+        .await
+        .process_unbonding(BLOCK_TS + UNBONDING_PERIOD_SECS - 1);
     assert_eq!(
         engine.staking_read().await.withdrawable_of(&validator),
         0,
         "not mature one second early"
     );
-    engine.staking_write().await.process_unbonding(BLOCK_TS + UNBONDING_PERIOD_SECS);
+    engine
+        .staking_write()
+        .await
+        .process_unbonding(BLOCK_TS + UNBONDING_PERIOD_SECS);
     assert_eq!(
         engine.staking_read().await.withdrawable_of(&validator),
         floor(),
@@ -316,7 +366,9 @@ async fn block_timestamp_reaches_the_vm_contract_creation_time() {
     let engine = InMemoryStateEngine::new();
     let sk = key(0x55);
     let creator = sk.verifying_key().to_bytes();
-    engine.update_account(AccountState::new(creator, 10_000_000)).await;
+    engine
+        .update_account(AccountState::new(creator, 10_000_000))
+        .await;
 
     let code = wat::parse_str("(module)").expect("wat compiles");
     let tx = Transaction::sign_with_payload(
@@ -329,14 +381,18 @@ async fn block_timestamp_reaches_the_vm_contract_creation_time() {
         1,
         vec![OpCode::SysCallDeployContract { code }],
     );
-    let (applied, failed, _fees, status, _) =
-        engine.apply_block_parallel_fees(std::slice::from_ref(&tx), BLOCK_TS).await;
+    let (applied, failed, _fees, status, _) = engine
+        .apply_block_parallel_fees(std::slice::from_ref(&tx), BLOCK_TS)
+        .await;
     assert_eq!((applied, failed), (1, 0), "the deploy applies");
     assert_eq!(status, vec![true]);
 
     let addresses = engine.all_contract_addresses().await;
     assert_eq!(addresses.len(), 1, "one contract deployed");
-    let contract = engine.get_contract(&addresses[0]).await.expect("contract exists");
+    let contract = engine
+        .get_contract(&addresses[0])
+        .await
+        .expect("contract exists");
     assert_eq!(
         contract.created_at, BLOCK_TS,
         "a contract is created when the block that deployed it says it is"
@@ -360,8 +416,9 @@ async fn run_on_both_paths(
 
     let res = single.apply_transaction(tx, BLOCK_TS).await;
     let single_err = res.is_err();
-    let (applied, failed, _fees, _status, _) =
-        block.apply_block_parallel_fees(std::slice::from_ref(tx), BLOCK_TS).await;
+    let (applied, failed, _fees, _status, _) = block
+        .apply_block_parallel_fees(std::slice::from_ref(tx), BLOCK_TS)
+        .await;
 
     assert_eq!(
         single_err,
@@ -390,14 +447,21 @@ async fn live_block_path_and_single_tx_path_agree_on_a_payload_transfer() {
         0,
         1,
         1,
-        vec![OpCode::Transfer { recipient: payload_to, amount: 7_000 }],
+        vec![OpCode::Transfer {
+            recipient: payload_to,
+            amount: 7_000,
+        }],
     );
 
     let (single, block, applied, failed) = run_on_both_paths(&tx, 1_000_000).await;
     assert_eq!((applied, failed), (1, 0));
 
     for e in [&single, &block] {
-        assert_eq!(balance(e, &payload_to).await, 7_000, "payload transfer credited");
+        assert_eq!(
+            balance(e, &payload_to).await,
+            7_000,
+            "payload transfer credited"
+        );
         assert_eq!(balance(e, &plain_to).await, 2_000, "plain amount credited");
         assert_eq!(
             balance(e, &sender).await,
@@ -442,7 +506,11 @@ async fn unaffordable_payload_transfer_fails_identically_on_both_paths() {
     );
 
     let (single, block, applied, failed) = run_on_both_paths(&tx, funding).await;
-    assert_eq!((applied, failed), (0, 1), "both paths refuse the transaction");
+    assert_eq!(
+        (applied, failed),
+        (0, 1),
+        "both paths refuse the transaction"
+    );
 
     for e in [&single, &block] {
         // No VALUE moves (the atomicity property) - but the failed attempt is
@@ -459,7 +527,11 @@ async fn unaffordable_payload_transfer_fails_identically_on_both_paths() {
             "the failure consumes the nonce"
         );
         assert_eq!(balance(e, &plain_to).await, 0, "no plain amount credited");
-        assert_eq!(balance(e, &payload_to).await, 0, "no payload amount credited");
+        assert_eq!(
+            balance(e, &payload_to).await,
+            0,
+            "no payload amount credited"
+        );
     }
     assert_eq!(
         single.get_state_root().await,

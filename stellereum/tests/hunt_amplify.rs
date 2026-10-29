@@ -118,9 +118,15 @@ fn downtime_slash_keeps_the_delegation_aggregate_consistent() {
     let from_self = 0;
     let _ = from_self;
 
-    println!("one 10-height outage burned {burned} nano = {} STELL", burned / 1_000_000_000);
+    println!(
+        "one 10-height outage burned {burned} nano = {} STELL",
+        burned / 1_000_000_000
+    );
     println!("after:   aggregate = {agg} | map sum = {map}");
-    println!("self_bond = {} STELL", l.validators[&val].self_bond / 1_000_000_000);
+    println!(
+        "self_bond = {} STELL",
+        l.validators[&val].self_bond / 1_000_000_000
+    );
     println!("total_burned = {}", l.total_burned);
 
     // FIXED. Two separate things were wrong on the downtime path, and both are
@@ -167,8 +173,11 @@ fn downtime_slash_cannot_inflate_reward_distribution() {
     let (outages, heights, _) = diverge_to(&mut l, val, 2.0);
     let agg = l.validators[&val].delegated;
     let map = sum_delegations(&l, val);
-    println!("{outages} outages / {heights} heights ({:.1} days at 3s) for a {:.3}x divergence",
-        heights as f64 * 3.0 / 86400.0, map as f64 / agg as f64);
+    println!(
+        "{outages} outages / {heights} heights ({:.1} days at 3s) for a {:.3}x divergence",
+        heights as f64 * 3.0 / 86400.0,
+        map as f64 / agg as f64
+    );
 
     let reward = stell(100);
     l.distribute_reward(val, reward).unwrap();
@@ -178,7 +187,10 @@ fn downtime_slash_cannot_inflate_reward_distribution() {
     // SETTLED part.
     let to_delegator = l.delegator_rewards_of(d(1), val);
     let paid = to_validator + to_delegator;
-    println!("emission authorised: {reward} ({} STELL)", reward / 1_000_000_000);
+    println!(
+        "emission authorised: {reward} ({} STELL)",
+        reward / 1_000_000_000
+    );
     println!("  -> validator   {to_validator}");
     println!("  -> delegator   {to_delegator}");
     println!("  -> TOTAL PAID  {paid}  ({} STELL)", paid / 1_000_000_000);
@@ -231,8 +243,11 @@ fn a_slashed_delegator_recovers_only_what_the_pool_still_holds() {
     let burned = slash_once_offline(&mut l, val, &mut h);
     pool -= burned; // exactly what runtime.rs:633 does
     let agg_after_slash = l.validators[&val].delegated;
-    println!("downtime burn {burned} ({:.0} STELL); aggregate delegated now {}",
-        burned as f64 / 1e9, agg_after_slash / 1_000_000_000);
+    println!(
+        "downtime burn {burned} ({:.0} STELL); aggregate delegated now {}",
+        burned as f64 / 1e9,
+        agg_after_slash / 1_000_000_000
+    );
 
     // The delegator asks for everything it ever delegated.
     let claim = sum_delegations(&l, val);
@@ -241,10 +256,15 @@ fn a_slashed_delegator_recovers_only_what_the_pool_still_holds() {
     let paid = l.withdraw_delegator(d(1), val).unwrap();
     pool -= paid;
 
-    println!("delegator withdrew {paid} ({} STELL) - the stake the slash had already burned",
-        paid / 1_000_000_000);
+    println!(
+        "delegator withdrew {paid} ({} STELL) - the stake the slash had already burned",
+        paid / 1_000_000_000
+    );
     println!("pool left {pool}; the honest validator had {honest_share_before} in there");
-    println!("honest principal silently consumed: {} STELL", (honest_share_before - pool) / 1_000_000_000);
+    println!(
+        "honest principal silently consumed: {} STELL",
+        (honest_share_before - pool) / 1_000_000_000
+    );
 
     // FIXED: the burn now debits the staking pool, so a delegator recovers only
     // what is actually left there. It used to get back 100% of a slashed stake,
@@ -265,7 +285,8 @@ fn a_slashed_delegator_recovers_only_what_the_pool_still_holds() {
     // It used to recover 100% of the pre-slash stake, and the excess came straight
     // out of the honest validator's principal.
     assert_eq!(
-        pool, honest_bond,
+        pool,
+        honest_bond,
         "the honest validator's principal must be exactly intact: {} STELL gone",
         (honest_bond as i64 - pool as i64) / 1_000_000_000
     );
@@ -287,9 +308,14 @@ fn repeated_slashing_cannot_underflow_the_delegated_aggregate() {
     let (outages, heights, _) = diverge_to(&mut l, val, 20.0);
     let agg = l.validators[&val].delegated;
     let map = sum_delegations(&l, val);
-    println!("{outages} downtime streaks / {heights} heights = {:.1} days of sustained downtime",
-        heights as f64 * 3.0 / 86400.0);
-    println!("aggregate {agg} vs map {map} = {:.2}x divergence", map as f64 / agg as f64);
+    println!(
+        "{outages} downtime streaks / {heights} heights = {:.1} days of sustained downtime",
+        heights as f64 * 3.0 / 86400.0
+    );
+    println!(
+        "aggregate {agg} vs map {map} = {:.2}x divergence",
+        map as f64 / agg as f64
+    );
 
     // Now the validator equivocates: 5% of the total.
     let total_before = l.validators[&val].total();
@@ -320,8 +346,12 @@ fn repeated_slashing_cannot_underflow_the_delegated_aggregate() {
             );
         }
         Err(_) => {
-            println!("*** slash PANICKED at src/staking.rs:408: 'attempt to subtract with overflow'");
-            println!("*** an attacker who is also the victim can halt every node that validates this");
+            println!(
+                "*** slash PANICKED at src/staking.rs:408: 'attempt to subtract with overflow'"
+            );
+            println!(
+                "*** an attacker who is also the victim can halt every node that validates this"
+            );
             // Re-run under the real hook so the report shows the panic message.
             let _ = l.slash(val, 500);
         }
@@ -359,7 +389,10 @@ fn slash_silently_forgives_the_rounding_remainder() {
             forgiven <= n_delegators as u64,
             "forgiveness is bounded by 1 nano per delegator, so it is dust"
         );
-        assert_eq!(l.total_burned, burned, "the counter matches what was actually removed");
+        assert_eq!(
+            l.total_burned, burned,
+            "the counter matches what was actually removed"
+        );
     }
     // Uneven delegations do produce a real (still tiny) remainder:
     let mut l = StakingLedger::new();
@@ -371,9 +404,18 @@ fn slash_silently_forgives_the_rounding_remainder() {
     let total = l.total_stake(&val);
     let nominal = (total as u128 * 500 / 10_000) as u64;
     let burned = l.slash(val, 500).unwrap();
-    println!("uneven: nominal {nominal}, burned {burned}, FORGIVEN {}", nominal - burned);
-    assert!(nominal - burned > 0, "an uneven book does leave a remainder unburned");
-    assert!(nominal - burned < 10, "but it is single-digit nanos: not a money bug");
+    println!(
+        "uneven: nominal {nominal}, burned {burned}, FORGIVEN {}",
+        nominal - burned
+    );
+    assert!(
+        nominal - burned > 0,
+        "an uneven book does leave a remainder unburned"
+    );
+    assert!(
+        nominal - burned < 10,
+        "but it is single-digit nanos: not a money bug"
+    );
 }
 
 /// CONTROL: with no divergence the two representations stay in step and the
@@ -395,6 +437,9 @@ fn control_healthy_ledger_conserves_reward_value() {
         "reward {reward} -> validator {} + delegators {to_delegators} = {paid}",
         l.validators[&val].pending_rewards
     );
-    assert!(paid <= reward, "a healthy ledger never pays out more than it was given");
+    assert!(
+        paid <= reward,
+        "a healthy ledger never pays out more than it was given"
+    );
     assert_eq!(l.validators[&val].delegated, sum_delegations(&l, val));
 }

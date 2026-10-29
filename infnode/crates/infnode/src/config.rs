@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub const NODEID_PREFIX: &str = "inf1:";
@@ -63,17 +63,20 @@ impl PeerConfig {
             .strip_prefix(NODEID_PREFIX)
             .unwrap_or(&self.node_id);
         let b = hex::decode(s)?;
-        b.try_into().map_err(|_| anyhow!("node_id должен быть 20 байт"))
+        b.try_into()
+            .map_err(|_| anyhow!("node_id должен быть 20 байт"))
     }
 
     pub fn ed_bytes(&self) -> Result<[u8; 32]> {
         let b = hex::decode(&self.ed_pub)?;
-        b.try_into().map_err(|_| anyhow!("ed_pub должен быть 32 байта"))
+        b.try_into()
+            .map_err(|_| anyhow!("ed_pub должен быть 32 байта"))
     }
 
     pub fn x_bytes(&self) -> Result<[u8; 32]> {
         let b = hex::decode(&self.x_pub)?;
-        b.try_into().map_err(|_| anyhow!("x_pub должен быть 32 байта"))
+        b.try_into()
+            .map_err(|_| anyhow!("x_pub должен быть 32 байта"))
     }
 }
 

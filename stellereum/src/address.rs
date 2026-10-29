@@ -27,7 +27,9 @@ impl std::fmt::Display for AddressError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AddressError::Empty => write!(f, "address is empty"),
-            AddressError::InvalidPrefix => write!(f, "invalid address prefix, expected 'Stl57' or '0x'"),
+            AddressError::InvalidPrefix => {
+                write!(f, "invalid address prefix, expected 'Stl57' or '0x'")
+            }
             AddressError::InvalidLength => write!(f, "invalid address length"),
             AddressError::InvalidBase58 => write!(f, "invalid base58 character in address"),
             AddressError::InvalidChecksum => write!(f, "address checksum mismatch (typo detected)"),
@@ -69,7 +71,9 @@ pub fn parse_address(input: &str) -> Result<[u8; 32], AddressError> {
     }
 
     // Check for Stl57 prefix (case-insensitive on the 5 prefix characters, safe against UTF-8 multi-byte boundaries)
-    if s.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("stl57")) {
+    if s.get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("stl57"))
+    {
         let b58_part = &s[5..];
         // Length pre-check to prevent quadratic big-int CPU exhaustion
         if b58_part.len() < 35 || b58_part.len() > 51 {
@@ -94,7 +98,10 @@ pub fn parse_address(input: &str) -> Result<[u8; 32], AddressError> {
     }
 
     // Fallback: 64-character hex (with optional 0x/0X prefix)
-    let hex_part = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let hex_part = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     if hex_part.len() == 64 {
         let decoded = hex::decode(hex_part).map_err(|_| AddressError::InvalidHex)?;
         let mut addr = [0u8; 32];
@@ -337,7 +344,10 @@ mod tests {
         let salted = derive_pq_address(PqScheme::Ed25519, &pk, &[0x01u8; 16]);
 
         assert_ne!(ed, falcon, "the scheme id must be bound into the address");
-        assert_ne!(ed, salted, "the sub-account salt must be bound into the address");
+        assert_ne!(
+            ed, salted,
+            "the sub-account salt must be bound into the address"
+        );
         assert_ne!(
             derive_pq_address(PqScheme::Ed25519, &pk, &[0x01u8; 16]),
             derive_pq_address(PqScheme::Ed25519, &pk, &[0x02u8; 16]),

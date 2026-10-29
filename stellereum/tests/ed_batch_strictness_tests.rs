@@ -11,9 +11,8 @@ fn mkvote(k: &SigningKey) -> Vote {
 
 // Ed25519 group order L (little-endian).
 const L: [u8; 32] = [
-    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x26, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0x2a,
-    0xde, 0xf9, 0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x26, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0x2a, 0xde, 0xf9, 0xde, 0x14,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
 ];
 
 fn scalar_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
@@ -41,11 +40,17 @@ fn batch_and_scalar_agree_on_valid_and_garbage() {
     let k = SigningKey::generate(&mut OsRng);
     let v = mkvote(&k);
     assert!(v.verify(), "control: valid vote verifies scalar");
-    assert!(Vote::verify_batch(std::slice::from_ref(&v)), "control: valid batch verifies");
+    assert!(
+        Vote::verify_batch(std::slice::from_ref(&v)),
+        "control: valid batch verifies"
+    );
     let mut bad = v.clone();
     bad.signature = vec![0x77u8; 64];
     assert!(!bad.verify(), "garbage refused scalar");
-    assert!(!Vote::verify_batch(std::slice::from_ref(&bad)), "garbage refused batch");
+    assert!(
+        !Vote::verify_batch(std::slice::from_ref(&bad)),
+        "garbage refused batch"
+    );
 }
 
 #[test]

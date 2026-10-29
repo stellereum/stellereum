@@ -49,7 +49,11 @@ fn lan_cluster() -> ConsensusCluster {
     let profiles: Vec<NodeProfile> = POWERS
         .iter()
         .zip(DELAYS.iter())
-        .map(|(p, d)| NodeProfile::default().with_power(*p).with_inbound_delay_ms(*d))
+        .map(|(p, d)| {
+            NodeProfile::default()
+                .with_power(*p)
+                .with_inbound_delay_ms(*d)
+        })
         .collect();
     ConsensusCluster::build(4, profiles, 0xBEEF1AAD, TICK_MS, ROUND_TIMEOUT_MS)
 }
@@ -108,15 +112,31 @@ async fn lan_profile_100_blocks_tempo() {
         assert_eq!(hs.len(), 1, "FORK at height {h}");
     }
     for node in &report.nodes {
-        assert_eq!(node.finalized.len() as u64, HEIGHTS + 1, "node {} non-contiguous", node.index);
-        assert!(report.double_votes(&[]).is_empty(), "double vote: {}", report.diagnostics());
+        assert_eq!(
+            node.finalized.len() as u64,
+            HEIGHTS + 1,
+            "node {} non-contiguous",
+            node.index
+        );
+        assert!(
+            report.double_votes(&[]).is_empty(),
+            "double vote: {}",
+            report.diagnostics()
+        );
     }
     let roots: Vec<_> = report.nodes.iter().map(|n| n.state_root).collect();
-    assert!(roots.windows(2).all(|w| w[0] == w[1]), "state root divergence");
+    assert!(
+        roots.windows(2).all(|w| w[0] == w[1]),
+        "state root divergence"
+    );
 
     // Tempo table (warmup height excluded from every stat).
     let (mean, p50, p99, max) = stats(per_height_ms);
-    let decide: Vec<u32> = report.nodes.iter().flat_map(|n| n.decide_rounds.iter().skip(1).copied()).collect();
+    let decide: Vec<u32> = report
+        .nodes
+        .iter()
+        .flat_map(|n| n.decide_rounds.iter().skip(1).copied())
+        .collect();
     let total_rounds: u32 = decide.iter().sum();
     let max_round = decide.iter().copied().max().unwrap_or(0);
     let heights = HEIGHTS as f64 * report.nodes.len() as f64;
@@ -129,22 +149,44 @@ async fn lan_profile_100_blocks_tempo() {
     for n in &report.nodes {
         println!("[tempo][lan] node{} finalized={} prevotes={} precommits={} proposals_rx={} sync_jumps={}",
             n.index, n.finalized_height, n.prevotes_cast, n.precommits_cast, n.proposals_received, n.sync_jumps);
-        let nz: Vec<(usize, u32)> = n.decide_rounds.iter().enumerate().filter(|(_, r)| **r > 0).map(|(i, r)| (i + 1, *r)).collect();
+        let nz: Vec<(usize, u32)> = n
+            .decide_rounds
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| **r > 0)
+            .map(|(i, r)| (i + 1, *r))
+            .collect();
         println!("[tempo][lan] node{} nonzero_rounds={nz:?}", n.index);
     }
 
     // Bands: the 0.5s budget holds on the LAN profile with room to spare,
     // and rounds stay synchronized (no view-change storms).
-    assert!(mean <= 500.0, "mean block time {mean:.1}ms exceeds 500ms budget");
-    assert!(p99 <= ROUND_TIMEOUT_MS, "p99 {p99}ms hit the round timeout (storm)");
-    assert!(max_round <= 1, "a height burned {max_round} rounds on a LAN profile");
-    assert!(total_rounds == 0, "expected zero view changes, burned {total_rounds}");
+    assert!(
+        mean <= 500.0,
+        "mean block time {mean:.1}ms exceeds 500ms budget"
+    );
+    assert!(
+        p99 <= ROUND_TIMEOUT_MS,
+        "p99 {p99}ms hit the round timeout (storm)"
+    );
+    assert!(
+        max_round <= 1,
+        "a height burned {max_round} rounds on a LAN profile"
+    );
+    assert!(
+        total_rounds == 0,
+        "expected zero view changes, burned {total_rounds}"
+    );
 
     // Determinism: an identical run prints the identical fingerprint.
     let mut c2 = lan_cluster();
     c2.seed_transactions_multi(20, 110).await;
     let r2 = c2.run_until(HEIGHTS + 1, BUDGET_MS).await;
-    assert_eq!(report.fingerprint(), r2.fingerprint(), "tempo proof must be deterministic");
+    assert_eq!(
+        report.fingerprint(),
+        r2.fingerprint(),
+        "tempo proof must be deterministic"
+    );
 }
 
 /// WAN CONTRAST — the residual gap, measured. Same code, same 50ms tick, but
@@ -162,7 +204,11 @@ async fn wan_contrast_profile_shows_the_residual_gap() {
     let profiles: Vec<NodeProfile> = POWERS
         .iter()
         .zip(W_DELAYS.iter())
-        .map(|(p, d)| NodeProfile::default().with_power(*p).with_inbound_delay_ms(*d))
+        .map(|(p, d)| {
+            NodeProfile::default()
+                .with_power(*p)
+                .with_inbound_delay_ms(*d)
+        })
         .collect();
     let mut c = ConsensusCluster::build(4, profiles, 0xBEEF1AAD, W_TICK, W_TIMEOUT);
     c.seed_transactions_multi(20, 30).await;
@@ -177,7 +223,11 @@ async fn wan_contrast_profile_shows_the_residual_gap() {
     }
     let report = c.run_until(W_HEIGHTS + 1, BUDGET_MS).await;
     let (mean, p50, p99, max) = stats(dts);
-    let extra: u32 = report.nodes.iter().flat_map(|n| n.decide_rounds.iter().skip(1).copied()).sum();
+    let extra: u32 = report
+        .nodes
+        .iter()
+        .flat_map(|n| n.decide_rounds.iter().skip(1).copied())
+        .sum();
     println!("[tempo][wan] heights={W_HEIGHTS} tick={W_TICK}ms timeout={W_TIMEOUT}ms delays={W_DELAYS:?}");
     println!("[tempo][wan] virtual_mean={mean:.0}ms p50={p50}ms p99={p99}ms max={max}ms extra_rounds={extra} wall={:.0}ms",
         wall0.elapsed().as_secs_f64() * 1000.0);

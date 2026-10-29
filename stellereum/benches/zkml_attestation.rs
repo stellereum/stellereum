@@ -21,7 +21,12 @@ use std::time::Instant;
 use stellereum::zkml::{QuantizedLayer, QuantizedLinearModel, ZkMlProof};
 
 fn ref_model() -> QuantizedLinearModel {
-    QuantizedLinearModel::new(vec![QuantizedLayer::new(2, 2, vec![2, -1, 1, 3], vec![1, -2])])
+    QuantizedLinearModel::new(vec![QuantizedLayer::new(
+        2,
+        2,
+        vec![2, -1, 1, 3],
+        vec![1, -2],
+    )])
 }
 
 fn time_ms(reps: u32, f: impl Fn()) -> f64 {

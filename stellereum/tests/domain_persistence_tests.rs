@@ -67,8 +67,8 @@ fn block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u8; 32])
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
-            order_merkle_root,
-            epoch_key_commitment: [0u8; 32],
+        order_merkle_root,
+        epoch_key_commitment: [0u8; 32],
     }
 }
 
@@ -91,14 +91,20 @@ fn confidential_tx(
 ) -> Transaction {
     // Shield + enforced-transfer bundle (audit 2026-10-06 F-A): the only way
     // to fund inputs under the ownership rule. Zero fee here.
-    use stellereum::crypto_privacy::RangeProof;
     use curve25519_dalek::scalar::Scalar;
+    use stellereum::crypto_privacy::RangeProof;
     let r = Scalar::from(0x5EED_u64);
     let in_val = 1_000u64;
     let inp = &transfer.input_commitments;
     let outp = &transfer.output_commitments;
-    let input_ranges: Vec<RangeProof> = inp.iter().map(|c| RangeProof::prove(c, in_val, &r, 32)).collect();
-    let output_ranges: Vec<RangeProof> = outp.iter().map(|c| RangeProof::prove(c, in_val, &r, 32)).collect();
+    let input_ranges: Vec<RangeProof> = inp
+        .iter()
+        .map(|c| RangeProof::prove(c, in_val, &r, 32))
+        .collect();
+    let output_ranges: Vec<RangeProof> = outp
+        .iter()
+        .map(|c| RangeProof::prove(c, in_val, &r, 32))
+        .collect();
     Transaction::sign_with_payload(
         sk,
         [0xEE; 32],
@@ -146,7 +152,12 @@ fn register_tx(
 }
 
 fn ref_model() -> QuantizedLinearModel {
-    QuantizedLinearModel::new(vec![QuantizedLayer::new(2, 2, vec![2, -1, 1, 3], vec![1, -2])])
+    QuantizedLinearModel::new(vec![QuantizedLayer::new(
+        2,
+        2,
+        vec![2, -1, 1, 3],
+        vec![1, -2],
+    )])
 }
 
 async fn persisted_snapshot_dir(
@@ -181,7 +192,12 @@ async fn persisted_snapshot_dir(
     // Anchor block at snap_h+1 committing to the post-snapshot root, which is
     // what the restore verifier compares against.
     let ask = key(0x11);
-    let mut anchor = block(snap_h + 1, TS + snap_h + 1, vec![], ask.verifying_key().to_bytes());
+    let mut anchor = block(
+        snap_h + 1,
+        TS + snap_h + 1,
+        vec![],
+        ask.verifying_key().to_bytes(),
+    );
     anchor.state_root = root;
     anchor.sign_block(&ask);
     let anchor_hash = store.put_block(&anchor).expect("anchor");
@@ -270,7 +286,11 @@ async fn confidential_spent_set_survives_snapshot_and_restore() {
     let out = fresh
         .apply_block_transition(&block(2, TS + 1, vec![replay], payer_pk), 0)
         .await;
-    assert_eq!(out.status, vec![false], "double-spend refused after restore");
+    assert_eq!(
+        out.status,
+        vec![false],
+        "double-spend refused after restore"
+    );
     // The refused replay moves no VALUE (the confidential ledger is
     // untouched - see the assertion below), but the failed attempt is not
     // free: it pays the F-01 failure fee it declared, so the root moves by

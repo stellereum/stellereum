@@ -171,7 +171,11 @@ fn opcode46_falcon512_execution() {
     let res = Svm::execute(&[op_valid], 100_000, &mut ctx);
     match res {
         VmExecutionResult::Success { return_value, .. } => {
-            assert_eq!(return_value, Some(1), "valid Falcon-512 signature must push 1");
+            assert_eq!(
+                return_value,
+                Some(1),
+                "valid Falcon-512 signature must push 1"
+            );
         }
         other => panic!("expected Success, got {other:?}"),
     }
@@ -190,7 +194,11 @@ fn opcode46_falcon512_execution() {
     let res = Svm::execute(&[op_bad_sig], 100_000, &mut ctx);
     match res {
         VmExecutionResult::Success { return_value, .. } => {
-            assert_eq!(return_value, Some(0), "tampered Falcon-512 signature must push 0");
+            assert_eq!(
+                return_value,
+                Some(0),
+                "tampered Falcon-512 signature must push 0"
+            );
         }
         other => panic!("expected Success, got {other:?}"),
     }
@@ -232,7 +240,11 @@ fn opcode46_mldsa44_execution() {
     let res = Svm::execute(&[op_bad_sig], 100_000, &mut ctx);
     match res {
         VmExecutionResult::Success { return_value, .. } => {
-            assert_eq!(return_value, Some(0), "tampered ML-DSA-44 signature must push 0");
+            assert_eq!(
+                return_value,
+                Some(0),
+                "tampered ML-DSA-44 signature must push 0"
+            );
         }
         other => panic!("expected Success, got {other:?}"),
     }
@@ -272,7 +284,11 @@ fn opcode46_hybrid_execution() {
     let res = Svm::execute(&[op_bad_ed], 100_000, &mut ctx);
     match res {
         VmExecutionResult::Success { return_value, .. } => {
-            assert_eq!(return_value, Some(0), "tampered Ed25519 portion of hybrid must push 0");
+            assert_eq!(
+                return_value,
+                Some(0),
+                "tampered Ed25519 portion of hybrid must push 0"
+            );
         }
         other => panic!("expected Success, got {other:?}"),
     }
@@ -290,7 +306,11 @@ fn opcode46_hybrid_execution() {
     let res = Svm::execute(&[op_bad_falcon], 100_000, &mut ctx);
     match res {
         VmExecutionResult::Success { return_value, .. } => {
-            assert_eq!(return_value, Some(0), "tampered Falcon portion of hybrid must push 0");
+            assert_eq!(
+                return_value,
+                Some(0),
+                "tampered Falcon portion of hybrid must push 0"
+            );
         }
         other => panic!("expected Success, got {other:?}"),
     }
@@ -317,7 +337,8 @@ fn opcode46_unknown_scheme_id_pushes_zero() {
 #[test]
 fn opcode46_gas_metering_and_schedule_shape() {
     let msg_short = b"short";
-    let msg_long = b"this is a much longer message to verify per-byte gas metering in SVM opcode 46";
+    let msg_long =
+        b"this is a much longer message to verify per-byte gas metering in SVM opcode 46";
     let (pk, sig) = sample_ed25519(1, msg_short);
 
     let op_short = OpCode::SysCallVerifyPqSignature {
@@ -340,7 +361,10 @@ fn opcode46_gas_metering_and_schedule_shape() {
     let wire_short = (pk.len() + msg_short.len() + sig.len()) as u64;
     let expected_short = GAS_PQ_VERIFY_BASE + wire_short * GAS_PQ_VERIFY_PER_BYTE;
     assert_eq!(cost_short, expected_short);
-    assert_eq!(cost_short, pq_verify_gas(pk.len(), msg_short.len(), sig.len()));
+    assert_eq!(
+        cost_short,
+        pq_verify_gas(pk.len(), msg_short.len(), sig.len())
+    );
 
     let wire_long = (pk.len() + msg_long.len() + sig.len()) as u64;
     let expected_long = GAS_PQ_VERIFY_BASE + wire_long * GAS_PQ_VERIFY_PER_BYTE;
@@ -348,7 +372,10 @@ fn opcode46_gas_metering_and_schedule_shape() {
 
     // Longer message costs more gas
     assert!(cost_long > cost_short);
-    assert_eq!(cost_long - cost_short, ((msg_long.len() - msg_short.len()) as u64) * GAS_PQ_VERIFY_PER_BYTE);
+    assert_eq!(
+        cost_long - cost_short,
+        ((msg_long.len() - msg_short.len()) as u64) * GAS_PQ_VERIFY_PER_BYTE
+    );
 
     // Exact gas consumed in execution
     let mut ctx = mk_ctx(10_000);
@@ -377,13 +404,20 @@ fn opcode46_out_of_gas_behavior() {
     // 1 gas unit short -> OutOfGas
     let mut ctx = mk_ctx(10_000);
     let res = Svm::execute(std::slice::from_ref(&op), cost - 1, &mut ctx);
-    assert!(matches!(res, VmExecutionResult::OutOfGas), "limit = cost - 1 must return OutOfGas");
+    assert!(
+        matches!(res, VmExecutionResult::OutOfGas),
+        "limit = cost - 1 must return OutOfGas"
+    );
 
     // Exact gas -> Success
     let mut ctx = mk_ctx(10_000);
     let res = Svm::execute(std::slice::from_ref(&op), cost, &mut ctx);
     match res {
-        VmExecutionResult::Success { gas_used, return_value, .. } => {
+        VmExecutionResult::Success {
+            gas_used,
+            return_value,
+            ..
+        } => {
             assert_eq!(gas_used, cost);
             assert_eq!(return_value, Some(1));
         }
@@ -394,7 +428,10 @@ fn opcode46_out_of_gas_behavior() {
     let seq = vec![OpCode::Push(42), op];
     let mut ctx = mk_ctx(10_000);
     let res = Svm::execute(&seq, GAS_PUSH + cost - 1, &mut ctx);
-    assert!(matches!(res, VmExecutionResult::OutOfGas), "insufficient gas for OpCode 46 mid-sequence must return OutOfGas");
+    assert!(
+        matches!(res, VmExecutionResult::OutOfGas),
+        "insufficient gas for OpCode 46 mid-sequence must return OutOfGas"
+    );
 }
 
 #[test]
@@ -429,7 +466,11 @@ fn opcode46_multi_scheme_sequence() {
     let mut ctx = mk_ctx(10_000);
     let res = Svm::execute(&prog, total_cost, &mut ctx);
     match res {
-        VmExecutionResult::Success { gas_used, return_value, .. } => {
+        VmExecutionResult::Success {
+            gas_used,
+            return_value,
+            ..
+        } => {
             assert_eq!(gas_used, total_cost);
             // Last op is ML-DSA-44, disabled fail-closed -> pushes 0.
             assert_eq!(return_value, Some(0));

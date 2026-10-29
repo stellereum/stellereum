@@ -56,7 +56,11 @@ fn snapshot_probe_pacing_is_linear_and_capped() {
     assert_eq!(snapshot_probe_pace_ms(1), 20);
     assert_eq!(snapshot_probe_pace_ms(5), 100);
     assert_eq!(snapshot_probe_pace_ms(10), 200);
-    assert_eq!(snapshot_probe_pace_ms(100), 200, "capped so a long miss run cannot stall a tick");
+    assert_eq!(
+        snapshot_probe_pace_ms(100),
+        200,
+        "capped so a long miss run cannot stall a tick"
+    );
 }
 
 #[test]
@@ -66,7 +70,10 @@ fn stale_pushes_are_skipped_only_while_far_behind() {
     // In-sync nodes behave byte-identically to before (no skip).
     assert!(!should_skip_retro_while_behind(74200, 74200));
     assert!(!should_skip_retro_while_behind(74199, 74200));
-    assert!(!should_skip_retro_while_behind(74200, 74100), "peer behind us is never a skip");
+    assert!(
+        !should_skip_retro_while_behind(74200, 74100),
+        "peer behind us is never a skip"
+    );
     assert!(!should_skip_retro_while_behind(
         74200 - RETRO_SKIP_BEHIND_GAP,
         74200
@@ -80,7 +87,10 @@ fn stale_pushes_are_skipped_only_while_far_behind() {
 #[test]
 fn fetch_concurrency_bound_is_eight_like_adopt_repl() {
     assert_eq!(FETCH_MAX_CONCURRENCY, 8);
-    assert_eq!(FETCH_MAX_CONCURRENCY, stellereum::sync::ADOPT_REPL_MAX_CONCURRENCY);
+    assert_eq!(
+        FETCH_MAX_CONCURRENCY,
+        stellereum::sync::ADOPT_REPL_MAX_CONCURRENCY
+    );
 }
 
 /// Sequential walk on a slow link converges with NO parallelism.
@@ -120,8 +130,10 @@ async fn slow_walk_converges_with_no_parallelism() {
         prev = b.compute_hash();
         blocks.push(b);
     }
-    let map: HashMap<[u8; 32], stellereum::sharding::Block> =
-        blocks.iter().map(|b| (b.compute_hash(), b.clone())).collect();
+    let map: HashMap<[u8; 32], stellereum::sharding::Block> = blocks
+        .iter()
+        .map(|b| (b.compute_hash(), b.clone()))
+        .collect();
     let genesis = blocks[0].compute_hash();
     let head = blocks[n as usize].compute_hash();
 
@@ -186,7 +198,11 @@ async fn bounded_backfill_on_weak_link_converges_without_storm() {
         done.push(h.await.unwrap());
     }
     done.sort_unstable();
-    assert_eq!(done.len(), 64, "every height in the window completes: convergence");
+    assert_eq!(
+        done.len(),
+        64,
+        "every height in the window completes: convergence"
+    );
     assert_eq!(done[0], 72416);
     assert_eq!(*done.last().unwrap(), 72479);
     let max = max_seen.load(Ordering::SeqCst);
@@ -194,5 +210,8 @@ async fn bounded_backfill_on_weak_link_converges_without_storm() {
         max <= FETCH_MAX_CONCURRENCY,
         "max in-flight {max} exceeds the {FETCH_MAX_CONCURRENCY} cap (storm)"
     );
-    assert!(max > 1, "test must actually exercise parallelism (max={max})");
+    assert!(
+        max > 1,
+        "test must actually exercise parallelism (max={max})"
+    );
 }

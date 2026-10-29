@@ -95,7 +95,9 @@ fn echo(_ctx: Ctx<'_>, payload: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>>> {
 
 fn ping(_ctx: Ctx<'_>, _payload: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>>> {
     Box::pin(async move {
-        Ok(json!({ "pong": true, "at": now_ms() }).to_string().into_bytes())
+        Ok(json!({ "pong": true, "at": now_ms() })
+            .to_string()
+            .into_bytes())
     })
 }
 
@@ -106,7 +108,9 @@ fn perf(_ctx: Ctx<'_>, payload: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>>> {
 /// Однонаправленный upload: принимаем payload, отвечаем маленьким ack (не эхом).
 fn perf_up(_ctx: Ctx<'_>, payload: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>>> {
     Box::pin(async move {
-        Ok(json!({ "ok": true, "received": payload.len() }).to_string().into_bytes())
+        Ok(json!({ "ok": true, "received": payload.len() })
+            .to_string()
+            .into_bytes())
     })
 }
 
@@ -124,7 +128,11 @@ fn perf_down(_ctx: Ctx<'_>, payload: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>>> 
 }
 
 fn poke(ctx: Ctx<'_>, _payload: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>>> {
-    Box::pin(async move { Ok(json!({ "observed": ctx.peer_addr.to_string() }).to_string().into_bytes()) })
+    Box::pin(async move {
+        Ok(json!({ "observed": ctx.peer_addr.to_string() })
+            .to_string()
+            .into_bytes())
+    })
 }
 
 fn info(ctx: Ctx<'_>, _payload: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>>> {
@@ -185,7 +193,11 @@ fn dir_size(path: &Path) -> u64 {
 }
 
 fn dht(_ctx: Ctx<'_>, _payload: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>>> {
-    Box::pin(async move { Ok(json!({ "dht": "phase2-not-implemented" }).to_string().into_bytes()) })
+    Box::pin(async move {
+        Ok(json!({ "dht": "phase2-not-implemented" })
+            .to_string()
+            .into_bytes())
+    })
 }
 
 pub fn invoke(handler: Handler, ctx: Ctx<'_>, payload: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>>> {

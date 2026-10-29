@@ -62,7 +62,10 @@ fn real_validator_set_has_a_reachable_quorum() {
     let q = v.quorum_power();
     assert_eq!(v.total_power(), 3_000);
     assert_eq!(q, (3_000 * 2) / 3 + 1);
-    assert!(q > 0 && q <= v.total_power(), "a real set must be able to finalise");
+    assert!(
+        q > 0 && q <= v.total_power(),
+        "a real set must be able to finalise"
+    );
 }
 
 #[test]

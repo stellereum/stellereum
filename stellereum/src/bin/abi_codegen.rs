@@ -286,7 +286,9 @@ fn generate_rust(abi: &ContractAbi, source: &str) -> String {
     out.push_str("    /// Build a client from the embedded manifest.\n");
     out.push_str("    pub fn new() -> Self {\n        Self { abi: abi().clone() }\n    }\n\n");
     out.push_str("    /// Build a client from an explicit manifest.\n");
-    out.push_str("    pub fn with_abi(abi: ContractAbi) -> Self {\n        Self { abi }\n    }\n\n");
+    out.push_str(
+        "    pub fn with_abi(abi: ContractAbi) -> Self {\n        Self { abi }\n    }\n\n",
+    );
     out.push_str("    /// The manifest this client speaks.\n");
     out.push_str("    pub fn abi(&self) -> &ContractAbi {\n        &self.abi\n    }\n\n");
     out.push_str("    /// Encode a full call payload (method selector + arguments).\n");
@@ -369,7 +371,10 @@ fn generate_rust(abi: &ContractAbi, source: &str) -> String {
         out.push_str(&format!(
             "pub fn decode_{ident}_event(bytes: &[u8]) -> Result<(Vec<AbiValue>, Vec<AbiValue>), AbiError> {{\n"
         ));
-        out.push_str(&format!("    abi().decode_event(\"{}\", bytes)\n}}\n\n", e.name));
+        out.push_str(&format!(
+            "    abi().decode_event(\"{}\", bytes)\n}}\n\n",
+            e.name
+        ));
     }
 
     // Typed event structs: one per event, with named fields.
@@ -400,7 +405,9 @@ fn generate_rust(abi: &ContractAbi, source: &str) -> String {
             "        let (topics, data) = abi().decode_event(\"{}\", bytes)?;\n",
             e.name
         ));
-        out.push_str("        let mut topic_index = 0usize;\n        let mut data_index = 0usize;\n");
+        out.push_str(
+            "        let mut topic_index = 0usize;\n        let mut data_index = 0usize;\n",
+        );
         for (i, p) in e.topics.iter().enumerate() {
             let field = rust_ident(&p.name);
             out.push_str(&format!(
@@ -416,14 +423,9 @@ fn generate_rust(abi: &ContractAbi, source: &str) -> String {
             ));
         }
         out.push_str("        let _ = (&mut topic_index, &mut data_index);\n");
-        out.push_str(&format!(
-            "        Ok({struct_name} {{\n"
-        ));
+        out.push_str(&format!("        Ok({struct_name} {{\n"));
         for p in e.topics.iter().chain(e.data.iter()) {
-            out.push_str(&format!(
-                "            {},\n",
-                rust_ident(&p.name)
-            ));
+            out.push_str(&format!("            {},\n", rust_ident(&p.name)));
         }
         out.push_str("        })\n    }\n}\n\n");
     }
@@ -508,7 +510,10 @@ fn generate_ts(abi: &ContractAbi, source: &str) -> String {
             "  async {ident}({}): Promise<Uint8Array> {{\n",
             params.join(", ")
         ));
-        out.push_str(&format!("    return encodeCall(this.abi, \"{}\", [", m.name));
+        out.push_str(&format!(
+            "    return encodeCall(this.abi, \"{}\", [",
+            m.name
+        ));
         out.push_str(
             &m.params
                 .iter()

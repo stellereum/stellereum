@@ -192,9 +192,13 @@ impl std::fmt::Display for ContractError {
             ContractError::OutOfFuel => "contract ran out of fuel",
             ContractError::Trapped => "contract trapped during execution",
             ContractError::Overflow => "contract id space exhausted",
-            ContractError::UnresolvableImports => "contract imports something the host does not provide",
+            ContractError::UnresolvableImports => {
+                "contract imports something the host does not provide"
+            }
             ContractError::InvalidAbi(m) => return write!(f, "invalid contract ABI manifest: {m}"),
-            ContractError::AbiMismatch(m) => return write!(f, "call does not match the contract ABI: {m}"),
+            ContractError::AbiMismatch(m) => {
+                return write!(f, "call does not match the contract ABI: {m}")
+            }
         };
         write!(f, "{s}")
     }
@@ -543,7 +547,8 @@ impl ContractRegistry {
     ) -> Result<[u8; 32], ContractError> {
         Self::validate_code(&code)?;
         if let Some(a) = &abi {
-            a.validate().map_err(|e| ContractError::InvalidAbi(e.to_string()))?;
+            a.validate()
+                .map_err(|e| ContractError::InvalidAbi(e.to_string()))?;
         }
         let address = contract_address(&creator, self.next_nonce);
         if self.contracts.contains_key(&address) {
@@ -583,7 +588,10 @@ impl ContractRegistry {
         source_hash: [u8; 32],
         caller: [u8; 32],
     ) -> Result<(), ContractError> {
-        let c = self.contracts.get_mut(address).ok_or(ContractError::NotFound)?;
+        let c = self
+            .contracts
+            .get_mut(address)
+            .ok_or(ContractError::NotFound)?;
         if c.creator != caller {
             return Err(ContractError::NotFound); // only creator may register
         }
@@ -604,13 +612,13 @@ impl ContractRegistry {
     }
 
     /// Attach (or replace) the ABI manifest of a deployed contract.
-    pub fn set_abi(
-        &mut self,
-        address: &[u8; 32],
-        abi: ContractAbi,
-    ) -> Result<(), ContractError> {
-        abi.validate().map_err(|e| ContractError::InvalidAbi(e.to_string()))?;
-        let c = self.contracts.get_mut(address).ok_or(ContractError::NotFound)?;
+    pub fn set_abi(&mut self, address: &[u8; 32], abi: ContractAbi) -> Result<(), ContractError> {
+        abi.validate()
+            .map_err(|e| ContractError::InvalidAbi(e.to_string()))?;
+        let c = self
+            .contracts
+            .get_mut(address)
+            .ok_or(ContractError::NotFound)?;
         c.abi = Some(abi);
         Ok(())
     }
@@ -626,13 +634,19 @@ impl ContractRegistry {
     }
 
     pub fn set_balance(&mut self, address: &[u8; 32], balance: u64) -> Result<(), ContractError> {
-        let c = self.contracts.get_mut(address).ok_or(ContractError::NotFound)?;
+        let c = self
+            .contracts
+            .get_mut(address)
+            .ok_or(ContractError::NotFound)?;
         c.balance = balance;
         Ok(())
     }
 
     pub fn deposit(&mut self, address: &[u8; 32], amount: u64) -> Result<(), ContractError> {
-        let c = self.contracts.get_mut(address).ok_or(ContractError::NotFound)?;
+        let c = self
+            .contracts
+            .get_mut(address)
+            .ok_or(ContractError::NotFound)?;
         c.balance = c.balance.saturating_add(amount);
         Ok(())
     }
@@ -650,7 +664,10 @@ impl ContractRegistry {
     }
 
     pub fn pause(&mut self, address: &[u8; 32], caller: [u8; 32]) -> Result<(), ContractError> {
-        let c = self.contracts.get_mut(address).ok_or(ContractError::NotFound)?;
+        let c = self
+            .contracts
+            .get_mut(address)
+            .ok_or(ContractError::NotFound)?;
         if c.creator != caller {
             return Err(ContractError::NotFound); // only creator may pause
         }
@@ -667,8 +684,14 @@ impl ContractRegistry {
         arg: i64,
         fuel: u64,
     ) -> Result<(i64, u64, Vec<ContractEvent>, Vec<ContractMessage>), ContractError> {
-        let outcome = self.call_with_context(address, method, arg, fuel, &ContractCallContext::default())?;
-        Ok((outcome.result, outcome.fuel_used, outcome.events, outcome.outbound_messages))
+        let outcome =
+            self.call_with_context(address, method, arg, fuel, &ContractCallContext::default())?;
+        Ok((
+            outcome.result,
+            outcome.fuel_used,
+            outcome.events,
+            outcome.outbound_messages,
+        ))
     }
 
     /// Call an exported method that takes several `i64` parameters.
@@ -692,7 +715,12 @@ impl ContractRegistry {
             fuel,
             &ContractCallContext::default(),
         )?;
-        Ok((outcome.result, outcome.fuel_used, outcome.events, outcome.outbound_messages))
+        Ok((
+            outcome.result,
+            outcome.fuel_used,
+            outcome.events,
+            outcome.outbound_messages,
+        ))
     }
 
     /// Call an exported `(i64) -> i64` method with full execution context and return outcome.
@@ -746,22 +774,26 @@ impl ContractRegistry {
         fuel: u64,
         ctx: &ContractCallContext,
     ) -> Result<ContractOutcome, ContractError> {
-        let contract = self.contracts.get_mut(address).ok_or(ContractError::NotFound)?;
+        let contract = self
+            .contracts
+            .get_mut(address)
+            .ok_or(ContractError::NotFound)?;
         if contract.paused {
             return Err(ContractError::Paused);
         }
         let fuel = fuel.min(MAX_CONTRACT_FUEL);
-        let (out, used, new_storage, new_balance, events, outbound_messages, return_data) = run_contract(
-            *address,
-            &contract.code,
-            &contract.storage,
-            contract.balance,
-            method,
-            args,
-            calldata,
-            fuel,
-            ctx,
-        )?;
+        let (out, used, new_storage, new_balance, events, outbound_messages, return_data) =
+            run_contract(
+                *address,
+                &contract.code,
+                &contract.storage,
+                contract.balance,
+                method,
+                args,
+                calldata,
+                fuel,
+                ctx,
+            )?;
         contract.storage = new_storage;
         contract.balance = new_balance;
         self.last_return_data = return_data.clone();
@@ -815,10 +847,9 @@ impl ContractRegistry {
         args: &[AbiValue],
     ) -> Result<(Vec<i64>, Vec<u8>), ContractError> {
         let contract = self.contracts.get(address).ok_or(ContractError::NotFound)?;
-        let abi = contract
-            .abi
-            .as_ref()
-            .ok_or_else(|| ContractError::AbiMismatch("contract has no ABI manifest".to_string()))?;
+        let abi = contract.abi.as_ref().ok_or_else(|| {
+            ContractError::AbiMismatch("contract has no ABI manifest".to_string())
+        })?;
         let m = abi
             .method(method)
             .ok_or_else(|| ContractError::AbiMismatch(format!("unknown method: {method}")))?;
@@ -871,7 +902,8 @@ impl ContractRegistry {
         args: &[i64],
         fuel_limit: Option<u64>,
     ) -> GetMethodResponse {
-        self.run_get_method_inner(address, method, args, &[], fuel_limit).0
+        self.run_get_method_inner(address, method, args, &[], fuel_limit)
+            .0
     }
 
     /// Same as [`ContractRegistry::run_get_method`] but also returns the raw
@@ -886,10 +918,18 @@ impl ContractRegistry {
     ) -> (GetMethodResponse, Vec<u8>) {
         let contract = match self.contracts.get(address) {
             Some(c) => c,
-            None => return (GetMethodResponse::error("contract not found", 0), Vec::new()),
+            None => {
+                return (
+                    GetMethodResponse::error("contract not found", 0),
+                    Vec::new(),
+                )
+            }
         };
         if contract.paused {
-            return (GetMethodResponse::error("contract is paused", 0), Vec::new());
+            return (
+                GetMethodResponse::error("contract is paused", 0),
+                Vec::new(),
+            );
         }
 
         let fuel = fuel_limit
@@ -1014,12 +1054,7 @@ impl ContractRegistry {
         };
         let abi = match &contract.abi {
             Some(a) => a,
-            None => {
-                return GetMethodResponse::error(
-                    "contract has no ABI manifest attached",
-                    0,
-                )
-            }
+            None => return GetMethodResponse::error("contract has no ABI manifest attached", 0),
         };
         if let Err(e) = abi.validate_args(method, args) {
             return GetMethodResponse::error(format!("ABI validation failed: {e}"), 0);
@@ -1110,7 +1145,9 @@ fn read_wasm_memory(
     len: usize,
 ) -> Result<Vec<u8>, wasmi::Error> {
     if ptr < 0 {
-        return Err(wasmi::Error::new("memory pointer out of bounds: negative pointer"));
+        return Err(wasmi::Error::new(
+            "memory pointer out of bounds: negative pointer",
+        ));
     }
     let offset = ptr as usize;
     let mem = get_memory(caller)?;
@@ -1131,7 +1168,9 @@ fn write_wasm_memory(
     bytes: &[u8],
 ) -> Result<(), wasmi::Error> {
     if ptr < 0 {
-        return Err(wasmi::Error::new("memory pointer out of bounds: negative pointer"));
+        return Err(wasmi::Error::new(
+            "memory pointer out of bounds: negative pointer",
+        ));
     }
     let offset = ptr as usize;
     let mem = get_memory(caller)?;
@@ -1151,31 +1190,54 @@ fn write_wasm_memory(
 /// closed: no clock, no network, no filesystem, no host memory.
 fn host_linker(engine: &Engine) -> Linker<HostState> {
     let mut linker = <Linker<HostState>>::new(engine);
-    let _ = linker.func_wrap("host", "sload", |mut caller: wasmi::Caller<'_, HostState>, key: i64| -> Result<i64, wasmi::Error> {
-        HostState::charge(&mut caller, FUEL_SLOAD)?;
-        Ok(caller.data().storage.get(&key).copied().unwrap_or(0))
-    });
-    let _ = linker.func_wrap("host", "sstore", |mut caller: wasmi::Caller<'_, HostState>, key: i64, val: i64| -> Result<(), wasmi::Error> {
-        HostState::charge(&mut caller, FUEL_SSTORE)?;
-        let state = caller.data_mut();
-        // Writing a *new* key grows the permanent consensus state, so it is
-        // capped; overwriting an existing slot is always allowed.
-        if !state.storage.contains_key(&key) && state.storage.len() >= MAX_CONTRACT_STORAGE_KEYS {
-            return Err(wasmi::Error::new("contract storage limit exceeded"));
-        }
-        state.storage.insert(key, val);
-        Ok(())
-    });
-    let _ = linker.func_wrap("host", "emit", |mut caller: wasmi::Caller<'_, HostState>, topic: i64, val: i64| -> Result<(), wasmi::Error> {
-        HostState::charge(&mut caller, FUEL_EMIT)?;
-        let state = caller.data_mut();
-        if state.events.len() >= MAX_CONTRACT_EVENTS {
-            return Err(wasmi::Error::new("contract event limit exceeded"));
-        }
-        let contract = state.contract_addr;
-        state.events.push(ContractEvent { contract, topic, value: val });
-        Ok(())
-    });
+    let _ = linker.func_wrap(
+        "host",
+        "sload",
+        |mut caller: wasmi::Caller<'_, HostState>, key: i64| -> Result<i64, wasmi::Error> {
+            HostState::charge(&mut caller, FUEL_SLOAD)?;
+            Ok(caller.data().storage.get(&key).copied().unwrap_or(0))
+        },
+    );
+    let _ = linker.func_wrap(
+        "host",
+        "sstore",
+        |mut caller: wasmi::Caller<'_, HostState>,
+         key: i64,
+         val: i64|
+         -> Result<(), wasmi::Error> {
+            HostState::charge(&mut caller, FUEL_SSTORE)?;
+            let state = caller.data_mut();
+            // Writing a *new* key grows the permanent consensus state, so it is
+            // capped; overwriting an existing slot is always allowed.
+            if !state.storage.contains_key(&key) && state.storage.len() >= MAX_CONTRACT_STORAGE_KEYS
+            {
+                return Err(wasmi::Error::new("contract storage limit exceeded"));
+            }
+            state.storage.insert(key, val);
+            Ok(())
+        },
+    );
+    let _ = linker.func_wrap(
+        "host",
+        "emit",
+        |mut caller: wasmi::Caller<'_, HostState>,
+         topic: i64,
+         val: i64|
+         -> Result<(), wasmi::Error> {
+            HostState::charge(&mut caller, FUEL_EMIT)?;
+            let state = caller.data_mut();
+            if state.events.len() >= MAX_CONTRACT_EVENTS {
+                return Err(wasmi::Error::new("contract event limit exceeded"));
+            }
+            let contract = state.contract_addr;
+            state.events.push(ContractEvent {
+                contract,
+                topic,
+                value: val,
+            });
+            Ok(())
+        },
+    );
     let _ = linker.func_wrap(
         "host",
         "caller",
@@ -1291,7 +1353,9 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
          sig_ptr: i32|
          -> Result<i32, wasmi::Error> {
             if msg_len < 0 {
-                return Err(wasmi::Error::new("negative message length for ed25519_verify"));
+                return Err(wasmi::Error::new(
+                    "negative message length for ed25519_verify",
+                ));
             }
             let mlen = msg_len as usize;
             if mlen > MAX_CONTRACT_MEMORY {
@@ -1326,7 +1390,10 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
     let _ = linker.func_wrap(
         "host",
         "return_data",
-        |mut caller: wasmi::Caller<'_, HostState>, ptr: i32, len: i32| -> Result<(), wasmi::Error> {
+        |mut caller: wasmi::Caller<'_, HostState>,
+         ptr: i32,
+         len: i32|
+         -> Result<(), wasmi::Error> {
             if len < 0 {
                 return Err(wasmi::Error::new("negative length for return_data"));
             }
@@ -1374,12 +1441,19 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
             };
 
             let mut recipient = [0u8; 32];
-            if memory.read(&caller, recipient_ptr as usize, &mut recipient).is_err() {
+            if memory
+                .read(&caller, recipient_ptr as usize, &mut recipient)
+                .is_err()
+            {
                 return Ok(-1);
             }
 
             let mut payload = vec![0u8; payload_len as usize];
-            if payload_len > 0 && memory.read(&caller, payload_ptr as usize, &mut payload).is_err() {
+            if payload_len > 0
+                && memory
+                    .read(&caller, payload_ptr as usize, &mut payload)
+                    .is_err()
+            {
                 return Ok(-1);
             }
 
@@ -1511,9 +1585,7 @@ fn call_export_exact(
         ),
         8 => try_arity!(
             (i64, i64, i64, i64, i64, i64, i64, i64),
-            (
-                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]
-            )
+            (args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7])
         ),
         _ => return None,
     }
@@ -1537,7 +1609,10 @@ fn call_export_exact(
         }
         3 => {
             if let Ok(f) = instance.get_typed_func::<(i64, i64, i64), ()>(&*store, method) {
-                return Some(f.call(&mut *store, (args[0], args[1], args[2])).map(|_| 0i64));
+                return Some(
+                    f.call(&mut *store, (args[0], args[1], args[2]))
+                        .map(|_| 0i64),
+                );
             }
         }
         _ => {}
@@ -1563,7 +1638,18 @@ fn run_contract(
     calldata: &[u8],
     fuel: u64,
     ctx: &ContractCallContext,
-) -> Result<(i64, u64, HashMap<i64, i64>, u64, Vec<ContractEvent>, Vec<ContractMessage>, Vec<u8>), ContractError> {
+) -> Result<
+    (
+        i64,
+        u64,
+        HashMap<i64, i64>,
+        u64,
+        Vec<ContractEvent>,
+        Vec<ContractMessage>,
+        Vec<u8>,
+    ),
+    ContractError,
+> {
     if args.len() > MAX_CONTRACT_CALL_ARGS {
         return Err(ContractError::AbiMismatch(format!(
             "a call may take at most {MAX_CONTRACT_CALL_ARGS} arguments, got {}",
@@ -1635,7 +1721,8 @@ mod tests {
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
         0x01, 0x06, 0x01, 0x60, 0x01, 0x7e, 0x01, 0x7e, // type: (i64)->i64
         0x03, 0x02, 0x01, 0x00, // function section: 1 func, type 0
-        0x07, 0x0a, 0x01, 0x06, 0x64, 0x6f, 0x75, 0x62, 0x6c, 0x65, 0x00, 0x00, // export "double"
+        0x07, 0x0a, 0x01, 0x06, 0x64, 0x6f, 0x75, 0x62, 0x6c, 0x65, 0x00,
+        0x00, // export "double"
         0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x42, 0x02, 0x7e, 0x0b, // code
     ];
 
@@ -1643,15 +1730,22 @@ mod tests {
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
         0x01, 0x06, 0x01, 0x60, 0x01, 0x7e, 0x01, 0x7e, // type: (i64)->i64
         0x03, 0x02, 0x01, 0x00, // function section
-        0x07, 0x0a, 0x01, 0x06, 0x61, 0x6e, 0x73, 0x77, 0x65, 0x72, 0x00, 0x00, // export "answer"
+        0x07, 0x0a, 0x01, 0x06, 0x61, 0x6e, 0x73, 0x77, 0x65, 0x72, 0x00,
+        0x00, // export "answer"
         0x0a, 0x06, 0x01, 0x04, 0x00, 0x42, 0x2a, 0x0b, // code: i64.const 42; end
     ];
 
     #[test]
     fn deploy_validates_and_rejects_bad_code() {
         let mut reg = ContractRegistry::new();
-        assert_eq!(reg.deploy([1u8; 32], vec![], 0), Err(ContractError::EmptyCode));
-        assert_eq!(reg.deploy([1u8; 32], vec![0, 1, 2, 3], 0), Err(ContractError::InvalidWasm));
+        assert_eq!(
+            reg.deploy([1u8; 32], vec![], 0),
+            Err(ContractError::EmptyCode)
+        );
+        assert_eq!(
+            reg.deploy([1u8; 32], vec![0, 1, 2, 3], 0),
+            Err(ContractError::InvalidWasm)
+        );
         let addr = reg.deploy([1u8; 32], DOUBLE_WASM.to_vec(), 0).unwrap();
         assert!(reg.exists(&addr));
         assert_eq!(reg.get(&addr).unwrap().creator, [1u8; 32]);
@@ -1672,7 +1766,10 @@ mod tests {
     fn call_unknown_method_fails() {
         let mut reg = ContractRegistry::new();
         let addr = reg.deploy([1u8; 32], DOUBLE_WASM.to_vec(), 0).unwrap();
-        assert_eq!(reg.call(&addr, "nope", 1, 10_000), Err(ContractError::NoSuchMethod));
+        assert_eq!(
+            reg.call(&addr, "nope", 1, 10_000),
+            Err(ContractError::NoSuchMethod)
+        );
     }
 
     #[test]
@@ -1680,7 +1777,10 @@ mod tests {
         let mut reg = ContractRegistry::new();
         let addr = reg.deploy([1u8; 32], DOUBLE_WASM.to_vec(), 0).unwrap();
         // One fuel unit is not enough to run anything.
-        assert_eq!(reg.call(&addr, "double", 1, 1), Err(ContractError::OutOfFuel));
+        assert_eq!(
+            reg.call(&addr, "double", 1, 1),
+            Err(ContractError::OutOfFuel)
+        );
     }
 
     #[test]
@@ -1704,7 +1804,10 @@ mod tests {
         let mut reg = ContractRegistry::new();
         let addr = reg.deploy([1u8; 32], spam, 0).unwrap();
         let res = reg.call(&addr, "spam", 0, crate::contract::MAX_CONTRACT_FUEL);
-        assert!(res.is_err(), "the 257th emit must trap, not bloat state: {res:?}");
+        assert!(
+            res.is_err(),
+            "the 257th emit must trap, not bloat state: {res:?}"
+        );
         assert!(
             reg.get(&addr).unwrap().storage.is_empty(),
             "a trapped spam call must not persist partial effects"
@@ -1720,7 +1823,8 @@ mod tests {
         let oob = wat::parse_str(oob_wat).expect("oob wat compiles");
         let addr2 = reg.deploy([2u8; 32], oob, 0).unwrap();
         assert!(
-            reg.call(&addr2, "evil", 0, crate::contract::MAX_CONTRACT_FUEL).is_err(),
+            reg.call(&addr2, "evil", 0, crate::contract::MAX_CONTRACT_FUEL)
+                .is_err(),
             "wild host-fn pointer must trap, never touch host memory"
         );
 
@@ -1738,7 +1842,10 @@ mod tests {
         let addr = reg.deploy(creator, ANSWER_WASM.to_vec(), 0).unwrap();
         assert_eq!(reg.call(&addr, "answer", 0, 10_000).unwrap().0, 42);
         reg.pause(&addr, creator).unwrap();
-        assert_eq!(reg.call(&addr, "answer", 0, 10_000), Err(ContractError::Paused));
+        assert_eq!(
+            reg.call(&addr, "answer", 0, 10_000),
+            Err(ContractError::Paused)
+        );
         // a non-creator cannot pause
         let addr2 = reg.deploy(creator, ANSWER_WASM.to_vec(), 0).unwrap();
         assert_eq!(reg.pause(&addr2, [9u8; 32]), Err(ContractError::NotFound));
@@ -1749,12 +1856,13 @@ mod tests {
         // Wasm module that imports host.sload and host.sstore and implements a counter:
         // `inc(key) -> sstore(key, sload(key) + 1); sload(key)`
         const COUNTER_WASM: &[u8] = &[
-            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0b, 0x02, 0x60, 0x01, 0x7e, 0x01, 0x7e,
-            0x60, 0x02, 0x7e, 0x7e, 0x00, 0x02, 0x1c, 0x02, 0x04, 0x68, 0x6f, 0x73, 0x74, 0x05, 0x73, 0x6c,
-            0x6f, 0x61, 0x64, 0x00, 0x00, 0x04, 0x68, 0x6f, 0x73, 0x74, 0x06, 0x73, 0x73, 0x74, 0x6f, 0x72,
-            0x65, 0x00, 0x01, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x69, 0x6e, 0x63, 0x00, 0x02,
-            0x0a, 0x13, 0x01, 0x11, 0x00, 0x20, 0x00, 0x20, 0x00, 0x10, 0x00, 0x42, 0x01, 0x7c, 0x10, 0x01,
-            0x20, 0x00, 0x10, 0x00, 0x0b,
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0b, 0x02, 0x60, 0x01, 0x7e,
+            0x01, 0x7e, 0x60, 0x02, 0x7e, 0x7e, 0x00, 0x02, 0x1c, 0x02, 0x04, 0x68, 0x6f, 0x73,
+            0x74, 0x05, 0x73, 0x6c, 0x6f, 0x61, 0x64, 0x00, 0x00, 0x04, 0x68, 0x6f, 0x73, 0x74,
+            0x06, 0x73, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x00, 0x01, 0x03, 0x02, 0x01, 0x00, 0x07,
+            0x07, 0x01, 0x03, 0x69, 0x6e, 0x63, 0x00, 0x02, 0x0a, 0x13, 0x01, 0x11, 0x00, 0x20,
+            0x00, 0x20, 0x00, 0x10, 0x00, 0x42, 0x01, 0x7c, 0x10, 0x01, 0x20, 0x00, 0x10, 0x00,
+            0x0b,
         ];
 
         let mut reg = ContractRegistry::new();
@@ -1766,7 +1874,10 @@ mod tests {
 
         // Call 2: key 42 -> was 1 -> now 2:
         let (v2, ..) = reg.call(&addr, "inc", 42, 50_000).unwrap();
-        assert_eq!(v2, 2, "second call must increment 1 -> 2 (persistent storage)");
+        assert_eq!(
+            v2, 2,
+            "second call must increment 1 -> 2 (persistent storage)"
+        );
 
         // Storage is persisted in contract:
         assert_eq!(reg.get(&addr).unwrap().storage.get(&42), Some(&2));
@@ -1827,11 +1938,24 @@ mod tests {
             .call(&addr, "fill", MAX_CONTRACT_STORAGE_KEYS as i64, 10_000_000)
             .unwrap();
         assert_eq!(out, 0);
-        assert_eq!(reg.get(&addr).unwrap().storage.len(), MAX_CONTRACT_STORAGE_KEYS);
+        assert_eq!(
+            reg.get(&addr).unwrap().storage.len(),
+            MAX_CONTRACT_STORAGE_KEYS
+        );
 
         // One more *new* key must trap instead of silently growing consensus state.
-        let err = reg.call(&addr, "fill", (MAX_CONTRACT_STORAGE_KEYS + 1) as i64, 10_000_000).unwrap_err();
-        assert!(matches!(err, ContractError::Trapped), "expected trap, got {err:?}");
+        let err = reg
+            .call(
+                &addr,
+                "fill",
+                (MAX_CONTRACT_STORAGE_KEYS + 1) as i64,
+                10_000_000,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ContractError::Trapped),
+            "expected trap, got {err:?}"
+        );
         assert_eq!(
             reg.get(&addr).unwrap().storage.len(),
             MAX_CONTRACT_STORAGE_KEYS,
@@ -1854,19 +1978,30 @@ mod tests {
         for _ in 0..(MAX_CONTRACT_STORAGE_KEYS * 2) {
             reg.call(&addr, "set", 9, 1_000_000).unwrap();
         }
-        assert_eq!(reg.get(&addr).unwrap().storage.len(), 1, "rewriting key 7 must not add slots");
+        assert_eq!(
+            reg.get(&addr).unwrap().storage.len(),
+            1,
+            "rewriting key 7 must not add slots"
+        );
     }
 
     #[test]
     fn event_emission_is_capped() {
         let mut reg = ContractRegistry::new();
         let addr = reg.deploy([1u8; 32], event_filler_wasm(), 0).unwrap();
-        let (_, _, events, ..) = reg.call(&addr, "fill", MAX_CONTRACT_EVENTS as i64, 10_000_000).unwrap();
+        let (_, _, events, ..) = reg
+            .call(&addr, "fill", MAX_CONTRACT_EVENTS as i64, 10_000_000)
+            .unwrap();
         assert_eq!(events.len(), MAX_CONTRACT_EVENTS);
         assert!(events.iter().all(|e| e.contract == addr));
 
-        let err = reg.call(&addr, "fill", (MAX_CONTRACT_EVENTS + 1) as i64, 10_000_000).unwrap_err();
-        assert!(matches!(err, ContractError::Trapped), "expected trap, got {err:?}");
+        let err = reg
+            .call(&addr, "fill", (MAX_CONTRACT_EVENTS + 1) as i64, 10_000_000)
+            .unwrap_err();
+        assert!(
+            matches!(err, ContractError::Trapped),
+            "expected trap, got {err:?}"
+        );
     }
 
     #[test]
@@ -1876,8 +2011,14 @@ mod tests {
         let mut reg = ContractRegistry::new();
         let addr = reg.deploy([1u8; 32], storage_filler_wasm(), 0).unwrap();
         let err = reg.call(&addr, "fill", 1_000_000, 5_000).unwrap_err();
-        assert!(matches!(err, ContractError::OutOfFuel), "expected out of fuel, got {err:?}");
-        assert!(reg.get(&addr).unwrap().storage.is_empty(), "a fuel-starved call must not persist writes");
+        assert!(
+            matches!(err, ContractError::OutOfFuel),
+            "expected out of fuel, got {err:?}"
+        );
+        assert!(
+            reg.get(&addr).unwrap().storage.is_empty(),
+            "a fuel-starved call must not persist writes"
+        );
     }
 
     #[test]
@@ -1903,7 +2044,9 @@ mod tests {
                 assert!(outcome.is_ok() || outcome.is_err());
             })
             .expect("spawn contract thread");
-        handle.join().expect("contract execution must not abort the process");
+        handle
+            .join()
+            .expect("contract execution must not abort the process");
     }
 
     /// WASM module that writes a recipient address and payload into memory,
@@ -1945,7 +2088,8 @@ mod tests {
         assert_eq!(reg.get_balance(&addr), 500_000);
 
         // Call method with value = 200_000
-        let (msg_id, used, events, msgs) = reg.call(&addr, "init_and_send", 200_000, 100_000).unwrap();
+        let (msg_id, used, events, msgs) =
+            reg.call(&addr, "init_and_send", 200_000, 100_000).unwrap();
         assert_eq!(msg_id, 1, "first message id must be 1");
         assert!(used > 0);
         assert_eq!(events.len(), 0);
@@ -1985,7 +2129,9 @@ mod tests {
         let contract_addr = engine.deploy_contract(creator, code, 0).await.unwrap();
 
         // Give the contract a balance
-        engine.update_account(AccountState::new(contract_addr, 1_000_000)).await;
+        engine
+            .update_account(AccountState::new(contract_addr, 1_000_000))
+            .await;
 
         // Recipient address matching the one written by send_message_wasm:
         let mut recipient = [0u8; 32];
@@ -1998,12 +2144,19 @@ mod tests {
         engine.update_account(AccountState::new(recipient, 0)).await;
 
         // Call the contract to send 250_000 nano-STELL
-        let (val, _) = engine.call_contract(&contract_addr, "init_and_send", 250_000, 100_000).await.unwrap();
+        let (val, _) = engine
+            .call_contract(&contract_addr, "init_and_send", 250_000, 100_000)
+            .await
+            .unwrap();
         assert_eq!(val, 1, "send_message must return message id 1");
 
         // Verify recipient's inbox received the message
         let rec_acc = engine.get_account(&recipient).await.unwrap();
-        assert_eq!(rec_acc.inbox.len(), 1, "recipient inbox must have 1 message");
+        assert_eq!(
+            rec_acc.inbox.len(),
+            1,
+            "recipient inbox must have 1 message"
+        );
         let msg = &rec_acc.inbox[0];
         assert_eq!(msg.sender, contract_addr);
         assert_eq!(msg.recipient, recipient);
@@ -2028,7 +2181,9 @@ mod tests {
         let creator = [0x22u8; 32];
         let code = send_message_wasm();
         let contract_addr = engine.deploy_contract(creator, code, 0).await.unwrap();
-        engine.update_account(AccountState::new(contract_addr, 1_000_000)).await;
+        engine
+            .update_account(AccountState::new(contract_addr, 1_000_000))
+            .await;
 
         // Recipient address routes to shard 1 (workchain)
         let mut recipient = [0u8; 32];
@@ -2038,7 +2193,10 @@ mod tests {
         recipient[24..32].copy_from_slice(&0x191a1b1c1d1e1f20u64.to_le_bytes());
 
         // Call the contract to send 350_000 nano-STELL
-        let (val, _) = engine.call_contract(&contract_addr, "init_and_send", 350_000, 100_000).await.unwrap();
+        let (val, _) = engine
+            .call_contract(&contract_addr, "init_and_send", 350_000, 100_000)
+            .await
+            .unwrap();
         assert_eq!(val, 1, "send_message must return message id 1");
 
         // Verify message was routed to cross_shard_out
@@ -2061,7 +2219,10 @@ mod tests {
 
         // Code exceeding MAX_CONTRACT_CODE_SIZE must be rejected immediately with CodeTooLarge
         let oversized = vec![0u8; MAX_CONTRACT_CODE_SIZE + 1];
-        assert_eq!(ContractRegistry::validate_code(&oversized), Err(ContractError::CodeTooLarge));
+        assert_eq!(
+            ContractRegistry::validate_code(&oversized),
+            Err(ContractError::CodeTooLarge)
+        );
 
         // Code up to 2 MiB: construct a valid WASM binary with a custom section padding it out to ~1.5 MiB
         let base_wasm = ANSWER_WASM.to_vec();
@@ -2084,7 +2245,9 @@ mod tests {
         assert!(padded_wasm.len() <= MAX_CONTRACT_CODE_SIZE);
 
         let mut reg = ContractRegistry::new();
-        let addr = reg.deploy([7u8; 32], padded_wasm, 0).expect("1.5 MiB contract must deploy");
+        let addr = reg
+            .deploy([7u8; 32], padded_wasm, 0)
+            .expect("1.5 MiB contract must deploy");
         assert_eq!(reg.call(&addr, "answer", 0, 10_000).unwrap().0, 42);
     }
 
@@ -2094,24 +2257,45 @@ mod tests {
         let creator = [8u8; 32];
 
         // 1 page (64 KiB) memory declaration: succeeds
-        let wasm_1p = wat::parse_str(r#"(module (memory 1) (func (export "f") (param i64) (result i64) local.get 0))"#).unwrap();
+        let wasm_1p = wat::parse_str(
+            r#"(module (memory 1) (func (export "f") (param i64) (result i64) local.get 0))"#,
+        )
+        .unwrap();
         assert!(reg.deploy(creator, wasm_1p, 0).is_ok());
 
         // 64 pages (4 MiB) memory declaration: succeeds
-        let wasm_64p = wat::parse_str(r#"(module (memory 64) (func (export "f") (param i64) (result i64) local.get 0))"#).unwrap();
+        let wasm_64p = wat::parse_str(
+            r#"(module (memory 64) (func (export "f") (param i64) (result i64) local.get 0))"#,
+        )
+        .unwrap();
         assert!(reg.deploy(creator, wasm_64p, 0).is_ok());
 
         // 128 pages (8 MiB) memory declaration: succeeds
-        let wasm_128p = wat::parse_str(r#"(module (memory 128) (func (export "f") (param i64) (result i64) local.get 0))"#).unwrap();
+        let wasm_128p = wat::parse_str(
+            r#"(module (memory 128) (func (export "f") (param i64) (result i64) local.get 0))"#,
+        )
+        .unwrap();
         assert!(reg.deploy(creator, wasm_128p, 0).is_ok());
 
         // 129 pages (> 128 pages limit) memory declaration: fails validation with InvalidWasm
-        let wasm_129p = wat::parse_str(r#"(module (memory 129) (func (export "f") (param i64) (result i64) local.get 0))"#).unwrap();
-        assert_eq!(ContractRegistry::validate_code(&wasm_129p), Err(ContractError::InvalidWasm));
+        let wasm_129p = wat::parse_str(
+            r#"(module (memory 129) (func (export "f") (param i64) (result i64) local.get 0))"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ContractRegistry::validate_code(&wasm_129p),
+            Err(ContractError::InvalidWasm)
+        );
 
         // Memory with explicit max exceeding limit: fails validation with InvalidWasm
-        let wasm_max_over = wat::parse_str(r#"(module (memory 1 129) (func (export "f") (param i64) (result i64) local.get 0))"#).unwrap();
-        assert_eq!(ContractRegistry::validate_code(&wasm_max_over), Err(ContractError::InvalidWasm));
+        let wasm_max_over = wat::parse_str(
+            r#"(module (memory 1 129) (func (export "f") (param i64) (result i64) local.get 0))"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ContractRegistry::validate_code(&wasm_max_over),
+            Err(ContractError::InvalidWasm)
+        );
     }
 
     #[test]
@@ -2166,14 +2350,20 @@ mod tests {
         assert_eq!(outcome.result, expected_word);
 
         // Bounds checks
-        let oob_err = reg.call_with_context(&addr, "read_caller", 65530, 100_000, &ctx).unwrap_err();
+        let oob_err = reg
+            .call_with_context(&addr, "read_caller", 65530, 100_000, &ctx)
+            .unwrap_err();
         assert!(matches!(oob_err, ContractError::Trapped));
 
-        let neg_err = reg.call_with_context(&addr, "read_caller", -1, 100_000, &ctx).unwrap_err();
+        let neg_err = reg
+            .call_with_context(&addr, "read_caller", -1, 100_000, &ctx)
+            .unwrap_err();
         assert!(matches!(neg_err, ContractError::Trapped));
 
         // Fuel check
-        let fuel_err = reg.call_with_context(&addr, "read_caller", 0, 1, &ctx).unwrap_err();
+        let fuel_err = reg
+            .call_with_context(&addr, "read_caller", 0, 1, &ctx)
+            .unwrap_err();
         assert!(matches!(fuel_err, ContractError::OutOfFuel));
     }
 
@@ -2194,10 +2384,14 @@ mod tests {
             value: 9876543210,
             ..Default::default()
         };
-        let outcome = reg.call_with_context(&addr, "read_value", 0, 100_000, &ctx).unwrap();
+        let outcome = reg
+            .call_with_context(&addr, "read_value", 0, 100_000, &ctx)
+            .unwrap();
         assert_eq!(outcome.result, 9876543210i64);
 
-        let fuel_err = reg.call_with_context(&addr, "read_value", 0, 1, &ctx).unwrap_err();
+        let fuel_err = reg
+            .call_with_context(&addr, "read_value", 0, 1, &ctx)
+            .unwrap_err();
         assert!(matches!(fuel_err, ContractError::OutOfFuel));
     }
 
@@ -2218,10 +2412,14 @@ mod tests {
             block_time: 1729000000,
             ..Default::default()
         };
-        let outcome = reg.call_with_context(&addr, "read_block_time", 0, 100_000, &ctx).unwrap();
+        let outcome = reg
+            .call_with_context(&addr, "read_block_time", 0, 100_000, &ctx)
+            .unwrap();
         assert_eq!(outcome.result, 1729000000i64);
 
-        let fuel_err = reg.call_with_context(&addr, "read_block_time", 0, 1, &ctx).unwrap_err();
+        let fuel_err = reg
+            .call_with_context(&addr, "read_block_time", 0, 1, &ctx)
+            .unwrap_err();
         assert!(matches!(fuel_err, ContractError::OutOfFuel));
     }
 
@@ -2252,14 +2450,20 @@ mod tests {
         assert_eq!(outcome.result, expected_word);
 
         // Bounds checks
-        let oob_err = reg.call_with_context(&addr, "read_block_hash", 65530, 100_000, &ctx).unwrap_err();
+        let oob_err = reg
+            .call_with_context(&addr, "read_block_hash", 65530, 100_000, &ctx)
+            .unwrap_err();
         assert!(matches!(oob_err, ContractError::Trapped));
 
-        let neg_err = reg.call_with_context(&addr, "read_block_hash", -5, 100_000, &ctx).unwrap_err();
+        let neg_err = reg
+            .call_with_context(&addr, "read_block_hash", -5, 100_000, &ctx)
+            .unwrap_err();
         assert!(matches!(neg_err, ContractError::Trapped));
 
         // Fuel check
-        let fuel_err = reg.call_with_context(&addr, "read_block_hash", 0, 1, &ctx).unwrap_err();
+        let fuel_err = reg
+            .call_with_context(&addr, "read_block_hash", 0, 1, &ctx)
+            .unwrap_err();
         assert!(matches!(fuel_err, ContractError::OutOfFuel));
     }
 
@@ -2337,7 +2541,8 @@ mod tests {
 
         // Empty input buffer
         let empty_expected = blake3::hash(b"");
-        let empty_first_word = i64::from_le_bytes(empty_expected.as_bytes()[0..8].try_into().unwrap());
+        let empty_first_word =
+            i64::from_le_bytes(empty_expected.as_bytes()[0..8].try_into().unwrap());
         let res_empty = reg.call(&addr, "compute_blake3", 0, 100_000).unwrap();
         assert_eq!(res_empty.0, empty_first_word);
 
@@ -2424,7 +2629,13 @@ mod tests {
         let addr = reg.deploy([1u8; 32], wasm, 0).unwrap();
 
         let outcome = reg
-            .call_with_context(&addr, "set_ret", 18, 100_000, &ContractCallContext::default())
+            .call_with_context(
+                &addr,
+                "set_ret",
+                18,
+                100_000,
+                &ContractCallContext::default(),
+            )
             .unwrap();
         assert_eq!(outcome.result, 42);
         assert_eq!(outcome.return_data, b"STELL_RETURN_BYTES");
@@ -2529,11 +2740,15 @@ mod tests {
         assert_eq!(v, 42);
 
         // 3 arguments
-        let (v, ..) = reg.call_args(&addr, "three", &[10, 20, 12], 100_000).unwrap();
+        let (v, ..) = reg
+            .call_args(&addr, "three", &[10, 20, 12], 100_000)
+            .unwrap();
         assert_eq!(v, 42);
 
         // 4 arguments
-        let (v, ..) = reg.call_args(&addr, "four", &[1, 2, 3, 36], 100_000).unwrap();
+        let (v, ..) = reg
+            .call_args(&addr, "four", &[1, 2, 3, 36], 100_000)
+            .unwrap();
         assert_eq!(v, 42);
     }
 
@@ -2600,7 +2815,9 @@ mod tests {
         };
 
         let mut reg = ContractRegistry::new();
-        let addr = reg.deploy_with_abi([1u8; 32], multi_arg_wasm(), 0, abi.clone()).unwrap();
+        let addr = reg
+            .deploy_with_abi([1u8; 32], multi_arg_wasm(), 0, abi.clone())
+            .unwrap();
 
         // The manifest travels with the contract.
         let stored = reg.abi(&addr).unwrap().clone();
@@ -2653,14 +2870,12 @@ mod tests {
             events: vec![],
         };
         let mut reg = ContractRegistry::new();
-        let addr = reg.deploy_with_abi([1u8; 32], multi_arg_wasm(), 0, abi).unwrap();
+        let addr = reg
+            .deploy_with_abi([1u8; 32], multi_arg_wasm(), 0, abi)
+            .unwrap();
 
-        let resp = reg.run_get_method_typed(
-            &addr,
-            "two",
-            &[AbiValue::I64(4), AbiValue::I64(2)],
-            None,
-        );
+        let resp =
+            reg.run_get_method_typed(&addr, "two", &[AbiValue::I64(4), AbiValue::I64(2)], None);
         assert!(resp.success);
         assert_eq!(resp.return_value, Some(42));
         assert_eq!(resp.return_typed, Some(AbiValue::U64(42)));

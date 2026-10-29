@@ -208,34 +208,58 @@ impl fmt::Display for SignerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SignerError::Transport(TransportErrorKind::Request) => {
-                write!(f, "remote signer transport failed (request could not be completed)")
+                write!(
+                    f,
+                    "remote signer transport failed (request could not be completed)"
+                )
             }
             SignerError::Transport(TransportErrorKind::Timeout) => {
                 write!(f, "remote signer transport failed (timed out)")
             }
             SignerError::Transport(TransportErrorKind::Rejected { status }) => {
-                write!(f, "remote signer rejected the request (http status {status})")
+                write!(
+                    f,
+                    "remote signer rejected the request (http status {status})"
+                )
             }
             SignerError::Transport(TransportErrorKind::UnreadableBody) => {
-                write!(f, "remote signer transport failed (response body unreadable)")
+                write!(
+                    f,
+                    "remote signer transport failed (response body unreadable)"
+                )
             }
             SignerError::MalformedResponse(MalformedResponseKind::BadJson) => {
                 write!(f, "remote signer returned a malformed response (bad json)")
             }
             SignerError::MalformedResponse(MalformedResponseKind::MissingField) => {
-                write!(f, "remote signer returned a malformed response (missing field)")
+                write!(
+                    f,
+                    "remote signer returned a malformed response (missing field)"
+                )
             }
             SignerError::MalformedResponse(MalformedResponseKind::NotHex) => {
-                write!(f, "remote signer returned a malformed response (field is not hex)")
+                write!(
+                    f,
+                    "remote signer returned a malformed response (field is not hex)"
+                )
             }
             SignerError::MalformedResponse(MalformedResponseKind::BodyTooLarge) => {
-                write!(f, "remote signer response exceeded {MAX_RESPONSE_BYTES} bytes")
+                write!(
+                    f,
+                    "remote signer response exceeded {MAX_RESPONSE_BYTES} bytes"
+                )
             }
             SignerError::BadPublicKeyLength { got } => {
-                write!(f, "remote signer returned a {got}-byte public key, expected {PUBLIC_KEY_LEN}")
+                write!(
+                    f,
+                    "remote signer returned a {got}-byte public key, expected {PUBLIC_KEY_LEN}"
+                )
             }
             SignerError::BadSignatureLength { got } => {
-                write!(f, "remote signer returned a {got}-byte signature, expected {SIGNATURE_LEN}")
+                write!(
+                    f,
+                    "remote signer returned a {got}-byte signature, expected {SIGNATURE_LEN}"
+                )
             }
             SignerError::SigningFailed(SigningFailureKind::EmptyMessage) => {
                 write!(f, "refusing to sign an empty message")
@@ -248,7 +272,10 @@ impl fmt::Display for SignerError {
                 write!(f, "local signing key is unusable")
             }
             SignerError::MalformedKey => {
-                write!(f, "signing key material is malformed (bad hex or wrong length)")
+                write!(
+                    f,
+                    "signing key material is malformed (bad hex or wrong length)"
+                )
             }
         }
     }
@@ -351,8 +378,10 @@ impl LocalSigner {
         let raw = zeroize::Zeroizing::new(
             hex::decode(hex_seed.trim()).map_err(|_| SignerError::MalformedKey)?,
         );
-        let mut seed: [u8; 32] =
-            raw.as_slice().try_into().map_err(|_| SignerError::MalformedKey)?;
+        let mut seed: [u8; 32] = raw
+            .as_slice()
+            .try_into()
+            .map_err(|_| SignerError::MalformedKey)?;
         let signer = Self::from_seed(&seed);
         // Wipe the stack copy; `raw` (also the seed) is wiped by `Zeroizing`
         // on scope exit. The `SigningKey` copy is the signer's by design.
@@ -465,7 +494,10 @@ impl RemoteSigner {
         // a signer that hands back garbage should fail loudly at startup
         // instead of at the first vote.
         let vk = VerifyingKey::from_bytes(&raw).map_err(|_| SignerError::MalformedKey)?;
-        Ok(Self { transport, public_key: vk.to_bytes() })
+        Ok(Self {
+            transport,
+            public_key: vk.to_bytes(),
+        })
     }
 
     /// The pinned public key.
@@ -512,7 +544,9 @@ impl Signer for RemoteSigner {
         // different key, which is what a hijacked endpoint or a swapped signer
         // would produce.
         if !Signer::verify(self, msg, &sig) {
-            return Err(SignerError::SigningFailed(SigningFailureKind::SignatureInvalid));
+            return Err(SignerError::SigningFailed(
+                SigningFailureKind::SignatureInvalid,
+            ));
         }
         Ok(sig)
     }
@@ -634,17 +668,16 @@ impl HttpSignerTransport {
     /// node's config, a client key would too, but the signer can then scope it
     /// to one key and one policy.
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
-        self.auth = Some(("Authorization".to_string(), format!("Bearer {}", token.into())));
+        self.auth = Some((
+            "Authorization".to_string(),
+            format!("Bearer {}", token.into()),
+        ));
         self
     }
 
     /// Send an arbitrary auth header with every request. Must be applied before
     /// use.
-    pub fn with_auth_header(
-        mut self,
-        name: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
+    pub fn with_auth_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.auth = Some((name.into(), value.into()));
         self
     }
@@ -665,7 +698,9 @@ impl HttpSignerTransport {
     }
 
     fn request(&self, method: &str, path: &str) -> ureq::Request {
-        let req = self.agent.request(method, &format!("{}{}", self.base_url, path));
+        let req = self
+            .agent
+            .request(method, &format!("{}{}", self.base_url, path));
         match &self.auth {
             Some((name, value)) => req.set(name, value),
             None => req,
@@ -674,10 +709,7 @@ impl HttpSignerTransport {
 
     /// Turn a completed request into a size-capped body, mapping every failure
     /// onto a [`SignerError`] class.
-    fn finish(
-        &self,
-        result: Result<ureq::Response, ureq::Error>,
-    ) -> Result<Vec<u8>, SignerError> {
+    fn finish(&self, result: Result<ureq::Response, ureq::Error>) -> Result<Vec<u8>, SignerError> {
         let resp = result.map_err(map_transport_error)?;
         let status = resp.status();
         if !(200..300).contains(&status) {
@@ -685,7 +717,9 @@ impl HttpSignerTransport {
             // is dropped unread on purpose: it is unbounded, it is usually an
             // error document from something that is not our signer, and it can
             // echo the request — which is the message.
-            return Err(SignerError::Transport(TransportErrorKind::Rejected { status }));
+            return Err(SignerError::Transport(TransportErrorKind::Rejected {
+                status,
+            }));
         }
         let mut body = Vec::new();
         // `take` bounds the read: a signer that streams forever is cut off at
@@ -701,7 +735,9 @@ impl HttpSignerTransport {
                 }
             })?;
         if body.len() > MAX_RESPONSE_BYTES {
-            return Err(SignerError::MalformedResponse(MalformedResponseKind::BodyTooLarge));
+            return Err(SignerError::MalformedResponse(
+                MalformedResponseKind::BodyTooLarge,
+            ));
         }
         Ok(body)
     }
@@ -767,20 +803,24 @@ impl SignerTransport for HttpSignerTransport {
         let parsed: PublicKeyResponseBody = serde_json::from_slice(&body).map_err(|e| {
             // `classify` only, never `e`: a serde error Display quotes the
             // offending input.
-            tracing::debug!("[remote-signer] public key response is not the expected json ({:?})", e.classify());
+            tracing::debug!(
+                "[remote-signer] public key response is not the expected json ({:?})",
+                e.classify()
+            );
             SignerError::MalformedResponse(MalformedResponseKind::BadJson)
         })?;
-        let hex_key = parsed
-            .public_key
-            .ok_or(SignerError::MalformedResponse(MalformedResponseKind::MissingField))?;
+        let hex_key = parsed.public_key.ok_or(SignerError::MalformedResponse(
+            MalformedResponseKind::MissingField,
+        ))?;
         let raw = hex::decode(&hex_key)
             .map_err(|_| SignerError::MalformedResponse(MalformedResponseKind::NotHex))?;
         // A key of the wrong width is a configuration error, not a malformed
         // packet, and is worth its own error: the operator needs to be told the
         // signer returned 31 bytes where 32 were expected.
         let got = raw.len();
-        let key: [u8; PUBLIC_KEY_LEN] =
-            raw.try_into().map_err(|_| SignerError::BadPublicKeyLength { got })?;
+        let key: [u8; PUBLIC_KEY_LEN] = raw
+            .try_into()
+            .map_err(|_| SignerError::BadPublicKeyLength { got })?;
         Ok(key)
     }
 
@@ -796,19 +836,23 @@ impl SignerTransport for HttpSignerTransport {
                 .send_string(&request_body),
         )?;
         let parsed: SignatureResponseBody = serde_json::from_slice(&body).map_err(|e| {
-            tracing::debug!("[remote-signer] signature response is not the expected json ({:?})", e.classify());
+            tracing::debug!(
+                "[remote-signer] signature response is not the expected json ({:?})",
+                e.classify()
+            );
             SignerError::MalformedResponse(MalformedResponseKind::BadJson)
         })?;
-        let hex_sig = parsed
-            .signature
-            .ok_or(SignerError::MalformedResponse(MalformedResponseKind::MissingField))?;
+        let hex_sig = parsed.signature.ok_or(SignerError::MalformedResponse(
+            MalformedResponseKind::MissingField,
+        ))?;
         let raw = hex::decode(&hex_sig)
             .map_err(|_| SignerError::MalformedResponse(MalformedResponseKind::NotHex))?;
         // Same reasoning as the public key: reject a truncated or padded
         // signature here, at the boundary, where the operator can see it.
         let got = raw.len();
-        let sig: [u8; SIGNATURE_LEN] =
-            raw.try_into().map_err(|_| SignerError::BadSignatureLength { got })?;
+        let sig: [u8; SIGNATURE_LEN] = raw
+            .try_into()
+            .map_err(|_| SignerError::BadSignatureLength { got })?;
         Ok(sig)
     }
 }

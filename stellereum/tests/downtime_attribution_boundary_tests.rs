@@ -104,7 +104,11 @@ fn genuine_qc(
     }
 }
 
-fn block_h2_with_bond(proposer: [u8; 32], bond_tx: Transaction, last_qc: QuorumCertificate) -> Block {
+fn block_h2_with_bond(
+    proposer: [u8; 32],
+    bond_tx: Transaction,
+    last_qc: QuorumCertificate,
+) -> Block {
     let txs = vec![bond_tx];
     Block {
         shard_id: MASTERCHAIN_SHARD,
@@ -131,7 +135,12 @@ fn block_h2_with_bond(proposer: [u8; 32], bond_tx: Transaction, last_qc: QuorumC
 async fn bond_in_block_does_not_raise_the_quorum_under_parent_evidence() {
     let keys: Vec<SigningKey> = (0..4).map(|_| SigningKey::generate(&mut OsRng)).collect();
     let engine = four_member_engine(&keys).await;
-    let (a, b, c, d) = (id_of(&keys[0]), id_of(&keys[1]), id_of(&keys[2]), id_of(&keys[3]));
+    let (a, b, c, d) = (
+        id_of(&keys[0]),
+        id_of(&keys[1]),
+        id_of(&keys[2]),
+        id_of(&keys[3]),
+    );
 
     // The H-1 evidence: A, B, C signed; D missed. Genuine quorum of the
     // 4-member set (3 of 4 by headcount AND by power: 3*B >= floor(8*B/3)+1).
@@ -171,7 +180,11 @@ async fn bond_in_block_does_not_raise_the_quorum_under_parent_evidence() {
     // The transition really did rotate the set mid-flight: without this the
     // test below is vacuous (no rotation, no boundary).
     let post = engine.staking_read().await.to_validator_set();
-    assert_eq!(post.len(), 5, "the bond transaction must have joined the set");
+    assert_eq!(
+        post.len(),
+        5,
+        "the bond transaction must have joined the set"
+    );
     assert!(
         !genuine_qc(&keys, &[0, 1, 2], 1, evidence_hash).verify(&post),
         "precondition: the same signatures must be a sub-quorum of the post-transition set"
@@ -186,9 +199,18 @@ async fn bond_in_block_does_not_raise_the_quorum_under_parent_evidence() {
         ledger.validators[&d].missed, 1,
         "D missed the H-1 QC and was a member at H-1: the miss must be recorded"
     );
-    assert_eq!(ledger.validators[&a].missed, 0, "signers must not accrue misses");
-    assert_eq!(ledger.validators[&b].missed, 0, "signers must not accrue misses");
-    assert_eq!(ledger.validators[&c].missed, 0, "signers must not accrue misses");
+    assert_eq!(
+        ledger.validators[&a].missed, 0,
+        "signers must not accrue misses"
+    );
+    assert_eq!(
+        ledger.validators[&b].missed, 0,
+        "signers must not accrue misses"
+    );
+    assert_eq!(
+        ledger.validators[&c].missed, 0,
+        "signers must not accrue misses"
+    );
     assert_eq!(
         ledger.validators[&newcomer_id].missed, 0,
         "the newcomer was not a member at H-1 and must not accrue a miss for it"
@@ -202,7 +224,12 @@ async fn bond_in_block_does_not_raise_the_quorum_under_parent_evidence() {
 #[tokio::test]
 async fn explicit_set_oracle_differs_from_the_live_oracle_at_a_rotation() {
     let keys: Vec<SigningKey> = (0..4).map(|_| SigningKey::generate(&mut OsRng)).collect();
-    let (a, _b, _c, d) = (id_of(&keys[0]), id_of(&keys[1]), id_of(&keys[2]), id_of(&keys[3]));
+    let (a, _b, _c, d) = (
+        id_of(&keys[0]),
+        id_of(&keys[1]),
+        id_of(&keys[2]),
+        id_of(&keys[3]),
+    );
     let evidence_hash = [0xBB; 32];
     let qc = genuine_qc(&keys, &[0, 1, 2], 7, evidence_hash);
 
@@ -215,7 +242,8 @@ async fn explicit_set_oracle_differs_from_the_live_oracle_at_a_rotation() {
         .await;
     assert_eq!(burned, 0, "one miss is below the slash threshold");
     assert_eq!(
-        engine1.staking_read().await.validators[&d].missed, 1,
+        engine1.staking_read().await.validators[&d].missed,
+        1,
         "the pre-rotation oracle must record D's miss"
     );
 
@@ -242,7 +270,8 @@ async fn explicit_set_oracle_differs_from_the_live_oracle_at_a_rotation() {
     let burned = engine2.apply_downtime_slash(7, Some(&qc)).await;
     assert_eq!(burned, 0);
     assert_eq!(
-        engine2.staking_read().await.validators[&d].missed, 0,
+        engine2.staking_read().await.validators[&d].missed,
+        0,
         "the live oracle skips post-rotation evidence it cannot verify"
     );
     let _ = a;

@@ -33,7 +33,15 @@ fn ed_addr() -> [u8; 32] {
 
 fn hand_ed(to: [u8; 32], amount: u64, gas: u64, nonce: u64, payload: Vec<OpCode>) -> Transaction {
     Transaction::sign_with_payload_and_chain_id(
-        &ed_signing_key(), to, amount, gas, nonce, 0, 0, payload, CHAIN,
+        &ed_signing_key(),
+        to,
+        amount,
+        gas,
+        nonce,
+        0,
+        0,
+        payload,
+        CHAIN,
     )
 }
 
@@ -47,7 +55,10 @@ fn assert_canonical(sdk_tx: &SignedTx, hand_tx: &Transaction, shape: &str) {
         "{shape}: tx hash differs"
     );
     assert!(sdk_tx.verify(), "{shape}: SDK tx does not verify");
-    assert!(hand_tx.verify_signature(), "{shape}: hand-built tx does not verify");
+    assert!(
+        hand_tx.verify_signature(),
+        "{shape}: hand-built tx does not verify"
+    );
 }
 
 // --- shape 1: transfer ------------------------------------------------------
@@ -55,7 +66,10 @@ fn assert_canonical(sdk_tx: &SignedTx, hand_tx: &Transaction, shape: &str) {
 #[test]
 fn transfer_is_byte_equal_to_hand_built() {
     let to = [0x99u8; 32];
-    let sdk = TxBuilder::transfer(to, 1_000).nonce(5).sign(&ed_key()).unwrap();
+    let sdk = TxBuilder::transfer(to, 1_000)
+        .nonce(5)
+        .sign(&ed_key())
+        .unwrap();
     let hand = hand_ed(to, 1_000, GAS_BASIC_TRANSFER, 5, vec![]);
     assert_canonical(&sdk, &hand, "transfer");
     assert!(sdk.is_bound() && sdk.chain_id() == Some(CHAIN));
@@ -67,8 +81,15 @@ fn transfer_is_byte_equal_to_hand_built() {
 fn token_transfer_is_byte_equal_to_hand_built() {
     let token = [0x11u8; 32];
     let to = [0x22u8; 32];
-    let op = OpCode::SysCallTokenTransfer { token_id: token, to, amount: 250 };
-    let sdk = TxBuilder::token_transfer(token, to, 250).nonce(7).sign(&ed_key()).unwrap();
+    let op = OpCode::SysCallTokenTransfer {
+        token_id: token,
+        to,
+        amount: 250,
+    };
+    let sdk = TxBuilder::token_transfer(token, to, 250)
+        .nonce(7)
+        .sign(&ed_key())
+        .unwrap();
     let hand = hand_ed(ed_addr(), 0, opcode_gas(&op), 7, vec![op]);
     assert_canonical(&sdk, &hand, "token_transfer");
 }
@@ -77,15 +98,28 @@ fn token_transfer_is_byte_equal_to_hand_built() {
 fn token_approve_and_transfer_from_are_byte_equal() {
     let token = [0x11u8; 32];
     let spender = [0x33u8; 32];
-    let op = OpCode::SysCallTokenApprove { token_id: token, spender, amount: 500 };
-    let sdk = TxBuilder::token_approve(token, spender, 500).sign(&ed_key()).unwrap();
+    let op = OpCode::SysCallTokenApprove {
+        token_id: token,
+        spender,
+        amount: 500,
+    };
+    let sdk = TxBuilder::token_approve(token, spender, 500)
+        .sign(&ed_key())
+        .unwrap();
     let hand = hand_ed(ed_addr(), 0, opcode_gas(&op), 0, vec![op]);
     assert_canonical(&sdk, &hand, "token_approve");
 
     let from = [0x44u8; 32];
     let to = [0x55u8; 32];
-    let op2 = OpCode::SysCallTokenTransferFrom { token_id: token, from, to, amount: 100 };
-    let sdk2 = TxBuilder::token_transfer_from(token, from, to, 100).sign(&ed_key()).unwrap();
+    let op2 = OpCode::SysCallTokenTransferFrom {
+        token_id: token,
+        from,
+        to,
+        amount: 100,
+    };
+    let sdk2 = TxBuilder::token_transfer_from(token, from, to, 100)
+        .sign(&ed_key())
+        .unwrap();
     let hand2 = hand_ed(ed_addr(), 0, opcode_gas(&op2), 0, vec![op2]);
     assert_canonical(&sdk2, &hand2, "token_transfer_from");
 }
@@ -96,16 +130,42 @@ fn token_approve_and_transfer_from_are_byte_equal() {
 fn stake_bond_delegate_undelegate_are_byte_equal() {
     let val = [0x66u8; 32];
 
-    let op = OpCode::SysCallStake { validator: val, amount: 10_000 };
-    let sdk = TxBuilder::stake_bond(val, 10_000).nonce(1).sign(&ed_key()).unwrap();
-    assert_canonical(&sdk, &hand_ed(ed_addr(), 0, opcode_gas(&op), 1, vec![op]), "stake_bond");
+    let op = OpCode::SysCallStake {
+        validator: val,
+        amount: 10_000,
+    };
+    let sdk = TxBuilder::stake_bond(val, 10_000)
+        .nonce(1)
+        .sign(&ed_key())
+        .unwrap();
+    assert_canonical(
+        &sdk,
+        &hand_ed(ed_addr(), 0, opcode_gas(&op), 1, vec![op]),
+        "stake_bond",
+    );
 
-    let op = OpCode::SysCallDelegate { validator: val, amount: 5_000 };
-    let sdk = TxBuilder::delegate(val, 5_000).nonce(2).sign(&ed_key()).unwrap();
-    assert_canonical(&sdk, &hand_ed(ed_addr(), 0, opcode_gas(&op), 2, vec![op]), "delegate");
+    let op = OpCode::SysCallDelegate {
+        validator: val,
+        amount: 5_000,
+    };
+    let sdk = TxBuilder::delegate(val, 5_000)
+        .nonce(2)
+        .sign(&ed_key())
+        .unwrap();
+    assert_canonical(
+        &sdk,
+        &hand_ed(ed_addr(), 0, opcode_gas(&op), 2, vec![op]),
+        "delegate",
+    );
 
-    let op = OpCode::SysCallBeginUndelegate { validator: val, amount: 5_000 };
-    let sdk = TxBuilder::begin_undelegate(val, 5_000).nonce(3).sign(&ed_key()).unwrap();
+    let op = OpCode::SysCallBeginUndelegate {
+        validator: val,
+        amount: 5_000,
+    };
+    let sdk = TxBuilder::begin_undelegate(val, 5_000)
+        .nonce(3)
+        .sign(&ed_key())
+        .unwrap();
     assert_canonical(
         &sdk,
         &hand_ed(ed_addr(), 0, opcode_gas(&op), 3, vec![op]),
@@ -113,7 +173,10 @@ fn stake_bond_delegate_undelegate_are_byte_equal() {
     );
 
     let op = OpCode::SysCallUndelegate { validator: val };
-    let sdk = TxBuilder::undelegate_withdraw(val).nonce(4).sign(&ed_key()).unwrap();
+    let sdk = TxBuilder::undelegate_withdraw(val)
+        .nonce(4)
+        .sign(&ed_key())
+        .unwrap();
     assert_canonical(
         &sdk,
         &hand_ed(ed_addr(), 0, opcode_gas(&op), 4, vec![op]),
@@ -127,7 +190,10 @@ fn stake_bond_delegate_undelegate_are_byte_equal() {
 fn contract_deploy_is_byte_equal_and_address_uses_node_function() {
     let code = vec![0x00u8, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
     let op = OpCode::SysCallDeployContract { code: code.clone() };
-    let sdk = TxBuilder::contract_deploy(code.clone()).nonce(9).sign(&ed_key()).unwrap();
+    let sdk = TxBuilder::contract_deploy(code.clone())
+        .nonce(9)
+        .sign(&ed_key())
+        .unwrap();
     assert_canonical(
         &sdk,
         &hand_ed(ed_addr(), 0, opcode_gas(&op), 9, vec![op]),
@@ -138,7 +204,10 @@ fn contract_deploy_is_byte_equal_and_address_uses_node_function() {
     // (imported, not reimplemented): sender + sender-nonce.
     let predicted = predict_contract_address(&ed_addr(), 9);
     let direct = stellereum::contract::contract_address(&ed_addr(), 9);
-    assert_eq!(predicted, direct, "deploy address must be the node's function");
+    assert_eq!(
+        predicted, direct,
+        "deploy address must be the node's function"
+    );
     assert_eq!(predicted, direct);
 }
 
@@ -223,11 +292,17 @@ fn bound_by_default_and_unbound_escape_warns() {
 
     // The escape hatch: unbound, still validly signed, but refused when the
     // node eventually requires chain binding (phase 3 of the A14 rollout).
-    let legacy = TxBuilder::transfer([1u8; 32], 1).unbound_legacy().sign(&ed_key()).unwrap();
+    let legacy = TxBuilder::transfer([1u8; 32], 1)
+        .unbound_legacy()
+        .sign(&ed_key())
+        .unwrap();
     assert!(!legacy.is_bound());
     assert_eq!(legacy.chain_id(), None);
     assert!(!legacy.as_node_tx().is_chain_id_bound());
-    assert!(legacy.as_node_tx().verify_signature(), "legacy sig must still verify");
+    assert!(
+        legacy.as_node_tx().verify_signature(),
+        "legacy sig must still verify"
+    );
     assert!(
         !legacy.as_node_tx().verify_signature_for_chain(CHAIN, true),
         "unbound tx must fail the strict chain check"
@@ -318,7 +393,9 @@ fn sign_verify_round_trip_hybrid() {
         key.address(),
         derive_pq_address(PqScheme::Hybrid, &key.pubkey_bytes(), &DEFAULT_SALT)
     );
-    let tx = TxBuilder::stake_bond([0x61u8; 32], 1_000).sign(&key).unwrap();
+    let tx = TxBuilder::stake_bond([0x61u8; 32], 1_000)
+        .sign(&key)
+        .unwrap();
     assert!(tx.verify(), "hybrid tx must verify");
     assert_eq!(tx.chain_id(), Some(CHAIN));
 

@@ -12,14 +12,14 @@
 //! see whether the digest moves.
 
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use stellereum::commitment::{commitment_digest, CommitmentSnapshot, COMMITMENT_VERSION};
 use stellereum::contract::{ContractRegistry, MAX_CONTRACT_CODE};
-use stellereum::orderbook::{OrderSide, OrderType, OrderbookManager, Order};
+use stellereum::orderbook::{Order, OrderSide, OrderType, OrderbookManager};
 use stellereum::pmm::PrimaryMarketMaker;
-use stellereum::state_engine::EscrowRecord;
 use stellereum::staking::StakingLedger;
+use stellereum::state_engine::EscrowRecord;
 use stellereum::token::{TokenMetadata, TokenRegistry};
-use std::collections::HashMap;
 
 fn empty_snapshot() -> CommitmentSnapshot {
     CommitmentSnapshot {
@@ -47,11 +47,13 @@ fn wasm() -> Vec<u8> {
 }
 fn wasm_mod(byte: u8) -> Vec<u8> {
     // (module (func (export "answer") (result i64) i64.const <byte>))
-    vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
-         0x01, 0x06, 0x01, 0x60, 0x01, 0x7e, 0x01, 0x7e, // type: (i64)->i64
-         0x03, 0x02, 0x01, 0x00, // function section
-         0x07, 0x0a, 0x01, 0x06, 0x61, 0x6e, 0x73, 0x77, 0x65, 0x72, 0x00, 0x00, // export
-         0x0a, 0x06, 0x01, 0x04, 0x00, 0x42, byte, 0x0b] // code: i64.const <byte>; end
+    vec![
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+        0x01, 0x06, 0x01, 0x60, 0x01, 0x7e, 0x01, 0x7e, // type: (i64)->i64
+        0x03, 0x02, 0x01, 0x00, // function section
+        0x07, 0x0a, 0x01, 0x06, 0x61, 0x6e, 0x73, 0x77, 0x65, 0x72, 0x00, 0x00, // export
+        0x0a, 0x06, 0x01, 0x04, 0x00, 0x42, byte, 0x0b,
+    ] // code: i64.const <byte>; end
 }
 
 fn meta(name: &str, sym: &str, desc: &str) -> TokenMetadata {
@@ -102,7 +104,13 @@ fn hunt_neg_a1_no_length_prefix_collision_between_adjacent_string_fields() {
         .create_token([1u8; 32], meta("A", "ABB", "BCCDD"), 1000)
         .unwrap();
 
-    let d = [stream(&a), stream(&s1), stream(&s2), stream(&s3), stream(&s4)];
+    let d = [
+        stream(&a),
+        stream(&s1),
+        stream(&s2),
+        stream(&s3),
+        stream(&s4),
+    ];
     println!("[COMMIT A1] digests:");
     for (i, x) in d.iter().enumerate() {
         println!("[COMMIT A1]   state {i} = {}", hex::encode(&x[..8]));
@@ -133,14 +141,24 @@ fn hunt_neg_a2_no_collision_from_padded_or_multibyte_strings() {
     let mut seen: HashMap<Vec<u8>, (&str, &str, &str)> = HashMap::new();
     for (n, sy, d) in &variants {
         let mut s = empty_snapshot();
-        s.tokens.create_token([1u8; 32], meta(n, sy, d), 1000).unwrap();
+        s.tokens
+            .create_token([1u8; 32], meta(n, sy, d), 1000)
+            .unwrap();
         let dig = stream(&s);
         if let Some(prev) = seen.get(&dig) {
-            panic!("COLLISION: {:?} and {:?} -> {}", prev, (n, sy, d), hex::encode(&dig[..8]));
+            panic!(
+                "COLLISION: {:?} and {:?} -> {}",
+                prev,
+                (n, sy, d),
+                hex::encode(&dig[..8])
+            );
         }
         seen.insert(dig, (n, sy, d));
     }
-    println!("[COMMIT A2] {} distinct name/symbol/description triples, all distinct digests", seen.len());
+    println!(
+        "[COMMIT A2] {} distinct name/symbol/description triples, all distinct digests",
+        seen.len()
+    );
 }
 
 #[test]
@@ -198,7 +216,9 @@ fn hunt_neg_a3_no_collision_across_sub_systems() {
     );
     assert_ne!(stream(&esc), base_d, "escrow field leaked");
 
-    println!("[COMMIT A3] 5/5 subsystem perturbations changed the digest. No cross-subsystem aliasing.");
+    println!(
+        "[COMMIT A3] 5/5 subsystem perturbations changed the digest. No cross-subsystem aliasing."
+    );
 }
 
 // ===========================================================================
@@ -235,7 +255,11 @@ fn hunt_finding_9_contract_code_is_not_committed() {
         honest_hash,
         "precondition: code_hash was NOT recomputed"
     );
-    assert_ne!(reg.get(&addr).unwrap().code, wasm(), "the body really did change");
+    assert_ne!(
+        reg.get(&addr).unwrap().code,
+        wasm(),
+        "the body really did change"
+    );
 
     let s2 = {
         let mut s = empty_snapshot();
@@ -244,15 +268,24 @@ fn hunt_finding_9_contract_code_is_not_committed() {
     };
     let d2 = commitment_digest(&s2);
 
-    println!("[FINDING 9] contract {}/{}", hex::encode(&addr[..6]), addr.len());
-    println!("[FINDING 9] honest code_hash = {}", hex::encode(&honest_hash[..8]));
+    println!(
+        "[FINDING 9] contract {}/{}",
+        hex::encode(&addr[..6]),
+        addr.len()
+    );
+    println!(
+        "[FINDING 9] honest code_hash = {}",
+        hex::encode(&honest_hash[..8])
+    );
     println!("[FINDING 9] digest with code A = {}", hex::encode(&d1[..8]));
     println!("[FINDING 9] digest with code B = {}", hex::encode(&d2[..8]));
     assert_eq!(
         d1, d2,
         "COLLISION: two different WASM bodies under one code_hash give the SAME commitment digest"
     );
-    println!("[FINDING 9] COLLISION CONFIRMED: the executable body of a contract is NOT committed.");
+    println!(
+        "[FINDING 9] COLLISION CONFIRMED: the executable body of a contract is NOT committed."
+    );
 
     // Every OTHER field of Contract does move the digest, which is what makes
     // `code` the odd one out rather than a general failure of the module.
@@ -300,7 +333,10 @@ fn hunt_finding_9b_contract_code_change_survives_a_full_state_root() {
         }
         let r2 = b.get_state_root().await;
         println!("[FINDING 9b] node A root = {}", hex::encode(&r1[..8]));
-        println!("[FINDING 9b] node B root (different WASM) = {}", hex::encode(&r2[..8]));
+        println!(
+            "[FINDING 9b] node B root (different WASM) = {}",
+            hex::encode(&r2[..8])
+        );
         assert_eq!(
             r1, r2,
             "two nodes running DIFFERENT contract code report the SAME state root"
@@ -339,7 +375,9 @@ fn hunt_neg_b1_every_other_committed_field_moves_the_digest() {
     assert_ne!(commitment_digest(&s), d0);
 
     let mut s = empty_snapshot();
-    s.tokens.create_token([1u8; 32], meta("N", "S", "D"), 1).unwrap();
+    s.tokens
+        .create_token([1u8; 32], meta("N", "S", "D"), 1)
+        .unwrap();
     assert_ne!(commitment_digest(&s), d0);
 
     // `missed` and `last_downtime_penalty` -- the two fields Findings 3 and 10
@@ -352,7 +390,6 @@ fn hunt_neg_b1_every_other_committed_field_moves_the_digest() {
     )
     .unwrap();
     {
-        
         let v = l.validators.get_mut(&[1u8; 32]).unwrap();
         assert_eq!(v.missed, 0);
         v.missed = 1;
@@ -370,7 +407,9 @@ fn hunt_neg_b1_every_other_committed_field_moves_the_digest() {
     let d2 = commitment_digest(&s2);
     assert_ne!(d1, d2);
     assert_ne!(d1, d0);
-    println!("[COMMIT B1] `missed` and `last_downtime_penalty` are both committed (as documented).");
+    println!(
+        "[COMMIT B1] `missed` and `last_downtime_penalty` are both committed (as documented)."
+    );
 
     // Version bump is committed too. Bump this in the SAME commit that bumps
     // COMMITMENT_VERSION and update the genesis known-answer root: it is a hard fork.

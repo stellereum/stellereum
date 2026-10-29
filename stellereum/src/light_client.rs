@@ -297,7 +297,13 @@ impl Checkpoint {
         state_root: CellHash,
         cert: QuorumCertificate,
     ) -> Self {
-        Self { height, block_hash, parent_hash, state_root, cert }
+        Self {
+            height,
+            block_hash,
+            parent_hash,
+            state_root,
+            cert,
+        }
     }
 
     /// Derive a checkpoint from an already-verified header.
@@ -321,7 +327,11 @@ impl Checkpoint {
     /// A `finalized: false` answer is refused: only a finalized anchor is
     /// evidence.
     pub fn from_historical_root_json(v: &serde_json::Value) -> Result<Self, String> {
-        if !v.get("finalized").and_then(|x| x.as_bool()).unwrap_or(false) {
+        if !v
+            .get("finalized")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false)
+        {
             return Err("historical root is not marked finalized: refusing".to_string());
         }
         let height = v
@@ -338,7 +348,11 @@ impl Checkpoint {
             .get("anchor_height")
             .and_then(|x| x.as_u64())
             .ok_or_else(|| "historical root has no anchor height".to_string())?;
-        if anchor_height != height.checked_add(1).ok_or_else(|| "height overflows".to_string())? {
+        if anchor_height
+            != height
+                .checked_add(1)
+                .ok_or_else(|| "height overflows".to_string())?
+        {
             return Err(format!(
                 "historical root anchor {anchor_height} is not the successor of height {height}: refusing"
             ));
@@ -364,7 +378,11 @@ impl Checkpoint {
         {
             "Precommit" => VoteKind::Precommit,
             "Prevote" => VoteKind::Prevote,
-            other => return Err(format!("historical root certificate has unknown kind {other}")),
+            other => {
+                return Err(format!(
+                    "historical root certificate has unknown kind {other}"
+                ))
+            }
         };
         let cert_height = cert_value
             .get("height")
@@ -373,7 +391,8 @@ impl Checkpoint {
         let cert_round = cert_value
             .get("round")
             .and_then(|x| x.as_u64())
-            .ok_or_else(|| "historical root certificate has no round".to_string())? as u32;
+            .ok_or_else(|| "historical root certificate has no round".to_string())?
+            as u32;
         let cert_block = match cert_value.get("block_hash") {
             Some(serde_json::Value::String(s)) => Some(parse_hex32(s)?),
             _ => None,
@@ -381,17 +400,15 @@ impl Checkpoint {
         let mut signatures = Vec::new();
         if let Some(arr) = cert_value.get("signatures").and_then(|x| x.as_array()) {
             for sig in arr {
-                let validator = parse_hex32(
-                    sig.get("validator")
-                        .and_then(|x| x.as_str())
-                        .ok_or_else(|| "historical root certificate signature has no validator".to_string())?,
-                )?;
-                let signature = hex::decode(
-                    sig.get("signature")
-                        .and_then(|x| x.as_str())
-                        .ok_or_else(|| "historical root certificate signature has no signature".to_string())?,
-                )
-                .map_err(|e| format!("bad historical root certificate signature hex: {e}"))?;
+                let validator =
+                    parse_hex32(sig.get("validator").and_then(|x| x.as_str()).ok_or_else(
+                        || "historical root certificate signature has no validator".to_string(),
+                    )?)?;
+                let signature =
+                    hex::decode(sig.get("signature").and_then(|x| x.as_str()).ok_or_else(
+                        || "historical root certificate signature has no signature".to_string(),
+                    )?)
+                    .map_err(|e| format!("bad historical root certificate signature hex: {e}"))?;
                 signatures.push((validator, signature));
             }
         }
@@ -603,7 +620,8 @@ impl LightHeader {
     /// `Block::sign_block`, which signs the same 32 bytes).
     pub fn sign_with(&mut self, key: &SigningKey) {
         let sig = key.sign(&self.block_hash);
-        self.signatures.push((key.verifying_key().to_bytes(), sig.to_vec()));
+        self.signatures
+            .push((key.verifying_key().to_bytes(), sig.to_vec()));
     }
 
     /// The checkpoint this header would become, once verified.
@@ -765,10 +783,9 @@ impl EpochRootAnswer {
             .and_then(|x| x.as_array())
             .ok_or_else(|| "epoch root answer has no peaks".to_string())?
         {
-            peaks.push(parse_hex32(
-                p.as_str()
-                    .ok_or_else(|| "epoch root peak is not a hex string".to_string())?,
-            )?);
+            peaks.push(parse_hex32(p.as_str().ok_or_else(|| {
+                "epoch root peak is not a hex string".to_string()
+            })?)?);
         }
         Ok(Self {
             epoch,
@@ -841,7 +858,8 @@ pub fn verify_epoch_root_answer(answer: &EpochRootAnswer) -> Result<(), String> 
     }
     if answer.mmr_root == [0u8; 32] {
         return Err(
-            "epoch root answer claims a complete epoch with the all-zero root: refusing".to_string(),
+            "epoch root answer claims a complete epoch with the all-zero root: refusing"
+                .to_string(),
         );
     }
     Ok(())
@@ -978,9 +996,15 @@ pub struct ProvenProof {
 
 /// Parse a 32-byte hex string (with or without `0x`).
 fn parse_hex32(s: &str) -> Result<[u8; 32], String> {
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     if s.len() != 64 {
-        return Err(format!("expected 32 bytes (64 hex characters), got {}", s.len()));
+        return Err(format!(
+            "expected 32 bytes (64 hex characters), got {}",
+            s.len()
+        ));
     }
     let b = hex::decode(s).map_err(|e| format!("bad hex: {e}"))?;
     b.try_into().map_err(|_| "expected 32 bytes".to_string())
@@ -1046,12 +1070,22 @@ impl ProofAnswer {
                         .ok_or_else(|| "storage proof has no key".to_string())?,
                 )?;
                 let value = match sp.get("value") {
-                    Some(serde_json::Value::String(s)) => Some(hex::decode(s).map_err(|e| format!("bad storage value hex: {e}"))?),
+                    Some(serde_json::Value::String(s)) => {
+                        Some(hex::decode(s).map_err(|e| format!("bad storage value hex: {e}"))?)
+                    }
                     _ => None,
                 };
-                let exists = sp.get("exists").and_then(|x| x.as_bool()).unwrap_or(value.is_some());
+                let exists = sp
+                    .get("exists")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(value.is_some());
                 let proof = parse_proof_nodes(sp.get("proof"))?;
-                storage_proofs.push(StorageProofAnswer { key, value, exists, proof });
+                storage_proofs.push(StorageProofAnswer {
+                    key,
+                    value,
+                    exists,
+                    proof,
+                });
             }
         }
         Ok(ProofAnswer {
@@ -1182,7 +1216,9 @@ impl LightClient {
 
     /// Height of the most recent finalized block this client knows.
     pub fn tip_height(&self) -> u64 {
-        self.headers.back().map_or(self.anchor_height(), |h| h.height)
+        self.headers
+            .back()
+            .map_or(self.anchor_height(), |h| h.height)
     }
 
     /// The height of the anchor itself.
@@ -1386,9 +1422,7 @@ impl LightClient {
         if header.state_root == self.state_root() {
             return None;
         }
-        if self.anchor_height() < parent_height
-            && header.state_root == self.anchor_state_root()
-        {
+        if self.anchor_height() < parent_height && header.state_root == self.anchor_state_root() {
             return Some(self.anchor_state_root());
         }
         self.headers
@@ -1601,7 +1635,8 @@ impl LightClient {
         }
         if proof.path.is_empty() && proof.leaf_hash == [0u8; 32] {
             return Err(LightError::InvalidProof(
-                "empty proof: a missing inclusion proof is not evidence that a key is absent".to_string(),
+                "empty proof: a missing inclusion proof is not evidence that a key is absent"
+                    .to_string(),
             ));
         }
 
@@ -1636,9 +1671,11 @@ impl LightClient {
     ///    authenticate at the trusted root.
     pub fn verify_proof_answer(&self, answer: &ProofAnswer) -> Result<ProvenProof, LightError> {
         // Trust first: an untrusted root makes every other check moot.
-        let height = self
-            .trusted_height_of_root(&answer.state_root)
-            .ok_or(LightError::RootUntrusted { root: answer.state_root })?;
+        let height =
+            self.trusted_height_of_root(&answer.state_root)
+                .ok_or(LightError::RootUntrusted {
+                    root: answer.state_root,
+                })?;
 
         // The account proof.
         let proof = crate::cpat2::MerkleProof::from_nodes(&answer.account_proof)
@@ -1659,7 +1696,10 @@ impl LightClient {
                     &proof.value,
                     &proof,
                 ) {
-                    return Err(LightError::NotIncluded { height, state_root: answer.state_root });
+                    return Err(LightError::NotIncluded {
+                        height,
+                        state_root: answer.state_root,
+                    });
                 }
                 if proof.value.len() < ACCOUNT_VALUE_LEN {
                     return Err(LightError::InvalidProof(format!(
@@ -1678,8 +1718,15 @@ impl LightClient {
                 (b, n, true)
             }
             crate::cpat2::ProofKind::Exclusion => {
-                if !crate::cpat2::verify_exclusion_proof(&answer.state_root, &answer.address, &proof) {
-                    return Err(LightError::NotIncluded { height, state_root: answer.state_root });
+                if !crate::cpat2::verify_exclusion_proof(
+                    &answer.state_root,
+                    &answer.address,
+                    &proof,
+                ) {
+                    return Err(LightError::NotIncluded {
+                        height,
+                        state_root: answer.state_root,
+                    });
                 }
                 if answer.balance != 0 || answer.nonce != 0 {
                     return Err(LightError::InvalidProof(
@@ -1710,7 +1757,10 @@ impl LightClient {
                         &sp_proof.value,
                         &sp_proof,
                     ) {
-                        return Err(LightError::NotIncluded { height, state_root: answer.state_root });
+                        return Err(LightError::NotIncluded {
+                            height,
+                            state_root: answer.state_root,
+                        });
                     }
                     match &sp.value {
                         Some(v) if *v == sp_proof.value => {}
@@ -1734,8 +1784,12 @@ impl LightClient {
                     });
                 }
                 crate::cpat2::ProofKind::Exclusion => {
-                    if !crate::cpat2::verify_exclusion_proof(&answer.state_root, &sp.key, &sp_proof) {
-                        return Err(LightError::NotIncluded { height, state_root: answer.state_root });
+                    if !crate::cpat2::verify_exclusion_proof(&answer.state_root, &sp.key, &sp_proof)
+                    {
+                        return Err(LightError::NotIncluded {
+                            height,
+                            state_root: answer.state_root,
+                        });
                     }
                     if sp.value.is_some() {
                         return Err(LightError::InvalidProof(format!(
@@ -1743,7 +1797,11 @@ impl LightClient {
                             hex::encode(sp.key)
                         )));
                     }
-                    storage.push(ProvenStorage { key: sp.key, value: None, exists: false });
+                    storage.push(ProvenStorage {
+                        key: sp.key,
+                        value: None,
+                        exists: false,
+                    });
                 }
             }
         }
@@ -1760,10 +1818,7 @@ impl LightClient {
     }
 
     /// Verify a raw `stell_getProof` JSON response.
-    pub fn verify_proof_json(
-        &self,
-        value: &serde_json::Value,
-    ) -> Result<ProvenProof, LightError> {
+    pub fn verify_proof_json(&self, value: &serde_json::Value) -> Result<ProvenProof, LightError> {
         let answer = ProofAnswer::from_json(value).map_err(LightError::InvalidProof)?;
         self.verify_proof_answer(&answer)
     }
@@ -1788,27 +1843,30 @@ impl LightClient {
         proof: &crate::cpat2::ArchiveProof,
     ) -> Result<ProvenArchiveProof, LightError> {
         // Trust first: with an untrusted root there is nothing to check against.
-        let height = self
-            .trusted_height_of_root(&proof.state_root)
-            .ok_or(LightError::RootUntrusted { root: proof.state_root })?;
+        let height =
+            self.trusted_height_of_root(&proof.state_root)
+                .ok_or(LightError::RootUntrusted {
+                    root: proof.state_root,
+                })?;
         // Replay guard: the proof must be ABOUT the trusted root, not merely
         // accompanied by it.
         if !proof.verify() {
             // Well-formed but not authenticating here (or malformed): either
             // way it is not evidence about the state we trust.
-            return Err(LightError::NotIncluded { height, state_root: proof.state_root });
+            return Err(LightError::NotIncluded {
+                height,
+                state_root: proof.state_root,
+            });
         }
         let (value, exists) = match proof.proof_type {
-            crate::cpat2::ArchiveProofType::Inclusion => {
-                match &proof.value {
-                    Some(v) => (Some(v.clone()), true),
-                    None => {
-                        return Err(LightError::InvalidProof(
-                            "archive proof claims inclusion but carries no value".to_string(),
-                        ))
-                    }
+            crate::cpat2::ArchiveProofType::Inclusion => match &proof.value {
+                Some(v) => (Some(v.clone()), true),
+                None => {
+                    return Err(LightError::InvalidProof(
+                        "archive proof claims inclusion but carries no value".to_string(),
+                    ))
                 }
-            }
+            },
             crate::cpat2::ArchiveProofType::Exclusion => (None, false),
         };
         Ok(ProvenArchiveProof {
@@ -1981,7 +2039,9 @@ mod tests {
 
         let missing = [0xEEu8; 32];
         let answer = answer_for(&trie, &missing, &[]);
-        let proven = lc.verify_proof_answer(&answer).expect("exclusion answer must verify");
+        let proven = lc
+            .verify_proof_answer(&answer)
+            .expect("exclusion answer must verify");
         assert!(!proven.exists);
         assert_eq!(proven.balance, 0);
         assert_eq!(proven.nonce, 0);
@@ -2070,7 +2130,9 @@ mod tests {
             "state_root": hex::encode(root),
             "height": 1u64,
         });
-        let proven = lc.verify_proof_json(&json).expect("json answer must verify");
+        let proven = lc
+            .verify_proof_json(&json)
+            .expect("json answer must verify");
         assert_eq!(proven.balance, 42);
         assert_eq!(proven.nonce, 3);
     }
@@ -2087,7 +2149,8 @@ mod tests {
         let scheme = crate::post_quantum::PqScheme::Falcon512.id();
         let pubkey_hash = [0x77u8; 32];
 
-        let pinned_leaf = crate::cpat2::AccountLeaf::new_pinned(balance, nonce, scheme, pubkey_hash).encode();
+        let pinned_leaf =
+            crate::cpat2::AccountLeaf::new_pinned(balance, nonce, scheme, pubkey_hash).encode();
         assert_eq!(pinned_leaf.len(), crate::cpat2::ACCOUNT_LEAF_LEN_PQ);
 
         let mut trie = PatriciaTrie::new();
@@ -2126,8 +2189,11 @@ mod tests {
         assert_eq!(proven_ans.nonce, nonce);
 
         // Negative check: wrong leaf data or altered balance fails
-        let tampered_leaf = crate::cpat2::AccountLeaf::new_pinned(balance + 1, nonce, scheme, pubkey_hash).encode();
-        assert!(lc.verify_account(&address, &tampered_leaf, &proof, state_root).is_err());
+        let tampered_leaf =
+            crate::cpat2::AccountLeaf::new_pinned(balance + 1, nonce, scheme, pubkey_hash).encode();
+        assert!(lc
+            .verify_account(&address, &tampered_leaf, &proof, state_root)
+            .is_err());
     }
 
     #[test]
@@ -2379,7 +2445,13 @@ mod tests {
         let anchor_height = archive_height + 1;
         let anchor_hash = [0xB0u8; 32];
         let parent_hash = [0xA0u8; 32];
-        let vote = Vote::sign(signer, anchor_height, 0, VoteKind::Precommit, Some(anchor_hash));
+        let vote = Vote::sign(
+            signer,
+            anchor_height,
+            0,
+            VoteKind::Precommit,
+            Some(anchor_hash),
+        );
         let cert = QuorumCertificate {
             height: anchor_height,
             round: 0,
@@ -2418,23 +2490,34 @@ mod tests {
         let trie_proof = trie.generate_proof(&present).expect("proof");
         let incl =
             crate::cpat2::ArchiveProof::inclusion(7, root, present, &trie_proof).expect("archive");
-        let proven = lc.verify_archive_proof(&incl).expect("inclusion must verify");
+        let proven = lc
+            .verify_archive_proof(&incl)
+            .expect("inclusion must verify");
         assert_eq!(proven.key, present);
         assert!(proven.exists);
-        assert_eq!(proven.value.as_deref(), Some(&account_leaf(1_000_000, 7)[..]));
+        assert_eq!(
+            proven.value.as_deref(),
+            Some(&account_leaf(1_000_000, 7)[..])
+        );
         assert_eq!(proven.state_root, root);
         assert_eq!(proven.archive_height, incl.height);
 
         // Exclusion.
-        let trie_excl = trie.generate_exclusion_proof(&missing).expect("exclusion proof");
+        let trie_excl = trie
+            .generate_exclusion_proof(&missing)
+            .expect("exclusion proof");
         let excl =
             crate::cpat2::ArchiveProof::exclusion(7, root, missing, &trie_excl).expect("archive");
-        let proven = lc.verify_archive_proof(&excl).expect("exclusion must verify");
+        let proven = lc
+            .verify_archive_proof(&excl)
+            .expect("exclusion must verify");
         assert!(!proven.exists);
         assert_eq!(proven.value, None);
 
         // The JSON wire form verifies too.
-        let proven = lc.verify_archive_proof_json(&incl.to_json()).expect("json must verify");
+        let proven = lc
+            .verify_archive_proof_json(&incl.to_json())
+            .expect("json must verify");
         assert!(proven.exists);
     }
 
@@ -2484,7 +2567,13 @@ mod tests {
         // The client's trusted anchor: the finalized block AT the archive
         // height, committing to the historical root.
         let anchor_hash = [0xA0u8; 32];
-        let anchor_vote = Vote::sign(&signer, archive_height, 0, VoteKind::Precommit, Some(anchor_hash));
+        let anchor_vote = Vote::sign(
+            &signer,
+            archive_height,
+            0,
+            VoteKind::Precommit,
+            Some(anchor_hash),
+        );
         let anchor_cert = QuorumCertificate {
             height: archive_height,
             round: 0,
@@ -2492,8 +2581,7 @@ mod tests {
             block_hash: Some(anchor_hash),
             signatures: vec![(anchor_vote.voter, anchor_vote.signature)],
         };
-        let anchor =
-            Checkpoint::new(archive_height, anchor_hash, [0u8; 32], root, anchor_cert);
+        let anchor = Checkpoint::new(archive_height, anchor_hash, [0u8; 32], root, anchor_cert);
         let mut lc = LightClient::new(validators.clone(), anchor).expect("anchor");
 
         // The historical-root answer for the SAME height, anchored at
@@ -2501,14 +2589,16 @@ mod tests {
         let (answer, cp, _) = historical_root_fixture(archive_height, root, &signer);
         let parsed = Checkpoint::from_historical_root_json(&answer).expect("parse");
         assert_eq!(parsed, cp);
-        parsed.verify(&validators).expect("the QC must verify under our own set");
-        lc.advance_to_checkpoint(parsed).expect("adopt the newer anchor");
+        parsed
+            .verify(&validators)
+            .expect("the QC must verify under our own set");
+        lc.advance_to_checkpoint(parsed)
+            .expect("adopt the newer anchor");
 
         // Now the archive proof verifies against the adopted root.
         let proof = trie.generate_proof(&present).expect("proof");
-        let archive =
-            crate::cpat2::ArchiveProof::inclusion(archive_height, root, present, &proof)
-                .expect("archive");
+        let archive = crate::cpat2::ArchiveProof::inclusion(archive_height, root, present, &proof)
+            .expect("archive");
         let proven = lc.verify_archive_proof(&archive).expect("must verify");
         assert!(proven.exists);
         assert_eq!(proven.archive_height, archive_height);

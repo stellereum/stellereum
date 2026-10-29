@@ -76,17 +76,29 @@ pub struct SdkKey {
 impl SdkKey {
     /// Classic fast Ed25519 key from a 32-byte seed.
     pub fn ed25519(seed: [u8; 32]) -> Self {
-        Self { scheme: PqScheme::Ed25519, ed_seed: seed, falcon_seed: [0u8; 32] }
+        Self {
+            scheme: PqScheme::Ed25519,
+            ed_seed: seed,
+            falcon_seed: [0u8; 32],
+        }
     }
 
     /// Post-quantum Falcon-512 key, deterministically derived from a 32-byte seed.
     pub fn falcon_from_seed(seed: [u8; 32]) -> Self {
-        Self { scheme: PqScheme::Falcon512, ed_seed: [0u8; 32], falcon_seed: seed }
+        Self {
+            scheme: PqScheme::Falcon512,
+            ed_seed: [0u8; 32],
+            falcon_seed: seed,
+        }
     }
 
     /// Hybrid dual-signature key (Ed25519 + Falcon-512).
     pub fn hybrid(ed_seed: [u8; 32], falcon_seed: [u8; 32]) -> Self {
-        Self { scheme: PqScheme::Hybrid, ed_seed, falcon_seed }
+        Self {
+            scheme: PqScheme::Hybrid,
+            ed_seed,
+            falcon_seed,
+        }
     }
 
     /// Which scheme this key signs with.
@@ -108,9 +120,7 @@ impl SdkKey {
             PqScheme::Ed25519 => self.ed_signing_key().verifying_key().to_bytes().to_vec(),
             PqScheme::Falcon512 => self.falcon_keypair().public_key().to_vec(),
             PqScheme::Hybrid => {
-                let mut pk = Vec::with_capacity(
-                    stellereum::post_quantum::HYBRID_PUBKEY_LEN,
-                );
+                let mut pk = Vec::with_capacity(stellereum::post_quantum::HYBRID_PUBKEY_LEN);
                 pk.extend_from_slice(&self.ed_signing_key().verifying_key().to_bytes());
                 pk.extend_from_slice(self.falcon_keypair().public_key());
                 pk
@@ -158,11 +168,7 @@ pub struct TxBuilder {
 }
 
 impl TxBuilder {
-    fn payload_tx(
-        payload: Vec<OpCode>,
-        gas_limit: u64,
-        chain_id: Option<u64>,
-    ) -> Self {
+    fn payload_tx(payload: Vec<OpCode>, gas_limit: u64, chain_id: Option<u64>) -> Self {
         Self {
             to: None, // resolved to the signer at `sign` (wallet convention)
             amount: 0,
@@ -191,14 +197,22 @@ impl TxBuilder {
 
     /// STS fungible-token transfer `{ token_id, to, amount }`.
     pub fn token_transfer(token_id: [u8; 32], to: [u8; 32], amount: u64) -> Self {
-        let op = OpCode::SysCallTokenTransfer { token_id, to, amount };
+        let op = OpCode::SysCallTokenTransfer {
+            token_id,
+            to,
+            amount,
+        };
         let gas = opcode_gas(&op);
         Self::payload_tx(vec![op], gas, Some(SDK_DEFAULT_CHAIN_ID))
     }
 
     /// STS approve `{ token_id, spender, amount }`.
     pub fn token_approve(token_id: [u8; 32], spender: [u8; 32], amount: u64) -> Self {
-        let op = OpCode::SysCallTokenApprove { token_id, spender, amount };
+        let op = OpCode::SysCallTokenApprove {
+            token_id,
+            spender,
+            amount,
+        };
         let gas = opcode_gas(&op);
         Self::payload_tx(vec![op], gas, Some(SDK_DEFAULT_CHAIN_ID))
     }
@@ -210,14 +224,23 @@ impl TxBuilder {
         to: [u8; 32],
         amount: u64,
     ) -> Self {
-        let op = OpCode::SysCallTokenTransferFrom { token_id, from, to, amount };
+        let op = OpCode::SysCallTokenTransferFrom {
+            token_id,
+            from,
+            to,
+            amount,
+        };
         let gas = opcode_gas(&op);
         Self::payload_tx(vec![op], gas, Some(SDK_DEFAULT_CHAIN_ID))
     }
 
     /// STS mint `{ token_id, to, amount }` (the minter key must sign).
     pub fn token_mint(token_id: [u8; 32], to: [u8; 32], amount: u64) -> Self {
-        let op = OpCode::SysCallTokenMint { token_id, to, amount };
+        let op = OpCode::SysCallTokenMint {
+            token_id,
+            to,
+            amount,
+        };
         let gas = opcode_gas(&op);
         Self::payload_tx(vec![op], gas, Some(SDK_DEFAULT_CHAIN_ID))
     }
@@ -225,7 +248,11 @@ impl TxBuilder {
     /// STS burn `{ token_id, from, amount }` (the holder's key signs a
     /// self-burn; the minter's key signs an admin burn of another account).
     pub fn token_burn(token_id: [u8; 32], from: [u8; 32], amount: u64) -> Self {
-        let op = OpCode::SysCallTokenBurn { token_id, from, amount };
+        let op = OpCode::SysCallTokenBurn {
+            token_id,
+            from,
+            amount,
+        };
         let gas = opcode_gas(&op);
         Self::payload_tx(vec![op], gas, Some(SDK_DEFAULT_CHAIN_ID))
     }
@@ -241,7 +268,13 @@ impl TxBuilder {
         initial_supply: u64,
         max_supply: Option<u64>,
     ) -> Self {
-        let op = OpCode::SysCallTokenCreate { name, symbol, decimals, initial_supply, max_supply };
+        let op = OpCode::SysCallTokenCreate {
+            name,
+            symbol,
+            decimals,
+            initial_supply,
+            max_supply,
+        };
         let gas = opcode_gas(&op);
         Self::payload_tx(vec![op], gas, Some(SDK_DEFAULT_CHAIN_ID))
     }
@@ -425,9 +458,7 @@ impl TxBuilder {
                 let sig = match scheme {
                     PqScheme::Falcon512 => key.falcon_keypair().sign(&msg),
                     _ => {
-                        let mut s = Vec::with_capacity(
-                            stellereum::post_quantum::HYBRID_SIG_LEN,
-                        );
+                        let mut s = Vec::with_capacity(stellereum::post_quantum::HYBRID_SIG_LEN);
                         s.extend_from_slice(&key.ed_signing_key().sign(&msg).to_bytes());
                         s.extend_from_slice(&key.falcon_keypair().sign(&msg));
                         s
@@ -436,7 +467,11 @@ impl TxBuilder {
                 let pubkey = key.pubkey_bytes();
                 let envelope = match self.chain_id {
                     Some(cid) => PqSignatureEnvelope::new_explicit_with_chain(
-                        scheme, pubkey, sig, DEFAULT_SALT, cid,
+                        scheme,
+                        pubkey,
+                        sig,
+                        DEFAULT_SALT,
+                        cid,
                     ),
                     None => PqSignatureEnvelope::new_explicit(scheme, pubkey, sig),
                 };
@@ -458,7 +493,9 @@ impl TxBuilder {
             }
         };
         if !tx.verify_signature() {
-            return Err("stellereum-sdk: freshly signed transaction failed verification".to_string());
+            return Err(
+                "stellereum-sdk: freshly signed transaction failed verification".to_string(),
+            );
         }
         Ok(SignedTx { tx })
     }
@@ -586,13 +623,20 @@ impl FeeEstimate {
             base_fee: Self::u64_field(v, "base_fee")?,
             source_shard: Self::u64_field(v, "source_shard")? as u32,
             target_shard: Self::u64_field(v, "target_shard")? as u32,
-            is_cross_shard: v.get("is_cross_shard").and_then(|b| b.as_bool()).unwrap_or(false),
+            is_cross_shard: v
+                .get("is_cross_shard")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false),
         })
     }
 }
 
 /// One JSON-RPC call over HTTP POST. Pure transport: no signing, no state.
-fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+fn rpc_call(
+    rpc_url: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,

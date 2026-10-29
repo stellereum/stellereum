@@ -29,8 +29,8 @@ use serde::Serialize;
 use stellereum::governance::{
     GovAction, GovError, ProposalStatus, VoteChoice, GOVERNANCE_VOTING_PERIOD_SECS,
 };
-use stellereum::oracle::{OracleState, PriceFeedUpdate};
 use stellereum::mempool::Mempool;
+use stellereum::oracle::{OracleState, PriceFeedUpdate};
 use stellereum::sharding::Transaction;
 use stellereum::staking::DEFAULT_COMMISSION_BPS;
 use stellereum::state_engine::InMemoryStateEngine;
@@ -52,7 +52,9 @@ fn sender_key() -> SigningKey {
 /// 100%-turnout quorum) and a funded feed sender.
 async fn gov_engine() -> (InMemoryStateEngine, [u8; 32]) {
     let e = InMemoryStateEngine::new();
-    let validator = SigningKey::from_bytes(&[0x51; 32]).verifying_key().to_bytes();
+    let validator = SigningKey::from_bytes(&[0x51; 32])
+        .verifying_key()
+        .to_bytes();
     e.credit_native(&validator, 1_000_000_000_000_000)
         .await
         .expect("fund validator");
@@ -118,7 +120,8 @@ async fn apply_feed(
         1,
         vec![OpCode::SysCallSubmitPriceFeed(Box::new(feed))],
     );
-    let (_applied, _failed, _fees, status, _) = e.apply_block_parallel_fees(&[tx], block_time).await;
+    let (_applied, _failed, _fees, status, _) =
+        e.apply_block_parallel_fees(&[tx], block_time).await;
     status.first().copied().unwrap_or(false)
 }
 
@@ -140,7 +143,10 @@ fn unregistered_publisher_feed_is_refused_even_with_a_valid_signature() {
     let err = oracle
         .commit_feed(&feed, BLOCK_TIME)
         .expect_err("an unregistered publisher must be refused");
-    assert!(err.contains("publisher"), "the refusal must name the set: {err}");
+    assert!(
+        err.contains("publisher"),
+        "the refusal must name the set: {err}"
+    );
     assert!(oracle.feeds.is_empty(), "nothing may be committed");
 }
 
@@ -217,8 +223,15 @@ async fn governance_registration_lets_a_block_feed_commit_and_moves_the_root() {
     // sender's nonce (SEC-07), so the retry is signed with the NEXT nonce (1).
     assert_eq!(e.get_account(&sender).await.unwrap().nonce, 1);
     assert!(apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 10), BLOCK_TIME, 1).await);
-    assert_eq!(e.oracle_read().await.feeds["STELL"].price_micro_usd, 250_000);
-    assert_ne!(e.get_state_root().await, registered, "the feed is committed");
+    assert_eq!(
+        e.oracle_read().await.feeds["STELL"].price_micro_usd,
+        250_000
+    );
+    assert_ne!(
+        e.get_state_root().await,
+        registered,
+        "the feed is committed"
+    );
 }
 
 #[tokio::test]
@@ -233,7 +246,11 @@ async fn unregister_revokes_future_feeds_but_keeps_committed_history() {
     let id = pass(&e, voter, GovAction::UnregisterOraclePublisher(pk)).await;
     execute_with_oracle(&e, voter, id).await;
     assert!(!e.oracle_read().await.publishers.contains(&pk));
-    assert_ne!(e.get_state_root().await, with_feed, "revocation is committed");
+    assert_ne!(
+        e.get_state_root().await,
+        with_feed,
+        "revocation is committed"
+    );
 
     // Future feeds are refused; the price already committed is history.
     assert!(!apply_feed(&e, stell_feed(251_000, BLOCK_TIME - 5), BLOCK_TIME, 1).await);
@@ -289,11 +306,20 @@ async fn breaker_reset_requires_a_passed_executed_governance_action() {
     let tx0 = mk_feed_tx(stell_feed(250_000, BLOCK_TIME - 60), 0);
     let floor0 = floor_mirror.effective_floor_for_tx(&tx0);
     let bal0 = e.get_account(&sender).await.unwrap().balance;
-    let (a0, f0, _, s0, fees0) = e.apply_block_parallel_fees(std::slice::from_ref(&tx0), BLOCK_TIME).await;
+    let (a0, f0, _, s0, fees0) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&tx0), BLOCK_TIME)
+        .await;
     assert_eq!((a0, f0), (1, 0), "seed feed must apply");
     assert_eq!(s0, vec![true]);
-    assert_eq!(fees0, vec![10_000.max(floor0)], "success pays max(declared, floor)");
-    assert_eq!(e.get_account(&sender).await.unwrap().balance, bal0 - fees0[0]);
+    assert_eq!(
+        fees0,
+        vec![10_000.max(floor0)],
+        "success pays max(declared, floor)"
+    );
+    assert_eq!(
+        e.get_account(&sender).await.unwrap().balance,
+        bal0 - fees0[0]
+    );
     assert_eq!(e.get_account(&sender).await.unwrap().nonce, 1);
     floor_mirror.note_apply_feedback(&[], &[sender]);
 
@@ -302,17 +328,37 @@ async fn breaker_reset_requires_a_passed_executed_governance_action() {
     let floor1 = floor_mirror.effective_floor_for_tx(&tx1);
     assert_eq!(floor1, 0, "first failure still sees floor 0");
     let bal1 = e.get_account(&sender).await.unwrap().balance;
-    let (a1, f1, _, s1, fees1) = e.apply_block_parallel_fees(std::slice::from_ref(&tx1), BLOCK_TIME).await;
+    let (a1, f1, _, s1, fees1) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&tx1), BLOCK_TIME)
+        .await;
     assert_eq!((a1, f1), (0, 1), "deviation feed must be refused");
     assert_eq!(s1, vec![false]);
     // The failure fee is max(declared, floor): with a zero floor the DECLARED
     // limit (10_000) is what the sender pays - a failure is never free.
-    assert_eq!(fees1, vec![10_000.max(floor1)], "a refusal pays max(declared, floor)");
-    assert_eq!(e.get_account(&sender).await.unwrap().balance, bal1 - fees1[0]);
-    assert_eq!(e.get_account(&sender).await.unwrap().nonce, 2, "the paid refusal consumes nonce");
+    assert_eq!(
+        fees1,
+        vec![10_000.max(floor1)],
+        "a refusal pays max(declared, floor)"
+    );
+    assert_eq!(
+        e.get_account(&sender).await.unwrap().balance,
+        bal1 - fees1[0]
+    );
+    assert_eq!(
+        e.get_account(&sender).await.unwrap().nonce,
+        2,
+        "the paid refusal consumes nonce"
+    );
     floor_mirror.note_apply_feedback(&[sender], &[]);
-    assert!(e.oracle_read().await.breaker_tripped, "deviation latches the breaker");
-    assert_ne!(e.get_state_root().await, root_before_trip, "the latch itself is committed");
+    assert!(
+        e.oracle_read().await.breaker_tripped,
+        "deviation latches the breaker"
+    );
+    assert_ne!(
+        e.get_state_root().await,
+        root_before_trip,
+        "the latch itself is committed"
+    );
     let tripped = e.get_state_root().await;
 
     // The latch refuses even a fresh, in-band feed — but the refusal is now a
@@ -322,30 +368,64 @@ async fn breaker_reset_requires_a_passed_executed_governance_action() {
     // debit (no longer a no-op).
     let tx2 = mk_feed_tx(stell_feed(251_000, BLOCK_TIME - 5), 2);
     let expected_floor = floor_mirror.effective_floor_for_tx(&tx2);
-    assert!(expected_floor > 0, "one prior failure must have raised the floor");
+    assert!(
+        expected_floor > 0,
+        "one prior failure must have raised the floor"
+    );
     let bal2 = e.get_account(&sender).await.unwrap().balance;
     let root2 = e.get_state_root().await;
-    let (a2, f2, _, s2, fees2) = e.apply_block_parallel_fees(std::slice::from_ref(&tx2), BLOCK_TIME).await;
+    let (a2, f2, _, s2, fees2) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&tx2), BLOCK_TIME)
+        .await;
     assert_eq!((a2, f2), (0, 1), "latched feed must still be refused");
     assert_eq!(s2, vec![false], "latched refusal still refuses");
-    assert_eq!(fees2, vec![10_000.max(expected_floor)], "latched refusal pays max(declared, floor)");
+    assert_eq!(
+        fees2,
+        vec![10_000.max(expected_floor)],
+        "latched refusal pays max(declared, floor)"
+    );
     let acct2 = e.get_account(&sender).await.unwrap();
-    assert_eq!(acct2.balance, bal2 - fees2[0], "refusal balance delta == the failure fee");
+    assert_eq!(
+        acct2.balance,
+        bal2 - fees2[0],
+        "refusal balance delta == the failure fee"
+    );
     assert_eq!(acct2.nonce, 3, "paid refusal consumes nonce");
-    assert_ne!(e.get_state_root().await, root2, "paid refusal moves root via fee");
-    assert_ne!(e.get_state_root().await, tripped, "a paid refusal is not a no-op");
-    assert!(e.oracle_read().await.breaker_tripped, "the latch is still set");
+    assert_ne!(
+        e.get_state_root().await,
+        root2,
+        "paid refusal moves root via fee"
+    );
+    assert_ne!(
+        e.get_state_root().await,
+        tripped,
+        "a paid refusal is not a no-op"
+    );
+    assert!(
+        e.oracle_read().await.breaker_tripped,
+        "the latch is still set"
+    );
     floor_mirror.note_apply_feedback(&[sender], &[]);
     let latched_paid_root = e.get_state_root().await;
 
     // A passed-but-unexecuted reset does nothing.
     let id = pass(&e, voter, GovAction::ResetOracleBreaker).await;
-    assert!(e.oracle_read().await.breaker_tripped, "voting alone must not clear it");
+    assert!(
+        e.oracle_read().await.breaker_tripped,
+        "voting alone must not clear it"
+    );
 
     execute_with_oracle(&e, voter, id).await;
-    assert!(!e.oracle_read().await.breaker_tripped, "execution clears the latch");
+    assert!(
+        !e.oracle_read().await.breaker_tripped,
+        "execution clears the latch"
+    );
     assert_ne!(e.get_state_root().await, tripped, "the reset is committed");
-    assert_ne!(e.get_state_root().await, latched_paid_root, "the reset moves past the paid refusal");
+    assert_ne!(
+        e.get_state_root().await,
+        latched_paid_root,
+        "the reset moves past the paid refusal"
+    );
 
     // The market reopens: a fresh in-band feed at the advanced nonce (3)
     // commits — paying max(declared, floor) since the two prior failures
@@ -354,14 +434,23 @@ async fn breaker_reset_requires_a_passed_executed_governance_action() {
     let expected_floor3 = floor_mirror.effective_floor_for_tx(&tx3);
     let bal3 = e.get_account(&sender).await.unwrap().balance;
     let root3 = e.get_state_root().await;
-    let (a3, f3, _, s3, fees3) = e.apply_block_parallel_fees(std::slice::from_ref(&tx3), BLOCK_TIME).await;
+    let (a3, f3, _, s3, fees3) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&tx3), BLOCK_TIME)
+        .await;
     assert_eq!((a3, f3), (1, 0), "post-reset feed must apply at nonce 3");
     assert_eq!(s3, vec![true]);
-    assert_eq!(fees3, vec![10_000.max(expected_floor3)], "success pays max(declared, floor)");
+    assert_eq!(
+        fees3,
+        vec![10_000.max(expected_floor3)],
+        "success pays max(declared, floor)"
+    );
     let acct3 = e.get_account(&sender).await.unwrap();
     assert_eq!(acct3.balance, bal3 - fees3[0]);
     assert_eq!(acct3.nonce, 4);
-    assert_eq!(e.oracle_read().await.feeds["STELL"].price_micro_usd, 251_000);
+    assert_eq!(
+        e.oracle_read().await.feeds["STELL"].price_micro_usd,
+        251_000
+    );
     assert_ne!(e.get_state_root().await, root3, "the feed is committed");
 }
 
@@ -510,13 +599,31 @@ fn oracle_action_classification() {
 #[test]
 fn oracle_registry_helpers_are_idempotent() {
     let mut o = OracleState::default();
-    assert!(o.register_publisher([0x11; 32]), "first insert changes the set");
-    assert!(!o.register_publisher([0x11; 32]), "duplicate insert is a no-op");
-    assert!(o.unregister_publisher([0x11; 32]), "removal changes the set");
-    assert!(!o.unregister_publisher([0x11; 32]), "second removal is a no-op");
+    assert!(
+        o.register_publisher([0x11; 32]),
+        "first insert changes the set"
+    );
+    assert!(
+        !o.register_publisher([0x11; 32]),
+        "duplicate insert is a no-op"
+    );
+    assert!(
+        o.unregister_publisher([0x11; 32]),
+        "removal changes the set"
+    );
+    assert!(
+        !o.unregister_publisher([0x11; 32]),
+        "second removal is a no-op"
+    );
 
-    assert!(!o.reset_breaker(), "an already-clear breaker reports no change");
+    assert!(
+        !o.reset_breaker(),
+        "an already-clear breaker reports no change"
+    );
     o.breaker_tripped = true;
-    assert!(o.reset_breaker(), "clearing a latched breaker reports a change");
+    assert!(
+        o.reset_breaker(),
+        "clearing a latched breaker reports a change"
+    );
     assert!(!o.breaker_tripped);
 }

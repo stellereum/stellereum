@@ -193,7 +193,13 @@ pub fn encode_qc_bls_envelope(
 /// hash against its own `block_hash.unwrap_or([0; 32])`.
 pub fn decode_qc_bls_envelope(
     payload: &[u8],
-) -> Option<(Height, Round, VoteKind, BlockHash, crate::bls::BlsAggregateSignature)> {
+) -> Option<(
+    Height,
+    Round,
+    VoteKind,
+    BlockHash,
+    crate::bls::BlsAggregateSignature,
+)> {
     const HEADER: usize = 16 + 8 + 4 + 1 + 32 + 4 + 96;
     if payload.len() < HEADER || &payload[..16] != QC_BLS_MAGIC {
         return None;
@@ -224,7 +230,10 @@ pub fn decode_qc_bls_envelope(
         round,
         kind,
         block_hash,
-        crate::bls::BlsAggregateSignature { signature, participants },
+        crate::bls::BlsAggregateSignature {
+            signature,
+            participants,
+        },
     ))
 }
 
@@ -892,7 +901,8 @@ pub fn decode_pq_micro_envelope(payload: &[u8]) -> Option<PqMicroCertificate> {
                 let signers_bitmask = payload[cursor..cursor + bitmask_len].to_vec();
                 cursor += bitmask_len;
 
-                let sig_count = u32::from_le_bytes(payload[cursor..cursor + 4].try_into().ok()?) as usize;
+                let sig_count =
+                    u32::from_le_bytes(payload[cursor..cursor + 4].try_into().ok()?) as usize;
                 cursor += 4;
 
                 if sig_count <= MAX_COMMIT_CERT_SIGNERS {
@@ -904,7 +914,9 @@ pub fn decode_pq_micro_envelope(payload: &[u8]) -> Option<PqMicroCertificate> {
                             valid = false;
                             break;
                         }
-                        let sig_len = u32::from_le_bytes(payload[cursor..cursor + 4].try_into().ok()?) as usize;
+                        let sig_len =
+                            u32::from_le_bytes(payload[cursor..cursor + 4].try_into().ok()?)
+                                as usize;
                         cursor += 4;
                         if cursor + sig_len > payload.len() {
                             valid = false;
@@ -963,8 +975,9 @@ pub fn decode_pq_epoch_envelope(payload: &[u8]) -> Option<PqMicroCertificate> {
 /// Global registry for validator post-quantum public keys.
 #[allow(clippy::type_complexity)]
 // GATE: registry type is fixed by consensus key shape; alias would churn all call sites without benefit.
-static PQ_VALIDATOR_KEYS: std::sync::RwLock<Option<HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>> =
-    std::sync::RwLock::new(None);
+static PQ_VALIDATOR_KEYS: std::sync::RwLock<
+    Option<HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
+> = std::sync::RwLock::new(None);
 
 /// Register a validator's post-quantum public key and scheme.
 pub fn register_validator_pq_key(
@@ -1008,7 +1021,9 @@ pub struct ValidatorSet {
 
 impl ValidatorSet {
     pub fn new() -> Self {
-        Self { validators: BTreeMap::new() }
+        Self {
+            validators: BTreeMap::new(),
+        }
     }
 
     pub fn from_list(list: Vec<(ValidatorId, u64)>) -> Self {
@@ -1205,7 +1220,12 @@ pub struct Vote {
 /// mainnet (and vice versa) even with the very same validator key. The domain
 /// tag was bumped `V1 -> V2` because the preimage layout changed; `V1` bytes
 /// are not accepted any more.
-pub fn vote_sign_bytes(height: Height, round: Round, kind: VoteKind, block_hash: &Option<BlockHash>) -> Vec<u8> {
+pub fn vote_sign_bytes(
+    height: Height,
+    round: Round,
+    kind: VoteKind,
+    block_hash: &Option<BlockHash>,
+) -> Vec<u8> {
     let mut m = Vec::with_capacity(80);
     m.extend_from_slice(b"STELLEREUM_BFT_VOTE_V2");
     m.extend_from_slice(&consensus_chain_id().to_be_bytes());
@@ -1238,7 +1258,14 @@ impl Vote {
         let sig = key.sign(&msg);
         let mut signature = sig.to_vec();
         attach_vote_bls(&msg, &mut signature);
-        Self { height, round, kind, block_hash, voter, signature }
+        Self {
+            height,
+            round,
+            kind,
+            block_hash,
+            voter,
+            signature,
+        }
     }
 
     /// Build a vote from a signature produced elsewhere (HSM / remote signer).
@@ -1259,7 +1286,14 @@ impl Vote {
         block_hash: Option<BlockHash>,
         signature: Vec<u8>,
     ) -> Self {
-        let mut vote = Self { height, round, kind, block_hash, voter, signature };
+        let mut vote = Self {
+            height,
+            round,
+            kind,
+            block_hash,
+            voter,
+            signature,
+        };
         let msg = vote_sign_bytes(height, round, kind, &block_hash);
         attach_vote_bls(&msg, &mut vote.signature);
         vote
@@ -1422,7 +1456,9 @@ impl Vote {
 
     /// The Falcon-512 half of this vote's signature, when it carries one.
     pub fn falcon_signature(&self) -> Option<&[u8]> {
-        if self.signature.len() == VOTE_FALCON_PART_LEN && self.signature.starts_with(VOTE_FALCON_MAGIC) {
+        if self.signature.len() == VOTE_FALCON_PART_LEN
+            && self.signature.starts_with(VOTE_FALCON_MAGIC)
+        {
             Some(&self.signature[80..80 + crate::post_quantum::FALCON512_SIG_LEN])
         } else if self.signature.len() == crate::post_quantum::FALCON512_SIG_LEN {
             Some(&self.signature)
@@ -1558,7 +1594,11 @@ impl EquivocationEvidence {
     /// Build the envelope from a recorded pair. No verification here —
     /// call [`verify_equivocation_evidence`] (fail-closed) before trusting it.
     pub fn new(voter: ValidatorId, vote_a: Vote, vote_b: Vote) -> Self {
-        Self { voter, vote_a, vote_b }
+        Self {
+            voter,
+            vote_a,
+            vote_b,
+        }
     }
 
     /// The per-offense dedup key (also the slash-evidence digest): a
@@ -1586,7 +1626,9 @@ impl EquivocationEvidence {
     /// Unmeasurable (should be impossible) reads as `usize::MAX` so the
     /// size cap below refuses it instead of admitting it.
     pub fn wire_len(&self) -> usize {
-        bincode::serialized_size(self).map(|n| n as usize).unwrap_or(usize::MAX)
+        bincode::serialized_size(self)
+            .map(|n| n as usize)
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -1792,7 +1834,11 @@ impl ProposalEquivocationEvidence {
         block_a: crate::sharding::Block,
         block_b: crate::sharding::Block,
     ) -> Self {
-        Self { proposer, block_a, block_b }
+        Self {
+            proposer,
+            block_a,
+            block_b,
+        }
     }
 
     /// The per-offense dedup key: a canonical commitment to everything that
@@ -1817,7 +1863,9 @@ impl ProposalEquivocationEvidence {
     /// Unmeasurable (should be impossible) reads as `usize::MAX` so the
     /// size cap below refuses it instead of admitting it.
     pub fn wire_len(&self) -> usize {
-        bincode::serialized_size(self).map(|n| n as usize).unwrap_or(usize::MAX)
+        bincode::serialized_size(self)
+            .map(|n| n as usize)
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -1833,7 +1881,11 @@ pub fn proposal_offense_key(
     hash_a: &BlockHash,
     hash_b: &BlockHash,
 ) -> [u8; 32] {
-    let (lo, hi) = if hash_a <= hash_b { (hash_a, hash_b) } else { (hash_b, hash_a) };
+    let (lo, hi) = if hash_a <= hash_b {
+        (hash_a, hash_b)
+    } else {
+        (hash_b, hash_a)
+    };
     let mut hasher = blake3::Hasher::new();
     hasher.update(PROPOSAL_EQUIVOCATION_OFFENSE_DOMAIN);
     hasher.update(proposer);
@@ -1935,7 +1987,14 @@ impl VoteSet {
     /// Add a vote. Returns Err on invalid signature / non-validator / wrong scope.
     /// A second, DIFFERENT vote by the same validator is recorded as equivocation
     /// (the first one is kept for quorum accounting).
-    pub fn add(&mut self, vote: Vote, validators: &ValidatorSet, height: Height, round: Round, kind: VoteKind) -> Result<(), String> {
+    pub fn add(
+        &mut self,
+        vote: Vote,
+        validators: &ValidatorSet,
+        height: Height,
+        round: Round,
+        kind: VoteKind,
+    ) -> Result<(), String> {
         if vote.height != height || vote.round != round || vote.kind != kind {
             return Err("vote out of scope".to_string());
         }
@@ -1977,7 +2036,8 @@ impl VoteSet {
                                 && a.block_hash == vote.block_hash))
                 });
                 if !already {
-                    self.equivocations.push((vote.voter, existing.clone(), vote));
+                    self.equivocations
+                        .push((vote.voter, existing.clone(), vote));
                 }
             }
             return Ok(()); // keep the first vote
@@ -2098,11 +2158,17 @@ impl VoteSet {
 
     /// Return the count of collected votes in this set carrying Falcon signatures.
     pub fn falcon_votes_count(&self) -> usize {
-        self.votes.values().filter(|v| v.falcon_signature().is_some()).count()
+        self.votes
+            .values()
+            .filter(|v| v.falcon_signature().is_some())
+            .count()
     }
 
     /// Return collected Falcon-512 signatures for votes matching `target`.
-    pub fn collect_falcon_signatures(&self, target: Option<BlockHash>) -> Vec<(ValidatorId, Vec<u8>)> {
+    pub fn collect_falcon_signatures(
+        &self,
+        target: Option<BlockHash>,
+    ) -> Vec<(ValidatorId, Vec<u8>)> {
         self.votes
             .values()
             .filter(|v| v.block_hash == target)
@@ -2178,9 +2244,10 @@ impl VoteSet {
             if v.block_hash == target {
                 signatures.push((v.voter, v.ed25519_signature().to_vec()));
                 if let Some(bytes) = v.bls_signature() {
-                    if let (Some(&idx), Some(sig)) =
-                        (index.get(&v.voter), crate::bls::BlsSignature::from_bytes(&bytes))
-                    {
+                    if let (Some(&idx), Some(sig)) = (
+                        index.get(&v.voter),
+                        crate::bls::BlsSignature::from_bytes(&bytes),
+                    ) {
                         bls_sigs.push((idx, sig));
                     }
                 }
@@ -2198,13 +2265,8 @@ impl VoteSet {
             && qc.signatures.len() < MAX_COMMIT_CERT_SIGNERS
         {
             if let Ok(aggregate) = crate::bls::aggregate_signatures(&bls_sigs, validators.len()) {
-                let payload = encode_qc_bls_envelope(
-                    &aggregate,
-                    qc.height,
-                    qc.round,
-                    qc.kind,
-                    qc.block_hash,
-                );
+                let payload =
+                    encode_qc_bls_envelope(&aggregate, qc.height, qc.round, qc.kind, qc.block_hash);
                 qc.signatures.push((BLS_QC_MARKER_ID, payload));
             }
         }
@@ -2288,8 +2350,7 @@ impl VoteSet {
                 // floor(2*k/3)+1, so old certificates keep verifying; on a
                 // skewed set (e.g. N=3 with A+B covering quorum) 2 signers
                 // now suffice instead of a fragile 3/3 unanimous.
-                let committee_total: u64 =
-                    committee.iter().map(|id| validators.power_of(id)).sum();
+                let committee_total: u64 = committee.iter().map(|id| validators.power_of(id)).sum();
                 if committee_total == 0 {
                     // Fail-closed: empty committee / zero weight never compiles.
                     return Some(qc);
@@ -2401,13 +2462,17 @@ impl QuorumCertificate {
             if vp == 0 {
                 continue;
             }
-            let Ok(vk) = VerifyingKey::from_bytes(voter) else { continue };
+            let Ok(vk) = VerifyingKey::from_bytes(voter) else {
+                continue;
+            };
             // Envelope-tolerant: a certificate entry copied from an envelope
             // vote keeps only its Ed25519 half. The marker entry never reaches
             // here in practice (it is not a validator, so `vp == 0` above skips
             // it), but stripping costs nothing and keeps every entry in this
             // list a bare Ed25519 signature.
-            let Ok(sig) = Signature::from_slice(ed25519_sig_bytes(sig_bytes)) else { continue };
+            let Ok(sig) = Signature::from_slice(ed25519_sig_bytes(sig_bytes)) else {
+                continue;
+            };
             candidates.push((vk, sig, vp));
         }
         if candidates.is_empty() {
@@ -2447,7 +2512,8 @@ impl QuorumCertificate {
         for (voter, payload) in &self.signatures {
             if *voter == PQ_UQC_MARKER_ID {
                 if let Some(cert) = decode_pq_micro_envelope(payload) {
-                    if crate::post_quantum::is_pure_pq_enforced() && !cert.scheme.is_post_quantum() {
+                    if crate::post_quantum::is_pure_pq_enforced() && !cert.scheme.is_post_quantum()
+                    {
                         continue;
                     }
                     if self.verify_micro_cert(&cert, validators, msg, pq_keys) {
@@ -2455,8 +2521,11 @@ impl QuorumCertificate {
                     }
                 }
             } else if *voter == PQ_QC_MARKER_ID {
-                if let Some(cert) = decode_pq_epoch_envelope(payload).or_else(|| decode_pq_micro_envelope(payload)) {
-                    if crate::post_quantum::is_pure_pq_enforced() && !cert.scheme.is_post_quantum() {
+                if let Some(cert) =
+                    decode_pq_epoch_envelope(payload).or_else(|| decode_pq_micro_envelope(payload))
+                {
+                    if crate::post_quantum::is_pure_pq_enforced() && !cert.scheme.is_post_quantum()
+                    {
                         continue;
                     }
                     if self.verify_epoch_cert(&cert, validators, msg, pq_keys) {
@@ -2504,7 +2573,10 @@ impl QuorumCertificate {
             return None;
         }
         let expected_committee_size = micro_committee_size(validators.len());
-        if cert.committee_size != expected_committee_size || cert.committee_size == 0 || cert.committee_size as usize > MAX_COMMIT_CERT_SIGNERS {
+        if cert.committee_size != expected_committee_size
+            || cert.committee_size == 0
+            || cert.committee_size as usize > MAX_COMMIT_CERT_SIGNERS
+        {
             return None;
         }
 
@@ -2662,7 +2734,8 @@ impl QuorumCertificate {
 
         let signed_count = cert.signed_count();
         let is_compact = cert.signatures.len() == signed_count;
-        let is_full = cert.signatures.len() == ids.len() || cert.signatures.len() == cert.committee_size as usize;
+        let is_full = cert.signatures.len() == ids.len()
+            || cert.signatures.len() == cert.committee_size as usize;
         if !is_compact && !is_full {
             return None;
         }
@@ -2731,7 +2804,8 @@ impl QuorumCertificate {
     /// Attach a post-quantum micro-certificate (µQC) to this QuorumCertificate.
     pub fn attach_pq_micro_certificate(&mut self, uqc: &PqMicroCertificate) {
         let payload = encode_pq_micro_envelope(uqc);
-        self.signatures.retain(|(voter, _)| *voter != PQ_UQC_MARKER_ID);
+        self.signatures
+            .retain(|(voter, _)| *voter != PQ_UQC_MARKER_ID);
         self.signatures.push((PQ_UQC_MARKER_ID, payload));
     }
 
@@ -2878,23 +2952,27 @@ impl QuorumCertificate {
                 // payload used to land on garbage bitmask bytes and attribute
                 // the wrong validators; a forged envelope now attributes none.
                 if let Some(cert) = decode_pq_micro_envelope(payload) {
-                    if crate::post_quantum::is_pure_pq_enforced() && !cert.scheme.is_post_quantum() {
+                    if crate::post_quantum::is_pure_pq_enforced() && !cert.scheme.is_post_quantum()
+                    {
                         continue;
                     }
-                    if let Some(ids) = self.micro_cert_valid_signers(&cert, validators, &msg, None) {
+                    if let Some(ids) = self.micro_cert_valid_signers(&cert, validators, &msg, None)
+                    {
                         signers.extend(ids);
                     }
                 }
             } else if *voter == PQ_QC_MARKER_ID {
                 // Verify-grade: exactly what `verify_epoch_cert` accepts (sans
                 // the quorum gate, same reasoning as above).
-                if let Some(cert) = decode_pq_epoch_envelope(payload)
-                    .or_else(|| decode_pq_micro_envelope(payload))
+                if let Some(cert) =
+                    decode_pq_epoch_envelope(payload).or_else(|| decode_pq_micro_envelope(payload))
                 {
-                    if crate::post_quantum::is_pure_pq_enforced() && !cert.scheme.is_post_quantum() {
+                    if crate::post_quantum::is_pure_pq_enforced() && !cert.scheme.is_post_quantum()
+                    {
                         continue;
                     }
-                    if let Some(ids) = self.epoch_cert_valid_signers(&cert, validators, &msg, None) {
+                    if let Some(ids) = self.epoch_cert_valid_signers(&cert, validators, &msg, None)
+                    {
                         signers.extend(ids);
                     }
                 }
@@ -2914,10 +2992,14 @@ impl QuorumCertificate {
                 if validators.power_of(voter) == 0 {
                     continue;
                 }
-                let Ok(vk) = VerifyingKey::from_bytes(voter) else { continue; };
+                let Ok(vk) = VerifyingKey::from_bytes(voter) else {
+                    continue;
+                };
                 // Envelope-tolerant, like verify: a certificate entry copied
                 // from an envelope vote keeps only its Ed25519 half.
-                let Ok(sig) = Signature::from_slice(ed25519_sig_bytes(payload)) else { continue; };
+                let Ok(sig) = Signature::from_slice(ed25519_sig_bytes(payload)) else {
+                    continue;
+                };
                 if vk.verify_strict(&msg, &sig).is_ok() {
                     signers.insert(*voter);
                 }
@@ -3323,7 +3405,11 @@ impl HeightConsensus {
     }
 
     /// Accept a proposal for the current round from the correct proposer.
-    pub fn receive_proposal(&mut self, proposer: ValidatorId, block_hash: BlockHash) -> Result<(), String> {
+    pub fn receive_proposal(
+        &mut self,
+        proposer: ValidatorId,
+        block_hash: BlockHash,
+    ) -> Result<(), String> {
         if self.step != Step::Propose {
             return Err("not in propose step".to_string());
         }
@@ -3374,7 +3460,13 @@ impl HeightConsensus {
         let round = vote.round;
         let res = {
             let set = self.prevotes.entry(round).or_default();
-            set.add(vote, &self.validators, self.height, round, VoteKind::Prevote)
+            set.add(
+                vote,
+                &self.validators,
+                self.height,
+                round,
+                VoteKind::Prevote,
+            )
         };
         // THE POLKA LEDGER (liveness fix, live 2026-10-21: the masterchain
         // parked at height 285027 with a prevote QC and NO precommit QC).
@@ -3393,7 +3485,13 @@ impl HeightConsensus {
         }
         let round = vote.round;
         let set = self.precommits.entry(round).or_default();
-        set.add(vote, &self.validators, self.height, round, VoteKind::Precommit)
+        set.add(
+            vote,
+            &self.validators,
+            self.height,
+            round,
+            VoteKind::Precommit,
+        )
     }
 
     pub fn prevote_set(&self, round: Round) -> Option<&VoteSet> {
@@ -3502,7 +3600,9 @@ impl HeightConsensus {
     pub fn finalize_blockers(&self) -> Option<String> {
         let short = |h: &[u8; 32]| hex::encode(&h[..4]);
         for r in self.rounds_to_inspect() {
-            let Some(pset) = self.precommits.get(&r) else { continue };
+            let Some(pset) = self.precommits.get(&r) else {
+                continue;
+            };
             let Some(ptarget) = pset.quorum_target(&self.validators) else {
                 continue;
             };
@@ -3574,8 +3674,12 @@ impl HeightConsensus {
         // network DID agree on a block in.
         let mut polka: Option<(Round, BlockHash)> = None;
         for round in self.rounds_to_inspect() {
-            let Some(set) = self.prevotes.get(&round) else { continue };
-            let Some(target) = set.quorum_target(&self.validators) else { continue };
+            let Some(set) = self.prevotes.get(&round) else {
+                continue;
+            };
+            let Some(target) = set.quorum_target(&self.validators) else {
+                continue;
+            };
             if found.is_none() {
                 if let Some(qc) =
                     set.certificate_with_parent(target, &self.validators, self.sortition_parent())
@@ -3598,9 +3702,7 @@ impl HeightConsensus {
         // still a polka, and it is still the network's latest word when it is
         // NEWER than anything the window holds.
         let polka = match (self.observed_polka, polka) {
-            (Some((r1, b1)), Some((r2, b2))) => {
-                Some(if r1 >= r2 { (r1, b1) } else { (r2, b2) })
-            }
+            (Some((r1, b1)), Some((r2, b2))) => Some(if r1 >= r2 { (r1, b1) } else { (r2, b2) }),
             (a, None) => a,
             (None, b) => b,
         };
@@ -3656,15 +3758,15 @@ impl HeightConsensus {
     /// can attach it to the precommit.
     pub fn try_polka_at(&mut self) -> Option<(Round, BlockHash)> {
         for round in self.rounds_to_inspect() {
-            let Some(set) = self.prevotes.get(&round) else { continue };
+            let Some(set) = self.prevotes.get(&round) else {
+                continue;
+            };
             let Some(Some(target)) = set.quorum_target(&self.validators) else {
                 continue;
             };
-            if let Some(qc) = set.certificate_with_parent(
-                Some(target),
-                &self.validators,
-                self.sortition_parent(),
-            ) {
+            if let Some(qc) =
+                set.certificate_with_parent(Some(target), &self.validators, self.sortition_parent())
+            {
                 self.prevote_qc.insert(round, qc);
             }
             return Some((round, target));
@@ -3688,22 +3790,19 @@ impl HeightConsensus {
     /// The certificate is built and stored at the same time, so the precommit
     /// that follows the polka carries the proof of the quorum it certifies.
     fn note_polka(&mut self, round: Round) {
-        let Some(set) = self.prevotes.get(&round) else { return };
+        let Some(set) = self.prevotes.get(&round) else {
+            return;
+        };
         // A NIL quorum is not a polka: "no block was agreed in that round"
         // says nothing about any block.
-        let Some(Some(target)) = set.quorum_target(&self.validators) else { return };
-        if self
-            .observed_polka
-            .map(|(r, _)| r > round)
-            .unwrap_or(false)
-        {
+        let Some(Some(target)) = set.quorum_target(&self.validators) else {
+            return;
+        };
+        if self.observed_polka.map(|(r, _)| r > round).unwrap_or(false) {
             return; // an older polka never supersedes a newer one
         }
-        let qc = set.certificate_with_parent(
-            Some(target),
-            &self.validators,
-            self.sortition_parent(),
-        );
+        let qc =
+            set.certificate_with_parent(Some(target), &self.validators, self.sortition_parent());
         if let Some(qc) = qc {
             self.prevote_qc.insert(round, qc);
         }
@@ -3725,9 +3824,7 @@ impl HeightConsensus {
     pub fn best_polka(&mut self) -> Option<(Round, BlockHash)> {
         let scanned = self.try_polka_at();
         match (self.observed_polka, scanned) {
-            (Some((r1, b1)), Some((r2, b2))) => {
-                Some(if r1 >= r2 { (r1, b1) } else { (r2, b2) })
-            }
+            (Some((r1, b1)), Some((r2, b2))) => Some(if r1 >= r2 { (r1, b1) } else { (r2, b2) }),
             (a, None) => a,
             (None, b) => b,
         }
@@ -3775,7 +3872,10 @@ impl HeightConsensus {
         // for. The two quorums have to agree on the target, otherwise a
         // pre-vote-certified block A and a precommit-certified block B could both
         // reach quorum and the node would pick whichever it checked first.
-        let prevoted = self.prevotes.get(&round).and_then(|s| s.quorum_target(&self.validators));
+        let prevoted = self
+            .prevotes
+            .get(&round)
+            .and_then(|s| s.quorum_target(&self.validators));
         if prevoted.flatten() != Some(block) {
             return None;
         }
@@ -3879,10 +3979,16 @@ impl HeightConsensus {
         self.precommits.retain(|&r, _| r >= floor);
         self.prevote_qc.retain(|&r, _| r >= floor);
         while self.retained_round_count() > MAX_RETAINED_VOTE_ROUNDS {
-            let Some(oldest) = self.oldest_retained_round() else { break };
+            let Some(oldest) = self.oldest_retained_round() else {
+                break;
+            };
             // The polka's round is kept even if it is the oldest one: it is
             // the round the decision is made in.
-            if self.observed_polka.map(|(r, _)| r == oldest).unwrap_or(false) {
+            if self
+                .observed_polka
+                .map(|(r, _)| r == oldest)
+                .unwrap_or(false)
+            {
                 break;
             }
             self.prevotes.remove(&oldest);
@@ -3933,8 +4039,8 @@ impl HeightConsensus {
         // `proposal_round == Some(left)` means WE accepted its proposal; any
         // other state (none, or a stale round) means the slot went empty.
         if let Some(sched) = self.validators.proposer_for(self.height, left) {
-            let proposed = self.proposal_round == Some(left)
-                && self.proposal.map(|(p, _)| p) == Some(sched);
+            let proposed =
+                self.proposal_round == Some(left) && self.proposal.map(|(p, _)| p) == Some(sched);
             self.note_proposer_missed(sched, proposed);
         }
         // SECURITY: saturate rather than `+= 1`, which panicked in debug and
@@ -4426,7 +4532,9 @@ mod tests {
     use crate::runtime::MAX_COMMIT_CERT_SIGNERS;
 
     fn keys(n: usize) -> Vec<SigningKey> {
-        (0..n).map(|_| SigningKey::generate(&mut rand::rngs::OsRng)).collect()
+        (0..n)
+            .map(|_| SigningKey::generate(&mut rand::rngs::OsRng))
+            .collect()
     }
 
     fn ids(keys: &[SigningKey]) -> Vec<ValidatorId> {
@@ -4473,7 +4581,10 @@ mod tests {
         let t1 = deterministic_round_timeout_ms(3500, 0, 0);
         let t2 = deterministic_round_timeout_ms(3500, 0, 0);
         assert_eq!(t1, 3500);
-        assert_eq!(t1, t2, "same state => same timeout (wall clocks differ, value must not)");
+        assert_eq!(
+            t1, t2,
+            "same state => same timeout (wall clocks differ, value must not)"
+        );
         // Backoff grows with the ROUND (not a local failure count).
         assert_eq!(deterministic_round_timeout_ms(3500, 1, 0), 4000);
         assert_eq!(deterministic_round_timeout_ms(3500, 4, 0), 5500);
@@ -4508,7 +4619,11 @@ mod tests {
         let out = hc.apply_nil_convergence();
         assert!(out.is_none(), "no QC exists yet: nothing to re-broadcast");
         assert!(hc.scan_lookback >= scan_before, "window widened");
-        assert_eq!(hc.round, r_before + 1, "convergence must never rewind the round");
+        assert_eq!(
+            hc.round,
+            r_before + 1,
+            "convergence must never rewind the round"
+        );
         // One-shot: second apply is a no-op.
         assert!(!hc.nil_breaker_due());
         assert!(hc.apply_nil_convergence().is_none());
@@ -4535,7 +4650,11 @@ mod tests {
         hc.next_round();
         assert!(hc.nil_breaker_due());
         let target = hc.apply_nil_convergence();
-        assert_eq!(target, Some(bh), "must re-broadcast the highest-QC-backed proposal");
+        assert_eq!(
+            target,
+            Some(bh),
+            "must re-broadcast the highest-QC-backed proposal"
+        );
     }
 
     #[test]
@@ -4553,7 +4672,10 @@ mod tests {
         // Fast-path re-admission: proposing again clears suspicion, no slash.
         hc.note_proposer_missed(sched, true);
         assert_eq!(hc.proposer_missed_streak(&sched), 0);
-        assert!(!hc.missed_proposals.contains_key(&sched), "zero-streak entries are removed (bounded)");
+        assert!(
+            !hc.missed_proposals.contains_key(&sched),
+            "zero-streak entries are removed (bounded)"
+        );
     }
     #[test]
     #[allow(clippy::assertions_on_constants)]
@@ -4596,7 +4718,8 @@ mod tests {
     }
 
     #[test]
-    fn quorum_threshold_is_two_thirds_plus_one() {        let keys = keys(4);
+    fn quorum_threshold_is_two_thirds_plus_one() {
+        let keys = keys(4);
         let vs = vset(&keys);
         assert_eq!(vs.total_power(), 4);
         assert_eq!(vs.quorum_power(), 3); // floor(8/3)+1 = 3
@@ -4739,7 +4862,11 @@ mod tests {
             vec![e2.clone(), garbage, e1dup, e1swapped, e1.clone()],
             &member,
         );
-        assert_eq!(out.len(), 2, "two distinct offenses survive, dupes collapse");
+        assert_eq!(
+            out.len(),
+            2,
+            "two distinct offenses survive, dupes collapse"
+        );
         let mut keys_sorted = [e1.offense_key(), e2.offense_key()];
         keys_sorted.sort();
         assert_eq!(out[0].offense_key(), keys_sorted[0]);
@@ -4766,7 +4893,11 @@ mod tests {
         let member = |v: &ValidatorId| vs.validators.contains_key(v);
         let a = signed_block(&ks[0], 5, 1_000);
         let b = signed_block(&ks[0], 5, 2_000);
-        assert_ne!(a.compute_hash(), b.compute_hash(), "need two distinct bodies");
+        assert_ne!(
+            a.compute_hash(),
+            b.compute_hash(),
+            "need two distinct bodies"
+        );
         let ev = ProposalEquivocationEvidence::new(ids(&ks)[0], a, b);
         assert!(verify_proposal_equivocation_evidence(&ev, &member));
     }
@@ -4856,7 +4987,11 @@ mod tests {
             vec![e2.clone(), garbage, e1dup, e1swapped, e1.clone()],
             &member,
         );
-        assert_eq!(out.len(), 2, "two distinct offenses survive, dupes collapse");
+        assert_eq!(
+            out.len(),
+            2,
+            "two distinct offenses survive, dupes collapse"
+        );
         let mut keys_sorted = [e1.offense_key(), e2.offense_key()];
         keys_sorted.sort();
         assert_eq!(out[0].offense_key(), keys_sorted[0]);
@@ -4915,8 +5050,12 @@ mod tests {
         hc.locked = Some((block_hash(1), 0));
         hc.round = 1;
         hc.proposal = Some((hc.proposer().unwrap(), block_hash(2))); // proposer offers B
-        // Locked on A -> we must NOT prevote B; we prevote nil
-        assert_eq!(hc.decide_prevote(), None, "locked validator must not prevote a conflicting value");
+                                                                     // Locked on A -> we must NOT prevote B; we prevote nil
+        assert_eq!(
+            hc.decide_prevote(),
+            None,
+            "locked validator must not prevote a conflicting value"
+        );
 
         // If the proposal matches our lock, we prevote it
         hc.proposal = Some((hc.proposer().unwrap(), block_hash(1)));
@@ -4949,7 +5088,13 @@ mod tests {
                 (v.voter, v.signature)
             })
             .collect();
-        let qc = QuorumCertificate { height: 1, round: 0, kind: VoteKind::Precommit, block_hash: Some(bh), signatures: sigs };
+        let qc = QuorumCertificate {
+            height: 1,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some(bh),
+            signatures: sigs,
+        };
         assert!(!qc.verify(&vs), "sub-quorum QC must not verify");
 
         // With 3 signatures it verifies
@@ -4961,7 +5106,13 @@ mod tests {
                 (v.voter, v.signature)
             })
             .collect();
-        let qc3 = QuorumCertificate { height: 1, round: 0, kind: VoteKind::Precommit, block_hash: Some(bh), signatures: sigs3 };
+        let qc3 = QuorumCertificate {
+            height: 1,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some(bh),
+            signatures: sigs3,
+        };
         assert!(qc3.verify(&vs));
     }
 
@@ -4972,8 +5123,18 @@ mod tests {
         let bh = block_hash(9);
         let v = Vote::sign(&keys[0], 1, 0, VoteKind::Precommit, Some(bh));
         // Same signer repeated 3 times must NOT count as quorum
-        let sigs = vec![(v.voter, v.signature.clone()), (v.voter, v.signature.clone()), (v.voter, v.signature.clone())];
-        let qc = QuorumCertificate { height: 1, round: 0, kind: VoteKind::Precommit, block_hash: Some(bh), signatures: sigs };
+        let sigs = vec![
+            (v.voter, v.signature.clone()),
+            (v.voter, v.signature.clone()),
+            (v.voter, v.signature.clone()),
+        ];
+        let qc = QuorumCertificate {
+            height: 1,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some(bh),
+            signatures: sigs,
+        };
         assert!(!qc.verify(&vs), "duplicate signers must not fake a quorum");
     }
 
@@ -5000,7 +5161,10 @@ mod tests {
             block_hash: Some(bh),
             signatures: sigs.clone(),
         };
-        assert!(base.verify(&vs), "a real quorum under the cap must still verify");
+        assert!(
+            base.verify(&vs),
+            "a real quorum under the cap must still verify"
+        );
 
         // Padding with unique junk entries up to exactly the cap is still
         // permitted (the cap is a strict upper bound), and the junk carries no
@@ -5019,7 +5183,10 @@ mod tests {
             signatures: sigs.clone(),
         };
         assert_eq!(at_cap.signatures.len(), MAX_COMMIT_CERT_SIGNERS);
-        assert!(at_cap.verify(&vs), "a certificate at the cap is still accepted");
+        assert!(
+            at_cap.verify(&vs),
+            "a certificate at the cap is still accepted"
+        );
 
         // One entry over the cap is refused outright -- before any signature
         // is examined -- even though its signers include a real quorum.
@@ -5032,7 +5199,10 @@ mod tests {
             signatures: sigs,
         };
         assert_eq!(over.signatures.len(), MAX_COMMIT_CERT_SIGNERS + 1);
-        assert!(!over.verify(&vs), "a certificate over the signer cap must be refused");
+        assert!(
+            !over.verify(&vs),
+            "a certificate over the signer cap must be refused"
+        );
     }
 
     #[test]
@@ -5047,11 +5217,13 @@ mod tests {
             let proposer = hc.proposer().unwrap();
             hc.receive_proposal(proposer, bh).unwrap();
             for k in keys.iter().take(3) {
-                hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh))).unwrap();
+                hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+                    .unwrap();
             }
             hc.try_prevote_quorum();
             for k in keys.iter().take(3) {
-                hc.add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh))).unwrap();
+                hc.add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+                    .unwrap();
             }
             hc.try_precommit_quorum();
         }
@@ -5066,12 +5238,20 @@ mod tests {
         let vs = vset(&keys);
         // Determinism: same input, same proposer, every time.
         let p0 = vs.proposer_for(0, 0).unwrap();
-        assert_eq!(vs.proposer_for(0, 0).unwrap(), p0, "selection must be deterministic");
+        assert_eq!(
+            vs.proposer_for(0, 0).unwrap(),
+            p0,
+            "selection must be deterministic"
+        );
         // Rotation (hash-slot is statistical, not periodic): over a window,
         // every validator must appear and no single one may own everything.
         let seq: Vec<[u8; 32]> = (0..64u64).map(|h| vs.proposer_for(h, 0).unwrap()).collect();
         let distinct: std::collections::HashSet<_> = seq.iter().collect();
-        assert_eq!(distinct.len(), 4, "all 4 validators must propose over 64 heights");
+        assert_eq!(
+            distinct.len(),
+            4,
+            "all 4 validators must propose over 64 heights"
+        );
     }
 
     #[test]
@@ -5081,10 +5261,18 @@ mod tests {
         // Hash-slot is uniform from height 1: over 200 heights each of the two
         // must hold 35-65% (mean 50%, std ~3.5% — ±15pp is >4 sigma).
         let k = keys(2);
-        let vs = ValidatorSet::from_list(vec![(ids(&k)[0], 1_000_000_000_000), (ids(&k)[1], 1_000_000_000_000)]);
-        let seq: Vec<[u8; 32]> = (1..=200u64).map(|h| vs.proposer_for(h, 0).unwrap()).collect();
+        let vs = ValidatorSet::from_list(vec![
+            (ids(&k)[0], 1_000_000_000_000),
+            (ids(&k)[1], 1_000_000_000_000),
+        ]);
+        let seq: Vec<[u8; 32]> = (1..=200u64)
+            .map(|h| vs.proposer_for(h, 0).unwrap())
+            .collect();
         let a = seq.iter().filter(|p| *p == &ids(&k)[0]).count();
-        assert!((70..=130).contains(&a), "equal powers must split ~100/100 over 200 heights, got {a}");
+        assert!(
+            (70..=130).contains(&a),
+            "equal powers must split ~100/100 over 200 heights, got {a}"
+        );
         // Round dimension also varies (not pinned to height parity).
         let r0 = vs.proposer_for(643, 0).unwrap();
         let r1 = vs.proposer_for(643, 1).unwrap();
@@ -5100,9 +5288,14 @@ mod tests {
         let (a, b) = (ids(&k)[0], ids(&k)[1]);
         let (lo, hi) = if a < b { (a, b) } else { (b, a) };
         let vs = ValidatorSet::from_list(vec![(lo, 2_000_000_000_000), (hi, 1_000_000_000_000)]);
-        let seq: Vec<[u8; 32]> = (0..600u64).map(|r| vs.proposer_for(0, r as u32).unwrap()).collect();
+        let seq: Vec<[u8; 32]> = (0..600u64)
+            .map(|r| vs.proposer_for(0, r as u32).unwrap())
+            .collect();
         let lo_n = seq.iter().filter(|p| *p == &lo).count();
-        assert!((330..=470).contains(&lo_n), "2:1 weighting must hold statistically, got {lo_n}/600");
+        assert!(
+            (330..=470).contains(&lo_n),
+            "2:1 weighting must hold statistically, got {lo_n}/600"
+        );
     }
 
     #[test]
@@ -5112,7 +5305,10 @@ mod tests {
         let mut hc = HeightConsensus::new(1, vs);
         let far = MAX_ROUND_AHEAD + 5;
         let v = Vote::sign(&keys[0], 1, far, VoteKind::Prevote, Some(block_hash(1)));
-        assert!(hc.add_prevote(v).is_err(), "vote for a far-future round must be rejected");
+        assert!(
+            hc.add_prevote(v).is_err(),
+            "vote for a far-future round must be rejected"
+        );
     }
 
     #[test]
@@ -5204,7 +5400,11 @@ mod tests {
             hc.add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(a)))
                 .unwrap();
         }
-        assert_eq!(hc.try_precommit_quorum(), Some(a), "A is decided and locked");
+        assert_eq!(
+            hc.try_precommit_quorum(),
+            Some(a),
+            "A is decided and locked"
+        );
 
         hc.next_round();
         for k in keys.iter() {
@@ -5228,8 +5428,7 @@ mod tests {
         // A malicious peer claims u32::MAX; we must not jump there.
         hc.advance_to_round(u32::MAX);
         assert_eq!(
-            hc.round,
-            MAX_ROUND_ADVANCE_PER_MESSAGE,
+            hc.round, MAX_ROUND_ADVANCE_PER_MESSAGE,
             "one message may move us at most one round"
         );
         // A small forward step still works.
@@ -5254,7 +5453,9 @@ mod round_parity_tests {
     use super::*;
 
     fn keys(n: usize) -> Vec<SigningKey> {
-        (0..n).map(|_| SigningKey::generate(&mut rand::rngs::OsRng)).collect()
+        (0..n)
+            .map(|_| SigningKey::generate(&mut rand::rngs::OsRng))
+            .collect()
     }
 
     #[test]
@@ -5265,12 +5466,26 @@ mod round_parity_tests {
         // `(height + round) % 2` alternation). What remains true and is pinned
         // here: determinism per (height, round), and statistical balance.
         let ks = keys(2);
-        let vs = ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect());
+        let vs = ValidatorSet::from_list(
+            ks.iter()
+                .map(|k| (k.verifying_key().to_bytes(), 1))
+                .collect(),
+        );
 
-        assert_eq!(vs.proposer_for(1, 5).unwrap(), vs.proposer_for(1, 5).unwrap(), "same slot, same proposer");
+        assert_eq!(
+            vs.proposer_for(1, 5).unwrap(),
+            vs.proposer_for(1, 5).unwrap(),
+            "same slot, same proposer"
+        );
         let seq: Vec<[u8; 32]> = (0..64u32).map(|r| vs.proposer_for(1, r).unwrap()).collect();
-        let zeros = seq.iter().filter(|p| *p == &ks[0].verifying_key().to_bytes()).count();
-        assert!((20..=44).contains(&zeros), "no parity structure, ~32/64 each, got {zeros}");
+        let zeros = seq
+            .iter()
+            .filter(|p| *p == &ks[0].verifying_key().to_bytes())
+            .count();
+        assert!(
+            (20..=44).contains(&zeros),
+            "no parity structure, ~32/64 each, got {zeros}"
+        );
     }
 
     #[test]
@@ -5279,7 +5494,11 @@ mod round_parity_tests {
         // HIGHER round, so they meet rather than chase each other, and the parity they
         // end on is shared. This is what `main.rs` does on an ahead vote.
         let ks = keys(2);
-        let vs = ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect());
+        let vs = ValidatorSet::from_list(
+            ks.iter()
+                .map(|k| (k.verifying_key().to_bytes(), 1))
+                .collect(),
+        );
         let mut a = HeightConsensus::new(1, vs.clone());
         let mut b = HeightConsensus::new(1, vs.clone());
 
@@ -5292,7 +5511,11 @@ mod round_parity_tests {
         assert_eq!(a.round, 7);
         b.sync_round_to(7);
         assert_eq!(b.round, 7, "b moved forward to a's round");
-        assert_eq!(a.proposer(), b.proposer(), "same round, same expected proposer");
+        assert_eq!(
+            a.proposer(),
+            b.proposer(),
+            "same round, same expected proposer"
+        );
     }
 
     #[test]
@@ -5300,13 +5523,20 @@ mod round_parity_tests {
         // A node must not be dragged back by a lagging peer, or it could re-vote a
         // round it already left.
         let ks = keys(2);
-        let vs = ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect());
+        let vs = ValidatorSet::from_list(
+            ks.iter()
+                .map(|k| (k.verifying_key().to_bytes(), 1))
+                .collect(),
+        );
         let mut hc = HeightConsensus::new(1, vs);
         // sync_round_to is itself capped at ROUND_LOOKBACK per call (audit F2).
         hc.sync_round_to(ROUND_LOOKBACK);
         assert_eq!(hc.round, ROUND_LOOKBACK);
         hc.sync_round_to(3); // a lagging peer
-        assert_eq!(hc.round, ROUND_LOOKBACK, "the round only ever moves forward");
+        assert_eq!(
+            hc.round, ROUND_LOOKBACK,
+            "the round only ever moves forward"
+        );
     }
 }
 
@@ -5409,10 +5639,7 @@ mod phase_convergence_tests {
         // Our own prevote for round 0 (we were there when the round opened).
         hc.add_prevote(Vote::sign(&keys[0], 1, 0, VoteKind::Prevote, Some(block)))
             .unwrap();
-        assert!(
-            hc.observed_polka().is_none(),
-            "one prevote is not a polka"
-        );
+        assert!(hc.observed_polka().is_none(), "one prevote is not a polka");
 
         // We leave the round and race ahead (the WAN round-skew shape).
         for _ in 0..12 {
@@ -5574,10 +5801,7 @@ mod post_quantum_uqc_tests {
         crate::post_quantum::FalconKeypair::generate_from_seed(seed)
     }
 
-    fn make_sample_falcon512_sig(
-        fk: &crate::post_quantum::FalconKeypair,
-        msg: &[u8],
-    ) -> Vec<u8> {
+    fn make_sample_falcon512_sig(fk: &crate::post_quantum::FalconKeypair, msg: &[u8]) -> Vec<u8> {
         fk.sign(msg)
     }
 
@@ -5602,7 +5826,10 @@ mod post_quantum_uqc_tests {
         // 1. Determinism: identical parameters yield identical committee
         let c1 = derive_sortition_committee(&vs, 10, 0, 2, &parent);
         let c2 = derive_sortition_committee(&vs, 10, 0, 2, &parent);
-        assert_eq!(c1, c2, "Sortition committee selection must be strictly deterministic");
+        assert_eq!(
+            c1, c2,
+            "Sortition committee selection must be strictly deterministic"
+        );
         assert_eq!(c1.len(), 2);
 
         // 2. Different height / round yields different ticket outcomes
@@ -5709,12 +5936,13 @@ mod post_quantum_uqc_tests {
         // Sign on the TESTNET.
         set_consensus_chain_id_for_tests(TESTNET);
         let vote = Vote::sign(&key, height, round, kind, target);
-        assert!(vote.verify(), "the vote must verify on the chain it was signed for");
+        assert!(
+            vote.verify(),
+            "the vote must verify on the chain it was signed for"
+        );
         let testnet_bytes = vote_sign_bytes(height, round, kind, &target);
         assert!(
-            testnet_bytes
-                .windows(8)
-                .any(|w| w == TESTNET.to_be_bytes()),
+            testnet_bytes.windows(8).any(|w| w == TESTNET.to_be_bytes()),
             "the vote preimage must commit to the chain id"
         );
 
@@ -5818,7 +6046,8 @@ mod post_quantum_uqc_tests {
         // Test wire encoding & decoding roundtrip
         let payload = encode_pq_micro_envelope(&uqc);
         assert!(payload.starts_with(QC_UQC_MAGIC));
-        let decoded = decode_pq_micro_envelope(&payload).expect("decoding µQC envelope must succeed");
+        let decoded =
+            decode_pq_micro_envelope(&payload).expect("decoding µQC envelope must succeed");
         assert_eq!(uqc, decoded);
 
         // Verify QuorumCertificate with µQC sentinel marker
@@ -5831,7 +6060,10 @@ mod post_quantum_uqc_tests {
         };
 
         assert!(qc.verify(&vs), "µQC with 16 Falcon signatures must verify");
-        assert!(qc.verify_unified(&vs), "µQC with 16 Falcon signatures must verify under verify_unified");
+        assert!(
+            qc.verify_unified(&vs),
+            "µQC with 16 Falcon signatures must verify under verify_unified"
+        );
 
         // Helper attachment / extraction check
         let mut qc2 = QuorumCertificate {
@@ -5899,8 +6131,14 @@ mod post_quantum_uqc_tests {
             block_hash,
             signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&sub_uqc))],
         };
-        assert!(!sub_qc.verify(&vs), "Sub-quorum (10 of 16) µQC must fail verification");
-        assert!(!sub_qc.verify_unified(&vs), "Sub-quorum must fail under verify_unified");
+        assert!(
+            !sub_qc.verify(&vs),
+            "Sub-quorum (10 of 16) µQC must fail verification"
+        );
+        assert!(
+            !sub_qc.verify_unified(&vs),
+            "Sub-quorum must fail under verify_unified"
+        );
 
         // 2. Tampered signature test: 11 valid signers (quorum), but 1 signature corrupted
         let mut quorum_sigs = Vec::new();
@@ -5930,7 +6168,10 @@ mod post_quantum_uqc_tests {
             block_hash,
             signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&tampered_uqc))],
         };
-        assert!(!tampered_qc.verify(&vs), "Tampered signature in µQC must fail verification");
+        assert!(
+            !tampered_qc.verify(&vs),
+            "Tampered signature in µQC must fail verification"
+        );
 
         // 3. Mismatched height / round
         let mut mismatched_uqc = tampered_uqc;
@@ -5942,7 +6183,10 @@ mod post_quantum_uqc_tests {
             block_hash,
             signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&mismatched_uqc))],
         };
-        assert!(!mismatched_qc.verify(&vs), "Height mismatch between QC and µQC must fail");
+        assert!(
+            !mismatched_qc.verify(&vs),
+            "Height mismatch between QC and µQC must fail"
+        );
 
         // 4. Corrupted envelope magic
         let mut bad_magic = encode_pq_micro_envelope(&sub_uqc);
@@ -5966,8 +6210,10 @@ mod post_quantum_uqc_tests {
         assert_eq!(pq_micro_quorum_power(committee_total), 427);
         // The network anchor raises it to a strict majority of the network.
         assert_eq!(pq_micro_required_power(committee_total, network_total), 501);
-        assert!(pq_micro_required_power(committee_total, network_total)
-            > pq_micro_quorum_power(committee_total));
+        assert!(
+            pq_micro_required_power(committee_total, network_total)
+                > pq_micro_quorum_power(committee_total)
+        );
         // A committee that IS the whole network keeps the legacy rule
         // (2/3 of the network) — the live N=4 configuration is unchanged.
         assert_eq!(pq_micro_required_power(1000, 1000), 667);
@@ -6025,9 +6271,8 @@ mod post_quantum_uqc_tests {
         // Real Falcon keys for the committee members that sign.
         let mut signers: Vec<(ValidatorId, crate::post_quantum::FalconKeypair)> = Vec::new();
         for val_id in committee.iter().take(sub_quorum_members + 1) {
-            let fk = make_sample_falcon512(
-                0x80u8.wrapping_add((*val_id)[0]).wrapping_add((*val_id)[1]),
-            );
+            let fk =
+                make_sample_falcon512(0x80u8.wrapping_add((*val_id)[0]).wrapping_add((*val_id)[1]));
             register_validator_pq_key(
                 *val_id,
                 crate::post_quantum::PqScheme::Falcon512,
@@ -6115,12 +6360,18 @@ mod post_quantum_uqc_tests {
         };
 
         assert!(qc.verify(&vs), "Classical Ed25519 QC must verify unchanged");
-        assert!(qc.verify_unified(&vs), "Classical Ed25519 QC must verify with verify_unified");
+        assert!(
+            qc.verify_unified(&vs),
+            "Classical Ed25519 QC must verify with verify_unified"
+        );
 
         // Tamper with one signature: with only 2 valid signers (20 power < 28 quorum), verification fails
         let mut tampered_qc = qc.clone();
         tampered_qc.signatures[0].1[10] ^= 0xFF;
-        assert!(!tampered_qc.verify(&vs), "Tampered classical QC must fail verification");
+        assert!(
+            !tampered_qc.verify(&vs),
+            "Tampered classical QC must fail verification"
+        );
     }
 
     #[test]
@@ -6135,7 +6386,11 @@ mod post_quantum_uqc_tests {
             let id = sk.verifying_key().to_bytes();
             let fk = FalconKeypair::generate_from_seed(i + 1);
             vs.add(id, 10);
-            register_validator_pq_key(id, crate::post_quantum::PqScheme::Falcon512, fk.public_key.clone());
+            register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
             signers.push((sk, id));
             falcon_keys.push(fk);
         }
@@ -6167,11 +6422,15 @@ mod post_quantum_uqc_tests {
             .certificate(block_hash, &vs, &parent)
             .expect("certificate must form");
         assert!(
-            qc.signatures.iter().any(|(voter, _)| *voter == PQ_UQC_MARKER_ID),
+            qc.signatures
+                .iter()
+                .any(|(voter, _)| *voter == PQ_UQC_MARKER_ID),
             "compiled QC must carry PQ_UQC_MARKER_ID sentinel marker"
         );
 
-        let uqc = qc.pq_micro_certificate().expect("micro-QC must be retrievable");
+        let uqc = qc
+            .pq_micro_certificate()
+            .expect("micro-QC must be retrievable");
         assert_eq!(uqc.scheme, crate::post_quantum::PqScheme::Falcon512);
         assert_eq!(uqc.height, height);
         assert_eq!(uqc.round, round);
@@ -6179,12 +6438,18 @@ mod post_quantum_uqc_tests {
         assert_eq!(uqc.signatures.len(), 16);
 
         // Verification under QuorumCertificate::verify_unified
-        assert!(qc.verify_unified(&vs), "micro-QC must verify under verify_unified");
+        assert!(
+            qc.verify_unified(&vs),
+            "micro-QC must verify under verify_unified"
+        );
         assert!(qc.verify(&vs), "micro-QC must verify under verify");
 
         // Verify that under Pure Post-Quantum Mode, the QC verifies via the µQC path
         crate::post_quantum::set_pure_pq_override(Some(true));
-        assert!(qc.verify_unified(&vs), "micro-QC must verify under Pure PQ mode");
+        assert!(
+            qc.verify_unified(&vs),
+            "micro-QC must verify under Pure PQ mode"
+        );
         crate::post_quantum::set_pure_pq_override(None);
     }
 
@@ -6199,7 +6464,11 @@ mod post_quantum_uqc_tests {
             let id = sk.verifying_key().to_bytes();
             let fk = FalconKeypair::generate_from_seed(i + 20);
             vs.add(id, 10);
-            register_validator_pq_key(id, crate::post_quantum::PqScheme::Falcon512, fk.public_key.clone());
+            register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
             signers.push((sk, id));
             falcon_keys.push(fk);
         }
@@ -6220,7 +6489,8 @@ mod post_quantum_uqc_tests {
         for i in 0..16 {
             let (ref sk, _) = signers[i];
             let fk = &falcon_keys[i];
-            let vote = Vote::sign_with_falcon(sk, fk, height, 0, VoteKind::Prevote, Some(block_hash));
+            let vote =
+                Vote::sign_with_falcon(sk, fk, height, 0, VoteKind::Prevote, Some(block_hash));
             assert!(hc.add_prevote(vote).is_ok());
         }
 
@@ -6231,22 +6501,31 @@ mod post_quantum_uqc_tests {
         let polka = hc.try_prevote_quorum_at().expect("polka must form");
         assert_eq!(polka, (0, Some(block_hash)));
         let prevote_qc = hc.prevote_qc.get(&0).expect("prevote QC must exist");
-        assert!(prevote_qc.signatures.iter().any(|(v, _)| *v == PQ_UQC_MARKER_ID));
+        assert!(prevote_qc
+            .signatures
+            .iter()
+            .any(|(v, _)| *v == PQ_UQC_MARKER_ID));
         assert!(prevote_qc.verify_unified(&vs));
 
         // 3. Precommit with Falcon signatures
         for i in 0..16 {
             let (ref sk, _) = signers[i];
             let fk = &falcon_keys[i];
-            let vote = Vote::sign_with_falcon(sk, fk, height, 0, VoteKind::Precommit, Some(block_hash));
+            let vote =
+                Vote::sign_with_falcon(sk, fk, height, 0, VoteKind::Precommit, Some(block_hash));
             assert!(hc.add_precommit(vote).is_ok());
         }
 
         assert_eq!(hc.falcon_votes_count(0, VoteKind::Precommit), 16);
-        let decided = hc.try_precommit_quorum().expect("precommit quorum must decide");
+        let decided = hc
+            .try_precommit_quorum()
+            .expect("precommit quorum must decide");
         assert_eq!(decided, block_hash);
         let precommit_qc = hc.precommit_qc.as_ref().expect("precommit QC must exist");
-        assert!(precommit_qc.signatures.iter().any(|(v, _)| *v == PQ_UQC_MARKER_ID));
+        assert!(precommit_qc
+            .signatures
+            .iter()
+            .any(|(v, _)| *v == PQ_UQC_MARKER_ID));
         assert!(precommit_qc.verify_unified(&vs));
     }
 
@@ -6261,7 +6540,11 @@ mod post_quantum_uqc_tests {
             let id = sk.verifying_key().to_bytes();
             let fk = FalconKeypair::generate_from_seed(i + 1);
             vs.add(id, 10);
-            register_validator_pq_key(id, crate::post_quantum::PqScheme::Falcon512, fk.public_key.clone());
+            register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
             signers.push((sk, id));
             falcon_keys.push(fk);
         }
@@ -6281,7 +6564,8 @@ mod post_quantum_uqc_tests {
         for i in 0..16 {
             let (ref sk, _) = signers[i];
             let fk = &falcon_keys[i];
-            let prevote = Vote::sign_with_falcon(sk, fk, height, 0, VoteKind::Prevote, Some(block_hash));
+            let prevote =
+                Vote::sign_with_falcon(sk, fk, height, 0, VoteKind::Prevote, Some(block_hash));
             assert!(prevote.verify());
             assert!(hc.add_prevote(prevote).is_ok());
         }
@@ -6290,7 +6574,10 @@ mod post_quantum_uqc_tests {
         assert_eq!(polka, (0, Some(block_hash)));
         let prevote_qc = hc.prevote_qc.get(&0).expect("prevote QC must exist");
         assert!(
-            prevote_qc.signatures.iter().any(|(v, _)| *v == PQ_UQC_MARKER_ID),
+            prevote_qc
+                .signatures
+                .iter()
+                .any(|(v, _)| *v == PQ_UQC_MARKER_ID),
             "prevote QC must contain PQ_UQC_MARKER_ID"
         );
         assert!(prevote_qc.verify_unified(&vs));
@@ -6299,16 +6586,22 @@ mod post_quantum_uqc_tests {
         for i in 0..16 {
             let (ref sk, _) = signers[i];
             let fk = &falcon_keys[i];
-            let precommit = Vote::sign_with_falcon(sk, fk, height, 0, VoteKind::Precommit, Some(block_hash));
+            let precommit =
+                Vote::sign_with_falcon(sk, fk, height, 0, VoteKind::Precommit, Some(block_hash));
             assert!(precommit.verify());
             assert!(hc.add_precommit(precommit).is_ok());
         }
 
-        let decided = hc.try_precommit_quorum().expect("precommit quorum must decide");
+        let decided = hc
+            .try_precommit_quorum()
+            .expect("precommit quorum must decide");
         assert_eq!(decided, block_hash);
         let precommit_qc = hc.precommit_qc.as_ref().expect("precommit QC must exist");
         assert!(
-            precommit_qc.signatures.iter().any(|(v, _)| *v == PQ_UQC_MARKER_ID),
+            precommit_qc
+                .signatures
+                .iter()
+                .any(|(v, _)| *v == PQ_UQC_MARKER_ID),
             "precommit QC must contain PQ_UQC_MARKER_ID"
         );
         assert!(precommit_qc.verify_unified(&vs));
@@ -6334,7 +6627,11 @@ mod post_quantum_uqc_tests {
             let id = sk.verifying_key().to_bytes();
             let fk = FalconKeypair::generate_from_seed(0xC0 + i);
             vs.add(id, 100);
-            register_validator_pq_key(id, crate::post_quantum::PqScheme::Falcon512, fk.public_key.clone());
+            register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
             sks.push(sk);
             fks.push(fk);
         }
@@ -6357,7 +6654,10 @@ mod post_quantum_uqc_tests {
             block_hash: Some(target),
             signatures: genuine,
         };
-        assert!(classical_qc.verify(&vs), "genuine classical quorum must verify");
+        assert!(
+            classical_qc.verify(&vs),
+            "genuine classical quorum must verify"
+        );
         let signers_classical = classical_qc.signers_set(&vs);
         assert_eq!(signers_classical.len(), 3);
         for id in &ids {
@@ -6370,7 +6670,10 @@ mod post_quantum_uqc_tests {
             block_hash: Some(target),
             signatures: vec![(ids[0], vec![7u8; 64]), (ids[1], vec![8u8; 64])],
         };
-        assert!(!forged_qc.verify(&vs), "forged classical QC must be rejected");
+        assert!(
+            !forged_qc.verify(&vs),
+            "forged classical QC must be rejected"
+        );
         assert!(
             forged_qc.signers_set(&vs).is_empty(),
             "a rejected classical QC must attribute nobody"
@@ -6385,7 +6688,10 @@ mod post_quantum_uqc_tests {
         let mut msigs = Vec::new();
         for (i, id) in committee.iter().enumerate() {
             bitmask[0] |= 1 << i;
-            let fk = &fks[ids.iter().position(|x| x == id).expect("committee is members")];
+            let fk = &fks[ids
+                .iter()
+                .position(|x| x == id)
+                .expect("committee is members")];
             msigs.push(fk.sign(&msg));
         }
         let uqc = PqMicroCertificate::new(
@@ -6425,7 +6731,8 @@ mod post_quantum_uqc_tests {
             signature: dummy_sig,
             participants: bitvec,
         };
-        let bls_payload = encode_qc_bls_envelope(&dummy_agg, 1, 0, VoteKind::Precommit, Some([0xAA; 32]));
+        let bls_payload =
+            encode_qc_bls_envelope(&dummy_agg, 1, 0, VoteKind::Precommit, Some([0xAA; 32]));
         let bls_qc = QuorumCertificate {
             height: 1,
             round: 0,
@@ -6433,7 +6740,10 @@ mod post_quantum_uqc_tests {
             block_hash: Some([0xAA; 32]),
             signatures: vec![(BLS_QC_MARKER_ID, bls_payload)],
         };
-        assert!(!bls_qc.verify(&vs), "BLS-off marker-only QC must be rejected");
+        assert!(
+            !bls_qc.verify(&vs),
+            "BLS-off marker-only QC must be rejected"
+        );
         assert!(
             bls_qc.signers_set(&vs).is_empty(),
             "BLS-off: an unverifiable marker must attribute nobody"

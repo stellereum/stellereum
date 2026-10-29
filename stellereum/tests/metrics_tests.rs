@@ -14,8 +14,8 @@
 use std::sync::Arc;
 use std::thread;
 use stellereum::metrics::{
-    Registry, Snapshot, VoteKind, CONTENT_TYPE, DEFAULT_BLOCK_INTERVAL_BUCKETS, DEFAULT_BLOCK_TXS_BUCKETS,
-    DEFAULT_PEER_LATENCY_BUCKETS,
+    Registry, Snapshot, VoteKind, CONTENT_TYPE, DEFAULT_BLOCK_INTERVAL_BUCKETS,
+    DEFAULT_BLOCK_TXS_BUCKETS, DEFAULT_PEER_LATENCY_BUCKETS,
 };
 
 /// Every family the consensus plan calls for, with the TYPE it must declare.
@@ -145,7 +145,10 @@ fn parse_sample(line: &str) -> Result<Sample, String> {
             if prefix[open + 1..].contains('{') {
                 return Err(format!("nested label braces: {line:?}"));
             }
-            (prefix[..open].to_string(), parse_labels(&prefix[open + 1..], line)?)
+            (
+                prefix[..open].to_string(),
+                parse_labels(&prefix[open + 1..], line)?,
+            )
         }
         None => {
             if head.contains('{') || head.contains('}') {
@@ -158,7 +161,11 @@ fn parse_sample(line: &str) -> Result<Sample, String> {
     if !is_valid_name(&name) {
         return Err(format!("invalid metric name {name:?}: {line:?}"));
     }
-    Ok(Sample { name, labels, value })
+    Ok(Sample {
+        name,
+        labels,
+        value,
+    })
 }
 
 fn parse_labels(src: &str, line: &str) -> Result<Vec<(String, String)>, String> {
@@ -236,7 +243,10 @@ fn parse_exposition(text: &str) -> Vec<Sample> {
 }
 
 fn samples_named(text: &str, name: &str) -> Vec<Sample> {
-    parse_exposition(text).into_iter().filter(|s| s.name == name).collect()
+    parse_exposition(text)
+        .into_iter()
+        .filter(|s| s.name == name)
+        .collect()
 }
 
 fn count_prefix(text: &str, prefix: &str) -> usize {
@@ -260,44 +270,113 @@ fn exposition_contains_every_required_metric() {
 
     // Counters carry their `_total` suffix in the sample names, so assert the
     // samples themselves exist and not just the TYPE declarations.
-    assert!(text.contains("stell_consensus_round 3"), "round sample missing:\n{text}");
-    assert!(text.contains("stell_consensus_height 412"), "height sample missing:\n{text}");
-    assert!(text.contains("stell_fork_total 1"), "fork counter missing:\n{text}");
-    assert!(text.contains("stell_mempool_size 17"), "mempool gauge missing:\n{text}");
-    assert!(text.contains("stell_validator_set_size 5"), "validator set gauge missing:\n{text}");
-    assert!(text.contains("stell_validator_power_total 5000000000000"), "validator power missing:\n{text}");
-    assert!(text.contains("stell_validator_quorum_power 3333333333334"), "quorum power missing:\n{text}");
-    assert!(text.contains("stell_validator_set_fragile 1"), "fragile flag missing:\n{text}");
-    assert!(text.contains("stell_data_dir_bytes 2900000000"), "data-dir gauge missing:\n{text}");
-    assert!(text.contains("stell_snapshot_count 9"), "snapshot gauge missing:\n{text}");
-    assert!(text.contains("stell_state_entries 1234"), "state-entries gauge missing:\n{text}");
-    assert!(text.contains("stell_persist_queue_depth 3"), "persist depth missing:\n{text}");
-    assert!(text.contains("stell_persist_queue_dropped_total 2"), "persist dropped missing:\n{text}");
-    assert!(text.contains("stell_peer_round_lag{peer=\"peer-a\"} 2"), "peer lag missing:\n{text}");
-    assert!(text.contains("stell_build_info{"), "build info missing:\n{text}");
+    assert!(
+        text.contains("stell_consensus_round 3"),
+        "round sample missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_consensus_height 412"),
+        "height sample missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_fork_total 1"),
+        "fork counter missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_mempool_size 17"),
+        "mempool gauge missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_validator_set_size 5"),
+        "validator set gauge missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_validator_power_total 5000000000000"),
+        "validator power missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_validator_quorum_power 3333333333334"),
+        "quorum power missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_validator_set_fragile 1"),
+        "fragile flag missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_data_dir_bytes 2900000000"),
+        "data-dir gauge missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_snapshot_count 9"),
+        "snapshot gauge missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_state_entries 1234"),
+        "state-entries gauge missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_persist_queue_depth 3"),
+        "persist depth missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_persist_queue_dropped_total 2"),
+        "persist dropped missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_peer_round_lag{peer=\"peer-a\"} 2"),
+        "peer lag missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_build_info{"),
+        "build info missing:\n{text}"
+    );
     assert!(
         text.contains("stell_state_root_commits_total 3"),
         "state root commit counter missing:\n{text}"
     );
-    assert!(text.contains("stell_consensus_votes_total"), "vote counter missing:\n{text}");
-    assert!(text.contains("stell_block_interval_seconds_bucket"), "block interval missing:\n{text}");
-    assert!(text.contains("stell_block_txs_bucket"), "block txs missing:\n{text}");
-    assert!(text.contains("stell_peer_latency_seconds_bucket"), "peer latency missing:\n{text}");
+    assert!(
+        text.contains("stell_consensus_votes_total"),
+        "vote counter missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_block_interval_seconds_bucket"),
+        "block interval missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_block_txs_bucket"),
+        "block txs missing:\n{text}"
+    );
+    assert!(
+        text.contains("stell_peer_latency_seconds_bucket"),
+        "peer latency missing:\n{text}"
+    );
 
     // Labels are part of the contract: votes are split by kind, latency by peer.
-    assert!(text.contains("stell_consensus_votes_total{kind=\"prevote\"} 2"), "prevote label missing:\n{text}");
+    assert!(
+        text.contains("stell_consensus_votes_total{kind=\"prevote\"} 2"),
+        "prevote label missing:\n{text}"
+    );
     assert!(
         text.contains("stell_consensus_votes_total{kind=\"precommit\"} 1"),
         "precommit label missing:\n{text}"
     );
-    assert!(text.contains("peer=\"peer-a\""), "peer label missing:\n{text}");
-    assert!(text.contains("peer=\"peer-b\""), "second peer label missing:\n{text}");
+    assert!(
+        text.contains("peer=\"peer-a\""),
+        "peer label missing:\n{text}"
+    );
+    assert!(
+        text.contains("peer=\"peer-b\""),
+        "second peer label missing:\n{text}"
+    );
 
     // A fresh registry must already describe the whole node, so alerting rules
     // see zero rather than "no data" before the first vote lands.
     let cold = Registry::shared().render();
     for (name, _) in REQUIRED {
-        assert!(cold.contains(&format!("# TYPE {name} ")), "{name} absent from a cold registry");
+        assert!(
+            cold.contains(&format!("# TYPE {name} ")),
+            "{name} absent from a cold registry"
+        );
     }
     assert!(cold.contains("stell_fork_total 0"));
     assert!(cold.contains("stell_data_dir_bytes 0"));
@@ -328,16 +407,37 @@ fn help_and_type_lines_are_well_formed() {
     // Exactly one HELP and one TYPE per family, each immediately preceding that
     // family's first sample.
     for (name, kind) in REQUIRED {
-        let help: Vec<&&str> = lines.iter().filter(|l| l.starts_with(&format!("# HELP {name} "))).collect();
-        let types: Vec<&&str> = lines.iter().filter(|l| l.starts_with(&format!("# TYPE {name} "))).collect();
+        let help: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.starts_with(&format!("# HELP {name} ")))
+            .collect();
+        let types: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.starts_with(&format!("# TYPE {name} ")))
+            .collect();
 
-        assert_eq!(help.len(), 1, "expected exactly one HELP for {name}, got {help:?}");
-        assert_eq!(types.len(), 1, "expected exactly one TYPE for {name}, got {types:?}");
-        assert_eq!(*types[0], format!("# TYPE {name} {kind}"), "wrong TYPE for {name}");
+        assert_eq!(
+            help.len(),
+            1,
+            "expected exactly one HELP for {name}, got {help:?}"
+        );
+        assert_eq!(
+            types.len(),
+            1,
+            "expected exactly one TYPE for {name}, got {types:?}"
+        );
+        assert_eq!(
+            *types[0],
+            format!("# TYPE {name} {kind}"),
+            "wrong TYPE for {name}"
+        );
 
         let help_text = help[0].strip_prefix(&format!("# HELP {name} ")).unwrap();
         assert!(!help_text.is_empty(), "{name} has an empty HELP");
-        assert!(!help_text.contains('\n'), "{name} HELP must stay on one line");
+        assert!(
+            !help_text.contains('\n'),
+            "{name} HELP must stay on one line"
+        );
         assert!(is_valid_name(name), "{name} is not a legal metric name");
 
         // The header must come before the family's samples: a TYPE line in the
@@ -354,12 +454,25 @@ fn help_and_type_lines_are_well_formed() {
             .unwrap_or_else(|| panic!("no samples for {name}"));
         let help_at = lines.iter().position(|l| *l == *help[0]).unwrap();
         let type_at = lines.iter().position(|l| *l == *types[0]).unwrap();
-        assert!(help_at < first_sample, "HELP for {name} must precede its samples");
-        assert!(type_at < first_sample, "TYPE for {name} must precede its samples");
-        assert_eq!(type_at, help_at + 1, "TYPE must directly follow HELP for {name}");
+        assert!(
+            help_at < first_sample,
+            "HELP for {name} must precede its samples"
+        );
+        assert!(
+            type_at < first_sample,
+            "TYPE for {name} must precede its samples"
+        );
+        assert_eq!(
+            type_at,
+            help_at + 1,
+            "TYPE must directly follow HELP for {name}"
+        );
     }
 
-    assert!(CONTENT_TYPE.starts_with("text/plain"), "unexpected content type: {CONTENT_TYPE}");
+    assert!(
+        CONTENT_TYPE.starts_with("text/plain"),
+        "unexpected content type: {CONTENT_TYPE}"
+    );
 }
 
 // ============================================================================
@@ -383,9 +496,18 @@ fn counter_increments_and_reflects_the_total() {
     }
 
     let text = reg.render();
-    assert!(text.contains("stell_fork_total 7"), "fork total wrong:\n{text}");
-    assert!(text.contains("stell_state_root_commits_total 15"), "commit total wrong:\n{text}");
-    assert!(text.contains("stell_consensus_votes_total{kind=\"prevote\"} 3"), "prevotes wrong:\n{text}");
+    assert!(
+        text.contains("stell_fork_total 7"),
+        "fork total wrong:\n{text}"
+    );
+    assert!(
+        text.contains("stell_state_root_commits_total 15"),
+        "commit total wrong:\n{text}"
+    );
+    assert!(
+        text.contains("stell_consensus_votes_total{kind=\"prevote\"} 3"),
+        "prevotes wrong:\n{text}"
+    );
     assert!(
         text.contains("stell_consensus_votes_total{kind=\"precommit\"} 4"),
         "precommits wrong:\n{text}"
@@ -396,7 +518,10 @@ fn counter_increments_and_reflects_the_total() {
         reg.inc_fork();
     }
     let after = reg.render();
-    assert!(after.contains("stell_fork_total 10"), "fork total must keep accumulating:\n{after}");
+    assert!(
+        after.contains("stell_fork_total 10"),
+        "fork total must keep accumulating:\n{after}"
+    );
     assert!(
         after.contains("stell_consensus_votes_total{kind=\"prevote\"} 3"),
         "prevote series must be untouched by precommits:\n{after}"
@@ -407,7 +532,11 @@ fn counter_increments_and_reflects_the_total() {
     assert_eq!(snap.state_root_commits, 15.0);
     assert_eq!(snap.votes_prevote, 3.0);
     assert_eq!(snap.votes_precommit, 4.0);
-    assert!(snap.to_json().contains("\"forks\":10.0"), "snapshot json: {}", snap.to_json());
+    assert!(
+        snap.to_json().contains("\"forks\":10.0"),
+        "snapshot json: {}",
+        snap.to_json()
+    );
 }
 
 // ============================================================================
@@ -432,17 +561,41 @@ fn gauge_takes_the_latest_value() {
     }
 
     let text = reg.render();
-    assert!(text.contains("stell_consensus_height 43\n"), "height must be the latest:\n{text}");
-    assert!(text.contains("stell_consensus_round 2\n"), "round must be the latest:\n{text}");
-    assert!(text.contains("stell_mempool_size 12\n"), "mempool must be the latest:\n{text}");
-    assert!(text.contains("stell_validator_set_size 6\n"), "validator set must be the latest:\n{text}");
+    assert!(
+        text.contains("stell_consensus_height 43\n"),
+        "height must be the latest:\n{text}"
+    );
+    assert!(
+        text.contains("stell_consensus_round 2\n"),
+        "round must be the latest:\n{text}"
+    );
+    assert!(
+        text.contains("stell_mempool_size 12\n"),
+        "mempool must be the latest:\n{text}"
+    );
+    assert!(
+        text.contains("stell_validator_set_size 6\n"),
+        "validator set must be the latest:\n{text}"
+    );
 
     // A gauge is a single value, not a total: exactly one sample each, and the
     // histogram families must not have been disturbed by the writes.
-    for name in ["stell_consensus_height", "stell_consensus_round", "stell_mempool_size", "stell_validator_set_size"] {
-        assert_eq!(samples_named(&text, name).len(), 1, "{name} must have exactly one sample");
+    for name in [
+        "stell_consensus_height",
+        "stell_consensus_round",
+        "stell_mempool_size",
+        "stell_validator_set_size",
+    ] {
+        assert_eq!(
+            samples_named(&text, name).len(),
+            1,
+            "{name} must have exactly one sample"
+        );
     }
-    assert!(text.contains("stell_block_interval_seconds_count 0"), "gauge writes must not observe histograms");
+    assert!(
+        text.contains("stell_block_interval_seconds_count 0"),
+        "gauge writes must not observe histograms"
+    );
     assert!(text.contains("stell_block_txs_count 0"));
 
     // Going back to zero is a legitimate gauge state, not a "missing" one.
@@ -468,12 +621,19 @@ fn histogram_emits_buckets_sum_and_count() {
     let text = reg.render();
     let samples = samples_named(&text, "stell_block_interval_seconds_count");
     assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0].value, 9.0, "_count must equal the number of observations");
+    assert_eq!(
+        samples[0].value, 9.0,
+        "_count must equal the number of observations"
+    );
 
     let sums = samples_named(&text, "stell_block_interval_seconds_sum");
     assert_eq!(sums.len(), 1);
     let expected_sum = 5.0 * 0.05 + 3.0 * 0.75 + 42.0;
-    assert!((sums[0].value - expected_sum).abs() < 1e-9, "_sum wrong: {} vs {expected_sum}", sums[0].value);
+    assert!(
+        (sums[0].value - expected_sum).abs() < 1e-9,
+        "_sum wrong: {} vs {expected_sum}",
+        sums[0].value
+    );
 
     // Every declared bound appears, in ascending order, plus the mandatory
     // `+Inf` bucket.
@@ -481,21 +641,42 @@ fn histogram_emits_buckets_sum_and_count() {
     let bounds: Vec<f64> = buckets
         .iter()
         .map(|s| {
-            assert_eq!(s.labels.len(), 1, "unlabelled histogram bucket must carry only `le`");
+            assert_eq!(
+                s.labels.len(),
+                1,
+                "unlabelled histogram bucket must carry only `le`"
+            );
             assert_eq!(s.labels[0].0, "le");
-            s.labels[0].1.parse::<f64>().expect("`le` must be a float or +Inf")
+            s.labels[0]
+                .1
+                .parse::<f64>()
+                .expect("`le` must be a float or +Inf")
         })
         .collect();
     let mut expected: Vec<f64> = DEFAULT_BLOCK_INTERVAL_BUCKETS.to_vec();
     expected.push(f64::INFINITY);
-    assert_eq!(bounds.len(), expected.len(), "bucket count mismatch: {bounds:?}");
+    assert_eq!(
+        bounds.len(),
+        expected.len(),
+        "bucket count mismatch: {bounds:?}"
+    );
     assert_eq!(bounds, expected, "bucket bounds/order mismatch: {bounds:?}");
 
     // Cumulative, so `histogram_quantile` has a monotone series to work with.
     let counts: Vec<f64> = buckets.iter().map(|s| s.value).collect();
-    assert!(counts.windows(2).all(|w| w[0] <= w[1]), "bucket counts must be non-decreasing: {counts:?}");
-    assert_eq!(counts[0], 5.0, "five 0.05s observations must land in the first bucket");
-    assert_eq!(*counts.last().unwrap(), 9.0, "+Inf bucket must equal _count");
+    assert!(
+        counts.windows(2).all(|w| w[0] <= w[1]),
+        "bucket counts must be non-decreasing: {counts:?}"
+    );
+    assert_eq!(
+        counts[0], 5.0,
+        "five 0.05s observations must land in the first bucket"
+    );
+    assert_eq!(
+        *counts.last().unwrap(),
+        9.0,
+        "+Inf bucket must equal _count"
+    );
 
     // The other two families use their own defaults and the same shape.
     reg.observe_block_txs(0);
@@ -504,9 +685,18 @@ fn histogram_emits_buckets_sum_and_count() {
     reg.observe_peer_latency("p1", 2.0);
     let text = reg.render();
     assert_eq!(samples_named(&text, "stell_block_txs_count")[0].value, 2.0);
-    assert_eq!(samples_named(&text, "stell_peer_latency_seconds_count").len(), 1);
-    assert_eq!(samples_named(&text, "stell_peer_latency_seconds_sum")[0].value, 2.02);
-    assert_eq!(samples_named(&text, "stell_block_interval_seconds_count").len(), 1);
+    assert_eq!(
+        samples_named(&text, "stell_peer_latency_seconds_count").len(),
+        1
+    );
+    assert_eq!(
+        samples_named(&text, "stell_peer_latency_seconds_sum")[0].value,
+        2.02
+    );
+    assert_eq!(
+        samples_named(&text, "stell_block_interval_seconds_count").len(),
+        1
+    );
 
     let txs_buckets = samples_named(&text, "stell_block_txs_bucket");
     assert_eq!(txs_buckets.len(), DEFAULT_BLOCK_TXS_BUCKETS.len() + 1);
@@ -522,7 +712,11 @@ fn histogram_emits_buckets_sum_and_count() {
     );
     for bucket in &peer_buckets {
         let keys: Vec<&str> = bucket.labels.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(keys, vec!["le", "peer"], "labels must be sorted by name, `le` first");
+        assert_eq!(
+            keys,
+            vec!["le", "peer"],
+            "labels must be sorted by name, `le` first"
+        );
     }
     // Two observations: 0.02s and 2.0s, each landing in the first bucket whose
     // bound it does not exceed. The index is looked up from the constant so the
@@ -532,10 +726,22 @@ fn histogram_emits_buckets_sum_and_count() {
         .take(DEFAULT_PEER_LATENCY_BUCKETS.len())
         .map(|s| s.value)
         .collect();
-    let fast = DEFAULT_PEER_LATENCY_BUCKETS.iter().position(|b| 0.02 <= *b).unwrap();
-    let slow = DEFAULT_PEER_LATENCY_BUCKETS.iter().position(|b| 2.0 <= *b).unwrap();
-    assert_eq!(landed[fast], 1.0, "the 0.02s sample belongs in the {fast} bucket: {landed:?}");
-    assert_eq!(landed[slow], 2.0, "the 2.0s sample belongs in the {slow} bucket: {landed:?}");
+    let fast = DEFAULT_PEER_LATENCY_BUCKETS
+        .iter()
+        .position(|b| 0.02 <= *b)
+        .unwrap();
+    let slow = DEFAULT_PEER_LATENCY_BUCKETS
+        .iter()
+        .position(|b| 2.0 <= *b)
+        .unwrap();
+    assert_eq!(
+        landed[fast], 1.0,
+        "the 0.02s sample belongs in the {fast} bucket: {landed:?}"
+    );
+    assert_eq!(
+        landed[slow], 2.0,
+        "the 2.0s sample belongs in the {slow} bucket: {landed:?}"
+    );
 }
 
 // ============================================================================
@@ -550,13 +756,21 @@ fn two_renders_with_identical_data_are_byte_identical() {
     for p in ["zz", "mm", "aa", "11", "zz", "AA", "peer-3", "peer-2"] {
         reg.observe_peer_latency(p, 0.02);
     }
-    for k in [VoteKind::Precommit, VoteKind::Prevote, VoteKind::Precommit, VoteKind::Prevote] {
+    for k in [
+        VoteKind::Precommit,
+        VoteKind::Prevote,
+        VoteKind::Precommit,
+        VoteKind::Prevote,
+    ] {
         reg.inc_vote(k);
     }
 
     let first = reg.render();
     let second = reg.render();
-    assert_eq!(first, second, "two renders of identical data must be byte-identical");
+    assert_eq!(
+        first, second,
+        "two renders of identical data must be byte-identical"
+    );
 
     // Same shape, independently built: a second registry fed the same
     // operations in the same order must render identically too. A HashMap
@@ -597,12 +811,21 @@ fn two_renders_with_identical_data_are_byte_identical() {
         for p in ["zz", "mm", "aa", "11", "zz", "AA", "peer-3", "peer-2"] {
             r.observe_peer_latency(p, 0.02);
         }
-        for k in [VoteKind::Precommit, VoteKind::Prevote, VoteKind::Precommit, VoteKind::Prevote] {
+        for k in [
+            VoteKind::Precommit,
+            VoteKind::Prevote,
+            VoteKind::Precommit,
+            VoteKind::Prevote,
+        ] {
             r.inc_vote(k);
         }
         r.render()
     };
-    assert_eq!(first, rebuild(), "identical operations must produce identical bytes");
+    assert_eq!(
+        first,
+        rebuild(),
+        "identical operations must produce identical bytes"
+    );
 
     // Labels come out sorted by value within a family.
     let peers: Vec<String> = parse_exposition(&first)
@@ -612,7 +835,10 @@ fn two_renders_with_identical_data_are_byte_identical() {
         .collect();
     let mut sorted = peers.clone();
     sorted.sort();
-    assert_eq!(peers, sorted, "label values must be emitted in sorted order: {peers:?}");
+    assert_eq!(
+        peers, sorted,
+        "label values must be emitted in sorted order: {peers:?}"
+    );
 
     // A fresh process would be a stronger guarantee, but this at least proves
     // nothing in the render path depends on wall-clock time or address order.
@@ -640,24 +866,55 @@ fn hostile_label_value_cannot_inject_a_fake_metric_line() {
         );
     }
     // Nor may it have manufactured a HELP/TYPE header for it.
-    assert!(!text.contains("# HELP stell_fake_metric"), "injected a HELP line:\n{text}");
-    assert!(!text.contains("# TYPE stell_fake_metric"), "injected a TYPE line:\n{text}");
+    assert!(
+        !text.contains("# HELP stell_fake_metric"),
+        "injected a HELP line:\n{text}"
+    );
+    assert!(
+        !text.contains("# TYPE stell_fake_metric"),
+        "injected a TYPE line:\n{text}"
+    );
 
     // The payload survives only as inert text inside a quoted label, and only
     // on the series it was attached to.
-    let mentioning: Vec<&str> = text.lines().filter(|l| l.contains("stell_fake_metric")).collect();
-    let peer_lines: Vec<&str> =
-        text.lines().filter(|l| l.starts_with("stell_peer_latency_seconds")).collect();
-    assert_eq!(mentioning.len(), peer_lines.len(), "payload must not escape its own series");
-    assert!(mentioning.iter().all(|l| l.contains("peer=")), "payload must stay inside the label");
-    assert!(!mentioning.iter().any(|l| l.contains("evil\"")), "quote must be escaped, not bare: {mentioning:?}");
+    let mentioning: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("stell_fake_metric"))
+        .collect();
+    let peer_lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("stell_peer_latency_seconds"))
+        .collect();
+    assert_eq!(
+        mentioning.len(),
+        peer_lines.len(),
+        "payload must not escape its own series"
+    );
+    assert!(
+        mentioning.iter().all(|l| l.contains("peer=")),
+        "payload must stay inside the label"
+    );
+    assert!(
+        !mentioning.iter().any(|l| l.contains("evil\"")),
+        "quote must be escaped, not bare: {mentioning:?}"
+    );
 
     // The single most important assertion: the whole document still parses.
     // Whatever the sanitiser did, it did not break the format.
     let samples = parse_exposition(&text);
-    let peer = samples.iter().filter(|s| s.name == "stell_peer_latency_seconds_count").collect::<Vec<_>>();
-    assert_eq!(peer.len(), 1, "hostile peer must produce exactly one latency series");
-    assert_eq!(peer[0].value, 1.0, "the observation itself must still be recorded");
+    let peer = samples
+        .iter()
+        .filter(|s| s.name == "stell_peer_latency_seconds_count")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        peer.len(),
+        1,
+        "hostile peer must produce exactly one latency series"
+    );
+    assert_eq!(
+        peer[0].value, 1.0,
+        "the observation itself must still be recorded"
+    );
 
     // The sanitised value round-trips through the format's own escapes: the
     // parser un-escapes `\"` back to a quote, so the meaningful assertion is
@@ -671,7 +928,10 @@ fn hostile_label_value_cannot_inject_a_fake_metric_line() {
         text.contains(&format!("peer=\"{sanitised}\"")),
         "payload must be escaped in place, not dropped:\n{text}"
     );
-    assert!(!peer_labels[0].1.contains('\n'), "newline must not survive into the parsed value");
+    assert!(
+        !peer_labels[0].1.contains('\n'),
+        "newline must not survive into the parsed value"
+    );
     assert_eq!(
         peer_labels[0].1, "evil\"_stell_fake_metric 1_",
         "the parsed value must be the sanitised payload, whole"
@@ -692,8 +952,14 @@ fn hostile_label_value_cannot_inject_a_fake_metric_line() {
         reg.observe_peer_latency(bad, 0.1);
         let text = reg.render();
         for line in text.lines() {
-            assert!(!line.starts_with("stell_fake_metric"), "injected via {bad:?}: {line:?}");
-            assert!(!line.contains("\r"), "carriage return leaked from {bad:?}: {line:?}");
+            assert!(
+                !line.starts_with("stell_fake_metric"),
+                "injected via {bad:?}: {line:?}"
+            );
+            assert!(
+                !line.contains("\r"),
+                "carriage return leaked from {bad:?}: {line:?}"
+            );
         }
         assert_eq!(
             samples_named(&text, "stell_peer_latency_seconds_count").len(),
@@ -707,7 +973,9 @@ fn hostile_label_value_cannot_inject_a_fake_metric_line() {
     // peer id is still a legal (if useless) series rather than a parse error.
     let reg = Registry::shared();
     reg.observe_peer_latency("", 0.1);
-    assert!(parse_exposition(&reg.render()).iter().any(|s| s.name == "stell_peer_latency_seconds_count"));
+    assert!(parse_exposition(&reg.render())
+        .iter()
+        .any(|s| s.name == "stell_peer_latency_seconds_count"));
 }
 
 // ============================================================================
@@ -761,10 +1029,21 @@ fn every_exposition_line_is_parsable() {
         if sample.name.ends_with("_bucket") {
             assert!(keys.contains(&"le"), "bucket must carry `le`: {line:?}");
             // Exactly the family's own labels plus `le`, and nothing else.
-            let family_labels = if family == "stell_peer_latency_seconds" { 1 } else { 0 };
-            assert_eq!(keys.len(), family_labels + 1, "unexpected bucket labels: {line:?}");
+            let family_labels = if family == "stell_peer_latency_seconds" {
+                1
+            } else {
+                0
+            };
+            assert_eq!(
+                keys.len(),
+                family_labels + 1,
+                "unexpected bucket labels: {line:?}"
+            );
         } else {
-            assert!(!keys.contains(&"le"), "`le` only belongs on a bucket: {line:?}");
+            assert!(
+                !keys.contains(&"le"),
+                "`le` only belongs on a bucket: {line:?}"
+            );
         }
         total += 1;
     }
@@ -783,7 +1062,10 @@ fn every_exposition_line_is_parsable() {
     // `le` bounds are non-decreasing within a family+label-set, and every
     // histogram ends in `+Inf`, which the text format requires.
     for (family, defaults) in [
-        ("stell_block_interval_seconds", DEFAULT_BLOCK_INTERVAL_BUCKETS),
+        (
+            "stell_block_interval_seconds",
+            DEFAULT_BLOCK_INTERVAL_BUCKETS,
+        ),
         ("stell_block_txs", DEFAULT_BLOCK_TXS_BUCKETS),
     ] {
         let bounds: Vec<f64> = samples_named(&text, &format!("{family}_bucket"))
@@ -791,7 +1073,11 @@ fn every_exposition_line_is_parsable() {
             .map(|s| s.labels[0].1.parse().unwrap())
             .collect();
         assert_eq!(bounds.len(), defaults.len() + 1, "{family} bucket count");
-        assert_eq!(bounds[defaults.len()], f64::INFINITY, "{family} must end with +Inf");
+        assert_eq!(
+            bounds[defaults.len()],
+            f64::INFINITY,
+            "{family} must end with +Inf"
+        );
     }
 }
 
@@ -811,7 +1097,11 @@ fn concurrent_updates_from_several_threads_produce_a_correct_total() {
         handles.push(thread::spawn(move || {
             for i in 0..PER_THREAD {
                 reg.inc_fork();
-                reg.inc_vote(if i % 2 == 0 { VoteKind::Prevote } else { VoteKind::Precommit });
+                reg.inc_vote(if i % 2 == 0 {
+                    VoteKind::Prevote
+                } else {
+                    VoteKind::Precommit
+                });
                 reg.observe_block_interval(0.1);
                 reg.observe_block_txs(3);
                 reg.observe_peer_latency(&format!("peer-{}", t % 3), 0.005);
@@ -832,7 +1122,10 @@ fn concurrent_updates_from_several_threads_produce_a_correct_total() {
     let total = THREADS as u64 * PER_THREAD;
     let text = reg.render();
 
-    assert!(text.contains(&format!("stell_fork_total {total}\n")), "fork total wrong:\n{text}");
+    assert!(
+        text.contains(&format!("stell_fork_total {total}\n")),
+        "fork total wrong:\n{text}"
+    );
     assert!(
         text.contains(&format!("stell_state_root_commits_total {total}\n")),
         "commit total wrong:\n{text}"
@@ -840,11 +1133,15 @@ fn concurrent_updates_from_several_threads_produce_a_correct_total() {
     // Every thread contributes an even split of prevotes and precommits.
     let expected_each = total / 2;
     assert!(
-        text.contains(&format!("stell_consensus_votes_total{{kind=\"prevote\"}} {expected_each}")),
+        text.contains(&format!(
+            "stell_consensus_votes_total{{kind=\"prevote\"}} {expected_each}"
+        )),
         "prevote total wrong:\n{text}"
     );
     assert!(
-        text.contains(&format!("stell_consensus_votes_total{{kind=\"precommit\"}} {expected_each}")),
+        text.contains(&format!(
+            "stell_consensus_votes_total{{kind=\"precommit\"}} {expected_each}"
+        )),
         "precommit total wrong:\n{text}"
     );
     // Histogram observations must not be lost either.
@@ -852,7 +1149,10 @@ fn concurrent_updates_from_several_threads_produce_a_correct_total() {
         text.contains(&format!("stell_block_interval_seconds_count {total}\n")),
         "block interval count wrong:\n{text}"
     );
-    assert!(text.contains(&format!("stell_block_txs_count {total}\n")), "block txs count wrong:\n{text}");
+    assert!(
+        text.contains(&format!("stell_block_txs_count {total}\n")),
+        "block txs count wrong:\n{text}"
+    );
     assert!(text.contains(&format!("stell_block_txs_sum {}", 3.0 * total as f64)));
 
     // Three peer ids across eight threads, so the split is uneven by
@@ -860,9 +1160,15 @@ fn concurrent_updates_from_several_threads_produce_a_correct_total() {
     let per_peer: Vec<Sample> = samples_named(&text, "stell_peer_latency_seconds_count");
     assert_eq!(per_peer.len(), 3, "one latency series per peer id");
     let observed: u64 = per_peer.iter().map(|s| s.value as u64).sum();
-    assert_eq!(observed, total, "no latency observation may be lost: {observed} != {total}");
+    assert_eq!(
+        observed, total,
+        "no latency observation may be lost: {observed} != {total}"
+    );
     let counts: Vec<u64> = per_peer.iter().map(|s| s.value as u64).collect();
-    assert!(counts.iter().all(|c| *c > 0), "every peer must be represented: {counts:?}");
+    assert!(
+        counts.iter().all(|c| *c > 0),
+        "every peer must be represented: {counts:?}"
+    );
     let spread = counts.iter().max().unwrap() - counts.iter().min().unwrap();
     assert!(
         spread <= PER_THREAD,
@@ -880,7 +1186,11 @@ fn concurrent_updates_from_several_threads_produce_a_correct_total() {
     assert_eq!(snap.state_root_commits, total as f64);
     assert_eq!(snap.votes_prevote, expected_each as f64);
     assert_eq!(snap.votes_precommit, expected_each as f64);
-    assert_eq!(snap.height, (PER_THREAD - 1) as f64, "a gauge ends on some thread's last write");
+    assert_eq!(
+        snap.height,
+        (PER_THREAD - 1) as f64,
+        "a gauge ends on some thread's last write"
+    );
 }
 
 // ============================================================================
@@ -900,25 +1210,64 @@ fn explorer_scrape_renders_registry_plus_live_gauges() {
     for (name, kind) in REQUIRED {
         let help = format!("# HELP {name} ");
         let ty = format!("# TYPE {name} {kind}");
-        assert_eq!(count_prefix(&text, &help), 1, "want exactly one HELP for {name}:\n{text}");
-        assert_eq!(count_prefix(&text, &ty), 1, "want exactly one TYPE for {name}:\n{text}");
+        assert_eq!(
+            count_prefix(&text, &help),
+            1,
+            "want exactly one HELP for {name}:\n{text}"
+        );
+        assert_eq!(
+            count_prefix(&text, &ty),
+            1,
+            "want exactly one TYPE for {name}:\n{text}"
+        );
     }
 
     // The registry gauges took the live values from the handler.
-    assert!(text.contains("stell_consensus_height 9000\n"), "height not wired into registry:\n{text}");
-    assert!(text.contains("stell_mempool_size 12\n"), "mempool not wired into registry:\n{text}");
+    assert!(
+        text.contains("stell_consensus_height 9000\n"),
+        "height not wired into registry:\n{text}"
+    );
+    assert!(
+        text.contains("stell_mempool_size 12\n"),
+        "mempool not wired into registry:\n{text}"
+    );
 
     // The explorer-local gauges survive under their public names.
-    assert!(text.contains("stellereum_block_height 9000\n"), "legacy height missing:\n{text}");
-    assert!(text.contains("stellereum_mempool_size 12\n"), "legacy mempool missing:\n{text}");
-    assert!(text.contains("stellereum_contracts_total 4\n"), "contracts gauge missing:\n{text}");
-    assert!(text.contains("stellereum_tokens_total 3\n"), "tokens gauge missing:\n{text}");
+    assert!(
+        text.contains("stellereum_block_height 9000\n"),
+        "legacy height missing:\n{text}"
+    );
+    assert!(
+        text.contains("stellereum_mempool_size 12\n"),
+        "legacy mempool missing:\n{text}"
+    );
+    assert!(
+        text.contains("stellereum_contracts_total 4\n"),
+        "contracts gauge missing:\n{text}"
+    );
+    assert!(
+        text.contains("stellereum_tokens_total 3\n"),
+        "tokens gauge missing:\n{text}"
+    );
 
     // Exactly one HELP/TYPE for the appended families too, and the whole
     // document still parses as exposition.
-    for name in ["stellereum_block_height", "stellereum_mempool_size", "stellereum_contracts_total", "stellereum_tokens_total"] {
-        assert_eq!(count_prefix(&text, &format!("# HELP {name} ")), 1, "one HELP for {name}");
-        assert_eq!(count_prefix(&text, &format!("# TYPE {name} gauge")), 1, "one TYPE for {name}");
+    for name in [
+        "stellereum_block_height",
+        "stellereum_mempool_size",
+        "stellereum_contracts_total",
+        "stellereum_tokens_total",
+    ] {
+        assert_eq!(
+            count_prefix(&text, &format!("# HELP {name} ")),
+            1,
+            "one HELP for {name}"
+        );
+        assert_eq!(
+            count_prefix(&text, &format!("# TYPE {name} gauge")),
+            1,
+            "one TYPE for {name}"
+        );
     }
     parse_exposition(&text);
 
@@ -933,22 +1282,40 @@ fn live_scrape_reflects_counter_increments_and_gauge_sets() {
     let reg = Registry::shared();
 
     let first = stellereum::explorer::render_metrics(&reg, 1, 0, 0, 0);
-    assert!(first.contains("stell_fork_total 0\n"), "cold counter must read zero:\n{first}");
+    assert!(
+        first.contains("stell_fork_total 0\n"),
+        "cold counter must read zero:\n{first}"
+    );
 
     reg.inc_fork();
     reg.inc_fork();
     reg.inc_vote(VoteKind::Precommit);
     let second = stellereum::explorer::render_metrics(&reg, 42, 7, 2, 1);
 
-    assert!(second.contains("stell_fork_total 2\n"), "counter increment not reflected:\n{second}");
+    assert!(
+        second.contains("stell_fork_total 2\n"),
+        "counter increment not reflected:\n{second}"
+    );
     assert!(
         second.contains("stell_consensus_votes_total{kind=\"precommit\"} 1"),
         "vote increment not reflected:\n{second}"
     );
-    assert!(second.contains("stell_consensus_height 42\n"), "gauge set not reflected:\n{second}");
-    assert!(second.contains("stell_mempool_size 7\n"), "mempool gauge set not reflected:\n{second}");
-    assert!(second.contains("stellereum_contracts_total 2\n"), "contracts gauge set not reflected:\n{second}");
-    assert!(second.contains("stellereum_tokens_total 1\n"), "tokens gauge set not reflected:\n{second}");
+    assert!(
+        second.contains("stell_consensus_height 42\n"),
+        "gauge set not reflected:\n{second}"
+    );
+    assert!(
+        second.contains("stell_mempool_size 7\n"),
+        "mempool gauge set not reflected:\n{second}"
+    );
+    assert!(
+        second.contains("stellereum_contracts_total 2\n"),
+        "contracts gauge set not reflected:\n{second}"
+    );
+    assert!(
+        second.contains("stellereum_tokens_total 1\n"),
+        "tokens gauge set not reflected:\n{second}"
+    );
 }
 
 /// `GatewayState::new` uses the process-wide registry, so anything else that
@@ -958,10 +1325,16 @@ fn live_scrape_reflects_counter_increments_and_gauge_sets() {
 fn global_registry_is_a_single_shared_instance() {
     let a = stellereum::metrics::global();
     let b = stellereum::metrics::global();
-    assert!(Arc::ptr_eq(&a, &b), "global() must hand back the same registry");
+    assert!(
+        Arc::ptr_eq(&a, &b),
+        "global() must hand back the same registry"
+    );
 
     a.set_height(31_337);
-    assert!(b.render().contains("stell_consensus_height 31337\n"), "shared registry must see the write");
+    assert!(
+        b.render().contains("stell_consensus_height 31337\n"),
+        "shared registry must see the write"
+    );
 }
 
 // ============================================================================
@@ -984,10 +1357,22 @@ fn observability_gauges_counters_and_build_info() {
     reg.set_validator_set_full(2, 4_000_000_000_000, 2_666_666_666_667, true);
     reg.set_validator_set_full(2, 4_000_000_000_000, 2_666_666_666_667, false);
     let text = reg.render();
-    assert!(text.contains("stell_validator_set_size 2\n"), "size:\n{text}");
-    assert!(text.contains("stell_validator_power_total 4000000000000\n"), "power:\n{text}");
-    assert!(text.contains("stell_validator_quorum_power 2666666666667\n"), "quorum:\n{text}");
-    assert!(text.contains("stell_validator_set_fragile 0\n"), "fragile must take latest:\n{text}");
+    assert!(
+        text.contains("stell_validator_set_size 2\n"),
+        "size:\n{text}"
+    );
+    assert!(
+        text.contains("stell_validator_power_total 4000000000000\n"),
+        "power:\n{text}"
+    );
+    assert!(
+        text.contains("stell_validator_quorum_power 2666666666667\n"),
+        "quorum:\n{text}"
+    );
+    assert!(
+        text.contains("stell_validator_set_fragile 0\n"),
+        "fragile must take latest:\n{text}"
+    );
 
     // Disk / state gauges.
     reg.set_data_dir_bytes(1);
@@ -997,24 +1382,45 @@ fn observability_gauges_counters_and_build_info() {
     reg.set_persist_queue_depth(8);
     reg.set_persist_queue_depth(0);
     let text = reg.render();
-    assert!(text.contains("stell_data_dir_bytes 2900000000\n"), "dir bytes:\n{text}");
-    assert!(text.contains("stell_snapshot_count 11\n"), "snapshots:\n{text}");
-    assert!(text.contains("stell_state_entries 777\n"), "entries:\n{text}");
-    assert!(text.contains("stell_persist_queue_depth 0\n"), "depth takes latest:\n{text}");
+    assert!(
+        text.contains("stell_data_dir_bytes 2900000000\n"),
+        "dir bytes:\n{text}"
+    );
+    assert!(
+        text.contains("stell_snapshot_count 11\n"),
+        "snapshots:\n{text}"
+    );
+    assert!(
+        text.contains("stell_state_entries 777\n"),
+        "entries:\n{text}"
+    );
+    assert!(
+        text.contains("stell_persist_queue_depth 0\n"),
+        "depth takes latest:\n{text}"
+    );
 
     // The dropped counter accumulates and never decreases.
     reg.add_persist_queue_dropped(4);
     reg.inc_persist_queue_dropped();
     let text = reg.render();
-    assert!(text.contains("stell_persist_queue_dropped_total 5\n"), "dropped:\n{text}");
+    assert!(
+        text.contains("stell_persist_queue_dropped_total 5\n"),
+        "dropped:\n{text}"
+    );
 
     // Per-peer lag: one series per peer, hostile ids stay inside the label.
     reg.set_peer_round_lag("peer-7", 12);
     reg.set_peer_round_lag("evil\"\nstell_fake_metric 1\n", 3);
     let text = reg.render();
-    assert!(text.contains("stell_peer_round_lag{peer=\"peer-7\"} 12"), "lag:\n{text}");
+    assert!(
+        text.contains("stell_peer_round_lag{peer=\"peer-7\"} 12"),
+        "lag:\n{text}"
+    );
     for line in text.lines() {
-        assert!(!line.starts_with("stell_fake_metric"), "lag label escaped its series: {line:?}");
+        assert!(
+            !line.starts_with("stell_fake_metric"),
+            "lag label escaped its series: {line:?}"
+        );
     }
     parse_exposition(&text);
     assert_eq!(samples_named(&text, "stell_peer_round_lag").len(), 2);
@@ -1064,7 +1470,10 @@ fn observability_gauges_counters_and_build_info() {
     let dirty = stellereum::metrics::build_dirty_resolved();
     assert!(!dirty.is_empty(), "resolved dirty flag must not be empty");
     let info = stellereum::metrics::build_info_json();
-    assert_eq!(info["version"], serde_json::Value::String(BUILD_VERSION.to_string()));
+    assert_eq!(
+        info["version"],
+        serde_json::Value::String(BUILD_VERSION.to_string())
+    );
     assert!(info.get("git_hash").is_some(), "info json: {info}");
     assert!(info.get("dirty").is_some(), "info json: {info}");
 
@@ -1072,7 +1481,10 @@ fn observability_gauges_counters_and_build_info() {
     assert_eq!(DATA_DIR_BYTES, "stell_data_dir_bytes");
     assert_eq!(SNAPSHOT_COUNT, "stell_snapshot_count");
     assert_eq!(STATE_ENTRIES, "stell_state_entries");
-    assert_eq!(PERSIST_QUEUE_DROPPED_TOTAL, "stell_persist_queue_dropped_total");
+    assert_eq!(
+        PERSIST_QUEUE_DROPPED_TOTAL,
+        "stell_persist_queue_dropped_total"
+    );
 
     // The explorer scrape carries the new families too.
     let scraped = stellereum::explorer::render_metrics(&reg, 5, 0, 0, 0);
@@ -1088,7 +1500,10 @@ fn observability_gauges_counters_and_build_info() {
         "stell_validator_set_fragile",
         "stell_build_info",
     ] {
-        assert!(scraped.contains(&format!("# TYPE {name} ")), "{name} missing from scrape:\n{scraped}");
+        assert!(
+            scraped.contains(&format!("# TYPE {name} ")),
+            "{name} missing from scrape:\n{scraped}"
+        );
     }
     parse_exposition(&scraped);
 }

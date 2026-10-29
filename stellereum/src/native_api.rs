@@ -527,7 +527,9 @@ fn need_u64(p: &Value, key: &str) -> Result<u64, NativeApiError> {
             .parse::<u64>()
             .map_err(|_| invalid(format!("parameter '{key}' must be an unsigned integer")));
     }
-    Err(invalid(format!("parameter '{key}' must be an unsigned integer")))
+    Err(invalid(format!(
+        "parameter '{key}' must be an unsigned integer"
+    )))
 }
 
 /// Read an optional unsigned integer parameter.
@@ -560,10 +562,14 @@ fn parse_address(s: &str) -> Result<[u8; 32], String> {
     match hex_clean.len() {
         64 => hex::decode(hex_clean)
             .map_err(|e| format!("bad hex: {e}"))
-            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).map_err(|_| "expected 32 bytes".to_string())),
+            .and_then(|b| {
+                <[u8; 32]>::try_from(b.as_slice()).map_err(|_| "expected 32 bytes".to_string())
+            }),
         40 => hex::decode(hex_clean)
             .map_err(|e| format!("bad hex: {e}"))
-            .and_then(|b| <[u8; 20]>::try_from(b.as_slice()).map_err(|_| "expected 20 bytes".to_string()))
+            .and_then(|b| {
+                <[u8; 20]>::try_from(b.as_slice()).map_err(|_| "expected 20 bytes".to_string())
+            })
             .map(|a| crate::evm_adapter::evm_to_stell_address(&a)),
         _ => Err("expected a 64-hex address or a Stl57 address".to_string()),
     }
@@ -571,10 +577,7 @@ fn parse_address(s: &str) -> Result<[u8; 32], String> {
 
 /// Hex address + its Stl57 form, the pair every answer in this namespace uses.
 fn addr_pair(a: &[u8; 32]) -> (String, String) {
-    (
-        hex::encode(a),
-        crate::address::encode_stl57_address(a),
-    )
+    (hex::encode(a), crate::address::encode_stl57_address(a))
 }
 
 /// The wrapper every prepared transaction carries: what to sign and how to
@@ -717,15 +720,15 @@ async fn require_token(
     let id = need_addr(p, "token")?;
     let reg = engine.tokens_read().await;
     if !reg.exists(&id) {
-        return Err(not_found(format!(
-            "token not found: {}",
-            hex::encode(id)
-        )));
+        return Err(not_found(format!("token not found: {}", hex::encode(id))));
     }
     Ok(id)
 }
 
-async fn token_balance_of(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, NativeApiError> {
+async fn token_balance_of(
+    engine: &InMemoryStateEngine,
+    p: &Value,
+) -> Result<Value, NativeApiError> {
     let token = require_token(engine, p).await?;
     let account = need_addr(p, "account")?;
     let reg = engine.tokens_read().await;
@@ -963,7 +966,11 @@ async fn token_burn(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, Na
     // enforces the authority either way.
     let from = need_addr(p, "from")?;
     let amount = need_u64(p, "amount")?;
-    let signer = match p.get("signer").or_else(|| p.get("caller")).or_else(|| p.get("minter")) {
+    let signer = match p
+        .get("signer")
+        .or_else(|| p.get("caller"))
+        .or_else(|| p.get("minter"))
+    {
         Some(_) => need_addr(p, "signer")
             .or_else(|_| need_addr(p, "caller"))
             .or_else(|_| need_addr(p, "minter"))?,
@@ -1621,7 +1628,8 @@ async fn bridge_withdraw(engine: &InMemoryStateEngine, p: &Value) -> Result<Valu
 async fn bridge_status(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, NativeApiError> {
     let br = engine.bridge_read().await;
     if let Some(src) = opt_str(p, "source_tx_hash") {
-        let src = parse_address(&src).map_err(|e| invalid(format!("parameter 'source_tx_hash': {e}")))?;
+        let src =
+            parse_address(&src).map_err(|e| invalid(format!("parameter 'source_tx_hash': {e}")))?;
         if let Some(rec) = br.deposit_records.get(&src) {
             let (src_hex, _) = addr_pair(&src);
             let (rec_hex, rec_stl57) = addr_pair(&rec.recipient);
@@ -1749,8 +1757,9 @@ async fn bridge_attest_status(
     p: &Value,
 ) -> Result<Value, NativeApiError> {
     let src = match opt_str(p, "source_tx_hash") {
-        Some(s) => parse_address(&s)
-            .map_err(|e| invalid(format!("parameter 'source_tx_hash': {e}")))?,
+        Some(s) => {
+            parse_address(&s).map_err(|e| invalid(format!("parameter 'source_tx_hash': {e}")))?
+        }
         None => return Err(invalid("missing parameter 'source_tx_hash'")),
     };
     let validators = bridge_validator_set(engine).await;
@@ -1834,9 +1843,9 @@ async fn bridge_release_estimate(
             if let Some(n) = v.as_u64() {
                 n
             } else if let Some(s) = v.as_str() {
-                s.trim().parse::<u64>().map_err(|_| {
-                    invalid("parameter 'request_id' must be an unsigned integer")
-                })?
+                s.trim()
+                    .parse::<u64>()
+                    .map_err(|_| invalid("parameter 'request_id' must be an unsigned integer"))?
             } else {
                 return Err(invalid(
                     "parameter 'request_id' must be an unsigned integer",
@@ -1859,9 +1868,7 @@ async fn bridge_release_estimate(
             let escrow_funded = br.escrow_balance >= w.amount;
             let timelock_matured_estimate = now >= w.unlock_at;
             let quorum_met = !validators.is_empty();
-            let refund_at = w
-                .unlock_at
-                .saturating_add(crate::bridge::REFUND_GRACE_SECS);
+            let refund_at = w.unlock_at.saturating_add(crate::bridge::REFUND_GRACE_SECS);
             let refundable_estimate = !w.executed && now >= refund_at;
             // Unmet conditions for a successful `Release`, in settlement
             // order. `timelock` / `already-executed` are what settlement
@@ -1906,10 +1913,7 @@ async fn bridge_release_estimate(
     }
 }
 
-async fn bridge_deposits(
-    engine: &InMemoryStateEngine,
-    p: &Value,
-) -> Result<Value, NativeApiError> {
+async fn bridge_deposits(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, NativeApiError> {
     let address = need_addr(p, "address")?;
     let limit = opt_u64(p, "limit").unwrap_or(100).min(1000) as usize;
     if limit == 0 {
@@ -2151,8 +2155,7 @@ async fn cancel_validated(
     let order_id = need_u64(p, "order_id")?;
     let pair = opt_u64(p, "pair")
         .map(|v| {
-            u32::try_from(v)
-                .map_err(|_| invalid("parameter 'pair' is out of range for a pair id"))
+            u32::try_from(v).map_err(|_| invalid("parameter 'pair' is out of range for a pair id"))
         })
         .transpose()?;
     let books = engine.orderbooks_read().await;
@@ -2168,9 +2171,7 @@ async fn cancel_validated(
             break;
         }
     }
-    let (pid, order) = found.ok_or_else(|| {
-        not_found(format!("unknown order id {order_id}"))
-    })?;
+    let (pid, order) = found.ok_or_else(|| not_found(format!("unknown order id {order_id}")))?;
     drop(books);
 
     let trader = opt_caller(p, "trader")?;
@@ -2203,7 +2204,10 @@ async fn cancel_validated(
     Ok(out)
 }
 
-async fn order_book_place(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, NativeApiError> {
+async fn order_book_place(
+    engine: &InMemoryStateEngine,
+    p: &Value,
+) -> Result<Value, NativeApiError> {
     let pair = opt_u64(p, "pair").unwrap_or(crate::orderbook::PAIR_STELL_USDT as u64);
     let pair = u32::try_from(pair)
         .map_err(|_| invalid("parameter 'pair' is out of range for a pair id"))?;
@@ -2226,7 +2230,10 @@ async fn place_order(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, N
     place_validated(engine, p, pair, "place_order", true).await
 }
 
-async fn order_book_cancel(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, NativeApiError> {
+async fn order_book_cancel(
+    engine: &InMemoryStateEngine,
+    p: &Value,
+) -> Result<Value, NativeApiError> {
     cancel_validated(engine, p, "order_book_cancel").await
 }
 
@@ -2235,7 +2242,10 @@ async fn cancel_order(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, 
     cancel_validated(engine, p, "cancel_order").await
 }
 
-async fn order_book_snapshot(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, NativeApiError> {
+async fn order_book_snapshot(
+    engine: &InMemoryStateEngine,
+    p: &Value,
+) -> Result<Value, NativeApiError> {
     let pair = opt_u64(p, "pair").unwrap_or(crate::orderbook::PAIR_STELL_USDT as u64);
     let pair = u32::try_from(pair)
         .map_err(|_| invalid("parameter 'pair' is out of range for a pair id"))?;
@@ -2391,7 +2401,10 @@ async fn session_key_register(
     Ok(out)
 }
 
-async fn session_key_revoke(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, NativeApiError> {
+async fn session_key_revoke(
+    engine: &InMemoryStateEngine,
+    p: &Value,
+) -> Result<Value, NativeApiError> {
     let session = need_addr(p, "session_pubkey")?;
     let reg = engine.session_keys_read().await;
     let rec = reg
@@ -2470,9 +2483,10 @@ async fn session_keys(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, 
 async fn oracle_price(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, NativeApiError> {
     let asset = need_str(p, "asset")?;
     let oracle = engine.oracle_read().await;
-    let feed = oracle.feeds.get(&asset).ok_or_else(|| {
-        not_found(format!("no committed price feed for asset '{asset}'"))
-    })?;
+    let feed = oracle
+        .feeds
+        .get(&asset)
+        .ok_or_else(|| not_found(format!("no committed price feed for asset '{asset}'")))?;
     let (pub_hex, _) = addr_pair(&feed.publisher);
     Ok(json!({
         "asset": asset,
@@ -2561,7 +2575,9 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
 /// a stealth object `{view_pub, spend_pub}` (both 64-hex) whose one-time
 /// address becomes the recipient.
 #[allow(clippy::type_complexity)] // GATE: recipient triple is local to this parser; alias churns the shielded path
-fn parse_shielded_recipient(p: &Value) -> Result<([u8; 32], Value, Option<[u8; 32]>), NativeApiError> {
+fn parse_shielded_recipient(
+    p: &Value,
+) -> Result<([u8; 32], Value, Option<[u8; 32]>), NativeApiError> {
     match p.get("to") {
         Some(Value::String(s)) => {
             let a = parse_address(s).map_err(|e| invalid(format!("parameter 'to': {e}")))?;
@@ -2609,7 +2625,10 @@ fn range_proof_json(p: &crate::crypto_privacy::RangeProof) -> Value {
     })
 }
 
-async fn shielded_transfer(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, NativeApiError> {
+async fn shielded_transfer(
+    engine: &InMemoryStateEngine,
+    p: &Value,
+) -> Result<Value, NativeApiError> {
     use crate::crypto_privacy::{RangeProof, ViewingKey, SHIELD_ESCROW};
     use crate::svm::{
         confidential_transfer2_gas, GAS_CONFIDENTIAL_SHIELD, GAS_CONFIDENTIAL_T2_PER_BIT,
@@ -2632,7 +2651,9 @@ async fn shielded_transfer(engine: &InMemoryStateEngine, p: &Value) -> Result<Va
         || recipient == crate::staking::STAKING_POOL
         || recipient == crate::bridge::BRIDGE_ESCROW
     {
-        return Err(refused("shielded transfer refused: recipient is a protocol account"));
+        return Err(refused(
+            "shielded transfer refused: recipient is a protocol account",
+        ));
     }
 
     // THE shared wallet builder path (same blinding-conservation equation the
@@ -2683,21 +2704,18 @@ async fn shielded_transfer(engine: &InMemoryStateEngine, p: &Value) -> Result<Va
     // Auditor payload: stealth recipients carry their own view_pub; plain
     // recipients may name one via `view_pub`. Without either there is nothing
     // to encrypt to — the openings below are the sender's inventory instead.
-    let auditor_view_pub: Option<[u8; 32]> = recipient_view_pub.or_else(|| {
-        opt_str(p, "view_pub").and_then(|s| parse_bytes32(&s).ok())
-    });
+    let auditor_view_pub: Option<[u8; 32]> =
+        recipient_view_pub.or_else(|| opt_str(p, "view_pub").and_then(|s| parse_bytes32(&s).ok()));
     let viewing_payload = match auditor_view_pub.as_ref() {
-        Some(vp) => {
-            match ViewingKey::encrypt_amount_for_auditor(vp, amount, &blinding) {
-                Ok(enc) => json!({
-                    "ephemeral_pub": hex::encode(enc.ephemeral_pub),
-                    "ciphertext": hex::encode(&enc.ciphertext),
-                    "nonce": hex::encode(enc.nonce),
-                    "recipient_view_pub": hex::encode(vp),
-                }),
-                Err(e) => return Err(invalid(format!("auditor payload: {e}"))),
-            }
-        }
+        Some(vp) => match ViewingKey::encrypt_amount_for_auditor(vp, amount, &blinding) {
+            Ok(enc) => json!({
+                "ephemeral_pub": hex::encode(enc.ephemeral_pub),
+                "ciphertext": hex::encode(&enc.ciphertext),
+                "nonce": hex::encode(enc.nonce),
+                "recipient_view_pub": hex::encode(vp),
+            }),
+            Err(e) => return Err(invalid(format!("auditor payload: {e}"))),
+        },
         None => Value::Null,
     };
 
@@ -2769,8 +2787,13 @@ async fn shielded_transfer(engine: &InMemoryStateEngine, p: &Value) -> Result<Va
     Ok(out)
 }
 
-async fn shielded_balance(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, NativeApiError> {
-    use crate::crypto_privacy::{ConfidentialState, EncryptedViewingPayload, PedersenCommitment, ViewingKey};
+async fn shielded_balance(
+    engine: &InMemoryStateEngine,
+    p: &Value,
+) -> Result<Value, NativeApiError> {
+    use crate::crypto_privacy::{
+        ConfidentialState, EncryptedViewingPayload, PedersenCommitment, ViewingKey,
+    };
 
     // The viewing key is a SECRET (it decrypts every payload ever encrypted
     // to it — past and future, no forward secrecy). It is parsed, used, and
@@ -2794,7 +2817,9 @@ async fn shielded_balance(engine: &InMemoryStateEngine, p: &Value) -> Result<Val
     if let Some(arr) = p.get("payloads").and_then(|v| v.as_array()) {
         for (i, item) in arr.iter().enumerate() {
             let parsed = (|| -> Result<EncryptedViewingPayload, String> {
-                let obj = item.as_object().ok_or_else(|| "must be an object".to_string())?;
+                let obj = item
+                    .as_object()
+                    .ok_or_else(|| "must be an object".to_string())?;
                 let get = |k: &str| {
                     obj.get(k)
                         .and_then(|v| v.as_str())
@@ -2808,14 +2833,18 @@ async fn shielded_balance(engine: &InMemoryStateEngine, p: &Value) -> Result<Val
                     .strip_prefix("0x")
                     .or_else(|| nonce_s.trim().strip_prefix("0X"))
                     .unwrap_or(nonce_s.trim());
-                let nonce_b = hex::decode(nonce_clean)
-                    .map_err(|e| format!("bad nonce hex: {e}"))?;
+                let nonce_b =
+                    hex::decode(nonce_clean).map_err(|e| format!("bad nonce hex: {e}"))?;
                 if nonce_b.len() != 24 {
                     return Err("nonce must be 24 bytes".to_string());
                 }
                 let mut nonce = [0u8; 24];
                 nonce.copy_from_slice(&nonce_b);
-                Ok(EncryptedViewingPayload { ephemeral_pub: ephem, ciphertext: ct, nonce })
+                Ok(EncryptedViewingPayload {
+                    ephemeral_pub: ephem,
+                    ciphertext: ct,
+                    nonce,
+                })
             })();
             let payload = match parsed {
                 Ok(pl) => pl,
@@ -2880,8 +2909,7 @@ async fn shielded_balance(engine: &InMemoryStateEngine, p: &Value) -> Result<Val
 async fn unshield(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, NativeApiError> {
     use crate::crypto_privacy::{ConfidentialState, UnshieldInput, SHIELD_ESCROW};
     use crate::svm::{
-        GAS_CONFIDENTIAL_UNSHIELD, GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT,
-        MAX_UNSHIELD_INPUTS_PER_TX,
+        GAS_CONFIDENTIAL_UNSHIELD, GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT, MAX_UNSHIELD_INPUTS_PER_TX,
     };
 
     // The exit pays the SIGNER (the opcode has no recipient field): `to` must
@@ -2920,14 +2948,16 @@ async fn unshield(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, Nati
     let mut inputs: Vec<UnshieldInput> = Vec::with_capacity(raw.len());
     let mut total: u64 = 0;
     for item in raw {
-        let obj = item.as_object().ok_or_else(|| invalid("each input must be an object"))?;
+        let obj = item
+            .as_object()
+            .ok_or_else(|| invalid("each input must be an object"))?;
         let get = |k: &str| {
             obj.get(k)
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| invalid(format!("each input needs '{k}'")))
         };
-        let commitment =
-            parse_bytes32(get("commitment")?).map_err(|e| invalid(format!("input commitment: {e}")))?;
+        let commitment = parse_bytes32(get("commitment")?)
+            .map_err(|e| invalid(format!("input commitment: {e}")))?;
         let value: u64 = get("amount")?
             .trim()
             .parse()
@@ -2956,7 +2986,10 @@ async fn unshield(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, Nati
                 hex::encode(commitment)
             )));
         }
-        if inputs.iter().any(|inp: &UnshieldInput| inp.commitment == commitment) {
+        if inputs
+            .iter()
+            .any(|inp: &UnshieldInput| inp.commitment == commitment)
+        {
             return Err(refused(format!(
                 "unshield rejected: duplicate input {}",
                 hex::encode(commitment)
@@ -2965,7 +2998,11 @@ async fn unshield(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, Nati
         total = total
             .checked_add(value)
             .ok_or_else(|| refused("unshield total overflows u64"))?;
-        inputs.push(UnshieldInput { commitment, amount: value, blinding });
+        inputs.push(UnshieldInput {
+            commitment,
+            amount: value,
+            blinding,
+        });
     }
     drop(shielded);
 
@@ -2989,7 +3026,11 @@ async fn unshield(engine: &InMemoryStateEngine, p: &Value) -> Result<Value, Nati
             "shield escrow holds {escrow_balance}, the exit needs {total}"
         )));
     }
-    let have = engine.get_account(&to).await.map(|a| a.balance).unwrap_or(0);
+    let have = engine
+        .get_account(&to)
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0);
     if have < gas_limit {
         return Err(refused(format!(
             "insufficient native balance for gas: have {have}, need {gas_limit}"
@@ -3412,8 +3453,7 @@ mod tests {
 
     async fn engine_with_validators(n: u8) -> InMemoryStateEngine {
         let engine = InMemoryStateEngine::new();
-        let stake = crate::staking::MIN_VALIDATOR_BOND
-            + crate::staking::STELL_MIN_BOND_BUFFER;
+        let stake = crate::staking::MIN_VALIDATOR_BOND + crate::staking::STELL_MIN_BOND_BUFFER;
         for i in 0..n {
             let pk = addr(0xA0 + i);
             engine
@@ -3429,7 +3469,11 @@ mod tests {
         engine
     }
 
-    fn quorum_record(recipient: [u8; 32], amount: u64, deposited_at: u64) -> crate::bridge::DepositRecord {
+    fn quorum_record(
+        recipient: [u8; 32],
+        amount: u64,
+        deposited_at: u64,
+    ) -> crate::bridge::DepositRecord {
         crate::bridge::DepositRecord {
             recipient,
             amount,
@@ -3448,7 +3492,8 @@ mod tests {
         {
             let mut br = engine.bridge_write().await;
             br.processed_source_txs.insert(src);
-            br.deposit_records.insert(src, quorum_record(addr(2), 42, 7));
+            br.deposit_records
+                .insert(src, quorum_record(addr(2), 42, 7));
         }
         let v = dispatch(
             &engine,
@@ -3559,7 +3604,10 @@ mod tests {
         assert_eq!(v["disputed"], true);
         assert_eq!(v["status"], "challenged");
         assert_eq!(v["dispute"]["dispute_id"], 0);
-        assert_eq!(v["dispute"]["deadline"], now + crate::bridge::DISPUTE_WINDOW_SECS);
+        assert_eq!(
+            v["dispute"]["deadline"],
+            now + crate::bridge::DISPUTE_WINDOW_SECS
+        );
         let remaining = v["dispute"]["remaining_secs"].as_u64().unwrap();
         assert!(remaining > 0 && remaining <= crate::bridge::DISPUTE_WINDOW_SECS);
     }
@@ -3637,9 +3685,13 @@ mod tests {
             br.next_withdrawal_id = 2;
         }
         // Matured small withdrawal: nothing missing.
-        let ready = dispatch(&engine, "stell_bridgeReleaseEstimate", &json!({ "request_id": 0 }))
-            .await
-            .unwrap();
+        let ready = dispatch(
+            &engine,
+            "stell_bridgeReleaseEstimate",
+            &json!({ "request_id": 0 }),
+        )
+        .await
+        .unwrap();
         assert_eq!(ready["found"], true);
         assert_eq!(ready["executed"], false);
         assert_eq!(ready["quorum_met"], true);
@@ -3647,9 +3699,13 @@ mod tests {
         assert!(ready["missing"].as_array().unwrap().is_empty());
         // Large withdrawal still inside the 1h timelock: timelock missing,
         // with a positive countdown; the request itself is untouched.
-        let locked = dispatch(&engine, "stell_bridgeReleaseEstimate", &json!({ "request_id": 1 }))
-            .await
-            .unwrap();
+        let locked = dispatch(
+            &engine,
+            "stell_bridgeReleaseEstimate",
+            &json!({ "request_id": 1 }),
+        )
+        .await
+        .unwrap();
         assert_eq!(locked["found"], true);
         let missing: Vec<String> = locked["missing"]
             .as_array()
@@ -3684,26 +3740,40 @@ mod tests {
             );
             br.next_withdrawal_id = 1;
         }
-        let v = dispatch(&engine, "stell_bridgeReleaseEstimate", &json!({ "request_id": 0 }))
-            .await
-            .unwrap();
+        let v = dispatch(
+            &engine,
+            "stell_bridgeReleaseEstimate",
+            &json!({ "request_id": 0 }),
+        )
+        .await
+        .unwrap();
         let missing: Vec<String> = v["missing"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        assert!(missing.contains(&"already-executed".to_string()), "{missing:?}");
-        assert!(missing.contains(&"escrow-shortfall".to_string()), "{missing:?}");
+        assert!(
+            missing.contains(&"already-executed".to_string()),
+            "{missing:?}"
+        );
+        assert!(
+            missing.contains(&"escrow-shortfall".to_string()),
+            "{missing:?}"
+        );
         assert_eq!(v["escrow_funded"], false);
     }
 
     #[tokio::test]
     async fn bridge_release_estimate_of_an_unknown_request_is_not_found() {
         let engine = engine_with_validators(1).await;
-        let v = dispatch(&engine, "stell_bridgeReleaseEstimate", &json!({ "request_id": 4242 }))
-            .await
-            .unwrap();
+        let v = dispatch(
+            &engine,
+            "stell_bridgeReleaseEstimate",
+            &json!({ "request_id": 4242 }),
+        )
+        .await
+        .unwrap();
         assert_eq!(v["found"], false);
         assert_eq!(v["request_id"], 4242);
     }
@@ -3730,9 +3800,13 @@ mod tests {
             );
             br.next_withdrawal_id = 1;
         }
-        let v = dispatch(&engine, "stell_bridgeReleaseEstimate", &json!({ "request_id": 0 }))
-            .await
-            .unwrap();
+        let v = dispatch(
+            &engine,
+            "stell_bridgeReleaseEstimate",
+            &json!({ "request_id": 0 }),
+        )
+        .await
+        .unwrap();
         assert_eq!(v["quorum_met"], false);
         let missing: Vec<String> = v["missing"]
             .as_array()
@@ -3740,7 +3814,10 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        assert!(missing.contains(&"no-validator-set".to_string()), "{missing:?}");
+        assert!(
+            missing.contains(&"no-validator-set".to_string()),
+            "{missing:?}"
+        );
     }
 
     #[tokio::test]
@@ -3754,11 +3831,13 @@ mod tests {
             br.processed_source_txs.insert(src_a);
             br.processed_source_txs.insert(src_b);
             br.processed_source_txs.insert(addr(23));
-            br.deposit_records.insert(src_a, quorum_record(addr(2), 42, now - 100));
+            br.deposit_records
+                .insert(src_a, quorum_record(addr(2), 42, now - 100));
             let mut challenged = quorum_record(addr(2), 43, now - 50);
             challenged.disputed = true;
             br.deposit_records.insert(src_b, challenged);
-            br.deposit_records.insert(addr(23), quorum_record(addr(3), 44, now - 10));
+            br.deposit_records
+                .insert(addr(23), quorum_record(addr(3), 44, now - 10));
             br.disputes.insert(
                 0,
                 crate::bridge::Dispute {
@@ -4054,9 +4133,13 @@ mod tests {
         let owner = addr(4);
         {
             let mut books = engine.orderbooks_write().await;
-            books
-                .get_book_mut(1)
-                .submit_order(owner, crate::orderbook::OrderSide::Sell, 250_000, 10, 0);
+            books.get_book_mut(1).submit_order(
+                owner,
+                crate::orderbook::OrderSide::Sell,
+                250_000,
+                10,
+                0,
+            );
         }
         let err = dispatch(
             &engine,
@@ -4074,9 +4157,13 @@ mod tests {
         let owner = addr(4);
         {
             let mut books = engine.orderbooks_write().await;
-            books
-                .get_book_mut(1)
-                .submit_order(owner, crate::orderbook::OrderSide::Sell, 250_000, 10, 0);
+            books.get_book_mut(1).submit_order(
+                owner,
+                crate::orderbook::OrderSide::Sell,
+                250_000,
+                10,
+                0,
+            );
         }
         let v = dispatch(
             &engine,
@@ -4149,7 +4236,9 @@ mod tests {
     #[tokio::test]
     async fn session_keys_lists_the_registry() {
         let engine = InMemoryStateEngine::new();
-        let v = dispatch(&engine, "stell_sessionKeys", &json!({})).await.unwrap();
+        let v = dispatch(&engine, "stell_sessionKeys", &json!({}))
+            .await
+            .unwrap();
         assert_eq!(v["count"], 0);
         assert!(v["session_keys"].is_array());
     }
@@ -4177,7 +4266,9 @@ mod tests {
                 },
             );
         }
-        let v = dispatch(&engine, "stell_oracleFeeds", &json!({})).await.unwrap();
+        let v = dispatch(&engine, "stell_oracleFeeds", &json!({}))
+            .await
+            .unwrap();
         assert_eq!(v["count"], 1);
         assert_eq!(v["feeds"][0]["price_micro_usd"], "250000");
         let p = dispatch(&engine, "stell_oraclePrice", &json!({ "asset": "STELL" }))
@@ -4504,8 +4595,15 @@ mod tests {
         // Fund a victim holding: minter(1) -> holder(2) 300.
         {
             let mut reg = engine.tokens_write().await;
-            reg.execute(&id, addr(1), crate::token::TokenOp::Transfer { to: addr(2), amount: 300 })
-                .unwrap();
+            reg.execute(
+                &id,
+                addr(1),
+                crate::token::TokenOp::Transfer {
+                    to: addr(2),
+                    amount: 300,
+                },
+            )
+            .unwrap();
         }
         // Admin-burn: from = victim, signer = minter.
         let v = dispatch(
@@ -4528,8 +4626,15 @@ mod tests {
         // Inclusion under the minter key burns the victim's balance.
         {
             let mut reg = engine.tokens_write().await;
-            reg.execute(&id, addr(1), crate::token::TokenOp::Burn { from: addr(2), amount: 100 })
-                .unwrap();
+            reg.execute(
+                &id,
+                addr(1),
+                crate::token::TokenOp::Burn {
+                    from: addr(2),
+                    amount: 100,
+                },
+            )
+            .unwrap();
         }
         assert_eq!(engine.tokens_read().await.balance_of(&id, &addr(2)), 200);
         // The `caller` / `minter` spellings are accepted as aliases of `signer`.
@@ -4711,8 +4816,15 @@ mod tests {
         // 2. Inclusion (the prepare mutates nothing; the block does).
         {
             let mut reg = engine.tokens_write().await;
-            reg.execute(&id, owner, crate::token::TokenOp::Approve { spender, amount: 500 })
-                .unwrap();
+            reg.execute(
+                &id,
+                owner,
+                crate::token::TokenOp::Approve {
+                    spender,
+                    amount: 500,
+                },
+            )
+            .unwrap();
         }
         // 3. Allowance read shows the grant.
         let v = dispatch(
@@ -4755,7 +4867,11 @@ mod tests {
             reg.execute(
                 &id,
                 spender,
-                crate::token::TokenOp::TransferFrom { from: owner, to: dest, amount: 300 },
+                crate::token::TokenOp::TransferFrom {
+                    from: owner,
+                    to: dest,
+                    amount: 300,
+                },
             )
             .unwrap();
         }
@@ -4801,8 +4917,15 @@ mod tests {
         let (engine, id) = engine_with_token().await;
         {
             let mut reg = engine.tokens_write().await;
-            reg.execute(&id, addr(1), crate::token::TokenOp::Approve { spender: addr(2), amount: 50 })
-                .unwrap();
+            reg.execute(
+                &id,
+                addr(1),
+                crate::token::TokenOp::Approve {
+                    spender: addr(2),
+                    amount: 50,
+                },
+            )
+            .unwrap();
         }
         let base = || {
             json!({
@@ -4817,21 +4940,30 @@ mod tests {
         let mut bad = base();
         bad["amount"] = json!("0");
         assert_eq!(
-            dispatch(&engine, "stell_tokenTransferFrom", &bad).await.unwrap_err().code(),
+            dispatch(&engine, "stell_tokenTransferFrom", &bad)
+                .await
+                .unwrap_err()
+                .code(),
             -32003
         );
         // To the zero address.
         let mut bad = base();
         bad["to"] = json!(hex::encode([0u8; 32]));
         assert_eq!(
-            dispatch(&engine, "stell_tokenTransferFrom", &bad).await.unwrap_err().code(),
+            dispatch(&engine, "stell_tokenTransferFrom", &bad)
+                .await
+                .unwrap_err()
+                .code(),
             -32003
         );
         // To self.
         let mut bad = base();
         bad["to"] = json!(hex::encode(addr(1)));
         assert_eq!(
-            dispatch(&engine, "stell_tokenTransferFrom", &bad).await.unwrap_err().code(),
+            dispatch(&engine, "stell_tokenTransferFrom", &bad)
+                .await
+                .unwrap_err()
+                .code(),
             -32003
         );
         // Paused token.
@@ -4840,7 +4972,10 @@ mod tests {
             reg.get_mut(&id).unwrap().metadata.paused = true;
         }
         assert_eq!(
-            dispatch(&engine, "stell_tokenTransferFrom", &base()).await.unwrap_err().code(),
+            dispatch(&engine, "stell_tokenTransferFrom", &base())
+                .await
+                .unwrap_err()
+                .code(),
             -32003
         );
     }
@@ -4942,22 +5077,48 @@ mod tests {
         let before_balance = {
             let reg = engine.tokens_read().await;
             let t = reg.get(&id).unwrap();
-            (t.balance_of(&addr(1)), t.metadata.total_supply, t.allowance(&addr(1), &addr(2)))
+            (
+                t.balance_of(&addr(1)),
+                t.metadata.total_supply,
+                t.allowance(&addr(1), &addr(2)),
+            )
         };
         // Every prepare arm answers bytes, never state.
         for (method, params) in [
-            ("stell_tokenTransfer", json!({"token": hex::encode(id), "from": hex::encode(addr(1)), "to": hex::encode(addr(2)), "amount": "10"})),
-            ("stell_tokenMint", json!({"token": hex::encode(id), "to": hex::encode(addr(2)), "amount": "10"})),
-            ("stell_tokenBurn", json!({"token": hex::encode(id), "from": hex::encode(addr(1)), "amount": "10"})),
-            ("stell_tokenApprove", json!({"token": hex::encode(id), "owner": hex::encode(addr(1)), "spender": hex::encode(addr(2)), "amount": "10"})),
-            ("stell_tokenCreate", json!({"creator": hex::encode(addr(9)), "name": "N", "symbol": "S", "decimals": 6})),
+            (
+                "stell_tokenTransfer",
+                json!({"token": hex::encode(id), "from": hex::encode(addr(1)), "to": hex::encode(addr(2)), "amount": "10"}),
+            ),
+            (
+                "stell_tokenMint",
+                json!({"token": hex::encode(id), "to": hex::encode(addr(2)), "amount": "10"}),
+            ),
+            (
+                "stell_tokenBurn",
+                json!({"token": hex::encode(id), "from": hex::encode(addr(1)), "amount": "10"}),
+            ),
+            (
+                "stell_tokenApprove",
+                json!({"token": hex::encode(id), "owner": hex::encode(addr(1)), "spender": hex::encode(addr(2)), "amount": "10"}),
+            ),
+            (
+                "stell_tokenCreate",
+                json!({"creator": hex::encode(addr(9)), "name": "N", "symbol": "S", "decimals": 6}),
+            ),
         ] {
             dispatch(&engine, method, &params).await.unwrap();
         }
         {
             let mut reg = engine.tokens_write().await;
-            reg.execute(&id, addr(1), crate::token::TokenOp::Approve { spender: addr(2), amount: 50 })
-                .unwrap();
+            reg.execute(
+                &id,
+                addr(1),
+                crate::token::TokenOp::Approve {
+                    spender: addr(2),
+                    amount: 50,
+                },
+            )
+            .unwrap();
         }
         dispatch(
             &engine,
@@ -4969,10 +5130,20 @@ mod tests {
         let after_balance = {
             let reg = engine.tokens_read().await;
             let t = reg.get(&id).unwrap();
-            (t.balance_of(&addr(1)), t.metadata.total_supply, t.allowance(&addr(1), &addr(2)))
+            (
+                t.balance_of(&addr(1)),
+                t.metadata.total_supply,
+                t.allowance(&addr(1), &addr(2)),
+            )
         };
-        assert_eq!(before_balance.0, after_balance.0, "balance moved under a prepare");
-        assert_eq!(before_balance.1, after_balance.1, "supply moved under a prepare");
+        assert_eq!(
+            before_balance.0, after_balance.0,
+            "balance moved under a prepare"
+        );
+        assert_eq!(
+            before_balance.1, after_balance.1,
+            "supply moved under a prepare"
+        );
         // The allowance moved only because the TEST executed an approve
         // directly (inclusion), never because a prepare wrote it.
         assert_eq!(after_balance.2, 50);

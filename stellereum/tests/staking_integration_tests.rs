@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use stellereum::consensus::{ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::ValidatorRuntime;
-use stellereum::staking::{StakingLedger, EQUIVOCATION_SLASH_BPS, DEFAULT_COMMISSION_BPS};
+use stellereum::staking::{StakingLedger, DEFAULT_COMMISSION_BPS, EQUIVOCATION_SLASH_BPS};
 use stellereum::state_engine::InMemoryStateEngine;
 
 fn stell(n: u64) -> u64 {
@@ -38,12 +38,20 @@ fn consensus_power_follows_stake() {
 #[tokio::test]
 async fn runtime_slashes_equivocation() {
     let ks = keys(4);
-    let vs = ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect());
+    let vs = ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    );
 
     let mut ledger = StakingLedger::new();
     for k in &ks {
         ledger
-            .bond(k.verifying_key().to_bytes(), stell(1_100), DEFAULT_COMMISSION_BPS)
+            .bond(
+                k.verifying_key().to_bytes(),
+                stell(1_100),
+                DEFAULT_COMMISSION_BPS,
+            )
             .unwrap();
     }
     let offender = ks[0].verifying_key().to_bytes();
@@ -55,7 +63,15 @@ async fn runtime_slashes_equivocation() {
     let a = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some([1u8; 32]));
     let b = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some([2u8; 32]));
     rt.hc.add_prevote(a).unwrap();
-    rt.hc.add_precommit(Vote::sign(&ks[1], 1, 0, VoteKind::Precommit, Some([1u8; 32]))).unwrap();
+    rt.hc
+        .add_precommit(Vote::sign(
+            &ks[1],
+            1,
+            0,
+            VoteKind::Precommit,
+            Some([1u8; 32]),
+        ))
+        .unwrap();
     rt.hc.add_prevote(b).unwrap();
     assert_eq!(rt.hc.equivocations().len(), 1, "evidence must be recorded");
 
@@ -72,7 +88,11 @@ async fn runtime_slashes_equivocation() {
 #[tokio::test]
 async fn no_ledger_no_slash() {
     let ks = keys(4);
-    let vs = ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect());
+    let vs = ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    );
     let state = Arc::new(InMemoryStateEngine::new());
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs, state, 1);
     let a = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some([1u8; 32]));
@@ -88,7 +108,11 @@ fn slash_never_over_burns() {
     let sk = SigningKey::generate(&mut OsRng);
     let mut ledger = StakingLedger::new();
     ledger
-        .bond(sk.verifying_key().to_bytes(), stell(1_100), DEFAULT_COMMISSION_BPS)
+        .bond(
+            sk.verifying_key().to_bytes(),
+            stell(1_100),
+            DEFAULT_COMMISSION_BPS,
+        )
         .unwrap();
     // 200% slash would be nonsense; cap at the whole stake via repeated 100% slashes.
     let id = sk.verifying_key().to_bytes();
@@ -117,12 +141,20 @@ async fn proposer_receives_block_reward_on_finalize() {
         let mut ledger = StakingLedger::new();
         for v in &ks {
             ledger
-                .bond(v.verifying_key().to_bytes(), stell(1_100), DEFAULT_COMMISSION_BPS)
+                .bond(
+                    v.verifying_key().to_bytes(),
+                    stell(1_100),
+                    DEFAULT_COMMISSION_BPS,
+                )
                 .unwrap();
         }
         let rt = ValidatorRuntime::new(
             k.clone(),
-            ValidatorSet::from_list(ks.iter().map(|x| (x.verifying_key().to_bytes(), 1)).collect()),
+            ValidatorSet::from_list(
+                ks.iter()
+                    .map(|x| (x.verifying_key().to_bytes(), 1))
+                    .collect(),
+            ),
             Arc::new(InMemoryStateEngine::new()),
             1,
         )
@@ -162,25 +194,34 @@ async fn runtime_staking_lifecycle_is_on_chain() {
     let delegator = [0xDD; 32];
 
     let state = Arc::new(InMemoryStateEngine::new());
-    state.update_account(AccountState::new(val, stell(10_000))).await;
-    state.update_account(AccountState::new(delegator, stell(10_000))).await;
+    state
+        .update_account(AccountState::new(val, stell(10_000)))
+        .await;
+    state
+        .update_account(AccountState::new(delegator, stell(10_000)))
+        .await;
 
-    let mut rt = ValidatorRuntime::new(
-        k,
-        ValidatorSet::from_list(vec![(val, 1)]),
-        state.clone(),
-        1,
-    )
-    .with_staking(StakingLedger::new());
+    let mut rt =
+        ValidatorRuntime::new(k, ValidatorSet::from_list(vec![(val, 1)]), state.clone(), 1)
+            .with_staking(StakingLedger::new());
 
-    rt.stake_bond(val, stell(2_000), DEFAULT_COMMISSION_BPS).await.unwrap();
-    rt.stake_delegate(delegator, val, stell(1_000)).await.unwrap();
+    rt.stake_bond(val, stell(2_000), DEFAULT_COMMISSION_BPS)
+        .await
+        .unwrap();
+    rt.stake_delegate(delegator, val, stell(1_000))
+        .await
+        .unwrap();
     assert_eq!(state.staking_read().await.total_stake(&val), stell(3_000));
     // A8: the funds actually moved OUT of the accounts.
     assert_eq!(state.get_account(&val).await.unwrap().balance, stell(8_000));
-    assert_eq!(state.get_account(&delegator).await.unwrap().balance, stell(9_000));
+    assert_eq!(
+        state.get_account(&delegator).await.unwrap().balance,
+        stell(9_000)
+    );
 
-    rt.stake_undelegate(delegator, val, stell(1_000), 0).await.unwrap();
+    rt.stake_undelegate(delegator, val, stell(1_000), 0)
+        .await
+        .unwrap();
     // Before cooldown: nothing withdrawable; delegator must not be able to
     // withdraw and the validator must not be able to steal it.
     rt.process_unbonding(1).await;
@@ -188,11 +229,21 @@ async fn runtime_staking_lifecycle_is_on_chain() {
     assert!(rt.stake_withdraw(val).await.is_err());
 
     // After cooldown the delegator (only) can withdraw the funds.
-    rt.process_unbonding(stellereum::staking::UNBONDING_PERIOD_SECS + 1).await;
-    assert_eq!(rt.stake_withdraw_delegator(delegator, val).await.unwrap(), stell(1_000));
-    assert!(rt.stake_withdraw(val).await.is_err(), "validator must not get delegator funds");
+    rt.process_unbonding(stellereum::staking::UNBONDING_PERIOD_SECS + 1)
+        .await;
+    assert_eq!(
+        rt.stake_withdraw_delegator(delegator, val).await.unwrap(),
+        stell(1_000)
+    );
+    assert!(
+        rt.stake_withdraw(val).await.is_err(),
+        "validator must not get delegator funds"
+    );
     // Delegator's balance is whole again.
-    assert_eq!(state.get_account(&delegator).await.unwrap().balance, stell(10_000));
+    assert_eq!(
+        state.get_account(&delegator).await.unwrap().balance,
+        stell(10_000)
+    );
 }
 
 #[tokio::test]
@@ -203,19 +254,24 @@ async fn stake_without_funds_is_rejected_and_moves_nothing() {
     let val = k.verifying_key().to_bytes();
 
     let state = Arc::new(InMemoryStateEngine::new());
-    state.update_account(AccountState::new(val, stell(100))).await; // far below min bond
+    state
+        .update_account(AccountState::new(val, stell(100)))
+        .await; // far below min bond
 
-    let mut rt = ValidatorRuntime::new(
-        k,
-        ValidatorSet::from_list(vec![(val, 1)]),
-        state.clone(),
-        1,
-    )
-    .with_staking(StakingLedger::new());
+    let mut rt =
+        ValidatorRuntime::new(k, ValidatorSet::from_list(vec![(val, 1)]), state.clone(), 1)
+            .with_staking(StakingLedger::new());
 
     // Cannot bond 1100 STELL with only 100 STELL.
-    assert!(rt.stake_bond(val, stell(1_100), DEFAULT_COMMISSION_BPS).await.is_err());
-    assert_eq!(state.get_account(&val).await.unwrap().balance, stell(100), "no funds moved");
+    assert!(rt
+        .stake_bond(val, stell(1_100), DEFAULT_COMMISSION_BPS)
+        .await
+        .is_err());
+    assert_eq!(
+        state.get_account(&val).await.unwrap().balance,
+        stell(100),
+        "no funds moved"
+    );
     assert_eq!(state.staking_read().await.total_stake(&val), 0);
 }
 
@@ -231,33 +287,55 @@ async fn validator_set_rotates_from_stake() {
 
     let state = Arc::new(InMemoryStateEngine::new());
     for id in &ids {
-        state.update_account(AccountState::new(*id, stell(20_000))).await;
+        state
+            .update_account(AccountState::new(*id, stell(20_000)))
+            .await;
     }
 
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs, state.clone(), 1)
         .with_staking(StakingLedger::new());
-    rt.stake_bond(ids[0], stell(1_100), DEFAULT_COMMISSION_BPS).await.unwrap();
-    rt.stake_bond(ids[1], stell(3_000), DEFAULT_COMMISSION_BPS).await.unwrap();
+    rt.stake_bond(ids[0], stell(1_100), DEFAULT_COMMISSION_BPS)
+        .await
+        .unwrap();
+    rt.stake_bond(ids[1], stell(3_000), DEFAULT_COMMISSION_BPS)
+        .await
+        .unwrap();
 
     // W10.5 ACTIVATION BOUNDARY: the refresh STAGES the rotation for height
     // L+1 (here: derived at height 1, in force from height 2) instead of
     // moving the live quorum mid-flight. The staged set must already carry
     // the bonded powers; the in-force set must still be the old one.
-    assert!(rt.refresh_validator_set_from_staking().await, "set must change");
+    assert!(
+        rt.refresh_validator_set_from_staking().await,
+        "set must change"
+    );
     let (activation, staged) = rt
         .pending_validators
         .clone()
         .expect("the rotation must be staged, not installed");
-    assert_eq!(activation, 2, "a change derived at height 1 takes effect at height 2");
+    assert_eq!(
+        activation, 2,
+        "a change derived at height 1 takes effect at height 2"
+    );
     assert_eq!(staged.power_of(&ids[1]), stell(3_000));
     assert_eq!(staged.power_of(&ids[0]), stell(1_100));
-    assert_eq!(rt.validators.power_of(&ids[1]), 1, "in-force set must not move mid-flight");
+    assert_eq!(
+        rt.validators.power_of(&ids[1]),
+        1,
+        "in-force set must not move mid-flight"
+    );
 
     // Advance across the boundary with a real height-1 finalize (both old
     // members vote under the still-in-force old set), and the staged set
     // activates exactly on arrival.
-    let proposer_id = rt.validators.proposer_for(1, 0).expect("schedule must name a proposer");
-    let pkey = ks.iter().find(|k| k.verifying_key().to_bytes() == proposer_id).unwrap();
+    let proposer_id = rt
+        .validators
+        .proposer_for(1, 0)
+        .expect("schedule must name a proposer");
+    let pkey = ks
+        .iter()
+        .find(|k| k.verifying_key().to_bytes() == proposer_id)
+        .unwrap();
     let mut blk = stellereum::sharding::Block {
         shard_id: stellereum::sharding::MASTERCHAIN_SHARD,
         height: 1,
@@ -278,8 +356,22 @@ async fn validator_set_rotates_from_stake() {
     blk.sign_block(pkey);
     let bh = blk.compute_hash();
     for k in ks.iter() {
-        rt.on_prevote(stellereum::consensus::Vote::sign(k, 1, 0, stellereum::consensus::VoteKind::Prevote, Some(bh))).unwrap();
-        rt.on_precommit(stellereum::consensus::Vote::sign(k, 1, 0, stellereum::consensus::VoteKind::Precommit, Some(bh))).unwrap();
+        rt.on_prevote(stellereum::consensus::Vote::sign(
+            k,
+            1,
+            0,
+            stellereum::consensus::VoteKind::Prevote,
+            Some(bh),
+        ))
+        .unwrap();
+        rt.on_precommit(stellereum::consensus::Vote::sign(
+            k,
+            1,
+            0,
+            stellereum::consensus::VoteKind::Precommit,
+            Some(bh),
+        ))
+        .unwrap();
     }
     assert_eq!(rt.hc.try_precommit_quorum(), Some(bh));
     rt.blocks.insert(bh, blk);
@@ -288,19 +380,27 @@ async fn validator_set_rotates_from_stake() {
 
     assert_eq!(rt.validators.power_of(&ids[1]), stell(3_000));
     assert_eq!(rt.validators.power_of(&ids[0]), stell(1_100));
-    assert_eq!(rt.hc.validators.power_of(&ids[1]), stell(3_000), "consensus set updated too");
+    assert_eq!(
+        rt.hc.validators.power_of(&ids[1]),
+        stell(3_000),
+        "consensus set updated too"
+    );
 }
 
 /// Governance is driven through the runtime against the staking ledger.
 #[tokio::test]
 async fn runtime_governance_flow_is_on_chain() {
-    use stellereum::governance::{GovAction, Governance, ProposalStatus, VoteChoice, GOVERNANCE_VOTING_PERIOD_SECS};
+    use stellereum::governance::{
+        GovAction, Governance, ProposalStatus, VoteChoice, GOVERNANCE_VOTING_PERIOD_SECS,
+    };
 
     let ks = keys(3);
     let ids: Vec<[u8; 32]> = ks.iter().map(|k| k.verifying_key().to_bytes()).collect();
     let mut ledger = StakingLedger::new();
     for id in &ids {
-        ledger.bond(*id, stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+        ledger
+            .bond(*id, stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
     }
 
     let mut rt = ValidatorRuntime::new(
@@ -313,12 +413,19 @@ async fn runtime_governance_flow_is_on_chain() {
     .with_governance(Governance::new());
 
     let id = rt
-        .gov_propose(ids[0], "raise reward".into(), GovAction::SetBlockReward(stell(9)), 0)
+        .gov_propose(
+            ids[0],
+            "raise reward".into(),
+            GovAction::SetBlockReward(stell(9)),
+            0,
+        )
         .unwrap();
     rt.gov_vote(ids[0], id, VoteChoice::Yes, 1).unwrap();
     rt.gov_vote(ids[1], id, VoteChoice::Yes, 1).unwrap();
     rt.gov_vote(ids[2], id, VoteChoice::No, 1).unwrap();
-    let status = rt.gov_finalize(id, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
+    let status = rt
+        .gov_finalize(id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+        .unwrap();
     assert_eq!(status, ProposalStatus::Passed);
     let applied = rt.gov_execute(ids[0], id).unwrap();
     assert_eq!(applied.block_reward, Some(stell(9)));

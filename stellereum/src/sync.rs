@@ -238,7 +238,9 @@ pub fn proposer_matches_schedule(
     }
     // If qc_round > 0 (view change occurred), allow tolerance for nearby view changes
     if qc_round > 0 {
-        let nearby = qc_round.saturating_add(4).min(MAX_PROPOSER_SCHEDULE_SCAN_ROUNDS);
+        let nearby = qc_round
+            .saturating_add(4)
+            .min(MAX_PROPOSER_SCHEDULE_SCAN_ROUNDS);
         return (0..=nearby).any(|r| validators.proposer_for(height, r).as_ref() == Some(proposer));
     }
     false
@@ -425,7 +427,10 @@ where
         Some((h, hash)) if h + 1 == next_height => hash,
         _ => genesis_root,
     });
-    Ok(SnapshotAnchor { state_root, boundary_hash })
+    Ok(SnapshotAnchor {
+        state_root,
+        boundary_hash,
+    })
 }
 
 /// How many trailing heights [`verify_snapshot_anchor_tail`] checks.
@@ -575,7 +580,10 @@ where
     // Below height 1 there is no boundary block (the chain roots at the zero
     // prev-hash sentinel), so the genesis parent is the honest answer.
     let boundary_hash = boundary_hash.unwrap_or([0u8; 32]);
-    Ok(SnapshotAnchor { state_root, boundary_hash })
+    Ok(SnapshotAnchor {
+        state_root,
+        boundary_hash,
+    })
 }
 
 /// F3(b): after a body walk, the walked tail must BE the advertised head.
@@ -647,9 +655,12 @@ pub fn validate_sync_chain(
     // set. Live callers MUST use `validate_sync_chain_with_sets` so each
     // certificate is checked against the set in force at ITS height.
     let single = validators.clone();
-    validate_sync_chain_with_sets(blocks, expected_first_height, expected_first_hash, &move |_| {
-        Some(single.clone())
-    })
+    validate_sync_chain_with_sets(
+        blocks,
+        expected_first_height,
+        expected_first_hash,
+        &move |_| Some(single.clone()),
+    )
 }
 
 /// W10.5 activation-boundary verification: every block's decision proof is
@@ -733,7 +744,10 @@ pub fn validate_sync_chain_for_shard_with_sets(
     let mut expected = expected_first_height;
     for b in blocks {
         if b.height != expected {
-            return Err(format!("block sync: height gap (expected {expected}, got {})", b.height));
+            return Err(format!(
+                "block sync: height gap (expected {expected}, got {})",
+                b.height
+            ));
         }
         // W10.5: the set IN FORCE AT THIS BLOCK'S HEIGHT — never the live
         // set. A rotation mid-window must not re-verify old certificates
@@ -745,7 +759,10 @@ pub fn validate_sync_chain_for_shard_with_sets(
             )
         })?;
         if b.height != expected {
-            return Err(format!("block sync: height gap (expected {expected}, got {})", b.height));
+            return Err(format!(
+                "block sync: height gap (expected {expected}, got {})",
+                b.height
+            ));
         }
         // F8: a synced block must belong to the chain we are syncing. A chain
         // that extends our finalized hash but claims another shard (or mixes
@@ -757,7 +774,9 @@ pub fn validate_sync_chain_for_shard_with_sets(
             ));
         }
         // The first block must continue OUR chain, not a peer's alternative.
-        let parent = prev.map(|p| p.compute_hash()).unwrap_or(expected_first_hash);
+        let parent = prev
+            .map(|p| p.compute_hash())
+            .unwrap_or(expected_first_hash);
         if b.prev_hash != parent {
             return Err("block sync: broken parent link".to_string());
         }
@@ -1039,9 +1058,8 @@ async fn install_bundle(
                 // blob is handled by the fail-closed gate in `fast_sync_state`
                 // (refuse unless the target is replay-empty), never by
                 // installing emptiness here.
-                let snap: crate::sharding::CrossShardReplaySnapshot =
-                    bincode::deserialize(dbytes)
-                        .map_err(|e| format!("fast sync: restore cross-shard error: {e:?}"))?;
+                let snap: crate::sharding::CrossShardReplaySnapshot = bincode::deserialize(dbytes)
+                    .map_err(|e| format!("fast sync: restore cross-shard error: {e:?}"))?;
                 engine.restore_cross_shard_replay(&snap).await;
             }
             "pq_keys" => {
@@ -1332,7 +1350,10 @@ where
             timeout_ms: SNAPSHOT_CHUNK_TIMEOUT_MS,
         });
     }
-    Ok(slots.into_iter().map(|s| s.expect("all slots filled")).collect())
+    Ok(slots
+        .into_iter()
+        .map(|s| s.expect("all slots filled"))
+        .collect())
 }
 
 /// Bound on chunks of ONE blob assembled concurrently.
@@ -1407,8 +1428,7 @@ pub fn snapshot_probe_pace_ms(consecutive_misses: u32) -> u64 {
 /// retry → re-flood" shape (`request_to dial=0ms resp=2500-3500ms`). The
 /// ceiling is `MAX_BACKOFF + JITTER_MAX`. Pure so tests pin it without time.
 pub fn fetch_retry_backoff_with_jitter_ms(attempt: u32, jitter: u64) -> u64 {
-    fetch_retry_backoff_ms(attempt)
-        .saturating_add(jitter.min(FETCH_RETRY_JITTER_MAX_MS))
+    fetch_retry_backoff_ms(attempt).saturating_add(jitter.min(FETCH_RETRY_JITTER_MAX_MS))
 }
 
 /// Chunk batch width for assembling one blob with `n_chunks`.
@@ -1450,8 +1470,7 @@ pub fn plan_chunk_batches(n_chunks: usize, batch: usize) -> Vec<(usize, usize)> 
 /// floor is always the base pace (pushes never fire faster than today), the
 /// draw only de-phases publishers that woke on the same cadence. Pure.
 pub fn retro_publish_pace_with_jitter_ms(jitter: u64) -> u64 {
-    crate::network::RETRO_PUBLISH_PACE_MS
-        .saturating_add(jitter.min(RETRO_PUSH_JITTER_MAX_MS))
+    crate::network::RETRO_PUBLISH_PACE_MS.saturating_add(jitter.min(RETRO_PUSH_JITTER_MAX_MS))
 }
 
 /// Whether a node at `our_tip` with a peer at `peer_tip` must skip its
@@ -1629,12 +1648,18 @@ mod tests {
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-};
+            };
             b.sign_block(&sk);
             let hash = b.compute_hash();
             // A decision proof travels with the block: without it the chain is
             // exactly what the quorum check must refuse.
-            let v = crate::consensus::Vote::sign(&sk, h, 0, crate::consensus::VoteKind::Precommit, Some(hash));
+            let v = crate::consensus::Vote::sign(
+                &sk,
+                h,
+                0,
+                crate::consensus::VoteKind::Precommit,
+                Some(hash),
+            );
             b.precommit_qc = Some(crate::consensus::QuorumCertificate {
                 height: h,
                 round: 0,
@@ -1702,7 +1727,7 @@ mod tests {
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-};
+            };
             b.sign_block(&proposer);
             let hash = b.compute_hash();
             // The quorum lives in the attached precommit QC, not in extra block-hash
@@ -1741,15 +1766,20 @@ mod tests {
             prev_hash: b.prev_hash,
             state_root: b.state_root,
             proposer: b.proposer,
-            qc: b.precommit_qc.clone().expect("quorum_chain blocks carry QCs"),
+            qc: b
+                .precommit_qc
+                .clone()
+                .expect("quorum_chain blocks carry QCs"),
         }
     }
 
     #[tokio::test]
     async fn collects_missing_blocks_ancestor_first() {
         let blocks = chain(3);
-        let map: HashMap<[u8; 32], Block> =
-            blocks.iter().map(|b| (b.compute_hash(), b.clone())).collect();
+        let map: HashMap<[u8; 32], Block> = blocks
+            .iter()
+            .map(|b| (b.compute_hash(), b.clone()))
+            .collect();
         let genesis = blocks[0].compute_hash();
         let head = blocks[3].compute_hash();
 
@@ -1781,17 +1811,24 @@ mod tests {
         for i in 0..3u8 {
             wider.add([0xEEu8.wrapping_add(i); 32], 1);
         }
-        assert!(wider.quorum_power() > 1, "a real network needs more than one");
+        assert!(
+            wider.quorum_power() > 1,
+            "a real network needs more than one"
+        );
         assert!(
             validate_sync_chain(&got, 1, genesis, &wider).is_err(),
             "a proposer-only chain must not satisfy a multi-validator quorum"
         );
 
         // A set with no power refuses outright rather than degenerating.
-        assert!(validate_sync_chain(&got, 1, genesis, &crate::consensus::ValidatorSet::new()).is_err());
+        assert!(
+            validate_sync_chain(&got, 1, genesis, &crate::consensus::ValidatorSet::new()).is_err()
+        );
 
         // Already at head -> nothing to fetch.
-        let none = collect_missing_blocks(head, head, 100, |_h| async { None }).await.unwrap();
+        let none = collect_missing_blocks(head, head, 100, |_h| async { None })
+            .await
+            .unwrap();
         assert!(none.is_empty());
     }
 
@@ -1799,15 +1836,18 @@ mod tests {
     fn sync_requires_validator_quorum_and_our_own_parent() {
         let blocks = quorum_chain(3, 2);
         let genesis = blocks[0].compute_hash();
-        let map: HashMap<[u8; 32], Block> =
-            blocks.iter().map(|b| (b.compute_hash(), b.clone())).collect();
+        let map: HashMap<[u8; 32], Block> = blocks
+            .iter()
+            .map(|b| (b.compute_hash(), b.clone()))
+            .collect();
         let head = blocks[3].compute_hash();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let got = rt.block_on(collect_missing_blocks(head, genesis, 100, |h| {
-            let b = map.get(&h).cloned();
-            async move { b }
-        }))
-        .unwrap();
+        let got = rt
+            .block_on(collect_missing_blocks(head, genesis, 100, |h| {
+                let b = map.get(&h).cloned();
+                async move { b }
+            }))
+            .unwrap();
 
         // 3 signers satisfy a quorum. The validator set is passed rather than a
         // count because the threshold is a fraction of stake and membership is
@@ -1909,7 +1949,7 @@ mod tests {
                 signatures: sigs,
             });
             b
-};
+        };
         let sched = |h: u64| vs.proposer_for(h, 0).unwrap();
         let b1 = mk(1, [0u8; 32], idx_of(sched(1)), MASTERCHAIN_SHARD);
         let b2 = mk(2, b1.compute_hash(), idx_of(sched(2)), MASTERCHAIN_SHARD);
@@ -1922,13 +1962,8 @@ mod tests {
         // slot must be refused, even though the QC is a genuine quorum.
         let wrong_idx = (idx_of(sched(1)) + 1) % keys.len();
         let wrong = mk(1, [0u8; 32], wrong_idx, MASTERCHAIN_SHARD);
-        let err = validate_sync_chain(
-            &[wrong, b2.clone(), b3.clone()],
-            1,
-            genesis,
-            &vs,
-        )
-        .unwrap_err();
+        let err =
+            validate_sync_chain(&[wrong, b2.clone(), b3.clone()], 1, genesis, &vs).unwrap_err();
         assert!(
             err.contains("schedule slot"),
             "non-scheduled proposer must be refused: {err}"
@@ -1946,7 +1981,10 @@ mod tests {
         let mut mixed = b2.clone();
         mixed.shard_id = 1;
         let err = validate_sync_chain(&[b1, mixed, b3], 1, genesis, &vs).unwrap_err();
-        assert!(err.contains("shard"), "mixed-shard chain must be refused: {err}");
+        assert!(
+            err.contains("shard"),
+            "mixed-shard chain must be refused: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1957,8 +1995,10 @@ mod tests {
         let err = collect_missing_blocks(head, [0u8; 32], 100, |_h| async { None }).await;
         assert!(err.is_err());
         // max_len smaller than the gap -> length error.
-        let map: HashMap<[u8; 32], Block> =
-            blocks.iter().map(|b| (b.compute_hash(), b.clone())).collect();
+        let map: HashMap<[u8; 32], Block> = blocks
+            .iter()
+            .map(|b| (b.compute_hash(), b.clone()))
+            .collect();
         let genesis = blocks[0].compute_hash();
         let err2 = collect_missing_blocks(head, genesis, 1, |h| {
             let b = map.get(&h).cloned();
@@ -1974,15 +2014,22 @@ mod tests {
 
         let source = InMemoryStateEngine::new();
         let user = [0x55u8; 32];
-        source.update_account(AccountState::new(user, 777_000)).await;
+        source
+            .update_account(AccountState::new(user, 777_000))
+            .await;
         let root = source.get_state_root().await;
         let snap = source.create_snapshot().await;
 
         let target = InMemoryStateEngine::new();
         // Fast-sync into the clean target engine (no domains: empty chain):
-        fast_sync_state(&target, root, || async { Some(snap.clone()) }, |_| async { None })
-            .await
-            .unwrap();
+        fast_sync_state(
+            &target,
+            root,
+            || async { Some(snap.clone()) },
+            |_| async { None },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(target.get_state_root().await, root);
         assert_eq!(target.get_account(&user).await.unwrap().balance, 777_000);
@@ -1994,7 +2041,9 @@ mod tests {
 
         let source = InMemoryStateEngine::new();
         let user = [0x55u8; 32];
-        source.update_account(AccountState::new(user, 777_000)).await;
+        source
+            .update_account(AccountState::new(user, 777_000))
+            .await;
         let genuine_root = source.get_state_root().await;
 
         // Attacker creates a poisoned snapshot where balance is 999_999_999:
@@ -2006,9 +2055,18 @@ mod tests {
 
         let target = InMemoryStateEngine::new();
         // Providing the poisoned snapshot against genuine_root MUST be rejected!
-        let res = fast_sync_state(&target, genuine_root, || async { Some(poisoned_snap.clone()) }, |_| async { None }).await;
+        let res = fast_sync_state(
+            &target,
+            genuine_root,
+            || async { Some(poisoned_snap.clone()) },
+            |_| async { None },
+        )
+        .await;
         assert!(res.is_err(), "poisoned snapshot must be rejected");
-        assert!(target.get_account(&user).await.is_none(), "target state must remain untouched");
+        assert!(
+            target.get_account(&user).await.is_none(),
+            "target state must remain untouched"
+        );
     }
 
     #[tokio::test]
@@ -2020,7 +2078,9 @@ mod tests {
 
         let source = InMemoryStateEngine::new();
         let user = [0x66u8; 32];
-        source.update_account(AccountState::new(user, 1_000_000)).await;
+        source
+            .update_account(AccountState::new(user, 1_000_000))
+            .await;
         let meta = TokenMetadata {
             name: "Sync".into(),
             symbol: "SYN".into(),
@@ -2038,12 +2098,11 @@ mod tests {
         let staking = source.staking_read().await.clone();
         let gov = source.governance_read().await.clone();
         let dom = crate::storage::DomainSnapshot::capture(&source, &staking, &gov).await;
-        let domains: std::collections::HashMap<String, Vec<u8>> = [
-            ("domains", bincode::serialize(&dom).unwrap()),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v))
-        .collect();
+        let domains: std::collections::HashMap<String, Vec<u8>> =
+            [("domains", bincode::serialize(&dom).unwrap())]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
 
         let target = InMemoryStateEngine::new();
         fast_sync_state(
@@ -2063,9 +2122,17 @@ mod tests {
         // And WITHOUT the domains the same snapshot must FAIL the root check
         // (this is the pre-fix behavior that stranded far-behind nodes).
         let bare = InMemoryStateEngine::new();
-        let res =
-            fast_sync_state(&bare, root, || async { Some(snap.clone()) }, |_| async { None }).await;
-        assert!(res.is_err(), "accounts-only must not verify on a live chain");
+        let res = fast_sync_state(
+            &bare,
+            root,
+            || async { Some(snap.clone()) },
+            |_| async { None },
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "accounts-only must not verify on a live chain"
+        );
     }
 
     #[tokio::test]
@@ -2100,7 +2167,10 @@ mod tests {
         .await;
 
         let reqs = requested_domains.lock().unwrap().clone();
-        assert!(reqs.contains(&"pq_keys"), "fast_sync_state must fetch pq_keys domain");
+        assert!(
+            reqs.contains(&"pq_keys"),
+            "fast_sync_state must fetch pq_keys domain"
+        );
     }
 
     // ==================== F3(a): mismatched body rejected ====================
@@ -2120,7 +2190,10 @@ mod tests {
         })
         .await
         .expect_err("a body filed under the wrong hash must be refused");
-        assert!(err.contains("does not hash"), "error names the mismatch: {err}");
+        assert!(
+            err.contains("does not hash"),
+            "error names the mismatch: {err}"
+        );
     }
 
     // ==================== F1: hash-linked snapshot anchor ====================
@@ -2132,23 +2205,15 @@ mod tests {
         let blocks = quorum_chain(5, 2);
         let head_hash = blocks[2].compute_hash();
         let vs = set_from(&blocks[2]);
-        let links: HashMap<u64, HeaderLink> = blocks
-            .iter()
-            .map(|b| (b.height, qc_link(b)))
-            .collect();
-        let root = verify_snapshot_anchor(
-            Some((2, head_hash)),
-            [0u8; 32],
-            5,
-            &vs,
-            1_000_000,
-            |h| {
+        let links: HashMap<u64, HeaderLink> =
+            blocks.iter().map(|b| (b.height, qc_link(b))).collect();
+        let root =
+            verify_snapshot_anchor(Some((2, head_hash)), [0u8; 32], 5, &vs, 1_000_000, |h| {
                 let l = links.get(&h).cloned();
                 async move { l }
-            },
-        )
-        .await
-        .expect("a genuine QC-anchored chain from our own finalized head must anchor");
+            })
+            .await
+            .expect("a genuine QC-anchored chain from our own finalized head must anchor");
         assert_eq!(root.state_root, blocks[5].state_root);
     }
 
@@ -2161,35 +2226,29 @@ mod tests {
         let blocks = quorum_chain(5, 2);
         let head_hash = blocks[2].compute_hash();
         let vs = set_from(&blocks[2]);
-        let mut links: HashMap<u64, HeaderLink> = blocks
-            .iter()
-            .map(|b| (b.height, qc_link(b)))
-            .collect();
+        let mut links: HashMap<u64, HeaderLink> =
+            blocks.iter().map(|b| (b.height, qc_link(b))).collect();
         links.insert(
             5,
             HeaderLink {
                 height: 5,
                 block_hash: [0xEE; 32],
-                prev_hash: [0xBA; 32], // not #4's hash: the link is broken
+                prev_hash: [0xBA; 32],  // not #4's hash: the link is broken
                 state_root: [0xEE; 32], // arbitrary forged root
                 proposer: [0u8; 32],
                 qc: blocks[5].precommit_qc.clone().unwrap(),
             },
         );
-        let err = verify_snapshot_anchor(
-            Some((2, head_hash)),
-            [0u8; 32],
-            5,
-            &vs,
-            1_000_000,
-            |h| {
-                let l = links.get(&h).cloned();
-                async move { l }
-            },
-        )
+        let err = verify_snapshot_anchor(Some((2, head_hash)), [0u8; 32], 5, &vs, 1_000_000, |h| {
+            let l = links.get(&h).cloned();
+            async move { l }
+        })
         .await
         .expect_err("a forged, unlinked header must be refused");
-        assert!(err.contains("does not link"), "error names the broken anchor: {err}");
+        assert!(
+            err.contains("does not link"),
+            "error names the broken anchor: {err}"
+        );
     }
 
     #[tokio::test]
@@ -2242,7 +2301,7 @@ mod tests {
                 order_merkle_root: [0u8; 32],
                 epoch_key_commitment: [0u8; 32],
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-};
+            };
             eb.sign_block(&proposer);
             let hash = eb.compute_hash();
             let mut sigs = Vec::new();
@@ -2297,20 +2356,16 @@ mod tests {
             .filter(|b| b.height != 3)
             .map(|b| (b.height, qc_link(b)))
             .collect();
-        let err = verify_snapshot_anchor(
-            Some((2, head_hash)),
-            [0u8; 32],
-            5,
-            &vs,
-            1_000_000,
-            |h| {
-                let l = links.get(&h).cloned();
-                async move { l }
-            },
-        )
+        let err = verify_snapshot_anchor(Some((2, head_hash)), [0u8; 32], 5, &vs, 1_000_000, |h| {
+            let l = links.get(&h).cloned();
+            async move { l }
+        })
         .await
         .expect_err("a gap in the header walk must be refused");
-        assert!(err.contains("no header published"), "error names the gap: {err}");
+        assert!(
+            err.contains("no header published"),
+            "error names the gap: {err}"
+        );
     }
 
     #[tokio::test]
@@ -2351,17 +2406,10 @@ mod tests {
             links.insert(h, mk_link(h, prev, [h as u8; 32]));
             prev = [h as u8; 32];
         }
-        let root = verify_snapshot_anchor(
-            None,
-            [0u8; 32],
-            3,
-            &vs,
-            1_000_000,
-            |h| {
-                let l = links.get(&h).cloned();
-                async move { l }
-            },
-        )
+        let root = verify_snapshot_anchor(None, [0u8; 32], 3, &vs, 1_000_000, |h| {
+            let l = links.get(&h).cloned();
+            async move { l }
+        })
         .await
         .expect("a chain rooted at genesis must anchor");
         assert_eq!(root.state_root, [3u8; 32]);
@@ -2370,17 +2418,10 @@ mod tests {
         let mut broken = links.clone();
         broken.insert(1, mk_link(1, [0xCC; 32], [0xCC; 32]));
         assert!(
-            verify_snapshot_anchor(
-                None,
-                [0u8; 32],
-                3,
-                &vs,
-                1_000_000,
-                |h| {
-                    let l = broken.get(&h).cloned();
-                    async move { l }
-                }
-            )
+            verify_snapshot_anchor(None, [0u8; 32], 3, &vs, 1_000_000, |h| {
+                let l = broken.get(&h).cloned();
+                async move { l }
+            })
             .await
             .is_err(),
             "a header not rooted at the genesis sentinel must be refused"
@@ -2394,10 +2435,8 @@ mod tests {
         let blocks = quorum_chain(5, 2);
         let head_hash = blocks[2].compute_hash();
         let vs = set_from(&blocks[2]);
-        let links: HashMap<u64, HeaderLink> = blocks
-            .iter()
-            .map(|b| (b.height, qc_link(b)))
-            .collect();
+        let links: HashMap<u64, HeaderLink> =
+            blocks.iter().map(|b| (b.height, qc_link(b))).collect();
         let err = verify_snapshot_anchor(
             Some((2, head_hash)),
             [0u8; 32],
@@ -2422,23 +2461,15 @@ mod tests {
         let blocks = quorum_chain(5, 2);
         let head_hash = blocks[2].compute_hash();
         let stale = crate::consensus::ValidatorSet::from_list(vec![([0xF0u8; 32], 1)]);
-        let links: HashMap<u64, HeaderLink> = blocks
-            .iter()
-            .map(|b| (b.height, qc_link(b)))
-            .collect();
-        let err = verify_snapshot_anchor(
-            Some((2, head_hash)),
-            [0u8; 32],
-            5,
-            &stale,
-            1_000_000,
-            |h| {
+        let links: HashMap<u64, HeaderLink> =
+            blocks.iter().map(|b| (b.height, qc_link(b))).collect();
+        let err =
+            verify_snapshot_anchor(Some((2, head_hash)), [0u8; 32], 5, &stale, 1_000_000, |h| {
                 let l = links.get(&h).cloned();
                 async move { l }
-            },
-        )
-        .await
-        .expect_err("stale disjoint set must not verify foreign QCs");
+            })
+            .await
+            .expect_err("stale disjoint set must not verify foreign QCs");
         assert!(
             err.contains("quorum") || err.contains("finality"),
             "error names the QC gate: {err}"
@@ -2459,7 +2490,10 @@ mod tests {
         // A walked tail that does not hash to the advertised head is refused too.
         let err2 = walked_head_anchor(&blocks, [0xAB; 32], 5)
             .expect_err("a walked tail not matching the advertised hash must be refused");
-        assert!(err2.contains("does not hash"), "error names the hash mismatch: {err2}");
+        assert!(
+            err2.contains("does not hash"),
+            "error names the hash mismatch: {err2}"
+        );
 
         // The honest case re-anchors on the WALKED height + 1.
         assert_eq!(walked_head_anchor(&blocks, head_hash, 5).unwrap(), 6);
@@ -2493,7 +2527,7 @@ mod repl_tests {
         };
         b.sign_block(&sk);
         b
-}
+    }
 
     #[test]
     fn replicated_body_must_hash_to_the_committed_header() {
@@ -2514,7 +2548,10 @@ mod repl_tests {
         let b = test_block(3);
         let h = b.compute_hash();
         let bytes = bincode::serialize(&b).unwrap();
-        assert_eq!(verify_replicated_bytes(&h, &bytes).unwrap().compute_hash(), h);
+        assert_eq!(
+            verify_replicated_bytes(&h, &bytes).unwrap().compute_hash(),
+            h
+        );
         assert!(verify_replicated_bytes(&[0xAAu8; 32], &bytes).is_err());
         assert!(verify_replicated_bytes(&h, &[0xFF, 0x00]).is_err());
     }
@@ -2522,7 +2559,8 @@ mod repl_tests {
     #[test]
     fn backfill_is_bounded_tip_ward_and_respects_windows() {
         // A node 1000 behind with cap 64 fetches the 64 nearest the tip first.
-        let plan = plan_backfill_tip_ward(0, 1000, 64, ADOPT_REPL_KEEP_WINDOW, ADOPT_REPL_RETRO_DEPTH);
+        let plan =
+            plan_backfill_tip_ward(0, 1000, 64, ADOPT_REPL_KEEP_WINDOW, ADOPT_REPL_RETRO_DEPTH);
         assert_eq!(plan.len(), 64);
         assert_eq!(plan[0], 937);
         assert_eq!(plan[63], 1000);
@@ -2532,14 +2570,35 @@ mod repl_tests {
             vec![11, 12, 13]
         );
         // Caught up / degenerate: nothing to fetch (never a storm).
-        assert!(plan_backfill_tip_ward(5, 5, 64, ADOPT_REPL_KEEP_WINDOW, ADOPT_REPL_RETRO_DEPTH).is_empty());
-        assert!(plan_backfill_tip_ward(5, 9, 0, ADOPT_REPL_KEEP_WINDOW, ADOPT_REPL_RETRO_DEPTH).is_empty());
+        assert!(
+            plan_backfill_tip_ward(5, 5, 64, ADOPT_REPL_KEEP_WINDOW, ADOPT_REPL_RETRO_DEPTH)
+                .is_empty()
+        );
+        assert!(
+            plan_backfill_tip_ward(5, 9, 0, ADOPT_REPL_KEEP_WINDOW, ADOPT_REPL_RETRO_DEPTH)
+                .is_empty()
+        );
         // Reuses the existing bounds: outside KEEP/retro the honest answer is
         // unavailability, not a fetch.
-        assert!(!height_is_replicable(1, 20_000, ADOPT_REPL_KEEP_WINDOW, ADOPT_REPL_RETRO_DEPTH));
-        assert!(height_is_replicable(19_900, 20_000, ADOPT_REPL_KEEP_WINDOW, ADOPT_REPL_RETRO_DEPTH));
-        let old: Vec<u64> =
-            plan_backfill_tip_ward(0, 20_000, 10_000, ADOPT_REPL_KEEP_WINDOW, ADOPT_REPL_RETRO_DEPTH);
+        assert!(!height_is_replicable(
+            1,
+            20_000,
+            ADOPT_REPL_KEEP_WINDOW,
+            ADOPT_REPL_RETRO_DEPTH
+        ));
+        assert!(height_is_replicable(
+            19_900,
+            20_000,
+            ADOPT_REPL_KEEP_WINDOW,
+            ADOPT_REPL_RETRO_DEPTH
+        ));
+        let old: Vec<u64> = plan_backfill_tip_ward(
+            0,
+            20_000,
+            10_000,
+            ADOPT_REPL_KEEP_WINDOW,
+            ADOPT_REPL_RETRO_DEPTH,
+        );
         assert!(!old.contains(&1), "pruned heights are never planned");
         assert_eq!(*old.last().unwrap(), 20_000);
     }
@@ -2593,7 +2652,20 @@ mod fanout_tests {
         assert_eq!(plan_chunk_batches(1, 4), vec![(0, 1)]);
         assert_eq!(plan_chunk_batches(4, 4), vec![(0, 4)]);
         assert_eq!(plan_chunk_batches(6, 4), vec![(0, 4), (4, 6)]);
-        assert_eq!(plan_chunk_batches(9, 1), vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9)]);
+        assert_eq!(
+            plan_chunk_batches(9, 1),
+            vec![
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 4),
+                (4, 5),
+                (5, 6),
+                (6, 7),
+                (7, 8),
+                (8, 9)
+            ]
+        );
         // Zero width saturates to serial instead of looping forever.
         assert_eq!(plan_chunk_batches(3, 0), vec![(0, 1), (1, 2), (2, 3)]);
         // Tiling property for a snapshot-sized blob.

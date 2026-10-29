@@ -137,7 +137,9 @@ impl MessageUndo {
     /// delivery began - is what an undo restores, which is exactly
     /// "walk the undo newest-first back to the original".
     fn note(&mut self, map: &HashMap<[u8; 32], AccountState>, addr: [u8; 32]) {
-        self.prev.entry(addr).or_insert_with(|| map.get(&addr).cloned());
+        self.prev
+            .entry(addr)
+            .or_insert_with(|| map.get(&addr).cloned());
     }
 
     /// Put every touched account back where it was before this message.
@@ -412,9 +414,7 @@ pub struct InMemoryStateEngine {
     /// `Arc` as every shard runtime in the process. Outer `Arc` keeps the
     /// derived `Clone` working (a `RwLock` alone is not `Clone`).
     finalized_headers: Arc<
-        std::sync::RwLock<
-            Option<Arc<std::sync::RwLock<crate::sharding::FinalizedHeaderRegistry>>>,
-        >,
+        std::sync::RwLock<Option<Arc<std::sync::RwLock<crate::sharding::FinalizedHeaderRegistry>>>>,
     >,
     /// Replay-protection set for consumed inbound cross-shard messages.
     ///
@@ -499,8 +499,11 @@ pub struct InMemoryStateEngine {
     /// skips it in that case (it used to double every key in RAM for nothing).
     /// When sled is unconfigured this map is the ONLY store (fail-open reads,
     /// never fail-closed); size it for tests / diskless nodes only.
-    pq_keys_fallback:
-        Arc<std::sync::RwLock<memory_bounds::BoundedLruCache<[u8; 32], (crate::post_quantum::PqScheme, Vec<u8>)>>>,
+    pq_keys_fallback: Arc<
+        std::sync::RwLock<
+            memory_bounds::BoundedLruCache<[u8; 32], (crate::post_quantum::PqScheme, Vec<u8>)>,
+        >,
+    >,
     /// F-01 consensus D2 penalty mirror: sender -> extra floor added to the
     /// consensus base for their next transactions. Updated ONLY from applied
     /// block verdicts (end of `apply_block_parallel_fees`), so every node
@@ -651,7 +654,6 @@ pub struct BlockTransitionOutcome {
     pub events: Vec<Vec<crate::contract::ContractEvent>>,
 }
 
-
 /// Namespaced trie key for a token balance: sha256("STS_BAL" || token_id || account)
 /// This commits token balances into the same state root as native STELL balances,
 /// enabling SPV Merkle proofs for token holdings.
@@ -735,7 +737,10 @@ pub struct ContractCallOutcome {
 /// A contract's ABI manifest is committed next to its code hash. So is the
 /// verified-source fingerprint, when one is registered (absent = unverified:
 /// the key is removed, never a placeholder).
-fn write_contract_trie_entries(trie: &mut PatriciaTrie, contracts: &crate::contract::ContractRegistry) {
+fn write_contract_trie_entries(
+    trie: &mut PatriciaTrie,
+    contracts: &crate::contract::ContractRegistry,
+) {
     for (addr, c) in &contracts.contracts {
         trie.insert(&contract_key(addr), &c.code_hash);
         match &c.abi {
@@ -769,7 +774,10 @@ fn write_token_trie_entries(trie: &mut PatriciaTrie, tokens: &TokenRegistry) {
                 trie.insert(&key, &bal.to_be_bytes());
             }
         }
-        trie.insert(&token_supply_key(id), &token.metadata.total_supply.to_be_bytes());
+        trie.insert(
+            &token_supply_key(id),
+            &token.metadata.total_supply.to_be_bytes(),
+        );
     }
 }
 
@@ -1051,7 +1059,8 @@ fn plan_plain_tx(
             plan.writes.push((auth.sponsor, sbal - fail_fee, snonce));
             return plan;
         }
-        plan.writes.push((tx.from, ubal.saturating_sub(tx.amount), unonce + 1));
+        plan.writes
+            .push((tx.from, ubal.saturating_sub(tx.amount), unonce + 1));
         plan.writes.push((auth.sponsor, sbal - fail_fee, snonce));
         if !cross_shard {
             match recipient {
@@ -1126,11 +1135,13 @@ fn plan_plain_tx(
 
     if tx.from == tx.to {
         // A self-transfer only pays the fee: the amount goes straight back.
-        plan.writes.push((tx.from, balance.saturating_sub(fee), nonce + 1));
+        plan.writes
+            .push((tx.from, balance.saturating_sub(fee), nonce + 1));
         return plan;
     }
 
-    plan.writes.push((tx.from, balance.saturating_sub(total_cost), nonce + 1));
+    plan.writes
+        .push((tx.from, balance.saturating_sub(total_cost), nonce + 1));
 
     if !cross_shard {
         match recipient {
@@ -1143,8 +1154,7 @@ fn plan_plain_tx(
                     plan.applied = false;
                     plan.fee = 0;
                     plan.writes.clear();
-                    if let Some((debited, balance, nonce)) =
-                        failure_fee_state(tx, sender, fail_fee)
+                    if let Some((debited, balance, nonce)) = failure_fee_state(tx, sender, fail_fee)
                     {
                         plan.fee = debited;
                         plan.writes.push((tx.from, balance, nonce));
@@ -1221,7 +1231,6 @@ struct WaveItemExec {
     post_actions: Option<ExecPostActions>,
 }
 
-
 impl InMemoryStateEngine {
     pub fn new() -> Self {
         Self {
@@ -1239,14 +1248,14 @@ impl InMemoryStateEngine {
             governance: Arc::new(RwLock::new(crate::governance::Governance::new())),
             oracle: Arc::new(RwLock::new(crate::oracle::OracleState::default())),
             session_keys: Arc::new(RwLock::new(crate::zkml::SessionKeyRegistry::default())),
-            confidential: Arc::new(RwLock::new(
-                crate::crypto_privacy::ConfidentialState::new(),
-            )),
+            confidential: Arc::new(RwLock::new(crate::crypto_privacy::ConfidentialState::new())),
             zkml_models: Arc::new(RwLock::new(crate::zkml::ZkMlModelRegistry::default())),
             commitment_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             committed_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             domain_gens: Arc::new(crate::commitment::DomainGenerations::default()),
-            domain_cache: Arc::new(std::sync::Mutex::new(crate::commitment::DomainCache::default())),
+            domain_cache: Arc::new(std::sync::Mutex::new(
+                crate::commitment::DomainCache::default(),
+            )),
             cross_shard_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             finalized_headers: Arc::new(std::sync::RwLock::new(None)),
             cross_shard_consumed: Arc::new(RwLock::new(HashSet::new())),
@@ -1265,7 +1274,9 @@ impl InMemoryStateEngine {
                 ),
             )),
             consensus_penalty: Arc::new(RwLock::new(HashMap::new())),
-            shard_id: Arc::new(std::sync::atomic::AtomicU32::new(crate::sharding::MASTERCHAIN_SHARD)),
+            shard_id: Arc::new(std::sync::atomic::AtomicU32::new(
+                crate::sharding::MASTERCHAIN_SHARD,
+            )),
             shard_topology: Arc::new(RwLock::new(crate::sharding::ShardTopology::new())),
             cross_shard_out: Arc::new(RwLock::new(Vec::new())),
         }
@@ -1317,10 +1328,12 @@ impl InMemoryStateEngine {
             confidential: Arc::new(RwLock::new(confidential)),
             zkml_models: Arc::new(RwLock::new(zkml_models)),
             commitment_generation: Arc::new(std::sync::atomic::AtomicU64::new(
-                self.commitment_generation.load(std::sync::atomic::Ordering::Relaxed),
+                self.commitment_generation
+                    .load(std::sync::atomic::Ordering::Relaxed),
             )),
             committed_generation: Arc::new(std::sync::atomic::AtomicU64::new(
-                self.committed_generation.load(std::sync::atomic::Ordering::Relaxed),
+                self.committed_generation
+                    .load(std::sync::atomic::Ordering::Relaxed),
             )),
             // FORK SAFETY: the deep copy holds equal state at equal
             // generations, but starts with an EMPTY preimage cache that
@@ -1335,9 +1348,12 @@ impl InMemoryStateEngine {
                 self.domain_gens.copy_values_into(&fresh);
                 Arc::new(fresh)
             },
-            domain_cache: Arc::new(std::sync::Mutex::new(crate::commitment::DomainCache::default())),
+            domain_cache: Arc::new(std::sync::Mutex::new(
+                crate::commitment::DomainCache::default(),
+            )),
             cross_shard_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
-                self.cross_shard_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                self.cross_shard_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
             )),
             finalized_headers: Arc::new(std::sync::RwLock::new(None)),
             cross_shard_consumed: Arc::new(RwLock::new(cross_shard_consumed)),
@@ -1346,7 +1362,8 @@ impl InMemoryStateEngine {
             cross_shard_xpc: Arc::new(RwLock::new(cross_shard_xpc)),
             bridge: Arc::new(RwLock::new(bridge)),
             parallel_exec: Arc::new(std::sync::atomic::AtomicBool::new(
-                self.parallel_exec.load(std::sync::atomic::Ordering::Relaxed),
+                self.parallel_exec
+                    .load(std::sync::atomic::Ordering::Relaxed),
             )),
             pq_tree: Arc::new(std::sync::RwLock::new(pq_tree)),
             pq_db: Arc::new(std::sync::RwLock::new(pq_db)),
@@ -1355,9 +1372,7 @@ impl InMemoryStateEngine {
             shard_id: Arc::new(std::sync::atomic::AtomicU32::new(
                 self.shard_id.load(std::sync::atomic::Ordering::Relaxed),
             )),
-            shard_topology: Arc::new(RwLock::new(
-                self.shard_topology.read().await.clone(),
-            )),
+            shard_topology: Arc::new(RwLock::new(self.shard_topology.read().await.clone())),
             cross_shard_out: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -1429,7 +1444,9 @@ impl InMemoryStateEngine {
             let mut map = self.accounts.write().await;
             let mut trie = self.state_trie.write().await;
 
-            let acc = map.entry(address).or_insert_with(|| AccountState::new(address, 0));
+            let acc = map
+                .entry(address)
+                .or_insert_with(|| AccountState::new(address, 0));
             if let Some(existing_hash) = acc.pubkey_hash {
                 if existing_hash != pk_hash || acc.scheme != scheme {
                     return Err(format!(
@@ -1479,12 +1496,8 @@ impl InMemoryStateEngine {
                 .insert(address, (scheme, pubkey.to_vec()));
         }
 
-        let _ = crate::sharding::Transaction::global_implicit_registry().register(
-            address,
-            scheme,
-            pubkey,
-            salt,
-        );
+        let _ = crate::sharding::Transaction::global_implicit_registry()
+            .register(address, scheme, pubkey, salt);
 
         Ok(())
     }
@@ -1497,7 +1510,8 @@ impl InMemoryStateEngine {
         &self,
         address: &[u8; 32],
     ) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)> {
-        self.get_pinned_pubkey_with_salt(address).map(|(s, pk, _)| (s, pk))
+        self.get_pinned_pubkey_with_salt(address)
+            .map(|(s, pk, _)| (s, pk))
     }
 
     /// Look up the pinned post-quantum scheme, raw public key, and salt for an account address.
@@ -1518,7 +1532,9 @@ impl InMemoryStateEngine {
             };
             if let Some(bytes) = bytes_opt {
                 if let Ok((scheme, pk, salt)) =
-                    bincode::deserialize::<(crate::post_quantum::PqScheme, Vec<u8>, [u8; 16])>(&bytes)
+                    bincode::deserialize::<(crate::post_quantum::PqScheme, Vec<u8>, [u8; 16])>(
+                        &bytes,
+                    )
                 {
                     return Some((scheme, pk, salt));
                 }
@@ -1529,7 +1545,11 @@ impl InMemoryStateEngine {
                 }
                 if bytes.len() > 1 {
                     if let Ok(scheme) = crate::post_quantum::PqScheme::from_id(bytes[0]) {
-                        return Some((scheme, bytes[1..].to_vec(), crate::post_quantum::DEFAULT_SALT));
+                        return Some((
+                            scheme,
+                            bytes[1..].to_vec(),
+                            crate::post_quantum::DEFAULT_SALT,
+                        ));
                     }
                 }
             }
@@ -1539,12 +1559,7 @@ impl InMemoryStateEngine {
         // In-memory fallback when persistent sled tree is unconfigured.
         // `get` refreshes LRU recency (needs the write guard); a miss here is
         // fail-open `None`, never an error.
-        if let Some((scheme, pk)) = self
-            .pq_keys_fallback
-            .write()
-            .unwrap()
-            .get(address)
-        {
+        if let Some((scheme, pk)) = self.pq_keys_fallback.write().unwrap().get(address) {
             return Some((scheme, pk, crate::post_quantum::DEFAULT_SALT));
         }
 
@@ -1717,13 +1732,15 @@ impl InMemoryStateEngine {
 
     /// Set parallel block execution flag.
     pub fn set_parallel_exec(&self, enabled: bool) {
-        self.parallel_exec.store(enabled, std::sync::atomic::Ordering::Release);
+        self.parallel_exec
+            .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
     /// Check whether disjoint wave parallel execution is enabled.
     /// Gated by in-memory engine configuration or `STELL_PARALLEL_EXEC` env var.
     pub fn is_parallel_exec_enabled(&self) -> bool {
-        self.parallel_exec.load(std::sync::atomic::Ordering::Acquire)
+        self.parallel_exec
+            .load(std::sync::atomic::Ordering::Acquire)
             || std::env::var("STELL_PARALLEL_EXEC")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false)
@@ -1749,10 +1766,7 @@ impl InMemoryStateEngine {
     /// [`crate::mempool::AdmissionCtx::with_sponsor_balance`] exactly like
     /// the sender balance they already read — one extra account read, under
     /// the same lock discipline (engine read BEFORE the pool write guard).
-    pub async fn sponsor_balance_of(
-        &self,
-        tx: &crate::sharding::Transaction,
-    ) -> Option<u64> {
+    pub async fn sponsor_balance_of(&self, tx: &crate::sharding::Transaction) -> Option<u64> {
         let grant = tx.sponsored_grant()?;
         Some(
             self.accounts
@@ -1912,7 +1926,8 @@ impl InMemoryStateEngine {
         tx: &crate::sharding::Transaction,
         timestamp: u64,
     ) -> Result<(crate::svm::VmExecutionResult, ExecPostActions), String> {
-        self.execute_payload_with_preverify(tx, timestamp, None).await
+        self.execute_payload_with_preverify(tx, timestamp, None)
+            .await
     }
 
     /// Capture pre-execution state for exactly the domains this payload's
@@ -2043,7 +2058,8 @@ impl InMemoryStateEngine {
     /// paths. Account-level legs (bridge/actor/PMM-native direct map writes)
     /// are restored separately via their own snapshots (see `ExecPostActions`
     /// at the call site); the accounts map itself is undone by `commit_native`.
-    async fn restore_payload_domains(&self, snap: PayloadDomainSnapshot) {        if let Some(v) = snap.tokens {
+    async fn restore_payload_domains(&self, snap: PayloadDomainSnapshot) {
+        if let Some(v) = snap.tokens {
             *self.tokens_write().await = v;
         }
         if let Some(v) = snap.contracts {
@@ -2094,11 +2110,7 @@ impl InMemoryStateEngine {
     /// hold. Contract code-hash entries written speculatively by a deploy
     /// are removed the same way (the caller writes them only after a commit
     /// now, so this covers only pre-existing write paths).
-    async fn rollback_payload(
-        &self,
-        snap: PayloadDomainSnapshot,
-        actions: ExecPostActions,
-    ) {
+    async fn rollback_payload(&self, snap: PayloadDomainSnapshot, actions: ExecPostActions) {
         // Diff BEFORE restoring (post-state is live right now). Scoped so
         // read guards drop before any write lock below (else deadlock).
         let mut dead_keys: HashSet<[u8; 32]> = HashSet::new();
@@ -2157,8 +2169,7 @@ impl InMemoryStateEngine {
             .await;
         self.restore_actor_native(actions.actor_snapshot.as_ref())
             .await;
-        self.restore_pmm_native(&actions.pmm_native_snapshot)
-            .await;
+        self.restore_pmm_native(&actions.pmm_native_snapshot).await;
         // Trie: drop touched keys, then re-add exactly what restored state holds.
         if !dead_keys.is_empty() {
             let mut trie = self.state_trie.write().await;
@@ -2211,9 +2222,10 @@ impl InMemoryStateEngine {
         // and a consensus rule that depends on it could make a sharded node
         // and a single-shard node disagree about the same block.
         if tx.source_shard != tx.target_shard
-            && tx.payload.iter().any(|op| {
-                matches!(op, crate::svm::OpCode::SysCallActorSend { .. })
-            })
+            && tx
+                .payload
+                .iter()
+                .any(|op| matches!(op, crate::svm::OpCode::SysCallActorSend { .. }))
         {
             return Err(
                 "actor send rejected: cross-shard actor messages are not supported (v1 is \
@@ -2223,24 +2235,27 @@ impl InMemoryStateEngine {
         }
 
         if tx.payload.is_empty() {
-            return Ok((crate::svm::VmExecutionResult::Success {
-                gas_used: 0,
-                return_value: None,
-                new_balance: 0,
-                trades: vec![],
-                transfers: vec![],
-                token_events: vec![],
-                clob_events: vec![],
-                payouts: vec![],
-                burns: vec![],
-                outbound_messages: vec![],
-                events: vec![],
-            }, ExecPostActions {
-                bridge_snapshot: None,
-                actor_snapshot: None,
-                pmm_native_snapshot: Vec::new(),
-                clob_native_snapshot: Vec::new(),
-            }));
+            return Ok((
+                crate::svm::VmExecutionResult::Success {
+                    gas_used: 0,
+                    return_value: None,
+                    new_balance: 0,
+                    trades: vec![],
+                    transfers: vec![],
+                    token_events: vec![],
+                    clob_events: vec![],
+                    payouts: vec![],
+                    burns: vec![],
+                    outbound_messages: vec![],
+                    events: vec![],
+                },
+                ExecPostActions {
+                    bridge_snapshot: None,
+                    actor_snapshot: None,
+                    pmm_native_snapshot: Vec::new(),
+                    clob_native_snapshot: Vec::new(),
+                },
+            ));
         }
 
         let sender_balance = self
@@ -2270,7 +2285,8 @@ impl InMemoryStateEngine {
         if tx.payload.iter().any(|op| {
             matches!(
                 op,
-                crate::svm::OpCode::SysCallPmmBuy { .. } | crate::svm::OpCode::SysCallPmmSell { .. }
+                crate::svm::OpCode::SysCallPmmBuy { .. }
+                    | crate::svm::OpCode::SysCallPmmSell { .. }
             )
         }) {
             pmm_before = Some(((*pmm).clone(), (*tokens).clone()));
@@ -2303,8 +2319,9 @@ impl InMemoryStateEngine {
         // exists to prevent: an order in the book whose funds were never locked.
         // Snapshot only for payloads that can produce events - plain transfers
         // must not pay for the clone.
-        let mut books_before: Option<std::collections::HashMap<u32, crate::orderbook::OrderbookActor>> =
-            None;
+        let mut books_before: Option<
+            std::collections::HashMap<u32, crate::orderbook::OrderbookActor>,
+        > = None;
         if tx.payload.iter().any(|op| {
             matches!(
                 op,
@@ -2329,12 +2346,11 @@ impl InMemoryStateEngine {
         //   * the consensus lock is held for nothing on the 99.99% of payloads
         //     that never mention a revoke (the same clone-on-demand shape as
         //     `oracle_before` and `books_before` above).
-        let mut session_keys_work = if tx.payload.iter().any(|op| {
-            matches!(
-                op,
-                crate::svm::OpCode::SysCallRevokeSession { .. }
-            )
-        }) {
+        let mut session_keys_work = if tx
+            .payload
+            .iter()
+            .any(|op| matches!(op, crate::svm::OpCode::SysCallRevokeSession { .. }))
+        {
             Some(self.session_keys.read().await.clone())
         } else {
             None
@@ -2641,8 +2657,7 @@ impl InMemoryStateEngine {
                 // counted against the SAME ledger every node derives its
                 // validators from, so all of them reach the same verdict on
                 // the same block.
-                let bridge_validators: Vec<[u8; 32]> =
-                    staking.validators.keys().copied().collect();
+                let bridge_validators: Vec<[u8; 32]> = staking.validators.keys().copied().collect();
                 // C7 shard gate: the bridge domain (replay set, escrow,
                 // mint counters, disputes) lives on the masterchain ONLY.
                 // Settling the same intents on a workchain would credit
@@ -2652,9 +2667,7 @@ impl InMemoryStateEngine {
                     && self.cross_shard_enabled()
                     && tx.source_shard != crate::sharding::MASTERCHAIN_SHARD
                 {
-                    return Err(
-                        "bridge intents settle on the masterchain only".to_string(),
-                    );
+                    return Err("bridge intents settle on the masterchain only".to_string());
                 }
                 match self
                     .settle_bridge_native(
@@ -2710,7 +2723,10 @@ impl InMemoryStateEngine {
         // once - never both.
         let mut actor_snapshot: Option<ActorSnapshot> = None;
         if let crate::svm::VmExecutionResult::Success {
-            transfers, clob_events, outbound_messages, ..
+            transfers,
+            clob_events,
+            outbound_messages,
+            ..
         } = &res
         {
             if !actor_send_sink.is_empty() {
@@ -2766,7 +2782,8 @@ impl InMemoryStateEngine {
 
             // Route any outbound contract messages produced by SysCallCallContract
             if !outbound_messages.is_empty() {
-                self.process_contract_outbound_messages(outbound_messages).await
+                self.process_contract_outbound_messages(outbound_messages)
+                    .await
                     .map_err(|e| format!("contract outbound message routing failed: {e}"))?;
             }
         }
@@ -2781,7 +2798,13 @@ impl InMemoryStateEngine {
         // therefore roll the book back before reporting the error (the payload
         // then behaves like a revert: no book change, no escrow change, no
         // value moved).
-        if let crate::svm::VmExecutionResult::Success { clob_events, trades, transfers, .. } = &res {
+        if let crate::svm::VmExecutionResult::Success {
+            clob_events,
+            trades,
+            transfers,
+            ..
+        } = &res
+        {
             if !clob_events.is_empty() {
                 // `ctx.trades` is the VM's own record of every fill it executed
                 // and the events are what settlement consumes; they are two
@@ -2801,8 +2824,7 @@ impl InMemoryStateEngine {
                     // keeps working if a later restore overwrites an account
                     // they share - every one of these snapshots predates the
                     // actor debit).
-                    self.restore_actor_native(actor_snapshot.as_ref())
-                        .await;
+                    self.restore_actor_native(actor_snapshot.as_ref()).await;
                     self.restore_pmm_native(&pmm_native_snapshot).await;
                     self.restore_bridge_native(bridge_snapshot.as_ref()).await;
                     if !pmm_events.is_empty() {
@@ -2837,8 +2859,7 @@ impl InMemoryStateEngine {
                     .saturating_add(tx.gas_limit)
                     .saturating_add(vm_out);
                 let clob_events = clob_events.clone();
-                let mut escrow =
-                    self.order_escrow_write().await;
+                let mut escrow = self.order_escrow_write().await;
                 let quote_id = *self.pmm_usdt_token.read().await;
                 let books = &orderbooks.books;
                 let settled = self
@@ -2856,27 +2877,26 @@ impl InMemoryStateEngine {
                 match settled {
                     Ok(snap) => clob_native_snapshot = snap,
                     Err(e) => {
-                    // The escrow settlement committed nothing (it plans on
-                    // private copies and only writes once the whole plan is
-                    // funded), so the swap, the bridge leg and the actor sends
-                    // above are the only native movements this payload made -
-                    // undo them (actor first: it was settled last), then undo
-                    // the VM's halves.
-                    self.restore_actor_native(actor_snapshot.as_ref())
-                        .await;
-                    self.restore_pmm_native(&pmm_native_snapshot).await;
-                    self.restore_bridge_native(bridge_snapshot.as_ref()).await;
-                    if !pmm_events.is_empty() {
-                        if let Some((before_pmm, before_tokens)) = pmm_before.take() {
-                            *pmm = before_pmm;
-                            *tokens = before_tokens;
+                        // The escrow settlement committed nothing (it plans on
+                        // private copies and only writes once the whole plan is
+                        // funded), so the swap, the bridge leg and the actor sends
+                        // above are the only native movements this payload made -
+                        // undo them (actor first: it was settled last), then undo
+                        // the VM's halves.
+                        self.restore_actor_native(actor_snapshot.as_ref()).await;
+                        self.restore_pmm_native(&pmm_native_snapshot).await;
+                        self.restore_bridge_native(bridge_snapshot.as_ref()).await;
+                        if !pmm_events.is_empty() {
+                            if let Some((before_pmm, before_tokens)) = pmm_before.take() {
+                                *pmm = before_pmm;
+                                *tokens = before_tokens;
+                            }
                         }
-                    }
-                    if let Some(before) = books_before.take() {
-                        orderbooks.books = before;
-                    }
-                    restore_oracle_after_failure(&mut oracle, oracle_before.take());
-                    return Err(format!("CLOB settlement failed: {e}"));
+                        if let Some(before) = books_before.take() {
+                            orderbooks.books = before;
+                        }
+                        restore_oracle_after_failure(&mut oracle, oracle_before.take());
+                        return Err(format!("CLOB settlement failed: {e}"));
                     }
                 }
             }
@@ -2895,8 +2915,7 @@ impl InMemoryStateEngine {
                 // /orderbook clones the VM commits internally, which survive a
                 // later settlement failure: revocation must be all-or-nothing
                 // with the transaction that performs it.
-                if let (Some(before), Some(work)) =
-                    (&session_keys_before, session_keys_work.take())
+                if let (Some(before), Some(work)) = (&session_keys_before, session_keys_work.take())
                 {
                     if *before != work {
                         *self.session_keys_write().await = work;
@@ -2910,8 +2929,7 @@ impl InMemoryStateEngine {
                 // remembered - and the write accessor bumps
                 // `commitment_generation`, so the next root read folds the new
                 // balances, spent inputs and fee total into the state root.
-                if let (Some(before), Some(work)) =
-                    (&confidential_before, confidential_work.take())
+                if let (Some(before), Some(work)) = (&confidential_before, confidential_work.take())
                 {
                     if *before != work {
                         *self.confidential_write().await = work;
@@ -2925,9 +2943,7 @@ impl InMemoryStateEngine {
                 // did not apply - and the write accessor bumps
                 // `commitment_generation`, so the next root read folds the new
                 // models into the state root.
-                if let (Some(before), Some(work)) =
-                    (&zkml_models_before, zkml_models_work.take())
-                {
+                if let (Some(before), Some(work)) = (&zkml_models_before, zkml_models_work.take()) {
                     if *before != work {
                         *self.zkml_models_write().await = work;
                     }
@@ -2937,12 +2953,15 @@ impl InMemoryStateEngine {
                 // (plus the domain snapshot it took before calling us),
                 // closing the B1 hole where a rejected transaction kept
                 // bridge/actor/PMM-native legs it had already settled.
-                Ok((res, ExecPostActions {
-                    bridge_snapshot,
-                    actor_snapshot,
-                    pmm_native_snapshot,
-                    clob_native_snapshot,
-                }))
+                Ok((
+                    res,
+                    ExecPostActions {
+                        bridge_snapshot,
+                        actor_snapshot,
+                        pmm_native_snapshot,
+                        clob_native_snapshot,
+                    },
+                ))
             }
             crate::svm::VmExecutionResult::OutOfGas => Err("SVM: out of gas".to_string()),
             crate::svm::VmExecutionResult::Reverted(e) => Err(format!("SVM reverted: {e}")),
@@ -2960,7 +2979,9 @@ impl InMemoryStateEngine {
         timestamp: u64,
     ) -> Result<(), String> {
         if tx.is_pq_implicit()
-            && crate::sharding::Transaction::global_implicit_registry().lookup(&tx.from).is_none()
+            && crate::sharding::Transaction::global_implicit_registry()
+                .lookup(&tx.from)
+                .is_none()
         {
             if let Some((scheme, pk)) = self.get_pinned_pubkey(&tx.from) {
                 let _ = crate::sharding::Transaction::global_implicit_registry().register(
@@ -3032,7 +3053,8 @@ impl InMemoryStateEngine {
         let mut map = self.accounts.write().await;
 
         // 2. Fetch sender account
-        let sender = map.get_mut(&tx.from)
+        let sender = map
+            .get_mut(&tx.from)
             .ok_or_else(|| "Sender account does not exist".to_string())?;
 
         // 3. Anti-Replay Nonce check
@@ -3071,7 +3093,9 @@ impl InMemoryStateEngine {
                 ));
             }
         } else {
-            let total_cost = tx.amount.checked_add(fee_reserved)
+            let total_cost = tx
+                .amount
+                .checked_add(fee_reserved)
                 .and_then(|t| t.checked_add(surcharge))
                 .ok_or_else(|| "Arithmetic overflow in transaction cost".to_string())?;
 
@@ -3124,16 +3148,21 @@ impl InMemoryStateEngine {
                 // writes back on Success, and the working copies die with it.)
                 Err(e) => {
                     if let Some(snap) = domain_snap {
-                        self.rollback_payload(snap, ExecPostActions {
-                            bridge_snapshot: None,
-                            actor_snapshot: None,
-                            pmm_native_snapshot: Vec::new(),
-                            clob_native_snapshot: Vec::new(),
-                        }).await;
+                        self.rollback_payload(
+                            snap,
+                            ExecPostActions {
+                                bridge_snapshot: None,
+                                actor_snapshot: None,
+                                pmm_native_snapshot: Vec::new(),
+                                clob_native_snapshot: Vec::new(),
+                            },
+                        )
+                        .await;
                     }
                     // F-01: an attributable failure pays the failure fee and
                     // consumes the nonce, exactly like the block path.
-                    self.charge_failure_fee_and_commit(tx, floor_base, surcharge).await;
+                    self.charge_failure_fee_and_commit(tx, floor_base, surcharge)
+                        .await;
                     return Err(e);
                 }
             };
@@ -3153,13 +3182,15 @@ impl InMemoryStateEngine {
                 }
                 crate::svm::VmExecutionResult::OutOfGas => {
                     // F-01: the failure fee + the nonce, like the block path.
-                    self.charge_failure_fee_and_commit(tx, floor_base, surcharge).await;
-                    return Err("SVM: out of gas".to_string())
+                    self.charge_failure_fee_and_commit(tx, floor_base, surcharge)
+                        .await;
+                    return Err("SVM: out of gas".to_string());
                 }
                 crate::svm::VmExecutionResult::Reverted(e) => {
                     // F-01: the failure fee + the nonce, like the block path.
-                    self.charge_failure_fee_and_commit(tx, floor_base, surcharge).await;
-                    return Err(format!("SVM reverted: {e}"))
+                    self.charge_failure_fee_and_commit(tx, floor_base, surcharge)
+                        .await;
+                    return Err(format!("SVM reverted: {e}"));
                 }
             }
         } else {
@@ -3186,7 +3217,8 @@ impl InMemoryStateEngine {
                     self.rollback_payload(snap, actions).await;
                 }
                 // F-01: the failure fee + the nonce, like the block path.
-                self.charge_failure_fee_and_commit(tx, floor_base, surcharge).await;
+                self.charge_failure_fee_and_commit(tx, floor_base, surcharge)
+                    .await;
                 return Err(e);
             }
         };
@@ -3201,9 +3233,11 @@ impl InMemoryStateEngine {
         // never speculatively inside execution (B1: the trie has no undo).
         // Read (never write-locked together with the trie below): lock order
         // is contracts-then-trie everywhere, or ABBA-deadlock with writers.
-        let deployed_contracts = if tx.payload.iter().any(|op| {
-            matches!(op, crate::svm::OpCode::SysCallDeployContract { .. })
-        }) {
+        let deployed_contracts = if tx
+            .payload
+            .iter()
+            .any(|op| matches!(op, crate::svm::OpCode::SysCallDeployContract { .. }))
+        {
             Some((*self.contracts_read().await).clone())
         } else {
             None
@@ -3329,7 +3363,8 @@ impl InMemoryStateEngine {
         penalties: &HashMap<[u8; 32], u64>,
         tx: &crate::sharding::Transaction,
     ) -> (u64, u64) {
-        let floor_base = governed_base.saturating_add(penalties.get(&tx.from).copied().unwrap_or(0));
+        let floor_base =
+            governed_base.saturating_add(penalties.get(&tx.from).copied().unwrap_or(0));
         let surcharge = if tx.is_pq_activation() {
             PQ_ACTIVATION_SURCHARGE_GAS
         } else {
@@ -3435,7 +3470,10 @@ impl InMemoryStateEngine {
         };
         user.nonce += 1;
         let user_state = (user.balance, user.nonce);
-        (fee, Some((user_state.0, user_state.1, sponsor_state.0, sponsor_state.1)))
+        (
+            fee,
+            Some((user_state.0, user_state.1, sponsor_state.0, sponsor_state.1)),
+        )
     }
 
     /// Async wrapper around [`Self::apply_sponsored_failure_fee_to_map`].
@@ -3476,8 +3514,7 @@ impl InMemoryStateEngine {
             let (_debited, charged_state) = self
                 .charge_sponsored_failure_fee(tx, &auth.sponsor, fee)
                 .await;
-            let Some((user_balance, user_nonce, sponsor_balance, sponsor_nonce)) =
-                charged_state
+            let Some((user_balance, user_nonce, sponsor_balance, sponsor_nonce)) = charged_state
             else {
                 // Not attributable (no sender / nonce mismatch / sponsor
                 // cannot cover): no pay, no state change.
@@ -3618,7 +3655,9 @@ impl InMemoryStateEngine {
         let (floor_base, surcharge) = self.consensus_floor_parts(tx).await;
         let fee = gas_charged.min(tx.gas_limit).max(floor_base);
         let fee_with_surcharge = fee.saturating_add(surcharge);
-        let charge = tx.amount.checked_add(fee_with_surcharge)
+        let charge = tx
+            .amount
+            .checked_add(fee_with_surcharge)
             .ok_or_else(|| "Arithmetic overflow in transaction cost".to_string())?;
         // Everything the payload moves has to be affordable on top of the fee.
         let required = charge
@@ -3627,7 +3666,9 @@ impl InMemoryStateEngine {
         // The floored fee is what is actually debited, so the reservation
         // check prices it (not the declared limit): when the floor binds,
         // `fee > gas_limit` and the declared-limit check would under-reserve.
-        let total_cost = tx.amount.checked_add(fee)
+        let total_cost = tx
+            .amount
+            .checked_add(fee)
             .and_then(|t| t.checked_add(surcharge))
             .ok_or_else(|| "Arithmetic overflow in transaction cost".to_string())?;
 
@@ -3663,7 +3704,10 @@ impl InMemoryStateEngine {
         // pin below, which runs after this lock is dropped and must roll back
         // through the same log (fork-288000 atomicity: a pin write failure
         // must not leak the debit + nonce advance).
-        let mut undo: Vec<([u8; 32], Option<(u64, u64, crate::post_quantum::PqScheme, Option<[u8; 32]>)>)> = Vec::new();
+        let mut undo: Vec<(
+            [u8; 32],
+            Option<(u64, u64, crate::post_quantum::PqScheme, Option<[u8; 32]>)>,
+        )> = Vec::new();
         // Accounts that ended up changed, for the caller's trie write.
         let mut touched: Vec<[u8; 32]> = Vec::new();
 
@@ -3672,8 +3716,7 @@ impl InMemoryStateEngine {
         // target shard and is credited only when the committed CrossShardMessage
         // is consumed there. Gated on the sharding flag, so a single-shard
         // engine (every pre-sharding test) keeps the historical behaviour.
-        let burn_for_cross_shard =
-            self.cross_shard_enabled() && tx.source_shard != tx.target_shard;
+        let burn_for_cross_shard = self.cross_shard_enabled() && tx.source_shard != tx.target_shard;
 
         let outcome = {
             let mut f = || -> Result<(), String> {
@@ -3688,7 +3731,9 @@ impl InMemoryStateEngine {
                 let sponsor_addr = tx.sponsored_grant().map(|a| a.sponsor);
                 // The user's leg needs `amount` at minimum, `amount + vm_out`
                 // once the payload's own movements are included.
-                let user_need = tx.amount.checked_add(vm_out)
+                let user_need = tx
+                    .amount
+                    .checked_add(vm_out)
                     .ok_or_else(|| "Arithmetic overflow in transaction cost".to_string())?;
                 let (ubal, unonce, uscheme, uhash) = map
                     .get(&tx.from)
@@ -3700,50 +3745,54 @@ impl InMemoryStateEngine {
                 }
                 // The sponsor's pre-mutation leaf for the undo log (its nonce
                 // never advances: only the user's does).
-                let sponsor_pre: Option<([u8; 32], (u64, u64, crate::post_quantum::PqScheme, Option<[u8; 32]>))> =
-                    if let Some(sponsor) = sponsor_addr {
-                        if ubal < tx.amount {
-                            return Err(
-                                "Insufficient balance (state changed during execution)".to_string(),
-                            );
-                        }
-                        if ubal < user_need {
-                            return Err(format!(
-                                "Insufficient balance for payload: has {ubal}, needs {user_need}"
-                            ));
-                        }
-                        let leaf = map
-                            .get(&sponsor)
-                            .map(|a| (a.balance, a.nonce, a.scheme, a.pubkey_hash))
-                            .ok_or_else(|| "Sponsor account does not exist".to_string())?;
-                        if leaf.0 < fee_with_surcharge {
-                            return Err(
+                let sponsor_pre: Option<(
+                    [u8; 32],
+                    (u64, u64, crate::post_quantum::PqScheme, Option<[u8; 32]>),
+                )> = if let Some(sponsor) = sponsor_addr {
+                    if ubal < tx.amount {
+                        return Err(
+                            "Insufficient balance (state changed during execution)".to_string()
+                        );
+                    }
+                    if ubal < user_need {
+                        return Err(format!(
+                            "Insufficient balance for payload: has {ubal}, needs {user_need}"
+                        ));
+                    }
+                    let leaf = map
+                        .get(&sponsor)
+                        .map(|a| (a.balance, a.nonce, a.scheme, a.pubkey_hash))
+                        .ok_or_else(|| "Sponsor account does not exist".to_string())?;
+                    if leaf.0 < fee_with_surcharge {
+                        return Err(
                                 "Sponsor has insufficient balance for fee (state changed during execution)".to_string(),
                             );
-                        }
-                        Some((sponsor, leaf))
-                    } else {
-                        if ubal < total_cost {
-                            return Err(
-                                "Insufficient balance (state changed during execution)".to_string(),
-                            );
-                        }
-                        if ubal < required {
-                            return Err(format!(
-                                "Insufficient balance for payload: has {ubal}, needs {required}"
-                            ));
-                        }
-                        None
-                    };
+                    }
+                    Some((sponsor, leaf))
+                } else {
+                    if ubal < total_cost {
+                        return Err(
+                            "Insufficient balance (state changed during execution)".to_string()
+                        );
+                    }
+                    if ubal < required {
+                        return Err(format!(
+                            "Insufficient balance for payload: has {ubal}, needs {required}"
+                        ));
+                    }
+                    None
+                };
 
                 if tx.is_pq_activation() {
-                    let env = tx.pq_envelope()
+                    let env = tx
+                        .pq_envelope()
                         .ok_or_else(|| "Missing PQ activation envelope".to_string())?;
                     if env.is_implicit {
                         return Err("PQ activation envelope must not be implicit".to_string());
                     }
-                    let pk = env.pubkey.as_deref()
-                        .ok_or_else(|| "Missing public key in PQ activation envelope".to_string())?;
+                    let pk = env.pubkey.as_deref().ok_or_else(|| {
+                        "Missing public key in PQ activation envelope".to_string()
+                    })?;
                     let salt = env.salt;
                     // Fork-288000 atomicity: every refusal `pin_pubkey` can
                     // produce must ALSO be produced here, BEFORE any mutation
@@ -3828,8 +3877,7 @@ impl InMemoryStateEngine {
                 // bookkeeping. Refusal rolls back via the undo log (caller
                 // also rolls back payload domains).
                 if let Some(locked) = sender_vesting_floor {
-                    let post_user_balance =
-                        map.get(&tx.from).map(|a| a.balance).unwrap_or(0);
+                    let post_user_balance = map.get(&tx.from).map(|a| a.balance).unwrap_or(0);
                     if post_user_balance < locked {
                         let msg = format!(
                             "team vesting lock: sender {} balance {} would fall below locked {locked} (spending above the unlocked amount is refused)",
@@ -3847,11 +3895,17 @@ impl InMemoryStateEngine {
                 // the committed message. Skipping it keeps value conserved
                 // ACROSS shards once the target applies the message.
                 if !burn_for_cross_shard {
-                    undo.push((tx.to, map.get(&tx.to).map(|a| (a.balance, a.nonce, a.scheme, a.pubkey_hash))));
+                    undo.push((
+                        tx.to,
+                        map.get(&tx.to)
+                            .map(|a| (a.balance, a.nonce, a.scheme, a.pubkey_hash)),
+                    ));
                     touched.push(tx.to);
                     if let Some(recipient) = map.get_mut(&tx.to) {
-                        recipient.balance = recipient.balance.checked_add(tx.amount)
-                            .ok_or_else(|| "Arithmetic overflow on recipient balance".to_string())?;
+                        recipient.balance =
+                            recipient.balance.checked_add(tx.amount).ok_or_else(|| {
+                                "Arithmetic overflow on recipient balance".to_string()
+                            })?;
                     } else {
                         map.insert(tx.to, AccountState::new(tx.to, tx.amount));
                     }
@@ -3860,7 +3914,11 @@ impl InMemoryStateEngine {
                 // The payload's own value movements (this is what `OpCode::Transfer`
                 // and the SysCallStake bond to the staking pool resolve to).
                 for (to, amount) in transfers {
-                    undo.push((*to, map.get(to).map(|a| (a.balance, a.nonce, a.scheme, a.pubkey_hash))));
+                    undo.push((
+                        *to,
+                        map.get(to)
+                            .map(|a| (a.balance, a.nonce, a.scheme, a.pubkey_hash)),
+                    ));
                     touched.push(*to);
                     if let Some(acc) = map.get_mut(to) {
                         acc.balance = acc.balance.checked_add(*amount).ok_or_else(|| {
@@ -3873,7 +3931,11 @@ impl InMemoryStateEngine {
                 // Payouts are funded by a third party (the staking pool), so the
                 // payer's balance is checked and debited here rather than assumed.
                 for (payer, beneficiary, amount) in payouts {
-                    undo.push((*payer, map.get(payer).map(|a| (a.balance, a.nonce, a.scheme, a.pubkey_hash))));
+                    undo.push((
+                        *payer,
+                        map.get(payer)
+                            .map(|a| (a.balance, a.nonce, a.scheme, a.pubkey_hash)),
+                    ));
                     let acc = map
                         .get_mut(payer)
                         .ok_or_else(|| "Payout payer account does not exist".to_string())?;
@@ -3889,7 +3951,9 @@ impl InMemoryStateEngine {
                     // Same vesting gate for a tracked payout payer: pool
                     // accounts are never tracked, so this only fires for a
                     // directly-constructed payout naming a vested account.
-                    if let Some((_, locked)) = payout_vesting_floors.iter().find(|(p, _)| p == payer) {
+                    if let Some((_, locked)) =
+                        payout_vesting_floors.iter().find(|(p, _)| p == payer)
+                    {
                         if acc.balance < *locked {
                             let msg = format!(
                                 "team vesting lock: payout payer {} balance {} would fall below locked {locked}",
@@ -3901,10 +3965,16 @@ impl InMemoryStateEngine {
                         }
                     }
 
-                    undo.push((*beneficiary, map.get(beneficiary).map(|a| (a.balance, a.nonce, a.scheme, a.pubkey_hash))));
+                    undo.push((
+                        *beneficiary,
+                        map.get(beneficiary)
+                            .map(|a| (a.balance, a.nonce, a.scheme, a.pubkey_hash)),
+                    ));
                     touched.push(*beneficiary);
                     if let Some(b) = map.get_mut(beneficiary) {
-                        b.balance = b.balance.checked_add(*amount)
+                        b.balance = b
+                            .balance
+                            .checked_add(*amount)
                             .ok_or_else(|| "Arithmetic overflow crediting payout".to_string())?;
                     } else {
                         map.insert(*beneficiary, AccountState::new(*beneficiary, *amount));
@@ -3926,7 +3996,11 @@ impl InMemoryStateEngine {
                     if *amount == 0 {
                         continue;
                     }
-                    undo.push((*from, map.get(from).map(|a| (a.balance, a.nonce, a.scheme, a.pubkey_hash))));
+                    undo.push((
+                        *from,
+                        map.get(from)
+                            .map(|a| (a.balance, a.nonce, a.scheme, a.pubkey_hash)),
+                    ));
                     let acc = map
                         .get_mut(from)
                         .ok_or_else(|| "Burn account does not exist".to_string())?;
@@ -4100,9 +4174,8 @@ impl InMemoryStateEngine {
                 for &i in wave {
                     let tx = &txs[i];
                     for addr in [tx.from, tx.to] {
-                        snap.entry(addr).or_insert_with(|| {
-                            map.get(&addr).map(|a| (a.balance, a.nonce))
-                        });
+                        snap.entry(addr)
+                            .or_insert_with(|| map.get(&addr).map(|a| (a.balance, a.nonce)));
                     }
                     // PAYMASTER v1: the wave also mutates the sponsor
                     // account (the fee leg), so it joins the snapshot —
@@ -4110,9 +4183,8 @@ impl InMemoryStateEngine {
                     // sponsor balance that moved underneath aborts the wave
                     // into the sequential path instead of double-spending.
                     if let Some(sponsor) = tx.effective_sponsor() {
-                        snap.entry(sponsor).or_insert_with(|| {
-                            map.get(&sponsor).map(|a| (a.balance, a.nonce))
-                        });
+                        snap.entry(sponsor)
+                            .or_insert_with(|| map.get(&sponsor).map(|a| (a.balance, a.nonce)));
                     }
                 }
                 snap
@@ -4123,7 +4195,8 @@ impl InMemoryStateEngine {
                 .par_iter()
                 .map(|&i| {
                     let tx = &txs[i];
-                    let (floor_base, surcharge) = Self::floor_parts_for(governed_base, penalties, tx);
+                    let (floor_base, surcharge) =
+                        Self::floor_parts_for(governed_base, penalties, tx);
                     let session_ok = session_valid
                         .map(|sv| sv.get(&i).copied().unwrap_or(false))
                         .unwrap_or(true);
@@ -4200,7 +4273,8 @@ impl InMemoryStateEngine {
                 let session_ok = session_valid
                     .map(|sv| sv.get(&i).copied().unwrap_or(false))
                     .unwrap_or(true);
-                let sponsor = tx.effective_sponsor()
+                let sponsor = tx
+                    .effective_sponsor()
                     .and_then(|s| map.get(&s).map(|a| (a.balance, a.nonce)));
                 let plan = plan_plain_tx(
                     tx,
@@ -4279,12 +4353,11 @@ impl InMemoryStateEngine {
                     ..
                 } = op
                 {
-                    let digest =
-                        crate::crypto_privacy::confidential_transfer2_preverify_digest(
-                            transfer,
-                            input_ranges,
-                            output_ranges,
-                        );
+                    let digest = crate::crypto_privacy::confidential_transfer2_preverify_digest(
+                        transfer,
+                        input_ranges,
+                        output_ranges,
+                    );
                     // First occurrence wins: identical bundles verify
                     // identically, so verifying each digest once is exact and
                     // keeps the batch order deterministic (block order).
@@ -4312,9 +4385,7 @@ impl InMemoryStateEngine {
             .map(|it| (it.transfer, it.input_ranges, it.output_ranges))
             .collect();
         let verdicts =
-            crate::crypto_privacy::ConfidentialTransfer::batch_verify_balanced_with_ranges(
-                &refs,
-            );
+            crate::crypto_privacy::ConfidentialTransfer::batch_verify_balanced_with_ranges(&refs);
         debug_assert_eq!(items.len(), verdicts.len());
         for (it, v) in items.iter().zip(verdicts.iter()) {
             tracing::trace!(tx = it.tx_idx, verdict = v, "confidential pre-pass verdict");
@@ -4363,8 +4434,9 @@ impl InMemoryStateEngine {
         txs: &[crate::sharding::Transaction],
         timestamp: u64,
     ) -> (usize, usize, u64, Vec<bool>, Vec<u64>) {
-        let (applied, failed, fees, status, tx_fees, _events) =
-            self.apply_block_parallel_fees_with_events(txs, timestamp).await;
+        let (applied, failed, fees, status, tx_fees, _events) = self
+            .apply_block_parallel_fees_with_events(txs, timestamp)
+            .await;
         (applied, failed, fees, status, tx_fees)
     }
 
@@ -4372,13 +4444,22 @@ impl InMemoryStateEngine {
         &self,
         txs: &[crate::sharding::Transaction],
         timestamp: u64,
-    ) -> (usize, usize, u64, Vec<bool>, Vec<u64>, Vec<Vec<crate::contract::ContractEvent>>) {
+    ) -> (
+        usize,
+        usize,
+        u64,
+        Vec<bool>,
+        Vec<u64>,
+        Vec<Vec<crate::contract::ContractEvent>>,
+    ) {
         if txs.is_empty() {
             return (0, 0, 0, Vec::new(), Vec::new(), Vec::new());
         }
         for tx in txs {
             if tx.is_pq_implicit()
-                && crate::sharding::Transaction::global_implicit_registry().lookup(&tx.from).is_none()
+                && crate::sharding::Transaction::global_implicit_registry()
+                    .lookup(&tx.from)
+                    .is_none()
             {
                 if let Some((scheme, pk)) = self.get_pinned_pubkey(&tx.from) {
                     let _ = crate::sharding::Transaction::global_implicit_registry().register(
@@ -4397,10 +4478,13 @@ impl InMemoryStateEngine {
         let mut order: Vec<[u8; 32]> = Vec::new();
         let mut groups: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
         for (i, tx) in txs.iter().enumerate() {
-            groups.entry(tx.from).or_insert_with(|| {
-                order.push(tx.from);
-                Vec::new()
-            }).push(i);
+            groups
+                .entry(tx.from)
+                .or_insert_with(|| {
+                    order.push(tx.from);
+                    Vec::new()
+                })
+                .push(i);
         }
 
         // 3) Pre-validate ADMISSION in deterministic order: signature,
@@ -4440,8 +4524,7 @@ impl InMemoryStateEngine {
             .applied
             .min_gas_limit
             .unwrap_or(0);
-        let penalties: HashMap<[u8; 32], u64> =
-            self.consensus_penalty.read().await.clone();
+        let penalties: HashMap<[u8; 32], u64> = self.consensus_penalty.read().await.clone();
         // Team-vesting locked floors at the block timestamp, snapshotted once
         // per block (same shape as the penalty snapshot above): the parallel
         // PLAIN fast path below bypasses `commit_native`, so it enforces the
@@ -4473,7 +4556,9 @@ impl InMemoryStateEngine {
             // nonce — the same shape as a missing sender).
             let mut sponsor_sim: HashMap<[u8; 32], u64> = HashMap::new();
             for addr in &order {
-                let Some(sender) = map.get(addr) else { continue };
+                let Some(sender) = map.get(addr) else {
+                    continue;
+                };
                 let mut nonce = sender.nonce;
                 let mut balance = sender.balance;
                 for &i in &groups[addr] {
@@ -4542,10 +4627,7 @@ impl InMemoryStateEngine {
                         if sponsor_balance < fee_total {
                             continue;
                         }
-                        sponsor_sim.insert(
-                            auth.sponsor,
-                            sponsor_balance.saturating_sub(fee_total),
-                        );
+                        sponsor_sim.insert(auth.sponsor, sponsor_balance.saturating_sub(fee_total));
                         admitted[i] = true;
                         nonce += 1;
                         balance = balance.saturating_sub(tx.amount);
@@ -4562,7 +4644,11 @@ impl InMemoryStateEngine {
                     let (floor_base, surcharge) =
                         Self::floor_parts_for(governed_base, &penalties, tx);
                     let fee_reserved = tx.gas_limit.max(floor_base);
-                    let Some(total) = tx.amount.checked_add(fee_reserved).and_then(|t| t.checked_add(surcharge)) else {
+                    let Some(total) = tx
+                        .amount
+                        .checked_add(fee_reserved)
+                        .and_then(|t| t.checked_add(surcharge))
+                    else {
                         continue;
                     };
                     if balance < total {
@@ -4639,8 +4725,7 @@ impl InMemoryStateEngine {
         macro_rules! fail_with_floor {
             ($tx:expr, $idx:expr) => {{
                 failed += 1;
-                let (floor_base, surcharge) =
-                    Self::floor_parts_for(governed_base, &penalties, $tx);
+                let (floor_base, surcharge) = Self::floor_parts_for(governed_base, &penalties, $tx);
                 let fee = $tx.gas_limit.max(floor_base).saturating_add(surcharge);
                 if let Some(auth) = $tx.sponsored_grant() {
                     let (debited, charged_state) = self
@@ -4655,9 +4740,7 @@ impl InMemoryStateEngine {
                     fees_collected = fees_collected.saturating_add(debited);
                     fees[$idx] = debited;
                 } else {
-                    let (debited, charged_state) = self
-                        .charge_failure_fee($tx, fee)
-                        .await;
+                    let (debited, charged_state) = self.charge_failure_fee($tx, fee).await;
                     if let Some((balance, nonce)) = charged_state {
                         trie_dirty.push(($tx.from, balance, nonce));
                     }
@@ -4678,7 +4761,9 @@ impl InMemoryStateEngine {
 
         if use_parallel {
             for wave in waves {
-                let wave_all_plain = wave.iter().all(|&i| txs[i].payload.is_empty() && !txs[i].is_pq_activation());
+                let wave_all_plain = wave
+                    .iter()
+                    .all(|&i| txs[i].payload.is_empty() && !txs[i].is_pq_activation());
                 if wave_all_plain {
                     // CONCURRENT WAVE: every transaction of this wave is a
                     // plain value transfer, and the scheduler guarantees that
@@ -4760,8 +4845,11 @@ impl InMemoryStateEngine {
                                         } else if sender.balance < tx.amount {
                                             4
                                         } else {
-                                            let (floor_base, surcharge) =
-                                                Self::floor_parts_for(governed_base, &penalties, tx);
+                                            let (floor_base, surcharge) = Self::floor_parts_for(
+                                                governed_base,
+                                                &penalties,
+                                                tx,
+                                            );
                                             let fee_total = tx
                                                 .gas_limit
                                                 .max(floor_base)
@@ -4788,7 +4876,10 @@ impl InMemoryStateEngine {
                                         } else {
                                             0
                                         };
-                                        let total = tx.amount.checked_add(tx.gas_limit).and_then(|t| t.checked_add(surcharge));
+                                        let total = tx
+                                            .amount
+                                            .checked_add(tx.gas_limit)
+                                            .and_then(|t| t.checked_add(surcharge));
                                         match total {
                                             None => 3,
                                             Some(tot) if sender.balance < tot => 4,
@@ -4818,55 +4909,82 @@ impl InMemoryStateEngine {
                         }
                         let mut domain_snap: Option<PayloadDomainSnapshot> = None;
                         let mut post_actions: Option<ExecPostActions> = None;
-                        let (transfers, payouts, burns, gas_used, tx_events) = if tx.payload.is_empty() {
-                            (Vec::new(), Vec::new(), Vec::new(), tx.gas_limit, Vec::new())
-                        } else {
-                            domain_snap =
-                                Some(self.snapshot_payload_domains(&tx.payload).await);
-                            match self.execute_payload_with_preverify(tx, timestamp, Some(&range_preverify)).await {
-                                Ok((crate::svm::VmExecutionResult::Success {
-                                    transfers,
-                                    payouts,
-                                    burns,
-                                    gas_used,
-                                    events: evts,
-                                    ..
-                                }, actions)) => {
-                                    post_actions = Some(actions);
-                                    (transfers, payouts, burns, gas_used, evts)
-                                }
-                                Ok((crate::svm::VmExecutionResult::OutOfGas, _)) => {
-                                    fail_with_floor!(tx, i);
-                                    continue;
-                                }
-                                Ok((crate::svm::VmExecutionResult::Reverted(e), _)) => {
-                                    tracing::debug!(tx = i, "payload reverted: {e}");
-                                    fail_with_floor!(tx, i);
-                                    continue;
-                                }
-                                Err(e) => {
-                                    tracing::debug!(tx = i, "payload rejected: {e}");
-                                    if let Some(snap) = domain_snap {
-                                        self.rollback_payload(snap, ExecPostActions {
-                                            bridge_snapshot: None,
-                                            actor_snapshot: None,
-                                            pmm_native_snapshot: Vec::new(),
-                                            clob_native_snapshot: Vec::new(),
-                                        }).await;
+                        let (transfers, payouts, burns, gas_used, tx_events) =
+                            if tx.payload.is_empty() {
+                                (Vec::new(), Vec::new(), Vec::new(), tx.gas_limit, Vec::new())
+                            } else {
+                                domain_snap =
+                                    Some(self.snapshot_payload_domains(&tx.payload).await);
+                                match self
+                                    .execute_payload_with_preverify(
+                                        tx,
+                                        timestamp,
+                                        Some(&range_preverify),
+                                    )
+                                    .await
+                                {
+                                    Ok((
+                                        crate::svm::VmExecutionResult::Success {
+                                            transfers,
+                                            payouts,
+                                            burns,
+                                            gas_used,
+                                            events: evts,
+                                            ..
+                                        },
+                                        actions,
+                                    )) => {
+                                        post_actions = Some(actions);
+                                        (transfers, payouts, burns, gas_used, evts)
                                     }
-                                    fail_with_floor!(tx, i);
-                                    continue;
+                                    Ok((crate::svm::VmExecutionResult::OutOfGas, _)) => {
+                                        fail_with_floor!(tx, i);
+                                        continue;
+                                    }
+                                    Ok((crate::svm::VmExecutionResult::Reverted(e), _)) => {
+                                        tracing::debug!(tx = i, "payload reverted: {e}");
+                                        fail_with_floor!(tx, i);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(tx = i, "payload rejected: {e}");
+                                        if let Some(snap) = domain_snap {
+                                            self.rollback_payload(
+                                                snap,
+                                                ExecPostActions {
+                                                    bridge_snapshot: None,
+                                                    actor_snapshot: None,
+                                                    pmm_native_snapshot: Vec::new(),
+                                                    clob_native_snapshot: Vec::new(),
+                                                },
+                                            )
+                                            .await;
+                                        }
+                                        fail_with_floor!(tx, i);
+                                        continue;
+                                    }
                                 }
-                            }
-                        };
-                        match self.commit_native(tx, tx.gas_limit, &transfers, &payouts, &burns, timestamp).await {
+                            };
+                        match self
+                            .commit_native(
+                                tx,
+                                tx.gas_limit,
+                                &transfers,
+                                &payouts,
+                                &burns,
+                                timestamp,
+                            )
+                            .await
+                        {
                             Ok((touched, fee)) => {
                                 if tx.is_pq_activation() {
                                     if let Some(env) = tx.pq_envelope() {
                                         if !env.is_implicit {
                                             if let Some(ref pk) = env.pubkey {
                                                 let salt = crate::post_quantum::DEFAULT_SALT;
-                                                let _ = self.pin_pubkey(tx.from, env.scheme, pk, &salt).await;
+                                                let _ = self
+                                                    .pin_pubkey(tx.from, env.scheme, pk, &salt)
+                                                    .await;
                                             }
                                         }
                                     }
@@ -4891,231 +5009,243 @@ impl InMemoryStateEngine {
                 }
             }
         } else {
-        for i in 0..txs.len() {
-            let tx = &txs[i];
-            if !admitted[i] {
-                failed += 1;
-                continue;
-            }
-            // Re-check admission under the lock BEFORE the payload runs (this is
-            // `apply_transaction`'s steps 2-4): admission assumed every
-            // predecessor from this sender would apply, and a predecessor can
-            // have failed since. A payload must never execute for a transaction
-            // that will be rejected (I9 / `rejected_tx_payload_is_not_executed`).
-            //
-            // Empty-payload transfers execute nothing, so they skip this
-            // read-lock pass: `commit_native` re-checks the same nonce/balance
-            // under the write lock and fails the transaction identically (same
-            // verdict, same untouched state). Skipping it only removes a lock
-            // round trip per plain transfer; payload-bearing transactions keep
-            // the guard.
-            if !tx.payload.is_empty() {
-                let precheck = {
-                    let map = self.accounts.read().await;
-                    // PAYMASTER v1: split-leg precheck (same shape as the
-                    // parallel-wave precheck above).
-                    if let Some(auth) = tx.sponsored_grant() {
-                        if let Some(sender) = map.get(&tx.from) {
-                            if tx.nonce != sender.nonce {
-                                2
-                            } else if sender.balance < tx.amount {
-                                4
-                            } else {
-                                let (floor_base, surcharge) =
-                                    Self::floor_parts_for(governed_base, &penalties, tx);
-                                let fee_total = tx
-                                    .gas_limit
-                                    .max(floor_base)
-                                    .saturating_add(surcharge);
-                                let sponsor_balance = map
-                                    .get(&auth.sponsor)
-                                    .map(|a| a.balance)
-                                    .unwrap_or(0);
-                                if sponsor_balance < fee_total {
+            for i in 0..txs.len() {
+                let tx = &txs[i];
+                if !admitted[i] {
+                    failed += 1;
+                    continue;
+                }
+                // Re-check admission under the lock BEFORE the payload runs (this is
+                // `apply_transaction`'s steps 2-4): admission assumed every
+                // predecessor from this sender would apply, and a predecessor can
+                // have failed since. A payload must never execute for a transaction
+                // that will be rejected (I9 / `rejected_tx_payload_is_not_executed`).
+                //
+                // Empty-payload transfers execute nothing, so they skip this
+                // read-lock pass: `commit_native` re-checks the same nonce/balance
+                // under the write lock and fails the transaction identically (same
+                // verdict, same untouched state). Skipping it only removes a lock
+                // round trip per plain transfer; payload-bearing transactions keep
+                // the guard.
+                if !tx.payload.is_empty() {
+                    let precheck = {
+                        let map = self.accounts.read().await;
+                        // PAYMASTER v1: split-leg precheck (same shape as the
+                        // parallel-wave precheck above).
+                        if let Some(auth) = tx.sponsored_grant() {
+                            if let Some(sender) = map.get(&tx.from) {
+                                if tx.nonce != sender.nonce {
+                                    2
+                                } else if sender.balance < tx.amount {
                                     4
                                 } else {
+                                    let (floor_base, surcharge) =
+                                        Self::floor_parts_for(governed_base, &penalties, tx);
+                                    let fee_total =
+                                        tx.gas_limit.max(floor_base).saturating_add(surcharge);
+                                    let sponsor_balance =
+                                        map.get(&auth.sponsor).map(|a| a.balance).unwrap_or(0);
+                                    if sponsor_balance < fee_total {
+                                        4
+                                    } else {
+                                        0
+                                    }
+                                }
+                            } else {
+                                1
+                            }
+                        } else if let Some(sender) = map.get(&tx.from) {
+                            if tx.nonce != sender.nonce {
+                                2
+                            } else {
+                                let surcharge = if tx.is_pq_activation() {
+                                    PQ_ACTIVATION_SURCHARGE_GAS
+                                } else {
                                     0
+                                };
+                                let total = tx
+                                    .amount
+                                    .checked_add(tx.gas_limit)
+                                    .and_then(|t| t.checked_add(surcharge));
+                                match total {
+                                    None => 3,
+                                    Some(tot) if sender.balance < tot => 4,
+                                    _ => 0,
                                 }
                             }
                         } else {
                             1
                         }
-                    } else if let Some(sender) = map.get(&tx.from) {
-                        if tx.nonce != sender.nonce {
-                            2
-                        } else {
-                            let surcharge = if tx.is_pq_activation() {
-                                PQ_ACTIVATION_SURCHARGE_GAS
-                            } else {
-                                0
-                            };
-                            let total = tx.amount.checked_add(tx.gas_limit).and_then(|t| t.checked_add(surcharge));
-                            match total {
-                                None => 3,
-                                Some(tot) if sender.balance < tot => 4,
-                                _ => 0,
-                            }
+                    };
+                    match precheck {
+                        1 => {
+                            failed += 1;
+                            continue;
                         }
-                    } else {
-                        1
+                        2..=4 => {
+                            fail_with_floor!(tx, i);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // ...and the session gate against the registry AS IT STANDS NOW.
+                // Admission above simulated this block's spend; here the earlier
+                // transactions have actually applied and been deducted, so this
+                // live check is the authoritative one - a predecessor can have
+                // consumed the rest of the grant since admission, and a payload
+                // must never execute for a transaction that will be rejected.
+                // (Revocation is re-checked here too, so a revoke earlier in this
+                // very block stops the ones after it.)
+                if let Err(e) = self.session_gate(tx, timestamp).await {
+                    tracing::debug!(tx = i, "session gate: {e}");
+                    fail_with_floor!(tx, i);
+                    continue;
+                }
+
+                // The payload itself: clone-commit, so a reverting or out-of-gas
+                // program leaves no partial effect. Its `transfers` and `payouts`
+                // are the value the payload moved, and they are NOT optional - the
+                // whole point of the P0 this replaced was that they were dropped
+                // here, so a Transfer, a SysCallStake bond or a reward claim moved
+                // no coins while still reporting success.
+                //
+                // `gas_used` is what the session budget will be charged if this
+                // transaction applies: the VM's consumption for a payload, the
+                // DECLARED `gas_limit` for an empty-payload transfer (no VM ran,
+                // so nothing else could measure it - and it must still consume
+                // budget, or a plain session transfer would bypass the cap that
+                // phase 1 closed for the policy checks).
+                //
+                // B1 atomicity (mirrors `apply_transaction`): per-tx domain
+                // snapshot + settlement undo records, restored if the commit
+                // below refuses.
+                let mut domain_snap: Option<PayloadDomainSnapshot> = None;
+                let mut post_actions: Option<ExecPostActions> = None;
+                let (transfers, payouts, burns, gas_used, tx_events) = if tx.payload.is_empty() {
+                    (Vec::new(), Vec::new(), Vec::new(), tx.gas_limit, Vec::new())
+                } else {
+                    // Block path: hand the pre-pass verdicts over. The single-tx
+                    // path (`apply_transaction` -> `execute_payload`) passes `None`
+                    // and never consults the cache.
+                    //
+                    // B1 atomicity: snapshot domains BEFORE the VM runs; any
+                    // failure after (including the native commit below) restores
+                    // everything (see rollback_payload). NOTE: must stay in sync
+                    // with the `apply_transaction` copy.
+                    domain_snap = Some(self.snapshot_payload_domains(&tx.payload).await);
+                    match self
+                        .execute_payload_with_preverify(tx, timestamp, Some(&range_preverify))
+                        .await
+                    {
+                        Ok((
+                            crate::svm::VmExecutionResult::Success {
+                                transfers,
+                                payouts,
+                                burns,
+                                gas_used,
+                                events: evts,
+                                ..
+                            },
+                            actions,
+                        )) => {
+                            // Stash for the commit-failure arm below.
+                            // (transfers, payouts, burns, gas_used) flow into the
+                            // commit; actions flow into the rollback.
+                            post_actions = Some(actions);
+                            (transfers, payouts, burns, gas_used, evts)
+                        }
+                        // `execute_payload` maps OutOfGas/Reverted to Err; the arms
+                        // are kept exhaustive to match `apply_transaction`.
+                        Ok((crate::svm::VmExecutionResult::OutOfGas, _)) => {
+                            fail_with_floor!(tx, i);
+                            continue;
+                        }
+                        Ok((crate::svm::VmExecutionResult::Reverted(e), _)) => {
+                            tracing::debug!(tx = i, "payload reverted: {e}");
+                            fail_with_floor!(tx, i);
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::debug!(tx = i, "payload rejected: {e}");
+                            if let Some(snap) = domain_snap {
+                                self.rollback_payload(
+                                    snap,
+                                    ExecPostActions {
+                                        bridge_snapshot: None,
+                                        actor_snapshot: None,
+                                        pmm_native_snapshot: Vec::new(),
+                                        clob_native_snapshot: Vec::new(),
+                                    },
+                                )
+                                .await;
+                            }
+                            fail_with_floor!(tx, i);
+                            continue;
+                        }
                     }
                 };
-                match precheck {
-                    1 => {
-                        failed += 1;
-                        continue;
-                    }
-                    2..=4 => {
-                        fail_with_floor!(tx, i);
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
 
-            // ...and the session gate against the registry AS IT STANDS NOW.
-            // Admission above simulated this block's spend; here the earlier
-            // transactions have actually applied and been deducted, so this
-            // live check is the authoritative one - a predecessor can have
-            // consumed the rest of the grant since admission, and a payload
-            // must never execute for a transaction that will be rejected.
-            // (Revocation is re-checked here too, so a revoke earlier in this
-            // very block stops the ones after it.)
-            if let Err(e) = self.session_gate(tx, timestamp).await {
-                tracing::debug!(tx = i, "session gate: {e}");
-                fail_with_floor!(tx, i);
-                continue;
-            }
-
-            // The payload itself: clone-commit, so a reverting or out-of-gas
-            // program leaves no partial effect. Its `transfers` and `payouts`
-            // are the value the payload moved, and they are NOT optional - the
-            // whole point of the P0 this replaced was that they were dropped
-            // here, so a Transfer, a SysCallStake bond or a reward claim moved
-            // no coins while still reporting success.
-            //
-            // `gas_used` is what the session budget will be charged if this
-            // transaction applies: the VM's consumption for a payload, the
-            // DECLARED `gas_limit` for an empty-payload transfer (no VM ran,
-            // so nothing else could measure it - and it must still consume
-            // budget, or a plain session transfer would bypass the cap that
-            // phase 1 closed for the policy checks).
-            //
-            // B1 atomicity (mirrors `apply_transaction`): per-tx domain
-            // snapshot + settlement undo records, restored if the commit
-            // below refuses.
-            let mut domain_snap: Option<PayloadDomainSnapshot> = None;
-            let mut post_actions: Option<ExecPostActions> = None;
-            let (transfers, payouts, burns, gas_used, tx_events) = if tx.payload.is_empty() {
-                (Vec::new(), Vec::new(), Vec::new(), tx.gas_limit, Vec::new())
-            } else {
-                // Block path: hand the pre-pass verdicts over. The single-tx
-                // path (`apply_transaction` -> `execute_payload`) passes `None`
-                // and never consults the cache.
+                // Commit: amount + fee + payload transfers + payload payouts.
                 //
-                // B1 atomicity: snapshot domains BEFORE the VM runs; any
-                // failure after (including the native commit below) restores
-                // everything (see rollback_payload). NOTE: must stay in sync
-                // with the `apply_transaction` copy.
-                domain_snap =
-                    Some(self.snapshot_payload_domains(&tx.payload).await);
-                match self.execute_payload_with_preverify(tx, timestamp, Some(&range_preverify)).await {
-                    Ok((crate::svm::VmExecutionResult::Success {
-                        transfers,
-                        payouts,
-                        burns,
-                        gas_used,
-                        events: evts,
-                        ..
-                    }, actions)) => {
-                        // Stash for the commit-failure arm below.
-                        // (transfers, payouts, burns, gas_used) flow into the
-                        // commit; actions flow into the rollback.
-                        post_actions = Some(actions);
-                        (transfers, payouts, burns, gas_used, evts)
-                    }
-                    // `execute_payload` maps OutOfGas/Reverted to Err; the arms
-                    // are kept exhaustive to match `apply_transaction`.
-                    Ok((crate::svm::VmExecutionResult::OutOfGas, _)) => {
-                        fail_with_floor!(tx, i);
-                        continue;
-                    }
-                    Ok((crate::svm::VmExecutionResult::Reverted(e), _)) => {
-                        tracing::debug!(tx = i, "payload reverted: {e}");
-                        fail_with_floor!(tx, i);
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::debug!(tx = i, "payload rejected: {e}");
-                        if let Some(snap) = domain_snap {
-                            self.rollback_payload(snap, ExecPostActions {
-                                bridge_snapshot: None,
-                                actor_snapshot: None,
-                                pmm_native_snapshot: Vec::new(),
-                                clob_native_snapshot: Vec::new(),
-                            }).await;
-                        }
-                        fail_with_floor!(tx, i);
-                        continue;
-                    }
-                }
-            };
-
-            // Commit: amount + fee + payload transfers + payload payouts.
-            //
-            // FEE: the block path hands `commit_native` the DECLARED
-            // `tx.gas_limit` - that is what admission reserved and what
-            // `fees_collected` credits to the proposer, and it is the rule this
-            // path has always had. `apply_transaction` hands over the gas
-            // actually consumed instead. The arithmetic is shared; only the
-            // number the caller supplies differs. See `commit_native` for why
-            // this divergence is preserved rather than papered over.
-            // F-01: EITHER number is raised to at least the consensus floor
-            // inside `commit_native` — a below-floor declaration is charged
-            // the floor anyway, never executed below it.
-            match self.commit_native(tx, tx.gas_limit, &transfers, &payouts, &burns, timestamp).await {
-                Ok((touched, fee)) => {
-                    if tx.is_pq_activation() {
-                        if let Some(env) = tx.pq_envelope() {
-                            if !env.is_implicit {
-                                if let Some(ref pk) = env.pubkey {
-                                    let salt = crate::post_quantum::DEFAULT_SALT;
-                                    let _ = self.pin_pubkey(tx.from, env.scheme, pk, &salt).await;
+                // FEE: the block path hands `commit_native` the DECLARED
+                // `tx.gas_limit` - that is what admission reserved and what
+                // `fees_collected` credits to the proposer, and it is the rule this
+                // path has always had. `apply_transaction` hands over the gas
+                // actually consumed instead. The arithmetic is shared; only the
+                // number the caller supplies differs. See `commit_native` for why
+                // this divergence is preserved rather than papered over.
+                // F-01: EITHER number is raised to at least the consensus floor
+                // inside `commit_native` — a below-floor declaration is charged
+                // the floor anyway, never executed below it.
+                match self
+                    .commit_native(tx, tx.gas_limit, &transfers, &payouts, &burns, timestamp)
+                    .await
+                {
+                    Ok((touched, fee)) => {
+                        if tx.is_pq_activation() {
+                            if let Some(env) = tx.pq_envelope() {
+                                if !env.is_implicit {
+                                    if let Some(ref pk) = env.pubkey {
+                                        let salt = crate::post_quantum::DEFAULT_SALT;
+                                        let _ =
+                                            self.pin_pubkey(tx.from, env.scheme, pk, &salt).await;
+                                    }
                                 }
                             }
                         }
+                        // Later transactions may touch the same accounts again; the
+                        // LAST tuple per account wins when the trie is written, and
+                        // it is the one taken after the final mutation.
+                        trie_dirty.extend(touched);
+                        fees_collected = fees_collected.saturating_add(fee);
+                        applied += 1;
+                        status[i] = true;
+                        fees[i] = fee;
+                        events[i] = tx_events;
+                        // Session budget: ONLY a transaction that actually applied
+                        // is charged, and only now - a transaction refused above
+                        // (nonce, balance, gate, payload, native commit) leaves the
+                        // grant's budget untouched. This is the live path
+                        // (`apply_block_transition` -> here), so the deduction is
+                        // consensus state: it lands in the committed registry.
+                        self.session_note_applied(tx, gas_used).await;
                     }
-                    // Later transactions may touch the same accounts again; the
-                    // LAST tuple per account wins when the trie is written, and
-                    // it is the one taken after the final mutation.
-                    trie_dirty.extend(touched);
-                    fees_collected = fees_collected.saturating_add(fee);
-                    applied += 1;
-                    status[i] = true;
-                    fees[i] = fee;
-                    events[i] = tx_events;
-                    // Session budget: ONLY a transaction that actually applied
-                    // is charged, and only now - a transaction refused above
-                    // (nonce, balance, gate, payload, native commit) leaves the
-                    // grant's budget untouched. This is the live path
-                    // (`apply_block_transition` -> here), so the deduction is
-                    // consensus state: it lands in the committed registry.
-                    self.session_note_applied(tx, gas_used).await;
-                }
-                Err(e) => {
-                    // B1 atomicity (mirrors `apply_transaction`): the commit
-                    // restored the accounts map itself; roll back everything
-                    // the payload touched before it (domains + settlement
-                    // legs + trie keys). F-01: the refusal itself still pays
-                    // the floor when attributable (`fail_with_floor!`).
-                    if let (Some(snap), Some(actions)) = (domain_snap, post_actions) {
-                        self.rollback_payload(snap, actions).await;
+                    Err(e) => {
+                        // B1 atomicity (mirrors `apply_transaction`): the commit
+                        // restored the accounts map itself; roll back everything
+                        // the payload touched before it (domains + settlement
+                        // legs + trie keys). F-01: the refusal itself still pays
+                        // the floor when attributable (`fail_with_floor!`).
+                        if let (Some(snap), Some(actions)) = (domain_snap, post_actions) {
+                            self.rollback_payload(snap, actions).await;
+                        }
+                        tracing::debug!(tx = i, "native commit rejected: {e}");
+                        fail_with_floor!(tx, i);
                     }
-                    tracing::debug!(tx = i, "native commit rejected: {e}");
-                    fail_with_floor!(tx, i);
                 }
             }
-        }
         }
 
         // 5) Commit touched accounts to the trie (only the touched ones).
@@ -5155,9 +5285,9 @@ impl InMemoryStateEngine {
         // no undo). Cheap check per block: only runs when some tx deployed.
         // Lock order contracts-then-trie (see apply_transaction).
         let deployed_contracts = if txs.iter().any(|tx| {
-            tx.payload.iter().any(|op| {
-                matches!(op, crate::svm::OpCode::SysCallDeployContract { .. })
-            })
+            tx.payload
+                .iter()
+                .any(|op| matches!(op, crate::svm::OpCode::SysCallDeployContract { .. }))
         }) {
             Some((*self.contracts_read().await).clone())
         } else {
@@ -5249,7 +5379,8 @@ impl InMemoryStateEngine {
     }
 
     pub fn cross_shard_enabled(&self) -> bool {
-        self.cross_shard_enabled.load(std::sync::atomic::Ordering::Acquire)
+        self.cross_shard_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Attach the process-shared finalized-header registry (C1 anchor).
@@ -5275,7 +5406,10 @@ impl InMemoryStateEngine {
     pub fn finalized_headers(
         &self,
     ) -> Option<Arc<std::sync::RwLock<crate::sharding::FinalizedHeaderRegistry>>> {
-        self.finalized_headers.read().ok().and_then(|slot| slot.clone())
+        self.finalized_headers
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     /// Anchored inclusion check for one inbound message (C1): proof AND a
@@ -5301,10 +5435,7 @@ impl InMemoryStateEngine {
     }
 
     /// True once the given message has been credited on this shard.
-    pub async fn is_cross_shard_consumed(
-        &self,
-        key: &crate::sharding::CrossShardKey,
-    ) -> bool {
+    pub async fn is_cross_shard_consumed(&self, key: &crate::sharding::CrossShardKey) -> bool {
         self.cross_shard_consumed.read().await.contains(key)
     }
 
@@ -5319,8 +5450,13 @@ impl InMemoryStateEngine {
     /// without persisting it a restart re-opened every consumed message for a
     /// second credit (the runtime mirrors alone cannot stop the apply).
     pub async fn cross_shard_consumed_snapshot(&self) -> Vec<crate::sharding::CrossShardKey> {
-        let mut v: Vec<crate::sharding::CrossShardKey> =
-            self.cross_shard_consumed.read().await.iter().copied().collect();
+        let mut v: Vec<crate::sharding::CrossShardKey> = self
+            .cross_shard_consumed
+            .read()
+            .await
+            .iter()
+            .copied()
+            .collect();
         v.sort();
         v
     }
@@ -5351,18 +5487,20 @@ impl InMemoryStateEngine {
     // ============ §9 CROSS-SHARD 2PC ============
 
     /// The §9 two-phase-commit record of one transfer, if this shard owns it.
-    pub async fn xpc_record(
-        &self,
-        tx_hash: &[u8; 32],
-    ) -> Option<crate::xshard2pc::XpcRecord> {
+    pub async fn xpc_record(&self, tx_hash: &[u8; 32]) -> Option<crate::xshard2pc::XpcRecord> {
         self.cross_shard_xpc.read().await.get(tx_hash).cloned()
     }
 
     /// Every §9 two-phase-commit record this shard owns, sorted by the
     /// transaction hash (deterministic bytes for the snapshot).
     pub async fn xpc_snapshot(&self) -> Vec<crate::xshard2pc::XpcRecord> {
-        let mut v: Vec<crate::xshard2pc::XpcRecord> =
-            self.cross_shard_xpc.read().await.values().cloned().collect();
+        let mut v: Vec<crate::xshard2pc::XpcRecord> = self
+            .cross_shard_xpc
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
         v.sort_by_key(|r| r.tx_hash);
         v
     }
@@ -5455,8 +5593,13 @@ impl InMemoryStateEngine {
     /// Snapshot the engine's completed set for persistence, sorted for
     /// deterministic bytes.
     pub async fn cross_shard_completed_snapshot(&self) -> Vec<[u8; 32]> {
-        let mut v: Vec<[u8; 32]> =
-            self.cross_shard_completed.read().await.iter().copied().collect();
+        let mut v: Vec<[u8; 32]> = self
+            .cross_shard_completed
+            .read()
+            .await
+            .iter()
+            .copied()
+            .collect();
         v.sort();
         v
     }
@@ -5539,8 +5682,7 @@ impl InMemoryStateEngine {
             }
         }
         let completed = self.cross_shard_completed.read().await;
-        let incoming_completed: HashSet<[u8; 32]> =
-            snap.completed.iter().copied().collect();
+        let incoming_completed: HashSet<[u8; 32]> = snap.completed.iter().copied().collect();
         if !completed.iter().all(|h| incoming_completed.contains(h)) {
             return false;
         }
@@ -5549,11 +5691,8 @@ impl InMemoryStateEngine {
         // transfer (the phase decides where the value is), so the coverage
         // gate refuses it exactly like the consumed set.
         let xpc = self.cross_shard_xpc.read().await;
-        let incoming_xpc: HashMap<[u8; 32], crate::xshard2pc::XpcPhase> = snap
-            .xpc
-            .iter()
-            .map(|r| (r.tx_hash, r.phase))
-            .collect();
+        let incoming_xpc: HashMap<[u8; 32], crate::xshard2pc::XpcPhase> =
+            snap.xpc.iter().map(|r| (r.tx_hash, r.phase)).collect();
         for (tx_hash, rec) in xpc.iter() {
             match incoming_xpc.get(tx_hash) {
                 Some(phase) if *phase == rec.phase => {}
@@ -5835,21 +5974,14 @@ impl InMemoryStateEngine {
             // (the re-published PREPARE - it proves the value is already
             // escrowed at the source, which is the stronger statement).
             CrossShardKind::Prepare => {
-                if !msg.verify_inclusion_strict()
-                    && !msg.verify_xpc_proof(&[XpcPhase::Prepared])
-                {
+                if !msg.verify_inclusion_strict() && !msg.verify_xpc_proof(&[XpcPhase::Prepared]) {
                     return false;
                 }
                 let transition = crate::xshard2pc::target_prepare(existing.as_ref());
                 if transition != XpcTransition::Created {
                     return false;
                 }
-                let rec = XpcRecord::prepared(
-                    tx.clone(),
-                    tx.source_shard,
-                    tx.target_shard,
-                    height,
-                );
+                let rec = XpcRecord::prepared(tx.clone(), tx.source_shard, tx.target_shard, height);
                 self.write_xpc_record(&rec).await;
                 true
             }
@@ -6119,7 +6251,9 @@ impl InMemoryStateEngine {
 
         // 4. Mature unbondings. Deterministic: the clock is the block's own
         //    timestamp, never local wall time.
-        self.staking_write().await.process_unbonding(block.timestamp);
+        self.staking_write()
+            .await
+            .process_unbonding(block.timestamp);
 
         // 5. Downtime slash, from the CANONICAL certificate the block carries.
         //
@@ -6629,11 +6763,7 @@ impl InMemoryStateEngine {
             return 0;
         }
         let signers = cert.signers_set(val_set);
-        let eligible: Vec<[u8; 32]> = val_set
-            .validators
-            .keys()
-            .copied()
-            .collect();
+        let eligible: Vec<[u8; 32]> = val_set.validators.keys().copied().collect();
         let burned = self.staking_write().await.note_missed_heights(
             height,
             &|v: &[u8; 32]| signers.contains(v),
@@ -6641,7 +6771,9 @@ impl InMemoryStateEngine {
         );
         if burned > 0 {
             // The coins are real: take them out of the staking pool.
-            let _ = self.debit_native(&crate::staking::STAKING_POOL, burned).await;
+            let _ = self
+                .debit_native(&crate::staking::STAKING_POOL, burned)
+                .await;
         }
         burned
     }
@@ -6730,11 +6862,7 @@ impl InMemoryStateEngine {
                 // Fail-closed per evidence: an unknown voter (membership moved
                 // since shaping) burns 0 with a loud WARN instead of failing
                 // the block; a repeat offense burns 0 via the ledger dedup.
-                let burned = match self
-                    .staking_write()
-                    .await
-                    .slash_equivocation_verified(&ev)
-                {
+                let burned = match self.staking_write().await.slash_equivocation_verified(&ev) {
                     Ok(b) => b,
                     Err(e) => {
                         tracing::warn!(
@@ -6909,7 +7037,10 @@ impl InMemoryStateEngine {
                 let state = self.tokens.read().await.clone();
                 let b = crate::commitment::tokens_preimage(&state);
                 if self.domain_gens.load(Domain::Tokens) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::Tokens, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::Tokens, gen, b.clone());
                 }
                 b
             }
@@ -6923,7 +7054,10 @@ impl InMemoryStateEngine {
                 let state = self.staking.read().await.clone();
                 let b = crate::commitment::staking_preimage(&state);
                 if self.domain_gens.load(Domain::Staking) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::Staking, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::Staking, gen, b.clone());
                 }
                 b
             }
@@ -6940,7 +7074,10 @@ impl InMemoryStateEngine {
                 let t = *self.pmm_treasury.read().await;
                 let b = crate::commitment::pmm_preimage(&p, &u, &t);
                 if self.domain_gens.load(Domain::Pmm) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::Pmm, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::Pmm, gen, b.clone());
                 }
                 b
             }
@@ -6948,7 +7085,11 @@ impl InMemoryStateEngine {
         // Contracts (with the per-contract ABI JSON cache: an unchanged
         // manifest reuses its exact JSON bytes).
         let gen = self.domain_gens.load(Domain::Contracts);
-        let contracts_hit = self.domain_cache.lock().unwrap().get(Domain::Contracts, gen);
+        let contracts_hit = self
+            .domain_cache
+            .lock()
+            .unwrap()
+            .get(Domain::Contracts, gen);
         let contracts = match contracts_hit {
             Some(b) => b,
             None => {
@@ -6957,7 +7098,10 @@ impl InMemoryStateEngine {
                 let b = crate::commitment::contracts_preimage_cached(&state, &mut dc.abi);
                 drop(dc);
                 if self.domain_gens.load(Domain::Contracts) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::Contracts, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::Contracts, gen, b.clone());
                 }
                 b
             }
@@ -6971,21 +7115,31 @@ impl InMemoryStateEngine {
                 let state = self.order_escrow.read().await.clone();
                 let b = crate::commitment::escrow_preimage(&state);
                 if self.domain_gens.load(Domain::Escrow) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::Escrow, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::Escrow, gen, b.clone());
                 }
                 b
             }
         };
         // Governance.
         let gen = self.domain_gens.load(Domain::Governance);
-        let governance_hit = self.domain_cache.lock().unwrap().get(Domain::Governance, gen);
+        let governance_hit = self
+            .domain_cache
+            .lock()
+            .unwrap()
+            .get(Domain::Governance, gen);
         let governance = match governance_hit {
             Some(b) => b,
             None => {
                 let state = self.governance.read().await.clone();
                 let b = crate::commitment::governance_preimage(&state);
                 if self.domain_gens.load(Domain::Governance) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::Governance, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::Governance, gen, b.clone());
                 }
                 b
             }
@@ -6999,21 +7153,31 @@ impl InMemoryStateEngine {
                 let state = self.oracle.read().await.clone();
                 let b = crate::commitment::oracle_preimage(&state);
                 if self.domain_gens.load(Domain::Oracle) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::Oracle, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::Oracle, gen, b.clone());
                 }
                 b
             }
         };
         // Session keys.
         let gen = self.domain_gens.load(Domain::SessionKeys);
-        let session_keys_hit = self.domain_cache.lock().unwrap().get(Domain::SessionKeys, gen);
+        let session_keys_hit = self
+            .domain_cache
+            .lock()
+            .unwrap()
+            .get(Domain::SessionKeys, gen);
         let session_keys = match session_keys_hit {
             Some(b) => b,
             None => {
                 let state = self.session_keys.read().await.clone();
                 let b = crate::commitment::session_keys_preimage(&state);
                 if self.domain_gens.load(Domain::SessionKeys) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::SessionKeys, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::SessionKeys, gen, b.clone());
                 }
                 b
             }
@@ -7027,7 +7191,10 @@ impl InMemoryStateEngine {
                 let state = self.orderbooks.read().await.clone();
                 let b = crate::commitment::books_preimage(&state);
                 if self.domain_gens.load(Domain::Books) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::Books, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::Books, gen, b.clone());
                 }
                 b
             }
@@ -7041,14 +7208,21 @@ impl InMemoryStateEngine {
                 let state = self.bridge.read().await.clone();
                 let b = crate::commitment::bridge_preimage(&state);
                 if self.domain_gens.load(Domain::Bridge) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::Bridge, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::Bridge, gen, b.clone());
                 }
                 b
             }
         };
         // Cross-shard replay sets (one domain over three locks).
         let gen = self.domain_gens.load(Domain::CrossShard);
-        let cross_shard_hit = self.domain_cache.lock().unwrap().get(Domain::CrossShard, gen);
+        let cross_shard_hit = self
+            .domain_cache
+            .lock()
+            .unwrap()
+            .get(Domain::CrossShard, gen);
         let cross_shard = match cross_shard_hit {
             Some(b) => b,
             None => {
@@ -7057,7 +7231,10 @@ impl InMemoryStateEngine {
                 let completed = self.cross_shard_completed_snapshot().await;
                 let b = crate::commitment::cross_shard_preimage(&consumed, &produced, &completed);
                 if self.domain_gens.load(Domain::CrossShard) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::CrossShard, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::CrossShard, gen, b.clone());
                 }
                 b
             }
@@ -7071,14 +7248,21 @@ impl InMemoryStateEngine {
                 let state = self.xpc_snapshot().await;
                 let b = crate::commitment::xpc_preimage(&state);
                 if self.domain_gens.load(Domain::Xpc) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::Xpc, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::Xpc, gen, b.clone());
                 }
                 b
             }
         };
         // Confidential (shielded ledger).
         let gen = self.domain_gens.load(Domain::Confidential);
-        let confidential_hit = self.domain_cache.lock().unwrap().get(Domain::Confidential, gen);
+        let confidential_hit = self
+            .domain_cache
+            .lock()
+            .unwrap()
+            .get(Domain::Confidential, gen);
         let confidential = match confidential_hit {
             Some(b) => b,
             None => {
@@ -7087,7 +7271,10 @@ impl InMemoryStateEngine {
                 let state = self.confidential.read().await.clone();
                 let b = crate::commitment::confidential_preimage(&state);
                 if self.domain_gens.load(Domain::Confidential) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::Confidential, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::Confidential, gen, b.clone());
                 }
                 b
             }
@@ -7101,7 +7288,10 @@ impl InMemoryStateEngine {
                 let state = self.zkml_models.read().await.clone();
                 let b = crate::commitment::zkml_preimage(&state);
                 if self.domain_gens.load(Domain::Zkml) == gen {
-                    self.domain_cache.lock().unwrap().put(Domain::Zkml, gen, b.clone());
+                    self.domain_cache
+                        .lock()
+                        .unwrap()
+                        .put(Domain::Zkml, gen, b.clone());
                 }
                 b
             }
@@ -7209,7 +7399,8 @@ impl InMemoryStateEngine {
     }
 
     pub async fn tokens_write(&self) -> tokio::sync::RwLockWriteGuard<'_, TokenRegistry> {
-        self.dom_guard(crate::commitment::Domain::Tokens, &self.tokens).await
+        self.dom_guard(crate::commitment::Domain::Tokens, &self.tokens)
+            .await
     }
 
     pub async fn staking_read(
@@ -7221,7 +7412,8 @@ impl InMemoryStateEngine {
     pub async fn staking_write(
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, crate::staking::StakingLedger> {
-        self.dom_guard(crate::commitment::Domain::Staking, &self.staking).await
+        self.dom_guard(crate::commitment::Domain::Staking, &self.staking)
+            .await
     }
 
     /// Non-blocking read of the staking ledger. No bump needed: reads cannot
@@ -7254,13 +7446,17 @@ impl InMemoryStateEngine {
     /// WRITES through the handle do NOT bump the commitment generation — every
     /// write site must go through `staking_write`/`try_staking_write` instead,
     /// or the state root can go stale.
-    pub fn staking_handle(&self) -> std::sync::Arc<tokio::sync::RwLock<crate::staking::StakingLedger>> {
+    pub fn staking_handle(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::RwLock<crate::staking::StakingLedger>> {
         std::sync::Arc::clone(&self.staking)
     }
 
     /// Shared handle to the governance lock. Same contract as `staking_handle`:
     /// reads are always safe; every write must go through `governance_write`.
-    pub fn governance_handle(&self) -> std::sync::Arc<tokio::sync::RwLock<crate::governance::Governance>> {
+    pub fn governance_handle(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::RwLock<crate::governance::Governance>> {
         std::sync::Arc::clone(&self.governance)
     }
 
@@ -7273,7 +7469,8 @@ impl InMemoryStateEngine {
     pub async fn orderbooks_write(
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, crate::orderbook::OrderbookManager> {
-        self.dom_guard(crate::commitment::Domain::Books, &self.orderbooks).await
+        self.dom_guard(crate::commitment::Domain::Books, &self.orderbooks)
+            .await
     }
 
     pub async fn order_escrow_read(
@@ -7285,7 +7482,8 @@ impl InMemoryStateEngine {
     pub async fn order_escrow_write(
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<(u32, u64), EscrowRecord>> {
-        self.dom_guard(crate::commitment::Domain::Escrow, &self.order_escrow).await
+        self.dom_guard(crate::commitment::Domain::Escrow, &self.order_escrow)
+            .await
     }
 
     pub async fn pmm_read(
@@ -7297,7 +7495,8 @@ impl InMemoryStateEngine {
     pub async fn pmm_write(
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, crate::pmm::PrimaryMarketMaker> {
-        self.dom_guard(crate::commitment::Domain::Pmm, &self.pmm).await
+        self.dom_guard(crate::commitment::Domain::Pmm, &self.pmm)
+            .await
     }
 
     pub async fn pmm_usdt_token_read(&self) -> tokio::sync::RwLockReadGuard<'_, Option<[u8; 32]>> {
@@ -7307,15 +7506,17 @@ impl InMemoryStateEngine {
     pub async fn pmm_usdt_token_write(
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, Option<[u8; 32]>> {
-        self.dom_guard(crate::commitment::Domain::Pmm, &self.pmm_usdt_token).await
+        self.dom_guard(crate::commitment::Domain::Pmm, &self.pmm_usdt_token)
+            .await
     }
 
     pub async fn pmm_treasury_read(&self) -> tokio::sync::RwLockReadGuard<'_, [u8; 32]> {
         self.pmm_treasury.read().await
     }
 
-    pub async fn pmm_treasury_write(&self    ) -> tokio::sync::RwLockWriteGuard<'_, [u8; 32]> {
-        self.dom_guard(crate::commitment::Domain::Pmm, &self.pmm_treasury).await
+    pub async fn pmm_treasury_write(&self) -> tokio::sync::RwLockWriteGuard<'_, [u8; 32]> {
+        self.dom_guard(crate::commitment::Domain::Pmm, &self.pmm_treasury)
+            .await
     }
 
     pub async fn contracts_read(
@@ -7327,7 +7528,8 @@ impl InMemoryStateEngine {
     pub async fn contracts_write(
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, crate::contract::ContractRegistry> {
-        self.dom_guard(crate::commitment::Domain::Contracts, &self.contracts).await
+        self.dom_guard(crate::commitment::Domain::Contracts, &self.contracts)
+            .await
     }
 
     pub async fn governance_read(
@@ -7339,7 +7541,8 @@ impl InMemoryStateEngine {
     pub async fn governance_write(
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, crate::governance::Governance> {
-        self.dom_guard(crate::commitment::Domain::Governance, &self.governance).await
+        self.dom_guard(crate::commitment::Domain::Governance, &self.governance)
+            .await
     }
 
     pub async fn oracle_read(
@@ -7355,7 +7558,8 @@ impl InMemoryStateEngine {
     pub async fn oracle_write(
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, crate::oracle::OracleState> {
-        self.dom_guard(crate::commitment::Domain::Oracle, &self.oracle).await
+        self.dom_guard(crate::commitment::Domain::Oracle, &self.oracle)
+            .await
     }
 
     /// Read the session-key registry (revocation lookups, the propose filter,
@@ -7372,7 +7576,8 @@ impl InMemoryStateEngine {
     pub async fn session_keys_write(
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, crate::zkml::SessionKeyRegistry> {
-        self.dom_guard(crate::commitment::Domain::SessionKeys, &self.session_keys).await
+        self.dom_guard(crate::commitment::Domain::SessionKeys, &self.session_keys)
+            .await
     }
 
     /// Read the shielded ledger (the VM's clone source, the commitment fold,
@@ -7391,7 +7596,8 @@ impl InMemoryStateEngine {
     pub async fn confidential_write(
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, crate::crypto_privacy::ConfidentialState> {
-        self.dom_guard(crate::commitment::Domain::Confidential, &self.confidential).await
+        self.dom_guard(crate::commitment::Domain::Confidential, &self.confidential)
+            .await
     }
 
     /// Read the §2 model registry (the VM's clone source, the commitment
@@ -7411,7 +7617,8 @@ impl InMemoryStateEngine {
     pub async fn zkml_models_write(
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, crate::zkml::ZkMlModelRegistry> {
-        self.dom_guard(crate::commitment::Domain::Zkml, &self.zkml_models).await
+        self.dom_guard(crate::commitment::Domain::Zkml, &self.zkml_models)
+            .await
     }
 
     /// Shared handle to the registry lock, for the one synchronous reader that
@@ -7461,8 +7668,8 @@ impl InMemoryStateEngine {
     /// snapshot's pinned `pubkey_hash`), so installing them never moves the
     /// root and needs no generation bump.
     pub async fn restore_pq_keys(&self, bytes: &[u8]) -> Result<(), String> {
-        let pairs: Vec<(Vec<u8>, Vec<u8>)> = bincode::deserialize(bytes)
-            .map_err(|e| format!("restore pq_keys failed: {e:?}"))?;
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> =
+            bincode::deserialize(bytes).map_err(|e| format!("restore pq_keys failed: {e:?}"))?;
         if let Some(tree) = self.pq_tree.read().unwrap().clone() {
             for (k, v) in &pairs {
                 tree.insert(k.as_slice(), v.as_slice())
@@ -7479,23 +7686,17 @@ impl InMemoryStateEngine {
             }
             let mut addr = [0u8; 32];
             addr.copy_from_slice(&k[2..]);
-            let rec: Option<(crate::post_quantum::PqScheme, Vec<u8>)> =
-                if let Ok((s, pk, _salt)) = bincode::deserialize::<(
-                    crate::post_quantum::PqScheme,
-                    Vec<u8>,
-                    [u8; 16],
-                )>(v)
-                {
-                    Some((s, pk))
-                } else if let Ok((s, pk)) = bincode::deserialize::<(
-                    crate::post_quantum::PqScheme,
-                    Vec<u8>,
-                )>(v)
-                {
-                    Some((s, pk))
-                } else {
-                    None
-                };
+            let rec: Option<(crate::post_quantum::PqScheme, Vec<u8>)> = if let Ok((s, pk, _salt)) =
+                bincode::deserialize::<(crate::post_quantum::PqScheme, Vec<u8>, [u8; 16])>(v)
+            {
+                Some((s, pk))
+            } else if let Ok((s, pk)) =
+                bincode::deserialize::<(crate::post_quantum::PqScheme, Vec<u8>)>(v)
+            {
+                Some((s, pk))
+            } else {
+                None
+            };
             if let Some((scheme, pk)) = rec {
                 fb.insert(addr, (scheme, pk));
             }
@@ -7552,9 +7753,11 @@ impl InMemoryStateEngine {
         // ever issued. Refuse it here, before the payload runs: revocation must
         // be signed by the master key itself (a legacy signature), never by a
         // key the master delegated to. Deterministic (payload + sender only).
-        if tx.payload.iter().any(|op| {
-            matches!(op, crate::svm::OpCode::SysCallRevokeSession { .. })
-        }) {
+        if tx
+            .payload
+            .iter()
+            .any(|op| matches!(op, crate::svm::OpCode::SysCallRevokeSession { .. }))
+        {
             return Err(
                 "session key delegation rejected: a delegated session key may not revoke \
                  session keys; revocation requires the master signature"
@@ -7621,8 +7824,10 @@ impl InMemoryStateEngine {
             .write()
             .await
             .insert(&crate::commitment::commitment_key(), &digest);
-        self.committed_generation
-            .store(generation.wrapping_add(1), std::sync::atomic::Ordering::Release);
+        self.committed_generation.store(
+            generation.wrapping_add(1),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// Clone the non-trie consensus state under each subsystem lock, so the
@@ -7681,7 +7886,10 @@ impl InMemoryStateEngine {
                 let key = token_balance_key(&id, &acct);
                 trie.insert(&key, &bal.to_be_bytes());
             }
-            trie.insert(&token_supply_key(&id), &token.metadata.total_supply.to_be_bytes());
+            trie.insert(
+                &token_supply_key(&id),
+                &token.metadata.total_supply.to_be_bytes(),
+            );
         }
         Ok(id)
     }
@@ -7698,7 +7906,10 @@ impl InMemoryStateEngine {
     ) -> Result<[u8; 32], crate::contract::ContractError> {
         let mut contracts = self.contracts_write().await;
         let address = contracts.deploy(creator, code, now)?;
-        let code_hash = contracts.get(&address).map(|c| c.code_hash).unwrap_or([0u8; 32]);
+        let code_hash = contracts
+            .get(&address)
+            .map(|c| c.code_hash)
+            .unwrap_or([0u8; 32]);
         let mut trie = self.state_trie.write().await;
         trie.insert(&contract_key(&address), &code_hash);
         Ok(address)
@@ -7716,7 +7927,10 @@ impl InMemoryStateEngine {
     ) -> Result<[u8; 32], crate::contract::ContractError> {
         let mut contracts = self.contracts_write().await;
         let address = contracts.deploy_with_abi(creator, code, now, abi.clone())?;
-        let code_hash = contracts.get(&address).map(|c| c.code_hash).unwrap_or([0u8; 32]);
+        let code_hash = contracts
+            .get(&address)
+            .map(|c| c.code_hash)
+            .unwrap_or([0u8; 32]);
         let mut trie = self.state_trie.write().await;
         trie.insert(&contract_key(&address), &code_hash);
         trie.insert(&contract_abi_key(&address), abi.to_json().as_bytes());
@@ -7740,7 +7954,10 @@ impl InMemoryStateEngine {
     }
 
     /// The ABI manifest of a deployed contract, if one is attached.
-    pub async fn get_contract_abi(&self, address: &[u8; 32]) -> Option<crate::contract_abi::ContractAbi> {
+    pub async fn get_contract_abi(
+        &self,
+        address: &[u8; 32],
+    ) -> Option<crate::contract_abi::ContractAbi> {
         self.contracts.read().await.abi(address).cloned()
     }
 
@@ -7751,7 +7968,11 @@ impl InMemoryStateEngine {
 
     /// The on-chain code hash of a deployed contract, if it exists.
     pub async fn get_contract_code_hash(&self, address: &[u8; 32]) -> Option<[u8; 32]> {
-        self.contracts.read().await.get(address).map(|c| c.code_hash)
+        self.contracts
+            .read()
+            .await
+            .get(address)
+            .map(|c| c.code_hash)
     }
 
     /// The registered verified-source fingerprint of a deployed contract, if
@@ -7981,7 +8202,9 @@ impl InMemoryStateEngine {
         match res {
             Ok(outcome) => {
                 if !outcome.outbound_messages.is_empty() {
-                    let _ = self.process_contract_outbound_messages(&outcome.outbound_messages).await;
+                    let _ = self
+                        .process_contract_outbound_messages(&outcome.outbound_messages)
+                        .await;
                 }
                 ContractCallOutcome {
                     status: "success".to_string(),
@@ -8031,7 +8254,8 @@ impl InMemoryStateEngine {
                 let _ = self.credit_native(address, value).await;
             }
         }
-        self.call_contract_structured(address, method, arg, fuel).await
+        self.call_contract_structured(address, method, arg, fuel)
+            .await
     }
 
     /// Return the shard id this engine is operating on.
@@ -8041,14 +8265,17 @@ impl InMemoryStateEngine {
 
     /// Set the shard id for this engine.
     pub fn set_shard_id(&self, id: u32) {
-        self.shard_id.store(id, std::sync::atomic::Ordering::Release);
+        self.shard_id
+            .store(id, std::sync::atomic::Ordering::Release);
     }
 
     /// Read the node's shard topology.
     ///
     /// The topology is the single source of truth of the address→shard rule
     /// (see `crate::sharding::ROUTING_RULE`).
-    pub async fn shard_topology(&self) -> tokio::sync::RwLockReadGuard<'_, crate::sharding::ShardTopology> {
+    pub async fn shard_topology(
+        &self,
+    ) -> tokio::sync::RwLockReadGuard<'_, crate::sharding::ShardTopology> {
         self.shard_topology.read().await
     }
 
@@ -8106,7 +8333,10 @@ impl InMemoryStateEngine {
         //    the token's minter (the address that created it).
         for (token_id, token) in self.tokens.read().await.tokens.iter() {
             for (holder, _bal) in token.balances.iter() {
-                manifest.own(crate::state_engine::token_balance_key(token_id, holder), *holder);
+                manifest.own(
+                    crate::state_engine::token_balance_key(token_id, holder),
+                    *holder,
+                );
             }
             manifest.own(
                 crate::state_engine::token_supply_key(token_id),
@@ -8133,12 +8363,7 @@ impl InMemoryStateEngine {
         let mut map = self.accounts.write().await;
         let mut xout = self.cross_shard_out.write().await;
         crate::svm::Svm::route_contract_messages_with_topology(
-            messages,
-            &mut map,
-            &mut xout,
-            my_shard,
-            sharded,
-            &topology,
+            messages, &mut map, &mut xout, my_shard, sharded, &topology,
         );
         Ok(())
     }
@@ -8163,7 +8388,10 @@ impl InMemoryStateEngine {
         fuel: u64,
     ) -> Result<(i64, u64), crate::contract::ContractError> {
         self.sync_contract_balance(address).await;
-        let (val, used, _events, messages) = self.contracts_write().await.call(address, method, arg, fuel)?;
+        let (val, used, _events, messages) = self
+            .contracts_write()
+            .await
+            .call(address, method, arg, fuel)?;
         self.sync_account_balance_from_contract(address).await;
         if !messages.is_empty() {
             let _ = self.process_contract_outbound_messages(&messages).await;
@@ -8180,7 +8408,10 @@ impl InMemoryStateEngine {
         fuel: u64,
     ) -> Result<(i64, u64), crate::contract::ContractError> {
         self.sync_contract_balance(address).await;
-        let (val, used, _events, messages) = self.contracts_write().await.call_args(address, method, args, fuel)?;
+        let (val, used, _events, messages) = self
+            .contracts_write()
+            .await
+            .call_args(address, method, args, fuel)?;
         self.sync_account_balance_from_contract(address).await;
         if !messages.is_empty() {
             let _ = self.process_contract_outbound_messages(&messages).await;
@@ -8195,9 +8426,13 @@ impl InMemoryStateEngine {
         method: &str,
         arg: i64,
         fuel: u64,
-    ) -> Result<(i64, u64, Vec<crate::contract::ContractEvent>), crate::contract::ContractError> {
+    ) -> Result<(i64, u64, Vec<crate::contract::ContractEvent>), crate::contract::ContractError>
+    {
         self.sync_contract_balance(address).await;
-        let (val, used, events, messages) = self.contracts_write().await.call(address, method, arg, fuel)?;
+        let (val, used, events, messages) = self
+            .contracts_write()
+            .await
+            .call(address, method, arg, fuel)?;
         self.sync_account_balance_from_contract(address).await;
         if !messages.is_empty() {
             let _ = self.process_contract_outbound_messages(&messages).await;
@@ -8212,9 +8447,20 @@ impl InMemoryStateEngine {
         method: &str,
         arg: i64,
         fuel: u64,
-    ) -> Result<(i64, u64, Vec<crate::contract::ContractEvent>, Vec<crate::contract::ContractMessage>), crate::contract::ContractError> {
+    ) -> Result<
+        (
+            i64,
+            u64,
+            Vec<crate::contract::ContractEvent>,
+            Vec<crate::contract::ContractMessage>,
+        ),
+        crate::contract::ContractError,
+    > {
         self.sync_contract_balance(address).await;
-        let (val, used, events, messages) = self.contracts_write().await.call(address, method, arg, fuel)?;
+        let (val, used, events, messages) = self
+            .contracts_write()
+            .await
+            .call(address, method, arg, fuel)?;
         self.sync_account_balance_from_contract(address).await;
         if !messages.is_empty() {
             let _ = self.process_contract_outbound_messages(&messages).await;
@@ -8282,7 +8528,8 @@ impl InMemoryStateEngine {
         arg: i64,
         fuel_limit: Option<u64>,
     ) -> crate::contract::GetMethodResponse {
-        self.run_get_method(address, method, &[arg], fuel_limit).await
+        self.run_get_method(address, method, &[arg], fuel_limit)
+            .await
     }
 
     /// Read-only getter execution with optional block height pinning.
@@ -8315,7 +8562,13 @@ impl InMemoryStateEngine {
     }
 
     pub async fn all_contract_addresses(&self) -> Vec<[u8; 32]> {
-        self.contracts.read().await.contracts.keys().copied().collect()
+        self.contracts
+            .read()
+            .await
+            .contracts
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// Persist the whole contract registry (mirrors the token snapshot API).
@@ -8438,12 +8691,18 @@ impl InMemoryStateEngine {
                         .execute(
                             &quote_id,
                             trader,
-                            crate::token::TokenOp::Burn { from: trader, amount: q_escrow },
+                            crate::token::TokenOp::Burn {
+                                from: trader,
+                                amount: q_escrow,
+                            },
                         )
                         .map_err(|e| format!("CLOB taker escrow lock failed: {e}"))?;
                     let new_bal = tokens.balance_of(&quote_id, &trader);
                     let mut trie = self.state_trie.write().await;
-                    trie.insert(&token_balance_key(&quote_id, &trader), &new_bal.to_be_bytes());
+                    trie.insert(
+                        &token_balance_key(&quote_id, &trader),
+                        &new_bal.to_be_bytes(),
+                    );
                     drop(trie);
                     drop(tokens);
                     self.order_escrow_write().await.insert(
@@ -8503,8 +8762,11 @@ impl InMemoryStateEngine {
         }
 
         for t in &trades {
-            let (buyer, seller) =
-                if taker_is_buyer { (t.taker, t.maker) } else { (t.maker, t.taker) };
+            let (buyer, seller) = if taker_is_buyer {
+                (t.taker, t.maker)
+            } else {
+                (t.maker, t.taker)
+            };
             if buyer == seller {
                 continue; // self-trade: no net transfer
             }
@@ -8548,8 +8810,8 @@ impl InMemoryStateEngine {
                 let qn = Self::clob_quote_native(t.price, t.amount);
                 match escrows.get(&(pair, t.maker_order_id)) {
                     Some(r) if r.locked_quote_wusdt > 0 || r.locked_quote_native > 0 => {
-                        let covers = r.locked_quote_wusdt >= q
-                            || (qn > 0 && r.locked_quote_native >= qn);
+                        let covers =
+                            r.locked_quote_wusdt >= q || (qn > 0 && r.locked_quote_native >= qn);
                         if !covers {
                             return Err(format!(
                                 "CLOB settlement: escrow for order {} cannot fund the quote leg",
@@ -8582,8 +8844,11 @@ impl InMemoryStateEngine {
         // 3) Apply settlement per trade and update/release maker escrows:
         let mut escrow_map = self.order_escrow_write().await;
         for t in &trades {
-            let (buyer, seller) =
-                if taker_is_buyer { (t.taker, t.maker) } else { (t.maker, t.taker) };
+            let (buyer, seller) = if taker_is_buyer {
+                (t.taker, t.maker)
+            } else {
+                (t.maker, t.taker)
+            };
 
             // Self-trade: release maker's locked escrow back to self (net zero).
             // `min` rather than a plain subtraction: the fill can never consume
@@ -8607,17 +8872,26 @@ impl InMemoryStateEngine {
                     if take_wusdt > 0 {
                         escrow_map.get_mut(&key).unwrap().locked_quote_wusdt -= take_wusdt;
                         let mut tokens = self.tokens_write().await;
-                        let token_minter = tokens.get(&quote_id).map(|tok| tok.metadata.minter).unwrap_or([0u8; 32]);
+                        let token_minter = tokens
+                            .get(&quote_id)
+                            .map(|tok| tok.metadata.minter)
+                            .unwrap_or([0u8; 32]);
                         tokens
                             .execute(
                                 &quote_id,
                                 token_minter,
-                                crate::token::TokenOp::Mint { to: buyer, amount: take_wusdt },
+                                crate::token::TokenOp::Mint {
+                                    to: buyer,
+                                    amount: take_wusdt,
+                                },
                             )
                             .map_err(|e| format!("CLOB escrow self-refund failed: {e}"))?;
                         let new_bal = tokens.balance_of(&quote_id, &buyer);
                         let mut trie = self.state_trie.write().await;
-                        trie.insert(&token_balance_key(&quote_id, &buyer), &new_bal.to_be_bytes());
+                        trie.insert(
+                            &token_balance_key(&quote_id, &buyer),
+                            &new_bal.to_be_bytes(),
+                        );
                     } else if let Some(rec) = escrow_map.get_mut(&key) {
                         let take = rec.locked_quote_native.min(qn);
                         rec.locked_quote_native -= take;
@@ -8657,17 +8931,26 @@ impl InMemoryStateEngine {
                     rec.locked_quote_wusdt -= q;
                     // Credit seller with wUSDT using minter authority:
                     let mut tokens = self.tokens_write().await;
-                    let token_minter = tokens.get(&quote_id).map(|tok| tok.metadata.minter).unwrap_or([0u8; 32]);
+                    let token_minter = tokens
+                        .get(&quote_id)
+                        .map(|tok| tok.metadata.minter)
+                        .unwrap_or([0u8; 32]);
                     tokens
                         .execute(
                             &quote_id,
                             token_minter,
-                            crate::token::TokenOp::Mint { to: seller, amount: q },
+                            crate::token::TokenOp::Mint {
+                                to: seller,
+                                amount: q,
+                            },
                         )
                         .map_err(|e| format!("CLOB escrow quote release failed: {e}"))?;
                     let seller_qbal = tokens.balance_of(&quote_id, &seller);
                     let mut trie = self.state_trie.write().await;
-                    trie.insert(&token_balance_key(&quote_id, &seller), &seller_qbal.to_be_bytes());
+                    trie.insert(
+                        &token_balance_key(&quote_id, &seller),
+                        &seller_qbal.to_be_bytes(),
+                    );
                 } else if qn > 0 && escrow_map.get(&maker_key).unwrap().locked_quote_native >= qn {
                     let rec = escrow_map.get_mut(&maker_key).unwrap();
                     rec.locked_quote_native -= qn;
@@ -8688,14 +8971,23 @@ impl InMemoryStateEngine {
                     .execute(
                         &quote_id,
                         buyer,
-                        crate::token::TokenOp::Transfer { to: seller, amount: q },
+                        crate::token::TokenOp::Transfer {
+                            to: seller,
+                            amount: q,
+                        },
                     )
                     .map_err(|e| format!("CLOB quote settlement failed: {e}"))?;
                 let buyer_qbal = tokens.balance_of(&quote_id, &buyer);
                 let seller_qbal = tokens.balance_of(&quote_id, &seller);
                 let mut trie = self.state_trie.write().await;
-                trie.insert(&token_balance_key(&quote_id, &buyer), &buyer_qbal.to_be_bytes());
-                trie.insert(&token_balance_key(&quote_id, &seller), &seller_qbal.to_be_bytes());
+                trie.insert(
+                    &token_balance_key(&quote_id, &buyer),
+                    &buyer_qbal.to_be_bytes(),
+                );
+                trie.insert(
+                    &token_balance_key(&quote_id, &seller),
+                    &seller_qbal.to_be_bytes(),
+                );
             }
 
             // Handle base payment (seller -> buyer):
@@ -8739,12 +9031,18 @@ impl InMemoryStateEngine {
                     .execute(
                         &quote_id,
                         trader,
-                        crate::token::TokenOp::Burn { from: trader, amount: q_escrow },
+                        crate::token::TokenOp::Burn {
+                            from: trader,
+                            amount: q_escrow,
+                        },
                     )
                     .map_err(|e| format!("CLOB taker escrow lock failed: {e}"))?;
                 let new_bal = tokens.balance_of(&quote_id, &trader);
                 let mut trie = self.state_trie.write().await;
-                trie.insert(&token_balance_key(&quote_id, &trader), &new_bal.to_be_bytes());
+                trie.insert(
+                    &token_balance_key(&quote_id, &trader),
+                    &new_bal.to_be_bytes(),
+                );
                 drop(trie);
                 drop(tokens);
                 escrow_map.insert(
@@ -8802,8 +9100,7 @@ impl InMemoryStateEngine {
             .map(|r| r.locked_quote_wusdt)
             .unwrap_or(0);
         if wusdt_refund > 0 {
-            let qid = quote_id
-                .ok_or_else(|| "CLOB quote token not configured".to_string())?;
+            let qid = quote_id.ok_or_else(|| "CLOB quote token not configured".to_string())?;
             // Dry-run against a throwaway copy of the registry.
             let mut probe = self.tokens.read().await.clone();
             let minter = probe
@@ -8814,7 +9111,10 @@ impl InMemoryStateEngine {
                 .execute(
                     &qid,
                     minter,
-                    crate::token::TokenOp::Mint { to: caller, amount: wusdt_refund },
+                    crate::token::TokenOp::Mint {
+                        to: caller,
+                        amount: wusdt_refund,
+                    },
                 )
                 .map_err(|e| format!("CLOB cancel refund would fail: {e}"))?;
         }
@@ -8851,15 +9151,19 @@ impl InMemoryStateEngine {
             if escrow.locked_base_stell > 0 || escrow.locked_quote_native > 0 {
                 self.credit_native(
                     &caller,
-                    escrow.locked_base_stell.saturating_add(escrow.locked_quote_native),
+                    escrow
+                        .locked_base_stell
+                        .saturating_add(escrow.locked_quote_native),
                 )
                 .await?;
             }
             if escrow.locked_quote_wusdt > 0 {
-                let qid = quote_id
-                    .ok_or_else(|| "CLOB quote token not configured".to_string())?;
+                let qid = quote_id.ok_or_else(|| "CLOB quote token not configured".to_string())?;
                 let mut tokens = self.tokens_write().await;
-                let token_minter = tokens.get(&qid).map(|tok| tok.metadata.minter).unwrap_or([0u8; 32]);
+                let token_minter = tokens
+                    .get(&qid)
+                    .map(|tok| tok.metadata.minter)
+                    .unwrap_or([0u8; 32]);
                 tokens
                     .execute(
                         &qid,
@@ -8985,7 +9289,9 @@ impl InMemoryStateEngine {
                     Some(acc) => acc.balance -= amount,
                 }
             } else {
-                let acc = map.entry(addr).or_insert_with(|| AccountState::new(addr, 0));
+                let acc = map
+                    .entry(addr)
+                    .or_insert_with(|| AccountState::new(addr, 0));
                 match acc.balance.checked_add(amount) {
                     Some(v) => acc.balance = v,
                     None => {
@@ -9088,8 +9394,7 @@ impl InMemoryStateEngine {
         let mut token_touched: HashSet<[u8; 32]> = HashSet::new();
         let mut supply_dirty = false;
         let qid = quote_id;
-        let minter: Option<[u8; 32]> =
-            qid.and_then(|q| staged.get(&q).map(|t| t.metadata.minter));
+        let minter: Option<[u8; 32]> = qid.and_then(|q| staged.get(&q).map(|t| t.metadata.minter));
 
         let live = self.accounts.read().await;
         let mut proj: HashMap<[u8; 32], i128> = HashMap::new();
@@ -9102,7 +9407,14 @@ impl InMemoryStateEngine {
         }
         macro_rules! credit {
             ($addr:expr, $amount:expr, $what:expr) => {
-                Self::plan_native_credit(&mut proj, &live, &mut native_moves, $addr, $amount, $what)?
+                Self::plan_native_credit(
+                    &mut proj,
+                    &live,
+                    &mut native_moves,
+                    $addr,
+                    $amount,
+                    $what,
+                )?
             };
         }
 
@@ -9177,7 +9489,13 @@ impl InMemoryStateEngine {
                                     let q = ClobQuoteMode::Wusdt.quote(t.price, t.amount);
                                     let take = rec.locked_quote_wusdt.min(q);
                                     rec.locked_quote_wusdt -= take;
-                                    tok_op(minter_or_err()?, TokenOp::Mint { to: buyer, amount: take })?;
+                                    tok_op(
+                                        minter_or_err()?,
+                                        TokenOp::Mint {
+                                            to: buyer,
+                                            amount: take,
+                                        },
+                                    )?;
                                 } else {
                                     let qn = ClobQuoteMode::NativeSvm.quote(t.price, t.amount);
                                     let take = rec.locked_quote_native.min(qn);
@@ -9224,13 +9542,25 @@ impl InMemoryStateEngine {
                         if maker_escrowed_quote {
                             if pays_wusdt {
                                 work.get_mut(&mkey).unwrap().locked_quote_wusdt -= q;
-                                tok_op(minter_or_err()?, TokenOp::Mint { to: seller, amount: q })?;
+                                tok_op(
+                                    minter_or_err()?,
+                                    TokenOp::Mint {
+                                        to: seller,
+                                        amount: q,
+                                    },
+                                )?;
                             } else {
                                 work.get_mut(&mkey).unwrap().locked_quote_native -= q;
                                 credit!(seller, q, "escrow quote release");
                             }
                         } else if pays_wusdt {
-                            tok_op(buyer, TokenOp::Transfer { to: seller, amount: q })?;
+                            tok_op(
+                                buyer,
+                                TokenOp::Transfer {
+                                    to: seller,
+                                    amount: q,
+                                },
+                            )?;
                         } else {
                             debit!(buyer, q, "buyer");
                             credit!(seller, q, "quote settlement");
@@ -9274,14 +9604,14 @@ impl InMemoryStateEngine {
                         && unfilled > 0
                         && !order_absent(*pair_id, *order_id)
                     {
-                        let rec = work
-                            .entry((*pair_id, *order_id))
-                            .or_insert_with(|| EscrowRecord {
-                                trader: *trader,
-                                locked_base_stell: 0,
-                                locked_quote_wusdt: 0,
-                                locked_quote_native: 0,
-                            });
+                        let rec =
+                            work.entry((*pair_id, *order_id))
+                                .or_insert_with(|| EscrowRecord {
+                                    trader: *trader,
+                                    locked_base_stell: 0,
+                                    locked_quote_wusdt: 0,
+                                    locked_quote_native: 0,
+                                });
                         if taker_is_buyer {
                             let q = mode.quote(*price, unfilled);
                             if q > 0 {
@@ -9299,8 +9629,7 @@ impl InMemoryStateEngine {
                             }
                         } else {
                             debit!(*trader, unfilled, "seller escrow lock");
-                            rec.locked_base_stell =
-                                rec.locked_base_stell.saturating_add(unfilled);
+                            rec.locked_base_stell = rec.locked_base_stell.saturating_add(unfilled);
                         }
                     }
                 }
@@ -9327,7 +9656,10 @@ impl InMemoryStateEngine {
                         if rec.locked_quote_wusdt > 0 {
                             tok_op(
                                 minter_or_err()?,
-                                TokenOp::Mint { to: *trader, amount: rec.locked_quote_wusdt },
+                                TokenOp::Mint {
+                                    to: *trader,
+                                    amount: rec.locked_quote_wusdt,
+                                },
                             )?;
                         }
                     }
@@ -9414,9 +9746,7 @@ impl InMemoryStateEngine {
     /// part of this: it lives in governance (`stell_governanceParams`), so a
     /// reader sees the parameter and the curve separately rather than a
     /// possibly-stale copy of it baked into the PMM.
-    pub async fn pmm_state(
-        &self,
-    ) -> (crate::pmm::PrimaryMarketMaker, Option<[u8; 32]>, [u8; 32]) {
+    pub async fn pmm_state(&self) -> (crate::pmm::PrimaryMarketMaker, Option<[u8; 32]>, [u8; 32]) {
         let pmm = self.pmm.read().await.clone();
         let usdt = *self.pmm_usdt_token.read().await;
         let treasury = *self.pmm_treasury.read().await;
@@ -9497,7 +9827,10 @@ impl InMemoryStateEngine {
                 .execute(
                     &usdt_id,
                     buyer,
-                    crate::token::TokenOp::Burn { from: buyer, amount: usdt_micro },
+                    crate::token::TokenOp::Burn {
+                        from: buyer,
+                        amount: usdt_micro,
+                    },
                 )
                 .map_err(|e| format!("wUSDT debit failed: {e}"))?;
             let new_bal = tokens.balance_of(&usdt_id, &buyer);
@@ -9518,7 +9851,10 @@ impl InMemoryStateEngine {
             let _ = tokens.execute(
                 &usdt_id,
                 treasury,
-                crate::token::TokenOp::Mint { to: buyer, amount: usdt_micro },
+                crate::token::TokenOp::Mint {
+                    to: buyer,
+                    amount: usdt_micro,
+                },
             );
             return Err(e);
         }
@@ -9564,12 +9900,18 @@ impl InMemoryStateEngine {
             match tokens.execute(
                 &usdt_id,
                 treasury,
-                crate::token::TokenOp::Mint { to: seller, amount: receipt.usdt_paid },
+                crate::token::TokenOp::Mint {
+                    to: seller,
+                    amount: receipt.usdt_paid,
+                },
             ) {
                 Ok(_) => {
                     let new_bal = tokens.balance_of(&usdt_id, &seller);
                     let mut trie = self.state_trie.write().await;
-                    trie.insert(&token_balance_key(&usdt_id, &seller), &new_bal.to_be_bytes());
+                    trie.insert(
+                        &token_balance_key(&usdt_id, &seller),
+                        &new_bal.to_be_bytes(),
+                    );
                     true
                 }
                 Err(_) => false,
@@ -9591,7 +9933,9 @@ impl InMemoryStateEngine {
             return Ok(());
         }
         let mut map = self.accounts.write().await;
-        let acc = map.entry(*addr).or_insert_with(|| AccountState::new(*addr, 0));
+        let acc = map
+            .entry(*addr)
+            .or_insert_with(|| AccountState::new(*addr, 0));
         acc.balance = acc.balance.checked_add(amount).ok_or("native overflow")?;
         let snap = acc.to_trie_bytes();
         drop(map);
@@ -9603,7 +9947,9 @@ impl InMemoryStateEngine {
     /// Debit native STELL from an account (burn) and commit to the trie.
     pub async fn debit_native(&self, addr: &[u8; 32], amount: u64) -> Result<(), String> {
         let mut map = self.accounts.write().await;
-        let acc = map.get_mut(addr).ok_or_else(|| "account does not exist".to_string())?;
+        let acc = map
+            .get_mut(addr)
+            .ok_or_else(|| "account does not exist".to_string())?;
         if acc.balance < amount {
             return Err("Insufficient native STELL balance".to_string());
         }
@@ -9614,7 +9960,6 @@ impl InMemoryStateEngine {
         trie.insert(addr, &snap);
         Ok(())
     }
-
 
     /// Apply the native half of a PMM swap: mint STELL to buyers, burn it from
     /// sellers, and commit every touched account to the state trie.
@@ -9640,12 +9985,14 @@ impl InMemoryStateEngine {
         let mut delta: HashMap<[u8; 32], i128> = HashMap::new();
         for ev in events {
             let (addr, d) = match ev {
-                crate::pmm::PmmEvent::Buy { buyer, stell_minted, .. } => {
-                    (*buyer, *stell_minted as i128)
-                }
-                crate::pmm::PmmEvent::Sell { seller, stell_nano, .. } => {
-                    (*seller, -(*stell_nano as i128))
-                }
+                crate::pmm::PmmEvent::Buy {
+                    buyer,
+                    stell_minted,
+                    ..
+                } => (*buyer, *stell_minted as i128),
+                crate::pmm::PmmEvent::Sell {
+                    seller, stell_nano, ..
+                } => (*seller, -(*stell_nano as i128)),
             };
             *delta.entry(addr).or_insert(0) += d;
         }
@@ -9653,8 +10000,7 @@ impl InMemoryStateEngine {
         let mut map = self.accounts.write().await;
 
         // Pass 1: validate against one consistent view of the balances.
-        let mut snapshot: Vec<([u8; 32], Option<(u64, u64)>)> =
-            Vec::with_capacity(delta.len());
+        let mut snapshot: Vec<([u8; 32], Option<(u64, u64)>)> = Vec::with_capacity(delta.len());
         for (addr, d) in &delta {
             let prev = map.get(addr).map(|a| (a.balance, a.nonce));
             let bal = prev.map(|(b, _)| b).unwrap_or(0);
@@ -9770,7 +10116,8 @@ impl InMemoryStateEngine {
     pub async fn bridge_write(
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, crate::bridge::BridgeState> {
-        self.dom_guard(crate::commitment::Domain::Bridge, &self.bridge).await
+        self.dom_guard(crate::commitment::Domain::Bridge, &self.bridge)
+            .await
     }
 
     /// Serialize the committed bridge domain for persistence.
@@ -9946,18 +10293,14 @@ impl InMemoryStateEngine {
                     // The payer default keeps the map correct if a future
                     // caller allows a different sender.
                     *delta.entry(payer).or_insert(0) -= *amount as i128;
-                    *delta
-                        .entry(crate::bridge::BRIDGE_ESCROW)
-                        .or_insert(0) += *amount as i128;
+                    *delta.entry(crate::bridge::BRIDGE_ESCROW).or_insert(0) += *amount as i128;
                 }
                 crate::bridge::BridgeEffect::Unpark { recipient, amount } => {
                     // Refund (F-G): escrow back to the original depositor.
                     // Escrow sufficiency is enforced in Pass 1 below like
                     // every other debit (an underfunded escrow fails the
                     // whole tx — fail closed, never partial).
-                    *delta
-                        .entry(crate::bridge::BRIDGE_ESCROW)
-                        .or_insert(0) -= *amount as i128;
+                    *delta.entry(crate::bridge::BRIDGE_ESCROW).or_insert(0) -= *amount as i128;
                     *delta.entry(*recipient).or_insert(0) += *amount as i128;
                 }
                 crate::bridge::BridgeEffect::Clawback { account, amount } => {
@@ -9965,17 +10308,13 @@ impl InMemoryStateEngine {
                     // Pass 1 below fails the whole tx if the account already
                     // moved them (after < 0) — fail closed, never partial.
                     *delta.entry(*account).or_insert(0) -= *amount as i128;
-                    *delta
-                        .entry(crate::bridge::BRIDGE_ESCROW)
-                        .or_insert(0) += *amount as i128;
+                    *delta.entry(crate::bridge::BRIDGE_ESCROW).or_insert(0) += *amount as i128;
                 }
                 crate::bridge::BridgeEffect::Burn { amount } => {
                     // Revoke: destroy escrowed funds (deflationary). Pass 1
                     // fails the whole tx if escrow cannot cover it — a burn
                     // of thin air is refused, never rounded to zero.
-                    *delta
-                        .entry(crate::bridge::BRIDGE_ESCROW)
-                        .or_insert(0) -= *amount as i128;
+                    *delta.entry(crate::bridge::BRIDGE_ESCROW).or_insert(0) -= *amount as i128;
                 }
             }
         }
@@ -9983,8 +10322,7 @@ impl InMemoryStateEngine {
         let mut map = self.accounts.write().await;
 
         // Pass 1: validate against one consistent view of the balances.
-        let mut snapshot: Vec<([u8; 32], Option<(u64, u64)>)> =
-            Vec::with_capacity(delta.len());
+        let mut snapshot: Vec<([u8; 32], Option<(u64, u64)>)> = Vec::with_capacity(delta.len());
         for (addr, d) in &delta {
             let prev = map.get(addr).map(|a| (a.balance, a.nonce));
             let bal = prev.map(|(b, _)| b).unwrap_or(0);
@@ -10011,7 +10349,9 @@ impl InMemoryStateEngine {
         // root never disagree.
         let mut touched: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(delta.len());
         for (addr, d) in &delta {
-            let acc = map.entry(*addr).or_insert_with(|| AccountState::new(*addr, 0));
+            let acc = map
+                .entry(*addr)
+                .or_insert_with(|| AccountState::new(*addr, 0));
             acc.balance = ((acc.balance as i128) + *d) as u64;
             touched.push((*addr, acc.to_trie_bytes()));
         }
@@ -10265,7 +10605,10 @@ impl InMemoryStateEngine {
             }
             // Total supply changes on mint/burn
             if matches!(op, TokenOp::Mint { .. } | TokenOp::Burn { .. }) {
-                trie.insert(&token_supply_key(token_id), &token.metadata.total_supply.to_be_bytes());
+                trie.insert(
+                    &token_supply_key(token_id),
+                    &token.metadata.total_supply.to_be_bytes(),
+                );
             }
         }
         Ok(event)
@@ -10277,7 +10620,11 @@ impl InMemoryStateEngine {
     }
 
     pub async fn token_total_supply(&self, token_id: &[u8; 32]) -> Option<u64> {
-        self.tokens.read().await.get(token_id).map(|t| t.metadata.total_supply)
+        self.tokens
+            .read()
+            .await
+            .get(token_id)
+            .map(|t| t.metadata.total_supply)
     }
 
     pub async fn token_resolve(
@@ -10286,7 +10633,10 @@ impl InMemoryStateEngine {
         name: &str,
         symbol: &str,
     ) -> Option<[u8; 32]> {
-        self.tokens.read().await.find_by_creator_name(creator, name, symbol)
+        self.tokens
+            .read()
+            .await
+            .find_by_creator_name(creator, name, symbol)
     }
 
     pub async fn all_token_ids(&self) -> Vec<[u8; 32]> {
@@ -10434,10 +10784,7 @@ impl InMemoryStateEngine {
     /// rebuild from replayed blocks). Two methods, not a flag: a flag at this
     /// call site is exactly how a future caller silently picks the wrong
     /// semantics and re-opens the double mint.
-    pub async fn restore_snapshot_preserve_replay_sets(
-        &self,
-        bytes: &[u8],
-    ) -> Result<(), String> {
+    pub async fn restore_snapshot_preserve_replay_sets(&self, bytes: &[u8]) -> Result<(), String> {
         let (snapshot, penalty) = Self::parse_account_snapshot(bytes)?;
         // The penalty travels with the state (see `create_snapshot`): install
         // it BEFORE the accounts lock (documented lock order).
@@ -10597,7 +10944,6 @@ impl InMemoryStateEngine {
     }
 }
 
-
 // ============ Phase 1 memory bounds (audit: /tmp/opencode/memory-audit.md) ============
 //
 // At scale (tens of millions of accounts) every unbounded in-memory map is an
@@ -10666,11 +11012,7 @@ pub mod memory_bounds {
 
     /// Emit `msg` at warn level at most once per `interval_ms` (per counter).
     /// Lock-free; a lost CAS race only ever SKIPS a duplicate line.
-    pub fn warn_throttled(
-        last_ms: &std::sync::atomic::AtomicU64,
-        interval_ms: u64,
-        msg: &str,
-    ) {
+    pub fn warn_throttled(last_ms: &std::sync::atomic::AtomicU64, interval_ms: u64, msg: &str) {
         let now = now_ms();
         let last = last_ms.load(std::sync::atomic::Ordering::Relaxed);
         if now.saturating_sub(last) < interval_ms {
@@ -10910,7 +11252,9 @@ pub mod memory_bounds {
 
     impl BlockBodyCache {
         pub fn new(cap: usize) -> Self {
-            Self { inner: BoundedLruCache::new("block_body_cache", cap) }
+            Self {
+                inner: BoundedLruCache::new("block_body_cache", cap),
+            }
         }
 
         pub fn with_env() -> Self {
@@ -11150,26 +11494,24 @@ pub mod memory_bounds {
         /// [`StateSnapshotV2`] shape); the rest are bare account chunks. The
         /// penalty is consensus-critical (it enters the charged fee), so it
         /// must travel with the state (audit W6.6).
-        pub async fn create_snapshot_chunked(
-            &self,
-            chunk_accounts: Option<usize>,
-        ) -> Vec<Vec<u8>> {
+        pub async fn create_snapshot_chunked(&self, chunk_accounts: Option<usize>) -> Vec<Vec<u8>> {
             let per = chunk_accounts.unwrap_or(snapshot_chunk_accounts()).max(1);
             let map = self.accounts.read().await;
             let mut addrs: Vec<[u8; 32]> = map.keys().copied().collect();
             addrs.sort();
             let mut out = Vec::new();
             for (i, group) in addrs.chunks(per).enumerate() {
-                let states: Vec<super::AccountState> = group
-                    .iter()
-                    .filter_map(|a| map.get(a).cloned())
-                    .collect();
+                let states: Vec<super::AccountState> =
+                    group.iter().filter_map(|a| map.get(a).cloned()).collect();
                 if i == 0 {
                     // The first chunk also carries the penalty map.
                     let penalty = self.consensus_penalty.read().await.clone();
                     out.push(
-                        bincode::serialize(&super::StateSnapshotV2 { accounts: states, penalty })
-                            .unwrap_or_default(),
+                        bincode::serialize(&super::StateSnapshotV2 {
+                            accounts: states,
+                            penalty,
+                        })
+                        .unwrap_or_default(),
                     );
                 } else {
                     out.push(bincode::serialize(&states).unwrap_or_default());
@@ -11195,10 +11537,7 @@ pub mod memory_bounds {
         /// replay sets are cleared and rebuilt from replayed blocks. A sync
         /// caller must use `restore_snapshot_chunked_preserve_replay_sets`
         /// with the coverage gate.
-        pub async fn restore_snapshot_chunked(
-            &self,
-            chunks: &[Vec<u8>],
-        ) -> Result<(), String> {
+        pub async fn restore_snapshot_chunked(&self, chunks: &[Vec<u8>]) -> Result<(), String> {
             // Phase 1 (validate): decode every chunk with no locks held and
             // no mutation. Any failure returns with live state untouched.
             let (decoded, penalty) = Self::decode_snapshot_chunks(chunks)?;
@@ -11294,18 +11633,27 @@ mod tests {
         assert_eq!(acc_dormant.balance, 10_000_000);
         assert_eq!(acc_dormant.nonce, 0);
         assert_eq!(acc_dormant.pubkey_hash, None);
-        assert_eq!(acc_dormant.to_trie_bytes().len(), crate::cpat2::ACCOUNT_LEAF_LEN_LEGACY);
+        assert_eq!(
+            acc_dormant.to_trie_bytes().len(),
+            crate::cpat2::ACCOUNT_LEAF_LEN_LEGACY
+        );
         assert_eq!(engine.get_pinned_pubkey(&address), None);
 
         // Phase 2: First spend pins public key
-        engine.pin_pubkey(address, scheme, &pubkey, &salt).await.unwrap();
+        engine
+            .pin_pubkey(address, scheme, &pubkey, &salt)
+            .await
+            .unwrap();
 
         let acc_pinned = engine.get_account(&address).await.unwrap();
         assert_eq!(acc_pinned.balance, 10_000_000);
         assert_eq!(acc_pinned.scheme, scheme);
         let expected_hash = *blake3::hash(&pubkey).as_bytes();
         assert_eq!(acc_pinned.pubkey_hash, Some(expected_hash));
-        assert_eq!(acc_pinned.to_trie_bytes().len(), crate::cpat2::ACCOUNT_LEAF_LEN_PQ);
+        assert_eq!(
+            acc_pinned.to_trie_bytes().len(),
+            crate::cpat2::ACCOUNT_LEAF_LEN_PQ
+        );
 
         // Phase 3: Second spend retrieves pinned public key
         let retrieved = engine.get_pinned_pubkey(&address);
@@ -11326,21 +11674,29 @@ mod tests {
         // Tampered address
         let mut tampered_address = correct_address;
         tampered_address[0] ^= 0xff;
-        let res_tampered_addr = engine.pin_pubkey(tampered_address, scheme, &pubkey, &salt).await;
+        let res_tampered_addr = engine
+            .pin_pubkey(tampered_address, scheme, &pubkey, &salt)
+            .await;
         assert!(res_tampered_addr.is_err());
         assert!(res_tampered_addr.unwrap_err().contains("Address mismatch"));
 
         // Tampered salt
         let tampered_salt = [0xaa; 16];
-        let res_tampered_salt = engine.pin_pubkey(correct_address, scheme, &pubkey, &tampered_salt).await;
+        let res_tampered_salt = engine
+            .pin_pubkey(correct_address, scheme, &pubkey, &tampered_salt)
+            .await;
         assert!(res_tampered_salt.is_err());
         assert!(res_tampered_salt.unwrap_err().contains("Address mismatch"));
 
         // Invalid pubkey length
         let bad_pk = vec![0x11u8; 64];
-        let res_bad_len = engine.pin_pubkey(correct_address, scheme, &bad_pk, &salt).await;
+        let res_bad_len = engine
+            .pin_pubkey(correct_address, scheme, &bad_pk, &salt)
+            .await;
         assert!(res_bad_len.is_err());
-        assert!(res_bad_len.unwrap_err().contains("Invalid public key length"));
+        assert!(res_bad_len
+            .unwrap_err()
+            .contains("Invalid public key length"));
     }
 
     #[tokio::test]
@@ -11362,9 +11718,15 @@ mod tests {
             engine1.open_pq_storage(&dir).unwrap();
 
             engine1.credit_native(&address, 50_000_000).await.unwrap();
-            engine1.pin_pubkey(address, scheme, &pubkey, &salt).await.unwrap();
+            engine1
+                .pin_pubkey(address, scheme, &pubkey, &salt)
+                .await
+                .unwrap();
 
-            assert_eq!(engine1.get_pinned_pubkey(&address), Some((scheme, pubkey.clone())));
+            assert_eq!(
+                engine1.get_pinned_pubkey(&address),
+                Some((scheme, pubkey.clone()))
+            );
             engine1.create_snapshot().await
         };
 
@@ -11396,7 +11758,10 @@ mod tests {
         let salt_mldsa = [0x12u8; 16];
         let addr_mldsa = derive_pq_address(scheme_mldsa, &pk_mldsa, &salt_mldsa);
         engine.credit_native(&addr_mldsa, 1_000).await.unwrap();
-        assert!(engine.pin_pubkey(addr_mldsa, scheme_mldsa, &pk_mldsa, &salt_mldsa).await.is_err());
+        assert!(engine
+            .pin_pubkey(addr_mldsa, scheme_mldsa, &pk_mldsa, &salt_mldsa)
+            .await
+            .is_err());
         assert_eq!(engine.get_pinned_pubkey(&addr_mldsa), None);
 
         // Hybrid
@@ -11405,8 +11770,14 @@ mod tests {
         let salt_hybrid = [0x34u8; 16];
         let addr_hybrid = derive_pq_address(scheme_hybrid, &pk_hybrid, &salt_hybrid);
         engine.credit_native(&addr_hybrid, 2_000).await.unwrap();
-        engine.pin_pubkey(addr_hybrid, scheme_hybrid, &pk_hybrid, &salt_hybrid).await.unwrap();
-        assert_eq!(engine.get_pinned_pubkey(&addr_hybrid), Some((scheme_hybrid, pk_hybrid)));
+        engine
+            .pin_pubkey(addr_hybrid, scheme_hybrid, &pk_hybrid, &salt_hybrid)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.get_pinned_pubkey(&addr_hybrid),
+            Some((scheme_hybrid, pk_hybrid))
+        );
 
         // Ed25519
         let scheme_ed = PqScheme::Ed25519;
@@ -11414,7 +11785,10 @@ mod tests {
         let salt_ed = [0x56u8; 16];
         let addr_ed = derive_pq_address(scheme_ed, &pk_ed, &salt_ed);
         engine.credit_native(&addr_ed, 3_000).await.unwrap();
-        engine.pin_pubkey(addr_ed, scheme_ed, &pk_ed, &salt_ed).await.unwrap();
+        engine
+            .pin_pubkey(addr_ed, scheme_ed, &pk_ed, &salt_ed)
+            .await
+            .unwrap();
         assert_eq!(engine.get_pinned_pubkey(&addr_ed), Some((scheme_ed, pk_ed)));
     }
 
@@ -11427,10 +11801,16 @@ mod tests {
         let address = derive_pq_address(scheme, &pubkey, &salt);
 
         engine.credit_native(&address, 10_000).await.unwrap();
-        engine.pin_pubkey(address, scheme, &pubkey, &salt).await.unwrap();
+        engine
+            .pin_pubkey(address, scheme, &pubkey, &salt)
+            .await
+            .unwrap();
 
         // Re-pinning identical key is idempotent and succeeds
-        assert!(engine.pin_pubkey(address, scheme, &pubkey, &salt).await.is_ok());
+        assert!(engine
+            .pin_pubkey(address, scheme, &pubkey, &salt)
+            .await
+            .is_ok());
 
         // Conflicting registration (different key matching same address would fail address derivation,
         // but if someone bypassed derivation or tried different scheme):
@@ -11465,9 +11845,15 @@ mod tests {
             engine.attach_pq_tree(storage.pq_keys.clone());
 
             engine.credit_native(&address, 100_000).await.unwrap();
-            engine.pin_pubkey(address, scheme, &pubkey, &salt).await.unwrap();
+            engine
+                .pin_pubkey(address, scheme, &pubkey, &salt)
+                .await
+                .unwrap();
 
-            assert_eq!(engine.get_pinned_pubkey(&address), Some((scheme, pubkey.clone())));
+            assert_eq!(
+                engine.get_pinned_pubkey(&address),
+                Some((scheme, pubkey.clone()))
+            );
             storage.flush().unwrap();
             // engine and storage dropped here ("engine stop")
         }
@@ -11521,10 +11907,19 @@ mod tests {
             let engine = InMemoryStateEngine::new();
             engine.attach_pq_tree(storage.pq_keys.clone());
 
-            engine.pin_pubkey(addr_falcon, scheme_falcon, &pk_falcon, &salt_falcon).await.unwrap();
+            engine
+                .pin_pubkey(addr_falcon, scheme_falcon, &pk_falcon, &salt_falcon)
+                .await
+                .unwrap();
             // ML-DSA-44 DISABLED: pinning refuses; the key is never stored.
-            assert!(engine.pin_pubkey(addr_mldsa, scheme_mldsa, &pk_mldsa, &salt_mldsa).await.is_err());
-            engine.pin_pubkey(addr_ed, scheme_ed, &pk_ed, &salt_ed).await.unwrap();
+            assert!(engine
+                .pin_pubkey(addr_mldsa, scheme_mldsa, &pk_mldsa, &salt_mldsa)
+                .await
+                .is_err());
+            engine
+                .pin_pubkey(addr_ed, scheme_ed, &pk_ed, &salt_ed)
+                .await
+                .unwrap();
             storage.flush().unwrap();
         }
 
@@ -11539,13 +11934,17 @@ mod tests {
         fresh_engine.attach_pq_tree(storage.pq_keys.clone());
 
         // Verify get_pinned_pubkey returns the exact registered keys
-        let got_falcon = fresh_engine.get_pinned_pubkey(&addr_falcon).expect("falcon key must be retrieved");
+        let got_falcon = fresh_engine
+            .get_pinned_pubkey(&addr_falcon)
+            .expect("falcon key must be retrieved");
         assert_eq!(got_falcon, (scheme_falcon, pk_falcon));
 
         let got_mldsa = fresh_engine.get_pinned_pubkey(&addr_mldsa);
         assert_eq!(got_mldsa, None, "disabled ML-DSA-44 keys are never stored");
 
-        let got_ed = fresh_engine.get_pinned_pubkey(&addr_ed).expect("ed25519 key must be retrieved");
+        let got_ed = fresh_engine
+            .get_pinned_pubkey(&addr_ed)
+            .expect("ed25519 key must be retrieved");
         assert_eq!(got_ed, (scheme_ed, pk_ed));
 
         // Unregistered address returns None
@@ -11580,7 +11979,10 @@ mod tests {
         // Verify account is legacy / unpinned before execution
         let acc_before = engine.get_account(&from).await.unwrap();
         assert_eq!(acc_before.pubkey_hash, None);
-        assert_eq!(acc_before.to_trie_bytes().len(), crate::cpat2::ACCOUNT_LEAF_LEN_LEGACY);
+        assert_eq!(
+            acc_before.to_trie_bytes().len(),
+            crate::cpat2::ACCOUNT_LEAF_LEN_LEGACY
+        );
         let leaf_before = engine.state_trie.read().await.get(&from).unwrap().to_vec();
         assert_eq!(leaf_before.len(), crate::cpat2::ACCOUNT_LEAF_LEN_LEGACY);
         assert_eq!(engine.get_pinned_pubkey(&from), None);
@@ -11626,7 +12028,10 @@ mod tests {
         assert_eq!(acc_after.balance, expected_balance);
 
         // 2. Verify account leaf becomes 49 bytes (ACCOUNT_LEAF_LEN_PQ)
-        assert_eq!(acc_after.to_trie_bytes().len(), crate::cpat2::ACCOUNT_LEAF_LEN_PQ);
+        assert_eq!(
+            acc_after.to_trie_bytes().len(),
+            crate::cpat2::ACCOUNT_LEAF_LEN_PQ
+        );
         assert_eq!(acc_after.to_trie_bytes().len(), 49);
         let leaf_after = engine.state_trie.read().await.get(&from).unwrap().to_vec();
         assert_eq!(leaf_after.len(), crate::cpat2::ACCOUNT_LEAF_LEN_PQ);
@@ -11723,7 +12128,10 @@ mod tests {
 
         let (applied2, failed2, _, status2, _) =
             engine.apply_block_parallel_fees(&[tx_imp], 1001).await;
-        assert_eq!(applied2, 1, "Steady-state implicit transaction must succeed");
+        assert_eq!(
+            applied2, 1,
+            "Steady-state implicit transaction must succeed"
+        );
         assert_eq!(failed2, 0);
         assert!(status2[0]);
 
@@ -11731,7 +12139,10 @@ mod tests {
         let acc_after2 = engine.get_account(&from).await.unwrap();
         assert_eq!(acc_after2.nonce, 2);
         assert_eq!(acc_after2.pubkey_hash, Some(*blake3::hash(&pk).as_bytes()));
-        assert_eq!(acc_after2.to_trie_bytes().len(), crate::cpat2::ACCOUNT_LEAF_LEN_PQ);
+        assert_eq!(
+            acc_after2.to_trie_bytes().len(),
+            crate::cpat2::ACCOUNT_LEAF_LEN_PQ
+        );
         assert_eq!(engine.state_trie.read().await.get(&from).unwrap().len(), 49);
 
         // 3. Steady-state across engine restart: fresh engine with attached storage
@@ -11762,8 +12173,9 @@ mod tests {
         let sig_imp2 = Transaction::create_falcon512_test_signature(&pk, &msg_imp2, seed);
         tx_imp2.signature = PqSignatureEnvelope::new_implicit(scheme, sig_imp2).encode();
 
-        let (applied3, failed3, _, _, _) =
-            restarted_engine.apply_block_parallel_fees(&[tx_imp2], 1002).await;
+        let (applied3, failed3, _, _, _) = restarted_engine
+            .apply_block_parallel_fees(&[tx_imp2], 1002)
+            .await;
         assert_eq!(
             applied3, 1,
             "Steady-state implicit transaction on restarted engine must succeed"
@@ -11775,9 +12187,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sec03_downtime_slash_with_falcon_uqc_and_bls() {
-        use crate::consensus::{
-            QuorumCertificate, Vote, VoteKind,
-        };
+        use crate::consensus::{QuorumCertificate, Vote, VoteKind};
         use crate::staking::{DOWNTIME_MISS_THRESHOLD, MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
         use ed25519_dalek::SigningKey;
         use rand::rngs::OsRng;
@@ -11795,9 +12205,16 @@ mod tests {
         let engine = InMemoryStateEngine::new();
         for id in &ids {
             engine.credit_native(id, bond_amount * 2).await.unwrap();
-            engine.staking_write().await.bond(*id, bond_amount, 0).unwrap();
+            engine
+                .staking_write()
+                .await
+                .bond(*id, bond_amount, 0)
+                .unwrap();
         }
-        engine.credit_native(&crate::staking::STAKING_POOL, bond_amount * 10).await.unwrap();
+        engine
+            .credit_native(&crate::staking::STAKING_POOL, bond_amount * 10)
+            .await
+            .unwrap();
 
         let vs = engine.staking_read().await.to_validator_set();
         assert_eq!(vs.len(), 4);
@@ -11826,21 +12243,37 @@ mod tests {
 
         // Apply downtime slash for heights 1..=threshold - 1
         for h in 1..DOWNTIME_MISS_THRESHOLD as u64 {
-            let burned = engine.apply_downtime_slash(h, Some(&qc_without_offline())).await;
+            let burned = engine
+                .apply_downtime_slash(h, Some(&qc_without_offline()))
+                .await;
             assert_eq!(burned, 0);
             let ledger = engine.staking_read().await;
-            assert_eq!(ledger.validators[&honest_id].missed, 0, "honest signer must NOT accumulate missed blocks");
-            assert_eq!(ledger.validators[&offline_id].missed, h as u32, "offline non-signer MUST accumulate missed blocks");
+            assert_eq!(
+                ledger.validators[&honest_id].missed, 0,
+                "honest signer must NOT accumulate missed blocks"
+            );
+            assert_eq!(
+                ledger.validators[&offline_id].missed, h as u32,
+                "offline non-signer MUST accumulate missed blocks"
+            );
         }
 
         // At threshold, offline validator gets slashed
-        let burned = engine.apply_downtime_slash(DOWNTIME_MISS_THRESHOLD as u64, Some(&qc_without_offline())).await;
+        let burned = engine
+            .apply_downtime_slash(DOWNTIME_MISS_THRESHOLD as u64, Some(&qc_without_offline()))
+            .await;
         assert!(burned > 0, "offline validator must be slashed at threshold");
         {
             let ledger = engine.staking_read().await;
             assert_eq!(ledger.validators[&honest_id].missed, 0);
-            assert_eq!(ledger.validators[&honest_id].total_slashed, 0, "honest validator must NEVER be slashed");
-            assert!(ledger.validators[&offline_id].total_slashed > 0, "offline validator must be slashed");
+            assert_eq!(
+                ledger.validators[&honest_id].total_slashed, 0,
+                "honest validator must NEVER be slashed"
+            );
+            assert!(
+                ledger.validators[&offline_id].total_slashed > 0,
+                "offline validator must be slashed"
+            );
         }
 
         // 2. Offline member comes back online and signs a genuine QC: the
@@ -11861,10 +12294,18 @@ mod tests {
                 signatures: sigs,
             }
         };
-        assert!(qc_with_offline.verify(&vs), "returning-member QC must verify");
-        engine.apply_downtime_slash(20, Some(&qc_with_offline)).await;
+        assert!(
+            qc_with_offline.verify(&vs),
+            "returning-member QC must verify"
+        );
+        engine
+            .apply_downtime_slash(20, Some(&qc_with_offline))
+            .await;
         let ledger = engine.staking_read().await;
-        assert_eq!(ledger.validators[&offline_id].missed, 0, "signing a genuine QC forgives the missed streak");
+        assert_eq!(
+            ledger.validators[&offline_id].missed, 0,
+            "signing a genuine QC forgives the missed streak"
+        );
 
         // 3. Fail-closed: a REJECTED QC (garbage markers, no verifiable
         // quorum) moves NOBODY — neither forgiving the offline member nor
@@ -11876,12 +12317,21 @@ mod tests {
             kind: VoteKind::Precommit,
             block_hash: Some([0xCC; 32]),
             signatures: vec![
-                (crate::consensus::PQ_UQC_MARKER_ID, b"garbage-not-an-envelope".to_vec()),
-                (crate::consensus::BLS_QC_MARKER_ID, b"garbage-not-an-envelope".to_vec()),
+                (
+                    crate::consensus::PQ_UQC_MARKER_ID,
+                    b"garbage-not-an-envelope".to_vec(),
+                ),
+                (
+                    crate::consensus::BLS_QC_MARKER_ID,
+                    b"garbage-not-an-envelope".to_vec(),
+                ),
                 (honest_id, vec![0x77u8; 64]),
             ],
         };
-        assert!(!garbage_qc.verify(&vs), "garbage-marker QC must be rejected");
+        assert!(
+            !garbage_qc.verify(&vs),
+            "garbage-marker QC must be rejected"
+        );
         assert!(garbage_qc.signers_set(&vs).is_empty());
         let missed_before: u32 = engine.staking_read().await.validators[&offline_id].missed;
         let honest_before: u32 = engine.staking_read().await.validators[&honest_id].missed;
@@ -11900,10 +12350,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_sec07_free_failure_dos_charges_fee_and_increments_nonce() {
+        use crate::sharding::{Block, MASTERCHAIN_SHARD};
+        use crate::svm::OpCode;
         use ed25519_dalek::SigningKey;
         use rand::rngs::OsRng;
-        use crate::svm::OpCode;
-        use crate::sharding::{Block, MASTERCHAIN_SHARD};
 
         let engine = InMemoryStateEngine::new();
         let alice = SigningKey::generate(&mut OsRng);
@@ -11913,7 +12363,10 @@ mod tests {
         let proposer_addr = proposer.verifying_key().to_bytes();
 
         let initial_balance = 1_000_000u64;
-        engine.credit_native(&alice_addr, initial_balance).await.unwrap();
+        engine
+            .credit_native(&alice_addr, initial_balance)
+            .await
+            .unwrap();
 
         // 1. Transaction that fails execution (e.g. out of gas)
         // Admitted because sender covers amount (0) + gas_limit (50_000).
@@ -11927,7 +12380,10 @@ mod tests {
             0,
             1,
             1,
-            vec![OpCode::Transfer { recipient: [0xCC; 32], amount: 1 }],
+            vec![OpCode::Transfer {
+                recipient: [0xCC; 32],
+                amount: 1,
+            }],
         );
 
         let transactions = vec![fail_tx.clone()];
@@ -11948,7 +12404,7 @@ mod tests {
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-};
+        };
         block.sign_block(&proposer);
 
         let outcome = engine.apply_block_transition(&block, 0).await;
@@ -11959,18 +12415,33 @@ mod tests {
         assert_eq!(outcome.failed, 1);
         assert_eq!(outcome.status, vec![false], "receipt records status failed");
         // 2. fee_charged equals the fee (gas_limit)
-        assert_eq!(outcome.tx_fees, vec![gas_limit], "receipt records actual fee_charged");
+        assert_eq!(
+            outcome.tx_fees,
+            vec![gas_limit],
+            "receipt records actual fee_charged"
+        );
         assert_eq!(outcome.fees_collected, gas_limit);
 
         // 3. Sender balance debited and nonce incremented
         let sender = engine.get_account(&alice_addr).await.unwrap();
-        assert_eq!(sender.balance, initial_balance - gas_limit, "fee debited from sender");
+        assert_eq!(
+            sender.balance,
+            initial_balance - gas_limit,
+            "fee debited from sender"
+        );
         assert_eq!(sender.nonce, 1, "sender nonce incremented");
 
         // 4. Conservation of value: proposer receives fees, total supply unchanged
         let proposer_acc = engine.get_account(&proposer_addr).await.unwrap();
-        assert_eq!(proposer_acc.balance, gas_limit, "proposer credited with failure fee");
-        assert_eq!(sender.balance + proposer_acc.balance, initial_balance, "funds conserved");
+        assert_eq!(
+            proposer_acc.balance, gas_limit,
+            "proposer credited with failure fee"
+        );
+        assert_eq!(
+            sender.balance + proposer_acc.balance,
+            initial_balance,
+            "funds conserved"
+        );
 
         // 5. Test sender whose balance drops below fee during execution:
         // Tx1 spends balance, Tx2 was admitted but now cannot cover the full fee.
@@ -11978,7 +12449,10 @@ mod tests {
         let alice_drain = SigningKey::generate(&mut OsRng);
         let alice_drain_addr = alice_drain.verifying_key().to_bytes();
         let bob_addr = [0xB0; 32];
-        engine.credit_native(&alice_drain_addr, 1_200_000).await.unwrap();
+        engine
+            .credit_native(&alice_drain_addr, 1_200_000)
+            .await
+            .unwrap();
 
         let tx_drain = Transaction::sign_with_payload(
             &alice_drain,
@@ -11988,7 +12462,10 @@ mod tests {
             0,
             1,
             1,
-            vec![OpCode::Transfer { recipient: bob_addr, amount: 600_000 }],
+            vec![OpCode::Transfer {
+                recipient: bob_addr,
+                amount: 600_000,
+            }],
         );
         // Tx2 is admitted against simulated remainder (1.2M - 500k = 700k >= 200k),
         // but at execution time Tx1 left only 100k balance.
@@ -12000,7 +12477,10 @@ mod tests {
             1,
             1,
             1,
-            vec![OpCode::Transfer { recipient: [0xCC; 32], amount: 1 }],
+            vec![OpCode::Transfer {
+                recipient: [0xCC; 32],
+                amount: 1,
+            }],
         );
 
         let transactions = vec![tx_drain, tx_broke];
@@ -12021,7 +12501,7 @@ mod tests {
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
             mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-};
+        };
         block2.sign_block(&proposer);
 
         let outcome2 = engine.apply_block_transition(&block2, 0).await;
@@ -12071,7 +12551,9 @@ mod tests {
         let engine = InMemoryStateEngine::new();
         let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let from = sk.verifying_key().to_bytes();
-        engine.update_account(AccountState::new(from, 10_000_000)).await;
+        engine
+            .update_account(AccountState::new(from, 10_000_000))
+            .await;
 
         let code = wat::parse_str(
             r#"(module
@@ -12152,7 +12634,11 @@ mod tests {
             .map(|_| ed25519_dalek::SigningKey::generate(&mut rng))
             .collect();
         let recipients: Vec<[u8; 32]> = (0..SENDERS)
-            .map(|_| ed25519_dalek::SigningKey::generate(&mut rng).verifying_key().to_bytes())
+            .map(|_| {
+                ed25519_dalek::SigningKey::generate(&mut rng)
+                    .verifying_key()
+                    .to_bytes()
+            })
             .collect();
 
         let txs: Vec<Transaction> = keys
@@ -12173,7 +12659,9 @@ mod tests {
             let engine = InMemoryStateEngine::new().with_parallel_exec(true);
             for k in &keys {
                 let addr = k.verifying_key().to_bytes();
-                engine.update_account(AccountState::new(addr, 1_000_000)).await;
+                engine
+                    .update_account(AccountState::new(addr, 1_000_000))
+                    .await;
             }
             let res = engine.apply_block_parallel_fees(&txs, 1_700_000_000).await;
             assert_eq!(res.0, txs.len(), "run {run}: every transfer must apply");
@@ -12210,7 +12698,11 @@ mod tests {
             .map(|_| ed25519_dalek::SigningKey::generate(&mut rng))
             .collect();
         let recipients: Vec<[u8; 32]> = (0..SENDERS)
-            .map(|_| ed25519_dalek::SigningKey::generate(&mut rng).verifying_key().to_bytes())
+            .map(|_| {
+                ed25519_dalek::SigningKey::generate(&mut rng)
+                    .verifying_key()
+                    .to_bytes()
+            })
             .collect();
 
         let base: Vec<Transaction> = keys
@@ -12232,7 +12724,9 @@ mod tests {
             let engine = InMemoryStateEngine::new().with_parallel_exec(true);
             for k in &keys {
                 let addr = k.verifying_key().to_bytes();
-                engine.update_account(AccountState::new(addr, 1_000_000)).await;
+                engine
+                    .update_account(AccountState::new(addr, 1_000_000))
+                    .await;
             }
             let res = engine.apply_block_parallel_fees(&txs, 1_700_000_000).await;
             assert_eq!(res.0, txs.len(), "perm {perm}: every transfer must apply");
@@ -12261,7 +12755,11 @@ mod tests {
             .map(|_| ed25519_dalek::SigningKey::generate(&mut rng))
             .collect();
         let recipients: Vec<[u8; 32]> = (0..40)
-            .map(|_| ed25519_dalek::SigningKey::generate(&mut rng).verifying_key().to_bytes())
+            .map(|_| {
+                ed25519_dalek::SigningKey::generate(&mut rng)
+                    .verifying_key()
+                    .to_bytes()
+            })
             .collect();
 
         // Two rounds per sender: the second round conflicts with the first
@@ -12290,7 +12788,9 @@ mod tests {
         for engine in [&seq, &par] {
             for k in &keys {
                 let addr = k.verifying_key().to_bytes();
-                engine.update_account(AccountState::new(addr, 1_000_000)).await;
+                engine
+                    .update_account(AccountState::new(addr, 1_000_000))
+                    .await;
             }
         }
 
@@ -12339,14 +12839,20 @@ mod tests {
             user_a.verifying_key().to_bytes(),
             user_b.verifying_key().to_bytes(),
         );
-        let recipient_a = ed25519_dalek::SigningKey::generate(&mut rng).verifying_key().to_bytes();
-        let recipient_b = ed25519_dalek::SigningKey::generate(&mut rng).verifying_key().to_bytes();
+        let recipient_a = ed25519_dalek::SigningKey::generate(&mut rng)
+            .verifying_key()
+            .to_bytes();
+        let recipient_b = ed25519_dalek::SigningKey::generate(&mut rng)
+            .verifying_key()
+            .to_bytes();
 
         let seq = InMemoryStateEngine::new().with_parallel_exec(false);
         let par = InMemoryStateEngine::new().with_parallel_exec(true);
         for engine in [&seq, &par] {
             for addr in [minter_addr, a_addr, b_addr] {
-                engine.update_account(AccountState::new(addr, 10_000_000)).await;
+                engine
+                    .update_account(AccountState::new(addr, 10_000_000))
+                    .await;
             }
         }
 
@@ -12369,11 +12875,25 @@ mod tests {
             .unwrap();
         for engine in [&seq, &par] {
             engine
-                .token_execute(&token_1, minter_addr, TokenOp::Transfer { to: a_addr, amount: 20_000 })
+                .token_execute(
+                    &token_1,
+                    minter_addr,
+                    TokenOp::Transfer {
+                        to: a_addr,
+                        amount: 20_000,
+                    },
+                )
                 .await
                 .unwrap();
             engine
-                .token_execute(&token_2, minter_addr, TokenOp::Transfer { to: b_addr, amount: 30_000 })
+                .token_execute(
+                    &token_2,
+                    minter_addr,
+                    TokenOp::Transfer {
+                        to: b_addr,
+                        amount: 30_000,
+                    },
+                )
                 .await
                 .unwrap();
         }
@@ -12458,7 +12978,9 @@ mod tests {
         // 1. An AFFORDABLE failure: the fee is charged, the nonce advances.
         {
             let engine = InMemoryStateEngine::new();
-            engine.update_account(AccountState::new(from, 1_000_000)).await;
+            engine
+                .update_account(AccountState::new(from, 1_000_000))
+                .await;
             // A payload that reverts (the token does not exist).
             let tx = Transaction::sign_with_payload(
                 &sk,
@@ -12514,7 +13036,9 @@ mod tests {
         // 3. A REPLAY (a stale nonce) moves nothing.
         {
             let engine = InMemoryStateEngine::new();
-            engine.update_account(AccountState::new(from, 1_000_000)).await;
+            engine
+                .update_account(AccountState::new(from, 1_000_000))
+                .await;
             let tx = Transaction::sign_with_payload(
                 &sk,
                 [0x44; 32],
@@ -12556,20 +13080,15 @@ mod tests {
                 to: [0x44; 32],
                 amount: 1,
             }];
-            let tx = Transaction::sign_with_payload(
-                &sk,
-                [0x44; 32],
-                0,
-                200_000,
-                0,
-                1,
-                1,
-                payload,
-            );
+            let tx = Transaction::sign_with_payload(&sk, [0x44; 32], 0, 200_000, 0, 1, 1, payload);
             let single = InMemoryStateEngine::new();
             let block = InMemoryStateEngine::new();
-            single.update_account(AccountState::new(from, 1_000_000)).await;
-            block.update_account(AccountState::new(from, 1_000_000)).await;
+            single
+                .update_account(AccountState::new(from, 1_000_000))
+                .await;
+            block
+                .update_account(AccountState::new(from, 1_000_000))
+                .await;
 
             assert!(
                 single.apply_transaction(&tx, 1_700_000_000).await.is_err(),
@@ -12630,8 +13149,9 @@ mod tests {
                 amount: 1,
             }],
         );
-        let (_, failed, _, status, fees) =
-            engine.apply_block_parallel_fees(std::slice::from_ref(&fail), 1_700_000_000).await;
+        let (_, failed, _, status, fees) = engine
+            .apply_block_parallel_fees(std::slice::from_ref(&fail), 1_700_000_000)
+            .await;
         assert_eq!(failed, 1, "the transaction must fail");
         assert_eq!(status, vec![false]);
         assert_eq!(fees, vec![50_000], "a failure still pays its fee");
@@ -12746,11 +13266,13 @@ mod tests {
             // concurrent threshold.
             let n_senders = 40usize + (rng.below(10) as usize);
             let senders: Vec<SigningKey> = (0..n_senders)
-                .map(|_| SigningKey::from_bytes(&{
-                    let mut b = [0u8; 32];
-                    b[..8].copy_from_slice(&rng.next().to_le_bytes());
-                    b
-                }))
+                .map(|_| {
+                    SigningKey::from_bytes(&{
+                        let mut b = [0u8; 32];
+                        b[..8].copy_from_slice(&rng.next().to_le_bytes());
+                        b
+                    })
+                })
                 .collect();
             let recipients: Vec<[u8; 32]> = (0..n_senders)
                 .map(|_| {
@@ -12807,7 +13329,10 @@ mod tests {
             let res_seq = seq.apply_block_parallel_fees(&txs, 1_700_000_000).await;
             let res_par = par.apply_block_parallel_fees(&txs, 1_700_000_000).await;
 
-            assert_eq!(res_seq.0, res_par.0, "applied count differs (round {round})");
+            assert_eq!(
+                res_seq.0, res_par.0,
+                "applied count differs (round {round})"
+            );
             assert_eq!(res_seq.1, res_par.1, "failed count differs (round {round})");
             assert_eq!(
                 res_seq.2, res_par.2,
@@ -12955,11 +13480,21 @@ mod tests {
                 .await
                 .unwrap();
             let pre_root = engine.get_state_root().await;
-            let (applied, failed, _fees_collected, status, fees) =
-                engine.apply_block_parallel_fees(std::slice::from_ref(&tx), 1_700_000_000).await;
+            let (applied, failed, _fees_collected, status, fees) = engine
+                .apply_block_parallel_fees(std::slice::from_ref(&tx), 1_700_000_000)
+                .await;
             let acc = engine.get_account(&from).await.unwrap();
             let root = engine.get_state_root().await;
-            results.push((applied, failed, status, fees, acc.balance, acc.nonce, pre_root, root));
+            results.push((
+                applied,
+                failed,
+                status,
+                fees,
+                acc.balance,
+                acc.nonce,
+                pre_root,
+                root,
+            ));
         }
 
         assert_eq!(results[0].7, results[1].7, "pre-state roots must match");
@@ -12978,7 +13513,10 @@ mod tests {
             *balance,
             fund - 350_000 - crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS
         );
-        assert_eq!(results[0], results[1], "identical pre-state must give identical verdicts");
+        assert_eq!(
+            results[0], results[1],
+            "identical pre-state must give identical verdicts"
+        );
         let _ = root;
     }
 
@@ -13002,18 +13540,24 @@ mod tests {
             .await
             .unwrap();
 
-        let (applied, failed, _, status, _fees) =
-            engine.apply_block_parallel_fees(std::slice::from_ref(&tx), 1_700_000_000).await;
+        let (applied, failed, _, status, _fees) = engine
+            .apply_block_parallel_fees(std::slice::from_ref(&tx), 1_700_000_000)
+            .await;
         assert_eq!((applied, failed), (1, 0));
         assert_eq!(status.as_slice(), &[true]);
         let mid = engine.get_account(&from).await.unwrap();
 
         // Second application of the same bytes = replayed nonce.
-        let (applied2, failed2, _, status2, fees2) =
-            engine.apply_block_parallel_fees(std::slice::from_ref(&tx), 1_700_000_000).await;
+        let (applied2, failed2, _, status2, fees2) = engine
+            .apply_block_parallel_fees(std::slice::from_ref(&tx), 1_700_000_000)
+            .await;
         assert_eq!((applied2, failed2), (0, 1));
         assert_eq!(status2.as_slice(), &[false]);
-        assert_eq!(fees2.as_slice(), &[0], "a replay moves nothing and files fee 0");
+        assert_eq!(
+            fees2.as_slice(),
+            &[0],
+            "a replay moves nothing and files fee 0"
+        );
         let after = engine.get_account(&from).await.unwrap();
         assert_eq!((after.balance, after.nonce), (mid.balance, mid.nonce));
     }
@@ -13043,8 +13587,9 @@ mod tests {
             map.get_mut(&from).unwrap().pubkey_hash = Some([0x99; 32]);
         }
 
-        let (applied, failed, _, status, fees) =
-            engine.apply_block_parallel_fees(std::slice::from_ref(&tx), 1_700_000_000).await;
+        let (applied, failed, _, status, fees) = engine
+            .apply_block_parallel_fees(std::slice::from_ref(&tx), 1_700_000_000)
+            .await;
         assert_eq!((applied, failed), (0, 1));
         assert_eq!(status.as_slice(), &[false]);
         assert_eq!(
@@ -13117,7 +13662,9 @@ mod tests {
         assert!(tx.is_pq_activation());
 
         let pre = engine.get_account(&from).await.unwrap();
-        let res = engine.commit_native(&tx, tx.gas_limit, &[], &[], &[], 1_700_000_000).await;
+        let res = engine
+            .commit_native(&tx, tx.gas_limit, &[], &[], &[], 1_700_000_000)
+            .await;
         assert!(res.is_err(), "pin write failure must refuse the commit");
         let after = engine.get_account(&from).await.unwrap();
         assert_eq!(
@@ -13153,9 +13700,7 @@ mod tests {
         let snap = engine.commitment_snapshot().await;
         let confidential = engine.confidential.read().await.clone();
         let zkml = engine.zkml_models.read().await.clone();
-        crate::commitment::commitment_digest_with_confidential_and_zkml(
-            &snap, &confidential, &zkml,
-        )
+        crate::commitment::commitment_digest_with_confidential_and_zkml(&snap, &confidential, &zkml)
     }
 
     /// The digest the engine actually folded into the trie (the live path).
@@ -13205,8 +13750,8 @@ mod tests {
                     paused: false,
                     description: String::new(),
                 };
-                let mut actor = crate::token::TokenActor::new(id, md, 1_000_000)
-                    .expect("valid test metadata");
+                let mut actor =
+                    crate::token::TokenActor::new(id, md, 1_000_000).expect("valid test metadata");
                 for j in 0..bals_per_token {
                     let mut acct = [0u8; 32];
                     acct[0..8].copy_from_slice(&(j as u64).to_be_bytes());
@@ -13282,11 +13827,7 @@ mod tests {
             }
             reg.next_nonce = n_contracts as u64;
         }
-        engine
-            .oracle_write()
-            .await
-            .publishers
-            .insert([0x0Au8; 32]);
+        engine.oracle_write().await.publishers.insert([0x0Au8; 32]);
         engine.oracle_write().await.feeds.insert(
             "STELL/USD".to_string(),
             crate::oracle::CommittedFeed {
@@ -13355,9 +13896,15 @@ mod tests {
         );
         // One mutation per domain; the root must track the reference exactly.
         engine.staking_write().await.total_burned += 1;
-        assert_eq!(committed_trie_digest(&engine).await, reference_digest(&engine).await);
+        assert_eq!(
+            committed_trie_digest(&engine).await,
+            reference_digest(&engine).await
+        );
         engine.tokens_write().await.next_nonce += 1;
-        assert_eq!(committed_trie_digest(&engine).await, reference_digest(&engine).await);
+        assert_eq!(
+            committed_trie_digest(&engine).await,
+            reference_digest(&engine).await
+        );
         engine
             .contracts_write()
             .await
@@ -13367,19 +13914,40 @@ mod tests {
             .unwrap()
             .storage
             .insert(12345, 1);
-        assert_eq!(committed_trie_digest(&engine).await, reference_digest(&engine).await);
+        assert_eq!(
+            committed_trie_digest(&engine).await,
+            reference_digest(&engine).await
+        );
         engine.governance_write().await.next_id += 100;
-        assert_eq!(committed_trie_digest(&engine).await, reference_digest(&engine).await);
+        assert_eq!(
+            committed_trie_digest(&engine).await,
+            reference_digest(&engine).await
+        );
         engine.oracle_write().await.breaker_tripped = true;
-        assert_eq!(committed_trie_digest(&engine).await, reference_digest(&engine).await);
+        assert_eq!(
+            committed_trie_digest(&engine).await,
+            reference_digest(&engine).await
+        );
         engine.session_keys_write().await.entries.clear();
-        assert_eq!(committed_trie_digest(&engine).await, reference_digest(&engine).await);
+        assert_eq!(
+            committed_trie_digest(&engine).await,
+            reference_digest(&engine).await
+        );
         engine.orderbooks_write().await.books.remove(&7);
-        assert_eq!(committed_trie_digest(&engine).await, reference_digest(&engine).await);
+        assert_eq!(
+            committed_trie_digest(&engine).await,
+            reference_digest(&engine).await
+        );
         engine.order_escrow_write().await.clear();
-        assert_eq!(committed_trie_digest(&engine).await, reference_digest(&engine).await);
+        assert_eq!(
+            committed_trie_digest(&engine).await,
+            reference_digest(&engine).await
+        );
         engine.bridge_write().await.escrow_balance = 7;
-        assert_eq!(committed_trie_digest(&engine).await, reference_digest(&engine).await);
+        assert_eq!(
+            committed_trie_digest(&engine).await,
+            reference_digest(&engine).await
+        );
         // Cross-shard + xpc + zkml + confidential touch.
         engine
             .cross_shard_completed
@@ -13387,20 +13955,22 @@ mod tests {
             .await
             .insert([0xC5u8; 32]);
         engine.bump_domain_generation(crate::commitment::Domain::CrossShard);
-        assert_eq!(committed_trie_digest(&engine).await, reference_digest(&engine).await);
-        engine
-            .zkml_models_write()
-            .await
-            .models
-            .insert(
-                [0x2Au8; 32],
-                crate::zkml::ZkMlModelRecord {
-                    model_hash: [0x2Bu8; 32],
-                    model: crate::zkml::QuantizedLinearModel::new(vec![]),
-                    spec: None,
-                },
-            );
-        assert_eq!(committed_trie_digest(&engine).await, reference_digest(&engine).await);
+        assert_eq!(
+            committed_trie_digest(&engine).await,
+            reference_digest(&engine).await
+        );
+        engine.zkml_models_write().await.models.insert(
+            [0x2Au8; 32],
+            crate::zkml::ZkMlModelRecord {
+                model_hash: [0x2Bu8; 32],
+                model: crate::zkml::QuantizedLinearModel::new(vec![]),
+                spec: None,
+            },
+        );
+        assert_eq!(
+            committed_trie_digest(&engine).await,
+            reference_digest(&engine).await
+        );
         engine.bump_domain_generation(crate::commitment::Domain::Pmm);
         assert_eq!(
             committed_trie_digest(&engine).await,
@@ -13421,7 +13991,10 @@ mod tests {
         engine.staking_write().await.total_burned += 1;
         let _ = committed_trie_digest(&engine).await;
         let (hits, misses) = cache_stats(&engine);
-        assert_eq!(misses, 1, "exactly the staking domain rebuilds, got {misses}");
+        assert_eq!(
+            misses, 1,
+            "exactly the staking domain rebuilds, got {misses}"
+        );
         assert_eq!(hits, 13, "every other domain must be a hit, got {hits}");
         // Steady state: the global generation skip serves the read; the
         // per-domain cache is not even consulted.

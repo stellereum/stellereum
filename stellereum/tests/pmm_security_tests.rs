@@ -51,7 +51,10 @@ fn no_roundtrip_profit() {
 fn cannot_redeem_unminted_supply() {
     let mut pmm = PrimaryMarketMaker::new();
     pmm.buy_with_usdt(usdt(100)).unwrap();
-    assert_eq!(pmm.sell_stell(stell(1_000_000_000)), Err(PmmError::InsufficientReserve));
+    assert_eq!(
+        pmm.sell_stell(stell(1_000_000_000)),
+        Err(PmmError::InsufficientReserve)
+    );
 }
 
 /// The price is monotonically increasing with supply: buying pushes it up,

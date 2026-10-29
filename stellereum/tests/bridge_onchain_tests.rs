@@ -30,8 +30,8 @@ use stellereum::bridge::{
 };
 use stellereum::commitment::{commitment_digest, CommitmentSnapshot};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
-use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::staking::{MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
+use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::svm::{OpCode, GAS_BRIDGE_INTENT};
 
 /// Fixed, realistic block timestamp. Never 0: 0 is exactly the bug I12 pins.
@@ -172,7 +172,11 @@ async fn sub_quorum_deposit_is_refused_on_the_block_path() {
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
 
-    assert_eq!(out.status, vec![false], "a sub-quorum deposit must not apply");
+    assert_eq!(
+        out.status,
+        vec![false],
+        "a sub-quorum deposit must not apply"
+    );
     assert_eq!(
         balance(&e, &recipient).await,
         0,
@@ -257,10 +261,7 @@ async fn quorum_deposit_credits_exactly_once() {
 
     let before = e.get_state_root().await;
     let out = e
-        .apply_block_transition(
-            &bridge_block(1, TS, vec![tx_a, tx_b], payer_pk),
-            0,
-        )
+        .apply_block_transition(&bridge_block(1, TS, vec![tx_a, tx_b], payer_pk), 0)
         .await;
 
     assert_eq!(
@@ -279,11 +280,7 @@ async fn quorum_deposit_credits_exactly_once() {
             br.processed_source_txs.contains(&[0x73u8; 32]),
             "the credited source tx must be in the committed replay set"
         );
-        assert_eq!(
-            br.processed_source_txs.len(),
-            1,
-            "one source tx, one entry"
-        );
+        assert_eq!(br.processed_source_txs.len(), 1, "one source tx, one entry");
     }
     assert_ne!(
         e.get_state_root().await,
@@ -429,11 +426,7 @@ async fn large_withdrawal_is_time_locked_until_the_block_clock_matures_it() {
             0,
         )
         .await;
-    assert_eq!(
-        out.status,
-        vec![true],
-        "at unlock_at the release applies"
-    );
+    assert_eq!(out.status, vec![true], "at unlock_at the release applies");
     assert!(
         e.bridge_read().await.pending_withdrawals[&0].executed,
         "the release is committed exactly once"
@@ -520,10 +513,7 @@ async fn hourly_rate_limit_is_enforced_on_the_block_clock() {
     let tx_a = bridge_tx(&payer, 0, vec![OpCode::SysCallBridge(Box::new(w(first)))]);
     let tx_b = bridge_tx(&payer, 1, vec![OpCode::SysCallBridge(Box::new(w(second)))]);
     let out = e
-        .apply_block_transition(
-            &bridge_block(1, TS, vec![tx_a, tx_b], payer_pk),
-            0,
-        )
+        .apply_block_transition(&bridge_block(1, TS, vec![tx_a, tx_b], payer_pk), 0)
         .await;
 
     assert_eq!(
@@ -672,16 +662,22 @@ async fn committed_root_changes_only_from_the_block() {
     );
     let after = e.get_state_root().await;
     assert_ne!(
-        after,
-        genesis_like,
+        after, genesis_like,
         "the applied block's settlement must move the root"
     );
-    assert_eq!(e.get_state_root().await, after, "and the root then stabilises");
+    assert_eq!(
+        e.get_state_root().await,
+        after,
+        "and the root then stabilises"
+    );
 
     // I1: the domain is folded into the digest, so a mutation of it alone
     // moves the root - a node holding a different replay set cannot report
     // the same root.
-    e.bridge_write().await.processed_source_txs.insert([0x99u8; 32]);
+    e.bridge_write()
+        .await
+        .processed_source_txs
+        .insert([0x99u8; 32]);
     assert_ne!(
         e.get_state_root().await,
         after,
@@ -746,25 +742,46 @@ fn bridge_domain_is_folded_into_the_commitment_digest() {
             b
         }),
         ("withdrawal id counter", {
-            BridgeState { next_withdrawal_id: 1, ..Default::default() }
+            BridgeState {
+                next_withdrawal_id: 1,
+                ..Default::default()
+            }
         }),
         ("rate window (withdrawn)", {
-            BridgeState { hourly_withdrawn: 7, ..Default::default() }
+            BridgeState {
+                hourly_withdrawn: 7,
+                ..Default::default()
+            }
         }),
         ("rate window (opened at)", {
-            BridgeState { last_rate_limit_reset: 9, ..Default::default() }
+            BridgeState {
+                last_rate_limit_reset: 9,
+                ..Default::default()
+            }
         }),
         ("escrow mirror", {
-            BridgeState { escrow_balance: 11, ..Default::default() }
+            BridgeState {
+                escrow_balance: 11,
+                ..Default::default()
+            }
         }),
         ("deposit window (minted)", {
-            BridgeState { hourly_deposited: 13, ..Default::default() }
+            BridgeState {
+                hourly_deposited: 13,
+                ..Default::default()
+            }
         }),
         ("deposit window (opened at)", {
-            BridgeState { last_deposit_reset: 17, ..Default::default() }
+            BridgeState {
+                last_deposit_reset: 17,
+                ..Default::default()
+            }
         }),
         ("cumulative minted supply", {
-            BridgeState { total_minted: 19, ..Default::default() }
+            BridgeState {
+                total_minted: 19,
+                ..Default::default()
+            }
         }),
         ("deposit record", {
             let mut b = BridgeState::default();
@@ -797,7 +814,10 @@ fn bridge_domain_is_folded_into_the_commitment_digest() {
             b
         }),
         ("dispute + id counter", {
-            let mut b = BridgeState { next_dispute_id: 1, ..Default::default() };
+            let mut b = BridgeState {
+                next_dispute_id: 1,
+                ..Default::default()
+            };
             b.disputes.insert(
                 0,
                 stellereum::bridge::Dispute {
@@ -846,7 +866,7 @@ fn ton_proof(
     root_override: Option<[u8; 32]>,
 ) -> BridgeIntent {
     use stellereum::bridge::bridge_adapters::{
-        DepositClaim, DepositEvidence, StoredHeader, ton_leaf_encoding,
+        ton_leaf_encoding, DepositClaim, DepositEvidence, StoredHeader,
     };
     let claim = DepositClaim {
         chain: SupportedChain::Ton,
@@ -886,7 +906,7 @@ fn evm_proof(
     keys: &[SigningKey],
 ) -> BridgeIntent {
     use stellereum::bridge::bridge_adapters::{
-        DepositEvidence, StoredHeader, evm_receipt_encoding, evm_receipt_key,
+        evm_receipt_encoding, evm_receipt_key, DepositEvidence, StoredHeader,
     };
     let log_index = 0u32;
     let receipt_key = evm_receipt_key(&source_tx_hash, log_index);
@@ -957,10 +977,18 @@ async fn adapter_ton_evidence_deposit_credits_on_the_block_path() {
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
-    assert_eq!(out.status, vec![true], "valid adapter evidence must admit the deposit");
+    assert_eq!(
+        out.status,
+        vec![true],
+        "valid adapter evidence must admit the deposit"
+    );
     assert_eq!(balance(&e, &recipient).await, amount);
     assert!(e.bridge_read().await.processed_source_txs.contains(&hash));
-    assert_ne!(e.get_state_root().await, before, "the credit must be committed");
+    assert_ne!(
+        e.get_state_root().await,
+        before,
+        "the credit must be committed"
+    );
 
     // Replay with the SAME valid evidence in a later block: refused.
     let replay = bridge_tx(
@@ -975,7 +1003,11 @@ async fn adapter_ton_evidence_deposit_credits_on_the_block_path() {
     let out = e
         .apply_block_transition(&bridge_block(2, TS + 1, vec![replay], payer_pk), 0)
         .await;
-    assert_eq!(out.status, vec![false], "replay via the evidence path must be refused");
+    assert_eq!(
+        out.status,
+        vec![false],
+        "replay via the evidence path must be refused"
+    );
     assert_eq!(balance(&e, &recipient).await, amount, "no second mint");
     // No second mint and no bridge-state change. (The root does move: the
     // refusal is an attributable failure, so it pays the D2 floor step and
@@ -1003,11 +1035,19 @@ async fn adapter_evm_evidence_deposit_credits_on_the_block_path() {
         recipient,
         amount,
     };
-    let tx = bridge_tx(&payer, 0, proof_ops(evm_proof(hash, recipient, amount, &vals), dep));
+    let tx = bridge_tx(
+        &payer,
+        0,
+        proof_ops(evm_proof(hash, recipient, amount, &vals), dep),
+    );
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
-    assert_eq!(out.status, vec![true], "valid EVM evidence must admit the deposit");
+    assert_eq!(
+        out.status,
+        vec![true],
+        "valid EVM evidence must admit the deposit"
+    );
     assert_eq!(balance(&e, &recipient).await, amount);
     assert!(e.bridge_read().await.processed_source_txs.contains(&hash));
 }
@@ -1036,7 +1076,11 @@ async fn adapter_tampered_evidence_is_refused_on_the_block_path() {
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
-    assert_eq!(out.status, vec![false], "evidence for the wrong root must be refused");
+    assert_eq!(
+        out.status,
+        vec![false],
+        "evidence for the wrong root must be refused"
+    );
     assert_eq!(balance(&e, &recipient).await, 0);
     assert!(e.bridge_read().await.processed_source_txs.is_empty());
     // No coin and no bridge state moved. (The root does move: the refusal is
@@ -1068,12 +1112,20 @@ async fn zk_placeholder_evidence_is_refused_on_the_block_path() {
             },
         ),
     };
-    let tx = bridge_tx(&payer, 0, proof_ops(placeholder, deposit(hash, recipient, 5 * STELL)));
+    let tx = bridge_tx(
+        &payer,
+        0,
+        proof_ops(placeholder, deposit(hash, recipient, 5 * STELL)),
+    );
     let before = e.get_state_root().await;
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
-    assert_eq!(out.status, vec![false], "the zk placeholder must always fail closed");
+    assert_eq!(
+        out.status,
+        vec![false],
+        "the zk placeholder must always fail closed"
+    );
     assert_eq!(balance(&e, &recipient).await, 0);
     assert!(e.bridge_read().await.processed_source_txs.is_empty());
     // No coin and no bridge state moved. (The root does move: the refusal is
@@ -1114,7 +1166,11 @@ async fn quorum_path_ignores_bogus_evidence() {
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
-    assert_eq!(out.status, vec![true], "a quorum deposit credits despite bogus evidence");
+    assert_eq!(
+        out.status,
+        vec![true],
+        "a quorum deposit credits despite bogus evidence"
+    );
     assert_eq!(balance(&e, &recipient).await, amount);
 }
 
@@ -1144,10 +1200,20 @@ async fn lone_deposit_proof_commits_nothing() {
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![lone], payer_pk), 0)
         .await;
-    assert_eq!(out.status, vec![true], "an inert bundle must not revert its carrier");
+    assert_eq!(
+        out.status,
+        vec![true],
+        "an inert bundle must not revert its carrier"
+    );
     let br = e.bridge_read().await;
-    assert!(br.processed_source_txs.is_empty(), "inert evidence commits no replay entry");
-    assert!(br.pending_withdrawals.is_empty(), "inert evidence queues nothing");
+    assert!(
+        br.processed_source_txs.is_empty(),
+        "inert evidence commits no replay entry"
+    );
+    assert!(
+        br.pending_withdrawals.is_empty(),
+        "inert evidence queues nothing"
+    );
     assert!(br.is_empty(), "the bridge domain is untouched");
     drop(br);
     assert_eq!(balance(&e, &[0xC6u8; 32]).await, 0, "nobody is credited");
@@ -1208,7 +1274,10 @@ async fn deposit_hourly_cap_enforced_on_the_block_clock() {
     {
         let br = e.bridge_read().await;
         assert_eq!(br.hourly_deposited, first, "the window holds what minted");
-        assert_eq!(br.total_minted, first, "the cumulative counter tracks mints");
+        assert_eq!(
+            br.total_minted, first,
+            "the cumulative counter tracks mints"
+        );
         assert_eq!(
             br.last_deposit_reset, TS,
             "the window opened on the BLOCK timestamp"
@@ -1251,31 +1320,47 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
 
     // Small withdrawal parks immediately (unlock_at = now).
     let amount = STELL;
-    let tx = bridge_tx(&payer, 0, vec![OpCode::SysCallBridge(Box::new(
-        BridgeIntent::Withdraw {
+    let tx = bridge_tx(
+        &payer,
+        0,
+        vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Withdraw {
             chain: SupportedChain::Arbitrum,
             target_address: "0xdeadbeef".to_string(),
             amount,
-        },
-    ))]);
-    let out = e.apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0).await;
+        }))],
+    );
+    let out = e
+        .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
+        .await;
     assert_eq!(out.status, vec![true]);
     assert_eq!(balance(&e, &BRIDGE_ESCROW).await, amount);
 
     // Too early: grace has not passed.
-    let early = bridge_tx(&payer, 1, vec![OpCode::SysCallBridge(Box::new(
-        BridgeIntent::Refund { req_id: 0 },
-    ))]);
-    let out = e.apply_block_transition(&bridge_block(2, TS + 60, vec![early], payer_pk), 0).await;
+    let early = bridge_tx(
+        &payer,
+        1,
+        vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Refund {
+            req_id: 0,
+        }))],
+    );
+    let out = e
+        .apply_block_transition(&bridge_block(2, TS + 60, vec![early], payer_pk), 0)
+        .await;
     assert_eq!(out.status, vec![false], "grace not passed");
 
     // Wrong sender: refused.
     let stranger = key(0x06);
     let stranger_pk = stranger.verifying_key().to_bytes();
-    e.credit_native(&stranger_pk, STELL).await.expect("fund stranger");
-    let wrong = bridge_tx(&stranger, 0, vec![OpCode::SysCallBridge(Box::new(
-        BridgeIntent::Refund { req_id: 0 },
-    ))]);
+    e.credit_native(&stranger_pk, STELL)
+        .await
+        .expect("fund stranger");
+    let wrong = bridge_tx(
+        &stranger,
+        0,
+        vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Refund {
+            req_id: 0,
+        }))],
+    );
     let out = e
         .apply_block_transition(
             &bridge_block(3, TS + REFUND_GRACE_SECS + 1, vec![wrong], payer_pk),
@@ -1287,9 +1372,13 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     // Past grace, right sender: escrow back, request gone. Nonce is 2: the
     // refused early refund consumed its nonce (a refused transaction still
     // advances the nonce and pays the D2 floor step).
-    let ok = bridge_tx(&payer, 2, vec![OpCode::SysCallBridge(Box::new(
-        BridgeIntent::Refund { req_id: 0 },
-    ))]);
+    let ok = bridge_tx(
+        &payer,
+        2,
+        vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Refund {
+            req_id: 0,
+        }))],
+    );
     let out = e
         .apply_block_transition(
             &bridge_block(4, TS + REFUND_GRACE_SECS + 1, vec![ok], payer_pk),
@@ -1304,9 +1393,13 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     );
 
     // Double refund: unknown id now. (Nonce 3: the refund above consumed 2.)
-    let again = bridge_tx(&payer, 3, vec![OpCode::SysCallBridge(Box::new(
-        BridgeIntent::Refund { req_id: 0 },
-    ))]);
+    let again = bridge_tx(
+        &payer,
+        3,
+        vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Refund {
+            req_id: 0,
+        }))],
+    );
     let out = e
         .apply_block_transition(
             &bridge_block(5, TS + REFUND_GRACE_SECS + 2, vec![again], payer_pk),
@@ -1316,9 +1409,13 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     assert_eq!(out.status, vec![false], "second refund finds nothing");
 
     // Release after refund: also unknown.
-    let rel = bridge_tx(&payer, 2, vec![OpCode::SysCallBridge(Box::new(
-        BridgeIntent::Release { req_id: 0 },
-    ))]);
+    let rel = bridge_tx(
+        &payer,
+        2,
+        vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Release {
+            req_id: 0,
+        }))],
+    );
     let out = e
         .apply_block_transition(
             &bridge_block(6, TS + REFUND_GRACE_SECS + 3, vec![rel], payer_pk),

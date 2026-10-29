@@ -7,8 +7,8 @@
 
 use blake3::Hasher;
 use ed25519_dalek::VerifyingKey;
-use x25519_dalek::{PublicKey as XPublic, StaticSecret};
 use serde_json::json;
+use x25519_dalek::{PublicKey as XPublic, StaticSecret};
 
 /// Домен деривации — не даёт пересекаться с другими ключами.
 const DERIVE_DOMAIN: &str = "infmail-nft-key-v1";
@@ -22,8 +22,8 @@ const DERIVE_DOMAIN: &str = "infmail-nft-key-v1";
 /// выводиться из ПОДПИСИ кошелька (секрета) в браузере, не из публичного ключа.
 /// Данная функция полезна только как СЛУЖЕБНАЯ (эпоха/метка владельца, тесты).
 pub fn derive_x_pub(wallet_ed_pub_hex: &str) -> Result<String, String> {
-    let ed_bytes = hex::decode(wallet_ed_pub_hex)
-        .map_err(|_| "wallet ed_pub: invalid hex".to_string())?;
+    let ed_bytes =
+        hex::decode(wallet_ed_pub_hex).map_err(|_| "wallet ed_pub: invalid hex".to_string())?;
     // валидируем ed25519 публичный ключ
     let vk = VerifyingKey::from_bytes(
         ed_bytes
@@ -190,14 +190,14 @@ mod tests {
         let plain = "Здравствуйте, это секретное письмо для владельца NFT.";
 
         // 1) бэкенд шифрует письмо на x_pub производный от подписи кошелька
-        let enc = infnode::node::proton_box_body(&x_pub_hex, plain)
-            .expect("proton_box_body encrypt");
+        let enc =
+            infnode::node::proton_box_body(&x_pub_hex, plain).expect("proton_box_body encrypt");
         assert_ne!(enc, plain);
         assert!(enc.contains("infmail-box-v1"));
 
         // 2) владелец (тот же кошелёк → та же подпись → тот же приватный x25519) расшифровывает
-        let dec = infnode::node::proton_unbox_body(&enc, &owner_priv_hex)
-            .expect("unbox with owner priv");
+        let dec =
+            infnode::node::proton_unbox_body(&enc, &owner_priv_hex).expect("unbox with owner priv");
         assert_eq!(dec, plain, "владелец видит своё письмо");
 
         // 3) ДРУГОЙ кошелёк (другая подпись → другой приватный x25519) НЕ может расшифровать

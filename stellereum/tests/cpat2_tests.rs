@@ -6,12 +6,17 @@ struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
         let mut x = self.0;
-        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-        self.0 = x; x
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
     }
     fn key(&mut self) -> Key {
         let mut k = [0u8; 32];
-        for c in k.chunks_mut(8) { c.copy_from_slice(&self.next().to_be_bytes()); }
+        for c in k.chunks_mut(8) {
+            c.copy_from_slice(&self.next().to_be_bytes());
+        }
         k
     }
 }
@@ -30,9 +35,12 @@ fn single_key() {
 #[test]
 fn two_keys_first_bit() {
     let mut t = CompressedTrie::new();
-    let mut a = [0u8; 32]; a[0] = 0x00;
-    let mut b = [0u8; 32]; b[0] = 0x80;
-    t.insert(&a, b"a"); t.insert(&b, b"b");
+    let mut a = [0u8; 32];
+    a[0] = 0x00;
+    let mut b = [0u8; 32];
+    b[0] = 0x80;
+    t.insert(&a, b"a");
+    t.insert(&b, b"b");
     let r = t.root_hash();
     assert!(CompressedTrie::verify(&r, &a, b"a", &t.proof(&a).unwrap()));
     assert!(CompressedTrie::verify(&r, &b, b"b", &t.proof(&b).unwrap()));
@@ -41,9 +49,12 @@ fn two_keys_first_bit() {
 #[test]
 fn deep_divergence_same_prefix() {
     let mut t = CompressedTrie::new();
-    let mut a = [0xAAu8; 32]; a[31] = 0x00;
-    let mut b = [0xAAu8; 32]; b[31] = 0x01;
-    t.insert(&a, b"x"); t.insert(&b, b"y");
+    let mut a = [0xAAu8; 32];
+    a[31] = 0x00;
+    let mut b = [0xAAu8; 32];
+    b[31] = 0x01;
+    t.insert(&a, b"x");
+    t.insert(&b, b"y");
     let r = t.root_hash();
     assert!(CompressedTrie::verify(&r, &a, b"x", &t.proof(&a).unwrap()));
     assert!(CompressedTrie::verify(&r, &b, b"y", &t.proof(&b).unwrap()));
@@ -65,8 +76,14 @@ fn property_random_matches_hashmap() {
         let r = t.root_hash();
         for (k, v) in &refm {
             assert_eq!(t.get(k), Some(v.as_slice()), "get trial {trial}");
-            let p = t.proof(k).unwrap_or_else(|| panic!("no proof trial {trial} key {:?}", &k[..4]));
-            assert!(CompressedTrie::verify(&r, k, v, &p), "verify trial {trial} key {:?}", &k[..4]);
+            let p = t
+                .proof(k)
+                .unwrap_or_else(|| panic!("no proof trial {trial} key {:?}", &k[..4]));
+            assert!(
+                CompressedTrie::verify(&r, k, v, &p),
+                "verify trial {trial} key {:?}",
+                &k[..4]
+            );
         }
         assert_eq!(t.len(), refm.len());
     }
@@ -110,8 +127,10 @@ fn property_insert_remove() {
 #[test]
 fn proof_rejects_forgery() {
     let mut t = CompressedTrie::new();
-    let a = [1u8; 32]; let b = [2u8; 32];
-    t.insert(&a, b"a"); t.insert(&b, b"b");
+    let a = [1u8; 32];
+    let b = [2u8; 32];
+    t.insert(&a, b"a");
+    t.insert(&b, b"b");
     let r = t.root_hash();
     let p = t.proof(&a).unwrap();
     assert!(!CompressedTrie::verify(&r, &a, b"z", &p));

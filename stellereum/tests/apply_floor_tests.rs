@@ -94,10 +94,10 @@ fn mk_block(txs: Vec<Transaction>, proposer: &SigningKey) -> Block {
         shard_headers: vec![],
         precommit_qc: None,
         last_qc: None,
-            order_merkle_root,
-            epoch_key_commitment: [0u8; 32],
-            mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-        };
+        order_merkle_root,
+        epoch_key_commitment: [0u8; 32],
+        mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
+    };
     blk.sign_block(proposer);
     blk
 }
@@ -113,9 +113,7 @@ async fn apply_charges_floor_for_underpriced_tx() {
     let engine = engine_with_floor(FLOOR).await;
     let alice = user_key();
     let from = id_of(&alice);
-    engine
-        .update_account(AccountState::new(from, BAL))
-        .await;
+    engine.update_account(AccountState::new(from, BAL)).await;
 
     // Declares 100, floor is 500k: applies, pays the floor.
     let tx = Transaction::sign(&alice, [0xB0; 32], 1_000, 100, 0, 1, 1);
@@ -124,7 +122,11 @@ async fn apply_charges_floor_for_underpriced_tx() {
 
     assert_eq!((applied, failed), (1, 0));
     assert_eq!(status, vec![true]);
-    assert_eq!(fees, vec![FLOOR], "must charge the floor, not the declaration");
+    assert_eq!(
+        fees,
+        vec![FLOOR],
+        "must charge the floor, not the declaration"
+    );
     assert_eq!(fees_collected, FLOOR);
     let sender = engine.get_account(&from).await.unwrap();
     assert_eq!(sender.balance, BAL - 1_000 - FLOOR);
@@ -139,9 +141,7 @@ async fn failed_tx_pays_floor_and_advances_nonce() {
     let engine = engine_with_floor(FLOOR).await;
     let alice = user_key();
     let from = id_of(&alice);
-    engine
-        .update_account(AccountState::new(from, BAL))
-        .await;
+    engine.update_account(AccountState::new(from, BAL)).await;
 
     // Gas 100 cannot run a 280k transfer: admitted (0 + 100 is covered),
     // fails at execution, pays the floor.
@@ -154,14 +154,17 @@ async fn failed_tx_pays_floor_and_advances_nonce() {
     assert_eq!(fees, vec![FLOOR], "a failed tx must still pay the floor");
     assert_eq!(fees_collected, FLOOR);
     let sender = engine.get_account(&from).await.unwrap();
-    assert_eq!(sender.balance, BAL - FLOOR, "only the floor leaves the account");
+    assert_eq!(
+        sender.balance,
+        BAL - FLOOR,
+        "only the floor leaves the account"
+    );
     assert_eq!(sender.nonce, 1, "a paid failure consumes its nonce");
 
     // The follow-up at the advanced nonce applies: failures no longer
     // cascade, and the consumed nonce cannot be replayed.
     let next = Transaction::sign(&alice, [0xB0; 32], 0, FLOOR, 1, 1, 1);
-    let (applied2, failed2, _, status2, _) =
-        engine.apply_block_parallel_fees(&[next], TS).await;
+    let (applied2, failed2, _, status2, _) = engine.apply_block_parallel_fees(&[next], TS).await;
     assert_eq!((applied2, failed2), (1, 0));
     assert_eq!(status2, vec![true]);
 }
@@ -178,7 +181,9 @@ async fn broke_sender_failure_changes_nothing() {
     let engine = engine_with_floor(FLOOR).await;
     let alice = user_key();
     let from = id_of(&alice);
-    engine.update_account(AccountState::new(from, 1_200_000)).await;
+    engine
+        .update_account(AccountState::new(from, 1_200_000))
+        .await;
 
     // tx1: declared 500k, moves 600k via payload. Admitted (500k reserved),
     // applies (1.1M affordable), leaves 100k.
@@ -247,9 +252,7 @@ async fn replay_and_gap_failures_pay_nothing() {
     let engine = engine_with_floor(0).await;
     let alice = user_key();
     let from = id_of(&alice);
-    engine
-        .update_account(AccountState::new(from, BAL))
-        .await;
+    engine.update_account(AccountState::new(from, BAL)).await;
 
     // Gap first: nonce 5 while the head is 0 — never admitted, never charged.
     let gap = Transaction::sign(&alice, [0xB0; 32], 0, FLOOR, 5, 1, 1);
@@ -271,7 +274,11 @@ async fn replay_and_gap_failures_pay_nothing() {
 
     let sender = engine.get_account(&from).await.unwrap();
     assert_eq!(sender.nonce, 1, "only the honest apply advanced the nonce");
-    assert_eq!(sender.balance, BAL - FLOOR, "only the honest apply was charged");
+    assert_eq!(
+        sender.balance,
+        BAL - FLOOR,
+        "only the honest apply was charged"
+    );
 }
 
 /// Mixed block through the shared transition core: a valid tx, an
@@ -284,14 +291,11 @@ async fn fee_accounting_balances_with_floor_and_failure_fees() {
     let from = id_of(&alice);
     let proposer = user_key();
     let proposer_id = id_of(&proposer);
-    engine
-        .update_account(AccountState::new(from, BAL))
-        .await;
+    engine.update_account(AccountState::new(from, BAL)).await;
 
     let valid = Transaction::sign(&alice, [0xB0; 32], 1_000, 600_000, 0, 1, 1);
     let cheap_ok = Transaction::sign(&alice, [0xB0; 32], 500, 100, 1, 1, 1);
-    let fails =
-        Transaction::sign_with_payload(&alice, [0xB0; 32], 0, 100, 2, 1, 1, oom_payload());
+    let fails = Transaction::sign_with_payload(&alice, [0xB0; 32], 0, 100, 2, 1, 1, oom_payload());
     let total_before = BAL; // proposer starts at 0
     let out = engine
         .apply_block_transition(&mk_block(vec![valid, cheap_ok, fails], &proposer), 0)
@@ -306,7 +310,10 @@ async fn fee_accounting_balances_with_floor_and_failure_fees() {
         sender.balance,
         BAL - (1_000 + 600_000) - (500 + FLOOR) - FLOOR
     );
-    assert_eq!(sender.nonce, 3, "success, paid floor AND paid failure all advance");
+    assert_eq!(
+        sender.nonce, 3,
+        "success, paid floor AND paid failure all advance"
+    );
     let bob = engine.get_account(&[0xB0; 32]).await.unwrap();
     assert_eq!(bob.balance, 1_000 + 500);
     let proposer_acct = engine.get_account(&proposer_id).await.unwrap();
@@ -325,9 +332,7 @@ async fn consensus_penalty_mirror_escalates_and_clears() {
     let engine = engine_with_floor(0).await; // floor = penalty only
     let alice = user_key();
     let from = id_of(&alice);
-    engine
-        .update_account(AccountState::new(from, BAL))
-        .await;
+    engine.update_account(AccountState::new(from, BAL)).await;
 
     // Fail once at floor 0: pays 0 and - no pay, no state change - leaves
     // the nonce alone, but the mirror records the failure.
@@ -361,16 +366,16 @@ async fn consensus_penalty_mirror_escalates_and_clears() {
 /// predicate admission uses.
 #[tokio::test]
 async fn pq_activation_floor_includes_surcharge_at_apply() {
-    use stellereum::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
+    use stellereum::post_quantum::{
+        derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+    };
     use stellereum::sharding::Transaction as Tx;
 
     let engine = engine_with_floor(FLOOR).await;
     let seed = 0xA0u8;
     let pk = Tx::sample_falcon512_pubkey(seed);
     let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
-    engine
-        .update_account(AccountState::new(from, BAL))
-        .await;
+    engine.update_account(AccountState::new(from, BAL)).await;
 
     // Declares exactly the base floor: the surcharge is charged on top.
     let mut tx = Tx {
@@ -383,7 +388,7 @@ async fn pq_activation_floor_includes_surcharge_at_apply() {
         target_shard: 1,
         signature: Vec::new(),
         payload: Vec::new(),
-    
+
         priority_fee_per_gas: 0,
     };
     let msg = tx.signing_message();
@@ -391,8 +396,7 @@ async fn pq_activation_floor_includes_surcharge_at_apply() {
     tx.signature = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk, sig).encode();
     assert!(tx.is_pq_activation());
 
-    let (applied, failed, _, status, fees) =
-        engine.apply_block_parallel_fees(&[tx], TS).await;
+    let (applied, failed, _, status, fees) = engine.apply_block_parallel_fees(&[tx], TS).await;
     assert_eq!((applied, failed), (1, 0));
     assert_eq!(status, vec![true]);
     assert_eq!(
@@ -501,7 +505,9 @@ async fn validate_refuses_underpriced_block_naming_tx() {
 /// covering the base but not the 45k surcharge is refused.
 #[tokio::test]
 async fn validate_refuses_activation_missing_surcharge() {
-    use stellereum::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
+    use stellereum::post_quantum::{
+        derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT,
+    };
     use stellereum::sharding::Transaction as Tx;
 
     let (key, vset, engine) = single_validator();
@@ -518,7 +524,11 @@ async fn validate_refuses_activation_missing_surcharge() {
         .update_account(AccountState::new(id_of(&alice), BAL))
         .await;
     let good = Transaction::sign(&alice, [0xB0; 32], 1_000, FLOOR, 0, 1, 1);
-    rt.mempool.write().await.add_checked(good, BAL).expect("admitted");
+    rt.mempool
+        .write()
+        .await
+        .add_checked(good, BAL)
+        .expect("admitted");
     let genuine = rt.propose(TS).await.expect("propose must succeed");
     let root = engine.get_state_root().await;
 
@@ -536,7 +546,7 @@ async fn validate_refuses_activation_missing_surcharge() {
         target_shard: 1,
         signature: Vec::new(),
         payload: Vec::new(),
-    
+
         priority_fee_per_gas: 0,
     };
     let msg = act.signing_message();
@@ -587,10 +597,7 @@ async fn validate_enforces_failure_penalty_like_admission() {
     // Direct admission would refuse this (penalty not covered)...
     let penalised = Transaction::sign(&alice, [0xB0; 32], 1, FLOOR, 1, 1, 1);
     assert_eq!(
-        rt.mempool
-            .write()
-            .await
-            .add_checked(penalised.clone(), BAL),
+        rt.mempool.write().await.add_checked(penalised.clone(), BAL),
         Err(stellereum::mempool::MempoolError::FeeTooLow)
     );
 

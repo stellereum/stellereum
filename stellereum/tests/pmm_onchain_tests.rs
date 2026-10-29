@@ -30,7 +30,14 @@ async fn setup() -> (InMemoryStateEngine, [u8; 32], [u8; 32], [u8; 32]) {
     let usdt_id = engine.create_token(usdt_minter, meta, 0).await.unwrap();
     // Mint 1,000,000 wUSDT to the buyer (6 decimals -> $1,000,000).
     engine
-        .token_execute(&usdt_id, usdt_minter, TokenOp::Mint { to: buyer, amount: 1_000_000_000_000 })
+        .token_execute(
+            &usdt_id,
+            usdt_minter,
+            TokenOp::Mint {
+                to: buyer,
+                amount: 1_000_000_000_000,
+            },
+        )
         .await
         .unwrap();
     // Seed the PMM with $1,000,000 USDT reserve.
@@ -47,10 +54,17 @@ async fn pmm_buy_mints_native_stell_and_burns_wusdt() {
 
     assert!(receipt.stell_minted > 0, "buy must mint STELL");
     let after_usdt = engine.token_balance(&usdt_id, &buyer).await;
-    assert_eq!(after_usdt, before_usdt - 250_000, "wUSDT must be debited exactly");
+    assert_eq!(
+        after_usdt,
+        before_usdt - 250_000,
+        "wUSDT must be debited exactly"
+    );
 
     let native = engine.get_account(&buyer).await.unwrap().balance;
-    assert_eq!(native, receipt.stell_minted, "native STELL credited on-chain");
+    assert_eq!(
+        native, receipt.stell_minted,
+        "native STELL credited on-chain"
+    );
 }
 
 #[tokio::test]
@@ -97,9 +111,16 @@ async fn pmm_sell_without_native_balance_is_rejected_atomically() {
 
     // Atomicity: buyer's native balance unchanged, wUSDT curve untouched.
     let native = engine.get_account(&buyer).await.unwrap().balance;
-    assert_eq!(native, buy.stell_minted, "failed sell must not change balances");
+    assert_eq!(
+        native, buy.stell_minted,
+        "failed sell must not change balances"
+    );
     let usdt = engine.token_balance(&usdt_id, &buyer).await;
-    assert_eq!(usdt, 1_000_000_000_000 - 100_000, "wUSDT unchanged by failed sell");
+    assert_eq!(
+        usdt,
+        1_000_000_000_000 - 100_000,
+        "wUSDT unchanged by failed sell"
+    );
 }
 
 #[tokio::test]
@@ -109,7 +130,14 @@ async fn pmm_buy_without_usdt_is_rejected() {
     let usdt_id = engine.pmm_usdt_token_read().await.unwrap();
     let bal = engine.token_balance(&usdt_id, &buyer).await;
     engine
-        .token_execute(&usdt_id, buyer, TokenOp::Burn { from: buyer, amount: bal })
+        .token_execute(
+            &usdt_id,
+            buyer,
+            TokenOp::Burn {
+                from: buyer,
+                amount: bal,
+            },
+        )
         .await
         .unwrap();
     let res = engine.pmm_buy(buyer, 1_000).await;
@@ -151,7 +179,10 @@ async fn pmm_buy_sell_roundtrip_on_the_live_block_path() {
         .token_execute(
             &usdt_id,
             treasury,
-            TokenOp::Mint { to: buyer, amount: 1_000_000_000 },
+            TokenOp::Mint {
+                to: buyer,
+                amount: 1_000_000_000,
+            },
         )
         .await
         .unwrap();
@@ -165,8 +196,9 @@ async fn pmm_buy_sell_roundtrip_on_the_live_block_path() {
     // Expected curve result, computed off the committed pre-block state.
     let usdt_micro = 1_000_000u64;
     let mut trial = pmm0.clone();
-    let expected_buy =
-        trial.buy_with_buffer(usdt_micro, stellereum::pmm::PMM_REDEMPTION_BUFFER_BPS).unwrap();
+    let expected_buy = trial
+        .buy_with_buffer(usdt_micro, stellereum::pmm::PMM_REDEMPTION_BUFFER_BPS)
+        .unwrap();
 
     let buy_tx = Transaction::sign_with_payload(
         &buyer_key,
@@ -180,9 +212,16 @@ async fn pmm_buy_sell_roundtrip_on_the_live_block_path() {
     );
     let (applied, failed, fees, status, _) =
         engine.apply_block_parallel_fees(&[buy_tx], BLOCK_TS).await;
-    assert_eq!((applied, failed), (1, 0), "the PMM buy must apply as part of a block");
+    assert_eq!(
+        (applied, failed),
+        (1, 0),
+        "the PMM buy must apply as part of a block"
+    );
     assert_eq!(status, vec![true]);
-    assert_eq!(fees, GAS_PMM_BUY, "the block path charges the declared gas limit");
+    assert_eq!(
+        fees, GAS_PMM_BUY,
+        "the block path charges the declared gas limit"
+    );
 
     let native_after_buy = engine.get_account(&buyer).await.unwrap().balance;
     assert_eq!(
@@ -230,11 +269,18 @@ async fn pmm_buy_sell_roundtrip_on_the_live_block_path() {
         1,
         1,
         1,
-        vec![OpCode::SysCallPmmSell { stell_nano: sell_amount }],
+        vec![OpCode::SysCallPmmSell {
+            stell_nano: sell_amount,
+        }],
     );
-    let (applied, failed, fees, status, _) =
-        engine.apply_block_parallel_fees(&[sell_tx], BLOCK_TS + 1).await;
-    assert_eq!((applied, failed), (1, 0), "the PMM sell must apply as part of a block");
+    let (applied, failed, fees, status, _) = engine
+        .apply_block_parallel_fees(&[sell_tx], BLOCK_TS + 1)
+        .await;
+    assert_eq!(
+        (applied, failed),
+        (1, 0),
+        "the PMM sell must apply as part of a block"
+    );
     assert_eq!(status, vec![true]);
     assert_eq!(fees, GAS_PMM_SELL);
 

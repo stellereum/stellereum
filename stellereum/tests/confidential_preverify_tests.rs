@@ -29,7 +29,7 @@ use stellereum::crypto_privacy::{
 };
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::svm::{confidential_transfer2_gas, GAS_CONFIDENTIAL_SHIELD, OpCode};
+use stellereum::svm::{confidential_transfer2_gas, OpCode, GAS_CONFIDENTIAL_SHIELD};
 
 const BLOCK_TS: u64 = 1_760_000_000;
 const RECIPIENT: [u8; 32] = [0x22; 32];
@@ -273,7 +273,16 @@ fn mixed_block_txs() -> Vec<Transaction> {
         let t = balanced_transfer(2_000, 15, r);
         let (mut ir, or_) = prove(&t, 2_015, 2_000, r);
         ir[0].bit_proofs[0].s0[0] ^= 0xFF;
-        txs.push(shield_transfer_tx(&key(0x15), t, 2_015, 2_000, r, ir, or_, 0));
+        txs.push(shield_transfer_tx(
+            &key(0x15),
+            t,
+            2_015,
+            2_000,
+            r,
+            ir,
+            or_,
+            0,
+        ));
     }
     // Unbalanced (forged equation, valid individual proofs).
     {
@@ -291,7 +300,16 @@ fn mixed_block_txs() -> Vec<Transaction> {
         let r = blinding(0x17);
         let t = balanced_transfer(3_000, 25, r);
         let (ir, _) = prove(&t, 3_025, 3_000, r);
-        txs.push(shield_transfer_tx(&key(0x17), t, 3_025, 3_000, r, ir, Vec::new(), 0));
+        txs.push(shield_transfer_tx(
+            &key(0x17),
+            t,
+            3_025,
+            3_000,
+            r,
+            ir,
+            Vec::new(),
+            0,
+        ));
     }
     // Double-spend pair: full shield+transfer, then a transfer-only replay of
     // the SAME bundle (same digest) one nonce later.
@@ -299,7 +317,16 @@ fn mixed_block_txs() -> Vec<Transaction> {
         let r = blinding(0x18);
         let t = balanced_transfer(900, 5, r);
         let (ir, or_) = prove(&t, 905, 900, r);
-        txs.push(shield_transfer_tx(&key(0x18), t.clone(), 905, 900, r, ir.clone(), or_.clone(), 0));
+        txs.push(shield_transfer_tx(
+            &key(0x18),
+            t.clone(),
+            905,
+            900,
+            r,
+            ir.clone(),
+            or_.clone(),
+            0,
+        ));
         let gas = confidential_transfer2_gas(&ir, &or_);
         txs.push(Transaction::sign_with_payload(
             &key(0x18),
@@ -328,18 +355,22 @@ async fn mixed_block_block_path_matches_sequential_single_tx_path() {
     let n_proof_txs = txs
         .iter()
         .filter(|tx| {
-            tx.payload.iter().any(|op| {
-                matches!(op, OpCode::SysCallConfidentialTransfer2 { .. })
-            })
+            tx.payload
+                .iter()
+                .any(|op| matches!(op, OpCode::SysCallConfidentialTransfer2 { .. }))
         })
         .count();
-    assert!(n_proof_txs >= 4, "the block must cross the parallel threshold");
+    assert!(
+        n_proof_txs >= 4,
+        "the block must cross the parallel threshold"
+    );
 
     let seeds = [0x11u8, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18];
     async fn funded() -> InMemoryStateEngine {
         let e = InMemoryStateEngine::new();
         for s in [0x11u8, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18] {
-            e.update_account(AccountState::new(sender_of(s), 1_000_000)).await;
+            e.update_account(AccountState::new(sender_of(s), 1_000_000))
+                .await;
         }
         e
     }

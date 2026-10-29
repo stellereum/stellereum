@@ -22,10 +22,9 @@
 
 use std::collections::HashSet;
 use stellereum::network::{
-    dht_blob_ttl_ms, parse_keep_blocks, plan_retained_prune, prune_batch,
-    prune_below_exclusive, EpochTag, BUCKET_STELLEREUM_BLOCKS, BUCKET_STELLEREUM_HEAD,
-    BUCKET_STELLEREUM_HEADERS, BUCKET_STELLEREUM_STATE, PREFIX_BLOCK_HASH,
-    PREFIX_LATEST_HEIGHT, STELL_DHT_FOREVER_TTL_MS,
+    dht_blob_ttl_ms, parse_keep_blocks, plan_retained_prune, prune_batch, prune_below_exclusive,
+    EpochTag, BUCKET_STELLEREUM_BLOCKS, BUCKET_STELLEREUM_HEAD, BUCKET_STELLEREUM_HEADERS,
+    BUCKET_STELLEREUM_STATE, PREFIX_BLOCK_HASH, PREFIX_LATEST_HEIGHT, STELL_DHT_FOREVER_TTL_MS,
 };
 
 /// The DHT keyspace slice the chain publisher touches: blob manifests
@@ -99,7 +98,11 @@ impl FakeDht {
     }
 
     fn stell_entry_count(&self) -> usize {
-        self.manifests.iter().filter(|k| k.contains("stell_")).count() + self.kv.len()
+        self.manifests
+            .iter()
+            .filter(|k| k.contains("stell_"))
+            .count()
+            + self.kv.len()
     }
 }
 
@@ -151,11 +154,18 @@ fn steady_state_is_bounded_by_keep_not_by_chain_length() {
     );
     // No height pointer or per-hash kv leak: exactly one height key, and no
     // `stell:block:` entry below the window.
-    let height_keys: Vec<_> =
-        dht.kv.iter().filter(|k| k.starts_with(PREFIX_LATEST_HEIGHT)).collect();
+    let height_keys: Vec<_> = dht
+        .kv
+        .iter()
+        .filter(|k| k.starts_with(PREFIX_LATEST_HEIGHT))
+        .collect();
     assert_eq!(height_keys.len(), 1, "one height pointer per shard");
     assert!(
-        dht.kv.iter().filter(|k| k.starts_with(PREFIX_BLOCK_HASH)).count() <= 8000,
+        dht.kv
+            .iter()
+            .filter(|k| k.starts_with(PREFIX_BLOCK_HASH))
+            .count()
+            <= 8000,
         "per-hash kv entries bounded by the window too"
     );
     // Sanity against the pre-fix behaviour: without pruning this would be
@@ -172,12 +182,8 @@ fn prune_never_touches_head_snapshot_or_height_pointer() {
     // no-index fallback (hash unknown → TTL backstop owns the body).
     for h in 1..=500u64 {
         for with_hash in [true, false] {
-            let plan = plan_retained_prune(
-                &epoch,
-                0,
-                h,
-                with_hash.then(|| hash_hex_for(h)).as_deref(),
-            );
+            let plan =
+                plan_retained_prune(&epoch, 0, h, with_hash.then(|| hash_hex_for(h)).as_deref());
             for (_, name) in &plan.blobs {
                 assert!(!name.contains("_head"), "head pointer forever (h={h})");
                 assert!(!name.contains("_snap_"), "snapshots forever (h={h})");
@@ -202,7 +208,10 @@ fn ttl_backstop_covers_what_height_prune_cannot() {
     let ttl = dht_blob_ttl_ms(8000);
     assert!(ttl < STELL_DHT_FOREVER_TTL_MS, "window blobs DO expire");
     assert!(ttl <= 30 * 24 * 3600 * 1000, "clamped so expiry is real");
-    assert!(ttl >= 7 * 24 * 3600 * 1000, "generous enough that prune wins first");
+    assert!(
+        ttl >= 7 * 24 * 3600 * 1000,
+        "generous enough that prune wins first"
+    );
     // Head/snapshot TTL is effectively forever and survives every sweep.
     assert!(STELL_DHT_FOREVER_TTL_MS > 30 * 24 * 3600 * 1000);
 }

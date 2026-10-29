@@ -25,15 +25,13 @@
 //!    to the same root.
 
 use ed25519_dalek::SigningKey;
+use std::sync::Arc;
 use stellereum::consensus::{ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::{fund_genesis, ChainState, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, ActorSendBody, InMemoryStateEngine};
 use stellereum::svm::{OpCode, GAS_ACTOR_DELIVER, GAS_ACTOR_SEND, GAS_BASIC_TRANSFER};
-use stellereum::zkml::{
-    SessionKeyAuthorization, SCOPE_ACTOR_SEND, SCOPE_ALL, SCOPE_SVM_PAYLOAD,
-};
-use std::sync::Arc;
+use stellereum::zkml::{SessionKeyAuthorization, SCOPE_ACTOR_SEND, SCOPE_ALL, SCOPE_SVM_PAYLOAD};
 
 /// Realistic block timestamp - never 0 (0 is exactly the hardcoded-clock bug
 /// the block path already fixed once).
@@ -92,8 +90,8 @@ fn mk_block(height: u64, ts: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> 
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
-            order_merkle_root,
-            epoch_key_commitment: [0u8; 32],
+        order_merkle_root,
+        epoch_key_commitment: [0u8; 32],
     }
 }
 
@@ -116,9 +114,7 @@ async fn send_reaches_the_inbox_from_the_block_transaction_step_then_the_pass_de
     engine
         .update_account(AccountState::new(sender, 10_000_000))
         .await;
-    engine
-        .update_account(AccountState::new(recipient, 0))
-        .await;
+    engine.update_account(AccountState::new(recipient, 0)).await;
 
     let gas = gas_for(1, 500);
     let tx = Transaction::sign_with_payload(
@@ -191,7 +187,10 @@ async fn send_reaches_the_inbox_from_the_block_transaction_step_then_the_pass_de
         500 + 4_242,
         "delivery adds the message value on top of the plain amount"
     );
-    assert!(mailbox_is_empty(&engine).await, "no account holds a message");
+    assert!(
+        mailbox_is_empty(&engine).await,
+        "no account holds a message"
+    );
 }
 
 // ===========================================================================
@@ -206,7 +205,9 @@ async fn delivery_credits_the_recipient_and_conserves_value() {
     let recipient = [0x78u8; 32];
     let proposer = [0x99u8; 32];
     let start = 10_000_000u64;
-    engine.update_account(AccountState::new(sender, start)).await;
+    engine
+        .update_account(AccountState::new(sender, start))
+        .await;
     engine.update_account(AccountState::new(recipient, 0)).await;
     engine.update_account(AccountState::new(proposer, 0)).await;
 
@@ -273,7 +274,9 @@ async fn bounce_returns_the_value_exactly_once() {
     missing[1] = 0xAD;
     let proposer = [0x99u8; 32];
     let start = 1_000_000u64;
-    engine.update_account(AccountState::new(sender, start)).await;
+    engine
+        .update_account(AccountState::new(sender, start))
+        .await;
     engine.update_account(AccountState::new(proposer, 0)).await;
 
     let gas = gas_for(1, 0);
@@ -326,7 +329,9 @@ async fn failed_body_has_no_partial_effect() {
     let recipient = [0x79u8; 32];
     let bystander = [0xC0u8; 32];
     let start = 1_000_000u64;
-    engine.update_account(AccountState::new(sender, start)).await;
+    engine
+        .update_account(AccountState::new(sender, start))
+        .await;
     engine.update_account(AccountState::new(recipient, 0)).await;
     engine.update_account(AccountState::new(bystander, 0)).await;
 
@@ -375,7 +380,10 @@ async fn failed_body_has_no_partial_effect() {
         "the value bounced back exactly once and the fee came back as the \
          proposer credit - so the sender is whole, and nobody else gained"
     );
-    assert!(mailbox_is_empty(&engine).await, "bounce and queue both drained");
+    assert!(
+        mailbox_is_empty(&engine).await,
+        "bounce and queue both drained"
+    );
 }
 
 // ===========================================================================
@@ -424,13 +432,19 @@ async fn delivery_order_is_deterministic_independent_of_insertion_order() {
         send_op(
             a,
             100,
-            vec![OpCode::Transfer { recipient: b, amount: 100 }],
+            vec![OpCode::Transfer {
+                recipient: b,
+                amount: 100,
+            }],
             500_000,
         ),
         send_op(
             b,
             0,
-            vec![OpCode::Transfer { recipient: a, amount: 100 }],
+            vec![OpCode::Transfer {
+                recipient: a,
+                amount: 100,
+            }],
             500_000,
         ),
     ];
@@ -490,7 +504,9 @@ async fn rejected_transaction_enqueues_nothing_and_moves_nothing() {
     let sender = sender_sk.verifying_key().to_bytes();
     let recipient = [0x7Au8; 32];
     let start = 1_000_000u64;
-    engine.update_account(AccountState::new(sender, start)).await;
+    engine
+        .update_account(AccountState::new(sender, start))
+        .await;
     engine.update_account(AccountState::new(recipient, 0)).await;
     let before = engine.get_state_root().await;
 
@@ -540,7 +556,7 @@ fn grant(master: &SigningKey, session: &SigningKey, scope: u64) -> SessionKeyAut
         2_000_000_000, // valid_until (well past TS)
         1_000_000,     // max_gas_spend
         scope,
-        u64::MAX,      // max_value_per_tx
+        u64::MAX, // max_value_per_tx
         CHAIN_ID,
     )
 }
@@ -579,14 +595,15 @@ async fn session_scope_gates_actor_sends_and_records_the_master_as_sender() {
     state
         .update_account(AccountState::new(master_pub, 10_000_000))
         .await;
-    state
-        .update_account(AccountState::new(recipient, 0))
-        .await;
+    state.update_account(AccountState::new(recipient, 0)).await;
     let err = state
         .apply_transaction(&session_tx(SCOPE_SVM_PAYLOAD), TS)
         .await
         .expect_err("an actor send needs the actor scope bit");
-    assert!(err.contains("scope"), "the refusal must name the scope: {err}");
+    assert!(
+        err.contains("scope"),
+        "the refusal must name the scope: {err}"
+    );
     assert!(mailbox_is_empty(&state).await);
 
     // Refused: actor bit but no payload bit - the ACTOR bit must not be a
@@ -595,7 +612,10 @@ async fn session_scope_gates_actor_sends_and_records_the_master_as_sender() {
         .apply_transaction(&session_tx(SCOPE_ACTOR_SEND), TS)
         .await
         .expect_err("the actor bit alone must not authorize a payload");
-    assert!(err.contains("scope"), "the refusal must name the scope: {err}");
+    assert!(
+        err.contains("scope"),
+        "the refusal must name the scope: {err}"
+    );
     assert!(mailbox_is_empty(&state).await);
     assert_eq!(
         balance(&state, &master_pub).await,
@@ -609,7 +629,10 @@ async fn session_scope_gates_actor_sends_and_records_the_master_as_sender() {
         .await
         .expect("SCOPE_ALL covers an actor send");
 
-    let acc = state.get_account(&recipient).await.expect("recipient exists");
+    let acc = state
+        .get_account(&recipient)
+        .await
+        .expect("recipient exists");
     assert_eq!(acc.inbox.len(), 1, "the send is queued");
     let msg = acc.inbox.front().expect("one message");
     assert_eq!(
@@ -636,7 +659,9 @@ async fn cross_shard_actor_send_is_refused() {
     let sender = sender_sk.verifying_key().to_bytes();
     let recipient = [0x7Cu8; 32];
     let start = 1_000_000u64;
-    engine.update_account(AccountState::new(sender, start)).await;
+    engine
+        .update_account(AccountState::new(sender, start))
+        .await;
     let before = engine.get_state_root().await;
 
     let gas = gas_for(1, 500);
@@ -724,8 +749,11 @@ async fn live_and_reorg_paths_agree_on_an_actor_block() {
     let ks: Vec<SigningKey> = (0..4u8)
         .map(|i| SigningKey::from_bytes(&[0x60 + i; 32]))
         .collect();
-    let vs =
-        ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect());
+    let vs = ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    );
 
     let sender_sk = key(0x3A);
     let sender = sender_sk.verifying_key().to_bytes();
@@ -735,8 +763,7 @@ async fn live_and_reorg_paths_agree_on_an_actor_block() {
     for _ in 0..2 {
         let e = Arc::new(InMemoryStateEngine::new());
         fund_genesis(&e, &vs, BAL).await;
-        e.update_account(AccountState::new(sender, 1_000_000))
-            .await;
+        e.update_account(AccountState::new(sender, 1_000_000)).await;
         e.update_account(AccountState::new(recipient, 0)).await;
         engines.push(e);
     }
@@ -784,7 +811,7 @@ async fn live_and_reorg_paths_agree_on_an_actor_block() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-};
+    };
     let bh = certify(&mut live, &ks, &mut blk).await;
 
     // ---- LIVE ----
@@ -832,10 +859,10 @@ async fn actor_send_coexists_with_a_plain_payload_transfer() {
     let recipient = [0x7Eu8; 32];
     let transfer_to = [0xC1u8; 32];
     let start = 1_000_000u64;
-    engine.update_account(AccountState::new(sender, start)).await;
     engine
-        .update_account(AccountState::new(recipient, 0))
+        .update_account(AccountState::new(sender, start))
         .await;
+    engine.update_account(AccountState::new(recipient, 0)).await;
 
     let gas = gas_for(1, 500) + GAS_BASIC_TRANSFER;
     let tx = Transaction::sign_with_payload(

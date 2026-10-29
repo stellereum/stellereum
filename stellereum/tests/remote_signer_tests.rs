@@ -15,15 +15,15 @@
 use ed25519_dalek::Signer as DalekSigner;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
 use stellereum::remote_signer::{
     remote_signer_from_config, validator_signer_from_env, HttpSignerTransport, LocalSigner,
     MalformedResponseKind, RemoteSigner, Signer, SignerError, SignerTransport, SigningFailureKind,
     TransportErrorKind, ValidatorSigner, MAX_RESPONSE_BYTES, PUBLIC_KEY_LEN, REMOTE_SIGNER_URL_ENV,
     SIGNATURE_LEN,
 };
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
 
 const MSG: &[u8] = b"stellereum remote signer test vector";
 
@@ -55,8 +55,13 @@ struct MockTransport {
 
 impl MockTransport {
     fn new(key: &SigningKey) -> Self {
-        let state = MockState { key: Some(key.clone()), ..Default::default() };
-        Self { state: Arc::new(Mutex::new(state)) }
+        let state = MockState {
+            key: Some(key.clone()),
+            ..Default::default()
+        };
+        Self {
+            state: Arc::new(Mutex::new(state)),
+        }
     }
 
     /// Shared view of what the transport saw, for assertions.
@@ -103,7 +108,10 @@ impl SignerTransport for MockTransport {
         if let Some(e) = st.public_key_error {
             return Err(e);
         }
-        st.key.as_ref().map(|k| k.verifying_key().to_bytes()).ok_or(SignerError::MalformedKey)
+        st.key
+            .as_ref()
+            .map(|k| k.verifying_key().to_bytes())
+            .ok_or(SignerError::MalformedKey)
     }
 
     fn sign(&self, msg: &[u8]) -> Result<[u8; SIGNATURE_LEN], SignerError> {
@@ -122,7 +130,10 @@ impl SignerTransport for MockTransport {
             st.signatures_returned += 1;
             return Ok(sig);
         }
-        let key = st.key.as_ref().ok_or(SignerError::SigningFailed(SigningFailureKind::UnusableKey))?;
+        let key = st
+            .key
+            .as_ref()
+            .ok_or(SignerError::SigningFailed(SigningFailureKind::UnusableKey))?;
         let sig = DalekSigner::try_sign(key, msg)
             .map_err(|_| SignerError::SigningFailed(SigningFailureKind::UnusableKey))?
             .to_bytes();
@@ -167,7 +178,10 @@ fn local_signer_rejects_a_malformed_hex_seed_without_echoing_it() {
     // A config that is not hex, and one of the wrong width, are both refused —
     // with an error that says nothing about what was configured.
     for bad in ["zzzz", "", &"ab".repeat(31), &"ab".repeat(33)] {
-        assert_eq!(LocalSigner::from_hex_seed(bad).err(), Some(SignerError::MalformedKey));
+        assert_eq!(
+            LocalSigner::from_hex_seed(bad).err(),
+            Some(SignerError::MalformedKey)
+        );
     }
     // A valid one works, and whitespace around a config value is tolerated.
     assert!(LocalSigner::from_hex_seed(&format!("  {}  ", "11".repeat(32))).is_ok());
@@ -209,7 +223,12 @@ fn remote_signer_pins_the_public_key_resolved_at_construction() {
     // still be the one that decides, and the foreign signature must be refused.
     let foreign = DalekSigner::try_sign(&other, MSG).expect("sign").to_bytes();
     mock.return_foreign_signature(foreign);
-    assert_eq!(remote.sign(MSG).err(), Some(SignerError::SigningFailed(SigningFailureKind::SignatureInvalid)));
+    assert_eq!(
+        remote.sign(MSG).err(),
+        Some(SignerError::SigningFailed(
+            SigningFailureKind::SignatureInvalid
+        ))
+    );
     assert_eq!(remote.public_key(), key.verifying_key().to_bytes());
 }
 
@@ -233,21 +252,35 @@ fn transport_failure_propagates_and_never_falls_back_to_a_local_key() {
     ];
     for failure in failures {
         mock.fail_sign(failure);
-        let err = remote.sign(MSG).expect_err("transport failure must surface");
+        let err = remote
+            .sign(MSG)
+            .expect_err("transport failure must surface");
         // The error is the transport's, unchanged: the node is told what
         // happened instead of being handed something to keep going with.
         assert_eq!(err, failure);
-        assert!(remote.sign(MSG).is_err(), "a failing signer must never produce a signature");
+        assert!(
+            remote.sign(MSG).is_err(),
+            "a failing signer must never produce a signature"
+        );
     }
-    assert_eq!(mock.signatures_returned(), 0, "a failing signer returned no signature");
+    assert_eq!(
+        mock.signatures_returned(),
+        0,
+        "a failing signer returned no signature"
+    );
 
     // The decisive assertion: a perfectly good key sits in this very process,
     // and the remote signer must not reach for it when the HSM is down. This is
     // the failure the whole module exists to prevent — an operator who believes
     // the key is in the HSM while the node quietly keeps voting.
-    mock.fail_sign(SignerError::Transport(TransportErrorKind::Rejected { status: 503 }));
+    mock.fail_sign(SignerError::Transport(TransportErrorKind::Rejected {
+        status: 503,
+    }));
     assert!(remote.sign(MSG).is_err(), "no local fallback");
-    assert!(local.sign(MSG).is_ok(), "the local key is healthy, which is exactly the trap");
+    assert!(
+        local.sign(MSG).is_ok(),
+        "the local key is healthy, which is exactly the trap"
+    );
 
     // Once the signer is back, signing works again: the failure is reported, not
     // latched.
@@ -264,7 +297,10 @@ fn public_key_resolution_failure_stops_the_signer_from_being_built() {
     // Construction resolves the key once, so an unreachable signer means no
     // signer at all. The node should fail to start rather than start degraded.
     let err = RemoteSigner::new(Arc::new(mock.clone())).err();
-    assert_eq!(err, Some(SignerError::Transport(TransportErrorKind::Request)));
+    assert_eq!(
+        err,
+        Some(SignerError::Transport(TransportErrorKind::Request))
+    );
 }
 
 // ============================================================================
@@ -314,7 +350,10 @@ fn remote_signer_rejects_a_signature_of_the_wrong_width() {
     let remote = remote_over(&mock);
     mock.return_signature_of_width(63);
 
-    assert_eq!(remote.sign(MSG).err(), Some(SignerError::BadSignatureLength { got: 63 }));
+    assert_eq!(
+        remote.sign(MSG).err(),
+        Some(SignerError::BadSignatureLength { got: 63 })
+    );
     assert_eq!(mock.signatures_returned(), 0);
 }
 
@@ -327,7 +366,12 @@ fn remote_signer_rejects_a_well_formed_but_garbage_signature() {
     // swapped signer, which a length check alone would wave through.
     mock.return_foreign_signature([0xABu8; SIGNATURE_LEN]);
 
-    assert_eq!(remote.sign(MSG).err(), Some(SignerError::SigningFailed(SigningFailureKind::SignatureInvalid)));
+    assert_eq!(
+        remote.sign(MSG).err(),
+        Some(SignerError::SigningFailed(
+            SigningFailureKind::SignatureInvalid
+        ))
+    );
 }
 
 // ============================================================================
@@ -361,7 +405,10 @@ fn signer_errors_never_contain_key_or_signature_material() {
     for err in all {
         let shown = format!("{err} | {err:?}");
         for secret in &secrets {
-            assert!(!shown.contains(secret.as_str()), "error leaked key material: {shown}");
+            assert!(
+                !shown.contains(secret.as_str()),
+                "error leaked key material: {shown}"
+            );
         }
     }
 
@@ -387,9 +434,13 @@ fn debug_output_hides_key_material() {
 
     // The HTTP transport holds an auth token; its Debug impl must redact it.
     let token = "s3cr3t-hsm-token";
-    let transport = HttpSignerTransport::new("https://signer.internal:8443").with_bearer_token(token);
+    let transport =
+        HttpSignerTransport::new("https://signer.internal:8443").with_bearer_token(token);
     let shown = format!("{transport:?}");
-    assert!(!shown.contains(token), "Debug leaked the auth token: {shown}");
+    assert!(
+        !shown.contains(token),
+        "Debug leaked the auth token: {shown}"
+    );
     assert!(!shown.to_lowercase().contains("bearer"));
     assert!(shown.contains("https://signer.internal:8443"));
 
@@ -413,7 +464,10 @@ fn tampering_with_the_message_changes_the_signature() {
     *tampered.last_mut().unwrap() ^= 1;
     let forged = local.sign(&tampered).expect("sign").to_bytes();
 
-    assert_ne!(honest, forged, "a modified message must not sign identically");
+    assert_ne!(
+        honest, forged,
+        "a modified message must not sign identically"
+    );
     assert!(!local.verify(&tampered, &Signature::from_bytes(&honest)));
     assert!(local.verify(MSG, &Signature::from_bytes(&honest)));
 
@@ -584,7 +638,10 @@ fn spawn_keyed_signer(public_key: &[u8; PUBLIC_KEY_LEN], sign_body: String) -> S
 fn spawn_signing_service(key: &SigningKey) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
-    let public_key_body = format!(r#"{{"public_key":"{}"}}"#, hex::encode(key.verifying_key().to_bytes()));
+    let public_key_body = format!(
+        r#"{{"public_key":"{}"}}"#,
+        hex::encode(key.verifying_key().to_bytes())
+    );
     let key = key.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -621,8 +678,14 @@ fn spawn_signing_service(key: &SigningKey) -> String {
                 // signer signs it and answers with the signature.
                 let hex_msg = body.split('"').nth(3).unwrap_or("").to_string();
                 let msg = hex::decode(&hex_msg).unwrap_or_default();
-                let sig = DalekSigner::try_sign(&key, &msg).map(|s| s.to_bytes()).unwrap_or([0u8; SIGNATURE_LEN]);
-                write_response(stream, "200 OK", &format!(r#"{{"signature":"{}"}}"#, hex::encode(sig)));
+                let sig = DalekSigner::try_sign(&key, &msg)
+                    .map(|s| s.to_bytes())
+                    .unwrap_or([0u8; SIGNATURE_LEN]);
+                write_response(
+                    stream,
+                    "200 OK",
+                    &format!(r#"{{"signature":"{}"}}"#, hex::encode(sig)),
+                );
             }
         }
     });
@@ -634,11 +697,15 @@ fn http_transport_signs_end_to_end_against_a_signing_service() {
     let (key, local) = key_and_local_signer();
     let base_url = spawn_signing_service(&key);
 
-    let remote = RemoteSigner::new(Arc::new(HttpSignerTransport::new(base_url))).expect("resolve key");
+    let remote =
+        RemoteSigner::new(Arc::new(HttpSignerTransport::new(base_url))).expect("resolve key");
     assert_eq!(remote.public_key(), local.public_key());
 
     let sig = remote.sign(MSG).expect("remote sign");
-    assert_eq!(sig.to_bytes(), local.sign(MSG).expect("local sign").to_bytes());
+    assert_eq!(
+        sig.to_bytes(),
+        local.sign(MSG).expect("local sign").to_bytes()
+    );
     assert!(remote.verify(MSG, &sig));
 }
 
@@ -647,22 +714,52 @@ fn http_transport_rejects_a_public_key_of_the_wrong_width() {
     for width in [31usize, 33] {
         let body = format!(r#"{{"public_key":"{}"}}"#, "ab".repeat(width));
         let transport = HttpSignerTransport::new(spawn_canned_signer("200 OK", body.into_bytes()));
-        assert_eq!(transport.public_key(), Err(SignerError::BadPublicKeyLength { got: width }));
+        assert_eq!(
+            transport.public_key(),
+            Err(SignerError::BadPublicKeyLength { got: width })
+        );
     }
 }
 
 #[test]
 fn http_transport_rejects_malformed_public_key_responses() {
     let cases = [
-        (br#"not json at all"#.to_vec(), SignerError::MalformedResponse(MalformedResponseKind::BadJson)),
-        (br#"{"public_key":}"#.to_vec(), SignerError::MalformedResponse(MalformedResponseKind::BadJson)),
-        (br#"{"public_key":[1,2,3]}"#.to_vec(), SignerError::MalformedResponse(MalformedResponseKind::BadJson)),
-        (br#"{}"#.to_vec(), SignerError::MalformedResponse(MalformedResponseKind::MissingField)),
-        (br#"{"public_key":null}"#.to_vec(), SignerError::MalformedResponse(MalformedResponseKind::MissingField)),
-        (br#"{"key":"ab"}"#.to_vec(), SignerError::MalformedResponse(MalformedResponseKind::MissingField)),
-        (br#"{"public_key":"nothexatall"}"#.to_vec(), SignerError::MalformedResponse(MalformedResponseKind::NotHex)),
-        (br#"{"public_key":"ab cd"}"#.to_vec(), SignerError::MalformedResponse(MalformedResponseKind::NotHex)),
-        (vec![b'x'; MAX_RESPONSE_BYTES + 1], SignerError::MalformedResponse(MalformedResponseKind::BodyTooLarge)),
+        (
+            br#"not json at all"#.to_vec(),
+            SignerError::MalformedResponse(MalformedResponseKind::BadJson),
+        ),
+        (
+            br#"{"public_key":}"#.to_vec(),
+            SignerError::MalformedResponse(MalformedResponseKind::BadJson),
+        ),
+        (
+            br#"{"public_key":[1,2,3]}"#.to_vec(),
+            SignerError::MalformedResponse(MalformedResponseKind::BadJson),
+        ),
+        (
+            br#"{}"#.to_vec(),
+            SignerError::MalformedResponse(MalformedResponseKind::MissingField),
+        ),
+        (
+            br#"{"public_key":null}"#.to_vec(),
+            SignerError::MalformedResponse(MalformedResponseKind::MissingField),
+        ),
+        (
+            br#"{"key":"ab"}"#.to_vec(),
+            SignerError::MalformedResponse(MalformedResponseKind::MissingField),
+        ),
+        (
+            br#"{"public_key":"nothexatall"}"#.to_vec(),
+            SignerError::MalformedResponse(MalformedResponseKind::NotHex),
+        ),
+        (
+            br#"{"public_key":"ab cd"}"#.to_vec(),
+            SignerError::MalformedResponse(MalformedResponseKind::NotHex),
+        ),
+        (
+            vec![b'x'; MAX_RESPONSE_BYTES + 1],
+            SignerError::MalformedResponse(MalformedResponseKind::BodyTooLarge),
+        ),
     ];
     for (body, expected) in cases {
         let label: String = String::from_utf8_lossy(&body).chars().take(48).collect();
@@ -677,8 +774,12 @@ fn http_transport_rejects_a_signature_of_the_wrong_width() {
     // The public key is good; the signature that comes back is 63 bytes.
     let body = format!(r#"{{"signature":"{}"}}"#, "cd".repeat(63));
     let base_url = spawn_keyed_signer(&key.verifying_key().to_bytes(), body);
-    let remote = RemoteSigner::new(Arc::new(HttpSignerTransport::new(base_url))).expect("resolve key");
-    assert_eq!(remote.sign(MSG).err(), Some(SignerError::BadSignatureLength { got: 63 }));
+    let remote =
+        RemoteSigner::new(Arc::new(HttpSignerTransport::new(base_url))).expect("resolve key");
+    assert_eq!(
+        remote.sign(MSG).err(),
+        Some(SignerError::BadSignatureLength { got: 63 })
+    );
 }
 
 #[test]
@@ -686,17 +787,38 @@ fn http_transport_rejects_malformed_signature_responses() {
     let (key, _) = key_and_local_signer();
     let public_key = key.verifying_key().to_bytes();
     let cases = [
-        (br#"{}"#.to_vec(), SignerError::MalformedResponse(MalformedResponseKind::MissingField)),
-        (br#"{"sig":"ab"}"#.to_vec(), SignerError::MalformedResponse(MalformedResponseKind::MissingField)),
-        (br#"not json"#.to_vec(), SignerError::MalformedResponse(MalformedResponseKind::BadJson)),
-        (br#"{"signature":"zz"}"#.to_vec(), SignerError::MalformedResponse(MalformedResponseKind::NotHex)),
+        (
+            br#"{}"#.to_vec(),
+            SignerError::MalformedResponse(MalformedResponseKind::MissingField),
+        ),
+        (
+            br#"{"sig":"ab"}"#.to_vec(),
+            SignerError::MalformedResponse(MalformedResponseKind::MissingField),
+        ),
+        (
+            br#"not json"#.to_vec(),
+            SignerError::MalformedResponse(MalformedResponseKind::BadJson),
+        ),
+        (
+            br#"{"signature":"zz"}"#.to_vec(),
+            SignerError::MalformedResponse(MalformedResponseKind::NotHex),
+        ),
         // 64 bytes of the right width that are simply not a signature.
-        (format!(r#"{{"signature":"{}"}}"#, "ab".repeat(SIGNATURE_LEN)).into_bytes(), SignerError::SigningFailed(SigningFailureKind::SignatureInvalid)),
+        (
+            format!(r#"{{"signature":"{}"}}"#, "ab".repeat(SIGNATURE_LEN)).into_bytes(),
+            SignerError::SigningFailed(SigningFailureKind::SignatureInvalid),
+        ),
     ];
     for (body, expected) in cases {
         let base_url = spawn_keyed_signer(&public_key, String::from_utf8_lossy(&body).into_owned());
-        let remote = RemoteSigner::new(Arc::new(HttpSignerTransport::new(base_url))).expect("resolve key");
-        assert_eq!(remote.sign(MSG).err(), Some(expected), "body: {}", String::from_utf8_lossy(&body));
+        let remote =
+            RemoteSigner::new(Arc::new(HttpSignerTransport::new(base_url))).expect("resolve key");
+        assert_eq!(
+            remote.sign(MSG).err(),
+            Some(expected),
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
     }
 }
 
@@ -714,20 +836,28 @@ fn http_transport_reports_a_non_2xx_status_without_echoing_the_request() {
     let transport = HttpSignerTransport::new(base_url.clone());
 
     let err = transport.public_key().expect_err("a 500 is a failure");
-    assert_eq!(err, SignerError::Transport(TransportErrorKind::Rejected { status: 500 }));
+    assert_eq!(
+        err,
+        SignerError::Transport(TransportErrorKind::Rejected { status: 500 })
+    );
     // The body was never parsed into the error, so neither the message nor the
     // key is in what the node reports.
     let shown = format!("{err} {err:?}");
     assert!(!shown.contains(&hex::encode(MSG)));
     assert!(!shown.contains(&hex::encode(key.to_bytes())));
-    assert!(!shown.contains(&base_url), "the endpoint URL must not be echoed either");
+    assert!(
+        !shown.contains(&base_url),
+        "the endpoint URL must not be echoed either"
+    );
 }
 
 #[test]
 fn http_transport_maps_an_unusable_url_to_a_transport_error() {
     // An unknown scheme fails locally: no DNS, no socket, no external service.
     let transport = HttpSignerTransport::new("nope://signer.invalid");
-    let err = transport.public_key().expect_err("an unusable URL cannot resolve a key");
+    let err = transport
+        .public_key()
+        .expect_err("an unusable URL cannot resolve a key");
     assert!(matches!(err, SignerError::Transport(_)), "got {err:?}");
     assert!(err.to_string().contains("remote signer"));
 }
@@ -772,8 +902,14 @@ fn validator_signer_remote_variant_uses_the_remote_and_never_signs_locally() {
     // and the remote variant must not reach for it.
     let signatures_before = mock.signatures_returned();
     mock.fail_sign(SignerError::Transport(TransportErrorKind::Request));
-    assert!(signer.sign(MSG).is_err(), "a remote failure must surface, not be hidden");
-    assert!(local.sign(MSG).is_ok(), "the local key is healthy, which is exactly the trap");
+    assert!(
+        signer.sign(MSG).is_err(),
+        "a remote failure must surface, not be hidden"
+    );
+    assert!(
+        local.sign(MSG).is_ok(),
+        "the local key is healthy, which is exactly the trap"
+    );
     assert_eq!(
         mock.signatures_returned(),
         signatures_before,
@@ -783,17 +919,17 @@ fn validator_signer_remote_variant_uses_the_remote_and_never_signs_locally() {
 
 #[test]
 fn remote_signer_config_is_optional_and_a_blank_url_means_local() {
-    assert!(remote_signer_from_config(None, None).expect("no remote").is_none());
+    assert!(remote_signer_from_config(None, None)
+        .expect("no remote")
+        .is_none());
     assert!(
         remote_signer_from_config(Some(String::new()), Some("tok".into()))
             .expect("blank url")
             .is_none()
     );
-    assert!(
-        remote_signer_from_config(Some("   ".into()), None)
-            .expect("whitespace url")
-            .is_none()
-    );
+    assert!(remote_signer_from_config(Some("   ".into()), None)
+        .expect("whitespace url")
+        .is_none());
 }
 
 #[test]

@@ -35,7 +35,11 @@ const H: u64 = 92079;
 
 // --- F7: polka unlock is newest-wins ------------------------------------------
 
-fn hc_locked_4(a: [u8; 32], locked_round: u32, at_round: u32) -> (HeightConsensus, Vec<SigningKey>) {
+fn hc_locked_4(
+    a: [u8; 32],
+    locked_round: u32,
+    at_round: u32,
+) -> (HeightConsensus, Vec<SigningKey>) {
     let ks = keys(4);
     let vs = vset1(&ks);
     let mut hc = HeightConsensus::new(H, vs);
@@ -85,7 +89,11 @@ fn f7_newer_nil_polka_never_unlocks() {
     let (mut hc, ks) = hc_locked_4(A_BLK, 5, 7);
     polka(&mut hc, &ks, 7, None);
     hc.try_prevote_quorum_at();
-    assert_eq!(hc.locked, Some((A_BLK, 5)), "nil polka must NEVER unlock (BFT safety)");
+    assert_eq!(
+        hc.locked,
+        Some((A_BLK, 5)),
+        "nil polka must NEVER unlock (BFT safety)"
+    );
 }
 
 #[test]
@@ -112,7 +120,10 @@ fn f02_forged_single_validator_committee_size_rejected() {
         sortition_parent: [0u8; 32],
     };
     qc.attach_pq_micro_certificate(&uqc);
-    assert!(!qc.verify(&vs), "forged committee_size = 1 on 4-validator set must be rejected");
+    assert!(
+        !qc.verify(&vs),
+        "forged committee_size = 1 on 4-validator set must be rejected"
+    );
 }
 
 #[test]
@@ -158,7 +169,10 @@ fn f8_btreemap_iteration_is_sorted_canonical_order() {
     let iterated: Vec<[u8; 32]> = vs.validators.keys().copied().collect();
     let mut sorted = iterated.clone();
     sorted.sort_unstable();
-    assert_eq!(iterated, sorted, "BTreeMap iteration must be canonical sorted order");
+    assert_eq!(
+        iterated, sorted,
+        "BTreeMap iteration must be canonical sorted order"
+    );
 }
 
 // --- F4: quorum curve ----------------------------------------------------------
@@ -168,10 +182,16 @@ fn f4_quorum_curve_pins_live_powers_and_fail_closed_empty() {
     // Live powers from the code comment: 1874531430003 / 2e12 / 2e12.
     let total = 1874531430003u64 + 2_000_000_000_000 + 2_000_000_000_000;
     assert_eq!(total, 5874531430003);
-    assert_eq!(stellereum::consensus::consensus_quorum_min(total), 3916354286669);
+    assert_eq!(
+        stellereum::consensus::consensus_quorum_min(total),
+        3916354286669
+    );
     // A+B alone cannot reach classical quorum (short by ~42e9).
     let a_plus_b = 1874531430003u64 + 2_000_000_000_000;
-    assert!(a_plus_b < 3916354286669, "A+B must be below quorum (F4 arithmetic)");
+    assert!(
+        a_plus_b < 3916354286669,
+        "A+B must be below quorum (F4 arithmetic)"
+    );
     // Empty / zero-power sets never reach quorum.
     assert_eq!(ValidatorSet::new().quorum_power(), u64::MAX);
     let mut zero = ValidatorSet::new();
@@ -297,7 +317,9 @@ fn qc_power_parity_two_heavy_assembles_and_verifies() {
         .certificate(target, &vs, &parent)
         .expect("4000 ≥ 3334 must form");
     assert!(qc.verify(&vs), "assembled power-QC must verify (parity)");
-    let uqc = qc.pq_micro_certificate().expect("µQC must compile from 2 heavy");
+    let uqc = qc
+        .pq_micro_certificate()
+        .expect("µQC must compile from 2 heavy");
     let committee = derive_sortition_committee(&vs, HH, RR, uqc.committee_size, &parent);
     assert_eq!(uqc.signed_power(&committee, &vs), 4000);
 }
@@ -373,7 +395,10 @@ fn far_ahead_votes_rejected_from_voteset() {
     let ks = keys(2);
     let mut hc = HeightConsensus::new(H, vset1(&ks));
     let bad = Vote::sign(&ks[0], H, 1001, VoteKind::Prevote, Some(A_BLK));
-    assert!(hc.add_prevote(bad).is_err(), "round > +1000 must be dropped");
+    assert!(
+        hc.add_prevote(bad).is_err(),
+        "round > +1000 must be dropped"
+    );
     let bad_c = Vote::sign(&ks[0], H, 1001, VoteKind::Precommit, Some(A_BLK));
     assert!(hc.add_precommit(bad_c).is_err());
 }
@@ -402,7 +427,10 @@ fn f3_nil_precommit_quorum_is_not_qc_observed() {
     // already voted in at this height is a self-equivocation (slashable).
     // It advances instead, and widens the quorum-scan window so the round
     // the network is actually in becomes committable.
-    assert_eq!(hc.round, 413, "the re-phase must move FORWARD, never rewind");
+    assert_eq!(
+        hc.round, 413,
+        "the re-phase must move FORWARD, never rewind"
+    );
     assert_eq!(
         hc.scan_lookback,
         stellereum::consensus::REPHASE_SCAN_WINDOW,
@@ -437,7 +465,10 @@ fn f3_banked_qc_survives_vote_set_pruning() {
 fn f9_decode_rejects_malformed_envelopes() {
     assert!(decode_pq_micro_envelope(&[]).is_none());
     assert!(decode_pq_micro_envelope(&[0u8; 40]).is_none());
-    assert!(decode_pq_micro_envelope(&[0xFFu8; 64]).is_none(), "bad magic");
+    assert!(
+        decode_pq_micro_envelope(&[0xFFu8; 64]).is_none(),
+        "bad magic"
+    );
     // Truncated canonical header.
     let cert = PqMicroCertificate {
         scheme: PqScheme::Falcon512,
@@ -449,8 +480,14 @@ fn f9_decode_rejects_malformed_envelopes() {
         sortition_parent: [0x6Bu8; 32],
     };
     let good = encode_pq_micro_envelope(&cert);
-    assert!(decode_pq_micro_envelope(&good).is_some(), "canonical must decode");
-    assert!(decode_pq_micro_envelope(&good[..good.len() - 3]).is_none(), "truncated must not");
+    assert!(
+        decode_pq_micro_envelope(&good).is_some(),
+        "canonical must decode"
+    );
+    assert!(
+        decode_pq_micro_envelope(&good[..good.len() - 3]).is_none(),
+        "truncated must not"
+    );
     // Bloated signer list.
     let mut evil = cert.clone();
     evil.signatures = vec![vec![0u8; 1]; MAX_COMMIT_CERT_SIGNERS + 1];

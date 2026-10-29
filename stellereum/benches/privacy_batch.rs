@@ -111,7 +111,10 @@ fn bench_conservation_scalar_vs_batch() {
     for &n in &[1usize, 8, 64] {
         let txs = transfers(n);
         let scalar = time_ns_per_op(n, 20, 2, || {
-            let got: Vec<bool> = txs.iter().map(|t| t.verify_balance_conservation()).collect();
+            let got: Vec<bool> = txs
+                .iter()
+                .map(|t| t.verify_balance_conservation())
+                .collect();
             assert!(got.iter().all(|&b| b));
         });
         let batch = time_ns_per_op(n, 20, 2, || {
@@ -163,7 +166,10 @@ fn bench_bitproof_reference_vs_msm() {
     assert!(items.iter().all(|(c, p)| BitProof::verify(c, p)));
     assert!(items.iter().all(|(c, p)| BitProof::verify_scalar(c, p)));
     let reference = time_ns_per_op(n, 20, 2, || {
-        let got: Vec<bool> = items.iter().map(|(c, p)| BitProof::verify_scalar(c, p)).collect();
+        let got: Vec<bool> = items
+            .iter()
+            .map(|(c, p)| BitProof::verify_scalar(c, p))
+            .collect();
         assert!(got.iter().all(|&b| b));
     });
     let msm = time_ns_per_op(n, 20, 2, || {

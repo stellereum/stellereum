@@ -22,7 +22,10 @@ fn batch_rejects_if_any_invalid() {
     let mut txs: Vec<Transaction> = (0..50).map(|i| tx(&sk, i)).collect();
     // tamper one signature
     txs[17].signature[0] ^= 0xFF;
-    assert!(!Transaction::verify_signatures_batch(&txs), "batch must reject a bad signature");
+    assert!(
+        !Transaction::verify_signatures_batch(&txs),
+        "batch must reject a bad signature"
+    );
 }
 
 #[test]
@@ -63,8 +66,8 @@ fn batch_mixed_keys() {
 // Partitioned tx batch: one bad neighbor must not sink the good ones.
 // ---------------------------------------------------------------------------
 
-use rand::{RngCore, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{RngCore, SeedableRng};
 use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
 use stellereum::sharding::Block;
 
@@ -87,7 +90,9 @@ fn partitioned_keeps_good_txs_with_one_forgery() {
     }
     // And the all-valid set partitions to all-true.
     let good: Vec<Transaction> = (0..50).map(|i| tx(&sk, i + 1000)).collect();
-    assert!(Transaction::verify_signatures_partitioned(&good).iter().all(|b| *b));
+    assert!(Transaction::verify_signatures_partitioned(&good)
+        .iter()
+        .all(|b| *b));
     assert!(Transaction::verify_signatures_batch(&good));
 }
 
@@ -125,7 +130,10 @@ fn partitioned_matches_scalar_differential_randomized() {
         }
         let scalar: Vec<bool> = txs.iter().map(|t| t.verify_signature()).collect();
         let part = Transaction::verify_signatures_partitioned(&txs);
-        assert_eq!(scalar, part, "partitioned must equal scalar per item (round {round})");
+        assert_eq!(
+            scalar, part,
+            "partitioned must equal scalar per item (round {round})"
+        );
         assert_eq!(
             Transaction::verify_signatures_batch(&txs),
             scalar.iter().all(|b| *b),
@@ -161,13 +169,14 @@ fn partitioned_mixed_session_and_legacy() {
         1_000_000,
         CHAIN_ID,
     );
-    let stx = Transaction::sign_with_session(
-        &session, grant, [1u8; 32], 10, 100, 0, 1, 1, Vec::new(),
-    );
+    let stx =
+        Transaction::sign_with_session(&session, grant, [1u8; 32], 10, 100, 0, 1, 1, Vec::new());
     assert!(stx.verify_signature());
     let mut txs = vec![tx(&master, 0), stx, tx(&master, 1)];
     assert!(Transaction::verify_signatures_batch(&txs));
-    assert!(Transaction::verify_signatures_partitioned(&txs).iter().all(|b| *b));
+    assert!(Transaction::verify_signatures_partitioned(&txs)
+        .iter()
+        .all(|b| *b));
     // Forge the SESSION signature only: exactly that item must fail.
     txs[1].signature[3] ^= 0x40;
     assert!(!txs[1].verify_signature());
@@ -233,7 +242,11 @@ fn vote_batch_matches_scalar_differential_randomized() {
             .enumerate()
             .map(|(i, k)| {
                 // Vary height/round/kind/target per vote: distinct messages.
-                let kind = if i % 2 == 0 { VoteKind::Prevote } else { VoteKind::Precommit };
+                let kind = if i % 2 == 0 {
+                    VoteKind::Prevote
+                } else {
+                    VoteKind::Precommit
+                };
                 let mut bh = [0u8; 32];
                 rng.fill_bytes(&mut bh);
                 let target = if i % 3 == 0 { None } else { Some(bh) };
@@ -254,7 +267,11 @@ fn vote_batch_matches_scalar_differential_randomized() {
             }
         }
         let scalar: Vec<bool> = votes.iter().map(|v| v.verify()).collect();
-        assert_eq!(Vote::partition_valid(&votes), scalar, "vote partition == scalar (round {round})");
+        assert_eq!(
+            Vote::partition_valid(&votes),
+            scalar,
+            "vote partition == scalar (round {round})"
+        );
         assert_eq!(
             Vote::verify_batch(&votes),
             scalar.iter().all(|b| *b),
@@ -277,7 +294,9 @@ fn vote_batch_empty_is_true() {
 fn voteset_add_batch_matches_sequential_and_keeps_good() {
     let ks = vote_keys(10);
     let vs = ValidatorSet::from_list(
-        ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect(),
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
     );
     let bh = [0x11u8; 32];
     let mut votes = vote_set(&ks, bh);
@@ -294,7 +313,10 @@ fn voteset_add_batch_matches_sequential_and_keeps_good() {
     let mut batched = stellereum::consensus::VoteSet::new();
     let batch_res = batched.add_batch(votes.clone(), &vs, 7, 2, VoteKind::Precommit);
     let batch_ok: Vec<bool> = batch_res.iter().map(|r| r.is_ok()).collect();
-    assert_eq!(seq_res, batch_ok, "per-vote admission outcomes must match sequential add");
+    assert_eq!(
+        seq_res, batch_ok,
+        "per-vote admission outcomes must match sequential add"
+    );
     assert_eq!(seq.len(), batched.len());
     assert_eq!(
         seq.quorum_target(&vs),
@@ -311,7 +333,9 @@ fn voteset_add_batch_matches_sequential_and_keeps_good() {
 fn voteset_add_batch_is_permutation_independent() {
     let ks = vote_keys(12);
     let vs = ValidatorSet::from_list(
-        ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect(),
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
     );
     let bh = [0x22u8; 32];
     let votes = vote_set(&ks, bh);
@@ -384,7 +408,7 @@ fn signed_block(n: usize) -> (Block, Vec<SigningKey>) {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     for k in &ks {
         block.sign_block(k);
     }
@@ -398,7 +422,9 @@ fn block_quorum_batch_equivalence_randomized() {
         let n = 2 + (rng.next_u32() % 10) as usize;
         let (mut block, ks) = signed_block(n);
         let vs = ValidatorSet::from_list(
-            ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect(),
+            ks.iter()
+                .map(|k| (k.verifying_key().to_bytes(), 1))
+                .collect(),
         );
         // Mutations: forge a sig, duplicate a signer, add a non-member signer.
         match rng.next_u32() % 5 {
@@ -416,7 +442,9 @@ fn block_quorum_batch_equivalence_randomized() {
                 use ed25519_dalek::Signer;
                 let h = block.compute_hash();
                 let s = outsider.sign(&h).to_vec();
-                block.validator_signatures.push((outsider.verifying_key().to_bytes(), s));
+                block
+                    .validator_signatures
+                    .push((outsider.verifying_key().to_bytes(), s));
             }
             3 => {
                 block.validator_signatures.truncate(1);
@@ -433,7 +461,7 @@ fn block_quorum_batch_equivalence_randomized() {
         let mut seen = std::collections::HashSet::new();
         let mut valid = 0usize;
         {
-            use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
             let h = block.compute_hash();
             for (pubkey, sig_bytes) in &block.validator_signatures {
                 if !seen.insert(*pubkey) {
@@ -448,7 +476,11 @@ fn block_quorum_batch_equivalence_randomized() {
                 }
             }
         }
-        assert_eq!(block.verify_signatures(need), valid >= need, "round {round}");
+        assert_eq!(
+            block.verify_signatures(need),
+            valid >= need,
+            "round {round}"
+        );
         let _ = round;
     }
 }
@@ -459,7 +491,9 @@ fn block_quorum_rejects_single_forgery_below_threshold() {
     let (mut block, ks) = signed_block(4);
     block.validator_signatures.truncate(3);
     let vs = ValidatorSet::from_list(
-        ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect(),
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
     );
     assert!(block.verify_validator_quorum(&vs));
     block.validator_signatures[1].1[0] ^= 0xFF;
@@ -488,7 +522,9 @@ fn qc_batch_still_covers_quorum_path() {
         signatures: sigs,
     };
     let vs = ValidatorSet::from_list(
-        ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect(),
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
     );
     assert!(qc.verify(&vs));
 }

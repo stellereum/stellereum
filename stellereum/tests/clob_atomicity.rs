@@ -79,12 +79,23 @@ async fn rest_maker_buy(
         .token_execute(
             usdt,
             [0x11u8; 32],
-            stellereum::token::TokenOp::Mint { to: maker_addr, amount: 10_000_000 },
+            stellereum::token::TokenOp::Mint {
+                to: maker_addr,
+                amount: 10_000_000,
+            },
         )
         .await
         .unwrap();
     let (order_id, fills) = engine
-        .place_order_settled(PAIR, maker_addr, OrderSide::Buy, OrderType::Limit, PRICE, amount, 100)
+        .place_order_settled(
+            PAIR,
+            maker_addr,
+            OrderSide::Buy,
+            OrderType::Limit,
+            PRICE,
+            amount,
+            100,
+        )
         .await
         .unwrap();
     assert_eq!(fills, 0);
@@ -169,7 +180,10 @@ async fn clob_fill_rolls_back_when_the_native_commit_fails() {
     // end of the block - reading the floor afterwards would over-state it).
     let fee = failure_fee(&engine, &tx).await;
     let res = engine.apply_transaction(&tx, 200).await;
-    assert!(res.is_err(), "commit_native must refuse the overflow: {res:?}");
+    assert!(
+        res.is_err(),
+        "commit_native must refuse the overflow: {res:?}"
+    );
 
     // F-01 / SEC-07: the refusal is ATTRIBUTABLE - the transaction got past
     // admission and failed in the native commit - so the sender pays the
@@ -264,8 +278,9 @@ async fn clob_fill_rolls_back_on_the_block_path_when_the_native_commit_fails() {
 
     let tx = doomed_taker_sell(&taker, overflow_to, amount);
     let fee = failure_fee(&engine, &tx).await;
-    let (applied, failed, _fees, status, fees) =
-        engine.apply_block_parallel_fees(std::slice::from_ref(&tx), 200).await;
+    let (applied, failed, _fees, status, fees) = engine
+        .apply_block_parallel_fees(std::slice::from_ref(&tx), 200)
+        .await;
     assert_eq!((applied, failed), (0, 1), "the block path refuses the tx");
     assert_eq!(status, vec![false]);
     // F-01 / SEC-07: the same contract as the single-transaction path - the
@@ -286,7 +301,8 @@ async fn clob_fill_rolls_back_on_the_block_path_when_the_native_commit_fails() {
     assert_eq!(engine.token_total_supply(&usdt).await, supply0);
     assert_eq!(*engine.order_escrow_read().await, escrow0);
     assert_eq!(
-        engine.get_account(&maker_addr).await.unwrap().nonce, 0,
+        engine.get_account(&maker_addr).await.unwrap().nonce,
+        0,
         "the maker never moved"
     );
 }

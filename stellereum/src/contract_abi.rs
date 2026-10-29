@@ -202,7 +202,10 @@ impl AbiType {
     /// `true` when the type can be carried by an `i64` wasm parameter
     /// (the runtime's native calling convention).
     pub const fn is_wasm_scalar(self) -> bool {
-        matches!(self, AbiType::I64 | AbiType::U64 | AbiType::I32 | AbiType::Bool)
+        matches!(
+            self,
+            AbiType::I64 | AbiType::U64 | AbiType::I32 | AbiType::Bool
+        )
     }
 }
 
@@ -628,7 +631,8 @@ impl AbiValue {
                     return Ok(AbiValue::Bool(false));
                 }
                 if t.starts_with("0x") || t.starts_with("0X") {
-                    let raw = hex::decode(&t[2..]).map_err(|e| AbiError::Json(format!("invalid hex: {e}")))?;
+                    let raw = hex::decode(&t[2..])
+                        .map_err(|e| AbiError::Json(format!("invalid hex: {e}")))?;
                     // A 32-byte blob is an address, anything else is bytes.
                     if raw.len() == ABI_ADDRESS_LEN {
                         let mut a = [0u8; 32];
@@ -648,15 +652,16 @@ impl AbiValue {
             serde_json::Value::Array(items) => {
                 let mut bytes = Vec::with_capacity(items.len());
                 for it in items {
-                    let n = it
-                        .as_u64()
-                        .filter(|n| *n <= 255)
-                        .ok_or_else(|| AbiError::Json("byte array must contain 0..=255".to_string()))?;
+                    let n = it.as_u64().filter(|n| *n <= 255).ok_or_else(|| {
+                        AbiError::Json("byte array must contain 0..=255".to_string())
+                    })?;
                     bytes.push(n as u8);
                 }
                 Ok(AbiValue::Bytes(bytes))
             }
-            serde_json::Value::Null => Err(AbiError::Json("null is not a valid ABI value".to_string())),
+            serde_json::Value::Null => {
+                Err(AbiError::Json("null is not a valid ABI value".to_string()))
+            }
             other => Err(AbiError::Json(format!(
                 "cannot convert {other} into an ABI value"
             ))),
@@ -769,7 +774,10 @@ impl fmt::Display for AbiError {
                 got,
             } => {
                 if method.is_empty() {
-                    write!(f, "type mismatch at index {index}: expected {expected}, got {got}")
+                    write!(
+                        f,
+                        "type mismatch at index {index}: expected {expected}, got {got}"
+                    )
                 } else {
                     write!(
                         f,
@@ -1051,7 +1059,9 @@ impl ContractAbi {
             out.push(AbiValue::decode_payload(p.ty, &mut cur)?);
         }
         if !cur.is_empty() {
-            return Err(AbiError::TrailingBytes { got: cur.remaining() });
+            return Err(AbiError::TrailingBytes {
+                got: cur.remaining(),
+            });
         }
         Ok(out)
     }
@@ -1062,7 +1072,12 @@ impl ContractAbi {
             .method(method)
             .ok_or_else(|| AbiError::UnknownMethod(method.to_string()))?;
         let v = value.coerce_to(m.returns).map_err(|e| match e {
-            AbiError::TypeMismatch { index, expected, got, .. } => AbiError::TypeMismatch {
+            AbiError::TypeMismatch {
+                index,
+                expected,
+                got,
+                ..
+            } => AbiError::TypeMismatch {
                 method: method.to_string(),
                 index,
                 expected,
@@ -1274,7 +1289,9 @@ impl ContractAbi {
             data.push(AbiValue::decode_payload(p.ty, &mut cur)?);
         }
         if !cur.is_empty() {
-            return Err(AbiError::TrailingBytes { got: cur.remaining() });
+            return Err(AbiError::TrailingBytes {
+                got: cur.remaining(),
+            });
         }
         Ok((topics, data))
     }
@@ -1365,7 +1382,11 @@ mod tests {
         let addr = [0x42u8; 32];
 
         // I64
-        let m = AbiMethod::view("f_i64", vec![AbiParam::new("v", AbiType::I64)], AbiType::I64);
+        let m = AbiMethod::view(
+            "f_i64",
+            vec![AbiParam::new("v", AbiType::I64)],
+            AbiType::I64,
+        );
         let mut a = sample_abi();
         a.methods.push(m);
         roundtrip(&a, "f_i64", &[AbiValue::I64(i64::MIN)]);
@@ -1416,8 +1437,24 @@ mod tests {
         roundtrip(&abi, "balance_of", &[AbiValue::Address(addr)]);
 
         // String
-        roundtrip(&abi, "transfer", &[AbiValue::Address(addr), AbiValue::U64(7), AbiValue::String("hello".into())]);
-        roundtrip(&abi, "transfer", &[AbiValue::Address(addr), AbiValue::U64(0), AbiValue::String(String::new())]);
+        roundtrip(
+            &abi,
+            "transfer",
+            &[
+                AbiValue::Address(addr),
+                AbiValue::U64(7),
+                AbiValue::String("hello".into()),
+            ],
+        );
+        roundtrip(
+            &abi,
+            "transfer",
+            &[
+                AbiValue::Address(addr),
+                AbiValue::U64(0),
+                AbiValue::String(String::new()),
+            ],
+        );
     }
 
     #[test]
@@ -1445,8 +1482,12 @@ mod tests {
             ],
             AbiType::I64,
         ));
-        let enc1 = abi2.encode_args("add2", &[AbiValue::I64(1), AbiValue::I64(2)]).unwrap();
-        let enc2 = abi2.encode_args("add2", &[AbiValue::I64(2), AbiValue::I64(1)]).unwrap();
+        let enc1 = abi2
+            .encode_args("add2", &[AbiValue::I64(1), AbiValue::I64(2)])
+            .unwrap();
+        let enc2 = abi2
+            .encode_args("add2", &[AbiValue::I64(2), AbiValue::I64(1)])
+            .unwrap();
         assert_ne!(enc1, enc2, "argument order must be part of the encoding");
         assert_eq!(
             abi2.decode_args("add2", &enc1).unwrap(),
@@ -1462,7 +1503,16 @@ mod tests {
     #[test]
     fn encoding_is_length_prefixed_and_tagged() {
         let abi = sample_abi();
-        let enc = abi.encode_args("transfer", &[AbiValue::Address([0u8; 32]), AbiValue::U64(1), AbiValue::String("ab".into())]).unwrap();
+        let enc = abi
+            .encode_args(
+                "transfer",
+                &[
+                    AbiValue::Address([0u8; 32]),
+                    AbiValue::U64(1),
+                    AbiValue::String("ab".into()),
+                ],
+            )
+            .unwrap();
         // u32_le(arg_count) = 3
         assert_eq!(&enc[0..4], &3u32.to_le_bytes());
         // first arg: ADDRESS tag + 32 bytes
@@ -1540,10 +1590,7 @@ mod tests {
             Err(AbiError::ArityMismatch { .. })
         ));
         assert!(matches!(
-            abi.encode_args(
-                "balance_of",
-                &[AbiValue::U64(1)]
-            ),
+            abi.encode_args("balance_of", &[AbiValue::U64(1)]),
             Err(AbiError::TypeMismatch { .. })
         ));
     }
@@ -1551,7 +1598,9 @@ mod tests {
     #[test]
     fn decode_rejects_truncated_and_trailing_bytes() {
         let abi = sample_abi();
-        let enc = abi.encode_args("balance_of", &[AbiValue::Address([3u8; 32])]).unwrap();
+        let enc = abi
+            .encode_args("balance_of", &[AbiValue::Address([3u8; 32])])
+            .unwrap();
         assert!(matches!(
             abi.decode_args("balance_of", &enc[..10]),
             Err(AbiError::BufferTooShort { .. })

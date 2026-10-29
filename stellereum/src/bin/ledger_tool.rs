@@ -53,7 +53,10 @@ fn main() {
         }
     };
     println!("latest domains snapshot height: {height}");
-    println!("snapshot bytes sha256: {}", hex::encode(blake3::hash(&bytes).as_bytes()));
+    println!(
+        "snapshot bytes sha256: {}",
+        hex::encode(blake3::hash(&bytes).as_bytes())
+    );
 
     let snap: stellereum::storage::DomainSnapshot =
         stellereum::storage::decode_domain_snapshot(&bytes).expect("decode DomainSnapshot");
@@ -95,8 +98,14 @@ fn main() {
         // Overwrite the SAME height: restore reads latest-paired, so the
         // edited snapshot is what every restarted node loads.
         storage.put_domains(height, &out).expect("write back");
-        println!("wrote demoted snapshot at height {height} ({} bytes)", out.len());
-        println!("new bytes sha256: {}", hex::encode(blake3::hash(&out).as_bytes()));
+        println!(
+            "wrote demoted snapshot at height {height} ({} bytes)",
+            out.len()
+        );
+        println!(
+            "new bytes sha256: {}",
+            hex::encode(blake3::hash(&out).as_bytes())
+        );
     }
 }
 
@@ -124,7 +133,8 @@ fn rollback(dir: &std::path::Path, height: u64) {
             }
         }
     }
-    let anchor = anchor.unwrap_or_else(|| panic!("height {height} missing from by_height — refusing"));
+    let anchor =
+        anchor.unwrap_or_else(|| panic!("height {height} missing from by_height — refusing"));
     println!("anchor: height {height} hash {}", hex::encode(anchor));
 
     // 2. Height-keyed trees: drop every 8-byte-BE key above H. by_height

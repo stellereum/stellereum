@@ -26,7 +26,9 @@
 //!
 //! Full prose, test vectors and the RPC/CLI surface: `docs/WALLET_SIGNING.md`.
 
-use crate::post_quantum::{derive_pq_address, verify_pq_signature, FalconKeypair, PqScheme, DEFAULT_SALT};
+use crate::post_quantum::{
+    derive_pq_address, verify_pq_signature, FalconKeypair, PqScheme, DEFAULT_SALT,
+};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -96,9 +98,8 @@ pub fn message_preimage(chain_id: u64, message: &[u8]) -> Vec<u8> {
 }
 
 fn message_preimage_with_domain(domain: &[u8], chain_id: u64, message: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(
-        STELL_MESSAGE_PREFIX.len() + domain.len() + 8 + 8 + message.len(),
-    );
+    let mut out =
+        Vec::with_capacity(STELL_MESSAGE_PREFIX.len() + domain.len() + 8 + 8 + message.len());
     out.extend_from_slice(STELL_MESSAGE_PREFIX);
     out.extend_from_slice(domain);
     out.extend_from_slice(&chain_id.to_be_bytes());
@@ -317,14 +318,15 @@ impl WalletSignature {
         // from_id refuses 0x03 (ML-DSA-44, forgeable verifier) and unknown ids.
         let scheme = PqScheme::from_id(bytes[1])?;
         let mut cur = 2usize;
-        let take = |bytes: &[u8], cur: &mut usize, n: usize, what: &str| -> Result<Vec<u8>, String> {
-            if bytes.len() < *cur + n {
-                return Err(format!("wallet signature: envelope truncated in {what}"));
-            }
-            let v = bytes[*cur..*cur + n].to_vec();
-            *cur += n;
-            Ok(v)
-        };
+        let take =
+            |bytes: &[u8], cur: &mut usize, n: usize, what: &str| -> Result<Vec<u8>, String> {
+                if bytes.len() < *cur + n {
+                    return Err(format!("wallet signature: envelope truncated in {what}"));
+                }
+                let v = bytes[*cur..*cur + n].to_vec();
+                *cur += n;
+                Ok(v)
+            };
         let mut len = [0u8; 2];
         len.copy_from_slice(&take(bytes, &mut cur, 2, "pubkey_len")?);
         let pubkey_len = u16::from_be_bytes(len) as usize;
@@ -337,10 +339,14 @@ impl WalletSignature {
         let pubkey = take(bytes, &mut cur, pubkey_len, "pubkey")?;
         // Extra fail-closed guard for Ed25519: a non-curve point is not a key.
         if scheme == PqScheme::Ed25519
-            && VerifyingKey::from_bytes(&<[u8; 32]>::try_from(pubkey.as_slice()).expect("len checked"))
-                .is_err()
+            && VerifyingKey::from_bytes(
+                &<[u8; 32]>::try_from(pubkey.as_slice()).expect("len checked"),
+            )
+            .is_err()
         {
-            return Err("wallet signature: Ed25519 public key is not a valid curve point".to_string());
+            return Err(
+                "wallet signature: Ed25519 public key is not a valid curve point".to_string(),
+            );
         }
         let mut slen = [0u8; 2];
         slen.copy_from_slice(&take(bytes, &mut cur, 2, "sig_len")?);
@@ -355,7 +361,12 @@ impl WalletSignature {
         if cur != bytes.len() {
             return Err("wallet signature: trailing bytes after signature".to_string());
         }
-        Ok(Self { version, scheme, pubkey, signature })
+        Ok(Self {
+            version,
+            scheme,
+            pubkey,
+            signature,
+        })
     }
 
     /// [`WalletSignature::decode`] from hex.
@@ -398,7 +409,10 @@ pub enum WalletSigningKey {
     /// Post-quantum Falcon-512.
     Falcon { keypair: FalconKeypair },
     /// Hybrid dual-signature (Ed25519 + Falcon-512).
-    Hybrid { ed_seed: [u8; 32], falcon: FalconKeypair },
+    Hybrid {
+        ed_seed: [u8; 32],
+        falcon: FalconKeypair,
+    },
 }
 
 impl WalletSigningKey {
@@ -435,7 +449,10 @@ impl WalletSigningKey {
     /// Canonical public key bytes.
     pub fn pubkey_bytes(&self) -> Vec<u8> {
         match self {
-            Self::Ed25519 { seed } => SigningKey::from_bytes(seed).verifying_key().to_bytes().to_vec(),
+            Self::Ed25519 { seed } => SigningKey::from_bytes(seed)
+                .verifying_key()
+                .to_bytes()
+                .to_vec(),
             Self::Falcon { keypair } => keypair.public_key().to_vec(),
             Self::Hybrid { ed_seed, falcon } => {
                 let mut pk = Vec::with_capacity(crate::post_quantum::HYBRID_PUBKEY_LEN);
@@ -498,7 +515,12 @@ impl WalletSigningKey {
         let pubkey = self.pubkey_bytes();
         let signature = self.sign_preimage(&preimage)?;
         debug_assert_eq!(signature.len(), scheme.signature_size());
-        Ok(WalletSignature { version: WALLET_SIG_VERSION, scheme, pubkey, signature })
+        Ok(WalletSignature {
+            version: WALLET_SIG_VERSION,
+            scheme,
+            pubkey,
+            signature,
+        })
     }
 
     /// Sign structured contract-call data (the wallet displays
@@ -506,7 +528,10 @@ impl WalletSigningKey {
     ///
     /// Returns the signature AND the canonical JSON that was signed, so the
     /// caller can show/store exactly what the bytes commit to.
-    pub fn sign_typed_data(&self, data: &TypedCallData) -> Result<(WalletSignature, String), String> {
+    pub fn sign_typed_data(
+        &self,
+        data: &TypedCallData,
+    ) -> Result<(WalletSignature, String), String> {
         let preimage = typed_data_preimage(data)?;
         let canonical = canonical_typed_data_json(data);
         let scheme = self.scheme();
@@ -514,7 +539,12 @@ impl WalletSigningKey {
         let signature = self.sign_preimage(&preimage)?;
         debug_assert_eq!(signature.len(), scheme.signature_size());
         Ok((
-            WalletSignature { version: WALLET_SIG_VERSION, scheme, pubkey, signature },
+            WalletSignature {
+                version: WALLET_SIG_VERSION,
+                scheme,
+                pubkey,
+                signature,
+            },
             canonical,
         ))
     }
@@ -558,11 +588,7 @@ pub fn verify_message(
 /// Verify a typed-data signature. The caller passes the STRUCTURED fields
 /// (rebuilt from what the user was shown); the canonical JSON is re-encoded
 /// locally and the preimage rebuilt with the caller's `chain_id`.
-pub fn verify_typed_data(
-    address: &[u8; 32],
-    data: &TypedCallData,
-    sig: &WalletSignature,
-) -> bool {
+pub fn verify_typed_data(address: &[u8; 32], data: &TypedCallData, sig: &WalletSignature) -> bool {
     if sig.version != WALLET_SIG_VERSION {
         return false;
     }
@@ -588,10 +614,15 @@ pub fn verify_typed_data(
 ///
 /// Exactly one of `message` (UTF-8 string) / `message_hex` (hex bytes) must be
 /// present. Returns the raw message bytes.
-pub fn parse_message_param(message: Option<&str>, message_hex: Option<&str>) -> Result<Vec<u8>, String> {
+pub fn parse_message_param(
+    message: Option<&str>,
+    message_hex: Option<&str>,
+) -> Result<Vec<u8>, String> {
     match (message, message_hex) {
         (Some(_), Some(_)) => Err("pass exactly one of 'message' / 'message_hex'".to_string()),
-        (None, None) => Err("missing message: pass 'message' (UTF-8) or 'message_hex' (hex)".to_string()),
+        (None, None) => {
+            Err("missing message: pass 'message' (UTF-8) or 'message_hex' (hex)".to_string())
+        }
         (Some(m), None) => {
             if m.len() > MAX_MESSAGE_BYTES {
                 return Err(format!("message longer than {MAX_MESSAGE_BYTES} bytes"));
@@ -616,7 +647,9 @@ pub fn parse_u64_param(v: &Value) -> Result<u64, String> {
         return Ok(n);
     }
     if let Some(s) = v.as_str() {
-        return s.parse::<u64>().map_err(|_| format!("not a u64 decimal string: {s:?}"));
+        return s
+            .parse::<u64>()
+            .map_err(|_| format!("not a u64 decimal string: {s:?}"));
     }
     Err("not a u64 (number or decimal string)".to_string())
 }
@@ -646,36 +679,63 @@ mod tests {
         let key = WalletSigningKey::ed25519([0x42u8; 32]);
         let addr = key.address();
         // Ed25519 address IS the public key.
-        assert_eq!(addr, SigningKey::from_bytes(&[0x42u8; 32]).verifying_key().to_bytes());
-        let sig = key.sign_message(CHAIN_MAIN, b"hello stellereum").expect("signs");
+        assert_eq!(
+            addr,
+            SigningKey::from_bytes(&[0x42u8; 32])
+                .verifying_key()
+                .to_bytes()
+        );
+        let sig = key
+            .sign_message(CHAIN_MAIN, b"hello stellereum")
+            .expect("signs");
         assert_eq!(sig.scheme, PqScheme::Ed25519);
         assert_eq!(sig.encode().len(), 102);
         assert!(verify_message(&addr, CHAIN_MAIN, b"hello stellereum", &sig));
         // Envelope round trip.
         let back = WalletSignature::decode(&sig.encode()).expect("decodes");
         assert_eq!(back, sig);
-        assert!(verify_message(&addr, CHAIN_MAIN, b"hello stellereum", &back));
+        assert!(verify_message(
+            &addr,
+            CHAIN_MAIN,
+            b"hello stellereum",
+            &back
+        ));
     }
 
     #[test]
     fn falcon512_round_trip() {
         let key = WalletSigningKey::falcon_from_seed(&[0x77u8; 32]);
         let addr = key.address();
-        assert_eq!(addr, derive_pq_address(PqScheme::Falcon512, &key.pubkey_bytes(), &WALLET_SIGN_SALT));
-        let sig = key.sign_message(CHAIN_MAIN, b"hello stellereum").expect("signs");
+        assert_eq!(
+            addr,
+            derive_pq_address(PqScheme::Falcon512, &key.pubkey_bytes(), &WALLET_SIGN_SALT)
+        );
+        let sig = key
+            .sign_message(CHAIN_MAIN, b"hello stellereum")
+            .expect("signs");
         assert_eq!(sig.scheme, PqScheme::Falcon512);
         assert_eq!(sig.encode().len(), 1569);
         assert!(verify_message(&addr, CHAIN_MAIN, b"hello stellereum", &sig));
         let back = WalletSignature::from_hex(&sig.to_hex()).expect("decodes");
-        assert!(verify_message(&addr, CHAIN_MAIN, b"hello stellereum", &back));
+        assert!(verify_message(
+            &addr,
+            CHAIN_MAIN,
+            b"hello stellereum",
+            &back
+        ));
     }
 
     #[test]
     fn hybrid_round_trip() {
         let key = WalletSigningKey::hybrid([0x42u8; 32], &[0x77u8; 32]);
         let addr = key.address();
-        assert_eq!(addr, derive_pq_address(PqScheme::Hybrid, &key.pubkey_bytes(), &WALLET_SIGN_SALT));
-        let sig = key.sign_message(CHAIN_MAIN, b"hello stellereum").expect("signs");
+        assert_eq!(
+            addr,
+            derive_pq_address(PqScheme::Hybrid, &key.pubkey_bytes(), &WALLET_SIGN_SALT)
+        );
+        let sig = key
+            .sign_message(CHAIN_MAIN, b"hello stellereum")
+            .expect("signs");
         assert_eq!(sig.scheme, PqScheme::Hybrid);
         assert_eq!(sig.encode().len(), 1665);
         assert!(verify_message(&addr, CHAIN_MAIN, b"hello stellereum", &sig));
@@ -694,14 +754,32 @@ mod tests {
             WalletSigningKey::hybrid([0x33u8; 32], &[0x44u8; 32]),
         ];
         let msg = b"cross-scheme matrix";
-        let sigs: Vec<_> = keys.iter().map(|k| k.sign_message(CHAIN_MAIN, msg).expect("signs")).collect();
+        let sigs: Vec<_> = keys
+            .iter()
+            .map(|k| k.sign_message(CHAIN_MAIN, msg).expect("signs"))
+            .collect();
         for (k, s) in keys.iter().zip(sigs.iter()) {
             assert!(verify_message(&k.address(), CHAIN_MAIN, msg, s));
         }
         // Cross-address presentation fails: sig[0] (Ed) claimed as falcon addr.
-        assert!(!verify_message(&keys[1].address(), CHAIN_MAIN, msg, &sigs[0]));
-        assert!(!verify_message(&keys[0].address(), CHAIN_MAIN, msg, &sigs[1]));
-        assert!(!verify_message(&keys[0].address(), CHAIN_MAIN, msg, &sigs[2]));
+        assert!(!verify_message(
+            &keys[1].address(),
+            CHAIN_MAIN,
+            msg,
+            &sigs[0]
+        ));
+        assert!(!verify_message(
+            &keys[0].address(),
+            CHAIN_MAIN,
+            msg,
+            &sigs[1]
+        ));
+        assert!(!verify_message(
+            &keys[0].address(),
+            CHAIN_MAIN,
+            msg,
+            &sigs[2]
+        ));
     }
 
     #[test]
@@ -712,7 +790,9 @@ mod tests {
             WalletSigningKey::hybrid([0x42u8; 32], &[0x43u8; 32]),
         ] {
             let addr = key.address();
-            let sig = key.sign_message(CHAIN_MAIN, b"move 1 STELL").expect("signs");
+            let sig = key
+                .sign_message(CHAIN_MAIN, b"move 1 STELL")
+                .expect("signs");
             assert!(verify_message(&addr, CHAIN_MAIN, b"move 1 STELL", &sig));
             assert!(
                 !verify_message(&addr, CHAIN_OTHER, b"move 1 STELL", &sig),
@@ -774,17 +854,25 @@ mod tests {
     #[test]
     fn typed_data_encoding_is_canonical() {
         let contract = [0xABu8; 32];
-        let args_a: Value = serde_json::json!({"to": "alice", "amount": 100, "nested": {"z": 1, "a": 2}});
-        let args_b: Value = serde_json::json!({"nested": {"a": 2, "z": 1}, "amount": 100, "to": "alice"});
+        let args_a: Value =
+            serde_json::json!({"to": "alice", "amount": 100, "nested": {"z": 1, "a": 2}});
+        let args_b: Value =
+            serde_json::json!({"nested": {"a": 2, "z": 1}, "amount": 100, "to": "alice"});
         // NOTE: serde_json's default Map is a BTreeMap, so both literals already
         // carry sorted keys. The canonicalizer must ALSO sort (it cannot rely on
         // that): parse from raw strings with adversarial key order instead.
-        let args_c: Value = serde_json::from_str(r#"{"to":"alice","nested":{"z":1,"a":2},"amount":100}"#).unwrap();
-        let args_d: Value = serde_json::from_str(r#"{"amount":100,"to":"alice","nested":{"a":2,"z":1}}"#).unwrap();
-        let da = TypedCallData::new(&contract, "transfer", args_a, 1000, 7, CHAIN_MAIN).expect("builds");
-        let db = TypedCallData::new(&contract, "transfer", args_b, 1000, 7, CHAIN_MAIN).expect("builds");
-        let dc = TypedCallData::new(&contract, "transfer", args_c, 1000, 7, CHAIN_MAIN).expect("builds");
-        let dd = TypedCallData::new(&contract, "transfer", args_d, 1000, 7, CHAIN_MAIN).expect("builds");
+        let args_c: Value =
+            serde_json::from_str(r#"{"to":"alice","nested":{"z":1,"a":2},"amount":100}"#).unwrap();
+        let args_d: Value =
+            serde_json::from_str(r#"{"amount":100,"to":"alice","nested":{"a":2,"z":1}}"#).unwrap();
+        let da =
+            TypedCallData::new(&contract, "transfer", args_a, 1000, 7, CHAIN_MAIN).expect("builds");
+        let db =
+            TypedCallData::new(&contract, "transfer", args_b, 1000, 7, CHAIN_MAIN).expect("builds");
+        let dc =
+            TypedCallData::new(&contract, "transfer", args_c, 1000, 7, CHAIN_MAIN).expect("builds");
+        let dd =
+            TypedCallData::new(&contract, "transfer", args_d, 1000, 7, CHAIN_MAIN).expect("builds");
         let ja = canonical_typed_data_json(&da);
         let jb = canonical_typed_data_json(&db);
         assert_eq!(ja, jb);
@@ -826,7 +914,11 @@ mod tests {
         ] {
             let addr = key.address();
             let (sig, canonical) = key.sign_typed_data(&data).expect("signs");
-            assert!(verify_typed_data(&addr, &data, &sig), "scheme {:?}", key.scheme());
+            assert!(
+                verify_typed_data(&addr, &data, &sig),
+                "scheme {:?}",
+                key.scheme()
+            );
             // Same fields on another chain fail.
             let mut other = data.clone();
             other.chain_id = CHAIN_OTHER.to_string();
@@ -846,12 +938,24 @@ mod tests {
         let key = WalletSigningKey::ed25519([0x42u8; 32]);
         let addr = key.address();
         let msg_sig = key.sign_message(CHAIN_MAIN, b"transfer").expect("signs");
-        let data = TypedCallData::new(&[0u8; 32], "m", serde_json::json!("transfer"), 0, 0, CHAIN_MAIN)
-            .expect("builds");
+        let data = TypedCallData::new(
+            &[0u8; 32],
+            "m",
+            serde_json::json!("transfer"),
+            0,
+            0,
+            CHAIN_MAIN,
+        )
+        .expect("builds");
         assert!(!verify_typed_data(&addr, &data, &msg_sig));
         let (typed_sig, _) = key.sign_typed_data(&data).expect("signs");
         let canonical = canonical_typed_data_json(&data);
-        assert!(!verify_message(&addr, CHAIN_MAIN, canonical.as_bytes(), &typed_sig));
+        assert!(!verify_message(
+            &addr,
+            CHAIN_MAIN,
+            canonical.as_bytes(),
+            &typed_sig
+        ));
     }
 
     #[test]
@@ -860,8 +964,18 @@ mod tests {
         let big = vec![0u8; MAX_MESSAGE_BYTES + 1];
         assert!(key.sign_message(CHAIN_MAIN, &big).is_err());
         assert!(parse_message_param(Some(&"x".repeat(MAX_MESSAGE_BYTES + 1)), None).is_err());
-        assert!(TypedCallData::new(&[0u8; 32], "", serde_json::json!(null), 0, 0, CHAIN_MAIN).is_err());
-        assert!(TypedCallData::new(&[0u8; 32], &"m".repeat(MAX_METHOD_BYTES + 1), serde_json::json!(null), 0, 0, CHAIN_MAIN).is_err());
+        assert!(
+            TypedCallData::new(&[0u8; 32], "", serde_json::json!(null), 0, 0, CHAIN_MAIN).is_err()
+        );
+        assert!(TypedCallData::new(
+            &[0u8; 32],
+            &"m".repeat(MAX_METHOD_BYTES + 1),
+            serde_json::json!(null),
+            0,
+            0,
+            CHAIN_MAIN
+        )
+        .is_err());
     }
 
     #[test]

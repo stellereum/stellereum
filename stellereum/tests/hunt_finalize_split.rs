@@ -20,11 +20,11 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use stellereum::consensus::{QuorumCertificate, Vote, VoteKind, ValidatorId, ValidatorSet};
+use std::sync::Arc;
+use stellereum::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use std::sync::Arc;
 
 const N: usize = 4;
 
@@ -77,7 +77,13 @@ async fn cluster(ks: &[SigningKey], payer: ValidatorId, bal: u64) -> Vec<Validat
     out
 }
 
-fn mkblock(proposer_key: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32], txs: Vec<Transaction>) -> Block {
+fn mkblock(
+    proposer_key: &SigningKey,
+    h: u64,
+    prev: [u8; 32],
+    root: [u8; 32],
+    txs: Vec<Transaction>,
+) -> Block {
     let order_merkle_root = stellereum::mev::compute_order_merkle_root(&txs);
     let mut b = Block {
         shard_id: stellereum::sharding::MASTERCHAIN_SHARD,
@@ -93,9 +99,9 @@ fn mkblock(proposer_key: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32], tx
         precommit_qc: None,
         last_qc: None,
         mmr_epoch_root: [0u8; 32],
-            order_merkle_root,
-            epoch_key_commitment: [0u8; 32],
-        };
+        order_merkle_root,
+        epoch_key_commitment: [0u8; 32],
+    };
     b.sign_block(proposer_key);
     b
 }
@@ -152,10 +158,16 @@ async fn hunt_finding_2_finalize_without_the_block_splits_state() {
     let to = [0x77u8; 32];
     let mut nodes = cluster(&ks, from, 10_000_000_000_000).await;
 
-    let proposer = nodes.iter().position(|n| n.is_proposer()).expect("a proposer");
+    let proposer = nodes
+        .iter()
+        .position(|n| n.is_proposer())
+        .expect("a proposer");
     // Pick a victim that is NOT the proposer, so it never learns the block body.
     let victim = (proposer + 1) % N;
-    assert_ne!(proposer, victim, "the victim must not be the proposer this round");
+    assert_ne!(
+        proposer, victim,
+        "the victim must not be the proposer this round"
+    );
     let pkey = ks[proposer].clone();
     let pid = pkey.verifying_key().to_bytes();
 
@@ -211,7 +223,10 @@ async fn hunt_finding_2_finalize_without_the_block_splits_state() {
     println!("[FINDING 2] victim built+verified a 3-of-4 cert from relayed precommits: ok");
 
     let decided = nodes[victim].try_finalize().await;
-    println!("[FINDING 2] victim try_finalize() = {}", decided.map(|h| hex::encode(&h[..4])).unwrap_or_default());
+    println!(
+        "[FINDING 2] victim try_finalize() = {}",
+        decided.map(|h| hex::encode(&h[..4])).unwrap_or_default()
+    );
     // FIX: a precommit quorum is not a licence to advance a height on a block
     // nobody sent. The node now refuses, and commits to nothing.
     assert_eq!(
@@ -237,12 +252,21 @@ async fn hunt_finding_2_finalize_without_the_block_splits_state() {
             n.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
                 .unwrap();
         }
-        assert_eq!(n.try_finalize().await, Some(bh), "node {i} finalises a real round");
+        assert_eq!(
+            n.try_finalize().await,
+            Some(bh),
+            "node {i} finalises a real round"
+        );
     }
 
     let mut roots = vec![];
     for (i, n) in nodes.iter().enumerate() {
-        let bal = n.state.get_account(&to).await.map(|a| a.balance).unwrap_or(0);
+        let bal = n
+            .state
+            .get_account(&to)
+            .await
+            .map(|a| a.balance)
+            .unwrap_or(0);
         let r = n.state.get_state_root().await;
         println!(
             "[FINDING 2] node{i}{} root={} recipient={bal} applied={}",
@@ -253,15 +277,30 @@ async fn hunt_finding_2_finalize_without_the_block_splits_state() {
         roots.push(r);
     }
     assert_eq!(
-        nodes[victim].state.get_account(&to).await.map(|a| a.balance),
+        nodes[victim]
+            .state
+            .get_account(&to)
+            .await
+            .map(|a| a.balance),
         None,
         "the victim's recipient account does not even exist"
     );
-    assert_eq!(nodes[signers[0]].state.get_account(&to).await.unwrap().balance, 1_000);
+    assert_eq!(
+        nodes[signers[0]]
+            .state
+            .get_account(&to)
+            .await
+            .unwrap()
+            .balance,
+        1_000
+    );
 
     // All three honest nodes agree; the victim does not.
     let honest: Vec<[u8; 32]> = (0..N).filter(|&i| i != victim).map(|i| roots[i]).collect();
-    assert!(honest.windows(2).all(|w| w[0] == w[1]), "the three honest nodes must agree");
+    assert!(
+        honest.windows(2).all(|w| w[0] == w[1]),
+        "the three honest nodes must agree"
+    );
     assert_ne!(
         roots[victim], honest[0],
         "SPLIT: nodes finalized the SAME certified block and disagree on the state root"
@@ -329,7 +368,11 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
     let ids: Vec<ValidatorId> = ks.iter().map(|k| k.verifying_key().to_bytes()).collect();
     let silent = ids[3];
     assert!(cert1.verify(&vset(&ks)));
-    println!("[FINDING 3] cert1 has {}/4 real signatures; silent validator = {}", cert1.signatures.len(), hex::encode(&silent[..6]));
+    println!(
+        "[FINDING 3] cert1 has {}/4 real signatures; silent validator = {}",
+        cert1.signatures.len(),
+        hex::encode(&silent[..6])
+    );
 
     // Path A: finalized locally.
     let mut local = cluster(&ks, from, BONDABLE_BALANCE).await;
@@ -343,13 +386,19 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
             .add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh1)))
             .unwrap();
     }
-    assert_eq!(local[0].hc.try_precommit_quorum(), Some(bh1), "3-of-4 precommit quorum at height 1");
+    assert_eq!(
+        local[0].hc.try_precommit_quorum(),
+        Some(bh1),
+        "3-of-4 precommit quorum at height 1"
+    );
     local[0].blocks.insert(bh1, block1.clone());
     assert_eq!(local[0].try_finalize().await, Some(bh1));
 
     // Path B: adopted from a peer.
     let mut peer = cluster(&ks, from, BONDABLE_BALANCE).await;
-    let r1 = peer[1].adopt_committed(1, block1.clone(), cert1.clone()).await;
+    let r1 = peer[1]
+        .adopt_committed(1, block1.clone(), cert1.clone())
+        .await;
     assert_eq!(r1, Ok(bh1), "the peer commit at height 1 was accepted");
 
     // Same block, same pre-state, no evidence: both paths skip attribution
@@ -359,7 +408,8 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
     assert_eq!(root_after_1_a, root_after_1_b, "height-1 roots must agree");
     for (tag, rt) in [("local", &local[0]), ("adopt", &peer[1])] {
         assert_eq!(
-            rt.state.staking_read().await.validators[&silent].missed, 0,
+            rt.state.staking_read().await.validators[&silent].missed,
+            0,
             "{tag}: with no canonical evidence for height 1, nothing is attributed"
         );
     }
@@ -397,7 +447,10 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
         live_set_h2.validators, peer_set_h2.validators,
         "both paths must judge height 2 by the same set"
     );
-    assert!(cert2.verify(&live_set_h2), "the height-2 decision QC must verify");
+    assert!(
+        cert2.verify(&live_set_h2),
+        "the height-2 decision QC must verify"
+    );
 
     // Path A: drive a real round at height 2 and finalize locally.
     for k in ks.iter().take(3) {
@@ -410,13 +463,23 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
             .add_precommit(Vote::sign(k, 2, 0, VoteKind::Precommit, Some(bh2)))
             .unwrap();
     }
-    assert_eq!(local[0].hc.try_precommit_quorum(), Some(bh2), "3-of-4 precommit quorum at height 2");
+    assert_eq!(
+        local[0].hc.try_precommit_quorum(),
+        Some(bh2),
+        "3-of-4 precommit quorum at height 2"
+    );
     local[0].blocks.insert(bh2, block2.clone());
     assert_eq!(local[0].try_finalize().await, Some(bh2));
 
     // Path B: adopt the height-2 commit.
-    let r2 = peer[1].adopt_committed(2, block2.clone(), cert2.clone()).await;
-    assert_eq!(r2, Ok(bh2), "the peer commit at height 2 was accepted: {r2:?}");
+    let r2 = peer[1]
+        .adopt_committed(2, block2.clone(), cert2.clone())
+        .await;
+    assert_eq!(
+        r2,
+        Ok(bh2),
+        "the peer commit at height 2 was accepted: {r2:?}"
+    );
 
     let burn_a = local[0].state.staking_read().await.total_burned;
     let burn_b = peer[1].state.staking_read().await.total_burned;
@@ -433,17 +496,27 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
         hex::encode(&root_b[..8])
     );
 
-    assert_eq!(missed_a, 1, "the local path marked the silent validator missed");
+    assert_eq!(
+        missed_a, 1,
+        "the local path marked the silent validator missed"
+    );
     assert_eq!(
         missed_b, missed_a,
         "FIXED: the adopt path must mark the same missed count"
     );
-    assert_eq!(burn_a, burn_b, "both paths must burn the same coins (here: none yet)");
+    assert_eq!(
+        burn_a, burn_b,
+        "both paths must burn the same coins (here: none yet)"
+    );
     assert_eq!(
         root_a, root_b,
         "FIXED: two legal paths over the SAME certified blocks must reach the SAME root"
     );
-    println!("[FINDING 3] FIXED: {} == {}", hex::encode(&root_a[..8]), hex::encode(&root_b[..8]));
+    println!(
+        "[FINDING 3] FIXED: {} == {}",
+        hex::encode(&root_a[..8]),
+        hex::encode(&root_b[..8])
+    );
 }
 
 // ===========================================================================
@@ -482,21 +555,34 @@ async fn hunt_finding_4_adopt_committed_binds_the_state_root() {
     let cert = genuine_cert(&ks, &[0, 1, 2], bh);
     let _set = nodes[2].validators.clone();
     let r = nodes[2].adopt_committed(1, block.clone(), cert).await;
-    println!("[FINDING 4] adopt_committed   -> {:?}", r.as_ref().map(|h| hex::encode(&h[..4])).map_err(|e| e.clone()));
+    println!(
+        "[FINDING 4] adopt_committed   -> {:?}",
+        r.as_ref()
+            .map(|h| hex::encode(&h[..4]))
+            .map_err(|e| e.clone())
+    );
     // FIXED: adopt_committed now checks the block's state_root against the state it
     // builds on, exactly as validate_proposal does. The parent-link check already
     // forces the block to extend our own finalized head, so our live root is the
     // right comparison. Without it, the adopt path applied blocks to a state the
     // network never committed to and computed a root nobody else had.
-    assert!(r.is_err(), "a block with a fabricated state_root must be refused");
+    assert!(
+        r.is_err(),
+        "a block with a fabricated state_root must be refused"
+    );
     assert!(
         r.as_ref().unwrap_err().contains("parent state root"),
         "the refusal must name the state root: {:?}",
         r.err()
     );
-    assert!(nodes[2].finalized.is_empty(), "nothing may be finalized from it");
-    println!("[FINDING 4] FIXED: header root 0xabab..ab != local root {} was refused",
-        hex::encode(&our_root[..6]));
+    assert!(
+        nodes[2].finalized.is_empty(),
+        "nothing may be finalized from it"
+    );
+    println!(
+        "[FINDING 4] FIXED: header root 0xabab..ab != local root {} was refused",
+        hex::encode(&our_root[..6])
+    );
 }
 
 // ===========================================================================
@@ -522,9 +608,20 @@ async fn hunt_finding_5_adopt_committed_uses_only_the_local_validator_set() {
     // (correctly) refuses before the quorum check is ever reached. A fixed
     // ks[i] with random keys made this test 1-in-4 flaky; resolving the
     // scheduled key keeps it deterministically on the QUORUM refusal path.
-    let sched = real.proposer_for(1, 0).expect("4-member set names a proposer");
-    let sched_key = ks.iter().find(|k| k.verifying_key().to_bytes() == sched).expect("scheduled proposer is one of ours");
-    let block = mkblock(sched_key, 1, [0u8; 32], [0xDE; 32], vec![Transaction::sign(&user, [1u8; 32], 999_999, 0, 0, 1, 1)]);
+    let sched = real
+        .proposer_for(1, 0)
+        .expect("4-member set names a proposer");
+    let sched_key = ks
+        .iter()
+        .find(|k| k.verifying_key().to_bytes() == sched)
+        .expect("scheduled proposer is one of ours");
+    let block = mkblock(
+        sched_key,
+        1,
+        [0u8; 32],
+        [0xDE; 32],
+        vec![Transaction::sign(&user, [1u8; 32], 999_999, 0, 0, 1, 1)],
+    );
     let bh = block.compute_hash();
     let v = Vote::sign(&attacker, 1, 0, VoteKind::Precommit, Some(bh));
     let cert = QuorumCertificate {
@@ -534,10 +631,19 @@ async fn hunt_finding_5_adopt_committed_uses_only_the_local_validator_set() {
         block_hash: Some(bh),
         signatures: vec![(v.voter, v.signature)],
     };
-    println!("[FINDING 5] cert.verify(REAL 4-validator set)     = {}", cert.verify(&real));
-    println!("[FINDING 5] cert.verify(ATTACKER-DECLARED set)   = {}", cert.verify(&forged_set));
+    println!(
+        "[FINDING 5] cert.verify(REAL 4-validator set)     = {}",
+        cert.verify(&real)
+    );
+    println!(
+        "[FINDING 5] cert.verify(ATTACKER-DECLARED set)   = {}",
+        cert.verify(&forged_set)
+    );
     assert!(!cert.verify(&real), "worthless against the real set");
-    assert!(cert.verify(&forged_set), "...but valid against a set the CALLER supplied");
+    assert!(
+        cert.verify(&forged_set),
+        "...but valid against a set the CALLER supplied"
+    );
 
     let id = ks[3].verifying_key().to_bytes();
     let state = funded_state(id, 10_000).await;
@@ -554,7 +660,10 @@ async fn hunt_finding_5_adopt_committed_uses_only_the_local_validator_set() {
         real.len(),
         real.quorum_power()
     );
-    assert!(r.is_err(), "a one-key certificate must not finalize anything");
+    assert!(
+        r.is_err(),
+        "a one-key certificate must not finalize anything"
+    );
     assert!(
         r.as_ref().unwrap_err().contains("validator quorum"),
         "the refusal must be the quorum check: {:?}",

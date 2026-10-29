@@ -67,7 +67,8 @@ fn e4_oversize_title_rejected_at_propose_time() {
     // Boundary: 256B is accepted.
     let ok_title = "t".repeat(256);
     assert!(
-        g.propose(&l, a, ok_title, GovAction::Signal("ok".into()), 0).is_ok(),
+        g.propose(&l, a, ok_title, GovAction::Signal("ok".into()), 0)
+            .is_ok(),
         "E4: 256B title must be accepted"
     );
 }
@@ -118,7 +119,8 @@ fn e4_oversize_signal_rejected_at_propose_time() {
         "E4: 1025B signal must be refused"
     );
     assert!(
-        g.propose(&l, a, "t".into(), GovAction::Signal("s".repeat(1024)), 0).is_ok(),
+        g.propose(&l, a, "t".into(), GovAction::Signal("s".repeat(1024)), 0)
+            .is_ok(),
         "E4: 1024B signal must be accepted"
     );
 }
@@ -165,7 +167,13 @@ fn e6_zero_key_publisher_fails_closed_at_execute_time() {
     let mut g = Governance::new();
     // Propose-time already refuses it (pinned); the hole is execute-time.
     assert_eq!(
-        g.propose(&l, a, "z".into(), GovAction::RegisterOraclePublisher([0u8; 32]), 0),
+        g.propose(
+            &l,
+            a,
+            "z".into(),
+            GovAction::RegisterOraclePublisher([0u8; 32]),
+            0
+        ),
         Err(GovError::InvalidAction)
     );
     // Smuggle past propose-time validation via direct insert.
@@ -230,18 +238,28 @@ fn e7_vote_then_exit_cannot_flip_rejected_to_passed() {
     // World 1: finalize with the electorate intact -> Rejected.
     let (mut l1, a1, b1, _) = ledger_29k();
     let mut g1 = Governance::new();
-    let id1 = g1.propose(&l1, a1, "t".into(), GovAction::Signal("t".into()), 0).unwrap();
+    let id1 = g1
+        .propose(&l1, a1, "t".into(), GovAction::Signal("t".into()), 0)
+        .unwrap();
     assert_eq!(g1.get(id1).unwrap().electorate, stell(29_000) as u128);
     g1.vote(&mut l1, a1, id1, VoteChoice::Yes, 1).unwrap(); // 10k
     g1.vote(&mut l1, b1, id1, VoteChoice::Yes, 1).unwrap(); // 9k
     assert_eq!(g1.get(id1).unwrap().turnout(), stell(19_000) as u128);
-    let s1 = g1.finalize(&mut l1, id1, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
-    assert_eq!(s1, ProposalStatus::Rejected, "19k < 19331 quorum on 29k base");
+    let s1 = g1
+        .finalize(&mut l1, id1, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+        .unwrap();
+    assert_eq!(
+        s1,
+        ProposalStatus::Rejected,
+        "19k < 19331 quorum on 29k base"
+    );
 
     // World 2: identical votes, then yes-voter B tries to exit before finalize.
     let (mut l2, a2, b2, _) = ledger_29k();
     let mut g2 = Governance::new();
-    let id2 = g2.propose(&l2, a2, "t".into(), GovAction::Signal("t".into()), 0).unwrap();
+    let id2 = g2
+        .propose(&l2, a2, "t".into(), GovAction::Signal("t".into()), 0)
+        .unwrap();
     g2.vote(&mut l2, a2, id2, VoteChoice::Yes, 1).unwrap();
     g2.vote(&mut l2, b2, id2, VoteChoice::Yes, 1).unwrap();
     assert_eq!(
@@ -249,7 +267,9 @@ fn e7_vote_then_exit_cannot_flip_rejected_to_passed() {
         Err(StakingError::LockedInGovernanceVote),
         "E7: stake locked in an open vote must not exit"
     );
-    let s2 = g2.finalize(&mut l2, id2, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
+    let s2 = g2
+        .finalize(&mut l2, id2, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+        .unwrap();
     assert_eq!(
         s2,
         ProposalStatus::Rejected,
@@ -268,8 +288,13 @@ fn e9_zero_price_feed_is_refused_without_commit_or_latch() {
     let sk = pubkey(0x42);
     let (mut o, _) = oracle_with_publisher(&sk);
     let zero = PriceFeedUpdate::sign("STELL", 0, BLOCK_TIME - 10, &sk);
-    let err = o.commit_feed(&zero, BLOCK_TIME).expect_err("E9: price 0 must be refused");
-    assert!(err.contains("price"), "refusal must name the price, got: {err}");
+    let err = o
+        .commit_feed(&zero, BLOCK_TIME)
+        .expect_err("E9: price 0 must be refused");
+    assert!(
+        err.contains("price"),
+        "refusal must name the price, got: {err}"
+    );
     assert!(o.feeds.is_empty(), "E9: nothing may be committed");
     assert!(!o.breaker_tripped, "E9: malformed data latches nothing");
 }
@@ -279,7 +304,9 @@ fn e9_zero_price_usdt_is_malformed_not_a_depeg_latch() {
     let sk = pubkey(0x42);
     let (mut o, _) = oracle_with_publisher(&sk);
     let zero = PriceFeedUpdate::sign("USDT", 0, BLOCK_TIME - 10, &sk);
-    let err = o.commit_feed(&zero, BLOCK_TIME).expect_err("E9: price 0 must be refused");
+    let err = o
+        .commit_feed(&zero, BLOCK_TIME)
+        .expect_err("E9: price 0 must be refused");
     assert!(err.contains("price"), "got: {err}");
     assert!(o.feeds.is_empty());
     assert!(
@@ -293,13 +320,24 @@ fn e9_zero_price_usdt_is_malformed_not_a_depeg_latch() {
 #[test]
 fn e10_malformed_asset_symbols_are_refused() {
     let sk = pubkey(0x42);
-    for bad in ["", " ", "ST ELL", "STELL!", "stell$", &"A".repeat(33), &"X".repeat(1024)] {
+    for bad in [
+        "",
+        " ",
+        "ST ELL",
+        "STELL!",
+        "stell$",
+        &"A".repeat(33),
+        &"X".repeat(1024),
+    ] {
         let (mut o, _) = oracle_with_publisher(&sk);
         let feed = PriceFeedUpdate::sign(bad, 250_000, BLOCK_TIME - 10, &sk);
         let err = o
             .commit_feed(&feed, BLOCK_TIME)
             .expect_err(&format!("E10: asset {bad:?} must be refused"));
-        assert!(err.contains("asset"), "refusal must name the asset, got: {err}");
+        assert!(
+            err.contains("asset"),
+            "refusal must name the asset, got: {err}"
+        );
         assert!(o.feeds.is_empty());
         assert!(!o.breaker_tripped);
     }

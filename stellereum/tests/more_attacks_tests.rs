@@ -42,7 +42,7 @@ fn consensus_duplicate_signatures_do_not_fake_quorum() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
 
     // Sign the SAME block three times with the SAME key
     block.sign_block(&attacker);
@@ -81,14 +81,17 @@ fn consensus_block_signature_not_replayable_across_height() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     block.sign_block(&val);
     assert!(block.verify_signatures(1));
 
     // Replay the same signatures onto a different height
     let mut replayed = block.clone();
     replayed.height = 11;
-    assert!(!replayed.verify_signatures(1), "signature must be bound to block height");
+    assert!(
+        !replayed.verify_signatures(1),
+        "signature must be bound to block height"
+    );
 }
 
 // ============================================================================
@@ -107,7 +110,11 @@ fn orderbook_cancel_refunds_only_unfilled() {
 
     let cancelled = book.cancel_order(sell.order_id).unwrap();
     assert_eq!(cancelled.filled, 4);
-    assert_eq!(cancelled.amount - cancelled.filled, 6, "only 6 unfilled must be refunded");
+    assert_eq!(
+        cancelled.amount - cancelled.filled,
+        6,
+        "only 6 unfilled must be refunded"
+    );
 }
 
 // ============================================================================
@@ -133,7 +140,11 @@ fn orderbook_zero_amount_noop() {
     let mut book = OrderbookActor::new(1, 100);
     let (_order, trades) = book.submit_order(addr(1), OrderSide::Buy, 100, 0, 0);
     assert!(trades.is_empty());
-    assert_eq!(book.depth(), (0, 0), "zero-amount order must not enter the book");
+    assert_eq!(
+        book.depth(),
+        (0, 0),
+        "zero-amount order must not enter the book"
+    );
 }
 
 // ============================================================================
@@ -144,11 +155,18 @@ fn genesis_vault_cumulative_cap_enforced() {
     let mut vault = GenesisVault::new();
     // 62,500,000 USDT at $1.00 == exactly 250,000,000 STELL (the cap)
     let amount_micro = 62_500_000u64 * 1_000_000;
-    let minted = vault.deposit_and_mint("USDT", amount_micro, 1_000_000).unwrap();
+    let minted = vault
+        .deposit_and_mint("USDT", amount_micro, 1_000_000)
+        .unwrap();
     assert_eq!(minted, 250_000_000u64 * 1_000_000_000);
 
     // Any further deposit must be rejected
-    assert!(vault.deposit_and_mint("USDT", 1_000_000, 1_000_000).is_err(), "cap must not be exceeded");
+    assert!(
+        vault
+            .deposit_and_mint("USDT", 1_000_000, 1_000_000)
+            .is_err(),
+        "cap must not be exceeded"
+    );
 }
 
 // ============================================================================
@@ -157,7 +175,9 @@ fn genesis_vault_cumulative_cap_enforced() {
 #[test]
 fn genesis_vault_unsupported_asset_rejected() {
     let mut vault = GenesisVault::new();
-    assert!(vault.deposit_and_mint("BTC", 1_000_000, 60_000_000_000).is_err());
+    assert!(vault
+        .deposit_and_mint("BTC", 1_000_000, 60_000_000_000)
+        .is_err());
     assert!(vault.deposit_and_mint("DOGE", 1_000_000, 100_000).is_err());
 }
 
@@ -183,7 +203,10 @@ fn session_key_budget_and_expiry_boundaries() {
     // Spend exactly the budget
     assert!(auth.verify_and_spend_gas(1_000, 1_000).is_ok());
     // Any further spend exceeds the budget
-    assert!(auth.verify_and_spend_gas(1, 1_000).is_err(), "budget must not be exceeded");
+    assert!(
+        auth.verify_and_spend_gas(1, 1_000).is_err(),
+        "budget must not be exceeded"
+    );
 
     // Fresh key: expired exactly one second after valid_until
     let mut auth2 = SessionKeyAuthorization::sign_delegation(
@@ -195,8 +218,14 @@ fn session_key_budget_and_expiry_boundaries() {
         u64::MAX,
         0,
     );
-    assert!(auth2.verify_and_spend_gas(10, valid_until).is_ok(), "valid at the boundary");
-    assert!(auth2.verify_and_spend_gas(10, valid_until + 1).is_err(), "expired one second later");
+    assert!(
+        auth2.verify_and_spend_gas(10, valid_until).is_ok(),
+        "valid at the boundary"
+    );
+    assert!(
+        auth2.verify_and_spend_gas(10, valid_until + 1).is_err(),
+        "expired one second later"
+    );
 }
 
 // ============================================================================
@@ -223,7 +252,10 @@ async fn actor_bounce_storm_terminates_and_conserves() {
 
     let total = engine.get_account(&a).await.unwrap().balance
         + engine.get_account(&b).await.unwrap().balance;
-    assert_eq!(total, 200_000, "bounced funds must be conserved (no inflation/loss)");
+    assert_eq!(
+        total, 200_000,
+        "bounced funds must be conserved (no inflation/loss)"
+    );
 }
 
 // ============================================================================
@@ -288,16 +320,23 @@ fn pedersen_wrong_value_or_blinding_rejected() {
 #[test]
 fn stealth_address_wrong_recipient_rejected() {
     let view_priv = Scalar::random(&mut OsRng);
-    let view_pub = (RISTRETTO_BASEPOINT_POINT * view_priv).compress().to_bytes();
+    let view_pub = (RISTRETTO_BASEPOINT_POINT * view_priv)
+        .compress()
+        .to_bytes();
     let spend_priv = Scalar::random(&mut OsRng);
-    let spend_pub = (RISTRETTO_BASEPOINT_POINT * spend_priv).compress().to_bytes();
+    let spend_pub = (RISTRETTO_BASEPOINT_POINT * spend_priv)
+        .compress()
+        .to_bytes();
 
     let stealth = StealthAddress::generate(&view_pub, &spend_pub).unwrap();
     assert!(stealth.is_for_recipient(&view_priv, &spend_pub).unwrap());
 
     // A different viewer must not recognize it
     let other_view = Scalar::random(&mut OsRng);
-    assert!(!stealth.is_for_recipient(&other_view, &spend_pub).unwrap(), "wrong viewer must not match");
+    assert!(
+        !stealth.is_for_recipient(&other_view, &spend_pub).unwrap(),
+        "wrong viewer must not match"
+    );
 }
 
 // ============================================================================
@@ -309,11 +348,15 @@ fn viewing_key_unauthorized_decrypt_rejected() {
     let other = ViewingKey::generate();
     let blinding = PedersenCommitment::random_blinding();
 
-    let payload = ViewingKey::encrypt_amount_for_auditor(&auditor.view_pub, 12_345, &blinding).unwrap();
+    let payload =
+        ViewingKey::encrypt_amount_for_auditor(&auditor.view_pub, 12_345, &blinding).unwrap();
     assert_eq!(auditor.decrypt_amount(&payload).unwrap().0, 12_345);
 
     // A different viewing key cannot decrypt
-    assert!(other.decrypt_amount(&payload).is_err(), "unauthorized viewing key must fail");
+    assert!(
+        other.decrypt_amount(&payload).is_err(),
+        "unauthorized viewing key must fail"
+    );
 }
 
 // ============================================================================
@@ -355,7 +398,10 @@ fn sharding_routing_after_split() {
         let mut a = [0u8; 32];
         a[0] = i;
         let sid = mgr.route_address(&a);
-        assert!(mgr.shards.contains_key(&sid), "routed to unknown shard {sid}");
+        assert!(
+            mgr.shards.contains_key(&sid),
+            "routed to unknown shard {sid}"
+        );
     }
 }
 

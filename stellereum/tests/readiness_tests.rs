@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use stellereum::explorer::{
-    GatewayState, ReadinessConfig, ReadinessState, render_metrics_with_readiness,
+    render_metrics_with_readiness, GatewayState, ReadinessConfig, ReadinessState,
 };
 use stellereum::metrics::{SizeRotatingWriter, DEFAULT_LOG_MAX_BYTES, DEFAULT_LOG_MAX_FILES};
 use stellereum::rpc::RpcState;
@@ -27,16 +27,22 @@ async fn test_rpc_state() -> Arc<RpcState> {
     let engine = Arc::new(stellereum::state_engine::InMemoryStateEngine::new());
     Arc::new(RpcState {
         engine,
-        mempool: Arc::new(tokio::sync::RwLock::new(stellereum::mempool::Mempool::default())),
+        mempool: Arc::new(tokio::sync::RwLock::new(
+            stellereum::mempool::Mempool::default(),
+        )),
         height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         node_id: "inf1:readiness".to_string(),
         chain_id: 5757,
-        staking: Arc::new(tokio::sync::RwLock::new(stellereum::staking::StakingLedger::new())),
+        staking: Arc::new(tokio::sync::RwLock::new(
+            stellereum::staking::StakingLedger::new(),
+        )),
         governance: Arc::new(tokio::sync::RwLock::new(
             stellereum::governance::Governance::new(),
         )),
         recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
-        receipts: Arc::new(tokio::sync::RwLock::new(stellereum::rpc::ReceiptIndex::default())),
+        receipts: Arc::new(tokio::sync::RwLock::new(
+            stellereum::rpc::ReceiptIndex::default(),
+        )),
         auth_token: None,
         tx_broadcast: None,
         faucet: None,
@@ -48,7 +54,10 @@ async fn test_rpc_state() -> Arc<RpcState> {
 }
 
 fn test_config() -> ReadinessConfig {
-    ReadinessConfig { max_stall_secs: STALL, min_peers: 1 }
+    ReadinessConfig {
+        max_stall_secs: STALL,
+        min_peers: 1,
+    }
 }
 
 async fn spawn_gateway(gw: Arc<GatewayState>) -> std::net::SocketAddr {
@@ -74,7 +83,10 @@ async fn http_get(addr: std::net::SocketAddr, path: &str) -> (String, String) {
     s.read_to_end(&mut buf).await.unwrap();
     let text = String::from_utf8_lossy(&buf).to_string();
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or(("", &text));
-    (head.lines().next().unwrap_or("").to_string(), body.to_string())
+    (
+        head.lines().next().unwrap_or("").to_string(),
+        body.to_string(),
+    )
 }
 
 // ============================================================================
@@ -121,8 +133,14 @@ fn ready_is_false_before_any_finality() {
     // Peers but nothing ever finalized (e.g. stuck in DHT warmup at height 0).
     let rep = r.evaluate_at(5_000);
     assert!(!rep.ready);
-    assert!(rep.failed_checks.contains(&"no_finality".to_string()), "{rep:?}");
-    assert!(rep.failed_checks.contains(&"height_zero".to_string()), "{rep:?}");
+    assert!(
+        rep.failed_checks.contains(&"no_finality".to_string()),
+        "{rep:?}"
+    );
+    assert!(
+        rep.failed_checks.contains(&"height_zero".to_string()),
+        "{rep:?}"
+    );
 }
 
 #[test]
@@ -152,8 +170,14 @@ fn repeated_finalize_at_same_height_refreshes_finality_not_height() {
     let late = r.evaluate_at(1_000 + STALL + 1);
     // Height signal (from t=1000) is now stale while finality (t=1030) is not.
     assert!(!late.ready);
-    assert!(late.failed_checks.contains(&"height_stalled".to_string()), "{late:?}");
-    assert!(!late.failed_checks.contains(&"finality_stalled".to_string()), "{late:?}");
+    assert!(
+        late.failed_checks.contains(&"height_stalled".to_string()),
+        "{late:?}"
+    );
+    assert!(
+        !late.failed_checks.contains(&"finality_stalled".to_string()),
+        "{late:?}"
+    );
 }
 
 #[test]
@@ -198,13 +222,21 @@ async fn readyz_names_the_failing_condition_then_recovers() {
 
     // Fresh node: no peers, nothing finalized.
     let (status, body) = http_get(addr, "/readyz").await;
-    assert!(status.contains("503"), "unready must be 503: {status} {body}");
+    assert!(
+        status.contains("503"),
+        "unready must be 503: {status} {body}"
+    );
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["ready"], false);
-    let failed: Vec<String> =
-        serde_json::from_value(v["failed_checks"].clone()).unwrap();
-    assert!(failed.contains(&"no_peers".to_string()), "must name no_peers: {body}");
-    assert!(failed.contains(&"no_finality".to_string()), "must name no_finality: {body}");
+    let failed: Vec<String> = serde_json::from_value(v["failed_checks"].clone()).unwrap();
+    assert!(
+        failed.contains(&"no_peers".to_string()),
+        "must name no_peers: {body}"
+    );
+    assert!(
+        failed.contains(&"no_finality".to_string()),
+        "must name no_finality: {body}"
+    );
 
     // Peers join and a block finalizes: the same endpoint flips to 200.
     gw.set_ready_peers(2);
@@ -228,12 +260,18 @@ async fn metrics_carries_stell_ready_gauge_matching_readyz() {
     let addr = spawn_gateway(gw.clone()).await;
 
     let (_, body) = http_get(addr, "/metrics").await;
-    assert!(body.contains("stell_ready 0"), "unready node must export 0:\n{body}");
+    assert!(
+        body.contains("stell_ready 0"),
+        "unready node must export 0:\n{body}"
+    );
 
     gw.set_ready_peers(1);
     gw.note_ready_finalized(5);
     let (_, body) = http_get(addr, "/metrics").await;
-    assert!(body.contains("stell_ready 1"), "ready node must export 1:\n{body}");
+    assert!(
+        body.contains("stell_ready 1"),
+        "ready node must export 1:\n{body}"
+    );
 }
 
 #[test]
@@ -288,13 +326,17 @@ fn rotation_keeps_at_most_n_files_and_loses_no_line() {
 
     const N: usize = 500;
     for i in 0..N {
-        w.write_line(&format!("line-{i:04}-payload-xxxxxxxxxx")).unwrap();
+        w.write_line(&format!("line-{i:04}-payload-xxxxxxxxxx"))
+            .unwrap();
     }
     drop(w);
 
     let (files, lines) = collect_lines(&dir);
     assert!(files <= 4, "must keep at most 4 files, found {files}");
-    assert!(files >= 2, "256-byte budget over 500 lines must rotate at least once");
+    assert!(
+        files >= 2,
+        "256-byte budget over 500 lines must rotate at least once"
+    );
     // Bounded rotation evicts whole files from the head: the survivors must be
     // a CONTIGUOUS SUFFIX of what was written — no gaps, no duplicates, every
     // line whole. Eviction may drop old lines; rotation itself must never tear
@@ -305,13 +347,27 @@ fn rotation_keeps_at_most_n_files_and_loses_no_line() {
         lines.iter().collect::<HashSet<_>>().len(),
         "no line may be duplicated"
     );
-    let mut idx: Vec<usize> =
-        lines.iter().map(|l| l[5..9].parse::<usize>().unwrap()).collect();
+    let mut idx: Vec<usize> = lines
+        .iter()
+        .map(|l| l[5..9].parse::<usize>().unwrap())
+        .collect();
     idx.sort_unstable();
-    assert_eq!(*idx.last().unwrap(), N - 1, "newest line must survive rotation");
-    assert_eq!(idx, (idx[0]..N).collect::<Vec<_>>(), "survivors must be a gapless suffix");
+    assert_eq!(
+        *idx.last().unwrap(),
+        N - 1,
+        "newest line must survive rotation"
+    );
+    assert_eq!(
+        idx,
+        (idx[0]..N).collect::<Vec<_>>(),
+        "survivors must be a gapless suffix"
+    );
     for l in &lines {
-        assert_eq!(l.len(), "line-0000-payload-xxxxxxxxxx".len(), "line must be whole: {l:?}");
+        assert_eq!(
+            l.len(),
+            "line-0000-payload-xxxxxxxxxx".len(),
+            "line must be whole: {l:?}"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -350,7 +406,10 @@ fn rotation_never_splits_a_line_mid_rotation() {
     assert!(files <= 3, "bounded files: {files}");
     // Only the newest 3 files' worth survive a 32-byte budget; what survives
     // must be whole, ordered-parseable lines — check the newest line survived.
-    assert!(all.contains("event-049"), "newest line must survive rotation");
+    assert!(
+        all.contains("event-049"),
+        "newest line must survive rotation"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -366,13 +425,15 @@ fn rotation_survives_an_oversized_single_line() {
     drop(w);
 
     let (_, lines) = collect_lines(&dir);
-    assert!(lines.iter().any(|l| l == &big), "oversized line must land whole");
+    assert!(
+        lines.iter().any(|l| l == &big),
+        "oversized line must land whole"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn rotation_is_bounded_under_concurrent_writers() {
-    
     let dir = unique_tmp_dir("concurrent");
     let base = dir.join("node.log");
     let log = stellereum::metrics::RotatingLog::new(base.clone(), 512, 4).unwrap();

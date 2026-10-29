@@ -18,6 +18,8 @@
 //! regardless of how fast the worker is — no timing races, no sleeps.
 
 use ed25519_dalek::SigningKey;
+use std::sync::Arc;
+use std::time::Instant;
 use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::{count_block_actor_sends, ChainState, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
@@ -25,8 +27,6 @@ use stellereum::state_engine::{
     AccountState, ActorMessage, InMemoryStateEngine, MAX_ACTOR_MSGS_PER_BLOCK,
 };
 use stellereum::svm::OpCode;
-use std::sync::Arc;
-use std::time::Instant;
 
 /// Realistic block timestamp - never 0.
 const TS: u64 = 1_760_000_000;
@@ -59,12 +59,8 @@ async fn single_runtime() -> (ValidatorRuntime, SigningKey, SigningKey) {
     let user_sk = key(0x22);
     let user = id_of(&user_sk);
     let engine = Arc::new(InMemoryStateEngine::new());
-    engine
-        .update_account(AccountState::new(val, BAL))
-        .await;
-    engine
-        .update_account(AccountState::new(user, BAL))
-        .await;
+    engine.update_account(AccountState::new(val, BAL)).await;
+    engine.update_account(AccountState::new(user, BAL)).await;
     let vs = ValidatorSet::from_list(vec![(val, 1)]);
     let rt = ValidatorRuntime::new(val_sk.clone(), vs, engine, 1);
     (rt, val_sk, user_sk)
@@ -84,7 +80,9 @@ async fn decide_submit(rt: &mut ValidatorRuntime) -> [u8; 32] {
     let bh = block.compute_hash();
     let pv = rt.make_prevote().expect("prevote with a live proposal");
     rt.on_prevote(pv).unwrap();
-    let pc = rt.make_precommit().expect("precommit off our own prevote QC");
+    let pc = rt
+        .make_precommit()
+        .expect("precommit off our own prevote QC");
     rt.on_precommit(pc).unwrap();
     let decided = rt
         .try_finalize_submit()
@@ -107,9 +105,7 @@ async fn decide_submit(rt: &mut ValidatorRuntime) -> [u8; 32] {
 async fn propose_returns_none_while_apply_pending() {
     let (mut rt, _val, user_sk) = single_runtime().await;
     let to = [0x77u8; 32];
-    rt.state
-        .update_account(AccountState::new(to, 0))
-        .await;
+    rt.state.update_account(AccountState::new(to, 0)).await;
     rt.add_tx(transfer_tx(&user_sk, to, 0)).await;
 
     let root_pre = rt.state_root().await;
@@ -155,9 +151,7 @@ async fn propose_returns_none_while_apply_pending() {
 async fn on_proposal_deferred_while_apply_pending() {
     let (mut rt, _val, user_sk) = single_runtime().await;
     let to = [0x77u8; 32];
-    rt.state
-        .update_account(AccountState::new(to, 0))
-        .await;
+    rt.state.update_account(AccountState::new(to, 0)).await;
     rt.add_tx(transfer_tx(&user_sk, to, 0)).await;
     let _bh = decide_submit(&mut rt).await;
 
@@ -179,7 +173,7 @@ async fn on_proposal_deferred_while_apply_pending() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     let h_before = rt.height();
     let fin_before = rt.finalized.len();
     let err = rt
@@ -190,7 +184,11 @@ async fn on_proposal_deferred_while_apply_pending() {
         err.contains("apply in flight"),
         "gate error must name the cause, got: {err}"
     );
-    assert_eq!(rt.height(), h_before, "height must not move on a deferred proposal");
+    assert_eq!(
+        rt.height(),
+        h_before,
+        "height must not move on a deferred proposal"
+    );
     assert_eq!(
         rt.finalized.len(),
         fin_before,
@@ -241,12 +239,8 @@ async fn worker_applied_root_equals_inline_and_reorg_roots() {
 
     // --- inline twin: same genesis, same block, direct transition ------------
     let engine_b = Arc::new(InMemoryStateEngine::new());
-    engine_b
-        .update_account(AccountState::new(rt.id, BAL))
-        .await;
-    engine_b
-        .update_account(AccountState::new(user, BAL))
-        .await;
+    engine_b.update_account(AccountState::new(rt.id, BAL)).await;
+    engine_b.update_account(AccountState::new(user, BAL)).await;
     engine_b
         .update_account(AccountState::new(actor_to, 0))
         .await;
@@ -260,12 +254,8 @@ async fn worker_applied_root_equals_inline_and_reorg_roots() {
 
     // --- reorg twin: ChainState::apply_block ----------------------------------
     let engine_c = Arc::new(InMemoryStateEngine::new());
-    engine_c
-        .update_account(AccountState::new(rt.id, BAL))
-        .await;
-    engine_c
-        .update_account(AccountState::new(user, BAL))
-        .await;
+    engine_c.update_account(AccountState::new(rt.id, BAL)).await;
+    engine_c.update_account(AccountState::new(user, BAL)).await;
     engine_c
         .update_account(AccountState::new(actor_to, 0))
         .await;
@@ -306,9 +296,7 @@ async fn worker_applied_root_equals_inline_and_reorg_roots() {
 async fn h_and_hplus1_execute_strictly_in_order() {
     let (mut rt, _val, user_sk) = single_runtime().await;
     let to = [0x77u8; 32];
-    rt.state
-        .update_account(AccountState::new(to, 0))
-        .await;
+    rt.state.update_account(AccountState::new(to, 0)).await;
     let user = id_of(&user_sk);
 
     // --- H ------------------------------------------------------------------
@@ -367,9 +355,7 @@ async fn h_and_hplus1_execute_strictly_in_order() {
 async fn no_observable_effects_before_poll() {
     let (mut rt, _val, user_sk) = single_runtime().await;
     let to = [0x77u8; 32];
-    rt.state
-        .update_account(AccountState::new(to, 0))
-        .await;
+    rt.state.update_account(AccountState::new(to, 0)).await;
     rt.add_tx(transfer_tx(&user_sk, to, 0)).await;
     let bh = decide_submit(&mut rt).await;
 
@@ -381,7 +367,10 @@ async fn no_observable_effects_before_poll() {
         }
         assert_eq!(rt.height(), 1);
         assert!(rt.finalized.is_empty());
-        assert!(rt.applied_statuses.is_empty(), "no receipts pre-certification");
+        assert!(
+            rt.applied_statuses.is_empty(),
+            "no receipts pre-certification"
+        );
         assert_eq!(rt.applied_txs, 0);
     }
     // Collect (poll or blocking — same install path) and only then move.
@@ -401,9 +390,7 @@ async fn no_observable_effects_before_poll() {
 async fn loop_drains_votes_while_apply_pending() {
     let (mut rt, val_sk, user_sk) = single_runtime().await;
     let to = [0x77u8; 32];
-    rt.state
-        .update_account(AccountState::new(to, 0))
-        .await;
+    rt.state.update_account(AccountState::new(to, 0)).await;
     rt.add_tx(transfer_tx(&user_sk, to, 0)).await;
     let _bh = decide_submit(&mut rt).await;
 
@@ -432,9 +419,7 @@ async fn loop_drains_votes_while_apply_pending() {
 async fn sequenced_submit_does_not_wait_for_execution() {
     let (mut rt, _val, user_sk) = single_runtime().await;
     let to = [0x77u8; 32];
-    rt.state
-        .update_account(AccountState::new(to, 0))
-        .await;
+    rt.state.update_account(AccountState::new(to, 0)).await;
     // A loaded block so execution is resolvably slower than queueing (batch
     // verify + per-tx apply + commitment). Same-sender bursts are capped per
     // block by the mempool's pass limit, so 400 queued selects a ~30-tx
@@ -518,10 +503,8 @@ async fn overcap_actor_block_rejected_at_propose() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-};
-    assert!(
-        count_block_actor_sends(&__overcap_block) > MAX_ACTOR_MSGS_PER_BLOCK
-    );
+    };
+    assert!(count_block_actor_sends(&__overcap_block) > MAX_ACTOR_MSGS_PER_BLOCK);
     rt.add_tx(over_tx).await;
     assert!(
         rt.propose(TS).await.is_none(),
@@ -602,7 +585,7 @@ async fn overcap_actor_block_rejected_at_adopt() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-};
+    };
     block.sign_block(&val_sk);
     let bh = block.compute_hash();
 
@@ -694,7 +677,7 @@ async fn actor_cap_counts_backlog_plus_block() {
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: root,
             epoch_key_commitment: [0u8; 32],
-}
+        }
     };
 
     let over = mk(4000);
@@ -717,7 +700,10 @@ async fn actor_cap_counts_backlog_plus_block() {
 
     // Boundary: 100 + 3996 == cap passes everywhere.
     let fit = mk(MAX_ACTOR_MSGS_PER_BLOCK - 100);
-    assert_eq!(count_block_actor_sends(&fit), MAX_ACTOR_MSGS_PER_BLOCK - 100);
+    assert_eq!(
+        count_block_actor_sends(&fit),
+        MAX_ACTOR_MSGS_PER_BLOCK - 100
+    );
     rt.check_actor_cap(&fit)
         .await
         .expect("backlog + block == cap must pass");
@@ -757,6 +743,6 @@ async fn actor_cap_counts_backlog_plus_block() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
-};
+    };
     assert_eq!(count_block_actor_sends(&nested), 3);
 }

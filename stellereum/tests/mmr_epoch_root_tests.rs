@@ -19,7 +19,9 @@ use stellereum::rpc::RpcState;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 
 fn keys() -> Vec<SigningKey> {
-    (0..4).map(|i| SigningKey::from_bytes(&[i as u8 + 1; 32])).collect()
+    (0..4)
+        .map(|i| SigningKey::from_bytes(&[i as u8 + 1; 32]))
+        .collect()
 }
 
 /// A genuine 3-of-4 precommit QC over `hash` at `height`.
@@ -44,12 +46,18 @@ fn test_state(tip: u64) -> Arc<RpcState> {
     let engine = Arc::new(stellereum::state_engine::InMemoryStateEngine::new());
     Arc::new(RpcState {
         engine,
-        mempool: Arc::new(tokio::sync::RwLock::new(stellereum::mempool::Mempool::default())),
+        mempool: Arc::new(tokio::sync::RwLock::new(
+            stellereum::mempool::Mempool::default(),
+        )),
         height: Arc::new(std::sync::atomic::AtomicU64::new(tip)),
         node_id: "inf1:mmr-test".to_string(),
         chain_id: 777,
-        staking: Arc::new(tokio::sync::RwLock::new(stellereum::staking::StakingLedger::new())),
-        governance: Arc::new(tokio::sync::RwLock::new(stellereum::governance::Governance::new())),
+        staking: Arc::new(tokio::sync::RwLock::new(
+            stellereum::staking::StakingLedger::new(),
+        )),
+        governance: Arc::new(tokio::sync::RwLock::new(
+            stellereum::governance::Governance::new(),
+        )),
         recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
         receipts: Arc::new(tokio::sync::RwLock::new(Default::default())),
         auth_token: None,
@@ -185,7 +193,9 @@ async fn stell_get_epoch_root_selectors_and_honest_misses() {
     // Epoch 7 (this binary's range): two headers only.
     record_epoch(&st, &ks, 896..=897).await;
 
-    let by_height_raw = st.call("stell_getEpochRoot", json!({ "height": 897 })).await;
+    let by_height_raw = st
+        .call("stell_getEpochRoot", json!({ "height": 897 }))
+        .await;
     let by_height = ok_body(&by_height_raw);
     assert_eq!(by_height["epoch"], 7);
     assert_eq!(by_height["start_height"], 896);
@@ -204,7 +214,10 @@ async fn stell_get_epoch_root_selectors_and_honest_misses() {
     );
 
     let no_selector = st.call("stell_getEpochRoot", json!({})).await;
-    assert!(no_selector.get("error").is_some(), "a missing selector is refused");
+    assert!(
+        no_selector.get("error").is_some(),
+        "a missing selector is refused"
+    );
 }
 
 /// An incomplete epoch has no epoch root yet: the answer says so, and the

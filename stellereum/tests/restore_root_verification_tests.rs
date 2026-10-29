@@ -84,17 +84,19 @@ async fn funded_engine() -> (InMemoryStateEngine, [u8; 32], [u8; 32], [u8; 32]) 
     let user = [0xA1u8; 32];
     let minter = [0xB2u8; 32];
     engine.update_account(AccountState::new(user, 50_000)).await;
-    engine.update_account(AccountState::new(minter, 5_000)).await;
-    let tid = engine.create_token(minter, token_meta(minter), 1_000).await.unwrap();
+    engine
+        .update_account(AccountState::new(minter, 5_000))
+        .await;
+    let tid = engine
+        .create_token(minter, token_meta(minter), 1_000)
+        .await
+        .unwrap();
     (engine, user, minter, tid)
 }
 
 /// Persist a full valid chain: state+domains at SNAP_H, header/body at
 /// SNAP_H+1 carrying the post-SNAP_H root, finalized at NEXT_H.
-async fn persist_valid_chain(
-    store: &Storage,
-    engine: &InMemoryStateEngine,
-) -> ([u8; 32], Vec<u8>) {
+async fn persist_valid_chain(store: &Storage, engine: &InMemoryStateEngine) -> ([u8; 32], Vec<u8>) {
     let root = engine.get_state_root().await;
     let snap = engine.create_snapshot().await;
     let domains = DomainSnapshot::capture(
@@ -134,7 +136,11 @@ async fn valid_snapshot_verifies_and_restores_everything() {
     assert_eq!(h, SNAP_H);
     assert_eq!(fresh.get_account(&user).await.unwrap().balance, 50_000);
     assert_eq!(fresh.token_balance(&tid, &minter).await, 1_000);
-    assert_eq!(fresh.get_state_root().await, root, "restored root must equal the anchored root");
+    assert_eq!(
+        fresh.get_state_root().await,
+        root,
+        "restored root must equal the anchored root"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -150,12 +156,16 @@ async fn valid_accounts_only_snapshot_verifies() {
     let snap = engine.create_snapshot().await;
     store.put_state(SNAP_H, &snap).unwrap();
     let sk = test_key();
-    let h0 = store.put_block(&mkblock(SNAP_H, [0u8; 32], [0xEEu8; 32], &sk)).unwrap();
+    let h0 = store
+        .put_block(&mkblock(SNAP_H, [0u8; 32], [0xEEu8; 32], &sk))
+        .unwrap();
     let h1 = store.put_block(&mkblock(NEXT_H, h0, root, &sk)).unwrap();
     store.set_finalized(NEXT_H, &h1).unwrap();
 
     let fresh = InMemoryStateEngine::new();
-    let h = load_state_into(&store, &fresh).await.expect("valid snapshot must verify");
+    let h = load_state_into(&store, &fresh)
+        .await
+        .expect("valid snapshot must verify");
     assert_eq!(h, Some(SNAP_H));
     assert_eq!(fresh.get_account(&user).await.unwrap().balance, 7_777);
     assert_eq!(fresh.get_state_root().await, root);
@@ -173,20 +183,26 @@ async fn mutated_account_snapshot_is_rejected_and_engine_untouched() {
     let snap = engine.create_snapshot().await;
     store.put_state(SNAP_H, &snap).unwrap();
     let sk = test_key();
-    let h0 = store.put_block(&mkblock(SNAP_H, [0u8; 32], [0xEEu8; 32], &sk)).unwrap();
+    let h0 = store
+        .put_block(&mkblock(SNAP_H, [0u8; 32], [0xEEu8; 32], &sk))
+        .unwrap();
     let h1 = store.put_block(&mkblock(NEXT_H, h0, root, &sk)).unwrap();
     store.set_finalized(NEXT_H, &h1).unwrap();
 
     // Attacker/griefed disk: same height, one balance inflated.
     let poison = InMemoryStateEngine::new();
     poison.restore_snapshot(&snap).await.unwrap();
-    poison.update_account(AccountState::new(user, 999_999_999)).await;
+    poison
+        .update_account(AccountState::new(user, 999_999_999))
+        .await;
     let bad = poison.create_snapshot().await;
     assert_ne!(bad, snap, "the mutation must actually change the bytes");
     store.put_state(SNAP_H, &bad).unwrap();
 
     let fresh = InMemoryStateEngine::new();
-    let err = load_state_into(&store, &fresh).await.expect_err("mutated snapshot must be rejected");
+    let err = load_state_into(&store, &fresh)
+        .await
+        .expect_err("mutated snapshot must be rejected");
     let msg = format!("{err:?}");
     assert!(msg.contains("mismatch"), "loud mismatch error, got: {msg}");
     assert!(
@@ -229,7 +245,9 @@ async fn wrong_height_snapshot_is_rejected() {
     let (engine, user, _minter, _tid) = funded_engine().await;
     let (root_a, _) = persist_valid_chain(&store, &engine).await;
 
-    engine.update_account(AccountState::new(user, 123_456)).await;
+    engine
+        .update_account(AccountState::new(user, 123_456))
+        .await;
     let root_b = engine.get_state_root().await;
     assert_ne!(root_a, root_b, "the later state must hash differently");
     let snap_b = engine.create_snapshot().await;
@@ -258,16 +276,22 @@ async fn tip_snapshot_without_successor_still_loads() {
     let store = Storage::open(&dir).unwrap();
     let engine = InMemoryStateEngine::new();
     let user = [0xE5u8; 32];
-    engine.update_account(AccountState::new(user, 314_159)).await;
+    engine
+        .update_account(AccountState::new(user, 314_159))
+        .await;
     let snap = engine.create_snapshot().await;
     const TIP: u64 = 77;
     store.put_state(TIP, &snap).unwrap();
     let sk = test_key();
-    let hb = store.put_block(&mkblock(TIP, [0u8; 32], [0xEEu8; 32], &sk)).unwrap();
+    let hb = store
+        .put_block(&mkblock(TIP, [0u8; 32], [0xEEu8; 32], &sk))
+        .unwrap();
     store.set_finalized(TIP, &hb).unwrap();
 
     let fresh = InMemoryStateEngine::new();
-    let h = load_state_into(&store, &fresh).await.expect("tip snapshot must load");
+    let h = load_state_into(&store, &fresh)
+        .await
+        .expect("tip snapshot must load");
     assert_eq!(h, Some(TIP));
     assert_eq!(fresh.get_account(&user).await.unwrap().balance, 314_159);
     std::fs::remove_dir_all(&dir).ok();
@@ -289,7 +313,9 @@ async fn unpaired_snapshots_are_refused_not_frankensteined() {
     // State at 100, domains only at 90: no paired height at 100.
     store.put_state(100, &snap).unwrap();
     let sk = test_key();
-    let hb = store.put_block(&mkblock(101, [0u8; 32], [0xEEu8; 32], &sk)).unwrap();
+    let hb = store
+        .put_block(&mkblock(101, [0u8; 32], [0xEEu8; 32], &sk))
+        .unwrap();
     store.set_finalized(101, &hb).unwrap();
 
     let fresh = InMemoryStateEngine::new();

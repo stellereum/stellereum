@@ -11,31 +11,21 @@
 //! payout path acts on a caller-supplied `validator` without consulting the
 //! ledger's owner field.
 
-use stellereum::sharding::Transaction;
-use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::staking::{self, StakingLedger};
-use stellereum::svm::OpCode;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use stellereum::sharding::Transaction;
+use stellereum::staking::{self, StakingLedger};
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
+use stellereum::svm::OpCode;
 
 const NANO: u64 = 1_000_000_000;
 /// A generous gas limit; only the *consumed* gas is charged.
 const GAS: u64 = 100_000;
 
-fn tx(
-    key: &SigningKey,
-    nonce: u64,
-    payload: Vec<OpCode>,
-) -> Transaction {
+fn tx(key: &SigningKey, nonce: u64, payload: Vec<OpCode>) -> Transaction {
     Transaction::sign_with_payload(
-        key,
-        [0xEE; 32], // `to` is irrelevant for a payload-only tx
-        0,
-        GAS,
-        nonce,
-        0,
-        1,
-        payload,
+        key, [0xEE; 32], // `to` is irrelevant for a payload-only tx
+        0, GAS, nonce, 0, 1, payload,
     )
 }
 
@@ -65,16 +55,24 @@ async fn a_stranger_cannot_steal_validator_rewards_via_claim_rewards() {
     let validator = [0x77; 32];
     let start = 100_000 * NANO;
     let attacker_start = 1_000 * NANO;
-    e.update_account(AccountState::new(victim_addr, start)).await;
-    e.update_account(AccountState::new(attacker_addr, attacker_start)).await;
+    e.update_account(AccountState::new(victim_addr, start))
+        .await;
+    e.update_account(AccountState::new(attacker_addr, attacker_start))
+        .await;
 
     // 1. The victim bonds, so the staking pool is funded with real value.
     let bond = 10_000 * NANO;
-    e.apply_transaction(&tx(
-        &victim,
+    e.apply_transaction(
+        &tx(
+            &victim,
+            0,
+            vec![OpCode::SysCallStake {
+                validator,
+                amount: bond,
+            }],
+        ),
         0,
-        vec![OpCode::SysCallStake { validator, amount: bond }],
-    ), 0)
+    )
     .await
     .expect("victim bond");
     let pool = bal(&e, &staking::STAKING_POOL).await;
@@ -87,11 +85,17 @@ async fn a_stranger_cannot_steal_validator_rewards_via_claim_rewards() {
     let block_reward = 500 * NANO;
     let mut accrued = 0u64;
     for _ in 0..10 {
-        e.staking_write().await.distribute_reward(validator, block_reward).unwrap();
+        e.staking_write()
+            .await
+            .distribute_reward(validator, block_reward)
+            .unwrap();
         accrued += block_reward;
     }
     let victim_rewards = e.staking_read().await.validators[&validator].pending_rewards;
-    assert_eq!(victim_rewards, accrued, "victim owns these rewards in the ledger");
+    assert_eq!(
+        victim_rewards, accrued,
+        "victim owns these rewards in the ledger"
+    );
     println!("victim accrued rewards      = {victim_rewards}");
 
     let supply_before = total_supply(&e).await;
@@ -100,11 +104,14 @@ async fn a_stranger_cannot_steal_validator_rewards_via_claim_rewards() {
     // 3. THE ATTACK. The attacker is not the validator, is not bonded to it, and
     //    has no relationship to it whatsoever. It just names the victim.
     let err = e
-        .apply_transaction(&tx(
-            &attacker,
+        .apply_transaction(
+            &tx(
+                &attacker,
+                0,
+                vec![OpCode::SysCallClaimRewards { validator }],
+            ),
             0,
-            vec![OpCode::SysCallClaimRewards { validator }],
-        ), 0)
+        )
         .await
         .expect_err("a stranger must not be able to claim another validator's rewards");
     println!("claim by a stranger rejected: {err}");
@@ -124,7 +131,8 @@ async fn a_stranger_cannot_steal_validator_rewards_via_claim_rewards() {
     // limit), which is the price of the block space their attempt consumed -
     // never a coin of the victim's rewards.
     assert_eq!(
-        profit, -(100_000i128),
+        profit,
+        -(100_000i128),
         "the theft is rejected: only the failure fee is paid"
     );
     assert_eq!(
@@ -161,10 +169,20 @@ async fn reward_theft_is_not_loopable() {
     let validator = [0x11; 32];
 
     // Fund the pool directly so the thief does not even have to bond first.
-    e.update_account(AccountState::new(attacker_addr, 1_000 * NANO)).await;
-    e.credit_native(&staking::STAKING_POOL, 1_000_000 * NANO).await.unwrap();
+    e.update_account(AccountState::new(attacker_addr, 1_000 * NANO))
+        .await;
+    e.credit_native(&staking::STAKING_POOL, 1_000_000 * NANO)
+        .await
+        .unwrap();
     // The validator exists (bonded at genesis); it has accrued nothing yet.
-    e.staking_write().await.bond(validator, staking::MIN_VALIDATOR_BOND + staking::STELL_MIN_BOND_BUFFER, 0).unwrap();
+    e.staking_write()
+        .await
+        .bond(
+            validator,
+            staking::MIN_VALIDATOR_BOND + staking::STELL_MIN_BOND_BUFFER,
+            0,
+        )
+        .unwrap();
 
     let reward = 10 * NANO;
     let mut nonce = 0u64;
@@ -177,19 +195,22 @@ async fn reward_theft_is_not_loopable() {
             .await
             .distribute_reward(validator, reward)
             .unwrap();
-        e.apply_transaction(&tx(
-            &attacker,
-            nonce,
-            vec![OpCode::SysCallClaimRewards { validator }],
-        ), 0)
+        e.apply_transaction(
+            &tx(
+                &attacker,
+                nonce,
+                vec![OpCode::SysCallClaimRewards { validator }],
+            ),
+            0,
+        )
         .await
-        .expect_err(&format!("round {round}: a stranger must not be able to claim"));
+        .expect_err(&format!(
+            "round {round}: a stranger must not be able to claim"
+        ));
         nonce += 1;
     }
     let end = bal(&e, &attacker_addr).await;
-    println!(
-        "attacker {start} -> {end}; skimmed {stolen}; all {nonce} claims rejected"
-    );
+    println!("attacker {start} -> {end}; skimmed {stolen}; all {nonce} claims rejected");
     assert_eq!(
         end,
         start - 25 * 100_000,
@@ -218,22 +239,36 @@ async fn a_stranger_cannot_force_unbond_a_validator_and_eject_it_from_the_set() 
     let attacker = SigningKey::generate(&mut OsRng);
 
     let validator = [0x55; 32];
-    e.update_account(AccountState::new(victim_addr, 100_000 * NANO)).await;
-    e.update_account(AccountState::new(attacker.verifying_key().to_bytes(), NANO)).await;
+    e.update_account(AccountState::new(victim_addr, 100_000 * NANO))
+        .await;
+    e.update_account(AccountState::new(attacker.verifying_key().to_bytes(), NANO))
+        .await;
 
     let bond = 50_000 * NANO;
-    e.apply_transaction(&tx(
-        &victim,
+    e.apply_transaction(
+        &tx(
+            &victim,
+            0,
+            vec![OpCode::SysCallStake {
+                validator,
+                amount: bond,
+            }],
+        ),
         0,
-        vec![OpCode::SysCallStake { validator, amount: bond }],
-    ), 0)
+    )
     .await
     .unwrap();
 
     let vs = e.staking_read().await.to_validator_set();
-    println!("validator set BEFORE attack: {:?}", vs.validators.keys().collect::<Vec<_>>());
+    println!(
+        "validator set BEFORE attack: {:?}",
+        vs.validators.keys().collect::<Vec<_>>()
+    );
     println!("victim power = {}", vs.power_of(&validator));
-    assert!(vs.validators.contains_key(&validator), "victim is a validator");
+    assert!(
+        vs.validators.contains_key(&validator),
+        "victim is a validator"
+    );
     assert_eq!(vs.power_of(&validator), bond);
 
     // THE ATTACK: the attacker submits `SysCallUnbond` naming the victim.
@@ -245,18 +280,24 @@ async fn a_stranger_cannot_force_unbond_a_validator_and_eject_it_from_the_set() 
         self_bond
     };
     let err = e
-        .apply_transaction(&tx(
-            &attacker,
+        .apply_transaction(
+            &tx(
+                &attacker,
+                0,
+                vec![OpCode::SysCallUnbond { validator, amount }],
+            ),
             0,
-            vec![OpCode::SysCallUnbond { validator, amount }],
-        ), 0)
+        )
         .await
         .expect_err("a stranger must not be able to force-unbond a validator");
     println!("force-unbond rejected: {err}");
     let _txs = 1u64;
 
     let vs = e.staking_read().await.to_validator_set();
-    println!("validator set AFTER  attack: {:?}", vs.validators.keys().collect::<Vec<_>>());
+    println!(
+        "validator set AFTER  attack: {:?}",
+        vs.validators.keys().collect::<Vec<_>>()
+    );
     println!("total power = {} (still {bond})", vs.total_power());
 
     assert!(

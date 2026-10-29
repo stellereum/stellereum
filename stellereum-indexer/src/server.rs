@@ -101,7 +101,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v2/tx/:hash/events", get(get_tx_events))
         .route("/api/v2/events", get(get_events))
         // Contract source verification (audit P2-15, Sourcify-style)
-        .route("/api/v2/contract/:address/verify", post(verify_contract_source))
+        .route(
+            "/api/v2/contract/:address/verify",
+            post(verify_contract_source),
+        )
         .route("/api/v2/contract/:address/source", get(get_contract_source))
         // Contracts (derived from the event log) and the LIVE shard topology
         .route("/api/v2/contracts", get(get_contracts))
@@ -140,7 +143,10 @@ async fn get_overview(State(state): State<AppState>) -> impl IntoResponse {
         avg_block_time: 0.8,
     });
 
-    let charts = state.db.get_charts().unwrap_or_else(|_| json!({"hours":[], "days":[]}));
+    let charts = state
+        .db
+        .get_charts()
+        .unwrap_or_else(|_| json!({"hours":[], "days":[]}));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -284,27 +290,33 @@ async fn get_network_stats(State(state): State<AppState>) -> impl IntoResponse {
 
 // 3. Price
 async fn get_price() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({
-        "price_usd": 0.25,
-        "currency": "USD",
-        "symbol": "STELL",
-        "source": "Stellereum Genesis Vault & PMM",
-        "fixed": true,
-        "updated": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "price_usd": 0.25,
+            "currency": "USD",
+            "symbol": "STELL",
+            "source": "Stellereum Genesis Vault & PMM",
+            "fixed": true,
+            "updated": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        })),
+    )
 }
 
 // 4. Status
 async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
     let tip = state.db.get_tip_height().unwrap_or(0);
-    (StatusCode::OK, Json(json!({
-        "ok": true,
-        "chain_id": 5757,
-        "tip_height": tip,
-        "synced": true,
-        "version": "0.1.0-pq-fips206",
-        "time": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "chain_id": 5757,
+            "tip_height": tip,
+            "synced": true,
+            "version": "0.1.0-pq-fips206",
+            "time": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        })),
+    )
 }
 
 // 5. Validators (gram.org/api/validators)
@@ -402,18 +414,21 @@ async fn get_validators() -> impl IntoResponse {
 
 // 6. Staking
 async fn get_staking() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({
-        "total_staked": "7778463847208",
-        "staked_percentage": 0.0031,
-        "validators_count": 4,
-        "cooldown_period_secs": 172800,
-        "min_validator_bond": "1000000000000",
-        "estimated_apy": 0.145,
-        "slashing_penalty_bps": {
-            "downtime": 10,
-            "equivocation": 500
-        }
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "total_staked": "7778463847208",
+            "staked_percentage": 0.0031,
+            "validators_count": 4,
+            "cooldown_period_secs": 172800,
+            "min_validator_bond": "1000000000000",
+            "estimated_apy": 0.145,
+            "slashing_penalty_bps": {
+                "downtime": 10,
+                "equivocation": 500
+            }
+        })),
+    )
 }
 
 // 7. Verified Smart Contracts & Actors (gram.org/api/verified)
@@ -481,20 +496,26 @@ async fn get_verified() -> impl IntoResponse {
         }
     ]);
 
-    (StatusCode::OK, Json(json!({
-        "items": items,
-        "total": 5,
-        "limit": 20,
-        "offset": 0
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "items": items,
+            "total": 5,
+            "limit": 20,
+            "offset": 0
+        })),
+    )
 }
 
 async fn get_verified_stats() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({
-        "total_verified": 5,
-        "languages": { "SVM": 5, "Wasm": 0 },
-        "categories": { "system": 1, "bridge": 1, "exchange": 1, "amm": 1, "staking": 1 }
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "total_verified": 5,
+            "languages": { "SVM": 5, "Wasm": 0 },
+            "categories": { "system": 1, "bridge": 1, "exchange": 1, "amm": 1, "staking": 1 }
+        })),
+    )
 }
 
 // 8. Tokens (gram.org/api/tokens)
@@ -543,11 +564,14 @@ async fn get_tokens() -> impl IntoResponse {
         }
     ]);
 
-    (StatusCode::OK, Json(json!({
-        "source": "Stellereum Token Registry",
-        "tokens": tokens,
-        "updated": now
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "source": "Stellereum Token Registry",
+            "tokens": tokens,
+            "updated": now
+        })),
+    )
 }
 
 // 9. Blocks
@@ -558,15 +582,20 @@ async fn get_blocks(
     let limit = p.limit.unwrap_or(50).min(200);
     let offset = p.offset.unwrap_or(0);
     match state.db.get_blocks(limit, offset) {
-        Ok(blocks) => (StatusCode::OK, Json(json!({ "blocks": blocks, "limit": limit, "offset": offset }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(blocks) => (
+            StatusCode::OK,
+            Json(json!({ "blocks": blocks, "limit": limit, "offset": offset })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
-async fn get_block(
-    State(state): State<AppState>,
-    Path(param): Path<String>,
-) -> impl IntoResponse {
+async fn get_block(State(state): State<AppState>, Path(param): Path<String>) -> impl IntoResponse {
     let block_opt = if let Ok(h) = param.parse::<u64>() {
         state.db.get_block_by_height(h)
     } else {
@@ -577,10 +606,22 @@ async fn get_block(
     match block_opt {
         Ok(Some(b)) => {
             let txs = state.db.get_block_txs(b.height).unwrap_or_default();
-            (StatusCode::OK, Json(json!({ "block": b, "transactions": txs }))).into_response()
+            (
+                StatusCode::OK,
+                Json(json!({ "block": b, "transactions": txs })),
+            )
+                .into_response()
         }
-        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "Block not found"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Block not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -592,19 +633,30 @@ async fn get_recent_txs(
     let limit = p.limit.unwrap_or(50).min(200);
     let offset = p.offset.unwrap_or(0);
     // Fetch latest transactions across blocks
-    let txs = state.db.get_account_txs("", limit, offset).unwrap_or_default();
-    (StatusCode::OK, Json(json!({ "transactions": txs, "limit": limit, "offset": offset })))
+    let txs = state
+        .db
+        .get_account_txs("", limit, offset)
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(json!({ "transactions": txs, "limit": limit, "offset": offset })),
+    )
 }
 
-async fn get_tx(
-    State(state): State<AppState>,
-    Path(hash): Path<String>,
-) -> impl IntoResponse {
+async fn get_tx(State(state): State<AppState>, Path(hash): Path<String>) -> impl IntoResponse {
     let clean = hash.strip_prefix("0x").unwrap_or(&hash);
     match state.db.get_tx_by_hash(clean) {
         Ok(Some(tx)) => (StatusCode::OK, Json(json!({ "transaction": tx }))).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "Transaction not found"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Transaction not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -613,7 +665,10 @@ async fn get_account_info(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
-    let clean = address.strip_prefix("0x").or_else(|| address.strip_prefix("0X")).unwrap_or(&address);
+    let clean = address
+        .strip_prefix("0x")
+        .or_else(|| address.strip_prefix("0X"))
+        .unwrap_or(&address);
     let stl57 = if let Ok(addr_bytes) = stellereum::address::parse_address(&address) {
         Some(stellereum::address::encode_stl57_address(&addr_bytes))
     } else if let Ok(decoded) = hex::decode(clean) {
@@ -632,12 +687,15 @@ async fn get_account_info(
         None
     };
     let tx_count = state.db.get_account_tx_count(clean).unwrap_or(0);
-    (StatusCode::OK, Json(json!({
-        "address": clean,
-        "stl57": stl57,
-        "tx_count": tx_count,
-        "status": "active"
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "address": clean,
+            "stl57": stl57,
+            "tx_count": tx_count,
+            "status": "active"
+        })),
+    )
 }
 
 async fn get_account_actions(
@@ -656,22 +714,26 @@ async fn get_account_actions(
 
 async fn get_whales() -> impl IntoResponse {
     // Rich list
-    (StatusCode::OK, Json(json!({
-        "whales": [
-            { "address": "c2313fbaf5c0b1a4921f132bed48772f0d0b788b8f27ad7f96772610996c3361", "balance_stell": 100000000.0, "role": "Validator Node A" },
-            { "address": "9c675ebc6cd20c9226da2fcbf6c167647e4e948b78368f038058b6b419175fcd", "balance_stell": 100000000.0, "role": "Validator Node B" },
-            { "address": "021776cdf2b3b644e91dbe44fbef4a29f5a8ebf80b01055d3e7cc83a85659694", "balance_stell": 190.0, "role": "Validator Node C" }
-        ]
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "whales": [
+                { "address": "c2313fbaf5c0b1a4921f132bed48772f0d0b788b8f27ad7f96772610996c3361", "balance_stell": 100000000.0, "role": "Validator Node A" },
+                { "address": "9c675ebc6cd20c9226da2fcbf6c167647e4e948b78368f038058b6b419175fcd", "balance_stell": 100000000.0, "role": "Validator Node B" },
+                { "address": "021776cdf2b3b644e91dbe44fbef4a29f5a8ebf80b01055d3e7cc83a85659694", "balance_stell": 190.0, "role": "Validator Node C" }
+            ]
+        })),
+    )
 }
 
 // 12. Search & Charts
-async fn search(
-    State(state): State<AppState>,
-    Query(q): Query<SearchQuery>,
-) -> impl IntoResponse {
+async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> impl IntoResponse {
     let Some(query) = q.q else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing query parameter 'q'"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing query parameter 'q'"})),
+        )
+            .into_response();
     };
     let trimmed = query.trim();
 
@@ -679,21 +741,37 @@ async fn search(
     let clean_hex = if let Ok(addr_bytes) = stellereum::address::parse_address(trimmed) {
         hex::encode(addr_bytes)
     } else {
-        trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")).unwrap_or(trimmed).to_string()
+        trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed)
+            .to_string()
     };
 
     if let Ok(h) = clean_hex.parse::<u64>() {
         if let Ok(Some(b)) = state.db.get_block_by_height(h) {
-            return (StatusCode::OK, Json(json!({ "type": "block", "result": b }))).into_response();
+            return (
+                StatusCode::OK,
+                Json(json!({ "type": "block", "result": b })),
+            )
+                .into_response();
         }
     }
 
     if let Ok(Some(tx)) = state.db.get_tx_by_hash(&clean_hex) {
-        return (StatusCode::OK, Json(json!({ "type": "transaction", "result": tx }))).into_response();
+        return (
+            StatusCode::OK,
+            Json(json!({ "type": "transaction", "result": tx })),
+        )
+            .into_response();
     }
 
     if let Ok(Some(b)) = state.db.get_block_by_hash(&clean_hex) {
-        return (StatusCode::OK, Json(json!({ "type": "block", "result": b }))).into_response();
+        return (
+            StatusCode::OK,
+            Json(json!({ "type": "block", "result": b })),
+        )
+            .into_response();
     }
 
     if clean_hex.len() >= 40 {
@@ -714,16 +792,28 @@ async fn search(
         } else {
             None
         };
-        return (StatusCode::OK, Json(json!({ "type": "account", "address": clean_hex, "stl57": stl57 }))).into_response();
+        return (
+            StatusCode::OK,
+            Json(json!({ "type": "account", "address": clean_hex, "stl57": stl57 })),
+        )
+            .into_response();
     }
 
-    (StatusCode::NOT_FOUND, Json(json!({"error": "No match found"}))).into_response()
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": "No match found"})),
+    )
+        .into_response()
 }
 
 async fn get_charts(State(state): State<AppState>) -> impl IntoResponse {
     match state.db.get_charts() {
         Ok(charts) => (StatusCode::OK, Json(charts)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -815,7 +905,10 @@ async fn get_contract_events(
     match state.db.get_events(&filter, limit, offset) {
         Ok(rows) => {
             let events: Vec<Value> = rows.iter().map(|e| event_json(e, &state.abis)).collect();
-            let total = state.db.count_events(&filter).unwrap_or(events.len() as u64);
+            let total = state
+                .db
+                .count_events(&filter)
+                .unwrap_or(events.len() as u64);
             (
                 StatusCode::OK,
                 Json(json!({
@@ -829,7 +922,11 @@ async fn get_contract_events(
             )
                 .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -855,7 +952,11 @@ async fn get_tx_events(
             )
                 .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -875,7 +976,10 @@ async fn get_events(
     match state.db.get_events(&filter, limit, offset) {
         Ok(rows) => {
             let events: Vec<Value> = rows.iter().map(|e| event_json(e, &state.abis)).collect();
-            let total = state.db.count_events(&filter).unwrap_or(events.len() as u64);
+            let total = state
+                .db
+                .count_events(&filter)
+                .unwrap_or(events.len() as u64);
             (
                 StatusCode::OK,
                 Json(json!({
@@ -891,7 +995,11 @@ async fn get_events(
             )
                 .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -938,7 +1046,11 @@ async fn get_contracts(
             )
                 .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1089,7 +1201,8 @@ async fn verify_contract_source(
         Err(e) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": format!("verification unavailable: {e}")})),            )
+                Json(json!({"error": format!("verification unavailable: {e}")})),
+            )
                 .into_response()
         }
     };

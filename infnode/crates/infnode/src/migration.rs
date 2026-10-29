@@ -34,9 +34,14 @@ fn chunk_target(bucket: &str, chunk_id: &str) -> [u8; NODEID_LEN] {
 
 /// Список локальных чанков на диске для указанного бакета.
 fn list_local_chunks(data_dir: &Path, bucket: &str) -> Vec<String> {
-    let safe: String = bucket.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let safe: String = bucket
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
     let dir = data_dir.join("chunks").join(safe);
-    let Ok(rd) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
     rd.filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|n| {
@@ -48,14 +53,23 @@ fn list_local_chunks(data_dir: &Path, bucket: &str) -> Vec<String> {
 
 /// Прочитать локальный чанк с диска (bytes).
 fn read_local_chunk(data_dir: &Path, bucket: &str, chunk_id: &str) -> Option<Vec<u8>> {
-    let safe: String = bucket.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let safe: String = bucket
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
     let p = data_dir.join("chunks").join(safe).join(chunk_id);
     std::fs::read(&p).ok()
 }
 
 /// Отправить чанк пиру через storage.store (с таймаутом — недоступный пир не должен
 /// вешать миграцию). Возвращает true при успехе.
-async fn push_chunk(node: &Arc<Node>, peer_id: [u8; NODEID_LEN], bucket: &str, chunk_id: &str, data: &[u8]) -> bool {
+async fn push_chunk(
+    node: &Arc<Node>,
+    peer_id: [u8; NODEID_LEN],
+    bucket: &str,
+    chunk_id: &str,
+    data: &[u8],
+) -> bool {
     if !node.peer_allows(&peer_id, bucket).await {
         return false;
     }
@@ -78,7 +92,10 @@ async fn push_chunk(node: &Arc<Node>, peer_id: [u8; NODEID_LEN], bucket: &str, c
 
 /// Удалить локальный чанк (через ту же логику, что и handle_storage_delete).
 fn delete_local_chunk(data_dir: &Path, bucket: &str, chunk_id: &str) {
-    let safe: String = bucket.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let safe: String = bucket
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
     let p = data_dir.join("chunks").join(safe).join(chunk_id);
     let _ = std::fs::remove_file(p);
 }
@@ -128,7 +145,9 @@ pub async fn migrate_pass(node: &Arc<Node>, data_dir: &Path) -> Value {
                 };
                 let mut sent = 0usize;
                 for n in closest.iter().take(K) {
-                    if n.id == our_id { continue; }
+                    if n.id == our_id {
+                        continue;
+                    }
                     if push_chunk(node, n.id, bucket, &chunk_id, &data).await {
                         sent += 1;
                     }
@@ -169,13 +188,21 @@ pub async fn integrity_pass(node: &Arc<Node>, data_dir: &Path) -> Value {
         let keys = node.kv_manifest_keys(prefix).await;
         for k in keys {
             total_mfs += 1;
-            let Some(raw) = node.get_local_kv(&k).await else { continue };
-            let Ok(mf) = serde_json::from_str::<Value>(&raw) else { continue };
+            let Some(raw) = node.get_local_kv(&k).await else {
+                continue;
+            };
+            let Ok(mf) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
             let bucket = mf["bucket"].as_str().unwrap_or("files");
-            let Some(chunks) = mf["chunks"].as_array() else { continue };
+            let Some(chunks) = mf["chunks"].as_array() else {
+                continue;
+            };
             for c in chunks {
                 total_chunks += 1;
-                let Some(cid) = c["id"].as_str() else { continue };
+                let Some(cid) = c["id"].as_str() else {
+                    continue;
+                };
                 let expected = c["hash"].as_str();
                 let Some(data) = read_local_chunk(data_dir, bucket, cid) else {
                     missing_local += 1;

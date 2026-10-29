@@ -247,7 +247,11 @@ mod slotted_share_serde {
             E: Error,
         {
             if v.len() != SLOTTED_SHARE_SIZE {
-                return Err(E::custom(format!("expected {} bytes, got {}", SLOTTED_SHARE_SIZE, v.len())));
+                return Err(E::custom(format!(
+                    "expected {} bytes, got {}",
+                    SLOTTED_SHARE_SIZE,
+                    v.len()
+                )));
             }
             let mut arr = [0u8; SLOTTED_SHARE_SIZE];
             arr.copy_from_slice(v);
@@ -268,7 +272,10 @@ mod slotted_share_serde {
                 i += 1;
             }
             if i != SLOTTED_SHARE_SIZE {
-                return Err(A::Error::custom(format!("expected {} bytes, got {}", SLOTTED_SHARE_SIZE, i)));
+                return Err(A::Error::custom(format!(
+                    "expected {} bytes, got {}",
+                    SLOTTED_SHARE_SIZE, i
+                )));
             }
             Ok(arr)
         }
@@ -314,12 +321,7 @@ impl std::fmt::Debug for SlottedDecryptionShare {
 
 impl SlottedDecryptionShare {
     /// Construct a new slotted decryption share
-    pub fn new(
-        validator_id: u32,
-        epoch: u64,
-        slot: u64,
-        share: [u8; SLOTTED_SHARE_SIZE],
-    ) -> Self {
+    pub fn new(validator_id: u32, epoch: u64, slot: u64, share: [u8; SLOTTED_SHARE_SIZE]) -> Self {
         Self {
             validator_id,
             epoch,
@@ -469,7 +471,10 @@ pub fn combine_lagrange_shares(
             return Err("Invalid validator ID 0 (must be 1-based)".to_string());
         }
         if !seen_validators.insert(s.validator_id) {
-            return Err(format!("Duplicate validator share for ID {}", s.validator_id));
+            return Err(format!(
+                "Duplicate validator share for ID {}",
+                s.validator_id
+            ));
         }
 
         let scalar = s.extract_share_scalar()?;
@@ -559,7 +564,8 @@ impl ProactiveEpochDkg {
         }
 
         let master_point = RISTRETTO_BASEPOINT_POINT * master_secret;
-        let master_public_key = Self::pack_master_public_key(epoch, threshold, total_validators, &master_point);
+        let master_public_key =
+            Self::pack_master_public_key(epoch, threshold, total_validators, &master_point);
 
         Self {
             epoch,
@@ -650,7 +656,9 @@ impl ProactiveEpochDkg {
     }
 
     /// Unpacks Ristretto base commitment from master public key
-    pub fn extract_master_point(pk: &[u8; MLKEM768_PUBLIC_KEY_SIZE]) -> Result<RistrettoPoint, String> {
+    pub fn extract_master_point(
+        pk: &[u8; MLKEM768_PUBLIC_KEY_SIZE],
+    ) -> Result<RistrettoPoint, String> {
         if &pk[..12] != MLKEM768_PK_MAGIC {
             return Err("Invalid ML-KEM-768 public key magic header".to_string());
         }
@@ -699,7 +707,11 @@ impl std::fmt::Debug for PqMevPreemptionEngine {
             .field("slot_key_count", &self.slot_keys.len())
             .field(
                 "registered_share_count",
-                &self.registered_shares.values().map(|v| v.len()).sum::<usize>(),
+                &self
+                    .registered_shares
+                    .values()
+                    .map(|v| v.len())
+                    .sum::<usize>(),
             )
             .finish()
     }
@@ -862,7 +874,8 @@ impl PqMevPreemptionEngine {
         prev_hash: &[u8; 32],
         envelopes: &[PqSealedEnvelope],
     ) -> PqOrderCommitment {
-        let order_root = SequentialBlake3HashChain::compute_order_chain(height, slot, prev_hash, envelopes);
+        let order_root =
+            SequentialBlake3HashChain::compute_order_chain(height, slot, prev_hash, envelopes);
         let envelope_hashes: Vec<[u8; 32]> = envelopes.iter().map(|e| e.envelope_hash()).collect();
 
         let commitment = PqOrderCommitment {
@@ -877,7 +890,8 @@ impl PqMevPreemptionEngine {
             signature: Vec::new(),
         };
 
-        self.order_commits.insert((height, slot), commitment.clone());
+        self.order_commits
+            .insert((height, slot), commitment.clone());
         commitment
     }
 
@@ -893,8 +907,12 @@ impl PqMevPreemptionEngine {
         if commitment.envelope_count != envelopes.len() {
             return false;
         }
-        let expected_root =
-            SequentialBlake3HashChain::compute_order_chain(commitment.height, commitment.slot, &commitment.prev_hash, envelopes);
+        let expected_root = SequentialBlake3HashChain::compute_order_chain(
+            commitment.height,
+            commitment.slot,
+            &commitment.prev_hash,
+            envelopes,
+        );
         expected_root == commitment.order_root
     }
 
@@ -971,6 +989,11 @@ impl PqMevPreemptionEngine {
 
         cipher
             .decrypt(xnonce, envelope.encrypted_payload.as_slice())
-            .map_err(|e| format!("Poly1305 AEAD decryption failure / payload tampered: {:?}", e))
+            .map_err(|e| {
+                format!(
+                    "Poly1305 AEAD decryption failure / payload tampered: {:?}",
+                    e
+                )
+            })
     }
 }

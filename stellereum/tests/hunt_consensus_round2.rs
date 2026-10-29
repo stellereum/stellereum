@@ -4,14 +4,12 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
-use stellereum::consensus::{
-    QuorumCertificate, ValidatorSet, Vote, VoteKind,
-};
-use stellereum::runtime::{fund_genesis, ValidatorRuntime};
-use stellereum::state_engine::InMemoryStateEngine;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::runtime::{fund_genesis, ValidatorRuntime};
+use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
+use stellereum::state_engine::InMemoryStateEngine;
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
@@ -127,7 +125,10 @@ async fn hunt10_peer_gossip_no_longer_diverges_the_ledger_and_the_state_root() {
         1,
         "node A must record the double-vote, or this test is vacuous"
     );
-    node_a.adopt_committed(1, blk.clone(), cert.clone()).await.unwrap();
+    node_a
+        .adopt_committed(1, blk.clone(), cert.clone())
+        .await
+        .unwrap();
 
     // ---- Node B: sees only the committed block.
     let mut node_b = ValidatorRuntime::new(ksb[0].clone(), vs_b.clone(), st_b.clone(), 1);
@@ -143,11 +144,13 @@ async fn hunt10_peer_gossip_no_longer_diverges_the_ledger_and_the_state_root() {
         "F4 FIX: peer gossip must not change the ledger; A={after_a:?} B={after_b:?}"
     );
     assert_eq!(
-        after_a[&id(&victim)].2, before_a[&id(&victim)].2,
+        after_a[&id(&victim)].2,
+        before_a[&id(&victim)].2,
         "F4 FIX: no equivocation slash on local evidence"
     );
     assert_eq!(
-        after_b[&id(&victim)].2, before_b[&id(&victim)].2,
+        after_b[&id(&victim)].2,
+        before_b[&id(&victim)].2,
         "node B slashes nothing"
     );
 
@@ -188,14 +191,24 @@ async fn hunt11_equivocation_burn_is_never_debited_from_the_pool() {
     let blk = block_at(&vset, &ks, 1, st.get_state_root().await);
     let block_hash = blk.compute_hash();
 
-    let pool_before = st.get_account(&stellereum::staking::STAKING_POOL).await.map(|a| a.balance);
+    let pool_before = st
+        .get_account(&stellereum::staking::STAKING_POOL)
+        .await
+        .map(|a| a.balance);
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), st.clone(), 1);
-    rt.on_prevote(Vote::sign(&victim, 1, 0, VoteKind::Prevote, Some(bh(0xA1)))).unwrap();
-    rt.on_prevote(Vote::sign(&victim, 1, 0, VoteKind::Prevote, Some(bh(0xA2)))).unwrap();
+    rt.on_prevote(Vote::sign(&victim, 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
+        .unwrap();
+    rt.on_prevote(Vote::sign(&victim, 1, 0, VoteKind::Prevote, Some(bh(0xA2))))
+        .unwrap();
     assert_eq!(rt.hc.equivocations().len(), 1, "evidence recorded locally");
-    rt.adopt_committed(1, blk, precommit_cert(&ks, 3, 1, block_hash)).await.unwrap();
+    rt.adopt_committed(1, blk, precommit_cert(&ks, 3, 1, block_hash))
+        .await
+        .unwrap();
 
-    let pool_after = st.get_account(&stellereum::staking::STAKING_POOL).await.map(|a| a.balance);
+    let pool_after = st
+        .get_account(&stellereum::staking::STAKING_POOL)
+        .await
+        .map(|a| a.balance);
     let ledger = st.staking_read().await;
     let total_burned = ledger.total_burned;
     let victim_slashed = ledger.validators[&id(&victim)].total_slashed;
@@ -210,7 +223,10 @@ async fn hunt11_equivocation_burn_is_never_debited_from_the_pool() {
         total_burned, 0,
         "F4 FIX: the adopt path must not slash equivocation from local evidence"
     );
-    assert_eq!(victim_slashed, 0, "F4 FIX: victim untouched by local gossip");
+    assert_eq!(
+        victim_slashed, 0,
+        "F4 FIX: victim untouched by local gossip"
+    );
 }
 
 // ===========================================================================
@@ -257,7 +273,7 @@ async fn hunt12_finalize_with_zero_prevotes_and_against_the_local_lock() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     block.sign_block(&ks[0]);
     rt.blocks.insert(block.compute_hash(), block);
     let decided = rt.try_finalize().await;
@@ -325,7 +341,7 @@ async fn hunt13_exited_validators_are_not_slashed_for_quorums_they_are_not_in() 
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         b.sign_block(pk);
         let bhash = b.compute_hash();
         prev = bhash;
@@ -336,7 +352,10 @@ async fn hunt13_exited_validators_are_not_slashed_for_quorums_they_are_not_in() 
             rt.on_prevote(Vote::sign(k, h, 0, VoteKind::Prevote, Some(bhash)))
                 .unwrap();
         }
-        assert!(rt.hc.try_prevote_quorum().is_some(), "prevote quorum at height {h}");
+        assert!(
+            rt.hc.try_prevote_quorum().is_some(),
+            "prevote quorum at height {h}"
+        );
         for k in ks.iter().take(3) {
             rt.on_precommit(Vote::sign(k, h, 0, VoteKind::Precommit, Some(bhash)))
                 .unwrap();
@@ -554,8 +573,8 @@ async fn hunt17_negative_no_framing_collision_in_the_digest() {
     use stellereum::token::{TokenActor, TokenMetadata, TokenRegistry};
 
     let snap = |name: &str, sym: &str, desc: &str, decimals: u8| CommitmentSnapshot {
-            governance: stellereum::governance::Governance::new(),
-            oracle: Default::default(),
+        governance: stellereum::governance::Governance::new(),
+        oracle: Default::default(),
         tokens: {
             let mut reg = TokenRegistry::new();
             reg.tokens.insert(
@@ -609,7 +628,11 @@ async fn hunt17_negative_no_framing_collision_in_the_digest() {
             }
         }
     }
-    assert!(seen.len() >= 30, "only {} distinct states exercised", seen.len());
+    assert!(
+        seen.len() >= 30,
+        "only {} distinct states exercised",
+        seen.len()
+    );
     eprintln!(
         "HUNT17 NEGATIVE: {} name/symbol/description byte-shifts (x3 decimals) all \
          produced distinct digests. put_bytes() length-prefixes BOTH the tag and the \
@@ -637,9 +660,13 @@ async fn hunt18_fast_sync_snapshot_omits_the_validator_set() {
     let snap = source.create_snapshot().await;
 
     let target = Arc::new(InMemoryStateEngine::new());
-    let res =
-        stellereum::sync::fast_sync_state(&target, honest_root, || async { Some(snap.clone()) }, |_| async { None })
-            .await;
+    let res = stellereum::sync::fast_sync_state(
+        &target,
+        honest_root,
+        || async { Some(snap.clone()) },
+        |_| async { None },
+    )
+    .await;
     eprintln!(
         "HUNT18: fast_sync_state -> {:?}; target root after={} (header root was {})",
         res,
@@ -654,7 +681,10 @@ async fn hunt18_fast_sync_snapshot_omits_the_validator_set() {
         // bincode Vec<AccountState> — accounts only.
         snap.len()
     };
-    assert!(res.is_err(), "with a real bonded set the poisoned/partial snapshot is refused");
+    assert!(
+        res.is_err(),
+        "with a real bonded set the poisoned/partial snapshot is refused"
+    );
 
     // And the reverse: a snapshot from a chain with NO staking state passes and
     // leaves the target's own staking untouched, so the target's root silently
@@ -666,10 +696,15 @@ async fn hunt18_fast_sync_snapshot_omits_the_validator_set() {
     fund_genesis(&target2, &vset, 1_000_000_000_000_000).await;
     let target2_root_before = target2.get_state_root().await;
     let bare_snap2 = bare_snap.clone();
-    let r2 = stellereum::sync::fast_sync_state(&target2, bare_root, move || {
-        let s = bare_snap2.clone();
-        async move { Some(s) }
-    }, |_| async { None })
+    let r2 = stellereum::sync::fast_sync_state(
+        &target2,
+        bare_root,
+        move || {
+            let s = bare_snap2.clone();
+            async move { Some(s) }
+        },
+        |_| async { None },
+    )
     .await;
     let target2_root_after = target2.get_state_root().await;
     eprintln!(

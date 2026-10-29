@@ -62,9 +62,9 @@ fn dummy_tx() -> stellereum::sharding::Transaction {
         target_shard: 1,
         signature: vec![0u8; 64],
         payload: vec![],
- 
-    priority_fee_per_gas: 0,
-}
+
+        priority_fee_per_gas: 0,
+    }
 }
 
 /// Build a VALID 5757-signed legacy raw tx (EIP-155 signing hash +
@@ -127,8 +127,14 @@ fn serving_identity_tracks_effective_id_default_5757() {
     assert_eq!(evm::effective_chain_id(), 5757);
     assert_eq!(evm::eth_chain_id(), "0x167d");
     assert_eq!(evm::net_version(), "5757");
-    assert_eq!(evm::eth_chain_id(), evm::eth_chain_id_for(evm::effective_chain_id()));
-    assert_eq!(evm::net_version(), evm::net_version_for(evm::effective_chain_id()));
+    assert_eq!(
+        evm::eth_chain_id(),
+        evm::eth_chain_id_for(evm::effective_chain_id())
+    );
+    assert_eq!(
+        evm::net_version(),
+        evm::net_version_for(evm::effective_chain_id())
+    );
     // Instance default agrees with the free functions out of the box.
     let adapter = evm::EvmAdapter::new();
     assert_eq!(adapter.chain_id, 5757);
@@ -161,7 +167,11 @@ fn serving_identity_follows_env_override_everywhere() {
     // Garbage / zero / blank fall back to the default (fail-closed, never 0).
     for bad in ["not-a-number", "0", "   ", ""] {
         std::env::set_var("STELL_CHAIN_ID", bad);
-        assert_eq!(evm::effective_chain_id(), 5757, "input {bad:?} must fall back");
+        assert_eq!(
+            evm::effective_chain_id(),
+            5757,
+            "input {bad:?} must fall back"
+        );
         assert_eq!(evm::eth_chain_id(), "0x167d");
         assert_eq!(evm::net_version(), "5757");
     }
@@ -319,7 +329,9 @@ fn verification_pins_stay_5757_under_custom_env() {
     let raw = sign_5757_legacy(41, 7);
     let decoded = evm::parse_legacy_transaction(&raw).expect("decodes");
     assert_eq!(decoded.chain_id, Some(5757));
-    decoded.verify_signature().expect("pinned verifier accepts 5757 under any env");
+    decoded
+        .verify_signature()
+        .expect("pinned verifier accepts 5757 under any env");
     // And the admission gate still files it (idempotent on re-admission).
     let h1 = evm::eth_send_raw_transaction_bytes(&raw).expect("gate admits pinned 5757 tx");
     let h2 = evm::eth_send_raw_transaction_bytes(&raw).expect("re-admission is idempotent");

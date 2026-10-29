@@ -21,9 +21,7 @@ use stellereum::sharding::{
     Block, CrossShardMessage, SharedLiquidityHub, Transaction, MASTERCHAIN_SHARD,
 };
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::zkml::{
-    QuantizedLayer, QuantizedLinearModel, SessionKeyAuthorization, ZkMlProof,
-};
+use stellereum::zkml::{QuantizedLayer, QuantizedLinearModel, SessionKeyAuthorization, ZkMlProof};
 
 #[tokio::test]
 async fn attack_test_double_spending_and_nonce_replay() {
@@ -37,7 +35,9 @@ async fn attack_test_double_spending_and_nonce_replay() {
     let charlie_addr = charlie_sk.verifying_key().to_bytes();
 
     // Alice has exactly 100 STELL (100_000_000_000 nano-STELL)
-    state_engine.update_account(AccountState::new(alice_addr, 100_000_000_000)).await;
+    state_engine
+        .update_account(AccountState::new(alice_addr, 100_000_000_000))
+        .await;
 
     // Tx1: Alice sends 80 STELL to Bob (nonce 0)
     let tx1 = Transaction::sign(&alice_sk, bob_addr, 80_000_000_000, 560, 0, 1, 1);
@@ -46,13 +46,19 @@ async fn attack_test_double_spending_and_nonce_replay() {
 
     // Attack 1: Replay exact same Tx1 again
     let replay_res = state_engine.apply_transaction(&tx1, 0).await;
-    assert!(replay_res.is_err(), "Replayed transaction MUST be rejected by nonce check!");
+    assert!(
+        replay_res.is_err(),
+        "Replayed transaction MUST be rejected by nonce check!"
+    );
 
     // Attack 2: Double-spend! Alice tries to send another 80 STELL to Charlie (nonce 1)
     // Alice only has ~20 STELL remaining, so spending 80 STELL must fail!
     let tx2 = Transaction::sign(&alice_sk, charlie_addr, 80_000_000_000, 560, 1, 1, 1);
     let res2 = state_engine.apply_transaction(&tx2, 0).await;
-    assert!(res2.is_err(), "Double spending beyond remaining balance MUST be rejected!");
+    assert!(
+        res2.is_err(),
+        "Double spending beyond remaining balance MUST be rejected!"
+    );
 
     // Verify Bob received 80 STELL and Charlie received 0 STELL
     let bob_acc = state_engine.get_account(&bob_addr).await.unwrap();
@@ -70,14 +76,19 @@ async fn attack_test_forged_signature_rejected() {
     let victim_addr = victim_sk.verifying_key().to_bytes();
     let mallory_addr = mallory_sk.verifying_key().to_bytes();
 
-    state_engine.update_account(AccountState::new(victim_addr, 50_000_000_000)).await;
+    state_engine
+        .update_account(AccountState::new(victim_addr, 50_000_000_000))
+        .await;
 
     // Mallory creates a tx purporting to be from Victim, but signs it with Mallory's key
     let mut forged_tx = Transaction::sign(&mallory_sk, mallory_addr, 50_000_000_000, 560, 0, 1, 1);
     forged_tx.from = victim_addr; // Spoof sender address
 
     let res = state_engine.apply_transaction(&forged_tx, 0).await;
-    assert!(res.is_err(), "Forged signature transaction MUST be rejected!");
+    assert!(
+        res.is_err(),
+        "Forged signature transaction MUST be rejected!"
+    );
 }
 
 #[test]
@@ -102,13 +113,16 @@ fn attack_test_rogue_validator_sybil_block_rejected() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
 
     // Rogue attacker signs the block
     block.sign_block(&rogue_attacker);
 
     // BFT Quorum requires 2/3 (at least 2 authorized signatures out of 3)
-    assert!(!block.verify_signatures(2), "Block with only rogue attacker signature must fail quorum!");
+    assert!(
+        !block.verify_signatures(2),
+        "Block with only rogue attacker signature must fail quorum!"
+    );
 
     // Authorized validator signs
     block.sign_block(&authorized_val1);
@@ -126,7 +140,8 @@ fn attack_test_mev_threshold_privacy_protection() {
     assert_eq!(shares.len(), 5);
 
     let victim_hft_payload = b"arbitrage_tx_buy_10000_stell_at_0.25";
-    let envelope = MevPreemptionEngine::seal_transaction(1, &round_key, victim_hft_payload).unwrap();
+    let envelope =
+        MevPreemptionEngine::seal_transaction(1, &round_key, victim_hft_payload).unwrap();
 
     // Attacker intercepts only 2 shares (less than threshold 3)
     let attacker_shares = vec![shares[0].clone(), shares[1].clone()];
@@ -139,7 +154,10 @@ fn attack_test_mev_threshold_privacy_protection() {
 
     // Attempting to unseal with wrong key MUST fail authenticated decryption
     let unseal_res = mev.unseal_with_shares(&envelope, &attacker_shares);
-    assert!(unseal_res.is_err(), "MevPreemption MUST prevent decryption with < threshold shares!");
+    assert!(
+        unseal_res.is_err(),
+        "MevPreemption MUST prevent decryption with < threshold shares!"
+    );
 
     // Honest validators with 3 shares successfully reconstruct and unseal
     let honest_shares = vec![shares[0].clone(), shares[2].clone(), shares[4].clone()];
@@ -173,14 +191,20 @@ fn attack_test_cross_shard_merkle_forgery_rejected() {
     let cross_msg = CrossShardMessage::new(1, 2, tx, state_root, [1u8; 32], Some(forged_proof));
 
     // Inclusion proof verification against state root MUST fail!
-    assert!(!cross_msg.verify_inclusion(), "Forged Merkle inclusion proof MUST be rejected!");
+    assert!(
+        !cross_msg.verify_inclusion(),
+        "Forged Merkle inclusion proof MUST be rejected!"
+    );
 
     let mut hub = SharedLiquidityHub::new(vec![1, 2]);
     hub.route_cross_shard_message(cross_msg);
 
     // Forged message was bounced and never delivered to Shard 2 inbox!
     let inbound_shard2 = hub.take_inbound_messages(2);
-    assert!(inbound_shard2.is_empty(), "Forged cross-shard message must NOT reach destination shard!");
+    assert!(
+        inbound_shard2.is_empty(),
+        "Forged cross-shard message must NOT reach destination shard!"
+    );
 }
 
 #[test]
@@ -201,20 +225,30 @@ fn attack_test_oracle_manipulation_and_circuit_breaker() {
     assert_eq!(stale_res.unwrap(), 5_000_000);
 
     // Attack 2: Flash loan price manipulation: sudden 15% spike to $5.75 (>10% allowed deviation)
-    let manipulated_feed = PriceFeedUpdate::sign("TON", 5_750_000, current_time, &trusted_oracle_sk);
+    let manipulated_feed =
+        PriceFeedUpdate::sign("TON", 5_750_000, current_time, &trusted_oracle_sk);
     let manipulation_res = oracle.resolve_price(Some(&manipulated_feed), "TON", current_time);
-    assert!(manipulation_res.is_err(), "15% price deviation MUST trip circuit breaker!");
+    assert!(
+        manipulation_res.is_err(),
+        "15% price deviation MUST trip circuit breaker!"
+    );
     assert!(oracle.circuit_breaker_triggered);
 
     // Once circuit breaker is tripped, all trades MUST be halted!
     let paused_res = oracle.resolve_price(None, "TON", current_time);
-    assert!(paused_res.is_err(), "All price resolutions must be paused when circuit breaker is active!");
+    assert!(
+        paused_res.is_err(),
+        "All price resolutions must be paused when circuit breaker is active!"
+    );
 
     // Attack 3: Stablecoin USDT depeg attack (USDT falls to $0.93 < $0.95 threshold)
     let mut oracle2 = OracleSafetyEngine::new(vec![trusted_pub]);
     let depeg_usdt = PriceFeedUpdate::sign("USDT", 930_000, current_time, &trusted_oracle_sk);
     let depeg_res = oracle2.resolve_price(Some(&depeg_usdt), "USDT", current_time);
-    assert!(depeg_res.is_err(), "USDT depeg MUST trigger circuit breaker!");
+    assert!(
+        depeg_res.is_err(),
+        "USDT depeg MUST trigger circuit breaker!"
+    );
     assert!(oracle2.circuit_breaker_triggered);
 }
 
@@ -228,20 +262,43 @@ fn attack_test_bridge_timelock_and_ratelimit_enforcement() {
 
     // Attack 1: Attempt to bypass large withdrawal time-lock (>50,000 STELL)
     let large_amt = 60_000 * 1_000_000_000;
-    let req_id = bridge.request_withdrawal(user, SupportedChain::Arbitrum, "0x123".to_string(), large_amt, now).unwrap();
+    let req_id = bridge
+        .request_withdrawal(
+            user,
+            SupportedChain::Arbitrum,
+            "0x123".to_string(),
+            large_amt,
+            now,
+        )
+        .unwrap();
 
     // Attacker tries to finalize withdrawal 1 minute later
     let early_res = bridge.finalize_withdrawal(req_id, now + 60);
-    assert!(early_res.is_err(), "Premature withdrawal MUST be blocked by time-lock!");
+    assert!(
+        early_res.is_err(),
+        "Premature withdrawal MUST be blocked by time-lock!"
+    );
 
     // Attacker tries to finalize after 1-hour time-lock
     let legit_res = bridge.finalize_withdrawal(req_id, now + 3600);
-    assert!(legit_res.is_ok(), "Withdrawal after time-lock expires should succeed");
+    assert!(
+        legit_res.is_ok(),
+        "Withdrawal after time-lock expires should succeed"
+    );
 
     // Attack 2: Attempt to withdraw more than hourly rate limit (500,000 STELL)
     let over_limit = 550_000 * 1_000_000_000;
-    let rate_limit_res = bridge.request_withdrawal(user, SupportedChain::Arbitrum, "0x123".to_string(), over_limit, now);
-    assert!(rate_limit_res.is_err(), "Withdrawal exceeding hourly rate limit MUST be rejected!");
+    let rate_limit_res = bridge.request_withdrawal(
+        user,
+        SupportedChain::Arbitrum,
+        "0x123".to_string(),
+        over_limit,
+        now,
+    );
+    assert!(
+        rate_limit_res.is_err(),
+        "Withdrawal exceeding hourly rate limit MUST be rejected!"
+    );
 }
 
 #[test]
@@ -277,7 +334,10 @@ fn attack_test_zkml_proof_forgery_and_session_abuse() {
 
     // Attacker tampers with output claim (claims 999 instead of 50)
     proof.public_outputs[1] = 999;
-    assert!(!proof.verify_inference(), "Tampered zkML output claim MUST be rejected!");
+    assert!(
+        !proof.verify_inference(),
+        "Tampered zkML output claim MUST be rejected!"
+    );
 
     // 2. Session key gas limit abuse attack
     let master_sk = SigningKey::generate(&mut OsRng);
@@ -299,9 +359,15 @@ fn attack_test_zkml_proof_forgery_and_session_abuse() {
 
     // Bot tries to spend 15,000 gas (> 10,000 limit)
     let overspend_res = auth.verify_and_spend_gas(15_000, 15_000);
-    assert!(overspend_res.is_err(), "Session key spending beyond budget MUST be rejected!");
+    assert!(
+        overspend_res.is_err(),
+        "Session key spending beyond budget MUST be rejected!"
+    );
 
     // Bot tries to transact after key has expired
     let expired_res = auth.verify_and_spend_gas(1_000, 25_000);
-    assert!(expired_res.is_err(), "Expired session key MUST be rejected!");
+    assert!(
+        expired_res.is_err(),
+        "Expired session key MUST be rejected!"
+    );
 }

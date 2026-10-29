@@ -22,9 +22,7 @@ use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use stellereum::cell::CellHash;
-use stellereum::consensus::{
-    BlockHash, QuorumCertificate, ValidatorSet, Vote, VoteKind,
-};
+use stellereum::consensus::{BlockHash, QuorumCertificate, ValidatorSet, Vote, VoteKind};
 use stellereum::light_client::{Checkpoint, LightClient, LightError, ProofAnswer};
 use stellereum::rpc::RpcState;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
@@ -32,11 +30,17 @@ use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 const N: usize = 4; // 4 validators at power 1 => quorum is 3
 
 fn keys() -> Vec<SigningKey> {
-    (0..N).map(|i| SigningKey::from_bytes(&[i as u8 + 1; 32])).collect()
+    (0..N)
+        .map(|i| SigningKey::from_bytes(&[i as u8 + 1; 32]))
+        .collect()
 }
 
 fn validators(keys: &[SigningKey]) -> ValidatorSet {
-    ValidatorSet::from_list(keys.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect())
+    ValidatorSet::from_list(
+        keys.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    )
 }
 
 /// A precommit quorum certificate over `hash` at `height`, signed by the
@@ -49,7 +53,13 @@ fn cert(signers: &[SigningKey], height: u64, hash: BlockHash) -> QuorumCertifica
             (v.voter, v.signature)
         })
         .collect();
-    QuorumCertificate { height, round: 0, kind: VoteKind::Precommit, block_hash: Some(hash), signatures }
+    QuorumCertificate {
+        height,
+        round: 0,
+        kind: VoteKind::Precommit,
+        block_hash: Some(hash),
+        signatures,
+    }
 }
 
 /// A minimal RPC state with an account that has a balance.
@@ -60,12 +70,18 @@ async fn rpc_state_with_account(addr: [u8; 32], balance: u64) -> Arc<RpcState> {
         .await;
     Arc::new(RpcState {
         engine,
-        mempool: Arc::new(tokio::sync::RwLock::new(stellereum::mempool::Mempool::default())),
+        mempool: Arc::new(tokio::sync::RwLock::new(
+            stellereum::mempool::Mempool::default(),
+        )),
         height: Arc::new(std::sync::atomic::AtomicU64::new(42)),
         node_id: "inf1:test".to_string(),
         chain_id: 777,
-        staking: Arc::new(tokio::sync::RwLock::new(stellereum::staking::StakingLedger::new())),
-        governance: Arc::new(tokio::sync::RwLock::new(stellereum::governance::Governance::new())),
+        staking: Arc::new(tokio::sync::RwLock::new(
+            stellereum::staking::StakingLedger::new(),
+        )),
+        governance: Arc::new(tokio::sync::RwLock::new(
+            stellereum::governance::Governance::new(),
+        )),
         recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
         receipts: Arc::new(tokio::sync::RwLock::new(Default::default())),
         auth_token: None,
@@ -111,7 +127,10 @@ async fn an_honest_proof_from_an_honest_node_verifies() {
     let raw = st
         .call("stell_getProof", json!({ "address": hex::encode(alice) }))
         .await;
-    assert!(raw.get("error").is_none(), "the proof must be served: {raw}");
+    assert!(
+        raw.get("error").is_none(),
+        "the proof must be served: {raw}"
+    );
     let answer = ProofAnswer::from_json(&raw).expect("the answer parses");
     assert_eq!(answer.balance, 5_000);
     assert_eq!(answer.address, alice);
@@ -149,7 +168,10 @@ async fn a_tampered_leaf_is_refused() {
     // the honest leaf, so the claim contradicts the proof: REFUSED.
     answer.balance = 5_000_000;
     assert!(
-        matches!(lc.verify_proof_answer(&answer), Err(LightError::InvalidProof(_))),
+        matches!(
+            lc.verify_proof_answer(&answer),
+            Err(LightError::InvalidProof(_))
+        ),
         "a balance that contradicts the proven leaf must be refused"
     );
 
@@ -187,7 +209,10 @@ async fn a_tampered_root_is_refused() {
     // The server names a root of its own: the client has never finalized it.
     answer.state_root = [0x99u8; 32];
     assert!(
-        matches!(lc.verify_proof_answer(&answer), Err(LightError::RootUntrusted { .. })),
+        matches!(
+            lc.verify_proof_answer(&answer),
+            Err(LightError::RootUntrusted { .. })
+        ),
         "a root the client never finalized must be refused"
     );
 }
@@ -230,10 +255,14 @@ async fn a_lying_server_cannot_make_the_client_believe_a_made_up_root() {
     //     not the root the proof is against — the client notices the two
     //     stories do not match.
     let honest_cert = cert(&ks[..3], 43, lying_hash);
-    let honest_but_wrong_root = Checkpoint::new(43, lying_hash, [0x11u8; 32], lying_root, honest_cert);
+    let honest_but_wrong_root =
+        Checkpoint::new(43, lying_hash, [0x11u8; 32], lying_root, honest_cert);
     let lc = LightClient::new(vs.clone(), honest_but_wrong_root).expect("the anchor verifies");
     assert!(
-        matches!(lc.verify_proof_answer(&answer), Err(LightError::RootUntrusted { .. })),
+        matches!(
+            lc.verify_proof_answer(&answer),
+            Err(LightError::RootUntrusted { .. })
+        ),
         "a proof about a root the anchored header does not commit to must be refused"
     );
 }
@@ -300,7 +329,7 @@ async fn the_rpc_serves_the_quorum_certified_header_and_the_anchor() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     let bh = b.compute_hash();
     b.precommit_qc = Some(cert(&ks, 43, bh));
     st.record_finalized_header(&b).await;
@@ -309,7 +338,10 @@ async fn the_rpc_serves_the_quorum_certified_header_and_the_anchor() {
     let served = st
         .call("stell_getFinalizedHeader", json!({ "height": 43 }))
         .await;
-    assert!(served.get("error").is_none(), "the header must be served: {served}");
+    assert!(
+        served.get("error").is_none(),
+        "the header must be served: {served}"
+    );
     assert_eq!(served["height"], 43);
     assert_eq!(served["block_hash"], hex::encode(bh));
     assert_eq!(served["state_root"], hex::encode([0x33u8; 32]));
@@ -324,7 +356,10 @@ async fn the_rpc_serves_the_quorum_certified_header_and_the_anchor() {
 
     // The anchor is served too.
     let anchor = st.call("stell_getFinalizedCheckpoint", json!({})).await;
-    assert!(anchor.get("error").is_none(), "the anchor must be served: {anchor}");
+    assert!(
+        anchor.get("error").is_none(),
+        "the anchor must be served: {anchor}"
+    );
     assert_eq!(anchor["height"], 43);
     assert_eq!(anchor["trusted_root"], hex::encode([0x33u8; 32]));
 
@@ -333,7 +368,10 @@ async fn the_rpc_serves_the_quorum_certified_header_and_the_anchor() {
     let miss = st
         .call("stell_getFinalizedHeader", json!({ "height": 999 }))
         .await;
-    assert!(miss.get("error").is_some(), "an unknown height must not be served");
+    assert!(
+        miss.get("error").is_some(),
+        "an unknown height must not be served"
+    );
 
     // And the served header really does anchor a light client.
     let header = stellereum::light_client_cli::parse_served_header(&served).expect("parses");
@@ -351,7 +389,10 @@ async fn the_rpc_serves_the_quorum_certified_header_and_the_anchor() {
 async fn the_rpc_serves_the_zkml_capability_statement() {
     let st = rpc_state_with_account([0xA1u8; 32], 5_000).await;
     let caps = st.call("stell_zkmlCapabilities", json!({})).await;
-    assert!(caps.get("error").is_none(), "the statement must be served: {caps}");
+    assert!(
+        caps.get("error").is_none(),
+        "the statement must be served: {caps}"
+    );
     assert_eq!(caps["zero_knowledge"], false);
     assert_eq!(caps["succinct"], false);
     assert_eq!(caps["hiding"], false);
@@ -437,7 +478,8 @@ fn the_cli_parses_a_served_header_and_refuses_a_certificate_it_cannot_check() {
         "timestamp": 1_700_000_000u64,
         "cert": cert_json,
     });
-    let header = stellereum::light_client_cli::parse_served_header(&served).expect("the header parses");
+    let header =
+        stellereum::light_client_cli::parse_served_header(&served).expect("the header parses");
     assert_eq!(header.height, 43);
     assert_eq!(header.cert.kind, VoteKind::Precommit);
     assert_eq!(header.cert.signatures.len(), 3);
@@ -468,7 +510,8 @@ fn the_cli_parses_a_served_header_and_refuses_a_certificate_it_cannot_check() {
         "state_root": hex::encode([0x33u8; 32]),
         "cert": prevote,
     });
-    let bad_header = stellereum::light_client_cli::parse_served_header(&bad).expect("the header parses");
+    let bad_header =
+        stellereum::light_client_cli::parse_served_header(&bad).expect("the header parses");
     assert_eq!(bad_header.cert.kind, VoteKind::Prevote);
     let bad_cp = Checkpoint::new(
         bad_header.height,
@@ -508,7 +551,7 @@ fn chain(keys: &[SigningKey], n: u64, root: CellHash) -> Vec<Block> {
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         let bh = b.compute_hash();
         b.precommit_qc = Some(cert(keys, h, bh));
         prev = bh;
@@ -525,11 +568,9 @@ fn a_peer_chain_that_extends_the_anchor_is_accepted() {
     let blocks = chain(&ks, 3, root);
 
     // The node's anchor: the genesis (height 0, the zero sentinel).
-    let light = LightClient::with_genesis_anchor(
-        vs.clone(),
-        stellereum::sync::genesis_light_anchor(root),
-    )
-    .expect("the genesis anchor");
+    let light =
+        LightClient::with_genesis_anchor(vs.clone(), stellereum::sync::genesis_light_anchor(root))
+            .expect("the genesis anchor");
 
     let anchored = stellereum::sync::verify_synced_blocks_against_anchor(&light, &blocks)
         .expect("an honest chain that extends the anchor must be accepted");
@@ -542,11 +583,9 @@ fn a_peer_chain_that_forks_off_the_anchor_is_refused() {
     let vs = validators(&ks);
     let root = [0x42u8; 32];
     let blocks = chain(&ks, 3, root);
-    let light = LightClient::with_genesis_anchor(
-        vs.clone(),
-        stellereum::sync::genesis_light_anchor(root),
-    )
-    .expect("the genesis anchor");
+    let light =
+        LightClient::with_genesis_anchor(vs.clone(), stellereum::sync::genesis_light_anchor(root))
+            .expect("the genesis anchor");
 
     // A fork: the second block names a different parent.
     let mut forked = blocks.clone();
@@ -575,11 +614,9 @@ fn a_peer_chain_without_a_quorum_certificate_is_refused() {
     let mut blocks = chain(&ks, 2, root);
     // The peer drops the decision proof from its second block.
     blocks[1].precommit_qc = None;
-    let light = LightClient::with_genesis_anchor(
-        vs.clone(),
-        stellereum::sync::genesis_light_anchor(root),
-    )
-    .expect("the genesis anchor");
+    let light =
+        LightClient::with_genesis_anchor(vs.clone(), stellereum::sync::genesis_light_anchor(root))
+            .expect("the genesis anchor");
     assert!(
         stellereum::sync::verify_synced_blocks_against_anchor(&light, &blocks).is_err(),
         "a block with no decision proof must be refused"
@@ -599,11 +636,9 @@ fn a_peer_chain_signed_by_outsiders_is_refused() {
         SigningKey::from_bytes(&[0xF2u8; 32]),
     ];
     blocks[1].precommit_qc = Some(cert(&liars, 2, blocks[1].compute_hash()));
-    let light = LightClient::with_genesis_anchor(
-        vs.clone(),
-        stellereum::sync::genesis_light_anchor(root),
-    )
-    .expect("the genesis anchor");
+    let light =
+        LightClient::with_genesis_anchor(vs.clone(), stellereum::sync::genesis_light_anchor(root))
+            .expect("the genesis anchor");
     assert!(
         stellereum::sync::verify_synced_blocks_against_anchor(&light, &blocks).is_err(),
         "a certificate signed by non-validators must be refused"
@@ -744,7 +779,10 @@ fn the_light_client_command_verifies_an_honest_proof_end_to_end() {
         let raw = st
             .call("stell_getProof", json!({ "address": hex::encode(alice) }))
             .await;
-        assert!(raw.get("error").is_none(), "the proof must be served: {raw}");
+        assert!(
+            raw.get("error").is_none(),
+            "the proof must be served: {raw}"
+        );
         let answer = ProofAnswer::from_json(&raw).expect("the answer parses");
         // The chain's convention: the header at h+1 commits to the state at h.
         let height = answer.height.expect("the answer carries a height") + 1;

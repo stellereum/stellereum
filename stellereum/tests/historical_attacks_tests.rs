@@ -58,11 +58,27 @@ fn the_dao_reentrancy_no_callback_surface() {
     let dest = addr(3);
     let id = reg.create_token(owner, meta("T", "T"), 1_000).unwrap();
 
-    reg.execute(&id, owner, TokenOp::Approve { spender, amount: 500 }).unwrap();
+    reg.execute(
+        &id,
+        owner,
+        TokenOp::Approve {
+            spender,
+            amount: 500,
+        },
+    )
+    .unwrap();
     let allowance_before = reg.get(&id).unwrap().allowance(&owner, &spender);
 
     // A plain transfer must not touch allowances (no re-entrant effect).
-    reg.execute(&id, owner, TokenOp::Transfer { to: dest, amount: 100 }).unwrap();
+    reg.execute(
+        &id,
+        owner,
+        TokenOp::Transfer {
+            to: dest,
+            amount: 100,
+        },
+    )
+    .unwrap();
 
     assert_eq!(
         reg.get(&id).unwrap().allowance(&owner, &spender),
@@ -89,7 +105,13 @@ fn parity_uninitialized_and_takeover_rejected() {
 
     // Attacker cannot seize minter authority.
     assert_eq!(
-        reg.execute(&id1, attacker, TokenOp::SetMinter { new_minter: attacker }),
+        reg.execute(
+            &id1,
+            attacker,
+            TokenOp::SetMinter {
+                new_minter: attacker
+            }
+        ),
         Err(TokenError::NotMinter)
     );
     assert_eq!(reg.get(&id1).unwrap().metadata.minter, owner);
@@ -107,12 +129,27 @@ fn bec_integer_overflow_rejected() {
     m.max_supply = Some(u64::MAX);
     let id = reg.create_token(minter, m, u64::MAX - 5).unwrap();
 
-    reg.execute(&id, minter, TokenOp::Mint { to: minter, amount: 5 }).unwrap();
+    reg.execute(
+        &id,
+        minter,
+        TokenOp::Mint {
+            to: minter,
+            amount: 5,
+        },
+    )
+    .unwrap();
     assert_eq!(reg.get(&id).unwrap().metadata.total_supply, u64::MAX);
 
     // Next mint overflows -> rejected
     assert_eq!(
-        reg.execute(&id, minter, TokenOp::Mint { to: minter, amount: 1 }),
+        reg.execute(
+            &id,
+            minter,
+            TokenOp::Mint {
+                to: minter,
+                amount: 1
+            }
+        ),
         Err(TokenError::Overflow)
     );
     assert_eq!(reg.get(&id).unwrap().metadata.total_supply, u64::MAX);
@@ -136,7 +173,10 @@ fn etc_cross_shard_replay_rejected() {
     // Replay on another target shard
     let mut replayed2 = tx.clone();
     replayed2.target_shard = 9;
-    assert!(!replayed2.verify_signature(), "cross-shard replay must fail");
+    assert!(
+        !replayed2.verify_signature(),
+        "cross-shard replay must fail"
+    );
 
     // Amount tampering
     let mut replayed3 = tx.clone();
@@ -188,7 +228,10 @@ fn ronin_bridge_subquorum_rejected() {
         validator_signatures: vec![(pubs[0], sig1.to_vec())],
         zk_proof: None,
     };
-    assert!(bridge.process_deposit(&event).is_err(), "sub-quorum deposit must be rejected!");
+    assert!(
+        bridge.process_deposit(&event).is_err(),
+        "sub-quorum deposit must be rejected!"
+    );
 
     // Two validators sign -> accepted
     let sig2 = ed25519_dalek::Signer::sign(&v2, &msg);
@@ -248,7 +291,10 @@ fn wormhole_signature_bypass_rejected() {
         ],
         zk_proof: None,
     };
-    assert!(bridge.process_deposit(&event).is_err(), "forged signatures must not count toward quorum!");
+    assert!(
+        bridge.process_deposit(&event).is_err(),
+        "forged signatures must not count toward quorum!"
+    );
 }
 
 // ============================================================================
@@ -264,7 +310,10 @@ fn nomad_bridge_missing_proof_rejected() {
 
     // Untrusted message with NO proof
     let msg = CrossShardMessage::new(1, 2, tx.clone(), root, [0u8; 32], None);
-    assert!(!msg.verify_inclusion(), "missing proof from untrusted source must be rejected");
+    assert!(
+        !msg.verify_inclusion(),
+        "missing proof from untrusted source must be rejected"
+    );
 
     let mut hub = SharedLiquidityHub::new(vec![1, 2]);
     hub.route_cross_shard_message(msg);
@@ -278,8 +327,14 @@ fn nomad_bridge_missing_proof_rejected() {
     let mut msg_nb = msg_nb;
     msg_nb.bounce = false;
     let seq = hub.route_cross_shard_message(msg_nb);
-    assert_eq!(seq, 0, "invalid non-bounceable message must not be sequenced");
-    assert!(hub.take_inbound_messages(2).is_empty(), "invalid message must be dropped");
+    assert_eq!(
+        seq, 0,
+        "invalid non-bounceable message must not be sequenced"
+    );
+    assert!(
+        hub.take_inbound_messages(2).is_empty(),
+        "invalid message must be dropped"
+    );
 }
 
 // ============================================================================
@@ -341,7 +396,10 @@ fn poly_network_cross_chain_tampering_rejected() {
     tampered_tx.amount = source_balance + 1;
     let tampered = CrossShardMessage::new(1, 2, tampered_tx, root, [0u8; 32], Some(proof))
         .with_source_balance(source_balance);
-    assert!(!tampered.verify_inclusion(), "inflated amount must fail the balance check");
+    assert!(
+        !tampered.verify_inclusion(),
+        "inflated amount must fail the balance check"
+    );
 }
 
 // ============================================================================
@@ -379,13 +437,30 @@ fn erc20_approve_race_safe_helpers() {
     let spender = addr(2);
     let id = reg.create_token(owner, meta("T", "T"), 1_000).unwrap();
 
-    reg.execute(&id, owner, TokenOp::Approve { spender, amount: 100 }).unwrap();
+    reg.execute(
+        &id,
+        owner,
+        TokenOp::Approve {
+            spender,
+            amount: 100,
+        },
+    )
+    .unwrap();
     // Safe decrease instead of raw approve
-    reg.execute(&id, owner, TokenOp::DecreaseAllowance { spender, delta: 60 }).unwrap();
+    reg.execute(
+        &id,
+        owner,
+        TokenOp::DecreaseAllowance { spender, delta: 60 },
+    )
+    .unwrap();
     assert_eq!(reg.get(&id).unwrap().allowance(&owner, &spender), 40);
     // Underflow protected
     assert_eq!(
-        reg.execute(&id, owner, TokenOp::DecreaseAllowance { spender, delta: 41 }),
+        reg.execute(
+            &id,
+            owner,
+            TokenOp::DecreaseAllowance { spender, delta: 41 }
+        ),
         Err(TokenError::AllowanceUnderflow)
     );
 }
@@ -423,12 +498,20 @@ fn out_of_gas_does_not_commit_token_changes() {
     };
 
     // Transfer (560 gas) then spam Nops to exhaust the 600 gas budget
-    let mut ops = vec![OpCode::SysCallTokenTransfer { token_id: id, to: bob, amount: 400 }];
+    let mut ops = vec![OpCode::SysCallTokenTransfer {
+        token_id: id,
+        to: bob,
+        amount: 400,
+    }];
     ops.extend(std::iter::repeat_n(OpCode::Nop, 100));
 
     let res = Svm::execute(&ops, 600, &mut ctx);
     assert!(matches!(res, VmExecutionResult::OutOfGas));
-    assert_eq!(registry.balance_of(&id, &alice), 1_000, "OOG must not move tokens");
+    assert_eq!(
+        registry.balance_of(&id, &alice),
+        1_000,
+        "OOG must not move tokens"
+    );
     assert_eq!(registry.balance_of(&id, &bob), 0);
 }
 
@@ -461,7 +544,10 @@ fn unbounded_ops_dos_no_panic() {
     };
     let ops: Vec<OpCode> = std::iter::repeat_n(OpCode::Nop, 1_000_000).collect();
     let res = Svm::execute(&ops, 1_000, &mut ctx);
-    assert!(matches!(res, VmExecutionResult::OutOfGas), "huge op list must OOG cleanly");
+    assert!(
+        matches!(res, VmExecutionResult::OutOfGas),
+        "huge op list must OOG cleanly"
+    );
 }
 
 // ============================================================================
@@ -515,7 +601,10 @@ fn corrupted_signature_rejected() {
     let mut tx = Transaction::sign(&sk, addr(2), 1_000, 560, 0, 1, 1);
     assert!(tx.verify_signature());
     tx.signature[0] ^= 0x01;
-    assert!(!tx.verify_signature(), "corrupted signature must be rejected");
+    assert!(
+        !tx.verify_signature(),
+        "corrupted signature must be rejected"
+    );
 }
 
 // ============================================================================
@@ -532,7 +621,11 @@ fn cross_shard_replay_dedup() {
     let seq2 = hub.route_cross_shard_message(msg.clone()); // replay
     assert!(seq1 > 0);
     assert_eq!(seq2, 0, "replayed cross-shard message must be rejected");
-    assert_eq!(hub.take_inbound_messages(2).len(), 1, "message must be delivered exactly once");
+    assert_eq!(
+        hub.take_inbound_messages(2).len(),
+        1,
+        "message must be delivered exactly once"
+    );
 }
 
 // ============================================================================
@@ -573,7 +666,10 @@ fn bridge_deposit_replay_rejected() {
 
     assert!(bridge.process_deposit(&event).is_ok());
     // Replay of the SAME source tx hash must be rejected
-    assert!(bridge.process_deposit(&event).is_err(), "bridge deposit replay must be rejected");
+    assert!(
+        bridge.process_deposit(&event).is_err(),
+        "bridge deposit replay must be rejected"
+    );
 }
 
 // ============================================================================
@@ -587,7 +683,13 @@ fn timestamp_manipulation_timelock_boundary() {
     let large = 60_000 * 1_000_000_000; // > 50k STELL threshold -> 1h lock
 
     let req_id = bridge
-        .request_withdrawal(addr(1), SupportedChain::Arbitrum, "0xabc".to_string(), large, now)
+        .request_withdrawal(
+            addr(1),
+            SupportedChain::Arbitrum,
+            "0xabc".to_string(),
+            large,
+            now,
+        )
         .unwrap();
 
     // One second before unlock -> rejected
@@ -602,10 +704,16 @@ fn timestamp_manipulation_timelock_boundary() {
 #[test]
 fn malformed_input_deserialization_safe() {
     let bad = bincode::deserialize::<Transaction>(&[0xFF, 0x00, 0x01, 0x02]);
-    assert!(bad.is_err(), "garbage must not deserialize into a Transaction");
+    assert!(
+        bad.is_err(),
+        "garbage must not deserialize into a Transaction"
+    );
 
     let bad2 = bincode::deserialize::<TokenRegistry>(&[0x00]);
-    assert!(bad2.is_err(), "garbage must not deserialize into a TokenRegistry");
+    assert!(
+        bad2.is_err(),
+        "garbage must not deserialize into a TokenRegistry"
+    );
 }
 
 // ============================================================================
@@ -617,6 +725,13 @@ fn unchecked_return_no_silent_failure() {
     let a = addr(1);
     let id = reg.create_token(a, meta("T", "T"), 100).unwrap();
     // Attempting to move more than the balance must return an explicit error
-    let res = reg.execute(&id, a, TokenOp::Transfer { to: addr(2), amount: 1_000 });
+    let res = reg.execute(
+        &id,
+        a,
+        TokenOp::Transfer {
+            to: addr(2),
+            amount: 1_000,
+        },
+    );
     assert_eq!(res, Err(TokenError::InsufficientBalance));
 }

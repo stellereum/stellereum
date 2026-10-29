@@ -44,8 +44,7 @@ const V2: [u8; 32] = [
     0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
 ];
 /// 32-byte ed25519 seed, as `STELL_FAUCET_KEY` would carry it (hex, no 0x).
-const FAUCET_SEED_HEX: &str =
-    "1111111111111111111111111111111111111111111111111111111111111111";
+const FAUCET_SEED_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
 /// The expected genesis state root for the inputs above.
 ///
@@ -103,14 +102,20 @@ async fn genesis_root_does_not_depend_on_funding_order() {
     let a = Arc::new(InMemoryStateEngine::new());
     let vs_a = ValidatorSet::from_list(vec![(V1, 1), (V2, 1)]);
     stellereum::runtime::fund_genesis(&a, &vs_a, 100_000_000_000_000_000).await;
-    let faucet_a = stellereum::rpc::Faucet::new([0x11u8; 32], 1, 100_000_000_000, 1_000_000_000_000);
-    let _ = a.credit_native(&faucet_a.account(), 1_000_000_000_000_000).await; // GATE: intentional ignore
+    let faucet_a =
+        stellereum::rpc::Faucet::new([0x11u8; 32], 1, 100_000_000_000, 1_000_000_000_000);
+    let _ = a
+        .credit_native(&faucet_a.account(), 1_000_000_000_000_000)
+        .await; // GATE: intentional ignore
 
     let b = Arc::new(InMemoryStateEngine::new());
     let vs_b = ValidatorSet::from_list(vec![(V2, 1), (V1, 1)]);
-    let faucet_b = stellereum::rpc::Faucet::new([0x11u8; 32], 1, 100_000_000_000, 1_000_000_000_000);
+    let faucet_b =
+        stellereum::rpc::Faucet::new([0x11u8; 32], 1, 100_000_000_000, 1_000_000_000_000);
     // Faucet first this time.
-    let _ = b.credit_native(&faucet_b.account(), 1_000_000_000_000_000).await; // GATE: intentional ignore
+    let _ = b
+        .credit_native(&faucet_b.account(), 1_000_000_000_000_000)
+        .await; // GATE: intentional ignore
     stellereum::runtime::fund_genesis(&b, &vs_b, 100_000_000_000_000_000).await;
 
     assert_eq!(
@@ -128,7 +133,9 @@ async fn a_different_validator_set_gives_a_different_root() {
     let vs = ValidatorSet::from_list(vec![(V1, 1), ([0x33u8; 32], 1)]);
     stellereum::runtime::fund_genesis(&engine, &vs, 100_000_000_000_000_000).await;
     let faucet = stellereum::rpc::Faucet::new([0x11u8; 32], 1, 100_000_000_000, 1_000_000_000_000);
-    let _ = engine.credit_native(&faucet.account(), 1_000_000_000_000_000).await; // GATE: intentional ignore
+    let _ = engine
+        .credit_native(&faucet.account(), 1_000_000_000_000_000)
+        .await; // GATE: intentional ignore
 
     assert_ne!(
         hex::encode(engine.get_state_root().await),
@@ -143,7 +150,9 @@ async fn a_different_faucet_key_gives_a_different_root() {
     let vs = ValidatorSet::from_list(vec![(V1, 1), (V2, 1)]);
     stellereum::runtime::fund_genesis(&engine, &vs, 100_000_000_000_000_000).await;
     let other = stellereum::rpc::Faucet::new([0x77u8; 32], 1, 100_000_000_000, 1_000_000_000_000);
-    let _ = engine.credit_native(&other.account(), 1_000_000_000_000_000).await; // GATE: intentional ignore
+    let _ = engine
+        .credit_native(&other.account(), 1_000_000_000_000_000)
+        .await; // GATE: intentional ignore
 
     assert_ne!(
         hex::encode(engine.get_state_root().await),
@@ -158,7 +167,8 @@ async fn commitment_version_is_written_into_the_digest() {
     // preimage. If that ever stops being true the known-answer test would stop
     // protecting anyone, so assert the constant explicitly.
     assert_eq!(
-        stellereum::commitment::COMMITMENT_VERSION, 5,
+        stellereum::commitment::COMMITMENT_VERSION,
+        5,
         "COMMITMENT_VERSION changed. If this is intentional, expect a hard fork, \
          wipe every data directory, and update EXPECTED_GENESIS_ROOT in the same \
          commit that bumps it."
@@ -191,7 +201,10 @@ async fn genesis_staking_pool_is_fully_backed() {
     stellereum::runtime::fund_genesis(&engine, &vs, initial_balance).await;
 
     let bond = stellereum::runtime::GENESIS_VALIDATOR_BOND;
-    let pool_acc = engine.get_account(&stellereum::staking::STAKING_POOL).await.expect("pool account exists");
+    let pool_acc = engine
+        .get_account(&stellereum::staking::STAKING_POOL)
+        .await
+        .expect("pool account exists");
     assert_eq!(
         pool_acc.balance,
         bond * 2,

@@ -17,12 +17,12 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::sync::Arc;
 use stellereum::mempool::Mempool;
 use stellereum::mev::{MevPreemptionEngine, OrderVerdict, SealVerdict};
 use stellereum::runtime::Cluster;
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use std::sync::Arc;
 
 fn engine_with() -> Arc<InMemoryStateEngine> {
     Arc::new(InMemoryStateEngine::new())
@@ -69,16 +69,26 @@ async fn run_height_tampered(cluster: &mut Cluster, timestamp: u64, tamper: Tamp
     for (i, n) in cluster.nodes.iter_mut().enumerate() {
         if i != proposer_idx {
             let r = n.hc.round;
-            n.on_proposal(proposer_id, block.clone(), r).await.expect("proposal rejected");
+            n.on_proposal(proposer_id, block.clone(), r)
+                .await
+                .expect("proposal rejected");
         }
     }
-    let prevotes: Vec<_> = cluster.nodes.iter().filter_map(|n| n.make_prevote()).collect();
+    let prevotes: Vec<_> = cluster
+        .nodes
+        .iter()
+        .filter_map(|n| n.make_prevote())
+        .collect();
     for v in &prevotes {
         for n in cluster.nodes.iter_mut() {
             let _ = n.on_prevote(v.clone());
         }
     }
-    let precommits: Vec<_> = cluster.nodes.iter_mut().filter_map(|n| n.make_precommit()).collect();
+    let precommits: Vec<_> = cluster
+        .nodes
+        .iter_mut()
+        .filter_map(|n| n.make_precommit())
+        .collect();
     for v in &precommits {
         for n in cluster.nodes.iter_mut() {
             let _ = n.on_precommit(v.clone());
@@ -99,7 +109,11 @@ async fn run_height_tampered(cluster: &mut Cluster, timestamp: u64, tamper: Tamp
         Tamper::ReorderStoredBody => {
             let p = &mut cluster.nodes[proposer_idx];
             let body = p.blocks.get_mut(&bh).expect("proposer has its own body");
-            assert_eq!(body.transactions.len(), 2, "need two transactions to reorder");
+            assert_eq!(
+                body.transactions.len(),
+                2,
+                "need two transactions to reorder"
+            );
             body.transactions.reverse();
         }
     }
@@ -123,15 +137,26 @@ async fn sealed_admission_unseals_to_the_same_transaction() {
 
     // ...and the envelope opens to the exact admitted bytes.
     assert_eq!(mp.mev.verify_pool_tx(&tx), SealVerdict::Match);
-    let env = mp.mev.pool_envelopes.get(&h).expect("envelope present").clone();
-    let unsealed = mp.mev.unseal_transaction(&env).expect("round key must open our own seal");
+    let env = mp
+        .mev
+        .pool_envelopes
+        .get(&h)
+        .expect("envelope present")
+        .clone();
+    let unsealed = mp
+        .mev
+        .unseal_transaction(&env)
+        .expect("round key must open our own seal");
     assert_eq!(unsealed, bincode::serialize(&tx).unwrap());
 
     // The recovered bytes ARE the transaction: reparse, verify the signature,
     // and the byte stream is stable under a second roundtrip.
     let reparsed: Transaction = bincode::deserialize(&unsealed).expect("roundtrip decodes");
     assert_eq!(bincode::serialize(&reparsed).unwrap(), unsealed);
-    assert!(reparsed.verify_signature(), "unsealed transaction must still be valid");
+    assert!(
+        reparsed.verify_signature(),
+        "unsealed transaction must still be valid"
+    );
     assert_eq!(reparsed.from, tx.from);
     assert_eq!(reparsed.to, tx.to);
     assert_eq!(reparsed.amount, tx.amount);
@@ -174,7 +199,7 @@ async fn sealed_then_unsealed_tx_executes_identically_to_a_direct_one() {
             mmr_epoch_root: [0u8; 32],
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
-};
+        };
         b.sign_block(&SigningKey::from_bytes(&[7u8; 32]));
         b
     };
@@ -186,11 +211,18 @@ async fn sealed_then_unsealed_tx_executes_identically_to_a_direct_one() {
     let root_before = s1.get_state_root().await;
     assert_eq!(root_before, s2.get_state_root().await, "identical genesis");
 
-    let out1 = s1.apply_block_transition(&make_block(direct, root_before), 0).await;
-    let out2 = s2.apply_block_transition(&make_block(via_seal, root_before), 0).await;
+    let out1 = s1
+        .apply_block_transition(&make_block(direct, root_before), 0)
+        .await;
+    let out2 = s2
+        .apply_block_transition(&make_block(via_seal, root_before), 0)
+        .await;
 
     assert_eq!(out1.applied, 1, "direct transaction must apply");
-    assert_eq!(out2.applied, 1, "sealed-then-unsealed transaction must apply");
+    assert_eq!(
+        out2.applied, 1,
+        "sealed-then-unsealed transaction must apply"
+    );
     assert!(out1.status[0] && out2.status[0], "both must succeed");
     assert_eq!(
         s1.get_state_root().await,
@@ -249,10 +281,21 @@ async fn build_order_commitment_matches_and_tampering_fails() {
 
     // No commitment yet: nothing to enforce (a node that did not build this
     // block must not be gated on someone else's order).
-    assert_eq!(engine.verify_block_order(5, bh, &[tx1.clone(), tx2.clone()]), OrderVerdict::NoCommit);
+    assert_eq!(
+        engine.verify_block_order(5, bh, &[tx1.clone(), tx2.clone()]),
+        OrderVerdict::NoCommit
+    );
 
-    engine.commit_block_order(5, bh, &[tx1.clone(), tx2.clone()], std::slice::from_ref(&key));
-    assert_eq!(engine.verify_block_order(5, bh, &[tx1.clone(), tx2.clone()]), OrderVerdict::Match);
+    engine.commit_block_order(
+        5,
+        bh,
+        &[tx1.clone(), tx2.clone()],
+        std::slice::from_ref(&key),
+    );
+    assert_eq!(
+        engine.verify_block_order(5, bh, &[tx1.clone(), tx2.clone()]),
+        OrderVerdict::Match
+    );
     // Reordered execution of the same transactions is a different order and
     // must be refused.
     assert_eq!(
@@ -260,10 +303,16 @@ async fn build_order_commitment_matches_and_tampering_fails() {
         OrderVerdict::Mismatch
     );
     // A subset / different set is likewise not the committed order.
-    assert_eq!(engine.verify_block_order(5, bh, std::slice::from_ref(&tx1)), OrderVerdict::Mismatch);
+    assert_eq!(
+        engine.verify_block_order(5, bh, std::slice::from_ref(&tx1)),
+        OrderVerdict::Mismatch
+    );
     // Another height, or another block hash at this height, has no
     // commitment: consensus decides those, the local gate does not.
-    assert_eq!(engine.verify_block_order(6, bh, &[tx1.clone(), tx2.clone()]), OrderVerdict::NoCommit);
+    assert_eq!(
+        engine.verify_block_order(6, bh, &[tx1.clone(), tx2.clone()]),
+        OrderVerdict::NoCommit
+    );
     assert_eq!(
         engine.verify_block_order(5, [0xEE; 32], &[tx1.clone(), tx2.clone()]),
         OrderVerdict::NoCommit
@@ -272,9 +321,20 @@ async fn build_order_commitment_matches_and_tampering_fails() {
     // A second build at the same height (fresh round) keeps BOTH commitments:
     // whichever body the network decides must find its own.
     let bh2 = [0xD1u8; 32];
-    engine.commit_block_order(5, bh2, std::slice::from_ref(&tx1), std::slice::from_ref(&key));
-    assert_eq!(engine.verify_block_order(5, bh, &[tx1.clone(), tx2.clone()]), OrderVerdict::Match);
-    assert_eq!(engine.verify_block_order(5, bh2, std::slice::from_ref(&tx1)), OrderVerdict::Match);
+    engine.commit_block_order(
+        5,
+        bh2,
+        std::slice::from_ref(&tx1),
+        std::slice::from_ref(&key),
+    );
+    assert_eq!(
+        engine.verify_block_order(5, bh, &[tx1.clone(), tx2.clone()]),
+        OrderVerdict::Match
+    );
+    assert_eq!(
+        engine.verify_block_order(5, bh2, std::slice::from_ref(&tx1)),
+        OrderVerdict::Match
+    );
     assert_eq!(
         engine.verify_block_order(5, bh2, &[tx1.clone(), tx2.clone()]),
         OrderVerdict::Mismatch,
@@ -315,9 +375,15 @@ async fn finalize_warns_but_converges_on_tampered_build_commitment() {
     let user = SigningKey::generate(&mut OsRng);
     let from = user.verifying_key().to_bytes();
     let mut cluster = cluster_of_two(from).await;
-    cluster.broadcast_tx(Transaction::sign(&user, [9u8; 32], 500, 0, 0, 1, 1)).await;
+    cluster
+        .broadcast_tx(Transaction::sign(&user, [9u8; 32], 500, 0, 0, 1, 1))
+        .await;
 
-    let proposer_idx = cluster.nodes.iter().position(|n| n.is_proposer()).expect("proposer");
+    let proposer_idx = cluster
+        .nodes
+        .iter()
+        .position(|n| n.is_proposer())
+        .expect("proposer");
     let root_before = cluster.nodes[proposer_idx].state_root().await;
 
     run_height_tampered(&mut cluster, 1_000, Tamper::BreakCommitmentSignature).await;
@@ -336,7 +402,11 @@ async fn finalize_warns_but_converges_on_tampered_build_commitment() {
     // Both validators converge on the same root — no split.
     for n in cluster.nodes.iter() {
         assert_eq!(n.finalized.len(), 1, "honest nodes still finalize");
-        assert_eq!(n.state_root().await, proposer.state_root().await, "roots converge");
+        assert_eq!(
+            n.state_root().await,
+            proposer.state_root().await,
+            "roots converge"
+        );
     }
 }
 
@@ -349,10 +419,18 @@ async fn finalize_refuses_a_reordered_block_body() {
     let user = SigningKey::generate(&mut OsRng);
     let from = user.verifying_key().to_bytes();
     let mut cluster = cluster_of_two(from).await;
-    cluster.broadcast_tx(Transaction::sign(&user, [9u8; 32], 100, 0, 0, 1, 1)).await;
-    cluster.broadcast_tx(Transaction::sign(&user, [8u8; 32], 100, 0, 1, 1, 1)).await;
+    cluster
+        .broadcast_tx(Transaction::sign(&user, [9u8; 32], 100, 0, 0, 1, 1))
+        .await;
+    cluster
+        .broadcast_tx(Transaction::sign(&user, [8u8; 32], 100, 0, 1, 1, 1))
+        .await;
 
-    let proposer_idx = cluster.nodes.iter().position(|n| n.is_proposer()).expect("proposer");
+    let proposer_idx = cluster
+        .nodes
+        .iter()
+        .position(|n| n.is_proposer())
+        .expect("proposer");
     let root_before = cluster.nodes[proposer_idx].state_root().await;
 
     run_height_tampered(&mut cluster, 1_000, Tamper::ReorderStoredBody).await;
@@ -362,7 +440,11 @@ async fn finalize_refuses_a_reordered_block_body() {
         proposer.finalized.is_empty(),
         "the proposer must refuse to execute a body that no longer matches the decided hash"
     );
-    assert_eq!(proposer.state_root().await, root_before, "nothing may have been applied");
+    assert_eq!(
+        proposer.state_root().await,
+        root_before,
+        "nothing may have been applied"
+    );
 }
 
 #[tokio::test]
@@ -373,8 +455,11 @@ async fn persisted_pool_roundtrip_reseals_on_restore() {
 
     let mut mp = Mempool::new(16, 16);
     mp.add(tx.clone()).unwrap();
-    let path =
-        std::env::temp_dir().join(format!("stell_mev_mempool_{}_{}.bin", std::process::id(), 1));
+    let path = std::env::temp_dir().join(format!(
+        "stell_mev_mempool_{}_{}.bin",
+        std::process::id(),
+        1
+    ));
     mp.save(&path);
     assert!(path.exists(), "pool with pending txs must persist");
 
@@ -415,7 +500,9 @@ async fn cluster_finalizes_normally_with_sealing_and_commitments_active() {
         seed(&n.state, from).await;
     }
     for h in 0..3u64 {
-        cluster.broadcast_tx(Transaction::sign(&user, [9u8; 32], 1_000, 0, h, 1, 1)).await;
+        cluster
+            .broadcast_tx(Transaction::sign(&user, [9u8; 32], 1_000, 0, h, 1, 1))
+            .await;
         cluster.run_height(1_000 + h).await;
         for n in &cluster.nodes {
             assert_eq!(n.finalized.last().unwrap().0, h + 1, "every node finalizes");

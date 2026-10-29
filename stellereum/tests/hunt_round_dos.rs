@@ -21,14 +21,14 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::sync::Arc;
 use stellereum::consensus::{
-    HeightConsensus, ROUND_LOOKBACK, ValidatorId, ValidatorSet, Vote, VoteKind, MAX_ROUND_AHEAD,
+    HeightConsensus, ValidatorId, ValidatorSet, Vote, VoteKind, MAX_ROUND_AHEAD, ROUND_LOOKBACK,
 };
-use stellereum::consensus_net::{ConsensusMsg, parse_incoming};
+use stellereum::consensus_net::{parse_incoming, ConsensusMsg};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
-use std::sync::Arc;
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
@@ -53,11 +53,15 @@ impl VictimLoop {
     /// `msg` is what came off the wire. Mirrors main.rs's `while let Ok(raw) = rx.try_recv()`.
     fn on_wire(&mut self, msg: &ConsensusMsg) {
         match msg {
-            ConsensusMsg::Proposal { round: r, block, .. } => {
+            ConsensusMsg::Proposal {
+                round: r, block, ..
+            } => {
                 // main.rs:417 -- happens unconditionally, before any validation
                 self.hc.advance_to_round(*r);
                 // main.rs:421 -- validation happens only AFTER the round moved
-                let _ = self.hc.receive_proposal(block.proposer, block.compute_hash());
+                let _ = self
+                    .hc
+                    .receive_proposal(block.proposer, block.compute_hash());
             }
             ConsensusMsg::Vote { vote: v, .. } => {
                 // main.rs:442 -- happens unconditionally, before v.verify()
@@ -140,7 +144,10 @@ fn hunt_finding_1_unauthenticated_datagrams_cannot_buy_rounds() {
         v.on_wire(&parsed);
     }
 
-    println!("[FINDING 1] after {datagrams} unauthenticated datagrams: round = {}", v.hc.round);
+    println!(
+        "[FINDING 1] after {datagrams} unauthenticated datagrams: round = {}",
+        v.hc.round
+    );
     assert_eq!(
         v.hc.round as usize, datagrams,
         "one round per datagram, never 1000 per datagram"
@@ -170,13 +177,11 @@ fn hunt_finding_1b_honest_proposers_are_still_accepted() {
 
     // 20 forged datagrams, as in the original attack.
     for i in 0..20u32 {
-        v.on_wire(
-            &ConsensusMsg::Proposal {
-                height: 1,
-                round: 10_000 + i,
-                block: garbage_block(1),
-            },
-        );
+        v.on_wire(&ConsensusMsg::Proposal {
+            height: 1,
+            round: 10_000 + i,
+            block: garbage_block(1),
+        });
     }
     let victim_round = v.hc.round;
     println!("[FINDING 1b] victim round = {victim_round} (was 0)");
@@ -192,8 +197,7 @@ fn hunt_finding_1b_honest_proposers_are_still_accepted() {
     // victim. What must remain true is that at the round the victim is actually
     // in, the honest proposer for THAT round is accepted.
     let honest_proposer = vs.proposer_for(1, victim_round).unwrap();
-    v.hc
-        .receive_proposal(honest_proposer, bh(victim_round as u8))
+    v.hc.receive_proposal(honest_proposer, bh(victim_round as u8))
         .expect("FIXED: the honest proposer for the victim's own round is accepted");
     println!("[FINDING 1b] FIXED: the victim still follows the network at round {victim_round}");
 }
@@ -217,23 +221,19 @@ fn hunt_finding_1c_quorum_at_the_victims_round_now_finalises() {
     };
 
     for i in 0..20u32 {
-        v.on_wire(
-            &ConsensusMsg::Proposal {
-                height: 1,
-                round: 10_000 + i,
-                block: garbage_block(1),
-            },
-        );
+        v.on_wire(&ConsensusMsg::Proposal {
+            height: 1,
+            round: 10_000 + i,
+            block: garbage_block(1),
+        });
     }
     let r = v.hc.round;
     let proposer = vs.proposer_for(1, r).unwrap();
-    v.hc
-        .receive_proposal(proposer, bh(r as u8))
+    v.hc.receive_proposal(proposer, bh(r as u8))
         .expect("honest proposal for the victim's own round is accepted");
 
     for k in ks.iter() {
-        v.hc
-            .add_prevote(Vote::sign(k, 1, r, VoteKind::Prevote, Some(bh(r as u8))))
+        v.hc.add_prevote(Vote::sign(k, 1, r, VoteKind::Prevote, Some(bh(r as u8))))
             .unwrap();
     }
     assert!(
@@ -241,16 +241,17 @@ fn hunt_finding_1c_quorum_at_the_victims_round_now_finalises() {
         "a real 4/4 prevote quorum is visible at the round the node is in"
     );
     for k in ks.iter() {
-        v.hc
-            .add_precommit(Vote::sign(k, 1, r, VoteKind::Precommit, Some(bh(r as u8))))
+        v.hc.add_precommit(Vote::sign(k, 1, r, VoteKind::Precommit, Some(bh(r as u8))))
             .unwrap();
     }
-    let qc = v
-        .hc
-        .try_precommit_quorum()
-        .expect("FIXED: the chain finalises again");
+    let qc =
+        v.hc.try_precommit_quorum()
+            .expect("FIXED: the chain finalises again");
     assert_eq!(qc, bh(r as u8), "the QC commits to the agreed block");
-    println!("[FINDING 1c] FIXED: recovery is operational at round {r}, QC = {}", hex::encode(&qc[..4]));
+    println!(
+        "[FINDING 1c] FIXED: recovery is operational at round {r}, QC = {}",
+        hex::encode(&qc[..4])
+    );
 }
 
 // ===========================================================================
@@ -268,7 +269,11 @@ fn hunt_finding_1e_next_round_saturates_at_u32_max() {
     hc.advance_to_round(u32::MAX);
     assert_eq!(hc.round, u32::MAX, "advance_to_round must reach u32::MAX");
     hc.advance_to_round(u32::MAX);
-    assert_eq!(hc.round, u32::MAX, "advance_to_round must saturate at u32::MAX");
+    assert_eq!(
+        hc.round,
+        u32::MAX,
+        "advance_to_round must saturate at u32::MAX"
+    );
     println!("[FINDING 1e] reached u32::MAX; round = {}", hc.round);
 
     // src/consensus.rs used to do `self.round += 1`, which panicked in debug and
@@ -361,7 +366,14 @@ async fn hunt_finding_f2_junk_votes_never_move_the_round() {
     for i in 0..64u32 {
         let target_round = r + 64 + i;
         let v = if i % 2 == 0 {
-            Vote::signed_with(member, h, target_round, VoteKind::Prevote, None, vec![0u8; 64])
+            Vote::signed_with(
+                member,
+                h,
+                target_round,
+                VoteKind::Prevote,
+                None,
+                vec![0u8; 64],
+            )
         } else {
             Vote::sign(&outsider, h, target_round, VoteKind::Prevote, None)
         };
@@ -388,7 +400,10 @@ async fn hunt_finding_f2_verified_far_vote_still_syncs_bounded() {
     // budget (MAX_SYNC_JUMPS_PER_ROUND capped jumps of ROUND_LOOKBACK each):
     // the Tendermint future-round rule, with the round-DoS bound intact.
     let v = Vote::sign(&ks[1], h, r + 100, VoteKind::Prevote, None);
-    assert!(drain_vote(&mut rt, v, None), "verified far vote must be accepted");
+    assert!(
+        drain_vote(&mut rt, v, None),
+        "verified far vote must be accepted"
+    );
     assert_eq!(
         rt.hc.round,
         r + stellereum::consensus::MAX_SYNC_JUMPS_PER_ROUND * ROUND_LOOKBACK,
@@ -423,7 +438,10 @@ async fn hunt_finding_f2_batch_of_32_junk_votes_does_not_inflate() {
     if let ConsensusMsg::Batch(inner) = batch {
         for msg in inner {
             if let ConsensusMsg::Vote { vote, locked } = msg {
-                assert!(!drain_vote(&mut rt, vote, locked), "junk inner must not verify");
+                assert!(
+                    !drain_vote(&mut rt, vote, locked),
+                    "junk inner must not verify"
+                );
             }
         }
     }

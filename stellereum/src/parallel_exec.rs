@@ -139,10 +139,7 @@ pub fn extract_access_keys(tx: &Transaction) -> Vec<ResourceKey> {
                 keys.push(ResourceKey::Account(*to));
             }
             OpCode::SysCallTokenTransferFrom {
-                token_id,
-                from,
-                to,
-                ..
+                token_id, from, to, ..
             } => {
                 keys.push(ResourceKey::Token(*token_id));
                 keys.push(ResourceKey::Account(*from));
@@ -157,9 +154,7 @@ pub fn extract_access_keys(tx: &Transaction) -> Vec<ResourceKey> {
                 keys.push(ResourceKey::Account(*from));
             }
             OpCode::SysCallTokenApprove {
-                token_id,
-                spender,
-                ..
+                token_id, spender, ..
             } => {
                 keys.push(ResourceKey::Token(*token_id));
                 keys.push(ResourceKey::Account(*spender));
@@ -371,10 +366,7 @@ mod tests {
         let r1 = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         let r2 = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
 
-        let txs = vec![
-            make_transfer(&k1, r1, 0),
-            make_transfer(&k1, r2, 1),
-        ];
+        let txs = vec![make_transfer(&k1, r1, 0), make_transfer(&k1, r2, 1)];
 
         let waves = DisjointScheduler::schedule(&txs);
         assert_eq!(waves.len(), 2);
@@ -543,7 +535,9 @@ mod tests {
             &k2,
             [0u8; 32],
             0,
-            vec![OpCode::SysCallDeployContract { code: vec![0x00, 0x61, 0x73, 0x6d] }],
+            vec![OpCode::SysCallDeployContract {
+                code: vec![0x00, 0x61, 0x73, 0x6d],
+            }],
         );
         let tx2 = make_transfer(&k3, r3, 0);
 
@@ -659,7 +653,11 @@ mod tests {
         assert!(!keys.contains(&ResourceKey::Global));
 
         let waves = DisjointScheduler::schedule(&[tx0, tx1]);
-        assert_eq!(waves.len(), 1, "two different contracts must share one wave");
+        assert_eq!(
+            waves.len(),
+            1,
+            "two different contracts must share one wave"
+        );
         assert_eq!(waves[0], vec![0, 1]);
     }
 
@@ -793,7 +791,11 @@ mod tests {
         let tx2 = make_transfer(&k3, r3, 0);
 
         let waves = DisjointScheduler::schedule(&[tx0, tx1, tx2]);
-        assert_eq!(waves.len(), 1, "a per-resource key must not split the block");
+        assert_eq!(
+            waves.len(),
+            1,
+            "a per-resource key must not split the block"
+        );
         assert_eq!(waves[0], vec![0, 1, 2]);
         assert_eq!(wave_of(&waves, 0), Some(0));
     }

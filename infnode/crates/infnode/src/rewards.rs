@@ -120,9 +120,15 @@ async fn proof_verify(
 
     let mut pool: Vec<String> = Vec::new();
     for k in keys.iter() {
-        let Some(raw) = node.get_local_kv(k).await else { continue };
-        let Ok(manifest) = serde_json::from_str::<Value>(&raw) else { continue };
-        let Some(chunks) = manifest["chunks"].as_array() else { continue };
+        let Some(raw) = node.get_local_kv(k).await else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(chunks) = manifest["chunks"].as_array() else {
+            continue;
+        };
         if chunks.iter().any(|c| c["hash"].as_str().is_some()) {
             pool.push(k.clone());
         }
@@ -139,17 +145,27 @@ async fn proof_verify(
     let mut rng = rand::rngs::OsRng;
     use rand::Rng;
     for k in pool.iter().take(max_challenges) {
-        let Some(raw) = node.get_local_kv(k).await else { continue };
-        let Ok(manifest) = serde_json::from_str::<Value>(&raw) else { continue };
-        let Some(chunks) = manifest["chunks"].as_array() else { continue };
+        let Some(raw) = node.get_local_kv(k).await else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(chunks) = manifest["chunks"].as_array() else {
+            continue;
+        };
         if chunks.is_empty() {
             continue;
         }
         // случайный чанк (крипто-random)
         let idx = rng.gen_range(0..chunks.len());
         let c = &chunks[idx];
-        let Some(cid) = c["id"].as_str() else { continue };
-        let Some(expected) = c["hash"].as_str() else { continue };
+        let Some(cid) = c["id"].as_str() else {
+            continue;
+        };
+        let Some(expected) = c["hash"].as_str() else {
+            continue;
+        };
         let bucket = manifest["bucket"].as_str().unwrap_or("files");
         // ЧЕСТНОСТЬ: засчитываем размер РЕАЛЬНО проверенного чанка (c["len"]),
         // а не весь манифест. Раньше нода, хранящая 1 чанк из 10-чанкового письма,
@@ -157,19 +173,26 @@ async fn proof_verify(
         let chunk_len = c["len"].as_u64().unwrap_or(0);
 
         res.total += 1;
-        let payload = json!({ "bucket": bucket, "chunk_id": cid }).to_string().into_bytes();
+        let payload = json!({ "bucket": bucket, "chunk_id": cid })
+            .to_string()
+            .into_bytes();
         let got = timeout(
             Duration::from_secs(REQ_TIMEOUT_SECS),
             node.request_to(pid, "storage.fetch", payload),
         )
         .await;
         let Ok(Ok(resp)) = got else { continue };
-        let Ok(v) = serde_json::from_slice::<Value>(&resp) else { continue };
+        let Ok(v) = serde_json::from_slice::<Value>(&resp) else {
+            continue;
+        };
         if !v["ok"].as_bool().unwrap_or(false) {
             continue;
         }
-        let Some(b64) = v["data"].as_str() else { continue };
-        let Ok(data) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64) else {
+        let Some(b64) = v["data"].as_str() else {
+            continue;
+        };
+        let Ok(data) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+        else {
             continue;
         };
         let actual = hex::encode(blake3::hash(&data).as_bytes());
@@ -266,8 +289,15 @@ pub async fn run(node: &Arc<Node>, data_dir: &Path) -> Result<()> {
             new_state.insert(key.clone(), json!({ "events": ev }));
 
             let total = ev.len() as f64;
-            let ok_n = ev.iter().filter(|e| e[1].as_bool().unwrap_or(false)).count();
-            let ratio = if total > 0.0 { ok_n as f64 / total } else { 0.0 };
+            let ok_n = ev
+                .iter()
+                .filter(|e| e[1].as_bool().unwrap_or(false))
+                .count();
+            let ratio = if total > 0.0 {
+                ok_n as f64 / total
+            } else {
+                0.0
+            };
 
             // Proof-of-storage: валидатор проверяет реальное хранение (челленджи по чанкам
             // из своих манифестов), а не доверяет самооценке ноды (core.storage убран).
@@ -317,9 +347,9 @@ pub async fn run(node: &Arc<Node>, data_dir: &Path) -> Result<()> {
             // оплате каждого чанка максимум RF раз (не линейно от числа одинаковых копий).
             let rf_verified = rf_bytes[i];
             // сбалансированный вес: сглаженный RF-ограниченный объём × (пол + доля аптайма)
-            let weight =
-                (smoothed_bytes(rf_verified) * (UPTIME_WEIGHT_FLOOR + (1.0 - UPTIME_WEIGHT_FLOOR) * ratio))
-                    .round() as u64;
+            let weight = (smoothed_bytes(rf_verified)
+                * (UPTIME_WEIGHT_FLOOR + (1.0 - UPTIME_WEIGHT_FLOOR) * ratio))
+                .round() as u64;
 
             nodes.push(json!({
                 // имя: для автодобавленных нод — короткий hex id (у конфигурированных есть name,
@@ -472,7 +502,10 @@ mod tests {
         assert!(a_nt > b_nt, "A should get more (higher weight)");
         // сумма не превышает пул
         assert!(all <= pool_nt as u64, "pool overspend");
-        println!("OK: val={} a={} b={} all={} pool={}", validator_nt, a_nt, b_nt, all, pool_nt as u64);
+        println!(
+            "OK: val={} a={} b={} all={} pool={}",
+            validator_nt, a_nt, b_nt, all, pool_nt as u64
+        );
     }
 
     /// Честный proof: размер проверенного чанка, а не манифеста.
@@ -525,8 +558,13 @@ mod tests {
             total,
             unique_bytes * n as u64
         );
-        println!("OK: 100 copies -> total {} = unique {} × RF {} (not ×100 = {})",
-            total, unique_bytes, RF, unique_bytes * n as u64);
+        println!(
+            "OK: 100 copies -> total {} = unique {} × RF {} (not ×100 = {})",
+            total,
+            unique_bytes,
+            RF,
+            unique_bytes * n as u64
+        );
     }
 
     /// RF-лимит учитывает разные наборы чанков: если нода хранит УНИКАЛЬНЫЙ чанк,
@@ -535,10 +573,8 @@ mod tests {
     fn rf_limit_respects_unique_chunks() {
         // нода A хранит c1; ноды B и C хранят тот же c1 + каждый свой уникальный c2/c3
         let chunks_a: Vec<(String, u64)> = vec![("c1".to_string(), 1000)];
-        let chunks_b: Vec<(String, u64)> =
-            vec![("c1".to_string(), 1000), ("c2".to_string(), 500)];
-        let chunks_c: Vec<(String, u64)> =
-            vec![("c1".to_string(), 1000), ("c3".to_string(), 700)];
+        let chunks_b: Vec<(String, u64)> = vec![("c1".to_string(), 1000), ("c2".to_string(), 500)];
+        let chunks_c: Vec<(String, u64)> = vec![("c1".to_string(), 1000), ("c3".to_string(), 700)];
         let nodes = vec![
             (chunks_a.as_slice(), 1.0),
             (chunks_b.as_slice(), 1.0),
@@ -573,7 +609,6 @@ mod tests {
 
 #[cfg(test)]
 mod tests_split {
-    
 
     /// Комиссия валидаторов делится ПОРОВНУ между основным + суб.
     #[test]
@@ -581,7 +616,7 @@ mod tests_split {
         let pool_nt: f64 = 1_000_000_000.0; // 1 TON
         let fee: f64 = 30.0;
         let validator_nt = (pool_nt * fee / 100.0).floor() as u64; // 300M
-        // 3 валидатора (основной + 2 суб)
+                                                                   // 3 валидатора (основной + 2 суб)
         let n_val = 3usize;
         let share_each = (validator_nt as f64 / n_val as f64).floor() as u64; // 100M
         assert_eq!(share_each, 100_000_000, "each validator should get 100M");
@@ -590,6 +625,9 @@ mod tests_split {
         // нодам остаётся >=70%
         let nodes_pool = (pool_nt - validator_nt as f64).max(0.0) as u64;
         assert!(nodes_pool as f64 / pool_nt >= 0.69);
-        println!("OK: 3 validators by {} nt, nodes {}", share_each, nodes_pool);
+        println!(
+            "OK: 3 validators by {} nt, nodes {}",
+            share_each, nodes_pool
+        );
     }
 }

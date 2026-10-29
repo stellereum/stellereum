@@ -14,15 +14,14 @@
 //!   снапшотов (`refresh_validator_set_from_domain_bytes`).
 
 use ed25519_dalek::SigningKey;
+use std::sync::Arc;
 use stellereum::consensus::ValidatorSet;
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::storage::{
     check_validator_set_freshness_with_lag, decode_domain_snapshot,
-    validator_set_freshness_max_lag, DomainSnapshot, Storage,
-    VALIDATOR_SET_FRESHNESS_DEFAULT_LAG,
+    validator_set_freshness_max_lag, DomainSnapshot, Storage, VALIDATOR_SET_FRESHNESS_DEFAULT_LAG,
 };
-use std::sync::Arc;
 
 fn test_key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -70,9 +69,8 @@ fn freshness_pure_gate_flags_stale_and_ahead() {
     assert!(check_validator_set_freshness_with_lag(92072, 91800, 300).is_ok());
     // Граница: lag == max — ещё свежо; lag == max+1 — STALE.
     assert!(check_validator_set_freshness_with_lag(1000, 700, 300).is_ok());
-    let err = check_validator_set_freshness_with_lag(92072, 81821 - 1, 300).expect_err(
-        "ledger 81820 при state 92072 отстаёт на 10252 — обязан быть STALE",
-    );
+    let err = check_validator_set_freshness_with_lag(92072, 81821 - 1, 300)
+        .expect_err("ledger 81820 при state 92072 отстаёт на 10252 — обязан быть STALE");
     assert!(err.contains("STALE"), "громкий WARN-маркер, got: {err}");
     // Леджер ВПЕРЕДИ стейта — тоже отказ (порча меток), никогда не доверять.
     let ahead = check_validator_set_freshness_with_lag(100, 200, 300)
@@ -122,7 +120,9 @@ async fn restore_with_stale_ledger_warns_and_fails_closed_to_observer() {
     );
     // Протухший сет НЕ подменил текущий (кворумы не считаются по-чужому).
     assert!(
-        !rt.validators.validators.contains_key(&kc.verifying_key().to_bytes()),
+        !rt.validators
+            .validators
+            .contains_key(&kc.verifying_key().to_bytes()),
         "чужой ключ C не должен проникнуть из свежего будущего; сет не тронут"
     );
 }
@@ -155,17 +155,18 @@ async fn fresh_ledger_installs_set_and_keeps_franchise() {
         .expect("свежий сет обязан быть застейджен, а не установлен сразу");
     assert_eq!(activation, 92_001, "активация — следующий хайт за леджером");
     assert!(
-        staged.validators.contains_key(&kc.verifying_key().to_bytes()),
+        staged
+            .validators
+            .contains_key(&kc.verifying_key().to_bytes()),
         "C обязан появиться в застейдженном сете"
     );
     assert!(
-        !rt.validators.validators.contains_key(&kc.verifying_key().to_bytes()),
+        !rt.validators
+            .validators
+            .contains_key(&kc.verifying_key().to_bytes()),
         "in-force сет не двигается до границы активации"
     );
-    assert!(
-        rt.effective_can_vote(true),
-        "со свежим сетом франшиза жива"
-    );
+    assert!(rt.effective_can_vote(true), "со свежим сетом франшиза жива");
 }
 
 #[tokio::test]
@@ -189,7 +190,10 @@ async fn set_only_refresh_from_fresh_domains_repairs_stale_node() {
     let bytes = bincode::serialize(&snap).unwrap();
     // Снапшот обязан декодироваться тем же путём, что и сетевой блоб.
     let decoded = decode_domain_snapshot(&bytes).unwrap();
-    assert!(decoded.staking.validators.contains_key(&kc.verifying_key().to_bytes()));
+    assert!(decoded
+        .staking
+        .validators
+        .contains_key(&kc.verifying_key().to_bytes()));
 
     let installed = rt
         .refresh_validator_set_from_domain_bytes(&bytes, 92_072, 92_050)

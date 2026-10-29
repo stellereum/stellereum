@@ -79,7 +79,15 @@ fn linear_vesting_boundaries_are_exact() {
     assert_eq!(s.unlocked_amount(u64::MAX), 2_000);
     assert_eq!(s.locked_amount(u64::MAX), 0);
     // locked + unlocked == total at every sampled point.
-    for t in [T0, T0 + 999, T0 + 1_000, T0 + 1_500, T0 + 2_999, T0 + 3_000, T0 + 99_999] {
+    for t in [
+        T0,
+        T0 + 999,
+        T0 + 1_000,
+        T0 + 1_500,
+        T0 + 2_999,
+        T0 + 3_000,
+        T0 + 99_999,
+    ] {
         assert_eq!(
             s.locked_amount(t) + s.unlocked_amount(t),
             2_000,
@@ -94,7 +102,10 @@ fn default_schedule_has_the_documented_shape() {
     assert_eq!(s.total_allocation, 100_000_000 * STELL);
     assert_eq!(s.cliff_duration_secs, 12 * 30 * 86400);
     assert_eq!(s.vesting_duration_secs, 24 * 30 * 86400);
-    assert_eq!(s.unlocked_amount(s.start_timestamp + s.cliff_duration_secs - 1), 0);
+    assert_eq!(
+        s.unlocked_amount(s.start_timestamp + s.cliff_duration_secs - 1),
+        0
+    );
     assert_eq!(
         s.unlocked_amount(s.start_timestamp + s.cliff_duration_secs + s.vesting_duration_secs),
         s.total_allocation
@@ -105,7 +116,7 @@ fn default_schedule_has_the_documented_shape() {
 fn spend_and_claim_helpers_fail_closed() {
     let mut s = sched(2_000);
     let half = T0 + 1_000 + 1_000; // unlocked == 1_000
-    // Spending within claimable passes; above it fails and changes nothing.
+                                   // Spending within claimable passes; above it fails and changes nothing.
     assert!(s.check_spend_allowed(half, 1_000).is_ok());
     assert!(s.check_spend_allowed(half, 1_001).is_err());
     assert!(s.check_balance_floor(half, 1_000).is_ok());
@@ -115,7 +126,10 @@ fn spend_and_claim_helpers_fail_closed() {
     assert_eq!(s.claimed_amount, 400);
     assert_eq!(s.claimable_amount(half), 600);
     assert!(s.record_claim(half, 601).is_err());
-    assert_eq!(s.claimed_amount, 400, "failed claim must not advance the counter");
+    assert_eq!(
+        s.claimed_amount, 400,
+        "failed claim must not advance the counter"
+    );
     s.record_claim(half, 600).expect("exact claimable");
     assert_eq!(s.claimable_amount(half), 0);
 }
@@ -133,7 +147,8 @@ fn registry_validation_is_fail_closed() {
     zero.total_allocation = 0;
     assert!(l.register_team_vesting(team_addr(), zero).is_err());
     // First registration succeeds; a duplicate is refused (rotate via unregister).
-    l.register_team_vesting(team_addr(), sched(2_000)).expect("register");
+    l.register_team_vesting(team_addr(), sched(2_000))
+        .expect("register");
     assert!(l.register_team_vesting(team_addr(), sched(2_000)).is_err());
     assert!(l.vesting_schedule_of(&team_addr()).is_some());
     assert!(l.vesting_schedule_of(&[9u8; 32]).is_none());
@@ -142,8 +157,12 @@ fn registry_validation_is_fail_closed() {
     assert!(l.check_vesting_balance_floor(&[9u8; 32], T0, 0).is_ok());
     // Tracked floor follows the schedule.
     assert_eq!(l.vesting_locked_floor_of(&team_addr(), T0), 2_000);
-    assert!(l.check_vesting_balance_floor(&team_addr(), T0, 2_000).is_ok());
-    assert!(l.check_vesting_balance_floor(&team_addr(), T0, 1_999).is_err());
+    assert!(l
+        .check_vesting_balance_floor(&team_addr(), T0, 2_000)
+        .is_ok());
+    assert!(l
+        .check_vesting_balance_floor(&team_addr(), T0, 1_999)
+        .is_err());
     // Unregister is idempotent and removes the gate.
     assert!(l.unregister_team_vesting(&team_addr()));
     assert!(!l.unregister_team_vesting(&team_addr()));
@@ -156,7 +175,9 @@ fn registry_validation_is_fail_closed() {
 
 async fn funded_tracked_engine(total: u64) -> InMemoryStateEngine {
     let e = InMemoryStateEngine::new();
-    e.credit_native(&team_addr(), total).await.expect("fund team");
+    e.credit_native(&team_addr(), total)
+        .await
+        .expect("fund team");
     e.credit_native(&other_key().verifying_key().to_bytes(), 10 * STELL)
         .await
         .expect("fund other");
@@ -172,8 +193,14 @@ async fn locked_spend_is_refused_and_moves_nothing() {
     let e = funded_tracked_engine(2_000).await;
     // Pre-cliff: locked == total, so ANY debit (here 100 nano + 0 fee) fails.
     let tx = plain(&team_key(), [0xABu8; 32], 100, 0, 0);
-    let err = e.apply_transaction(&tx, T0).await.expect_err("locked spend must fail");
-    assert!(err.contains("vesting"), "fail-closed reason must name the lock: {err}");
+    let err = e
+        .apply_transaction(&tx, T0)
+        .await
+        .expect_err("locked spend must fail");
+    assert!(
+        err.contains("vesting"),
+        "fail-closed reason must name the lock: {err}"
+    );
     let sender = e.get_account(&team_addr()).await.expect("sender exists");
     assert_eq!(sender.balance, 2_000, "refused spend moves no funds");
     assert_eq!(sender.nonce, 0, "refused spend consumes no nonce");
@@ -184,7 +211,9 @@ async fn unlocked_spend_passes_after_full_vesting() {
     let e = funded_tracked_engine(2_000).await;
     let done = T0 + 1_000 + 2_000;
     let tx = plain(&team_key(), [0xABu8; 32], 1_500, 0, 0);
-    e.apply_transaction(&tx, done).await.expect("fully unlocked spend passes");
+    e.apply_transaction(&tx, done)
+        .await
+        .expect("fully unlocked spend passes");
     assert_eq!(e.get_account(&team_addr()).await.unwrap().balance, 500);
 }
 
@@ -192,7 +221,7 @@ async fn unlocked_spend_passes_after_full_vesting() {
 async fn partial_unlock_boundary_is_exact_and_cumulative() {
     let e = funded_tracked_engine(2_000).await;
     let half = T0 + 1_000 + 1_000; // unlocked == 1_000, locked == 1_000
-    // Spend exactly the unlocked half: balance_after == locked passes.
+                                   // Spend exactly the unlocked half: balance_after == locked passes.
     e.apply_transaction(&plain(&team_key(), [0xABu8; 32], 1_000, 0, 0), half)
         .await
         .expect("exact-unlocked spend passes");
@@ -212,7 +241,7 @@ async fn partial_unlock_boundary_is_exact_and_cumulative() {
 async fn fees_count_toward_the_locked_floor() {
     let e = funded_tracked_engine(2_000).await;
     let half = T0 + 1_000 + 1_000; // locked == 1_000
-    // Amount alone fits, but amount + fee would breach the floor: refused.
+                                   // Amount alone fits, but amount + fee would breach the floor: refused.
     let err = e
         .apply_transaction(&plain(&team_key(), [0xABu8; 32], 1_000, 10, 0), half)
         .await
@@ -227,15 +256,17 @@ async fn untracked_accounts_are_unaffected() {
     e.apply_transaction(&plain(&other_key(), [0xCDu8; 32], 1_000, 0, 0), T0)
         .await
         .expect("untracked spend always passes");
-    assert_eq!(e.get_account(&other).await.unwrap().balance, 10 * STELL - 1_000);
+    assert_eq!(
+        e.get_account(&other).await.unwrap().balance,
+        10 * STELL - 1_000
+    );
 }
 
 #[tokio::test]
 async fn block_path_refuses_locked_spend() {
     let e = funded_tracked_engine(2_000).await;
     let tx = plain(&team_key(), [0xABu8; 32], 100, 0, 0);
-    let (applied, failed, _fees, status, _) =
-        e.apply_block_parallel_fees(&[tx], T0).await;
+    let (applied, failed, _fees, status, _) = e.apply_block_parallel_fees(&[tx], T0).await;
     assert_eq!((applied, failed), (0, 1));
     assert_eq!(status, vec![false]);
     assert_eq!(e.get_account(&team_addr()).await.unwrap().balance, 2_000);
@@ -259,9 +290,12 @@ async fn parallel_plain_fast_path_refuses_locked_spend() {
     let c = [0xCCu8; 32];
     let tx0 = Transaction::sign(&a_key, b, 500, 0, 0, 1, 1); // inbound to B: allowed
     let tx1 = Transaction::sign(&b_key, c, 1_500, 0, 0, 1, 1); // B spends locked funds: refused
-    let (applied, failed, _fees, status, _) =
-        e.apply_block_parallel_fees(&[tx0, tx1], T0).await;
-    assert_eq!(status, vec![true, false], "inbound applies, locked spend refused");
+    let (applied, failed, _fees, status, _) = e.apply_block_parallel_fees(&[tx0, tx1], T0).await;
+    assert_eq!(
+        status,
+        vec![true, false],
+        "inbound applies, locked spend refused"
+    );
     assert_eq!((applied, failed), (1, 1));
     assert_eq!(
         e.get_account(&b).await.unwrap().balance,

@@ -46,15 +46,22 @@ fn fund_inputs(state: &mut ConfidentialState, tx: &ConfidentialTransfer) {
 /// `v_a - v_b` — exact group arithmetic, so the balance equation still holds
 /// while the result encodes a NEGATIVE value no range proof can cover.
 fn sub_commitment(a: &PedersenCommitment, b: &PedersenCommitment) -> PedersenCommitment {
-    let pa = CompressedRistretto(a.commitment).decompress().expect("valid point");
-    let pb = CompressedRistretto(b.commitment).decompress().expect("valid point");
+    let pa = CompressedRistretto(a.commitment)
+        .decompress()
+        .expect("valid point");
+    let pb = CompressedRistretto(b.commitment)
+        .decompress()
+        .expect("valid point");
     PedersenCommitment {
         commitment: (pa - pb).compress().to_bytes(),
     }
 }
 
 fn assert_pristine(state: &ConfidentialState) {
-    assert!(state.spent.is_empty(), "rejection must not touch the spent set");
+    assert!(
+        state.spent.is_empty(),
+        "rejection must not touch the spent set"
+    );
     assert_eq!(state.total_fees, 0, "rejection must not advance fees");
 }
 
@@ -192,7 +199,13 @@ fn missing_proof_rejected() {
             Err(ConfidentialError::MissingRangeProof)
         );
         assert_eq!(
-            state.apply_transfer_with_ranges(&SENDER, &RECIPIENT, &tx, &[], std::slice::from_ref(&p_out)),
+            state.apply_transfer_with_ranges(
+                &SENDER,
+                &RECIPIENT,
+                &tx,
+                &[],
+                std::slice::from_ref(&p_out)
+            ),
             Err(ConfidentialError::MissingRangeProof)
         );
         assert_pristine(&state);

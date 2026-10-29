@@ -60,12 +60,7 @@ pub struct LightClientOptions {
 }
 
 /// One JSON-RPC call over the vendored blocking HTTP client.
-fn rpc_call(
-    url: &str,
-    method: &str,
-    params: Value,
-    verbose: bool,
-) -> anyhow::Result<Value> {
+fn rpc_call(url: &str, method: &str, params: Value, verbose: bool) -> anyhow::Result<Value> {
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
     if verbose {
         eprintln!("  rpc -> {method}");
@@ -82,9 +77,13 @@ fn rpc_call(
 
 /// Parse a 32-byte hex string (with or without `0x`).
 fn parse_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     let b = hex::decode(s).map_err(|e| anyhow::anyhow!("bad hex {s:?}: {e}"))?;
-    b.try_into().map_err(|_| anyhow::anyhow!("expected 32 bytes, got {}", s.len() / 2))
+    b.try_into()
+        .map_err(|_| anyhow::anyhow!("expected 32 bytes, got {}", s.len() / 2))
 }
 
 /// Load the OUT-OF-BAND validator set.
@@ -102,10 +101,15 @@ fn parse_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
 /// from the server at verification time is circular — the server would be
 /// able to certify its own chain.
 pub fn load_validator_set(path: &Path) -> anyhow::Result<ValidatorSet> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("cannot read the validator set file {}: {e}", path.display()))?;
-    let v: Value = serde_json::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("the validator set file {} is not valid JSON: {e}", path.display()))?;
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        anyhow::anyhow!("cannot read the validator set file {}: {e}", path.display())
+    })?;
+    let v: Value = serde_json::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!(
+            "the validator set file {} is not valid JSON: {e}",
+            path.display()
+        )
+    })?;
     let entries: Vec<Value> = match &v {
         Value::Object(map) => map
             .get("validators")
@@ -138,9 +142,7 @@ pub fn load_validator_set(path: &Path) -> anyhow::Result<ValidatorSet> {
                     .or_else(|| e.get("pubkey"))
                     .or_else(|| e.get("id"))
                     .and_then(|x| x.as_str())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("validator entry {i} has no pubkey")
-                    })?;
+                    .ok_or_else(|| anyhow::anyhow!("validator entry {i} has no pubkey"))?;
                 let p = e
                     .get("power")
                     .or_else(|| e.get("stake"))
@@ -150,8 +152,8 @@ pub fn load_validator_set(path: &Path) -> anyhow::Result<ValidatorSet> {
             }
             _ => return Err(anyhow::anyhow!("validator entry {i} is malformed")),
         };
-        let id: ValidatorId = parse_hex32(&id_hex)
-            .map_err(|e| anyhow::anyhow!("validator entry {i}: {e}"))?;
+        let id: ValidatorId =
+            parse_hex32(&id_hex).map_err(|e| anyhow::anyhow!("validator entry {i}: {e}"))?;
         let power: u64 = match power {
             Value::Number(n) => n.as_u64().ok_or_else(|| {
                 anyhow::anyhow!("validator entry {i}: the power is not an unsigned integer")
@@ -159,7 +161,11 @@ pub fn load_validator_set(path: &Path) -> anyhow::Result<ValidatorSet> {
             Value::String(s) => s.trim().parse::<u64>().map_err(|e| {
                 anyhow::anyhow!("validator entry {i}: the power {s:?} is not a number: {e}")
             })?,
-            _ => return Err(anyhow::anyhow!("validator entry {i}: the power is not a number")),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "validator entry {i}: the power is not a number"
+                ))
+            }
         };
         set.add(id, power);
     }

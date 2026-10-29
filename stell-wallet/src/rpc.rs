@@ -35,10 +35,7 @@ pub enum TxFinality {
         index: u64,
     },
     /// Finalized but FAILED (receipt `success == false`), or otherwise dead.
-    Failed {
-        height: Option<u64>,
-        detail: String,
-    },
+    Failed { height: Option<u64>, detail: String },
     /// Node has never seen this hash (not in mempool, no receipt).
     Unknown,
 }
@@ -107,7 +104,9 @@ pub fn parse_http_url(url: &str) -> Result<(String, String), String> {
     } else if let Some(r) = url.strip_prefix("https://") {
         r
     } else {
-        return Err(format!("only http:// and https:// URLs are supported, got {url:?}"));
+        return Err(format!(
+            "only http:// and https:// URLs are supported, got {url:?}"
+        ));
     };
     let (host_port, path) = match rest.find('/') {
         Some(i) => (rest[..i].to_string(), rest[i..].to_string()),
@@ -204,11 +203,7 @@ fn http_post(url: &str, body: &str, api_token: Option<&str>) -> Result<String, S
 
 /// Single JSON-RPC call. Returns the `result` field, or the node's
 /// `error.message` as `Err`.
-pub fn rpc_call(
-    cfg: &RpcConfig,
-    method: &str,
-    params: Value,
-) -> Result<Value, String> {
+pub fn rpc_call(cfg: &RpcConfig, method: &str, params: Value) -> Result<Value, String> {
     static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let body = build_jsonrpc_body(method, &params, id);
@@ -278,14 +273,25 @@ pub struct RpcBlockTx {
 /// `stell_latestBlocks` -> list of latest blocks
 pub fn latest_blocks(cfg: &RpcConfig) -> Result<Vec<RpcBlockSummary>, String> {
     let v = rpc_call(cfg, "stell_latestBlocks", serde_json::json!({}))?;
-    let arr = v.as_array().ok_or_else(|| format!("node returned non-array latestBlocks: {v}"))?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| format!("node returned non-array latestBlocks: {v}"))?;
     let mut list = Vec::new();
     for item in arr {
         let height = item.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
-        let hash = item.get("hash").and_then(|h| h.as_str()).unwrap_or("").to_string();
+        let hash = item
+            .get("hash")
+            .and_then(|h| h.as_str())
+            .unwrap_or("")
+            .to_string();
         let txs = item.get("txs").and_then(|t| t.as_u64()).unwrap_or(0);
         let timestamp = item.get("timestamp").and_then(|t| t.as_u64()).unwrap_or(0);
-        list.push(RpcBlockSummary { height, hash, txs, timestamp });
+        list.push(RpcBlockSummary {
+            height,
+            hash,
+            txs,
+            timestamp,
+        });
     }
     Ok(list)
 }
@@ -298,15 +304,42 @@ pub fn get_block_transactions(cfg: &RpcConfig, height: u64) -> Result<Vec<RpcBlo
         serde_json::json!({ "height": height }),
     )?;
     let txs_val = v.get("txs").unwrap_or(&v);
-    let arr = txs_val.as_array().ok_or_else(|| format!("node returned non-array block transactions: {v}"))?;
+    let arr = txs_val
+        .as_array()
+        .ok_or_else(|| format!("node returned non-array block transactions: {v}"))?;
     let mut list = Vec::new();
     for item in arr {
-        let tx_hash = item.get("tx_hash").and_then(|h| h.as_str()).unwrap_or("").to_string();
+        let tx_hash = item
+            .get("tx_hash")
+            .and_then(|h| h.as_str())
+            .unwrap_or("")
+            .to_string();
         let index = item.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
-        let status = item.get("status").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        let gas_limit = item.get("gas_limit").and_then(|g| g.as_str().map(String::from).or_else(|| g.as_u64().map(|n| n.to_string()))).unwrap_or_default();
-        let fee_charged = item.get("fee_charged").and_then(|f| f.as_str().map(String::from).or_else(|| f.as_u64().map(|n| n.to_string()))).unwrap_or_default();
-        let raw_tx = item.get("raw_tx").and_then(|r| r.as_str()).map(String::from);
+        let status = item
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let gas_limit = item
+            .get("gas_limit")
+            .and_then(|g| {
+                g.as_str()
+                    .map(String::from)
+                    .or_else(|| g.as_u64().map(|n| n.to_string()))
+            })
+            .unwrap_or_default();
+        let fee_charged = item
+            .get("fee_charged")
+            .and_then(|f| {
+                f.as_str()
+                    .map(String::from)
+                    .or_else(|| f.as_u64().map(|n| n.to_string()))
+            })
+            .unwrap_or_default();
+        let raw_tx = item
+            .get("raw_tx")
+            .and_then(|r| r.as_str())
+            .map(String::from);
         list.push(RpcBlockTx {
             tx_hash,
             index,
@@ -334,11 +367,20 @@ pub fn get_balance(cfg: &RpcConfig, address_hex: &str) -> Result<(u64, u64), Str
     let v = rpc_call(cfg, "stell_getBalance", serde_json::json!(address_hex))?;
     let bal = v
         .get("balance")
-        .and_then(|b| b.as_str().unwrap_or("").parse::<u64>().ok().or_else(|| b.as_u64()))
+        .and_then(|b| {
+            b.as_str()
+                .unwrap_or("")
+                .parse::<u64>()
+                .ok()
+                .or_else(|| b.as_u64())
+        })
         .ok_or_else(|| format!("node returned bad balance: {v}"))?;
     let nonce = v
         .get("nonce")
-        .and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse::<u64>().ok())))
+        .and_then(|n| {
+            n.as_u64()
+                .or_else(|| n.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
         .unwrap_or(0);
     Ok((bal, nonce))
 }
@@ -354,10 +396,7 @@ pub struct SpvAnswer {
     pub leaf_data: Option<Vec<u8>>,
 }
 
-pub fn get_balance_spv(
-    cfg: &RpcConfig,
-    address_hex: &str,
-) -> Result<SpvAnswer, String> {
+pub fn get_balance_spv(cfg: &RpcConfig, address_hex: &str) -> Result<SpvAnswer, String> {
     let v = rpc_call(
         cfg,
         "stell_getBalanceSpv",
@@ -367,13 +406,9 @@ pub fn get_balance_spv(
 }
 
 fn parse_hex32(hex_str: &str) -> Result<[u8; 32], String> {
-    let bytes =
-        hex::decode(hex_str).map_err(|e| format!("bad hex from node: {e}"))?;
+    let bytes = hex::decode(hex_str).map_err(|e| format!("bad hex from node: {e}"))?;
     if bytes.len() != 32 {
-        return Err(format!(
-            "bad 32-byte hash from node: {} bytes",
-            bytes.len()
-        ));
+        return Err(format!("bad 32-byte hash from node: {} bytes", bytes.len()));
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
@@ -391,7 +426,10 @@ fn parse_spv_answer(v: &Value) -> Result<SpvAnswer, String> {
         .ok_or_else(|| format!("node returned bad SPV balance: {v}"))?;
     let nonce = v
         .get("nonce")
-        .and_then(|n| n.as_u64().or_else(|| n.as_str().and_then(|s| s.parse::<u64>().ok())))
+        .and_then(|n| {
+            n.as_u64()
+                .or_else(|| n.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
         .unwrap_or(0);
     let root_hex = v
         .get("stateRoot")
@@ -436,10 +474,7 @@ pub enum SpvVerdict {
     Failed,
 }
 
-pub fn verify_spv_balance_answer(
-    address: &[u8; 32],
-    answer: &SpvAnswer,
-) -> SpvVerdict {
+pub fn verify_spv_balance_answer(address: &[u8; 32], answer: &SpvAnswer) -> SpvVerdict {
     let proof = match &answer.proof {
         Some(p) => p,
         None => {
@@ -598,9 +633,9 @@ pub struct TokenListAnswer {
 /// Parse the `{tokens, total, offset}` object shape. A bare array (the old
 /// shape) is rejected loudly so callers never misread it as "all tokens".
 pub fn parse_token_list_answer(v: &Value) -> Result<TokenListAnswer, String> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| format!("node returned bad token list (expected object with tokens/total/offset): {v}"))?;
+    let obj = v.as_object().ok_or_else(|| {
+        format!("node returned bad token list (expected object with tokens/total/offset): {v}")
+    })?;
     let tokens = obj
         .get("tokens")
         .and_then(|t| t.as_array())
@@ -647,10 +682,7 @@ pub fn list_tokens(cfg: &RpcConfig, limit: u64, offset: u64) -> Result<TokenList
 /// Submit a signed transaction (`bincode(Transaction)` hex) to the mempool.
 /// Returns the mempool tx hash hex. This is ADMISSION ONLY — finality must
 /// be established by polling the receipt (see `poll_receipt`).
-pub fn send_raw_transaction(
-    cfg: &RpcConfig,
-    tx_bincode_hex: &str,
-) -> Result<String, String> {
+pub fn send_raw_transaction(cfg: &RpcConfig, tx_bincode_hex: &str) -> Result<String, String> {
     let mut params = serde_json::json!({ "tx": tx_bincode_hex });
     if let Some(t) = &cfg.auth_token {
         params["token"] = serde_json::json!(t);

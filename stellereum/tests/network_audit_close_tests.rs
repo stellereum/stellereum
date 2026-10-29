@@ -12,14 +12,13 @@ use stellereum::bootstrap::{
 use stellereum::consensus::VoteKind;
 use stellereum::consensus_net::{
     broadcast_join_timeout_ms, committed_height_of, cons_bcast_min_interval_ms,
-    cons_probe_min_interval_ms, inbound_is_critical, join_should_dial, join_with_timeout,
-    pace_due, pace_wait_ms, parse_broadcast_join_timeout_ms, parse_probe_evict_after,
-    plan_peer_send, prioritize_inbound_for_verify, probe_evict_after,
-    probe_timeout_should_evict, InboundBulkLimiter, InboundDecision, SendPlan, VoteSendFilter,
+    cons_probe_min_interval_ms, inbound_is_critical, join_should_dial, join_with_timeout, pace_due,
+    pace_wait_ms, parse_broadcast_join_timeout_ms, parse_probe_evict_after, plan_peer_send,
+    prioritize_inbound_for_verify, probe_evict_after, probe_timeout_should_evict, ConsensusMsg,
+    InboundBulkLimiter, InboundDecision, SendPlan, VoteSendFilter,
     BROADCAST_JOIN_TIMEOUT_MS_DEFAULT, CONS_BCAST_MIN_INTERVAL_MS_DEFAULT,
     CONS_PROBE_MIN_INTERVAL_MS_DEFAULT, INBOUND_BULK_BURST_BYTES_DEFAULT,
     INBOUND_BULK_BYTES_PER_SEC_DEFAULT, PROBE_EVICT_AFTER_DEFAULT, VOTE_SEND_DEDUP_TTL_MS,
-    ConsensusMsg,
 };
 use stellereum::dns_seeds::{merge_seeds, parse_seed_domains, parse_txt_record, MAX_DNS_PEERS};
 use stellereum::network::{
@@ -129,12 +128,18 @@ fn f1_bulk_limiter_defers_flood_but_never_drops_and_bypasses_critical() {
     assert_eq!(lim.admit("flood", 800, false, 0), InboundDecision::Allow);
     match lim.admit("flood", 800, false, 0) {
         InboundDecision::Defer { wait_ms } => {
-            assert!((1..=5_000).contains(&wait_ms), "bounded hint, got {wait_ms}");
+            assert!(
+                (1..=5_000).contains(&wait_ms),
+                "bounded hint, got {wait_ms}"
+            );
         }
         InboundDecision::Allow => panic!("second burst must defer"),
     }
     // Refill over time re-admits: deferral is scheduling, not parking.
-    assert_eq!(lim.admit("flood", 100, false, 5_000), InboundDecision::Allow);
+    assert_eq!(
+        lim.admit("flood", 100, false, 5_000),
+        InboundDecision::Allow
+    );
     // Per-peer isolation: another peer is unaffected by the flooder.
     assert_eq!(lim.admit("honest", 800, false, 0), InboundDecision::Allow);
 }
@@ -178,12 +183,19 @@ fn f2_committed_sorts_first_and_never_counts_as_flood_tail() {
 fn f4_probe_evicts_only_on_streak_and_parses_clamped() {
     assert_eq!(PROBE_EVICT_AFTER_DEFAULT, 3);
     assert_eq!(probe_evict_after(), 3, "default without env");
-    assert!(!probe_timeout_should_evict(1, 3), "single timeout must NOT evict");
+    assert!(
+        !probe_timeout_should_evict(1, 3),
+        "single timeout must NOT evict"
+    );
     assert!(!probe_timeout_should_evict(2, 3));
     assert!(probe_timeout_should_evict(3, 3));
     assert!(probe_timeout_should_evict(9, 3));
     assert_eq!(parse_probe_evict_after(None), 3);
-    assert_eq!(parse_probe_evict_after(Some("0".into())), 3, "zero clamps to default");
+    assert_eq!(
+        parse_probe_evict_after(Some("0".into())),
+        3,
+        "zero clamps to default"
+    );
     assert_eq!(parse_probe_evict_after(Some("garbage".into())), 3);
     assert_eq!(parse_probe_evict_after(Some("2".into())), 2);
 }
@@ -219,7 +231,10 @@ async fn dead_peer_never_delays_live_delivery() {
     let took = t.elapsed();
     assert_eq!(done, vec!["live-ok"], "live delivery must join");
     assert_eq!(detached, 1, "dead peer detaches, never blocks");
-    assert!(took < Duration::from_millis(400), "flush must not inherit the stall, took {took:?}");
+    assert!(
+        took < Duration::from_millis(400),
+        "flush must not inherit the stall, took {took:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -244,7 +259,11 @@ fn tempo_sender_detach_budget_stays_500ms() {
     assert_eq!(BROADCAST_JOIN_TIMEOUT_MS_DEFAULT, 500);
     assert_eq!(broadcast_join_timeout_ms(), 500, "default without env");
     assert_eq!(parse_broadcast_join_timeout_ms(None), 500);
-    assert_eq!(parse_broadcast_join_timeout_ms(Some("0".into())), 500, "zero clamps");
+    assert_eq!(
+        parse_broadcast_join_timeout_ms(Some("0".into())),
+        500,
+        "zero clamps"
+    );
     assert_eq!(parse_broadcast_join_timeout_ms(Some("garbage".into())), 500);
     assert_eq!(parse_broadcast_join_timeout_ms(Some("250".into())), 250);
 }
@@ -265,24 +284,46 @@ fn tempo_pacing_floors_stay_put() {
 
 #[test]
 fn tempo_c_slot_and_alignment_stay_put() {
-    assert_eq!(stellereum::runtime::PROPOSAL_ALIGN_WINDOW_ROUNDS, 8, "+8 alignment");
+    assert_eq!(
+        stellereum::runtime::PROPOSAL_ALIGN_WINDOW_ROUNDS,
+        8,
+        "+8 alignment"
+    );
     // Retransmit cadence at the live 800ms timeout: fast first retries, then
     // backoff, capped — loss recovery without thunder.
-    assert_eq!(stellereum::consensus_net::retransmit_interval_ms(800, 0), 400);
-    assert_eq!(stellereum::consensus_net::retransmit_interval_ms(800, 10_000), 1600);
+    assert_eq!(
+        stellereum::consensus_net::retransmit_interval_ms(800, 0),
+        400
+    );
+    assert_eq!(
+        stellereum::consensus_net::retransmit_interval_ms(800, 10_000),
+        1600
+    );
 }
 
 #[test]
 fn sent_votes_dedup_ttl_coalesces_then_recovers() {
-    assert_eq!(VOTE_SEND_DEDUP_TTL_MS, 200, "shorter than the 400ms retransmit cadence");
+    assert_eq!(
+        VOTE_SEND_DEDUP_TTL_MS, 200,
+        "shorter than the 400ms retransmit cadence"
+    );
     let mut f = VoteSendFilter::new(Duration::from_millis(VOTE_SEND_DEDUP_TTL_MS));
     let v = test_vote(9);
     let p = test_proposal(9);
     let t0 = Instant::now();
     assert!(f.should_send(&v, t0), "first send always passes");
-    assert!(!f.should_send(&v, t0 + Duration::from_millis(50)), "same-tick dup coalesces");
-    assert!(f.should_send(&p, t0 + Duration::from_millis(50)), "proposals never deduped");
-    assert!(f.should_send(&v, t0 + Duration::from_millis(1_000)), "retry past TTL recovers");
+    assert!(
+        !f.should_send(&v, t0 + Duration::from_millis(50)),
+        "same-tick dup coalesces"
+    );
+    assert!(
+        f.should_send(&p, t0 + Duration::from_millis(50)),
+        "proposals never deduped"
+    );
+    assert!(
+        f.should_send(&v, t0 + Duration::from_millis(1_000)),
+        "retry past TTL recovers"
+    );
 }
 
 // --- F7: replication lanes + 1vCPU defaults ----------------------------------
@@ -292,7 +333,10 @@ fn f7_replication_defaults_sane_for_1vcpu() {
     let cfg = ReplPublishConfig::default();
     assert_eq!(cfg.max_concurrent, REPL_PUBLISH_MAX_CONCURRENT_DEFAULT);
     assert_eq!(cfg.max_concurrent, 4);
-    assert_eq!(cfg.bulk_min_interval_ms, REPL_PUBLISH_MIN_INTERVAL_MS_DEFAULT);
+    assert_eq!(
+        cfg.bulk_min_interval_ms,
+        REPL_PUBLISH_MIN_INTERVAL_MS_DEFAULT
+    );
     assert_eq!(cfg.bulk_min_interval_ms, 100, "~10 bulk/s sustained");
     assert_eq!(cfg.head_min_interval_ms, REPL_HEAD_MIN_INTERVAL_MS_DEFAULT);
     assert_eq!(cfg.head_min_interval_ms, 10, "pointers never lag the tip");
@@ -337,7 +381,10 @@ fn f7_breaker_is_per_lane_not_overlay_global() {
     }
     assert!(bp.in_cooldown(&body, 1_000), "slow lane sheds");
     assert!(!bp.in_cooldown(&head, 1_000), "pointer lane unaffected");
-    assert!(!bp.in_cooldown(&other_bucket, 1_000), "other bucket unaffected");
+    assert!(
+        !bp.in_cooldown(&other_bucket, 1_000),
+        "other bucket unaffected"
+    );
     // Success closes the lane immediately (half-open, no sticky shed).
     bp.record_success(&body);
     assert_eq!(bp.consec_timeouts(&body), 0);
@@ -419,7 +466,10 @@ fn dns_merge_never_overflows_and_dedups_validator_ids() {
     let mut spoof = mk(0x77);
     spoof.host = "evil.example".into();
     let r2 = merge_seeds(&[cfg_peer], vec![spoof]);
-    assert!(r2.new_peers.is_empty(), "known validator key must not re-enter as new");
+    assert!(
+        r2.new_peers.is_empty(),
+        "known validator key must not re-enter as new"
+    );
     assert_eq!(r2.duplicates, 1);
 }
 
@@ -434,19 +484,52 @@ fn dht_retention_prune_is_bounded_and_ttl_clamped() {
     assert!(next <= 100_000);
     // TTL is generous, never tight, clamped to [7d, 30d].
     const DAY: i64 = 24 * 3600 * 1000;
-    assert_eq!(dht_blob_ttl_ms(8_000), (8_000i64 * 120_000).clamp(7 * DAY, 30 * DAY));
-    assert!(dht_blob_ttl_ms(1) >= 7 * DAY, "tiny KEEP cannot outrun the prune");
-    assert!(dht_blob_ttl_ms(u64::MAX) <= 30 * DAY, "huge KEEP cannot disable expiry");
+    assert_eq!(
+        dht_blob_ttl_ms(8_000),
+        (8_000i64 * 120_000).clamp(7 * DAY, 30 * DAY)
+    );
+    assert!(
+        dht_blob_ttl_ms(1) >= 7 * DAY,
+        "tiny KEEP cannot outrun the prune"
+    );
+    assert!(
+        dht_blob_ttl_ms(u64::MAX) <= 30 * DAY,
+        "huge KEEP cannot disable expiry"
+    );
 }
 
 #[test]
 fn bootstrap_boundary_mirrors_engine_and_steps_down_loudly() {
     assert_eq!(BOOTSTRAP_SNAPSHOT_GAP, 100, "mirrors the >100 walk gate");
-    assert_eq!(select_bootstrap_boundary(50, 0, None), None, "walk-sized gap: no snapshot");
+    assert_eq!(
+        select_bootstrap_boundary(50, 0, None),
+        None,
+        "walk-sized gap: no snapshot"
+    );
     assert_eq!(select_bootstrap_boundary(72704, 0, None), Some(72700));
-    assert_eq!(select_bootstrap_boundary(78620, 0, Some(78519)), Some(78519), "exact pointer wins");
-    assert_eq!(select_bootstrap_boundary(78620, 0, Some(99999)), Some(78600), "insane pointer ignored");
-    assert_eq!(next_boundary_after_stale(72700, 2, 0), Some(72700), "budget holds: retry");
-    assert_eq!(next_boundary_after_stale(72700, 3, 0), Some(72600), "budget spent: step down");
-    assert_eq!(next_boundary_after_stale(100, 3, 0), None, "floor refuses loudly");
+    assert_eq!(
+        select_bootstrap_boundary(78620, 0, Some(78519)),
+        Some(78519),
+        "exact pointer wins"
+    );
+    assert_eq!(
+        select_bootstrap_boundary(78620, 0, Some(99999)),
+        Some(78600),
+        "insane pointer ignored"
+    );
+    assert_eq!(
+        next_boundary_after_stale(72700, 2, 0),
+        Some(72700),
+        "budget holds: retry"
+    );
+    assert_eq!(
+        next_boundary_after_stale(72700, 3, 0),
+        Some(72600),
+        "budget spent: step down"
+    );
+    assert_eq!(
+        next_boundary_after_stale(100, 3, 0),
+        None,
+        "floor refuses loudly"
+    );
 }

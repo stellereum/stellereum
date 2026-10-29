@@ -5,6 +5,7 @@
 //! NEW file — never edits shared tests.
 
 use ed25519_dalek::SigningKey;
+use std::collections::HashMap;
 use stellereum::governance::{
     GovAction, GovError, Governance, Proposal, ProposalStatus, VoteChoice,
     GOVERNANCE_QUORUM_FLOOR_BPS, GOVERNANCE_VOTING_PERIOD_SECS,
@@ -14,7 +15,6 @@ use stellereum::oracle::{
     OracleState, PriceFeedUpdate, MAX_PRICE_DEVIATION_BPS, STALE_PRICE_MAX_SECS,
 };
 use stellereum::staking::{StakingLedger, DEFAULT_COMMISSION_BPS};
-use std::collections::HashMap;
 
 const STELL: u64 = 1_000_000_000;
 
@@ -49,30 +49,51 @@ fn o1_per_step_drift_cap_holds_and_resets_only_via_governance() {
     let mut s = state_with_publisher(publisher);
     let t0 = 1_760_000_000u64;
     let p0 = 1_000_000u64;
-    assert_eq!(s.commit_feed(&feed_at(&pubk, "STELL", p0, t0), t0).unwrap(), p0);
+    assert_eq!(
+        s.commit_feed(&feed_at(&pubk, "STELL", p0, t0), t0).unwrap(),
+        p0
+    );
     // Same-key walk is capped at 5%/step (O1 fix): +5% commits without latching.
     let p1 = p0 * 105 / 100;
-    assert_eq!(s.commit_feed(&feed_at(&pubk, "STELL", p1, t0 + 1), t0 + 1).unwrap(), p1);
+    assert_eq!(
+        s.commit_feed(&feed_at(&pubk, "STELL", p1, t0 + 1), t0 + 1)
+            .unwrap(),
+        p1
+    );
     assert!(!s.breaker_tripped);
     // Single-publisher walk is capped at 5%/step (O1 fix): a second +10%
     // step from the SAME key is refused WITHOUT latching; +5% steps walk.
     let p2 = p1 * 105 / 100;
-    assert_eq!(s.commit_feed(&feed_at(&pubk, "STELL", p2, t0 + 2), t0 + 2).unwrap(), p2);
+    assert_eq!(
+        s.commit_feed(&feed_at(&pubk, "STELL", p2, t0 + 2), t0 + 2)
+            .unwrap(),
+        p2
+    );
     assert!(!s.breaker_tripped);
     let too_fast = p2 * 110 / 100;
-    assert!(s.commit_feed(&feed_at(&pubk, "STELL", too_fast, t0 + 3), t0 + 3).is_err());
+    assert!(s
+        .commit_feed(&feed_at(&pubk, "STELL", too_fast, t0 + 3), t0 + 3)
+        .is_err());
     assert!(!s.breaker_tripped, "same-key 10% step refused, not latched");
     assert_eq!(s.feeds.get("STELL").unwrap().price_micro_usd, p2);
     // One step over the cap latches and commits nothing.
     let over = p2 + p2 * 1001 / 10_000 + 1;
     assert!(deviation_bps(over, p2) > MAX_PRICE_DEVIATION_BPS);
-    assert!(s.commit_feed(&feed_at(&pubk, "STELL", over, t0 + 3), t0 + 3).is_err());
+    assert!(s
+        .commit_feed(&feed_at(&pubk, "STELL", over, t0 + 3), t0 + 3)
+        .is_err());
     assert!(s.breaker_tripped, "deviation violation latches");
     assert_eq!(s.feeds.get("STELL").unwrap().price_micro_usd, p2);
     // Latched: even a perfect feed is refused until governance resets.
-    assert!(s.commit_feed(&feed_at(&pubk, "STELL", p2, t0 + 4), t0 + 4).is_err());
+    assert!(s
+        .commit_feed(&feed_at(&pubk, "STELL", p2, t0 + 4), t0 + 4)
+        .is_err());
     assert!(s.reset_breaker(), "reset reports a real reset");
-    assert_eq!(s.commit_feed(&feed_at(&pubk, "STELL", p2, t0 + 4), t0 + 4).unwrap(), p2);
+    assert_eq!(
+        s.commit_feed(&feed_at(&pubk, "STELL", p2, t0 + 4), t0 + 4)
+            .unwrap(),
+        p2
+    );
 }
 
 #[test]
@@ -83,10 +104,17 @@ fn o1_distinct_publisher_key_is_unaffected_by_drift_or_latch() {
     assert!(s.register_publisher(a.verifying_key().to_bytes()));
     assert!(s.register_publisher(b.verifying_key().to_bytes()));
     let t0 = 1_760_000_000u64;
-    assert!(s.commit_feed(&feed_at(&a, "STELL", 1_000_000, t0), t0).is_ok());
+    assert!(s
+        .commit_feed(&feed_at(&a, "STELL", 1_000_000, t0), t0)
+        .is_ok());
     // A second publisher's in-cap feed commits against the first's baseline.
-    assert!(s.commit_feed(&feed_at(&b, "STELL", 1_050_000, t0 + 1), t0 + 1).is_ok());
-    assert_eq!(s.feeds.get("STELL").unwrap().publisher, b.verifying_key().to_bytes());
+    assert!(s
+        .commit_feed(&feed_at(&b, "STELL", 1_050_000, t0 + 1), t0 + 1)
+        .is_ok());
+    assert_eq!(
+        s.feeds.get("STELL").unwrap().publisher,
+        b.verifying_key().to_bytes()
+    );
 }
 
 #[test]
@@ -96,25 +124,55 @@ fn oracle_freshness_monotonicity_peg_and_shape_are_fail_closed() {
     let mut s = state_with_publisher(publisher);
     let t0 = 1_760_000_000u64;
     // Stale refused, no latch.
-    assert!(s.commit_feed(&feed_at(&pubk, "STELL", 1_000_000, t0 - STALE_PRICE_MAX_SECS - 1), t0).is_err());
+    assert!(s
+        .commit_feed(
+            &feed_at(&pubk, "STELL", 1_000_000, t0 - STALE_PRICE_MAX_SECS - 1),
+            t0
+        )
+        .is_err());
     assert!(!s.breaker_tripped);
     assert!(check_freshness(t0 - STALE_PRICE_MAX_SECS - 1, t0).is_err());
     // Future-dated refused.
-    assert!(s.commit_feed(&feed_at(&pubk, "STELL", 1_000_000, t0 + 1), t0).is_err());
+    assert!(s
+        .commit_feed(&feed_at(&pubk, "STELL", 1_000_000, t0 + 1), t0)
+        .is_err());
     // Baseline commits, then a rewind (older timestamp) is refused even
     // though it is still within the freshness window.
-    assert!(s.commit_feed(&feed_at(&pubk, "STELL", 1_000_000, t0), t0).is_ok());
-    assert!(s.commit_feed(&feed_at(&pubk, "STELL", 1_000_000, t0 - 5), t0 + 5).is_err());
+    assert!(s
+        .commit_feed(&feed_at(&pubk, "STELL", 1_000_000, t0), t0)
+        .is_ok());
+    assert!(s
+        .commit_feed(&feed_at(&pubk, "STELL", 1_000_000, t0 - 5), t0 + 5)
+        .is_err());
     // USDT depeg latches; a non-peg asset never trips the peg arm.
-    assert!(s.commit_feed(&feed_at(&pubk, "USDT", 1_000_000, t0 + 6), t0 + 6).is_ok());
-    assert!(s.commit_feed(&feed_at(&pubk, "USDT", 940_000, t0 + 7), t0 + 7).is_err());
+    assert!(s
+        .commit_feed(&feed_at(&pubk, "USDT", 1_000_000, t0 + 6), t0 + 6)
+        .is_ok());
+    assert!(s
+        .commit_feed(&feed_at(&pubk, "USDT", 940_000, t0 + 7), t0 + 7)
+        .is_err());
     assert!(s.breaker_tripped);
     // Malformed inputs are refused WITHOUT latching (fresh state here).
     let mut s2 = state_with_publisher(publisher);
     assert!(s2.commit_feed(&feed_at(&pubk, "STELL", 0, t0), t0).is_err());
-    assert!(s2.commit_feed(&feed_at(&pubk, "", 1_000_000, t0), t0).is_err());
-    assert!(s2.commit_feed(&feed_at(&pubk, "WAY-TOO-LONG-SYMBOL-OVER-32-BYTES-LIMIT", 1_000_000, t0), t0).is_err());
-    assert!(!s2.breaker_tripped, "malformed input must not halt the chain");
+    assert!(s2
+        .commit_feed(&feed_at(&pubk, "", 1_000_000, t0), t0)
+        .is_err());
+    assert!(s2
+        .commit_feed(
+            &feed_at(
+                &pubk,
+                "WAY-TOO-LONG-SYMBOL-OVER-32-BYTES-LIMIT",
+                1_000_000,
+                t0
+            ),
+            t0
+        )
+        .is_err());
+    assert!(
+        !s2.breaker_tripped,
+        "malformed input must not halt the chain"
+    );
     assert!(!is_valid_asset_symbol(""));
     assert!(is_valid_asset_symbol("STELL/USDT"));
 }
@@ -135,11 +193,21 @@ fn publisher_set_is_governance_gated_and_sybil_priced() {
     // Registration is idempotent; revocation retires FUTURE feeds only.
     let publisher = key(0xA0).verifying_key().to_bytes();
     assert!(s.register_publisher(publisher));
-    assert!(!s.register_publisher(publisher), "repeat is an observable no-op");
-    assert!(s.commit_feed(&feed_at(&key(0xA0), "STELL", 1_000_000, t0), t0).is_ok());
+    assert!(
+        !s.register_publisher(publisher),
+        "repeat is an observable no-op"
+    );
+    assert!(s
+        .commit_feed(&feed_at(&key(0xA0), "STELL", 1_000_000, t0), t0)
+        .is_ok());
     assert!(s.unregister_publisher(publisher));
-    assert!(!s.unregister_publisher(publisher), "repeat is an observable no-op");
-    assert!(s.commit_feed(&feed_at(&key(0xA0), "STELL", 1_000_000, t0 + 1), t0 + 1).is_err());
+    assert!(
+        !s.unregister_publisher(publisher),
+        "repeat is an observable no-op"
+    );
+    assert!(s
+        .commit_feed(&feed_at(&key(0xA0), "STELL", 1_000_000, t0 + 1), t0 + 1)
+        .is_err());
     assert_eq!(
         s.feeds.get("STELL").unwrap().price_micro_usd,
         1_000_000,
@@ -162,7 +230,10 @@ fn twap_is_advisory_only_and_never_commits() {
         .expect("two observations average");
     assert_eq!(twap, 1_050_000);
     // No pull feed: Tier 2 answers from TWAP alone.
-    assert_eq!(engine.resolve_price(None, "STELL", t0 + 10).unwrap(), 1_050_000);
+    assert_eq!(
+        engine.resolve_price(None, "STELL", t0 + 10).unwrap(),
+        1_050_000
+    );
     // A pull feed >10% from TWAP trips the ENGINE-local breaker only.
     let far = PriceFeedUpdate::sign("STELL", 2_000_000, t0 + 10, &key(0xA0));
     assert!(engine.resolve_price(Some(&far), "STELL", t0 + 10).is_err());
@@ -182,7 +253,8 @@ fn ledger_with(n: usize, bond_stell: u64) -> (StakingLedger, Vec<[u8; 32]>) {
     let mut l = StakingLedger::new();
     let ids: Vec<[u8; 32]> = (0..n).map(|i| [i as u8 + 1; 32]).collect();
     for id in &ids {
-        l.bond(*id, stell(bond_stell), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(*id, stell(bond_stell), DEFAULT_COMMISSION_BPS)
+            .unwrap();
     }
     (l, ids)
 }
@@ -213,15 +285,24 @@ fn tiny_electorate_truncation_is_harmless_empty_never_passes() {
     // Electorate of 1 unit: quorum_needed truncates to 0 — but a pass still
     // needs a real yes > no, so the truncation grants nothing by itself.
     g.proposals.insert(1, smuggled_proposal(1, 1, 1, 0, end));
-    assert_eq!(g.finalize(&mut l, 1, end + 1).unwrap(), ProposalStatus::Passed);
+    assert_eq!(
+        g.finalize(&mut l, 1, end + 1).unwrap(),
+        ProposalStatus::Passed
+    );
     // Empty electorate, zero turnout: Rejected (yes > no fails).
     g.proposals.insert(2, smuggled_proposal(2, 0, 0, 0, end));
-    assert_eq!(g.finalize(&mut l, 2, end + 1).unwrap(), ProposalStatus::Rejected);
+    assert_eq!(
+        g.finalize(&mut l, 2, end + 1).unwrap(),
+        ProposalStatus::Rejected
+    );
     // Abstain-only turnout on a tiny base: still Rejected.
     let mut p3 = smuggled_proposal(3, 1, 0, 0, end);
     p3.abstain = 1;
     g.proposals.insert(3, p3);
-    assert_eq!(g.finalize(&mut l, 3, end + 1).unwrap(), ProposalStatus::Rejected);
+    assert_eq!(
+        g.finalize(&mut l, 3, end + 1).unwrap(),
+        ProposalStatus::Rejected
+    );
 }
 
 #[test]
@@ -231,14 +312,26 @@ fn propose_on_an_empty_ledger_fails_before_any_electorate_read() {
     // No stake at all: the NotStaker gate fires first (the electorate==0
     // refuse behind it is unreachable-today defense in depth).
     assert_eq!(
-        g.propose(&l, [0x09u8; 32], "t".into(), GovAction::Signal("t".into()), 0),
+        g.propose(
+            &l,
+            [0x09u8; 32],
+            "t".into(),
+            GovAction::Signal("t".into()),
+            0
+        ),
         Err(GovError::NotStaker)
     );
     // Quorum floor still enforced at the propose gate.
     let (l2, ids) = ledger_with(1, 10_000);
     let mut g2 = Governance::new();
     assert_eq!(
-        g2.propose(&l2, ids[0], "bad".into(), GovAction::SetGovernanceQuorumBps(GOVERNANCE_QUORUM_FLOOR_BPS - 1), 0),
+        g2.propose(
+            &l2,
+            ids[0],
+            "bad".into(),
+            GovAction::SetGovernanceQuorumBps(GOVERNANCE_QUORUM_FLOOR_BPS - 1),
+            0
+        ),
         Err(GovError::InvalidAction)
     );
 }
@@ -247,8 +340,12 @@ fn propose_on_an_empty_ledger_fails_before_any_electorate_read() {
 fn vote_replay_is_refused_per_proposal_but_independent_across_proposals() {
     let (mut l, ids) = ledger_with(3, 10_000);
     let mut g = Governance::new();
-    let a = g.propose(&l, ids[0], "a".into(), GovAction::Signal("a".into()), 0).unwrap();
-    let b = g.propose(&l, ids[0], "b".into(), GovAction::Signal("b".into()), 0).unwrap();
+    let a = g
+        .propose(&l, ids[0], "a".into(), GovAction::Signal("a".into()), 0)
+        .unwrap();
+    let b = g
+        .propose(&l, ids[0], "b".into(), GovAction::Signal("b".into()), 0)
+        .unwrap();
     g.vote(&mut l, ids[1], a, VoteChoice::Yes, 1).unwrap();
     // Same proposal, changed mind: still a replay.
     assert_eq!(

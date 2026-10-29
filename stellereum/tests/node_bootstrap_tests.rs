@@ -121,7 +121,7 @@ async fn build_live_chain(
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         b.sign_block(&proposer);
         let bh = b.compute_hash();
         attach_quorum(&mut b, ks, h, bh);
@@ -149,13 +149,17 @@ async fn build_live_chain(
             snapshots.insert(h, engine.create_snapshot().await);
             let staking = engine.staking_read().await.clone();
             let gov = engine.governance_read().await.clone();
-            let dom =
-                stellereum::storage::DomainSnapshot::capture(&engine, &staking, &gov).await;
+            let dom = stellereum::storage::DomainSnapshot::capture(&engine, &staking, &gov).await;
             domains.insert(h, bincode::serialize(&dom).unwrap());
         }
     }
     (
-        LiveChain { blocks, snapshots, domains, roots },
+        LiveChain {
+            blocks,
+            snapshots,
+            domains,
+            roots,
+        },
         engine,
     )
 }
@@ -191,9 +195,7 @@ impl<'a> FlakyPeers<'a> {
     fn link_at(&self, h: u64) -> Option<HeaderLink> {
         if self
             .header_misses_left
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                n.checked_sub(1)
-            })
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             self.n_header_miss.fetch_add(1, Ordering::SeqCst);
@@ -219,9 +221,7 @@ impl<'a> FlakyPeers<'a> {
     fn snapshot_at(&self, h: u64) -> Option<Vec<u8>> {
         if self
             .snapshot_misses_left
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                n.checked_sub(1)
-            })
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             self.n_snapshot_miss.fetch_add(1, Ordering::SeqCst);
@@ -236,9 +236,7 @@ impl<'a> FlakyPeers<'a> {
         }
         if self
             .stale_domains_left
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                n.checked_sub(1)
-            })
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             self.n_stale_domain.fetch_add(1, Ordering::SeqCst);
@@ -416,23 +414,32 @@ async fn node_bootstrap_reaches_tip_from_zero_over_weak_link_and_stale_peers() {
     // exactly the honest-retry shape a weak link produces live.
     let mut walked = None;
     for _ in 0..60 {
-        if let Ok(w) =
-            collect_missing_blocks(tip_hash, boundary_hash, 1_000_000, |h| {
-                let b = peers.body_at(&h);
-                async move { b }
-            })
-            .await
+        if let Ok(w) = collect_missing_blocks(tip_hash, boundary_hash, 1_000_000, |h| {
+            let b = peers.body_at(&h);
+            async move { b }
+        })
+        .await
         {
             walked = Some(w);
             break;
         }
     }
     let walked = walked.expect("post-snapshot bodies are retained: the walk must complete");
-    validate_sync_chain_for_shard(&walked, committed + 1, boundary_hash, &vs, MASTERCHAIN_SHARD)
-        .expect("the remainder carries a genuine quorum per height");
+    validate_sync_chain_for_shard(
+        &walked,
+        committed + 1,
+        boundary_hash,
+        &vs,
+        MASTERCHAIN_SHARD,
+    )
+    .expect("the remainder carries a genuine quorum per height");
     for b in &walked {
         let ours = observer_engine.get_state_root().await;
-        assert_eq!(b.state_root, ours, "block {} must extend our state", b.height);
+        assert_eq!(
+            b.state_root, ours,
+            "block {} must extend our state",
+            b.height
+        );
         observer_engine
             .update_account(AccountState::new(
                 effect_account(b.height),
@@ -442,7 +449,8 @@ async fn node_bootstrap_reaches_tip_from_zero_over_weak_link_and_stale_peers() {
     }
     assert_eq!(walked.last().unwrap().compute_hash(), tip_hash);
     assert_eq!(
-        observer_engine.get_state_root().await, source_tip_root,
+        observer_engine.get_state_root().await,
+        source_tip_root,
         "the observer converges on the source tip state EXACTLY — no manual copy involved"
     );
 

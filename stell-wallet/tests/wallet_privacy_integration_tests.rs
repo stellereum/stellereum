@@ -33,13 +33,11 @@ use notes::{
     add_note, calculate_shielded_balance, get_unspent_notes, load_notes, mark_notes_spent,
     select_notes_for_unshield, ShieldedNote,
 };
-use stellereum::crypto_privacy::{
-    verify_stealth_signature, PedersenCommitment, StealthAddress,
-};
-use stellereum::wallet::WalletAccount;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use stellereum::crypto_privacy::{verify_stealth_signature, PedersenCommitment, StealthAddress};
+use stellereum::wallet::WalletAccount;
 
 fn make_temp_dir(label: &str) -> std::path::PathBuf {
     let rand_suffix: u64 = rand::random();
@@ -74,7 +72,9 @@ async fn test_automated_note_saving_on_shield() {
 
     // Initial funding
     let initial_balance = 50_000_000_000u64; // 50 STELL
-    client.set_balance(account.address, initial_balance, 0).await;
+    client
+        .set_balance(account.address, initial_balance, 0)
+        .await;
 
     // Shield 15 STELL
     let shield_amount = 15_000_000_000u64;
@@ -168,7 +168,13 @@ fn test_balance_calculation_of_shielded_notes() {
     // All notes loaded includes spent one
     let all_notes = load_notes(&notes_path).unwrap();
     assert_eq!(all_notes.len(), 3);
-    assert!(all_notes.iter().find(|n| n.amount == 10_000_000_000).unwrap().spent);
+    assert!(
+        all_notes
+            .iter()
+            .find(|n| n.amount == 10_000_000_000)
+            .unwrap()
+            .spent
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -188,7 +194,9 @@ async fn test_automatic_note_selection_on_unshield() {
     let account = WalletAccount::from_seed(&seed);
 
     // Fund account
-    client.set_balance(account.address, 100_000_000_000, 0).await;
+    client
+        .set_balance(account.address, 100_000_000_000, 0)
+        .await;
 
     // Shield 3 distinct notes on-chain
     let amt1 = 4_000_000_000u64; // 4 STELL
@@ -200,42 +208,96 @@ async fn test_automatic_note_selection_on_unshield() {
     let b3 = PedersenCommitment::random_blinding().to_bytes();
 
     let n_nonce = client.nonce_of(&account.address).await.unwrap();
-    let (_, _, c1) = client.broadcast_shield_tx(&account.signing_key, amt1, b1, n_nonce, 0).await.unwrap();
-    let (_, _, c2) = client.broadcast_shield_tx(&account.signing_key, amt2, b2, n_nonce + 1, 0).await.unwrap();
-    let (_, _, c3) = client.broadcast_shield_tx(&account.signing_key, amt3, b3, n_nonce + 2, 0).await.unwrap();
+    let (_, _, c1) = client
+        .broadcast_shield_tx(&account.signing_key, amt1, b1, n_nonce, 0)
+        .await
+        .unwrap();
+    let (_, _, c2) = client
+        .broadcast_shield_tx(&account.signing_key, amt2, b2, n_nonce + 1, 0)
+        .await
+        .unwrap();
+    let (_, _, c3) = client
+        .broadcast_shield_tx(&account.signing_key, amt3, b3, n_nonce + 2, 0)
+        .await
+        .unwrap();
 
-    add_note(&notes_path, ShieldedNote { commitment: c1.clone(), amount: amt1, blinding: hex::encode(b1), height: 1, spent: false }).unwrap();
-    add_note(&notes_path, ShieldedNote { commitment: c2.clone(), amount: amt2, blinding: hex::encode(b2), height: 1, spent: false }).unwrap();
-    add_note(&notes_path, ShieldedNote { commitment: c3.clone(), amount: amt3, blinding: hex::encode(b3), height: 1, spent: false }).unwrap();
+    add_note(
+        &notes_path,
+        ShieldedNote {
+            commitment: c1.clone(),
+            amount: amt1,
+            blinding: hex::encode(b1),
+            height: 1,
+            spent: false,
+        },
+    )
+    .unwrap();
+    add_note(
+        &notes_path,
+        ShieldedNote {
+            commitment: c2.clone(),
+            amount: amt2,
+            blinding: hex::encode(b2),
+            height: 1,
+            spent: false,
+        },
+    )
+    .unwrap();
+    add_note(
+        &notes_path,
+        ShieldedNote {
+            commitment: c3.clone(),
+            amount: amt3,
+            blinding: hex::encode(b3),
+            height: 1,
+            spent: false,
+        },
+    )
+    .unwrap();
 
     // Test 1: Single exact note match for 15 STELL
-    let sel_single = select_notes_for_unshield(&notes_path, 15_000_000_000).expect("Must find exact 15 STELL note");
+    let sel_single = select_notes_for_unshield(&notes_path, 15_000_000_000)
+        .expect("Must find exact 15 STELL note");
     assert_eq!(sel_single.len(), 1);
     assert_eq!(sel_single[0].amount, 15_000_000_000);
     assert_eq!(sel_single[0].commitment, c3);
 
     // Test 2: Multi-note combination match for 10 STELL (4 STELL + 6 STELL)
-    let sel_combo = select_notes_for_unshield(&notes_path, 10_000_000_000).expect("Must combine 4 + 6 STELL");
+    let sel_combo =
+        select_notes_for_unshield(&notes_path, 10_000_000_000).expect("Must combine 4 + 6 STELL");
     assert_eq!(sel_combo.len(), 2);
     let total_combo: u64 = sel_combo.iter().map(|n| n.amount).sum();
     assert_eq!(total_combo, 10_000_000_000);
 
     // Test 3: Perform on-chain unshield with the auto-selected notes (4 + 6 STELL)
-    let cs = sel_combo.iter().map(|n| {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&hex::decode(&n.commitment).unwrap());
-        arr
-    }).collect::<Vec<_>>();
+    let cs = sel_combo
+        .iter()
+        .map(|n| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&hex::decode(&n.commitment).unwrap());
+            arr
+        })
+        .collect::<Vec<_>>();
     let ams = sel_combo.iter().map(|n| n.amount).collect::<Vec<_>>();
-    let bs = sel_combo.iter().map(|n| {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&hex::decode(&n.blinding).unwrap());
-        arr
-    }).collect::<Vec<_>>();
+    let bs = sel_combo
+        .iter()
+        .map(|n| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&hex::decode(&n.blinding).unwrap());
+            arr
+        })
+        .collect::<Vec<_>>();
 
     let unshield_nonce = client.nonce_of(&account.address).await.unwrap();
     let (tx_hash, finality) = client
-        .broadcast_unshield_tx(&account.signing_key, cs.clone(), ams.clone(), bs.clone(), unshield_nonce, 0)
+        .broadcast_unshield_tx(
+            &account.signing_key,
+            cs.clone(),
+            ams.clone(),
+            bs.clone(),
+            unshield_nonce,
+            0,
+        )
         .await
         .expect("broadcast_unshield_tx must succeed");
 
@@ -250,17 +312,24 @@ async fn test_automatic_note_selection_on_unshield() {
     let remaining_unspent = get_unspent_notes(&notes_path).unwrap();
     assert_eq!(remaining_unspent.len(), 1);
     assert_eq!(remaining_unspent[0].commitment, c3);
-    assert_eq!(calculate_shielded_balance(&remaining_unspent), 15_000_000_000);
+    assert_eq!(
+        calculate_shielded_balance(&remaining_unspent),
+        15_000_000_000
+    );
 
     // Test 4: Insufficient funds rejection
     let err_exceed = select_notes_for_unshield(&notes_path, 20_000_000_000);
     assert!(err_exceed.is_err());
-    assert!(err_exceed.unwrap_err().contains("Insufficient shielded balance"));
+    assert!(err_exceed
+        .unwrap_err()
+        .contains("Insufficient shielded balance"));
 
     // Test 5: Exact combination unattainable rejection (only 15 STELL remains, request 7 STELL)
     let err_no_subset = select_notes_for_unshield(&notes_path, 7_000_000_000);
     assert!(err_no_subset.is_err());
-    assert!(err_no_subset.unwrap_err().contains("No combination of unspent shielded notes"));
+    assert!(err_no_subset
+        .unwrap_err()
+        .contains("No combination of unspent shielded notes"));
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -312,9 +381,15 @@ async fn test_real_stealth_address_pay_and_derived_spending() {
 
     assert_eq!(tx.to, derived_stealth.one_time_pub);
     assert_eq!(tx.amount, transfer_amount);
-    assert_eq!(LightClient::extract_ephemeral_pub(&tx.payload), Some(derived_stealth.ephemeral_pub));
+    assert_eq!(
+        LightClient::extract_ephemeral_pub(&tx.payload),
+        Some(derived_stealth.ephemeral_pub)
+    );
 
-    let (tx_hash, finality) = client.broadcast_tx(&tx).await.expect("broadcast_tx must succeed");
+    let (tx_hash, finality) = client
+        .broadcast_tx(&tx)
+        .await
+        .expect("broadcast_tx must succeed");
     assert!(!tx_hash.is_empty());
     assert!(!finality.is_failed());
 
@@ -349,7 +424,9 @@ async fn test_real_stealth_address_pay_and_derived_spending() {
         .expect("Bob must derive one-time private key");
 
     // Verify cryptographic correspondence: RISTRETTO_BASEPOINT * one_time_priv == stealth.one_time_pub
-    let derived_pub = (RISTRETTO_BASEPOINT_POINT * one_time_priv).compress().to_bytes();
+    let derived_pub = (RISTRETTO_BASEPOINT_POINT * one_time_priv)
+        .compress()
+        .to_bytes();
     assert_eq!(
         derived_pub, derived_stealth.one_time_pub,
         "Derived one-time public point must match one_time_pub"
@@ -361,7 +438,11 @@ async fn test_real_stealth_address_pay_and_derived_spending() {
 
     // Verify valid signature against the one-time public key
     assert!(
-        StealthAddress::verify_one_time_signature(&derived_stealth.one_time_pub, spend_auth_message, &sig),
+        StealthAddress::verify_one_time_signature(
+            &derived_stealth.one_time_pub,
+            spend_auth_message,
+            &sig
+        ),
         "Signature must verify against one_time_pub"
     );
     assert!(
@@ -371,7 +452,11 @@ async fn test_real_stealth_address_pay_and_derived_spending() {
 
     // Tampered payload rejected
     assert!(
-        !verify_stealth_signature(&derived_stealth.one_time_pub, b"Altered transfer memo", &sig),
+        !verify_stealth_signature(
+            &derived_stealth.one_time_pub,
+            b"Altered transfer memo",
+            &sig
+        ),
         "Tampered spend payload must fail verification"
     );
 
@@ -380,17 +465,31 @@ async fn test_real_stealth_address_pay_and_derived_spending() {
         .scan_stealth_payments(&bob_view_priv, &bob_spend_pub)
         .await
         .expect("scan_stealth_payments must succeed");
-    assert!(!scanned.is_empty(), "Bob must discover at least 1 stealth payment");
-    let matching = scanned.iter().find(|(s, _, _, _)| s.one_time_pub == derived_stealth.one_time_pub);
-    assert!(matching.is_some(), "Bob must find the payment to derived_stealth");
-    assert_eq!(matching.unwrap().0.ephemeral_pub, derived_stealth.ephemeral_pub);
+    assert!(
+        !scanned.is_empty(),
+        "Bob must discover at least 1 stealth payment"
+    );
+    let matching = scanned
+        .iter()
+        .find(|(s, _, _, _)| s.one_time_pub == derived_stealth.one_time_pub);
+    assert!(
+        matching.is_some(),
+        "Bob must find the payment to derived_stealth"
+    );
+    assert_eq!(
+        matching.unwrap().0.ephemeral_pub,
+        derived_stealth.ephemeral_pub
+    );
     assert_eq!(matching.unwrap().1, transfer_amount);
 
     let charlie_scanned = client
         .scan_stealth_payments(&charlie_view_priv, &charlie.spend_pub)
         .await
         .expect("charlie scan must succeed");
-    assert!(charlie_scanned.is_empty(), "Charlie must discover 0 stealth payments");
+    assert!(
+        charlie_scanned.is_empty(),
+        "Charlie must discover 0 stealth payments"
+    );
 
     // 8. Bob spends from stealth.one_time_pub to Bob's main address
     let (bob_before, _, _) = client.get_balance_spv(&bob.address, 0).await.unwrap();
@@ -405,8 +504,14 @@ async fn test_real_stealth_address_pay_and_derived_spending() {
         0,
         0,
     );
-    assert!(spend_tx.verify_signature(), "Stealth spend transaction signature must verify via Schnorr stealth signature");
-    let (spend_hash, spend_finality) = client.broadcast_tx(&spend_tx).await.expect("spend broadcast must succeed");
+    assert!(
+        spend_tx.verify_signature(),
+        "Stealth spend transaction signature must verify via Schnorr stealth signature"
+    );
+    let (spend_hash, spend_finality) = client
+        .broadcast_tx(&spend_tx)
+        .await
+        .expect("spend broadcast must succeed");
     assert!(!spend_hash.is_empty());
     assert!(!spend_finality.is_failed());
 
@@ -466,11 +571,7 @@ fn test_cli_stealth_pay_and_shield_balance_workflow() {
 
     // 4. Check shield-balance
     let bal_out = Command::new(bin)
-        .args([
-            "--wallet",
-            wallet_path.to_str().unwrap(),
-            "shield-balance",
-        ])
+        .args(["--wallet", wallet_path.to_str().unwrap(), "shield-balance"])
         .output()
         .expect("exec shield-balance");
     assert!(bal_out.status.success());
@@ -586,11 +687,7 @@ fn test_cli_stealth_pay_and_shield_balance_workflow() {
 
     // 8. Shield balance is now 0 STELL
     let bal_after = Command::new(bin)
-        .args([
-            "--wallet",
-            wallet_path.to_str().unwrap(),
-            "shield-balance",
-        ])
+        .args(["--wallet", wallet_path.to_str().unwrap(), "shield-balance"])
         .output()
         .expect("exec shield-balance after");
     assert!(bal_after.status.success());

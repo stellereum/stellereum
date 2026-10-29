@@ -11,50 +11,100 @@ async fn main() -> Result<()> {
     let raw = hex::decode(RAW_HEX).context("bad raw hex")?;
     let tx: stellereum::sharding::Transaction =
         bincode::deserialize(&raw).context("tx decode failed")?;
-    println!("decoded: from={} to={} amount={} gas={} nonce={} src={} dst={} payload_len={}",
-        hex::encode(tx.from), hex::encode(tx.to), tx.amount, tx.gas_limit, tx.nonce,
-        tx.source_shard, tx.target_shard, tx.payload.len());
+    println!(
+        "decoded: from={} to={} amount={} gas={} nonce={} src={} dst={} payload_len={}",
+        hex::encode(tx.from),
+        hex::encode(tx.to),
+        tx.amount,
+        tx.gas_limit,
+        tx.nonce,
+        tx.source_shard,
+        tx.target_shard,
+        tx.payload.len()
+    );
     if let Some(env) = tx.pq_envelope() {
-        println!("envelope: scheme={} implicit={} pk_len={:?} salt={}",
-            env.scheme.name(), env.is_implicit,
-            env.pubkey.as_ref().map(|p| p.len()), hex::encode(env.salt));
-        println!("Falcon512 pubkey_size={}", stellereum::post_quantum::PqScheme::Falcon512.pubkey_size());
+        println!(
+            "envelope: scheme={} implicit={} pk_len={:?} salt={}",
+            env.scheme.name(),
+            env.is_implicit,
+            env.pubkey.as_ref().map(|p| p.len()),
+            hex::encode(env.salt)
+        );
+        println!(
+            "Falcon512 pubkey_size={}",
+            stellereum::post_quantum::PqScheme::Falcon512.pubkey_size()
+        );
     } else {
         println!("NO PQ ENVELOPE?!");
     }
-    println!("is_pq_activation={} verify_signature={}", tx.is_pq_activation(), tx.verify_signature());
+    println!(
+        "is_pq_activation={} verify_signature={}",
+        tx.is_pq_activation(),
+        tx.verify_signature()
+    );
 
     let engine = stellereum::state_engine::InMemoryStateEngine::new();
     let faucet = tx.from;
-    engine.credit_native(&faucet, 1_000_000_000_000_000).await
+    engine
+        .credit_native(&faucet, 1_000_000_000_000_000)
+        .await
         .map_err(|e| anyhow::anyhow!("fund: {e}"))?;
     let a = engine.get_account(&faucet).await.unwrap();
-    println!("funded: balance={} nonce={} scheme={:?} pubkey_hash={:?}", a.balance, a.nonce, a.scheme.name(), a.pubkey_hash.map(hex::encode));
+    println!(
+        "funded: balance={} nonce={} scheme={:?} pubkey_hash={:?}",
+        a.balance,
+        a.nonce,
+        a.scheme.name(),
+        a.pubkey_hash.map(hex::encode)
+    );
 
     let seed = [0x11u8; 32];
     let key = stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed);
     let my_addr = stellereum::post_quantum::derive_pq_address(
-        stellereum::post_quantum::PqScheme::Falcon512, key.public_key(),
-        &stellereum::post_quantum::DEFAULT_SALT);
-    println!("my derived addr matches tx.from: {} (pk len {})", my_addr == faucet, key.public_key().len());
+        stellereum::post_quantum::PqScheme::Falcon512,
+        key.public_key(),
+        &stellereum::post_quantum::DEFAULT_SALT,
+    );
+    println!(
+        "my derived addr matches tx.from: {} (pk len {})",
+        my_addr == faucet,
+        key.public_key().len()
+    );
 
     for n in 0..4u64 {
         let mut dust = stellereum::sharding::Transaction {
-            from: faucet, to: faucet, amount: 1, gas_limit: 350_000, nonce: n,
-            source_shard: 0, target_shard: 0, signature: vec![],
-            payload: vec![], priority_fee_per_gas: 0,
+            from: faucet,
+            to: faucet,
+            amount: 1,
+            gas_limit: 350_000,
+            nonce: n,
+            source_shard: 0,
+            target_shard: 0,
+            signature: vec![],
+            payload: vec![],
+            priority_fee_per_gas: 0,
         };
         let msg = dust.signing_message();
         let sig = key.sign(&msg);
         dust.signature = stellereum::post_quantum::PqSignatureEnvelope::new_explicit(
-            stellereum::post_quantum::PqScheme::Falcon512, key.public_key().to_vec(), sig).encode();
+            stellereum::post_quantum::PqScheme::Falcon512,
+            key.public_key().to_vec(),
+            sig,
+        )
+        .encode();
         match engine.apply_transaction(&dust, 1792703094).await {
             Ok(_) => println!("dust nonce {n}: OK"),
             Err(e) => println!("dust nonce {n}: ERR {e}"),
         }
     }
     let a = engine.get_account(&faucet).await.unwrap();
-    println!("after dust: balance={} nonce={} scheme={:?} pubkey_hash={:?}", a.balance, a.nonce, a.scheme.name(), a.pubkey_hash.map(hex::encode));
+    println!(
+        "after dust: balance={} nonce={} scheme={:?} pubkey_hash={:?}",
+        a.balance,
+        a.nonce,
+        a.scheme.name(),
+        a.pubkey_hash.map(hex::encode)
+    );
 
     match engine.apply_transaction(&tx, 1792703094).await {
         Ok(_) => println!("LIVE TX: OK (no error)"),

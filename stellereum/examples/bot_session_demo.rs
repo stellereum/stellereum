@@ -41,9 +41,7 @@ use stellereum::orderbook::PAIR_STELL_USDT;
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{OpCode, GAS_ORDER_PLACE, GAS_SESSION_REVOKE};
-use stellereum::zkml::{
-    now_secs, SessionKeyAuthorization, SCOPE_SVM_PAYLOAD, SCOPE_TRANSFER,
-};
+use stellereum::zkml::{now_secs, SessionKeyAuthorization, SCOPE_SVM_PAYLOAD, SCOPE_TRANSFER};
 
 // ---------------------------------------------------------------------------
 // `stell_sessionBudget` contract (owned by the companion agent).
@@ -72,7 +70,10 @@ struct SessionBudget {
 // `rpc_session_budget` below already tries the real method first and only
 // falls back here so the demo keeps working until then.
 // >>> STUB-END <<<
-async fn stub_session_budget(engine: &InMemoryStateEngine, session_hex: &str) -> Result<SessionBudget> {
+async fn stub_session_budget(
+    engine: &InMemoryStateEngine,
+    session_hex: &str,
+) -> Result<SessionBudget> {
     let raw = hex::decode(session_hex.trim_start_matches("0x"))
         .context("session must be 64 hex chars")?;
     let pk: [u8; 32] = raw
@@ -120,7 +121,9 @@ fn rpc_session_budget(rpc_url: &str, session_hex: &str) -> Result<Option<Session
         .context("budget RPC returned non-JSON")?;
     if let Some(err) = resp.get("error") {
         // -32601 = method not found: the integration gap, not a demo bug.
-        eprintln!("  [note] node answered budget query with error {err} - treating as missing method");
+        eprintln!(
+            "  [note] node answered budget query with error {err} - treating as missing method"
+        );
         return Ok(None);
     }
     let result = resp
@@ -169,12 +172,19 @@ fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<se
     if let Some(err) = resp.get("error") {
         return Err(anyhow!("node rejected {method}: {err}"));
     }
-    Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    Ok(resp
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
 }
 
 fn rpc_submit(rpc_url: &str, tx: &Transaction) -> Result<String> {
     let raw = hex::encode(bincode::serialize(tx)?);
-    let result = rpc_call(rpc_url, "stell_sendRawTransaction", serde_json::json!({ "tx": raw }))?;
+    let result = rpc_call(
+        rpc_url,
+        "stell_sendRawTransaction",
+        serde_json::json!({ "tx": raw }),
+    )?;
     Ok(result.as_str().unwrap_or("?").to_string())
 }
 
@@ -208,7 +218,11 @@ async fn main() -> Result<()> {
         .windows(2)
         .find(|w| w[0] == "--rpc")
         .map(|w| w[1].clone())
-        .or_else(|| std::env::var("STELL_RPC_URL").ok().filter(|s| !s.is_empty()));
+        .or_else(|| {
+            std::env::var("STELL_RPC_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
     let live = rpc_url.is_some() && !dry_run;
 
     println!("=== Stellereum trading bot in 5 minutes (session-key demo) ===");
@@ -232,8 +246,14 @@ async fn main() -> Result<()> {
     let master_pub = master.verifying_key().to_bytes();
     let session_pub = session.verifying_key().to_bytes();
     println!("\n[0] identities (fresh keys, generated just now - no secrets on disk)");
-    println!("    master  (funds owner, grant signer): {}", short(&master_pub));
-    println!("    session (the bot's ONLY key - it never sees the master): {}", short(&session_pub));
+    println!(
+        "    master  (funds owner, grant signer): {}",
+        short(&master_pub)
+    );
+    println!(
+        "    session (the bot's ONLY key - it never sees the master): {}",
+        short(&session_pub)
+    );
     println!("    WHY: the master key stays cold/offline; a leaked bot key can only do what the grant allows.");
 
     // --- a. Master signs the delegation grant.
@@ -253,7 +273,10 @@ async fn main() -> Result<()> {
     );
     assert!(grant.verify_signature(), "fresh grant must verify");
     println!("\n[a] master signed a delegation grant for the bot. Each field means:");
-    println!("    session_pubkey   = {}..: WHO may act (the bot key, not the master);", short(&session_pub));
+    println!(
+        "    session_pubkey   = {}..: WHO may act (the bot key, not the master);",
+        short(&session_pub)
+    );
     println!("    scope            = {scope} (SCOPE_SVM_PAYLOAD: may run contract/orderbook payloads, may NOT plain-transfer - compare SCOPE_TRANSFER={SCOPE_TRANSFER} for empty-payload transfers);");
     println!("    valid_until      = {valid_until} (unix secs, now+1h: the grant dies on its own even if nobody revokes it);");
     println!("    max_gas_spend    = {max_gas_spend} (TOTAL gas budget across ALL bot txs - cumulative, never refills);");
@@ -267,8 +290,7 @@ async fn main() -> Result<()> {
     if live {
         let url = rpc_url.clone().unwrap();
         println!("\n[faucet] requesting test funds for the master via stell_faucet ...");
-        let mut faucet_params =
-            serde_json::json!({ "address": hex::encode(master_pub) });
+        let mut faucet_params = serde_json::json!({ "address": hex::encode(master_pub) });
         if let Ok(tok) = std::env::var("STELL_FAUCET_TOKEN").map(|s| s.trim().to_string()) {
             if !tok.is_empty() {
                 faucet_params["token"] = serde_json::Value::String(tok);
@@ -294,9 +316,8 @@ async fn main() -> Result<()> {
                 .ok()
                 .and_then(|v| {
                     v.get("balance").and_then(|x| {
-                        x.as_u64().or_else(|| {
-                            x.as_str().and_then(|s| s.parse::<u64>().ok())
-                        })
+                        x.as_u64()
+                            .or_else(|| x.as_str().and_then(|s| s.parse::<u64>().ok()))
                     })
                 })
                 .unwrap_or(0);
@@ -312,7 +333,9 @@ async fn main() -> Result<()> {
         println!("\n[faucet] (dry-run: no ledger write - nothing is credited or sent anywhere.)");
         println!("    WHY: the master pays for the bot's gas+escrow, so the master - never the session key - must hold funds.");
     } else {
-        engine.update_account(AccountState::new(master_pub, MASTER_FUNDS)).await;
+        engine
+            .update_account(AccountState::new(master_pub, MASTER_FUNDS))
+            .await;
         println!("\n[faucet] sim faucet credited master with {MASTER_FUNDS} nano-STELL (embedded ledger).");
         println!("    WHY: the master pays for the bot's gas+escrow, so the master - never the session key - must hold funds.");
     }
@@ -341,12 +364,17 @@ async fn main() -> Result<()> {
     );
     let bot_hash = if live { String::new() } else { tx_id(&bot_tx) };
     println!("\n[b] bot built a session-signed SELL order (10 STELL @ 1.00 USDT, pair {PAIR_STELL_USDT}).");
-    println!("    tx.from is the MASTER ({}..) - the master's account pays gas+escrow;", short(&master_pub));
+    println!(
+        "    tx.from is the MASTER ({}..) - the master's account pays gas+escrow;",
+        short(&master_pub)
+    );
     println!("    but the signature is the BOT's, over message+grant, so neither grant nor payload can be swapped afterwards.");
     println!("    WHY session-signing: the node checks bot-sig + grant-policy + on-chain registry instead of the master sig.");
 
     if dry_run {
-        println!("    (dry-run: NOT submitted. It would register the key on first use and lock escrow.)");
+        println!(
+            "    (dry-run: NOT submitted. It would register the key on first use and lock escrow.)"
+        );
     } else if live {
         let url = rpc_url.clone().unwrap();
         let hash = rpc_submit(&url, &bot_tx)?;
@@ -355,9 +383,15 @@ async fn main() -> Result<()> {
         println!("    WHY poll: admission is not finality - a tx can sit in the mempool and never be included.");
         let final_state = rpc_poll_receipt(&url, &hash)?;
         println!("    receipt: status = {final_state}");
-        assert_eq!(final_state, "success", "bot order must be included on the live node");
+        assert_eq!(
+            final_state, "success",
+            "bot order must be included on the live node"
+        );
     } else {
-        engine.apply_transaction(&bot_tx, now_secs()).await.map_err(|e| anyhow!("sim apply failed: {e}"))?;
+        engine
+            .apply_transaction(&bot_tx, now_secs())
+            .await
+            .map_err(|e| anyhow!("sim apply failed: {e}"))?;
         println!("    applied to the local sim node. Polling its receipt ...");
         println!("    WHY poll: admission is not finality - here the 'receipt' is the committed registry record + master nonce.");
         let mut registered = false;
@@ -365,20 +399,32 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_millis(150)).await;
             let reg = engine.session_keys_read().await;
             registered = reg.get(&session_pub).is_some();
-            let nonce = engine.get_account(&master_pub).await.map(|a| a.nonce).unwrap_or(0);
+            let nonce = engine
+                .get_account(&master_pub)
+                .await
+                .map(|a| a.nonce)
+                .unwrap_or(0);
             println!("    poll #{attempt}: registered = {registered}, master nonce = {nonce}");
             if registered {
                 break;
             }
         }
-        assert!(registered, "first bot tx must lazily register the session key");
+        assert!(
+            registered,
+            "first bot tx must lazily register the session key"
+        );
         println!("    receipt: {{ tx: \"{bot_hash}\", status: \"success\" }} (registry record exists, escrow locked).");
     }
 
     // --- c. Bot checks its remaining budget.
-    println!("\n[c] bot asks how much budget is left (it cannot refill itself - it can only read).");
+    println!(
+        "\n[c] bot asks how much budget is left (it cannot refill itself - it can only read)."
+    );
     if dry_run {
-        println!("    (dry-run) stell_sessionBudget {{\"session\": \"{}..\"}} would answer:", short(&session_pub));
+        println!(
+            "    (dry-run) stell_sessionBudget {{\"session\": \"{}..\"}} would answer:",
+            short(&session_pub)
+        );
         println!("    {{\"registered\": true, \"revoked\": false, \"spent\": ~{GAS_ORDER_PLACE}, \"remaining_gas\": ~{}}}", max_gas_spend - GAS_ORDER_PLACE);
     } else if live {
         let url = rpc_url.clone().unwrap();
@@ -395,7 +441,10 @@ async fn main() -> Result<()> {
         // Embedded mode: no HTTP node exists, so read the registry through the
         // STUB (same params in, same 8 fields out as the real RPC will have).
         let b = stub_session_budget(&engine, &hex::encode(session_pub)).await?;
-        println!("    STUB stell_sessionBudget {{\"session\": \"{}..\"}} ->", short(&session_pub));
+        println!(
+            "    STUB stell_sessionBudget {{\"session\": \"{}..\"}} ->",
+            short(&session_pub)
+        );
         println!("    {{\"registered\": {}, \"revoked\": {}, \"valid_until\": {}, \"scope\": {}, \"max_gas_spend\": {}, \"spent\": {}, \"remaining_gas\": {}, \"master\": \"{}..\"}}",
             b.registered, b.revoked, b.valid_until, b.scope, b.max_gas_spend, b.spent, b.remaining_gas, &b.master[..12]);
         println!("    WHY poll the budget: every applied bot tx deducts cumulatively; at 0 the node refuses further bot txs.");
@@ -413,7 +462,9 @@ async fn main() -> Result<()> {
         1, // nonce 1 on the master account (bot tx used 0)
         1,
         1,
-        vec![OpCode::SysCallRevokeSession { session_pubkey: session_pub }],
+        vec![OpCode::SysCallRevokeSession {
+            session_pubkey: session_pub,
+        }],
     );
     if dry_run {
         println!("    (dry-run: NOT submitted. It would set revoked=true terminally - no un-revoke exists.)");
@@ -422,7 +473,10 @@ async fn main() -> Result<()> {
         let hash = rpc_submit(&url, &revoke_tx)?;
         println!("    revoke submitted, hash {hash}");
         let final_state = rpc_poll_receipt(&url, &hash)?;
-        assert_eq!(final_state, "success", "revoke must be included on the live node");
+        assert_eq!(
+            final_state, "success",
+            "revoke must be included on the live node"
+        );
         println!("    revoke mined. Bot retries with the SAME grant ...");
         let retry = Transaction::sign_with_session(
             &session,
@@ -480,11 +534,16 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 println!("    post-revoke bot tx rejected at admission: {e}");
-                println!("    SECURITY DEMO HOLDS: the revoked key is worthless (admission refused it).");
+                println!(
+                    "    SECURITY DEMO HOLDS: the revoked key is worthless (admission refused it)."
+                );
             }
         }
     } else {
-        engine.apply_transaction(&revoke_tx, now_secs()).await.map_err(|e| anyhow!("revoke apply failed: {e}"))?;
+        engine
+            .apply_transaction(&revoke_tx, now_secs())
+            .await
+            .map_err(|e| anyhow!("revoke apply failed: {e}"))?;
         println!("    revoke applied. Registry now reports revoked=true (terminal - nothing ever sets it back).");
         println!("    Bot retries with the SAME grant (stolen-key scenario) ...");
         let retry = Transaction::sign_with_session(
@@ -535,6 +594,9 @@ async fn main() -> Result<()> {
 fn print_budget_gap(session_pub: &[u8; 32]) {
     println!("    INTEGRATION GAP: no `stell_sessionBudget` method exists on the node yet");
     println!("    (checked src/rpc.rs dispatch + docs/RPC.md) - the numbers above come from the");
-    println!("    clearly-marked STUB reader (same params {{\"session\": \"{}\"}} / same 8 fields).", short(session_pub));
+    println!(
+        "    clearly-marked STUB reader (same params {{\"session\": \"{}\"}} / same 8 fields).",
+        short(session_pub)
+    );
     println!("    Wire it to the companion agent's RPC as soon as it lands; demo logic needs no other change.");
 }

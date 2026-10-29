@@ -12,8 +12,8 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::Arc;
 
-use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::staking::{STAKING_POOL, UNBONDING_PERIOD_SECS};
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{OpCode, GAS_STAKE_UNBOND};
 
 mod support;
@@ -61,10 +61,15 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     // Bond the floor as self-bond (sender == validator).
     engine
         .apply_transaction(
-            &tx_of(&validator, 0, 100_000, vec![OpCode::SysCallStake {
-                validator: vaddr,
-                amount: floor,
-            }]),
+            &tx_of(
+                &validator,
+                0,
+                100_000,
+                vec![OpCode::SysCallStake {
+                    validator: vaddr,
+                    amount: floor,
+                }],
+            ),
             0,
         )
         .await
@@ -75,10 +80,15 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     // Unbond everything (full exit to zero is allowed).
     engine
         .apply_transaction(
-            &tx_of(&validator, 1, 100_000, vec![OpCode::SysCallUnbond {
-                validator: vaddr,
-                amount: floor,
-            }]),
+            &tx_of(
+                &validator,
+                1,
+                100_000,
+                vec![OpCode::SysCallUnbond {
+                    validator: vaddr,
+                    amount: floor,
+                }],
+            ),
             0,
         )
         .await
@@ -87,9 +97,12 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     // Immature withdraw refuses (fail-closed): nothing matured yet. The
     // refusal is attributable, so it pays the failure fee and consumes the
     // nonce - the matured withdraw below is therefore signed with nonce 3.
-    let early = tx_of(&validator, 2, 100_000, vec![OpCode::SysCallWithdrawSelfBond {
-        validator: vaddr,
-    }]);
+    let early = tx_of(
+        &validator,
+        2,
+        100_000,
+        vec![OpCode::SysCallWithdrawSelfBond { validator: vaddr }],
+    );
     let early_fee = failure_fee(&engine, &early).await;
     let before_early = bal(&engine, &vaddr).await;
     assert!(
@@ -117,10 +130,15 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     // A stranger cannot take it even now that funds are available.
     let attacker = SigningKey::generate(&mut OsRng);
     let aaddr = attacker.verifying_key().to_bytes();
-    engine.update_account(AccountState::new(aaddr, 20_000)).await;
-    let steal = tx_of(&attacker, 0, 20_000, vec![OpCode::SysCallWithdrawSelfBond {
-        validator: vaddr,
-    }]);
+    engine
+        .update_account(AccountState::new(aaddr, 20_000))
+        .await;
+    let steal = tx_of(
+        &attacker,
+        0,
+        20_000,
+        vec![OpCode::SysCallWithdrawSelfBond { validator: vaddr }],
+    );
     let steal_fee = failure_fee(&engine, &steal).await;
     let before_steal = bal(&engine, &aaddr).await;
     assert!(
@@ -141,9 +159,12 @@ async fn m1_self_bond_withdraws_only_when_matured() {
     let mine_before = bal(&engine, &vaddr).await;
     engine
         .apply_transaction(
-            &tx_of(&validator, 3, 100_000, vec![OpCode::SysCallWithdrawSelfBond {
-                validator: vaddr,
-            }]),
+            &tx_of(
+                &validator,
+                3,
+                100_000,
+                vec![OpCode::SysCallWithdrawSelfBond { validator: vaddr }],
+            ),
             0,
         )
         .await
@@ -170,9 +191,12 @@ async fn m1_self_bond_withdraws_only_when_matured() {
 
     // Replay refuses (single-claim). It is a refusal like any other, so it
     // costs the failure fee too.
-    let again = tx_of(&validator, 4, 100_000, vec![OpCode::SysCallWithdrawSelfBond {
-        validator: vaddr,
-    }]);
+    let again = tx_of(
+        &validator,
+        4,
+        100_000,
+        vec![OpCode::SysCallWithdrawSelfBond { validator: vaddr }],
+    );
     let again_fee = failure_fee(&engine, &again).await;
     let before_again = bal(&engine, &vaddr).await;
     assert!(
@@ -297,12 +321,16 @@ async fn persist_queue_full_counts_drops() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     let storage = Arc::new(Storage::open(&dir).expect("temp storage opens"));
-    let before = stellereum::metrics::global().snapshot().persist_queue_dropped;
+    let before = stellereum::metrics::global()
+        .snapshot()
+        .persist_queue_dropped;
     let ap = AsyncPersistence::start(storage);
     for _ in 0..PERSIST_QUEUE_CAP + 5 {
         ap.enqueue_finalized(1, [0u8; 32]);
     }
-    let after = stellereum::metrics::global().snapshot().persist_queue_dropped;
+    let after = stellereum::metrics::global()
+        .snapshot()
+        .persist_queue_dropped;
     assert!(
         after - before >= 5.0,
         "5 over-cap pushes must count 5 drops (delta={})",
@@ -365,7 +393,7 @@ fn insert_enforces_nonce_gap_from_context() {
 #[test]
 fn inbound_bulk_limiter_defers_never_drops() {
     use stellereum::consensus_net::{
-        InboundBulkLimiter, InboundDecision, inbound_is_critical, ConsensusMsg,
+        inbound_is_critical, ConsensusMsg, InboundBulkLimiter, InboundDecision,
     };
     // Bypass shape: only Batch is bulk.
     assert!(!inbound_is_critical(&ConsensusMsg::Batch(vec![])));
@@ -383,8 +411,5 @@ fn inbound_bulk_limiter_defers_never_drops() {
         InboundDecision::Allow => panic!("over-budget bulk must defer"),
     }
     // Critical bypasses even when the bucket is empty.
-    assert_eq!(
-        lim.admit("p", 1_000_000, true, 0),
-        InboundDecision::Allow
-    );
+    assert_eq!(lim.admit("p", 1_000_000, true, 0), InboundDecision::Allow);
 }

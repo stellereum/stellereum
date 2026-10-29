@@ -6,20 +6,22 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use stellereum::consensus::{
-    HeightConsensus, QuorumCertificate, ValidatorSet, Vote, VoteKind,
-};
+use std::sync::Arc;
+use stellereum::consensus::{HeightConsensus, QuorumCertificate, ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::{Cluster, ValidatorRuntime};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use std::sync::Arc;
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
 }
 
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
-    ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect())
+    ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    )
 }
 
 fn bh(n: u8) -> [u8; 32] {
@@ -31,7 +33,16 @@ fn bh(n: u8) -> [u8; 32] {
 // ============================================================================
 #[test]
 fn quorum_threshold_is_two_thirds_plus_one() {
-    for (n, expected) in [(1usize, 1u64), (2, 2), (3, 3), (4, 3), (5, 4), (6, 5), (7, 5), (10, 7)] {
+    for (n, expected) in [
+        (1usize, 1u64),
+        (2, 2),
+        (3, 3),
+        (4, 3),
+        (5, 4),
+        (6, 5),
+        (7, 5),
+        (10, 7),
+    ] {
         let ks = keys(n);
         assert_eq!(vset(&ks).quorum_power(), expected, "n={n}");
     }
@@ -52,9 +63,14 @@ fn safety_no_conflicting_quorum_with_one_byzantine() {
 
     // 3 validators prevote A (2 honest + 1 that will equivocate)
     for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(a))).unwrap();
+        hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(a)))
+            .unwrap();
     }
-    assert_eq!(hc.try_prevote_quorum(), Some(Some(a)), "A must reach quorum");
+    assert_eq!(
+        hc.try_prevote_quorum(),
+        Some(Some(a)),
+        "A must reach quorum"
+    );
 
     // Now the same 3 validators (equivocators) + the 4th try to build quorum on B
     for k in &ks {
@@ -63,9 +79,15 @@ fn safety_no_conflicting_quorum_with_one_byzantine() {
 
     let set = hc.prevote_set(0).unwrap();
     assert!(set.quorum_reached(Some(a), &vs), "A keeps its quorum");
-    assert!(!set.quorum_reached(Some(b), &vs), "B must NOT reach quorum (safety)");
+    assert!(
+        !set.quorum_reached(Some(b), &vs),
+        "B must NOT reach quorum (safety)"
+    );
     // The conflicting votes are recorded as equivocation evidence
-    assert!(!hc.equivocations().is_empty(), "equivocation must be recorded");
+    assert!(
+        !hc.equivocations().is_empty(),
+        "equivocation must be recorded"
+    );
 }
 
 // ============================================================================
@@ -78,9 +100,17 @@ fn safety_lock_prevents_conflicting_prevote() {
     hc.locked = Some((bh(1), 0)); // locked on A
     hc.round = 1;
     hc.proposal = Some((hc.proposer().unwrap(), bh(2))); // proposer offers B
-    assert_eq!(hc.decide_prevote(), None, "locked validator must prevote nil for a conflicting value");
+    assert_eq!(
+        hc.decide_prevote(),
+        None,
+        "locked validator must prevote nil for a conflicting value"
+    );
     hc.proposal = Some((hc.proposer().unwrap(), bh(1)));
-    assert_eq!(hc.decide_prevote(), Some(bh(1)), "may prevote the locked value");
+    assert_eq!(
+        hc.decide_prevote(),
+        Some(bh(1)),
+        "may prevote the locked value"
+    );
 }
 
 // ============================================================================
@@ -99,7 +129,9 @@ async fn liveness_with_one_silent_validator() {
         nodes.push((k.clone(), st));
     }
     let mut cluster = Cluster::new(nodes);
-    cluster.broadcast_tx(Transaction::sign(&user, [9u8; 32], 10, 0, 0, 1, 1)).await;
+    cluster
+        .broadcast_tx(Transaction::sign(&user, [9u8; 32], 10, 0, 0, 1, 1))
+        .await;
 
     let proposer_idx = cluster.nodes.iter().position(|n| n.is_proposer()).unwrap();
     let block = cluster.nodes[proposer_idx].propose(1).await.unwrap();
@@ -112,13 +144,23 @@ async fn liveness_with_one_silent_validator() {
         }
     }
     // only the first 3 vote (quorum = 3); the 4th stays silent
-    let prevotes: Vec<Vote> = cluster.nodes.iter().take(3).filter_map(|n| n.make_prevote()).collect();
+    let prevotes: Vec<Vote> = cluster
+        .nodes
+        .iter()
+        .take(3)
+        .filter_map(|n| n.make_prevote())
+        .collect();
     for v in &prevotes {
         for n in cluster.nodes.iter_mut() {
             let _ = n.on_prevote(v.clone());
         }
     }
-    let precommits: Vec<Vote> = cluster.nodes.iter_mut().take(3).filter_map(|n| n.make_precommit()).collect();
+    let precommits: Vec<Vote> = cluster
+        .nodes
+        .iter_mut()
+        .take(3)
+        .filter_map(|n| n.make_precommit())
+        .collect();
     for v in &precommits {
         for n in cluster.nodes.iter_mut() {
             let _ = n.on_precommit(v.clone());
@@ -148,7 +190,9 @@ async fn liveness_with_two_silent_of_seven() {
         nodes.push((k.clone(), st));
     }
     let mut cluster = Cluster::new(nodes);
-    cluster.broadcast_tx(Transaction::sign(&user, [9u8; 32], 10, 0, 0, 1, 1)).await;
+    cluster
+        .broadcast_tx(Transaction::sign(&user, [9u8; 32], 10, 0, 0, 1, 1))
+        .await;
 
     let proposer_idx = cluster.nodes.iter().position(|n| n.is_proposer()).unwrap();
     let block = cluster.nodes[proposer_idx].propose(1).await.unwrap();
@@ -161,13 +205,23 @@ async fn liveness_with_two_silent_of_seven() {
         }
     }
     // 5 of 7 vote (quorum 5); 2 silent
-    let prevotes: Vec<Vote> = cluster.nodes.iter().take(5).filter_map(|n| n.make_prevote()).collect();
+    let prevotes: Vec<Vote> = cluster
+        .nodes
+        .iter()
+        .take(5)
+        .filter_map(|n| n.make_prevote())
+        .collect();
     for v in &prevotes {
         for n in cluster.nodes.iter_mut() {
             let _ = n.on_prevote(v.clone());
         }
     }
-    let precommits: Vec<Vote> = cluster.nodes.iter_mut().take(5).filter_map(|n| n.make_precommit()).collect();
+    let precommits: Vec<Vote> = cluster
+        .nodes
+        .iter_mut()
+        .take(5)
+        .filter_map(|n| n.make_precommit())
+        .collect();
     for v in &precommits {
         for n in cluster.nodes.iter_mut() {
             let _ = n.on_precommit(v.clone());
@@ -194,7 +248,8 @@ fn view_change_recovers_liveness() {
 
     // Round 0: only 2 prevote (below quorum 3) -> no quorum
     for k in ks.iter().take(2) {
-        hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(a))).unwrap();
+        hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(a)))
+            .unwrap();
     }
     assert_eq!(hc.try_prevote_quorum(), None, "no quorum in round 0");
 
@@ -205,9 +260,14 @@ fn view_change_recovers_liveness() {
 
     // Round 1: 3 prevote -> quorum
     for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, 1, 1, VoteKind::Prevote, Some(a))).unwrap();
+        hc.add_prevote(Vote::sign(k, 1, 1, VoteKind::Prevote, Some(a)))
+            .unwrap();
     }
-    assert_eq!(hc.try_prevote_quorum(), Some(Some(a)), "quorum in round 1 after view change");
+    assert_eq!(
+        hc.try_prevote_quorum(),
+        Some(Some(a)),
+        "quorum in round 1 after view change"
+    );
 }
 
 // ============================================================================
@@ -292,7 +352,9 @@ async fn no_finality_without_quorum() {
         nodes.push((k.clone(), st));
     }
     let mut cluster = Cluster::new(nodes);
-    cluster.broadcast_tx(Transaction::sign(&user, [9u8; 32], 1, 0, 0, 1, 1)).await;
+    cluster
+        .broadcast_tx(Transaction::sign(&user, [9u8; 32], 1, 0, 0, 1, 1))
+        .await;
 
     let proposer_idx = cluster.nodes.iter().position(|n| n.is_proposer()).unwrap();
     let block = cluster.nodes[proposer_idx].propose(1).await.unwrap();
@@ -304,20 +366,34 @@ async fn no_finality_without_quorum() {
         }
     }
     // only 2 of 4 vote -> below quorum
-    let prevotes: Vec<Vote> = cluster.nodes.iter().take(2).filter_map(|n| n.make_prevote()).collect();
+    let prevotes: Vec<Vote> = cluster
+        .nodes
+        .iter()
+        .take(2)
+        .filter_map(|n| n.make_prevote())
+        .collect();
     for v in &prevotes {
         for n in cluster.nodes.iter_mut() {
             let _ = n.on_prevote(v.clone());
         }
     }
-    let precommits: Vec<Vote> = cluster.nodes.iter_mut().take(2).filter_map(|n| n.make_precommit()).collect();
+    let precommits: Vec<Vote> = cluster
+        .nodes
+        .iter_mut()
+        .take(2)
+        .filter_map(|n| n.make_precommit())
+        .collect();
     for v in &precommits {
         for n in cluster.nodes.iter_mut() {
             let _ = n.on_precommit(v.clone());
         }
     }
     for n in cluster.nodes.iter_mut() {
-        assert_eq!(n.try_finalize().await, None, "must not finalize below quorum");
+        assert_eq!(
+            n.try_finalize().await,
+            None,
+            "must not finalize below quorum"
+        );
     }
 }
 
@@ -328,7 +404,11 @@ async fn no_finality_without_quorum() {
 async fn proposal_from_wrong_proposer_rejected() {
     let ks = keys(4);
     let st = Arc::new(InMemoryStateEngine::new());
-    st.update_account(AccountState::new(ks[0].verifying_key().to_bytes(), 1_000_000)).await;
+    st.update_account(AccountState::new(
+        ks[0].verifying_key().to_bytes(),
+        1_000_000,
+    ))
+    .await;
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vset(&ks), st, 1);
 
     // The real proposer for (1,0) is deterministic; make a block signed by someone else.
@@ -355,5 +435,10 @@ async fn proposal_from_wrong_proposer_rejected() {
         epoch_key_commitment: [0u8; 32],
     };
     bad.sign_block(impostor);
-    assert!(rt.on_proposal(impostor.verifying_key().to_bytes(), bad, rt.hc.round).await.is_err(), "impostor proposal must be rejected");
+    assert!(
+        rt.on_proposal(impostor.verifying_key().to_bytes(), bad, rt.hc.round)
+            .await
+            .is_err(),
+        "impostor proposal must be rejected"
+    );
 }

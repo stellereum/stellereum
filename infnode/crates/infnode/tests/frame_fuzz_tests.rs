@@ -7,8 +7,8 @@
 //!   2. mutations of a valid frame (bit flips, truncation, length tampering)
 //!   3. adversarial length fields (huge plen/nlen, off-by-one boundaries)
 
-use infnode::proto::{Frame, MAX_FRAME};
 use ed25519_dalek::{Signer, SigningKey};
+use infnode::proto::{Frame, MAX_FRAME};
 use rand::rngs::OsRng;
 
 /// Minimal deterministic PRNG (xorshift64) for reproducible fuzzing.
@@ -115,12 +115,18 @@ fn fuzz_adversarial_lengths_rejected() {
     // plen exactly MAX_FRAME+1
     let mut b3 = base.clone();
     b3[64..68].copy_from_slice(&((MAX_FRAME + 1) as u32).to_le_bytes());
-    assert!(Frame::decode(&b3).is_err(), "plen over MAX_FRAME must be rejected");
+    assert!(
+        Frame::decode(&b3).is_err(),
+        "plen over MAX_FRAME must be rejected"
+    );
 
     // plen that overflows the total-length computation
     let mut b4 = base.clone();
     b4[64..68].copy_from_slice(&0xFFFF_FF00u32.to_le_bytes());
-    assert!(Frame::decode(&b4).is_err(), "overflow plen must be rejected");
+    assert!(
+        Frame::decode(&b4).is_err(),
+        "overflow plen must be rejected"
+    );
 }
 
 /// TRUNCATION BOUNDARY: every prefix of a valid frame must be handled safely.

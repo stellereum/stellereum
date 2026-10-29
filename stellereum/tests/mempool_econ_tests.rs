@@ -44,8 +44,12 @@ fn squat_256_with_one_funding_is_refused() {
     let mut mp = Mempool::new(1024, 256);
     let balance = 2 * TX_COST;
 
-    let h0 = mp.add_checked(tx(&sk, 1_000, 0), balance).expect("tx0 fits");
-    let h1 = mp.add_checked(tx(&sk, 1_000, 1), balance).expect("tx1 fits");
+    let h0 = mp
+        .add_checked(tx(&sk, 1_000, 0), balance)
+        .expect("tx0 fits");
+    let h1 = mp
+        .add_checked(tx(&sk, 1_000, 1), balance)
+        .expect("tx1 fits");
     assert_eq!(mp.reserved_for(&me), balance, "both txs fully reserved");
 
     // Slot 3 and every slot after: fail closed, never silently admitted.
@@ -73,8 +77,11 @@ fn full_pool_churn_costs_a_gentle_premium() {
     let mut mp = Mempool::new(4, 100);
     for _ in 0..4u64 {
         let k = key();
-        mp.add_checked(Transaction::sign(&k, [1u8; 32], 10, 100, 0, 1, 1), 1_000_000)
-            .unwrap();
+        mp.add_checked(
+            Transaction::sign(&k, [1u8; 32], 10, 100, 0, 1, 1),
+            1_000_000,
+        )
+        .unwrap();
     }
     assert_eq!(mp.len(), 4);
 
@@ -82,12 +89,18 @@ fn full_pool_churn_costs_a_gentle_premium() {
     let rich = 1_000_000u64;
     // fee+1 (the old churn price) no longer displaces anything...
     assert_eq!(
-        mp.add_checked(Transaction::sign(&attacker, [2u8; 32], 10, 101, 0, 1, 1), rich),
+        mp.add_checked(
+            Transaction::sign(&attacker, [2u8; 32], 10, 101, 0, 1, 1),
+            rich
+        ),
         Err(MempoolError::Full)
     );
     // ...nor does anything below the premium (104 < 100 + ceil(100/20) = 105)...
     assert_eq!(
-        mp.add_checked(Transaction::sign(&attacker, [2u8; 32], 10, 104, 0, 1, 1), rich),
+        mp.add_checked(
+            Transaction::sign(&attacker, [2u8; 32], 10, 104, 0, 1, 1),
+            rich
+        ),
         Err(MempoolError::Full)
     );
     assert_eq!(mp.len(), 4, "pool untouched by sub-premium bids");
@@ -99,8 +112,11 @@ fn full_pool_churn_costs_a_gentle_premium() {
     // the old 2x rule, locking every honest transaction out for good).
     let mut attacker_fees = 0u64;
     for n in 0..4u64 {
-        mp.add_checked(Transaction::sign(&attacker, [2u8; 32], 10, 105, n, 1, 1), rich)
-            .unwrap_or_else(|e| panic!("premium bid at step {n} must evict: {e:?}"));
+        mp.add_checked(
+            Transaction::sign(&attacker, [2u8; 32], 10, 105, n, 1, 1),
+            rich,
+        )
+        .unwrap_or_else(|e| panic!("premium bid at step {n} must evict: {e:?}"));
         attacker_fees += 105;
     }
     assert_eq!(mp.len(), 4);
@@ -114,7 +130,10 @@ fn full_pool_churn_costs_a_gentle_premium() {
         "churn must stay GENTLE (no exponential ratchet): attacker {attacker_fees} vs honest {honest_fees}"
     );
     let min_fee: u64 = mp.all().iter().map(|t| t.gas_limit).min().unwrap();
-    assert!(min_fee >= 105, "floor ratcheted to the gentle premium, got {min_fee}");
+    assert!(
+        min_fee >= 105,
+        "floor ratcheted to the gentle premium, got {min_fee}"
+    );
 }
 
 #[test]
@@ -130,8 +149,11 @@ fn honest_burst_is_unaffected() {
         let balance = 20 * (100 + 1_002) + 50_000;
         for n in 0..20u64 {
             let fee = 1_000 + (n % 3); // small honest fee jitter
-            mp.add_checked(Transaction::sign(&kk, [9u8; 32], 100, fee, n, 1, 1), balance)
-                .unwrap_or_else(|e| panic!("honest burst tx n={n} refused: {e:?}"));
+            mp.add_checked(
+                Transaction::sign(&kk, [9u8; 32], 100, fee, n, 1, 1),
+                balance,
+            )
+            .unwrap_or_else(|e| panic!("honest burst tx n={n} refused: {e:?}"));
         }
     }
     assert_eq!(mp.len(), 200, "whole honest burst must be pooled");

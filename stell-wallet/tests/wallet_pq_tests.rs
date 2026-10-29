@@ -33,11 +33,11 @@ use client::LightClient;
 use pq::{
     derive_pq_address, format_address_with_visual_checksum, format_pq_address,
     format_pq_address_hex, generate_sample_keypair, PqGenScheme, PqScheme, PqSignatureEnvelope,
-    DEFAULT_SALT, ED25519_PUBKEY_LEN, FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN,
-    HYBRID_PUBKEY_LEN, HYBRID_SIG_LEN, MLDSA44_PUBKEY_LEN, PQ_ADDRESS_DOMAIN, PQ_ENVELOPE_MAGIC,
+    DEFAULT_SALT, ED25519_PUBKEY_LEN, FALCON512_PUBKEY_LEN, FALCON512_SIG_LEN, HYBRID_PUBKEY_LEN,
+    HYBRID_SIG_LEN, MLDSA44_PUBKEY_LEN, PQ_ADDRESS_DOMAIN, PQ_ENVELOPE_MAGIC,
 };
-use stellereum::sharding::Transaction;
 use std::process::Command;
+use stellereum::sharding::Transaction;
 
 // =============================================================================
 // Helper: reference manual implementation of Stellereum PQ-BFT v4 address rule
@@ -74,28 +74,40 @@ fn test_derive_pq_address_all_four_schemes_against_spec() {
     let ed_pub = [0x11u8; 32];
     let addr_ed = derive_pq_address(PqScheme::Ed25519, &ed_pub, &salt);
     let expected_ed = reference_pq_address(1, &ed_pub, &salt);
-    assert_eq!(addr_ed, expected_ed, "Ed25519 address must match BLAKE3 spec");
+    assert_eq!(
+        addr_ed, expected_ed,
+        "Ed25519 address must match BLAKE3 spec"
+    );
     assert_eq!(addr_ed.len(), 32);
 
     // 2. Scheme 2: Falcon-512 (897 bytes public key)
     let falcon_pub = vec![0x22u8; FALCON512_PUBKEY_LEN];
     let addr_falcon = derive_pq_address(PqScheme::Falcon512, &falcon_pub, &salt);
     let expected_falcon = reference_pq_address(2, &falcon_pub, &salt);
-    assert_eq!(addr_falcon, expected_falcon, "Falcon-512 address must match BLAKE3 spec");
+    assert_eq!(
+        addr_falcon, expected_falcon,
+        "Falcon-512 address must match BLAKE3 spec"
+    );
     assert_eq!(addr_falcon.len(), 32);
 
     // 3. Scheme 3: ML-DSA-44 (1312 bytes public key)
     let mldsa_pub = vec![0x33u8; MLDSA44_PUBKEY_LEN];
     let addr_mldsa = derive_pq_address(PqScheme::MlDsa44, &mldsa_pub, &salt);
     let expected_mldsa = reference_pq_address(3, &mldsa_pub, &salt);
-    assert_eq!(addr_mldsa, expected_mldsa, "ML-DSA-44 address must match BLAKE3 spec");
+    assert_eq!(
+        addr_mldsa, expected_mldsa,
+        "ML-DSA-44 address must match BLAKE3 spec"
+    );
     assert_eq!(addr_mldsa.len(), 32);
 
     // 4. Scheme 4: Hybrid (929 bytes public key)
     let hybrid_pub = vec![0x44u8; HYBRID_PUBKEY_LEN];
     let addr_hybrid = derive_pq_address(PqScheme::Hybrid, &hybrid_pub, &salt);
     let expected_hybrid = reference_pq_address(4, &hybrid_pub, &salt);
-    assert_eq!(addr_hybrid, expected_hybrid, "Hybrid address must match BLAKE3 spec");
+    assert_eq!(
+        addr_hybrid, expected_hybrid,
+        "Hybrid address must match BLAKE3 spec"
+    );
     assert_eq!(addr_hybrid.len(), 32);
 }
 
@@ -114,7 +126,8 @@ fn test_scheme_domain_separation_prevents_cross_scheme_collisions() {
     for i in 0..addresses.len() {
         for j in (i + 1)..addresses.len() {
             assert_ne!(
-                addresses[i], addresses[j],
+                addresses[i],
+                addresses[j],
                 "Schemes {} and {} collided on identical input!",
                 i + 1,
                 j + 1
@@ -176,8 +189,14 @@ fn test_scheme_metadata_and_discriminants() {
 #[test]
 fn test_scheme_from_str_parsing() {
     assert_eq!("ed25519".parse::<PqScheme>().unwrap(), PqScheme::Ed25519);
-    assert_eq!("falcon512".parse::<PqScheme>().unwrap(), PqScheme::Falcon512);
-    assert_eq!("falcon-512".parse::<PqScheme>().unwrap(), PqScheme::Falcon512);
+    assert_eq!(
+        "falcon512".parse::<PqScheme>().unwrap(),
+        PqScheme::Falcon512
+    );
+    assert_eq!(
+        "falcon-512".parse::<PqScheme>().unwrap(),
+        PqScheme::Falcon512
+    );
     assert_eq!("mldsa44".parse::<PqScheme>().unwrap(), PqScheme::MlDsa44);
     assert_eq!("ml-dsa-44".parse::<PqScheme>().unwrap(), PqScheme::MlDsa44);
     assert_eq!("hybrid".parse::<PqScheme>().unwrap(), PqScheme::Hybrid);
@@ -389,7 +408,10 @@ fn test_cli_rejects_invalid_scheme_and_bad_arguments() {
     let bin = env!("CARGO_BIN_EXE_stell");
 
     // 1. Missing required --scheme argument
-    let out_no_scheme = Command::new(bin).args(["pq-address"]).output().expect("exec");
+    let out_no_scheme = Command::new(bin)
+        .args(["pq-address"])
+        .output()
+        .expect("exec");
     assert_eq!(out_no_scheme.status.code(), Some(2));
 
     // 2. Invalid scheme name
@@ -401,7 +423,13 @@ fn test_cli_rejects_invalid_scheme_and_bad_arguments() {
 
     // 3. Bad hex for pubkey
     let out_bad_hex = Command::new(bin)
-        .args(["pq-address", "--scheme", "ed25519", "--pubkey", "not-hex-at-all"])
+        .args([
+            "pq-address",
+            "--scheme",
+            "ed25519",
+            "--pubkey",
+            "not-hex-at-all",
+        ])
         .output()
         .expect("exec");
     assert!(!out_bad_hex.status.success());
@@ -442,7 +470,10 @@ fn test_tx_construction_explicit_falcon512_activation_envelope() {
     let tx = LightClient::build_pq_transfer_tx(&kp, to, amount, nonce, shard, is_activation);
 
     let from_addr = kp.derive_address(&DEFAULT_SALT);
-    assert_eq!(tx.from, from_addr, "Sender address must match derived PQ address");
+    assert_eq!(
+        tx.from, from_addr,
+        "Sender address must match derived PQ address"
+    );
     assert_eq!(tx.to, to);
     assert_eq!(tx.amount, amount);
     assert_eq!(tx.nonce, nonce);
@@ -452,9 +483,15 @@ fn test_tx_construction_explicit_falcon512_activation_envelope() {
 
     // Frame markers
     assert!(tx.is_pq(), "Transaction must report is_pq = true");
-    assert!(tx.is_pq_activation(), "Activation tx must carry explicit pubkey");
+    assert!(
+        tx.is_pq_activation(),
+        "Activation tx must carry explicit pubkey"
+    );
     assert!(!tx.is_pq_implicit(), "Activation tx must not be implicit");
-    assert!(tx.signature.starts_with(PQ_ENVELOPE_MAGIC), "Signature wire must start with PQ1");
+    assert!(
+        tx.signature.starts_with(PQ_ENVELOPE_MAGIC),
+        "Signature wire must start with PQ1"
+    );
 
     // Decode and verify envelope
     let envelope = PqSignatureEnvelope::decode(&tx.signature).expect("Valid PQ1 envelope");
@@ -471,7 +508,9 @@ fn test_tx_construction_explicit_falcon512_activation_envelope() {
 
     // Verify key was registered into implicit registry during verification
     let registry = Transaction::global_implicit_registry();
-    let looked_up = registry.lookup(&from_addr).expect("Key must be registered after explicit tx");
+    let looked_up = registry
+        .lookup(&from_addr)
+        .expect("Key must be registered after explicit tx");
     assert_eq!(looked_up.0, stellereum::post_quantum::PqScheme::Falcon512);
     assert_eq!(looked_up.1, kp.public_key());
 }
@@ -489,7 +528,12 @@ fn test_tx_construction_implicit_falcon512_envelope() {
     // Pre-register key into global implicit registry (simulating steady-state spend after Tx #1)
     let registry = Transaction::global_implicit_registry();
     registry
-        .register(from_addr, kp.scheme().into(), kp.public_key(), &DEFAULT_SALT)
+        .register(
+            from_addr,
+            kp.scheme().into(),
+            kp.public_key(),
+            &DEFAULT_SALT,
+        )
         .expect("Pre-registration must succeed");
 
     let tx = LightClient::build_pq_transfer_tx(&kp, to, amount, nonce, shard, is_activation);
@@ -503,14 +547,20 @@ fn test_tx_construction_implicit_falcon512_envelope() {
     // Frame markers
     assert!(tx.is_pq());
     assert!(!tx.is_pq_activation(), "Implicit tx must not be activation");
-    assert!(tx.is_pq_implicit(), "Implicit tx must report is_pq_implicit = true");
+    assert!(
+        tx.is_pq_implicit(),
+        "Implicit tx must report is_pq_implicit = true"
+    );
     assert!(tx.signature.starts_with(PQ_ENVELOPE_MAGIC));
 
     // Decode and verify envelope
     let envelope = PqSignatureEnvelope::decode(&tx.signature).expect("Valid PQ1 envelope");
     assert_eq!(envelope.scheme, PqScheme::Falcon512);
     assert!(envelope.is_implicit, "Envelope must be implicit");
-    assert_eq!(envelope.pubkey, None, "Implicit envelope omits public key from wire");
+    assert_eq!(
+        envelope.pubkey, None,
+        "Implicit envelope omits public key from wire"
+    );
     assert_eq!(envelope.signature_bytes.len(), FALCON512_SIG_LEN);
 
     // Transaction signature verification succeeds using pre-registered key
@@ -539,7 +589,10 @@ fn test_tx_construction_hybrid_activation_and_implicit_envelopes() {
     assert_eq!(env_act.scheme, PqScheme::Hybrid);
     assert_eq!(env_act.pubkey, Some(kp.public_key().to_vec()));
     assert_eq!(env_act.signature_bytes.len(), HYBRID_SIG_LEN);
-    assert!(tx_act.verify_signature(), "Hybrid activation tx must verify");
+    assert!(
+        tx_act.verify_signature(),
+        "Hybrid activation tx must verify"
+    );
 
     // 2. Implicit steady-state spend
     let tx_imp = LightClient::build_pq_transfer_tx(&kp, to, amount, 1, 1, false);
@@ -551,7 +604,10 @@ fn test_tx_construction_hybrid_activation_and_implicit_envelopes() {
     assert_eq!(env_imp.scheme, PqScheme::Hybrid);
     assert_eq!(env_imp.pubkey, None);
     assert_eq!(env_imp.signature_bytes.len(), HYBRID_SIG_LEN);
-    assert!(tx_imp.verify_signature(), "Hybrid implicit tx must verify against registered key");
+    assert!(
+        tx_imp.verify_signature(),
+        "Hybrid implicit tx must verify against registered key"
+    );
 }
 
 #[test]
@@ -561,7 +617,10 @@ fn test_deterministic_keypair_derivation_from_seed() {
     let kp_falcon2 = pq::PqKeyPair::from_seed(PqScheme::Falcon512, &seed);
 
     assert_eq!(kp_falcon1.public_key(), kp_falcon2.public_key());
-    assert_eq!(kp_falcon1.derive_address(&DEFAULT_SALT), kp_falcon2.derive_address(&DEFAULT_SALT));
+    assert_eq!(
+        kp_falcon1.derive_address(&DEFAULT_SALT),
+        kp_falcon2.derive_address(&DEFAULT_SALT)
+    );
 
     let msg = b"Stellereum PQ Transfer Signing Test";
     let sig1 = kp_falcon1.sign(msg);
@@ -629,7 +688,10 @@ fn test_cli_pq_transfer_argument_validation_and_rejections() {
     let valid_to = "aa".repeat(32);
 
     // 1. Missing arguments entirely
-    let out_no_args = Command::new(bin).args(["pq-transfer"]).output().expect("exec");
+    let out_no_args = Command::new(bin)
+        .args(["pq-transfer"])
+        .output()
+        .expect("exec");
     assert_eq!(out_no_args.status.code(), Some(2));
 
     // 2. Missing required --scheme
@@ -662,14 +724,32 @@ fn test_cli_pq_transfer_argument_validation_and_rejections() {
 
     // 6. Bad recipient hex length
     let out_bad_to = Command::new(bin)
-        .args(["pq-transfer", "deadbeef", "10.0", "--scheme", "falcon512", "--dry-run", "--password", "testpass"])
+        .args([
+            "pq-transfer",
+            "deadbeef",
+            "10.0",
+            "--scheme",
+            "falcon512",
+            "--dry-run",
+            "--password",
+            "testpass",
+        ])
         .output()
         .expect("exec");
     assert!(!out_bad_to.status.success());
 
     // 7. Bad amount format
     let out_bad_amt = Command::new(bin)
-        .args(["pq-transfer", &valid_to, "-5.0", "--scheme", "falcon512", "--dry-run", "--password", "testpass"])
+        .args([
+            "pq-transfer",
+            &valid_to,
+            "-5.0",
+            "--scheme",
+            "falcon512",
+            "--dry-run",
+            "--password",
+            "testpass",
+        ])
         .output()
         .expect("exec");
     assert!(!out_bad_amt.status.success());
@@ -686,10 +766,19 @@ fn create_temp_wallet(bin: &str, password: &str) -> std::path::PathBuf {
         rand::random::<u64>()
     ));
     let out = Command::new(bin)
-        .args(["--wallet", tmp.to_str().unwrap(), "new", "--password", password])
+        .args([
+            "--wallet",
+            tmp.to_str().unwrap(),
+            "new",
+            "--password",
+            password,
+        ])
         .output()
         .expect("create test wallet");
-    assert!(out.status.success(), "Creating temporary wallet must succeed");
+    assert!(
+        out.status.success(),
+        "Creating temporary wallet must succeed"
+    );
     tmp
 }
 
@@ -827,16 +916,34 @@ fn test_cli_wallet_creation_default_falcon512_scheme() {
 
     // 1. Run `stell new` without --scheme: must default to falcon512!
     let out = Command::new(bin)
-        .args(["--wallet", tmp.to_str().unwrap(), "new", "--password", password])
+        .args([
+            "--wallet",
+            tmp.to_str().unwrap(),
+            "new",
+            "--password",
+            password,
+        ])
         .output()
         .expect("exec new default");
 
     assert!(out.status.success(), "Creating default wallet must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Falcon-512"), "Stdout must state Falcon-512 scheme");
-    assert!(stdout.contains("Quantum Resistant:    Yes"), "Must report Quantum Resistant: Yes");
-    assert!(stdout.contains("897 bytes"), "Must report Falcon-512 public key size 897 bytes");
-    assert!(stdout.contains("PQ Public Key:"), "Must display public key hex");
+    assert!(
+        stdout.contains("Falcon-512"),
+        "Stdout must state Falcon-512 scheme"
+    );
+    assert!(
+        stdout.contains("Quantum Resistant:    Yes"),
+        "Must report Quantum Resistant: Yes"
+    );
+    assert!(
+        stdout.contains("897 bytes"),
+        "Must report Falcon-512 public key size 897 bytes"
+    );
+    assert!(
+        stdout.contains("PQ Public Key:"),
+        "Must display public key hex"
+    );
 
     // 2. Verify keystore file on disk
     assert!(tmp.exists(), "Keystore file must exist on disk");
@@ -859,7 +966,15 @@ fn test_cli_wallet_creation_default_falcon512_scheme() {
     // 4. Test explicit --scheme ed25519 and --scheme hybrid options
     let tmp_ed = std::env::temp_dir().join(format!("stell_ed_{}.json", rand::random::<u64>()));
     let out_ed = Command::new(bin)
-        .args(["--wallet", tmp_ed.to_str().unwrap(), "new", "--scheme", "ed25519", "--password", password])
+        .args([
+            "--wallet",
+            tmp_ed.to_str().unwrap(),
+            "new",
+            "--scheme",
+            "ed25519",
+            "--password",
+            password,
+        ])
         .output()
         .expect("exec new ed25519");
     assert!(out_ed.status.success());
@@ -870,7 +985,15 @@ fn test_cli_wallet_creation_default_falcon512_scheme() {
 
     let tmp_hyb = std::env::temp_dir().join(format!("stell_hyb_{}.json", rand::random::<u64>()));
     let out_hyb = Command::new(bin)
-        .args(["--wallet", tmp_hyb.to_str().unwrap(), "new", "--scheme", "hybrid", "--password", password])
+        .args([
+            "--wallet",
+            tmp_hyb.to_str().unwrap(),
+            "new",
+            "--scheme",
+            "hybrid",
+            "--password",
+            password,
+        ])
         .output()
         .expect("exec new hybrid");
     assert!(out_hyb.status.success());
@@ -905,12 +1028,30 @@ fn test_cli_pay_routing_to_pq_transfer_when_falcon512() {
 
     assert!(out_default.status.success(), "Pay dry-run must succeed");
     let stdout_default = String::from_utf8_lossy(&out_default.stdout);
-    assert!(stdout_default.contains("POST-QUANTUM TRANSACTION DRY-RUN"), "Must route to PQ transfer dry-run");
-    assert!(stdout_default.contains("Falcon-512"), "Must use Falcon-512 scheme");
-    assert!(stdout_default.contains("PQ1"), "Must use PQ1 envelope format");
-    assert!(stdout_default.contains("12.34 STELL"), "Must contain payment amount");
-    assert!(stdout_default.contains("✅ Valid PQ1 Frame"), "Frame must be valid PQ1");
-    assert!(stdout_default.contains("✅ Signature Verifies"), "Signature must verify");
+    assert!(
+        stdout_default.contains("POST-QUANTUM TRANSACTION DRY-RUN"),
+        "Must route to PQ transfer dry-run"
+    );
+    assert!(
+        stdout_default.contains("Falcon-512"),
+        "Must use Falcon-512 scheme"
+    );
+    assert!(
+        stdout_default.contains("PQ1"),
+        "Must use PQ1 envelope format"
+    );
+    assert!(
+        stdout_default.contains("12.34 STELL"),
+        "Must contain payment amount"
+    );
+    assert!(
+        stdout_default.contains("✅ Valid PQ1 Frame"),
+        "Frame must be valid PQ1"
+    );
+    assert!(
+        stdout_default.contains("✅ Signature Verifies"),
+        "Signature must verify"
+    );
 
     // 2. Run `stell pay` with explicit `--scheme falcon512`
     let out_explicit = Command::new(bin)

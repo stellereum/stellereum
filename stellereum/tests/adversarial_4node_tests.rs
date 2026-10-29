@@ -19,7 +19,9 @@ fn vset(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect())
 }
 fn idx_of(ks: &[SigningKey], target: [u8; 32]) -> usize {
-    ks.iter().position(|k| id(k) == target).expect("known validator")
+    ks.iter()
+        .position(|k| id(k) == target)
+        .expect("known validator")
 }
 fn h(x: u8) -> [u8; 32] {
     [x; 32]
@@ -74,8 +76,9 @@ fn adv_equivocating_proposer_splits_halves_but_cannot_hold_the_split() {
     let gy: Vec<usize> = (0..4).filter(|i| !gx.contains(i)).collect();
     assert_eq!(gy.len(), 2);
 
-    let mut hcs: Vec<HeightConsensus> =
-        (0..4).map(|_| HeightConsensus::new(height, vs.clone())).collect();
+    let mut hcs: Vec<HeightConsensus> = (0..4)
+        .map(|_| HeightConsensus::new(height, vs.clone()))
+        .collect();
     for &i in &gx {
         hcs[i].receive_proposal(byz_id, x).unwrap();
     }
@@ -98,7 +101,11 @@ fn adv_equivocating_proposer_splits_halves_but_cannot_hold_the_split() {
         }
     }
     for (i, hc) in hcs.iter_mut().enumerate() {
-        assert_eq!(hc.try_prevote_quorum(), None, "node {i}: 2-vs-2 is no quorum");
+        assert_eq!(
+            hc.try_prevote_quorum(),
+            None,
+            "node {i}: 2-vs-2 is no quorum"
+        );
         assert_eq!(hc.prevote_set(0).unwrap().power_for(Some(x)), 2);
         assert_eq!(hc.prevote_set(0).unwrap().power_for(Some(y)), 2);
     }
@@ -117,8 +124,15 @@ fn adv_equivocating_proposer_splits_halves_but_cannot_hold_the_split() {
         }
     }
     for (i, hc) in hcs.iter_mut().enumerate() {
-        assert_eq!(hc.try_precommit_quorum(), None, "node {i}: neither half finalizes");
-        assert_eq!(hc.decided, None, "node {i}: nothing decided on equivocation");
+        assert_eq!(
+            hc.try_precommit_quorum(),
+            None,
+            "node {i}: neither half finalizes"
+        );
+        assert_eq!(
+            hc.decided, None,
+            "node {i}: nothing decided on equivocation"
+        );
     }
 
     // Later round with an HONEST proposer reunites everyone on Z.
@@ -143,7 +157,11 @@ fn adv_equivocating_proposer_splits_halves_but_cannot_hold_the_split() {
             Some(z),
             "node {i}: honest round {r} must decide Z"
         );
-        assert_eq!(hc.decided, Some(z), "node {i}: converged on Z, no permanent split");
+        assert_eq!(
+            hc.decided,
+            Some(z),
+            "node {i}: converged on Z, no permanent split"
+        );
     }
 }
 
@@ -159,8 +177,9 @@ fn adv_targeted_round_inflation_is_capped_and_victim_still_finalizes() {
     let victim = 0usize;
     let x = h(0x44);
 
-    let mut hcs: Vec<HeightConsensus> =
-        (0..4).map(|_| HeightConsensus::new(height, vs.clone())).collect();
+    let mut hcs: Vec<HeightConsensus> = (0..4)
+        .map(|_| HeightConsensus::new(height, vs.clone()))
+        .collect();
     assert_eq!(hcs[victim].round, 0);
 
     // Far-future vote delivered ONLY to the victim.
@@ -173,7 +192,10 @@ fn adv_targeted_round_inflation_is_capped_and_victim_still_finalizes() {
         if i == victim {
             continue;
         }
-        assert!(hc.prevote_set(far).is_none(), "node {i}: uninfected by targeted vote");
+        assert!(
+            hc.prevote_set(far).is_none(),
+            "node {i}: uninfected by targeted vote"
+        );
     }
     // One message moves the victim at most one round.
     hcs[victim].advance_to_round(far);
@@ -204,7 +226,11 @@ fn adv_targeted_round_inflation_is_capped_and_victim_still_finalizes() {
         }
     }
     let prop = vs.proposer_for(height, r).unwrap();
-    assert_ne!(prop, id(&ks[byz]), "reunion round must have an honest proposer");
+    assert_ne!(
+        prop,
+        id(&ks[byz]),
+        "reunion round must have an honest proposer"
+    );
     let z = h(0x45);
     let mut reunion: Vec<HeightConsensus> = honest.iter().map(|&i| hcs[i].clone()).collect();
     for hc in reunion.iter_mut() {
@@ -234,16 +260,24 @@ fn adv_withheld_qc_replay_at_next_height_is_inert() {
     // Build a GENUINE QC for X at H=1 (3 prevotes + 3 precommits).
     let mut hc1 = HeightConsensus::new(h1, vs.clone());
     for k in ks.iter().take(3) {
-        hc1.add_prevote(Vote::sign(k, h1, 0, VoteKind::Prevote, Some(x))).unwrap();
+        hc1.add_prevote(Vote::sign(k, h1, 0, VoteKind::Prevote, Some(x)))
+            .unwrap();
     }
     assert_eq!(hc1.try_prevote_quorum(), Some(Some(x)));
     for k in ks.iter().take(3) {
-        hc1.add_precommit(Vote::sign(k, h1, 0, VoteKind::Precommit, Some(x))).unwrap();
+        hc1.add_precommit(Vote::sign(k, h1, 0, VoteKind::Precommit, Some(x)))
+            .unwrap();
     }
     assert_eq!(hc1.try_precommit_quorum(), Some(x));
-    let qc = hc1.precommit_qc.clone().expect("genuine precommit QC exists");
+    let qc = hc1
+        .precommit_qc
+        .clone()
+        .expect("genuine precommit QC exists");
     assert_eq!(qc.height, h1);
-    assert!(qc.verify(&vs), "the withheld QC is cryptographically genuine");
+    assert!(
+        qc.verify(&vs),
+        "the withheld QC is cryptographically genuine"
+    );
 
     // The network moves to H+1 (fresh per-height state).
     let mut hc2 = HeightConsensus::new(h2, vs.clone());
@@ -252,27 +286,42 @@ fn adv_withheld_qc_replay_at_next_height_is_inert() {
     // Replay: every vote inside the old QC is out-of-scope at H+1.
     for k in ks.iter().take(3) {
         let stale_pv = Vote::sign(k, h1, 0, VoteKind::Prevote, Some(x));
-        let e = hc2.add_prevote(stale_pv).expect_err("stale height-1 vote must be rejected");
-        assert!(e.contains("out of scope"), "reject reason must be scope: {e}");
+        let e = hc2
+            .add_prevote(stale_pv)
+            .expect_err("stale height-1 vote must be rejected");
+        assert!(
+            e.contains("out of scope"),
+            "reject reason must be scope: {e}"
+        );
         let stale_pc = Vote::sign(k, h1, 0, VoteKind::Precommit, Some(x));
-        let e2 = hc2.add_precommit(stale_pc).expect_err("stale height-1 vote must be rejected");
-        assert!(e2.contains("out of scope"), "reject reason must be scope: {e2}");
+        let e2 = hc2
+            .add_precommit(stale_pc)
+            .expect_err("stale height-1 vote must be rejected");
+        assert!(
+            e2.contains("out of scope"),
+            "reject reason must be scope: {e2}"
+        );
     }
     // The old QC changes nothing: no finalize, no rewind.
     assert_eq!(hc2.try_prevote_quorum(), None);
     assert_eq!(hc2.try_precommit_quorum(), None);
-    assert_eq!(hc2.decided, None, "stale QC must not finalize anything at H+1");
+    assert_eq!(
+        hc2.decided, None,
+        "stale QC must not finalize anything at H+1"
+    );
     assert_eq!(hc2.height, h2, "stale QC must not rewind the height");
     assert!(hc2.precommit_qc.is_none(), "no QC installed from replay");
 
     // And the fresh height still finalizes normally on a new value.
     let y = h(0x67);
     for k in ks.iter().take(3) {
-        hc2.add_prevote(Vote::sign(k, h2, 0, VoteKind::Prevote, Some(y))).unwrap();
+        hc2.add_prevote(Vote::sign(k, h2, 0, VoteKind::Prevote, Some(y)))
+            .unwrap();
     }
     assert_eq!(hc2.try_prevote_quorum(), Some(Some(y)));
     for k in ks.iter().take(3) {
-        hc2.add_precommit(Vote::sign(k, h2, 0, VoteKind::Precommit, Some(y))).unwrap();
+        hc2.add_precommit(Vote::sign(k, h2, 0, VoteKind::Precommit, Some(y)))
+            .unwrap();
     }
     assert_eq!(hc2.try_precommit_quorum(), Some(y));
 }
@@ -291,8 +340,9 @@ fn adv_nil_grind_does_not_deny_quorum_and_chain_advances() {
     assert_eq!(honest.len(), 3);
 
     for height in [1u64, 2u64] {
-        let mut hcs: Vec<HeightConsensus> =
-            (0..4).map(|_| HeightConsensus::new(height, vs.clone())).collect();
+        let mut hcs: Vec<HeightConsensus> = (0..4)
+            .map(|_| HeightConsensus::new(height, vs.clone()))
+            .collect();
         // Honest proposer for this height/round 0 (never the byzantine:
         // heights rotate but with 4 keys round 0 may still name `byz` at
         // some height — walk rounds until honest, deterministically).
@@ -317,7 +367,10 @@ fn adv_nil_grind_does_not_deny_quorum_and_chain_advances() {
             }
         }
         let nil_pv = Vote::sign(&ks[byz], height, r, VoteKind::Prevote, None);
-        assert!(nil_pv.verify(), "nil vote carries an honest signature on nil");
+        assert!(
+            nil_pv.verify(),
+            "nil vote carries an honest signature on nil"
+        );
         for hc in hcs.iter_mut() {
             hc.add_prevote(nil_pv.clone()).unwrap();
         }
@@ -375,10 +428,20 @@ fn adv_amnesia_replay_of_own_old_votes_is_rejected_and_inert() {
     let round_before = hc.round;
 
     // Replay at H=2: rejected as out-of-scope.
-    let e1 = hc.add_prevote(old_pv.clone()).expect_err("old-height prevote must be rejected");
-    assert!(e1.contains("out of scope"), "reject reason must be scope: {e1}");
-    let e2 = hc.add_precommit(old_pc.clone()).expect_err("old-height precommit must be rejected");
-    assert!(e2.contains("out of scope"), "reject reason must be scope: {e2}");
+    let e1 = hc
+        .add_prevote(old_pv.clone())
+        .expect_err("old-height prevote must be rejected");
+    assert!(
+        e1.contains("out of scope"),
+        "reject reason must be scope: {e1}"
+    );
+    let e2 = hc
+        .add_precommit(old_pc.clone())
+        .expect_err("old-height precommit must be rejected");
+    assert!(
+        e2.contains("out of scope"),
+        "reject reason must be scope: {e2}"
+    );
 
     // Nothing changed: no power counted, no quorum, no round move.
     // (Note: `add_*` leaves an empty per-round `VoteSet` entry behind on
@@ -398,8 +461,14 @@ fn adv_amnesia_replay_of_own_old_votes_is_rejected_and_inert() {
     }
     assert_eq!(hc.try_prevote_quorum(), Some(Some(cur_block)));
     for k in ks.iter().take(3) {
-        hc.add_precommit(Vote::sign(k, cur_h, 0, VoteKind::Precommit, Some(cur_block)))
-            .unwrap();
+        hc.add_precommit(Vote::sign(
+            k,
+            cur_h,
+            0,
+            VoteKind::Precommit,
+            Some(cur_block),
+        ))
+        .unwrap();
     }
     assert_eq!(
         hc.try_precommit_quorum(),

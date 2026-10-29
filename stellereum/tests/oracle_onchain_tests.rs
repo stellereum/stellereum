@@ -16,8 +16,8 @@
 
 use ed25519_dalek::SigningKey;
 use stellereum::oracle::{
-    deviation_bps, OracleState, PriceFeedUpdate, MAX_PRICE_DEVIATION_BPS,
-    STALE_PRICE_MAX_SECS, USDT_MIN_PEG_MICRO_USD,
+    deviation_bps, OracleState, PriceFeedUpdate, MAX_PRICE_DEVIATION_BPS, STALE_PRICE_MAX_SECS,
+    USDT_MIN_PEG_MICRO_USD,
 };
 use stellereum::orderbook::{OrderSide, OrderType, PAIR_STELL_USDT};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
@@ -49,7 +49,9 @@ async fn wired_engine() -> InMemoryStateEngine {
     let pk = publisher_key().verifying_key().to_bytes();
     e.oracle_write().await.publishers.insert(pk);
     let sender = sender_key().verifying_key().to_bytes();
-    e.credit_native(&sender, 1_000_000_000_000).await.expect("fund");
+    e.credit_native(&sender, 1_000_000_000_000)
+        .await
+        .expect("fund");
     e
 }
 
@@ -80,7 +82,8 @@ async fn apply_feed_block(
 ) -> (bool, [u8; 32], [u8; 32]) {
     let before = e.get_state_root().await;
     let tx = feed_tx(feed, nonce);
-    let (_applied, _failed, _fees, status, _) = e.apply_block_parallel_fees(&[tx], block_time).await;
+    let (_applied, _failed, _fees, status, _) =
+        e.apply_block_parallel_fees(&[tx], block_time).await;
     let after = e.get_state_root().await;
     (status.first().copied().unwrap_or(false), before, after)
 }
@@ -260,8 +263,9 @@ async fn stale_feed_rejected_at_block_time() {
     let balance_before = e.get_account(&sender).await.unwrap().balance;
 
     let before = e.get_state_root().await;
-    let (_applied, _failed, _fees, status, _) =
-        e.apply_block_parallel_fees(std::slice::from_ref(&tx), BLOCK_TIME).await;
+    let (_applied, _failed, _fees, status, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&tx), BLOCK_TIME)
+        .await;
     let after = e.get_state_root().await;
 
     assert!(!status[0], "a stale feed must be rejected at block time");
@@ -322,10 +326,14 @@ async fn deviation_feed_rejected_latches_breaker_and_blocks_later_feeds() {
     let fee2 = failure_fee(&e, &tx2).await;
     let balance_before = e.get_account(&sender).await.unwrap().balance;
     let before = e.get_state_root().await;
-    let (_applied, _failed, _fees, status, _) =
-        e.apply_block_parallel_fees(std::slice::from_ref(&tx2), BLOCK_TIME).await;
+    let (_applied, _failed, _fees, status, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&tx2), BLOCK_TIME)
+        .await;
     let after = e.get_state_root().await;
-    assert!(!status[0], "a latched breaker refuses even a perfectly fresh feed");
+    assert!(
+        !status[0],
+        "a latched breaker refuses even a perfectly fresh feed"
+    );
     // PINNED POLICY (SEC-07): a refusal is NOT free and NOT a no-op: it pays
     // the failure fee and consumes the nonce, so the root moves. What must NOT
     // move is the ORACLE - the latch is already set and the price unchanged.
@@ -349,7 +357,11 @@ async fn deviation_feed_rejected_latches_breaker_and_blocks_later_feeds() {
     // allowed, the rule is `> limit`), and a percent over it is not.
     assert_eq!(deviation_bps(110_000, 100_000), MAX_PRICE_DEVIATION_BPS);
     assert!(deviation_bps(110_101, 100_000) > MAX_PRICE_DEVIATION_BPS);
-    assert_eq!(deviation_bps(90_000, 100_000), MAX_PRICE_DEVIATION_BPS, "symmetric");
+    assert_eq!(
+        deviation_bps(90_000, 100_000),
+        MAX_PRICE_DEVIATION_BPS,
+        "symmetric"
+    );
     assert_eq!(deviation_bps(100_000, 100_000), 0);
 }
 
@@ -358,7 +370,12 @@ async fn usdt_peg_boundary_at_block_time() {
     let e = wired_engine().await;
 
     // Exactly at the peg floor: accepted (the rule is `price < floor`).
-    let at_floor = PriceFeedUpdate::sign("USDT", USDT_MIN_PEG_MICRO_USD, BLOCK_TIME - 10, &publisher_key());
+    let at_floor = PriceFeedUpdate::sign(
+        "USDT",
+        USDT_MIN_PEG_MICRO_USD,
+        BLOCK_TIME - 10,
+        &publisher_key(),
+    );
     let (ok, _, _) = apply_feed_block(&e, at_floor, BLOCK_TIME, 0).await;
     assert!(ok, "a feed exactly at the peg floor must be accepted");
 
@@ -374,8 +391,7 @@ async fn usdt_peg_boundary_at_block_time() {
     {
         let oracle = e.oracle_read().await;
         assert_eq!(
-            oracle.feeds["USDT"].price_micro_usd,
-            USDT_MIN_PEG_MICRO_USD,
+            oracle.feeds["USDT"].price_micro_usd, USDT_MIN_PEG_MICRO_USD,
             "the depegged price must not replace the pegged one"
         );
         assert!(oracle.breaker_tripped, "a depeg must latch the breaker");
@@ -417,7 +433,10 @@ async fn place_order_settled_cannot_bypass_the_gates() {
         )
         .await;
     let err = res.expect_err("a deviating order must be refused");
-    assert!(err.contains("deviates"), "gate error, not later checks: {err}");
+    assert!(
+        err.contains("deviates"),
+        "gate error, not later checks: {err}"
+    );
 
     // ... and the refusal latches NOTHING (E3 fix): a trader's far-away
     // limit is refused, trading continues. Only a PUBLISHER's deviant
@@ -441,7 +460,10 @@ async fn place_order_settled_cannot_bypass_the_gates() {
         )
         .await;
     let err = res.expect_err("still no wUSDT configured here");
-    assert!(!err.contains("Circuit breaker"), "gate passed, later check fired: {err}");
+    assert!(
+        !err.contains("Circuit breaker"),
+        "gate passed, later check fired: {err}"
+    );
 
     // No latch to reset (E3 fix): prove nothing latched, then check the SAME
     // order passes the gate: the only error left is the missing wUSDT quote
@@ -506,14 +528,17 @@ async fn svm_place_order_gate_cannot_bypass() {
     let fee = failure_fee(&e, &deviating).await;
     let sender = sender_key().verifying_key().to_bytes();
     let balance_before = e.get_account(&sender).await.unwrap().balance;
-    let (_a, _f, _fees, status, _) =
-        e.apply_block_parallel_fees(std::slice::from_ref(&deviating), BLOCK_TIME).await;
+    let (_a, _f, _fees, status, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&deviating), BLOCK_TIME)
+        .await;
     assert_eq!(status, vec![false], "the deviating order must revert");
     // The refusal is not free: the failure fee is charged and the nonce is
     // consumed, while the ORDER itself left nothing behind.
     assert_refused_tx_paid_failure_fee(&e, &deviating, fee, balance_before, 1).await;
     assert!(
-        e.orderbooks_read().await.get_book(PAIR_STELL_USDT)
+        e.orderbooks_read()
+            .await
+            .get_book(PAIR_STELL_USDT)
             .map(|b| b.depth() == (0, 0))
             .unwrap_or(true),
         "no order may be placed by a reverted transaction"
@@ -560,7 +585,9 @@ async fn svm_mixed_block_deviating_order_does_not_poison_block_mate() {
     // Second trader, funded so the fair order is fully appliable.
     let victim_key = SigningKey::from_bytes(&[0x08; 32]);
     let victim = victim_key.verifying_key().to_bytes();
-    e.credit_native(&victim, 1_000_000_000_000).await.expect("fund victim");
+    e.credit_native(&victim, 1_000_000_000_000)
+        .await
+        .expect("fund victim");
 
     // Commit $0.25/STELL via a real block (consumes the sender's nonce 0,
     // so its next sequence number is 1; the victim is still at 0 — nonces
@@ -623,7 +650,10 @@ async fn oracle_state_roundtrips_through_a_domain_snapshot() {
     let pk = publisher_key().verifying_key().to_bytes();
     e.oracle_write().await.publishers.insert(pk);
     let feed = PriceFeedUpdate::sign("STELL", 250_000, BLOCK_TIME - 10, &publisher_key());
-    e.oracle_write().await.commit_feed(&feed, BLOCK_TIME).expect("commit");
+    e.oracle_write()
+        .await
+        .commit_feed(&feed, BLOCK_TIME)
+        .expect("commit");
     // A latched breaker must survive too: it is state, not a cache.
     e.oracle_write().await.breaker_tripped = true;
     let root = e.get_state_root().await;
@@ -687,7 +717,9 @@ async fn oracle_state_roundtrips_through_snapshot_domains_and_load_full_state() 
 
     // The account snapshot, then the domain snapshot through the REAL
     // `AsyncPersistence::snapshot_domains` path (background writer + all).
-    store.put_state(SNAP_H, &engine.create_snapshot().await).expect("state");
+    store
+        .put_state(SNAP_H, &engine.create_snapshot().await)
+        .expect("state");
     let ap = AsyncPersistence::start(store.clone());
     ap.snapshot_domains(
         &engine,
@@ -726,11 +758,13 @@ async fn oracle_state_roundtrips_through_snapshot_domains_and_load_full_state() 
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         b.sign_block(&sk);
         b
     };
-    let h0 = store.put_block(&mkblock(SNAP_H, [0u8; 32], [0xEEu8; 32])).expect("b0");
+    let h0 = store
+        .put_block(&mkblock(SNAP_H, [0u8; 32], [0xEEu8; 32]))
+        .expect("b0");
     let h1 = store.put_block(&mkblock(NEXT_H, h0, root)).expect("b1");
     store.set_finalized(NEXT_H, &h1).expect("finalized");
     store.flush().expect("flush");
@@ -779,7 +813,10 @@ async fn every_oracle_difference_is_a_root_difference() {
     );
 
     let feed = PriceFeedUpdate::sign("STELL", 250_000, BLOCK_TIME - 10, &publisher_key());
-    b.oracle_write().await.commit_feed(&feed, BLOCK_TIME).expect("commit");
+    b.oracle_write()
+        .await
+        .commit_feed(&feed, BLOCK_TIME)
+        .expect("commit");
     assert_ne!(
         a.get_state_root().await,
         b.get_state_root().await,

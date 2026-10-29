@@ -21,7 +21,14 @@ fn ms(nanos: u128, iters: u64) -> f64 {
 
 #[tokio::main]
 async fn main() {
-    println!("profile: {}", if cfg!(debug_assertions) { "DEBUG (slow)" } else { "RELEASE" });
+    println!(
+        "profile: {}",
+        if cfg!(debug_assertions) {
+            "DEBUG (slow)"
+        } else {
+            "RELEASE"
+        }
+    );
     println!();
 
     // ---- 1. get_state_root vs state size ----
@@ -30,7 +37,9 @@ async fn main() {
         for i in 0..accounts {
             let mut addr = [0u8; 32];
             addr[..8].copy_from_slice(&i.to_le_bytes());
-            engine.update_account(AccountState::new(addr, 1_000_000)).await;
+            engine
+                .update_account(AccountState::new(addr, 1_000_000))
+                .await;
         }
         // Warm up (first read commits the digest).
         let _ = engine.get_state_root().await;
@@ -49,7 +58,6 @@ async fn main() {
 
     // ---- 1b. get_state_root with heavy non-trie domains ----
     {
-        
         let engine = Arc::new(InMemoryStateEngine::new());
         // 200 validators x 50 delegators + orderbook + contracts pressure.
         for v in 0..200u64 {

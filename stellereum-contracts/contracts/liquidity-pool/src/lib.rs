@@ -14,8 +14,8 @@
 extern crate std;
 
 use stellereum_contract_sdk::{
-    emit, setup_wasm_panic_handler, sload, sstore, ERR_ALREADY_EXISTS,
-    ERR_INSUFFICIENT_BALANCE, ERR_INVALID_ARGUMENT,
+    emit, setup_wasm_panic_handler, sload, sstore, ERR_ALREADY_EXISTS, ERR_INSUFFICIENT_BALANCE,
+    ERR_INVALID_ARGUMENT,
 };
 
 setup_wasm_panic_handler!();

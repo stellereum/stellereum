@@ -90,10 +90,8 @@ fn write_key_file(path: &std::path::Path, contents: &str, mode: u32) {
     }
 }
 
-const GOOD_SEED_HEX: &str =
-    "9d61b19deffd5a60ba844af492ec2d4449c5697b326597703fae7a3c8a354c70";
-const TEST_SEED_HEX: &str =
-    "1111111111111111111111111111111111111111111111111111111111111111";
+const GOOD_SEED_HEX: &str = "9d61b19deffd5a60ba844af492ec2d4449c5697b326597703fae7a3c8a354c70";
+const TEST_SEED_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
 // ==================== (a) fresh-join guard ====================
 
@@ -197,7 +195,10 @@ fn faucet_seed_hex_parses_and_rejects() {
     assert_eq!(prefixed, seed);
     // Garbage fails closed.
     assert!(parse_faucet_seed_hex("zzzz").is_err());
-    assert!(parse_faucet_seed_hex("abcd").is_err(), "wrong length must fail");
+    assert!(
+        parse_faucet_seed_hex("abcd").is_err(),
+        "wrong length must fail"
+    );
     assert!(parse_faucet_seed_hex("").is_err());
 }
 
@@ -229,7 +230,10 @@ fn faucet_refuses_public_test_key_unless_dev_override() {
     // No override: loud refusal naming the exact unsafe flag.
     let err = check_faucet_seed_allows_startup(&test_seed).expect_err("test key must be refused");
     assert!(err.contains("REFUSING"), "loud: {err}");
-    assert!(err.contains("STELL_DEV_UNSAFE_TESTKEY"), "must name the override: {err}");
+    assert!(
+        err.contains("STELL_DEV_UNSAFE_TESTKEY"),
+        "must name the override: {err}"
+    );
     // Dev override: allowed.
     g.set("STELL_DEV_UNSAFE_TESTKEY", "1");
     assert!(check_faucet_seed_allows_startup(&test_seed).is_ok());
@@ -254,7 +258,10 @@ fn faucet_key_file_loads_when_0600_and_refuses_otherwise() {
     #[cfg(unix)]
     {
         let err = load_faucet_seed_from_file(&bad_path).expect_err("0640 must be refused");
-        assert!(err.contains("0600") || err.contains("permissions"), "loud perms error: {err}");
+        assert!(
+            err.contains("0600") || err.contains("permissions"),
+            "loud perms error: {err}"
+        );
     }
     // Empty file is refused.
     let empty_path = tmp_path("faucetempty");
@@ -296,7 +303,10 @@ fn faucet_load_is_fail_closed_end_to_end() {
     assert!(stellereum::rpc::faucet_key_present_from_env());
     let seed = stellereum::rpc::load_faucet_seed().expect("real inline key loads");
     assert_eq!(hex::encode(seed), GOOD_SEED_HEX);
-    assert_eq!(stellereum::rpc::try_load_faucet_seed_opt().unwrap(), Some(seed));
+    assert_eq!(
+        stellereum::rpc::try_load_faucet_seed_opt().unwrap(),
+        Some(seed)
+    );
     // Inline test key without override: refused (no silent money-printing).
     g.set("STELL_FAUCET_KEY", TEST_SEED_HEX);
     let err = stellereum::rpc::load_faucet_seed().expect_err("test key must be refused");
@@ -341,7 +351,10 @@ fn peer_chain_id_mismatch_aborts_loudly() {
     // Mismatch: loud abort naming both ids — never a silent partition.
     let err = stellereum::zkml::check_peer_chain_id(5757, 1234).expect_err("mismatch must abort");
     assert!(err.contains("REFUSING"), "loud: {err}");
-    assert!(err.contains("5757") && err.contains("1234"), "both ids: {err}");
+    assert!(
+        err.contains("5757") && err.contains("1234"),
+        "both ids: {err}"
+    );
     let err2 = stellereum::evm_adapter::check_peer_chain_id(1234, 5757)
         .expect_err("evm site enforces the same rule");
     assert!(err2.contains("REFUSING"), "loud: {err2}");

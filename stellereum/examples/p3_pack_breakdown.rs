@@ -35,7 +35,8 @@ async fn main() {
         let mut seq = 0u64;
         for sk in &keys {
             for nonce in 0..100u64 {
-                p.add_checked(legacy_tx(sk, RECIP, nonce, seq), BAL).unwrap();
+                p.add_checked(legacy_tx(sk, RECIP, nonce, seq), BAL)
+                    .unwrap();
                 seq += 1;
             }
         }
@@ -52,7 +53,10 @@ async fn main() {
         let out = pool.select_for_block_multi(10_000, 30_000_000, |_| true);
         assert_eq!(out.len(), 10_000);
     }
-    println!("select trivial 10k: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 5.0);
+    println!(
+        "select trivial 10k: {:.2} ms",
+        t.elapsed().as_secs_f64() * 1000.0 / 5.0
+    );
 
     let mut expected: std::collections::HashMap<[u8; 32], (u64, u64)> =
         std::collections::HashMap::new();
@@ -80,20 +84,29 @@ async fn main() {
         });
         assert_eq!(out.len(), 10_000);
     }
-    println!("select nonce-filter 10k: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 5.0);
+    println!(
+        "select nonce-filter 10k: {:.2} ms",
+        t.elapsed().as_secs_f64() * 1000.0 / 5.0
+    );
 
     // ---- senders() vs all() derivation ----
     let t = Instant::now();
     for _ in 0..20 {
         let _ = pool.senders();
     }
-    println!("senders() 10k: {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
+    println!(
+        "senders() 10k: {:.3} ms",
+        t.elapsed().as_secs_f64() * 1000.0 / 20.0
+    );
     let t = Instant::now();
     for _ in 0..20 {
         let v = pool.all();
         let _: std::collections::BTreeSet<[u8; 32]> = v.iter().map(|tx| tx.from).collect();
     }
-    println!("all()+derive 10k: {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
+    println!(
+        "all()+derive 10k: {:.3} ms",
+        t.elapsed().as_secs_f64() * 1000.0 / 20.0
+    );
 
     // ---- full propose (pool prebuilt, engine pre-funded; time propose only) ----
     let funding: Vec<([u8; 32], u64)> = keys.iter().map(|k| (id_of(k), BAL)).collect();
@@ -130,7 +143,10 @@ async fn main() {
         block = Some(b);
     }
     // NOTE: pool rebuild (signing 10k) is inside the loop above; isolate below.
-    println!("propose+poolbuild 10k x5 avg: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 5.0);
+    println!(
+        "propose+poolbuild 10k x5 avg: {:.2} ms",
+        t.elapsed().as_secs_f64() * 1000.0 / 5.0
+    );
     let block = block.unwrap();
 
     // propose-only, pool+engine prebuilt once, fresh runtime per propose is
@@ -152,7 +168,10 @@ async fn main() {
             let b = rt.propose(TS).await.unwrap();
             assert_eq!(b.transactions.len(), 10_000);
         }
-        println!("propose-only 10k (same pool): {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 5.0);
+        println!(
+            "propose-only 10k (same pool): {:.2} ms",
+            t.elapsed().as_secs_f64() * 1000.0 / 5.0
+        );
     }
 
     // ---- assembly pieces ----
@@ -162,12 +181,19 @@ async fn main() {
         let bytes = bincode::serialize(&block).unwrap();
         enc_len = bytes.len();
     }
-    println!("block encode 10k ({} bytes): {:.2} ms", enc_len, t.elapsed().as_secs_f64() * 1000.0 / 5.0);
+    println!(
+        "block encode 10k ({} bytes): {:.2} ms",
+        enc_len,
+        t.elapsed().as_secs_f64() * 1000.0 / 5.0
+    );
     let t = Instant::now();
     for _ in 0..5 {
         let _ = block.compute_hash();
     }
-    println!("block compute_hash 10k: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 5.0);
+    println!(
+        "block compute_hash 10k: {:.2} ms",
+        t.elapsed().as_secs_f64() * 1000.0 / 5.0
+    );
     let t = Instant::now();
     for _ in 0..5 {
         let mut acc = 0u64;
@@ -176,7 +202,10 @@ async fn main() {
         }
         std::hint::black_box(acc);
     }
-    println!("compute_tx_hash x10k: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 5.0);
+    println!(
+        "compute_tx_hash x10k: {:.2} ms",
+        t.elapsed().as_secs_f64() * 1000.0 / 5.0
+    );
 
     // unseal gate sequential vs parallel (plain txs: hash+lookup)
     {
@@ -186,33 +215,59 @@ async fn main() {
         for _ in 0..5 {
             let mut kept = 0;
             for tx in &txs {
-                if matches!(pool_r.mev.verify_pool_tx(tx), stellereum::mev::SealVerdict::Match | stellereum::mev::SealVerdict::NotSealed) {
+                if matches!(
+                    pool_r.mev.verify_pool_tx(tx),
+                    stellereum::mev::SealVerdict::Match | stellereum::mev::SealVerdict::NotSealed
+                ) {
                     kept += 1;
                 }
             }
             assert_eq!(kept, 10_000);
         }
-        println!("unseal sequential 10k: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 5.0);
+        println!(
+            "unseal sequential 10k: {:.2} ms",
+            t.elapsed().as_secs_f64() * 1000.0 / 5.0
+        );
         use rayon::prelude::*;
         let t = Instant::now();
         for _ in 0..5 {
-            let checked: Vec<bool> = txs.par_iter().map(|tx| matches!(pool_r.mev.verify_pool_tx(tx), stellereum::mev::SealVerdict::Match | stellereum::mev::SealVerdict::NotSealed)).collect();
+            let checked: Vec<bool> = txs
+                .par_iter()
+                .map(|tx| {
+                    matches!(
+                        pool_r.mev.verify_pool_tx(tx),
+                        stellereum::mev::SealVerdict::Match
+                            | stellereum::mev::SealVerdict::NotSealed
+                    )
+                })
+                .collect();
             assert_eq!(checked.len(), 10_000);
         }
-        println!("unseal parallel 10k: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 5.0);
+        println!(
+            "unseal parallel 10k: {:.2} ms",
+            t.elapsed().as_secs_f64() * 1000.0 / 5.0
+        );
     }
 
     // ---- sig verify ----
     let t = Instant::now();
     for _ in 0..3 {
-        assert!(Transaction::verify_signatures_batch_parallel(&block.transactions));
+        assert!(Transaction::verify_signatures_batch_parallel(
+            &block.transactions
+        ));
     }
-    println!("batch-parallel sig verify 10k: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 3.0);
+    println!(
+        "batch-parallel sig verify 10k: {:.2} ms",
+        t.elapsed().as_secs_f64() * 1000.0 / 3.0
+    );
     let t = Instant::now();
     for _ in 0..3 {
         assert!(Transaction::verify_signatures_batch(&block.transactions));
     }
-    println!("sequential batch sig verify 10k: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 3.0);
+    println!(
+        "sequential batch sig verify 10k: {:.2} ms",
+        t.elapsed().as_secs_f64() * 1000.0 / 3.0
+    );
 
     // ---- apply vs N ----
     for n in [1_000usize, 5_000, 10_000] {
@@ -227,7 +282,10 @@ async fn main() {
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(applied, n);
         assert_eq!(failed, 0);
-        println!("apply {n}: {ms:.2} ms ({:.0} tx/s)", n as f64 / (ms / 1000.0));
+        println!(
+            "apply {n}: {ms:.2} ms ({:.0} tx/s)",
+            n as f64 / (ms / 1000.0)
+        );
     }
 
     // ---- apply split: sig verify vs commit (commit measured by pre-verified path is same fn; report verify share) ----
@@ -247,7 +305,10 @@ async fn main() {
         let (a, _, _, _, _) = e.apply_block_parallel_fees(txs, TS).await;
         let ams = t.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(a, 10_000);
-        println!("apply split 10k: verify {vms:.2} ms of {ams:.2} ms total ({:.0}% verify)", vms / ams * 100.0);
+        println!(
+            "apply split 10k: verify {vms:.2} ms of {ams:.2} ms total ({:.0}% verify)",
+            vms / ams * 100.0
+        );
     }
 
     // ---- thread scaling curve 1/2/4/8 (isolated pools, same 10k workload) ----

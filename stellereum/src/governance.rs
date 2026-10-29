@@ -272,7 +272,11 @@ impl GovAction {
                     return Err(GovError::InvalidAction);
                 }
             }
-            GovAction::SoftwareUpgrade { name, height, sha256 } => {
+            GovAction::SoftwareUpgrade {
+                name,
+                height,
+                sha256,
+            } => {
                 if name.is_empty()
                     || name.len() > 64
                     || *height == 0
@@ -521,9 +525,10 @@ pub fn upgrade_name_is_safe(name: &str) -> bool {
     }
     // A path separator of ANY flavour (unix `/`, windows `\`, and the
     // unicode look-alikes that survive a naive byte check) is refused.
-    if name.chars().any(|c| {
-        c == '/' || c == '\\' || c == '\0' || !c.is_ascii()
-    }) {
+    if name
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c == '\0' || !c.is_ascii())
+    {
         return false;
     }
     if name == "." || name == ".." {
@@ -1144,7 +1149,11 @@ impl Governance {
             GovAction::ResetOracleBreaker => {
                 oracle.ok_or(GovError::InvalidAction)?.reset_breaker();
             }
-            GovAction::SoftwareUpgrade { name, height, sha256 } => {
+            GovAction::SoftwareUpgrade {
+                name,
+                height,
+                sha256,
+            } => {
                 if name.is_empty()
                     || name.len() > 64
                     || height == 0
@@ -1153,7 +1162,11 @@ impl Governance {
                 {
                     return Err(GovError::InvalidAction);
                 }
-                self.applied.upgrade_plan = Some(UpgradePlan { name, height, sha256 });
+                self.applied.upgrade_plan = Some(UpgradePlan {
+                    name,
+                    height,
+                    sha256,
+                });
             }
             GovAction::CancelUpgrade => {
                 self.applied.upgrade_plan = None;
@@ -1188,7 +1201,10 @@ impl Governance {
 
     /// Number of proposals in a given status (for dashboards/tests).
     pub fn count_status(&self, status: ProposalStatus) -> usize {
-        self.proposals.values().filter(|p| p.status == status).count()
+        self.proposals
+            .values()
+            .filter(|p| p.status == status)
+            .count()
     }
 }
 
@@ -1214,7 +1230,8 @@ mod tests {
         let mut l = StakingLedger::new();
         let ids: Vec<[u8; 32]> = (0..n).map(|i| [i as u8 + 1; 32]).collect();
         for id in &ids {
-            l.bond(*id, stell(bond_stell), DEFAULT_COMMISSION_BPS).unwrap();
+            l.bond(*id, stell(bond_stell), DEFAULT_COMMISSION_BPS)
+                .unwrap();
         }
         (l, ids)
     }
@@ -1359,7 +1376,12 @@ mod tests {
     fn propose_requires_minimum_stake() {
         let mut l = StakingLedger::new();
         let poor = [9u8; 32];
-        l.bond(poor, stell(1_000) + crate::staking::STELL_MIN_BOND_BUFFER, DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(
+            poor,
+            stell(1_000) + crate::staking::STELL_MIN_BOND_BUFFER,
+            DEFAULT_COMMISSION_BPS,
+        )
+        .unwrap();
         let mut g = Governance::new();
         // 1,100 < 10,000 min -> rejected
         assert_eq!(
@@ -1373,13 +1395,21 @@ mod tests {
         let (mut l, ids) = ledger_with(3, 10_000);
         let mut g = Governance::new();
         let id = g
-            .propose(&l, ids[0], "raise reward".into(), GovAction::SetBlockReward(stell(9)), 0)
+            .propose(
+                &l,
+                ids[0],
+                "raise reward".into(),
+                GovAction::SetBlockReward(stell(9)),
+                0,
+            )
             .unwrap();
         // 2 of 3 vote yes (>= 2/3 quorum)
         g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
         g.vote(&mut l, ids[1], id, VoteChoice::Yes, 1).unwrap();
         g.vote(&mut l, ids[2], id, VoteChoice::No, 1).unwrap();
-        let status = g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
+        let status = g
+            .finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+            .unwrap();
         assert_eq!(status, ProposalStatus::Passed);
         let applied = g.execute(ids[0], id).unwrap();
         assert_eq!(applied.block_reward, Some(stell(9)));
@@ -1391,10 +1421,14 @@ mod tests {
     fn low_turnout_fails_quorum() {
         let (mut l, ids) = ledger_with(3, 10_000);
         let mut g = Governance::new();
-        let id = g.propose(&l, ids[0], "x".into(), GovAction::Signal("t".into()), 0).unwrap();
+        let id = g
+            .propose(&l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
         // only 1 of 3 votes (~33% < 2/3 quorum)
         g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
-        let status = g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
+        let status = g
+            .finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+            .unwrap();
         assert_eq!(status, ProposalStatus::Rejected);
     }
 
@@ -1402,12 +1436,16 @@ mod tests {
     fn no_majority_is_rejected() {
         let (mut l, ids) = ledger_with(3, 10_000);
         let mut g = Governance::new();
-        let id = g.propose(&l, ids[0], "x".into(), GovAction::Signal("t".into()), 0).unwrap();
+        let id = g
+            .propose(&l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
         // all vote but yes does not exceed no
         g.vote(&mut l, ids[0], id, VoteChoice::No, 1).unwrap();
         g.vote(&mut l, ids[1], id, VoteChoice::No, 1).unwrap();
         g.vote(&mut l, ids[2], id, VoteChoice::Yes, 1).unwrap();
-        let status = g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
+        let status = g
+            .finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+            .unwrap();
         assert_eq!(status, ProposalStatus::Rejected);
     }
 
@@ -1415,11 +1453,22 @@ mod tests {
     fn cannot_vote_twice_or_after_close() {
         let (mut l, ids) = ledger_with(3, 10_000);
         let mut g = Governance::new();
-        let id = g.propose(&l, ids[0], "x".into(), GovAction::Signal("t".into()), 0).unwrap();
+        let id = g
+            .propose(&l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
         g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
-        assert_eq!(g.vote(&mut l, ids[0], id, VoteChoice::No, 1), Err(GovError::AlreadyVoted));
         assert_eq!(
-            g.vote(&mut l, ids[1], id, VoteChoice::Yes, GOVERNANCE_VOTING_PERIOD_SECS + 1),
+            g.vote(&mut l, ids[0], id, VoteChoice::No, 1),
+            Err(GovError::AlreadyVoted)
+        );
+        assert_eq!(
+            g.vote(
+                &mut l,
+                ids[1],
+                id,
+                VoteChoice::Yes,
+                GOVERNANCE_VOTING_PERIOD_SECS + 1
+            ),
             Err(GovError::VotingClosed)
         );
     }
@@ -1427,10 +1476,14 @@ mod tests {
     #[test]
     fn vote_weight_tracks_stake() {
         let mut l = StakingLedger::new();
-        l.bond([1u8; 32], stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
-        l.bond([2u8; 32], stell(30_000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond([1u8; 32], stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
+        l.bond([2u8; 32], stell(30_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         let mut g = Governance::new();
-        let id = g.propose(&l, [1u8; 32], "x".into(), GovAction::Signal("t".into()), 0).unwrap();
+        let id = g
+            .propose(&l, [1u8; 32], "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
         let w1 = g.vote(&mut l, [1u8; 32], id, VoteChoice::Yes, 1).unwrap();
         let w2 = g.vote(&mut l, [2u8; 32], id, VoteChoice::No, 1).unwrap();
         assert_eq!(w1, stell(10_000) as u128);
@@ -1446,12 +1499,24 @@ mod tests {
         let mut g = Governance::new();
         // 150% slash is nonsense
         assert_eq!(
-            g.propose(&l, ids[0], "bad".into(), GovAction::SetEquivocationSlashBps(15_000), 0),
+            g.propose(
+                &l,
+                ids[0],
+                "bad".into(),
+                GovAction::SetEquivocationSlashBps(15_000),
+                0
+            ),
             Err(GovError::InvalidAction)
         );
         // zero quorum is nonsense
         assert_eq!(
-            g.propose(&l, ids[0], "bad".into(), GovAction::SetGovernanceQuorumBps(0), 0),
+            g.propose(
+                &l,
+                ids[0],
+                "bad".into(),
+                GovAction::SetGovernanceQuorumBps(0),
+                0
+            ),
             Err(GovError::InvalidAction)
         );
     }
@@ -1460,10 +1525,13 @@ mod tests {
     fn anyone_can_execute_passed_proposal() {
         let (mut l, ids) = ledger_with(3, 10_000);
         let mut g = Governance::new();
-        let id = g.propose(&l, ids[0], "x".into(), GovAction::Signal("t".into()), 0).unwrap();
+        let id = g
+            .propose(&l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
         g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
         g.vote(&mut l, ids[1], id, VoteChoice::Yes, 1).unwrap();
-        g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
+        g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+            .unwrap();
         // E5: no proposer-only gate — a non-proposer executes fine.
         assert!(g.execute(ids[1], id).is_ok());
         assert_eq!(g.get(id).unwrap().status, ProposalStatus::Executed);
@@ -1475,7 +1543,13 @@ mod tests {
         let mut g = Governance::new();
         // 1 bps (0.01%) must be refused at propose time.
         assert_eq!(
-            g.propose(&l, ids[0], "bad".into(), GovAction::SetGovernanceQuorumBps(1), 0),
+            g.propose(
+                &l,
+                ids[0],
+                "bad".into(),
+                GovAction::SetGovernanceQuorumBps(1),
+                0
+            ),
             Err(GovError::InvalidAction)
         );
         // Just below the 3333 bps floor is also refused.
@@ -1491,23 +1565,28 @@ mod tests {
         );
         // The floor error message must name the floor.
         let err = g
-            .propose(&l, ids[0], "bad".into(), GovAction::SetGovernanceQuorumBps(1), 0)
+            .propose(
+                &l,
+                ids[0],
+                "bad".into(),
+                GovAction::SetGovernanceQuorumBps(1),
+                0,
+            )
             .unwrap_err();
         assert!(
             format!("{err}").contains("3333"),
             "quorum-floor error must name the 3333 bps floor, got: {err}"
         );
         // The floor itself is accepted.
-        assert!(
-            g.propose(
+        assert!(g
+            .propose(
                 &l,
                 ids[0],
                 "ok".into(),
                 GovAction::SetGovernanceQuorumBps(GOVERNANCE_QUORUM_FLOOR_BPS),
                 0
             )
-            .is_ok()
-        );
+            .is_ok());
     }
 
     #[test]
@@ -1550,11 +1629,18 @@ mod tests {
         let (mut l, ids) = ledger_with(3, 10_000);
         let mut g = Governance::new();
         let id = g
-            .propose(&l, ids[0], "q".into(), GovAction::SetGovernanceQuorumBps(5_000), 0)
+            .propose(
+                &l,
+                ids[0],
+                "q".into(),
+                GovAction::SetGovernanceQuorumBps(5_000),
+                0,
+            )
             .unwrap();
         g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
         g.vote(&mut l, ids[1], id, VoteChoice::Yes, 1).unwrap();
-        g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
+        g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+            .unwrap();
         // Non-proposer executes a passed quorum change.
         g.execute(ids[2], id).unwrap();
         assert_eq!(g.quorum_bps, 5_000);
@@ -1565,11 +1651,18 @@ mod tests {
         let (mut l, ids) = ledger_with(3, 10_000);
         let mut g = Governance::new();
         let id = g
-            .propose(&l, ids[0], "q".into(), GovAction::SetGovernanceQuorumBps(5_000), 0)
+            .propose(
+                &l,
+                ids[0],
+                "q".into(),
+                GovAction::SetGovernanceQuorumBps(5_000),
+                0,
+            )
             .unwrap();
         g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
         g.vote(&mut l, ids[1], id, VoteChoice::Yes, 1).unwrap();
-        g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
+        g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+            .unwrap();
         g.execute(ids[0], id).unwrap();
         assert_eq!(g.quorum_bps, 5_000);
     }
@@ -1577,36 +1670,54 @@ mod tests {
     #[test]
     fn vote_weight_does_not_double_count_delegated_stake() {
         let mut l = StakingLedger::new();
-        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         l.delegate(del(2), vid(1), stell(5_000)).unwrap();
         let mut g = Governance::new();
-        let id = g.propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0).unwrap();
+        let id = g
+            .propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
         // The validator owns its 10k self-bond; the 5k delegated by del(2) is
         // del(2)'s stake, NOT the validator's. Vote weight must be exactly 10k.
         let w = g.vote(&mut l, vid(1), id, VoteChoice::Yes, 1).unwrap();
-        assert_eq!(w, stell(10_000) as u128, "delegated-in stake must not double count");
+        assert_eq!(
+            w,
+            stell(10_000) as u128,
+            "delegated-in stake must not double count"
+        );
     }
 
     #[test]
     fn self_delegation_does_not_inflate_vote() {
         let mut l = StakingLedger::new();
-        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         l.delegate(vid(1), vid(1), stell(5_000)).unwrap();
         let mut g = Governance::new();
-        let id = g.propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0).unwrap();
+        let id = g
+            .propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
         // self-bond 10k + own delegation out 5k = 15k (counted once each)
         let w = g.vote(&mut l, vid(1), id, VoteChoice::Yes, 1).unwrap();
-        assert_eq!(w, stell(15_000) as u128, "self-delegation must not be counted twice");
+        assert_eq!(
+            w,
+            stell(15_000) as u128,
+            "self-delegation must not be counted twice"
+        );
     }
 
     #[test]
     fn delegator_votes_with_own_stake_only_once() {
         let mut l = StakingLedger::new();
-        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
-        l.bond(vid(2), stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
+        l.bond(vid(2), stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         l.delegate(vid(1), vid(2), stell(5_000)).unwrap(); // vid1 delegates 5k to vid2
         let mut g = Governance::new();
-        let id = g.propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0).unwrap();
+        let id = g
+            .propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
         // vid1's own stake is 10k (self) + 5k (delegated out); it must NOT also
         // gain the 5k as if it were still consensus power on vid1.
         let w = g.vote(&mut l, vid(1), id, VoteChoice::Yes, 1).unwrap();
@@ -1616,18 +1727,23 @@ mod tests {
     #[test]
     fn finalize_denominator_matches_total_voting_power() {
         let mut l = StakingLedger::new();
-        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         l.delegate(del(1), vid(1), stell(9_000)).unwrap();
         // total voting power = self 10k + delegated 9k = 19k
         assert_eq!(Governance::total_voting_power(&l), stell(19_000) as u128);
         let mut g = Governance::new();
-        let id = g.propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0).unwrap();
+        let id = g
+            .propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
         g.vote(&mut l, vid(1), id, VoteChoice::Yes, 1).unwrap(); // 10k
         g.vote(&mut l, del(1), id, VoteChoice::Yes, 1).unwrap(); // 9k
         let p = g.get(id).unwrap();
         // turnout (19k) must not exceed the quorum base (19k)
         assert!(p.turnout() <= Governance::total_voting_power(&l));
-        let status = g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
+        let status = g
+            .finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+            .unwrap();
         assert_eq!(status, ProposalStatus::Passed);
     }
 
@@ -1640,12 +1756,16 @@ mod tests {
         use crate::staking::StakingError;
 
         let mut l = StakingLedger::new();
-        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
-        l.bond(vid(2), stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
+        l.bond(vid(2), stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         l.delegate(del(1), vid(1), stell(9_000)).unwrap();
         assert_eq!(Governance::total_voting_power(&l), stell(29_000) as u128);
         let mut g = Governance::new();
-        let id = g.propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0).unwrap();
+        let id = g
+            .propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
         // The quorum base is frozen at propose time.
         assert_eq!(g.get(id).unwrap().electorate, stell(29_000) as u128);
         g.vote(&mut l, vid(1), id, VoteChoice::Yes, 1).unwrap(); // 10k
@@ -1658,7 +1778,9 @@ mod tests {
         );
         // ... and even a completed exit could not move the frozen base:
         // 19k < 19,331 quorum on 29k stays Rejected.
-        let status = g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
+        let status = g
+            .finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+            .unwrap();
         assert_eq!(
             status,
             ProposalStatus::Rejected,
@@ -1682,8 +1804,14 @@ mod tests {
             Err(GovError::InvalidAction)
         );
         // Valid MIN_VALIDATOR_BOND
-        assert!(GovAction::SetMinValidatorBond(crate::staking::MIN_VALIDATOR_BOND).validate().is_ok());
-        assert!(GovAction::SetMinValidatorBond(MAX_VALIDATOR_BOND).validate().is_ok());
+        assert!(
+            GovAction::SetMinValidatorBond(crate::staking::MIN_VALIDATOR_BOND)
+                .validate()
+                .is_ok()
+        );
+        assert!(GovAction::SetMinValidatorBond(MAX_VALIDATOR_BOND)
+            .validate()
+            .is_ok());
 
         // Above MAX_BLOCK_REWARD_NANO: invalid
         assert_eq!(
@@ -1691,20 +1819,33 @@ mod tests {
             Err(GovError::InvalidAction)
         );
         // Valid BlockReward
-        assert!(GovAction::SetBlockReward(MAX_BLOCK_REWARD_NANO).validate().is_ok());
+        assert!(GovAction::SetBlockReward(MAX_BLOCK_REWARD_NANO)
+            .validate()
+            .is_ok());
         assert!(GovAction::SetBlockReward(0).validate().is_ok());
     }
 
     #[test]
     fn finalize_requires_positive_non_abstaining_turnout() {
         let mut l = StakingLedger::new();
-        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+        l.bond(vid(1), stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
         let mut g = Governance::new();
-        let id = g.propose(&l, vid(1), "abstain only".into(), GovAction::Signal("s".into()), 0).unwrap();
+        let id = g
+            .propose(
+                &l,
+                vid(1),
+                "abstain only".into(),
+                GovAction::Signal("s".into()),
+                0,
+            )
+            .unwrap();
 
         // Only abstain vote: turnout meets quorum (100%), but yes == 0, no == 0
         g.vote(&mut l, vid(1), id, VoteChoice::Abstain, 1).unwrap();
-        let status = g.finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1).unwrap();
+        let status = g
+            .finalize(&mut l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1)
+            .unwrap();
         assert_eq!(status, ProposalStatus::Rejected);
     }
 
@@ -1787,7 +1928,10 @@ mod tests {
                 height: 100,
                 sha256: [1u8; 32],
             };
-            assert!(action.validate().is_ok(), "{good:?} must be a legal upgrade name");
+            assert!(
+                action.validate().is_ok(),
+                "{good:?} must be a legal upgrade name"
+            );
         }
     }
 
@@ -1923,11 +2067,17 @@ mod tests {
         // A mismatch is refused.
         let err = stage_verified_upgrade_binary(&cand, &[0u8; 32])
             .expect_err("the all-zero digest must be refused");
-        assert!(err.contains("mismatch"), "the error must name the mismatch: {err}");
+        assert!(
+            err.contains("mismatch"),
+            "the error must name the mismatch: {err}"
+        );
         let mut wrong = expected;
         wrong[0] ^= 0xff;
         let err = stage_verified_upgrade_binary(&cand, &wrong).expect_err("must refuse");
-        assert!(err.contains("mismatch"), "the error must name the mismatch: {err}");
+        assert!(
+            err.contains("mismatch"),
+            "the error must name the mismatch: {err}"
+        );
 
         // The right digest stages a byte-identical copy.
         let staged = stage_verified_upgrade_binary(&cand, &expected).expect("stage");
@@ -1936,7 +2086,11 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::symlink_metadata(&staged).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::symlink_metadata(&staged)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o700, "the staged binary must be owner-only");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1966,9 +2120,14 @@ mod tests {
         assert!(auto_upgrade_armed_from(Some("true")));
         assert!(auto_upgrade_armed_from(Some("TRUE")));
         assert!(auto_upgrade_armed_from(Some("True")));
-        assert!(auto_upgrade_armed_from(Some(" 1 ")), "surrounding space is ignored");
+        assert!(
+            auto_upgrade_armed_from(Some(" 1 ")),
+            "surrounding space is ignored"
+        );
         // Everything else fails SAFE.
-        for off in ["0", "false", "FALSE", "", " ", "yes", "on", "2", "armed", "tru"] {
+        for off in [
+            "0", "false", "FALSE", "", " ", "yes", "on", "2", "armed", "tru",
+        ] {
             assert!(
                 !auto_upgrade_armed_from(Some(off)),
                 "{off:?} must NOT arm the live migration"
@@ -1981,7 +2140,10 @@ mod tests {
     #[test]
     fn live_migration_state_line_names_the_switch() {
         let line = auto_upgrade_state_line();
-        assert!(line.contains(AUTO_UPGRADE_ENV), "the line must name the switch: {line}");
+        assert!(
+            line.contains(AUTO_UPGRADE_ENV),
+            "the line must name the switch: {line}"
+        );
         assert!(
             line.contains("DISARMED") || line.contains("ARMED"),
             "the line must state the state: {line}"

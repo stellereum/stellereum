@@ -71,7 +71,10 @@ async fn shard1_transaction_lands_in_a_shard1_block() {
 
     assert_eq!(block.shard_id, SHARD1, "block must be stamped with shard 1");
     assert!(
-        block.transactions.iter().any(|t| t.compute_tx_hash() == tx_hash),
+        block
+            .transactions
+            .iter()
+            .any(|t| t.compute_tx_hash() == tx_hash),
         "the shard-1 transaction must be included in the shard-1 block"
     );
 
@@ -96,14 +99,17 @@ async fn shard0_chain_is_untouched_by_a_shard1_transaction() {
     let from = user.verifying_key().to_bytes();
 
     let engine = Arc::new(InMemoryStateEngine::new());
-    engine.update_account(AccountState::new(from, 1_000_000)).await;
-    let mut cluster =
-        Cluster::new_sharded(vec![(validator, engine)], MASTERCHAIN_SHARD, sharded());
+    engine
+        .update_account(AccountState::new(from, 1_000_000))
+        .await;
+    let mut cluster = Cluster::new_sharded(vec![(validator, engine)], MASTERCHAIN_SHARD, sharded());
 
     let genesis_root = cluster.nodes[0].state_root().await;
     // Targeted at shard 1: in a sharded process it must NOT enter shard 0.
     cluster
-        .broadcast_tx(Transaction::sign(&user, [8u8; 32], 100, 1_000, 0, 1, SHARD1))
+        .broadcast_tx(Transaction::sign(
+            &user, [8u8; 32], 100, 1_000, 0, 1, SHARD1,
+        ))
         .await;
 
     let bh = cluster.run_height(1).await;
@@ -114,7 +120,10 @@ async fn shard0_chain_is_untouched_by_a_shard1_transaction() {
         block.transactions.is_empty(),
         "shard 0 must not include a transaction targeted at shard 1"
     );
-    assert!(block.transactions.iter().all(|t| tx_targets_shard(t, MASTERCHAIN_SHARD)));
+    assert!(block
+        .transactions
+        .iter()
+        .all(|t| tx_targets_shard(t, MASTERCHAIN_SHARD)));
     assert_eq!(
         cluster.nodes[0].state_root().await,
         genesis_root,
@@ -171,7 +180,15 @@ async fn sharded_node_rejects_a_proposal_for_the_wrong_shard() {
     // A shard-1 block carrying a shard-0-targeted transaction is refused too.
     let mut block2 = cluster.nodes[0].blocks.values().next().cloned().unwrap();
     block2.shard_id = SHARD1;
-    block2.transactions = vec![Transaction::sign(&user, [1u8; 32], 1, 1_000, 0, 0, MASTERCHAIN_SHARD)];
+    block2.transactions = vec![Transaction::sign(
+        &user,
+        [1u8; 32],
+        1,
+        1_000,
+        0,
+        0,
+        MASTERCHAIN_SHARD,
+    )];
     block2.validator_signatures.clear();
     block2.sign_block(&validator);
     let err = cluster.nodes[0]

@@ -95,15 +95,17 @@ async fn svm_place_order_escrows_the_order_cost() {
     let amount = 1_000 * NANO;
     let cost = price_micro.saturating_mul(amount) / 1_000_000; // same as svm.rs
 
-    e.apply_transaction(&tx(
-        &alice,
-        0,
-        vec![OpCode::SysCallPlaceOrder {
-            pair_id: 1,
-            is_buy: true,
-            price: price_micro,
-            amount,
-        }]),
+    e.apply_transaction(
+        &tx(
+            &alice,
+            0,
+            vec![OpCode::SysCallPlaceOrder {
+                pair_id: 1,
+                is_buy: true,
+                price: price_micro,
+                amount,
+            }],
+        ),
         0,
     )
     .await
@@ -123,7 +125,11 @@ async fn svm_place_order_escrows_the_order_cost() {
         "the {} nano order cost is really debited, plus gas",
         cost
     );
-    assert_eq!((start - after) as i128, cost as i128 + gas, "cost + gas, nothing else");
+    assert_eq!(
+        (start - after) as i128,
+        cost as i128 + gas,
+        "cost + gas, nothing else"
+    );
 
     // The position IS secured: one escrow record for exactly that cost.
     let escrow = e.order_escrow_read().await.clone();
@@ -143,7 +149,9 @@ async fn svm_place_order_escrows_the_order_cost() {
         .unwrap_or(0);
     assert_eq!(book_orders, 1, "the order really is resting in the book");
     assert!(
-        e.orderbooks_read().await.books[&1].find_order(key.1).is_some(),
+        e.orderbooks_read().await.books[&1]
+            .find_order(key.1)
+            .is_some(),
         "the escrowed order is reachable in the book"
     );
     println!("resting orders with escrow: {book_orders}");
@@ -170,16 +178,33 @@ async fn anyone_can_cancel_a_foreign_order_and_orphan_its_escrow() {
     let pair = 1u32;
     let price = 250_000u64;
 
-    e.update_account(AccountState::new(victim_addr, 1_000 * NANO)).await;
-    e.update_account(AccountState::new(attacker_addr, 10 * NANO)).await;
-    e.token_execute(&usdt, [0xF0; 32], stellereum::token::TokenOp::Mint { to: victim_addr, amount: 1_000_000_000 })
-        .await
-        .unwrap();
+    e.update_account(AccountState::new(victim_addr, 1_000 * NANO))
+        .await;
+    e.update_account(AccountState::new(attacker_addr, 10 * NANO))
+        .await;
+    e.token_execute(
+        &usdt,
+        [0xF0; 32],
+        stellereum::token::TokenOp::Mint {
+            to: victim_addr,
+            amount: 1_000_000_000,
+        },
+    )
+    .await
+    .unwrap();
 
     // The victim posts a real, fully-escrowed resting bid through the CLOB path.
     let amount = 500 * NANO;
     let (order_id, fills) = e
-        .place_order_settled(pair, victim_addr, OrderSide::Buy, OrderType::Limit, price, amount, 0)
+        .place_order_settled(
+            pair,
+            victim_addr,
+            OrderSide::Buy,
+            OrderType::Limit,
+            price,
+            amount,
+            0,
+        )
         .await
         .expect("victim order");
     assert_eq!(fills, 0);
@@ -197,11 +222,10 @@ async fn anyone_can_cancel_a_foreign_order_and_orphan_its_escrow() {
     // order up in the book - so the funds were stranded permanently. That is
     // censorship plus theft of the escrowed balance, using one transaction.
     let res = e
-        .apply_transaction(&tx(
-            &attacker,
+        .apply_transaction(
+            &tx(&attacker, 0, vec![OpCode::SysCallCancelOrder { order_id }]),
             0,
-            vec![OpCode::SysCallCancelOrder { order_id }],
-        ), 0)
+        )
         .await;
     assert!(
         res.is_err(),
@@ -215,7 +239,12 @@ async fn anyone_can_cancel_a_foreign_order_and_orphan_its_escrow() {
         .await
         .books
         .get(&pair)
-        .map(|b| b.bids.values().flat_map(|v| v.iter()).any(|o| o.order_id == order_id))
+        .map(|b| {
+            b.bids
+                .values()
+                .flat_map(|v| v.iter())
+                .any(|o| o.order_id == order_id)
+        })
         .unwrap_or(false);
     assert!(
         still_in_book,
@@ -241,7 +270,6 @@ async fn anyone_can_cancel_a_foreign_order_and_orphan_its_escrow() {
         owner.is_some(),
         "the owner must still be able to cancel and reclaim"
     );
-
 }
 
 // ---------------------------------------------------------------------------
@@ -255,10 +283,18 @@ async fn depth_saturation_never_orphans_escrow() {
     let trader = [0xA5; 32];
     let pair = 1u32;
     let minter = [0xF0; 32];
-    e.update_account(AccountState::new(trader, 1_000_000 * NANO)).await;
-    e.token_execute(&usdt, minter, stellereum::token::TokenOp::Mint { to: trader, amount: 1_000_000_000_000 })
-        .await
-        .unwrap();
+    e.update_account(AccountState::new(trader, 1_000_000 * NANO))
+        .await;
+    e.token_execute(
+        &usdt,
+        minter,
+        stellereum::token::TokenOp::Mint {
+            to: trader,
+            amount: 1_000_000_000_000,
+        },
+    )
+    .await
+    .unwrap();
 
     // max_depth is 1000, so push 1001 distinct price levels.
     let mut ids = Vec::new();
@@ -278,7 +314,13 @@ async fn depth_saturation_never_orphans_escrow() {
         ids.push(id);
     }
     let escrow_count = e.order_escrow_read().await.len();
-    let levels = e.orderbooks_read().await.books.get(&pair).map(|b| b.bids.len()).unwrap_or(0);
+    let levels = e
+        .orderbooks_read()
+        .await
+        .books
+        .get(&pair)
+        .map(|b| b.bids.len())
+        .unwrap_or(0);
     println!("levels in book = {levels}, escrows = {escrow_count}");
     // HUNT-FIXED: the book refuses the NEWCOMER instead of evicting the worst
     // funded level, so the depth bound still holds and no escrow is stranded.
@@ -301,7 +343,11 @@ async fn depth_saturation_never_orphans_escrow() {
                 .collect::<Vec<_>>()
         })
         .unwrap();
-    assert_eq!(resting.len(), 1000, "every funded order is still in the book");
+    assert_eq!(
+        resting.len(),
+        1000,
+        "every funded order is still in the book"
+    );
 
     // The invariant the whole escrow design rests on: a record exists if and
     // only if the order it secures is resting.
@@ -335,7 +381,10 @@ async fn depth_saturation_never_orphans_escrow() {
         "and locked nothing on the way in"
     );
     assert!(
-        e.cancel_order_settled(pair, refused, trader).await.unwrap().is_none(),
+        e.cancel_order_settled(pair, refused, trader)
+            .await
+            .unwrap()
+            .is_none(),
         "cancelling an order that never rested is a no-op, not a refund of nothing"
     );
     assert_eq!(
@@ -346,8 +395,15 @@ async fn depth_saturation_never_orphans_escrow() {
 
     // And every order that DID rest can still be cancelled and refunded.
     for id in ids.iter().take(1000) {
-        assert!(e.cancel_order_settled(pair, *id, trader).await.unwrap().is_some());
+        assert!(e
+            .cancel_order_settled(pair, *id, trader)
+            .await
+            .unwrap()
+            .is_some());
     }
-    assert!(e.order_escrow_read().await.is_empty(), "every lock released");
+    assert!(
+        e.order_escrow_read().await.is_empty(),
+        "every lock released"
+    );
     assert_eq!(e.orderbooks_read().await.books[&pair].depth(), (0, 0));
 }

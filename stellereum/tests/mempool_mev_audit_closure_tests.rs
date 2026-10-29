@@ -99,7 +99,8 @@ fn f03_eviction_releases_reservation() {
     // Pool of exactly 1: the second admission must evict at >= 2x.
     let mut mp = Mempool::new(1, 64);
     let cost = |fee: u64| 100 + fee;
-    mp.add_checked(transfer(&sk, [1u8; 32], 100, 1_000, 0), 50_000_000).unwrap();
+    mp.add_checked(transfer(&sk, [1u8; 32], 100, 1_000, 0), 50_000_000)
+        .unwrap();
     assert_eq!(mp.reserved_for(&me), cost(1_000));
 
     let sk2 = key();
@@ -211,8 +212,12 @@ fn f06_single_cost_formula_plain_and_activation() {
     );
     let (exact, _) = activation_tx(500 + PQ_ACTIVATION_SURCHARGE_GAS, 0);
     let rich = 500 + PQ_ACTIVATION_SURCHARGE_GAS + 1_000_000;
-    mp2.add_checked(exact, rich).expect("exact floor+surcharge admits");
-    assert_eq!(mp2.reserved_for(&from), 500 + PQ_ACTIVATION_SURCHARGE_GAS + PQ_ACTIVATION_SURCHARGE_GAS);
+    mp2.add_checked(exact, rich)
+        .expect("exact floor+surcharge admits");
+    assert_eq!(
+        mp2.reserved_for(&from),
+        500 + PQ_ACTIVATION_SURCHARGE_GAS + PQ_ACTIVATION_SURCHARGE_GAS
+    );
 }
 
 /// Pack-vs-admission balance parity (F-07): the proposer must skip what
@@ -256,8 +261,13 @@ fn f10_replay_duplicate_refused_same_nonce_coexists() {
     );
     // Same (sender, nonce), different amount → different hash, coexists.
     let t2 = transfer(&sk, [2u8; 32], 200, 1_000, 0);
-    mp.add_checked(t2, 50_000_000).expect("replacement coexists in pool");
-    assert_eq!(mp.len(), 2, "implicit-RBF pair both pooled; execution picks first");
+    mp.add_checked(t2, 50_000_000)
+        .expect("replacement coexists in pool");
+    assert_eq!(
+        mp.len(),
+        2,
+        "implicit-RBF pair both pooled; execution picks first"
+    );
 }
 
 /// The floor is static: no clock, no pressure feed, no hidden dynamic term.
@@ -378,8 +388,11 @@ fn mev_v4_stays_parked_and_default_off() {
 #[test]
 fn flat_block_reward_is_live_and_schedule_is_dead() {
     use stellereum::staking::REWARDS_EMISSION_CAP;
-    use stellereum::tokenomics::{TokenAllocation, BLOCK_REWARD_NANO, StakingEmissionSchedule};
-    assert_eq!(BLOCK_REWARD_NANO, 317_000_000, "flat 0.317 STELL is the live reward");
+    use stellereum::tokenomics::{StakingEmissionSchedule, TokenAllocation, BLOCK_REWARD_NANO};
+    assert_eq!(
+        BLOCK_REWARD_NANO, 317_000_000,
+        "flat 0.317 STELL is the live reward"
+    );
     let sched = StakingEmissionSchedule::default();
     assert_eq!(
         sched.calculate_block_reward(3),
@@ -394,5 +407,8 @@ fn flat_block_reward_is_live_and_schedule_is_dead() {
     );
     // Cap horizon sanity at the live flat rate (200 ms tokenomics clock).
     let blocks = REWARDS_EMISSION_CAP / BLOCK_REWARD_NANO;
-    assert!(blocks > 1_000_000_000, "cap must span >1B blocks at flat rate");
+    assert!(
+        blocks > 1_000_000_000,
+        "cap must span >1B blocks at flat rate"
+    );
 }

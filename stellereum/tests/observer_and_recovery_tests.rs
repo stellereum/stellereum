@@ -25,9 +25,8 @@ use stellereum::network::{
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::sync::{
-    collect_missing_blocks, fast_sync_state, validate_sync_chain_for_shard,
-    verify_snapshot_anchor, verify_snapshot_anchor_tail, HeaderLink, SYNC_DOMAIN_KINDS,
-    SNAPSHOT_ANCHOR_TAIL_WINDOW,
+    collect_missing_blocks, fast_sync_state, validate_sync_chain_for_shard, verify_snapshot_anchor,
+    verify_snapshot_anchor_tail, HeaderLink, SNAPSHOT_ANCHOR_TAIL_WINDOW, SYNC_DOMAIN_KINDS,
 };
 
 /// infnode derives a node id as `blake3(ed25519_pub)[..20]`, which is what a
@@ -245,7 +244,7 @@ async fn build_live_chain(ks: &[SigningKey], tip: u64) -> (LiveChain, InMemorySt
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         b.sign_block(&proposer);
         let bh = b.compute_hash();
         attach_quorum(&mut b, ks, h, bh);
@@ -261,7 +260,14 @@ async fn build_live_chain(ks: &[SigningKey], tip: u64) -> (LiveChain, InMemorySt
             snapshots.insert(h, engine.create_snapshot().await);
         }
     }
-    (LiveChain { blocks, snapshots, roots }, engine)
+    (
+        LiveChain {
+            blocks,
+            snapshots,
+            roots,
+        },
+        engine,
+    )
 }
 
 /// Peers that prune like live nodes: snapshots forever, everything else only
@@ -327,7 +333,11 @@ async fn observer_catches_up_from_pruned_peers_via_tail_anchored_snapshot() {
     let ks = observer_keys(2);
     let vs = observer_vset(&ks);
     let (chain, source_engine) = build_live_chain(&ks, TIP).await;
-    let peers = PrunedPeers { chain: &chain, tip: TIP, keep: KEEP };
+    let peers = PrunedPeers {
+        chain: &chain,
+        tip: TIP,
+        keep: KEEP,
+    };
     let source_tip_root = source_engine.get_state_root().await;
 
     // Newest 100-boundary at/below the tip, like try_snapshot_sync probes first.
@@ -336,17 +346,10 @@ async fn observer_catches_up_from_pruned_peers_via_tail_anchored_snapshot() {
 
     // 1. The OLD proof (full walk from our genesis anchor) cannot complete:
     //    headers 1..=230 are pruned on every peer.
-    let full = verify_snapshot_anchor(
-        None,
-        [0u8; 32],
-        boundary + 1,
-        &vs,
-        1_000_000,
-        |h| {
-            let l = peers.link_at(h);
-            async move { l }
-        },
-    )
+    let full = verify_snapshot_anchor(None, [0u8; 32], boundary + 1, &vs, 1_000_000, |h| {
+        let l = peers.link_at(h);
+        async move { l }
+    })
     .await;
     assert!(
         full.is_err(),
@@ -384,7 +387,10 @@ async fn observer_catches_up_from_pruned_peers_via_tail_anchored_snapshot() {
     )
     .await
     .expect("a genuine snapshot against a proven root must apply");
-    assert_eq!(observer_engine.get_state_root().await, chain.roots[&boundary]);
+    assert_eq!(
+        observer_engine.get_state_root().await,
+        chain.roots[&boundary]
+    );
 
     // 4. The short remainder walks by bodies, QC-checked per height, and lands
     //    on the source tip root exactly.
@@ -400,14 +406,8 @@ async fn observer_catches_up_from_pruned_peers_via_tail_anchored_snapshot() {
     .expect("post-snapshot bodies are all inside the retention window");
     assert_eq!(walked.first().unwrap().height, boundary + 1);
     assert_eq!(walked.last().unwrap().height, TIP);
-    validate_sync_chain_for_shard(
-        &walked,
-        boundary + 1,
-        boundary_hash,
-        &vs,
-        MASTERCHAIN_SHARD,
-    )
-    .expect("the remainder carries a genuine quorum per height");
+    validate_sync_chain_for_shard(&walked, boundary + 1, boundary_hash, &vs, MASTERCHAIN_SHARD)
+        .expect("the remainder carries a genuine quorum per height");
     for b in &walked {
         let ours = observer_engine.get_state_root().await;
         assert_eq!(
@@ -425,7 +425,8 @@ async fn observer_catches_up_from_pruned_peers_via_tail_anchored_snapshot() {
     // Keep the binding tight: the walked tail must BE the advertised head.
     assert_eq!(walked.last().unwrap().compute_hash(), tip_hash);
     assert_eq!(
-        observer_engine.get_state_root().await, source_tip_root,
+        observer_engine.get_state_root().await,
+        source_tip_root,
         "the observer converges on the source tip state exactly"
     );
 }
@@ -439,7 +440,11 @@ async fn tail_anchor_rejects_forgery_missing_qc_and_wrong_proposer() {
     let ks = observer_keys(2);
     let vs = observer_vset(&ks);
     let (chain, _) = build_live_chain(&ks, TIP).await;
-    let peers = PrunedPeers { chain: &chain, tip: TIP, keep: KEEP };
+    let peers = PrunedPeers {
+        chain: &chain,
+        tip: TIP,
+        keep: KEEP,
+    };
     let boundary = 300u64;
 
     // Baseline: genuine window anchors.
@@ -453,8 +458,7 @@ async fn tail_anchor_rejects_forgery_missing_qc_and_wrong_proposer() {
     // A header that does not link to its parent is refused.
     let mut forged: HashMap<u64, HeaderLink> = ((boundary + 1)
         .saturating_sub(SNAPSHOT_ANCHOR_TAIL_WINDOW - 1)
-        .max(1)
-        ..=boundary + 1)
+        .max(1)..=boundary + 1)
         .map(|h| (h, peers.link_at(h).unwrap()))
         .collect();
     forged.get_mut(&boundary).unwrap().prev_hash = [0xFFu8; 32];
@@ -467,7 +471,11 @@ async fn tail_anchor_rejects_forgery_missing_qc_and_wrong_proposer() {
 
     // A height with no published QC is not anchorable, never trusted.
     assert!(verify_snapshot_anchor_tail(boundary + 1, &vs, |h| {
-        let l = if h == boundary { None } else { peers.link_at(h) };
+        let l = if h == boundary {
+            None
+        } else {
+            peers.link_at(h)
+        };
         async move { l }
     })
     .await
@@ -477,8 +485,7 @@ async fn tail_anchor_rejects_forgery_missing_qc_and_wrong_proposer() {
     // outside its slot must not carry a snapshot.
     let mut wrong: HashMap<u64, HeaderLink> = ((boundary + 1)
         .saturating_sub(SNAPSHOT_ANCHOR_TAIL_WINDOW - 1)
-        .max(1)
-        ..=boundary + 1)
+        .max(1)..=boundary + 1)
         .map(|h| (h, peers.link_at(h).unwrap()))
         .collect();
     let other = ks
@@ -493,7 +500,10 @@ async fn tail_anchor_rejects_forgery_missing_qc_and_wrong_proposer() {
     })
     .await
     .expect_err("a non-scheduled proposer must be refused");
-    assert!(err.contains("schedule slot"), "refusal names the cause: {err}");
+    assert!(
+        err.contains("schedule slot"),
+        "refusal names the cause: {err}"
+    );
 }
 
 /// The shared head key is last-writer-wins: a height-0 node must never publish
@@ -514,7 +524,10 @@ fn head_key_never_rewinds_and_only_ahead_heads_pull() {
 
     // Read side: our own echo (equal) and stale peers (below) are "nothing to
     // do"; only strictly-ahead heads are actionable.
-    assert!(!peer_head_is_ahead(0, 0), "a height-0 echo is not a peer ahead");
+    assert!(
+        !peer_head_is_ahead(0, 0),
+        "a height-0 echo is not a peer ahead"
+    );
     assert!(!peer_head_is_ahead(100, 100));
     assert!(!peer_head_is_ahead(72704, 100));
     assert!(peer_head_is_ahead(0, 72704));

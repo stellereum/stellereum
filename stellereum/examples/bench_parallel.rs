@@ -43,7 +43,9 @@ fn token_meta(name: &str, symbol: &str) -> TokenMetadata {
 async fn fund_accounts(engine: &InMemoryStateEngine, keys: &[SigningKey], balance: u64) {
     for k in keys {
         let addr = k.verifying_key().to_bytes();
-        engine.update_account(AccountState::new(addr, balance)).await;
+        engine
+            .update_account(AccountState::new(addr, balance))
+            .await;
     }
 }
 
@@ -57,7 +59,10 @@ async fn setup_tokens(
     for (i, k) in creators.iter().enumerate() {
         let addr = k.verifying_key().to_bytes();
         let meta = token_meta(&format!("TOKEN_{i}"), &format!("TK{i}"));
-        let tid = engine.create_token(addr, meta, supply_per_token).await.unwrap();
+        let tid = engine
+            .create_token(addr, meta, supply_per_token)
+            .await
+            .unwrap();
         token_ids.push(tid);
     }
     token_ids
@@ -92,7 +97,9 @@ fn build_block_1k_plain(setup: &mut BenchmarkSetup) -> Block {
     let num_senders = 50;
     let txs_per_sender = 20;
 
-    let senders: Vec<SigningKey> = (0..num_senders).map(|_| SigningKey::generate(&mut rng)).collect();
+    let senders: Vec<SigningKey> = (0..num_senders)
+        .map(|_| SigningKey::generate(&mut rng))
+        .collect();
     let recips: Vec<[u8; 32]> = (0..num_senders)
         .map(|_| SigningKey::generate(&mut rng).verifying_key().to_bytes())
         .collect();
@@ -100,7 +107,15 @@ fn build_block_1k_plain(setup: &mut BenchmarkSetup) -> Block {
     let mut txs = Vec::with_capacity(num_senders * txs_per_sender);
     for nonce in 0..txs_per_sender as u64 {
         for i in 0..num_senders {
-            txs.push(Transaction::sign(&senders[i], recips[i], 100, 10, nonce, 1, 1));
+            txs.push(Transaction::sign(
+                &senders[i],
+                recips[i],
+                100,
+                10,
+                nonce,
+                1,
+                1,
+            ));
         }
     }
 
@@ -136,7 +151,10 @@ fn build_block_1k_mixed(setup: &mut BenchmarkSetup) -> (Block, Vec<[u8; 32]>) {
     // but the transaction payload needs `token_id`.
     // In Stellereum, `create_token` uses sha256(creator || name || symbol || timestamp=0).
     // Let's compute token IDs identically by running create_token on a dummy engine.
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let token_ids = rt.block_on(async {
         let dummy = InMemoryStateEngine::new();
         setup_tokens(&dummy, &senders_token, 100_000_000).await
@@ -146,7 +164,15 @@ fn build_block_1k_mixed(setup: &mut BenchmarkSetup) -> (Block, Vec<[u8; 32]>) {
     for wave in 0..waves as u64 {
         // Plain transfers (20 txs)
         for i in 0..20 {
-            txs.push(Transaction::sign(&senders_xfer[i], recips_xfer[i], 50, 10, wave, 1, 1));
+            txs.push(Transaction::sign(
+                &senders_xfer[i],
+                recips_xfer[i],
+                50,
+                10,
+                wave,
+                1,
+                1,
+            ));
         }
         // STS token transfers (15 txs)
         for i in 0..15 {
@@ -169,7 +195,11 @@ fn build_block_1k_mixed(setup: &mut BenchmarkSetup) -> (Block, Vec<[u8; 32]>) {
         for (i, trader) in traders.iter().enumerate().take(15) {
             let is_buy = (i % 2) == 0;
             let pair_id = (i as u32 % 3) + 1;
-            let price = if is_buy { 80 + (i as u64 % 10) } else { 120 + (i as u64 % 10) };
+            let price = if is_buy {
+                80 + (i as u64 % 10)
+            } else {
+                120 + (i as u64 % 10)
+            };
             txs.push(Transaction::sign_with_payload(
                 trader,
                 [0u8; 32],
@@ -207,7 +237,9 @@ fn build_block_4k_blast(setup: &mut BenchmarkSetup) -> Block {
     let num_senders = 100;
     let txs_per_sender = 40;
 
-    let senders: Vec<SigningKey> = (0..num_senders).map(|_| SigningKey::generate(&mut rng)).collect();
+    let senders: Vec<SigningKey> = (0..num_senders)
+        .map(|_| SigningKey::generate(&mut rng))
+        .collect();
     let recips: Vec<[u8; 32]> = (0..num_senders)
         .map(|_| SigningKey::generate(&mut rng).verifying_key().to_bytes())
         .collect();
@@ -215,7 +247,15 @@ fn build_block_4k_blast(setup: &mut BenchmarkSetup) -> Block {
     let mut txs = Vec::with_capacity(num_senders * txs_per_sender);
     for nonce in 0..txs_per_sender as u64 {
         for i in 0..num_senders {
-            txs.push(Transaction::sign(&senders[i], recips[i], 100, 10, nonce, 1, 1));
+            txs.push(Transaction::sign(
+                &senders[i],
+                recips[i],
+                100,
+                10,
+                nonce,
+                1,
+                1,
+            ));
         }
     }
 
@@ -243,15 +283,19 @@ fn execute_run(
     pool: &rayon::ThreadPool,
 ) -> RunMetric {
     pool.install(|| {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let engine = InMemoryStateEngine::new();
             engine.set_parallel_exec(parallel_exec);
             setup.clone_into_engine(&engine).await;
 
             let t0 = Instant::now();
-            let (applied, failed, _fees, _status, _tx_fees) =
-                engine.apply_block_parallel_fees(&block.transactions, block.timestamp).await;
+            let (applied, failed, _fees, _status, _tx_fees) = engine
+                .apply_block_parallel_fees(&block.transactions, block.timestamp)
+                .await;
             let elapsed = t0.elapsed();
 
             let state_root = engine.get_state_root().await;
@@ -273,17 +317,26 @@ fn benchmark_block(name: &str, setup: &BenchmarkSetup, block: &Block) {
     let tx_count = block.transactions.len();
     println!("\n{}", "=".repeat(80));
     println!("BENCHMARK: {} ({} transactions)", name, tx_count);
-    println!("Scheduler waves: {}", stellereum::parallel_exec::DisjointScheduler::schedule(&block.transactions).len());
+    println!(
+        "Scheduler waves: {}",
+        stellereum::parallel_exec::DisjointScheduler::schedule(&block.transactions).len()
+    );
     println!("{}", "-".repeat(80));
 
     // Warm-up run
-    let warmup_pool = rayon::ThreadPoolBuilder::new().num_threads(12).build().unwrap();
+    let warmup_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(12)
+        .build()
+        .unwrap();
     let _ = execute_run(setup, block, false, &warmup_pool);
     let _ = execute_run(setup, block, true, &warmup_pool);
 
     // 1. Sequential execution (parallel_exec = false)
     // Run 3 iterations and take the best elapsed duration
-    let seq_pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let seq_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
     let mut best_seq: Option<RunMetric> = None;
     for _ in 0..3 {
         let m = execute_run(setup, block, false, &seq_pool);
@@ -299,7 +352,10 @@ fn benchmark_block(name: &str, setup: &BenchmarkSetup, block: &Block) {
         seq.applied,
         seq.failed
     );
-    assert_eq!(seq.applied, tx_count, "all transactions in block must apply");
+    assert_eq!(
+        seq.applied, tx_count,
+        "all transactions in block must apply"
+    );
 
     // 2. Parallel thread scaling curve (parallel_exec = true) across 1, 2, 4, 8, 12 threads
     println!("\nParallel Thread Scaling Curve (parallel_exec=true):");
@@ -312,7 +368,10 @@ fn benchmark_block(name: &str, setup: &BenchmarkSetup, block: &Block) {
     let mut t1_elapsed = Duration::ZERO;
 
     for &threads in &THREAD_CONFIGS {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
 
         let mut best_par: Option<RunMetric> = None;
         for _ in 0..3 {
@@ -351,11 +410,21 @@ fn benchmark_block(name: &str, setup: &BenchmarkSetup, block: &Block) {
 }
 
 fn main() {
-    println!("╔══════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║       STELLEREUM RELEASE BENCHMARK: PARALLEL EXECUTION & THREAD SCALING          ║");
-    println!("║       Architecture: AMD Ryzen 5 3600 (6 Cores / 12 Threads)                      ║");
-    println!("║       Invariant: COMMITMENT_VERSION = 4 | Bit-Identical Roots Verified           ║");
-    println!("╚══════════════════════════════════════════════════════════════════════════════════╝");
+    println!(
+        "╔══════════════════════════════════════════════════════════════════════════════════╗"
+    );
+    println!(
+        "║       STELLEREUM RELEASE BENCHMARK: PARALLEL EXECUTION & THREAD SCALING          ║"
+    );
+    println!(
+        "║       Architecture: AMD Ryzen 5 3600 (6 Cores / 12 Threads)                      ║"
+    );
+    println!(
+        "║       Invariant: COMMITMENT_VERSION = 4 | Bit-Identical Roots Verified           ║"
+    );
+    println!(
+        "╚══════════════════════════════════════════════════════════════════════════════════╝"
+    );
 
     // Workload (a): 1,000 plain transfers
     {

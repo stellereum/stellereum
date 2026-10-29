@@ -226,7 +226,10 @@ impl SignerBitVector {
         if bitmask.len() != total_validators.div_ceil(8) {
             return None;
         }
-        Some(Self { bitmask, total_validators })
+        Some(Self {
+            bitmask,
+            total_validators,
+        })
     }
 
     pub fn total_validators(&self) -> usize {
@@ -258,7 +261,9 @@ impl SignerBitVector {
     }
 
     pub fn signed_count(&self) -> usize {
-        (0..self.total_validators).filter(|&i| self.is_set(i)).count()
+        (0..self.total_validators)
+            .filter(|&i| self.is_set(i))
+            .count()
     }
 
     /// Validator indices absent from this certificate. This is the downtime-slash
@@ -373,8 +378,7 @@ pub fn verify_aggregate_signature(
     }
 
     let h = G2Affine::from(hash_to_g2(msg));
-    pairing(&G1Affine::generator(), &sig_pt)
-        == pairing(&G1Affine::from(sum_pk), &h)
+    pairing(&G1Affine::generator(), &sig_pt) == pairing(&G1Affine::from(sum_pk), &h)
 }
 
 /// Hybrid consensus certificate supporting the soft-fork transition.
@@ -495,7 +499,9 @@ pub const BLS_SK_SEED_ENV: &str = "STELL_BLS_SK_SEED";
 /// Parses the flag EXACTLY like [`QcBlsConfig::from_env`] (`1` or
 /// case-insensitive `true`/`on`): anything else is OFF.
 pub fn refuse_bls_qc_if_enabled() -> Result<(), String> {
-    let enabled = std::env::var(BLS_QC_ENV).map(|v| bls_flag_on(&v)).unwrap_or(false);
+    let enabled = std::env::var(BLS_QC_ENV)
+        .map(|v| bls_flag_on(&v))
+        .unwrap_or(false);
     if !enabled {
         return Ok(());
     }
@@ -555,7 +561,10 @@ impl std::fmt::Debug for QcBlsConfig {
         f.debug_struct("QcBlsConfig")
             .field("enabled", &self.enabled)
             .field("registry_len", &self.registry.len())
-            .field("local_vote_seed", &self.local_vote_seed.map(|_| "[redacted]"))
+            .field(
+                "local_vote_seed",
+                &self.local_vote_seed.map(|_| "[redacted]"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -580,7 +589,9 @@ impl QcBlsConfig {
     /// warning — a partial registry disables the BLS path per certificate
     /// (missing member => fallback), which is the safe direction.
     pub fn from_env() -> Self {
-        let enabled = std::env::var(BLS_QC_ENV).map(|v| bls_flag_on(&v)).unwrap_or(false);
+        let enabled = std::env::var(BLS_QC_ENV)
+            .map(|v| bls_flag_on(&v))
+            .unwrap_or(false);
         let mut registry = BlsKeyRegistry::new();
         if let Ok(path) = std::env::var(BLS_KEYS_FILE_ENV) {
             match std::fs::read_to_string(&path) {
@@ -597,7 +608,11 @@ impl QcBlsConfig {
             .ok()
             .and_then(|s| hex::decode(s.trim()).ok())
             .and_then(|b| <[u8; 32]>::try_from(b).ok());
-        Self { enabled, registry, local_vote_seed }
+        Self {
+            enabled,
+            registry,
+            local_vote_seed,
+        }
     }
 
     /// Canonical BLS public keys for `validators`, in the set's canonical
@@ -643,8 +658,9 @@ fn parse_registry_entries(text: &str, out: &mut BlsKeyRegistry) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let parts: Vec<&str> =
-            line.split(|c: char| c.is_whitespace() || c == ':' || c == '=').collect();
+        let parts: Vec<&str> = line
+            .split(|c: char| c.is_whitespace() || c == ':' || c == '=')
+            .collect();
         if parts.len() < 2 {
             tracing::warn!(line, "bls: registry entry malformed; skipped");
             continue;
@@ -653,8 +669,10 @@ fn parse_registry_entries(text: &str, out: &mut BlsKeyRegistry) {
             tracing::warn!(line, "bls: registry entry is not hex; skipped");
             continue;
         };
-        let (Ok(ed), Ok(bls)) = (<[u8; 32]>::try_from(ed), <[u8; PUBLIC_KEY_LEN]>::try_from(bls))
-        else {
+        let (Ok(ed), Ok(bls)) = (
+            <[u8; 32]>::try_from(ed),
+            <[u8; PUBLIC_KEY_LEN]>::try_from(bls),
+        ) else {
             tracing::warn!(line, "bls: registry entry has wrong length; skipped");
             continue;
         };
@@ -662,7 +680,10 @@ fn parse_registry_entries(text: &str, out: &mut BlsKeyRegistry) {
             Some(pk) => {
                 out.insert(ed, pk);
             }
-            None => tracing::warn!(line, "bls: registry BLS key is not a valid G1 point; skipped"),
+            None => tracing::warn!(
+                line,
+                "bls: registry BLS key is not a valid G1 point; skipped"
+            ),
         }
     }
 }
@@ -817,14 +838,19 @@ pub struct BlsRegistryStats {
 /// already get). A 3-token entry whose third token is NOT 96 bytes falls
 /// back to the v1 reading (extra tokens ignored), so no previously accepted
 /// file changes meaning.
-pub fn parse_registry_entries_v2(text: &str, out: &mut BlsKeyRegistry, stats: &mut BlsRegistryStats) {
+pub fn parse_registry_entries_v2(
+    text: &str,
+    out: &mut BlsKeyRegistry,
+    stats: &mut BlsRegistryStats,
+) {
     for raw in text.split(['\n', ',', ';']) {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let parts: Vec<&str> =
-            line.split(|c: char| c.is_whitespace() || c == ':' || c == '=').collect();
+        let parts: Vec<&str> = line
+            .split(|c: char| c.is_whitespace() || c == ':' || c == '=')
+            .collect();
         if parts.len() < 2 {
             tracing::warn!(line, "bls: registry entry malformed; skipped");
             stats.rejected += 1;
@@ -835,14 +861,19 @@ pub fn parse_registry_entries_v2(text: &str, out: &mut BlsKeyRegistry, stats: &m
             stats.rejected += 1;
             continue;
         };
-        let (Ok(ed), Ok(bls)) = (<[u8; 32]>::try_from(ed), <[u8; PUBLIC_KEY_LEN]>::try_from(bls))
-        else {
+        let (Ok(ed), Ok(bls)) = (
+            <[u8; 32]>::try_from(ed),
+            <[u8; PUBLIC_KEY_LEN]>::try_from(bls),
+        ) else {
             tracing::warn!(line, "bls: registry entry has wrong length; skipped");
             stats.rejected += 1;
             continue;
         };
         let Some(pk) = BlsPublicKey::from_bytes(&bls) else {
-            tracing::warn!(line, "bls: registry BLS key is not a valid G1 point; skipped");
+            tracing::warn!(
+                line,
+                "bls: registry BLS key is not a valid G1 point; skipped"
+            );
             stats.rejected += 1;
             continue;
         };
@@ -940,7 +971,9 @@ mod internal_tests {
             sigs.push((i, k.sign(b"same")));
         }
         let agg = aggregate_signatures(&sigs, 4).unwrap();
-        assert!(!bool::from(sig_point(&agg.signature).unwrap().is_identity()));
+        assert!(!bool::from(
+            sig_point(&agg.signature).unwrap().is_identity()
+        ));
         let pks: Vec<BlsPublicKey> = ks.iter().map(|k| k.public_key()).collect();
         assert!(verify_aggregate_signature(&pks, b"same", &agg));
     }
@@ -1029,7 +1062,11 @@ mod internal_tests {
         // Legacy 2-token line (accepted, counted legacy).
         let sk2 = BlsSecretKey::from_seed(&[0x52u8; 32]);
         let ed2 = [0x22u8; 32];
-        let line_legacy = format!("{} {}", hex::encode(ed2), hex::encode(sk2.public_key().to_bytes()));
+        let line_legacy = format!(
+            "{} {}",
+            hex::encode(ed2),
+            hex::encode(sk2.public_key().to_bytes())
+        );
 
         let mut reg = BlsKeyRegistry::new();
         let mut stats = BlsRegistryStats::default();

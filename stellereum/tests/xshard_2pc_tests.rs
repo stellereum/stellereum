@@ -83,9 +83,7 @@ async fn xpc_cluster(
 }
 
 async fn balance(cluster: &ShardedCluster, shard: u32, addr: &[u8; 32]) -> u64 {
-    cluster
-        .shard(shard)
-        .nodes[0]
+    cluster.shard(shard).nodes[0]
         .state
         .get_account(addr)
         .await
@@ -99,7 +97,10 @@ async fn xpc_record(
     shard: u32,
     tx_hash: &[u8; 32],
 ) -> Option<stellereum::xshard2pc::XpcRecord> {
-    cluster.shard(shard).nodes[0].state.xpc_record(tx_hash).await
+    cluster.shard(shard).nodes[0]
+        .state
+        .xpc_record(tx_hash)
+        .await
 }
 
 /// Drive the 2PC handshake to completion, running the heights in the order
@@ -133,15 +134,7 @@ async fn two_phase_commit_credits_the_target_exactly_once() {
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
 
-    let tx = Transaction::sign(
-        &sender,
-        recipient_addr,
-        amount,
-        fee,
-        0,
-        SHARD0,
-        SHARD1,
-    );
+    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -170,7 +163,9 @@ async fn two_phase_commit_credits_the_target_exactly_once() {
         "the source escrows the value"
     );
     assert_eq!(
-        xpc_record(&cluster, SHARD0, &tx_hash).await.map(|r| r.phase),
+        xpc_record(&cluster, SHARD0, &tx_hash)
+            .await
+            .map(|r| r.phase),
         Some(XpcPhase::Prepared),
         "the source recorded the PREPARED state"
     );
@@ -184,7 +179,9 @@ async fn two_phase_commit_credits_the_target_exactly_once() {
         "the target must NOT credit on the PREPARE"
     );
     assert_eq!(
-        xpc_record(&cluster, SHARD1, &tx_hash).await.map(|r| r.phase),
+        xpc_record(&cluster, SHARD1, &tx_hash)
+            .await
+            .map(|r| r.phase),
         Some(XpcPhase::Prepared),
         "the target recorded the PREPARED state and voted YES"
     );
@@ -200,7 +197,9 @@ async fn two_phase_commit_credits_the_target_exactly_once() {
     // Height 2 on the source: the ACK is consumed, the source commits.
     cluster.run_height(SHARD0, TS + 3).await;
     assert_eq!(
-        xpc_record(&cluster, SHARD0, &tx_hash).await.map(|r| r.phase),
+        xpc_record(&cluster, SHARD0, &tx_hash)
+            .await
+            .map(|r| r.phase),
         Some(XpcPhase::Committed),
         "the source commits on the target's vote"
     );
@@ -222,7 +221,9 @@ async fn two_phase_commit_credits_the_target_exactly_once() {
         "the recipient is credited exactly once"
     );
     assert_eq!(
-        xpc_record(&cluster, SHARD1, &tx_hash).await.map(|r| r.phase),
+        xpc_record(&cluster, SHARD1, &tx_hash)
+            .await
+            .map(|r| r.phase),
         Some(XpcPhase::Committed),
         "the target committed"
     );
@@ -261,15 +262,7 @@ async fn a_source_that_prepares_and_then_crashes_resumes_to_commit() {
     let fee = 280_000u64;
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
-    let tx = Transaction::sign(
-        &sender,
-        recipient_addr,
-        amount,
-        fee,
-        0,
-        SHARD0,
-        SHARD1,
-    );
+    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -323,9 +316,7 @@ async fn a_source_that_prepares_and_then_crashes_resumes_to_commit() {
         s0_block2.cross_shard_out.iter().any(|m| m.is_prepare_ack()),
         "the source consumed the target's vote"
     );
-    fresh
-        .apply_cross_shard_consumptions(&s0_block2)
-        .await;
+    fresh.apply_cross_shard_consumptions(&s0_block2).await;
     assert_eq!(
         fresh.xpc_record(&tx_hash).await.map(|r| r.phase),
         Some(XpcPhase::Committed),
@@ -340,7 +331,8 @@ async fn a_source_that_prepares_and_then_crashes_resumes_to_commit() {
         .map(|a| a.balance)
         .unwrap_or(0);
     assert_eq!(
-        recovered_sender, initial - amount - fee,
+        recovered_sender,
+        initial - amount - fee,
         "the recovered source must NOT refund the escrow"
     );
 }
@@ -366,15 +358,7 @@ async fn a_target_that_prepares_and_then_crashes_resumes_to_the_same_decision() 
     let fee = 280_000u64;
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
-    let tx = Transaction::sign(
-        &sender,
-        recipient_addr,
-        amount,
-        fee,
-        0,
-        SHARD0,
-        SHARD1,
-    );
+    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -382,7 +366,9 @@ async fn a_target_that_prepares_and_then_crashes_resumes_to_the_same_decision() 
     cluster.run_height(SHARD0, TS).await;
     cluster.run_height(SHARD1, TS + 1).await;
     assert_eq!(
-        xpc_record(&cluster, SHARD1, &tx_hash).await.map(|r| r.phase),
+        xpc_record(&cluster, SHARD1, &tx_hash)
+            .await
+            .map(|r| r.phase),
         Some(XpcPhase::Prepared)
     );
 
@@ -456,15 +442,7 @@ async fn a_byzantine_source_cannot_bounce_after_a_successful_prepare() {
     let fee = 280_000u64;
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
-    let tx = Transaction::sign(
-        &sender,
-        recipient_addr,
-        amount,
-        fee,
-        0,
-        SHARD0,
-        SHARD1,
-    );
+    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -509,7 +487,9 @@ async fn a_byzantine_source_cannot_bounce_after_a_successful_prepare() {
     );
     // And the source's own state machine refuses the abort of a transfer it
     // already committed: the phase is monotone.
-    let record = xpc_record(&cluster, SHARD0, &tx_hash).await.expect("record");
+    let record = xpc_record(&cluster, SHARD0, &tx_hash)
+        .await
+        .expect("record");
     assert_eq!(record.phase, XpcPhase::Committed);
     assert_eq!(
         stellereum::xshard2pc::source_on_abort_ack(Some(&record)),
@@ -573,15 +553,7 @@ async fn a_byzantine_target_that_acks_and_then_refuses_to_credit_does_not_double
     let fee = 280_000u64;
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
-    let tx = Transaction::sign(
-        &sender,
-        recipient_addr,
-        amount,
-        fee,
-        0,
-        SHARD0,
-        SHARD1,
-    );
+    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -592,7 +564,9 @@ async fn a_byzantine_target_that_acks_and_then_refuses_to_credit_does_not_double
     // The source consumes the vote and commits.
     cluster.run_height(SHARD0, TS + 3).await;
     assert_eq!(
-        xpc_record(&cluster, SHARD0, &tx_hash).await.map(|r| r.phase),
+        xpc_record(&cluster, SHARD0, &tx_hash)
+            .await
+            .map(|r| r.phase),
         Some(XpcPhase::Committed)
     );
 
@@ -606,10 +580,7 @@ async fn a_byzantine_target_that_acks_and_then_refuses_to_credit_does_not_double
         .map(|m| m.msg_id)
         .collect();
     assert!(!commit_ids.is_empty(), "the source published the COMMIT");
-    cluster
-        .transport
-        .prune_consumed(SHARD1, &commit_ids)
-        .await;
+    cluster.transport.prune_consumed(SHARD1, &commit_ids).await;
 
     // The target never credits. Run the timeout window on the source.
     for i in 0..(stellereum::xshard2pc::XPC_PREPARE_TIMEOUT_HEIGHTS + 4) {
@@ -669,15 +640,7 @@ async fn replay_of_a_prepare_or_commit_is_rejected() {
     let fee = 280_000u64;
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
-    let tx = Transaction::sign(
-        &sender,
-        recipient_addr,
-        amount,
-        fee,
-        0,
-        SHARD0,
-        SHARD1,
-    );
+    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -738,7 +701,9 @@ async fn replay_of_a_prepare_or_commit_is_rejected() {
         "a replayed COMMIT must not credit again"
     );
     assert_eq!(
-        xpc_record(&cluster, SHARD1, &tx_hash).await.map(|r| r.phase),
+        xpc_record(&cluster, SHARD1, &tx_hash)
+            .await
+            .map(|r| r.phase),
         Some(XpcPhase::Committed),
         "the phase is terminal"
     );
@@ -778,7 +743,8 @@ async fn a_two_validator_shard_accepts_the_2pc_records() {
     let s0a = Arc::new(InMemoryStateEngine::new());
     let s0b = Arc::new(InMemoryStateEngine::new());
     for e in [&s0a, &s0b] {
-        e.update_account(AccountState::new(sender_addr, initial)).await;
+        e.update_account(AccountState::new(sender_addr, initial))
+            .await;
     }
     let s1 = Arc::new(InMemoryStateEngine::new());
 
@@ -792,15 +758,7 @@ async fn a_two_validator_shard_accepts_the_2pc_records() {
     );
     cluster.with_xpc_activation(XpcActivation::FromHeight(0));
 
-    let tx = Transaction::sign(
-        &sender,
-        recipient_addr,
-        amount,
-        fee,
-        0,
-        SHARD0,
-        SHARD1,
-    );
+    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -826,7 +784,9 @@ async fn a_two_validator_shard_accepts_the_2pc_records() {
         "the 2PC transfer must complete under validator validation"
     );
     assert_eq!(
-        xpc_record(&cluster, SHARD1, &tx_hash).await.map(|r| r.phase),
+        xpc_record(&cluster, SHARD1, &tx_hash)
+            .await
+            .map(|r| r.phase),
         Some(XpcPhase::Committed)
     );
 }
@@ -854,15 +814,7 @@ async fn a_lost_prepare_is_re_published_and_the_transfer_still_completes() {
     let fee = 280_000u64;
 
     let mut cluster = xpc_cluster(&validator, &[(sender_addr, initial)], &[]).await;
-    let tx = Transaction::sign(
-        &sender,
-        recipient_addr,
-        amount,
-        fee,
-        0,
-        SHARD0,
-        SHARD1,
-    );
+    let tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx.clone()).await;
 
@@ -875,11 +827,12 @@ async fn a_lost_prepare_is_re_published_and_the_transfer_still_completes() {
         .filter(|m| m.is_prepare())
         .map(|m| m.msg_id)
         .collect();
-    assert_eq!(prepare_ids.len(), 1, "precondition: one PREPARE was published");
-    cluster
-        .transport
-        .prune_consumed(SHARD1, &prepare_ids)
-        .await;
+    assert_eq!(
+        prepare_ids.len(),
+        1,
+        "precondition: one PREPARE was published"
+    );
+    cluster.transport.prune_consumed(SHARD1, &prepare_ids).await;
 
     // The target sees nothing (the PREPARE is gone) - it must NOT prepare.
     cluster.run_height(SHARD1, TS + 1).await;
@@ -914,7 +867,9 @@ async fn a_lost_prepare_is_re_published_and_the_transfer_still_completes() {
         "the re-published PREPARE must complete the transfer"
     );
     assert_eq!(
-        xpc_record(&cluster, SHARD1, &tx_hash).await.map(|r| r.phase),
+        xpc_record(&cluster, SHARD1, &tx_hash)
+            .await
+            .map(|r| r.phase),
         Some(XpcPhase::Committed)
     );
     assert_eq!(
@@ -1033,7 +988,8 @@ async fn the_activation_boundary_switches_the_protocol() {
     let fee = 280_000u64;
 
     let s0 = Arc::new(InMemoryStateEngine::new());
-    s0.update_account(AccountState::new(sender_addr, initial)).await;
+    s0.update_account(AccountState::new(sender_addr, initial))
+        .await;
     let s1 = Arc::new(InMemoryStateEngine::new());
     let mut cluster = ShardedCluster::new(
         sharded(),
@@ -1047,15 +1003,7 @@ async fn the_activation_boundary_switches_the_protocol() {
     cluster.with_xpc_activation(XpcActivation::FromHeight(2));
 
     // ---- height 1: the LEGACY flow. ----
-    let legacy_tx = Transaction::sign(
-        &sender,
-        recipient_addr,
-        amount,
-        fee,
-        0,
-        SHARD0,
-        SHARD1,
-    );
+    let legacy_tx = Transaction::sign(&sender, recipient_addr, amount, fee, 0, SHARD0, SHARD1);
     let legacy_hash = legacy_tx.compute_tx_hash();
     cluster.broadcast_tx(legacy_tx.clone()).await;
     let h1 = cluster.run_height(SHARD0, TS).await;
@@ -1086,15 +1034,7 @@ async fn the_activation_boundary_switches_the_protocol() {
     );
 
     // ---- height 2+: the 2PC. ----
-    let xpc_tx = Transaction::sign(
-        &sender,
-        recipient_addr,
-        amount,
-        fee,
-        1,
-        SHARD0,
-        SHARD1,
-    );
+    let xpc_tx = Transaction::sign(&sender, recipient_addr, amount, fee, 1, SHARD0, SHARD1);
     let xpc_hash = xpc_tx.compute_tx_hash();
     cluster.broadcast_tx(xpc_tx.clone()).await;
     let h2 = cluster.run_height(SHARD0, TS + 3).await;
@@ -1112,7 +1052,9 @@ async fn the_activation_boundary_switches_the_protocol() {
         "the 2PC transfer must not be published as a plain transfer"
     );
     assert_eq!(
-        xpc_record(&cluster, SHARD0, &xpc_hash).await.map(|r| r.phase),
+        xpc_record(&cluster, SHARD0, &xpc_hash)
+            .await
+            .map(|r| r.phase),
         Some(XpcPhase::Prepared)
     );
 }
@@ -1147,9 +1089,13 @@ async fn the_2pc_state_is_committed_in_the_digest_and_the_snapshot() {
     let base_root = base.get_state_root().await;
 
     let e_prepared = InMemoryStateEngine::new();
-    e_prepared.restore_xpc_records(std::slice::from_ref(&prepared)).await;
+    e_prepared
+        .restore_xpc_records(std::slice::from_ref(&prepared))
+        .await;
     let e_committed = InMemoryStateEngine::new();
-    e_committed.restore_xpc_records(std::slice::from_ref(&committed)).await;
+    e_committed
+        .restore_xpc_records(std::slice::from_ref(&committed))
+        .await;
 
     assert_ne!(
         e_prepared.get_state_root().await,

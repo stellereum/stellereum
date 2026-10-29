@@ -13,16 +13,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
 
-
 use stellereum::bridge::{SupportedChain, TeleportBridgeEngine};
+use stellereum::consensus::{ValidatorSet, VoteKind};
+use stellereum::consensus_net::{
+    parse_incoming, ConsensusMsg, ConsensusNetwork, ConsensusSender, TxGossip, MAX_BATCH_ITEMS,
+};
 use stellereum::crypto_privacy::{
     ConfidentialTransfer, PedersenCommitment, StealthAddress, ViewingKey,
 };
-use stellereum::consensus::{ValidatorSet, VoteKind};
-use stellereum::consensus_net::{parse_incoming, ConsensusMsg, ConsensusNetwork, ConsensusSender, TxGossip, MAX_BATCH_ITEMS};
 use stellereum::mev::MevPreemptionEngine;
-use stellereum::network::P2pNetworkAdapter;
 use stellereum::network::CrossShardTransport;
+use stellereum::network::P2pNetworkAdapter;
 
 /// How often to push this node's own finalized block BODIES back onto the DHT.
 /// Default 30000 ms; override with `STELL_RETRO_PUBLISH_INTERVAL_MS`.
@@ -59,8 +60,7 @@ fn retro_publish_interval() -> std::time::Duration {
 const RETRO_SUPPRESS_IDLE_SECS: u64 = 60;
 
 /// Node-loud count of suppressed dead-peer retro passes (visibility only).
-static RETRO_SUPPRESSED_N: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static RETRO_SUPPRESSED_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether this retro-publish pass should be suppressed (dead-peer spin gate).
 ///
@@ -195,19 +195,15 @@ fn catchup_interval() -> std::time::Duration {
     )
 }
 use stellereum::oracle::{OracleSafetyEngine, PriceFeedUpdate};
+use stellereum::orderbook::{OrderSide, OrderType, OrderbookManager, PAIR_STELL_USDT};
 use stellereum::pmm::PrimaryMarketMaker;
-use stellereum::orderbook::{
-    OrderSide, OrderType, OrderbookManager, PAIR_STELL_USDT,
-};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{
     Block, CrossShardMessage, DynamicShardManager, ShardRegistry, SharedLiquidityHub, Transaction,
 };
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::tokenomics::{GenesisVault, TeamVestingSchedule, BLOCK_REWARD_NANO};
-use stellereum::zkml::{
-    QuantizedLayer, QuantizedLinearModel, SessionKeyAuthorization, ZkMlProof,
-};
+use stellereum::zkml::{QuantizedLayer, QuantizedLinearModel, SessionKeyAuthorization, ZkMlProof};
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -293,14 +289,15 @@ async fn start_workchain_shard(
     // The dev/faucet account is the ONLY funded account on a workchain.
     // Key file (STELL_FAUCET_KEY_FILE, 0600-checked, zeroized) wins when set;
     // the public test key is refused without STELL_DEV_UNSAFE_TESTKEY=1.
-    let workchain_seed: Option<[u8; 32]> = match stellereum::rpc::try_load_faucet_seed_opt_for_genesis() {
-        Ok(opt) => opt,
-        Err(e) => {
-            eprintln!("{e}");
-            tracing::error!("{e}");
-            None
-        }
-    };
+    let workchain_seed: Option<[u8; 32]> =
+        match stellereum::rpc::try_load_faucet_seed_opt_for_genesis() {
+            Ok(opt) => opt,
+            Err(e) => {
+                eprintln!("{e}");
+                tracing::error!("{e}");
+                None
+            }
+        };
     if let Some(seed) = workchain_seed {
         // Own the seed in a wiping wrapper: the copy handed to Faucet::new is
         // wiped with its frame there; this binding is wiped on scope exit.
@@ -319,7 +316,11 @@ async fn start_workchain_shard(
         .await;
     }
     debug_assert!(
-        state_engine.staking_read().await.to_validator_set().is_empty(),
+        state_engine
+            .staking_read()
+            .await
+            .to_validator_set()
+            .is_empty(),
         "workchain genesis must not seed a staking ledger"
     );
     let genesis_root = state_engine.get_state_root().await;
@@ -330,7 +331,9 @@ async fn start_workchain_shard(
         .await
         .map_err(|e| anyhow::anyhow!("shard {shard} genesis publish: {e}"))?;
     adapter.persist_block_header(shard, &genesis_block).await;
-    adapter.publish_head(shard, 0, genesis_block.compute_hash()).await;
+    adapter
+        .publish_head(shard, 0, genesis_block.compute_hash())
+        .await;
     // C1 anchor: note our own genesis so height-1 messages referencing it
     // verify. Cross-node height-1 messages reference the PROPOSER's genesis
     // (timestamp/proposer differ per node by construction); a validator that
@@ -377,7 +380,8 @@ async fn start_workchain_shard(
     let shared_gov = state_engine.governance_handle();
     let mev_engine = MevPreemptionEngine::new();
     let (tx_bcast_tx, mut tx_bcast_rx) = tokio::sync::mpsc::unbounded_channel();
-    let gossip_bcast = std::sync::Arc::new(stellereum::consensus_net::TxGossip::new(adapter.clone()));
+    let gossip_bcast =
+        std::sync::Arc::new(stellereum::consensus_net::TxGossip::new(adapter.clone()));
     // The epoch-seal path publishes SEALED ciphertexts (and the DKG /
     // order-commitment / share-release frames) through the same channel.
     stellereum::consensus_net::set_global_tx_gossip(gossip_bcast.clone());
@@ -389,7 +393,13 @@ async fn start_workchain_shard(
     });
     let base_fee = stellereum::mempool::Mempool::read_base_fee_from_env();
     info!("[config] admission base_fee floor={base_fee} (STELL_MIN_GAS_LIMIT; MUST match on all validators)");
-    let init_height = persistence.storage().finalized().ok().flatten().map(|(h, _)| h).unwrap_or(0);
+    let init_height = persistence
+        .storage()
+        .finalized()
+        .ok()
+        .flatten()
+        .map(|(h, _)| h)
+        .unwrap_or(0);
     let rpc_state = Arc::new(stellereum::rpc::RpcState {
         engine: state_engine.clone(),
         mempool: Arc::new(tokio::sync::RwLock::new(
@@ -411,8 +421,12 @@ async fn start_workchain_shard(
         receipts: Arc::new(tokio::sync::RwLock::new(
             stellereum::rpc::ReceiptIndex::default(),
         )),
-        auth_token: std::env::var("STELL_RPC_AUTH_TOKEN").ok().filter(|s| !s.is_empty()),
-        faucet_token: std::env::var("STELL_FAUCET_TOKEN").ok().filter(|s| !s.is_empty()),
+        auth_token: std::env::var("STELL_RPC_AUTH_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        faucet_token: std::env::var("STELL_FAUCET_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty()),
         tx_broadcast: Some(tx_bcast_tx),
         faucet: None,
         // `stell_signMessage` / `stell_signTypedData` sign with the NODE's key
@@ -535,9 +549,9 @@ fn build_session_grant_tx(
         nonce,
         1,
         1,
-        vec![stellereum::svm::OpCode::SysCallPublishSessionGrant(Box::new(
-            grant.clone(),
-        ))],
+        vec![stellereum::svm::OpCode::SysCallPublishSessionGrant(
+            Box::new(grant.clone()),
+        )],
     )
 }
 
@@ -583,9 +597,9 @@ fn build_bridge_intent_tx(
 fn parse_wallet_seed(raw: &str, what: &str) -> anyhow::Result<[u8; 32]> {
     let clean = raw.strip_prefix("0x").unwrap_or(raw);
     let bytes = hex::decode(clean).map_err(|e| anyhow::anyhow!("Invalid {what} hex: {e}"))?;
-    bytes.try_into().map_err(|b: Vec<u8>| {
-        anyhow::anyhow!("{what} must be 32 bytes, got {} bytes", b.len())
-    })
+    bytes
+        .try_into()
+        .map_err(|b: Vec<u8>| anyhow::anyhow!("{what} must be 32 bytes, got {} bytes", b.len()))
 }
 
 /// Parse a 32-byte hex address (optional `0x` prefix).
@@ -615,16 +629,27 @@ fn resolve_wallet_signing_key(
             let seed = parse_wallet_seed(seed_hex, "falcon seed")?;
             return Ok(stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed));
         }
-        anyhow::bail!("scheme '{scheme}' needs a Falcon-512 key: pass --falcon-key-file or --falcon-seed")
+        anyhow::bail!(
+            "scheme '{scheme}' needs a Falcon-512 key: pass --falcon-key-file or --falcon-seed"
+        )
     };
     match scheme {
         "ed25519" => {
-            let raw = from_key.as_ref().ok_or_else(|| anyhow::anyhow!("scheme 'ed25519' needs --from-key"))?;
-            Ok(WalletSigningKey::ed25519(parse_wallet_seed(raw, "private key")?))
+            let raw = from_key
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("scheme 'ed25519' needs --from-key"))?;
+            Ok(WalletSigningKey::ed25519(parse_wallet_seed(
+                raw,
+                "private key",
+            )?))
         }
-        "falcon" => Ok(WalletSigningKey::Falcon { keypair: load_falcon()? }),
+        "falcon" => Ok(WalletSigningKey::Falcon {
+            keypair: load_falcon()?,
+        }),
         "hybrid" => {
-            let raw = from_key.as_ref().ok_or_else(|| anyhow::anyhow!("scheme 'hybrid' needs --from-key"))?;
+            let raw = from_key
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("scheme 'hybrid' needs --from-key"))?;
             Ok(WalletSigningKey::Hybrid {
                 ed_seed: parse_wallet_seed(raw, "private key")?,
                 falcon: load_falcon()?,
@@ -647,7 +672,9 @@ fn parse_wallet_typed_data(
     let contract_bytes = parse_wallet_seed(contract, "contract address")?;
     let args_value = match args {
         None => serde_json::Value::Null,
-        Some(raw) => serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("Invalid --args JSON: {e}"))?,
+        Some(raw) => {
+            serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("Invalid --args JSON: {e}"))?
+        }
     };
     stellereum::wallet_signing::TypedCallData::new(
         &contract_bytes,
@@ -682,7 +709,10 @@ fn resolve_attest_keys(
         let bytes =
             hex::decode(raw).map_err(|e| anyhow::anyhow!("invalid --attest-key hex: {e}"))?;
         let seed: [u8; 32] = bytes.try_into().map_err(|b: Vec<u8>| {
-            anyhow::anyhow!("--attest-key must be a 32-byte hex seed, got {} bytes", b.len())
+            anyhow::anyhow!(
+                "--attest-key must be a 32-byte hex seed, got {} bytes",
+                b.len()
+            )
         })?;
         let k = SigningKey::from_bytes(&seed);
         if seen.insert(k.verifying_key().to_bytes()) {
@@ -699,9 +729,7 @@ fn resolve_attest_keys(
     }
 
     if keys.is_empty() {
-        let hint = default_err
-            .map(|e| format!(" ({e})"))
-            .unwrap_or_default();
+        let hint = default_err.map(|e| format!(" ({e})")).unwrap_or_default();
         anyhow::bail!(
             "no attestation key available{hint}: pass --attest-key <hex seed> once per bonded \
              validator you hold - a deposit without a 2/3 quorum of the committed relayer set \
@@ -1026,8 +1054,12 @@ fn build_validator_set(
     }
 
     let we_are_listed = {
-        let self_hex = self_node_id_hex.strip_prefix("inf1:").unwrap_or(self_node_id_hex);
-        cfg.validators.iter().any(|v| v.strip_prefix("inf1:").unwrap_or(v) == self_hex)
+        let self_hex = self_node_id_hex
+            .strip_prefix("inf1:")
+            .unwrap_or(self_node_id_hex);
+        cfg.validators
+            .iter()
+            .any(|v| v.strip_prefix("inf1:").unwrap_or(v) == self_hex)
     };
 
     let mut vs = ValidatorSet::new();
@@ -1037,7 +1069,8 @@ fn build_validator_set(
     // the list names only OTHERS (the deployed convention): in that last case every
     // listed id resolves to a peer entry whose key is not ours, and we still have to be
     // one of the validators or there would be nobody to propose.
-    let list_names_only_others = !empty && !we_are_listed && from_peers.len() == cfg.validators.len();
+    let list_names_only_others =
+        !empty && !we_are_listed && from_peers.len() == cfg.validators.len();
     // Observer override (opt-in via STELL_OBSERVER=1): a fresh node that must
     // FOLLOW an existing chain skips the implicit self-add, so its bootstrap
     // set — and therefore its genesis state root — exactly matches the live
@@ -1102,15 +1135,14 @@ const INBOUND_DEFERRED_CAP: usize = 1024;
 /// Rate-limit state for the tick-side flush ENQUEUE sub-timing WARN. The
 /// transport cost itself is now logged by the background sender as
 /// `flush_outbox`; this one proves the tick no longer waits for it.
-static FLUSH_ENQUEUE_STAGE_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FLUSH_ENQUEUE_STAGE_GATE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Dedup key for an outbound vote: one vote per (height, round, kind, voter).
 /// Proposals and commits have no key (never deduped).
 fn outbox_vote_key(msg: &ConsensusMsg) -> Option<(u64, u32, VoteKind, [u8; 32])> {
     match msg {
-        ConsensusMsg::Vote { vote, .. } => {
-            Some((vote.height, vote.round, vote.kind, vote.voter))
-        }
+        ConsensusMsg::Vote { vote, .. } => Some((vote.height, vote.round, vote.kind, vote.voter)),
         _ => None,
     }
 }
@@ -1123,7 +1155,10 @@ fn outbox_vote_key(msg: &ConsensusMsg) -> Option<(u64, u32, VoteKind, [u8; 32])>
 /// re-sends, which rebuild the vote with a fresh hint after locking, collapse
 /// against the still-queued hintless original and the rescue hint never
 /// reaches the wire. Returns true when queued (or upgraded).
-fn enqueue_outbox(outbox: &mut std::collections::VecDeque<ConsensusMsg>, msg: ConsensusMsg) -> bool {
+fn enqueue_outbox(
+    outbox: &mut std::collections::VecDeque<ConsensusMsg>,
+    msg: ConsensusMsg,
+) -> bool {
     // Audit-network F12: `Committed` was never deduped, so a wedged transport
     // (continuous enqueue-refusal) plus steady finality grew the outbox one
     // entry per finalize without bound. Dedup by height: a height's commit is
@@ -1131,7 +1166,10 @@ fn enqueue_outbox(outbox: &mut std::collections::VecDeque<ConsensusMsg>, msg: Co
     // height collapses. Heights are kept (only exact duplicates collapse), so
     // no catch-up proof is ever lost — only the same proof twice.
     if let Some(h) = stellereum::consensus_net::committed_height_of(&msg) {
-        if outbox.iter().any(|m| stellereum::consensus_net::committed_height_of(m) == Some(h)) {
+        if outbox
+            .iter()
+            .any(|m| stellereum::consensus_net::committed_height_of(m) == Some(h))
+        {
             return false;
         }
         outbox.push_back(msg);
@@ -1170,10 +1208,12 @@ fn outbox_has_proposal(
     height: u64,
     round: u32,
 ) -> bool {
-    outbox.iter().any(|m| matches!(
-        m,
-        ConsensusMsg::Proposal { height: h, round: r, .. } if *h == height && *r == round
-    ))
+    outbox.iter().any(|m| {
+        matches!(
+            m,
+            ConsensusMsg::Proposal { height: h, round: r, .. } if *h == height && *r == round
+        )
+    })
 }
 
 /// True when `msg` is a proposal superseded at `(height, round)`: a proposal
@@ -1183,7 +1223,11 @@ fn outbox_has_proposal(
 /// Never true for votes, commits, or batches.
 fn is_superseded_proposal(msg: &ConsensusMsg, height: u64, round: u32) -> bool {
     match msg {
-        ConsensusMsg::Proposal { height: h, round: r, .. } => {
+        ConsensusMsg::Proposal {
+            height: h,
+            round: r,
+            ..
+        } => {
             *h != height
                 || r.saturating_add(stellereum::consensus_net::SUPERSEDED_ROUND_LAG) <= round
         }
@@ -1536,7 +1580,9 @@ async fn try_snapshot_sync(
             boundary = boundary.saturating_sub(100);
             continue;
         };
-        let Some(next_hdr) = adapter.fetch_block_header(shard, boundary + 1, next_hash).await
+        let Some(next_hdr) = adapter
+            .fetch_block_header(shard, boundary + 1, next_hash)
+            .await
         else {
             miss_header += 1;
             consecutive_misses = consecutive_misses.saturating_add(1);
@@ -1665,13 +1711,8 @@ async fn try_snapshot_sync(
                 async move { a.fetch_domain_snapshot(shard, boundary, kind).await }
             }
         };
-        if let Err(e) = stellereum::sync::fast_sync_state(
-            &rt.state,
-            trusted_root,
-            fetch,
-            fetch_domain,
-        )
-        .await
+        if let Err(e) =
+            stellereum::sync::fast_sync_state(&rt.state, trusted_root, fetch, fetch_domain).await
         {
             eprintln!("[sync] snapshot at {boundary} rejected: {e}");
             consecutive_misses = consecutive_misses.saturating_add(1);
@@ -1839,7 +1880,9 @@ async fn refresh_validator_set_from_fresh_snapshot(
     // Newest first: the first fresh install wins (freshest set).
     candidates.sort_unstable_by(|a, b| b.cmp(a));
     for boundary in candidates {
-        let Some(blob) = adapter.fetch_domain_snapshot(shard, boundary, "domains").await
+        let Some(blob) = adapter
+            .fetch_domain_snapshot(shard, boundary, "domains")
+            .await
         else {
             continue;
         };
@@ -1975,7 +2018,9 @@ async fn try_catch_up(
     if rt.is_validator_set_stale() {
         let state_h = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
         if refresh_validator_set_from_fresh_snapshot(adapter, rt, shard, state_h).await {
-            info!("[validator-set] stale set repaired from fresh domain snapshot; franchise restored");
+            info!(
+                "[validator-set] stale set repaired from fresh domain snapshot; franchise restored"
+            );
         }
     }
     let mut snapshotted_boundary = None;
@@ -1999,7 +2044,9 @@ async fn try_catch_up(
         let our_now = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
         if peer_height > our_now && peer_height - our_now > 100 {
             if let Some(b) = try_snapshot_sync(adapter, rt, shard, peer_height).await {
-                if let Some(h) = walk_chain(adapter, rt, shard, peer_height, peer_hash, persist, rpc).await {
+                if let Some(h) =
+                    walk_chain(adapter, rt, shard, peer_height, peer_hash, persist, rpc).await
+                {
                     return Some(h);
                 }
                 return Some(b);
@@ -2021,7 +2068,6 @@ async fn walk_chain(
     persist: Option<&std::sync::Arc<stellereum::storage::AsyncPersistence>>,
     rpc: &Arc<stellereum::rpc::RpcState>,
 ) -> Option<u64> {
-
     // F3(c): anchor the walk on OUR finalized head and demand the NEXT height,
     // never the walked chain's own first height (passing `blocks[0].height` made
     // the height check a tautology). At genesis the chain roots at the zero
@@ -2082,7 +2128,10 @@ async fn walk_chain(
     // Drop any leading block at or below our finalized height (at genesis this is
     // the height-0 root block), so validation starts exactly at the first height
     // we have not already applied.
-    while blocks.first().is_some_and(|b| b.height < expected_first_height) {
+    while blocks
+        .first()
+        .is_some_and(|b| b.height < expected_first_height)
+    {
         blocks.remove(0);
     }
     if blocks.is_empty() {
@@ -2158,15 +2207,19 @@ async fn walk_chain(
         );
     }
     let anchored_root = match rt.light_client() {
-        Some(light) if !tip_connected => match stellereum::sync::verify_synced_blocks_against_anchor_with_sets(light, &blocks, &|h| {
-            Some(rt.validator_set_for_height(h))
-        }) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                eprintln!("[sync] rejecting peer chain: light-client anchor: {e}");
-                return None;
+        Some(light) if !tip_connected => {
+            match stellereum::sync::verify_synced_blocks_against_anchor_with_sets(
+                light,
+                &blocks,
+                &|h| Some(rt.validator_set_for_height(h)),
+            ) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    eprintln!("[sync] rejecting peer chain: light-client anchor: {e}");
+                    return None;
+                }
             }
-        },
+        }
         _ => {
             // No anchor (the node has no genesis root wired — a library or
             // test runtime), or the walk is anchored by our own finalized tip
@@ -2231,7 +2284,10 @@ async fn walk_chain(
             return None;
         }
         let Some(qc) = b.precommit_qc.clone() else {
-            eprintln!("[sync] rejecting peer chain: block {} has no decision proof", b.height);
+            eprintln!(
+                "[sync] rejecting peer chain: block {} has no decision proof",
+                b.height
+            );
             return None;
         };
         rt.hc.precommit_qc = Some(qc);
@@ -2397,7 +2453,9 @@ async fn retro_publish_pass(
         let from_disk = tokio::task::spawn_blocking(move || {
             let mut out: Vec<stellereum::sharding::Block> = Vec::new();
             for h in wanted {
-                let Ok(hashes) = store.hashes_at_height(h) else { continue };
+                let Ok(hashes) = store.hashes_at_height(h) else {
+                    continue;
+                };
                 for hash in hashes {
                     if let Ok(Some(b)) = store.get_block(&hash) {
                         out.push(b);
@@ -2544,7 +2602,11 @@ async fn run_consensus_node(
 ) {
     // Shard-scoped topic: use block_shard so masterchain (0) and workchains (1..N)
     // strictly use disjoint topics and never cross-talk or flood each other.
-    let net = Arc::new(ConsensusNetwork::new_for_shard(adapter.clone(), block_shard, &registry));
+    let net = Arc::new(ConsensusNetwork::new_for_shard(
+        adapter.clone(),
+        block_shard,
+        &registry,
+    ));
     // Dedicated ordered broadcast sender (P4): the tick enqueues drained chunks
     // and never awaits the peer's `request_to` round trip. See `flush_outbox`.
     let net_sender = net.start_sender();
@@ -2624,11 +2686,12 @@ async fn run_consensus_node(
             let mut parts = entry.split(':');
             if let (Some(ed_hex), Some(pq_hex)) = (parts.next(), parts.next()) {
                 if let (Ok(ed), Ok(pq)) = (hex::decode(ed_hex.trim()), hex::decode(pq_hex.trim())) {
-                    if let (Ok(ed_arr), ) = (ed.as_slice().try_into().map(|a: &[u8]| {
+                    if let (Ok(ed_arr),) = (ed.as_slice().try_into().map(|a: &[u8]| {
                         let mut out = [0u8; 32];
                         out.copy_from_slice(a);
                         out
-                    }),) {
+                    }),)
+                    {
                         stellereum::consensus::register_validator_pq_key(
                             ed_arr,
                             stellereum::post_quantum::PqScheme::Falcon512,
@@ -2740,7 +2803,10 @@ async fn run_consensus_node(
     // keeps `cross_shard == None` and behaves byte-identically to before.
     if registry.is_sharded() {
         rt = rt.with_cross_shard(CrossShardTransport::from_node(adapter.clone()));
-        info!("[shard {}] cross-shard transport wired (node-local KV)", block_shard);
+        info!(
+            "[shard {}] cross-shard transport wired (node-local KV)",
+            block_shard
+        );
         // §9 CROSS-SHARD 2PC: the activation switch. `STELL_XPC_ACTIVATION_HEIGHT`
         // names the height from which NEW cross-shard transfers run the
         // two-phase commit (prepare / vote / commit) instead of the legacy
@@ -2777,7 +2843,10 @@ async fn run_consensus_node(
         match stellereum::storage::load_full_state_into(&ap.storage(), &rt.state).await {
             Ok(Some((h, ledger, gov))) => {
                 restored_state_height = h;
-                info!("[storage] restored full state from height {h}, resuming at {}", h + 1);
+                info!(
+                    "[storage] restored full state from height {h}, resuming at {}",
+                    h + 1
+                );
                 rt.hc = stellereum::consensus::HeightConsensus::new(h + 1, rt.validators.clone());
                 // Sortition entropy for the resumed height: the parent block
                 // hash of the restored state (the block at height `h`). The
@@ -2825,9 +2894,9 @@ async fn run_consensus_node(
                     .unwrap_or(h);
                 // Newest-state vs newest-domains gap (crash-tail detector).
                 if let Ok(Some((s_newest, l_newest))) = ap.storage().ledger_state_gap() {
-                    if let Err(reason) = stellereum::storage::check_validator_set_freshness(
-                        s_newest, l_newest,
-                    ) {
+                    if let Err(reason) =
+                        stellereum::storage::check_validator_set_freshness(s_newest, l_newest)
+                    {
                         rt.mark_validator_set_stale(s_newest, l_newest, reason);
                     }
                 }
@@ -2836,9 +2905,7 @@ async fn run_consensus_node(
                         .refresh_validator_set_from_staking_checked(h, ledger_h_for_check)
                         .await
                 {
-                    info!(
-                        "[storage] validator set converged to the restored ledger at height {h}"
-                    );
+                    info!("[storage] validator set converged to the restored ledger at height {h}");
                 }
                 if rt.is_validator_set_stale() {
                     eprintln!(
@@ -2909,11 +2976,12 @@ async fn run_consensus_node(
             Ok(Some((fh, fhash))) => {
                 rt.finalized.push((fh, fhash));
                 if fh + 1 > rt.hc.height {
-                    rt.hc = stellereum::consensus::HeightConsensus::new(
-                        fh + 1,
-                        rt.validators.clone(),
+                    rt.hc =
+                        stellereum::consensus::HeightConsensus::new(fh + 1, rt.validators.clone());
+                    info!(
+                        "[storage] finalized head at height {fh}, resuming at {}",
+                        fh + 1
                     );
-                    info!("[storage] finalized head at height {fh}, resuming at {}", fh + 1);
                 }
                 if fh + 1 == rt.hc.height {
                     // Sortition entropy for the resumed height: the finalized
@@ -3095,115 +3163,115 @@ async fn run_consensus_node(
         }
     }
 
-/// Bring the engine's state up to the finalized head BEFORE joining consensus.
-///
-/// A restart loads the newest PAIRED snapshot (state S) and seeds the finalized head
-/// (F) from metadata. Whenever S < F the engine is behind its own head, and voting
-/// from S-state at height F+1 forks the node while reporting healthy -- observed live
-/// as proposals carrying a 78-block-stale root forever. This closes the gap or
-/// refuses to start; it never lets the node vote from unproven state.
-///
-/// Method, in order: (1) replay bodies S+1..F from the LOCAL block store (our own
-/// finalized history, archive mode keeps every body); bodies missing locally are
-/// fetched from peers; (2) every replayed block must carry a verifiable precommit QC
-/// and commit to the running engine root -- history that predates decision proofs
-/// cannot be replayed and fails here, which is correct: it is unverifiable by anyone.
-/// (3) If the gap cannot be closed, exit(1). A node that cannot prove its state must
-/// not vote; the operator wipes or restores a verified backup.
-///
-/// Returns the engine height reached (== F on success).
-#[allow(clippy::blocks_in_conditions)]
-// GATE: behind-peer gate builds its predicate inline for auditability; hoisting would obscure the suppression logic.
-#[allow(unused_assignments)]
-// GATE: healing counters are observability-only; dead stores preserve restart-safe accounting without affecting consensus.
-#[allow(unused_variables)]
-// GATE: tick/phase counters are perf-visibility only; unused reads preserve timing attribution without behavior change.
-async fn heal_engine_to_head(
-    adapter: &Arc<P2pNetworkAdapter>,
-    rt: &mut ValidatorRuntime,
-    store: &stellereum::storage::Storage,
-    shard: u32,
-    engine_height: u64,
-    finalized_head: u64,
-    finalized_hash: [u8; 32],
-) -> Result<u64, String> {
-    if engine_height >= finalized_head {
-        return Ok(engine_height);
-    }
-    // Walk BACKWARD from the head collecting hashes, preferring local bodies and
-    // falling back to the network per hash. Bounded by the same million-block cap
-    // as the live catch-up path.
-    let mut hashes: Vec<[u8; 32]> = vec![finalized_hash];
-    let mut cur = finalized_hash;
-    for _ in 0..1_000_000u64 {
-        let h = hashes.len() as u64;
-        // Height of `cur` = finalized_head - (hashes.len() - 1). Stop when we reach
-        // engine_height's block (whose hash we anchor below).
-        if finalized_head - (h - 1) <= engine_height {
-            break;
+    /// Bring the engine's state up to the finalized head BEFORE joining consensus.
+    ///
+    /// A restart loads the newest PAIRED snapshot (state S) and seeds the finalized head
+    /// (F) from metadata. Whenever S < F the engine is behind its own head, and voting
+    /// from S-state at height F+1 forks the node while reporting healthy -- observed live
+    /// as proposals carrying a 78-block-stale root forever. This closes the gap or
+    /// refuses to start; it never lets the node vote from unproven state.
+    ///
+    /// Method, in order: (1) replay bodies S+1..F from the LOCAL block store (our own
+    /// finalized history, archive mode keeps every body); bodies missing locally are
+    /// fetched from peers; (2) every replayed block must carry a verifiable precommit QC
+    /// and commit to the running engine root -- history that predates decision proofs
+    /// cannot be replayed and fails here, which is correct: it is unverifiable by anyone.
+    /// (3) If the gap cannot be closed, exit(1). A node that cannot prove its state must
+    /// not vote; the operator wipes or restores a verified backup.
+    ///
+    /// Returns the engine height reached (== F on success).
+    #[allow(clippy::blocks_in_conditions)]
+    // GATE: behind-peer gate builds its predicate inline for auditability; hoisting would obscure the suppression logic.
+    #[allow(unused_assignments)]
+    // GATE: healing counters are observability-only; dead stores preserve restart-safe accounting without affecting consensus.
+    #[allow(unused_variables)]
+    // GATE: tick/phase counters are perf-visibility only; unused reads preserve timing attribution without behavior change.
+    async fn heal_engine_to_head(
+        adapter: &Arc<P2pNetworkAdapter>,
+        rt: &mut ValidatorRuntime,
+        store: &stellereum::storage::Storage,
+        shard: u32,
+        engine_height: u64,
+        finalized_head: u64,
+        finalized_hash: [u8; 32],
+    ) -> Result<u64, String> {
+        if engine_height >= finalized_head {
+            return Ok(engine_height);
         }
-        let blk = match store.get_block(&cur) {
-            Ok(Some(b)) => b,
-            _ => match adapter.fetch_block(&cur).await {
-                Some(b) => b,
-                None => {
-                    return Err(format!(
-                        "healing stuck: body {} unavailable locally and from peers",
-                        hex::encode(cur)
-                    ))
-                }
-            },
-        };
-        cur = blk.prev_hash;
-        hashes.push(cur);
-    }
-    hashes.reverse();
-    // hashes[0] must be the engine state's block (height == engine_height). We prove
-    // it by hash-linkage below rather than by trusting labels: each applied block's
-    // F3.2 root check ties it to the running engine, so a wrong anchor fails loudly
-    // on the first apply instead of forking quietly.
-    let _ = shard;
-    let mut applied = engine_height;
-    for (i, hash) in hashes.iter().enumerate().skip(1) {
-        let expected_height = engine_height + i as u64;
-        let blk = match store.get_block(hash) {
-            Ok(Some(b)) => b,
-            _ => match adapter.fetch_block(hash).await {
-                Some(b) => b,
-                None => {
-                    return Err(format!(
-                        "healing stuck: body {} unavailable locally and from peers",
-                        hex::encode(hash)
-                    ))
-                }
-            },
-        };
-        if blk.height != expected_height {
-            return Err(format!(
-                "healing broken: expected height {expected_height}, got {}",
-                blk.height
-            ));
+        // Walk BACKWARD from the head collecting hashes, preferring local bodies and
+        // falling back to the network per hash. Bounded by the same million-block cap
+        // as the live catch-up path.
+        let mut hashes: Vec<[u8; 32]> = vec![finalized_hash];
+        let mut cur = finalized_hash;
+        for _ in 0..1_000_000u64 {
+            let h = hashes.len() as u64;
+            // Height of `cur` = finalized_head - (hashes.len() - 1). Stop when we reach
+            // engine_height's block (whose hash we anchor below).
+            if finalized_head - (h - 1) <= engine_height {
+                break;
+            }
+            let blk = match store.get_block(&cur) {
+                Ok(Some(b)) => b,
+                _ => match adapter.fetch_block(&cur).await {
+                    Some(b) => b,
+                    None => {
+                        return Err(format!(
+                            "healing stuck: body {} unavailable locally and from peers",
+                            hex::encode(cur)
+                        ))
+                    }
+                },
+            };
+            cur = blk.prev_hash;
+            hashes.push(cur);
         }
-        if blk.compute_hash() != *hash {
-            return Err(format!(
+        hashes.reverse();
+        // hashes[0] must be the engine state's block (height == engine_height). We prove
+        // it by hash-linkage below rather than by trusting labels: each applied block's
+        // F3.2 root check ties it to the running engine, so a wrong anchor fails loudly
+        // on the first apply instead of forking quietly.
+        let _ = shard;
+        let mut applied = engine_height;
+        for (i, hash) in hashes.iter().enumerate().skip(1) {
+            let expected_height = engine_height + i as u64;
+            let blk = match store.get_block(hash) {
+                Ok(Some(b)) => b,
+                _ => match adapter.fetch_block(hash).await {
+                    Some(b) => b,
+                    None => {
+                        return Err(format!(
+                            "healing stuck: body {} unavailable locally and from peers",
+                            hex::encode(hash)
+                        ))
+                    }
+                },
+            };
+            if blk.height != expected_height {
+                return Err(format!(
+                    "healing broken: expected height {expected_height}, got {}",
+                    blk.height
+                ));
+            }
+            if blk.compute_hash() != *hash {
+                return Err(format!(
                 "healing broken: body at height {expected_height} does not hash to the linked hash"
             ));
-        }
-        if blk.prev_hash != hashes[i - 1] {
-            return Err(format!(
+            }
+            if blk.prev_hash != hashes[i - 1] {
+                return Err(format!(
                 "healing broken: block at height {expected_height} prev_hash mismatch: expected {}, got {}",
                 hex::encode(hashes[i - 1]),
                 hex::encode(blk.prev_hash)
             ));
+            }
+            rt.replay_historical_block(&blk)
+                .await
+                .map_err(|e| format!("healing refused at height {expected_height}: {e}"))?;
+            rt.blocks.insert(*hash, blk.clone());
+            applied = expected_height;
         }
-        rt.replay_historical_block(&blk).await.map_err(|e| {
-            format!("healing refused at height {expected_height}: {e}")
-        })?;
-        rt.blocks.insert(*hash, blk.clone());
-        applied = expected_height;
+        Ok(applied)
     }
-    Ok(applied)
-}
 
     // Announce where we are before anyone asks. A node that restarts has not
     // finalized anything since, so without this its head is invisible to peers
@@ -3234,12 +3302,10 @@ async fn heal_engine_to_head(
 
     // BFT-02: Restore vote history from persisted checkpoint to guarantee crash-resilience
     // and strictly forbid accidental self-equivocation across restarts.
-    let mut last_prevoted: Option<(u64, u32)> = restored_checkpoint
-        .as_ref()
-        .map(|cp| (cp.height, cp.round));
-    let mut last_precommitted: Option<(u64, u32)> = restored_checkpoint
-        .as_ref()
-        .map(|cp| (cp.height, cp.round));
+    let mut last_prevoted: Option<(u64, u32)> =
+        restored_checkpoint.as_ref().map(|cp| (cp.height, cp.round));
+    let mut last_precommitted: Option<(u64, u32)> =
+        restored_checkpoint.as_ref().map(|cp| (cp.height, cp.round));
     // Throttle for the finalize-blocker diagnostic below: one line per round.
     let mut last_blockers_log: Option<(u64, u32)> = None;
     // Throttle for the propose-gate diagnostic: one line per round.
@@ -3391,7 +3457,11 @@ async fn heal_engine_to_head(
         info!("[storage] pruning mode: block bodies older than {keep_blocks} blocks will be dropped, header records retained");
     }
 
-    info!("[consensus] loop started at height {} (proposer={})", rt.hc.height, rt.is_proposer());
+    info!(
+        "[consensus] loop started at height {} (proposer={})",
+        rt.hc.height,
+        rt.is_proposer()
+    );
     info!(
         "[consensus] validator set: {}",
         rt.validators
@@ -3433,7 +3503,14 @@ async fn heal_engine_to_head(
     let mut last_prune_height: u64 = 0;
 
     // Push what we already have before waiting for anything from a peer.
-    retro_publish_pass(adapter.clone(), &rt, persistence.as_ref(), &mut retro_published_upto, None).await;
+    retro_publish_pass(
+        adapter.clone(),
+        &rt,
+        persistence.as_ref(),
+        &mut retro_published_upto,
+        None,
+    )
+    .await;
 
     let mut _tick_no: u64 = 0;
     // Tick-split attribution (packing-perf visibility only, no behavior
@@ -3577,7 +3654,8 @@ async fn heal_engine_to_head(
                 )
             }
         };
-        if last_catchup.elapsed() >= catchup_interval && !rt.has_pending_apply() && !defer_for_live {
+        if last_catchup.elapsed() >= catchup_interval && !rt.has_pending_apply() && !defer_for_live
+        {
             catchup_ran = true;
             last_catchup = std::time::Instant::now();
             let split_catchup_t0 = std::time::Instant::now();
@@ -3645,7 +3723,10 @@ async fn heal_engine_to_head(
                         let _ = rt.on_prevote(v.clone());
                         enqueue_outbox(
                             &mut outbox,
-                            ConsensusMsg::Vote { vote: v.clone(), locked: lock_hint(&rt, &v) },
+                            ConsensusMsg::Vote {
+                                vote: v.clone(),
+                                locked: lock_hint(&rt, &v),
+                            },
                         );
                         cast_prevote = Some(v);
                         last_prevoted = Some((rt.hc.height, rt.hc.round));
@@ -3683,8 +3764,7 @@ async fn heal_engine_to_head(
             // Hoisted behind-peer predicate (clippy::blocks_in_conditions): pure, no side effects.
             let behind_suppress = {
                 let we_are_behind = peer_tip > our_tip
-                    && peer_tip - our_tip
-                        > stellereum::sync::RETRO_SKIP_BEHIND_GAP;
+                    && peer_tip - our_tip > stellereum::sync::RETRO_SKIP_BEHIND_GAP;
                 let behind_window = retro_behind_window_secs();
                 let behind_idle = last_behind_peer_seen.map(|t| t.elapsed().as_secs());
                 should_suppress_retro_no_behind_peer(behind_idle, behind_window, we_are_behind)
@@ -3709,8 +3789,7 @@ async fn heal_engine_to_head(
                 // `last_inbound_msg` and the next pass runs; a new
                 // finalization advances `our_tip` and the next pass runs.
                 last_retro_publish = std::time::Instant::now();
-                let n =
-                    RETRO_SUPPRESSED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let n = RETRO_SUPPRESSED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 eprintln!(
                     "[retro-publish] SUPPRESSED dead-peer pass #{n} (tip={our_tip} unchanged since last pass, inbound idle {}s >= {RETRO_SUPPRESS_IDLE_SECS}s; resumes on new finalization or first inbound vote/proposal)",
                     last_inbound_msg.elapsed().as_secs()
@@ -3735,46 +3814,52 @@ async fn heal_engine_to_head(
                     "[retro-publish] suppressed no-behind-peer pass #{n} (tip={our_tip} behind_idle={idle_txt})"
                 );
             } else {
-            retro_ran = true;
-            let split_retro_t0 = std::time::Instant::now();
-            last_retro_publish = std::time::Instant::now();
-            retro_tip_at_last_pass = our_tip;
-            let _ = tokio::time::timeout(
-                net_budget,
-                retro_publish_pass(adapter.clone(), &rt, persistence.as_ref(), &mut retro_published_upto, Some(&publish_lane)),
-            )
-            .await;
-            // Tip-first supplement: the backfill cursor above works bottom-up
-            // and reaches a fresh tip last, but a recovering peer almost always
-            // needs exactly the tip. Publish it every pass (one body, memory
-            // first) so a restart never strands a peer for a whole window.
-            // Publish the last few, not just the tip: a 1-8 block lag needs
-            // middle children the tip-only publish would miss for hours.
-            // OFF-TICK (observer C): `store_blob` waits on replicas — awaited
-            // here it held the consensus tick for seconds every 30s pass. Same
-            // bytes, same order, but on `publish_lane` behind the window above.
-            {
-                let recent: Vec<_> = rt.finalized.iter().rev().take(8).copied().collect();
-                let mut bodies = Vec::with_capacity(recent.len());
-                for (_, thash) in recent {
-                    if let Some(body) = rt.blocks.get(&thash).cloned().or_else(|| {
-                        persistence
-                            .as_ref()
-                            .and_then(|ap| ap.storage().get_block(&thash).ok().flatten())
-                    }) {
-                        bodies.push(body);
+                retro_ran = true;
+                let split_retro_t0 = std::time::Instant::now();
+                last_retro_publish = std::time::Instant::now();
+                retro_tip_at_last_pass = our_tip;
+                let _ = tokio::time::timeout(
+                    net_budget,
+                    retro_publish_pass(
+                        adapter.clone(),
+                        &rt,
+                        persistence.as_ref(),
+                        &mut retro_published_upto,
+                        Some(&publish_lane),
+                    ),
+                )
+                .await;
+                // Tip-first supplement: the backfill cursor above works bottom-up
+                // and reaches a fresh tip last, but a recovering peer almost always
+                // needs exactly the tip. Publish it every pass (one body, memory
+                // first) so a restart never strands a peer for a whole window.
+                // Publish the last few, not just the tip: a 1-8 block lag needs
+                // middle children the tip-only publish would miss for hours.
+                // OFF-TICK (observer C): `store_blob` waits on replicas — awaited
+                // here it held the consensus tick for seconds every 30s pass. Same
+                // bytes, same order, but on `publish_lane` behind the window above.
+                {
+                    let recent: Vec<_> = rt.finalized.iter().rev().take(8).copied().collect();
+                    let mut bodies = Vec::with_capacity(recent.len());
+                    for (_, thash) in recent {
+                        if let Some(body) = rt.blocks.get(&thash).cloned().or_else(|| {
+                            persistence
+                                .as_ref()
+                                .and_then(|ap| ap.storage().get_block(&thash).ok().flatten())
+                        }) {
+                            bodies.push(body);
+                        }
+                    }
+                    if !bodies.is_empty() {
+                        let a = adapter.clone();
+                        publish_lane.submit(async move {
+                            let _ = a.retro_publish_blocks(bodies.iter(), bodies.len()).await;
+                        });
                     }
                 }
-                if !bodies.is_empty() {
-                    let a = adapter.clone();
-                    publish_lane.submit(async move {
-                        let _ = a.retro_publish_blocks(bodies.iter(), bodies.len()).await;
-                    });
-                }
-            }
-            split_retro_ms += split_retro_t0.elapsed().as_millis() as u64;
-            retro_ms = split_retro_t0.elapsed().as_millis() as u64;
-            split_retro_n += 1;
+                split_retro_ms += split_retro_t0.elapsed().as_millis() as u64;
+                retro_ms = split_retro_t0.elapsed().as_millis() as u64;
+                split_retro_n += 1;
             }
         }
 
@@ -3923,8 +4008,8 @@ async fn heal_engine_to_head(
                     // gossip can no longer squat in this shard's pool. The
                     // pool-level pin is the backstop; this is the explicit
                     // first line.
-                    let mut gctx = stellereum::mempool::AdmissionCtx::wall_now()
-                        .with_onchain_nonce(onchain);
+                    let mut gctx =
+                        stellereum::mempool::AdmissionCtx::wall_now().with_onchain_nonce(onchain);
                     // PAYMASTER: gossiped sponsored transactions carry their
                     // sponsor's balance head (fail-closed without it).
                     if let Some(sbal) = rt.state.sponsor_balance_of(&tx).await {
@@ -3933,11 +4018,7 @@ async fn heal_engine_to_head(
                     if rt.shard_registry.is_sharded() {
                         gctx = gctx.with_shard(rt.shard_id);
                     }
-                    if let Err(e) = pool.add_checked_ctx(
-                        tx.clone(),
-                        bal,
-                        gctx,
-                    ) {
+                    if let Err(e) = pool.add_checked_ctx(tx.clone(), bal, gctx) {
                         tracing::debug!(
                             "[mempool] gossip admission refused from {} nonce={}: {e}",
                             hex::encode(&tx.from[..6]),
@@ -3960,8 +4041,8 @@ async fn heal_engine_to_head(
                 continue;
             }
             // Same P2/F-02 pinning as the gossip path above.
-            let mut octx = stellereum::mempool::AdmissionCtx::wall_now()
-                .with_onchain_nonce(onchain);
+            let mut octx =
+                stellereum::mempool::AdmissionCtx::wall_now().with_onchain_nonce(onchain);
             // PAYMASTER: same sponsor head as the gossip path above.
             if let Some(sbal) = rt.state.sponsor_balance_of(&tx).await {
                 octx = octx.with_sponsor_balance(sbal);
@@ -3969,8 +4050,7 @@ async fn heal_engine_to_head(
             if rt.shard_registry.is_sharded() {
                 octx = octx.with_shard(rt.shard_id);
             }
-            let _ = pool
-                .add_checked_ctx(tx, bal, octx);
+            let _ = pool.add_checked_ctx(tx, bal, octx);
         }
 
         // 1. propose if we are the proposer for this (height, round)
@@ -4076,19 +4156,29 @@ async fn heal_engine_to_head(
                 let engine = rt.state.clone();
                 let mut accounts: std::collections::HashMap<[u8; 32], (u64, u64)> =
                     std::collections::HashMap::new();
-                let senders: Vec<[u8; 32]> =
-                    rt.mempool.read().await.all().iter().map(|t| t.from).collect();
+                let senders: Vec<[u8; 32]> = rt
+                    .mempool
+                    .read()
+                    .await
+                    .all()
+                    .iter()
+                    .map(|t| t.from)
+                    .collect();
                 for s in senders {
                     if let Some(a) = engine.get_account(&s).await {
                         accounts.insert(s, (a.nonce, a.balance));
                     }
                 }
-                let dropped = rt.mempool.write().await.evict_unexecutable_at(now_secs, |s| {
-                    // Unknown senders are skipped, never assumed broke: the
-                    // snapshot may be partial or pre-height, and deleting a
-                    // funded transaction here is irreversible (audit 2026-10-06).
-                    accounts.get(s).copied()
-                });
+                let dropped = rt
+                    .mempool
+                    .write()
+                    .await
+                    .evict_unexecutable_at(now_secs, |s| {
+                        // Unknown senders are skipped, never assumed broke: the
+                        // snapshot may be partial or pre-height, and deleting a
+                        // funded transaction here is irreversible (audit 2026-10-06).
+                        accounts.get(s).copied()
+                    });
                 if dropped > 0 {
                     info!("[mempool] evicted {dropped} unexecutable transaction(s)");
                 }
@@ -4097,9 +4187,11 @@ async fn heal_engine_to_head(
                 // Same snapshot (no extra engine reads); wall clock is local
                 // policy, never consensus.
                 {
-                    let swept = rt.mempool.write().await.sweep_expired(now_secs, |s| {
-                        accounts.get(s).copied()
-                    });
+                    let swept = rt
+                        .mempool
+                        .write()
+                        .await
+                        .sweep_expired(now_secs, |s| accounts.get(s).copied());
                     if swept > 0 {
                         info!("[mempool] swept {swept} stuck transaction(s) past TTL");
                     }
@@ -4113,16 +4205,26 @@ async fn heal_engine_to_head(
                 let bh = block.compute_hash();
                 let ntx = block.transactions.len();
                 // P3-H4: enqueue; proposals carry bodies so they flush at once.
-                let msg = ConsensusMsg::Proposal { height, round, block };
+                let msg = ConsensusMsg::Proposal {
+                    height,
+                    round,
+                    block,
+                };
                 let large = msg.is_large();
                 enqueue_outbox(&mut outbox, msg);
                 if large {
                     flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
-            outbox_flushes += 1;
+                    outbox_flushes += 1;
                     last_flush = std::time::Instant::now();
                 }
                 last_block_at = std::time::Instant::now();
-                info!("[consensus] proposed block #{} r{} {} txs={}", height, round, hex::encode(&bh[..6]), ntx);
+                info!(
+                    "[consensus] proposed block #{} r{} {} txs={}",
+                    height,
+                    round,
+                    hex::encode(&bh[..6]),
+                    ntx
+                );
             }
         }
 
@@ -4141,7 +4243,10 @@ async fn heal_engine_to_head(
                 // exactly once even though the wire flush happens later.
                 enqueue_outbox(
                     &mut outbox,
-                    ConsensusMsg::Vote { vote: v.clone(), locked: lock_hint(&rt, &v) },
+                    ConsensusMsg::Vote {
+                        vote: v.clone(),
+                        locked: lock_hint(&rt, &v),
+                    },
                 );
                 flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
                 outbox_flushes += 1;
@@ -4204,7 +4309,10 @@ async fn heal_engine_to_head(
                 let _ = rt.on_prevote(v.clone());
                 enqueue_outbox(
                     &mut outbox,
-                    ConsensusMsg::Vote { vote: v.clone(), locked: lock_hint(&rt, &v) },
+                    ConsensusMsg::Vote {
+                        vote: v.clone(),
+                        locked: lock_hint(&rt, &v),
+                    },
                 );
                 cast_prevote = Some(v);
                 last_prevoted = Some((height, round));
@@ -4335,7 +4443,9 @@ async fn heal_engine_to_head(
                 // against the verification budget nor is dropped as flood
                 // tail — only Batch-carried votes/proposals burn the budget.
                 // Scheduling only: validation below is untouched.
-                for msg in stellereum::consensus_net::prioritize_inbound_for_verify(flatten_incoming(msg)) {
+                for msg in
+                    stellereum::consensus_net::prioritize_inbound_for_verify(flatten_incoming(msg))
+                {
                     let is_catchup = matches!(msg, ConsensusMsg::Committed { .. });
                     if is_catchup {
                         // VERIFICATION F2-hardening: Committed bypasses the
@@ -4346,9 +4456,8 @@ async fn heal_engine_to_head(
                         // tick too), the rest of the drain continues, and the
                         // sender's rebroadcast + the DHT walk cover honest
                         // catch-up (which needs ~1 proof per finalize).
-                        if !stellereum::consensus_net::committed_admit_this_tick(
-                            committed_admitted,
-                        ) {
+                        if !stellereum::consensus_net::committed_admit_this_tick(committed_admitted)
+                        {
                             inbound_overcap_count += 1;
                             tracing::warn!(
                                 "[consensus] dropping Committed proof over per-tick cap ({} proves/tick); flood tail, catch-up falls back to rebroadcast/DHT walk",
@@ -4369,35 +4478,161 @@ async fn heal_engine_to_head(
                             break 'drain;
                         }
                     }
-                match msg {
-                    ConsensusMsg::Batch(_) => {}
-                    ConsensusMsg::Proposal { round: r, block, .. } => {
-                        info!(
-                            "[consensus] RX proposal from {} #{} r{}",
-                            hex::encode(&block.proposer[..6]),
-                            block.height,
-                            r
-                        );
-                        // Deliberately NOT advancing our round to match a peer's
-                        // claim. A node advances rounds on its own 3s timeout
-                        // (next_round), and nothing else. Syncing to a peer's
-                        // claimed round sounds harmless but is what wedged the
-                        // two-machine stand: one node timed out a round before the
-                        // other, the follower adopted the leader's round, the
-                        // leader then timed out again, and they drifted apart by
-                        // one round permanently. At an offset of one, each
-                        // expects the other to propose, every proposal is refused
-                        // as "wrong proposer", the follower prevotes nil, and no
-                        // prevote+precommit quorum for the same block ever forms.
-                        // Local timeouts are the single source of round changes.
-                        let proposer = block.proposer;
-                        let height = block.height;
-                        let round_of_block = r;
-                        // Height-ahead deferral: peer finalized and proposed for H+1 while
-                        // we are still applying H (or in tick transition). Defer instead of
-                        // dropping, so H+1 proposals execute immediately on the next tick!
-                        if height == rt.hc.height + 1 {
-                            if rt.has_pending_apply() {
+                    match msg {
+                        ConsensusMsg::Batch(_) => {}
+                        ConsensusMsg::Proposal {
+                            round: r, block, ..
+                        } => {
+                            info!(
+                                "[consensus] RX proposal from {} #{} r{}",
+                                hex::encode(&block.proposer[..6]),
+                                block.height,
+                                r
+                            );
+                            // Deliberately NOT advancing our round to match a peer's
+                            // claim. A node advances rounds on its own 3s timeout
+                            // (next_round), and nothing else. Syncing to a peer's
+                            // claimed round sounds harmless but is what wedged the
+                            // two-machine stand: one node timed out a round before the
+                            // other, the follower adopted the leader's round, the
+                            // leader then timed out again, and they drifted apart by
+                            // one round permanently. At an offset of one, each
+                            // expects the other to propose, every proposal is refused
+                            // as "wrong proposer", the follower prevotes nil, and no
+                            // prevote+precommit quorum for the same block ever forms.
+                            // Local timeouts are the single source of round changes.
+                            let proposer = block.proposer;
+                            let height = block.height;
+                            let round_of_block = r;
+                            // Height-ahead deferral: peer finalized and proposed for H+1 while
+                            // we are still applying H (or in tick transition). Defer instead of
+                            // dropping, so H+1 proposals execute immediately on the next tick!
+                            if height == rt.hc.height + 1 {
+                                if rt.has_pending_apply() {
+                                    if inbound_deferred.len() < INBOUND_DEFERRED_CAP {
+                                        let wake_at = Instant::now() + Duration::from_millis(10);
+                                        let pos = inbound_deferred
+                                            .iter()
+                                            .position(|(w, _)| *w > wake_at)
+                                            .unwrap_or(inbound_deferred.len());
+                                        inbound_deferred.insert(pos, (wake_at, raw));
+                                    }
+                                    continue 'drain;
+                                } else if block.height > 0 {
+                                    // We are not applying H: we missed block H! Record peer hint immediately
+                                    // so try_catch_up can pull block H without waiting.
+                                    //
+                                    // VERIFICATION G1: the hint forces the
+                                    // catch-up timer every tick, so it must be
+                                    // attributable — only a proposal with a valid
+                                    // proposer signature from a staked member
+                                    // plants it. A forged H+1 proposal previously
+                                    // set this before any verification, keeping
+                                    // the node on loudly-failing DHT walks.
+                                    if stellereum::consensus_net::proposal_hint_admissible(
+                                        &block,
+                                        &rt.validators,
+                                    ) {
+                                        let h = (block.height - 1, block.prev_hash);
+                                        if rt.peer_hint.map(|(ph, _)| ph < h.0).unwrap_or(true) {
+                                            rt.peer_hint = Some(h);
+                                        }
+                                    }
+                                }
+                            }
+                            // Behind-peer retro gate: a VERIFIED proposal (signature
+                            // + membership) from below our height proves a lagging
+                            // peer is talking — the only consumer a retro push can
+                            // serve. Stamped BEFORE any refusal below (wrong
+                            // proposer/round still proves liveness); forgeries never
+                            // land here (unverified).
+                            if height < rt.hc.height
+                                && stellereum::consensus::verify_proposer_signature(&block)
+                                && rt.validators.power_of(&proposer) != 0
+                            {
+                                last_behind_peer_seen = Some(std::time::Instant::now());
+                            }
+                            match rt.on_proposal(proposer, block, round_of_block).await {
+                                Ok(_) => {
+                                    // VEL-2 vote-fan-in pipeline: vote in the SAME
+                                    // drain instead of waiting for the next tick's
+                                    // prevote step, overlapping the r-prevote
+                                    // fan-in with the proposal processing that
+                                    // triggered it. Timing-only: the vote content
+                                    // is identical to what the next-tick step
+                                    // would cast (same round — no timeout fires
+                                    // mid-drain — same live proposal, same lock,
+                                    // same `make_prevote`), the once-per-round
+                                    // dedup (`last_prevoted`) is shared with that
+                                    // step so no double vote is possible, and QCs
+                                    // stay strictly per-round, so quorum
+                                    // intersection is untouched: earlier arrival
+                                    // can only form the same QC sooner, never a
+                                    // different one. Refused proposals (the Err
+                                    // arm) never vote.
+                                    if can_vote
+                                        && rt.hc.has_live_proposal()
+                                        && last_prevoted != Some((rt.hc.height, rt.hc.round))
+                                    {
+                                        if let Some(v) = rt.make_prevote() {
+                                            let _ = rt.on_prevote(v.clone());
+                                            enqueue_outbox(
+                                                &mut outbox,
+                                                ConsensusMsg::Vote {
+                                                    vote: v.clone(),
+                                                    locked: lock_hint(&rt, &v),
+                                                },
+                                            );
+                                            flush_outbox(
+                                                &net_sender,
+                                                &mut outbox,
+                                                rt.hc.height,
+                                                rt.hc.round,
+                                            );
+                                            outbox_flushes += 1;
+                                            last_flush = std::time::Instant::now();
+                                            cast_prevote = Some(v);
+                                            last_prevoted = Some((rt.hc.height, rt.hc.round));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Never swallow this: a rejected proposal is the
+                                    // difference between liveness and a silent stall.
+                                    tracing::warn!(
+                                        "[consensus] rejected proposal from {} at #{} r{}: {}",
+                                        hex::encode(&proposer[..6]),
+                                        height,
+                                        round_of_block,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        ConsensusMsg::Vote { vote: v, locked } => {
+                            info!(
+                                "[consensus] RX {:?} from {} #{} r{} target {}",
+                                v.kind,
+                                hex::encode(&v.voter[..6]),
+                                v.height,
+                                v.round,
+                                v.block_hash
+                                    .map(|h| hex::encode(&h[..4]))
+                                    .unwrap_or_else(|| "nil".into())
+                            );
+                            // Audit F2/F9: authenticate FIRST. `on_prevote` /
+                            // `on_precommit` run `Vote::verify` plus the
+                            // membership/scope checks inside `VoteSet::add`. An
+                            // unauthenticated (height, round) or lock hint must
+                            // NEVER reach the round counter: a Batch of 32 junk
+                            // votes previously moved our round up to 2048 rounds
+                            // (MAX_SYNC_JUMP=64 each) with zero signatures, and a
+                            // forged nil prevote could plant a lock hint.
+                            let (vh, vk, vr, vbh, voter) =
+                                (v.height, v.kind, v.round, v.block_hash, v.voter);
+                            // Height-ahead deferral: peer cast a vote for H+1 while
+                            // we are still finishing H. Defer so it applies immediately on H+1!
+                            if vh == rt.hc.height + 1 && rt.has_pending_apply() {
                                 if inbound_deferred.len() < INBOUND_DEFERRED_CAP {
                                     let wake_at = Instant::now() + Duration::from_millis(10);
                                     let pos = inbound_deferred
@@ -4407,357 +4642,239 @@ async fn heal_engine_to_head(
                                     inbound_deferred.insert(pos, (wake_at, raw));
                                 }
                                 continue 'drain;
-                            } else if block.height > 0 {
-                                // We are not applying H: we missed block H! Record peer hint immediately
-                                // so try_catch_up can pull block H without waiting.
-                                //
-                                // VERIFICATION G1: the hint forces the
-                                // catch-up timer every tick, so it must be
-                                // attributable — only a proposal with a valid
-                                // proposer signature from a staked member
-                                // plants it. A forged H+1 proposal previously
-                                // set this before any verification, keeping
-                                // the node on loudly-failing DHT walks.
-                                if stellereum::consensus_net::proposal_hint_admissible(
-                                    &block,
-                                    &rt.validators,
-                                ) {
-                                    let h = (block.height - 1, block.prev_hash);
-                                    if rt.peer_hint.map(|(ph, _)| ph < h.0).unwrap_or(true) {
-                                        rt.peer_hint = Some(h);
-                                    }
-                                }
                             }
-                        }
-                        // Behind-peer retro gate: a VERIFIED proposal (signature
-                        // + membership) from below our height proves a lagging
-                        // peer is talking — the only consumer a retro push can
-                        // serve. Stamped BEFORE any refusal below (wrong
-                        // proposer/round still proves liveness); forgeries never
-                        // land here (unverified).
-                        if height < rt.hc.height
-                            && stellereum::consensus::verify_proposer_signature(&block)
-                            && rt.validators.power_of(&proposer) != 0
-                        {
-                            last_behind_peer_seen = Some(std::time::Instant::now());
-                        }
-                        match rt.on_proposal(proposer, block, round_of_block).await {
-                            Ok(_) => {
-                                // VEL-2 vote-fan-in pipeline: vote in the SAME
-                                // drain instead of waiting for the next tick's
-                                // prevote step, overlapping the r-prevote
-                                // fan-in with the proposal processing that
-                                // triggered it. Timing-only: the vote content
-                                // is identical to what the next-tick step
-                                // would cast (same round — no timeout fires
-                                // mid-drain — same live proposal, same lock,
-                                // same `make_prevote`), the once-per-round
-                                // dedup (`last_prevoted`) is shared with that
-                                // step so no double vote is possible, and QCs
-                                // stay strictly per-round, so quorum
-                                // intersection is untouched: earlier arrival
-                                // can only form the same QC sooner, never a
-                                // different one. Refused proposals (the Err
-                                // arm) never vote.
-                                if can_vote
-                                    && rt.hc.has_live_proposal()
-                                    && last_prevoted != Some((rt.hc.height, rt.hc.round))
+                            let round_before = rt.hc.round;
+                            let vcopy = v.clone();
+                            let accepted = match vk {
+                                VoteKind::Prevote => rt.on_prevote(v).is_ok(),
+                                VoteKind::Precommit => rt.on_precommit(v).is_ok(),
+                            };
+                            if !accepted {
+                                // Scope/signature failure: the vote does NOT count
+                                // toward any quorum. BUT a verified same-height
+                                // vote still feeds the peer-round counter
+                                // (`ValidatorRuntime::observe_peer_vote` already
+                                // ran inside `on_prevote`/`on_precommit`): a
+                                // stale far-behind vote or an absurd far-ahead
+                                // vote is true information about where the peer
+                                // is, and dropping it is what wedged A r1550 vs
+                                // B r318 forever (live 2026-10-14). Only verified
+                                // votes update liveness/timer state here.
+                                if vh == rt.hc.height
+                                    && vcopy.verify()
+                                    && rt.validators.power_of(&vcopy.voter) != 0
                                 {
-                                    if let Some(v) = rt.make_prevote() {
-                                        let _ = rt.on_prevote(v.clone());
-                                        enqueue_outbox(
-                                            &mut outbox,
-                                            ConsensusMsg::Vote {
-                                                vote: v.clone(),
-                                                locked: lock_hint(&rt, &v),
-                                            },
-                                        );
-                                        flush_outbox(
-                                            &net_sender,
-                                            &mut outbox,
-                                            rt.hc.height,
-                                            rt.hc.round,
-                                        );
-                                        outbox_flushes += 1;
-                                        last_flush = std::time::Instant::now();
-                                        cast_prevote = Some(v);
-                                        last_prevoted = Some((rt.hc.height, rt.hc.round));
+                                    // Verified same-height vote (down-proposer
+                                    // fast timeout): the voter is provably alive
+                                    // right now, even though this vote itself is
+                                    // not votable (stale round / too far ahead).
+                                    votes_seen_voters.insert(vcopy.voter);
+                                    peer_round_seen = Some((vh, vr, std::time::Instant::now()));
+                                    if rt.hc.round != round_before {
+                                        round_started = std::time::Instant::now();
                                     }
                                 }
+                                // Behind-peer retro gate: a VERIFIED vote from
+                                // below our height proves a lagging peer is
+                                // talking — the only consumer a retro push can
+                                // serve. Forged votes never land here (unverified),
+                                // so an attacker cannot wake retro — worst case a
+                                // real behind peer keeps it awake.
+                                if vh < rt.hc.height
+                                    && vcopy.verify()
+                                    && rt.validators.power_of(&vcopy.voter) != 0
+                                {
+                                    last_behind_peer_seen = Some(std::time::Instant::now());
+                                }
+                                continue;
                             }
-                            Err(e) => {
-                                // Never swallow this: a rejected proposal is the
-                                // difference between liveness and a silent stall.
-                                tracing::warn!(
-                                    "[consensus] rejected proposal from {} at #{} r{}: {}",
-                                    hex::encode(&proposer[..6]),
-                                    height,
-                                    round_of_block,
-                                    e
-                                );
+                            // Verified-only height fast path: this vote passed
+                            // signature + membership + scope checks, so a height
+                            // above ours proves a peer finalized ahead of us.
+                            // (Down-proposer fast timeout: an ACCEPTED vote is the
+                            // strongest aliveness proof — record the voter before
+                            // any of the bookkeeping below.)
+                            if vh == rt.hc.height {
+                                votes_seen_voters.insert(voter);
                             }
-                        }
-                    }
-                    ConsensusMsg::Vote { vote: v, locked } => {
-                        info!(
-                            "[consensus] RX {:?} from {} #{} r{} target {}",
-                            v.kind,
-                            hex::encode(&v.voter[..6]),
-                            v.height,
-                            v.round,
-                            v.block_hash.map(|h| hex::encode(&h[..4])).unwrap_or_else(|| "nil".into())
-                        );
-                        // Audit F2/F9: authenticate FIRST. `on_prevote` /
-                        // `on_precommit` run `Vote::verify` plus the
-                        // membership/scope checks inside `VoteSet::add`. An
-                        // unauthenticated (height, round) or lock hint must
-                        // NEVER reach the round counter: a Batch of 32 junk
-                        // votes previously moved our round up to 2048 rounds
-                        // (MAX_SYNC_JUMP=64 each) with zero signatures, and a
-                        // forged nil prevote could plant a lock hint.
-                        let (vh, vk, vr, vbh, voter) =
-                            (v.height, v.kind, v.round, v.block_hash, v.voter);
-                        // Height-ahead deferral: peer cast a vote for H+1 while
-                        // we are still finishing H. Defer so it applies immediately on H+1!
-                        if vh == rt.hc.height + 1 && rt.has_pending_apply() {
-                            if inbound_deferred.len() < INBOUND_DEFERRED_CAP {
-                                let wake_at = Instant::now() + Duration::from_millis(10);
-                                let pos = inbound_deferred
-                                    .iter()
-                                    .position(|(w, _)| *w > wake_at)
-                                    .unwrap_or(inbound_deferred.len());
-                                inbound_deferred.insert(pos, (wake_at, raw));
+                            // Behind-peer retro gate: an ACCEPTED vote passed
+                            // signature + membership + scope, so a height below
+                            // ours proves a lagging peer is talking — stamp it.
+                            if vh < rt.hc.height {
+                                last_behind_peer_seen = Some(std::time::Instant::now());
                             }
-                            continue 'drain;
-                        }
-                        let round_before = rt.hc.round;
-                        let vcopy = v.clone();
-                        let accepted = match vk {
-                            VoteKind::Prevote => rt.on_prevote(v).is_ok(),
-                            VoteKind::Precommit => rt.on_precommit(v).is_ok(),
-                        };
-                        if !accepted {
-                            // Scope/signature failure: the vote does NOT count
-                            // toward any quorum. BUT a verified same-height
-                            // vote still feeds the peer-round counter
-                            // (`ValidatorRuntime::observe_peer_vote` already
-                            // ran inside `on_prevote`/`on_precommit`): a
-                            // stale far-behind vote or an absurd far-ahead
-                            // vote is true information about where the peer
-                            // is, and dropping it is what wedged A r1550 vs
-                            // B r318 forever (live 2026-10-14). Only verified
-                            // votes update liveness/timer state here.
-                            if vh == rt.hc.height
-                                && vcopy.verify()
-                                && rt.validators.power_of(&vcopy.voter) != 0
-                            {
-                                // Verified same-height vote (down-proposer
-                                // fast timeout): the voter is provably alive
-                                // right now, even though this vote itself is
-                                // not votable (stale round / too far ahead).
-                                votes_seen_voters.insert(vcopy.voter);
-                                peer_round_seen =
-                                    Some((vh, vr, std::time::Instant::now()));
-                                if rt.hc.round != round_before {
+                            // Flag it; the post-drain block forces the catch-up
+                            // timer instead of waiting out the catch-up interval while
+                            // we burn view changes collecting "wrong height".
+                            if vh > rt.hc.height {
+                                catchup_due = true;
+                                stellereum::rpc::note_peer_height(vh);
+                            }
+                            // A nil prevote carrying the sender's locked hash is a
+                            // rescue request: it is stuck on one of OUR bodies.
+                            // Record the demand; our next proposer slot re-proposes
+                            // that body verbatim (see `ValidatorRuntime::propose`).
+                            rt.note_lock_hint(vh, vk, vbh, locked);
+                            // Adopt a peer's round when it is ahead, so the two stay in the
+                            // same PHASE.
+                            //
+                            // This is subtle with an even validator count. `proposer_for`
+                            // hash-schedules per round, so two validators walking their
+                            // rounds independently still meet rounds where neither is
+                            // the scheduled proposer while each waits for a proposal
+                            // in its own round: every proposal is rejected as
+                            // "wrong proposer", and the height never finalises --
+                            // observed live as r78/r73, r80/r75, all "wrong proposer",
+                            // forever. (Pre-hash-slot the schedule even alternated by
+                            // round parity, making opposite phases PERMANENT.)
+                            //
+                            // Catching up one round at a time cannot fix that, because the
+                            // offset (and its parity) is preserved. A node must move to the
+                            // round its peers are in. `sync_round_to` is bounded (to
+                            // ROUND_LOOKBACK rounds per message) and only moves forward,
+                            // so this cannot drag a node backwards or jump it unreachably
+                            // far; it only runs for a vote that already verified.
+                            if vh == rt.hc.height {
+                                peer_round_seen = Some((vh, vr, std::time::Instant::now()));
+                                // `note_peer_vote_round` skips the jump while we hold a
+                                // live proposal for a near round (accept-wipe livelock),
+                                // and jumps otherwise (phase alignment).
+                                if rt.note_peer_vote_round(vh, vr) {
+                                    // The round moved under us: restart the round
+                                    // timer. Without this the elapsed-time check
+                                    // already exceeded the timeout, so on the very
+                                    // next tick the node view-changed straight past
+                                    // the peer it had just aligned with -- measured
+                                    // live as a view change 269ms after syncing.
                                     round_started = std::time::Instant::now();
                                 }
                             }
-                            // Behind-peer retro gate: a VERIFIED vote from
-                            // below our height proves a lagging peer is
-                            // talking — the only consumer a retro push can
-                            // serve. Forged votes never land here (unverified),
-                            // so an attacker cannot wake retro — worst case a
-                            // real behind peer keeps it awake.
-                            if vh < rt.hc.height
-                                && vcopy.verify()
-                                && rt.validators.power_of(&vcopy.voter) != 0
-                            {
-                                last_behind_peer_seen = Some(std::time::Instant::now());
-                            }
-                            continue;
                         }
-                        // Verified-only height fast path: this vote passed
-                        // signature + membership + scope checks, so a height
-                        // above ours proves a peer finalized ahead of us.
-                        // (Down-proposer fast timeout: an ACCEPTED vote is the
-                        // strongest aliveness proof — record the voter before
-                        // any of the bookkeeping below.)
-                        if vh == rt.hc.height {
-                            votes_seen_voters.insert(voter);
-                        }
-                        // Behind-peer retro gate: an ACCEPTED vote passed
-                        // signature + membership + scope, so a height below
-                        // ours proves a lagging peer is talking — stamp it.
-                        if vh < rt.hc.height {
-                            last_behind_peer_seen = Some(std::time::Instant::now());
-                        }
-                        // Flag it; the post-drain block forces the catch-up
-                        // timer instead of waiting out the catch-up interval while
-                        // we burn view changes collecting "wrong height".
-                        if vh > rt.hc.height {
-                            catchup_due = true;
-                            stellereum::rpc::note_peer_height(vh);
-                        }
-                        // A nil prevote carrying the sender's locked hash is a
-                        // rescue request: it is stuck on one of OUR bodies.
-                        // Record the demand; our next proposer slot re-proposes
-                        // that body verbatim (see `ValidatorRuntime::propose`).
-                        rt.note_lock_hint(vh, vk, vbh, locked);
-                        // Adopt a peer's round when it is ahead, so the two stay in the
-                        // same PHASE.
-                        //
-                        // This is subtle with an even validator count. `proposer_for`
-                        // hash-schedules per round, so two validators walking their
-                        // rounds independently still meet rounds where neither is
-                        // the scheduled proposer while each waits for a proposal
-                        // in its own round: every proposal is rejected as
-                        // "wrong proposer", and the height never finalises --
-                        // observed live as r78/r73, r80/r75, all "wrong proposer",
-                        // forever. (Pre-hash-slot the schedule even alternated by
-                        // round parity, making opposite phases PERMANENT.)
-                        //
-                        // Catching up one round at a time cannot fix that, because the
-                        // offset (and its parity) is preserved. A node must move to the
-                        // round its peers are in. `sync_round_to` is bounded (to
-                        // ROUND_LOOKBACK rounds per message) and only moves forward,
-                        // so this cannot drag a node backwards or jump it unreachably
-                        // far; it only runs for a vote that already verified.
-                        if vh == rt.hc.height {
-                            peer_round_seen =
-                                Some((vh, vr, std::time::Instant::now()));
-                            // `note_peer_vote_round` skips the jump while we hold a
-                            // live proposal for a near round (accept-wipe livelock),
-                            // and jumps otherwise (phase alignment).
-                            if rt.note_peer_vote_round(vh, vr) {
-                                // The round moved under us: restart the round
-                                // timer. Without this the elapsed-time check
-                                // already exceeded the timeout, so on the very
-                                // next tick the node view-changed straight past
-                                // the peer it had just aligned with -- measured
-                                // live as a view change 269ms after syncing.
-                                round_started = std::time::Instant::now();
-                            }
-                        }
-                    }
-                    ConsensusMsg::Committed { height, block, certificate } => {
-                        // §7 Phase 2: adopting means executing, and the worker
-                        // is still applying the decided height. The message is
-                        // dropped, not queued: the peer rebroadcasts the commit
-                        // at its next finalize and the periodic catch-up
-                        // re-walks the same body, so a one-tick deferral loses
-                        // nothing and can never double-apply a height.
-                        if rt.has_pending_apply() {
-                            info!(
+                        ConsensusMsg::Committed {
+                            height,
+                            block,
+                            certificate,
+                        } => {
+                            // §7 Phase 2: adopting means executing, and the worker
+                            // is still applying the decided height. The message is
+                            // dropped, not queued: the peer rebroadcasts the commit
+                            // at its next finalize and the periodic catch-up
+                            // re-walks the same body, so a one-tick deferral loses
+                            // nothing and can never double-apply a height.
+                            if rt.has_pending_apply() {
+                                info!(
                                 "[consensus] deferring peer commit at #{height}: apply still in flight"
                             );
-                            continue;
-                        }
-                        // A peer already committed this height. Adopt it (after
-                        // checking the certificate) so a node that missed the
-                        // deciding vote does not stall behind the network.
-                        // `adopt_committed` checks the certificate against our own
-                        // validator set internally, so a peer cannot nominate the
-                        // quorum it is measured against.
-                        match rt.adopt_committed(height, block.clone(), certificate).await {
-                            Ok(bh) => {
-                                // Verified commit (QC checked inside adopt):
-                                // feed the syncing signal too (audit follow-up).
-                                stellereum::rpc::note_peer_height(height);
-                                // The live flow just delivered: stamp it so the
-                                // tick-top defer above keeps the DHT machine off
-                                // these heights even when the next Committed is
-                                // still in transit at the next tick top.
-                                last_live_adopt = std::time::Instant::now();
-                                // LIVE-ADOPT PUBLISH OFFLOAD (observer C, 2026-10-13):
-                                // `store_blob` can wait seconds for a replica. Awaited
-                                // here it held the drain while more Committed messages
-                                // queued behind it — ~30s/block at 1 block/s chain tempo
-                                // on empty blocks (execution trivial, publishes dominant).
-                                // Same order as the finalize path (body then header),
-                                // but on `publish_lane`: the tick keeps draining and the
-                                // next height adopts immediately.
-                                if let Some(body) = rt.blocks.get(&bh).cloned() {
-                                    let a = adapter.clone();
-                                    let shard_id = block_shard;
-                                    publish_lane.submit(async move {
-                                        let _ = a.retro_publish_blocks([&body], 1).await;
-                                        a.persist_block_header(shard_id, &body).await;
-                                    });
-                                }
-                                // Replication for adopters (bodies + receipts):
-                                // the adopted block carries its transactions
-                                // (adopt verified their signatures) and
-                                // `rt.applied_statuses` holds THIS application's
-                                // outcome (set by adopt's apply_and_advance).
-                                // File both so adopters serve real txs/receipts
-                                // instead of txs=0. Verified data only: the
-                                // block passed adopt_committed's QC/proposer/
-                                // root checks. Records ride `record_lane` (the
-                                // same FIFO the finalize path uses: receipts
-                                // before the block summary inside one job,
-                                // heights in order across jobs) instead of two
-                                // contended write locks awaited inline while
-                                // more Committed messages queue behind them.
-                                // The body itself is persisted by
-                                // `enqueue_block` below (async, finalize-path
-                                // parity): the synchronous sled
-                                // `committed_body` + `put_verified_block` round
-                                // trip that used to sit here re-hashed the block
-                                // twice and held the drain on disk I/O for bytes
-                                // the queue already carries. A not-yet-persisted
-                                // body is an honest serve-miss (fetch covers it),
-                                // never fabricated data.
-                                if rt.applied_statuses.len() == block.transactions.len() {
-                                    let r = rpc.clone();
-                                    let txs = block.transactions.clone();
-                                    let statuses = rt.applied_statuses.clone();
-                                    let fees = rt.applied_fees.clone();
-                                    let events = rt.applied_events.clone();
-                                    let ts = block.timestamp;
-                                    let hdr = block.clone();
-                                    record_lane.submit(async move {
-                                        // LIGHT CLIENT (audit W8.3): the
-                                        // adopted header's quorum certificate
-                                        // is what makes its state root
-                                        // externally verifiable.
-                                        r.record_finalized_header(&hdr).await;
-                                        r.record_adopted_block_with_events(
-                                            height, bh, &txs, &statuses, &fees, &events, ts,
-                                        )
-                                        .await;
-                                    });
-                                } else {
-                                    eprintln!(
+                                continue;
+                            }
+                            // A peer already committed this height. Adopt it (after
+                            // checking the certificate) so a node that missed the
+                            // deciding vote does not stall behind the network.
+                            // `adopt_committed` checks the certificate against our own
+                            // validator set internally, so a peer cannot nominate the
+                            // quorum it is measured against.
+                            match rt.adopt_committed(height, block.clone(), certificate).await {
+                                Ok(bh) => {
+                                    // Verified commit (QC checked inside adopt):
+                                    // feed the syncing signal too (audit follow-up).
+                                    stellereum::rpc::note_peer_height(height);
+                                    // The live flow just delivered: stamp it so the
+                                    // tick-top defer above keeps the DHT machine off
+                                    // these heights even when the next Committed is
+                                    // still in transit at the next tick top.
+                                    last_live_adopt = std::time::Instant::now();
+                                    // LIVE-ADOPT PUBLISH OFFLOAD (observer C, 2026-10-13):
+                                    // `store_blob` can wait seconds for a replica. Awaited
+                                    // here it held the drain while more Committed messages
+                                    // queued behind it — ~30s/block at 1 block/s chain tempo
+                                    // on empty blocks (execution trivial, publishes dominant).
+                                    // Same order as the finalize path (body then header),
+                                    // but on `publish_lane`: the tick keeps draining and the
+                                    // next height adopts immediately.
+                                    if let Some(body) = rt.blocks.get(&bh).cloned() {
+                                        let a = adapter.clone();
+                                        let shard_id = block_shard;
+                                        publish_lane.submit(async move {
+                                            let _ = a.retro_publish_blocks([&body], 1).await;
+                                            a.persist_block_header(shard_id, &body).await;
+                                        });
+                                    }
+                                    // Replication for adopters (bodies + receipts):
+                                    // the adopted block carries its transactions
+                                    // (adopt verified their signatures) and
+                                    // `rt.applied_statuses` holds THIS application's
+                                    // outcome (set by adopt's apply_and_advance).
+                                    // File both so adopters serve real txs/receipts
+                                    // instead of txs=0. Verified data only: the
+                                    // block passed adopt_committed's QC/proposer/
+                                    // root checks. Records ride `record_lane` (the
+                                    // same FIFO the finalize path uses: receipts
+                                    // before the block summary inside one job,
+                                    // heights in order across jobs) instead of two
+                                    // contended write locks awaited inline while
+                                    // more Committed messages queue behind them.
+                                    // The body itself is persisted by
+                                    // `enqueue_block` below (async, finalize-path
+                                    // parity): the synchronous sled
+                                    // `committed_body` + `put_verified_block` round
+                                    // trip that used to sit here re-hashed the block
+                                    // twice and held the drain on disk I/O for bytes
+                                    // the queue already carries. A not-yet-persisted
+                                    // body is an honest serve-miss (fetch covers it),
+                                    // never fabricated data.
+                                    if rt.applied_statuses.len() == block.transactions.len() {
+                                        let r = rpc.clone();
+                                        let txs = block.transactions.clone();
+                                        let statuses = rt.applied_statuses.clone();
+                                        let fees = rt.applied_fees.clone();
+                                        let events = rt.applied_events.clone();
+                                        let ts = block.timestamp;
+                                        let hdr = block.clone();
+                                        record_lane.submit(async move {
+                                            // LIGHT CLIENT (audit W8.3): the
+                                            // adopted header's quorum certificate
+                                            // is what makes its state root
+                                            // externally verifiable.
+                                            r.record_finalized_header(&hdr).await;
+                                            r.record_adopted_block_with_events(
+                                                height, bh, &txs, &statuses, &fees, &events, ts,
+                                            )
+                                            .await;
+                                        });
+                                    } else {
+                                        eprintln!(
                                         "[repl] adopt #{}: statuses {}/{} txs, receipts skipped",
                                         height,
                                         rt.applied_statuses.len(),
                                         block.transactions.len()
                                     );
+                                    }
+                                    info!(
+                                        "[consensus] adopted committed block #{} {} from a peer",
+                                        height,
+                                        hex::encode(&bh[..6])
+                                    );
+                                    // New height, new round timer: an adopted block
+                                    // advanced us without a view change, so a stale
+                                    // timer would fire a view change within
+                                    // milliseconds and drop the peer's first vote
+                                    // (live: 269ms from adopt to view change).
+                                    round_started = std::time::Instant::now();
+                                    // Persist adopted bodies like finalized ones:
+                                    // they are anchor material for snapshot
+                                    // verification and healing sources after a
+                                    // restart. Without this, every adopted height
+                                    // leaves a hole that refuses the next start.
+                                    if let Some(ap) = &persistence {
+                                        ap.enqueue_block(block);
+                                    }
                                 }
-                                info!(
-                                    "[consensus] adopted committed block #{} {} from a peer",
-                                    height,
-                                    hex::encode(&bh[..6])
-                                );
-                                // New height, new round timer: an adopted block
-                                // advanced us without a view change, so a stale
-                                // timer would fire a view change within
-                                // milliseconds and drop the peer's first vote
-                                // (live: 269ms from adopt to view change).
-                                round_started = std::time::Instant::now();
-                                // Persist adopted bodies like finalized ones:
-                                // they are anchor material for snapshot
-                                // verification and healing sources after a
-                                // restart. Without this, every adopted height
-                                // leaves a hole that refuses the next start.
-                                if let Some(ap) = &persistence {
-                                    ap.enqueue_block(block);
+                                Err(e) => {
+                                    info!("[consensus] refused peer commit at #{}: {}", height, e)
                                 }
                             }
-                            Err(e) => info!("[consensus] refused peer commit at #{}: {}", height, e),
                         }
                     }
-                }
                 }
             }
         }
@@ -4796,26 +4913,32 @@ async fn heal_engine_to_head(
         if can_vote {
             if let Some(v) = rt.make_precommit() {
                 if last_precommitted != Some((height, v.round)) {
-                let _ = rt.on_precommit(v.clone());
-                // P3-H4: guards are set at ENQUEUE time (same reason as prevotes).
-                enqueue_outbox(&mut outbox, ConsensusMsg::Vote { vote: v.clone(), locked: None });
-                flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
-                outbox_flushes += 1;
-                last_flush = std::time::Instant::now();
-                cast_precommit = Some(v.clone());
-                last_precommitted = Some((height, v.round));
-                // Persist the lock so a restart cannot double-vote this height.
-                if let (Some(ap), Some((lh, lr))) = (&persistence, rt.hc.locked) {
-                    let (fh, fhash) = rt.finalized.last().copied().unwrap_or((0, [0u8; 32]));
-                    ap.enqueue_consensus(stellereum::storage::ConsensusCheckpoint {
-                        height,
-                        round,
-                        locked_hash: Some(lh),
-                        locked_round: lr,
-                        finalized_height: fh,
-                        finalized_hash: fhash,
-                    });
-                }
+                    let _ = rt.on_precommit(v.clone());
+                    // P3-H4: guards are set at ENQUEUE time (same reason as prevotes).
+                    enqueue_outbox(
+                        &mut outbox,
+                        ConsensusMsg::Vote {
+                            vote: v.clone(),
+                            locked: None,
+                        },
+                    );
+                    flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
+                    outbox_flushes += 1;
+                    last_flush = std::time::Instant::now();
+                    cast_precommit = Some(v.clone());
+                    last_precommitted = Some((height, v.round));
+                    // Persist the lock so a restart cannot double-vote this height.
+                    if let (Some(ap), Some((lh, lr))) = (&persistence, rt.hc.locked) {
+                        let (fh, fhash) = rt.finalized.last().copied().unwrap_or((0, [0u8; 32]));
+                        ap.enqueue_consensus(stellereum::storage::ConsensusCheckpoint {
+                            height,
+                            round,
+                            locked_hash: Some(lh),
+                            locked_round: lr,
+                            finalized_height: fh,
+                            finalized_hash: fhash,
+                        });
+                    }
                 }
             }
         }
@@ -4939,10 +5062,14 @@ async fn heal_engine_to_head(
                     // learn the outcome on this tick, not the next window.
                     enqueue_outbox(
                         &mut outbox,
-                        ConsensusMsg::Committed { height, block, certificate },
+                        ConsensusMsg::Committed {
+                            height,
+                            block,
+                            certificate,
+                        },
                     );
                     flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
-            outbox_flushes += 1;
+                    outbox_flushes += 1;
                     last_flush = std::time::Instant::now();
                 }
                 rt.last_decision = None;
@@ -4973,7 +5100,15 @@ async fn heal_engine_to_head(
                     // check a served proof against a root a QUORUM committed
                     // to.
                     r.record_finalized_header(&block).await;
-                    r.record_receipts_with_events(height, bh, &block.transactions, &statuses, &fees, &events).await;
+                    r.record_receipts_with_events(
+                        height,
+                        bh,
+                        &block.transactions,
+                        &statuses,
+                        &fees,
+                        &events,
+                    )
+                    .await;
                     r.record_block(height, bh, tx_count, block_ts).await;
                 });
             } else {
@@ -5004,7 +5139,13 @@ async fn heal_engine_to_head(
                     finalized_hash: bh,
                 });
                 // Check if an on-chain governed software upgrade is scheduled for this height.
-                let upgrade_plan = rt.state.governance_read().await.applied.upgrade_plan.clone();
+                let upgrade_plan = rt
+                    .state
+                    .governance_read()
+                    .await
+                    .applied
+                    .upgrade_plan
+                    .clone();
                 if let Some(plan) = upgrade_plan {
                     if plan.height == height {
                         info!(
@@ -5131,7 +5272,9 @@ async fn heal_engine_to_head(
                 // that `try_snapshot_sync`'s `(peer_height / 100) * 100` probes
                 // find them reliably on any peer without needing to guess offsets.
                 let snap_int = snapshot_interval();
-                if (height % snap_int == 0 || (height > last_snapshot_height.saturating_add(snap_int) && height % 100 == 0))
+                if (height % snap_int == 0
+                    || (height > last_snapshot_height.saturating_add(snap_int)
+                        && height % 100 == 0))
                     && height > last_snapshot_height
                 {
                     if rt.submit_snapshot(height, root) {
@@ -5164,9 +5307,8 @@ async fn heal_engine_to_head(
                         bundle.accounts.accounts.len(),
                     );
                     last_snapshot_height = bundle.height;
-                    let cross_shard =
-                        bincode::serialize(&rt.cross_shard_replay_snapshot().await)
-                            .unwrap_or_default();
+                    let cross_shard = bincode::serialize(&rt.cross_shard_replay_snapshot().await)
+                        .unwrap_or_default();
                     let tip_header = rt
                         .finalized
                         .last()
@@ -5242,15 +5384,14 @@ async fn heal_engine_to_head(
                             // FOREVER (one per 100 heights), because a node
                             // thousands of blocks behind anchors on a recent
                             // one long after every body/header window elapsed.
-                            let by_kind: Vec<(&'static str, Vec<u8>)> =
-                                vec![
-                                    ("domains", domain_bytes.clone()),
-                                    ("session", session_keys.clone()),
-                                    ("bridge", bridge.clone()),
-                                    ("confidential", confidential.clone()),
-                                    ("zkml", zkml_models.clone()),
-                                    ("cross_shard", cross_shard.clone()),
-                                ];
+                            let by_kind: Vec<(&'static str, Vec<u8>)> = vec![
+                                ("domains", domain_bytes.clone()),
+                                ("session", session_keys.clone()),
+                                ("bridge", bridge.clone()),
+                                ("confidential", confidential.clone()),
+                                ("zkml", zkml_models.clone()),
+                                ("cross_shard", cross_shard.clone()),
+                            ];
                             debug_assert!(
                                 {
                                     let mut got: Vec<&str> =
@@ -5311,7 +5452,10 @@ async fn heal_engine_to_head(
                             // against the trusted state root before it is applied
                             // (`sync::fast_sync_state`), so a poisoned snapshot is rejected
                             // rather than committed.
-                            if !adapter2.persist_state_snapshot(shard_id, height, &bytes).await {
+                            if !adapter2
+                                .persist_state_snapshot(shard_id, height, &bytes)
+                                .await
+                            {
                                 // The persist fn already logged LOUDLY (and
                                 // held the pointer fail-closed); this
                                 // caller-side line ties it to the height.
@@ -5413,7 +5557,11 @@ async fn heal_engine_to_head(
                     let round = rt.hc.round;
                     let bh = block.compute_hash();
                     let ntx = block.transactions.len();
-                    let msg = ConsensusMsg::Proposal { height, round, block };
+                    let msg = ConsensusMsg::Proposal {
+                        height,
+                        round,
+                        block,
+                    };
                     let large = msg.is_large();
                     enqueue_outbox(&mut outbox, msg);
                     if large {
@@ -5506,8 +5654,8 @@ async fn heal_engine_to_head(
             peer_round_seen,
             Some((ph, _, at)) if ph == rt.hc.height && at.elapsed() < round_timeout
         );
-        let hold_bounded =
-            (peer_is_active_nearby || peer_alive_recently) && round_started.elapsed() < 2 * round_timeout;
+        let hold_bounded = (peer_is_active_nearby || peer_alive_recently)
+            && round_started.elapsed() < 2 * round_timeout;
         // C2 DETERMINISTIC ROUND TIMING: the timeout VALUE for (height, round)
         // is a pure function of (base env, round, proposer ledger-missed) —
         // see `deterministic_timeout_for`. Two honest nodes at the same
@@ -5519,14 +5667,17 @@ async fn heal_engine_to_head(
         // EXECUTION (delaying the firing), never part of the timeout value.
         let scheduled = rt.hc.proposer();
         let missed_streak = match scheduled {
-            Some(p) => rt.staking_read().await.validators.get(&p).map(|s| s.missed).unwrap_or(0),
+            Some(p) => rt
+                .staking_read()
+                .await
+                .validators
+                .get(&p)
+                .map(|s| s.missed)
+                .unwrap_or(0),
             None => 0,
         };
-        let backoff_ms = deterministic_timeout_for(
-            round_timeout.as_millis() as u64,
-            rt.hc.round,
-            missed_streak,
-        );
+        let backoff_ms =
+            deterministic_timeout_for(round_timeout.as_millis() as u64, rt.hc.round, missed_streak);
         // C-SLOT FAST TIMEOUT (local policy only — timeouts are never
         // consensus): when the scheduled proposer for the CURRENT round is
         // proven down (ledger missed-streak >= DOWNTIME_MISS_THRESHOLD) the
@@ -5541,9 +5692,7 @@ async fn heal_engine_to_head(
         let fast_down_proposer = !rt.hc.has_live_proposal()
             && scheduled.is_some()
             && should_use_down_proposer_timeout_deterministic(missed_streak);
-        if fast_down_proposer
-            && last_fast_timeout_logged != Some((rt.hc.height, rt.hc.round))
-        {
+        if fast_down_proposer && last_fast_timeout_logged != Some((rt.hc.height, rt.hc.round)) {
             last_fast_timeout_logged = Some((rt.hc.height, rt.hc.round));
             eprintln!(
                 "[consensus] DOWN-PROPOSER fast timeout h={} r{} proposer={} missed={} (cap {}ms, no backoff)",
@@ -5583,10 +5732,16 @@ async fn heal_engine_to_head(
             // lock_hint: the node may have locked since casting) and force
             // flushes. Never a direct broadcast from this path.
             let mut requeued = false;
-            for v in [cast_prevote.clone(), cast_precommit.clone()].into_iter().flatten() {
+            for v in [cast_prevote.clone(), cast_precommit.clone()]
+                .into_iter()
+                .flatten()
+            {
                 requeued |= enqueue_outbox(
                     &mut outbox,
-                    ConsensusMsg::Vote { vote: v.clone(), locked: lock_hint(&rt, &v) },
+                    ConsensusMsg::Vote {
+                        vote: v.clone(),
+                        locked: lock_hint(&rt, &v),
+                    },
                 );
             }
             // Re-send OUR proposal for this round as well. If that one message
@@ -5616,7 +5771,7 @@ async fn heal_engine_to_head(
             // retransmit below, which backs off while stuck instead.
             if requeued {
                 flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
-            outbox_flushes += 1;
+                outbox_flushes += 1;
                 last_flush = std::time::Instant::now();
             }
             rt.next_round();
@@ -5625,7 +5780,10 @@ async fn heal_engine_to_head(
             cast_prevote = None;
             cast_precommit = None;
             round_started = std::time::Instant::now();
-            info!("[consensus] view change -> height {} round {}", rt.hc.height, rt.hc.round);
+            info!(
+                "[consensus] view change -> height {} round {}",
+                rt.hc.height, rt.hc.round
+            );
             // C2 NIL-STORM CIRCUIT BREAKER (one-shot per streak, K=3): after K
             // consecutive nil-rounds, (a) re-broadcast the highest-QC-backed
             // proposal body we hold (same bytes, idempotent), (b) widen the
@@ -5699,8 +5857,7 @@ async fn heal_engine_to_head(
         if let Some(new_round) = rt.check_deadlock_breaker() {
             info!(
                 "[consensus] DEADLOCK-BREAKER jumped to round {} at height {}",
-                new_round,
-                rt.hc.height
+                new_round, rt.hc.height
             );
             round_started = std::time::Instant::now();
             last_prevoted = None;
@@ -5711,8 +5868,15 @@ async fn heal_engine_to_head(
             let timeout = ValidatorRuntime::deadlock_timeout();
             let timeout_secs = timeout.as_secs().max(1);
             let no_progress_secs = rt.last_progress_at.elapsed().as_secs();
-            let rate_ok = rt.last_breaker_at.map(|t| t.elapsed() >= timeout).unwrap_or(true);
-            if rate_ok && rt.hc.deadlock_local_reset_due(no_progress_secs, timeout_secs) {
+            let rate_ok = rt
+                .last_breaker_at
+                .map(|t| t.elapsed() >= timeout)
+                .unwrap_or(true);
+            if rate_ok
+                && rt
+                    .hc
+                    .deadlock_local_reset_due(no_progress_secs, timeout_secs)
+            {
                 let height_before = rt.hc.height;
                 let from_round = rt.hc.round;
                 let locked_body_present = rt
@@ -5722,7 +5886,10 @@ async fn heal_engine_to_head(
                     .unwrap_or(true);
                 if rt.hc.apply_deadlock_local_reset(locked_body_present) {
                     rt.last_breaker_at = Some(std::time::Instant::now());
-                    debug_assert_eq!(rt.hc.height, height_before, "breaker must never move height");
+                    debug_assert_eq!(
+                        rt.hc.height, height_before,
+                        "breaker must never move height"
+                    );
                     debug_assert!(
                         rt.hc.round > from_round,
                         "re-phase must never rewind the round (self-equivocation)"
@@ -5766,19 +5933,24 @@ async fn heal_engine_to_head(
         // cadence re-sent at full rate forever, and each wedged round added
         // its own storm on top of the 2s TIMEOUTs. `round_started` resets on
         // every round change, so a new round automatically retries fast.
-        let rexmit_every = Duration::from_millis(
-            stellereum::consensus_net::retransmit_interval_ms(
+        let rexmit_every =
+            Duration::from_millis(stellereum::consensus_net::retransmit_interval_ms(
                 round_timeout.as_millis() as u64,
                 round_started.elapsed().as_millis() as u64,
-            ),
-        );
+            ));
         if last_rexmit.elapsed() >= rexmit_every {
             last_rexmit = std::time::Instant::now();
             let mut resent = false;
-            for v in [cast_prevote.clone(), cast_precommit.clone()].into_iter().flatten() {
+            for v in [cast_prevote.clone(), cast_precommit.clone()]
+                .into_iter()
+                .flatten()
+            {
                 resent |= enqueue_outbox(
                     &mut outbox,
-                    ConsensusMsg::Vote { vote: v.clone(), locked: lock_hint(&rt, &v) },
+                    ConsensusMsg::Vote {
+                        vote: v.clone(),
+                        locked: lock_hint(&rt, &v),
+                    },
                 );
             }
             // Thin blocks only (<=32 txs): re-sending a full block every window
@@ -5804,7 +5976,7 @@ async fn heal_engine_to_head(
             }
             if resent {
                 flush_outbox(&net_sender, &mut outbox, rt.hc.height, rt.hc.round);
-            outbox_flushes += 1;
+                outbox_flushes += 1;
                 last_flush = std::time::Instant::now();
             }
         }
@@ -5887,7 +6059,9 @@ async fn heal_engine_to_head(
 #[command(name = "stellereum")]
 #[command(author = "Stellereum Core Contributors")]
 #[command(version = "0.1.0")]
-#[command(about = "Stellereum: Lightweight, AI-Native, MEV-Resistant & Orderbook-Optimized L1 Blockchain")]
+#[command(
+    about = "Stellereum: Lightweight, AI-Native, MEV-Resistant & Orderbook-Optimized L1 Blockchain"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -6580,7 +6754,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Genesis { action, asset, amount, price_usd } => {
+        Commands::Genesis {
+            action,
+            asset,
+            amount,
+            price_usd,
+        } => {
             println!("╔═══════════════════════════════════════════════════════════════╗");
             println!("║              🏛  STELLEREUM GENESIS VAULT                     ║");
             println!("╚═══════════════════════════════════════════════════════════════╝");
@@ -6596,7 +6775,7 @@ async fn main() -> anyhow::Result<()> {
                 let price_micro = (price_usd * 1_000_000.0) as u64;
                 let native_amount = match asset.to_uppercase().as_str() {
                     "USDT" => amount * 1_000_000, // 6 decimals
-                    _ => amount * 1_000_000_000,   // 9 decimals for TON/GRAM
+                    _ => amount * 1_000_000_000,  // 9 decimals for TON/GRAM
                 };
 
                 match vault.deposit_and_mint(&asset.to_uppercase(), native_amount, price_micro) {
@@ -6604,10 +6783,16 @@ async fn main() -> anyhow::Result<()> {
                         println!("✅ MINT SUCCESSFUL:");
                         println!("  Deposited:          {} {}", amount, asset.to_uppercase());
                         println!("  Asset Price:        ${:.2} USD", price_usd);
-                        println!("  Minted:             {} nano-STELL ({:.4} STELL)",
-                            minted_nano, (minted_nano as f64) / 1_000_000_000.0);
-                        println!("  Vault Total Minted: {} / {} nano-STELL\n",
-                            vault.total_minted_nano, stellereum::tokenomics::GENESIS_VAULT_CAP);
+                        println!(
+                            "  Minted:             {} nano-STELL ({:.4} STELL)",
+                            minted_nano,
+                            (minted_nano as f64) / 1_000_000_000.0
+                        );
+                        println!(
+                            "  Vault Total Minted: {} / {} nano-STELL\n",
+                            vault.total_minted_nano,
+                            stellereum::tokenomics::GENESIS_VAULT_CAP
+                        );
                     }
                     Err(e) => {
                         eprintln!("❌ Mint Failed: {}", e);
@@ -6616,12 +6801,23 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 let vesting = TeamVestingSchedule::new(now_secs());
                 println!("• Team Vesting:       100M STELL, 12 mo cliff, 24 mo linear");
-                println!("  Cliff Duration:     {} days", vesting.cliff_duration_secs / 86400);
-                println!("  Vesting Duration:   {} days", vesting.vesting_duration_secs / 86400);
+                println!(
+                    "  Cliff Duration:     {} days",
+                    vesting.cliff_duration_secs / 86400
+                );
+                println!(
+                    "  Vesting Duration:   {} days",
+                    vesting.vesting_duration_secs / 86400
+                );
             }
         }
 
-        Commands::Run { config, shard, parallel_exec, pure_pq } => {
+        Commands::Run {
+            config,
+            shard,
+            parallel_exec,
+            pure_pq,
+        } => {
             if pure_pq {
                 stellereum::post_quantum::set_pure_pq_override(Some(true));
             }
@@ -6783,11 +6979,12 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 // (task (c)): a recorded foreign id means we are pointed at a
                 // different network — refuse to start on it.
                 if let Some(sighted) = stellereum::rpc::fresh_peer_chain_id() {
-                    stellereum::zkml::check_peer_chain_id(local_chain_id, sighted)
-                        .map_err(|e| {
+                    stellereum::zkml::check_peer_chain_id(local_chain_id, sighted).map_err(
+                        |e| {
                             eprintln!("{e}");
                             anyhow::anyhow!("{e}")
-                        })?;
+                        },
+                    )?;
                 }
 
                 // Fail-closed BLS QC gate (audit-pq-crypto HIGH): the
@@ -6796,8 +6993,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 // forgery. Refuse LOUDLY at startup; default-off nodes are
                 // unaffected (Ed25519 baseline, zero behavior change). See
                 // `bls::refuse_bls_qc_if_enabled` for the PoP rationale.
-                stellereum::bls::refuse_bls_qc_if_enabled()
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                stellereum::bls::refuse_bls_qc_if_enabled().map_err(|e| anyhow::anyhow!("{e}"))?;
 
                 // Fail-closed fresh-join guard (task (a)): an EMPTY data dir
                 // with peers/DNS seeds configured means JOIN, not found —
@@ -6817,9 +7013,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 {
                     // `data_dir` moved into `Node::new` above; this is the same
                     // historical `./data` it was built from.
-                    let dir_clean = stellereum::bootstrap::data_dir_is_clean_fs(
-                        std::path::Path::new("./data"),
-                    );
+                    let dir_clean =
+                        stellereum::bootstrap::data_dir_is_clean_fs(std::path::Path::new("./data"));
                     let peer_pointer = !adapter.node.cfg.peers.is_empty()
                         || !stellereum::dns_seeds::seed_domains_from_env().is_empty();
                     let observer = std::env::var("STELL_OBSERVER")
@@ -6860,7 +7055,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         vset.len()
                     );
                 }
-                stellereum::runtime::fund_genesis(&state_engine, &vset, GENESIS_VALIDATOR_BALANCE).await;
+                stellereum::runtime::fund_genesis(&state_engine, &vset, GENESIS_VALIDATOR_BALANCE)
+                    .await;
                 // A testnet faucet needs pre-funded genesis balance, and that
                 // credit MUST be identical on every node or the genesis state
                 // roots diverge and the chain splits. So the funding keys off
@@ -6883,10 +7079,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 // consistency (it bails on any recomputed-root mismatch).
                 // Freshness reuses the same `./data` clean check as the
                 // fresh-join guard above, so the two gates can never disagree.
-                let fresh_dir = stellereum::bootstrap::data_dir_is_clean_fs(
-                    std::path::Path::new("./data"),
-                );
-                let faucet_seed_opt = match stellereum::rpc::try_load_faucet_seed_opt_for_genesis() {
+                let fresh_dir =
+                    stellereum::bootstrap::data_dir_is_clean_fs(std::path::Path::new("./data"));
+                let faucet_seed_opt = match stellereum::rpc::try_load_faucet_seed_opt_for_genesis()
+                {
                     Ok(opt) => opt,
                     Err(e) => {
                         eprintln!("{e}");
@@ -6912,17 +7108,16 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                          (0600 file, preferred) or STELL_FAUCET_KEY to the network's shared seed and restart."
                     );
                 }
-                let faucet_key = faucet_seed_opt
-                    .map(|seed| {
-                        let seed = zeroize::Zeroizing::new(seed);
-                        let faucet = stellereum::rpc::Faucet::new(
-                            *seed,
-                            shard,
-                            stellereum::rpc::Faucet::default_drip_nano(),
-                            FAUCET_LIFETIME_CAP,
-                        );
-                        faucet.account()
-                    });
+                let faucet_key = faucet_seed_opt.map(|seed| {
+                    let seed = zeroize::Zeroizing::new(seed);
+                    let faucet = stellereum::rpc::Faucet::new(
+                        *seed,
+                        shard,
+                        stellereum::rpc::Faucet::default_drip_nano(),
+                        FAUCET_LIFETIME_CAP,
+                    );
+                    faucet.account()
+                });
                 if let Some(faucet_addr) = faucet_key {
                     let _ = state_engine
                         .credit_native(&faucet_addr, GENESIS_FAUCET_BALANCE)
@@ -6944,7 +7139,9 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 // writes, and tagging them with the wrong epoch would make a fresh
                 // node invisible to itself.
                 let genesis_root_early = state_engine.get_state_root().await;
-                adapter.set_epoch(stellereum::network::EpochTag::from_genesis(&genesis_root_early));
+                adapter.set_epoch(stellereum::network::EpochTag::from_genesis(
+                    &genesis_root_early,
+                ));
                 info!(
                     "[network] chain epoch {} (blobs from other chains are ignored)",
                     adapter.epoch().as_str()
@@ -6966,17 +7163,24 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     order_merkle_root: [0u8; 32],
                     epoch_key_commitment: [0u8; 32],
                     mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
-};
+                };
 
-                let block_hash = adapter.broadcast_block(&genesis_block).await
+                let block_hash = adapter
+                    .broadcast_block(&genesis_block)
+                    .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 // The genesis HEADER is the anchor a cold node verifies a header chain
                 // against. It is recomputed locally by every node from the same config,
                 // so a cold node does not have to trust a peer for it: it derives the
                 // same header and then checks that the chain a peer offers descends
                 // from it. Main flow is always the masterchain (block_shard pin).
-                adapter.persist_block_header(stellereum::sharding::MASTERCHAIN_SHARD, &genesis_block).await;
-                info!("Published Block #0 to infnode DHT: {}", hex::encode(block_hash));
+                adapter
+                    .persist_block_header(stellereum::sharding::MASTERCHAIN_SHARD, &genesis_block)
+                    .await;
+                info!(
+                    "Published Block #0 to infnode DHT: {}",
+                    hex::encode(block_hash)
+                );
                 // C1 anchor: note our own genesis (see the workchain note
                 // above for the divergent-genesis height-1 limit).
                 {
@@ -7019,7 +7223,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         info!("Genesis fingerprint matches the persisted chain");
                     }
                     Ok(Some(prev)) if prev.as_slice() == legacy_v1_root.as_slice() => {
-                        info!("Genesis fingerprint matches legacy v1 testnet chain: {}", hex::encode(&prev));
+                        info!(
+                            "Genesis fingerprint matches legacy v1 testnet chain: {}",
+                            hex::encode(&prev)
+                        );
                         if let Ok(arr) = prev.as_slice().try_into() {
                             adapter.set_epoch(stellereum::network::EpochTag::from_genesis(&arr));
                         }
@@ -7141,9 +7348,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     mempool: Arc::new(tokio::sync::RwLock::new(
                         stellereum::mempool::Mempool::default()
                             .with_mev_engine(mev_engine)
-                            .with_base_fee(
-                                stellereum::mempool::Mempool::read_base_fee_from_env(),
-                            )
+                            .with_base_fee(stellereum::mempool::Mempool::read_base_fee_from_env())
                             // Session-key phase 2: this ONE pool is shared with
                             // the consensus loop (`with_mempool`), so handing it
                             // the engine's registry is what lets admission see a
@@ -7152,22 +7357,30 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                             // P2 shard gate (pool level): the main flow is the
                             // masterchain; when sharded, its pool admits only
                             // shard 0 on EVERY path (RPC, gossip, restore).
-                            .pin_admission_shard(registry.is_sharded().then_some(
-                                stellereum::sharding::MASTERCHAIN_SHARD,
-                            )),
+                            .pin_admission_shard(
+                                registry
+                                    .is_sharded()
+                                    .then_some(stellereum::sharding::MASTERCHAIN_SHARD),
+                            ),
                     )),
                     height: Arc::new(std::sync::atomic::AtomicU64::new(init_height)),
                     node_id: adapter.node.id_hex.clone(),
                     chain_id: stellereum::zkml::effective_chain_id(),
                     staking: shared_staking.clone(),
                     governance: shared_gov.clone(),
-                    recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
+                    recent_blocks: Arc::new(tokio::sync::RwLock::new(
+                        std::collections::VecDeque::new(),
+                    )),
                     receipts: Arc::new(tokio::sync::RwLock::new(
                         stellereum::rpc::ReceiptIndex::default(),
                     )),
-                    auth_token: std::env::var("STELL_RPC_AUTH_TOKEN").ok().filter(|s| !s.is_empty()),
+                    auth_token: std::env::var("STELL_RPC_AUTH_TOKEN")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
                     // Fail-closed: an enabled faucet with no token refuses to serve.
-                    faucet_token: std::env::var("STELL_FAUCET_TOKEN").ok().filter(|s| !s.is_empty()),
+                    faucet_token: std::env::var("STELL_FAUCET_TOKEN")
+                        .ok()
+                        .filter(|s| !s.is_empty()),
                     tx_broadcast: Some(tx_bcast_tx),
                     // `stell_signMessage` / `stell_signTypedData` sign with the
                     // NODE's key (testing/devnet only — production wallets sign
@@ -7201,7 +7414,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                                     tracing::error!("{e}");
                                     return None;
                                 }
-        };
+                            };
                             // Lifetime caps and the nonce must survive a restart, or
                             // every previously-capped address can draw its full cap
                             // again (and the nonce sequence restarts at 0). The state
@@ -7218,14 +7431,11 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                             // NOTE: the persisted state is loaded asynchronously just
                             // below, once rpc_state exists; the hook is attached here
                             // so no drip can slip through unpersisted.
-                            let saver: std::sync::Arc<
-                                dyn Fn(&[u8]) + Send + Sync,
-                            > = std::sync::Arc::new(move |bytes: &[u8]| {
-                                let _ = store.set_meta(
-                                    stellereum::rpc::FAUCET_STATE_META_KEY,
-                                    bytes,
-                                );
-                            });
+                            let saver: std::sync::Arc<dyn Fn(&[u8]) + Send + Sync> =
+                                std::sync::Arc::new(move |bytes: &[u8]| {
+                                    let _ = store
+                                        .set_meta(stellereum::rpc::FAUCET_STATE_META_KEY, bytes);
+                                });
                             Some(Arc::new(faucet.with_persist(saver)))
                         }),
                 });
@@ -7285,12 +7495,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         {
                             let _ = tokio::signal::ctrl_c().await;
                         }
-                        mp.read()
-                            .await
-                            .save(&mempool_path_for_shard(
-                                stellereum::sharding::MASTERCHAIN_SHARD,
-                                sharded,
-                            ));
+                        mp.read().await.save(&mempool_path_for_shard(
+                            stellereum::sharding::MASTERCHAIN_SHARD,
+                            sharded,
+                        ));
                     });
                 }
                 // Additional shards in this process (`STELL_SHARDS=0,1`): each
@@ -7306,8 +7514,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 for extra in registry
                     .ids()
                     .filter(|s| {
-                        registry.is_sharded()
-                            && *s != stellereum::sharding::MASTERCHAIN_SHARD
+                        registry.is_sharded() && *s != stellereum::sharding::MASTERCHAIN_SHARD
                     })
                     .collect::<Vec<_>>()
                 {
@@ -7351,7 +7558,24 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 let c_registry = registry.clone();
                 let c_headers = header_registry.clone();
                 tokio::spawn(async move {
-                    run_consensus_node(c_adapter, c_key, vset, c_state, shard, stellereum::sharding::MASTERCHAIN_SHARD, Some(c_persist), c_staking, c_gov, c_rpc, c_remote_signer, is_validator, c_registry, c_headers, master_staking).await;
+                    run_consensus_node(
+                        c_adapter,
+                        c_key,
+                        vset,
+                        c_state,
+                        shard,
+                        stellereum::sharding::MASTERCHAIN_SHARD,
+                        Some(c_persist),
+                        c_staking,
+                        c_gov,
+                        c_rpc,
+                        c_remote_signer,
+                        is_validator,
+                        c_registry,
+                        c_headers,
+                        master_staking,
+                    )
+                    .await;
                 });
 
                 // JSON-RPC API for wallets, explorers and bots.
@@ -7372,7 +7596,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 // proxied setups are legitimate), but screams.
                 if !rpc_listen.starts_with("127.0.0.1")
                     && !rpc_listen.starts_with("localhost")
-                    && std::env::var("STELL_RPC_AUTH_TOKEN").ok().filter(|t| !t.is_empty()).is_none()
+                    && std::env::var("STELL_RPC_AUTH_TOKEN")
+                        .ok()
+                        .filter(|t| !t.is_empty())
+                        .is_none()
                 {
                     tracing::warn!(
                         "[security] JSON-RPC on {rpc_listen} with NO STELL_RPC_AUTH_TOKEN: sendRawTransaction/mempoolDump are open to the network. Bind loopback or set the token."
@@ -7383,7 +7610,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 let explorer_listen = std::env::var("STELL_EXPLORER_LISTEN")
                     .unwrap_or_else(|_| "127.0.0.1:8080".to_string());
                 let explorer_rate: u32 = stellereum::explorer::default_rate_limit_per_sec();
-                let gateway = Arc::new(stellereum::explorer::GatewayState::new(rpc_state.clone(), explorer_rate));
+                let gateway = Arc::new(stellereum::explorer::GatewayState::new(
+                    rpc_state.clone(),
+                    explorer_rate,
+                ));
                 let explorer_addr = explorer_listen.clone();
                 tokio::spawn(async move {
                     match stellereum::explorer::serve(&explorer_addr, gateway).await {
@@ -7393,7 +7623,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 });
                 info!("Explorer + gateway listening on {explorer_listen}");
             } else {
-                info!("No infnode config found at {:?}. Running in local memory mode.", config);
+                info!(
+                    "No infnode config found at {:?}. Running in local memory mode.",
+                    config
+                );
             }
 
             info!("Stellereum Node operational and processing orders.");
@@ -7433,53 +7666,76 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             let alice_addr = trader_alice.verifying_key().to_bytes();
             let bob_addr = trader_bob.verifying_key().to_bytes();
 
-            state_engine.update_account(AccountState::new(alice_addr, 50_000_000_000_000)).await;
-            state_engine.update_account(AccountState::new(bob_addr, 50_000_000_000_000)).await;
+            state_engine
+                .update_account(AccountState::new(alice_addr, 50_000_000_000_000))
+                .await;
+            state_engine
+                .update_account(AccountState::new(bob_addr, 50_000_000_000_000))
+                .await;
 
             println!("✓ Cluster initialized with 3 Validators & Quorum 2/3");
-            println!("✓ Genesis Accounts: Alice ({}) | Bob ({})\n",
-                hex::encode(&alice_addr[..6]), hex::encode(&bob_addr[..6]));
+            println!(
+                "✓ Genesis Accounts: Alice ({}) | Bob ({})\n",
+                hex::encode(&alice_addr[..6]),
+                hex::encode(&bob_addr[..6])
+            );
 
             for b in 1..=blocks {
                 let start_time = std::time::Instant::now();
                 println!("--- Block #{} (Timestamp: {}) ---", b, now_secs());
 
                 // 1. CLOB Orderbook Actor Matching
-                let (sell_order, mut trades) = orderbook_mgr.get_book_mut(PAIR_STELL_USDT).submit_order_ext(
-                    alice_addr,
-                    OrderSide::Sell,
-                    OrderType::Limit,
-                    250_000, // $0.25
-                    10_000,  // 10,000 units
-                    now_secs(),
-                );
+                let (sell_order, mut trades) = orderbook_mgr
+                    .get_book_mut(PAIR_STELL_USDT)
+                    .submit_order_ext(
+                        alice_addr,
+                        OrderSide::Sell,
+                        OrderType::Limit,
+                        250_000, // $0.25
+                        10_000,  // 10,000 units
+                        now_secs(),
+                    );
 
-                let (buy_order, buy_trades) = orderbook_mgr.get_book_mut(PAIR_STELL_USDT).submit_order_ext(
-                    bob_addr,
-                    OrderSide::Buy,
-                    OrderType::Limit,
-                    250_000,
-                    6_000,
-                    now_secs(),
-                );
+                let (buy_order, buy_trades) = orderbook_mgr
+                    .get_book_mut(PAIR_STELL_USDT)
+                    .submit_order_ext(
+                        bob_addr,
+                        OrderSide::Buy,
+                        OrderType::Limit,
+                        250_000,
+                        6_000,
+                        now_secs(),
+                    );
                 trades.extend(buy_trades);
 
-                println!("  [CLOB] Alice placed Sell Order #{} | Bob placed Buy Order #{}",
-                    sell_order.order_id, buy_order.order_id);
+                println!(
+                    "  [CLOB] Alice placed Sell Order #{} | Bob placed Buy Order #{}",
+                    sell_order.order_id, buy_order.order_id
+                );
                 for t in &trades {
-                    println!("    ↳ Matched Trade: {} STELL @ ${:.2} USD",
-                        t.amount, (t.price as f64) / 1_000_000.0);
+                    println!(
+                        "    ↳ Matched Trade: {} STELL @ ${:.2} USD",
+                        t.amount,
+                        (t.price as f64) / 1_000_000.0
+                    );
                 }
 
                 // 2. MEV Preemption (Threshold Blind Round 2-of-3)
                 let (round_key, shares) = mev_engine.prepare_threshold_round(b, 2, 3);
                 let raw_tx = b"bot_hft_micro_gas_trade_payload";
-                let envelope = MevPreemptionEngine::seal_transaction(b, &round_key, raw_tx).unwrap();
+                let envelope =
+                    MevPreemptionEngine::seal_transaction(b, &round_key, raw_tx).unwrap();
 
-                let commit = mev_engine.commit_blind_round(b, std::slice::from_ref(&envelope), &[val1.clone(), val2.clone(), val3.clone()]);
+                let commit = mev_engine.commit_blind_round(
+                    b,
+                    std::slice::from_ref(&envelope),
+                    &[val1.clone(), val2.clone(), val3.clone()],
+                );
                 assert!(MevPreemptionEngine::verify_round_commitment(&commit, 2));
 
-                let unsealed = mev_engine.unseal_with_shares(&envelope, &[shares[0].clone(), shares[1].clone()]).unwrap();
+                let unsealed = mev_engine
+                    .unseal_with_shares(&envelope, &[shares[0].clone(), shares[1].clone()])
+                    .unwrap();
                 assert_eq!(unsealed, raw_tx);
                 println!("  [MEV] 2-of-3 Threshold Blind Round #{} Sealed & Committed (Zero Frontrunning)", b);
 
@@ -7488,14 +7744,21 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 let model = QuantizedLinearModel::new(vec![layer]);
                 let (outputs, proof) = ZkMlProof::prove_reexec(&model, &[3, 4]);
                 assert!(proof.verify_inference());
-                println!("  [zkML] AI Agent Inference Verified: in=[3,4] -> out={:?}", outputs);
+                println!(
+                    "  [zkML] AI Agent Inference Verified: in=[3,4] -> out={:?}",
+                    outputs
+                );
 
                 // 4. Cross-Shard Atomic Transaction with Merkle Proof
                 let cross_tx = Transaction::sign(&trader_alice, bob_addr, 500, 1000, b, 1, 2);
                 let state_root = state_engine.get_state_root().await;
-                let cross_msg = CrossShardMessage::new_trusted(1, 2, cross_tx, state_root, [b as u8; 32]);
+                let cross_msg =
+                    CrossShardMessage::new_trusted(1, 2, cross_tx, state_root, [b as u8; 32]);
                 let seq = liquidity_hub.route_cross_shard_message(cross_msg);
-                println!("  [Cross-Shard] Routed Atomic Message Shard 1 -> Shard 2 (Sequencer #{})", seq);
+                println!(
+                    "  [Cross-Shard] Routed Atomic Message Shard 1 -> Shard 2 (Sequencer #{})",
+                    seq
+                );
 
                 // 5. Dynamic Sharding Load Check
                 shard_mgr.record_tx_load(1, 120);
@@ -7517,8 +7780,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
 
                 // 7. Oracle 3-Tier Price Check
                 let price = oracle.resolve_price(None, "TON", now_secs()).unwrap();
-                println!("  [Oracle] Tier 2 DEX TWAP Resolved: TON = ${:.2} USD (Breaker: Clean)",
-                    (price as f64) / 1_000_000.0);
+                println!(
+                    "  [Oracle] Tier 2 DEX TWAP Resolved: TON = ${:.2} USD (Breaker: Clean)",
+                    (price as f64) / 1_000_000.0
+                );
 
                 // 8. Teleport Bridge Deposit Verification
                 let dep_event = stellereum::bridge::TeleportDepositEvent {
@@ -7537,7 +7802,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 println!("  [Bridge] Teleport Gateway: Verified 2/3 Quorum for TON -> Stellereum Deposit");
 
                 let elapsed = start_time.elapsed();
-                println!("  ✓ Block #{} Finalized in {:.2?} (Latency < 200ms Target)\n", b, elapsed);
+                println!(
+                    "  ✓ Block #{} Finalized in {:.2?} (Latency < 200ms Target)\n",
+                    b, elapsed
+                );
             }
 
             println!("═════════════════════════════════════════════════════════════════");
@@ -7566,23 +7834,35 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             use stellereum::simulator::{ChainSimulator, SimConfig};
 
             let seed_bytes = parse_devnet_seed(&seed)?;
-            let config = SimConfig { txs_per_block, block_time_ms, ..Default::default() };
+            let config = SimConfig {
+                txs_per_block,
+                block_time_ms,
+                ..Default::default()
+            };
 
-            let mut simulator =
-                ChainSimulator::genesis(&seed_bytes, accounts, config).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut simulator = ChainSimulator::genesis(&seed_bytes, accounts, config)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             let started = std::time::Instant::now();
-            let summary = simulator.run_blocks(blocks).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let summary = simulator
+                .run_blocks(blocks)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let elapsed = started.elapsed();
 
             println!("╔═══════════════════════════════════════════════════════════════╗");
             println!("║       🧪 STELLEREUM LOCAL DEVNET (DETERMINISTIC SIMULATOR)      ║");
             println!("╚═══════════════════════════════════════════════════════════════╝");
             println!("• Seed:             {}", hex::encode(&seed_bytes));
-            println!("• Chain id:         0x{:x} (devnet — never the production chain id)", config.chain_id);
+            println!(
+                "• Chain id:         0x{:x} (devnet — never the production chain id)",
+                config.chain_id
+            );
             println!("• Validators:       {}", summary.accounts);
             println!("• Blocks:           {}", summary.blocks);
-            println!("• Block time:       {} ms (logical — the simulator never reads a clock)", summary.block_time_ms);
+            println!(
+                "• Block time:       {} ms (logical — the simulator never reads a clock)",
+                summary.block_time_ms
+            );
             println!("• Transactions:     {}", summary.transactions);
             println!("• Total gas:        {}", summary.total_gas);
             println!("• Total fees:       {} nano-STELL", summary.total_fees);
@@ -7600,7 +7880,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 println!("• Last block:       {}", hex::encode(hash));
             }
 
-            println!("\nFINAL VALIDATOR SET ({} validators)", summary.validators.len());
+            println!(
+                "\nFINAL VALIDATOR SET ({} validators)",
+                summary.validators.len()
+            );
             for (index, validator) in summary.validators.iter().enumerate() {
                 println!(
                     "  {}. {}  stake {:.4} STELL  balance {:.4} STELL",
@@ -7679,7 +7962,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
 
                 let viewing_key = ViewingKey::generate();
                 let spend_priv = curve25519_dalek::scalar::Scalar::from_bytes_mod_order(priv_bytes);
-                let spend_pub = (curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT * spend_priv)
+                let spend_pub = (curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT
+                    * spend_priv)
                     .compress()
                     .to_bytes();
                 let stealth = StealthAddress::generate(&viewing_key.view_pub, &spend_pub)
@@ -7690,14 +7974,24 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 println!("╚═══════════════════════════════════════════════════════════════╝");
                 println!("• Address (Public Key):   {}", hex::encode(pub_bytes));
                 println!("• Private Key:            {}", hex::encode(priv_bytes));
-                println!("• Viewing Public Key:     {}", hex::encode(viewing_key.view_pub));
-                println!("• Viewing Private Key:    {}", hex::encode(viewing_key.view_priv));
-                println!("• Stealth One-Time Pub:   {}", hex::encode(stealth.one_time_pub));
+                println!(
+                    "• Viewing Public Key:     {}",
+                    hex::encode(viewing_key.view_pub)
+                );
+                println!(
+                    "• Viewing Private Key:    {}",
+                    hex::encode(viewing_key.view_priv)
+                );
+                println!(
+                    "• Stealth One-Time Pub:   {}",
+                    hex::encode(stealth.one_time_pub)
+                );
                 println!("\n⚠️  Keep your private keys safe! Do not share them.");
             }
 
             WalletCommands::Balance { address } => {
-                let addr_bytes = hex::decode(&address).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
+                let addr_bytes =
+                    hex::decode(&address).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
                 if addr_bytes.len() != 32 {
                     anyhow::bail!("Address must be 32 bytes (64 hex characters)");
                 }
@@ -7706,8 +8000,16 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 let mut fixed_addr = [0u8; 32];
                 fixed_addr.copy_from_slice(&addr_bytes);
 
-                let balance = state_engine.get_account(&fixed_addr).await.map(|a| a.balance).unwrap_or(0);
-                println!("Account Balance: {} nano-STELL ({:.6} STELL)", balance, (balance as f64) / 1_000_000_000.0);
+                let balance = state_engine
+                    .get_account(&fixed_addr)
+                    .await
+                    .map(|a| a.balance)
+                    .unwrap_or(0);
+                println!(
+                    "Account Balance: {} nano-STELL ({:.6} STELL)",
+                    balance,
+                    (balance as f64) / 1_000_000_000.0
+                );
             }
 
             WalletCommands::Address { from_key } => {
@@ -7720,9 +8022,20 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 println!("{}", hex::encode(addr));
             }
 
-            WalletCommands::Send { from_key, to, amount, target_shard, rpc, nonce, dry_run, verbose } => {
-                let from_bytes = hex::decode(&from_key).map_err(|e| anyhow::anyhow!("Invalid from_key hex: {e}"))?;
-                let to_bytes = hex::decode(&to).map_err(|e| anyhow::anyhow!("Invalid to hex: {e}"))?;
+            WalletCommands::Send {
+                from_key,
+                to,
+                amount,
+                target_shard,
+                rpc,
+                nonce,
+                dry_run,
+                verbose,
+            } => {
+                let from_bytes = hex::decode(&from_key)
+                    .map_err(|e| anyhow::anyhow!("Invalid from_key hex: {e}"))?;
+                let to_bytes =
+                    hex::decode(&to).map_err(|e| anyhow::anyhow!("Invalid to hex: {e}"))?;
                 if from_bytes.len() != 32 || to_bytes.len() != 32 {
                     anyhow::bail!("Keys must be 32 bytes");
                 }
@@ -7734,7 +8047,9 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 // Reusing a fixed nonce meant only the first transaction from a
                 // key could ever be accepted; every later one was a replay. Read
                 // the account's real nonce unless the caller pinned one.
-                let query = |method: &str, params: serde_json::Value| -> anyhow::Result<serde_json::Value> {
+                let query = |method: &str,
+                             params: serde_json::Value|
+                 -> anyhow::Result<serde_json::Value> {
                     let body = serde_json::json!({
                         "jsonrpc": "2.0", "id": 1, "method": method, "params": params
                     })
@@ -7742,16 +8057,18 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     if verbose {
                         eprintln!("  rpc -> {method}: {body}");
                     }
-                    let resp: serde_json::Value = ureq::post(&rpc)
-                        .send_string(&body)?
-                        .into_json()?;
+                    let resp: serde_json::Value =
+                        ureq::post(&rpc).send_string(&body)?.into_json()?;
                     if verbose {
                         eprintln!("  rpc <- {method}: {resp}");
                     }
                     if let Some(e) = resp.get("error") {
                         anyhow::bail!("RPC error: {e}");
                     }
-                    Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
+                    Ok(resp
+                        .get("result")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null))
                 };
 
                 // The account address is the PUBLIC key, not the private key.
@@ -7766,15 +8083,23 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                             "stell_getBalance",
                             serde_json::json!({ "address": hex::encode(account) }),
                         )?;
-                        acc.get("nonce")
-                            .and_then(|n| n.as_u64())
-                            .ok_or_else(|| anyhow::anyhow!("node did not return an account nonce"))?
+                        acc.get("nonce").and_then(|n| n.as_u64()).ok_or_else(|| {
+                            anyhow::anyhow!("node did not return an account nonce")
+                        })?
                     }
                 };
 
                 // Source is always the masterchain here: spendable funds live
                 // on shard 0 (the namespace/DHT shard is not a chain).
-                let tx = Transaction::sign(&signing_key, to_arr, amount, 1000, nonce, stellereum::sharding::MASTERCHAIN_SHARD, target_shard);
+                let tx = Transaction::sign(
+                    &signing_key,
+                    to_arr,
+                    amount,
+                    1000,
+                    nonce,
+                    stellereum::sharding::MASTERCHAIN_SHARD,
+                    target_shard,
+                );
                 println!("✅ Transaction Signed:");
                 println!("  Hash:   {}", hex::encode(tx.compute_tx_hash()));
                 println!("  From:   {}", hex::encode(tx.from));
@@ -7798,7 +8123,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 if let Some(e) = resp.get("error") {
                     anyhow::bail!("rejected by node: {e}");
                 }
-                println!("  Submitted, mempool tx hash: {}", resp["result"].as_str().unwrap_or("?"));
+                println!(
+                    "  Submitted, mempool tx hash: {}",
+                    resp["result"].as_str().unwrap_or("?")
+                );
             }
 
             WalletCommands::DelegateSession {
@@ -7814,8 +8142,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 dry_run,
                 token,
             } => {
-                let master_bytes = hex::decode(&master_key).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
-                let session_bytes = hex::decode(&session_pub).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
+                let master_bytes =
+                    hex::decode(&master_key).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
+                let session_bytes =
+                    hex::decode(&session_pub).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
                 if master_bytes.len() != 32 || session_bytes.len() != 32 {
                     anyhow::bail!("Keys must be 32 bytes");
                 }
@@ -7874,19 +8204,29 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 message_hex,
                 chain_id,
             } => {
-                let key = resolve_wallet_signing_key(&scheme, from_key, falcon_key_file, falcon_seed)?;
+                let key =
+                    resolve_wallet_signing_key(&scheme, from_key, falcon_key_file, falcon_seed)?;
                 let msg = stellereum::wallet_signing::parse_message_param(
                     message.as_deref(),
                     message_hex.as_deref(),
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let sig = key.sign_message(chain_id, &msg).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let sig = key
+                    .sign_message(chain_id, &msg)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 let addr = key.address();
                 println!("✅ Message Signed (WALLET SIGNATURE STANDARD, docs/WALLET_SIGNING.md):");
-                println!("  Scheme:    {} (0x{:02x})", sig.scheme.name(), sig.scheme.id());
+                println!(
+                    "  Scheme:    {} (0x{:02x})",
+                    sig.scheme.name(),
+                    sig.scheme.id()
+                );
                 println!("  Address:   {}", hex::encode(addr));
                 println!("  Chain Id:  {chain_id}");
-                println!("  Preimage:  {}", hex::encode(stellereum::wallet_signing::message_preimage(chain_id, &msg)));
+                println!(
+                    "  Preimage:  {}",
+                    hex::encode(stellereum::wallet_signing::message_preimage(chain_id, &msg))
+                );
                 println!("  Signature: {}", sig.to_hex());
             }
 
@@ -7906,7 +8246,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 let sig = stellereum::wallet_signing::WalletSignature::from_hex(&signature)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 if stellereum::wallet_signing::verify_message(&addr, chain_id, &msg, &sig) {
-                    println!("VALID: {} signed the message on chain {chain_id}", hex::encode(addr));
+                    println!(
+                        "VALID: {} signed the message on chain {chain_id}",
+                        hex::encode(addr)
+                    );
                 } else {
                     println!("INVALID: signature does not verify for this address/message/chain");
                     anyhow::bail!("signature INVALID");
@@ -7925,14 +8268,30 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 nonce,
                 chain_id,
             } => {
-                let key = resolve_wallet_signing_key(&scheme, from_key, falcon_key_file, falcon_seed)?;
-                let data = parse_wallet_typed_data(&contract, &method, args.as_deref(), value, nonce, chain_id)?;
+                let key =
+                    resolve_wallet_signing_key(&scheme, from_key, falcon_key_file, falcon_seed)?;
+                let data = parse_wallet_typed_data(
+                    &contract,
+                    &method,
+                    args.as_deref(),
+                    value,
+                    nonce,
+                    chain_id,
+                )?;
                 let canonical = stellereum::wallet_signing::canonical_typed_data_json(&data);
-                let (sig, _) = key.sign_typed_data(&data).map_err(|e| anyhow::anyhow!("{e}"))?;
-                println!("✅ Typed Data Signed (WALLET SIGNATURE STANDARD, docs/WALLET_SIGNING.md):");
+                let (sig, _) = key
+                    .sign_typed_data(&data)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!(
+                    "✅ Typed Data Signed (WALLET SIGNATURE STANDARD, docs/WALLET_SIGNING.md):"
+                );
                 println!("  Sign EXACTLY what is shown below — this canonical JSON is what the signature commits to.");
                 println!("  Canonical: {canonical}");
-                println!("  Scheme:    {} (0x{:02x})", sig.scheme.name(), sig.scheme.id());
+                println!(
+                    "  Scheme:    {} (0x{:02x})",
+                    sig.scheme.name(),
+                    sig.scheme.id()
+                );
                 println!("  Address:   {}", hex::encode(key.address()));
                 println!("  Signature: {}", sig.to_hex());
             }
@@ -7948,14 +8307,29 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 signature,
             } => {
                 let addr = parse_wallet_address(&address)?;
-                let data = parse_wallet_typed_data(&contract, &method, args.as_deref(), value, nonce, chain_id)?;
+                let data = parse_wallet_typed_data(
+                    &contract,
+                    &method,
+                    args.as_deref(),
+                    value,
+                    nonce,
+                    chain_id,
+                )?;
                 let sig = stellereum::wallet_signing::WalletSignature::from_hex(&signature)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 if stellereum::wallet_signing::verify_typed_data(&addr, &data, &sig) {
-                    println!("VALID: {} authorized the typed call on chain {chain_id}", hex::encode(addr));
-                    println!("  Canonical: {}", stellereum::wallet_signing::canonical_typed_data_json(&data));
+                    println!(
+                        "VALID: {} authorized the typed call on chain {chain_id}",
+                        hex::encode(addr)
+                    );
+                    println!(
+                        "  Canonical: {}",
+                        stellereum::wallet_signing::canonical_typed_data_json(&data)
+                    );
                 } else {
-                    println!("INVALID: signature does not verify for this address/typed-data/chain");
+                    println!(
+                        "INVALID: signature does not verify for this address/typed-data/chain"
+                    );
                     anyhow::bail!("signature INVALID");
                 }
             }
@@ -8021,7 +8395,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 dry_run,
                 token,
             } => {
-                let key_bytes = hex::decode(&trader_key).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
+                let key_bytes =
+                    hex::decode(&trader_key).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
                 if key_bytes.len() != 32 {
                     anyhow::bail!("Key must be 32 bytes");
                 }
@@ -8040,7 +8415,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
 
                 let sender = trader_sk.verifying_key().to_bytes();
                 let account_nonce = resolve_nonce(&rpc, &sender, nonce)?;
-                let tx = build_place_order_tx(&trader_sk, pair, is_buy, price, amount, account_nonce);
+                let tx =
+                    build_place_order_tx(&trader_sk, pair, is_buy, price, amount, account_nonce);
 
                 println!("✅ Order Signed:");
                 println!("  Hash:    {}", hex::encode(tx.compute_tx_hash()));
@@ -8069,7 +8445,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 dry_run,
                 token,
             } => {
-                let key_bytes = hex::decode(&trader_key).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
+                let key_bytes =
+                    hex::decode(&trader_key).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
                 if key_bytes.len() != 32 {
                     anyhow::bail!("Key must be 32 bytes");
                 }
@@ -8095,100 +8472,137 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             }
         },
 
-        Commands::Oracle { sub } => match sub {
-            OracleCommands::Feed { key, asset, price_micro, from_key, rpc, nonce, dry_run, token } => {
-                let key_bytes = hex::decode(&key).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
-                let publisher =
-                    SigningKey::from_bytes(key_bytes.as_slice().try_into().map_err(|_| {
-                        anyhow::anyhow!("Publisher key must be exactly 32 bytes")
-                    })?);
+        Commands::Oracle { sub } => {
+            match sub {
+                OracleCommands::Feed {
+                    key,
+                    asset,
+                    price_micro,
+                    from_key,
+                    rpc,
+                    nonce,
+                    dry_run,
+                    token,
+                } => {
+                    let key_bytes =
+                        hex::decode(&key).map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))?;
+                    let publisher =
+                        SigningKey::from_bytes(key_bytes.as_slice().try_into().map_err(|_| {
+                            anyhow::anyhow!("Publisher key must be exactly 32 bytes")
+                        })?);
 
-                // The feed carries the OFF-CHAIN clock: it is timestamped when
-                // the publisher signs it. The chain re-checks it against
-                // `block.timestamp` in `commit_feed`, so a feed signed in the
-                // future or older than STALE_PRICE_MAX_SECS is rejected at
-                // block time - the local clock never reaches consensus state.
-                let update = PriceFeedUpdate::sign(&asset, price_micro, now_secs(), &publisher);
+                    // The feed carries the OFF-CHAIN clock: it is timestamped when
+                    // the publisher signs it. The chain re-checks it against
+                    // `block.timestamp` in `commit_feed`, so a feed signed in the
+                    // future or older than STALE_PRICE_MAX_SECS is rejected at
+                    // block time - the local clock never reaches consensus state.
+                    let update = PriceFeedUpdate::sign(&asset, price_micro, now_secs(), &publisher);
 
-                println!("✅ Price Feed Signed:");
-                println!("  Asset:     {}", update.asset);
-                println!("  Price:     ${:.4} USD", (update.price_micro_usd as f64) / 1_000_000.0);
-                println!("  Timestamp: {}", update.timestamp);
-                println!("  Publisher: {}", hex::encode(update.publisher_pubkey));
+                    println!("✅ Price Feed Signed:");
+                    println!("  Asset:     {}", update.asset);
+                    println!(
+                        "  Price:     ${:.4} USD",
+                        (update.price_micro_usd as f64) / 1_000_000.0
+                    );
+                    println!("  Timestamp: {}", update.timestamp);
+                    println!("  Publisher: {}", hex::encode(update.publisher_pubkey));
 
-                // Wrap it in a transaction: only a block carrying this payload
-                // commits the price (determinism rule), so the CLI signs the
-                // wrapping transaction instead of pretending a printout (or a
-                // gossip message) is a price update.
-                let sender = match &from_key {
-                    Some(k) => {
-                        let b = hex::decode(k).map_err(|e| anyhow::anyhow!("Invalid from_key hex: {e}"))?;
-                        let arr: [u8; 32] = b
-                            .try_into()
-                            .map_err(|_| anyhow::anyhow!("from_key must be 32 bytes"))?;
-                        SigningKey::from_bytes(&arr)
+                    // Wrap it in a transaction: only a block carrying this payload
+                    // commits the price (determinism rule), so the CLI signs the
+                    // wrapping transaction instead of pretending a printout (or a
+                    // gossip message) is a price update.
+                    let sender = match &from_key {
+                        Some(k) => {
+                            let b = hex::decode(k)
+                                .map_err(|e| anyhow::anyhow!("Invalid from_key hex: {e}"))?;
+                            let arr: [u8; 32] = b
+                                .try_into()
+                                .map_err(|_| anyhow::anyhow!("from_key must be 32 bytes"))?;
+                            SigningKey::from_bytes(&arr)
+                        }
+                        None => publisher.clone(),
+                    };
+                    let sender_addr = sender.verifying_key().to_bytes();
+
+                    let query = |method: &str,
+                                 params: serde_json::Value|
+                     -> anyhow::Result<serde_json::Value> {
+                        let body = serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+                        })
+                        .to_string();
+                        let resp: serde_json::Value =
+                            ureq::post(&rpc).send_string(&body)?.into_json()?;
+                        if let Some(e) = resp.get("error") {
+                            anyhow::bail!("RPC error: {e}");
+                        }
+                        Ok(resp
+                            .get("result")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null))
+                    };
+
+                    let nonce = match nonce {
+                        Some(n) => n,
+                        None => {
+                            let acc = query(
+                                "stell_getBalance",
+                                serde_json::json!({ "address": hex::encode(sender_addr) }),
+                            )?;
+                            acc.get("nonce").and_then(|n| n.as_u64()).ok_or_else(|| {
+                                anyhow::anyhow!("node did not return an account nonce")
+                            })?
+                        }
+                    };
+
+                    let payload = vec![stellereum::svm::OpCode::SysCallSubmitPriceFeed(Box::new(
+                        update.clone(),
+                    ))];
+                    let tx = Transaction::sign_with_payload(
+                        &sender,
+                        sender_addr,
+                        0,
+                        20_000,
+                        nonce,
+                        1,
+                        1,
+                        payload,
+                    );
+                    println!("  Wrapping tx: {}", hex::encode(tx.compute_tx_hash()));
+                    println!("  Sender:   {}", hex::encode(tx.from));
+                    println!("  Nonce:    {nonce}");
+
+                    if dry_run {
+                        println!("  raw: {}", hex::encode(bincode::serialize(&tx)?));
+                        return Ok(());
                     }
-                    None => publisher.clone(),
-                };
-                let sender_addr = sender.verifying_key().to_bytes();
 
-                let query = |method: &str, params: serde_json::Value| -> anyhow::Result<serde_json::Value> {
-                    let body = serde_json::json!({
-                        "jsonrpc": "2.0", "id": 1, "method": method, "params": params
-                    })
-                    .to_string();
-                    let resp: serde_json::Value = ureq::post(&rpc).send_string(&body)?.into_json()?;
-                    if let Some(e) = resp.get("error") {
-                        anyhow::bail!("RPC error: {e}");
+                    let raw = hex::encode(bincode::serialize(&tx)?);
+                    let mut params = serde_json::json!({ "tx": raw });
+                    if let Some(t) = &token {
+                        params["token"] = serde_json::json!(t);
                     }
-                    Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
-                };
-
-                let nonce = match nonce {
-                    Some(n) => n,
-                    None => {
-                        let acc = query(
-                            "stell_getBalance",
-                            serde_json::json!({ "address": hex::encode(sender_addr) }),
-                        )?;
-                        acc.get("nonce")
-                            .and_then(|n| n.as_u64())
-                            .ok_or_else(|| anyhow::anyhow!("node did not return an account nonce"))?
-                    }
-                };
-
-                let payload = vec![stellereum::svm::OpCode::SysCallSubmitPriceFeed(Box::new(
-                    update.clone(),
-                ))];
-                let tx = Transaction::sign_with_payload(&sender, sender_addr, 0, 20_000, nonce, 1, 1, payload);
-                println!("  Wrapping tx: {}", hex::encode(tx.compute_tx_hash()));
-                println!("  Sender:   {}", hex::encode(tx.from));
-                println!("  Nonce:    {nonce}");
-
-                if dry_run {
-                    println!("  raw: {}", hex::encode(bincode::serialize(&tx)?));
-                    return Ok(());
+                    let result = query("stell_submitPriceFeed", params)?;
+                    println!(
+                        "  Submitted, mempool tx hash: {}",
+                        result.as_str().unwrap_or("?")
+                    );
+                    println!("  (committed only when a proposer includes it in a block)");
                 }
 
-                let raw = hex::encode(bincode::serialize(&tx)?);
-                let mut params = serde_json::json!({ "tx": raw });
-                if let Some(t) = &token {
-                    params["token"] = serde_json::json!(t);
+                OracleCommands::Status { asset } => {
+                    let mut oracle = OracleSafetyEngine::new(vec![]);
+                    oracle.record_dex_trade(&asset, 5_000_000, now_secs(), 100);
+                    let price = oracle.resolve_price(None, &asset, now_secs()).unwrap();
+                    println!("Oracle Status for {}:", asset);
+                    println!(
+                        "  Resolved Price:   ${:.2} USD",
+                        (price as f64) / 1_000_000.0
+                    );
+                    println!("  Circuit Breaker:  Clean (Not Triggered)");
                 }
-                let result = query("stell_submitPriceFeed", params)?;
-                println!("  Submitted, mempool tx hash: {}", result.as_str().unwrap_or("?"));
-                println!("  (committed only when a proposer includes it in a block)");
             }
-
-            OracleCommands::Status { asset } => {
-                let mut oracle = OracleSafetyEngine::new(vec![]);
-                oracle.record_dex_trade(&asset, 5_000_000, now_secs(), 100);
-                let price = oracle.resolve_price(None, &asset, now_secs()).unwrap();
-                println!("Oracle Status for {}:", asset);
-                println!("  Resolved Price:   ${:.2} USD", (price as f64) / 1_000_000.0);
-                println!("  Circuit Breaker:  Clean (Not Triggered)");
-            }
-        },
+        }
 
         Commands::Bridge { sub } => match sub {
             BridgeCommands::Deposit {
@@ -8204,7 +8618,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 dry_run,
                 token,
             } => {
-                let key_bytes = hex::decode(&from_key).map_err(|e| anyhow::anyhow!("Invalid from_key hex: {e}"))?;
+                let key_bytes = hex::decode(&from_key)
+                    .map_err(|e| anyhow::anyhow!("Invalid from_key hex: {e}"))?;
                 if key_bytes.len() != 32 {
                     anyhow::bail!("Key must be 32 bytes");
                 }
@@ -8250,7 +8665,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 // bundle, so gather the signatures FIRST - a claim with no
                 // quorum is refused by every block and must not look like a
                 // successful submission.
-                let attest_keys = resolve_attest_keys(&attest_key, std::path::Path::new(&attest_keys_dir))?;
+                let attest_keys =
+                    resolve_attest_keys(&attest_key, std::path::Path::new(&attest_keys_dir))?;
                 let attestation = attest_for(&intent, &attest_keys)?;
                 let attesters = match &attestation {
                     stellereum::bridge::BridgeIntent::Attest { signatures, .. } => signatures.len(),
@@ -8291,7 +8707,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 dry_run,
                 token,
             } => {
-                let key_bytes = hex::decode(&from_key).map_err(|e| anyhow::anyhow!("Invalid from_key hex: {e}"))?;
+                let key_bytes = hex::decode(&from_key)
+                    .map_err(|e| anyhow::anyhow!("Invalid from_key hex: {e}"))?;
                 if key_bytes.len() != 32 {
                     anyhow::bail!("Key must be 32 bytes");
                 }
@@ -8305,7 +8722,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 };
                 let sender = signer.verifying_key().to_bytes();
                 let account_nonce = resolve_nonce(&rpc, &sender, nonce)?;
-                let tx = build_bridge_intent_tx(&signer, std::slice::from_ref(&intent), account_nonce);
+                let tx =
+                    build_bridge_intent_tx(&signer, std::slice::from_ref(&intent), account_nonce);
 
                 println!("✅ Bridge Withdrawal Intent Signed:");
                 println!("  Target chain:   {chain}");
@@ -8317,7 +8735,9 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 if amount >= stellereum::bridge::LARGE_WITHDRAWAL_THRESHOLD_NANO {
                     println!("  ⚠️  Time-lock applies at settlement: 1 hour unlock delay.");
                 } else {
-                    println!("  Status:         time-lock free below the large-withdrawal threshold.");
+                    println!(
+                        "  Status:         time-lock free below the large-withdrawal threshold."
+                    );
                 }
 
                 if dry_run {
@@ -8331,7 +8751,11 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             }
         },
 
-        Commands::Pmm { action, amount, reserve_usd } => {
+        Commands::Pmm {
+            action,
+            amount,
+            reserve_usd,
+        } => {
             println!("╔═══════════════════════════════════════════════════════════════╗");
             println!("║        🏦  STELLEREUM PRIMARY MARKET MAKER (PMM)              ║");
             println!("╚═══════════════════════════════════════════════════════════════╝");
@@ -8346,7 +8770,11 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         Ok(r) => {
                             println!("✅ BOUGHT:");
                             println!("  Paid:        ${}", amount);
-                            println!("  Minted:      {} nano-STELL ({:.4} STELL)", r.stell_minted, r.stell_minted as f64 / 1e9);
+                            println!(
+                                "  Minted:      {} nano-STELL ({:.4} STELL)",
+                                r.stell_minted,
+                                r.stell_minted as f64 / 1e9
+                            );
                             println!("  New price:   ${:.4}", r.new_price_micro_usd as f64 / 1e6);
                             println!("  Supply:      {:.4} STELL", r.supply_after as f64 / 1e9);
                             println!("  Reserve:     ${:.2}", pmm.reserve_usd());
@@ -8359,7 +8787,11 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     match pmm.sell_stell(nano) {
                         Ok(r) => {
                             println!("✅ SOLD:");
-                            println!("  Burned:      {} nano-STELL ({:.4} STELL)", r.stell_burned, r.stell_burned as f64 / 1e9);
+                            println!(
+                                "  Burned:      {} nano-STELL ({:.4} STELL)",
+                                r.stell_burned,
+                                r.stell_burned as f64 / 1e9
+                            );
                             println!("  Received:    ${:.6}", r.usdt_paid as f64 / 1e6);
                             println!("  New price:   ${:.4}", r.new_price_micro_usd as f64 / 1e6);
                             println!("  Reserve:     ${:.2}", pmm.reserve_usd());
@@ -8368,13 +8800,25 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     }
                 }
                 _ => {
-                    println!("  Current price: ${:.4}", pmm.price_micro_usd() as f64 / 1e6);
-                    println!("  Max redeemable: {:.4} STELL", pmm.max_redeemable_stell() as f64 / 1e9);
+                    println!(
+                        "  Current price: ${:.4}",
+                        pmm.price_micro_usd() as f64 / 1e6
+                    );
+                    println!(
+                        "  Max redeemable: {:.4} STELL",
+                        pmm.max_redeemable_stell() as f64 / 1e9
+                    );
                 }
             }
         }
 
-        Commands::NodeBootstrap { config, shard, data_dir, allow_dirty, no_exec } => {
+        Commands::NodeBootstrap {
+            config,
+            shard,
+            data_dir,
+            allow_dirty,
+            no_exec,
+        } => {
             use stellereum::bootstrap as boot;
             eprintln!(
                 "{}",
@@ -8433,7 +8877,13 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     preflight.failures().len()
                 );
             }
-            eprintln!("{}", boot::stage_line(1, "preflight OK: clean dir, observer, peer pointer, validator set"));
+            eprintln!(
+                "{}",
+                boot::stage_line(
+                    1,
+                    "preflight OK: clean dir, observer, peer pointer, validator set"
+                )
+            );
             eprintln!(
                 "{}",
                 boot::stage_line(
@@ -8497,11 +8947,13 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             }
         }
         Commands::Keys { sub } => match sub {
-            KeysCommands::Init { keys_dir, falcon_file } => {
+            KeysCommands::Init {
+                keys_dir,
+                falcon_file,
+            } => {
                 let falcon_path = resolve_falcon_path(&keys_dir, falcon_file);
                 let keys = stellereum::node_keys::load_or_generate_node_keys(&keys_dir)?;
-                let falcon =
-                    stellereum::node_keys::load_or_generate_falcon_key(&falcon_path)?;
+                let falcon = stellereum::node_keys::load_or_generate_falcon_key(&falcon_path)?;
                 println!(
                     "NODE IDENTITY: id={} ed={} x={} falcon={}",
                     keys.id_hex(),
@@ -8512,13 +8964,26 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 println!("keys dir: {} (0700), files 0600", keys_dir.display());
                 println!("falcon key: {}", falcon_path.display());
             }
-            KeysCommands::PeerStanza { keys_dir, falcon_file, name, endpoint } => {
+            KeysCommands::PeerStanza {
+                keys_dir,
+                falcon_file,
+                name,
+                endpoint,
+            } => {
                 let falcon_path = resolve_falcon_path(&keys_dir, falcon_file);
                 let keys = stellereum::node_keys::load_node_keys(&keys_dir).map_err(|e| {
-                    anyhow::anyhow!("{} (run `stellereum keys init --keys-dir {}` first)", e, keys_dir.display())
+                    anyhow::anyhow!(
+                        "{} (run `stellereum keys init --keys-dir {}` first)",
+                        e,
+                        keys_dir.display()
+                    )
                 })?;
                 let falcon = stellereum::node_keys::load_falcon_key(&falcon_path).map_err(|e| {
-                    anyhow::anyhow!("{} (run `stellereum keys init --keys-dir {}` first)", e, keys_dir.display())
+                    anyhow::anyhow!(
+                        "{} (run `stellereum keys init --keys-dir {}` first)",
+                        e,
+                        keys_dir.display()
+                    )
                 })?;
                 let id_hex = keys.id_hex();
                 let ed_hex = keys.ed_hex();
@@ -8618,7 +9083,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     backup_note
                 );
                 println!("new validator address     : {}", hex::encode(new_address));
-                println!("new falcon public key     : {}", hex::encode(new_key.public_key()));
+                println!(
+                    "new falcon public key     : {}",
+                    hex::encode(new_key.public_key())
+                );
                 if let Some(old) = old_address {
                     println!("previous validator address : {}", hex::encode(old));
                     if old == new_address {
@@ -8663,7 +9131,9 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             println!("\n🔍 HOW APPS AND WALLETS CONNECT TO STELLEREUM:");
             println!("  1. Bootstrap Node: Connect to any seed node specified in config.yaml");
             println!("  2. DHT Lookup:     Node queries 'dht.find_node' to discover nearest peers");
-            println!("  3. Shard Sync:     Wallet queries 'stell:height:{{shard}}' via get_local_kv");
+            println!(
+                "  3. Shard Sync:     Wallet queries 'stell:height:{{shard}}' via get_local_kv"
+            );
             println!("  4. SPV Light Mode: Wallets verify state via Patricia-Merkle BoC proofs");
             println!("  5. Full Node Mode: Downloads block chunks via 'fetch_blob' and verifies\n");
         }
@@ -8693,10 +9163,16 @@ mod gossip_batch_tests {
         let mut outbox = std::collections::VecDeque::new();
         let v = test_vote(1, 0, VoteKind::Prevote, [7u8; 32]);
         assert!(enqueue_outbox(&mut outbox, v.clone()));
-        assert!(!enqueue_outbox(&mut outbox, v.clone()), "same vote must dedup");
+        assert!(
+            !enqueue_outbox(&mut outbox, v.clone()),
+            "same vote must dedup"
+        );
         assert_eq!(outbox.len(), 1);
         // A different kind is a different vote.
-        assert!(enqueue_outbox(&mut outbox, test_vote(1, 0, VoteKind::Precommit, [7u8; 32])));
+        assert!(enqueue_outbox(
+            &mut outbox,
+            test_vote(1, 0, VoteKind::Precommit, [7u8; 32])
+        ));
         assert_eq!(outbox.len(), 2);
     }
 
@@ -8749,7 +9225,10 @@ mod gossip_batch_tests {
         }
         assert_eq!(outbox.len(), 40);
         flush_outbox(&sender, &mut outbox, 1, 0);
-        assert!(outbox.is_empty(), "a successful flush empties the outbox exactly once");
+        assert!(
+            outbox.is_empty(),
+            "a successful flush empties the outbox exactly once"
+        );
 
         let mut got = Vec::new();
         for _ in 0..40 {
@@ -8839,7 +9318,11 @@ mod gossip_batch_tests {
         let mut outbox = std::collections::VecDeque::new();
         assert!(enqueue_outbox(&mut outbox, vote(9, 3)));
         assert!(enqueue_outbox(&mut outbox, vote(9, 5)));
-        outbox.push_back(ConsensusMsg::Proposal { height: 9, round: 5, block: block_at(9) });
+        outbox.push_back(ConsensusMsg::Proposal {
+            height: 9,
+            round: 5,
+            block: block_at(9),
+        });
         outbox.push_back(commit(9, 5));
         flush_outbox(&sender, &mut outbox, 9, 5);
         assert!(outbox.is_empty());
@@ -8861,7 +9344,10 @@ mod gossip_batch_tests {
         let mut outbox2 = std::collections::VecDeque::new();
         outbox2.push_back(commit(9, 5));
         flush_outbox(&sender, &mut outbox2, 9, 99);
-        assert!(outbox2.is_empty(), "a commit must always flush, even at r=99");
+        assert!(
+            outbox2.is_empty(),
+            "a commit must always flush, even at r=99"
+        );
         let back = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("commit must be delivered")
@@ -8897,12 +9383,21 @@ mod gossip_batch_tests {
             "queued copy must carry the fresh hint"
         );
         // Identical re-enqueue collapses.
-        assert!(!enqueue_outbox(&mut outbox, vote_locked([7u8; 32], Some([9u8; 32]))));
+        assert!(!enqueue_outbox(
+            &mut outbox,
+            vote_locked([7u8; 32], Some([9u8; 32]))
+        ));
         assert_eq!(outbox.len(), 1);
         // A hintless re-send never strips a queued hint.
         assert!(!enqueue_outbox(&mut outbox, vote_locked([7u8; 32], None)));
         assert!(
-            matches!(&outbox[0], ConsensusMsg::Vote { locked: Some(_), .. }),
+            matches!(
+                &outbox[0],
+                ConsensusMsg::Vote {
+                    locked: Some(_),
+                    ..
+                }
+            ),
             "queued hint must survive a hintless duplicate"
         );
     }
@@ -8956,9 +9451,21 @@ mod gossip_batch_tests {
             },
         };
         let mut outbox = std::collections::VecDeque::new();
-        outbox.push_back(ConsensusMsg::Proposal { height: 8, round: 5, block: block_at(8) });
-        outbox.push_back(ConsensusMsg::Proposal { height: 9, round: 3, block: block_at(9) });
-        outbox.push_back(ConsensusMsg::Proposal { height: 9, round: 5, block: block_at(9) });
+        outbox.push_back(ConsensusMsg::Proposal {
+            height: 8,
+            round: 5,
+            block: block_at(8),
+        });
+        outbox.push_back(ConsensusMsg::Proposal {
+            height: 9,
+            round: 3,
+            block: block_at(9),
+        });
+        outbox.push_back(ConsensusMsg::Proposal {
+            height: 9,
+            round: 5,
+            block: block_at(9),
+        });
         outbox.push_back(commit(9, 5));
         flush_outbox(&sender, &mut outbox, 9, 5);
         assert!(outbox.is_empty());
@@ -8971,8 +9478,19 @@ mod gossip_batch_tests {
                     .expect("channel stays open"),
             );
         }
-        assert_eq!(got.len(), 2, "stale proposals must be pruned, current + commit delivered");
-        assert!(matches!(&got[0], ConsensusMsg::Proposal { height: 9, round: 5, .. }));
+        assert_eq!(
+            got.len(),
+            2,
+            "stale proposals must be pruned, current + commit delivered"
+        );
+        assert!(matches!(
+            &got[0],
+            ConsensusMsg::Proposal {
+                height: 9,
+                round: 5,
+                ..
+            }
+        ));
         assert!(matches!(&got[1], ConsensusMsg::Committed { .. }));
     }
 
@@ -9000,13 +9518,27 @@ mod gossip_batch_tests {
             epoch_key_commitment: [0u8; 32],
         };
         let mut outbox = std::collections::VecDeque::new();
-        outbox.push_back(ConsensusMsg::Proposal { height: 7, round: 2, block: blk.clone() });
+        outbox.push_back(ConsensusMsg::Proposal {
+            height: 7,
+            round: 2,
+            block: blk.clone(),
+        });
         assert!(outbox_has_proposal(&outbox, 7, 2));
-        assert!(!outbox_has_proposal(&outbox, 7, 3), "other rounds are distinct");
-        assert!(!outbox_has_proposal(&outbox, 8, 2), "other heights are distinct");
+        assert!(
+            !outbox_has_proposal(&outbox, 7, 3),
+            "other rounds are distinct"
+        );
+        assert!(
+            !outbox_has_proposal(&outbox, 8, 2),
+            "other heights are distinct"
+        );
         // The guarded re-send path pushes only when absent.
         if !outbox_has_proposal(&outbox, 7, 2) {
-            outbox.push_back(ConsensusMsg::Proposal { height: 7, round: 2, block: blk });
+            outbox.push_back(ConsensusMsg::Proposal {
+                height: 7,
+                round: 2,
+                block: blk,
+            });
         }
         assert_eq!(outbox.len(), 1, "identical proposal must not duplicate");
     }
@@ -9020,11 +9552,9 @@ mod gossip_batch_tests {
         // unverified claims.
         use stellereum::consensus::ValidatorSet;
         use stellereum::runtime::{fund_genesis, ValidatorRuntime};
-        let ks: Vec<SigningKey> =
-            (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let ks: Vec<SigningKey> = (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let id = |k: &SigningKey| k.verifying_key().to_bytes();
-        let vset =
-            ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
+        let vset = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
         let state = Arc::new(InMemoryStateEngine::new());
         fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
         let mut rt = ValidatorRuntime::new(ks[0].clone(), vset, state, 1);
@@ -9039,8 +9569,14 @@ mod gossip_batch_tests {
         // vote it verified; it is a no-op here because the round already
         // moved.
         let peer_vote = Vote::sign(&ks[1], h, 2, VoteKind::Prevote, None);
-        assert!(rt.on_prevote(peer_vote.clone()).is_ok(), "genuine vote must verify");
-        assert_eq!(rt.hc.round, 2, "behind node follows the verified peer round");
+        assert!(
+            rt.on_prevote(peer_vote.clone()).is_ok(),
+            "genuine vote must verify"
+        );
+        assert_eq!(
+            rt.hc.round, 2,
+            "behind node follows the verified peer round"
+        );
         assert!(
             !rt.note_peer_vote_round(peer_vote.height, peer_vote.round),
             "following the round twice must not move it"
@@ -9049,9 +9585,15 @@ mod gossip_batch_tests {
         // Forged vote (tampered after signing): rejected, round untouched.
         let mut bad = Vote::sign(&ks[1], h, 5, VoteKind::Prevote, Some([1u8; 32]));
         bad.block_hash = Some([2u8; 32]);
-        assert!(rt.on_prevote(bad.clone()).is_err(), "forged vote must fail verification");
+        assert!(
+            rt.on_prevote(bad.clone()).is_err(),
+            "forged vote must fail verification"
+        );
         // The drain never calls note_peer_vote_round for a rejected vote.
-        assert_eq!(rt.hc.round, 2, "unverified claims must never move the round");
+        assert_eq!(
+            rt.hc.round, 2,
+            "unverified claims must never move the round"
+        );
     }
 
     #[test]
@@ -9064,9 +9606,15 @@ mod gossip_batch_tests {
         // re-done first.
         assert_eq!(DEFAULT_MIN_BLOCK_MS, 50, "empty-block floor stays 50ms");
         assert_eq!(TICK_MS, 50, "tick quantum stays 50ms");
-        assert_eq!(BATCH_MS, TICK_MS, "batch window rides the tick, no extra wakeup");
+        assert_eq!(
+            BATCH_MS, TICK_MS,
+            "batch window rides the tick, no extra wakeup"
+        );
         // The retransmit floor keeps a wedged round from becoming a hot loop.
-        assert_eq!(stellereum::consensus_net::retransmit_interval_ms(200, 0), 150);
+        assert_eq!(
+            stellereum::consensus_net::retransmit_interval_ms(200, 0),
+            150
+        );
     }
 
     #[tokio::test]
@@ -9076,11 +9624,9 @@ mod gossip_batch_tests {
         use stellereum::consensus::ValidatorSet;
         use stellereum::runtime::{fund_genesis, ValidatorRuntime};
         use stellereum::sharding::MASTERCHAIN_SHARD;
-        let ks: Vec<SigningKey> =
-            (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let ks: Vec<SigningKey> = (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let id = |k: &SigningKey| k.verifying_key().to_bytes();
-        let vset =
-            ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
+        let vset = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
         let state = Arc::new(InMemoryStateEngine::new());
         fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
         let mut rt = ValidatorRuntime::new(ks[0].clone(), vset, state, 1);
@@ -9108,8 +9654,15 @@ mod gossip_batch_tests {
         block.sign_block(&ks[1]);
         let peer_vote = Vote::sign(&ks[1], rt.hc.height, r, VoteKind::Prevote, None);
         let batch = ConsensusMsg::Batch(vec![
-            ConsensusMsg::Vote { vote: peer_vote, locked: None },
-            ConsensusMsg::Proposal { height: rt.hc.height, round: r, block },
+            ConsensusMsg::Vote {
+                vote: peer_vote,
+                locked: None,
+            },
+            ConsensusMsg::Proposal {
+                height: rt.hc.height,
+                round: r,
+                block,
+            },
         ]);
         // Encode/decode round-trips as one Batch, then flatten like the drain.
         let bytes = ConsensusMsg::batch_encode(&flatten_incoming(batch)).unwrap();
@@ -9141,11 +9694,9 @@ mod gossip_batch_tests {
         // demand via note_lock_hint.
         use stellereum::consensus::ValidatorSet;
         use stellereum::runtime::{fund_genesis, ValidatorRuntime};
-        let ks: Vec<SigningKey> =
-            (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let ks: Vec<SigningKey> = (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let id = |k: &SigningKey| k.verifying_key().to_bytes();
-        let vset =
-            ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
+        let vset = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
         let state = Arc::new(InMemoryStateEngine::new());
         fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
         let mut rt = ValidatorRuntime::new(ks[0].clone(), vset, state, 1);
@@ -9156,9 +9707,10 @@ mod gossip_batch_tests {
         let mh = mine.compute_hash();
         // Peer's nil prevote with our locked hash, delivered in a Batch.
         let nil = Vote::sign(&ks[1], rt.hc.height, rt.hc.round, VoteKind::Prevote, None);
-        let batch = ConsensusMsg::Batch(vec![
-            ConsensusMsg::Vote { vote: nil, locked: Some(mh) },
-        ]);
+        let batch = ConsensusMsg::Batch(vec![ConsensusMsg::Vote {
+            vote: nil,
+            locked: Some(mh),
+        }]);
         let bytes = ConsensusMsg::batch_encode(&flatten_incoming(batch)).unwrap();
         let decoded = ConsensusMsg::decode(&bytes).unwrap();
         for inner in flatten_incoming(decoded) {
@@ -9171,7 +9723,11 @@ mod gossip_batch_tests {
             rt.hc.next_round();
         }
         let served = rt.propose(1).await.expect("must serve the demand");
-        assert_eq!(served.compute_hash(), mh, "batched nil hint must be recorded");
+        assert_eq!(
+            served.compute_hash(),
+            mh,
+            "batched nil hint must be recorded"
+        );
     }
 
     #[tokio::test]
@@ -9216,7 +9772,10 @@ mod gossip_batch_tests {
 
         // 4. Now add an already-matured deferred item (wake_at <= now)
         let past_wake = Instant::now() - Duration::from_millis(10);
-        let pos = inbound_deferred.iter().position(|(w, _)| *w > past_wake).unwrap_or(inbound_deferred.len());
+        let pos = inbound_deferred
+            .iter()
+            .position(|(w, _)| *w > past_wake)
+            .unwrap_or(inbound_deferred.len());
         inbound_deferred.insert(pos, (past_wake, "matured_deferred_msg".to_string()));
 
         // At this point, rx is empty. Drain loop should pop the matured item, but leave the future item.
@@ -9274,9 +9833,12 @@ mod round_timeout_tests {
         assert_eq!(a_ms, b_ms, "identical state => identical timeout");
         assert_eq!(a_ms, 3500 + 3 * 500 + 2 * 500);
         let _ = (a_start, b_start); // clocks exist, value ignores them
-        // Enumerated inputs, pinned: base + round-backoff (cap 10s) + adaptive (cap 5s).
+                                    // Enumerated inputs, pinned: base + round-backoff (cap 10s) + adaptive (cap 5s).
         assert_eq!(deterministic_timeout_for(3500, 0, 0), 3500);
-        assert_eq!(deterministic_timeout_for(3500, 1000, 1000), 3500 + 10_000 + 5_000);
+        assert_eq!(
+            deterministic_timeout_for(3500, 1000, 1000),
+            3500 + 10_000 + 5_000
+        );
         // Deterministic down-proposer gate: ledger evidence only.
         assert!(should_use_down_proposer_timeout_deterministic(10));
         assert!(!should_use_down_proposer_timeout_deterministic(0));
@@ -9322,7 +9884,11 @@ mod liveness_policy_tests {
         // Seen, but stale (at/over the window): SUPPRESS.
         assert!(should_suppress_retro_no_behind_peer(Some(w), w, false));
         assert!(should_suppress_retro_no_behind_peer(Some(w + 1), w, false));
-        assert!(should_suppress_retro_no_behind_peer(Some(u64::MAX), w, false));
+        assert!(should_suppress_retro_no_behind_peer(
+            Some(u64::MAX),
+            w,
+            false
+        ));
     }
 
     #[test]
@@ -9332,7 +9898,11 @@ mod liveness_policy_tests {
         // a node that is itself behind must NOT suppress via this gate (the
         // stale-push guard owns that decision separately).
         assert!(!should_suppress_retro_no_behind_peer(None, w, true));
-        assert!(!should_suppress_retro_no_behind_peer(Some(u64::MAX), w, true));
+        assert!(!should_suppress_retro_no_behind_peer(
+            Some(u64::MAX),
+            w,
+            true
+        ));
         assert!(!should_suppress_retro_no_behind_peer(Some(0), w, true));
     }
 
@@ -9486,7 +10056,10 @@ mod dns_seed_guard_tests {
         format!("inf1:{}", hex::encode(&h.as_bytes()[..20]))
     }
 
-    fn cfg_with(peers: Vec<node_config::PeerConfig>, validators: Vec<String>) -> node_config::NodeConfig {
+    fn cfg_with(
+        peers: Vec<node_config::PeerConfig>,
+        validators: Vec<String>,
+    ) -> node_config::NodeConfig {
         node_config::NodeConfig {
             name: "guard".to_string(),
             listen: "127.0.0.1:9400".to_string(),
@@ -9525,7 +10098,8 @@ mod dns_seed_guard_tests {
         let base_peers = vec![peer("b", peer_ed)];
         let validators = vec![node_id_hex(&self_ed), node_id_hex(&peer_ed)];
         let cfg = cfg_with(base_peers.clone(), validators.clone());
-        let (vset_plain, is_val_plain) = build_validator_set(&cfg, self_ed, &node_id_hex(&self_ed), false);
+        let (vset_plain, is_val_plain) =
+            build_validator_set(&cfg, self_ed, &node_id_hex(&self_ed), false);
         assert!(is_val_plain);
         assert_eq!(vset_plain.len(), 2);
 
@@ -9534,7 +10108,8 @@ mod dns_seed_guard_tests {
         with_discovered.push(discovered_peer_entry(0xC1));
         with_discovered.push(discovered_peer_entry(0xC2));
         let cfg2 = cfg_with(with_discovered, validators);
-        let (vset_dns, is_val_dns) = build_validator_set(&cfg2, self_ed, &node_id_hex(&self_ed), false);
+        let (vset_dns, is_val_dns) =
+            build_validator_set(&cfg2, self_ed, &node_id_hex(&self_ed), false);
 
         assert_eq!(is_val_dns, is_val_plain);
         assert_eq!(
@@ -9573,14 +10148,16 @@ mod dns_seed_guard_tests {
         let base_peers = vec![peer("b", peer_ed)];
         let validators = vec![node_id_hex(&peer_ed)];
         let cfg = cfg_with(base_peers.clone(), validators.clone());
-        let (vset_plain, is_val_plain) = build_validator_set(&cfg, self_ed, &node_id_hex(&self_ed), false);
+        let (vset_plain, is_val_plain) =
+            build_validator_set(&cfg, self_ed, &node_id_hex(&self_ed), false);
         assert!(is_val_plain, "list-names-only-others still includes self");
         assert_eq!(vset_plain.len(), 2);
 
         let mut with_discovered = base_peers;
         with_discovered.push(discovered_peer_entry(0xC3));
         let cfg2 = cfg_with(with_discovered, validators);
-        let (vset_dns, is_val_dns) = build_validator_set(&cfg2, self_ed, &node_id_hex(&self_ed), false);
+        let (vset_dns, is_val_dns) =
+            build_validator_set(&cfg2, self_ed, &node_id_hex(&self_ed), false);
 
         assert_eq!(is_val_dns, is_val_plain);
         assert_eq!(
@@ -9663,7 +10240,11 @@ mod cli_tx_builder_tests {
         assert_eq!(cli_tx_gas(0), GAS_BASIC_TRANSFER);
         assert_eq!(cli_tx_gas(GAS_BASIC_TRANSFER), GAS_BASIC_TRANSFER);
         let high = GAS_BASIC_TRANSFER + 5_000;
-        assert_eq!(cli_tx_gas(high), high, "a costlier opcode keeps its own budget");
+        assert_eq!(
+            cli_tx_gas(high),
+            high,
+            "a costlier opcode keeps its own budget"
+        );
     }
 
     #[test]
@@ -9678,7 +10259,12 @@ mod cli_tx_builder_tests {
         assert!(tx.gas_limit >= GAS_BASIC_TRANSFER);
         assert!(tx.verify_signature(), "CLI tx must verify");
         match only_op(&tx) {
-            OpCode::SysCallPlaceOrder { pair_id, is_buy, price, amount } => {
+            OpCode::SysCallPlaceOrder {
+                pair_id,
+                is_buy,
+                price,
+                amount,
+            } => {
                 assert_eq!(*pair_id, 1);
                 assert!(*is_buy);
                 assert_eq!(*price, 250_000);
@@ -9720,14 +10306,20 @@ mod cli_tx_builder_tests {
         );
         let tx = build_session_grant_tx(&master, &grant, 1);
 
-        assert_eq!(tx.from, master_addr, "only the master may publish its grant");
+        assert_eq!(
+            tx.from, master_addr,
+            "only the master may publish its grant"
+        );
         assert_eq!(tx.nonce, 1);
         assert!(tx.gas_limit >= stellereum::svm::GAS_PUBLISH_SESSION_GRANT);
         assert!(tx.verify_signature());
         match only_op(&tx) {
             OpCode::SysCallPublishSessionGrant(carried) => {
                 assert_eq!(carried.master_address, master_addr);
-                assert!(carried.verify_signature(), "the carried grant must still verify");
+                assert!(
+                    carried.verify_signature(),
+                    "the carried grant must still verify"
+                );
             }
             other => panic!("wrong opcode: {other:?}"),
         }
@@ -9791,11 +10383,7 @@ mod cli_tx_builder_tests {
         // The CLI gathers signatures from the keys it can access ...
         let attestation = attest_for(&deposit, &validators[..2]).expect("attest");
         // ... and builds ONE transaction carrying both intents.
-        let tx = build_bridge_intent_tx(
-            &signer,
-            &[attestation.clone(), deposit.clone()],
-            4,
-        );
+        let tx = build_bridge_intent_tx(&signer, &[attestation.clone(), deposit.clone()], 4);
         assert_eq!(tx.payload.len(), 2, "Attest and Deposit ride the same tx");
         assert!(
             tx.gas_limit >= stellereum::svm::GAS_BRIDGE_INTENT * 2,
@@ -9839,7 +10427,12 @@ mod cli_tx_builder_tests {
             })
             .collect();
         let plan = stellereum::bridge::BridgeState::default()
-            .plan(&carried, &validator_pks, signer.verifying_key().to_bytes(), 1_760_000_000)
+            .plan(
+                &carried,
+                &validator_pks,
+                signer.verifying_key().to_bytes(),
+                1_760_000_000,
+            )
             .expect("a deposit the CLI submits must pass §8 policy");
         assert_eq!(
             plan.effects,
@@ -9882,7 +10475,8 @@ mod cli_tx_builder_tests {
         );
 
         // (b) explicit seeds.
-        let keys = resolve_attest_keys(std::slice::from_ref(&explicit_hex), &dir).expect("explicit seed");
+        let keys =
+            resolve_attest_keys(std::slice::from_ref(&explicit_hex), &dir).expect("explicit seed");
         assert_eq!(keys.len(), 1);
         assert_eq!(
             keys[0].verifying_key().to_bytes(),
@@ -9903,11 +10497,8 @@ mod cli_tx_builder_tests {
         );
 
         // (d) explicit replaces the fallback (duplicates collapse too).
-        let keys = resolve_attest_keys(
-            &[explicit_hex.clone(), explicit_hex.clone()],
-            &dir,
-        )
-        .expect("explicit wins");
+        let keys = resolve_attest_keys(&[explicit_hex.clone(), explicit_hex.clone()], &dir)
+            .expect("explicit wins");
         assert_eq!(keys.len(), 1, "duplicate seeds collapse to one signer");
 
         // (e) malformed input fails loudly.
@@ -10038,7 +10629,10 @@ mod tick_offload_tests {
             !path.exists(),
             "nothing may be written while the pool is locked"
         );
-        assert!(guard.load(Ordering::SeqCst), "guard held until the write ends");
+        assert!(
+            guard.load(Ordering::SeqCst),
+            "guard held until the write ends"
+        );
 
         drop(held);
         assert!(
@@ -10049,7 +10643,8 @@ mod tick_offload_tests {
         let bytes = std::fs::read(&path).expect("read the pool back");
         // Versioned envelope (MP02 magic + bincode): strip the prefix before
         // decoding, mirroring `load_into`.
-        let body: &[u8] = match bytes.strip_prefix(stellereum::mempool::Mempool::MEMPOOL_FILE_MAGIC) {
+        let body: &[u8] = match bytes.strip_prefix(stellereum::mempool::Mempool::MEMPOOL_FILE_MAGIC)
+        {
             Some(b) => b,
             None => &bytes,
         };
@@ -10132,7 +10727,9 @@ mod tick_offload_tests {
             "the guard must be reusable after the job completes"
         );
         assert!(
-            wait_until(Duration::from_secs(10), || finished.load(Ordering::SeqCst) == 2).await,
+            wait_until(Duration::from_secs(10), || finished.load(Ordering::SeqCst)
+                == 2)
+            .await,
             "the follow-up job must run"
         );
     }
@@ -10211,7 +10808,11 @@ mod tick_offload_tests {
             .expect("the lane must drain")
             .expect("lane stays open");
 
-        assert_eq!(peak.load(Ordering::SeqCst), 1, "one job at a time on a lane");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "one job at a time on a lane"
+        );
         assert_eq!(
             *order.lock().expect("lock"),
             (0..24).collect::<Vec<u32>>(),
@@ -10260,8 +10861,14 @@ mod tick_offload_tests {
         // The tick's submissions, in the order the finalize path makes them.
         let (r1, r2) = (rpc.clone(), rpc.clone());
         lane.submit(async move {
-            r1.record_receipts(1, [0x11; 32], std::slice::from_ref(&tx), &[true], &[100_000])
-                .await;
+            r1.record_receipts(
+                1,
+                [0x11; 32],
+                std::slice::from_ref(&tx),
+                &[true],
+                &[100_000],
+            )
+            .await;
             r1.record_block(1, [0x11; 32], 1, 100).await;
         });
         lane.submit(async move {
@@ -10343,7 +10950,11 @@ mod tick_offload_tests {
         }
         let cli_default = Cli::try_parse_from(["stellereum", "run"]).unwrap();
         match cli_default.command {
-            Commands::Run { parallel_exec, pure_pq, .. } => {
+            Commands::Run {
+                parallel_exec,
+                pure_pq,
+                ..
+            } => {
                 assert!(!parallel_exec);
                 assert!(!pure_pq);
             }

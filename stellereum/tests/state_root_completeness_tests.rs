@@ -17,8 +17,8 @@ use ed25519_dalek::SigningKey;
 use stellereum::orderbook::OrderSide;
 use stellereum::pmm::PrimaryMarketMaker;
 use stellereum::sharding::Transaction;
-use stellereum::state_engine::{EscrowRecord, InMemoryStateEngine};
 use stellereum::staking::StakingLedger;
+use stellereum::state_engine::{EscrowRecord, InMemoryStateEngine};
 
 fn funded_key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -38,13 +38,18 @@ async fn native_balance_change_moves_the_root() {
 
     let tx = Transaction::sign(&key, [0xEE; 32], 10, 0, 0, 0, 0);
     let (applied, failed, _, _, _) = e.apply_block_parallel_fees(&[tx], 0).await;
-    assert_eq!((applied, failed), (1, 0), "the control transaction must execute");
-
-    assert_ne!(
-        before, seeded,
-        "the control transaction must move the root"
+    assert_eq!(
+        (applied, failed),
+        (1, 0),
+        "the control transaction must execute"
     );
-    assert_ne!(seeded, e.get_state_root().await, "native transfer must move the root");
+
+    assert_ne!(before, seeded, "the control transaction must move the root");
+    assert_ne!(
+        seeded,
+        e.get_state_root().await,
+        "native transfer must move the root"
+    );
     assert_eq!(e.get_account(&addr).await.unwrap().balance, 1_000 - 10);
 }
 
@@ -55,7 +60,9 @@ async fn staking_bond_moves_the_root() {
 
     let key = funded_key(2);
     let val = key.verifying_key().to_bytes();
-    e.credit_native(&val, 1_000_000_000_000).await.expect("credit");
+    e.credit_native(&val, 1_000_000_000_000)
+        .await
+        .expect("credit");
     let seeded = e.get_state_root().await;
     assert_ne!(seeded, before, "funding the validator must move the root");
 
@@ -79,17 +86,18 @@ async fn staking_slash_moves_the_root() {
     let e = InMemoryStateEngine::new();
     let key = funded_key(3);
     let val = key.verifying_key().to_bytes();
-    e.credit_native(&val, 1_000_000_000_000).await.expect("credit");
-    e.staking_write().await.bond(val, 2_000_000_000_000, 0).unwrap();
+    e.credit_native(&val, 1_000_000_000_000)
+        .await
+        .expect("credit");
+    e.staking_write()
+        .await
+        .bond(val, 2_000_000_000_000, 0)
+        .unwrap();
 
     let committed = e.get_state_root().await;
     {
         let mut ledger = e.staking_write().await;
-        ledger.note_missed_heights(
-            1,
-            &|_| false,
-            std::slice::from_ref(&val),
-        );
+        ledger.note_missed_heights(1, &|_| false, std::slice::from_ref(&val));
     }
     assert_ne!(
         e.get_state_root().await,
@@ -185,7 +193,9 @@ async fn contract_storage_moves_the_root() {
     // contract exists but nothing about what it holds.
     let e = InMemoryStateEngine::new();
     let owner = funded_key(6).verifying_key().to_bytes();
-    e.credit_native(&owner, 10_000_000_000).await.expect("credit");
+    e.credit_native(&owner, 10_000_000_000)
+        .await
+        .expect("credit");
     let seeded = e.get_state_root().await;
 
     let mut reg = e.contracts_write().await;
@@ -193,9 +203,7 @@ async fn contract_storage_moves_the_root() {
     // exactly what that check is for. Compiled from WAT so this exercises the
     // production deploy path instead of a bypass.
     let code = wat::parse_str("(module)").expect("wat compiles");
-    let addr = reg
-        .deploy(owner, code, 0)
-        .expect("deploy");
+    let addr = reg.deploy(owner, code, 0).expect("deploy");
     reg.contracts.get_mut(&addr).unwrap().storage.insert(1, 42);
     drop(reg);
 
@@ -233,7 +241,11 @@ async fn state_root_is_independent_of_insertion_order() {
     async fn build(reverse: bool) -> InMemoryStateEngine {
         let e = InMemoryStateEngine::new();
         let mut ledger = StakingLedger::new();
-        let order: Vec<u8> = if reverse { (0..8u8).rev().collect() } else { (0..8u8).collect() };
+        let order: Vec<u8> = if reverse {
+            (0..8u8).rev().collect()
+        } else {
+            (0..8u8).collect()
+        };
         for i in order {
             let val = [1u8.wrapping_add(i); 32];
             ledger.bond(val, 2_000_000_000_000, 0).unwrap();
@@ -273,7 +285,9 @@ async fn pmm_constructor_state_is_reproducible() {
 async fn token_allowances_and_metadata_move_the_root() {
     let e = InMemoryStateEngine::new();
     let creator = funded_key(8).verifying_key().to_bytes();
-    e.credit_native(&creator, 10_000_000_000).await.expect("credit");
+    e.credit_native(&creator, 10_000_000_000)
+        .await
+        .expect("credit");
     let seeded = e.get_state_root().await;
 
     let id = e
@@ -354,7 +368,11 @@ async fn session_key_registry_moves_the_root() {
     let tx = Transaction::sign_with_session(&session, grant, [1u8; 32], 10, 1_000, 0, 1, 1, vec![]);
     let (_, _, _, status, _) = e.apply_block_parallel_fees(&[tx], 1_000).await;
     assert_eq!(status, vec![true], "the registering transaction must apply");
-    assert_eq!(e.session_keys_read().await.len(), 1, "it registered the key");
+    assert_eq!(
+        e.session_keys_read().await.len(),
+        1,
+        "it registered the key"
+    );
     assert_ne!(
         e.get_state_root().await,
         funded,
@@ -419,8 +437,13 @@ async fn staking_equivocation_dedup_pq_keys_and_vesting_move_the_root() {
     let e = InMemoryStateEngine::new();
     let key = funded_key(21);
     let val = key.verifying_key().to_bytes();
-    e.credit_native(&val, 1_000_000_000_000).await.expect("credit");
-    e.staking_write().await.bond(val, 2_000_000_000_000, 0).unwrap();
+    e.credit_native(&val, 1_000_000_000_000)
+        .await
+        .expect("credit");
+    e.staking_write()
+        .await
+        .bond(val, 2_000_000_000_000, 0)
+        .unwrap();
 
     let committed = e.get_state_root().await;
 
@@ -452,7 +475,10 @@ async fn staking_equivocation_dedup_pq_keys_and_vesting_move_the_root() {
         let mut ledger = e.staking_write().await;
         ledger.validator_pq_keys.insert(
             val,
-            (stellereum::post_quantum::PqScheme::Ed25519, vec![0xC3u8; 32]),
+            (
+                stellereum::post_quantum::PqScheme::Ed25519,
+                vec![0xC3u8; 32],
+            ),
         );
     }
     let after_keys = e.get_state_root().await;
@@ -479,10 +505,9 @@ async fn staking_equivocation_dedup_pq_keys_and_vesting_move_the_root() {
     // 4. The vesting schedule of the account.
     {
         let mut ledger = e.staking_write().await;
-        ledger.vesting_schedules.insert(
-            val,
-            stellereum::tokenomics::TeamVestingSchedule::new(1_000),
-        );
+        ledger
+            .vesting_schedules
+            .insert(val, stellereum::tokenomics::TeamVestingSchedule::new(1_000));
     }
     let after_vesting = e.get_state_root().await;
     assert_ne!(
@@ -521,7 +546,9 @@ async fn staking_lazy_reward_accumulator_moves_the_root() {
     let key = funded_key(31);
     let val = key.verifying_key().to_bytes();
     let delegator = funded_key(32).verifying_key().to_bytes();
-    e.credit_native(&val, 2_000_000_000_000).await.expect("credit");
+    e.credit_native(&val, 2_000_000_000_000)
+        .await
+        .expect("credit");
     {
         let mut ledger = e.staking_write().await;
         ledger.bond(val, 1_100_000_000_000, 0).unwrap();
@@ -532,7 +559,10 @@ async fn staking_lazy_reward_accumulator_moves_the_root() {
     // 1. The accumulator itself (the rate the payout is measured against).
     {
         let mut ledger = e.staking_write().await;
-        let state = stellereum::staking::ValidatorRewardState { reward_per_token: 1, ..Default::default() };
+        let state = stellereum::staking::ValidatorRewardState {
+            reward_per_token: 1,
+            ..Default::default()
+        };
         ledger.reward_accumulators.insert(val, state);
     }
     let after_acc = e.get_state_root().await;

@@ -12,9 +12,9 @@ use stellereum::sharding::{
 };
 use stellereum::state_engine::{memory_bounds, AccountState, InMemoryStateEngine};
 use stellereum::storage::{
-    check_validator_set_freshness, check_validator_set_freshness_with_lag,
-    decode_domain_snapshot, load_full_state_into, persist_push_policy, DomainSnapshot,
-    PersistJob, PersistPushPolicy, Storage, PERSIST_BLOCKING_WAIT_MS, PERSIST_QUEUE_CAP,
+    check_validator_set_freshness, check_validator_set_freshness_with_lag, decode_domain_snapshot,
+    load_full_state_into, persist_push_policy, DomainSnapshot, PersistJob, PersistPushPolicy,
+    Storage, PERSIST_BLOCKING_WAIT_MS, PERSIST_QUEUE_CAP,
 };
 use stellereum::sync::{
     chunk_batch_for_blob, fast_sync_state, plan_chunk_batches, snapshot_blob_budget_ms,
@@ -39,7 +39,11 @@ fn id_of(k: &SigningKey) -> [u8; 32] {
 }
 
 fn fabric_key(a: u8, b: u8) -> CrossShardKey {
-    CrossShardKey { source_shard: MASTERCHAIN_SHARD, finalized_in_block: [a; 32], msg_id: [b; 32] }
+    CrossShardKey {
+        source_shard: MASTERCHAIN_SHARD,
+        finalized_in_block: [a; 32],
+        msg_id: [b; 32],
+    }
 }
 
 fn test_block(height: u64, prev: [u8; 32], proposer: [u8; 32], state_root: [u8; 32]) -> Block {
@@ -98,12 +102,22 @@ async fn store_paired_snapshot(
     let dom_bytes = bincode::serialize(&dom).unwrap();
     store.put_state(height, &snap).unwrap();
     store.put_domains(height, &dom_bytes).unwrap();
-    store.put_session_keys(height, &engine.session_keys_snapshot().await).unwrap();
-    store.put_bridge(height, &engine.bridge_snapshot().await).unwrap();
-    store.put_confidential(height, &engine.confidential_snapshot().await).unwrap();
-    store.put_zkml_models(height, &engine.zkml_models_snapshot().await).unwrap();
+    store
+        .put_session_keys(height, &engine.session_keys_snapshot().await)
+        .unwrap();
+    store
+        .put_bridge(height, &engine.bridge_snapshot().await)
+        .unwrap();
+    store
+        .put_confidential(height, &engine.confidential_snapshot().await)
+        .unwrap();
+    store
+        .put_zkml_models(height, &engine.zkml_models_snapshot().await)
+        .unwrap();
     if let Some(r) = replay {
-        store.put_cross_shard(height, &bincode::serialize(r).unwrap()).unwrap();
+        store
+            .put_cross_shard(height, &bincode::serialize(r).unwrap())
+            .unwrap();
     }
     // Anchor at H+1 committing the post-H state (the rule
     // `expected_restore_root` enforces).
@@ -128,15 +142,33 @@ async fn f1_boot_restores_full_replay_sets() {
     assert_eq!(loaded.0, 11);
     // ALL THREE legs survive the restart — the pre-fix loader restored only
     // `engine_consumed`, dropping produced/completed (and the runtime half).
-    assert!(live.is_cross_shard_consumed(&replay.engine_consumed[0]).await);
-    assert!(live.is_cross_shard_consumed(&replay.runtime_consumed[0]).await);
-    assert_eq!(live.cross_shard_consumed_len().await, 2, "both consumed halves install");
-    assert_eq!(live.cross_shard_produced_len().await, 1, "produced survives restart");
+    assert!(
+        live.is_cross_shard_consumed(&replay.engine_consumed[0])
+            .await
+    );
+    assert!(
+        live.is_cross_shard_consumed(&replay.runtime_consumed[0])
+            .await
+    );
+    assert_eq!(
+        live.cross_shard_consumed_len().await,
+        2,
+        "both consumed halves install"
+    );
+    assert_eq!(
+        live.cross_shard_produced_len().await,
+        1,
+        "produced survives restart"
+    );
     assert!(
         live.is_cross_shard_completed(&replay.completed[0]).await,
         "completed survives restart"
     );
-    assert_eq!(live.get_state_root().await, root, "root covers the full replay set");
+    assert_eq!(
+        live.get_state_root().await,
+        root,
+        "root covers the full replay set"
+    );
 }
 
 #[tokio::test]
@@ -154,7 +186,9 @@ async fn f1_boot_missing_cross_shard_blob_is_refused() {
     let live = InMemoryStateEngine::new();
     let err = format!(
         "{:?}",
-        load_full_state_into(&store, &live).await.expect_err("must refuse")
+        load_full_state_into(&store, &live)
+            .await
+            .expect_err("must refuse")
     );
     assert!(
         err.contains("mismatch"),
@@ -189,7 +223,7 @@ fn f2_push_policy_classes() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     // Prune is the ONLY droppable class (re-scheduled next cadence).
     assert_eq!(
         persist_push_policy(&PersistJob::Prune { keep_from: 9 }),
@@ -201,7 +235,10 @@ fn f2_push_policy_classes() {
         PersistPushPolicy::BoundedWait
     );
     assert_eq!(
-        persist_push_policy(&PersistJob::State { height: 1, snapshot: vec![] }),
+        persist_push_policy(&PersistJob::State {
+            height: 1,
+            snapshot: vec![]
+        }),
         PersistPushPolicy::BoundedWait
     );
     assert_eq!(
@@ -217,7 +254,10 @@ fn f2_push_policy_classes() {
         PersistPushPolicy::BoundedWait
     );
     assert_eq!(
-        persist_push_policy(&PersistJob::Finalized { height: 1, hash: [0u8; 32] }),
+        persist_push_policy(&PersistJob::Finalized {
+            height: 1,
+            hash: [0u8; 32]
+        }),
         PersistPushPolicy::BoundedWait
     );
     assert_eq!(
@@ -235,7 +275,10 @@ fn f2_push_policy_classes() {
         persist_push_policy(&PersistJob::Consensus(Box::default())),
         PersistPushPolicy::BoundedWait
     );
-    assert_eq!(persist_push_policy(&PersistJob::Flush), PersistPushPolicy::BoundedWait);
+    assert_eq!(
+        persist_push_policy(&PersistJob::Flush),
+        PersistPushPolicy::BoundedWait
+    );
     // Audit numbers pinned: 8192-cap queue, 200ms bounded wait (deadlock-free
     // by the producer→writer→disk proof on `push`).
     assert_eq!(PERSIST_QUEUE_CAP, 8192);
@@ -265,14 +308,19 @@ async fn prune_safety_pruned_data_never_live_needed() {
     // Paired snapshot at 11 + a young domains row at 3 (prune fodder).
     let user = [0x11u8; 32];
     let engine = InMemoryStateEngine::new();
-    engine.update_account(AccountState::new(user, 500_000)).await;
+    engine
+        .update_account(AccountState::new(user, 500_000))
+        .await;
     store_paired_snapshot(&store, &engine, 11, None).await;
     store.put_domains(3, b"old").unwrap();
     store.put_cross_shard(3, b"old").unwrap();
 
     // Prune bodies below 8 (boundary rule height+1<keep_from keeps 7..).
     let removed = store.prune_blocks_below(8).unwrap();
-    assert_eq!(removed, 7, "heights 0..=6 go, 7.. stay (boundary keeps the link)");
+    assert_eq!(
+        removed, 7,
+        "heights 0..=6 go, 7.. stay (boundary keeps the link)"
+    );
     // Kept bodies verify; pruned bodies are honest misses, never fabrications.
     for h in 7..12u64 {
         let got = store.committed_body(h, &hashes[h as usize]).unwrap();
@@ -281,7 +329,10 @@ async fn prune_safety_pruned_data_never_live_needed() {
     }
     for h in 0..7u64 {
         assert!(
-            store.committed_body(h, &hashes[h as usize]).unwrap().is_none(),
+            store
+                .committed_body(h, &hashes[h as usize])
+                .unwrap()
+                .is_none(),
             "pruned body {h} must read as an honest miss"
         );
         assert!(
@@ -291,7 +342,10 @@ async fn prune_safety_pruned_data_never_live_needed() {
     }
     // Tip pointer + paired snapshot survive the prune.
     assert_eq!(store.finalized().unwrap(), Some((11, hashes[11])));
-    let (paired_h, _) = store.latest_paired_snapshot().unwrap().expect("paired survives");
+    let (paired_h, _) = store
+        .latest_paired_snapshot()
+        .unwrap()
+        .expect("paired survives");
     assert_eq!(paired_h, 11);
     // Domain-window prune drops the young rows, keeps the paired height.
     store.prune_domains_below(5).unwrap();
@@ -334,7 +388,10 @@ async fn crash_tail_unpaired_snapshot_refused() {
     let store = Storage::open(&dir).expect("open");
     // Genuine fresh dir: nothing stored → Ok(None) (fresh start, not an error).
     let fresh = InMemoryStateEngine::new();
-    assert!(load_full_state_into(&store, &fresh).await.unwrap().is_none());
+    assert!(load_full_state_into(&store, &fresh)
+        .await
+        .unwrap()
+        .is_none());
 
     // Crash between the two snapshot jobs: state@9 with no domains@9.
     let user = [0x22u8; 32];
@@ -342,12 +399,20 @@ async fn crash_tail_unpaired_snapshot_refused() {
     engine.update_account(AccountState::new(user, 10_000)).await;
     store.put_state(9, &engine.create_snapshot().await).unwrap();
     let live = InMemoryStateEngine::new();
-    let err = format!("{:?}", load_full_state_into(&store, &live).await.expect_err("half snapshot"));
+    let err = format!(
+        "{:?}",
+        load_full_state_into(&store, &live)
+            .await
+            .expect_err("half snapshot")
+    );
     assert!(
         err.contains("both") || err.contains("half") || err.contains("paired"),
         "must refuse the unpaired tail loudly, never resume on half: {err}"
     );
-    assert!(live.get_account(&user).await.is_none(), "refusal leaves live state untouched");
+    assert!(
+        live.get_account(&user).await.is_none(),
+        "refusal leaves live state untouched"
+    );
 }
 
 // ===========================================================================
@@ -406,7 +471,10 @@ fn bond_genesis_callers_only_fund_genesis() {
         1,
         "exactly one bond_genesis call site may exist (fund_genesis): {calls:?}"
     );
-    assert_eq!(calls[0].0, "runtime.rs", "the call must live in runtime.rs: {calls:?}");
+    assert_eq!(
+        calls[0].0, "runtime.rs",
+        "the call must live in runtime.rs: {calls:?}"
+    );
     // The call must sit inside `fund_genesis`: nearest preceding fn item.
     let text = std::fs::read_to_string(srcdir.join("runtime.rs")).unwrap();
     let lines: Vec<&str> = text.lines().collect();
@@ -433,8 +501,7 @@ fn bond_genesis_callers_only_fund_genesis() {
 async fn f5_slash_after_reward_net_outcome_pinned() {
     use stellereum::consensus::{QuorumCertificate, Vote, VoteKind};
     use stellereum::staking::{
-        DOWNTIME_SLASH_BPS, MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL,
-        UNBONDING_PERIOD_SECS,
+        DOWNTIME_SLASH_BPS, MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, UNBONDING_PERIOD_SECS,
     };
 
     // POLICY (W10.5 canonical downtime evidence + V-P34 fail-closed QC):
@@ -450,32 +517,36 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
     let w: [u8; 32] = w_key.verifying_key().to_bytes();
     const W_POWER: u64 = 10 * MIN_VALIDATOR_BOND;
 
-    async fn prepared_engine(
-        w_key: &SigningKey,
-        w: [u8; 32],
-    ) -> (InMemoryStateEngine, [u8; 32]) {
+    async fn prepared_engine(w_key: &SigningKey, w: [u8; 32]) -> (InMemoryStateEngine, [u8; 32]) {
         let v = [0xEBu8; 32];
         let e = InMemoryStateEngine::new();
         // Bond victim 2x MIN + witness quorum-alone power.
-        e.staking_write().await.bond(v, 2 * MIN_VALIDATOR_BOND, 0).unwrap();
+        e.staking_write()
+            .await
+            .bond(v, 2 * MIN_VALIDATOR_BOND, 0)
+            .unwrap();
         e.staking_write().await.bond(w, W_POWER, 0).unwrap();
         // Native legs the transition touches (else debits fail — ignored but
         // counted — and the test would pin noise instead of economics).
-        e.update_account(AccountState::new(STAKING_POOL, u64::MAX / 2)).await;
+        e.update_account(AccountState::new(STAKING_POOL, u64::MAX / 2))
+            .await;
         e.update_account(AccountState::new(REWARDS_POOL, 0)).await;
         e.update_account(AccountState::new(v, 1_000_000)).await;
         // Unbond 0.5x MIN now: leaves slashable immediately (pool-separation
         // proof), matures at TS+PERIOD inside the transition's step 4.
         const TS: u64 = 1_760_000_000;
-        e.staking_write().await.unbond(v, MIN_VALIDATOR_BOND / 2, TS).unwrap();
+        e.staking_write()
+            .await
+            .unbond(v, MIN_VALIDATOR_BOND / 2, TS)
+            .unwrap();
         // 9 recorded misses for the victim (threshold 10): the witness signs
         // every height, so only the victim's streak grows.
         let _ = w_key;
         for h in 1..10u64 {
-            let burned = e
-                .staking_write()
-                .await
-                .note_missed_heights(h, &|id: &[u8; 32]| *id == w, &[v, w]);
+            let burned =
+                e.staking_write()
+                    .await
+                    .note_missed_heights(h, &|id: &[u8; 32]| *id == w, &[v, w]);
             assert_eq!(burned, 0, "threshold not yet reached at height {h}");
         }
         (e, v)
@@ -490,7 +561,10 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
     async fn apply_once(
         w_key: &SigningKey,
         w: [u8; 32],
-    ) -> (InMemoryStateEngine, stellereum::state_engine::BlockTransitionOutcome) {
+    ) -> (
+        InMemoryStateEngine,
+        stellereum::state_engine::BlockTransitionOutcome,
+    ) {
         let (e, v) = prepared_engine(w_key, w).await;
         // Genuine height-9 QC signed by the witness alone (quorum-alone power,
         // omits the victim): verifies under the pre-transition set and casts
@@ -506,7 +580,10 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
         };
         {
             let set = e.staking_read().await.to_validator_set();
-            assert!(qc.verify(&set), "height-9 witness QC must verify under the pre-transition set");
+            assert!(
+                qc.verify(&set),
+                "height-9 witness QC must verify under the pre-transition set"
+            );
         }
         let block = Block {
             shard_id: MASTERCHAIN_SHARD,
@@ -524,20 +601,26 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         let out = e.apply_block_transition(&block, REWARD).await;
         (e, out)
     }
 
     let (e1, out1) = apply_once(&w_key, w).await;
     // Slash fired exactly once, at 0.1% of the post-unbond slashable total.
-    assert_eq!(out1.slashed, expected_slash, "slash burns bonded stake only");
+    assert_eq!(
+        out1.slashed, expected_slash,
+        "slash burns bonded stake only"
+    );
     // Reward was paid DESPITE the same-block slash (pool separation: reward
     // mints to pending_rewards, slash burns bonded) — the deterministic
     // economic edge F5 documents, pinned so any reorder attempt must update it.
     let ledger = e1.staking_read().await;
     let rec = ledger.validators.get(&[0xEBu8; 32]).unwrap();
-    assert_eq!(rec.pending_rewards, REWARD, "same-block reward survives the slash");
+    assert_eq!(
+        rec.pending_rewards, REWARD,
+        "same-block reward survives the slash"
+    );
     assert_eq!(
         rec.self_bond,
         slashable - expected_slash,
@@ -579,10 +662,11 @@ async fn fee_parity_fast_path_and_sequential_charge_floor() {
     let batch_engine = InMemoryStateEngine::new();
     batch_engine.governance_write().await.applied.min_gas_limit = Some(FLOOR);
     for k in &senders {
-        batch_engine.update_account(AccountState::new(id_of(k), BAL)).await;
+        batch_engine
+            .update_account(AccountState::new(id_of(k), BAL))
+            .await;
     }
-    let (_, _, collected, status, fees) =
-        batch_engine.apply_block_parallel_fees(&txs, TS).await;
+    let (_, _, collected, status, fees) = batch_engine.apply_block_parallel_fees(&txs, TS).await;
     assert_eq!(status, vec![true; 10]);
     assert_eq!(fees, vec![FLOOR; 10], "batch path must charge the floor");
     assert_eq!(collected, FLOOR * 10);
@@ -592,7 +676,9 @@ async fn fee_parity_fast_path_and_sequential_charge_floor() {
         let e = InMemoryStateEngine::new();
         e.governance_write().await.applied.min_gas_limit = Some(FLOOR);
         e.update_account(AccountState::new(id_of(k), BAL)).await;
-        let (_, _, _, s, f) = e.apply_block_parallel_fees(std::slice::from_ref(tx), TS).await;
+        let (_, _, _, s, f) = e
+            .apply_block_parallel_fees(std::slice::from_ref(tx), TS)
+            .await;
         assert_eq!(s, vec![true]);
         assert_eq!(f, vec![FLOOR], "sequential path must charge the same floor");
     }
@@ -655,7 +741,10 @@ fn memory_caps_watermark_is_warn_only_pure() {
         5_000_000 * 384,
         "5M accounts ≈ 1.9GiB hot state (the warn-at-OOM datum)"
     );
-    assert!(memory_bounds::snapshot_chunk_accounts() >= 1, "chunk size clamps to ≥1");
+    assert!(
+        memory_bounds::snapshot_chunk_accounts() >= 1,
+        "chunk size clamps to ≥1"
+    );
 }
 
 // ===========================================================================
@@ -668,28 +757,41 @@ async fn chunked_roundtrip_validate_then_commit_and_preserve_twin() {
     // one chunk, not full state).
     let src = InMemoryStateEngine::new();
     for i in 0..5u8 {
-        src.update_account(AccountState::new([0x40 + i; 32], 1000 + i as u64)).await;
+        src.update_account(AccountState::new([0x40 + i; 32], 1000 + i as u64))
+            .await;
     }
     let chunks = src.create_snapshot_chunked(Some(2)).await;
     assert_eq!(chunks.len(), 3, "5 accounts at 2/chunk stream as 3 chunks");
 
     // Reorg twin installs; root matches the monolithic restore.
     let reorg = InMemoryStateEngine::new();
-    reorg.restore_snapshot_chunked(&chunks).await.expect("valid chunks install");
+    reorg
+        .restore_snapshot_chunked(&chunks)
+        .await
+        .expect("valid chunks install");
     let mono = InMemoryStateEngine::new();
-    mono.restore_snapshot(&src.create_snapshot().await).await.unwrap();
+    mono.restore_snapshot(&src.create_snapshot().await)
+        .await
+        .unwrap();
     assert_eq!(reorg.get_state_root().await, mono.get_state_root().await);
 
     // Poisoned middle chunk: Err AND live state untouched (F10 fix — the old
     // code wiped map+trie+replay before decoding).
     let victim = InMemoryStateEngine::new();
     let keep = [0x77u8; 32];
-    victim.update_account(AccountState::new(keep, 999_999)).await;
-    victim.restore_cross_shard_consumed(&[fabric_key(1, 2)]).await;
+    victim
+        .update_account(AccountState::new(keep, 999_999))
+        .await;
+    victim
+        .restore_cross_shard_consumed(&[fabric_key(1, 2)])
+        .await;
     let root_before = victim.get_state_root().await;
     let mut bad = chunks.clone();
     bad[1] = vec![0xDE, 0xAD, 0xBE, 0xEF];
-    let err = victim.restore_snapshot_chunked(&bad).await.expect_err("poisoned chunk");
+    let err = victim
+        .restore_snapshot_chunked(&bad)
+        .await
+        .expect_err("poisoned chunk");
     assert!(err.contains('1'), "error names the chunk index: {err}");
     assert_eq!(victim.get_account(&keep).await.unwrap().balance, 999_999);
     assert_eq!(victim.cross_shard_consumed_len().await, 1);
@@ -699,13 +801,27 @@ async fn chunked_roundtrip_validate_then_commit_and_preserve_twin() {
     // monolithic preserve-restore of the same inputs.
     let keeper = InMemoryStateEngine::new();
     keeper.update_account(AccountState::new(keep, 1)).await;
-    keeper.restore_cross_shard_consumed(&[fabric_key(3, 4)]).await;
-    keeper.restore_snapshot_chunked_preserve_replay_sets(&chunks).await.expect("preserve installs");
-    assert_eq!(keeper.cross_shard_consumed_len().await, 1, "replay preserved");
+    keeper
+        .restore_cross_shard_consumed(&[fabric_key(3, 4)])
+        .await;
+    keeper
+        .restore_snapshot_chunked_preserve_replay_sets(&chunks)
+        .await
+        .expect("preserve installs");
+    assert_eq!(
+        keeper.cross_shard_consumed_len().await,
+        1,
+        "replay preserved"
+    );
     assert!(keeper.is_cross_shard_consumed(&fabric_key(3, 4)).await);
     let reference = InMemoryStateEngine::new();
-    reference.restore_snapshot_preserve_replay_sets(&src.create_snapshot().await).await.unwrap();
-    reference.restore_cross_shard_consumed(&[fabric_key(3, 4)]).await;
+    reference
+        .restore_snapshot_preserve_replay_sets(&src.create_snapshot().await)
+        .await
+        .unwrap();
+    reference
+        .restore_cross_shard_consumed(&[fabric_key(3, 4)])
+        .await;
     assert_eq!(
         keeper.get_state_root().await,
         reference.get_state_root().await,
@@ -716,10 +832,7 @@ async fn chunked_roundtrip_validate_then_commit_and_preserve_twin() {
 #[test]
 fn chunk_streaming_bounds_pure() {
     // Batch planner: exact tiling, no drops, no overlaps, zero-width safe.
-    assert_eq!(
-        plan_chunk_batches(10, 4),
-        vec![(0, 4), (4, 8), (8, 10)]
-    );
+    assert_eq!(plan_chunk_batches(10, 4), vec![(0, 4), (4, 8), (8, 10)]);
     assert!(plan_chunk_batches(0, 4).is_empty());
     assert_eq!(plan_chunk_batches(3, 0), vec![(0, 1), (1, 2), (2, 3)]);
     // Large blobs assemble strictly serially (one chunk stream on weak nodes).
@@ -747,7 +860,9 @@ async fn f7_pq_keys_blob_installs_on_sync() {
     let e = InMemoryStateEngine::new();
     assert!(e.restore_pq_keys(&[0xDE, 0xAD]).await.is_err());
     e.restore_pq_keys(&blob).await.expect("pq blob installs");
-    let (scheme, got) = e.get_pinned_pubkey(&addr).expect("key pinned after restore");
+    let (scheme, got) = e
+        .get_pinned_pubkey(&addr)
+        .expect("key pinned after restore");
     assert_eq!(scheme, PqScheme::Falcon512);
     assert_eq!(got, pk);
 
@@ -766,13 +881,22 @@ async fn f7_pq_keys_blob_installs_on_sync() {
         || async { Some(snap.clone()) },
         |kind: &'static str| {
             let blob = blob.clone();
-            async move { if kind == "pq_keys" { Some(blob) } else { None } }
+            async move {
+                if kind == "pq_keys" {
+                    Some(blob)
+                } else {
+                    None
+                }
+            }
         },
     )
     .await
     .expect("sync with pq blob verifies");
     assert_eq!(target.get_state_root().await, root);
-    assert!(target.get_pinned_pubkey(&addr).is_some(), "pq keys installed, not skipped");
+    assert!(
+        target.get_pinned_pubkey(&addr).is_some(),
+        "pq keys installed, not skipped"
+    );
 }
 
 // ===========================================================================
@@ -790,15 +914,31 @@ async fn receipts_short_fees_match_block_path() {
     let hash = [0x77u8; 32];
     // Truncated fees (one entry for two txs): success falls back to the
     // BLOCK-path charge (declared gas_limit), exactly what commit_native took.
-    store.put_receipts_for_block(5, &hash, &txs, &[true, true], &[600_000]).unwrap();
-    let r0 = store.get_receipt(&tx0.compute_tx_hash()).unwrap().expect("r0");
-    let r1 = store.get_receipt(&tx1.compute_tx_hash()).unwrap().expect("r1");
+    store
+        .put_receipts_for_block(5, &hash, &txs, &[true, true], &[600_000])
+        .unwrap();
+    let r0 = store
+        .get_receipt(&tx0.compute_tx_hash())
+        .unwrap()
+        .expect("r0");
+    let r1 = store
+        .get_receipt(&tx1.compute_tx_hash())
+        .unwrap()
+        .expect("r1");
     assert_eq!(r0.fee_charged, 600_000, "explicit fee filed verbatim");
-    assert_eq!(r1.fee_charged, 700_000, "short-fees success falls back to gas_limit (block path)");
+    assert_eq!(
+        r1.fee_charged, 700_000,
+        "short-fees success falls back to gas_limit (block path)"
+    );
     // Short statuses fail closed (missing = failed) with zero fee (fees short
     // too, so the failure fallback — 0-on-fail — applies, not an explicit fee).
-    store.put_receipts_for_block(6, &hash, &txs, &[true], &[600_000]).unwrap();
-    let r1b = store.get_receipt(&tx1.compute_tx_hash()).unwrap().expect("r1b");
+    store
+        .put_receipts_for_block(6, &hash, &txs, &[true], &[600_000])
+        .unwrap();
+    let r1b = store
+        .get_receipt(&tx1.compute_tx_hash())
+        .unwrap()
+        .expect("r1b");
     assert!(!r1b.success);
     assert_eq!(r1b.fee_charged, 0);
 }
@@ -824,7 +964,9 @@ fn finalized_blob_survives_half_written_legacy_keys() {
     );
     // And a rotted blob falls back to the legacy pair instead of bricking.
     store.set_meta("finalized_blob", b"junk").unwrap();
-    store.set_meta("finalized_height", &7u64.to_be_bytes()).unwrap();
+    store
+        .set_meta("finalized_height", &7u64.to_be_bytes())
+        .unwrap();
     assert_eq!(
         store.finalized().unwrap(),
         Some((7, [9u8; 32])),
@@ -843,13 +985,17 @@ fn finalized_blob_survives_half_written_legacy_keys() {
 
 #[tokio::test]
 async fn tail_anchor_refuses_gaps_and_empty() {
-    use stellereum::sync::verify_snapshot_anchor_tail;
     use stellereum::consensus::ValidatorSet;
+    use stellereum::sync::verify_snapshot_anchor_tail;
     let vset = ValidatorSet::from_list(vec![([0x01u8; 32], 1)]);
     // No header at height 0 to anchor on.
-    let err = verify_snapshot_anchor_tail(0, &vset, |_| async { None }).await.unwrap_err();
+    let err = verify_snapshot_anchor_tail(0, &vset, |_| async { None })
+        .await
+        .unwrap_err();
     assert!(err.contains("height 0"), "empty anchor refused: {err}");
     // Missing window header is a refusal, never a skip (unverifiable tail).
-    let err = verify_snapshot_anchor_tail(100, &vset, |_| async { None }).await.unwrap_err();
+    let err = verify_snapshot_anchor_tail(100, &vset, |_| async { None })
+        .await
+        .unwrap_err();
     assert!(err.contains("no header"), "gap refused fail-closed: {err}");
 }

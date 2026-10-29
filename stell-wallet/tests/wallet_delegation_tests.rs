@@ -24,14 +24,14 @@ mod client;
 
 use client::LightClient;
 use rpc::{RpcConfig, TxFinality};
-use stellereum::svm::{
-    OpCode, GAS_BASIC_TRANSFER, GAS_STAKE_BOND, GAS_STAKE_CLAIM, GAS_STAKE_UNBOND,
-};
-use stellereum::wallet::WalletAccount;
 use std::process::Command;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use stellereum::svm::{
+    OpCode, GAS_BASIC_TRANSFER, GAS_STAKE_BOND, GAS_STAKE_CLAIM, GAS_STAKE_UNBOND,
+};
+use stellereum::wallet::WalletAccount;
 
 static NEXT_PORT: AtomicU16 = AtomicU16::new(19800);
 
@@ -115,7 +115,10 @@ async fn fund_account(node: &LiveNode, addr: [u8; 32], balance: u64) {
 
 fn get_opcode_discriminant(op: &OpCode) -> u32 {
     let bytes = bincode::serialize(op).expect("serialize opcode");
-    assert!(bytes.len() >= 4, "bincode encodes discriminant in first 4 bytes");
+    assert!(
+        bytes.len() >= 4,
+        "bincode encodes discriminant in first 4 bytes"
+    );
     u32::from_le_bytes(bytes[..4].try_into().unwrap())
 }
 
@@ -128,7 +131,10 @@ fn test_cli_parsing_delegate_command() {
     let bin = env!("CARGO_BIN_EXE_stell");
 
     // Help displays usage and expected arguments
-    let out = Command::new(bin).args(["delegate", "--help"]).output().expect("exec");
+    let out = Command::new(bin)
+        .args(["delegate", "--help"])
+        .output()
+        .expect("exec");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("delegate [OPTIONS] <AMOUNT>"));
@@ -146,8 +152,14 @@ fn test_cli_parsing_delegate_command() {
         .output()
         .expect("exec");
     assert!(!out_bad_hex.status.success());
-    let err_msg = format!("{}{}", String::from_utf8_lossy(&out_bad_hex.stdout), String::from_utf8_lossy(&out_bad_hex.stderr));
-    assert!(err_msg.contains("validator key") || err_msg.contains("hex") || err_msg.contains("Invalid"));
+    let err_msg = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out_bad_hex.stdout),
+        String::from_utf8_lossy(&out_bad_hex.stderr)
+    );
+    assert!(
+        err_msg.contains("validator key") || err_msg.contains("hex") || err_msg.contains("Invalid")
+    );
 
     // Passing invalid amount (negative or 0) triggers amount parser error
     let out_zero = Command::new(bin)
@@ -155,7 +167,11 @@ fn test_cli_parsing_delegate_command() {
         .output()
         .expect("exec");
     assert!(!out_zero.status.success());
-    let err_msg = format!("{}{}", String::from_utf8_lossy(&out_zero.stdout), String::from_utf8_lossy(&out_zero.stderr));
+    let err_msg = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out_zero.stdout),
+        String::from_utf8_lossy(&out_zero.stderr)
+    );
     assert!(err_msg.contains("greater than zero") || err_msg.contains("Wallet not found"));
 }
 
@@ -164,14 +180,20 @@ fn test_cli_parsing_begin_unbond_command() {
     let bin = env!("CARGO_BIN_EXE_stell");
 
     // Help displays usage
-    let out = Command::new(bin).args(["begin-unbond", "--help"]).output().expect("exec");
+    let out = Command::new(bin)
+        .args(["begin-unbond", "--help"])
+        .output()
+        .expect("exec");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("begin-unbond [OPTIONS] <AMOUNT>"));
     assert!(stdout.contains("--validator <VALIDATOR>"));
 
     // Missing amount fails with code 2
-    let out_err = Command::new(bin).args(["begin-unbond"]).output().expect("exec");
+    let out_err = Command::new(bin)
+        .args(["begin-unbond"])
+        .output()
+        .expect("exec");
     assert_eq!(out_err.status.code(), Some(2));
 
     // Invalid validator key length rejected
@@ -180,7 +202,11 @@ fn test_cli_parsing_begin_unbond_command() {
         .output()
         .expect("exec");
     assert!(!out_short_hex.status.success());
-    let err_msg = format!("{}{}", String::from_utf8_lossy(&out_short_hex.stdout), String::from_utf8_lossy(&out_short_hex.stderr));
+    let err_msg = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out_short_hex.stdout),
+        String::from_utf8_lossy(&out_short_hex.stderr)
+    );
     assert!(err_msg.contains("32 bytes") || err_msg.contains("64 hex"));
 }
 
@@ -189,7 +215,10 @@ fn test_cli_parsing_withdraw_unbond_command() {
     let bin = env!("CARGO_BIN_EXE_stell");
 
     // Help displays usage
-    let out = Command::new(bin).args(["withdraw-unbond", "--help"]).output().expect("exec");
+    let out = Command::new(bin)
+        .args(["withdraw-unbond", "--help"])
+        .output()
+        .expect("exec");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("withdraw-unbond [OPTIONS]"));
@@ -208,7 +237,10 @@ fn test_cli_parsing_claim_rewards_command() {
     let bin = env!("CARGO_BIN_EXE_stell");
 
     // Help displays usage
-    let out = Command::new(bin).args(["claim-rewards", "--help"]).output().expect("exec");
+    let out = Command::new(bin)
+        .args(["claim-rewards", "--help"])
+        .output()
+        .expect("exec");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("claim-rewards [OPTIONS]"));
@@ -239,7 +271,10 @@ fn test_tx_construction_delegate() {
 
     // Direct construction via WalletAccount::create_payload_transaction
     let tx2 = delegator.create_payload_transaction(
-        vec![OpCode::SysCallDelegate { validator, amount: amount_nano }],
+        vec![OpCode::SysCallDelegate {
+            validator,
+            amount: amount_nano,
+        }],
         GAS_STAKE_BOND + GAS_BASIC_TRANSFER,
         nonce,
     );
@@ -256,7 +291,10 @@ fn test_tx_construction_delegate() {
     // Check payload
     assert_eq!(tx1.payload.len(), 1);
     match &tx1.payload[0] {
-        OpCode::SysCallDelegate { validator: v, amount: a } => {
+        OpCode::SysCallDelegate {
+            validator: v,
+            amount: a,
+        } => {
             assert_eq!(*v, validator);
             assert_eq!(*a, amount_nano);
         }
@@ -281,7 +319,10 @@ fn test_tx_construction_begin_unbond() {
 
     assert_eq!(tx.payload.len(), 1);
     match &tx.payload[0] {
-        OpCode::SysCallBeginUndelegate { validator: v, amount: a } => {
+        OpCode::SysCallBeginUndelegate {
+            validator: v,
+            amount: a,
+        } => {
             assert_eq!(*v, validator);
             assert_eq!(*a, amount_nano);
         }
@@ -347,11 +388,13 @@ fn test_tx_construction_claim_rewards_validator_and_delegator() {
     }
 
     // Case 3: Explicit build_claim_delegator_rewards_tx helper
-    let tx_del_explicit = LightClient::build_claim_delegator_rewards_tx(&account, other_validator, nonce + 1);
+    let tx_del_explicit =
+        LightClient::build_claim_delegator_rewards_tx(&account, other_validator, nonce + 1);
     assert_eq!(tx_del.compute_tx_hash(), tx_del_explicit.compute_tx_hash());
 
     // Case 4: Explicit build_claim_validator_rewards_tx helper
-    let tx_val_explicit = LightClient::build_claim_validator_rewards_tx(&account, account.address, nonce);
+    let tx_val_explicit =
+        LightClient::build_claim_validator_rewards_tx(&account, account.address, nonce);
     assert_eq!(tx_val.compute_tx_hash(), tx_val_explicit.compute_tx_hash());
 }
 
@@ -364,29 +407,56 @@ fn test_verify_opcode_discriminants_exhaustive() {
     let dummy_val = [0x55u8; 32];
 
     // 1. SysCallDelegate (defined at svm.rs line 375, bincode discriminant 23)
-    let op_delegate = OpCode::SysCallDelegate { validator: dummy_val, amount: 100 };
+    let op_delegate = OpCode::SysCallDelegate {
+        validator: dummy_val,
+        amount: 100,
+    };
     let disc_delegate = get_opcode_discriminant(&op_delegate);
-    assert_eq!(disc_delegate, 23, "SysCallDelegate must have bincode discriminant 23 (svm.rs:375)");
+    assert_eq!(
+        disc_delegate, 23,
+        "SysCallDelegate must have bincode discriminant 23 (svm.rs:375)"
+    );
 
     // 2. SysCallBeginUndelegate (discriminant 44)
-    let op_begin_unbond = OpCode::SysCallBeginUndelegate { validator: dummy_val, amount: 100 };
+    let op_begin_unbond = OpCode::SysCallBeginUndelegate {
+        validator: dummy_val,
+        amount: 100,
+    };
     let disc_begin_unbond = get_opcode_discriminant(&op_begin_unbond);
-    assert_eq!(disc_begin_unbond, 44, "SysCallBeginUndelegate must have bincode discriminant 44");
+    assert_eq!(
+        disc_begin_unbond, 44,
+        "SysCallBeginUndelegate must have bincode discriminant 44"
+    );
 
     // 3. SysCallUndelegate (defined at svm.rs line 377, bincode discriminant 24)
-    let op_withdraw_unbond = OpCode::SysCallUndelegate { validator: dummy_val };
+    let op_withdraw_unbond = OpCode::SysCallUndelegate {
+        validator: dummy_val,
+    };
     let disc_withdraw = get_opcode_discriminant(&op_withdraw_unbond);
-    assert_eq!(disc_withdraw, 24, "SysCallUndelegate must have bincode discriminant 24 (svm.rs:377)");
+    assert_eq!(
+        disc_withdraw, 24,
+        "SysCallUndelegate must have bincode discriminant 24 (svm.rs:377)"
+    );
 
     // 4. SysCallClaimRewards (defined at svm.rs line 379, bincode discriminant 25)
-    let op_claim_val = OpCode::SysCallClaimRewards { validator: dummy_val };
+    let op_claim_val = OpCode::SysCallClaimRewards {
+        validator: dummy_val,
+    };
     let disc_claim_val = get_opcode_discriminant(&op_claim_val);
-    assert_eq!(disc_claim_val, 25, "SysCallClaimRewards must have bincode discriminant 25 (svm.rs:379)");
+    assert_eq!(
+        disc_claim_val, 25,
+        "SysCallClaimRewards must have bincode discriminant 25 (svm.rs:379)"
+    );
 
     // 5. SysCallClaimDelegatorRewards (discriminant 45)
-    let op_claim_del = OpCode::SysCallClaimDelegatorRewards { validator: dummy_val };
+    let op_claim_del = OpCode::SysCallClaimDelegatorRewards {
+        validator: dummy_val,
+    };
     let disc_claim_del = get_opcode_discriminant(&op_claim_del);
-    assert_eq!(disc_claim_del, 45, "SysCallClaimDelegatorRewards must have bincode discriminant 45");
+    assert_eq!(
+        disc_claim_del, 45,
+        "SysCallClaimDelegatorRewards must have bincode discriminant 45"
+    );
 
     // Verify round-trip deserialization preserves opcodes
     let raw_del = bincode::serialize(&op_delegate).unwrap();
@@ -407,7 +477,10 @@ fn test_verify_opcode_discriminants_exhaustive() {
 
     let raw_cdr = bincode::serialize(&op_claim_del).unwrap();
     let de_cdr: OpCode = bincode::deserialize(&raw_cdr).unwrap();
-    assert!(matches!(de_cdr, OpCode::SysCallClaimDelegatorRewards { .. }));
+    assert!(matches!(
+        de_cdr,
+        OpCode::SysCallClaimDelegatorRewards { .. }
+    ));
 }
 
 // -----------------------------------------------------------------------------
@@ -432,7 +505,13 @@ async fn test_delegate_tx_admission_and_receipt_confirmation() {
 
     // Consensus finalize hook records successful receipt at height 1
     node.state
-        .record_receipts(1, [0x01u8; 32], std::slice::from_ref(&tx), &[true], &[282_000])
+        .record_receipts(
+            1,
+            [0x01u8; 32],
+            std::slice::from_ref(&tx),
+            &[true],
+            &[282_000],
+        )
         .await;
 
     let cfg = client.rpc.clone().unwrap();
@@ -453,18 +532,30 @@ async fn test_begin_unbond_admission_and_receipt_confirmation() {
     let client = rpc_client(&node).await;
     let tx = LightClient::build_begin_unbond_tx(&delegator, validator, 5_000_000_000, 0);
 
-    let (tx_hash, finality) = client.broadcast_tx(&tx).await.expect("broadcast begin unbond");
+    let (tx_hash, finality) = client
+        .broadcast_tx(&tx)
+        .await
+        .expect("broadcast begin unbond");
     assert_eq!(finality, TxFinality::Pending);
     assert!(node.state.mempool.read().await.contains(&tx_hash));
 
     // Finalize at height 2
     node.state
-        .record_receipts(2, [0x02u8; 32], std::slice::from_ref(&tx), &[true], &[280_800])
+        .record_receipts(
+            2,
+            [0x02u8; 32],
+            std::slice::from_ref(&tx),
+            &[true],
+            &[280_800],
+        )
         .await;
 
     let cfg = client.rpc.clone().unwrap();
     let final_status = rpc::poll_receipt(&cfg, &hex::encode(tx_hash), 5, 1);
-    assert!(matches!(final_status, TxFinality::Confirmed { height: 2, .. }));
+    assert!(matches!(
+        final_status,
+        TxFinality::Confirmed { height: 2, .. }
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -477,17 +568,29 @@ async fn test_withdraw_unbond_admission_and_receipt_confirmation() {
     let client = rpc_client(&node).await;
     let tx = LightClient::build_withdraw_unbond_tx(&delegator, validator, 0);
 
-    let (tx_hash, finality) = client.broadcast_tx(&tx).await.expect("broadcast withdraw unbond");
+    let (tx_hash, finality) = client
+        .broadcast_tx(&tx)
+        .await
+        .expect("broadcast withdraw unbond");
     assert_eq!(finality, TxFinality::Pending);
 
     // Finalize at height 3
     node.state
-        .record_receipts(3, [0x03u8; 32], std::slice::from_ref(&tx), &[true], &[280_800])
+        .record_receipts(
+            3,
+            [0x03u8; 32],
+            std::slice::from_ref(&tx),
+            &[true],
+            &[280_800],
+        )
         .await;
 
     let cfg = client.rpc.clone().unwrap();
     let final_status = rpc::poll_receipt(&cfg, &hex::encode(tx_hash), 5, 1);
-    assert!(matches!(final_status, TxFinality::Confirmed { height: 3, .. }));
+    assert!(matches!(
+        final_status,
+        TxFinality::Confirmed { height: 3, .. }
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -500,17 +603,29 @@ async fn test_claim_rewards_admission_and_receipt_confirmation() {
     let client = rpc_client(&node).await;
     let tx = LightClient::build_claim_delegator_rewards_tx(&delegator, validator, 0);
 
-    let (tx_hash, finality) = client.broadcast_tx(&tx).await.expect("broadcast claim delegator rewards");
+    let (tx_hash, finality) = client
+        .broadcast_tx(&tx)
+        .await
+        .expect("broadcast claim delegator rewards");
     assert_eq!(finality, TxFinality::Pending);
 
     // Finalize at height 4
     node.state
-        .record_receipts(4, [0x04u8; 32], std::slice::from_ref(&tx), &[true], &[280_600])
+        .record_receipts(
+            4,
+            [0x04u8; 32],
+            std::slice::from_ref(&tx),
+            &[true],
+            &[280_600],
+        )
         .await;
 
     let cfg = client.rpc.clone().unwrap();
     let final_status = rpc::poll_receipt(&cfg, &hex::encode(tx_hash), 5, 1);
-    assert!(matches!(final_status, TxFinality::Confirmed { height: 4, .. }));
+    assert!(matches!(
+        final_status,
+        TxFinality::Confirmed { height: 4, .. }
+    ));
 }
 
 // -----------------------------------------------------------------------------
@@ -530,13 +645,25 @@ async fn test_receipt_polling_rejection_marks_failed_not_confirmed() {
 
     // Node reports receipt with success=false (SVM execution reverted)
     node.state
-        .record_receipts(5, [0x05u8; 32], std::slice::from_ref(&tx), &[false], &[282_000])
+        .record_receipts(
+            5,
+            [0x05u8; 32],
+            std::slice::from_ref(&tx),
+            &[false],
+            &[282_000],
+        )
         .await;
 
     let cfg = client.rpc.clone().unwrap();
     let status = rpc::poll_receipt(&cfg, &hex::encode(tx_hash), 5, 1);
     assert!(
-        matches!(status, TxFinality::Failed { height: Some(5), .. }),
+        matches!(
+            status,
+            TxFinality::Failed {
+                height: Some(5),
+                ..
+            }
+        ),
         "failed receipt must never report confirmed: got {status:?}"
     );
 }
@@ -552,7 +679,10 @@ async fn test_node_rejection_mempool_insufficient_funds() {
 
     // Node mempool admission rejects transactions with balance < gas_limit
     let res = client.broadcast_tx(&tx).await;
-    assert!(res.is_err(), "node must reject admission for account with zero balance");
+    assert!(
+        res.is_err(),
+        "node must reject admission for account with zero balance"
+    );
     let err_text = res.err().unwrap();
     assert!(err_text.contains("rejected") && err_text.contains("cannot pay"));
 }
@@ -571,7 +701,10 @@ async fn test_node_rejection_corrupted_signature() {
     tx.signature[0] ^= 0xFF;
 
     let res = client.broadcast_tx(&tx).await;
-    assert!(res.is_err(), "tampered signature must be rejected immediately");
+    assert!(
+        res.is_err(),
+        "tampered signature must be rejected immediately"
+    );
     assert!(res.err().unwrap().contains("signature"));
 }
 

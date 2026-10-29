@@ -8,11 +8,11 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
+use std::collections::HashSet;
 use stellereum::consensus::{
     HeightConsensus, QuorumCertificate, ValidatorSet, Vote, VoteKind, MAX_ROUND_AHEAD,
 };
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
-use std::collections::HashSet;
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
@@ -96,7 +96,7 @@ fn hunt1_sync_accepts_chain_signed_only_by_non_validators() {
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         for k in &attacker {
             sign_with(&mut b, k);
         }
@@ -116,8 +116,14 @@ fn hunt1_sync_accepts_chain_signed_only_by_non_validators() {
         // And it is NOT a valid proposal from the rightful proposer either:
         // The count-only helper still says "3" - which is exactly why it must not
         // be the thing a consensus decision depends on.
-        assert!(b.verify_signatures(1), "the count-only helper is fooled by design");
-        assert!(!b.verify_validator_quorum(&vset), "the real check must refuse");
+        assert!(
+            b.verify_signatures(1),
+            "the count-only helper is fooled by design"
+        );
+        assert!(
+            !b.verify_validator_quorum(&vset),
+            "the real check must refuse"
+        );
     }
 
     // THE ATTACK - now a regression test.
@@ -188,7 +194,7 @@ async fn hunt1b_forged_chain_passes_the_state_root_replay_too() {
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         for k in &attacker {
             sign_with(&mut b, k);
         }
@@ -219,7 +225,8 @@ fn hunt2_quorum_is_a_power_sum_used_as_a_signature_count() {
     assert_eq!(vset.total_power(), 10_000_000_000_000);
     assert_eq!(q, 6_666_666_666_667);
     assert_eq!(
-        vset.len() as u64, 4,
+        vset.len() as u64,
+        4,
         "the WHOLE network is only 4 signatures wide"
     );
     // main.rs passes `q as usize` as `required_quorum` to a signature COUNT.
@@ -277,7 +284,7 @@ async fn hunt3_adopt_committed_accepts_a_prevote_certificate() {
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         b.sign_block(&proposer_k);
         b
     };
@@ -314,9 +321,7 @@ async fn hunt3_adopt_committed_accepts_a_prevote_certificate() {
         "a PREVOTE-only certificate must not finalize anything"
     );
     assert!(
-        r.as_ref()
-            .unwrap_err()
-            .contains("not a precommit quorum"),
+        r.as_ref().unwrap_err().contains("not a precommit quorum"),
         "the refusal must name the reason: {:?}",
         r.err()
     );
@@ -324,11 +329,7 @@ async fn hunt3_adopt_committed_accepts_a_prevote_certificate() {
         rt.finalized.is_empty(),
         "nothing may be finalized off a prevote certificate"
     );
-    assert_eq!(
-        rt.height(),
-        1,
-        "the height must not advance either"
-    );
+    assert_eq!(rt.height(), 1, "the height must not advance either");
     eprintln!(
         "HUNT3 FIXED: a PREVOTE certificate (kind={:?}) was refused and the height \
          stayed at 1; finalized={:?}",
@@ -372,7 +373,7 @@ async fn hunt4_adopt_committed_never_binds_certificate_height() {
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         b.sign_block(&proposer_k);
         b
     };
@@ -405,7 +406,9 @@ async fn hunt4_adopt_committed_never_binds_certificate_height() {
         "a certificate for another height must not be accepted"
     );
     assert!(
-        r.as_ref().unwrap_err().contains("certificate is for height"),
+        r.as_ref()
+            .unwrap_err()
+            .contains("certificate is for height"),
         "the refusal must name the reason: {:?}",
         r.err()
     );
@@ -422,9 +425,9 @@ async fn hunt4_adopt_committed_never_binds_certificate_height() {
 
 #[tokio::test]
 async fn hunt5_adopt_vs_local_finalize_split_the_state_root() {
+    use std::sync::Arc;
     use stellereum::runtime::{fund_genesis, ValidatorRuntime};
     use stellereum::state_engine::InMemoryStateEngine;
-    use std::sync::Arc;
 
     let ks = keys(4);
     let vset = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
@@ -449,7 +452,7 @@ async fn hunt5_adopt_vs_local_finalize_split_the_state_root() {
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         b.sign_block(pk);
         b
     };
@@ -483,7 +486,10 @@ async fn hunt5_adopt_vs_local_finalize_split_the_state_root() {
             signatures: sigs,
         }
     };
-    assert!(cert.verify(&vset), "the certificate is a genuine 3/4 precommit QC");
+    assert!(
+        cert.verify(&vset),
+        "the certificate is a genuine 3/4 precommit QC"
+    );
     // A node finalizes a block it HOLDS. Node A never received this one - it
     // only has the certificate - so the fix makes it refuse rather than commit
     // the height on a block it never saw. That is the same class as HUNT6 and
@@ -510,9 +516,9 @@ async fn hunt5_adopt_vs_local_finalize_split_the_state_root() {
 
 #[tokio::test]
 async fn hunt6_finalize_a_block_this_node_never_saw_or_validated() {
+    use std::sync::Arc;
     use stellereum::runtime::{fund_genesis, ValidatorRuntime};
     use stellereum::state_engine::InMemoryStateEngine;
-    use std::sync::Arc;
 
     let ks = keys(4);
     let vset = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
@@ -525,14 +531,8 @@ async fn hunt6_finalize_a_block_this_node_never_saw_or_validated() {
     // validators signing is enough, and we simply never deliver the block.
     let phantom = blake3::hash(b"attacker-chosen-block-contents").into();
     for k in ks.iter().take(3) {
-        rt.on_precommit(Vote::sign(
-            k,
-            1,
-            0,
-            VoteKind::Precommit,
-            Some(phantom),
-        ))
-        .unwrap();
+        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(phantom)))
+            .unwrap();
     }
     assert!(
         !rt.blocks.contains_key(&phantom),
@@ -597,19 +597,37 @@ fn hunt7_peer_messages_cannot_drag_the_round_counter_past_the_network() {
     hc.advance_to_round(honest_round);
     hc.receive_proposal(honest, bh(2)).unwrap();
     for k in ks.iter() {
-        hc.add_prevote(Vote::sign(k, 1, honest_round, VoteKind::Prevote, Some(bh(2))))
-            .unwrap();
+        hc.add_prevote(Vote::sign(
+            k,
+            1,
+            honest_round,
+            VoteKind::Prevote,
+            Some(bh(2)),
+        ))
+        .unwrap();
     }
     assert!(
         hc.try_prevote_quorum().is_some(),
         "a real 4/4 prevote quorum at our own round is still visible"
     );
     for k in ks.iter() {
-        hc.add_precommit(Vote::sign(k, 1, honest_round, VoteKind::Precommit, Some(bh(2))))
-            .unwrap();
+        hc.add_precommit(Vote::sign(
+            k,
+            1,
+            honest_round,
+            VoteKind::Precommit,
+            Some(bh(2)),
+        ))
+        .unwrap();
     }
-    assert!(hc.try_precommit_quorum().is_some(), "the chain is not stuck");
-    eprintln!("[HUNT7] FIXED: 500 far-future round claims moved us to {}, not 500*1000", hc.round);
+    assert!(
+        hc.try_precommit_quorum().is_some(),
+        "the chain is not stuck"
+    );
+    eprintln!(
+        "[HUNT7] FIXED: 500 far-future round claims moved us to {}, not 500*1000",
+        hc.round
+    );
     eprintln!("[HUNT7] the node still accepts the honest proposal and reaches a real quorum");
 }
 
@@ -634,7 +652,7 @@ fn hunt7b_proposal_round_field_is_unauthenticated_metadata() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     b.sign_block(&fake_proposer[0]);
     let msg = ConsensusMsg::Proposal {
         height: 1,
@@ -722,18 +740,15 @@ fn hunt8_negative_power_attribution_checks() {
     let sigs = vec![
         (
             id(&ks[0]),
-            Vote::sign(&ks[0], 1, 0, VoteKind::Precommit, Some(bh(1)))
-                .signature,
+            Vote::sign(&ks[0], 1, 0, VoteKind::Precommit, Some(bh(1))).signature,
         ),
         (
             id(&ks[0]),
-            Vote::sign(&ks[0], 1, 0, VoteKind::Precommit, Some(bh(1)))
-                .signature,
+            Vote::sign(&ks[0], 1, 0, VoteKind::Precommit, Some(bh(1))).signature,
         ),
         (
             id(&ks[0]),
-            Vote::sign(&ks[0], 1, 0, VoteKind::Precommit, Some(bh(1)))
-                .signature,
+            Vote::sign(&ks[0], 1, 0, VoteKind::Precommit, Some(bh(1))).signature,
         ),
     ];
     let qc = QuorumCertificate {
@@ -745,8 +760,10 @@ fn hunt8_negative_power_attribution_checks() {
     };
     assert!(!qc.verify(&vset), "3x same signer != quorum of 3");
 
-    eprintln!("HUNT8 NEGATIVE: power attribution, kind binding, nil/zero framing and \
-               QC de-duplication all hold. VoteSet::add verifies before power_of().");
+    eprintln!(
+        "HUNT8 NEGATIVE: power attribution, kind binding, nil/zero framing and \
+               QC de-duplication all hold. VoteSet::add verifies before power_of()."
+    );
 }
 
 // ===========================================================================
@@ -799,6 +816,8 @@ fn hunt9_zero_power_quorum_guard_cannot_be_bypassed() {
              a release build wraps silently)."
         ),
     }
-    eprintln!("HUNT9 NEGATIVE: the u64::MAX guard holds for every reachable empty/\
-               zero-power set built through ValidatorSet::add.");
+    eprintln!(
+        "HUNT9 NEGATIVE: the u64::MAX guard holds for every reachable empty/\
+               zero-power set built through ValidatorSet::add."
+    );
 }

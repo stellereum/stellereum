@@ -79,7 +79,11 @@ fn setup_pq_set(seeds: [u8; 3], height: u64, round: u32) -> Fixture {
 }
 
 fn fk_of<'a>(f: &'a Fixture, id: &[u8; 32]) -> &'a FalconKeypair {
-    f.keys.iter().find(|(k, _)| k == id).map(|(_, fk)| fk).unwrap()
+    f.keys
+        .iter()
+        .find(|(k, _)| k == id)
+        .map(|(_, fk)| fk)
+        .unwrap()
 }
 
 /// Собрать компактный µQC по подмножеству комитета `signer_ids` (сигнатуры — в
@@ -120,7 +124,11 @@ fn wrap_uqc(f: &Fixture, uqc: &PqMicroCertificate) -> QuorumCertificate {
 #[test]
 fn micro_quorum_power_math_is_classical_two_thirds_plus_one() {
     assert_eq!(pq_micro_quorum_power(TOTAL_W), QUORUM_W);
-    assert_eq!(pq_micro_quorum_power(0), u64::MAX, "нулевой вес — fail-closed");
+    assert_eq!(
+        pq_micro_quorum_power(0),
+        u64::MAX,
+        "нулевой вес — fail-closed"
+    );
     // Легаси-кривая на головах не тронута (запинена bridge-тестом).
     assert_eq!(pq_micro_quorum_threshold(3), 3);
     assert_eq!(pq_micro_quorum_threshold(16), 11);
@@ -142,7 +150,10 @@ fn two_heavy_weights_of_three_pass_power_quorum() {
     assert_eq!(uqc.signed_power(&f.committee, &f.vs), 4000);
     assert!(uqc.has_power_quorum(&f.committee, &f.vs));
     let qc = wrap_uqc(&f, &uqc);
-    assert!(qc.verify(&f.vs), "2/2 веса (4000 ≥ 3334) обязаны верифицироваться");
+    assert!(
+        qc.verify(&f.vs),
+        "2/2 веса (4000 ≥ 3334) обязаны верифицироваться"
+    );
     assert!(qc.verify_unified(&f.vs));
 }
 
@@ -168,7 +179,10 @@ fn legacy_three_of_three_still_verifies() {
     assert!(uqc.has_quorum(), "3/3 проходит и легаси-счёт");
     assert_eq!(uqc.signed_power(&f.committee, &f.vs), TOTAL_W);
     let qc = wrap_uqc(&f, &uqc);
-    assert!(qc.verify(&f.vs), "старые 3/3 серты обязаны проходить новым кодом");
+    assert!(
+        qc.verify(&f.vs),
+        "старые 3/3 серты обязаны проходить новым кодом"
+    );
     assert!(qc.verify_unified(&f.vs));
 }
 
@@ -289,19 +303,23 @@ fn voteset_compiles_uqc_from_two_heavy_falcon_votes() {
     let mut set = stellereum::consensus::VoteSet::new();
     for i in 0..2 {
         let v = Vote::sign_with_falcon(&sks[i], &fks[i], height, round, kind, block_hash);
-        set.add(v, &vs, height, round, kind).expect("heavy vote admits");
+        set.add(v, &vs, height, round, kind)
+            .expect("heavy vote admits");
     }
     let parent = [0x5Au8; 32];
     let qc = set
         .certificate(block_hash, &vs, &parent)
         .expect("classical quorum 4000 ≥ 3334 must form");
     assert!(qc.verify(&vs));
-    let uqc = qc.pq_micro_certificate().expect(
-        "µQC обязан скомпилироваться уже с 2 тяжёлых голосов (по весу), а не ждать 3/3",
+    let uqc = qc
+        .pq_micro_certificate()
+        .expect("µQC обязан скомпилироваться уже с 2 тяжёлых голосов (по весу), а не ждать 3/3");
+    assert_eq!(
+        uqc.signed_power(
+            &derive_sortition_committee(&vs, height, round, uqc.committee_size, &parent),
+            &vs
+        ),
+        4000
     );
-    assert_eq!(uqc.signed_power(
-        &derive_sortition_committee(&vs, height, round, uqc.committee_size, &parent),
-        &vs
-    ), 4000);
     assert!(qc.verify_unified(&vs));
 }

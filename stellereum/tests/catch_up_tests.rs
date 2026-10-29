@@ -45,11 +45,7 @@ async fn state_with_funds(who: [u8; 32], bal: u64) -> Arc<InMemoryStateEngine> {
 
 /// Build `n` empty blocks on top of `base`, each signed by enough of `ks` to carry
 /// a real quorum, and each committing to the state root in force *before* it.
-async fn build_chain(
-    ks: &[SigningKey],
-    base: &Arc<InMemoryStateEngine>,
-    n: u64,
-) -> Vec<Block> {
+async fn build_chain(ks: &[SigningKey], base: &Arc<InMemoryStateEngine>, n: u64) -> Vec<Block> {
     let vs = vset(ks);
     let mut out = Vec::new();
     let mut prev = [0u8; 32];
@@ -79,7 +75,7 @@ async fn build_chain(
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         b.sign_block(&proposer);
         // Real quorum, carried as the block's precommit QC: validate_sync_chain must
         // be able to tell a genuine history from a single-peer forgery, and it checks
@@ -139,7 +135,9 @@ async fn catch_up(
     }
     let first = missing[0].height;
     if first != first_height {
-        return Err(format!("first synced height {first} != expected {first_height}"));
+        return Err(format!(
+            "first synced height {first} != expected {first_height}"
+        ));
     }
     validate_sync_chain(&missing, first, our_last, validators)?;
     for b in &missing {
@@ -152,7 +150,9 @@ async fn catch_up(
                 hex::encode(root_before)
             ));
         }
-        our_state.apply_block_parallel_fees(&b.transactions, b.timestamp).await;
+        our_state
+            .apply_block_parallel_fees(&b.transactions, b.timestamp)
+            .await;
     }
     Ok(missing.len() as u64)
 }
@@ -177,7 +177,9 @@ async fn a_lagging_node_replays_the_gap_and_lands_on_the_peers_state_root() {
             b.state_root,
             "prefix replay must reproduce the chain's roots"
         );
-        our_state.apply_block_parallel_fees(&b.transactions, b.timestamp).await;
+        our_state
+            .apply_block_parallel_fees(&b.transactions, b.timestamp)
+            .await;
     }
 
     let n = catch_up(&blocks, &our_state, our_last, we_have + 1, &vs)
@@ -204,7 +206,9 @@ async fn a_gap_of_one_block_is_enough_to_recover() {
     let our_last = blocks[3].compute_hash(); // we have 4 of 5
     let our_state = state_with_funds(payer, 1_000_000_000_000).await;
     for b in blocks.iter().take(4) {
-        our_state.apply_block_parallel_fees(&b.transactions, b.timestamp).await;
+        our_state
+            .apply_block_parallel_fees(&b.transactions, b.timestamp)
+            .await;
     }
 
     let n = catch_up(&blocks, &our_state, our_last, 5, &vs)
@@ -246,7 +250,7 @@ async fn catch_up_refuses_a_chain_that_forks_before_our_finalized_block() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     b.sign_block(&proposer);
     let bh = b.compute_hash();
     attach_quorum(&mut b, &ks, 6, bh);
@@ -256,7 +260,9 @@ async fn catch_up_refuses_a_chain_that_forks_before_our_finalized_block() {
     let our_last = honest[4].compute_hash();
     let our_state = state_with_funds(payer, 1_000_000_000_000).await;
     for blk in honest.iter().take(5) {
-        our_state.apply_block_parallel_fees(&blk.transactions, blk.timestamp).await;
+        our_state
+            .apply_block_parallel_fees(&blk.transactions, blk.timestamp)
+            .await;
     }
     let before = our_state.get_state_root().await;
 
@@ -297,12 +303,17 @@ async fn catch_up_refuses_a_chain_with_no_real_quorum() {
     let our_last = blocks[2].compute_hash();
     let our_state = state_with_funds(payer, 1_000_000_000_000).await;
     for b in blocks.iter().take(3) {
-        our_state.apply_block_parallel_fees(&b.transactions, b.timestamp).await;
+        our_state
+            .apply_block_parallel_fees(&b.transactions, b.timestamp)
+            .await;
     }
     let before = our_state.get_state_root().await;
 
     let res = catch_up(&forged, &our_state, our_last, 4, &vs).await;
-    assert!(res.is_err(), "a single-signer history must be refused: {res:?}");
+    assert!(
+        res.is_err(),
+        "a single-signer history must be refused: {res:?}"
+    );
     assert_eq!(our_state.get_state_root().await, before);
 }
 
@@ -321,12 +332,17 @@ async fn catch_up_refuses_a_block_whose_header_disagrees_with_our_state() {
 
     let our_state = state_with_funds(payer, 1_000_000_000_000).await;
     for b in blocks.iter().take(2) {
-        our_state.apply_block_parallel_fees(&b.transactions, b.timestamp).await;
+        our_state
+            .apply_block_parallel_fees(&b.transactions, b.timestamp)
+            .await;
     }
     let before = our_state.get_state_root().await;
 
     let res = catch_up(&blocks, &our_state, our_last, 3, &vs).await;
-    assert!(res.is_err(), "a state-root disagreement must be refused: {res:?}");
+    assert!(
+        res.is_err(),
+        "a state-root disagreement must be refused: {res:?}"
+    );
     assert_eq!(our_state.get_state_root().await, before);
 }
 

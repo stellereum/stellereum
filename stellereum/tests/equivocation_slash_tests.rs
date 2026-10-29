@@ -34,8 +34,8 @@ use stellereum::consensus::{
 };
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
-use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::staking::{EQUIVOCATION_SLASH_BPS, MIN_VALIDATOR_BOND, STAKING_POOL};
+use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::svm::OpCode;
 
 /// Genesis balance per validator account (far above the bonded stake, so fees
@@ -58,7 +58,11 @@ fn keys(n: usize) -> Vec<SigningKey> {
 }
 
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
-    ValidatorSet::from_list(ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect())
+    ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    )
 }
 
 fn id_of(k: &SigningKey) -> ValidatorId {
@@ -172,7 +176,10 @@ fn certify_full(
 }
 
 async fn pool_of(e: &Arc<InMemoryStateEngine>) -> u64 {
-    e.get_account(&STAKING_POOL).await.map(|a| a.balance).unwrap_or(0)
+    e.get_account(&STAKING_POOL)
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0)
 }
 
 // ===========================================================================
@@ -202,7 +209,13 @@ async fn double_sign_slashed_exactly_five_percent() {
 
     let evidence = double_sign(&ks[3]);
     let root = engine.get_state_root().await;
-    let mut blk = mk_block(&ks[0], 1, [0u8; 32], root, vec![report_tx(&ks[0], 0, evidence)]);
+    let mut blk = mk_block(
+        &ks[0],
+        1,
+        [0u8; 32],
+        root,
+        vec![report_tx(&ks[0], 0, evidence)],
+    );
     let bh = blk.compute_hash();
     blk.precommit_qc = Some(certify_full(&mut rt, &ks, 1, bh));
     rt.blocks.insert(bh, blk.clone());
@@ -275,7 +288,10 @@ async fn repeat_offense_slashed_once() {
     assert_eq!(rt.applied_statuses, vec![true, true]);
     let l = engine.staking_read().await;
     assert_eq!(l.validators[&offender].self_bond, MIN_VALIDATOR_BOND - burn);
-    assert_eq!(l.total_burned, burn, "in-block duplicate must not double-burn");
+    assert_eq!(
+        l.total_burned, burn,
+        "in-block duplicate must not double-burn"
+    );
     assert_eq!(l.total_burned, burn);
     drop(l);
     let pool_after_1 = pool_of(&engine).await;
@@ -297,19 +313,30 @@ async fn repeat_offense_slashed_once() {
         rt.on_precommit(Vote::sign(k, 2, 0, VoteKind::Precommit, Some(bh2)))
             .expect("precommit accepted");
     }
-    assert_eq!(rt.hc.try_precommit_quorum(), Some(bh2), "survivors must quorum");
+    assert_eq!(
+        rt.hc.try_precommit_quorum(),
+        Some(bh2),
+        "survivors must quorum"
+    );
     blk2.precommit_qc = rt.hc.precommit_qc.clone();
     rt.blocks.insert(bh2, blk2.clone());
     assert_eq!(rt.try_finalize().await, Some(bh2), "must finalize height 2");
 
-    assert_eq!(rt.applied_statuses, vec![true], "re-included report still executes");
+    assert_eq!(
+        rt.applied_statuses,
+        vec![true],
+        "re-included report still executes"
+    );
     let l = engine.staking_read().await;
     assert_eq!(
         l.validators[&offender].self_bond,
         MIN_VALIDATOR_BOND - burn,
         "re-inclusion must not burn again"
     );
-    assert_eq!(l.total_burned, burn, "global burn must not move on re-inclusion");
+    assert_eq!(
+        l.total_burned, burn,
+        "global burn must not move on re-inclusion"
+    );
     drop(l);
     assert_eq!(
         pool_of(&engine).await,
@@ -347,7 +374,11 @@ async fn single_vote_repeated_burns_nothing() {
 
     // Fail-closed: the envelope does not verify, so the reporter's
     // transaction reverts (reporter wastes gas) and the scan skips it.
-    assert_eq!(rt.applied_statuses, vec![false], "invalid report tx must revert");
+    assert_eq!(
+        rt.applied_statuses,
+        vec![false],
+        "invalid report tx must revert"
+    );
     let l = engine.staking_read().await;
     assert_eq!(
         l.validators[&offender].self_bond, MIN_VALIDATOR_BOND,
@@ -385,7 +416,13 @@ async fn two_engines_same_block_same_root() {
         .position(|k| id_of(k) == scheduled)
         .expect("scheduled proposer is one of ks");
     let root = engine_a.get_state_root().await;
-    let mut blk = mk_block(&ks[pi], 1, [0u8; 32], root, vec![report_tx(&ks[0], 0, evidence)]);
+    let mut blk = mk_block(
+        &ks[pi],
+        1,
+        [0u8; 32],
+        root,
+        vec![report_tx(&ks[0], 0, evidence)],
+    );
     let bh = blk.compute_hash();
     let qc = certify_full(&mut a, &ks, 1, bh);
     blk.precommit_qc = Some(qc.clone());
@@ -440,8 +477,14 @@ async fn feed_converts_local_observations_without_touching_state() {
     let bh = [0xABu8; 32];
     rt.on_prevote(Vote::sign(&ks[3], 1, 0, VoteKind::Prevote, Some(bh)))
         .unwrap();
-    rt.on_prevote(Vote::sign(&ks[3], 1, 0, VoteKind::Prevote, Some([0xCDu8; 32])))
-        .unwrap();
+    rt.on_prevote(Vote::sign(
+        &ks[3],
+        1,
+        0,
+        VoteKind::Prevote,
+        Some([0xCDu8; 32]),
+    ))
+    .unwrap();
     assert_eq!(rt.hc.equivocations().len(), 1, "evidence must be observed");
 
     let feed = rt.equivocation_feed_evidence();

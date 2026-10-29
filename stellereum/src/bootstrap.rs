@@ -348,7 +348,10 @@ mod tests {
         assert!(good.ready());
         assert!(good.failures().is_empty());
         // One lost flag is enough to refuse: the observer flag alone gates genesis.
-        let lost_flag = BootstrapPreflight { observer: false, ..good.clone()};
+        let lost_flag = BootstrapPreflight {
+            observer: false,
+            ..good.clone()
+        };
         assert!(!lost_flag.ready());
     }
 
@@ -365,7 +368,10 @@ mod tests {
             Some(78519)
         );
         // Insane pointers are ignored, never trusted.
-        assert_eq!(select_bootstrap_boundary(78620, 0, Some(99999)), Some(78600));
+        assert_eq!(
+            select_bootstrap_boundary(78620, 0, Some(99999)),
+            Some(78600)
+        );
         assert_eq!(select_bootstrap_boundary(78620, 0, Some(0)), Some(78600));
         // Not ahead of us: nothing to do.
         assert_eq!(select_bootstrap_boundary(100, 100, None), None);

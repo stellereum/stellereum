@@ -178,7 +178,9 @@ impl Mmr {
 
     /// Build an MMR over a fixed leaf set.
     pub fn of(leaves: &[[u8; 32]]) -> Self {
-        Self { leaves: leaves.to_vec() }
+        Self {
+            leaves: leaves.to_vec(),
+        }
     }
 
     /// Append one finalized block hash.
@@ -432,22 +434,27 @@ mod tests {
             let root = m.root();
             assert_ne!(root, [0u8; 32]);
             for i in 0..n {
-                let proof = m.prove(i).unwrap_or_else(|| panic!("leaf {i} proves at size {n}"));
+                let proof = m
+                    .prove(i)
+                    .unwrap_or_else(|| panic!("leaf {i} proves at size {n}"));
                 assert_eq!(proof.leaf, leaf(i));
                 assert_eq!(proof.num_leaves, n);
-                assert!(
-                    proof.verify(&root),
-                    "leaf {i} verifies at size {n}"
-                );
+                assert!(proof.verify(&root), "leaf {i} verifies at size {n}");
                 // A proof for size n must NOT verify against another size's root.
                 if n > 1 {
                     let other = Mmr::of(&(0..n - 1).map(leaf).collect::<Vec<_>>()).root();
                     if other != root {
-                        assert!(!proof.verify(&other), "leaf {i} must not verify under a foreign root");
+                        assert!(
+                            !proof.verify(&other),
+                            "leaf {i} must not verify under a foreign root"
+                        );
                     }
                 }
             }
-            assert!(m.prove(n).is_none(), "index == len is out of range at size {n}");
+            assert!(
+                m.prove(n).is_none(),
+                "index == len is out of range at size {n}"
+            );
         }
     }
 
@@ -468,7 +475,10 @@ mod tests {
             let m = Mmr::of(leaves);
             let root = m.root();
             for i in 0..n {
-                assert!(m.prove(i).unwrap().verify(&root), "leaf {i} verifies at size {n}");
+                assert!(
+                    m.prove(i).unwrap().verify(&root),
+                    "leaf {i} verifies at size {n}"
+                );
             }
         }
     }

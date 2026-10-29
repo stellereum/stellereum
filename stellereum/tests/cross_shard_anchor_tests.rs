@@ -4,13 +4,12 @@
 //! A self-attested root (attacker trie + valid-for-that-root proof) fails
 //! the anchor even though its proof math checks out.
 
-use stellereum::cell::PatriciaTrie;
-use stellereum::sharding::{
-    CrossShardMessage, FinalizedHeaderRegistry, MASTERCHAIN_SHARD,
-    BASE_WORKCHAIN_SHARD_INITIAL,
-};
-use stellereum::sharding::Transaction;
 use ed25519_dalek::SigningKey;
+use stellereum::cell::PatriciaTrie;
+use stellereum::sharding::Transaction;
+use stellereum::sharding::{
+    CrossShardMessage, FinalizedHeaderRegistry, BASE_WORKCHAIN_SHARD_INITIAL, MASTERCHAIN_SHARD,
+};
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -57,7 +56,10 @@ fn anchored_accepts_committed_header_with_valid_proof() {
     // Unanchored contexts fail closed.
     assert!(!msg.verify_anchored(None));
     let empty = FinalizedHeaderRegistry::default();
-    assert!(!msg.verify_anchored(Some(&empty)), "unknown hash fails closed");
+    assert!(
+        !msg.verify_anchored(Some(&empty)),
+        "unknown hash fails closed"
+    );
 
     let mut reg = FinalizedHeaderRegistry::default();
     reg.note_finalized(MASTERCHAIN_SHARD, hash, root);

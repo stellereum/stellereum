@@ -9,7 +9,8 @@
 /// Any assets or domain ownership transferred here are permanently destroyed.
 pub const BURN_ADDRESS: [u8; 32] = [0u8; 32];
 
-pub const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+pub const BASE58_ALPHABET: &[u8; 58] =
+    b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 /// Hash a domain name into a 28-bit domain ID using FNV-1a (deterministic, fits in packed i64).
 pub const fn hash_domain(name: &str) -> i64 {
@@ -32,7 +33,6 @@ pub const fn hash_domain(name: &str) -> i64 {
 
 /// Calculate optical hue shift (0..359) for an STL domain name or domain ID.
 pub const fn calculate_domain_hue(domain_id: i64) -> i64 {
-    
     (domain_id.abs() * 137) % 360
 }
 
@@ -58,10 +58,7 @@ pub const DOMAIN_INFMAIL: i64 = hash_domain("infmail.stl");
 pub const DOMAIN_STELLEREUM: i64 = hash_domain("stellereum.stl");
 pub const DOMAIN_STELL: i64 = hash_domain("stell.stl");
 
-pub const SYSTEM_BURN_DOMAINS: [i64; 2] = [
-    DOMAIN_BURN,
-    DOMAIN_TRASH,
-];
+pub const SYSTEM_BURN_DOMAINS: [i64; 2] = [DOMAIN_BURN, DOMAIN_TRASH];
 
 pub const PROTOCOL_RESERVED_DOMAINS: [i64; 12] = [
     DOMAIN_VAULT,

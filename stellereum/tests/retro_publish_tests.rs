@@ -35,10 +35,9 @@ use rand::rngs::OsRng;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use stellereum::network::{
-    EpochTag,
     block_body_blob_name, plan_block_body_publish, plan_block_body_publish_bytes,
-    retro_publish_chunk, PublishWrite, BUCKET_STELLEREUM_BLOCKS, PREFIX_BLOCK_HASH,
-    PREFIX_LATEST_HEIGHT, RetroPublishReport,
+    retro_publish_chunk, EpochTag, PublishWrite, RetroPublishReport, BUCKET_STELLEREUM_BLOCKS,
+    PREFIX_BLOCK_HASH, PREFIX_LATEST_HEIGHT,
 };
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 
@@ -174,7 +173,7 @@ fn chain(n: u64) -> Vec<Block> {
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         b.sign_block(&sk);
         prev = b.compute_hash();
         out.push(b);
@@ -194,9 +193,12 @@ async fn retro_published_body_is_retrievable_by_fetch_block() {
 
     for b in &blocks {
         // The single-block method applies exactly this plan.
-        net.apply(&plan_block_body_publish(&EpochTag::default(), b).unwrap(), &all_stored)
-            .await
-            .unwrap();
+        net.apply(
+            &plan_block_body_publish(&EpochTag::default(), b).unwrap(),
+            &all_stored,
+        )
+        .await
+        .unwrap();
     }
 
     for b in &blocks {
@@ -255,7 +257,10 @@ fn retro_publish_uses_the_fetch_block_bucket_and_name() {
         assert_eq!(writes.len(), 1, "a body publish is exactly one blob write");
 
         let w = &writes[0];
-        assert_eq!(w.bucket, BUCKET_STELLEREUM_BLOCKS, "same bucket as fetch_block");
+        assert_eq!(
+            w.bucket, BUCKET_STELLEREUM_BLOCKS,
+            "same bucket as fetch_block"
+        );
         // The name is epoch-scoped, and this is the regression that matters: the
         // writer and the reader must agree. A previous split had `broadcast_block`
         // writing an epoch-scoped name while the retro-publish path wrote the bare
@@ -307,9 +312,12 @@ async fn retro_publish_never_moves_the_advertised_head() {
 
     // Retro-publish the recent history: single publishes, then a batched pass.
     for b in &blocks {
-        net.apply(&plan_block_body_publish(&EpochTag::default(), b).unwrap(), &all_stored)
-            .await
-            .unwrap();
+        net.apply(
+            &plan_block_body_publish(&EpochTag::default(), b).unwrap(),
+            &all_stored,
+        )
+        .await
+        .unwrap();
     }
     let mut it = blocks.iter();
     let report = publish_pass(&mut it, 3, &net, &all_stored).await;
@@ -335,8 +343,9 @@ async fn retro_publish_never_moves_the_advertised_head() {
         "a retro-publish must write no local KV at all, found: {keys:?}"
     );
     assert!(
-        !keys.iter().any(|k| k.starts_with(PREFIX_LATEST_HEIGHT)
-            || k.starts_with(PREFIX_BLOCK_HASH)),
+        !keys
+            .iter()
+            .any(|k| k.starts_with(PREFIX_LATEST_HEIGHT) || k.starts_with(PREFIX_BLOCK_HASH)),
         "neither the head pointer nor the block-hash index may be written by a re-publish"
     );
 
@@ -388,7 +397,11 @@ async fn a_stale_nodes_republish_leaves_a_higher_head_exactly_where_it_is() {
             break;
         }
     }
-    assert_eq!(net.blobs.borrow().len(), 10, "all ten stale bodies went out");
+    assert_eq!(
+        net.blobs.borrow().len(),
+        10,
+        "all ten stale bodies went out"
+    );
 
     assert_eq!(
         net.latest_shard_height(MASTERCHAIN_SHARD),
@@ -415,7 +428,10 @@ async fn batch_publish_respects_its_bound() {
     assert_eq!(first.attempted, 4, "exactly the bound is attempted");
     assert_eq!(first.published, 4, "exactly the bound is published");
     assert_eq!(first.failed, 0);
-    assert!(first.maybe_more, "a full window means the caller should come back");
+    assert!(
+        first.maybe_more,
+        "a full window means the caller should come back"
+    );
     assert_eq!(
         net.blobs.borrow().len(),
         4,
@@ -430,7 +446,10 @@ async fn batch_publish_respects_its_bound() {
     let third = publish_pass(&mut it, 4, &net, &all_stored).await;
     assert_eq!(third.attempted, 2, "the tail is the remainder");
     assert_eq!(third.published, 2);
-    assert!(!third.maybe_more, "a short pass means the iterator is drained");
+    assert!(
+        !third.maybe_more,
+        "a short pass means the iterator is drained"
+    );
 
     assert_eq!(net.blobs.borrow().len(), 10, "every block got published");
     for b in &blocks {
@@ -483,8 +502,14 @@ async fn one_unfetchable_block_does_not_stop_the_batch_and_is_reported() {
     let mut it = blocks.iter();
     let report = publish_pass(&mut it, 6, &net, &two_missing).await;
 
-    assert_eq!(report.attempted, 6, "every block in the window was attempted");
-    assert_eq!(report.published, 4, "the four retrievable bodies still went out");
+    assert_eq!(
+        report.attempted, 6,
+        "every block in the window was attempted"
+    );
+    assert_eq!(
+        report.published, 4,
+        "the four retrievable bodies still went out"
+    );
     assert_eq!(
         report.failed, 2,
         "and the two that could not be are counted, not hidden"
@@ -551,7 +576,11 @@ async fn a_body_that_does_not_hash_to_its_address_is_refused_and_reported() {
             let bytes = bincode::serialize(b).unwrap();
             // Height 3 is addressed as a hash it does not compute to, modelling
             // a disk scan that hands back the wrong body.
-            let address = if b.height == bad_height { bogus } else { b.compute_hash() };
+            let address = if b.height == bad_height {
+                bogus
+            } else {
+                b.compute_hash()
+            };
             match plan_block_body_publish_bytes(&EpochTag::default(), address, &bytes) {
                 Ok(write) => {
                     let writes = [write];
@@ -568,8 +597,14 @@ async fn a_body_that_does_not_hash_to_its_address_is_refused_and_reported() {
         report.published, 3,
         "the three honest bodies still went out"
     );
-    assert_eq!(report.failed, 1, "the mismatched body is counted, not hidden");
-    let first = report.first_error.clone().expect("a reason must be reported");
+    assert_eq!(
+        report.failed, 1,
+        "the mismatched body is counted, not hidden"
+    );
+    let first = report
+        .first_error
+        .clone()
+        .expect("a reason must be reported");
     assert!(
         first.contains("hashes to") && first.contains("addressed as"),
         "the reason must name the mismatch, got: {first}"
@@ -597,7 +632,8 @@ async fn a_body_that_does_not_hash_to_its_address_is_refused_and_reported() {
     }
 
     // Garbage that is not a block at all is refused the same way, with no panic.
-    let err = plan_block_body_publish_bytes(&EpochTag::default(), [1u8; 32], &[0xff, 0x00, 0x7f]).unwrap_err();
+    let err = plan_block_body_publish_bytes(&EpochTag::default(), [1u8; 32], &[0xff, 0x00, 0x7f])
+        .unwrap_err();
     assert!(
         err.contains("deserialize failed"),
         "undecodable bytes must be refused, got: {err}"

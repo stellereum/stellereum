@@ -252,7 +252,9 @@ pub fn retention_keep_blocks() -> u64 {
 
 /// Parse the `STELL_KEEP_BLOCKS` value; pure so tests need no env mutation.
 pub fn parse_keep_blocks(v: Option<String>) -> u64 {
-    v.and_then(|s| s.parse::<u64>().ok()).filter(|&n| n > 0).unwrap_or(STELL_DHT_KEEP_BLOCKS_DEFAULT)
+    v.and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(STELL_DHT_KEEP_BLOCKS_DEFAULT)
 }
 
 /// TTL (ms) for body/header/index blobs holding `keep_blocks` heights.
@@ -269,7 +271,9 @@ pub fn dht_blob_ttl_ms(keep_blocks: u64) -> i64 {
     const DAY_MS: i64 = 24 * 3600 * 1000;
     // NOTE: `keep_blocks as i64` would WRAP on absurd values (int→int `as`
     // casts wrap); `try_from` saturates instead, so the clamp below holds.
-    let want = i64::try_from(keep_blocks).unwrap_or(i64::MAX).saturating_mul(120_000);
+    let want = i64::try_from(keep_blocks)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(120_000);
     want.clamp(7 * DAY_MS, 30 * DAY_MS)
 }
 
@@ -366,11 +370,17 @@ pub fn plan_retained_prune(
 ) -> PruneDeletes {
     let mut blobs = vec![
         (BUCKET_STELLEREUM_HEADERS, header_name(epoch, height)),
-        (BUCKET_STELLEREUM_HEADERS, header_index_name(epoch, shard_id, height)),
+        (
+            BUCKET_STELLEREUM_HEADERS,
+            header_index_name(epoch, shard_id, height),
+        ),
         // A1 anchor: QC sidecar retention == header retention (KEEP window,
         // same TTL backstop). A pruned QC simply reads as missing (fail
         // closed to "skip this boundary").
-        (BUCKET_STELLEREUM_HEADERS, header_qc_name(epoch, shard_id, height)),
+        (
+            BUCKET_STELLEREUM_HEADERS,
+            header_qc_name(epoch, shard_id, height),
+        ),
     ];
     let mut kv = Vec::new();
     if let Some(hash_hex) = body_hash_hex {
@@ -471,9 +481,7 @@ pub const SNAPSHOT_PUBLISH_DOMAIN_KINDS: &[&str] = &[
 /// re-flooding on the same tick.
 fn fetch_sem() -> &'static tokio::sync::Semaphore {
     static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    SEM.get_or_init(|| {
-        tokio::sync::Semaphore::new(crate::sync::FETCH_MAX_CONCURRENCY.max(1))
-    })
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(crate::sync::FETCH_MAX_CONCURRENCY.max(1)))
 }
 
 /// Process-wide lane for LARGE-blob (snapshot/domain) fetches: at most
@@ -534,8 +542,8 @@ impl P2pNetworkAdapter {
         let block_hash = block.compute_hash();
         let hash_hex = hex::encode(block_hash);
 
-        let block_bytes = bincode::serialize(block)
-            .map_err(|e| format!("Serialization failed: {:?}", e))?;
+        let block_bytes =
+            bincode::serialize(block).map_err(|e| format!("Serialization failed: {:?}", e))?;
 
         // 1. Store block binary chunks in infnode blob storage. The manifest
         // carries the retention-window TTL (`dht_blob_ttl_ms`): bodies below
@@ -572,7 +580,10 @@ impl P2pNetworkAdapter {
         let hash_hex = hex::encode(block_hash);
         let bytes = self
             .node
-            .fetch_blob(BUCKET_STELLEREUM_BLOCKS, &block_name(&self.epoch(), &hash_hex))
+            .fetch_blob(
+                BUCKET_STELLEREUM_BLOCKS,
+                &block_name(&self.epoch(), &hash_hex),
+            )
             .await?;
 
         bincode::deserialize(&bytes).ok()
@@ -699,7 +710,15 @@ impl P2pNetworkAdapter {
         // Same backpressure as every other publish (bounded, never infinite);
         // charged as a Pointer (small floor) rather than Bulk so the per-finalize
         // head republish cannot lag the tip behind the bulk lane.
-        paced_store_blob(&self.node, bucket, name, payload, ttl_ms, ReplStoreKind::Pointer).await;
+        paced_store_blob(
+            &self.node,
+            bucket,
+            name,
+            payload,
+            ttl_ms,
+            ReplStoreKind::Pointer,
+        )
+        .await;
     }
 
     /// Publish this node's finalized head so a peer can discover it.
@@ -888,13 +907,16 @@ impl P2pNetworkAdapter {
                 }
             }
         }
-        let last_tip = self.last_prune_tip.load(std::sync::atomic::Ordering::Relaxed);
+        let last_tip = self
+            .last_prune_tip
+            .load(std::sync::atomic::Ordering::Relaxed);
         if tip_height < last_tip + dht_prune_interval_heights() && bound > 0 {
             return 0;
         }
         let cursor = self.prune_cursor.load(std::sync::atomic::Ordering::Relaxed);
         if cursor >= bound {
-            self.last_prune_tip.store(tip_height, std::sync::atomic::Ordering::Relaxed);
+            self.last_prune_tip
+                .store(tip_height, std::sync::atomic::Ordering::Relaxed);
             return 0;
         }
         let (batch, next) = prune_batch(cursor, bound, dht_prune_max_per_run());
@@ -908,19 +930,19 @@ impl P2pNetworkAdapter {
             let idx_name = header_index_name(&epoch, shard_id, h);
             let idx_mkey =
                 infnode::node::Node::blob_manifest_key(BUCKET_STELLEREUM_HEADERS, &idx_name);
-            let body_hash_hex: Option<String> =
-                if self.node.get_local_kv(&idx_mkey).await.is_some() {
-                    let Ok(_permit) = fetch_sem().acquire().await else {
-                        return pruned;
-                    };
-                    self.node
-                        .fetch_blob(BUCKET_STELLEREUM_HEADERS, &idx_name)
-                        .await
-                        .and_then(|b| parse_header_index(&b))
-                        .and_then(|(ih, hex)| (ih == h).then_some(hex))
-                } else {
-                    None
+            let body_hash_hex: Option<String> = if self.node.get_local_kv(&idx_mkey).await.is_some()
+            {
+                let Ok(_permit) = fetch_sem().acquire().await else {
+                    return pruned;
                 };
+                self.node
+                    .fetch_blob(BUCKET_STELLEREUM_HEADERS, &idx_name)
+                    .await
+                    .and_then(|b| parse_header_index(&b))
+                    .and_then(|(ih, hex)| (ih == h).then_some(hex))
+            } else {
+                None
+            };
             let plan = plan_retained_prune(&epoch, shard_id, h, body_hash_hex.as_deref());
             for (bucket, name) in &plan.blobs {
                 self.node.delete_blob_local(bucket, name).await;
@@ -930,8 +952,10 @@ impl P2pNetworkAdapter {
             }
             pruned += 1;
         }
-        self.prune_cursor.store(next, std::sync::atomic::Ordering::Relaxed);
-        self.last_prune_tip.store(tip_height, std::sync::atomic::Ordering::Relaxed);
+        self.prune_cursor
+            .store(next, std::sync::atomic::Ordering::Relaxed);
+        self.last_prune_tip
+            .store(tip_height, std::sync::atomic::Ordering::Relaxed);
         // Persist the cursor so the next restart resumes instead of rewinding
         // to 0. One kv write per pass (every ~100 heights): negligible next
         // to the deletes themselves. Best-effort; a lost write only repeats
@@ -1095,7 +1119,12 @@ impl P2pNetworkAdapter {
     /// otherwise the pointer stays at the last GOOD height and the failure is
     /// LOUD on both channels. Returns true when the snapshot (and pointer)
     /// published.
-    pub async fn persist_state_snapshot(&self, shard_id: u32, height: u64, snapshot_data: &[u8]) -> bool {
+    pub async fn persist_state_snapshot(
+        &self,
+        shard_id: u32,
+        height: u64,
+        snapshot_data: &[u8],
+    ) -> bool {
         let name = snapshot_name(&self.epoch(), shard_id, height);
         // Snapshots stay FOREVER (one per 100 heights): `try_snapshot_sync`
         // probes recent 100-height boundaries downward, and the snapshot at the
@@ -1182,7 +1211,9 @@ impl P2pNetworkAdapter {
                     arr.copy_from_slice(&bytes);
                     let h = u64::from_le_bytes(arr);
                     if h > 0 {
-                        tracing::info!("[sync] fetch_latest_snapshot {name}: pointer={h} (attempt {attempt})");
+                        tracing::info!(
+                            "[sync] fetch_latest_snapshot {name}: pointer={h} (attempt {attempt})"
+                        );
                         return Some(h);
                     }
                 }
@@ -1212,7 +1243,8 @@ impl P2pNetworkAdapter {
         let _permit = fetch_sem().acquire().await.ok()?;
         let _snap = snapshot_fetch_sem().acquire().await.ok()?;
         let name = snapshot_name(&self.epoch(), shard_id, height);
-        let out = Self::fetch_large_blob_resumable(&self.node, BUCKET_STELLEREUM_STATE, &name).await;
+        let out =
+            Self::fetch_large_blob_resumable(&self.node, BUCKET_STELLEREUM_STATE, &name).await;
         if out.is_none() {
             eprintln!(
                 "[sync] fetch_state_snapshot shard={shard_id} height={height} name={name}: \
@@ -1287,18 +1319,28 @@ impl P2pNetworkAdapter {
                 return None;
             }
         };
-        let manifest: serde_json::Value = serde_json::from_str(&manifest_str).map_err(|e| {
-            eprintln!(
-                "[sync] snapshot-fetch manifest undecodable: {bucket}/{name}: {e:?} \
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_str)
+            .map_err(|e| {
+                eprintln!(
+                    "[sync] snapshot-fetch manifest undecodable: {bucket}/{name}: {e:?} \
                  (treating as miss, not trusted)"
-            );
-        }).ok()?;
-        let nonce = hex::decode(manifest["nonce"].as_str().unwrap_or("")).map_err(|_| {
-            eprintln!("[sync] snapshot-fetch manifest {bucket}/{name}: bad nonce (treating as miss)");
-        }).ok()?;
-        let key = hex::decode(manifest["key"].as_str().unwrap_or("")).map_err(|_| {
-            eprintln!("[sync] snapshot-fetch manifest {bucket}/{name}: bad key (treating as miss)");
-        }).ok()?;
+                );
+            })
+            .ok()?;
+        let nonce = hex::decode(manifest["nonce"].as_str().unwrap_or(""))
+            .map_err(|_| {
+                eprintln!(
+                    "[sync] snapshot-fetch manifest {bucket}/{name}: bad nonce (treating as miss)"
+                );
+            })
+            .ok()?;
+        let key = hex::decode(manifest["key"].as_str().unwrap_or(""))
+            .map_err(|_| {
+                eprintln!(
+                    "[sync] snapshot-fetch manifest {bucket}/{name}: bad key (treating as miss)"
+                );
+            })
+            .ok()?;
         if key.len() != 32 {
             eprintln!(
                 "[sync] snapshot-fetch manifest {bucket}/{name}: key is {} bytes, want 32 \
@@ -1506,7 +1548,10 @@ impl P2pNetworkAdapter {
         kind: &str,
         data: &[u8],
     ) -> bool {
-        let name = format!("{}_dom_{kind}", snapshot_name(&self.epoch(), shard_id, height));
+        let name = format!(
+            "{}_dom_{kind}",
+            snapshot_name(&self.epoch(), shard_id, height)
+        );
         // Paced as Bulk like the state blob it rides beside (same fan-out shape).
         let stored = paced_store_blob(
             &self.node,
@@ -1552,8 +1597,12 @@ impl P2pNetworkAdapter {
     ) -> Option<Vec<u8>> {
         let _permit = fetch_sem().acquire().await.ok()?;
         let _snap = snapshot_fetch_sem().acquire().await.ok()?;
-        let name = format!("{}_dom_{kind}", snapshot_name(&self.epoch(), shard_id, height));
-        let out = Self::fetch_large_blob_resumable(&self.node, BUCKET_STELLEREUM_STATE, &name).await;
+        let name = format!(
+            "{}_dom_{kind}",
+            snapshot_name(&self.epoch(), shard_id, height)
+        );
+        let out =
+            Self::fetch_large_blob_resumable(&self.node, BUCKET_STELLEREUM_STATE, &name).await;
         if out.is_none() {
             eprintln!(
                 "[sync] fetch_domain_snapshot shard={shard_id} height={height} kind={kind} \
@@ -1572,11 +1621,13 @@ impl P2pNetworkAdapter {
         }
         let tx_hash = tx.compute_tx_hash();
         let hash_hex = hex::encode(tx_hash);
-        let tx_bytes = bincode::serialize(tx)
-            .map_err(|e| format!("Tx serialize error: {:?}", e))?;
+        let tx_bytes =
+            bincode::serialize(tx).map_err(|e| format!("Tx serialize error: {:?}", e))?;
 
         let tx_key = format!("{}{}", PREFIX_MEMPOOL_TX, hash_hex);
-        self.node.kv_store_local(&tx_key, &hex::encode(&tx_bytes)).await;
+        self.node
+            .kv_store_local(&tx_key, &hex::encode(&tx_bytes))
+            .await;
 
         // Append to shard mempool index
         let shard_key = format!("{}{}", PREFIX_SHARD_MEMPOOL, tx.source_shard);
@@ -1705,7 +1756,9 @@ impl P2pNetworkAdapter {
             .map_err(|e| format!("CrossShardMessage serialize error: {:?}", e))?;
 
         let key = format!("{}{}:{}", PREFIX_CROSS_SHARD, msg.target_shard, msg_id_hex);
-        self.node.kv_store_local(&key, &hex::encode(&msg_bytes)).await;
+        self.node
+            .kv_store_local(&key, &hex::encode(&msg_bytes))
+            .await;
 
         let index_key = format!("{}{}:index", PREFIX_CROSS_SHARD, msg.target_shard);
         let current_index = self.node.get_local_kv(&index_key).await.unwrap_or_default();
@@ -1740,7 +1793,11 @@ impl P2pNetworkAdapter {
     /// because pruning rides the apply path and must not fail finalization.
     /// Returns how many per-message entries were dropped (the index rewrite
     /// is not counted; it carries no value on its own).
-    pub async fn prune_cross_shard_consumed(&self, target_shard: u32, msg_ids: &[[u8; 32]]) -> usize {
+    pub async fn prune_cross_shard_consumed(
+        &self,
+        target_shard: u32,
+        msg_ids: &[[u8; 32]],
+    ) -> usize {
         if msg_ids.is_empty() {
             return 0;
         }
@@ -1795,7 +1852,9 @@ impl P2pNetworkAdapter {
         let update_bytes = bincode::serialize(update)
             .map_err(|e| format!("PriceFeedUpdate serialize error: {:?}", e))?;
         let key = format!("{}{}", PREFIX_ORACLE, update.asset);
-        self.node.kv_store_local(&key, &hex::encode(&update_bytes)).await;
+        self.node
+            .kv_store_local(&key, &hex::encode(&update_bytes))
+            .await;
         Ok(())
     }
 
@@ -1818,7 +1877,9 @@ impl P2pNetworkAdapter {
         let commit_bytes = bincode::serialize(commit)
             .map_err(|e| format!("BlindRoundCommitment serialize error: {:?}", e))?;
         let key = format!("{}{}", PREFIX_MEV_COMMIT, commit.round_number);
-        self.node.kv_store_local(&key, &hex::encode(&commit_bytes)).await;
+        self.node
+            .kv_store_local(&key, &hex::encode(&commit_bytes))
+            .await;
         Ok(())
     }
 
@@ -2064,7 +2125,10 @@ pub async fn fetch_verified_body(
     let _permit = fetch_sem().acquire().await.ok()?;
     let bytes = adapter
         .node
-        .fetch_blob(BUCKET_STELLEREUM_BLOCKS, &block_body_blob_name(&adapter.epoch(), expected_hash))
+        .fetch_blob(
+            BUCKET_STELLEREUM_BLOCKS,
+            &block_body_blob_name(&adapter.epoch(), expected_hash),
+        )
         .await?;
     // A body fetched from a PEER is wire data: it must decode STRICTLY. The
     // legacy tolerance (a body persisted before the trailing commitment
@@ -2074,7 +2138,10 @@ pub async fn fetch_verified_body(
     let block: Block = match bincode::deserialize(&bytes) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("[repl] discarding undecodable body for {}: {e:?}", hex::encode(expected_hash));
+            eprintln!(
+                "[repl] discarding undecodable body for {}: {e:?}",
+                hex::encode(expected_hash)
+            );
             return None;
         }
     };
@@ -2196,7 +2263,10 @@ impl P2pNetworkAdapter {
         for h in handles {
             match h.await {
                 Ok(Some(pair)) => out.push(pair),
-                _ => out.push((u64::MAX, ReplicateOutcome::Unavailable("join failed".into()))),
+                _ => out.push((
+                    u64::MAX,
+                    ReplicateOutcome::Unavailable("join failed".into()),
+                )),
             }
         }
         out.sort_by_key(|(h, _)| *h);
@@ -2596,7 +2666,9 @@ impl CrossShardPubSub for InfnodeCrossShardPubSub {
             });
             // Network subscription: every peer relays what it publishes on
             // this topic to us (idempotent, safe to repeat).
-            let payload = serde_json::json!({ "topic": topic }).to_string().into_bytes();
+            let payload = serde_json::json!({ "topic": topic })
+                .to_string()
+                .into_bytes();
             for pid in self.peer_ids() {
                 let node = Arc::clone(&self.node);
                 let payload = payload.clone();
@@ -3004,7 +3076,10 @@ mod tests {
         assert_eq!(crate::sync::ADOPT_REPL_BACKFILL_MAX_PER_PASS, 64);
         assert_eq!(crate::sync::ADOPT_REPL_RETRO_DEPTH, 4096);
         assert_eq!(crate::sync::ADOPT_REPL_KEEP_WINDOW, 8000);
-        assert_eq!(crate::sync::ADOPT_REPL_KEEP_WINDOW, STELL_DHT_KEEP_BLOCKS_DEFAULT);
+        assert_eq!(
+            crate::sync::ADOPT_REPL_KEEP_WINDOW,
+            STELL_DHT_KEEP_BLOCKS_DEFAULT
+        );
     }
 
     #[test]
@@ -3088,11 +3163,8 @@ mod tests {
         let msg = CrossShardMessage::new_trusted(1, 2, tx, [0u8; 32], [3u8; 32]);
         sender.send_outbound(&msg).await.expect("publish");
 
-        let leaked = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            inbound.recv(),
-        )
-        .await;
+        let leaked =
+            tokio::time::timeout(std::time::Duration::from_millis(250), inbound.recv()).await;
         assert!(
             leaked.is_err(),
             "a different chain epoch must never receive the message"
@@ -3171,7 +3243,10 @@ mod header_lane_tests {
         );
         // And that lane is the Pointer lane, NOT the Bulk lane the sidecars
         // used to ride.
-        assert_eq!(lanes[0], repl_lane_key(BUCKET_STELLEREUM_HEADERS, ReplStoreKind::Pointer));
+        assert_eq!(
+            lanes[0],
+            repl_lane_key(BUCKET_STELLEREUM_HEADERS, ReplStoreKind::Pointer)
+        );
         assert_ne!(
             lanes[0],
             repl_lane_key(BUCKET_STELLEREUM_HEADERS, ReplStoreKind::Bulk),
@@ -3203,7 +3278,6 @@ mod header_lane_tests {
         );
     }
 }
-
 
 #[cfg(test)]
 mod epoch_tests {
@@ -3240,7 +3314,10 @@ mod epoch_tests {
         assert_ne!(snapshot_name(&e1, 1, 100), snapshot_name(&e2, 1, 100));
 
         // And the same chain always agrees on them.
-        assert_eq!(head_name(&e1, 1), head_name(&EpochTag::from_genesis(&[0x11u8; 32]), 1));
+        assert_eq!(
+            head_name(&e1, 1),
+            head_name(&EpochTag::from_genesis(&[0x11u8; 32]), 1)
+        );
     }
 
     #[test]
@@ -3342,7 +3419,11 @@ pub struct PeerEndpoint {
 impl PeerEndpoint {
     /// New record for an endpoint just observed live.
     pub fn new(endpoint: &str, now_ms: u64) -> Self {
-        Self { endpoint: endpoint.to_string(), last_seen_ms: now_ms, consecutive_failures: 0 }
+        Self {
+            endpoint: endpoint.to_string(),
+            last_seen_ms: now_ms,
+            consecutive_failures: 0,
+        }
     }
 
     /// Record a successful dial: refresh last-seen and clear the failure streak.
@@ -3381,7 +3462,10 @@ pub struct PeerEndpointTable {
 impl PeerEndpointTable {
     /// Empty table holding at most `cap` records (`cap` saturates to >= 1).
     pub fn new(cap: usize) -> Self {
-        Self { entries: std::collections::HashMap::new(), cap: cap.max(1) }
+        Self {
+            entries: std::collections::HashMap::new(),
+            cap: cap.max(1),
+        }
     }
 
     /// Empty table with the production cap.
@@ -3414,10 +3498,8 @@ impl PeerEndpointTable {
         match self.entries.get_mut(endpoint) {
             Some(rec) => rec.mark_success(now_ms),
             None => {
-                self.entries.insert(
-                    endpoint.to_string(),
-                    PeerEndpoint::new(endpoint, now_ms),
-                );
+                self.entries
+                    .insert(endpoint.to_string(), PeerEndpoint::new(endpoint, now_ms));
             }
         }
         self.enforce_cap();
@@ -3446,11 +3528,16 @@ impl PeerEndpointTable {
     pub fn preferred_order(&self) -> Vec<String> {
         let mut recs: Vec<&PeerEndpoint> = self.entries.values().collect();
         recs.sort_by(|a, b| {
-            (a.backed_off(), a.consecutive_failures, std::cmp::Reverse(a.last_seen_ms)).cmp(&(
-                b.backed_off(),
-                b.consecutive_failures,
-                std::cmp::Reverse(b.last_seen_ms),
-            ))
+            (
+                a.backed_off(),
+                a.consecutive_failures,
+                std::cmp::Reverse(a.last_seen_ms),
+            )
+                .cmp(&(
+                    b.backed_off(),
+                    b.consecutive_failures,
+                    std::cmp::Reverse(b.last_seen_ms),
+                ))
         });
         recs.into_iter().map(|r| r.endpoint.clone()).collect()
     }
@@ -3464,8 +3551,16 @@ impl PeerEndpointTable {
                 .entries
                 .iter()
                 .max_by(|(ka, a), (kb, b)| {
-                    (a.consecutive_failures, std::cmp::Reverse(a.last_seen_ms), kb)
-                        .cmp(&(b.consecutive_failures, std::cmp::Reverse(b.last_seen_ms), ka))
+                    (
+                        a.consecutive_failures,
+                        std::cmp::Reverse(a.last_seen_ms),
+                        kb,
+                    )
+                        .cmp(&(
+                            b.consecutive_failures,
+                            std::cmp::Reverse(b.last_seen_ms),
+                            ka,
+                        ))
                 })
                 .map(|(k, _)| k.clone());
             match victim {
@@ -3514,9 +3609,18 @@ mod retention_tests {
         assert_eq!(parse_keep_blocks(Some("8000".into())), 8000);
         assert_eq!(parse_keep_blocks(Some("50000".into())), 50_000);
         // Garbage and non-positive values fall back instead of disabling prune.
-        assert_eq!(parse_keep_blocks(Some("".into())), STELL_DHT_KEEP_BLOCKS_DEFAULT);
-        assert_eq!(parse_keep_blocks(Some("nope".into())), STELL_DHT_KEEP_BLOCKS_DEFAULT);
-        assert_eq!(parse_keep_blocks(Some("0".into())), STELL_DHT_KEEP_BLOCKS_DEFAULT);
+        assert_eq!(
+            parse_keep_blocks(Some("".into())),
+            STELL_DHT_KEEP_BLOCKS_DEFAULT
+        );
+        assert_eq!(
+            parse_keep_blocks(Some("nope".into())),
+            STELL_DHT_KEEP_BLOCKS_DEFAULT
+        );
+        assert_eq!(
+            parse_keep_blocks(Some("0".into())),
+            STELL_DHT_KEEP_BLOCKS_DEFAULT
+        );
     }
 
     #[test]
@@ -3532,7 +3636,11 @@ mod retention_tests {
         assert_eq!(dht_blob_ttl_ms(1), 7 * DAY);
         assert_eq!(dht_blob_ttl_ms(100), 7 * DAY);
         assert_eq!(dht_blob_ttl_ms(1_000_000), 30 * DAY);
-        assert_eq!(dht_blob_ttl_ms(u64::MAX), 30 * DAY, "no overflow on absurd KEEP");
+        assert_eq!(
+            dht_blob_ttl_ms(u64::MAX),
+            30 * DAY,
+            "no overflow on absurd KEEP"
+        );
     }
 
     #[test]
@@ -3567,8 +3675,16 @@ mod retention_tests {
         assert_eq!(prune_below_exclusive(9000, 8000), 1000);
         // Heights below the bound are exactly the prunable ones; the KEEP
         // window itself (bound..=tip) is untouched.
-        assert_eq!(prune_below_exclusive(8000, 8000), 0, "nothing to prune at exactly KEEP");
-        assert_eq!(prune_below_exclusive(100, 8000), 0, "young chain prunes nothing");
+        assert_eq!(
+            prune_below_exclusive(8000, 8000),
+            0,
+            "nothing to prune at exactly KEEP"
+        );
+        assert_eq!(
+            prune_below_exclusive(100, 8000),
+            0,
+            "young chain prunes nothing"
+        );
         assert_eq!(prune_below_exclusive(0, 8000), 0);
     }
 
@@ -3586,16 +3702,19 @@ mod retention_tests {
         assert_eq!(next2, 1024);
         // ...and the tail batch stops exactly at the bound.
         let (b3, next3) = prune_batch(9_900, 10_000, 512);
-        assert_eq!(b3, vec![9901, 9902, 9903, 9904, 9905, 9906, 9907, 9908, 9909, 9910,
-                            9911, 9912, 9913, 9914, 9915, 9916, 9917, 9918, 9919, 9920,
-                            9921, 9922, 9923, 9924, 9925, 9926, 9927, 9928, 9929, 9930,
-                            9931, 9932, 9933, 9934, 9935, 9936, 9937, 9938, 9939, 9940,
-                            9941, 9942, 9943, 9944, 9945, 9946, 9947, 9948, 9949, 9950,
-                            9951, 9952, 9953, 9954, 9955, 9956, 9957, 9958, 9959, 9960,
-                            9961, 9962, 9963, 9964, 9965, 9966, 9967, 9968, 9969, 9970,
-                            9971, 9972, 9973, 9974, 9975, 9976, 9977, 9978, 9979, 9980,
-                            9981, 9982, 9983, 9984, 9985, 9986, 9987, 9988, 9989, 9990,
-                            9991, 9992, 9993, 9994, 9995, 9996, 9997, 9998, 9999, 10000]);
+        assert_eq!(
+            b3,
+            vec![
+                9901, 9902, 9903, 9904, 9905, 9906, 9907, 9908, 9909, 9910, 9911, 9912, 9913, 9914,
+                9915, 9916, 9917, 9918, 9919, 9920, 9921, 9922, 9923, 9924, 9925, 9926, 9927, 9928,
+                9929, 9930, 9931, 9932, 9933, 9934, 9935, 9936, 9937, 9938, 9939, 9940, 9941, 9942,
+                9943, 9944, 9945, 9946, 9947, 9948, 9949, 9950, 9951, 9952, 9953, 9954, 9955, 9956,
+                9957, 9958, 9959, 9960, 9961, 9962, 9963, 9964, 9965, 9966, 9967, 9968, 9969, 9970,
+                9971, 9972, 9973, 9974, 9975, 9976, 9977, 9978, 9979, 9980, 9981, 9982, 9983, 9984,
+                9985, 9986, 9987, 9988, 9989, 9990, 9991, 9992, 9993, 9994, 9995, 9996, 9997, 9998,
+                9999, 10000
+            ]
+        );
         assert_eq!(next3, 10_000);
         // Caught-up cursor prunes nothing.
         let (b4, next4) = prune_batch(10_000, 10_000, 512);
@@ -3741,10 +3860,22 @@ mod retention_tests {
         // same retention window) plus the hash-addressed
         // body resolved through that index...
         assert_eq!(plan.blobs.len(), 4);
-        assert!(plan.blobs.iter().any(|(b, n)| *b == BUCKET_STELLEREUM_HEADERS && n.contains("_h_1000")));
-        assert!(plan.blobs.iter().any(|(b, n)| *b == BUCKET_STELLEREUM_HEADERS && n.contains("_hi_0_1000")));
-        assert!(plan.blobs.iter().any(|(b, n)| *b == BUCKET_STELLEREUM_HEADERS && n.contains("_hq_0_1000")));
-        assert!(plan.blobs.iter().any(|(b, n)| *b == BUCKET_STELLEREUM_BLOCKS && n.contains(&hash_hex)));
+        assert!(plan
+            .blobs
+            .iter()
+            .any(|(b, n)| *b == BUCKET_STELLEREUM_HEADERS && n.contains("_h_1000")));
+        assert!(plan
+            .blobs
+            .iter()
+            .any(|(b, n)| *b == BUCKET_STELLEREUM_HEADERS && n.contains("_hi_0_1000")));
+        assert!(plan
+            .blobs
+            .iter()
+            .any(|(b, n)| *b == BUCKET_STELLEREUM_HEADERS && n.contains("_hq_0_1000")));
+        assert!(plan
+            .blobs
+            .iter()
+            .any(|(b, n)| *b == BUCKET_STELLEREUM_BLOCKS && n.contains(&hash_hex)));
         // ...and the per-hash kv index `broadcast_block` wrote alongside it.
         assert_eq!(plan.kv, vec![format!("{}{}", PREFIX_BLOCK_HASH, hash_hex)]);
         // The head pointer and snapshots are never planned: they stay forever.
@@ -3799,7 +3930,10 @@ mod retention_tests {
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].bucket, BUCKET_STELLEREUM_BLOCKS);
         assert!(writes[0].kv.is_empty(), "retro publish still writes no kv");
-        assert_eq!(writes[0].name, block_body_blob_name(&epoch, &block.compute_hash()));
+        assert_eq!(
+            writes[0].name,
+            block_body_blob_name(&epoch, &block.compute_hash())
+        );
     }
 }
 
@@ -3861,12 +3995,16 @@ mod pointer_overwrite_tests {
 
     /// Live (non-hidden) chunk files under `<data_dir>/chunks`, all buckets.
     /// Hidden `.*.tmp.*` files are atomic-write leftovers, counted separately.
-    fn chunk_files(data_dir: &std::path::Path) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    fn chunk_files(
+        data_dir: &std::path::Path,
+    ) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
         let mut live = Vec::new();
         let mut hidden = Vec::new();
         let mut stack = vec![data_dir.join("chunks")];
         while let Some(d) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
             for e in rd.flatten() {
                 let p = e.path();
                 if p.is_dir() {
@@ -3972,7 +4110,10 @@ mod pointer_overwrite_tests {
             N + 2
         );
 
-        let latest = adapter.fetch_latest_snapshot(0).await.expect("pointer must read back");
+        let latest = adapter
+            .fetch_latest_snapshot(0)
+            .await
+            .expect("pointer must read back");
         assert_eq!(latest, N * 100);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4207,7 +4348,9 @@ pub fn repl_pace_wait_ms() -> u64 {
 /// The floor is always the base — a timed-out store never retries sooner.
 pub fn repl_retry_backoff_ms(attempt: u32) -> u64 {
     let shift = attempt.saturating_sub(1).min(4);
-    REPL_RETRY_BASE_MS.saturating_mul(1u64 << shift).min(REPL_RETRY_CAP_MS)
+    REPL_RETRY_BASE_MS
+        .saturating_mul(1u64 << shift)
+        .min(REPL_RETRY_CAP_MS)
 }
 
 /// Backoff plus a uniform jitter draw `0..=250` (caller passes `rand::random::<u64>()`).
@@ -4428,13 +4571,7 @@ impl ReplBackpressure {
     /// is stamped (drives both the bucket and the spacing floor). Denials are
     /// cheap and side-effect-free apart from the refill accounting.
     pub fn publish_allowed(&mut self, peer: &str, now_ms: u64) -> bool {
-        let gate = Self::gate_for(
-            &mut self.peers,
-            self.max_peers,
-            self.capacity,
-            peer,
-            now_ms,
-        );
+        let gate = Self::gate_for(&mut self.peers, self.max_peers, self.capacity, peer, now_ms);
         let refill = self.refill_per_sec;
         let capacity = self.capacity;
         let interval = self.min_interval_ms;

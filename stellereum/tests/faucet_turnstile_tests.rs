@@ -24,7 +24,10 @@ struct MockVerifier {
 
 impl MockVerifier {
     fn new(verdict: CaptchaVerdict) -> Arc<Self> {
-        Arc::new(Self { verdict, calls: AtomicUsize::new(0) })
+        Arc::new(Self {
+            verdict,
+            calls: AtomicUsize::new(0),
+        })
     }
 }
 
@@ -52,20 +55,30 @@ async fn state() -> Arc<RpcState> {
     let faucet_key = [0x11u8; 32];
     engine
         .update_account(AccountState::new(
-            ed25519_dalek::SigningKey::from_bytes(&faucet_key).verifying_key().to_bytes(),
+            ed25519_dalek::SigningKey::from_bytes(&faucet_key)
+                .verifying_key()
+                .to_bytes(),
             10_000_000_000_000,
         ))
         .await;
     Arc::new(RpcState {
         engine,
-        mempool: Arc::new(tokio::sync::RwLock::new(stellereum::mempool::Mempool::default())),
+        mempool: Arc::new(tokio::sync::RwLock::new(
+            stellereum::mempool::Mempool::default(),
+        )),
         height: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         node_id: "inf1:turnstile".to_string(),
         chain_id: 5757,
-        staking: Arc::new(tokio::sync::RwLock::new(stellereum::staking::StakingLedger::new())),
-        governance: Arc::new(tokio::sync::RwLock::new(stellereum::governance::Governance::new())),
+        staking: Arc::new(tokio::sync::RwLock::new(
+            stellereum::staking::StakingLedger::new(),
+        )),
+        governance: Arc::new(tokio::sync::RwLock::new(
+            stellereum::governance::Governance::new(),
+        )),
         recent_blocks: Arc::new(tokio::sync::RwLock::new(std::collections::VecDeque::new())),
-        receipts: Arc::new(tokio::sync::RwLock::new(stellereum::rpc::ReceiptIndex::default())),
+        receipts: Arc::new(tokio::sync::RwLock::new(
+            stellereum::rpc::ReceiptIndex::default(),
+        )),
         auth_token: None,
         tx_broadcast: None,
         faucet: Some(Arc::new(stellereum::rpc::Faucet::new(
@@ -156,11 +169,17 @@ async fn no_captcha_config_requires_no_token_and_keeps_throttle() {
     let addr = spawn_gateway_no_captcha().await;
     let who = hex::encode([7u8; 32]);
     let (status, body) = http_post(addr, &format!("/api/faucet-public/{who}"), "").await;
-    assert!(status.contains("200"), "tokenless drip must work without captcha: {status} {body}");
+    assert!(
+        status.contains("200"),
+        "tokenless drip must work without captcha: {status} {body}"
+    );
     assert!(body.contains("pending"), "must mint: {body}");
     // Per-address cooldown: the very next request for the SAME address is 429.
     let (status, _) = http_post(addr, &format!("/api/faucet-public/{who}"), "").await;
-    assert!(status.contains("429"), "cooldown must still apply: {status}");
+    assert!(
+        status.contains("429"),
+        "cooldown must still apply: {status}"
+    );
 }
 
 // 2. Captcha configured, request without a token → 400 (siteverify not called).
@@ -170,9 +189,19 @@ async fn captcha_enabled_missing_token_is_400() {
     let addr = spawn_gateway_with(enabled_gate(mock.clone())).await;
     let who = hex::encode([8u8; 32]);
     let (status, body) = http_post(addr, &format!("/api/faucet-public/{who}"), "").await;
-    assert!(status.contains("400"), "missing token must be 400: {status} {body}");
-    assert!(body.contains("captcha token required"), "body must explain: {body}");
-    assert_eq!(mock.calls.load(Ordering::SeqCst), 0, "siteverify must not be called without a token");
+    assert!(
+        status.contains("400"),
+        "missing token must be 400: {status} {body}"
+    );
+    assert!(
+        body.contains("captcha token required"),
+        "body must explain: {body}"
+    );
+    assert_eq!(
+        mock.calls.load(Ordering::SeqCst),
+        0,
+        "siteverify must not be called without a token"
+    );
 }
 
 // 3. Captcha configured, valid token (siteverify → {"success":true}) → 200 mint.
@@ -181,10 +210,22 @@ async fn captcha_success_dispenses() {
     let mock = MockVerifier::new(CaptchaVerdict::Success);
     let addr = spawn_gateway_with(enabled_gate(mock.clone())).await;
     let who = hex::encode([9u8; 32]);
-    let (status, body) = http_post(addr, &format!("/api/faucet-public/{who}"), &ok_body("tok-good")).await;
-    assert!(status.contains("200"), "valid token must mint: {status} {body}");
+    let (status, body) = http_post(
+        addr,
+        &format!("/api/faucet-public/{who}"),
+        &ok_body("tok-good"),
+    )
+    .await;
+    assert!(
+        status.contains("200"),
+        "valid token must mint: {status} {body}"
+    );
     assert!(body.contains("\"status\":\"pending\""), "must mint: {body}");
-    assert_eq!(mock.calls.load(Ordering::SeqCst), 1, "siteverify must be called exactly once");
+    assert_eq!(
+        mock.calls.load(Ordering::SeqCst),
+        1,
+        "siteverify must be called exactly once"
+    );
 }
 
 // 4. siteverify {"success":false,"error-codes":["invalid-input-response"]}
@@ -196,10 +237,24 @@ async fn captcha_rejected_is_403_with_error_codes() {
     });
     let addr = spawn_gateway_with(enabled_gate(mock.clone())).await;
     let who = hex::encode([10u8; 32]);
-    let (status, body) = http_post(addr, &format!("/api/faucet-public/{who}"), &ok_body("tok-bad")).await;
-    assert!(status.contains("403"), "rejected token must be 403: {status} {body}");
-    assert!(body.contains("invalid-input-response"), "error-codes must be surfaced: {body}");
-    assert!(!body.contains("tok-bad"), "the token must never be echoed back: {body}");
+    let (status, body) = http_post(
+        addr,
+        &format!("/api/faucet-public/{who}"),
+        &ok_body("tok-bad"),
+    )
+    .await;
+    assert!(
+        status.contains("403"),
+        "rejected token must be 403: {status} {body}"
+    );
+    assert!(
+        body.contains("invalid-input-response"),
+        "error-codes must be surfaced: {body}"
+    );
+    assert!(
+        !body.contains("tok-bad"),
+        "the token must never be echoed back: {body}"
+    );
 }
 
 // 5. siteverify unreachable/timeout → fail-closed 503, NO mint.
@@ -210,13 +265,24 @@ async fn siteverify_unavailable_fails_closed() {
     });
     let addr = spawn_gateway_with(enabled_gate(mock.clone())).await;
     let who = hex::encode([11u8; 32]);
-    let (status, body) = http_post(addr, &format!("/api/faucet-public/{who}"), &ok_body("tok-x")).await;
-    assert!(status.contains("503"), "outage must fail closed: {status} {body}");
+    let (status, body) = http_post(
+        addr,
+        &format!("/api/faucet-public/{who}"),
+        &ok_body("tok-x"),
+    )
+    .await;
+    assert!(
+        status.contains("503"),
+        "outage must fail closed: {status} {body}"
+    );
     assert!(!body.contains("pending"), "must not mint on outage: {body}");
     assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
     // The recipient got nothing: balance is still zero.
     let (_, bal) = http_get(addr, &format!("/api/balance/{who}")).await;
-    assert!(bal.contains("\"balance\":\"0\""), "no mint on outage: {bal}");
+    assert!(
+        bal.contains("\"balance\":\"0\""),
+        "no mint on outage: {bal}"
+    );
 }
 
 // 6. Only the secret key set (misconfigured) → 503, fail-closed.
@@ -226,13 +292,31 @@ async fn secret_only_config_is_503() {
     let gate = Arc::new(CaptchaGate::new(CaptchaConfig::Misconfigured, mock.clone()));
     let addr = spawn_gateway_with(gate).await;
     let who = hex::encode([12u8; 32]);
-    let (status, body) = http_post(addr, &format!("/api/faucet-public/{who}"), &ok_body("tok-x")).await;
-    assert!(status.contains("503"), "misconfigured gate must refuse: {status} {body}");
-    assert!(body.contains("misconfigured"), "body must name the problem: {body}");
-    assert_eq!(mock.calls.load(Ordering::SeqCst), 0, "verifier must not be consulted");
+    let (status, body) = http_post(
+        addr,
+        &format!("/api/faucet-public/{who}"),
+        &ok_body("tok-x"),
+    )
+    .await;
+    assert!(
+        status.contains("503"),
+        "misconfigured gate must refuse: {status} {body}"
+    );
+    assert!(
+        body.contains("misconfigured"),
+        "body must name the problem: {body}"
+    );
+    assert_eq!(
+        mock.calls.load(Ordering::SeqCst),
+        0,
+        "verifier must not be consulted"
+    );
     // Even a tokenless request is refused with the same clarity.
     let (status, body) = http_post(addr, &format!("/api/faucet-public/{who}"), "").await;
-    assert!(status.contains("503"), "misconfigured gate must refuse everything: {status} {body}");
+    assert!(
+        status.contains("503"),
+        "misconfigured gate must refuse everything: {status} {body}"
+    );
 }
 
 // 7. The per-IP throttle gates the MINT, and the captcha is verified FIRST.
@@ -261,16 +345,26 @@ async fn ip_throttle_enforced_before_captcha() {
         let who = hex::encode([100u8.wrapping_add(i); 32]);
         let (status, body) =
             http_post(addr, &format!("/api/faucet-public/{who}"), &ok_body("tok")).await;
-        assert!(status.contains("200"), "drip #{i} within budget must pass: {status} {body}");
+        assert!(
+            status.contains("200"),
+            "drip #{i} within budget must pass: {status} {body}"
+        );
     }
     let calls_after_budget = mock.calls.load(Ordering::SeqCst);
-    assert_eq!(calls_after_budget, 20, "every in-budget drip passed the captcha");
+    assert_eq!(
+        calls_after_budget, 20,
+        "every in-budget drip passed the captcha"
+    );
 
     // Over budget WITH a valid token: the captcha is verified first (the
     // order is captcha -> throttle), and the THROTTLE then refuses the mint.
     let who = hex::encode([200u8; 32]);
-    let (status, body) = http_post(addr, &format!("/api/faucet-public/{who}"), &ok_body("tok")).await;
-    assert!(status.contains("429"), "over-budget request must be 429: {status} {body}");
+    let (status, body) =
+        http_post(addr, &format!("/api/faucet-public/{who}"), &ok_body("tok")).await;
+    assert!(
+        status.contains("429"),
+        "over-budget request must be 429: {status} {body}"
+    );
     assert!(
         mock.calls.load(Ordering::SeqCst) == calls_after_budget + 1,
         "the captcha is verified BEFORE the throttle (one more siteverify call)"
@@ -281,7 +375,10 @@ async fn ip_throttle_enforced_before_captcha() {
     // burned on it either.
     let calls_before_tokenless = mock.calls.load(Ordering::SeqCst);
     let (status, body) = http_post(addr, &format!("/api/faucet-public/{who}"), "").await;
-    assert!(status.contains("400"), "tokenless request must be 400: {status} {body}");
+    assert!(
+        status.contains("400"),
+        "tokenless request must be 400: {status} {body}"
+    );
     assert!(
         mock.calls.load(Ordering::SeqCst) == calls_before_tokenless,
         "a request without a token must not reach siteverify"
@@ -290,7 +387,10 @@ async fn ip_throttle_enforced_before_captcha() {
     // And the over-budget recipient still got NOTHING: the throttle gated
     // the mint even though the captcha passed.
     let (_, bal) = http_get(addr, &format!("/api/balance/{who}")).await;
-    assert!(bal.contains("\"balance\":\"0\""), "no mint over budget: {bal}");
+    assert!(
+        bal.contains("\"balance\":\"0\""),
+        "no mint over budget: {bal}"
+    );
 }
 
 // 8. Token via header (CF-Turnstile-Response) and via body both work.
@@ -300,9 +400,16 @@ async fn token_accepted_from_header_and_body() {
     let addr = spawn_gateway_with(enabled_gate(mock.clone())).await;
     // Body field.
     let who = hex::encode([13u8; 32]);
-    let (status, body) =
-        http_post(addr, &format!("/api/faucet-public/{who}"), &ok_body("tok-body")).await;
-    assert!(status.contains("200"), "body token must work: {status} {body}");
+    let (status, body) = http_post(
+        addr,
+        &format!("/api/faucet-public/{who}"),
+        &ok_body("tok-body"),
+    )
+    .await;
+    assert!(
+        status.contains("200"),
+        "body token must work: {status} {body}"
+    );
     // Header.
     let who = hex::encode([14u8; 32]);
     let (status, body) = http_post_with(
@@ -312,7 +419,10 @@ async fn token_accepted_from_header_and_body() {
         &[("CF-Turnstile-Response", "tok-header")],
     )
     .await;
-    assert!(status.contains("200"), "header token must work: {status} {body}");
+    assert!(
+        status.contains("200"),
+        "header token must work: {status} {body}"
+    );
     assert_eq!(mock.calls.load(Ordering::SeqCst), 2);
     // Alias body field `turnstile_token` is accepted too.
     let who = hex::encode([15u8; 32]);
@@ -322,7 +432,10 @@ async fn token_accepted_from_header_and_body() {
         r#"{"turnstile_token":"tok-alias"}"#,
     )
     .await;
-    assert!(status.contains("200"), "turnstile_token alias must work: {status} {body}");
+    assert!(
+        status.contains("200"),
+        "turnstile_token alias must work: {status} {body}"
+    );
 }
 
 // 9. Address validation runs BEFORE the captcha: a malformed address is
@@ -336,10 +449,23 @@ async fn bad_address_rejected_before_siteverify() {
     let mock = MockVerifier::new(CaptchaVerdict::Success);
     let addr = spawn_gateway_with(enabled_gate(mock.clone())).await;
     let (status, body) = http_post(addr, "/api/faucet-public/zzzz", &ok_body("tok")).await;
-    assert!(status.contains("400"), "bad address must be 400: {status} {body}");
-    assert!(body.to_lowercase().contains("address"), "must name the problem: {body}");
-    assert!(body.contains("invalid address"), "namespaced address error, got: {body}");
-    assert_eq!(mock.calls.load(Ordering::SeqCst), 0, "siteverify must not be burned on garbage");
+    assert!(
+        status.contains("400"),
+        "bad address must be 400: {status} {body}"
+    );
+    assert!(
+        body.to_lowercase().contains("address"),
+        "must name the problem: {body}"
+    );
+    assert!(
+        body.contains("invalid address"),
+        "namespaced address error, got: {body}"
+    );
+    assert_eq!(
+        mock.calls.load(Ordering::SeqCst),
+        0,
+        "siteverify must not be burned on garbage"
+    );
 }
 
 // 10. The index page embeds the Turnstile widget + script only when a site
@@ -349,19 +475,38 @@ async fn index_embeds_widget_only_when_configured() {
     // Captcha off.
     let addr = spawn_gateway_no_captcha().await;
     let (_, body) = http_get(addr, "/").await;
-    assert!(body.contains("Public faucet"), "faucet form must be present: {}", &body[..body.len().min(200)]);
+    assert!(
+        body.contains("Public faucet"),
+        "faucet form must be present: {}",
+        &body[..body.len().min(200)]
+    );
     assert!(
         !body.contains("challenges.cloudflare.com"),
         "no turnstile script when captcha is off"
     );
-    assert!(!body.contains("data-sitekey"), "no widget when captcha is off");
-    assert!(!body.contains("TS_REQUIRED=true"), "captcha must not be required when off");
+    assert!(
+        !body.contains("data-sitekey"),
+        "no widget when captcha is off"
+    );
+    assert!(
+        !body.contains("TS_REQUIRED=true"),
+        "captcha must not be required when off"
+    );
 
     // Captcha on.
     let mock = MockVerifier::new(CaptchaVerdict::Success);
     let addr = spawn_gateway_with(enabled_gate(mock)).await;
     let (_, body) = http_get(addr, "/").await;
-    assert!(body.contains("challenges.cloudflare.com/turnstile/v0/api.js"), "script must be embedded");
-    assert!(body.contains("data-sitekey=\"test-site-key\""), "widget must carry the site key");
-    assert!(body.contains("'cf-turnstile-response'"), "submit must send the token");
+    assert!(
+        body.contains("challenges.cloudflare.com/turnstile/v0/api.js"),
+        "script must be embedded"
+    );
+    assert!(
+        body.contains("data-sitekey=\"test-site-key\""),
+        "widget must carry the site key"
+    );
+    assert!(
+        body.contains("'cf-turnstile-response'"),
+        "submit must send the token"
+    );
 }

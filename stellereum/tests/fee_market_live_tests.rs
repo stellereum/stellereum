@@ -17,9 +17,8 @@
 
 use ed25519_dalek::SigningKey;
 use stellereum::mempool::Mempool;
-use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::sharding::Transaction;
-
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -44,7 +43,11 @@ fn an_overflowing_block_keeps_the_highest_paying_transactions() {
     let picked = mp.select_bounded(10, u64::MAX);
     assert_eq!(picked.len(), 10, "the count cap must hold");
     let fees: Vec<u64> = picked.iter().map(|t| t.gas_limit).collect();
-    assert_eq!(fees, vec![149, 148, 147, 146, 145, 144, 143, 142, 141, 140], "highest fees win");
+    assert_eq!(
+        fees,
+        vec![149, 148, 147, 146, 145, 144, 143, 142, 141, 140],
+        "highest fees win"
+    );
 }
 
 #[test]
@@ -59,8 +62,14 @@ fn the_gas_budget_skips_an_oversized_transaction_rather_than_truncating() {
 
     let picked = mp.select_bounded(10, 1_500);
     let senders: Vec<[u8; 32]> = picked.iter().map(|t| t.from).collect();
-    assert!(!senders.contains(&key(3).verifying_key().to_bytes()), "the oversized tx must be skipped");
-    assert!(senders.contains(&key(4).verifying_key().to_bytes()), "a cheaper tx behind it must still fit");
+    assert!(
+        !senders.contains(&key(3).verifying_key().to_bytes()),
+        "the oversized tx must be skipped"
+    );
+    assert!(
+        senders.contains(&key(4).verifying_key().to_bytes()),
+        "a cheaper tx behind it must still fit"
+    );
     assert_eq!(picked.len(), 3, "500 + 400 + 300 = 1200 fits a 1500 budget");
 }
 
@@ -71,7 +80,9 @@ async fn unexecutable_transactions_do_not_occupy_the_block() {
     // them fail at application.
     let engine = InMemoryStateEngine::new();
     let addr = funded(1);
-    engine.update_account(AccountState::new(addr, 1_000_000)).await;
+    engine
+        .update_account(AccountState::new(addr, 1_000_000))
+        .await;
 
     let mut mp = Mempool::new(1_000, 1_000);
     // One executable transaction, then a flood of replays at a higher fee.
@@ -85,9 +96,10 @@ async fn unexecutable_transactions_do_not_occupy_the_block() {
     // sequence per sender, so the expected nonce advances as transactions are
     // accepted. Comparing against the account's nonce alone would admit a gap.
     let account = engine.get_account(&addr).await.expect("account");
-    let cursors = std::cell::RefCell::new(
-        std::collections::HashMap::from([(addr, (account.nonce, account.balance))]),
-    );
+    let cursors = std::cell::RefCell::new(std::collections::HashMap::from([(
+        addr,
+        (account.nonce, account.balance),
+    )]));
     let selected: std::cell::RefCell<Vec<Transaction>> = std::cell::RefCell::new(Vec::new());
     mp.select_for_block(50, 30_000_000, |t| {
         let Some(&(expected, balance)) = cursors.borrow().get(&t.from) else {
@@ -100,7 +112,9 @@ async fn unexecutable_transactions_do_not_occupy_the_block() {
         if balance < cost {
             return false;
         }
-        cursors.borrow_mut().insert(t.from, (expected + 1, balance - cost));
+        cursors
+            .borrow_mut()
+            .insert(t.from, (expected + 1, balance - cost));
         selected.borrow_mut().push(t.clone());
         true
     });
@@ -121,13 +135,15 @@ async fn a_drained_sender_cannot_fill_a_block() {
 
     let mut mp = Mempool::new(1_000, 1_000);
     for n in 0..20u64 {
-        mp.add(transfer(2, n, 600, 5_000)).expect("admit by signature");
+        mp.add(transfer(2, n, 600, 5_000))
+            .expect("admit by signature");
     }
     let account = engine.get_account(&addr).await.expect("account");
     let picked: std::cell::RefCell<Vec<Transaction>> = std::cell::RefCell::new(Vec::new());
-    let cursors = std::cell::RefCell::new(
-        std::collections::HashMap::from([(addr, (account.nonce, account.balance))]),
-    );
+    let cursors = std::cell::RefCell::new(std::collections::HashMap::from([(
+        addr,
+        (account.nonce, account.balance),
+    )]));
     mp.select_for_block(50, 30_000_000, |t| {
         let Some(&(expected, balance)) = cursors.borrow().get(&t.from) else {
             return false;
@@ -139,7 +155,9 @@ async fn a_drained_sender_cannot_fill_a_block() {
         if balance < cost {
             return false;
         }
-        cursors.borrow_mut().insert(t.from, (expected + 1, balance - cost));
+        cursors
+            .borrow_mut()
+            .insert(t.from, (expected + 1, balance - cost));
         picked.borrow_mut().push(t.clone());
         true
     });
@@ -154,12 +172,17 @@ fn a_base_fee_above_zero_blocks_free_spam() {
     // With `base_fee == 0` a `gas_limit: 0` transaction is free, still takes a
     // slot, and is paid for like real work.
     let open = Mempool::default();
-    assert_eq!(open.base_fee, 0, "the library default stays 0 so tests are unaffected");
+    assert_eq!(
+        open.base_fee, 0,
+        "the library default stays 0 so tests are unaffected"
+    );
 
     let mut guarded = Mempool::default().with_base_fee(560);
     let k = key(3);
     let spam = Transaction::sign(&k, [0xEE; 32], 1, 0, 0, 0, 0);
-    let err = guarded.add_checked(spam, 1_000_000).expect_err("free tx must be rejected");
+    let err = guarded
+        .add_checked(spam, 1_000_000)
+        .expect_err("free tx must be rejected");
     assert_eq!(err, stellereum::mempool::MempoolError::FeeTooLow);
 
     // And a real transfer, priced at the cheapest real operation, gets through.
@@ -207,8 +230,12 @@ async fn proposer_filter_skips_below_floor_without_rejecting() {
     let poor = key(12);
     let poor_pub = poor.verifying_key().to_bytes();
     let engine = Arc::new(InMemoryStateEngine::new());
-    engine.update_account(AccountState::new(master_pub, 10_000_000)).await;
-    engine.update_account(AccountState::new(poor_pub, 10_000_000)).await;
+    engine
+        .update_account(AccountState::new(master_pub, 10_000_000))
+        .await;
+    engine
+        .update_account(AccountState::new(poor_pub, 10_000_000))
+        .await;
     let vset = ValidatorSet::from_list(vec![(master_pub, 1)]);
     let mut rt = ValidatorRuntime::new(master, vset, engine, 1);
 
@@ -226,9 +253,19 @@ async fn proposer_filter_skips_below_floor_without_rejecting() {
     }
 
     let block = rt.propose(1_000_000).await.expect("propose must succeed");
-    let packed: Vec<[u8; 32]> = block.transactions.iter().map(|t| t.compute_tx_hash()).collect();
-    assert!(packed.contains(&ok_tx.compute_tx_hash()), "above-floor tx is packed");
-    assert!(!packed.contains(&low_tx.compute_tx_hash()), "below-floor tx is skipped, not packed");
+    let packed: Vec<[u8; 32]> = block
+        .transactions
+        .iter()
+        .map(|t| t.compute_tx_hash())
+        .collect();
+    assert!(
+        packed.contains(&ok_tx.compute_tx_hash()),
+        "above-floor tx is packed"
+    );
+    assert!(
+        !packed.contains(&low_tx.compute_tx_hash()),
+        "below-floor tx is skipped, not packed"
+    );
     assert!(
         rt.mempool.read().await.contains(&low_tx.compute_tx_hash()),
         "a skipped tx is NOT rejected: the pool keeps it"

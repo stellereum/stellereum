@@ -80,7 +80,9 @@ impl XffMode {
 
     /// Effective mode from `STELL_XFF_MODE` (default [`XffMode::Rightmost`]).
     pub fn from_env() -> Self {
-        std::env::var(XFF_MODE_ENV).map(|v| Self::parse(&v)).unwrap_or(XffMode::Rightmost)
+        std::env::var(XFF_MODE_ENV)
+            .map(|v| Self::parse(&v))
+            .unwrap_or(XffMode::Rightmost)
     }
 }
 
@@ -153,20 +155,32 @@ pub fn parse_trusted_token(tok: &str) -> Option<TrustedNet> {
                     return None;
                 }
                 let mask = v4_mask(prefix);
-                Some(TrustedNet::V4 { net: u32::from(v4) & mask, prefix })
+                Some(TrustedNet::V4 {
+                    net: u32::from(v4) & mask,
+                    prefix,
+                })
             }
             IpAddr::V6(v6) => {
                 if prefix > 128 {
                     return None;
                 }
                 let mask = v6_mask(prefix);
-                Some(TrustedNet::V6 { net: u128::from(v6) & mask, prefix })
+                Some(TrustedNet::V6 {
+                    net: u128::from(v6) & mask,
+                    prefix,
+                })
             }
         }
     } else {
         match tok.parse::<IpAddr>() {
-            Ok(IpAddr::V4(v4)) => Some(TrustedNet::V4 { net: u32::from(v4), prefix: 32 }),
-            Ok(IpAddr::V6(v6)) => Some(TrustedNet::V6 { net: u128::from(v6), prefix: 128 }),
+            Ok(IpAddr::V4(v4)) => Some(TrustedNet::V4 {
+                net: u32::from(v4),
+                prefix: 32,
+            }),
+            Ok(IpAddr::V6(v6)) => Some(TrustedNet::V6 {
+                net: u128::from(v6),
+                prefix: 128,
+            }),
             Err(_) => None,
         }
     }
@@ -175,8 +189,14 @@ pub fn parse_trusted_token(tok: &str) -> Option<TrustedNet> {
 /// Default trust: loopback only (`127.0.0.0/8`, `::1/128`).
 pub fn default_trusted_nets() -> Vec<TrustedNet> {
     vec![
-        TrustedNet::V4 { net: u32::from(Ipv4Addr::new(127, 0, 0, 0)), prefix: 8 },
-        TrustedNet::V6 { net: u128::from(Ipv6Addr::LOCALHOST), prefix: 128 },
+        TrustedNet::V4 {
+            net: u32::from(Ipv4Addr::new(127, 0, 0, 0)),
+            prefix: 8,
+        },
+        TrustedNet::V6 {
+            net: u128::from(Ipv6Addr::LOCALHOST),
+            prefix: 128,
+        },
     ]
 }
 
@@ -290,7 +310,9 @@ pub fn forwarded_chain_from_headers(headers: &HeaderMap) -> Vec<IpAddr> {
         for elem in s.split(',') {
             for pair in elem.split(';') {
                 let pair = pair.trim();
-                let Some((k, val)) = pair.split_once('=') else { continue };
+                let Some((k, val)) = pair.split_once('=') else {
+                    continue;
+                };
                 if !k.trim().eq_ignore_ascii_case("for") {
                     continue;
                 }
@@ -317,7 +339,11 @@ fn single_ip_header(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
 /// - [`XffMode::Leftmost`]: first entry (only for overwriting proxies).
 /// - [`XffMode::Rightmost`]: rightmost entry that is NOT itself a trusted
 ///   proxy; if all entries are trusted, the leftmost (original client).
-pub fn select_from_chain(chain: &[IpAddr], mode: XffMode, trusted: &[TrustedNet]) -> Option<IpAddr> {
+pub fn select_from_chain(
+    chain: &[IpAddr],
+    mode: XffMode,
+    trusted: &[TrustedNet],
+) -> Option<IpAddr> {
     if chain.is_empty() {
         return None;
     }
@@ -335,7 +361,12 @@ pub fn select_from_chain(chain: &[IpAddr], mode: XffMode, trusted: &[TrustedNet]
 }
 
 /// Resolve with explicit config (deterministic; tests use this).
-pub fn resolve_with(headers: &HeaderMap, peer: IpAddr, trusted: &[TrustedNet], mode: XffMode) -> IpAddr {
+pub fn resolve_with(
+    headers: &HeaderMap,
+    peer: IpAddr,
+    trusted: &[TrustedNet],
+    mode: XffMode,
+) -> IpAddr {
     if !is_trusted_in(&peer, trusted) {
         return peer;
     }
@@ -409,10 +440,19 @@ mod tests {
         let n = nets("10.0.0.0/8, 192.168.1.0/24, 2001:db8::/32");
         assert!(is_trusted_in(&"10.1.2.3".parse::<IpAddr>().unwrap(), &n));
         assert!(!is_trusted_in(&"11.0.0.1".parse::<IpAddr>().unwrap(), &n));
-        assert!(is_trusted_in(&"192.168.1.99".parse::<IpAddr>().unwrap(), &n));
-        assert!(!is_trusted_in(&"192.168.2.1".parse::<IpAddr>().unwrap(), &n));
+        assert!(is_trusted_in(
+            &"192.168.1.99".parse::<IpAddr>().unwrap(),
+            &n
+        ));
+        assert!(!is_trusted_in(
+            &"192.168.2.1".parse::<IpAddr>().unwrap(),
+            &n
+        ));
         assert!(is_trusted_in(&"2001:db8::1".parse::<IpAddr>().unwrap(), &n));
-        assert!(!is_trusted_in(&"2001:db9::1".parse::<IpAddr>().unwrap(), &n));
+        assert!(!is_trusted_in(
+            &"2001:db9::1".parse::<IpAddr>().unwrap(),
+            &n
+        ));
         // Plain IPs are /32 + /128.
         let n = nets("1.2.3.4, 2001:db8::7");
         assert!(is_trusted_in(&"1.2.3.4".parse::<IpAddr>().unwrap(), &n));
@@ -429,8 +469,14 @@ mod tests {
         let trusted = nets("127.0.0.0/8, ::1/128");
         let peer: IpAddr = "8.8.8.8".parse::<IpAddr>().unwrap();
         let headers = h(&[("x-forwarded-for", "1.2.3.4")]);
-        assert_eq!(resolve_with(&headers, peer, &trusted, XffMode::Rightmost), peer);
-        assert_eq!(resolve_with(&headers, peer, &trusted, XffMode::Leftmost), peer);
+        assert_eq!(
+            resolve_with(&headers, peer, &trusted, XffMode::Rightmost),
+            peer
+        );
+        assert_eq!(
+            resolve_with(&headers, peer, &trusted, XffMode::Leftmost),
+            peer
+        );
     }
 
     #[test]
@@ -466,9 +512,18 @@ mod tests {
 
     #[test]
     fn xff_parsing_handles_ipv6_ports_and_garbage() {
-        assert_eq!(parse_ip_token("2001:db8::1"), Some("2001:db8::1".parse::<IpAddr>().unwrap()));
-        assert_eq!(parse_ip_token("[2001:db8::1]:4711"), Some("2001:db8::1".parse::<IpAddr>().unwrap()));
-        assert_eq!(parse_ip_token("1.2.3.4:5678"), Some("1.2.3.4".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            parse_ip_token("2001:db8::1"),
+            Some("2001:db8::1".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(
+            parse_ip_token("[2001:db8::1]:4711"),
+            Some("2001:db8::1".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(
+            parse_ip_token("1.2.3.4:5678"),
+            Some("1.2.3.4".parse::<IpAddr>().unwrap())
+        );
         assert_eq!(parse_ip_token("unknown"), None);
         assert_eq!(parse_ip_token("_hidden"), None);
         assert_eq!(parse_ip_token(""), None);
@@ -477,7 +532,10 @@ mod tests {
         let chain = parse_xff_chain("unknown, 1.2.3.4, garbage, 2001:db8::9");
         assert_eq!(
             chain,
-            vec!["1.2.3.4".parse::<IpAddr>().unwrap(), "2001:db8::9".parse::<IpAddr>().unwrap()]
+            vec![
+                "1.2.3.4".parse::<IpAddr>().unwrap(),
+                "2001:db8::9".parse::<IpAddr>().unwrap()
+            ]
         );
     }
 
@@ -485,11 +543,17 @@ mod tests {
     fn forwarded_for_is_parsed() {
         let trusted = nets("127.0.0.0/8");
         let peer: IpAddr = "127.0.0.1".parse::<IpAddr>().unwrap();
-        let headers = h(&[("forwarded", "for=192.0.2.60;proto=http, for=\"[2001:db8::1]:4711\"")]);
+        let headers = h(&[(
+            "forwarded",
+            "for=192.0.2.60;proto=http, for=\"[2001:db8::1]:4711\"",
+        )]);
         let chain = forwarded_chain_from_headers(&headers);
         assert_eq!(
             chain,
-            vec!["192.0.2.60".parse::<IpAddr>().unwrap(), "2001:db8::1".parse::<IpAddr>().unwrap()]
+            vec![
+                "192.0.2.60".parse::<IpAddr>().unwrap(),
+                "2001:db8::1".parse::<IpAddr>().unwrap()
+            ]
         );
         // Rightmost picks the entry closest to the proxy.
         assert_eq!(
@@ -516,7 +580,10 @@ mod tests {
         }
         // No headers → peer.
         let headers = h(&[]);
-        assert_eq!(resolve_with(&headers, peer, &trusted, XffMode::Rightmost), peer);
+        assert_eq!(
+            resolve_with(&headers, peer, &trusted, XffMode::Rightmost),
+            peer
+        );
         // XFF wins over single-IP fallbacks.
         let headers = h(&[("x-forwarded-for", "1.1.1.1"), ("x-real-ip", "2.2.2.2")]);
         assert_eq!(

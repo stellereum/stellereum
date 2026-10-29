@@ -23,12 +23,16 @@ use security::{HardenedKeystore, SecureSecret};
 #[path = "../src/wallets.rs"]
 mod wallets;
 use wallets::{
-    get_active_wallet_name, list_wallets, sanitize_wallet_name, save_named_wallet,
-    switch_wallet, wallets_dir,
+    get_active_wallet_name, list_wallets, sanitize_wallet_name, save_named_wallet, switch_wallet,
+    wallets_dir,
 };
 
 fn create_temp_env(test_name: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("stell_test_multi_{}_{}", test_name, std::process::id()));
+    let base = std::env::temp_dir().join(format!(
+        "stell_test_multi_{}_{}",
+        test_name,
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).expect("Failed to create tempdir");
     base
@@ -69,7 +73,10 @@ fn test_multi_wallet_create_list_and_switch_security() {
     save_named_wallet("savings", &ks1, Some(&base)).expect("Save savings failed");
 
     // Active should now be savings
-    assert_eq!(get_active_wallet_name(Some(&base)), Some("savings".to_string()));
+    assert_eq!(
+        get_active_wallet_name(Some(&base)),
+        Some("savings".to_string())
+    );
 
     // 3. Create wallet "trading"
     let secret2 = SecureSecret::new([0x22; 32]);
@@ -79,25 +86,37 @@ fn test_multi_wallet_create_list_and_switch_security() {
     save_named_wallet("trading", &ks2, Some(&base)).expect("Save trading failed");
 
     // Active should now be trading
-    assert_eq!(get_active_wallet_name(Some(&base)), Some("trading".to_string()));
+    assert_eq!(
+        get_active_wallet_name(Some(&base)),
+        Some("trading".to_string())
+    );
 
     // 4. List wallets: both exist, trading is active
     let list1 = list_wallets(Some(&base)).expect("Listing failed");
     assert_eq!(list1.len(), 2);
-    let active_entry = list1.iter().find(|w| w.is_active).expect("No active wallet");
+    let active_entry = list1
+        .iter()
+        .find(|w| w.is_active)
+        .expect("No active wallet");
     assert_eq!(active_entry.name, "trading");
     assert_eq!(active_entry.address_hex, addr2);
 
     // 5. Try switching to "savings" with WRONG password -> MUST FAIL and keep "trading" active!
     let bad_switch = switch_wallet("savings", "WrongPassword#999", Some(&base));
     assert!(bad_switch.is_err(), "Switch with wrong password must fail");
-    assert_eq!(get_active_wallet_name(Some(&base)), Some("trading".to_string()));
+    assert_eq!(
+        get_active_wallet_name(Some(&base)),
+        Some("trading".to_string())
+    );
 
     // 6. Switch to "savings" with CORRECT password -> MUST SUCCEED
     let good_switch = switch_wallet("savings", pass1, Some(&base)).expect("Switch failed");
     assert_eq!(good_switch.name, "savings");
     assert_eq!(good_switch.address_hex, addr1);
-    assert_eq!(get_active_wallet_name(Some(&base)), Some("savings".to_string()));
+    assert_eq!(
+        get_active_wallet_name(Some(&base)),
+        Some("savings".to_string())
+    );
 
     // Legacy `wallet.json` must now match savings
     let legacy = base.join("wallet.json");
@@ -108,7 +127,10 @@ fn test_multi_wallet_create_list_and_switch_security() {
     // 7. Switch back to "trading" by address with correct password
     let switch_by_addr = switch_wallet(addr2, pass2, Some(&base)).expect("Switch by addr failed");
     assert_eq!(switch_by_addr.name, "trading");
-    assert_eq!(get_active_wallet_name(Some(&base)), Some("trading".to_string()));
+    assert_eq!(
+        get_active_wallet_name(Some(&base)),
+        Some("trading".to_string())
+    );
 
     // Legacy `wallet.json` must now match trading
     let legacy_ks2 = HardenedKeystore::load(&legacy).expect("Load legacy failed");

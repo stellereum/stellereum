@@ -66,7 +66,10 @@ fn rpc_call(method: &str, params: serde_json::Value) -> Result<serde_json::Value
     if let Some(err) = resp.get("error") {
         return Err(anyhow!("node rejected {method}: {err}"));
     }
-    Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    Ok(resp
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
 }
 
 fn build_pq_tx(
@@ -94,13 +97,23 @@ fn build_pq_tx(
     };
     let msg = tx.signing_message();
     let sig_bytes = key.sign(&msg);
-    let envelope =
-        PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, key.public_key().to_vec(), sig_bytes);
+    let envelope = PqSignatureEnvelope::new_explicit(
+        PqScheme::Falcon512,
+        key.public_key().to_vec(),
+        sig_bytes,
+    );
     tx.signature = envelope.encode();
     tx
 }
 
-fn send_tx(key: &FalconKeypair, to: [u8; 32], amount: u64, gas: u64, nonce: u64, payload: Vec<OpCode>) -> Result<String> {
+fn send_tx(
+    key: &FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Result<String> {
     let tx = build_pq_tx(key, to, amount, gas, nonce, payload);
     let raw = hex::encode(bincode::serialize(&tx)?);
     let res = rpc_call("stell_sendRawTransaction", serde_json::json!({ "tx": raw }))?;
@@ -118,14 +131,20 @@ fn wait_for_tx(tag: &str, tx_hash: &str) -> Result<u64> {
             print!("{i}s.");
             std::io::stdout().flush().ok();
         }
-        let res = rpc_call("stell_getTransactionReceipt", serde_json::json!({ "hash": tx_hash }));
+        let res = rpc_call(
+            "stell_getTransactionReceipt",
+            serde_json::json!({ "hash": tx_hash }),
+        );
         if let Ok(val) = res {
             if let Some(status) = val.get("status").and_then(|s| s.as_str()) {
                 if status == "success" {
                     let h = val
                         .get("height")
                         .or_else(|| val.get("block_number"))
-                        .and_then(|b| b.as_u64().or_else(|| b.as_str().and_then(|s| s.parse::<u64>().ok())))
+                        .and_then(|b| {
+                            b.as_u64()
+                                .or_else(|| b.as_str().and_then(|s| s.parse::<u64>().ok()))
+                        })
                         .unwrap_or(0);
                     println!(" FINALIZED at #{h}");
                     return Ok(h);
@@ -141,7 +160,10 @@ fn wait_for_tx(tag: &str, tx_hash: &str) -> Result<u64> {
 }
 
 fn balance_of(addr_hex: &str) -> Result<(u64, u64)> {
-    let v = rpc_call("stell_getBalance", serde_json::json!({ "address": addr_hex }))?;
+    let v = rpc_call(
+        "stell_getBalance",
+        serde_json::json!({ "address": addr_hex }),
+    )?;
     let bal = v["balance"]
         .as_str()
         .and_then(|s| s.parse::<u64>().ok())
@@ -162,7 +184,10 @@ fn stake_of(val_hex: &str) -> Result<u64> {
 
 fn print_validators(tag: &str) -> Result<()> {
     let v = rpc_call("stell_getValidators", serde_json::json!({}))?;
-    println!("--- validator set ({tag}) ---\n{}", serde_json::to_string_pretty(&v)?);
+    println!(
+        "--- validator set ({tag}) ---\n{}",
+        serde_json::to_string_pretty(&v)?
+    );
     Ok(())
 }
 
@@ -242,7 +267,10 @@ fn faucet_keypair() -> Result<FalconKeypair> {
 
 fn fund_helpers(h: &Helpers, fk: &FalconKeypair, faucet_addr: &str) -> Result<()> {
     let (fbal, mut fnonce) = balance_of(faucet_addr)?;
-    println!("faucet account shard-0 balance={} nonce={fnonce}", fbal as f64 / STELL as f64);
+    println!(
+        "faucet account shard-0 balance={} nonce={fnonce}",
+        fbal as f64 / STELL as f64
+    );
     if fbal < 5_100 * STELL {
         return Err(anyhow!("faucet shard-0 balance too low: {fbal}"));
     }
@@ -251,7 +279,10 @@ fn fund_helpers(h: &Helpers, fk: &FalconKeypair, faucet_addr: &str) -> Result<()
     for (i, addr) in h.addrs.iter().enumerate() {
         let (bal, _) = balance_of(addr)?;
         if bal >= DRIP - STELL {
-            println!("  helper[{i}] already funded ({})", bal as f64 / STELL as f64);
+            println!(
+                "  helper[{i}] already funded ({})",
+                bal as f64 / STELL as f64
+            );
             continue;
         }
         let (_, live_nonce) = balance_of(faucet_addr)?;
@@ -280,7 +311,9 @@ fn consolidate(h: &Helpers) -> Result<()> {
                 println!("  H{s}->H{d}: source low ({sbal}) but dest already has {dbal}, skipping");
                 continue;
             }
-            return Err(anyhow!("H{s} balance {sbal} < 999 STELL and dest not funded; abort"));
+            return Err(anyhow!(
+                "H{s} balance {sbal} < 999 STELL and dest not funded; abort"
+            ));
         }
         if dbal >= 2_900 * STELL {
             println!("  H{s}->H{d}: dest already consolidated ({dbal}), skipping");
@@ -307,7 +340,10 @@ fn stake_a(h: &Helpers) -> Result<()> {
         return Err(anyhow!("H1 balance {bal} < 1000 STELL; fund first"));
     }
     let val: [u8; 32] = hex::decode(VAL_A)?.try_into().unwrap();
-    let payload = vec![OpCode::SysCallStake { validator: val, amount: STAKE_A }];
+    let payload = vec![OpCode::SysCallStake {
+        validator: val,
+        amount: STAKE_A,
+    }];
     println!("submitting SysCallStake A +1000...");
     // NOTE (W10.5-retry5): tx `amount` MUST be 0 for stake txs. The bond is
     // debited by the opcode alone (pinned by
@@ -341,7 +377,10 @@ fn stake_d(h: &Helpers) -> Result<()> {
         return Err(anyhow!("H4 balance {bal} < 2000 STELL; fund first"));
     }
     let val: [u8; 32] = hex::decode(VAL_D)?.try_into().unwrap();
-    let payload = vec![OpCode::SysCallStake { validator: val, amount: STAKE_D }];
+    let payload = vec![OpCode::SysCallStake {
+        validator: val,
+        amount: STAKE_D,
+    }];
     println!("submitting SysCallStake D +2000...");
     // NOTE (W10.5-retry5): tx `amount` MUST be 0 for stake txs (see stake_a
     // note): the opcode debits the bond, a nonzero `amount` would burn an
@@ -374,23 +413,38 @@ fn stake_b(h: &Helpers, fk: &FalconKeypair, faucet_addr: &str) -> Result<()> {
     }
     let need = STAKE_B + STELL; // stake opcode debit + gas headroom
     let (bal, _) = balance_of(&h.addrs[3])?;
-    println!("H3 balance={} nonce=? need>={}", bal as f64 / STELL as f64, need as f64 / STELL as f64);
+    println!(
+        "H3 balance={} nonce=? need>={}",
+        bal as f64 / STELL as f64,
+        need as f64 / STELL as f64
+    );
     if bal < need {
         let top = need - bal + STELL;
         let (_, live_nonce) = balance_of(faucet_addr)?;
         let to: [u8; 32] = hex::decode(&h.addrs[3])?.try_into().unwrap();
-        println!("topping up H3 by {} (faucet nonce {live_nonce})...", top as f64 / STELL as f64);
+        println!(
+            "topping up H3 by {} (faucet nonce {live_nonce})...",
+            top as f64 / STELL as f64
+        );
         let (_, faucet_nonce_now) = balance_of(faucet_addr)?;
         let hash = send_tx(fk, to, top, 350_000, faucet_nonce_now, vec![])?;
         wait_for_tx("topup-H3", &hash)?;
     }
     let (bal2, nonce3) = balance_of(&h.addrs[3])?;
-    println!("H3 funded balance={} nonce={nonce3}", bal2 as f64 / STELL as f64);
+    println!(
+        "H3 funded balance={} nonce={nonce3}",
+        bal2 as f64 / STELL as f64
+    );
     if bal2 < STAKE_B {
-        return Err(anyhow!("H3 balance {bal2} < 1000 STELL after top-up; abort"));
+        return Err(anyhow!(
+            "H3 balance {bal2} < 1000 STELL after top-up; abort"
+        ));
     }
     let val: [u8; 32] = hex::decode(VAL_B)?.try_into().unwrap();
-    let payload = vec![OpCode::SysCallStake { validator: val, amount: STAKE_B }];
+    let payload = vec![OpCode::SysCallStake {
+        validator: val,
+        amount: STAKE_B,
+    }];
     println!("submitting SysCallStake B +1000 (tx amount=0, gas=1M, shard 0/0)...");
     // tx `amount` MUST be 0 (value travels via the opcode; nonzero burns extra
     // to the zero address). Gas 1M: admission floor is base_fee + failure-bond
@@ -412,30 +466,48 @@ fn main() -> Result<()> {
     let stage = std::env::args().nth(1).unwrap_or_else(|| "all".to_string());
     println!("W10.3 rebond: stage={stage} rpc={}", rpc_url());
     let fk = faucet_keypair()?;
-    let faucet_addr =
-        hex::encode(derive_pq_address(PqScheme::Falcon512, fk.public_key(), &DEFAULT_SALT));
+    let faucet_addr = hex::encode(derive_pq_address(
+        PqScheme::Falcon512,
+        fk.public_key(),
+        &DEFAULT_SALT,
+    ));
     println!("faucet account (shard-0 scope): {faucet_addr}");
     print_validators("before")?;
-    println!("stakeOf(A)={} stakeOf(D)={} stakeOf(B)={}",
+    println!(
+        "stakeOf(A)={} stakeOf(D)={} stakeOf(B)={}",
         stake_of(VAL_A)? as f64 / STELL as f64,
         stake_of(VAL_D)? as f64 / STELL as f64,
-        stake_of(VAL_B)? as f64 / STELL as f64);
+        stake_of(VAL_B)? as f64 / STELL as f64
+    );
     let (h, _resumed) = load_or_create_helpers()?;
     for (i, a) in h.addrs.iter().enumerate() {
         let (b, n) = balance_of(a)?;
-        println!("  helper[{i}] {a} balance={} nonce={n}", b as f64 / STELL as f64);
-    }    match stage.as_str() {
+        println!(
+            "  helper[{i}] {a} balance={} nonce={n}",
+            b as f64 / STELL as f64
+        );
+    }
+    match stage.as_str() {
         "check" => {
             let (fbal, fnonce) = balance_of(&faucet_addr)?;
-            println!("faucet shard-0 PQ balance={} nonce={fnonce}", fbal as f64 / STELL as f64);
+            println!(
+                "faucet shard-0 PQ balance={} nonce={fnonce}",
+                fbal as f64 / STELL as f64
+            );
             // Also probe the ed25519 form (in case genesis predates pure-PQ).
             let seed_hex = std::env::var("FAUCET_SEED").unwrap();
             let seed: [u8; 32] = hex::decode(seed_hex.trim())?.try_into().unwrap();
-            let ed = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+            let ed = ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes();
             let ed_hex = hex::encode(ed);
             let (ebal, enonce) = balance_of(&ed_hex)?;
-            println!("faucet shard-0 ED address={ed_hex} balance={} nonce={enonce}", ebal as f64 / STELL as f64);
-        }        "fund" => {
+            println!(
+                "faucet shard-0 ED address={ed_hex} balance={} nonce={enonce}",
+                ebal as f64 / STELL as f64
+            );
+        }
+        "fund" => {
             fund_helpers(&h, &fk, &faucet_addr)?;
             consolidate(&h)?;
         }

@@ -125,14 +125,28 @@ fn test_aggregate_is_one_signature_regardless_of_signer_count() {
     // bitvector, not N * 64 bytes.
     for n in [1usize, 8, 9, 64, 100] {
         let keys: Vec<BlsSecretKey> = (0..n).map(|_| BlsSecretKey::generate()).collect();
-        let sigs: Vec<(usize, BlsSignature)> =
-            keys.iter().enumerate().map(|(i, k)| (i, k.sign(b"blk"))).collect();
+        let sigs: Vec<(usize, BlsSignature)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (i, k.sign(b"blk")))
+            .collect();
         let agg = aggregate_signatures(&sigs, n).expect("aggregate");
         let (sig_bytes, bits) = agg.to_bytes();
-        assert_eq!(sig_bytes.len(), SIGNATURE_LEN, "still one signature for n={n}");
-        assert_eq!(bits.len(), n.div_ceil(8), "bitvector is one bit per validator");
+        assert_eq!(
+            sig_bytes.len(),
+            SIGNATURE_LEN,
+            "still one signature for n={n}"
+        );
+        assert_eq!(
+            bits.len(),
+            n.div_ceil(8),
+            "bitvector is one bit per validator"
+        );
         let pks: Vec<BlsPublicKey> = keys.iter().map(|k| k.public_key()).collect();
-        assert!(verify_aggregate_signature(&pks, b"blk", &agg), "n={n} must verify");
+        assert!(
+            verify_aggregate_signature(&pks, b"blk", &agg),
+            "n={n} must verify"
+        );
     }
 }
 
@@ -153,11 +167,8 @@ fn test_rogue_key_attack_needs_the_bitvector() {
         // pk_evil = attacker_pk - honest_pk would be the real rogue construction; we
         // do not need to build it to show the defence, only that a 2-of-2 claim over
         // {honest, attacker} requires BOTH secrets.
-        let agg = aggregate_signatures(
-            &[(0, attacker.sign(b"m"))],
-            2,
-        )
-        .expect("one signer aggregate over a 2-set");
+        let agg = aggregate_signatures(&[(0, attacker.sign(b"m"))], 2)
+            .expect("one signer aggregate over a 2-set");
         // Bitvector says only index 0 signed.
         assert_eq!(agg.participants.signed_count(), 1);
         agg
@@ -191,7 +202,11 @@ fn test_key_from_seed_is_deterministic() {
     let b = BlsSecretKey::from_seed(&seed);
     assert_eq!(a.public_key(), b.public_key(), "same seed, same key");
     let other = BlsSecretKey::from_seed(&[0x5Bu8; 32]);
-    assert_ne!(a.public_key(), other.public_key(), "different seed, different key");
+    assert_ne!(
+        a.public_key(),
+        other.public_key(),
+        "different seed, different key"
+    );
 }
 
 #[test]
@@ -215,11 +230,7 @@ fn test_aggregate_verifies_only_for_the_exact_participant_set() {
     let keys: Vec<BlsSecretKey> = (0..5).map(|_| BlsSecretKey::generate()).collect();
     let pks: Vec<BlsPublicKey> = keys.iter().map(|k| k.public_key()).collect();
     // Only 0 and 2 sign.
-    let agg = aggregate_signatures(
-        &[(0, keys[0].sign(b"m")), (2, keys[2].sign(b"m"))],
-        5,
-    )
-    .unwrap();
+    let agg = aggregate_signatures(&[(0, keys[0].sign(b"m")), (2, keys[2].sign(b"m"))], 5).unwrap();
     assert!(verify_aggregate_signature(&pks, b"m", &agg));
 
     // Claim the same signature covers validator 1 instead: must fail.

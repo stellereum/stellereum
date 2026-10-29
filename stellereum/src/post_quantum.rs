@@ -392,7 +392,14 @@ impl PqSignatureEnvelope {
 
     /// Encodes envelope into canonical bytes prefixed by `b"PQ1"`.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(3 + 1 + 1 + 2 + self.pubkey.as_ref().map_or(0, |k| k.len()) + 2 + self.signature_bytes.len());
+        let mut out = Vec::with_capacity(
+            3 + 1
+                + 1
+                + 2
+                + self.pubkey.as_ref().map_or(0, |k| k.len())
+                + 2
+                + self.signature_bytes.len(),
+        );
         out.extend_from_slice(PQ_ENVELOPE_MAGIC);
         out.push(self.scheme.id());
         out.push(if self.is_implicit { 1 } else { 0 });
@@ -538,7 +545,8 @@ pub fn verify_pq_signature(
             let ed_sig = &signature[..ED25519_SIG_LEN];
             let falcon_sig = &signature[ED25519_SIG_LEN..];
 
-            verify_ed25519(ed_pk, message, ed_sig) && verify_falcon512(falcon_pk, message, falcon_sig)
+            verify_ed25519(ed_pk, message, ed_sig)
+                && verify_falcon512(falcon_pk, message, falcon_sig)
         }
     }
 }
@@ -562,12 +570,30 @@ fn verify_ed25519(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
 
 pub(crate) fn keccak_f1600(state: &mut [u64; 25]) {
     const RC: [u64; 24] = [
-        0x0000000000000001, 0x0000000000008082, 0x800000000000808A, 0x8000000080008000,
-        0x000000000000808B, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
-        0x000000000000008A, 0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
-        0x000000008000808B, 0x800000000000008B, 0x8000000000008089, 0x8000000000008003,
-        0x8000000000008002, 0x8000000000000080, 0x000000000000800A, 0x800000008000000A,
-        0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
+        0x0000000000000001,
+        0x0000000000008082,
+        0x800000000000808A,
+        0x8000000080008000,
+        0x000000000000808B,
+        0x0000000080000001,
+        0x8000000080008081,
+        0x8000000000008009,
+        0x000000000000008A,
+        0x0000000000000088,
+        0x0000000080008009,
+        0x000000008000000A,
+        0x000000008000808B,
+        0x800000000000008B,
+        0x8000000000008089,
+        0x8000000000008003,
+        0x8000000000008002,
+        0x8000000000000080,
+        0x000000000000800A,
+        0x800000008000000A,
+        0x8000000080008081,
+        0x8000000000008080,
+        0x0000000080000001,
+        0x8000000080008008,
     ];
     const ROTC: [[u32; 5]; 5] = [
         [0, 36, 3, 41, 18],
@@ -1062,104 +1088,96 @@ fn compute_h(f: &[i16; 512], g: &[i16; 512]) -> Option<[u16; 512]> {
 }
 
 static BASE_F: [i16; 512] = [
-    -4, -2, -5, -1, 4, -2, 0, -3, -1, 1, -2, -2, -6, -3, 3, -5, -1, 4, -3, -8, 4, -1, 2,
-    -1, -8, 5, -6, -3, 6, 0, -2, 4, 5, -6, 2, 3, 6, 4, 2, 3, 3, 7, 0, 1, 5, -3, -1, -9, -1,
-    6, -2, -5, 4, 0, 4, -2, 10, -4, -3, 4, -7, -1, -7, -2, -1, -6, 5, -1, -9, 3, 2, -5, 4,
-    -2, 2, -4, 4, -3, -1, 0, 5, 2, 2, -1, -9, -7, -2, -1, 0, 3, 1, 0, -1, -2, -5, 4, -1,
-    -1, 3, -1, 1, 4, -3, 2, -5, -2, 2, -4, 3, 6, 3, 9, 1, -2, 4, -1, -1, -6, -2, -2, 4, 5,
-    -1, 0, 10, -2, 1, -2, -3, 0, -4, -4, -1, 0, 1, -5, -3, -7, -2, -1, 2, -6, 3, 0, 0, 4,
-    -4, 0, 0, -5, -2, 5, -8, 8, 5, 4, 10, -4, 3, 8, 5, 1, -7, 0, -5, 0, -4, 3, -4, -2, 2,
-    -2, 6, 8, 2, -1, 4, -4, -2, 1, 0, 3, 7, 0, 9, -3, 1, 4, -3, 2, -1, 5, -8, 4, -1, 1, -8,
-    2, 4, -9, -3, 1, 3, -1, -7, 5, 5, 4, -3, 0, -7, -3, -1, -6, -7, 0, -3, 0, 3, -3, 0, -3,
-    1, 3, 4, -6, -6, -3, 6, 0, 2, -5, 1, -3, -6, -6, -1, -7, -2, -4, 3, 0, -4, -1, 2, 7,
-    -7, -2, 4, 2, 0, 1, -1, -3, 2, 1, 8, -1, 1, -2, 1, -1, 1, 4, 0, -4, 4, 3, -2, 6, -3,
-    -2, 1, 2, 3, 6, 5, -4, -7, -6, 4, 3, -4, 3, -3, 3, -3, 2, -1, 1, 5, -2, 2, 1, 0, -7, 0,
-    0, -1, 4, -3, 2, 1, -3, 5, 4, -6, -1, -3, 2, -1, -8, 4, 2, 4, 0, 1, -5, 8, 5, 4, -3,
-    -1, -2, 4, 0, 2, -2, 0, -2, -1, -7, 5, 0, 1, 2, 1, -2, 2, -1, 1, -4, 1, 0, 4, -4, 0, 5,
-    1, 4, -5, -2, -3, -2, 1, 3, 1, 2, 5, 12, 0, -1, 4, -6, 1, -4, 3, -5, -4, 4, 2, -2, -6,
-    1, 1, 3, -1, 0, -4, -4, -4, 6, -2, 4, -3, 0, -2, -1, 0, -6, -3, -2, 0, 6, 5, -5, -5, 3,
-    0, 3, -3, -2, 5, 7, -3, 1, -1, 0, 3, 0, 3, -7, 2, -4, -4, 1, 1, 1, 0, -3, -8, 3, 6, 1,
-    -2, -7, 3, 3, 4, -1, -2, -5, 9, 7, 1, 2, -4, 4, 0, -11, 3, 0, -3, -5, 5, -1, -1, 7, 6,
-    -1, 6, 3, 9, 5, -2, -3, -3, 1, -2, 0, -1, 1, -2, 2, 0, -5, -1, -4, -2, 2, -1, -3, 0,
-    -3, 0, 1, 3, -3, 2, 5, 8, -2, 3, -4, -7, 0, 4, -8, 1, 8, -2, 1, -1, 2, 0, -2, 1, 3, 3,
-    4, -2, -4, 3, -4, 2, 3, -2, -4, 1, -4, 10, 2,
+    -4, -2, -5, -1, 4, -2, 0, -3, -1, 1, -2, -2, -6, -3, 3, -5, -1, 4, -3, -8, 4, -1, 2, -1, -8, 5,
+    -6, -3, 6, 0, -2, 4, 5, -6, 2, 3, 6, 4, 2, 3, 3, 7, 0, 1, 5, -3, -1, -9, -1, 6, -2, -5, 4, 0,
+    4, -2, 10, -4, -3, 4, -7, -1, -7, -2, -1, -6, 5, -1, -9, 3, 2, -5, 4, -2, 2, -4, 4, -3, -1, 0,
+    5, 2, 2, -1, -9, -7, -2, -1, 0, 3, 1, 0, -1, -2, -5, 4, -1, -1, 3, -1, 1, 4, -3, 2, -5, -2, 2,
+    -4, 3, 6, 3, 9, 1, -2, 4, -1, -1, -6, -2, -2, 4, 5, -1, 0, 10, -2, 1, -2, -3, 0, -4, -4, -1, 0,
+    1, -5, -3, -7, -2, -1, 2, -6, 3, 0, 0, 4, -4, 0, 0, -5, -2, 5, -8, 8, 5, 4, 10, -4, 3, 8, 5, 1,
+    -7, 0, -5, 0, -4, 3, -4, -2, 2, -2, 6, 8, 2, -1, 4, -4, -2, 1, 0, 3, 7, 0, 9, -3, 1, 4, -3, 2,
+    -1, 5, -8, 4, -1, 1, -8, 2, 4, -9, -3, 1, 3, -1, -7, 5, 5, 4, -3, 0, -7, -3, -1, -6, -7, 0, -3,
+    0, 3, -3, 0, -3, 1, 3, 4, -6, -6, -3, 6, 0, 2, -5, 1, -3, -6, -6, -1, -7, -2, -4, 3, 0, -4, -1,
+    2, 7, -7, -2, 4, 2, 0, 1, -1, -3, 2, 1, 8, -1, 1, -2, 1, -1, 1, 4, 0, -4, 4, 3, -2, 6, -3, -2,
+    1, 2, 3, 6, 5, -4, -7, -6, 4, 3, -4, 3, -3, 3, -3, 2, -1, 1, 5, -2, 2, 1, 0, -7, 0, 0, -1, 4,
+    -3, 2, 1, -3, 5, 4, -6, -1, -3, 2, -1, -8, 4, 2, 4, 0, 1, -5, 8, 5, 4, -3, -1, -2, 4, 0, 2, -2,
+    0, -2, -1, -7, 5, 0, 1, 2, 1, -2, 2, -1, 1, -4, 1, 0, 4, -4, 0, 5, 1, 4, -5, -2, -3, -2, 1, 3,
+    1, 2, 5, 12, 0, -1, 4, -6, 1, -4, 3, -5, -4, 4, 2, -2, -6, 1, 1, 3, -1, 0, -4, -4, -4, 6, -2,
+    4, -3, 0, -2, -1, 0, -6, -3, -2, 0, 6, 5, -5, -5, 3, 0, 3, -3, -2, 5, 7, -3, 1, -1, 0, 3, 0, 3,
+    -7, 2, -4, -4, 1, 1, 1, 0, -3, -8, 3, 6, 1, -2, -7, 3, 3, 4, -1, -2, -5, 9, 7, 1, 2, -4, 4, 0,
+    -11, 3, 0, -3, -5, 5, -1, -1, 7, 6, -1, 6, 3, 9, 5, -2, -3, -3, 1, -2, 0, -1, 1, -2, 2, 0, -5,
+    -1, -4, -2, 2, -1, -3, 0, -3, 0, 1, 3, -3, 2, 5, 8, -2, 3, -4, -7, 0, 4, -8, 1, 8, -2, 1, -1,
+    2, 0, -2, 1, 3, 3, 4, -2, -4, 3, -4, 2, 3, -2, -4, 1, -4, 10, 2,
 ];
 static BASE_G: [i16; 512] = [
-    -1, 5, -7, -1, -4, 6, 4, -1, -4, -13, -1, -5, -2, -8, 2, 1, 4, 2, 0, 0, 2, 0, -1, 2, 5,
-    -5, -8, 8, 1, 11, 0, -8, -4, 1, 1, -6, -4, 1, -3, 0, -10, -4, -6, -3, -2, 1, 6, 2, 8,
-    -2, 2, -2, 1, 3, -4, 2, -1, -1, -2, -2, -3, 0, -3, 2, -3, 2, -3, -4, 2, 3, 4, -5, 6,
-    -3, -2, -1, -1, -6, -2, 1, -4, -7, 8, 0, 2, -2, 2, 0, 1, 0, 4, 9, 7, 0, -1, -1, 4, -3,
-    -2, 6, 6, 0, 1, 7, -6, -5, 5, 1, 4, -1, 0, -2, 3, -4, 1, -1, -3, -2, 0, -1, -7, -8, -1,
-    2, 0, -5, 0, 1, -4, 6, -5, 6, 4, 1, -4, -5, 8, -1, 1, -2, 1, 1, 1, 3, 0, -1, 1, 1, -4,
-    -5, -4, 2, -3, 2, -2, 3, 7, -4, 4, -1, -2, 4, -4, -5, 2, 6, -7, 5, -1, 1, 3, 0, -5, -5,
-    3, -2, -3, -1, -6, 0, 2, 3, 2, 7, -3, -2, -2, 1, -5, 3, 3, -7, 0, 4, 4, -1, 2, -3, 1,
-    3, -1, -1, 0, -7, -6, -3, 7, -3, 5, -5, 1, -2, 0, 9, -2, 3, -1, -5, -3, -5, 3, 1, -4,
-    -3, 2, -2, 2, 8, -1, 0, 5, -3, -2, -6, 4, 0, 3, -3, -3, 4, -1, 0, 0, -2, -1, 3, 7, 4,
-    5, -1, 8, 0, -1, -6, -3, 4, 3, -3, 5, 2, -1, -2, 1, -1, 3, -2, -6, 4, 0, 0, -4, 1, 6,
-    2, 0, 10, 9, 2, -2, 0, 2, 1, -3, -1, -1, 3, 2, 1, 1, -3, -2, 7, 2, -1, 5, -3, -2, 1,
-    -2, 2, -2, -4, 3, 2, 1, -4, 1, 4, 3, -7, -4, 2, -5, -2, 5, -3, 1, -4, -5, 1, 0, 0, 0,
-    7, -5, -1, 2, 2, -3, 6, -6, 4, -3, -5, -6, -7, -4, 3, -2, -2, -10, -3, 2, -1, -6, -4,
-    1, 2, 2, 1, 4, 1, -5, -10, -2, 2, -4, 4, 4, -2, 1, 4, -3, 0, -6, -3, 1, 5, -7, -6, -4,
-    8, -1, 0, -1, 6, -3, -2, -2, 6, 2, 3, -3, -3, 5, -2, 1, 1, -4, -4, 8, 0, 3, 2, 3, 7, 4,
-    3, 2, -6, -9, 0, -8, 11, -2, 2, -2, -2, 3, 0, -6, 2, -1, 4, 2, -2, 0, -3, -7, -1, -1,
-    0, -1, -4, -2, -5, 3, -4, 2, 2, -1, -1, 7, -1, 3, 6, -7, 1, -5, 0, -7, 4, 3, -5, -1, 0,
-    3, -4, 1, 2, -7, 1, -2, -8, -2, -5, -5, 1, -4, -4, 4, -3, -2, 2, -4, -8, -1, 0, -9, 5,
-    -1, -2, 3, 2, 6, -1, 1, -1, -5, 5, 9, 3, -6, -5, 1, -6, 0, 2, -4, 6, 2, 7, 2, 15, 0,
-    -2, 9, 0, 1, 6, 4, -1, -1, -6, -3, 3, 1, -6, -3, 2, 2, -2,
+    -1, 5, -7, -1, -4, 6, 4, -1, -4, -13, -1, -5, -2, -8, 2, 1, 4, 2, 0, 0, 2, 0, -1, 2, 5, -5, -8,
+    8, 1, 11, 0, -8, -4, 1, 1, -6, -4, 1, -3, 0, -10, -4, -6, -3, -2, 1, 6, 2, 8, -2, 2, -2, 1, 3,
+    -4, 2, -1, -1, -2, -2, -3, 0, -3, 2, -3, 2, -3, -4, 2, 3, 4, -5, 6, -3, -2, -1, -1, -6, -2, 1,
+    -4, -7, 8, 0, 2, -2, 2, 0, 1, 0, 4, 9, 7, 0, -1, -1, 4, -3, -2, 6, 6, 0, 1, 7, -6, -5, 5, 1, 4,
+    -1, 0, -2, 3, -4, 1, -1, -3, -2, 0, -1, -7, -8, -1, 2, 0, -5, 0, 1, -4, 6, -5, 6, 4, 1, -4, -5,
+    8, -1, 1, -2, 1, 1, 1, 3, 0, -1, 1, 1, -4, -5, -4, 2, -3, 2, -2, 3, 7, -4, 4, -1, -2, 4, -4,
+    -5, 2, 6, -7, 5, -1, 1, 3, 0, -5, -5, 3, -2, -3, -1, -6, 0, 2, 3, 2, 7, -3, -2, -2, 1, -5, 3,
+    3, -7, 0, 4, 4, -1, 2, -3, 1, 3, -1, -1, 0, -7, -6, -3, 7, -3, 5, -5, 1, -2, 0, 9, -2, 3, -1,
+    -5, -3, -5, 3, 1, -4, -3, 2, -2, 2, 8, -1, 0, 5, -3, -2, -6, 4, 0, 3, -3, -3, 4, -1, 0, 0, -2,
+    -1, 3, 7, 4, 5, -1, 8, 0, -1, -6, -3, 4, 3, -3, 5, 2, -1, -2, 1, -1, 3, -2, -6, 4, 0, 0, -4, 1,
+    6, 2, 0, 10, 9, 2, -2, 0, 2, 1, -3, -1, -1, 3, 2, 1, 1, -3, -2, 7, 2, -1, 5, -3, -2, 1, -2, 2,
+    -2, -4, 3, 2, 1, -4, 1, 4, 3, -7, -4, 2, -5, -2, 5, -3, 1, -4, -5, 1, 0, 0, 0, 7, -5, -1, 2, 2,
+    -3, 6, -6, 4, -3, -5, -6, -7, -4, 3, -2, -2, -10, -3, 2, -1, -6, -4, 1, 2, 2, 1, 4, 1, -5, -10,
+    -2, 2, -4, 4, 4, -2, 1, 4, -3, 0, -6, -3, 1, 5, -7, -6, -4, 8, -1, 0, -1, 6, -3, -2, -2, 6, 2,
+    3, -3, -3, 5, -2, 1, 1, -4, -4, 8, 0, 3, 2, 3, 7, 4, 3, 2, -6, -9, 0, -8, 11, -2, 2, -2, -2, 3,
+    0, -6, 2, -1, 4, 2, -2, 0, -3, -7, -1, -1, 0, -1, -4, -2, -5, 3, -4, 2, 2, -1, -1, 7, -1, 3, 6,
+    -7, 1, -5, 0, -7, 4, 3, -5, -1, 0, 3, -4, 1, 2, -7, 1, -2, -8, -2, -5, -5, 1, -4, -4, 4, -3,
+    -2, 2, -4, -8, -1, 0, -9, 5, -1, -2, 3, 2, 6, -1, 1, -1, -5, 5, 9, 3, -6, -5, 1, -6, 0, 2, -4,
+    6, 2, 7, 2, 15, 0, -2, 9, 0, 1, 6, 4, -1, -1, -6, -3, 3, 1, -6, -3, 2, 2, -2,
 ];
 static BASE_CAPITAL_F: [i16; 512] = [
-    0, -25, -39, 21, 7, -5, -10, 4, -1, -38, -9, -1, 4, -23, 15, -1, 8, 1, -38, 41, 29, 22,
-    9, 12, -46, 0, 9, -17, -19, 32, 38, -3, 14, 6, 2, -6, -18, -1, 23, 80, -12, -20, 24,
-    22, -31, -38, -11, 8, 17, 18, 19, -10, 0, -1, 28, -5, -28, -33, 4, -31, -33, -8, -9,
-    -44, 46, -11, -5, -21, -22, -7, 1, -11, 33, -8, 12, -7, -6, 63, 17, 12, -49, -11, -31,
-    -8, 7, -28, 33, -28, -19, 8, 46, -73, 9, 32, 18, 7, -43, 0, -6, -4, 8, -39, -17, 11,
-    15, -25, -9, -28, -2, 24, -23, 10, -15, 4, 41, 46, 18, 2, -3, -29, 11, -3, 20, 35, 21,
-    23, 5, -8, -3, -27, -69, 0, 26, -29, -24, 8, 19, 6, -14, -18, 47, 5, 21, -50, 17, -44,
-    -36, 24, 9, 16, -38, -5, -54, 34, 13, 31, -2, 9, 8, -12, -14, -17, 28, -59, -20, 19,
-    31, 14, 14, 7, -32, 37, 5, -3, -7, -6, 21, -29, -33, 23, -25, -23, 14, 38, -29, -33,
-    -9, 23, -43, 18, -12, 2, 30, 32, -28, -21, 42, 1, 6, -6, 58, 34, -22, 1, 5, -2, -8, 14,
-    -19, -4, -6, 10, -3, -3, 32, 18, -19, -12, 49, 13, 4, -18, 57, 37, -19, 25, 14, 18,
-    -51, 13, 4, 4, 17, -37, -2, 1, 41, -36, -8, -13, 49, -6, 9, 46, -36, -6, -20, -18, -6,
-    -29, -42, -21, -25, -29, 5, -41, 51, 49, -20, -22, -9, 3, -6, -52, 10, 41, 12, -27,
-    -20, 31, -17, -23, -16, 3, 44, -3, -5, -2, 0, -22, 14, -30, -41, 3, -27, 3, 18, 38, 10,
-    49, 45, -13, -27, -4, -10, -67, -1, -17, -2, 72, 46, 20, 24, 22, 16, 25, 6, -6, -31, 2,
-    0, -13, -14, 9, 4, 31, 18, 22, 12, 59, -1, -3, -24, -47, -10, 48, 37, -34, -32, -4, 18,
-    -2, 52, -8, -7, 34, -44, -14, -21, -49, -35, 41, -4, 31, 3, 23, 9, 8, 0, -24, 38, -9,
-    -9, 4, -10, -55, -19, 21, 27, 22, 41, 6, -23, 41, -2, 28, -46, 20, 52, 16, 20, 32, 18,
-    2, -3, 9, 16, 33, -18, 12, 6, -9, -19, 1, -5, -15, -17, 6, -3, 4, -22, 30, -34, 43, -4,
-    9, -3, -33, -43, -5, -13, -56, 38, 16, 11, -36, 11, -4, -56, 2, 0, -19, -45, -8, -34,
-    16, 31, -3, 16, 27, -16, -9, 8, 45, -51, -20, 62, -17, -4, 4, 17, -45, 4, -15, -19, 39,
-    39, 15, 17, -19, 2, 45, 36, -22, 16, -23, 28, 34, 12, 5, 10, -7, 28, -35, 17, -37, -50,
-    -28, 19, -25, 9, 45, -6, -7, -16, 57, 27, 50, -30, 2, -10, -1, -57, -49, -23, 0, -9,
-    -36, -4, -3, 32, -6, -25, 67, -27, -19, 25, -6, 1, -17, -14, 0, 29, 26, -12, -20, 44,
-    14, 10, 8, -11, -18, -53, 22, 25, 27, 35, 6, -16, 12, 71, -8,
+    0, -25, -39, 21, 7, -5, -10, 4, -1, -38, -9, -1, 4, -23, 15, -1, 8, 1, -38, 41, 29, 22, 9, 12,
+    -46, 0, 9, -17, -19, 32, 38, -3, 14, 6, 2, -6, -18, -1, 23, 80, -12, -20, 24, 22, -31, -38,
+    -11, 8, 17, 18, 19, -10, 0, -1, 28, -5, -28, -33, 4, -31, -33, -8, -9, -44, 46, -11, -5, -21,
+    -22, -7, 1, -11, 33, -8, 12, -7, -6, 63, 17, 12, -49, -11, -31, -8, 7, -28, 33, -28, -19, 8,
+    46, -73, 9, 32, 18, 7, -43, 0, -6, -4, 8, -39, -17, 11, 15, -25, -9, -28, -2, 24, -23, 10, -15,
+    4, 41, 46, 18, 2, -3, -29, 11, -3, 20, 35, 21, 23, 5, -8, -3, -27, -69, 0, 26, -29, -24, 8, 19,
+    6, -14, -18, 47, 5, 21, -50, 17, -44, -36, 24, 9, 16, -38, -5, -54, 34, 13, 31, -2, 9, 8, -12,
+    -14, -17, 28, -59, -20, 19, 31, 14, 14, 7, -32, 37, 5, -3, -7, -6, 21, -29, -33, 23, -25, -23,
+    14, 38, -29, -33, -9, 23, -43, 18, -12, 2, 30, 32, -28, -21, 42, 1, 6, -6, 58, 34, -22, 1, 5,
+    -2, -8, 14, -19, -4, -6, 10, -3, -3, 32, 18, -19, -12, 49, 13, 4, -18, 57, 37, -19, 25, 14, 18,
+    -51, 13, 4, 4, 17, -37, -2, 1, 41, -36, -8, -13, 49, -6, 9, 46, -36, -6, -20, -18, -6, -29,
+    -42, -21, -25, -29, 5, -41, 51, 49, -20, -22, -9, 3, -6, -52, 10, 41, 12, -27, -20, 31, -17,
+    -23, -16, 3, 44, -3, -5, -2, 0, -22, 14, -30, -41, 3, -27, 3, 18, 38, 10, 49, 45, -13, -27, -4,
+    -10, -67, -1, -17, -2, 72, 46, 20, 24, 22, 16, 25, 6, -6, -31, 2, 0, -13, -14, 9, 4, 31, 18,
+    22, 12, 59, -1, -3, -24, -47, -10, 48, 37, -34, -32, -4, 18, -2, 52, -8, -7, 34, -44, -14, -21,
+    -49, -35, 41, -4, 31, 3, 23, 9, 8, 0, -24, 38, -9, -9, 4, -10, -55, -19, 21, 27, 22, 41, 6,
+    -23, 41, -2, 28, -46, 20, 52, 16, 20, 32, 18, 2, -3, 9, 16, 33, -18, 12, 6, -9, -19, 1, -5,
+    -15, -17, 6, -3, 4, -22, 30, -34, 43, -4, 9, -3, -33, -43, -5, -13, -56, 38, 16, 11, -36, 11,
+    -4, -56, 2, 0, -19, -45, -8, -34, 16, 31, -3, 16, 27, -16, -9, 8, 45, -51, -20, 62, -17, -4, 4,
+    17, -45, 4, -15, -19, 39, 39, 15, 17, -19, 2, 45, 36, -22, 16, -23, 28, 34, 12, 5, 10, -7, 28,
+    -35, 17, -37, -50, -28, 19, -25, 9, 45, -6, -7, -16, 57, 27, 50, -30, 2, -10, -1, -57, -49,
+    -23, 0, -9, -36, -4, -3, 32, -6, -25, 67, -27, -19, 25, -6, 1, -17, -14, 0, 29, 26, -12, -20,
+    44, 14, 10, 8, -11, -18, -53, 22, 25, 27, 35, 6, -16, 12, 71, -8,
 ];
 static BASE_CAPITAL_G: [i16; 512] = [
-    27, 6, 12, -3, -31, -42, 27, 17, 11, 8, 34, 6, -3, 2, 11, -11, 18, 48, 1, 21, -7, -6,
-    9, 33, -18, -40, -55, -9, -71, -50, 32, -36, 11, 4, 29, 33, 10, -19, -43, -10, 22, -36,
-    -23, -21, -14, -47, 25, -4, -14, 30, 16, -18, -11, 6, -37, -27, -12, 6, 7, 33, -36, 33,
-    -2, 12, -21, 1, 16, 49, -11, -16, -41, 15, 11, 8, 20, -15, 26, -8, 11, -43, -36, 28, 2,
-    -47, -30, -47, -1, 1, 48, -6, -22, 24, -20, -3, -1, -15, -12, 62, 12, 7, -9, 15, -71,
-    49, 22, 27, 20, -8, -28, -13, -31, 18, 28, 54, 29, 5, 0, 33, -5, -22, -21, -12, -14,
-    -2, 11, -24, 32, -26, -71, 21, -15, -20, -12, 36, -5, 35, 46, 13, -34, -8, 10, -10, 10,
-    40, -52, 8, 0, 18, -33, -10, 8, 43, -8, -6, -31, -17, 19, 30, 12, -9, 8, -19, -32, -18,
-    -1, -37, 4, 43, 27, 14, -6, -14, -44, -34, -8, 16, -39, 13, 6, -32, 8, 17, -12, 23,
-    -44, -25, -66, -12, -31, 30, 14, -9, -5, -10, 44, -12, -2, -43, -22, -18, -7, -9, -15,
-    -7, -21, -27, -5, 1, -13, -10, 8, -8, 29, 21, 64, 47, -28, -9, -28, 25, -47, -34, -3,
-    -14, -26, -12, -5, -10, -27, -9, -14, -23, -2, -31, 28, 17, -4, -30, 31, 3, -15, 25, 9,
-    -32, 0, -6, -22, 20, -37, 3, 12, -19, -17, 13, 30, 11, -15, 15, 50, 66, -31, -31, 16,
-    2, 3, -8, 40, -21, -31, -2, 41, -29, -12, 9, 14, -4, 9, 8, -20, 28, 12, 20, -10, 5, -6,
-    -33, 6, 21, 51, 30, 9, 3, 8, 7, 19, -53, 19, 15, 4, -38, 19, 29, 18, 6, 19, 3, -17,
-    -32, 16, 3, 46, -6, -3, 47, 3, -66, 3, 25, -6, -6, 21, -24, -9, 28, -39, -42, 42, -6,
-    -19, -14, 6, -8, 9, 28, -4, 23, 12, -17, -13, 3, 3, 6, 44, 6, -5, 38, -4, -16, 12, -15,
-    8, -11, 45, 1, -16, 37, -35, 20, 26, 9, 13, 34, 25, -3, -10, -2, -42, -23, -22, -56,
-    -56, 6, 17, -9, 0, 36, 20, 6, -58, 12, 0, -3, -29, -49, -24, -12, -13, 5, -39, -8, 36,
-    -9, 44, 35, -64, -22, -12, 26, -15, 41, 36, -19, -37, -20, 46, 35, 9, 32, -5, 27, 21,
-    -36, -51, 19, 10, -23, 28, 46, 28, 8, 22, -31, 18, 2, -16, -9, 1, -22, -22, 31, 14, 5,
-    44, -3, 38, 0, -12, 50, -23, -19, 1, 42, 15, 1, 13, 32, 45, 37, 15, 11, -9, -23, -6,
-    -23, 36, 4, -34, -14, -14, -37, -28, 19, 20, 14, 24, -48, -34, -27, -34, -12, 9, -20,
-    -30, 25, 28, -51, -13, 11, -20, -1, -3, 6, -38, -46, -15, 28, 10, -4, 3, -1, 4, -40,
-    16, 61, 31, 28, 8, -2, 21, -3, -25, -12, -32, -15, -38, 20, -7, -35, 28, 29, 9, -27,
+    27, 6, 12, -3, -31, -42, 27, 17, 11, 8, 34, 6, -3, 2, 11, -11, 18, 48, 1, 21, -7, -6, 9, 33,
+    -18, -40, -55, -9, -71, -50, 32, -36, 11, 4, 29, 33, 10, -19, -43, -10, 22, -36, -23, -21, -14,
+    -47, 25, -4, -14, 30, 16, -18, -11, 6, -37, -27, -12, 6, 7, 33, -36, 33, -2, 12, -21, 1, 16,
+    49, -11, -16, -41, 15, 11, 8, 20, -15, 26, -8, 11, -43, -36, 28, 2, -47, -30, -47, -1, 1, 48,
+    -6, -22, 24, -20, -3, -1, -15, -12, 62, 12, 7, -9, 15, -71, 49, 22, 27, 20, -8, -28, -13, -31,
+    18, 28, 54, 29, 5, 0, 33, -5, -22, -21, -12, -14, -2, 11, -24, 32, -26, -71, 21, -15, -20, -12,
+    36, -5, 35, 46, 13, -34, -8, 10, -10, 10, 40, -52, 8, 0, 18, -33, -10, 8, 43, -8, -6, -31, -17,
+    19, 30, 12, -9, 8, -19, -32, -18, -1, -37, 4, 43, 27, 14, -6, -14, -44, -34, -8, 16, -39, 13,
+    6, -32, 8, 17, -12, 23, -44, -25, -66, -12, -31, 30, 14, -9, -5, -10, 44, -12, -2, -43, -22,
+    -18, -7, -9, -15, -7, -21, -27, -5, 1, -13, -10, 8, -8, 29, 21, 64, 47, -28, -9, -28, 25, -47,
+    -34, -3, -14, -26, -12, -5, -10, -27, -9, -14, -23, -2, -31, 28, 17, -4, -30, 31, 3, -15, 25,
+    9, -32, 0, -6, -22, 20, -37, 3, 12, -19, -17, 13, 30, 11, -15, 15, 50, 66, -31, -31, 16, 2, 3,
+    -8, 40, -21, -31, -2, 41, -29, -12, 9, 14, -4, 9, 8, -20, 28, 12, 20, -10, 5, -6, -33, 6, 21,
+    51, 30, 9, 3, 8, 7, 19, -53, 19, 15, 4, -38, 19, 29, 18, 6, 19, 3, -17, -32, 16, 3, 46, -6, -3,
+    47, 3, -66, 3, 25, -6, -6, 21, -24, -9, 28, -39, -42, 42, -6, -19, -14, 6, -8, 9, 28, -4, 23,
+    12, -17, -13, 3, 3, 6, 44, 6, -5, 38, -4, -16, 12, -15, 8, -11, 45, 1, -16, 37, -35, 20, 26, 9,
+    13, 34, 25, -3, -10, -2, -42, -23, -22, -56, -56, 6, 17, -9, 0, 36, 20, 6, -58, 12, 0, -3, -29,
+    -49, -24, -12, -13, 5, -39, -8, 36, -9, 44, 35, -64, -22, -12, 26, -15, 41, 36, -19, -37, -20,
+    46, 35, 9, 32, -5, 27, 21, -36, -51, 19, 10, -23, 28, 46, 28, 8, 22, -31, 18, 2, -16, -9, 1,
+    -22, -22, 31, 14, 5, 44, -3, 38, 0, -12, 50, -23, -19, 1, 42, 15, 1, 13, 32, 45, 37, 15, 11,
+    -9, -23, -6, -23, 36, 4, -34, -14, -14, -37, -28, 19, 20, 14, 24, -48, -34, -27, -34, -12, 9,
+    -20, -30, 25, 28, -51, -13, 11, -20, -1, -3, 6, -38, -46, -15, 28, 10, -4, 3, -1, 4, -40, 16,
+    61, 31, 28, 8, -2, 21, -3, -25, -12, -32, -15, -38, 20, -7, -35, 28, 29, 9, -27,
 ];
 
 // ===========================================================================
@@ -1291,7 +1309,9 @@ fn falcon_i8(value: i16) -> Option<i8> {
 /// public key `h = g * f^-1 mod q`.
 #[allow(clippy::type_complexity)]
 // GATE: Falcon-512 keygen returns the full (f,g,F,G,h) tuple by algorithm definition; a struct would churn PQ call sites.
-fn falcon512_keygen(seed: &[u8; FALCON512_KEYGEN_SEED_LEN]) -> Option<([i16; 512], [i16; 512], [i16; 512], [i16; 512], [u16; 512])> {
+fn falcon512_keygen(
+    seed: &[u8; FALCON512_KEYGEN_SEED_LEN],
+) -> Option<([i16; 512], [i16; 512], [i16; 512], [i16; 512], [u16; 512])> {
     let mut ctx = falcon_shake256_context(seed);
     let mut f = [0i8; 512];
     let mut g = [0i8; 512];
@@ -1599,7 +1619,11 @@ fn warn_legacy_ntru_key_once(repaired: bool, address: [u8; 32]) {
             "Falcon-512 legacy key (no NTRU partner G) loaded again{repair_note}; \
              validator address {}",
             addr,
-            repair_note = if repaired { " (partner reconstructed)" } else { " (NOT repairable)" },
+            repair_note = if repaired {
+                " (partner reconstructed)"
+            } else {
+                " (NOT repairable)"
+            },
         );
     }
 }
@@ -2061,11 +2085,7 @@ impl FalconKeypair {
 
     /// Derives the 32-byte validator ID for this Falcon-512 keypair.
     pub fn validator_id(&self) -> [u8; 32] {
-        derive_pq_address(
-            PqScheme::Falcon512,
-            &self.public_key,
-            &DEFAULT_SALT,
-        )
+        derive_pq_address(PqScheme::Falcon512, &self.public_key, &DEFAULT_SALT)
     }
 
     /// Signs a message producing an authentic 666-byte Falcon-512 signature satisfying
@@ -2214,7 +2234,6 @@ impl FalconKeypair {
     }
 }
 
-
 fn unpack_falcon_pubkey(pubkey: &[u8]) -> Option<[u16; 512]> {
     if pubkey.len() != FALCON512_PUBKEY_LEN {
         return None;
@@ -2315,7 +2334,8 @@ fn verify_falcon512(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
 
     let mut norm_sq = 0i64;
     for i in 0..512 {
-        let s1_val = (c[i] as i32 + FALCON_MODULUS_Q as i32 - s2_h[i] as i32) % (FALCON_MODULUS_Q as i32);
+        let s1_val =
+            (c[i] as i32 + FALCON_MODULUS_Q as i32 - s2_h[i] as i32) % (FALCON_MODULUS_Q as i32);
         let s1_c = if s1_val > (FALCON_MODULUS_Q as i32 / 2) {
             s1_val - (FALCON_MODULUS_Q as i32)
         } else {
@@ -2516,24 +2536,10 @@ mod tests {
 
         let seed_a = [0xA1u8; 48];
         let seed_b = [0xB2u8; 48];
-        let s2_a = falcon512_sign_dyn(
-            &kp.f,
-            &kp.g,
-            &kp.capital_f,
-            &kp.capital_g,
-            &c,
-            &seed_a,
-        )
-        .expect("signing with seed A");
-        let s2_b = falcon512_sign_dyn(
-            &kp.f,
-            &kp.g,
-            &kp.capital_f,
-            &kp.capital_g,
-            &c,
-            &seed_b,
-        )
-        .expect("signing with seed B");
+        let s2_a = falcon512_sign_dyn(&kp.f, &kp.g, &kp.capital_f, &kp.capital_g, &c, &seed_a)
+            .expect("signing with seed A");
+        let s2_b = falcon512_sign_dyn(&kp.f, &kp.g, &kp.capital_f, &kp.capital_g, &c, &seed_b)
+            .expect("signing with seed B");
         assert_ne!(
             s2_a, s2_b,
             "the sampler must consume its seed: identical samples for different seeds mean \
@@ -2604,7 +2610,10 @@ mod tests {
         assert!(kp.g.iter().all(|&v| v == 0), "g must be wiped");
         assert!(kp.capital_f.iter().all(|&v| v == 0), "F must be wiped");
         assert!(kp.capital_g.iter().all(|&v| v == 0), "G must be wiped");
-        assert!(kp.private_key.iter().all(|&v| v == 0), "the private key must be wiped");
+        assert!(
+            kp.private_key.iter().all(|&v| v == 0),
+            "the private key must be wiped"
+        );
         // The public half survives (it is not secret).
         assert!(!kp.public_key.is_empty());
     }
@@ -2624,7 +2633,10 @@ mod tests {
         for _ in 0..32 {
             let sig = kp.sign(msg);
             assert_eq!(sig.len(), FALCON512_SIG_LEN);
-            assert!(nonces.insert(sig[1..41].to_vec()), "a Falcon nonce repeated");
+            assert!(
+                nonces.insert(sig[1..41].to_vec()),
+                "a Falcon nonce repeated"
+            );
         }
         // Even with a FIXED caller seed the nonce must move (the OS entropy
         // is mixed in).
@@ -2643,7 +2655,10 @@ mod tests {
 
         let addr1 = derive_pq_address(PqScheme::Ed25519, &ed_pk, &salt);
         let addr2 = derive_pq_address(PqScheme::Ed25519, &ed_pk, &salt);
-        assert_eq!(addr1, addr2, "Address derivation must be strictly deterministic");
+        assert_eq!(
+            addr1, addr2,
+            "Address derivation must be strictly deterministic"
+        );
 
         let addr_other_scheme = derive_pq_address(PqScheme::Falcon512, &ed_pk, &salt);
         assert_ne!(
@@ -2652,7 +2667,10 @@ mod tests {
         );
 
         let addr_other_salt = derive_pq_address(PqScheme::Ed25519, &ed_pk, &[8u8; 16]);
-        assert_ne!(addr1, addr_other_salt, "Different salts must yield disjoint addresses");
+        assert_ne!(
+            addr1, addr_other_salt,
+            "Different salts must yield disjoint addresses"
+        );
     }
 
     #[test]
@@ -2665,7 +2683,9 @@ mod tests {
         let addr = derive_pq_address(PqScheme::Falcon512, &pk, &salt);
 
         // Registration succeeds
-        assert!(registry.register(addr, PqScheme::Falcon512, &pk, &salt).is_ok());
+        assert!(registry
+            .register(addr, PqScheme::Falcon512, &pk, &salt)
+            .is_ok());
         assert_eq!(registry.len(), 1);
 
         // Lookup retrieves exact scheme and pubkey
@@ -2674,7 +2694,9 @@ mod tests {
         assert_eq!(looked_up.1, pk);
 
         // Duplicate registration with identical key is idempotent
-        assert!(registry.register(addr, PqScheme::Falcon512, &pk, &salt).is_ok());
+        assert!(registry
+            .register(addr, PqScheme::Falcon512, &pk, &salt)
+            .is_ok());
 
         // Conflicting registration with different key is refused fail-closed
         let (other_pk, _) = sample_falcon512(0x22);
@@ -2687,7 +2709,8 @@ mod tests {
         let (pk, sig) = sample_falcon512(0x33);
 
         // Explicit envelope
-        let env_explicit = PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig.clone());
+        let env_explicit =
+            PqSignatureEnvelope::new_explicit(PqScheme::Falcon512, pk.clone(), sig.clone());
         let encoded = env_explicit.encode();
         let decoded = PqSignatureEnvelope::decode(&encoded).expect("Envelope must decode");
         assert_eq!(env_explicit, decoded);
@@ -2697,7 +2720,8 @@ mod tests {
         // Implicit envelope (key omitted from wire)
         let env_implicit = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig);
         let encoded_imp = env_implicit.encode();
-        let decoded_imp = PqSignatureEnvelope::decode(&encoded_imp).expect("Implicit envelope must decode");
+        let decoded_imp =
+            PqSignatureEnvelope::decode(&encoded_imp).expect("Implicit envelope must decode");
         assert_eq!(env_implicit, decoded_imp);
         assert!(decoded_imp.is_implicit);
         assert_eq!(decoded_imp.pubkey, None);
@@ -2712,7 +2736,12 @@ mod tests {
         assert!(verify_pq_signature(PqScheme::Ed25519, &pk, msg, &sig));
 
         // Tampered message
-        assert!(!verify_pq_signature(PqScheme::Ed25519, &pk, b"Tampered Message", &sig));
+        assert!(!verify_pq_signature(
+            PqScheme::Ed25519,
+            &pk,
+            b"Tampered Message",
+            &sig
+        ));
 
         // Tampered signature
         let mut bad_sig = sig.clone();
@@ -2727,7 +2756,12 @@ mod tests {
         let msg = b"sample";
 
         // Falcon-512 standalone
-        assert!(verify_pq_signature(PqScheme::Falcon512, &falcon_pk, msg, &falcon_sig));
+        assert!(verify_pq_signature(
+            PqScheme::Falcon512,
+            &falcon_pk,
+            msg,
+            &falcon_sig
+        ));
 
         // Hybrid combination: Ed25519 + Falcon-512
         let ed_sig = ed_sk.sign(msg).to_bytes().to_vec();
@@ -2739,17 +2773,32 @@ mod tests {
         hybrid_sig.extend_from_slice(&ed_sig);
         hybrid_sig.extend_from_slice(&falcon_sig);
 
-        assert!(verify_pq_signature(PqScheme::Hybrid, &hybrid_pk, msg, &hybrid_sig));
+        assert!(verify_pq_signature(
+            PqScheme::Hybrid,
+            &hybrid_pk,
+            msg,
+            &hybrid_sig
+        ));
 
         // Tampering Ed25519 portion breaks hybrid verification
         let mut broken_ed = hybrid_sig.clone();
         broken_ed[0] ^= 0xFF;
-        assert!(!verify_pq_signature(PqScheme::Hybrid, &hybrid_pk, msg, &broken_ed));
+        assert!(!verify_pq_signature(
+            PqScheme::Hybrid,
+            &hybrid_pk,
+            msg,
+            &broken_ed
+        ));
 
         // Tampering Falcon portion breaks hybrid verification
         let mut broken_falcon = hybrid_sig.clone();
         broken_falcon[ED25519_SIG_LEN] ^= 0xFF;
-        assert!(!verify_pq_signature(PqScheme::Hybrid, &hybrid_pk, msg, &broken_falcon));
+        assert!(!verify_pq_signature(
+            PqScheme::Hybrid,
+            &hybrid_pk,
+            msg,
+            &broken_falcon
+        ));
     }
 
     #[test]
@@ -2764,7 +2813,10 @@ mod tests {
         let a_orig = a;
         ntt(&mut a);
         intt(&mut a);
-        assert_eq!(a, a_orig, "NTT forward followed by inverse NTT must round-trip exactly");
+        assert_eq!(
+            a, a_orig,
+            "NTT forward followed by inverse NTT must round-trip exactly"
+        );
 
         let c_ntt = poly_mul_ntt(&a_orig, &b);
         let mut c_schoolbook = [0u32; 512];
@@ -2776,7 +2828,8 @@ mod tests {
                 if idx < 512 {
                     c_schoolbook[idx] = (c_schoolbook[idx] + term) % FALCON_MODULUS_Q;
                 } else {
-                    c_schoolbook[idx - 512] = (c_schoolbook[idx - 512] + FALCON_MODULUS_Q - term) % FALCON_MODULUS_Q;
+                    c_schoolbook[idx - 512] =
+                        (c_schoolbook[idx - 512] + FALCON_MODULUS_Q - term) % FALCON_MODULUS_Q;
                 }
             }
         }
@@ -2803,7 +2856,12 @@ mod tests {
         let other_msg = b"Transaction payload with deterministic keypair";
         let other_sig = keypair_seed.sign(other_msg);
         assert!(
-            verify_pq_signature(PqScheme::Falcon512, keypair_seed.pubkey(), other_msg, &other_sig),
+            verify_pq_signature(
+                PqScheme::Falcon512,
+                keypair_seed.pubkey(),
+                other_msg,
+                &other_sig
+            ),
             "Authentic Falcon-512 signature from seeded keypair must verify"
         );
     }
@@ -2815,11 +2873,21 @@ mod tests {
         let sig = keypair.sign(msg);
 
         // 1. Valid signature passes
-        assert!(verify_pq_signature(PqScheme::Falcon512, keypair.pubkey(), msg, &sig));
+        assert!(verify_pq_signature(
+            PqScheme::Falcon512,
+            keypair.pubkey(),
+            msg,
+            &sig
+        ));
 
         // 2. Tampered message FAILS
         assert!(
-            !verify_pq_signature(PqScheme::Falcon512, keypair.pubkey(), b"Tampered Message", &sig),
+            !verify_pq_signature(
+                PqScheme::Falcon512,
+                keypair.pubkey(),
+                b"Tampered Message",
+                &sig
+            ),
             "Tampered message must fail"
         );
         assert!(
@@ -3023,21 +3091,42 @@ mod tests {
         // 0x03 byte identifier is refused LOUDLY at admission (every envelope /
         // grant / opcode decode funnels through `from_id`).
         let err = PqScheme::from_id(3).expect_err("0x03 must be refused");
-        assert!(err.contains("ML-DSA-44"), "refusal must name the scheme: {err}");
+        assert!(
+            err.contains("ML-DSA-44"),
+            "refusal must name the scheme: {err}"
+        );
         assert!(err.contains("DISABLED"), "refusal must be loud: {err}");
-        assert!(err.contains("0x03"), "refusal must name the scheme id: {err}");
+        assert!(
+            err.contains("0x03"),
+            "refusal must name the scheme id: {err}"
+        );
 
         // Verify-level refusal: even well-formed 0x03 material MUST NOT verify.
         // (The old engine was forgeable — norm window + self-computed trailer —
         // so refusal is unconditional, not length-dependent.)
         let pk = vec![0x77u8; MLDSA44_PUBKEY_LEN];
         let sig = vec![0x22u8; MLDSA44_SIG_LEN];
-        assert!(!verify_pq_signature(PqScheme::MlDsa44, &pk, b"ML-DSA-44 test message", &sig));
-        assert!(!verify_pq_signature(PqScheme::MlDsa44, &pk, b"Tampered msg", &sig));
+        assert!(!verify_pq_signature(
+            PqScheme::MlDsa44,
+            &pk,
+            b"ML-DSA-44 test message",
+            &sig
+        ));
+        assert!(!verify_pq_signature(
+            PqScheme::MlDsa44,
+            &pk,
+            b"Tampered msg",
+            &sig
+        ));
         // Degenerate inputs refuse identically (no acceptance branch remains).
         let mut zero_rho = pk.clone();
         zero_rho[..32].fill(0);
-        assert!(!verify_pq_signature(PqScheme::MlDsa44, &zero_rho, b"m", &sig));
+        assert!(!verify_pq_signature(
+            PqScheme::MlDsa44,
+            &zero_rho,
+            b"m",
+            &sig
+        ));
 
         // Admission-level refusal: a PQ1 envelope carrying scheme byte 0x03
         // fails to decode with the loud error (never admitted, never verified).
@@ -3045,7 +3134,10 @@ mod tests {
         let bytes = env.encode();
         assert_eq!(bytes[3], 3, "envelope must still frame the 0x03 scheme id");
         let err = PqSignatureEnvelope::decode(&bytes).expect_err("0x03 envelope must not decode");
-        assert!(err.contains("ML-DSA-44"), "decode refusal must name the scheme: {err}");
+        assert!(
+            err.contains("ML-DSA-44"),
+            "decode refusal must name the scheme: {err}"
+        );
     }
 
     #[test]
@@ -3350,7 +3442,12 @@ mod tests {
             verify_falcon512(&pk_bytes, msg, &sig),
             "a legacy key must produce signatures that verify under the EXISTING public key"
         );
-        assert!(verify_pq_signature(PqScheme::Falcon512, &pk_bytes, msg, &sig));
+        assert!(verify_pq_signature(
+            PqScheme::Falcon512,
+            &pk_bytes,
+            msg,
+            &sig
+        ));
 
         // The recovered partner is the genuine NTRU partner: it satisfies the
         // exact integer relation f*G - g*F = q.
@@ -3417,7 +3514,6 @@ mod tests {
         buf_idx
     }
 
-
     #[test]
     fn test_falcon_keypair_generate_full_entropy_unique_keys() {
         use std::collections::HashSet;
@@ -3461,7 +3557,8 @@ mod tests {
             let s2_h = poly_mul_ntt(&s2_modq, &kp.h);
             let mut norm_sq = 0i64;
             for i in 0..512 {
-                let s1_val = (c[i] as i32 + FALCON_MODULUS_Q as i32 - s2_h[i] as i32) % (FALCON_MODULUS_Q as i32);
+                let s1_val = (c[i] as i32 + FALCON_MODULUS_Q as i32 - s2_h[i] as i32)
+                    % (FALCON_MODULUS_Q as i32);
                 let s1_c = if s1_val > (FALCON_MODULUS_Q as i32 / 2) {
                     s1_val - (FALCON_MODULUS_Q as i32)
                 } else {
@@ -3501,12 +3598,30 @@ mod tests {
 
             // Test strict determinism
             let kp_repeat = FalconKeypair::generate_from_seed_bytes(&seed);
-            assert_eq!(kp.public_key, kp_repeat.public_key, "Determinism: identical seed must yield identical pubkey");
-            assert_eq!(kp.f, kp_repeat.f, "Determinism: identical seed must yield identical f");
-            assert_eq!(kp.g, kp_repeat.g, "Determinism: identical seed must yield identical g");
-            assert_eq!(kp.capital_f, kp_repeat.capital_f, "Determinism: identical seed must yield identical F");
-            assert_eq!(kp.capital_g, kp_repeat.capital_g, "Determinism: identical seed must yield identical G");
-            assert_eq!(kp.h, kp_repeat.h, "Determinism: identical seed must yield identical h");
+            assert_eq!(
+                kp.public_key, kp_repeat.public_key,
+                "Determinism: identical seed must yield identical pubkey"
+            );
+            assert_eq!(
+                kp.f, kp_repeat.f,
+                "Determinism: identical seed must yield identical f"
+            );
+            assert_eq!(
+                kp.g, kp_repeat.g,
+                "Determinism: identical seed must yield identical g"
+            );
+            assert_eq!(
+                kp.capital_f, kp_repeat.capital_f,
+                "Determinism: identical seed must yield identical F"
+            );
+            assert_eq!(
+                kp.capital_g, kp_repeat.capital_g,
+                "Determinism: identical seed must yield identical G"
+            );
+            assert_eq!(
+                kp.h, kp_repeat.h,
+                "Determinism: identical seed must yield identical h"
+            );
 
             assert!(
                 seen_pubkeys.insert(kp.pubkey().to_vec()),
@@ -3533,7 +3648,12 @@ mod tests {
         for i in 0..NUM_SEEDS {
             let next_idx = (i + 1) % NUM_SEEDS;
             assert!(
-                !verify_pq_signature(PqScheme::Falcon512, keypairs[next_idx].0.pubkey(), msg, &keypairs[i].1),
+                !verify_pq_signature(
+                    PqScheme::Falcon512,
+                    keypairs[next_idx].0.pubkey(),
+                    msg,
+                    &keypairs[i].1
+                ),
                 "Signature from keypair {} must fail verification under keypair {}",
                 i,
                 next_idx

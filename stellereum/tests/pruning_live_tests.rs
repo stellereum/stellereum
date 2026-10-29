@@ -72,7 +72,7 @@ fn exec_chain(store: &Storage, n: u64) -> (Vec<BlockHash>, Vec<Block>) {
             cross_shard_out: vec![],
             order_merkle_root,
             epoch_key_commitment: [0u8; 32],
-};
+        };
         prev = store.put_block(&b).expect("persist block");
         out_hashes.push(prev);
         out_blocks.push(b);
@@ -117,7 +117,10 @@ async fn live_prune_keeps_sync_working_inside_the_window() {
     // Same cursor the node uses (src/main.rs): height.saturating_sub(keep_blocks).
     let keep_from = tip.saturating_sub(keep_blocks);
 
-    let retention = RetentionConfig { archive: false, keep_blocks };
+    let retention = RetentionConfig {
+        archive: false,
+        keep_blocks,
+    };
     assert!(!retention.archive, "this test proves pruning mode");
     store.prune_blocks_below(keep_from).expect("prune");
 
@@ -127,13 +130,22 @@ async fn live_prune_keeps_sync_working_inside_the_window() {
         let rec = store
             .header_at(h)
             .expect("header read must not error")
-            .unwrap_or_else(|| panic!("BREAKAGE: header at height {h} dropped by pruning; header walk is broken"));
+            .unwrap_or_else(|| {
+                panic!("BREAKAGE: header at height {h} dropped by pruning; header walk is broken")
+            });
         let body = store
             .get_block(&rec.block_hash)
             .unwrap_or_else(|_| panic!("BREAKAGE: body read at height {h} errored (corrupt read) instead of returning the body"))
             .unwrap_or_else(|| panic!("BREAKAGE: pruning broke sync inside the window: body at height {h} (keep_from={keep_from}) is gone"));
-        assert_eq!(body.compute_hash(), rec.block_hash, "window body at {h} must match its header record");
-        assert_eq!(hashes[h as usize], rec.block_hash, "window body at {h} must be the canonical block");
+        assert_eq!(
+            body.compute_hash(),
+            rec.block_hash,
+            "window body at {h} must match its header record"
+        );
+        assert_eq!(
+            hashes[h as usize], rec.block_hash,
+            "window body at {h} must be the canonical block"
+        );
     }
     // Headers exist for ALL heights, including pruned ones.
     for h in 0..N_SYNC {
@@ -160,7 +172,11 @@ async fn live_prune_keeps_sync_working_inside_the_window() {
         "sync must return every block between anchor {anchor_h} and tip {tip}"
     );
     for (i, b) in synced.iter().enumerate() {
-        assert_eq!(b.height, anchor_h + 1 + i as u64, "synced blocks must be ancestor-first with no gaps");
+        assert_eq!(
+            b.height,
+            anchor_h + 1 + i as u64,
+            "synced blocks must be ancestor-first with no gaps"
+        );
     }
     assert!(
         validate_linkage(&synced, anchor_hash),
@@ -212,12 +228,18 @@ fn live_pruned_body_reads_fail_cleanly_not_corrupt() {
         .header_at(3)
         .expect("header read must not error")
         .expect("BREAKAGE: header for pruned height 3 is gone; pruned-vs-unknown is no longer distinguishable");
-    assert_eq!(rec.block_hash, pruned_hash, "header must still name the pruned body");
+    assert_eq!(
+        rec.block_hash, pruned_hash,
+        "header must still name the pruned body"
+    );
     // An unknown hash is also a clean None, never an error or garbage.
     let unknown = store
         .get_block(&[0xFFu8; 32])
         .expect("BREAKAGE: unknown-hash read errored instead of clean None");
-    assert!(unknown.is_none(), "BREAKAGE: unknown hash returned garbage instead of clean None");
+    assert!(
+        unknown.is_none(),
+        "BREAKAGE: unknown hash returned garbage instead of clean None"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -228,7 +250,10 @@ async fn live_archive_retains_everything_and_reexecutes() {
     let dir = tmpdir("archive");
     let store = Storage::open(&dir).expect("open");
     let retention = RetentionConfig::default();
-    assert!(retention.archive, "archive must stay the default; only archive allows re-execution/audit");
+    assert!(
+        retention.archive,
+        "archive must stay the default; only archive allows re-execution/audit"
+    );
 
     let (hashes, blocks) = exec_chain(&store, N_ARCHIVE);
     // Archive mode never prunes: no prune call happens here by construction.
@@ -238,8 +263,14 @@ async fn live_archive_retains_everything_and_reexecutes() {
         let body = store
             .get_block(want)
             .expect("archive read must not error")
-            .unwrap_or_else(|| panic!("BREAKAGE: archive mode lost body at height {h}; archive retains everything"));
-        assert_eq!(body.compute_hash(), *want, "archive body at {h} must be intact");
+            .unwrap_or_else(|| {
+                panic!("BREAKAGE: archive mode lost body at height {h}; archive retains everything")
+            });
+        assert_eq!(
+            body.compute_hash(),
+            *want,
+            "archive body at {h} must be intact"
+        );
         assert_eq!(body.height, h as u64);
     }
 
@@ -256,7 +287,11 @@ async fn live_archive_retains_everything_and_reexecutes() {
             .get_block(&rec.block_hash)
             .expect("archive read must not error")
             .expect("BREAKAGE: archive lost a body needed for re-execution/audit");
-        assert_eq!(body.compute_hash(), rec.block_hash, "re-executed body must match its header");
+        assert_eq!(
+            body.compute_hash(),
+            rec.block_hash,
+            "re-executed body must match its header"
+        );
         replayed.push(body);
     }
     let (root_replay, _) = apply_blocks_in_order(&replayed).await;
@@ -280,32 +315,56 @@ fn live_header_walk_survives_pruning_past_the_prune_point() {
     // Prove bodies really are gone below the prune point, so the walk below
     // genuinely crosses it.
     let pruned_gone = store.get_block(&hashes[2]).expect("read").is_none();
-    assert!(pruned_gone, "test setup broken: body at height 2 should be pruned");
+    assert!(
+        pruned_gone,
+        "test setup broken: body at height 2 should be pruned"
+    );
 
     // Walk headers from the tip down past the prune point via header records.
     let mut cur = store
         .header_at(tip)
         .expect("tip header read must not error")
         .expect("BREAKAGE: tip header missing after pruning");
-    assert_eq!(cur.block_hash, hashes[tip as usize], "tip header must name the tip block");
+    assert_eq!(
+        cur.block_hash, hashes[tip as usize],
+        "tip header must name the tip block"
+    );
     for h in (0..tip).rev() {
         let parent = store
             .header_at(h)
             .expect("header read must not error")
-            .unwrap_or_else(|| panic!("BREAKAGE: header walk stops at height {h}: header dropped by pruning"));
-        assert_eq!(parent.height, h, "header record height field must match its index");
+            .unwrap_or_else(|| {
+                panic!("BREAKAGE: header walk stops at height {h}: header dropped by pruning")
+            });
+        assert_eq!(
+            parent.height, h,
+            "header record height field must match its index"
+        );
         assert_eq!(
             cur.prev_hash, parent.block_hash,
             "BREAKAGE: header linkage broken between heights {h} and {}: prev_hash does not resolve",
             h + 1
         );
-        assert_eq!(parent.block_hash, hashes[h as usize], "header at {h} must carry the real block hash");
+        assert_eq!(
+            parent.block_hash, hashes[h as usize],
+            "header at {h} must carry the real block hash"
+        );
         cur = parent;
     }
     assert_eq!(cur.height, 0, "walk must reach genesis");
-    let latest = store.latest_header().expect("latest read").expect("latest header must exist");
-    assert_eq!(latest.height, tip, "latest_header must still report the tip after pruning");
-    assert_eq!(store.header_count().expect("count"), N_WALK as usize, "BREAKAGE: headers were dropped by pruning; the chain is no longer walkable");
+    let latest = store
+        .latest_header()
+        .expect("latest read")
+        .expect("latest header must exist");
+    assert_eq!(
+        latest.height, tip,
+        "latest_header must still report the tip after pruning"
+    );
+    assert_eq!(
+        store.header_count().expect("count"),
+        N_WALK as usize,
+        "BREAKAGE: headers were dropped by pruning; the chain is no longer walkable"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -334,7 +393,10 @@ fn live_pruning_pass_is_bounded_and_spares_the_window() {
     // Nothing within keep_blocks of the tip (plus the boundary parent) is touched.
     let window_start = keep_from.saturating_sub(1);
     for h in window_start..=tip {
-        let rec = store.header_at(h).expect("header read").expect("header must exist");
+        let rec = store
+            .header_at(h)
+            .expect("header read")
+            .expect("header must exist");
         assert!(
             store.get_block(&rec.block_hash).expect("read").is_some(),
             "BREAKAGE: pruning touched a body within keep_blocks of the tip at height {h} (keep_from={keep_from})"
@@ -343,8 +405,14 @@ fn live_pruning_pass_is_bounded_and_spares_the_window() {
     }
     // A second pass with the same cursor is a no-op: the pass was bounded and complete.
     let again = store.prune_blocks_below(keep_from).expect("second prune");
-    assert_eq!(again, 0, "BREAKAGE: pruning pass was unbounded/incomplete: second pass removed {again} more");
-    assert!(!store.has_blocks_below(keep_from).expect("check"), "nothing must remain eligible after a complete pass");
+    assert_eq!(
+        again, 0,
+        "BREAKAGE: pruning pass was unbounded/incomplete: second pass removed {again} more"
+    );
+    assert!(
+        !store.has_blocks_below(keep_from).expect("check"),
+        "nothing must remain eligible after a complete pass"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

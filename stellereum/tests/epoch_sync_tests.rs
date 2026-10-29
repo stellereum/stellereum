@@ -135,7 +135,11 @@ impl FakeEpochStore {
     fn persist_header(&self, epoch: &EpochTag, shard_id: u32, block: &Block) {
         let rec = BlockHeaderRecord::of(block);
         if let Ok(bytes) = bincode::serialize(&rec) {
-            self.put(BUCKET_STELLEREUM_HEADERS, &mirror_header_name(epoch, block.height), bytes);
+            self.put(
+                BUCKET_STELLEREUM_HEADERS,
+                &mirror_header_name(epoch, block.height),
+                bytes,
+            );
             let idx = format!("{}:{}", block.height, hex::encode(block.compute_hash()));
             self.put(
                 BUCKET_STELLEREUM_HEADERS,
@@ -146,8 +150,10 @@ impl FakeEpochStore {
     }
 
     fn fetch_head_hash(&self, epoch: &EpochTag, shard_id: u32, height: u64) -> Option<[u8; 32]> {
-        let bytes =
-            self.get(BUCKET_STELLEREUM_HEADERS, &mirror_header_index_name(epoch, shard_id, height))?;
+        let bytes = self.get(
+            BUCKET_STELLEREUM_HEADERS,
+            &mirror_header_index_name(epoch, shard_id, height),
+        )?;
         let s = String::from_utf8(bytes).ok()?;
         let (_h, hash_hex) = s.split_once(':')?;
         let raw = hex::decode(hash_hex).ok()?;
@@ -165,7 +171,10 @@ impl FakeEpochStore {
         height: u64,
         expected_hash: [u8; 32],
     ) -> Option<BlockHeaderRecord> {
-        let bytes = self.get(BUCKET_STELLEREUM_HEADERS, &mirror_header_name(epoch, height))?;
+        let bytes = self.get(
+            BUCKET_STELLEREUM_HEADERS,
+            &mirror_header_name(epoch, height),
+        )?;
         let rec: BlockHeaderRecord = bincode::deserialize(&bytes).ok()?;
         if rec.height != height || rec.block_hash != expected_hash {
             return None;
@@ -183,14 +192,21 @@ impl FakeEpochStore {
     }
 
     fn fetch_snapshot(&self, epoch: &EpochTag, shard_id: u32, height: u64) -> Option<Vec<u8>> {
-        self.get(BUCKET_STELLEREUM_STATE, &mirror_snapshot_name(epoch, shard_id, height))
+        self.get(
+            BUCKET_STELLEREUM_STATE,
+            &mirror_snapshot_name(epoch, shard_id, height),
+        )
     }
 
     // ---- body (REAL production naming via block_body_blob_name) ----
     fn persist_body(&self, epoch: &EpochTag, block: &Block) {
         let hash = block.compute_hash();
         let bytes = bincode::serialize(block).expect("block must serialize");
-        self.put(BUCKET_STELLEREUM_BLOCKS, &block_body_blob_name(epoch, &hash), bytes);
+        self.put(
+            BUCKET_STELLEREUM_BLOCKS,
+            &block_body_blob_name(epoch, &hash),
+            bytes,
+        );
     }
 
     fn fetch_body(&self, epoch: &EpochTag, hash: &[u8; 32]) -> Option<Block> {
@@ -207,7 +223,9 @@ fn keys(n: usize) -> Vec<SigningKey> {
 
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(
-        ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect(),
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
     )
 }
 
@@ -257,7 +275,7 @@ async fn build_chain(ks: &[SigningKey], base: &Arc<InMemoryStateEngine>, n: u64)
             mmr_epoch_root: [0u8; 32],
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
-};
+        };
         b.sign_block(&proposer);
         let bh = b.compute_hash();
         attach_quorum(&mut b, ks, h, bh);
@@ -278,8 +296,10 @@ async fn catch_up(
     validators: &ValidatorSet,
 ) -> Result<u64, String> {
     let head = blocks.last().ok_or("empty chain")?.compute_hash();
-    let map: HashMap<[u8; 32], Block> =
-        blocks.iter().map(|b| (b.compute_hash(), b.clone())).collect();
+    let map: HashMap<[u8; 32], Block> = blocks
+        .iter()
+        .map(|b| (b.compute_hash(), b.clone()))
+        .collect();
     let missing = collect_missing_blocks(head, our_last, 100_000, move |h| {
         let m = map.clone();
         async move { m.get(&h).cloned() }
@@ -305,7 +325,9 @@ async fn catch_up(
                 hex::encode(root_before)
             ));
         }
-        our_state.apply_block_parallel_fees(&b.transactions, b.timestamp).await;
+        our_state
+            .apply_block_parallel_fees(&b.transactions, b.timestamp)
+            .await;
     }
     Ok(missing.len() as u64)
 }
@@ -406,7 +428,10 @@ fn epoch_isolation_of_names_disjoint_and_deterministic() {
 
     // Determinism: identical inputs reproduce identical names.
     let a2 = EpochTag::from_genesis(&[0x11u8; 32]);
-    assert_eq!(a, a2, "the same genesis fingerprint must always name the same epoch");
+    assert_eq!(
+        a, a2,
+        "the same genesis fingerprint must always name the same epoch"
+    );
     for &shard in &shards {
         for &h in &[1u64, 17, 32] {
             assert_eq!(mirror_head_name(&a, shard), mirror_head_name(&a2, shard));
@@ -436,7 +461,8 @@ async fn cross_epoch_reader_finds_nothing_from_foreign_epoch() {
 
     let ks = keys(3);
     let base = Arc::new(InMemoryStateEngine::new());
-    base.update_account(AccountState::new([0x55u8; 32], 777_000)).await;
+    base.update_account(AccountState::new([0x55u8; 32], 777_000))
+        .await;
     let blocks = build_chain(&ks, &base, 6).await;
     let snap = base.create_snapshot().await;
 
@@ -467,7 +493,8 @@ async fn cross_epoch_reader_finds_nothing_from_foreign_epoch() {
     for blk in &blocks {
         let h = blk.compute_hash();
         assert!(
-            net.fetch_head_hash(&epoch_reader, shard, blk.height).is_none(),
+            net.fetch_head_hash(&epoch_reader, shard, blk.height)
+                .is_none(),
             "epoch isolation BROKE: cross-epoch header-index fetch leaked at height {}",
             blk.height
         );
@@ -499,7 +526,8 @@ async fn same_epoch_catch_up_succeeds_and_lands_on_peer_root() {
     let vs = vset(&ks);
     let payer = ks[0].verifying_key().to_bytes();
     let base = Arc::new(InMemoryStateEngine::new());
-    base.update_account(AccountState::new(payer, 1_000_000_000_000)).await;
+    base.update_account(AccountState::new(payer, 1_000_000_000_000))
+        .await;
     let blocks = build_chain(&ks, &base, 8).await;
     let snap = base.create_snapshot().await;
     let peer_root = blocks.last().unwrap().state_root;
@@ -519,24 +547,31 @@ async fn same_epoch_catch_up_succeeds_and_lands_on_peer_root() {
     let we_have = 5u64;
     let our_last = blocks[(we_have - 1) as usize].compute_hash();
     let our_state = Arc::new(InMemoryStateEngine::new());
-    our_state.update_account(AccountState::new(payer, 1_000_000_000_000)).await;
+    our_state
+        .update_account(AccountState::new(payer, 1_000_000_000_000))
+        .await;
     for blk in blocks.iter().take(we_have as usize) {
         assert_eq!(
             our_state.get_state_root().await,
             blk.state_root,
             "epoch refactor broke the normal path: prefix replay diverged before catch-up"
         );
-        our_state.apply_block_parallel_fees(&blk.transactions, blk.timestamp).await;
+        our_state
+            .apply_block_parallel_fees(&blk.transactions, blk.timestamp)
+            .await;
     }
 
     // The catch-up sequence a node runs: discover the head, walk prev_hash via
     // epoch-scoped body fetches, validate, then root-checked replay.
-    let (head_h, head_hash) = net.fetch_head(&epoch, shard).expect(
-        "epoch refactor broke the normal path: same-epoch head fetch returned None",
-    );
+    let (head_h, head_hash) = net
+        .fetch_head(&epoch, shard)
+        .expect("epoch refactor broke the normal path: same-epoch head fetch returned None");
     assert_eq!((head_h, head_hash), (tip.height, tip_hash));
 
-    let map: HashMap<[u8; 32], Block> = blocks.iter().map(|b| (b.compute_hash(), b.clone())).collect();
+    let map: HashMap<[u8; 32], Block> = blocks
+        .iter()
+        .map(|b| (b.compute_hash(), b.clone()))
+        .collect();
     let fetch = |h: [u8; 32]| {
         let m = map.clone();
         let store_blobs = net.blobs.borrow().clone();
@@ -553,20 +588,29 @@ async fn same_epoch_catch_up_succeeds_and_lands_on_peer_root() {
     let missing = collect_missing_blocks(head_hash, our_last, 100_000, fetch)
         .await
         .expect("epoch refactor broke the normal path: collect_missing_blocks failed same-epoch");
-    assert_eq!(missing.len(), 3, "exactly the three missing blocks are expected");
+    assert_eq!(
+        missing.len(),
+        3,
+        "exactly the three missing blocks are expected"
+    );
     validate_sync_chain(&missing, we_have + 1, our_last, &vs)
         .expect("epoch refactor broke the normal path: validate_sync_chain failed same-epoch");
 
     // Root-checked replay of the fetched bodies, plus the snapshot check: the
     // snapshot must restore to the header-committed root (poisoning guard).
     let target = Arc::new(InMemoryStateEngine::new());
-    target.update_account(AccountState::new(payer, 1_000_000_000_000)).await;
-    let snap_bytes = net.fetch_snapshot(&epoch, shard, 1).expect(
-        "epoch refactor broke the normal path: same-epoch snapshot fetch returned None",
-    );
-    fast_sync_state(&target, base.get_state_root().await, || async {
-        Some(snap_bytes.clone())
-    }, /* fetch_domain */ |_| async { None })
+    target
+        .update_account(AccountState::new(payer, 1_000_000_000_000))
+        .await;
+    let snap_bytes = net
+        .fetch_snapshot(&epoch, shard, 1)
+        .expect("epoch refactor broke the normal path: same-epoch snapshot fetch returned None");
+    fast_sync_state(
+        &target,
+        base.get_state_root().await,
+        || async { Some(snap_bytes.clone()) },
+        /* fetch_domain */ |_| async { None },
+    )
     .await
     .expect("epoch refactor broke the normal path: same-epoch snapshot failed root check");
     assert_eq!(
@@ -614,15 +658,23 @@ fn topic_isolation_across_epochs_and_message_kinds() {
         cb, tb,
         "topic isolation BROKE: consensus and tx traffic share one topic ({cb})"
     );
-    assert_eq!(ca, consensus_topic(a.as_str()), "same epoch must reuse its topic");
+    assert_eq!(
+        ca,
+        consensus_topic(a.as_str()),
+        "same epoch must reuse its topic"
+    );
     assert_eq!(ta, tx_topic(a.as_str()), "same epoch must reuse its topic");
 
     // A message published under epoch A's topic is not visible under epoch B's
     // subscription name. No live network needed: visibility IS the topic name,
     // so an in-process topic -> messages map proves the property.
     let mut bus: HashMap<String, Vec<String>> = HashMap::new();
-    bus.entry(ca.clone()).or_default().push("proposal#1".to_string());
-    bus.entry(ta.clone()).or_default().push("tx:deadbeef".to_string());
+    bus.entry(ca.clone())
+        .or_default()
+        .push("proposal#1".to_string());
+    bus.entry(ta.clone())
+        .or_default()
+        .push("tx:deadbeef".to_string());
 
     let got_b: &[String] = bus.get(&cb).map(Vec::as_slice).unwrap_or(&[]);
     assert!(
@@ -658,22 +710,45 @@ fn default_epoch_is_well_formed_and_distinct_from_any_real_epoch() {
     );
 
     // Pre-genesis publishes produce valid, non-colliding names.
-    let heads: HashSet<String> = [0u32, 1, 7].iter().map(|&s| mirror_head_name(&d, s)).collect();
-    assert_eq!(heads.len(), 3, "default-epoch head names must not collide across shards");
+    let heads: HashSet<String> = [0u32, 1, 7]
+        .iter()
+        .map(|&s| mirror_head_name(&d, s))
+        .collect();
+    assert_eq!(
+        heads.len(),
+        3,
+        "default-epoch head names must not collide across shards"
+    );
     for n in &heads {
-        assert!(!n.is_empty() && !n.starts_with('_'), "ill-formed default head name: {n:?}");
+        assert!(
+            !n.is_empty() && !n.starts_with('_'),
+            "ill-formed default head name: {n:?}"
+        );
     }
-    let headers: HashSet<String> = [1u64, 2, 100].iter().map(|&h| mirror_header_name(&d, h)).collect();
-    assert_eq!(headers.len(), 3, "default-epoch header names must not collide across heights");
+    let headers: HashSet<String> = [1u64, 2, 100]
+        .iter()
+        .map(|&h| mirror_header_name(&d, h))
+        .collect();
+    assert_eq!(
+        headers.len(),
+        3,
+        "default-epoch header names must not collide across heights"
+    );
     for h in (1u64..=8).map(|i| [i as u8; 32]) {
         let name = block_body_blob_name(&d, &h);
-        assert!(!name.is_empty() && !name.starts_with('_'), "ill-formed default body name: {name:?}");
+        assert!(
+            !name.is_empty() && !name.starts_with('_'),
+            "ill-formed default body name: {name:?}"
+        );
     }
 
     // Switching from default to a real epoch changes EVERY name: no silent
     // aliasing between "no epoch yet" and a real chain.
     let real = epoch_a();
-    assert_ne!(d, real, "precondition: default must differ from a real epoch tag");
+    assert_ne!(
+        d, real,
+        "precondition: default must differ from a real epoch tag"
+    );
     for &shard in &[0u32, 1, 7] {
         assert_ne!(
             mirror_head_name(&d, shard),
@@ -727,11 +802,16 @@ fn default_epoch_is_well_formed_and_distinct_from_any_real_epoch() {
         b"default-body".to_vec(),
     );
     assert!(
-        net.get(BUCKET_STELLEREUM_BLOCKS, &block_body_blob_name(&d, &hash)).is_some(),
+        net.get(BUCKET_STELLEREUM_BLOCKS, &block_body_blob_name(&d, &hash))
+            .is_some(),
         "default-epoch publish must be readable under the default epoch"
     );
     assert!(
-        net.get(BUCKET_STELLEREUM_BLOCKS, &block_body_blob_name(&real, &hash)).is_none(),
+        net.get(
+            BUCKET_STELLEREUM_BLOCKS,
+            &block_body_blob_name(&real, &hash)
+        )
+        .is_none(),
         "default/real aliasing BROKE: default-epoch body visible under the real epoch"
     );
 }

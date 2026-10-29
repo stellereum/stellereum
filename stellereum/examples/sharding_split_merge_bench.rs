@@ -111,7 +111,9 @@ fn main() {
             .check_and_merge(c0.shard_id, c1.shard_id)
             .expect("the merge trigger fires once the load decayed");
         let merge_migration = TrieMigration::new(merge.plan.clone(), manifest.clone());
-        let _ = merge_migration.execute_merge(&child0, &child1).expect("merge");
+        let _ = merge_migration
+            .execute_merge(&child0, &child1)
+            .expect("merge");
         let merge_elapsed = t4.elapsed();
 
         println!(

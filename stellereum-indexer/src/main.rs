@@ -1,9 +1,9 @@
 use anyhow::Result;
+use std::net::SocketAddr;
 use stellereum_indexer::db::Database;
 use stellereum_indexer::events::AbiCache;
 use stellereum_indexer::server::{create_router, AppState};
 use stellereum_indexer::syncer::Syncer;
-use std::net::SocketAddr;
 use tracing::info;
 
 #[tokio::main]
@@ -15,8 +15,10 @@ async fn main() -> Result<()> {
     info!("╚═══════════════════════════════════════════════════════════════╝");
 
     let db_path = std::env::var("INDEXER_DB_PATH").unwrap_or_else(|_| "indexer.db".to_string());
-    let node_url = std::env::var("INDEXER_NODE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-    let rpc_url = std::env::var("INDEXER_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8545".to_string());
+    let node_url =
+        std::env::var("INDEXER_NODE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let rpc_url =
+        std::env::var("INDEXER_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8545".to_string());
     let listen_port: u16 = std::env::var("INDEXER_PORT")
         .ok()
         .and_then(|p| p.parse().ok())

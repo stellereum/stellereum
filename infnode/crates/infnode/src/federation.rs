@@ -52,11 +52,7 @@ pub fn query_txt(domain: &str) -> Result<Vec<String>> {
             .timeout_read(std::time::Duration::from_secs(10))
             .build();
         // Google отдаёт JSON; Cloudflare/Quad9 при запросе с Accept: application/dns-json тоже JSON.
-        match agent
-            .get(&url)
-            .set("accept", "application/dns-json")
-            .call()
-        {
+        match agent.get(&url).set("accept", "application/dns-json").call() {
             Ok(resp) => match resp.into_json::<serde_json::Value>() {
                 Ok(j) => {
                     let empty = vec![];
@@ -104,7 +100,10 @@ pub fn record_self_consistent(rec: &ValidatorRecord) -> bool {
         return false;
     }
     let h = blake3::hash(&ed_bytes);
-    let expected_id = format!("inf1:{}", hex::encode(&h.as_bytes()[..crate::proto::NODEID_LEN]));
+    let expected_id = format!(
+        "inf1:{}",
+        hex::encode(&h.as_bytes()[..crate::proto::NODEID_LEN])
+    );
     expected_id == rec.node_id
 }
 
@@ -139,7 +138,11 @@ pub fn parse_validator_record(data: &str) -> Option<ValidatorRecord> {
     if ip.is_empty() {
         return None; // an endpoint is required
     }
-    Some(ValidatorRecord { node_id, ed_pub, ip })
+    Some(ValidatorRecord {
+        node_id,
+        ed_pub,
+        ip,
+    })
 }
 
 /// Сформировать TXT-значение для валидатора.
@@ -211,7 +214,6 @@ pub async fn resolve_with_trust_anchor(
     }
 }
 
-
 /// Простой URL-энкодер (без внешних зависимостей).
 fn urlencoding(s: &str) -> String {
     let mut out = String::new();
@@ -243,4 +245,6 @@ pub fn announce_message(node_id: &str, ed_pub: &str, domain: &str, ip: &str) -> 
 
 // тихие use для json (может пригодиться позже)
 #[allow(dead_code)]
-fn _j(_x: serde_json::Value) -> serde_json::Value { json!({}) }
+fn _j(_x: serde_json::Value) -> serde_json::Value {
+    json!({})
+}

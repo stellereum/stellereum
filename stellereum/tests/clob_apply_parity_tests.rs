@@ -66,8 +66,12 @@ async fn base_engine(seller: &SigningKey, taker: &SigningKey) -> InMemoryStateEn
 
     let s = seller.verifying_key().to_bytes();
     let t = taker.verifying_key().to_bytes();
-    engine.update_account(AccountState::new(s, 100 * STELL)).await;
-    engine.update_account(AccountState::new(t, 10 * STELL)).await;
+    engine
+        .update_account(AccountState::new(s, 100 * STELL))
+        .await;
+    engine
+        .update_account(AccountState::new(t, 10 * STELL))
+        .await;
     engine
 }
 
@@ -76,7 +80,15 @@ async fn build(seller: &SigningKey, taker: &SigningKey) -> InMemoryStateEngine {
     let engine = base_engine(seller, taker).await;
     let s = seller.verifying_key().to_bytes();
     engine
-        .place_order_settled(PAIR_STELL_USDT, s, OrderSide::Sell, OrderType::Limit, PRICE, 10 * STELL, 1)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            s,
+            OrderSide::Sell,
+            OrderType::Limit,
+            PRICE,
+            10 * STELL,
+            1,
+        )
         .await
         .unwrap();
     engine
@@ -130,8 +142,12 @@ async fn both_apply_paths_reach_the_identical_state_root() {
     let gas = stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL;
     let tx = buy_tx(&taker, 0, gas, 4 * STELL);
 
-    a.apply_transaction(&tx, 42).await.expect("single-tx path applies");
-    let (applied, failed, fees, status, _) = b.apply_block_parallel_fees(std::slice::from_ref(&tx), 42).await;
+    a.apply_transaction(&tx, 42)
+        .await
+        .expect("single-tx path applies");
+    let (applied, failed, fees, status, _) = b
+        .apply_block_parallel_fees(std::slice::from_ref(&tx), 42)
+        .await;
     assert_eq!((applied, failed), (1, 0), "the block path applies it too");
     assert_eq!(fees, gas, "the block path collects the declared limit");
     assert_eq!(status, vec![true]);
@@ -147,14 +163,25 @@ async fn both_apply_paths_reach_the_identical_state_root() {
         commitment_digest(&b.commitment_snapshot().await),
         "same commitment digest (books, escrow, tokens, staking, PMM, contracts)"
     );
-    assert_eq!(books_bytes(&a).await, books_bytes(&b).await, "same book bytes");
-    assert_eq!(escrow_bytes(&a).await, escrow_bytes(&b).await, "same escrow bytes");
+    assert_eq!(
+        books_bytes(&a).await,
+        books_bytes(&b).await,
+        "same book bytes"
+    );
+    assert_eq!(
+        escrow_bytes(&a).await,
+        escrow_bytes(&b).await,
+        "same escrow bytes"
+    );
 
     let s = seller.verifying_key().to_bytes();
     let t = taker.verifying_key().to_bytes();
     for e in [&a, &b] {
         // The maker was paid 1 STELL of quote for 4 STELL sold.
-        assert_eq!(e.get_account(&s).await.unwrap().balance, 90 * STELL + native_quote(PRICE, 4 * STELL));
+        assert_eq!(
+            e.get_account(&s).await.unwrap().balance,
+            90 * STELL + native_quote(PRICE, 4 * STELL)
+        );
         // The taker paid the quote and received the collateral.
         assert_eq!(
             e.get_account(&t).await.unwrap().balance,
@@ -162,7 +189,11 @@ async fn both_apply_paths_reach_the_identical_state_root() {
         );
         // The 6 STELL that never traded are still locked.
         assert_eq!(
-            e.order_escrow_read().await.get(&(PAIR_STELL_USDT, 1)).unwrap().locked_base_stell,
+            e.order_escrow_read()
+                .await
+                .get(&(PAIR_STELL_USDT, 1))
+                .unwrap()
+                .locked_base_stell,
             6 * STELL
         );
     }
@@ -232,7 +263,15 @@ async fn block_timestamp_stamps_orders_and_decides_time_priority() {
 
     // 1) The stamp on a resting order placed through the CLOB API is `now`.
     let oid_500 = engine
-        .place_order_settled(PAIR_STELL_USDT, s, OrderSide::Sell, OrderType::Limit, PRICE, 2 * STELL, 500)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            s,
+            OrderSide::Sell,
+            OrderType::Limit,
+            PRICE,
+            2 * STELL,
+            500,
+        )
         .await
         .unwrap()
         .0;
@@ -241,7 +280,9 @@ async fn block_timestamp_stamps_orders_and_decides_time_priority() {
     let bot_addr = bot.verifying_key().to_bytes();
     let gas = stellereum::svm::GAS_ORDER_PLACE;
     // A SELL locks its `amount` (base), not the quote: fund the base + the fee.
-    engine.update_account(AccountState::new(bot_addr, 2 * STELL + gas)).await;
+    engine
+        .update_account(AccountState::new(bot_addr, 2 * STELL + gas))
+        .await;
     engine
         .apply_transaction(
             &Transaction::sign_with_payload(
@@ -275,13 +316,24 @@ async fn block_timestamp_stamps_orders_and_decides_time_priority() {
         .find(|o| o.trader == bot_addr)
         .map(|o| o.timestamp)
         .expect("the bot's ask rests");
-    assert_eq!(stamped, 4_242, "ctx.timestamp is the block timestamp, not a dead 0");
+    assert_eq!(
+        stamped, 4_242,
+        "ctx.timestamp is the block timestamp, not a dead 0"
+    );
 
     // 3) TIME PRIORITY. The FIRST order inserted into the level is stamped 500;
     //    the second one, inserted afterwards, is stamped 400 - earlier, so it
     //    has priority. A cross must therefore fill the stamp-400 order first.
     let oid_400 = engine
-        .place_order_settled(PAIR_STELL_USDT, s, OrderSide::Sell, OrderType::Limit, PRICE, 2 * STELL, 400)
+        .place_order_settled(
+            PAIR_STELL_USDT,
+            s,
+            OrderSide::Sell,
+            OrderType::Limit,
+            PRICE,
+            2 * STELL,
+            400,
+        )
         .await
         .unwrap()
         .0;
@@ -301,7 +353,12 @@ async fn block_timestamp_stamps_orders_and_decides_time_priority() {
 
     // The taker takes the whole level: 2 STELL from the stamp-400 order.
     let fill_gas = stellereum::svm::GAS_ORDER_PLACE + stellereum::svm::GAS_PER_MATCH_LEVEL;
-    engine.update_account(AccountState::new(taker.verifying_key().to_bytes(), 10 * STELL)).await;
+    engine
+        .update_account(AccountState::new(
+            taker.verifying_key().to_bytes(),
+            10 * STELL,
+        ))
+        .await;
     let taker_addr = taker.verifying_key().to_bytes();
     engine
         .apply_transaction(
@@ -340,7 +397,10 @@ async fn block_timestamp_stamps_orders_and_decides_time_priority() {
         vec![500],
         "the stamp-400 order was filled first and is gone"
     );
-    assert_eq!(level[0].filled, 0, "the stamp-500 order was not touched at all");
+    assert_eq!(
+        level[0].filled, 0,
+        "the stamp-500 order was not touched at all"
+    );
 
     // ...and its escrow was released while the survivor's (and the untouched
     // far-side ask) are still intact.
@@ -349,9 +409,14 @@ async fn block_timestamp_stamps_orders_and_decides_time_priority() {
         !escrow.contains_key(&(PAIR_STELL_USDT, oid_400)),
         "the filled order's escrow was released with it"
     );
-    let survivor = escrow.get(&(PAIR_STELL_USDT, oid_500)).expect("the survivor still locked");
+    let survivor = escrow
+        .get(&(PAIR_STELL_USDT, oid_500))
+        .expect("the survivor still locked");
     assert_eq!(survivor.locked_base_stell, 2 * STELL);
-    assert_eq!(survivor.locked_quote_wusdt + survivor.locked_quote_native, 0);
+    assert_eq!(
+        survivor.locked_quote_wusdt + survivor.locked_quote_native,
+        0
+    );
     assert_eq!(
         escrow
             .values()

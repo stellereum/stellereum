@@ -43,7 +43,8 @@ const GOLDEN_TX_HASH: &str = "5396c8cb4dbfe9f745a51980a892adf059ad6a10737e4ba1d9
 const GOLDEN_BLOCK_HASH: &str = "68e8c8dc7c0de7915e9d6eb620c1b25f80fb6216fa929a283a856ad2ab37d6d2";
 const GOLDEN_BLOCK_BYTES: &str = "000000000100000000000000000000000000000000000000000000000000000000000000000000000000000002020202020202020202020202020202020202020202020202020202020202020100000000000000ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c0909090909090909090909090909090909090909090909090909090909090909e8030000000000003200000000000000030000000000000001000000010000004000000000000000ec92a88d6c30df1625df08d1172e2baecf20964110ce727278849ee953418106c995e7ac322958b6ea6910abe8a7c55f709d5fe935ae09a53fa099b843dee8060000000000000000000000000000000000f1536500000000ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c0100000000000000ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c40000000000000003d12d67dfedc7232b0bef033e5182e4dfde39cb6255567a82e0eee1e76b4bd9c25be7ce4374cca6fd75128f79201c184069972b9b753a89f62b3cd887c4a470300";
 /// `sign_with_payload(&sk7, [9u8;32], 5, 700, 8, 1, 2, [Push(42)])`
-const GOLDEN_PAYLOAD_TX_HASH: &str = "1c0dd4788cffddce81eca80d10a3d054cc88b5f2b965e72609ef555ae3723958";
+const GOLDEN_PAYLOAD_TX_HASH: &str =
+    "1c0dd4788cffddce81eca80d10a3d054cc88b5f2b965e72609ef555ae3723958";
 
 fn h(s: &str) -> Vec<u8> {
     hex::decode(s).expect("golden hex")
@@ -72,7 +73,11 @@ fn legacy_tx_and_block_encodings_are_unchanged() {
     assert_eq!(tx.from, h32(GOLDEN_PUBKEY));
     assert_eq!(tx.signature, h(GOLDEN_SIG));
     assert!(tx.payload.is_empty(), "the golden tx carries no payload");
-    assert_eq!(bincode::serialize(&tx).unwrap(), raw, "re-encode must be byte-identical");
+    assert_eq!(
+        bincode::serialize(&tx).unwrap(),
+        raw,
+        "re-encode must be byte-identical"
+    );
     assert_eq!(
         hex::encode(tx.signing_message()),
         GOLDEN_SIGNING_MSG,
@@ -91,16 +96,8 @@ fn legacy_tx_and_block_encodings_are_unchanged() {
 
     // A payload-carrying legacy transaction: the payload commitment is
     // untouched, so its hash is too.
-    let ptx = Transaction::sign_with_payload(
-        &sk,
-        [9u8; 32],
-        5,
-        700,
-        8,
-        1,
-        2,
-        vec![OpCode::Push(42)],
-    );
+    let ptx =
+        Transaction::sign_with_payload(&sk, [9u8; 32], 5, 700, 8, 1, 2, vec![OpCode::Push(42)]);
     assert_eq!(hex::encode(ptx.compute_tx_hash()), GOLDEN_PAYLOAD_TX_HASH);
 
     // The pinned legacy block still decodes and rehashes to its voted hash.
@@ -108,10 +105,9 @@ fn legacy_tx_and_block_encodings_are_unchanged() {
     // The legacy body shape (the trailing commitment fields absent) is
     // tolerated on the STORE path only: the wire decodes strictly, so a
     // truncated message can never be reinterpreted as a different block.
-    let block: Block = stellereum::sharding::with_legacy_block_tolerance(|| {
-        bincode::deserialize(&raw_block)
-    })
-    .expect("legacy block must still decode");
+    let block: Block =
+        stellereum::sharding::with_legacy_block_tolerance(|| bincode::deserialize(&raw_block))
+            .expect("legacy block must still decode");
     assert_eq!(block.height, 1);
     assert_eq!(block.shard_id, MASTERCHAIN_SHARD);
     assert_eq!(hex::encode(block.compute_hash()), GOLDEN_BLOCK_HASH);
@@ -137,13 +133,11 @@ fn legacy_tx_and_block_encodings_are_unchanged() {
         "only the empty shard-head set, the zero order root, the zero epoch-key commitment, the None last_qc byte and the zero epoch-MMR root are appended (W10.5 canonical downtime evidence; V5 Tier-2 MMR)"
     );
     assert_eq!(
-        block.order_merkle_root,
-        [0u8; 32],
+        block.order_merkle_root, [0u8; 32],
         "a legacy block commits to no transaction order"
     );
     assert_eq!(
-        block.mmr_epoch_root,
-        [0u8; 32],
+        block.mmr_epoch_root, [0u8; 32],
         "a legacy block commits to no epoch MMR root"
     );
 }
@@ -180,18 +174,30 @@ fn every_opcode_and_its_discriminant() -> Vec<(OpCode, u32)> {
         (OpCode::Div, 6),
         (OpCode::LoadBalance, 7),
         (
-            OpCode::Transfer { recipient: [0; 32], amount: 1 },
+            OpCode::Transfer {
+                recipient: [0; 32],
+                amount: 1,
+            },
             8,
         ),
         (
-            OpCode::SysCallPlaceOrder { pair_id: 1, is_buy: true, price: 1, amount: 1 },
+            OpCode::SysCallPlaceOrder {
+                pair_id: 1,
+                is_buy: true,
+                price: 1,
+                amount: 1,
+            },
             9,
         ),
         (OpCode::SysCallCancelOrder { order_id: 1 }, 10),
         (OpCode::SysCallVerifyZkMl, 11),
         (OpCode::SysCallPatriciaLookup([0u8; 32]), 12),
         (
-            OpCode::SysCallTokenTransfer { token_id: [0; 32], to: [0; 32], amount: 1 },
+            OpCode::SysCallTokenTransfer {
+                token_id: [0; 32],
+                to: [0; 32],
+                amount: 1,
+            },
             13,
         ),
         (
@@ -204,36 +210,64 @@ fn every_opcode_and_its_discriminant() -> Vec<(OpCode, u32)> {
             14,
         ),
         (
-            OpCode::SysCallTokenMint { token_id: [0; 32], to: [0; 32], amount: 1 },
+            OpCode::SysCallTokenMint {
+                token_id: [0; 32],
+                to: [0; 32],
+                amount: 1,
+            },
             15,
         ),
         (
-            OpCode::SysCallTokenBurn { token_id: [0; 32], from: [0; 32], amount: 1 },
+            OpCode::SysCallTokenBurn {
+                token_id: [0; 32],
+                from: [0; 32],
+                amount: 1,
+            },
             16,
         ),
         (
-            OpCode::SysCallTokenApprove { token_id: [0; 32], spender: [0; 32], amount: 1 },
+            OpCode::SysCallTokenApprove {
+                token_id: [0; 32],
+                spender: [0; 32],
+                amount: 1,
+            },
             17,
         ),
         (
-            OpCode::SysCallTokenBalanceOf { token_id: [0; 32], account: [0; 32] },
+            OpCode::SysCallTokenBalanceOf {
+                token_id: [0; 32],
+                account: [0; 32],
+            },
             18,
         ),
         (OpCode::SysCallDeployContract { code: vec![] }, 19),
         (
-            OpCode::SysCallCallContract { contract: [0; 32], method: vec![], arg: 0 },
+            OpCode::SysCallCallContract {
+                contract: [0; 32],
+                method: vec![],
+                arg: 0,
+            },
             20,
         ),
         (
-            OpCode::SysCallStake { validator: [0; 32], amount: 1 },
+            OpCode::SysCallStake {
+                validator: [0; 32],
+                amount: 1,
+            },
             21,
         ),
         (
-            OpCode::SysCallUnbond { validator: [0; 32], amount: 1 },
+            OpCode::SysCallUnbond {
+                validator: [0; 32],
+                amount: 1,
+            },
             22,
         ),
         (
-            OpCode::SysCallDelegate { validator: [0; 32], amount: 1 },
+            OpCode::SysCallDelegate {
+                validator: [0; 32],
+                amount: 1,
+            },
             23,
         ),
         (OpCode::SysCallUndelegate { validator: [0; 32] }, 24),
@@ -250,7 +284,9 @@ fn every_opcode_and_its_discriminant() -> Vec<(OpCode, u32)> {
             27,
         ),
         (
-            OpCode::SysCallRevokeSession { session_pubkey: [0; 32] },
+            OpCode::SysCallRevokeSession {
+                session_pubkey: [0; 32],
+            },
             28,
         ),
         (OpCode::SysCallPmmBuy { usdt_micro: 1 }, 29),
@@ -352,10 +388,7 @@ fn every_opcode_and_its_discriminant() -> Vec<(OpCode, u32)> {
             },
             41,
         ),
-        (
-            OpCode::SysCallConfidentialUnshield { inputs: vec![] },
-            42,
-        ),
+        (OpCode::SysCallConfidentialUnshield { inputs: vec![] }, 42),
         (
             OpCode::SysCallRotateValidatorKey {
                 old_validator: [0; 32],
@@ -466,15 +499,19 @@ fn actor_tx_hash_commits_the_body() {
     // payload is inside what the key signed, not a mutable annex.
     let mut tampered = a.clone();
     tampered.payload[0] = match &tampered.payload[0] {
-        OpCode::SysCallActorSend { recipient, value, body: _, bounce, gas_budget } => {
-            OpCode::SysCallActorSend {
-                recipient: *recipient,
-                value: *value,
-                body: vec![OpCode::Push(99)],
-                bounce: *bounce,
-                gas_budget: *gas_budget,
-            }
-        }
+        OpCode::SysCallActorSend {
+            recipient,
+            value,
+            body: _,
+            bounce,
+            gas_budget,
+        } => OpCode::SysCallActorSend {
+            recipient: *recipient,
+            value: *value,
+            body: vec![OpCode::Push(99)],
+            bounce: *bounce,
+            gas_budget: *gas_budget,
+        },
         other => panic!("unexpected payload opcode: {other:?}"),
     };
     assert!(
@@ -535,8 +572,14 @@ fn pre_actor_decoder_fails_closed_on_the_appended_variant() {
     for legacy in [
         vec![OpCode::Push(42)],
         vec![OpCode::Halt],
-        vec![OpCode::Transfer { recipient, amount: 5 }],
-        vec![OpCode::SysCallStake { validator: recipient, amount: 9 }],
+        vec![OpCode::Transfer {
+            recipient,
+            amount: 5,
+        }],
+        vec![OpCode::SysCallStake {
+            validator: recipient,
+            amount: 9,
+        }],
         vec![],
     ] {
         assert!(

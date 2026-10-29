@@ -114,7 +114,11 @@ impl HardenedKeystore {
 
     /// Encrypt master secret key using memory-hard Argon2id (64MB RAM) and XChaCha20Poly1305 (defaults to Ed25519)
     #[allow(dead_code)]
-    pub fn encrypt(secret: &SecureSecret, address_hex: &str, password: &str) -> Result<Self, String> {
+    pub fn encrypt(
+        secret: &SecureSecret,
+        address_hex: &str,
+        password: &str,
+    ) -> Result<Self, String> {
         Self::encrypt_with_scheme(secret, address_hex, password, "ed25519", None)
     }
 
@@ -197,8 +201,10 @@ impl HardenedKeystore {
         }
         let salt = hex::decode(&self.salt_hex).map_err(|e| format!("Corrupted salt: {e}"))?;
         let nonce = hex::decode(&self.nonce_hex).map_err(|e| format!("Corrupted nonce: {e}"))?;
-        let ct_body = hex::decode(&self.ciphertext_hex).map_err(|e| format!("Corrupted ciphertext: {e}"))?;
-        let auth_tag = hex::decode(&self.auth_tag_hex).map_err(|e| format!("Corrupted auth tag: {e}"))?;
+        let ct_body =
+            hex::decode(&self.ciphertext_hex).map_err(|e| format!("Corrupted ciphertext: {e}"))?;
+        let auth_tag =
+            hex::decode(&self.auth_tag_hex).map_err(|e| format!("Corrupted auth tag: {e}"))?;
 
         let params = argon2::Params::new(65536, 3, 4, Some(32))
             .map_err(|e| format!("Argon2 params error: {:?}", e))?;
@@ -247,7 +253,8 @@ impl HardenedKeystore {
             fs::create_dir_all(parent).map_err(|e| format!("IO error creating dir: {e}"))?;
             enforce_strict_permissions(parent);
         }
-        let json = serde_json::to_string_pretty(self).map_err(|e| format!("Serialization error: {e}"))?;
+        let json =
+            serde_json::to_string_pretty(self).map_err(|e| format!("Serialization error: {e}"))?;
         // Create with 0600 ATOMICALLY (audit 2026-10-06: fs::write + chmod
         // left a 0644 window; existing lax files were just chmodded). Then
         // verify — a wrong mode aborts loudly instead of printing "0600".
@@ -286,7 +293,8 @@ impl HardenedKeystore {
             return Err(format!("Keystore file does not exist at {:?}", path));
         }
         enforce_strict_permissions(path);
-        let raw = fs::read_to_string(path).map_err(|e| format!("IO error reading keystore: {e}"))?;
+        let raw =
+            fs::read_to_string(path).map_err(|e| format!("IO error reading keystore: {e}"))?;
         serde_json::from_str(&raw).map_err(|e| format!("Invalid keystore format: {e}"))
     }
 }
@@ -342,7 +350,11 @@ pub fn format_address_with_visual_checksum(address_hex: &str) -> String {
                         format!("0x{clean}").dimmed()
                     );
                 } else {
-                    return format!("{}\n  └─ Raw Hex: {}", stl57.yellow().bold(), format!("0x{clean}").dimmed());
+                    return format!(
+                        "{}\n  └─ Raw Hex: {}",
+                        stl57.yellow().bold(),
+                        format!("0x{clean}").dimmed()
+                    );
                 }
             }
         }
@@ -354,5 +366,10 @@ pub fn format_address_with_visual_checksum(address_hex: &str) -> String {
     let prefix = &address_hex[..8];
     let mid = &address_hex[8..address_hex.len() - 8];
     let suffix = &address_hex[address_hex.len() - 8..];
-    format!("{}{}{}", prefix.cyan().bold(), mid.white(), suffix.green().bold())
+    format!(
+        "{}{}{}",
+        prefix.cyan().bold(),
+        mid.white(),
+        suffix.green().bold()
+    )
 }

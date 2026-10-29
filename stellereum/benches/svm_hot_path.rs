@@ -73,7 +73,10 @@ fn mixed_ops(len: usize) -> Vec<OpCode> {
         // One small transfer every 200 ops so the mix also covers a
         // balance-mutating syscall arm (1 unit from a deep balance).
         if i % 200 == 199 {
-            v.push(OpCode::Transfer { recipient: [9u8; 32], amount: 1 });
+            v.push(OpCode::Transfer {
+                recipient: [9u8; 32],
+                amount: 1,
+            });
         }
     }
     v
@@ -110,7 +113,11 @@ fn nop_cached() {
     {
         let mut ctx = mk_ctx(1);
         match Svm::execute(&ops, 1_000_000, &mut ctx) {
-            VmExecutionResult::Success { gas_used, return_value, .. } => {
+            VmExecutionResult::Success {
+                gas_used,
+                return_value,
+                ..
+            } => {
                 assert_eq!(gas_used, 1_000, "1,000 Nops cost 1 gas each");
                 assert_eq!(return_value, None, "no pushes, empty stack");
             }
@@ -137,7 +144,12 @@ fn mixed_single() {
     {
         let mut ctx = mk_ctx(1_000_000_000);
         match Svm::execute(&ops, u64::MAX / 2, &mut ctx) {
-            VmExecutionResult::Success { return_value, transfers, new_balance, .. } => {
+            VmExecutionResult::Success {
+                return_value,
+                transfers,
+                new_balance,
+                ..
+            } => {
                 assert_eq!(return_value, None, "stack-neutral mix leaves nothing");
                 assert_eq!(transfers.len(), 1_000_000 / 200, "one transfer per 200 ops");
                 assert_eq!(new_balance, 1_000_000_000 - transfers.len() as u64);

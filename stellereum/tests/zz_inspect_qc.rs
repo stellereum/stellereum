@@ -19,11 +19,25 @@ fn test_inspect_qc_at_node_b() {
 
     // Read the finalized block
     if let Ok(Some(blk)) = storage.get_block(&hash) {
-        println!("Final block: height={} precommit_qc={:?}", blk.height, blk.precommit_qc.is_some());
+        println!(
+            "Final block: height={} precommit_qc={:?}",
+            blk.height,
+            blk.precommit_qc.is_some()
+        );
         if let Some(ref qc) = blk.precommit_qc {
-            println!("  QC: height={} round={} kind={:?} sigs_len={}", qc.height, qc.round, qc.kind, qc.signatures.len());
+            println!(
+                "  QC: height={} round={} kind={:?} sigs_len={}",
+                qc.height,
+                qc.round,
+                qc.kind,
+                qc.signatures.len()
+            );
             for (vid, sig) in &qc.signatures {
-                println!("    signer={}: sig_len={}", hex::encode(&vid[..6]), sig.len());
+                println!(
+                    "    signer={}: sig_len={}",
+                    hex::encode(&vid[..6]),
+                    sig.len()
+                );
             }
         }
     }
@@ -31,7 +45,12 @@ fn test_inspect_qc_at_node_b() {
     if let Ok(Some(domain_bytes)) = storage.domain_at(h) {
         if let Ok(domains) = stellereum::storage::decode_domain_snapshot(&domain_bytes) {
             let vs = domains.staking.to_validator_set();
-            println!("Staking ledger at {h}: len={} total_power={} quorum={}", vs.len(), vs.total_power(), vs.quorum_power());
+            println!(
+                "Staking ledger at {h}: len={} total_power={} quorum={}",
+                vs.len(),
+                vs.total_power(),
+                vs.quorum_power()
+            );
             for (id, p) in &vs.validators {
                 println!("  validator {}: power={}", hex::encode(&id[..6]), p);
             }

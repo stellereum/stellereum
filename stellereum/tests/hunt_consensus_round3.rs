@@ -3,11 +3,11 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::sync::Arc;
 use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
-use std::sync::Arc;
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
@@ -44,8 +44,14 @@ async fn hunt19_prevote_a_precommit_b_is_never_slashed() {
     // The textbook equivocation: says A out loud, commits B.
     rt.on_prevote(Vote::sign(&honest, 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
         .unwrap();
-    rt.on_precommit(Vote::sign(&honest, 1, 0, VoteKind::Precommit, Some(bh(0xB2))))
-        .unwrap();
+    rt.on_precommit(Vote::sign(
+        &honest,
+        1,
+        0,
+        VoteKind::Precommit,
+        Some(bh(0xB2)),
+    ))
+    .unwrap();
 
     let evidence = rt.hc.equivocations();
     eprintln!(
@@ -62,7 +68,10 @@ async fn hunt19_prevote_a_precommit_b_is_never_slashed() {
     let burned = rt.apply_equivocation_slashes().await;
     let slashed_after = st.staking_read().await.validators[&id(&honest)].total_slashed;
     assert_eq!(burned, 0);
-    assert_eq!(slashed_after, slashed_before, "zero penalty for equivocating");
+    assert_eq!(
+        slashed_after, slashed_before,
+        "zero penalty for equivocating"
+    );
     eprintln!(
         "HUNT19 OK: burned={burned}. consensus.rs:365-366 keeps prevotes and precommits in \
          SEPARATE VoteSets, and staking.rs:427 refuses any pair with a.kind != b.kind."
@@ -100,7 +109,12 @@ async fn hunt20_equivocation_evidence_is_never_cleared_after_charging() {
     );
     assert!(first > 0);
     assert!(second > 0, "the same evidence was charged a SECOND time");
-    assert!(after_second > after_first, "{} -> {}", after_first, after_second);
+    assert!(
+        after_second > after_first,
+        "{} -> {}",
+        after_first,
+        after_second
+    );
     eprintln!(
         "HUNT20 OK: charged twice ({first} each). Nothing clears `equivocations` — \
          runtime.rs:160-161 documents 'once processed, the consumed evidence is \
@@ -122,13 +136,13 @@ fn hunt21_downtime_signer_membership_is_taken_on_the_raw_signature_list() {
     let ks = keys(3);
     let mut l = StakingLedger::new();
     for k in &ks {
-        l.bond(id(k), MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0).unwrap();
+        l.bond(id(k), MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
+            .unwrap();
     }
     let honest = id(&ks[1]);
     // A certificate whose signature list merely NAMES the honest validator.
     // No signature object exists at this layer at all.
-    let claimed_signers: std::collections::HashSet<[u8; 32]> =
-        std::iter::once(honest).collect();
+    let claimed_signers: std::collections::HashSet<[u8; 32]> = std::iter::once(honest).collect();
     let eligible: Vec<[u8; 32]> = ks.iter().map(id).collect();
 
     let mut l2 = l.clone();
@@ -136,7 +150,10 @@ fn hunt21_downtime_signer_membership_is_taken_on_the_raw_signature_list() {
         l2.note_missed_heights(h, &|v: &[u8; 32]| claimed_signers.contains(v), &eligible);
     }
     let forgave = l2.validators[&honest].missed;
-    assert_eq!(forgave, 0, "naming a validator in the list forgives its downtime");
+    assert_eq!(
+        forgave, 0,
+        "naming a validator in the list forgives its downtime"
+    );
 
     let mut l3 = l.clone();
     for h in 1..=11u64 {
@@ -183,7 +200,11 @@ fn hunt22_negative_vote_scope_is_enforced() {
         hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh(1))))
             .unwrap();
     }
-    assert_eq!(hc.try_prevote_quorum(), Some(Some(bh(1))), "current round is used");
+    assert_eq!(
+        hc.try_prevote_quorum(),
+        Some(Some(bh(1))),
+        "current round is used"
+    );
     // The old round's set is a separate bucket and its power is its own.
     assert!(hc.prevote_set(5).is_some());
     assert_eq!(hc.prevote_set(0).unwrap().power_for(Some(bh(1))), 4);
@@ -203,7 +224,10 @@ fn hunt22_negative_vote_scope_is_enforced() {
         block_hash: Some(bh(1)),
         signatures: vec![],
     };
-    assert!(!cert.verify(&ValidatorSet::new()), "an empty set never verifies");
+    assert!(
+        !cert.verify(&ValidatorSet::new()),
+        "an empty set never verifies"
+    );
     let _ = fund_genesis;
     let _ = ValidatorRuntime::new;
     let _ = Block {
@@ -222,7 +246,7 @@ fn hunt22_negative_vote_scope_is_enforced() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
 }
 
 // ===========================================================================
@@ -251,7 +275,9 @@ async fn hunt23_adopt_committed_accepts_a_non_proposer_block() {
                 if id(&ks[i]) == real {
                     continue;
                 }
-                if let Some(r) = (1..=4u32).find(|r| vset.proposer_for(1, *r).unwrap() == id(&ks[i])) {
+                if let Some(r) =
+                    (1..=4u32).find(|r| vset.proposer_for(1, *r).unwrap() == id(&ks[i]))
+                {
                     let imposter = ks[i].clone();
                     found = Some((ks, vset, imposter, r));
                     break;
@@ -288,7 +314,7 @@ async fn hunt23_adopt_committed_accepts_a_non_proposer_block() {
         mmr_epoch_root: [0u8; 32],
         order_merkle_root: [0u8; 32],
         epoch_key_commitment: [0u8; 32],
-};
+    };
     b.sign_block(&imposter);
     let bhash = b.compute_hash();
     assert_ne!(id(&imposter), real_proposer);
@@ -305,7 +331,10 @@ async fn hunt23_adopt_committed_accepts_a_non_proposer_block() {
         "genuine block from a near-slot owner aligns, not rejects: {:?}",
         reject.as_ref().err()
     );
-    assert_eq!(rt.hc.round, owned_round, "must align to the slot the signer owns");
+    assert_eq!(
+        rt.hc.round, owned_round,
+        "must align to the slot the signer owns"
+    );
     assert_eq!(
         rt.hc.proposer().unwrap(),
         id(&imposter),

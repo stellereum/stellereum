@@ -25,6 +25,8 @@
 //! exercises at scale.
 
 use ed25519_dalek::SigningKey;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use stellereum::consensus::ValidatorSet;
 use stellereum::mempool::Mempool;
 use stellereum::runtime::ValidatorRuntime;
@@ -32,8 +34,6 @@ use stellereum::sharding::{Block, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
 use stellereum::zkml::{SessionKeyAuthorization, SCOPE_TRANSFER};
-use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 
 /// Ten thousand transactions: 100 senders x 100 nonces (the MAX_BLOCK_TXS cap).
 const N_SENDERS: usize = 100;
@@ -114,7 +114,8 @@ fn fill_canonical(pool: &mut Mempool) -> Vec<SigningKey> {
         for nonce in 0..PER_SENDER {
             let tx = legacy_tx(sk, RECIPIENT, nonce, seq);
             seq += 1;
-            pool.add_checked(tx, BAL).expect("funded admission must succeed");
+            pool.add_checked(tx, BAL)
+                .expect("funded admission must succeed");
         }
     }
     assert_eq!(pool.len(), N_TXS);
@@ -129,8 +130,7 @@ fn fill_canonical(pool: &mut Mempool) -> Vec<SigningKey> {
 async fn scale_ten_k_propose_selects_all_contiguous_and_applies_clean() {
     let mut pool = Mempool::new(20_000, 10_000);
     let keys = fill_canonical(&mut pool);
-    let funding: Vec<([u8; 32], u64)> =
-        keys.iter().map(|k| (id_of(k), BAL)).collect();
+    let funding: Vec<([u8; 32], u64)> = keys.iter().map(|k| (id_of(k), BAL)).collect();
     let pool = Arc::new(tokio::sync::RwLock::new(pool));
     let mut rt = runtime_with_pool(pool, &funding).await;
 
@@ -166,8 +166,7 @@ async fn scale_ten_k_propose_selects_all_contiguous_and_applies_clean() {
 async fn scale_ten_k_same_root_twice_through_encode() {
     let mut pool = Mempool::new(20_000, 10_000);
     let keys = fill_canonical(&mut pool);
-    let funding: Vec<([u8; 32], u64)> =
-        keys.iter().map(|k| (id_of(k), BAL)).collect();
+    let funding: Vec<([u8; 32], u64)> = keys.iter().map(|k| (id_of(k), BAL)).collect();
     let pool = Arc::new(tokio::sync::RwLock::new(pool));
     let mut rt = runtime_with_pool(pool, &funding).await;
 
@@ -181,7 +180,8 @@ async fn scale_ten_k_same_root_twice_through_encode() {
     let mut roots = Vec::new();
     for _ in 0..2 {
         let e = Arc::new(InMemoryStateEngine::new());
-        e.update_account(AccountState::new(block.proposer, BAL)).await;
+        e.update_account(AccountState::new(block.proposer, BAL))
+            .await;
         for (addr, bal) in &funding {
             e.update_account(AccountState::new(*addr, *bal)).await;
         }
@@ -193,7 +193,10 @@ async fn scale_ten_k_same_root_twice_through_encode() {
         assert!(outcome.status.iter().all(|s| *s));
         roots.push(e.get_state_root().await);
     }
-    assert_eq!(roots[0], roots[1], "same block must certify the same root twice");
+    assert_eq!(
+        roots[0], roots[1],
+        "same block must certify the same root twice"
+    );
 }
 
 // ============================================================================
@@ -211,10 +214,12 @@ async fn scale_selection_skips_nonce_gaps_and_revoked_session_grants() {
     const GAP_AT: u64 = 50;
 
     let legacy: Vec<SigningKey> = (0..LEGACY_SENDERS as u64).map(det_key).collect();
-    let masters: Vec<SigningKey> =
-        (0..SESSION_MASTERS as u64).map(|i| det_key(1_000_000 + i)).collect();
-    let sessions: Vec<SigningKey> =
-        (0..SESSION_MASTERS as u64).map(|i| det_key(2_000_000 + i)).collect();
+    let masters: Vec<SigningKey> = (0..SESSION_MASTERS as u64)
+        .map(|i| det_key(1_000_000 + i))
+        .collect();
+    let sessions: Vec<SigningKey> = (0..SESSION_MASTERS as u64)
+        .map(|i| det_key(2_000_000 + i))
+        .collect();
     // Master 9 is revoked on chain before propose; its pooled session
     // transactions start at nonce 2 (setup consumed 0 and 1).
     const REVOKED: usize = 9;
@@ -232,7 +237,8 @@ async fn scale_selection_skips_nonce_gaps_and_revoked_session_grants() {
     let m9 = &masters[REVOKED];
     let s9 = &sessions[REVOKED];
     let grant9 = grant(m9, s9, u64::MAX, 1_000_000);
-    let first = Transaction::sign_with_session(s9, grant9.clone(), [7u8; 32], 1, 1_000, 0, 1, 1, vec![]);
+    let first =
+        Transaction::sign_with_session(s9, grant9.clone(), [7u8; 32], 1, 1_000, 0, 1, 1, vec![]);
     let (a, f, _, _, _) = rt.state.apply_block_parallel_fees(&[first], TS).await;
     assert_eq!((a, f), (1, 0), "setup session tx must register the grant");
     let revoke = Transaction::sign_with_payload(
@@ -243,7 +249,9 @@ async fn scale_selection_skips_nonce_gaps_and_revoked_session_grants() {
         1,
         1,
         1,
-        vec![OpCode::SysCallRevokeSession { session_pubkey: id_of(s9) }],
+        vec![OpCode::SysCallRevokeSession {
+            session_pubkey: id_of(s9),
+        }],
     );
     let (a, f, _, _, _) = rt.state.apply_block_parallel_fees(&[revoke], TS).await;
     assert_eq!((a, f), (1, 0), "setup revoke must land");
@@ -267,14 +275,26 @@ async fn scale_selection_skips_nonce_gaps_and_revoked_session_grants() {
             let base = if mi == REVOKED { 2 } else { 0 };
             for j in 0..SESSION_TXS {
                 let tx = Transaction::sign_with_session(
-                    s, g.clone(), [7u8; 32], 1, 1_000, base + j, 1, 1, vec![],
+                    s,
+                    g.clone(),
+                    [7u8; 32],
+                    1,
+                    1_000,
+                    base + j,
+                    1,
+                    1,
+                    vec![],
                 );
-                pool.add_checked(tx, BAL).expect("statelessly valid grant admits");
+                pool.add_checked(tx, BAL)
+                    .expect("statelessly valid grant admits");
             }
         }
     }
 
-    let block = rt.propose(TS).await.expect("gapped pool must still propose");
+    let block = rt
+        .propose(TS)
+        .await
+        .expect("gapped pool must still propose");
 
     // Gapped senders contribute exactly 0..50; ungapped 0..100.
     let mut by_sender: HashMap<[u8; 32], Vec<u64>> = HashMap::new();
@@ -285,7 +305,11 @@ async fn scale_selection_skips_nonce_gaps_and_revoked_session_grants() {
         let mut nonces = by_sender.remove(&id_of(sk)).unwrap_or_default();
         nonces.sort_unstable();
         if li % 9 == 8 {
-            assert_eq!(nonces, (0..GAP_AT).collect::<Vec<_>>(), "gap successors wait");
+            assert_eq!(
+                nonces,
+                (0..GAP_AT).collect::<Vec<_>>(),
+                "gap successors wait"
+            );
         } else {
             assert_eq!(nonces, (0..PER_SENDER).collect::<Vec<_>>());
         }
@@ -295,7 +319,10 @@ async fn scale_selection_skips_nonce_gaps_and_revoked_session_grants() {
         let mut nonces = by_sender.remove(&id_of(m)).unwrap_or_default();
         nonces.sort_unstable();
         if mi == REVOKED {
-            assert!(nonces.is_empty(), "revoked grant must be filtered at propose");
+            assert!(
+                nonces.is_empty(),
+                "revoked grant must be filtered at propose"
+            );
         } else {
             assert_eq!(nonces, (0..SESSION_TXS).collect::<Vec<_>>());
         }
@@ -313,9 +340,7 @@ async fn scale_selection_skips_nonce_gaps_and_revoked_session_grants() {
     assert_eq!(failed, 0);
 
     // And the apply path refuses the revoked grant directly, like propose did.
-    let bad = Transaction::sign_with_session(
-        s9, grant9, [7u8; 32], 1, 1_000, 2, 1, 1, vec![],
-    );
+    let bad = Transaction::sign_with_session(s9, grant9, [7u8; 32], 1, 1_000, 2, 1, 1, vec![]);
     let (_, _, _, status, _) = rt.state.apply_block_parallel_fees(&[bad], TS).await;
     assert_eq!(status, vec![false], "revoked grant is refused at apply too");
 }
@@ -341,10 +366,7 @@ async fn grouped_workload() -> (Arc<InMemoryStateEngine>, Vec<Transaction>) {
     (e, txs)
 }
 
-async fn balances(
-    e: &InMemoryStateEngine,
-    addrs: &[[u8; 32]],
-) -> Vec<(u64, u64)> {
+async fn balances(e: &InMemoryStateEngine, addrs: &[[u8; 32]]) -> Vec<(u64, u64)> {
     let mut out = Vec::with_capacity(addrs.len());
     for a in addrs {
         let acc = e.get_account(a).await.expect("account exists");
@@ -421,8 +443,7 @@ async fn scale_parallel_matches_sequential_distinct_accounts() {
 async fn scale_mev_parallel_gate_matches_sequential_filter() {
     const N: usize = 600; // over the 512-tx parallel-gate threshold
     let keys: Vec<SigningKey> = (0..N as u64).map(|i| det_key(700_000 + i)).collect();
-    let funding: Vec<([u8; 32], u64)> =
-        keys.iter().map(|k| (id_of(k), BAL)).collect();
+    let funding: Vec<([u8; 32], u64)> = keys.iter().map(|k| (id_of(k), BAL)).collect();
     let pool = Arc::new(tokio::sync::RwLock::new(Mempool::new(4_096, 4_096)));
     {
         let mut pool = pool.write().await;
@@ -444,16 +465,20 @@ async fn scale_mev_parallel_gate_matches_sequential_filter() {
         .filter(|t| {
             matches!(
                 pool.mev.verify_pool_tx(t),
-                stellereum::mev::SealVerdict::Match
-                    | stellereum::mev::SealVerdict::NotSealed
+                stellereum::mev::SealVerdict::Match | stellereum::mev::SealVerdict::NotSealed
             )
         })
         .collect();
-    let got: Vec<[u8; 32]> =
-        block.transactions.iter().map(|t| t.compute_tx_hash()).collect();
-    let want: Vec<[u8; 32]> =
-        expected.iter().map(|t| t.compute_tx_hash()).collect();
-    assert_eq!(got, want, "parallel gate must keep the sequential set in order");
+    let got: Vec<[u8; 32]> = block
+        .transactions
+        .iter()
+        .map(|t| t.compute_tx_hash())
+        .collect();
+    let want: Vec<[u8; 32]> = expected.iter().map(|t| t.compute_tx_hash()).collect();
+    assert_eq!(
+        got, want,
+        "parallel gate must keep the sequential set in order"
+    );
 }
 
 // ============================================================================
@@ -463,7 +488,9 @@ async fn scale_mev_parallel_gate_matches_sequential_filter() {
 #[tokio::test]
 async fn scale_trie_insert_order_does_not_move_root() {
     const N: usize = 2_000;
-    let addrs: Vec<[u8; 32]> = (0..N as u64).map(|i| id_of(&det_key(900_000 + i))).collect();
+    let addrs: Vec<[u8; 32]> = (0..N as u64)
+        .map(|i| id_of(&det_key(900_000 + i)))
+        .collect();
     // Deterministic "shuffle": multiply-permute (coprime stride), plus reverse.
     let perm: Vec<usize> = (0..N).map(|i| (i * 1_009 + 17) % N).collect();
     assert_eq!(perm.iter().collect::<BTreeSet<_>>().len(), N);
@@ -472,7 +499,8 @@ async fn scale_trie_insert_order_does_not_move_root() {
     for order in [&(0..N).collect::<Vec<_>>(), &perm, &rev] {
         let e = InMemoryStateEngine::new();
         for &i in order.iter() {
-            e.update_account(AccountState::new(addrs[i], 1_000 + i as u64)).await;
+            e.update_account(AccountState::new(addrs[i], 1_000 + i as u64))
+                .await;
         }
         roots.push(e.get_state_root().await);
         // Reads see the same values regardless of insert order.
@@ -496,7 +524,8 @@ fn scale_senders_matches_all_derivation() {
     for i in 0..300u64 {
         // 30 senders x 10 nonces.
         let sk = det_key(i / 10);
-        pool.add(legacy_tx(&sk, RECIPIENT, i % 10, i)).expect("admission");
+        pool.add(legacy_tx(&sk, RECIPIENT, i % 10, i))
+            .expect("admission");
     }
     let want: BTreeSet<[u8; 32]> = pool.all().iter().map(|t| t.from).collect();
     assert_eq!(pool.senders(), want);

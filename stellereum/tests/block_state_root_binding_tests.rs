@@ -46,7 +46,12 @@ async fn runtime() -> ValidatorRuntime {
 
 use std::sync::Arc;
 
-fn block_at(height: u64, state_root: [u8; 32], proposer: [u8; 32], k: &SigningKey) -> stellereum::sharding::Block {
+fn block_at(
+    height: u64,
+    state_root: [u8; 32],
+    proposer: [u8; 32],
+    k: &SigningKey,
+) -> stellereum::sharding::Block {
     let mut b = stellereum::sharding::Block {
         shard_id: 1,
         height,
@@ -102,8 +107,13 @@ async fn the_state_root_check_precedes_the_rest_of_validation() {
     let me = k.verifying_key().to_bytes();
     let our_root = rt.state.get_state_root().await;
     let wrong_height = block_at(rt.hc.height + 5, [0xDE; 32], me, &k);
-    let err = rt.validate_proposal(&wrong_height, our_root).expect_err("rejected");
-    assert!(err.contains("wrong height"), "height is checked first, got: {err}");
+    let err = rt
+        .validate_proposal(&wrong_height, our_root)
+        .expect_err("rejected");
+    assert!(
+        err.contains("wrong height"),
+        "height is checked first, got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -129,9 +139,7 @@ async fn the_state_root_moves_after_a_block_applies() {
 
     let key2 = key(2);
     let to = key2.verifying_key().to_bytes();
-    rt.state
-        .update_account(AccountState::new(to, 1_000))
-        .await;
+    rt.state.update_account(AccountState::new(to, 1_000)).await;
     let with_funding = rt.state.get_state_root().await;
     assert_ne!(with_funding, before, "funding moves the root");
 

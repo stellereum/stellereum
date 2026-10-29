@@ -76,7 +76,8 @@ fn fill_plain(n: usize) -> Mempool {
     for i in 0..n as u64 {
         let sk = det_key(300_000 + i);
         let tx = Transaction::sign(&sk, RECIPIENT, 1, GAS_BASIC_TRANSFER, 0, 1, 1);
-        pool.add_checked(tx, BAL).expect("funded admission must succeed");
+        pool.add_checked(tx, BAL)
+            .expect("funded admission must succeed");
     }
     assert_eq!(pool.len(), n);
     pool
@@ -126,7 +127,11 @@ fn packing_plain_10000() {
 /// One balanced 1-in/1-out transfer with explicit proof width: input commits
 /// value+fee, output commits value, same blinding (mirrors the live
 /// confidential-tx test helper).
-fn transfer2_pair(value: u64, fee: u64, bits: u8) -> (ConfidentialTransfer, Vec<RangeProof>, Vec<RangeProof>) {
+fn transfer2_pair(
+    value: u64,
+    fee: u64,
+    bits: u8,
+) -> (ConfidentialTransfer, Vec<RangeProof>, Vec<RangeProof>) {
     let r = Scalar::from(0x5EED_u64);
     let c_in = PedersenCommitment::commit(value + fee, &r);
     let c_out = PedersenCommitment::commit(value, &r);
@@ -162,7 +167,10 @@ fn mixed_txs(n: usize) -> Vec<Transaction> {
         .map(|i| {
             let sk = det_key(600_000 + i);
             let payload = if i % 4 == 3 {
-                vec![OpCode::Transfer { recipient: RECIPIENT, amount: 1 }]
+                vec![OpCode::Transfer {
+                    recipient: RECIPIENT,
+                    amount: 1,
+                }]
             } else {
                 Vec::new()
             };

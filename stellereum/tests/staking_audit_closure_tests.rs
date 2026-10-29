@@ -33,11 +33,11 @@ use std::sync::Arc;
 use stellereum::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
-use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::staking::{
-    StakingError, StakingLedger, DOWNTIME_MISS_THRESHOLD, MIN_VALIDATOR_BOND,
-    REWARDS_EMISSION_CAP, STAKING_POOL, STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS,
+    StakingError, StakingLedger, DOWNTIME_MISS_THRESHOLD, MIN_VALIDATOR_BOND, REWARDS_EMISSION_CAP,
+    STAKING_POOL, STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS,
 };
+use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
 const STELL: u64 = 1_000_000_000;
 /// New-bond floor: bare MIN is refused, MIN+buffer is accepted.
@@ -64,7 +64,10 @@ async fn funded_runtime(k: &SigningKey, balance: u64) -> ValidatorRuntime {
 }
 
 async fn pool_of(st: &Arc<InMemoryStateEngine>) -> u64 {
-    st.get_account(&STAKING_POOL).await.map(|a| a.balance).unwrap_or(0)
+    st.get_account(&STAKING_POOL)
+        .await
+        .map(|a| a.balance)
+        .unwrap_or(0)
 }
 async fn bal(st: &Arc<InMemoryStateEngine>, a: &[u8; 32]) -> u64 {
     st.get_account(a).await.map(|x| x.balance).unwrap_or(0)
@@ -90,7 +93,11 @@ async fn m2_bond_failure_leaves_pool_and_sender_untouched() {
     // Thin bond (bare MIN, below MIN+buffer): ledger refuses.
     let r = rt.stake_bond(me, MIN_VALIDATOR_BOND, 1_000).await;
     assert_eq!(r, Err(StakingError::BondBelowMinimum));
-    assert_eq!(pool_of(&st).await, 0, "failed bond must not inflate the pool");
+    assert_eq!(
+        pool_of(&st).await,
+        0,
+        "failed bond must not inflate the pool"
+    );
     assert_eq!(bal(&st, &me).await, initial, "failed bond refunds in full");
 
     // Good bond, then double-register: the second attempt unwinds fully.
@@ -123,7 +130,8 @@ async fn m2_delegate_escrows_pool_and_failure_unwinds() {
 
     let d = key();
     let delegator = id(&d);
-    st.update_account(AccountState::new(delegator, 5 * STELL)).await;
+    st.update_account(AccountState::new(delegator, 5 * STELL))
+        .await;
 
     rt.stake_delegate(delegator, vid, 2 * STELL).await.unwrap();
     assert_eq!(
@@ -137,8 +145,16 @@ async fn m2_delegate_escrows_pool_and_failure_unwinds() {
     let ghost = [0x99u8; 32];
     let r = rt.stake_delegate(delegator, ghost, STELL).await;
     assert_eq!(r, Err(StakingError::NotValidator));
-    assert_eq!(pool_of(&st).await, floor() + 2 * STELL, "pool untouched by failure");
-    assert_eq!(bal(&st, &delegator).await, 3 * STELL, "delegator refunded in full");
+    assert_eq!(
+        pool_of(&st).await,
+        floor() + 2 * STELL,
+        "pool untouched by failure"
+    );
+    assert_eq!(
+        bal(&st, &delegator).await,
+        3 * STELL,
+        "delegator refunded in full"
+    );
 
     // Zero delegator: refused before any coin moves.
     let z = rt.stake_delegate([0u8; 32], vid, STELL).await;
@@ -226,9 +242,12 @@ async fn m2_delegator_cycle_pays_from_pool() {
 
     let d = key();
     let delegator = id(&d);
-    st.update_account(AccountState::new(delegator, 4 * STELL)).await;
+    st.update_account(AccountState::new(delegator, 4 * STELL))
+        .await;
     rt.stake_delegate(delegator, vid, 2 * STELL).await.unwrap();
-    rt.stake_undelegate(delegator, vid, 2 * STELL, 0).await.unwrap();
+    rt.stake_undelegate(delegator, vid, 2 * STELL, 0)
+        .await
+        .unwrap();
     rt.process_unbonding(UNBONDING_PERIOD_SECS + 1).await;
 
     let pool_before = pool_of(&st).await;
@@ -242,7 +261,11 @@ async fn m2_delegator_cycle_pays_from_pool() {
         pool_before - 2 * STELL,
         "delegator withdraw debits the pool (never mints)"
     );
-    assert_eq!(bal(&st, &delegator).await, 4 * STELL, "delegator made whole");
+    assert_eq!(
+        bal(&st, &delegator).await,
+        4 * STELL,
+        "delegator made whole"
+    );
 }
 
 // ============================================================================
@@ -307,7 +330,11 @@ async fn m3_downtime_skips_unelected_while_elected_slashes() {
         .bond_genesis(ghost, stell(500), 0)
         .unwrap();
     assert!(
-        !st.staking_read().await.to_validator_set().validators.contains_key(&ghost),
+        !st.staking_read()
+            .await
+            .to_validator_set()
+            .validators
+            .contains_key(&ghost),
         "precondition: sub-MIN record is unelected"
     );
 
@@ -321,7 +348,9 @@ async fn m3_downtime_skips_unelected_while_elected_slashes() {
         }
     }
     // Fund the pool so the slash debit is observable.
-    st.credit_native(&STAKING_POOL, 10 * MIN_VALIDATOR_BOND).await.unwrap();
+    st.credit_native(&STAKING_POOL, 10 * MIN_VALIDATOR_BOND)
+        .await
+        .unwrap();
     let pool_before = pool_of(&st).await;
     let burn_before = st.staking_read().await.total_burned;
 
@@ -332,8 +361,10 @@ async fn m3_downtime_skips_unelected_while_elected_slashes() {
     let block = mkblock(&pkey, 1, [0u8; 32], root);
     let bh = block.compute_hash();
     for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh))).unwrap();
-        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh))).unwrap();
+        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+            .unwrap();
+        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+            .unwrap();
     }
     assert_eq!(rt.hc.try_precommit_quorum(), Some(bh));
     let cert: QuorumCertificate = rt.hc.precommit_qc.clone().expect("QC exists");
@@ -345,8 +376,14 @@ async fn m3_downtime_skips_unelected_while_elected_slashes() {
     // no slash can have fired yet — the streaks are untouched.
     {
         let l = st.staking_read().await;
-        assert_eq!(l.total_burned, burn_before, "height 1 carries no evidence: no slash yet");
-        assert_eq!(l.validators[&silent_elected].missed, DOWNTIME_MISS_THRESHOLD - 1);
+        assert_eq!(
+            l.total_burned, burn_before,
+            "height 1 carries no evidence: no slash yet"
+        );
+        assert_eq!(
+            l.validators[&silent_elected].missed,
+            DOWNTIME_MISS_THRESHOLD - 1
+        );
         assert_eq!(l.validators[&ghost].missed, DOWNTIME_MISS_THRESHOLD - 1);
     }
 
@@ -362,8 +399,10 @@ async fn m3_downtime_skips_unelected_while_elected_slashes() {
     block2.sign_block(&pkey2);
     let bh2 = block2.compute_hash();
     for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 2, 0, VoteKind::Prevote, Some(bh2))).unwrap();
-        rt.on_precommit(Vote::sign(k, 2, 0, VoteKind::Precommit, Some(bh2))).unwrap();
+        rt.on_prevote(Vote::sign(k, 2, 0, VoteKind::Prevote, Some(bh2)))
+            .unwrap();
+        rt.on_precommit(Vote::sign(k, 2, 0, VoteKind::Precommit, Some(bh2)))
+            .unwrap();
     }
     assert_eq!(rt.hc.try_precommit_quorum(), Some(bh2));
     rt.blocks.insert(bh2, block2);
@@ -452,7 +491,10 @@ async fn commission_immutable_across_topups() {
     assert_eq!(l.validators[&v].commission_bps, 1_000);
     l.delegate(d, v, stell(1000)).unwrap();
     l.distribute_reward(v, stell(2600)).unwrap();
-    assert_eq!(l.validators[&v].commission_bps, 1_000, "distribution must not move the rate");
+    assert_eq!(
+        l.validators[&v].commission_bps, 1_000,
+        "distribution must not move the rate"
+    );
     // Total 2600 (1600 self + 1000 delegated): dshare=1000, commission=100,
     // validator leg = 2600−1000+100 = 1700, delegator = 900.
     assert_eq!(l.claim_validator_rewards(v).unwrap(), stell(1700));
@@ -486,7 +528,10 @@ async fn l1_slash_dust_stays_staked_and_consistent() {
         map_sum, l.validators[&v].delegated,
         "map and aggregate stay mutually consistent"
     );
-    assert!(burned <= burn_target, "never burns more than the floored math");
+    assert!(
+        burned <= burn_target,
+        "never burns more than the floored math"
+    );
     assert!(burned < burn_target, "uneven splits leave real floor dust");
     assert_eq!(
         l.total_burned, burned,
@@ -537,11 +582,12 @@ async fn l3_overflow_refuses_instead_of_saturating() {
     let v = [0x61u8; 32];
     l.bond(v, stell(1100), 0).unwrap();
     l.validators.get_mut(&v).unwrap().self_bond = u64::MAX;
+    assert_eq!(l.add_bond(v, 1), Err(StakingError::ArithmeticOverflow));
     assert_eq!(
-        l.add_bond(v, 1),
-        Err(StakingError::ArithmeticOverflow)
+        l.validators[&v].self_bond,
+        u64::MAX,
+        "refused top-up changes nothing"
     );
-    assert_eq!(l.validators[&v].self_bond, u64::MAX, "refused top-up changes nothing");
 
     l.validators.get_mut(&v).unwrap().delegated = u64::MAX;
     assert_eq!(
@@ -575,7 +621,8 @@ async fn floor_buffer_grandfather_and_topup_reentry() {
         Err(StakingError::BondBelowMinimum)
     );
     let v = [4u8; 32];
-    l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0).unwrap();
+    l.bond(v, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
+        .unwrap();
     assert!(l.to_validator_set().validators.contains_key(&v));
 
     // Grandfathered bare-MIN genesis entry: creatable ONLY via bond_genesis,
@@ -638,17 +685,20 @@ async fn rotation_carries_history_refuses_merge() {
     l.delegate([0xD1u8; 32], a, stell(100)).unwrap();
     l.slash_downtime(a).unwrap();
     l.validators.get_mut(&a).unwrap().missed = 7;
-    let (missed, slashed) = (
-        l.validators[&a].missed,
-        l.validators[&a].total_slashed,
-    );
+    let (missed, slashed) = (l.validators[&a].missed, l.validators[&a].total_slashed);
 
     assert_eq!(l.rotate_key(a, a), Err(StakingError::AlreadyValidator));
     assert_eq!(l.rotate_key(a, c), Err(StakingError::AlreadyValidator));
     l.rotate_key(a, b).unwrap();
     assert!(!l.validators.contains_key(&a), "old key is gone");
-    assert_eq!(l.validators[&b].missed, missed, "downtime record carries over");
-    assert_eq!(l.validators[&b].total_slashed, slashed, "slash history carries over");
+    assert_eq!(
+        l.validators[&b].missed, missed,
+        "downtime record carries over"
+    );
+    assert_eq!(
+        l.validators[&b].total_slashed, slashed,
+        "slash history carries over"
+    );
     assert_eq!(
         l.delegations.get(&(b, [0xD1u8; 32])).copied(),
         Some(stell(100)),
@@ -683,7 +733,11 @@ async fn rewards_shortfall_never_touches_principal() {
         Err(StakingError::RewardsPoolShortfall)
     );
     assert_eq!(l.validators[&v].pending_rewards, owed, "entry left intact");
-    assert_eq!(l.validators[&v].self_bond, stell(1100), "principal untouched");
+    assert_eq!(
+        l.validators[&v].self_bond,
+        stell(1100),
+        "principal untouched"
+    );
 
     // Cap is fail-closed too: nothing credited past the ceiling.
     l.rewards_minted = REWARDS_EMISSION_CAP - 50;

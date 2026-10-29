@@ -168,7 +168,13 @@ impl KvStore {
         let expires = now + ttl_ms;
         self.entries_mut().insert(
             key.to_string(),
-            StoredValue { value, expires, origin, ttl_ms, stored_at: now },
+            StoredValue {
+                value,
+                expires,
+                origin,
+                ttl_ms,
+                stored_at: now,
+            },
         );
     }
 
@@ -193,7 +199,13 @@ impl KvStore {
         }
         self.entries_mut().insert(
             key.to_string(),
-            StoredValue { value, expires, origin, ttl_ms, stored_at: sa },
+            StoredValue {
+                value,
+                expires,
+                origin,
+                ttl_ms,
+                stored_at: sa,
+            },
         );
     }
 
@@ -201,7 +213,14 @@ impl KvStore {
     /// локального (по stored_at), иначе оставить свежее локальное. Защищает от затирания
     /// свежих записей старыми слепками пиров (dht.sync / catch_up / dht.store).
     /// Возвращает true, если пировское значение применили.
-    pub fn merge_replica(&mut self, key: &str, value: String, ttl_ms: i64, origin: [u8; NODEID_LEN], stored_at: i64) -> bool {
+    pub fn merge_replica(
+        &mut self,
+        key: &str,
+        value: String,
+        ttl_ms: i64,
+        origin: [u8; NODEID_LEN],
+        stored_at: i64,
+    ) -> bool {
         let now = now_ms();
         if stored_at <= 0 {
             // пир не прислал stored_at — не затираем локальное, отдаём приоритет локальному
@@ -226,7 +245,13 @@ impl KvStore {
         if apply {
             self.entries_mut().insert(
                 key.to_string(),
-                StoredValue { value, expires, origin, ttl_ms, stored_at },
+                StoredValue {
+                    value,
+                    expires,
+                    origin,
+                    ttl_ms,
+                    stored_at,
+                },
             );
         }
         apply
@@ -255,13 +280,18 @@ impl KvStore {
             None => {
                 self.entries_mut().insert(
                     key.to_string(),
-                    StoredValue { value, expires: now + ttl_ms, origin, ttl_ms, stored_at },
+                    StoredValue {
+                        value,
+                        expires: now + ttl_ms,
+                        origin,
+                        ttl_ms,
+                        stored_at,
+                    },
                 );
                 true
             }
             Some(local) => {
-                let mut ids: Vec<String> =
-                    serde_json::from_str(&local.value).unwrap_or_default();
+                let mut ids: Vec<String> = serde_json::from_str(&local.value).unwrap_or_default();
                 // чистим от tombstones при слиянии, чтобы удалённое не воскресало
                 // от старых реплик (удаление реплицируется и списком, и tombstone)
                 let tombs = self.tombs_for(key);
@@ -308,7 +338,13 @@ impl KvStore {
             None => {
                 self.entries_mut().insert(
                     key.to_string(),
-                    StoredValue { value, expires: now + ttl_ms, origin, ttl_ms, stored_at },
+                    StoredValue {
+                        value,
+                        expires: now + ttl_ms,
+                        origin,
+                        ttl_ms,
+                        stored_at,
+                    },
                 );
                 true
             }
@@ -363,7 +399,9 @@ impl KvStore {
     pub fn keys_to_republish(&self, now: i64) -> Vec<(String, String, i64, [u8; NODEID_LEN], i64)> {
         self.entries
             .iter()
-            .filter(|(k, v)| !k.starts_with("dedup:") && v.expires > now && now - v.stored_at > v.ttl_ms / 2)
+            .filter(|(k, v)| {
+                !k.starts_with("dedup:") && v.expires > now && now - v.stored_at > v.ttl_ms / 2
+            })
             .map(|(k, v)| (k.clone(), v.value.clone(), v.ttl_ms, v.origin, v.stored_at))
             .collect()
     }
@@ -447,7 +485,9 @@ impl KvStore {
             let is_stell_blob = k.starts_with("stell_blocks:")
                 || k.starts_with("stell_headers:")
                 || k.starts_with("stell_state:");
-            if is_stell_blob && (v.stored_at == 0 || now.saturating_sub(v.stored_at) > 2 * 3600 * 1000) {
+            if is_stell_blob
+                && (v.stored_at == 0 || now.saturating_sub(v.stored_at) > 2 * 3600 * 1000)
+            {
                 expired += 1;
                 removed.push((k.clone(), v.value.clone()));
                 return false;
@@ -499,12 +539,22 @@ mod kv_sweep_tests {
         let now = now_ms();
         let mut kv = KvStore::default();
         // живые записи (манифест/индекс)
-        kv.store("mail:alice:index", "[\"m1\"]".into(), 30 * 24 * 3600 * 1000, origin());
+        kv.store(
+            "mail:alice:index",
+            "[\"m1\"]".into(),
+            30 * 24 * 3600 * 1000,
+            origin(),
+        );
         kv.store("files:alice", "[]".into(), 30 * 24 * 3600 * 1000, origin());
         // уже просроченная запись (отрицательный TTL)
         kv.store("expired:key", "x".into(), -1_000, origin());
         // свежий dedup — записан только что
-        kv.store("dedup:fresh", "{\"nodes\":[]}".into(), DEDUP_TTL_MS, origin());
+        kv.store(
+            "dedup:fresh",
+            "{\"nodes\":[]}".into(),
+            DEDUP_TTL_MS,
+            origin(),
+        );
         // легаси-dedup: 30-дневный TTL, но последняя запись была 10 минут назад
         kv.restore(
             "dedup:stale".into(),
@@ -512,12 +562,19 @@ mod kv_sweep_tests {
         );
 
         let before = kv.len();
-        assert_eq!(before, 5, "before: 2 live + expired + fresh dedup + stale dedup");
+        assert_eq!(
+            before, 5,
+            "before: 2 live + expired + fresh dedup + stale dedup"
+        );
 
         let (removed, removed_dedup, _) = kv.sweep(now);
         let after = kv.len();
 
-        assert_eq!(before - after, removed, "removed must match the entry delta");
+        assert_eq!(
+            before - after,
+            removed,
+            "removed must match the entry delta"
+        );
         assert_eq!(removed, 2, "expired + stale dedup");
         assert_eq!(removed_dedup, 1);
         assert_eq!(after, 3, "after: 2 live + fresh dedup");
@@ -538,33 +595,72 @@ mod kv_sweep_tests {
         let now = now_ms();
         let mut kv = KvStore::default();
         // живые stell-манифесты (окно retention)
-        kv.store("stell_blocks:abc_blk_deadbeef", "{}".into(), 11 * 24 * 3600 * 1000, origin());
-        kv.store("stell_headers:abc_h_42000", "{}".into(), 11 * 24 * 3600 * 1000, origin());
-        kv.store("stell_head:abc_shard_0_head", "{}".into(), 30 * 24 * 3600 * 1000, origin());
+        kv.store(
+            "stell_blocks:abc_blk_deadbeef",
+            "{}".into(),
+            11 * 24 * 3600 * 1000,
+            origin(),
+        );
+        kv.store(
+            "stell_headers:abc_h_42000",
+            "{}".into(),
+            11 * 24 * 3600 * 1000,
+            origin(),
+        );
+        kv.store(
+            "stell_head:abc_shard_0_head",
+            "{}".into(),
+            30 * 24 * 3600 * 1000,
+            origin(),
+        );
         // просроченные stell-манифесты (окно вышло)
         kv.store("stell_blocks:abc_blk_ffff", "x".into(), -1_000, origin());
         kv.store("stell_headers:abc_h_7", "x".into(), -1_000, origin());
         // легаси-долгоживущие (реестр/индексы, 30 дней как раньше)
-        kv.store("mail:alice:index", "[\"m1\"]".into(), 30 * 24 * 3600 * 1000, origin());
+        kv.store(
+            "mail:alice:index",
+            "[\"m1\"]".into(),
+            30 * 24 * 3600 * 1000,
+            origin(),
+        );
 
         assert_eq!(kv.len(), 6);
         let (removed, _, _) = kv.sweep(now);
         assert_eq!(removed, 2, "только два просроченных stell-ключа");
         assert_eq!(kv.len(), 4);
-        assert!(kv.get("stell_blocks:abc_blk_deadbeef").is_some(), "живое тело kept");
-        assert!(kv.get("stell_headers:abc_h_42000").is_some(), "живой заголовок kept");
+        assert!(
+            kv.get("stell_blocks:abc_blk_deadbeef").is_some(),
+            "живое тело kept"
+        );
+        assert!(
+            kv.get("stell_headers:abc_h_42000").is_some(),
+            "живой заголовок kept"
+        );
         assert!(kv.get("stell_head:abc_shard_0_head").is_some(), "head kept");
-        assert!(kv.get("mail:alice:index").is_some(), "долгоживущие без expiry-концепта kept");
-        assert!(kv.get("stell_blocks:abc_blk_ffff").is_none(), "просроченное тело dropped");
-        assert!(kv.get("stell_headers:abc_h_7").is_none(), "просроченный заголовок dropped");
+        assert!(
+            kv.get("mail:alice:index").is_some(),
+            "долгоживущие без expiry-концепта kept"
+        );
+        assert!(
+            kv.get("stell_blocks:abc_blk_ffff").is_none(),
+            "просроченное тело dropped"
+        );
+        assert!(
+            kv.get("stell_headers:abc_h_7").is_none(),
+            "просроченный заголовок dropped"
+        );
     }
 
     #[test]
-    fn keys_to_republish_skips_dedup() {        let now = now_ms();
+    fn keys_to_republish_skips_dedup() {
+        let now = now_ms();
         let mut kv = KvStore::default();
         // обе записи старше половины TTL => раньше обе бы ушли в republish
         kv.restore("dedup:old".into(), value(now, now - 600_000, 600_000));
-        kv.restore("mail:alice:index".into(), value(now, now - 600_000, 600_000));
+        kv.restore(
+            "mail:alice:index".into(),
+            value(now, now - 600_000, 600_000),
+        );
 
         let mut keys: Vec<String> = kv
             .keys_to_republish(now)
@@ -572,7 +668,11 @@ mod kv_sweep_tests {
             .map(|(k, _, _, _, _)| k)
             .collect();
         keys.sort();
-        assert_eq!(keys, vec!["mail:alice:index".to_string()], "dedup must not be republished");
+        assert_eq!(
+            keys,
+            vec!["mail:alice:index".to_string()],
+            "dedup must not be republished"
+        );
     }
 
     #[test]
@@ -593,7 +693,13 @@ mod kv_sweep_tests {
         kv2.store("mail:fresh:index", "v".into(), ttl, [7u8; 20]);
         assert!(kv2.stored_at("mail:fresh:index") >= now);
         // Future stored_at cannot extend life past now+ttl...
-        kv.store_replica("mail:fut:index", "v".into(), ttl, [7u8; 20], now + 999_999_999);
+        kv.store_replica(
+            "mail:fut:index",
+            "v".into(),
+            ttl,
+            [7u8; 20],
+            now + 999_999_999,
+        );
         assert!(kv.stored_at("mail:fut:index") <= now);
         // ...and an already-dead entry is not resurrected.
         kv.store_replica("mail:dead:index", "v".into(), ttl, [7u8; 20], now - ttl - 1);

@@ -23,8 +23,15 @@ consumers — external-facing, publish candidate), `scripts/tools/stelops`,
 
 ## Done (verified)
 
-- [x] clippy `-D warnings` 0/0 all 7 workspaces (2026-10-29)
+- [x] clippy `-D warnings` 0/0 all 7 workspaces (2026-10-29, holds after polish wave 1)
 - [x] Full suite green: 218 targets stellereum, infmail, e2e 7/7, wallet, indexer, sdk, stelops
+- [x] Polish wave 1 (5 agents, integrated 9d7ab9b, pushed `hdae-polish-*` to core+contracts):
+  RPC 140-method drift pinned (7 new tests) · crypto gap pins: VRF-not-wired,
+  BLS-refusal message, zkML-no-hiding (99 green) · contracts gate pins:
+  workchain-bridge refusal, 2PC-off + AMM/u128 strengthened · consensus quorum
+  value pins (4) + constant docs · state proof pins: archive-tamper at LC layer,
+  snapshot roundtrip+garbage · lead: zkML spec section, Groth16 header fix
+- [ ] Full feature-matrix re-run (38 rows; agents verified own rows green)
 - [x] Session bloat archived (30 files), specs 00-04 + isolation plan written
 - [x] Gate scripts + justfile + agents infra + AGENTS.md constitution
 - [x] Prune timers on all 4 nodes, snapshot fresh, divergence-watch pattern

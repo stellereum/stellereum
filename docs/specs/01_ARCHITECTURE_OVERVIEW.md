@@ -10,7 +10,7 @@ Supersedes: all `docs/handoff/*` diaries and `docs/audits/audit-*.md` working no
 | Workspace | Members | Role |
 |---|---|---|
 | `stellereum/` | `stellereum` (single package) + path dep `infnode` | Canonical node: consensus, execution, storage, RPC, P2P |
-| `infmail-valid-backend/` | `infnode`, `infmail` | Overlay network (QUIC+DHT+storage) + webmail backend |
+| `infnode/` | `infnode`, `infmail` | Overlay network (QUIC+DHT+storage) + webmail backend |
 | `stellereum-contracts/` | `stellereum-sdk`, `e2e-tests`, `stl-dns`, `sts20-token`, `liquidity-pool`, `account-object` | On-chain contracts + contract SDK |
 | `stellereum-indexer/` | single | SQLite indexer, `/api/v2/*` |
 | `stellereum-sdk/` | single | Canonical client SDK (byte-pinned) |

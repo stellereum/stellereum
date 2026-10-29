@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 stellereum = { path = "../stellereum" }
-infnode = { path = "../infmail-valid-backend/crates/infnode" }
+infnode = { path = "../infnode/crates/infnode" }
 anyhow = "1"
 bincode = "1.3"
 tokio = { version = "1", features = ["full"] }

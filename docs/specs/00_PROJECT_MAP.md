@@ -10,7 +10,7 @@ stellereum-project/
 ├── stellereum/               # CANONICAL NODE (60 src files, crate `stellereum`)
 │   └── src/                  # consensus, runtime, main loop, sharding, state_engine,
 │                             # cpat2 trie, staking, contract/VM, rpc, mempool, PQ
-├── infmail-valid-backend/    # crates/infnode (QUIC+DHT) + crates/infmail (webmail)
+├── infnode/    # crates/infnode (QUIC+DHT) + crates/infmail (webmail)
 ├── stellereum-contracts/     # contracts/{stl-dns,sts20-token,liquidity-pool,account-object}
 │                             # + crates/{stellereum-sdk,e2e-tests}
 ├── stellereum-indexer/       # SQLite indexer, /api/v2

@@ -4,7 +4,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$ROOT/artifacts"
-RUST_WS="stellereum infmail-valid-backend stellereum-contracts stellereum-indexer stellereum-sdk stell-wallet scripts/tools/stelops"
+RUST_WS="stellereum infnode stellereum-contracts stellereum-indexer stellereum-sdk stell-wallet scripts/tools/stelops"
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 json='{"generated_utc":"'$TS'","workspaces":{'

@@ -9,12 +9,10 @@ cargo-fuzz = true
 
 [dependencies]
 stellereum = { path = ".." }
-# Relative path: `fuzz/` -> repo root -> sibling workspace checkout. The old
-# absolute path (`/home/imm/infmail-valid-backend/...`) did not even exist on
-# this machine and broke `cargo fuzz` on a clean clone. Resolved relative to
-# THIS manifest's directory, so it needs one `..` more than the root
-# Cargo.toml's `../infmail-valid-backend/crates/infnode`.
-infnode = { path = "../../infmail-valid-backend/crates/infnode" }
+# Relative path: `fuzz/` -> repo root -> sibling workspace checkout.
+# Resolved relative to THIS manifest's directory, so it needs one `..`
+# more than the root Cargo.toml's `../infnode/crates/infnode`.
+infnode = { path = "../../infnode/crates/infnode" }
 bincode = "1.3"
 
 [dependencies.libfuzzer-sys]

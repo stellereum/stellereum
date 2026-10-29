@@ -3,7 +3,7 @@
 ## Current graph (from `cargo metadata --no-deps`)
 
 - `stellereum` (single package, 60 src files) → path-dep `infnode`.
-- `infmail-valid-backend`: `infnode` + `infmail` (infmail → infnode).
+- `infnode`: `infnode` + `infmail` (infmail → infnode).
 - `stellereum-contracts`: sdk + e2e + 4 contract crates.
 - Standalone: indexer, sdk, wallet (lib+bin), stelops.
 - NO root workspace. NO git repo (step zero: `git init` + first commit).

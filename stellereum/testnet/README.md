@@ -60,7 +60,7 @@ the first day of running the current code. See `../docs/OPERATIONS.md`.
 - Rust toolchain able to build the workspace (`edition 2021`, `wasmi 2`,
   `sled 0.34`, `axum 0.7`, `tokio` with the `full` feature).
 - The `infnode` crate at the path `Cargo.toml` points it at
-  (`/home/imm/infmail-valid-backend/crates/infnode`). It is a path dependency,
+  (`/home/imm/infnode/crates/infnode`). It is a path dependency,
   not a registry crate, so the node cannot be built without that checkout
   present. In Docker the build context must contain both directories.
 - One host per node for anything you care about. Two nodes on one host works and

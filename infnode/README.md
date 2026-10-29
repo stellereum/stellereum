@@ -1,6 +1,6 @@
 > **⚠️ Unaudited testnet — do not use real funds.** This code has passed internal audits and penetration tests, but no independent external audit has been completed yet. It is published for testnet use and review only; do not trust it with real funds or mainnet keys until an external audit is done.
 
-# infmail-valid-backend
+# infnode
 
 The InfMail network validator. Everything for the owner in one place: **mail API, TON smart contracts, NFT card generator, Go/Zig tools**.
 
@@ -18,7 +18,7 @@ Makefile            all commands
 ## Quick start
 
 ```bash
-git clone https://github.com/immtes/infmail-valid-backend && cd infmail-valid-backend
+git clone https://github.com/immtes/infnode && cd infnode
 
 # owner env (required):
 export INFNODE_VALIDATOR_KEY=<your secret, >=16 chars>

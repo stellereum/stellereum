@@ -17,7 +17,7 @@ pass() { echo "[GATE PASS] $1"; }
 fail() { echo "[GATE FAIL] $1"; exit 1; }
 info() { echo "[gate] $1"; }
 
-RUST_WS="stellereum infmail-valid-backend stellereum-contracts stellereum-indexer stellereum-sdk stell-wallet scripts/tools/stelops"
+RUST_WS="stellereum infnode stellereum-contracts stellereum-indexer stellereum-sdk stell-wallet scripts/tools/stelops"
 
 # ---- STAGE 0: fake-code scan (hard fail) ----
 info "stage 0: fake-code scan"

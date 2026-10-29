@@ -1,0 +1,20 @@
+# HDAE shared cargo config (2026-10-29). Portable defaults; fast-linker
+# stanzas are opt-in via env (tools not installed everywhere).
+# NOTE: codegen-units lives under [profile.*], not [build].
+[profile.dev]
+debug = 0
+codegen-units = 16
+
+[profile.test]
+debug = 0
+
+# Uncomment when sccache is installed (shared compile cache across worktrees):
+# [build]
+# rustc-wrapper = "sccache"
+#
+# Uncomment when mold is installed (link via mold):
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+#
+# Share one target dir across worktrees for instant reuse:
+#   export CARGO_TARGET_DIR=/home/imm/stellereum-project/target-shared

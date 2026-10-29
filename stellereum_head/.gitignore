@@ -1,0 +1,15 @@
+/target
+/fuzz/target
+/data
+/keys
+/wallet_data
+/wallet_keys
+*.bin
+*.log
+*.tmp
+.env
+
+# docker local volumes
+/docker/data-store
+/docker/keys-store
+docs/handoff/

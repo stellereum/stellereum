@@ -1,0 +1,16 @@
+# HDAE project ignores (generated 2026-10-29)
+.archive/
+target/
+node_modules/
+explorer-site/node_modules/
+multinode/
+*.log
+*.tmp
+*.key
+keys/
+artifacts/
+.DS_Store
+# live node material (keys, stores, envs) must NEVER be committed:
+*.yaml.bak*
+env.*
+data.bak.*

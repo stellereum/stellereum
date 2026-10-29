@@ -1,0 +1,185 @@
+name: Stellereum CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout infmail-valid-backend (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: immtes/infmail-valid-backend
+          # `path` is relative to GITHUB_WORKSPACE; `..` puts the sibling
+          # exactly where `../infmail-valid-backend` in Cargo.toml expects it.
+          path: ../infmail-valid-backend
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # ADVISORY (2026-10-20): the tree has pre-existing rustfmt debt — the
+      # whole repo (src/, tests/, examples/, benches/) has never been run
+      # through `cargo fmt`, so `cargo fmt --check` reports ~290 files with
+      # diffs. Fixing that is a mechanical but repo-wide reformat, which does
+      # not belong in a hygiene change that also touches Cargo.lock. The step
+      # runs, reports and uploads the diff, but does not fail the build until
+      # the format sweep lands. Flip `continue-on-error` to `false` then.
+      - name: cargo fmt --check (advisory)
+        continue-on-error: true
+        run: |
+          cargo fmt --all -- --check > fmt.diff 2>&1 || true
+          grep -o '^Diff in [^:]*' fmt.diff | sort -u > fmt.files || true
+          {
+            echo "### rustfmt would reformat $(wc -l < fmt.files) file(s):"
+            cat fmt.files
+          } >> fmt.diff
+          tail -n 40 fmt.diff
+
+      - name: Upload rustfmt diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfmt-diff
+          path: fmt.diff
+          if-no-files-found: ignore
+
+      # ADVISORY (2026-10-20): the tree also carries pre-existing clippy/rustc
+      # debt (dead_code, unused_mut, unused_imports on the lib and bins), so
+      # `-D warnings` cannot be blocking yet. The step is real clippy with
+      # `-D warnings` — it reports the exact lint list that must be cleaned
+      # before this can gate merges.
+      - name: cargo clippy -- -D warnings (advisory)
+        continue-on-error: true
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout infmail-valid-backend (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: immtes/infmail-valid-backend
+          path: ../infmail-valid-backend
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Build node binary and all targets
+        run: cargo build --verbose --all-targets
+
+      - name: Build release node binary
+        run: cargo build --release --verbose
+
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout infmail-valid-backend (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: immtes/infmail-valid-backend
+          path: ../infmail-valid-backend
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Unit tests (src/)
+        run: cargo test --lib --verbose
+
+      - name: Integration tests (tests/)
+        run: cargo test --tests --verbose
+
+      - name: Verify passport conformance audit
+        run: cargo run --release --example passport_audit
+
+      - name: Run security vulnerability regression hunts
+        run: |
+          cargo run --release --example vuln_hunt
+          cargo run --release --example vuln_hunt2
+          cargo run --release --example vuln_hunt3
+          cargo run --release --example vuln_hunt4
+
+  audit:
+    name: Dependency Audit (cargo-audit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # audit-check posts advisories as a check / an issue on the PR.
+      checks: write
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # rustsec/audit-check needs no Rust toolchain — it ships a prebuilt
+      # cargo-audit binary. Path dependencies (infnode) are ignored by it.
+      - name: Audit dependencies against the RustSec advisory DB
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  fuzz:
+    name: Fuzz smoke (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout infmail-valid-backend (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: immtes/infmail-valid-backend
+          path: ../infmail-valid-backend
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      # `cargo fuzz build` compiles all four harnesses (frame_decode,
+      # consensus_msg_decode, transaction_decode, block_decode) and links
+      # libFuzzer. This is the step that was impossible on a clean clone
+      # while fuzz/Cargo.toml pointed at an absolute, non-existent path.
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+
+      # libFuzzer mutates the corpus in place, so the working tree would
+      # otherwise come back dirty after every CI run.
+      - name: Fuzz smoke run (replays the committed corpus)
+        run: |
+          for target in frame_decode consensus_msg_decode transaction_decode block_decode; do
+            echo "=== fuzzing $target ==="
+            cargo +nightly fuzz run "$target" -- -runs=2000 -timeout=10
+          done

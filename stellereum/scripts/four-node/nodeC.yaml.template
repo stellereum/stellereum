@@ -1,0 +1,67 @@
+# =============================================================================
+# Stellereum 4-validator stand — node C template (validator 3 of 4)
+# =============================================================================
+#
+# DEPLOY TARGET: /root/nodeC/node.yaml on the live server (root@<VALIDATOR_HOST>
+# — the real host is operator knowledge, it is deliberately NOT stored in this
+# repo).
+# This file is a TEMPLATE: ALL identities below (A/B/C/D) are PLACEHOLDERS that
+# must be filled in before use (see "HOW TO FILL IN THE PLACEHOLDERS" below).
+# nodeA/nodeB values come from the live /root/nodeA/node.yaml and
+# /root/nodeB/node.yaml; nodeC/nodeD values come from each node's
+# "NODE IDENTITY" log line.
+#
+# CONVENTION (deployed "others only", confirmed from the live files):
+#   * nodeA.validators = [nodeB id]  (lists the PEER, not itself)
+#   * nodeB.validators = [nodeA id]  (lists the PEER, not itself)
+#   * build_validator_set() in src/main.rs then derives the set as
+#         { own key } UNION { ed-pub of every peers: entry whose node-id is listed }
+#     so each 2-node set = {A, B} on both nodes.
+#   * For 4 nodes the same convention means: each node's `validators:` lists the
+#     OTHER THREE ids, and each node carries a `peers:` entry for each of them.
+#     nodeC.validators below = [A, B, D]. Its derived set = {C} + {A, B, D}.
+#
+# PORTS (single server): P2P 0.0.0.0:9412, advertise 127.0.0.1:9412.
+# RPC is not in this file; it comes from /root/env.C (127.0.0.1:8547).
+#
+# HOW TO FILL IN THE PLACEHOLDERS
+#   0. nodeA/nodeB placeholders: copy node-id, ed-pub and x-pub from the
+#      `peers:` entries of the live /root/nodeA/node.yaml and
+#      /root/nodeB/node.yaml (public identity values — NEVER a private key
+#      belongs in this file).
+#   1. mkdir -p /root/nodeC, copy this file to /root/nodeC/node.yaml, then
+#      temporarily empty its `peers:` list (keep a backup).
+#   2. Start nodeC once with an empty peers list. It logs:
+#        NODE IDENTITY: id=inf1:<40 hex> ed=<64 hex> x=<64 hex> listen=...
+#   3. Replace PLACEHOLDER_C_* below with those three values, restore the full
+#      peers list, and do the mirror step for nodeD. Then update nodeA/nodeB
+#      yamls per scripts/four-node/VALIDATOR_SET_PLAN.md, wipe ALL data dirs
+#      (genesis changes 2 -> 4 validators, old data is unusable), and start.
+# -----------------------------------------------------------------------------
+
+name: nodeC
+listen: "0.0.0.0:9412"
+advertise: "127.0.0.1:9412"
+validators:
+  - "inf1:PLACEHOLDER_A_NODE_ID_00000000000000000000"
+  - "inf1:PLACEHOLDER_B_NODE_ID_00000000000000000000"
+  - "inf1:PLACEHOLDER_D_NODE_ID_00000000000000000000"
+peers:
+  - name: nodeA
+    node-id: "inf1:PLACEHOLDER_A_NODE_ID_00000000000000000000"
+    ed-pub: "PLACEHOLDER_A_ED_PUB_0000000000000000000000000000000000000000000000000000"
+    x-pub: "PLACEHOLDER_A_X_PUB_0000000000000000000000000000000000000000000000000000000"
+    endpoints: ["127.0.0.1:9410"]
+    allow: ["*"]
+  - name: nodeB
+    node-id: "inf1:PLACEHOLDER_B_NODE_ID_00000000000000000000"
+    ed-pub: "PLACEHOLDER_B_ED_PUB_0000000000000000000000000000000000000000000000000000"
+    x-pub: "PLACEHOLDER_B_X_PUB_0000000000000000000000000000000000000000000000000000000"
+    endpoints: ["127.0.0.1:9411"]
+    allow: ["*"]
+  - name: nodeD
+    node-id: "inf1:PLACEHOLDER_D_NODE_ID_00000000000000000000"
+    ed-pub: "PLACEHOLDER_D_ED_PUB_0000000000000000000000000000000000000000000000000000"
+    x-pub: "PLACEHOLDER_D_X_PUB_0000000000000000000000000000000000000000000000000000000"
+    endpoints: ["127.0.0.1:9413"]
+    allow: ["*"]

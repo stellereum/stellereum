@@ -1,0 +1,15 @@
+# Stellereum stand log rotation.
+#
+# Install on the stand with:
+#   cp scripts/logrotate.stellereum /etc/logrotate.d/stellereum
+#
+# `copytruncate` is required because the nodes hold `current.log` open for
+# append across the whole run (stell-node.sh truncates it only at start);
+/root/nodeA/current.log /root/nodeB/current.log {
+    size 50M
+    rotate 7
+    compress
+    copytruncate
+    missingok
+    notifempty
+}

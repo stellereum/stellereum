@@ -1,0 +1,165 @@
+/* ==========================================================================
+   Stellereum — ВСЕ медиазапросы (breakpoints: 480 / 768 / 992 / 1280 / 1536)
+   Mobile-first: база выше (в base/layout/components/sections) — здесь только
+   min-width overrides. Единственное исключение по духу файла — «тонкий»
+   pointer/hover-безопасность и max-width для 320px.
+   ========================================================================== */
+
+/* --- очень узкие экраны (320–479) ---------------------------------------- */
+@media (max-width: 479.98px) {
+  :root {
+    --section-y: 56px;
+  }
+
+  .metric { padding: var(--sp-4) var(--sp-5); min-height: 120px; }
+  .perf-grid { grid-template-columns: minmax(0, 1fr); gap: var(--sp-6); }
+  .code-body { padding: var(--sp-4); }
+  .code-body pre { font-size: 12.5px; }
+  .cta-panel { padding: var(--sp-9) var(--sp-5); }
+  .card { padding: var(--sp-5); }
+  .timeline { padding-left: 34px; }
+  .timeline-item::before { left: -34px; width: 22px; height: 22px; }
+  .timeline-item::after { left: -27px; top: 10px; }
+  .timeline::before { left: 9px; }
+}
+
+/* --- 480+ --------------------------------------------------------------- */
+@media (min-width: 480px) {
+  :root {
+    --gutter: 24px;
+  }
+
+  .metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .footer-grid { gap: var(--sp-8) var(--sp-7); }
+  .perf-band { padding: var(--sp-9) var(--sp-7); }
+}
+
+/* --- 768+ --------------------------------------------------------------- */
+@media (min-width: 768px) {
+  :root {
+    --gutter: 32px;
+    --section-y: 80px;
+  }
+
+  .section-head { margin-bottom: var(--sp-10); gap: var(--sp-4); }
+
+  .features-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-5); }
+  .eco-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-5); }
+
+  .perf-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--sp-6); }
+  .perf-item { text-align: left; }
+
+  .hero { padding-block: var(--sp-13) var(--sp-14); }
+  .hero-visual { max-width: 520px; }
+
+  .net-strip { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr); }
+
+  .cta-panel { padding: var(--sp-13) var(--sp-9); }
+
+  /* монозначение state root держит свой кегль и не перекрывается */
+  .metric-value:not(.metric-value--mono) { font-size: clamp(30px, 3.4vw, 36px); }
+}
+
+/* --- 992+ (десктопная навигация, двухколоночные секции) ------------------ */
+@media (min-width: 992px) {
+  :root {
+    --section-y: 96px;
+  }
+
+  /* header: drawer → inline nav */
+  .nav-toggle,
+  .nav-close,
+  .nav-backdrop,
+  .nav-panel-top { display: none; }
+
+  .nav-panel {
+    position: static;
+    width: auto;
+    height: auto;
+    padding: 0;
+    border: 0;
+    background: none;
+    box-shadow: none;
+    overflow: visible;
+    visibility: visible;
+    transform: none;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--sp-5);
+    flex: 1 1 auto;
+    min-width: 0;
+    transition: none;
+  }
+
+  .nav-list {
+    flex-direction: row;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .nav-link {
+    padding: 9px 14px;
+    font-size: 15px;
+    border-radius: var(--r-pill);
+    white-space: nowrap;
+  }
+
+  .nav-cta { width: auto; }
+
+  /* hero: 1 колонка → 2 */
+  .hero-grid {
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, .95fr);
+    gap: var(--sp-8);
+  }
+
+  .hero-visual { max-width: 100%; margin-inline: 0; }
+
+  /* metrics: 3 × 2 */
+  .metrics-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-4); }
+
+  /* features: 3 × 2 */
+  .features-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+  /* quickstart: текст + код */
+  .quickstart-grid {
+    grid-template-columns: minmax(0, .92fr) minmax(0, 1.08fr);
+    gap: var(--sp-9);
+  }
+
+  /* footer: 4 колонки */
+  .footer-grid { grid-template-columns: minmax(0, 1.5fr) repeat(3, minmax(0, 1fr)); }
+  .footer-brand { grid-column: auto; }
+}
+
+/* --- 1280+ -------------------------------------------------------------- */
+@media (min-width: 1280px) {
+  :root {
+    --gutter: 40px;
+    --header-h: 76px;
+    --section-y: 112px;
+  }
+
+  .hero { padding-block: var(--sp-14) var(--sp-15); }
+  .hero-grid { gap: var(--sp-10); }
+  .section-head { margin-bottom: var(--sp-11); }
+
+  .card { padding: var(--sp-7); }
+  .metric { padding: var(--sp-6) var(--sp-7); }
+  .perf-band { padding: var(--sp-10) var(--sp-9); }
+}
+
+/* --- 1536+ -------------------------------------------------------------- */
+@media (min-width: 1536px) {
+  :root {
+    --section-y: 128px;
+  }
+}
+
+/* --- только устройства с точным указателем: hover-эффекты ---------------- */
+@media (hover: none), (pointer: coarse) {
+  .card:hover,
+  .btn:hover { transform: none; }
+
+  .card.is-tilting { transform: none; }
+}

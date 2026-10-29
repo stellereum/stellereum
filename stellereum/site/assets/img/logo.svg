@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Stellereum">
+  <defs>
+    <linearGradient id="stell-grad" x1="6" y1="4" x2="58" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3fa9ff"/>
+      <stop offset=".55" stop-color="#5ec8ff"/>
+      <stop offset="1" stop-color="#8b6cff"/>
+    </linearGradient>
+    <linearGradient id="stell-core" x1="32" y1="16" x2="32" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".92"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity=".35"/>
+    </linearGradient>
+  </defs>
+  <path d="M32 2c1.9 15.4 5.4 24.6 12.4 28.9C37.4 35.2 33.9 44.4 32 60c-1.9-15.6-5.4-24.8-12.4-29.1C26.6 26.6 30.1 17.4 32 2Z" fill="url(#stell-grad)"/>
+  <path d="M8.6 8.6c9.6 4.6 15.4 8.7 18.1 15.3-6.7 2.7-10.8 8.5-15.4 18.1-4.6-9.6-8.7-15.4-15.3-18.1 6.7-2.7 10.8-8.5 12.6-15.3Z" fill="url(#stell-grad)" opacity=".55"/>
+  <path d="M55.4 8.6c-9.6 4.6-15.4 8.7-18.1 15.3 6.7 2.7 10.8 8.5 15.4 18.1 4.6-9.6 8.7-15.4 15.3-18.1-6.7-2.7-10.8-8.5-12.6-15.3Z" fill="url(#stell-grad)" opacity=".55"/>
+  <path d="M32 24.5 39.5 32 32 39.5 24.5 32 32 24.5Z" fill="url(#stell-core)"/>
+</svg>

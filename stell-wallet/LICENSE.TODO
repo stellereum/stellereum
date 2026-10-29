@@ -1,0 +1,56 @@
+# LICENSE — FOUNDER MUST CHOOSE (do not publish without this file)
+
+This repository currently has NO license file. Until the founder picks one,
+the code is "all rights reserved" by default — which blocks open-source use.
+Pick ONE of the options below, then run the matching `cp` command.
+
+## Option A — MIT (recommended for ecosystem growth)
+
+A short permissive license: anyone may use, fork, modify and sell the code,
+provided they keep the copyright notice. For an L1 this maximizes integrations
+(wallets, exchanges, indexers) because there is zero legal friction — but it
+also lets competitors run closed modified versions without sharing improvements.
+
+```sh
+cp ../stellereum/LICENSE-MIT ./LICENSE-MIT
+```
+
+## Option B — Apache-2.0 (recommended if patents matter)
+
+Same permissiveness as MIT, plus an explicit patent grant and retaliation
+clause: contributors grant patent rights to users, and anyone who sues over
+those patents loses the grant. For an L1 with novel cryptography (PQ Falcon,
+custom BFT) this is the safest permissive choice — it deters patent attacks
+while keeping integration friction near zero. Note: the main `stellereum`
+repo is already dual-licensed MIT/Apache-2.0; matching it keeps the
+whole project uniform.
+
+```sh
+cp ../stellereum/LICENSE-APACHE ./LICENSE-APACHE
+```
+
+## Option C — GPL (copyleft: share-alike)
+
+Anyone who distributes modified versions (including running a modified node
+as a public network service — use AGPL for that) must publish their changes
+under the same license. For an L1 this prevents closed forks and forces
+improvements back upstream — but it scares off commercial integrators and is
+incompatible with several exchange/wallet compliance policies.
+
+```sh
+# GPL text is NOT vendored locally; fetch it or pick via the GitHub web UI:
+curl -o LICENSE https://www.gnu.org/licenses/gpl-3.0.txt
+```
+
+## Dual-license (what the main repo does)
+
+To match `stellereum/` exactly (MIT *or* Apache-2.0 at the user's option),
+copy both texts plus a 5-line pointer file:
+
+```sh
+cp ../stellereum/LICENSE-MIT ./LICENSE-MIT
+cp ../stellereum/LICENSE-APACHE ./LICENSE-APACHE
+printf 'Stellereum is distributed under the terms of either of the following licenses,\nat your option:\n\n  * Apache License, Version 2.0 (see LICENSE-APACHE)\n  * MIT License (see LICENSE-MIT)\n' > LICENSE
+```
+
+After choosing: delete this `LICENSE.TODO` file (`rm LICENSE.TODO`).

@@ -1,0 +1,1395 @@
+//! Public block explorer + rate-limited gateway.
+//!
+//! Serves a tiny self-contained HTML explorer and a read-only JSON API on top of
+//! the node's `RpcState`, and mounts the JSON-RPC endpoint under `/rpc`. The
+//! whole surface is protected by a per-IP fixed-window rate limiter so it can be
+//! exposed publicly without being trivially DoS-able.
+//!
+//! This module is deliberately dependency-light (no template engine): the page
+//! is a static string that calls the JSON API with `fetch`. That keeps the
+//! attack surface small and the build reproducible.
+
+use crate::rpc::{constant_time_eq, extract_header_token, RpcState};
+use axum::{
+    extract::{ConnectInfo, Path as AxumPath, Query, Request, State},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use serde_json::json;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+
+/// Default requests/second allowed per IP on the public gateway. Default 30;
+/// override with `STELL_RATE_LIMIT_PER_SEC`. Per-node abuse guard, not
+/// consensus — nodes MAY differ.
+pub const DEFAULT_RATE_LIMIT_PER_SEC: u32 = 30;
+
+/// Effective gateway per-IP budget (`STELL_RATE_LIMIT_PER_SEC`, default 30).
+pub fn default_rate_limit_per_sec() -> u32 {
+    std::env::var("STELL_RATE_LIMIT_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_RATE_LIMIT_PER_SEC)
+}
+
+/// Per-IP fixed-window rate limiter (no external dependency).
+pub struct RateLimiter {
+    per_sec: u32,
+    inner: Mutex<HashMap<IpAddr, (u64, u32)>>,
+}
+
+impl RateLimiter {
+    pub fn new(per_sec: u32) -> Self {
+        Self { per_sec: per_sec.max(1), inner: Mutex::new(HashMap::new()) }
+    }
+
+    /// Returns true if the request is allowed (and counts it).
+    pub fn check(&self, ip: IpAddr) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.check_at(ip, now)
+    }
+
+    /// Deterministic core (audit follow-up: the old test flaked on second
+    /// boundaries under load — time is injected here so tests pin behavior).
+    pub fn check_at(&self, ip: IpAddr, now: u64) -> bool {
+        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Bound memory: with many distinct source IPs the map could grow without
+        // limit. Periodically drop stale windows (O(n) but rare).
+        if m.len() > 100_000 {
+            m.retain(|_, (t, _)| now.saturating_sub(*t) < 2);
+        }
+        let entry = m.entry(ip).or_insert((now, 0));
+        if entry.0 != now {
+            *entry = (now, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        entry.1 <= self.per_sec
+    }
+
+    /// Drop stale windows (call periodically to bound memory).
+    pub fn prune(&self, now: u64) {
+        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|_, (t, _)| now.saturating_sub(*t) < 2);
+    }
+}
+
+/// Env var tuning how long a node may go without finalizing before `/readyz`
+/// reports unready. Default 30 s. Example: `STELL_READY_MAX_STALL_SECS=60`.
+pub const READY_MAX_STALL_SECS_ENV: &str = "STELL_READY_MAX_STALL_SECS";
+/// Env var tuning how many peers `/readyz` requires. Default 1.
+///
+/// Solo / dev nodes hold no peers by construction: run them with
+/// `STELL_READY_MIN_PEERS=0`, otherwise they are (correctly) never ready.
+pub const READY_MIN_PEERS_ENV: &str = "STELL_READY_MIN_PEERS";
+
+/// Thresholds for `/readyz`, env-tunable with sane defaults.
+///
+/// | variable | default | meaning |
+/// |---|---|---|
+/// | `STELL_READY_MAX_STALL_SECS` | `30` | max seconds since the last finalized block before unready |
+/// | `STELL_READY_MIN_PEERS` | `1` | minimum connected peers (`0` for solo/dev) |
+///
+/// A node that is "running" but useless — stuck pre-consensus in DHT warmup,
+/// answering RPC at height 0 forever, spinning view changes with zero
+/// finalizes, or holding no peer at all — fails one of these checks, and the
+/// response names which one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadinessConfig {
+    /// Max seconds since the last finalized block (and since the last height
+    /// advance) before the node counts as stalled.
+    pub max_stall_secs: u64,
+    /// Minimum connected peers for the node to count as ready.
+    pub min_peers: usize,
+}
+
+impl Default for ReadinessConfig {
+    fn default() -> Self {
+        Self { max_stall_secs: 30, min_peers: 1 }
+    }
+}
+
+impl ReadinessConfig {
+    /// Read thresholds from the environment, falling back to [`Default`].
+    pub fn from_env() -> Self {
+        let base = Self::default();
+        let max_stall_secs = std::env::var(READY_MAX_STALL_SECS_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(base.max_stall_secs);
+        let min_peers = std::env::var(READY_MIN_PEERS_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(base.min_peers);
+        Self { max_stall_secs, min_peers }
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[derive(Debug, Default)]
+struct ReadinessInner {
+    peers: usize,
+    height: u64,
+    last_finalized_at_secs: Option<u64>,
+    last_height_change_at_secs: Option<u64>,
+}
+
+/// Live readiness input, shared between the node loop (writers) and the
+/// `/readyz` handler (reader). A plain `Mutex` is enough: it is never held
+/// across `.await`, and a poisoned lock is recovered rather than propagated
+/// so a panicking writer cannot wedge the probe.
+pub struct ReadinessState {
+    config: ReadinessConfig,
+    inner: Mutex<ReadinessInner>,
+}
+
+impl ReadinessState {
+    pub fn new(config: ReadinessConfig) -> Self {
+        Self { config, inner: Mutex::new(ReadinessInner::default()) }
+    }
+
+    pub fn config(&self) -> ReadinessConfig {
+        self.config
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReadinessInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Current connected-peer count. Called from the supervisor/loop.
+    pub fn set_peers(&self, n: usize) {
+        self.lock().peers = n;
+    }
+
+    /// Record a finalized block at the real wall-clock time.
+    pub fn note_finalized(&self, height: u64) {
+        self.note_finalized_at(height, unix_now_secs());
+    }
+
+    /// Record a finalized block at an explicit time (deterministic tests).
+    pub fn note_finalized_at(&self, height: u64, now_secs: u64) {
+        let mut g = self.lock();
+        if height != g.height {
+            g.height = height;
+            g.last_height_change_at_secs = Some(now_secs);
+        }
+        g.last_finalized_at_secs = Some(now_secs);
+    }
+
+    /// Evaluate against the real wall-clock time.
+    pub fn evaluate(&self) -> ReadinessReport {
+        self.evaluate_at(unix_now_secs())
+    }
+
+    /// Evaluate against an explicit time (deterministic tests).
+    pub fn evaluate_at(&self, now_secs: u64) -> ReadinessReport {
+        let g = self.lock();
+        let mut failed_checks: Vec<String> = Vec::new();
+        if g.peers < self.config.min_peers {
+            failed_checks.push("no_peers".to_string());
+        }
+        let secs_since_finalized = g.last_finalized_at_secs.map(|t| now_secs.saturating_sub(t));
+        match secs_since_finalized {
+            None => failed_checks.push("no_finality".to_string()),
+            Some(age) if age > self.config.max_stall_secs => {
+                failed_checks.push("finality_stalled".to_string())
+            }
+            _ => {}
+        }
+        if g.height == 0 {
+            failed_checks.push("height_zero".to_string());
+        } else if let Some(t) = g.last_height_change_at_secs {
+            if now_secs.saturating_sub(t) > self.config.max_stall_secs {
+                failed_checks.push("height_stalled".to_string());
+            }
+        }
+        ReadinessReport {
+            ready: failed_checks.is_empty(),
+            failed_checks,
+            height: g.height,
+            peers: g.peers,
+            secs_since_finalized,
+            max_stall_secs: self.config.max_stall_secs,
+            min_peers: self.config.min_peers,
+        }
+    }
+}
+
+/// The outcome of one readiness evaluation. `failed_checks` names WHICH
+/// condition failed (`no_peers`, `no_finality`, `finality_stalled`,
+/// `height_zero`, `height_stalled`) so a supervisor can tell a peerless node
+/// from a stalled chain without guessing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadinessReport {
+    pub ready: bool,
+    pub failed_checks: Vec<String>,
+    pub height: u64,
+    pub peers: usize,
+    pub secs_since_finalized: Option<u64>,
+    pub max_stall_secs: u64,
+    pub min_peers: usize,
+}
+
+pub struct GatewayState {
+    pub rpc: Arc<RpcState>,
+    pub limiter: Arc<RateLimiter>,
+    /// Dedicated limiter for the nested /rpc router (audit follow-up): a
+    /// second layer on the SAME instance double-counted every hit; a static
+    /// ignored the configured rate. Same budget, separate bucket.
+    pub rpc_limiter: Arc<RateLimiter>,
+    /// Shared consensus metrics. Defaults to the process-wide registry in
+    /// [`crate::metrics::global`] so the two-argument constructor the node
+    /// binary already uses keeps working, while a caller that *does* hold the
+    /// consensus driver's registry can still be given the same instance.
+    pub metrics: Arc<crate::metrics::Registry>,
+    /// Readiness input for `/readyz` and `stell_ready`. Written by the node
+    /// loop through [`GatewayState::set_ready_peers`] /
+    /// [`GatewayState::note_ready_finalized`], read by the HTTP handlers.
+    pub readiness: Arc<ReadinessState>,
+    /// Cloudflare Turnstile gate for the public faucet
+    /// (`POST /api/faucet-public/:address`). Loaded from `STELL_TURNSTILE_*`
+    /// env; `Disabled` when unset (legacy IP-throttle-only behaviour).
+    pub captcha: Arc<crate::turnstile::CaptchaGate>,
+}
+
+impl GatewayState {
+    pub fn new(rpc: Arc<RpcState>, per_sec: u32) -> Self {
+        Self::with_readiness(rpc, per_sec, ReadinessConfig::from_env())
+    }
+
+    /// Same as [`GatewayState::new`] with explicit readiness thresholds
+    /// (tests, or callers that do not want env dependence).
+    pub fn with_readiness(rpc: Arc<RpcState>, per_sec: u32, config: ReadinessConfig) -> Self {
+        Self {
+            rpc,
+            limiter: Arc::new(RateLimiter::new(per_sec)),
+            rpc_limiter: Arc::new(RateLimiter::new(per_sec)),
+            metrics: crate::metrics::global(),
+            readiness: Arc::new(ReadinessState::new(config)),
+            // Env-loaded: logs the "no captcha configured" warning once per
+            // process when the keys are absent, so a forgotten config on a
+            // public node is visible at startup.
+            captcha: Arc::new(crate::turnstile::CaptchaGate::from_env()),
+        }
+    }
+
+    /// Same as [`GatewayState::with_readiness`] with an explicit captcha gate
+    /// (tests inject a mock verifier here; no env, no network).
+    pub fn with_captcha(
+        rpc: Arc<RpcState>,
+        per_sec: u32,
+        config: ReadinessConfig,
+        captcha: Arc<crate::turnstile::CaptchaGate>,
+    ) -> Self {
+        Self {
+            rpc,
+            limiter: Arc::new(RateLimiter::new(per_sec)),
+            rpc_limiter: Arc::new(RateLimiter::new(per_sec)),
+            metrics: crate::metrics::global(),
+            readiness: Arc::new(ReadinessState::new(config)),
+            captcha,
+        }
+    }
+
+    /// Set the current connected-peer count for `/readyz` (call from the
+    /// node/supervisor loop, e.g. once per consensus tick).
+    pub fn set_ready_peers(&self, n: usize) {
+        self.readiness.set_peers(n);
+    }
+
+    /// Record a finalized block for `/readyz` (call from the finalize path).
+    pub fn note_ready_finalized(&self, height: u64) {
+        self.readiness.note_finalized(height);
+    }
+}
+
+/// Per-IP gate for the whole surface (audit 2026-10-14 F8/F10 interplay:
+/// the bucket key is the RESOLVED client IP, and resolution honors proxy
+/// headers ONLY from a trusted peer — so a remote spoofer's forged XFF is
+/// ignored and they stay in their own TCP-peer's bucket; they cannot hop
+/// into (or flood) anyone else's. The nested `/rpc` router carries its own
+/// separate bucket below for the same reason).
+async fn rate_limit(
+    State(st): State<Arc<GatewayState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // Real client IP behind a trusted reverse proxy (X-Forwarded-For /
+    // Forwarded only when the TCP peer is in STELL_TRUSTED_PROXY_CIDRS,
+    // loopback-only by default); otherwise the TCP peer. Without this every
+    // client behind nginx/Cloudflare shared one bucket.
+    let client = crate::client_ip::resolve_client_ip(req.headers(), addr.ip());
+    if !st.limiter.check(client) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+    next.run(req).await
+}
+
+async fn nested_rpc_rate_limit(
+    State(st): State<Arc<GatewayState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let client = crate::client_ip::resolve_client_ip(req.headers(), addr.ip());
+    if !st.rpc_limiter.check(client) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+    next.run(req).await
+}
+
+/// Explorer HTML template. `%TS_SCRIPT%` / `%TS_WIDGET%` / `%TS_REQUIRED%`
+/// are substituted by [`render_index`] (plain `str::replace`, no template
+/// engine — the page must keep working byte-for-byte identical when the
+/// captcha is off).
+const INDEX_HTML: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stellereum Explorer</title>
+<style>
+ body{background:#0b0e14;color:#d7dae0;font-family:ui-monospace,Menlo,monospace;margin:0;padding:2rem}
+ h1{color:#59d0ff} .card{background:#141924;border:1px solid #222a38;border-radius:10px;padding:1rem;margin:1rem 0}
+ input,button{background:#0b0e14;color:#d7dae0;border:1px solid #2a3345;border-radius:6px;padding:.5rem}
+ button{cursor:pointer;color:#7CFFB2} a{color:#59d0ff} .k{color:#8b95a7} pre{white-space:pre-wrap;word-break:break-all}
+ .warn{color:#ffb86b}
+</style>%TS_SCRIPT%</head><body>
+<h1>Stellereum Explorer</h1>
+<div class="card"><div id="stats">loading…</div></div>
+<div class="card">
+  <input id="q" placeholder="address (hex)" size="70">
+  <button onclick="lookup()">Lookup balance / SPV</button>
+  <pre id="out"></pre>
+</div>
+<div class="card"><h3>Public faucet</h3>
+  <div class="k">5 STELL per address every 45 minutes</div>
+  <input id="fa" placeholder="address (hex)" size="70">
+  <button onclick="faucetGo()">Request 5 STELL</button>
+  %TS_WIDGET%
+  <pre id="fout"></pre>
+</div>
+<div class="card"><h3>Recent blocks</h3><div id="blocks">loading…</div></div>
+<script>
+const TS_REQUIRED=%TS_REQUIRED%;
+async function j(u){const r=await fetch(u);return await r.json();}
+async function loadStats(){
+  try{const s=await j('/api/stats');
+   document.getElementById('stats').innerHTML =
+     '<span class="k">chainId</span> '+s.chain_id+' &nbsp; <span class="k">height</span> '+s.height+
+     ' &nbsp; <span class="k">mempool</span> '+s.mempool+' &nbsp; <span class="k">stateRoot</span> '+s.state_root;
+  }catch(e){document.getElementById('stats').textContent='error: '+e;}
+}
+async function loadBlocks(){
+  try{const b=await j('/api/blocks');
+   document.getElementById('blocks').innerHTML = b.length? b.map(x=>
+     '<div>#'+x.height+' <span class="k">'+x.hash.slice(0,18)+'…</span> txs='+x.txs+' ts='+x.timestamp+'</div>').join('')
+     : '<span class="k">no finalized blocks yet</span>';
+  }catch(e){document.getElementById('blocks').textContent='error: '+e;}
+}
+async function lookup(){
+  const a=document.getElementById('q').value.trim();
+  if(!a){return;}
+  try{const r=await j('/api/spv/'+a);
+   document.getElementById('out').textContent=JSON.stringify(r,null,2);
+  }catch(e){document.getElementById('out').textContent='error: '+e;}
+}
+async function faucetGo(){
+  const out=document.getElementById('fout');
+  const a=document.getElementById('fa').value.trim();
+  if(!a){out.textContent='enter an address';return;}
+  let token=null;
+  if(TS_REQUIRED){
+    if(typeof turnstile==='undefined'){
+      out.innerHTML='<span class="warn">captcha failed to load — check your connection/adblocker and reload the page</span>';
+      return;
+    }
+    token=turnstile.getResponse();
+    if(!token){out.innerHTML='<span class="warn">solve the captcha first</span>';return;}
+  }
+  out.textContent='requesting…';
+  try{
+    const body=token?JSON.stringify({'cf-turnstile-response':token}):'';
+    const r=await fetch('/api/faucet-public/'+a,{method:'POST',headers:{'content-type':'application/json'},body:body});
+    out.textContent=r.status+' '+(await r.text());
+    if(r.ok&&typeof turnstile!=='undefined'){turnstile.reset();}
+  }catch(e){out.textContent='error: '+e;}
+}
+loadStats();loadBlocks();setInterval(()=>{loadStats();loadBlocks();},4000);
+</script></body></html>"#;
+
+/// Substitute the Turnstile placeholders in [`INDEX_HTML`]. With
+/// `site_key = None` (captcha disabled) the page is the pre-captcha explorer
+/// plus a plain faucet form; no external script is referenced.
+fn render_index(site_key: Option<&str>) -> String {
+    match site_key {
+        Some(key) => INDEX_HTML
+            .replace(
+                "%TS_SCRIPT%",
+                "\n<script src=\"https://challenges.cloudflare.com/turnstile/v0/api.js\" async defer></script>",
+            )
+            .replace(
+                "%TS_WIDGET%",
+                &format!(
+                    "\n  <div class=\"cf-turnstile\" data-sitekey=\"{}\" data-theme=\"dark\" data-size=\"flexible\"></div>",
+                    key.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;")
+                ),
+            )
+            .replace("%TS_REQUIRED%", "true"),
+        None => INDEX_HTML
+            .replace("%TS_SCRIPT%", "")
+            .replace("%TS_WIDGET%", "")
+            .replace("%TS_REQUIRED%", "false"),
+    }
+}
+
+async fn index(State(st): State<Arc<GatewayState>>) -> (HeaderMap, Html<String>) {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    headers.insert("x-frame-options", "SAMEORIGIN".parse().unwrap());
+    headers.insert("referrer-policy", "strict-origin-when-cross-origin".parse().unwrap());
+    headers.insert("permissions-policy", "geolocation=(), microphone=(), camera=()".parse().unwrap());
+    (headers, Html(render_index(st.captcha.site_key())))
+}
+
+async fn api_stats(State(st): State<Arc<GatewayState>>) -> Json<serde_json::Value> {
+    let height = st.rpc.height.load(std::sync::atomic::Ordering::Relaxed);
+    let root = st.rpc.engine.get_state_root().await;
+    let mempool = st.rpc.mempool.read().await.len();
+    Json(json!({
+        "chain_id": st.rpc.chain_id,
+        "node_id": st.rpc.node_id,
+        "height": height,
+        "mempool": mempool,
+        "state_root": hex::encode(root),
+        "contracts": st.rpc.engine.contract_count().await,
+    }))
+}
+
+async fn api_blocks(State(st): State<Arc<GatewayState>>) -> Json<serde_json::Value> {
+    let rb = st.rpc.recent_blocks.read().await;
+    let list: Vec<serde_json::Value> = rb
+        .iter()
+        .map(|b| json!({ "height": b.height, "hash": b.hash, "txs": b.tx_count, "timestamp": b.timestamp }))
+        .collect();
+    Json(json!(list))
+}
+
+/// Parse a 32-byte hex address (with or without a `0x` prefix).
+pub fn parse_addr(s: &str) -> Option<[u8; 32]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    hex::decode(s).ok()?.try_into().ok()
+}
+
+/// GET hint for the POST-only faucet (see the route above).
+async fn faucet_get_hint() -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        "faucet is POST-only (GET would let crawlers mint); POST to this URL with the token in the Authorization header",
+    )
+        .into_response()
+}
+
+async fn api_faucet(
+    State(st): State<Arc<GatewayState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    AxumPath(addr_param): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(faucet) = st.rpc.faucet.clone() else {
+        return (StatusCode::NOT_FOUND, "faucet is disabled on this node").into_response();
+    };
+    // Real client IP: proxy headers only from a trusted peer (see
+    // crate::client_ip); feeds the per-IP faucet budget and the logs below.
+    let client_ip = crate::client_ip::resolve_client_ip(&headers, addr.ip());
+    // Fail-closed: the faucet mints money, so "no token configured" must never
+    // degrade into "anyone who can reach this gateway may mint". This mirrors
+    // the `stell_faucet` JSON-RPC gate exactly and accepts the token either as
+    // `?token=`/`?apiKey=` or via the conventional auth headers.
+    let Some(expected) = st.rpc.faucet_token.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "faucet is enabled but STELL_FAUCET_TOKEN is not set; refusing to dispense",
+        )
+            .into_response();
+    };
+    let provided = query
+        .get("token")
+        .or_else(|| query.get("apiKey"))
+        .map(|s| s.as_str())
+        .or_else(|| extract_header_token(&headers));
+    if query.contains_key("token") || query.contains_key("apiKey") {
+        // Tokens in URLs land in access/proxy logs and browser history;
+        // headers are the safe path (audit 2026-10-06). Still accepted.
+        tracing::warn!("[faucet] token passed via URL query from {}; prefer Authorization header", client_ip);
+    }
+    if !provided.map(|p| constant_time_eq(p, expected)).unwrap_or(false) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized: missing or invalid faucet token")
+            .into_response();
+    }
+    // Per-IP drip throttle (shared with the RPC path's token gate).
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if !faucet.check_ip_throttle(Some(client_ip), now_secs).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "per-IP faucet budget exhausted for this hour",
+        )
+            .into_response();
+    }
+    let Some(a) = parse_addr(&addr_param) else {
+        return (StatusCode::BAD_REQUEST, "bad address").into_response();
+    };
+    // Same atomic mex-reconcile as the JSON-RPC faucet path: without it,
+    // reserved-but-never-executed drips (wiped mempool across a restart)
+    // leave a permanent nonce gap that explorer drips wait behind forever
+    // (audit 2026-10-06).
+    let faucet_addr = faucet.account();
+    let onchain = st
+        .rpc
+        .engine
+        .get_account(&faucet_addr)
+        .await
+        .map(|acc| acc.nonce)
+        .unwrap_or(0);
+    let pending: Vec<u64> = st
+        .rpc
+        .mempool
+        .read()
+        .await
+        .all()
+        .iter()
+        .filter(|t| t.from == faucet_addr)
+        .map(|t| t.nonce)
+        .collect();
+    let Some((tx, amount)) = faucet.build_transfer(a, None, Some((onchain, pending))).await else {
+        return (StatusCode::TOO_MANY_REQUESTS, "faucet limit reached for this address").into_response();
+    };
+    let balance = st.rpc.engine.get_account(&faucet.account()).await.map(|acc| acc.balance).unwrap_or(0);
+    let tx_hash = match st
+        .rpc
+        .mempool
+        .write()
+        .await
+        .add_checked_ctx(tx.clone(), balance, crate::mempool::AdmissionCtx::wall_now())
+    {
+        Ok(h) => h,
+        Err(e) => {
+            faucet.rollback(&tx, a, amount).await;
+            return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+        }
+    };
+    if let Some(bcast) = &st.rpc.tx_broadcast {
+        let _ = bcast.send(tx);
+    }
+    Json(json!({
+        "status": "pending",
+        "credited_nano": amount.to_string(),
+        "recipient": hex::encode(a),
+        "tx_hash": hex::encode(tx_hash),
+    }))
+    .into_response()
+}
+
+/// Pull the Turnstile token out of a public-faucet request: either the
+/// conventional `cf-turnstile-response` JSON/body field (what the widget's
+/// form POST carries), the alias `turnstile_token`, or the headers
+/// `CF-Turnstile-Response` / `X-Turnstile-Token` for API clients that do not
+/// want to build a JSON body. Empty/blank values count as absent.
+fn extract_turnstile_token(headers: &HeaderMap, body: &[u8]) -> Option<String> {
+    let from_headers = ["cf-turnstile-response", "x-turnstile-token"]
+        .iter()
+        .find_map(|name| headers.get(*name))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    if from_headers.is_some() {
+        return from_headers.map(str::to_string);
+    }
+    if body.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    ["cf-turnstile-response", "turnstile_token"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Public testnet faucet (TON-style, tokenless): fixed 5 STELL per address
+/// per 45 minutes. Deliberately POST-only (GET would let crawlers drain it).
+/// Defenses, all enforced before any mint:
+/// - per-address 45-minute cooldown (persisted, survives restarts);
+/// - per-IP hourly budget (shared throttle with the token faucet path);
+/// - Cloudflare Turnstile captcha, when `STELL_TURNSTILE_SITE_KEY` +
+///   `STELL_TURNSTILE_SECRET_KEY` are set (see [`crate::turnstile`]).
+///
+/// Check order (deliberate, cheapest-first):
+/// 1. address validation — free; a malformed address must never reach
+///    siteverify or consume any budget;
+/// 2. per-IP hourly throttle — local and cheap; running it BEFORE the
+///    captcha bounds expensive siteverify round-trips per source IP (the
+///    nginx `api_limit` zone is a second, coarser net), and a caller who is
+///    already over budget is told so without wasting a single-use Turnstile
+///    token. A failed captcha also consumes the caller's own IP budget,
+///    which only deters hammering;
+/// 3. Turnstile captcha (when configured) — fail-closed: missing token →
+///    400, Cloudflare rejection → 403, siteverify unreachable → 503;
+/// 4. mint/dispense.
+async fn api_faucet_public(
+    State(st): State<Arc<GatewayState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    AxumPath(addr_param): AxumPath<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(faucet) = st.rpc.faucet.clone() else {
+        return (StatusCode::NOT_FOUND, "faucet is disabled on this node").into_response();
+    };
+    // (1) Address validation first: garbage never burns a siteverify call.
+    let Some(a) = parse_addr(&addr_param) else {
+        return (StatusCode::BAD_REQUEST, "bad address").into_response();
+    };
+    // Real client IP behind a trusted proxy (see crate::client_ip): feeds the
+    // per-IP faucet budget and Turnstile `remoteip` below.
+    let client_ip = crate::client_ip::resolve_client_ip(&headers, addr.ip());
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // (2) Per-IP drip throttle before the captcha — see the doc comment above.
+    if !faucet.check_ip_throttle(Some(client_ip), now_secs).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "per-IP faucet budget exhausted for this hour",
+        )
+            .into_response();
+    }
+    // (3) Cloudflare Turnstile. Misconfigured (secret without site key) fails
+    // closed: better to refuse than to dispense unprotected while the
+    // operator believes the captcha is on.
+    match st.captcha.config() {
+        crate::turnstile::CaptchaConfig::Misconfigured => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "faucet captcha is misconfigured on this node (STELL_TURNSTILE_SECRET_KEY without STELL_TURNSTILE_SITE_KEY); refusing to dispense",
+            )
+                .into_response();
+        }
+        crate::turnstile::CaptchaConfig::Enabled { .. } => {
+            let Some(token) = extract_turnstile_token(&headers, &body) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "captcha token required: send the cf-turnstile-response body field or the CF-Turnstile-Response header",
+                )
+                    .into_response();
+            };
+            match st.captcha.verify(&token, Some(client_ip)).await {
+                crate::turnstile::CaptchaVerdict::Success => {}
+                crate::turnstile::CaptchaVerdict::Rejected { error_codes } => {
+                    // Error codes are Cloudflare's vocabulary (safe to show);
+                    // the token itself is never echoed or logged.
+                    return (
+                        StatusCode::FORBIDDEN,
+                        format!(
+                            "captcha failed (error-codes: {}); solve a fresh captcha and retry",
+                            if error_codes.is_empty() {
+                                "unknown".to_string()
+                            } else {
+                                error_codes.join(", ")
+                            }
+                        ),
+                    )
+                        .into_response();
+                }
+                crate::turnstile::CaptchaVerdict::Unavailable { reason } => {
+                    // Fail-closed: an unreachable siteverify must not dispense.
+                    tracing::warn!(
+                        "[faucet] turnstile siteverify unavailable from {}: {reason}",
+                        client_ip
+                    );
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "captcha verification is temporarily unavailable; try again shortly",
+                    )
+                        .into_response();
+                }
+            }
+        }
+        crate::turnstile::CaptchaConfig::Disabled => {}
+    }
+    // (4) Same atomic mex-reconcile as the token faucet path.
+    let faucet_addr = faucet.account();
+    let onchain = st
+        .rpc
+        .engine
+        .get_account(&faucet_addr)
+        .await
+        .map(|acc| acc.nonce)
+        .unwrap_or(0);
+    let pending: Vec<u64> = st
+        .rpc
+        .mempool
+        .read()
+        .await
+        .all()
+        .iter()
+        .filter(|t| t.from == faucet_addr)
+        .map(|t| t.nonce)
+        .collect();
+    let (tx, amount) = match faucet
+        .build_public_transfer(a, now_secs, Some((onchain, pending)))
+        .await
+    {
+        Ok(v) => v,
+        Err(wait_secs) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "public drip cooling down for this address, retry in {wait_secs} seconds"
+                ),
+            )
+                .into_response();
+        }
+    };
+    let balance = st.rpc.engine.get_account(&faucet.account()).await.map(|acc| acc.balance).unwrap_or(0);
+    let tx_hash = match st
+        .rpc
+        .mempool
+        .write()
+        .await
+        .add_checked_ctx(tx.clone(), balance, crate::mempool::AdmissionCtx::wall_now())
+    {
+        Ok(h) => h,
+        Err(e) => {
+            faucet.rollback(&tx, a, amount).await;
+            return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+        }
+    };
+    if let Some(bcast) = &st.rpc.tx_broadcast {
+        let _ = bcast.send(tx);
+    }
+    Json(json!({
+        "status": "pending",
+        "credited_nano": amount.to_string(),
+        "recipient": hex::encode(a),
+        "tx_hash": hex::encode(tx_hash),
+        "next_drip_in_seconds": crate::rpc::public_drip_cooldown_secs(),
+    }))
+    .into_response()
+}
+
+async fn api_balance(
+    State(st): State<Arc<GatewayState>>,
+    AxumPath(addr): AxumPath<String>,
+) -> Response {
+    let Some(a) = parse_addr(&addr) else {
+        return (StatusCode::BAD_REQUEST, "bad address").into_response();
+    };
+    let acc = st.rpc.engine.get_account(&a).await;
+    let (balance, nonce) = acc.map(|x| (x.balance, x.nonce)).unwrap_or((0, 0));
+    Json(json!({ "address": hex::encode(a), "balance": balance.to_string(), "nonce": nonce })).into_response()
+}
+
+async fn api_spv(
+    State(st): State<Arc<GatewayState>>,
+    AxumPath(addr): AxumPath<String>,
+) -> Response {
+    let Some(a) = parse_addr(&addr) else {
+        return (StatusCode::BAD_REQUEST, "bad address").into_response();
+    };
+    let acc = st.rpc.engine.get_account(&a).await;
+    let (balance, nonce) = acc.map(|x| (x.balance, x.nonce)).unwrap_or((0, 0));
+    let root = st.rpc.engine.get_state_root().await;
+    let proof = st.rpc.engine.get_account_proof(&a).await;
+    Json(json!({
+        "address": hex::encode(a),
+        "balance": balance.to_string(),
+        "nonce": nonce,
+        "state_root": hex::encode(root),
+        "proof": proof,
+    }))
+    .into_response()
+}
+
+async fn api_contracts(
+    State(st): State<Arc<GatewayState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    // Paginated like stell_listTokens (audit 2026-10-06): permissionless
+    // deploys grow this list; `limit` default 100, hard max 1000.
+    let limit: usize = query
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .map(|n: usize| n.min(1000))
+        .unwrap_or(100);
+    let offset: usize = query.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Bounded iteration like stell_listTokens (audit 2026-10-06): walk the
+    // registry directly and stop after offset+limit instead of materializing
+    // every address; skip/take semantics (and `total`) are unchanged.
+    let contracts = st.rpc.engine.contracts_read().await;
+    let total = contracts.contracts.len();
+    let addrs: Vec<String> =
+        contracts.contracts.keys().skip(offset).take(limit).map(hex::encode).collect();
+    Json(json!({ "contracts": addrs, "total": total, "offset": offset }))
+}
+
+/// Human-readable confidential display (backend part; read-only rendering,
+/// no consensus change).
+///
+/// A confidential transfer finalizes on chain but is opaque bytes without
+/// this: the commitments reveal no amount, so every other surface shows raw
+/// hex. These helpers turn it into a labeled shape the frontend can render
+/// instead.
+///
+/// JSON shape for the frontend (stable; additive-only evolution):
+/// ```json
+/// {
+///   "kind": "confidential",
+///   "sender": "<64-hex>",
+///   "recipient": "<64-hex>",
+///   "fee": 20,                       // u64 JSON number (confidential inner only)
+///   "inputs": 1,                     // input commitment count
+///   "outputs": 1,                   // output commitment count
+///   "input_commitments": ["<64-hex>", "..."],
+///   "output_commitments": ["<64-hex>", "..."],
+///   "spent": [true],                // per-input spent-status from the
+///                                    // committed ConfidentialState
+///   "all_spent": true
+/// }
+/// ```
+/// Non-confidential transactions use:
+/// ```json
+/// {
+///   "kind": "transparent",
+///   "sender": "<64-hex>", "recipient": "<64-hex>",
+///   "amount": 10, "fee_limit": 5, "nonce": 0,
+///   "tx_hash": "<64-hex>", "payload_ops": 0
+/// }
+/// ```
+/// (`fee_limit` is the DECLARED limit, not the charged fee — the old `fee`
+/// key overstated the charge and is gone.)
+/// `fee` here is the confidential-transfer inner fee (`transfer.fee`), NOT
+/// the transaction gas limit; gas is reported separately as `gas_limit` by
+/// `describe_transaction`.
+pub fn describe_confidential_transfer(
+    sender: &[u8; 32],
+    recipient: &[u8; 32],
+    transfer: &crate::crypto_privacy::ConfidentialTransfer,
+    state: &crate::crypto_privacy::ConfidentialState,
+) -> serde_json::Value {
+    let spent: Vec<bool> = transfer
+        .input_commitments
+        .iter()
+        .map(|c| state.is_spent(&c.commitment))
+        .collect();
+    let all_spent = !spent.is_empty() && spent.iter().all(|&b| b);
+    json!({
+        "kind": "confidential",
+        "sender": hex::encode(sender),
+        "recipient": hex::encode(recipient),
+        "fee": transfer.fee,
+        "inputs": transfer.input_commitments.len(),
+        "outputs": transfer.output_commitments.len(),
+        "input_commitments": transfer.input_commitments.iter().map(|c| hex::encode(c.commitment)).collect::<Vec<_>>(),
+        "output_commitments": transfer.output_commitments.iter().map(|c| hex::encode(c.commitment)).collect::<Vec<_>>(),
+        "spent": spent,
+        "all_spent": all_spent,
+    })
+}
+
+/// Human-readable rendering of one full transaction: a labeled confidential
+/// shape when the payload carries `SysCallConfidentialTransfer`, otherwise a
+/// transparent summary. Read-only; `confidential` is the committed shielded
+/// ledger used only for per-input spent-status.
+pub fn describe_transaction(
+    tx: &crate::sharding::Transaction,
+    confidential: &crate::crypto_privacy::ConfidentialState,
+) -> serde_json::Value {
+    let tx_hash = hex::encode(tx.compute_tx_hash());
+    for op in &tx.payload {
+        if let crate::svm::OpCode::SysCallConfidentialTransfer { recipient, transfer } = op {
+            let mut inner =
+                describe_confidential_transfer(&tx.from, recipient, transfer, confidential);
+            inner["tx_hash"] = json!(tx_hash);
+            inner["nonce"] = json!(tx.nonce);
+            inner["gas_limit"] = json!(tx.gas_limit);
+            inner["amount"] = json!(tx.amount);
+            return inner;
+        }
+        // V2 enforced transfer renders through the same viewer (proofs are
+        // verification material, not display data).
+        if let crate::svm::OpCode::SysCallConfidentialTransfer2 { recipient, transfer, .. } = op {
+            let mut inner =
+                describe_confidential_transfer(&tx.from, recipient, transfer, confidential);
+            inner["tx_hash"] = json!(tx_hash);
+            inner["nonce"] = json!(tx.nonce);
+            inner["gas_limit"] = json!(tx.gas_limit);
+            inner["amount"] = json!(tx.amount);
+            inner["enforced"] = json!(true);
+            return inner;
+        }
+        if let crate::svm::OpCode::SysCallConfidentialShield { commitment, amount, .. } = op {
+            return json!({
+                "kind": "confidential-shield",
+                "sender": hex::encode(tx.from),
+                "commitment": hex::encode(commitment),
+                "amount": amount,
+                "fee_limit": tx.gas_limit,
+                "nonce": tx.nonce,
+                "gas_limit": tx.gas_limit,
+                "tx_hash": tx_hash,
+            });
+        }
+        if let crate::svm::OpCode::SysCallConfidentialUnshield { inputs } = op {
+            let total: u64 = inputs.iter().map(|i| i.amount).fold(0u64, |a, b| a.saturating_add(b));
+            return json!({
+                "kind": "confidential-unshield",
+                "sender": hex::encode(tx.from),
+                "inputs": inputs.len(),
+                "amount": total,
+                "fee_limit": tx.gas_limit,
+                "nonce": tx.nonce,
+                "gas_limit": tx.gas_limit,
+                "tx_hash": tx_hash,
+            });
+        }
+    }
+    json!({
+        "kind": "transparent",
+        "sender": hex::encode(tx.from),
+        "recipient": hex::encode(tx.to),
+        "amount": tx.amount,
+        // Honest naming (audit 2026-10-06): this is the DECLARED limit, not
+        // the charged fee (charged <= limit; receipts don't store gas_used).
+        // The old "fee" key overstated the charge, so it is gone.
+        "fee_limit": tx.gas_limit,
+        "nonce": tx.nonce,
+        "gas_limit": tx.gas_limit,
+        "tx_hash": tx_hash,
+        "payload_ops": tx.payload.len(),
+    })
+}
+
+/// `GET /api/tx/:hash` — human-readable transaction view.
+///
+/// Serve order: mempool body (the only place a full pre-finalization payload
+/// lives on this node) rendered via `describe_transaction` + receipt status
+/// when finalized; else the finalized receipt alone (no payload to render, so
+/// `kind` is `receipt-only`); else 404 `{"status":"unknown"}` — never
+/// fabricated.
+async fn api_tx(
+    State(st): State<Arc<GatewayState>>,
+    AxumPath(hash_hex): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(raw) = hex::decode(hash_hex.strip_prefix("0x").unwrap_or(&hash_hex)) else {
+        return (StatusCode::BAD_REQUEST, "bad tx hash").into_response();
+    };
+    let Ok(hash): Result<[u8; 32], _> = raw.try_into() else {
+        return (StatusCode::BAD_REQUEST, "bad tx hash").into_response();
+    };
+    let found = st.rpc.mempool.read().await.all().into_iter().find(|t| t.compute_tx_hash() == hash);
+    if let Some(tx) = found {
+        let shielded = st.rpc.engine.confidential_read().await;
+        let mut view = describe_transaction(&tx, &shielded);
+        drop(shielded);
+        let receipts = st.rpc.receipts.read().await;
+        if let Some(r) = receipts.get(&hash) {
+            view["status"] = json!(if r.success { "success" } else { "failed" });
+            view["height"] = json!(r.height);
+            view["block_hash"] = json!(hex::encode(r.block_hash));
+            view["index"] = json!(r.index);
+            view["fee_charged"] = json!(r.fee_charged.to_string());
+        } else {
+            // Pending bodies are non-public, same as `stell_mempoolDump`:
+            // unauthenticated callers get hash/nonce/status only, never the
+            // full pre-finalization payload (front-running aid).
+            let authed = match &st.rpc.auth_token {
+                None => true,
+                Some(expected) => {
+                    let provided = query
+                        .get("token")
+                        .or_else(|| query.get("apiKey"))
+                        .map(|s| s.as_str())
+                        .or_else(|| extract_header_token(&headers));
+                    provided.map(|p| constant_time_eq(p, expected)).unwrap_or(false)
+                }
+            };
+            if !authed {
+                return Json(json!({
+                    "tx_hash": hex::encode(hash),
+                    "nonce": tx.nonce,
+                    "status": "pending",
+                }))
+                .into_response();
+            }
+            view["status"] = json!("pending");
+        }
+        return Json(view).into_response();
+    }
+    let receipts = st.rpc.receipts.read().await;
+    if let Some(r) = receipts.get(&hash) {
+        return Json(json!({
+            "kind": "receipt-only",
+            "tx_hash": hex::encode(r.tx_hash),
+            "height": r.height,
+            "block_hash": hex::encode(r.block_hash),
+            "index": r.index,
+            "status": if r.success { "success" } else { "failed" },
+            "gas_limit": r.gas_limit.to_string(),
+            "fee_charged": r.fee_charged.to_string(),
+        }))
+        .into_response();
+    }
+    (StatusCode::NOT_FOUND, Json(json!({ "status": "unknown" }))).into_response()
+}
+
+/// `GET /api/confidential/:commitment` — spent-status of one shielded input
+/// commitment (`{"commitment": hex, "spent": bool}`), read from the committed
+/// `ConfidentialState`. Read-only.
+async fn api_confidential_spent(
+    State(st): State<Arc<GatewayState>>,
+    AxumPath(commit_hex): AxumPath<String>,
+) -> Response {
+    let Some(a) = parse_addr(&commit_hex) else {
+        return (StatusCode::BAD_REQUEST, "bad commitment").into_response();
+    };
+    let shielded = st.rpc.engine.confidential_read().await;
+    let spent = shielded.is_spent(&a);
+    Json(json!({ "commitment": hex::encode(a), "spent": spent })).into_response()
+}
+
+async fn health_check() -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::OK, Json(json!({ "status": "ok", "service": "stellereum-gateway" })))
+}
+
+/// Liveness probe: the process is up and answering HTTP. Deliberately cheap —
+/// no locks, no state reads — so a wedged subsystem cannot fail it. Use
+/// `/readyz` to ask whether the node is actually useful.
+async fn healthz() -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::OK, Json(json!({ "status": "ok", "service": "stellereum-gateway" })))
+}
+
+/// Readiness probe: 200 when the node has finalized recently, holds peers and
+/// its height is advancing; 503 with a JSON body naming WHICH condition
+/// failed (`failed_checks`: `no_peers`, `no_finality`, `finality_stalled`,
+/// `height_zero`, `height_stalled`).
+async fn readyz(State(st): State<Arc<GatewayState>>) -> (StatusCode, Json<serde_json::Value>) {
+    let rep = st.readiness.evaluate();
+    let code = if rep.ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (
+        code,
+        Json(json!({
+            "ready": rep.ready,
+            "failed_checks": rep.failed_checks,
+            "height": rep.height,
+            "peers": rep.peers,
+            "secs_since_finalized": rep.secs_since_finalized,
+            "max_stall_secs": rep.max_stall_secs,
+            "min_peers": rep.min_peers,
+        })),
+    )
+}
+
+/// Render a scrape for the gateway.
+///
+/// The consensus [`Registry`](crate::metrics::Registry) is the primary source:
+/// it owns the whole consensus story (round, height, vote counters, fork
+/// counter, block/tx histograms, latency) plus the disk/state/validator
+/// observability families (`stell_data_dir_bytes`, `stell_snapshot_count`,
+/// `stell_state_entries`, `stell_persist_queue_*`, `stell_peer_round_lag`,
+/// `stell_validator_power_total`, `stell_validator_quorum_power`,
+/// `stell_validator_set_fragile`, `stell_build_info`), and is written to by
+/// the consensus driver through the same process-wide `Arc`. The four
+/// explorer-local gauges are folded in on top:
+///
+///  * `height` and `mempool` are also pushed into the registry, so a caller
+///    reading `stell_consensus_height` / `stell_mempool_size` sees them.
+///  * `contracts` and `tokens` have no family in the consensus registry, so
+///    they are appended below in the same exposition format (one HELP/TYPE
+///    pair each, LF-terminated) under their existing public names.
+///  * The disk/validator/state values the gateway *can* see (staking ledger,
+///    account map, data-dir scan, build identity) are pushed into the registry
+///    by the `/metrics` handler before rendering; families with no producer
+///    yet (persist queue, per-peer round lag) keep their pre-seeded zeros so
+///    a scrape is stable until wiring lands — see the NOTE on their setters.
+///
+/// Splitting it into a free function keeps the HTTP handler a thin adapter and
+/// makes the exact bytes a scrape produces testable without spinning up an
+/// `RpcState` or a server.
+pub fn render_metrics(
+    registry: &crate::metrics::Registry,
+    height: u64,
+    mempool: usize,
+    contracts: usize,
+    tokens: usize,
+) -> String {
+    // Legacy entry point: no readiness input, so `stell_ready` reports 0
+    // (fail-closed: unknown counts as not ready). Handlers that know the
+    // readiness use `render_metrics_with_readiness`.
+    render_metrics_with_readiness(registry, height, mempool, contracts, tokens, false)
+}
+
+/// Like [`render_metrics`], but carries the gateway readiness as the
+/// `stell_ready` gauge (1 = ready to serve, 0 = not ready), mirroring
+/// `/readyz`. The gauge is appended here — next to the other explorer-local
+/// gauges — rather than registered in the consensus [`Registry`], because it
+/// describes the gateway's view of the node, not consensus internals.
+pub fn render_metrics_with_readiness(
+    registry: &crate::metrics::Registry,
+    height: u64,
+    mempool: usize,
+    contracts: usize,
+    tokens: usize,
+    ready: bool,
+) -> String {
+    registry.set_height(height);
+    registry.set_mempool_size(mempool as u64);
+
+    let mut out = registry.render();
+    let ready_int = if ready { 1 } else { 0 };
+    out.push_str(&format!(
+        "# HELP stellereum_block_height Current finalized block height\n\
+         # TYPE stellereum_block_height gauge\n\
+         stellereum_block_height {height}\n\
+         # HELP stellereum_mempool_size Pending transactions in mempool\n\
+         # TYPE stellereum_mempool_size gauge\n\
+         stellereum_mempool_size {mempool}\n\
+         # HELP stellereum_contracts_total Deployed WASM smart contracts count\n\
+         # TYPE stellereum_contracts_total gauge\n\
+         stellereum_contracts_total {contracts}\n\
+         # HELP stellereum_tokens_total Fungible STS tokens count\n\
+         # TYPE stellereum_tokens_total gauge\n\
+         stellereum_tokens_total {tokens}\n\
+         # HELP stell_ready Node readiness for serving traffic (1 = ready, 0 = not ready)\n\
+         # TYPE stell_ready gauge\n\
+         stell_ready {ready_int}\n"
+    ));
+    out
+}
+
+/// Env var overriding the data directory scanned for the disk gauges.
+pub const DATA_DIR_ENV: &str = "STELL_DATA_DIR";
+/// Cap on directory entries visited per scrape: bounds scrape latency when the
+/// data dir grows (archive default is unbounded — see the disk-risk note).
+const DATA_DIR_SCAN_FILE_CAP: usize = 100_000;
+
+/// Data directory scanned for the disk gauges (`STELL_DATA_DIR`, else `./data`).
+pub fn data_dir_path() -> std::path::PathBuf {
+    std::env::var(DATA_DIR_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("./data"))
+}
+
+/// Best-effort `(bytes, snapshot_files)` under `dir`.
+///
+/// Never fails a scrape: unreadable entries are skipped, symlinks are not
+/// followed, traversal is capped, and a missing dir reads as `(0, 0)`.
+/// `snapshot_files` counts files whose name contains `snapshot` — an estimate
+/// for dashboards, not the sled tree count.
+pub fn data_dir_stats(dir: &std::path::Path) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut snaps = 0u64;
+    let mut visited = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if meta.is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            let Ok(entries) = std::fs::read_dir(&path) else { continue };
+            for entry in entries.flatten() {
+                if visited >= DATA_DIR_SCAN_FILE_CAP {
+                    return (bytes, snaps);
+                }
+                visited += 1;
+                stack.push(entry.path());
+            }
+        } else if meta.is_file() {
+            bytes = bytes.saturating_add(meta.len());
+            let is_snapshot = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.contains("snapshot"))
+                .unwrap_or(false);
+            if is_snapshot {
+                snaps = snaps.saturating_add(1);
+            }
+        }
+    }
+    (bytes, snaps)
+}
+
+/// `GET /api/version` — build identity of this binary.
+///
+/// Same values as the `stell_build_info` series in `/metrics`: crate version,
+/// git hash (build-script `STELL_BUILD_HASH`, else runtime `git rev-parse`
+/// fallback logged once, else `"unknown"`), and the dirty flag — plus the live
+/// height and node id so a deploy record (`docs/handoff/LIVE_VERSIONS.txt`)
+/// can be filled from one call.
+async fn api_version(State(st): State<Arc<GatewayState>>) -> Json<serde_json::Value> {
+    let mut v = crate::metrics::build_info_json();
+    v["height"] = json!(st.rpc.height.load(std::sync::atomic::Ordering::Relaxed));
+    v["node_id"] = json!(st.rpc.node_id.clone());
+    Json(v)
+}
+
+async fn prometheus_metrics(State(st): State<Arc<GatewayState>>) -> (StatusCode, [(&'static str, &'static str); 1], String) {
+    let height = st.rpc.height.load(std::sync::atomic::Ordering::Relaxed);
+    let mempool = st.rpc.mempool.read().await.len();
+    let contracts = st.rpc.engine.contract_count().await;
+    let tokens = st.rpc.engine.tokens_read().await.token_count();
+    // Validator-set story, same derivation as `stell_getValidators` (rpc.rs) so
+    // the gauge can never disagree with RPC: size, power, quorum, fragile flag.
+    {
+        let ledger = st.rpc.engine.staking_read().await;
+        let vs = ledger.to_validator_set();
+        let fragile = ledger.quorum_fragility().is_some();
+        st.metrics.set_validator_set_full(vs.len() as u64, vs.total_power(), vs.quorum_power(), fragile);
+    }
+    // State-entries estimate: live accounts plus the two committed registries
+    // that already have their own gauges above.
+    {
+        let accounts = st.rpc.engine.accounts.read().await.len() as u64;
+        st.metrics.set_state_entries(
+            accounts.saturating_add(contracts as u64).saturating_add(tokens as u64),
+        );
+    }
+    // Disk footprint (best-effort scan, capped; non-blocking spawn_blocking off Tokio worker thread).
+    {
+        let dir = data_dir_path();
+        let (bytes, snaps) = tokio::task::spawn_blocking(move || data_dir_stats(&dir))
+            .await
+            .unwrap_or((0, 0));
+        st.metrics.set_data_dir_bytes(bytes);
+        st.metrics.set_snapshot_count(snaps);
+    }
+    // Build identity (runtime git fallback inside the resolver, logged once).
+    // Persist-queue depth/dropped and per-peer round-lag have no producer yet
+    // (see the NOTE on their setters): the registry keeps their last values,
+    // pre-seeded at zero, so a scrape is stable until wiring lands.
+    st.metrics.set_build_info(
+        crate::metrics::BUILD_VERSION,
+        &crate::metrics::build_hash_resolved(),
+        &crate::metrics::build_dirty_resolved(),
+    );
+    let ready = st.readiness.evaluate().ready;
+    let text = render_metrics_with_readiness(&st.metrics, height, mempool, contracts, tokens, ready);
+    (StatusCode::OK, [("content-type", crate::metrics::CONTENT_TYPE)], text)
+}
+
+async fn cors_middleware(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert("access-control-allow-origin", "*".parse().unwrap());
+    headers.insert("access-control-allow-methods", "GET, POST, OPTIONS".parse().unwrap());
+    headers.insert("access-control-allow-headers", "content-type, authorization, x-requested-with, cf-turnstile-response, x-turnstile-token".parse().unwrap());
+    resp
+}
+
+/// Build the gateway router (explorer UI + JSON API + JSON-RPC under /rpc).
+pub fn router(gateway: Arc<GatewayState>) -> Router {
+    // CORS on the nested router (headers must be set on its responses);
+    // rate limiting via a DEDICATED limiter instance (audit follow-up): the
+    // outer limiter below may or may not cover nested routes depending on
+    // axum layer/nest semantics — either way /rpc gets exactly one counting
+    // layer here, never zero, never double-counted on the shared bucket.
+    let rpc_router = crate::rpc::router(gateway.rpc.clone())
+        .layer(middleware::from_fn(cors_middleware))
+        .layer(middleware::from_fn_with_state(gateway.clone(), nested_rpc_rate_limit));
+    Router::new()
+        .route("/", get(index))
+        .route("/health", get(health_check))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(prometheus_metrics))
+        .route("/api/stats", get(api_stats))
+        .route("/api/version", get(api_version))
+        .route("/api/blocks", get(api_blocks))
+        .route("/api/balance/:address", get(api_balance))
+        .route("/api/tx/:hash", get(api_tx))
+        .route("/api/confidential/:commitment", get(api_confidential_spent))
+        // State-changing on GET is a crawler/prefetch/CSRF footgun (audit
+        // 2026-10-06): the faucet mints money, so it is POST-only. GET keeps
+        // a 405 with a hint instead of silently minting.
+        .route("/api/faucet/:address", post(api_faucet).get(faucet_get_hint))
+        // Public testnet drip (TON-style, tokenless): POST-only, 5 STELL per
+        // address per 45 minutes. Separate route so the token gate on the
+        // operator faucet above is never weakened.
+        .route("/api/faucet-public/:address", post(api_faucet_public).get(faucet_get_hint))
+        .route("/api/spv/:address", get(api_spv))
+        .route("/api/contracts", get(api_contracts))
+        .layer(middleware::from_fn(cors_middleware))
+        .layer(middleware::from_fn_with_state(gateway.clone(), rate_limit))
+        // Same anti-slow-loris layers as the standalone RPC (audit 2026-10-06).
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(axum::error_handling::HandleErrorLayer::new(
+                    |_: axum::BoxError| async { axum::http::StatusCode::REQUEST_TIMEOUT },
+                ))
+                .layer(tower::timeout::TimeoutLayer::new(std::time::Duration::from_secs(30)))
+                .layer(tower::limit::ConcurrencyLimitLayer::new(512)),
+        )
+        .with_state(gateway)
+        // Nesting after `with_state` so both routers share the `()` state. The
+        // nested router already carries its own CORS/rate-limit layers above.
+        .nest("/rpc", rpc_router)
+}
+
+/// Serve the gateway with per-IP connect info for the rate limiter.
+pub async fn serve(addr: &str, gateway: Arc<GatewayState>) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(
+        listener,
+        router(gateway).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limiter_enforces_per_ip_window() {
+        let rl = RateLimiter::new(2);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let t = 1_700_000_000u64;
+        assert!(rl.check_at(ip, t));
+        assert!(rl.check_at(ip, t));
+        assert!(!rl.check_at(ip, t), "third request in the same second must be rejected");
+        // a different IP has its own bucket
+        assert!(rl.check_at("5.6.7.8".parse().unwrap(), t));
+        // next second resets the window
+        assert!(rl.check_at(ip, t + 1));
+    }
+
+    #[test]
+    fn parse_addr_validates_length() {
+        assert!(parse_addr("0x00").is_none());
+        let good = hex::encode([9u8; 32]);
+        assert_eq!(parse_addr(&good), Some([9u8; 32]));
+        assert_eq!(parse_addr(&format!("0x{good}")), Some([9u8; 32]));
+    }
+}

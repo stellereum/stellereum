@@ -1,0 +1,31 @@
+# Stellereum node in one command.
+#
+#   docker compose up
+#
+# Build context is the parent dir so both the blockchain and its infnode
+# dependency are available (docker build needs both sources).
+services:
+  stellereum:
+    build:
+      context: ..
+      dockerfile: stellereum/Dockerfile
+    image: stellereum/node:dev
+    container_name: stellereum-node
+    ports:
+      - "9410:9410/udp"   # QUIC P2P
+      - "8545:8545/tcp"   # JSON-RPC
+      - "8080:8080/tcp"   # Explorer UI & Gateway
+    volumes:
+      - ./data-store:/opt/stellereum/data
+      - ./keys-store:/opt/stellereum/keys
+    environment:
+      # SECURITY (audit 2026-10-06): these binds expose the ports to the
+      # world while auth tokens default to UNSET (fail-open dev mode). For a
+      # public host EITHER keep the loopback binds below and reverse-proxy,
+      # OR set STELL_RPC_AUTH_TOKEN (+ STELL_FAUCET_TOKEN if faucet is on).
+      # Loopback default: reach the node via `docker exec` or a proxy.
+      - STELL_RPC_LISTEN=127.0.0.1:8545
+      - STELL_EXPLORER_LISTEN=127.0.0.1:8080
+      # - STELL_RPC_AUTH_TOKEN=change-me-before-exposing
+      # - STELL_FAUCET_TOKEN=change-me-before-exposing
+    restart: unless-stopped

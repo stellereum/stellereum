@@ -1,0 +1,46 @@
+# =============================================================================
+# Stellereum 4-validator stand — node D template (validator 4 of 4)
+# =============================================================================
+#
+# DEPLOY TARGET: /root/nodeD/node.yaml on the live server (root@<VALIDATOR_HOST>
+# — the real host is operator knowledge, it is deliberately NOT stored in this
+# repo).
+# TEMPLATE — ALL identities below (A/B/C/D) are placeholders; fill them in
+# first (procedure is in nodeC.yaml.template and in VALIDATOR_SET_PLAN.md):
+# A/B from the live /root/nodeA/node.yaml and /root/nodeB/node.yaml, C/D from
+# each node's "NODE IDENTITY" log line.
+#
+# CONVENTION: deployed "others only" (see nodeC.yaml.template header).
+# nodeD.validators below = [A, C, B-ordered-as-A,B,C]. Its derived set is
+# {D} UNION {A, B, C} = {A, B, C, D}, identical to every other node's set.
+#
+# PORTS (single server): P2P 0.0.0.0:9413, advertise 127.0.0.1:9413.
+# RPC is not in this file; it comes from /root/env.D (127.0.0.1:8548).
+# -----------------------------------------------------------------------------
+
+name: nodeD
+listen: "0.0.0.0:9413"
+advertise: "127.0.0.1:9413"
+validators:
+  - "inf1:PLACEHOLDER_A_NODE_ID_00000000000000000000"
+  - "inf1:PLACEHOLDER_B_NODE_ID_00000000000000000000"
+  - "inf1:PLACEHOLDER_C_NODE_ID_00000000000000000000"
+peers:
+  - name: nodeA
+    node-id: "inf1:PLACEHOLDER_A_NODE_ID_00000000000000000000"
+    ed-pub: "PLACEHOLDER_A_ED_PUB_0000000000000000000000000000000000000000000000000000"
+    x-pub: "PLACEHOLDER_A_X_PUB_0000000000000000000000000000000000000000000000000000000"
+    endpoints: ["127.0.0.1:9410"]
+    allow: ["*"]
+  - name: nodeB
+    node-id: "inf1:PLACEHOLDER_B_NODE_ID_00000000000000000000"
+    ed-pub: "PLACEHOLDER_B_ED_PUB_0000000000000000000000000000000000000000000000000000"
+    x-pub: "PLACEHOLDER_B_X_PUB_0000000000000000000000000000000000000000000000000000000"
+    endpoints: ["127.0.0.1:9411"]
+    allow: ["*"]
+  - name: nodeC
+    node-id: "inf1:PLACEHOLDER_C_NODE_ID_00000000000000000000"
+    ed-pub: "PLACEHOLDER_C_ED_PUB_0000000000000000000000000000000000000000000000000000"
+    x-pub: "PLACEHOLDER_C_X_PUB_0000000000000000000000000000000000000000000000000000000"
+    endpoints: ["127.0.0.1:9412"]
+    allow: ["*"]

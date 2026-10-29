@@ -1,0 +1,260 @@
+use anyhow::{anyhow, bail, Result};
+use rand::RngCore;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use rand::rngs::OsRng;
+use std::path::Path;
+use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
+use crate::proto::NODEID_LEN;
+
+/// Параметры KDF (memory-hard Argon2id): 64 MiB, 3 прохода, 4 линии.
+const KDF_MEM_KIB: u32 = 65_536;
+const KDF_ITERS: u32 = 3;
+const KDF_LANES: u32 = 4;
+
+/// Вывести 32-байтовый ключ шифрования из пассфразы через Argon2id (memory-hard).
+fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
+    let params = argon2::Params::new(KDF_MEM_KIB, KDF_ITERS, KDF_LANES, Some(32))
+        .map_err(|e| anyhow!("argon2 params: {e}"))?;
+    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let mut key = [0u8; 32];
+    argon2
+        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .map_err(|e| anyhow!("argon2 kdf: {e}"))?;
+    Ok(key)
+}
+
+fn get_passphrase() -> Option<String> {
+    std::env::var("STELL_NODE_PASSPHRASE")
+        .ok()
+        .or_else(|| std::env::var("INFNODE_KEY_PASSPHRASE").ok())
+        .filter(|p| !p.is_empty())
+}
+
+/// LEGACY KDF (iterated blake3) — только для чтения старых `enc:` файлов.
+fn legacy_passphrase_key() -> Option<[u8; 32]> {
+    let p = get_passphrase()?;
+    let mut h = blake3::hash(format!("infnode-key-v1:{p}").as_bytes());
+    for _ in 0..65536 {
+        h = blake3::hash(h.as_bytes());
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&h.as_bytes()[..32]);
+    Some(k)
+}
+
+/// Шифрует данные, если задана STELL_NODE_PASSPHRASE или INFNODE_KEY_PASSPHRASE; иначе возвращает как есть с предупреждением.
+/// Формат: `enc2:<salt_hex>:<nonce_hex>:<ct_hex>` (Argon2id + XChaCha20-Poly1305).
+pub fn protect(data: &[u8]) -> String {
+    let Some(pass) = get_passphrase() else {
+        eprintln!("[WARN] STELL_NODE_PASSPHRASE не задан: сохранение ключей в открытом виде");
+        return String::from_utf8_lossy(data).to_string();
+    };
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    let mut key = derive_key(&pass, &salt).expect("argon2 kdf");
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce);
+    let c = XChaCha20Poly1305::new(Key::from_slice(&key));
+    let ct = c
+        .encrypt(XNonce::from_slice(&nonce), data)
+        .expect("key encrypt");
+    key.zeroize();
+    format!(
+        "enc2:{}:{}:{}",
+        hex::encode(salt),
+        hex::encode(nonce),
+        hex::encode(&ct)
+    )
+}
+
+/// Дешифрует строку. Поддерживает `enc2:` (Argon2id), legacy `enc:` и plaintext.
+pub fn unprotect(data: &str) -> Result<String> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+
+    if let Some(rest) = data.strip_prefix("enc2:") {
+        let parts: Vec<&str> = rest.splitn(3, ':').collect();
+        if parts.len() != 3 {
+            bail!("bad enc2 blob");
+        }
+        let salt = hex::decode(parts[0])?;
+        let nonce = hex::decode(parts[1])?;
+        let ct = hex::decode(parts[2])?;
+        let pass = get_passphrase()
+            .ok_or_else(|| anyhow!("ключи зашифрованы, но STELL_NODE_PASSPHRASE не задан"))?;
+        let mut key = derive_key(&pass, &salt)?;
+        let c = XChaCha20Poly1305::new(Key::from_slice(&key));
+        let plain = c
+            .decrypt(XNonce::from_slice(&nonce), ct.as_ref())
+            .map_err(|_| anyhow!("неверная пассфраза"));
+        key.zeroize();
+        let plain = plain?;
+        Ok(String::from_utf8_lossy(&plain).to_string())
+    } else if let Some(b64) = data.strip_prefix("enc:") {
+        // Legacy iterated-blake3 формат (обратная совместимость)
+        let key = legacy_passphrase_key()
+            .ok_or_else(|| anyhow!("ключи зашифрованы, но STELL_NODE_PASSPHRASE не задан"))?;
+        let blob = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)?;
+        if blob.len() < 24 {
+            bail!("bad enc blob");
+        }
+        let (nonce, ct) = blob.split_at(24);
+        let c = XChaCha20Poly1305::new(Key::from_slice(&key));
+        let plain = c
+            .decrypt(XNonce::from_slice(nonce), ct)
+            .map_err(|_| anyhow!("неверная пассфраза"))?;
+        Ok(String::from_utf8_lossy(&plain).to_string())
+    } else {
+        if get_passphrase().is_none() {
+            eprintln!("[WARN] STELL_NODE_PASSPHRASE не задан: загрузка ключей в открытом виде");
+        }
+        Ok(data.to_string())
+    }
+}
+
+/// Записать приватный файл с правами 0600 (только владелец).
+#[cfg(unix)]
+pub fn write_private(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn write_private(path: &Path, contents: &str) -> Result<()> {
+    std::fs::write(path, contents)?;
+    Ok(())
+}
+
+/// Каталог для секретов — только владелец (0700).
+#[cfg(unix)]
+pub fn secure_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn secure_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct NodeKeys {
+    pub signing: SigningKey,
+    pub verifying: VerifyingKey,
+    pub e2e_sec: StaticSecret,
+    pub e2e_pub: PublicKey,
+}
+
+impl NodeKeys {
+    pub fn generate() -> Self {
+        let mut csprng = OsRng;
+        let signing = SigningKey::generate(&mut csprng);
+        let verifying = signing.verifying_key();
+        let e2e_sec = StaticSecret::random_from_rng(OsRng);
+        let e2e_pub = PublicKey::from(&e2e_sec);
+        Self {
+            signing,
+            verifying,
+            e2e_sec,
+            e2e_pub,
+        }
+    }
+
+    pub fn id(&self) -> [u8; NODEID_LEN] {
+        let h = blake3::hash(self.verifying.as_bytes());
+        let mut id = [0u8; NODEID_LEN];
+        id.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
+        id
+    }
+
+    pub fn id_hex(&self) -> String {
+        format!("inf1:{}", hex::encode(self.id()))
+    }
+
+    pub fn ed_hex(&self) -> String {
+        hex::encode(self.verifying.as_bytes())
+    }
+
+    pub fn x_hex(&self) -> String {
+        hex::encode(self.e2e_pub.as_bytes())
+    }
+
+    pub fn save(&self, dir: &Path) -> Result<()> {
+        secure_dir(dir)?;
+        // Шифруем (если задана пассфраза) и пишем с правами 0600.
+        let mut id_hex = hex::encode(self.signing.to_bytes());
+        let mut e2e_hex = hex::encode(self.e2e_sec.to_bytes());
+        write_private(&dir.join("identity.key"), &protect(id_hex.as_bytes()))?;
+        write_private(&dir.join("e2e.key"), &protect(e2e_hex.as_bytes()))?;
+        id_hex.zeroize();
+        e2e_hex.zeroize();
+        Ok(())
+    }
+
+    pub fn load(dir: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_meta = std::fs::metadata(dir)
+                .map_err(|e| anyhow!("keystore dir {}: {e}", dir.display()))?;
+            let dir_mode = dir_meta.permissions().mode() & 0o777;
+            if dir_mode != 0o700 {
+                bail!("keystore dir {} has insecure permissions 0o{:03o}, expected 0o700", dir.display(), dir_mode);
+            }
+            let id_path = dir.join("identity.key");
+            let id_meta = std::fs::metadata(&id_path)
+                .map_err(|e| anyhow!("identity.key: {e}"))?;
+            let id_mode = id_meta.permissions().mode() & 0o777;
+            if id_mode != 0o600 {
+                bail!("identity.key has insecure permissions 0o{:03o}, expected 0o600", id_mode);
+            }
+            let e2e_path = dir.join("e2e.key");
+            let e2e_meta = std::fs::metadata(&e2e_path)
+                .map_err(|e| anyhow!("e2e.key: {e}"))?;
+            let e2e_mode = e2e_meta.permissions().mode() & 0o777;
+            if e2e_mode != 0o600 {
+                bail!("e2e.key has insecure permissions 0o{:03o}, expected 0o600", e2e_mode);
+            }
+        }
+        let id = std::fs::read_to_string(dir.join("identity.key"))
+            .map_err(|e| anyhow!("identity.key: {e}"))?;
+        let e2e = std::fs::read_to_string(dir.join("e2e.key"))
+            .map_err(|e| anyhow!("e2e.key: {e}"))?;
+        let mut id_plain = unprotect(id.trim())?;
+        let mut e2e_plain = unprotect(e2e.trim())?;
+        let id_bytes: [u8; 32] = hex::decode(id_plain.trim())?
+            .try_into()
+            .map_err(|_| anyhow!("identity seed должен быть 32 байта"))?;
+        let e2e_bytes: [u8; 32] = hex::decode(e2e_plain.trim())?
+            .try_into()
+            .map_err(|_| anyhow!("e2e seed должен быть 32 байта"))?;
+        // Стереть промежуточные plaintext-строки из памяти
+        id_plain.zeroize();
+        e2e_plain.zeroize();
+        let signing = SigningKey::from_bytes(&id_bytes);
+        let verifying = signing.verifying_key();
+        let e2e_sec = StaticSecret::from(e2e_bytes);
+        let e2e_pub = PublicKey::from(&e2e_sec);
+        Ok(Self {
+            signing,
+            verifying,
+            e2e_sec,
+            e2e_pub,
+        })
+    }
+}

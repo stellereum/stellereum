@@ -1,0 +1,121 @@
+# alerts.rules — Prometheus alerting rules for the Stellereum two-node stand.
+#
+# Load from prometheus.yml via:
+#   rule_files:
+#     - "alerts.rules"
+# Evaluate with: promtool check rules alerts.rules
+#
+# Metric sources (see src/metrics.rs, src/explorer.rs):
+#   stell_consensus_height  gauge, block height the engine is working on
+#   stell_ready             gauge, 1 = /readyz reports ready, 0 = not ready
+#                           (absent on pre-readiness binaries — see runbook)
+#   up                      standard Prometheus scrape-health gauge
+#   node_filesystem_*       node_exporter (required for the disk rules)
+#
+# Stall window N: the node itself treats "no finalize / no height advance for
+# more than STELL_READY_MAX_STALL_SECS" as unready (/readyz names
+# finality_stalled / height_stalled). The default is 30 s
+# (ReadinessConfig::default in src/explorer.rs; tests pin it in
+# tests/readiness_tests.rs via STALL=30). The PromQL windows below are
+# multiples of that N so Prometheus (scrape_interval 15 s) does not flap on
+# a slow-but-live chain; /readyz remains the fast (30 s) path.
+#
+# KNOWN GAP (2026-09-26): no metric exports the connected-peer count, so
+# "no_peers" has no exact PromQL. StellNoPeersSuspected below is best-effort
+# (per-peer latency series vanish when no peer is measured); the authoritative
+# signal is /readyz failed_checks containing "no_peers". If a peer-count
+# gauge is ever exported, replace that rule with `peer_count == 0`.
+
+groups:
+  - name: stellereum-node
+    interval: 30s
+    rules:
+      # --- process down -------------------------------------------------
+      - alert: StellNodeDown
+        expr: up{job=~"stellereum.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Stellereum {{ $labels.instance }} is not scrapeable (process down?)"
+          description: "No successful /metrics scrape for 1m. check.sh reports DOWN (exit 2)."
+          runbook: "scripts/monitor/RUNBOOK.md#stellnodedown"
+
+      # --- alive but not ready ------------------------------------------
+      - alert: StellNotReady
+        expr: stell_ready{job=~"stellereum.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Stellereum {{ $labels.instance }} alive but not ready"
+          description: "/readyz reports unready for 2m. Curl /readyz for the named failed_checks (no_peers, no_finality, finality_stalled, height_zero, height_stalled)."
+          runbook: "scripts/monitor/RUNBOOK.md#stellnotready"
+
+      # --- finality stalled: no height advance for N sec -----------------
+      # N comes from the readiness default (30 s); window 2m + for 1m ~= 3xN.
+      - alert: StellFinalityStalled
+        expr: changes(stell_consensus_height{job=~"stellereum.*"}[2m]) == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Stellereum {{ $labels.instance }} height not advancing (~3m)"
+          description: "stell_consensus_height unchanged for ~3m (readiness N=30s). Chain is stalled: possible view-change spin with zero finalizes or peer loss."
+          runbook: "scripts/monitor/RUNBOOK.md#stellfinalitystalled"
+
+      # --- stuck pre-consensus (height 0 forever) ------------------------
+      - alert: StellHeightZero
+        expr: stell_consensus_height{job=~"stellereum.*"} == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stellereum {{ $labels.instance }} still at height 0 after 10m"
+          description: "RPC answers but height never left 0: stuck pre-consensus (DHT warmup) or never finalized. Cf. readyz height_zero + no_finality."
+          runbook: "scripts/monitor/RUNBOOK.md#stellheightzero"
+
+      # --- no peers (best-effort; see KNOWN GAP above) --------------------
+      - alert: StellNoPeersSuspected
+        expr: absent(stell_peer_latency_seconds_bucket{job=~"stellereum.*"})
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stellereum: no per-peer latency series for 15m (peer loss?)"
+          description: "Best-effort signal only — no peer-count metric is exported. Confirm with: curl /readyz (failed_checks=no_peers?) and log greps. Do not page on this alone."
+          runbook: "scripts/monitor/RUNBOOK.md#stellnopeerssuspected"
+
+      # --- disk: the box is ~10 GB ---------------------------------------
+      - alert: StellDiskFullWarning
+        expr: 100 * (1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})
+          > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk on {{ $labels.instance }} > 85% full"
+          description: "Root filesystem above 85% for 10m. Logs grow ~7 MB/hour/node unbounded without rotation; journal is ~1 GB. Free space before any restart/wipe."
+          runbook: "scripts/monitor/RUNBOOK.md#stelldiskfullwarning"
+
+      - alert: StellDiskFullCritical
+        expr: 100 * (1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})
+          > 95
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Disk on {{ $labels.instance }} > 95% full — node will die"
+          description: "Root filesystem above 95% for 5m. Abort restarts; free space NOW (vacuum journal, clear stale *.log, never delete data/ to free space)."
+          runbook: "scripts/monitor/RUNBOOK.md#stelldiskfullwarning"
+
+      # --- log growth anomaly: disk *will* fill at current burn rate -----
+      - alert: StellDiskFillingFast
+        expr: predict_linear(node_filesystem_avail_bytes{mountpoint="/"}[2h], 6 * 3600) < 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk on {{ $labels.instance }} fills within ~6h at current growth"
+          description: "predict_linear over 2h says avail bytes hit zero within 6h. Usual cause: node logs (STELL_LOG_MAX_BYTES/MAX_FILES rotation) or stale *.log files in /root/nodeA|B. Confirm with du before acting."
+          runbook: "scripts/monitor/RUNBOOK.md#stelldiskfillingfast"

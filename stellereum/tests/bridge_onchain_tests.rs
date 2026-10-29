@@ -1473,7 +1473,12 @@ async fn bridge_intents_from_a_workchain_are_refused() {
     let att_mc = attest(&dep_mc, &vals[..2]);
     let out = e
         .apply_block_transition(
-            &bridge_block(1, TS, vec![bridge_tx(&payer, 0, ops(Some(att_mc), dep_mc))], payer_pk),
+            &bridge_block(
+                1,
+                TS,
+                vec![bridge_tx(&payer, 0, ops(Some(att_mc), dep_mc))],
+                payer_pk,
+            ),
             0,
         )
         .await;

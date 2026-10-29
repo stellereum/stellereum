@@ -6,12 +6,12 @@
 //! timeout, quorum-math, vote-path, or serialization changes.
 
 use stellereum::consensus::{
+    consensus_quorum_min, deterministic_round_timeout_ms, pq_micro_quorum_threshold,
     ADAPTIVE_EXTENSION_CAP_MS, ADAPTIVE_EXTENSION_PER_MISS_MS, DETERMINISTIC_BACKOFF_CAP_MS,
-    DETERMINISTIC_BACKOFF_PER_ROUND_MS, MAX_COMMIT_CERT_SIGNERS,
-    MAX_DEADLOCK_JUMP, MAX_RETAINED_VOTE_ROUNDS, MAX_ROUND_ADVANCE_PER_MESSAGE, MAX_ROUND_AHEAD,
-    MAX_SCAN_SPAN, MAX_SYNC_JUMPS_PER_ROUND, MICRO_COMMITTEE_MAX_SIZE, NIL_CIRCUIT_BREAKER_K,
-    PROPOSER_MISS_THRESHOLD_M, REPHASE_SCAN_WINDOW, ROUND_LOOKBACK, consensus_quorum_min,
-    deterministic_round_timeout_ms, pq_micro_quorum_threshold,
+    DETERMINISTIC_BACKOFF_PER_ROUND_MS, MAX_COMMIT_CERT_SIGNERS, MAX_DEADLOCK_JUMP,
+    MAX_RETAINED_VOTE_ROUNDS, MAX_ROUND_ADVANCE_PER_MESSAGE, MAX_ROUND_AHEAD, MAX_SCAN_SPAN,
+    MAX_SYNC_JUMPS_PER_ROUND, MICRO_COMMITTEE_MAX_SIZE, NIL_CIRCUIT_BREAKER_K,
+    PROPOSER_MISS_THRESHOLD_M, REPHASE_SCAN_WINDOW, ROUND_LOOKBACK,
 };
 use stellereum::consensus_net::{
     BROADCAST_JOIN_TIMEOUT_MS_DEFAULT, CONS_BCAST_MIN_INTERVAL_MS_DEFAULT,
@@ -87,8 +87,5 @@ fn transport_and_block_bounds_are_pinned() {
     assert_eq!(MAX_TIMESTAMP_JUMP_SECS, 3_600);
     assert_eq!(PROPOSAL_ALIGN_WINDOW_ROUNDS, 8);
     assert_eq!(PendingActivationBuffer::MAX_GLOBAL_BUFFERED_TXS, 2048);
-    assert_eq!(
-        PendingActivationBuffer::MAX_NONCES_PER_ACCOUNT,
-        4
-    );
+    assert_eq!(PendingActivationBuffer::MAX_NONCES_PER_ACCOUNT, 4);
 }

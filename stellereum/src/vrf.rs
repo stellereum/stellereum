@@ -520,9 +520,7 @@ mod tests {
     /// silently broken.
     #[test]
     fn phase1_sortition_election_ignores_vrf_registry() {
-        use crate::consensus::{
-            derive_sortition_committee, sortition_seed, ValidatorSet,
-        };
+        use crate::consensus::{derive_sortition_committee, sortition_seed, ValidatorSet};
         let ids: Vec<[u8; 32]> = (1u8..=4).map(|i| [i; 32]).collect();
         let vs = ValidatorSet::from_list(ids.iter().map(|id| (*id, 10)).collect());
         let parent = [0x5Au8; 32];
@@ -531,8 +529,7 @@ mod tests {
         // Register a verified VRF key for every validator...
         let mut reg = VrfRegistry::new();
         for id in &ids {
-            let falcon =
-                crate::post_quantum::FalconKeypair::generate_from_seed_bytes(id);
+            let falcon = crate::post_quantum::FalconKeypair::generate_from_seed_bytes(id);
             let vrf_pk = VrfSecret::from_seed(id).public_key().to_bytes();
             let sig = falcon.sign(&vrf_binding_preimage(id, &vrf_pk));
             reg.register(

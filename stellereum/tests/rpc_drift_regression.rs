@@ -143,13 +143,9 @@ async fn unshield_missing_params_is_invalid_params() {
     assert_eq!(err.code(), -32602);
 
     let to = hex::encode([0xccu8; 32]);
-    let err2 = native_api::dispatch(
-        &e,
-        "stell_unshield",
-        &json!({"to": to, "amount": 10u64}),
-    )
-    .await
-    .expect_err("unshield without inputs must refuse");
+    let err2 = native_api::dispatch(&e, "stell_unshield", &json!({"to": to, "amount": 10u64}))
+        .await
+        .expect_err("unshield without inputs must refuse");
     assert_eq!(err2.code(), -32602);
 }
 
@@ -203,7 +199,11 @@ async fn rpc_router_routes_shielded_and_native_manifest() {
         .iter()
         .filter_map(|m| m["name"].as_str().map(str::to_string))
         .collect();
-    for n in ["stell_shieldedTransfer", "stell_shieldedBalance", "stell_unshield"] {
+    for n in [
+        "stell_shieldedTransfer",
+        "stell_shieldedBalance",
+        "stell_unshield",
+    ] {
         assert!(names.contains(&n.to_string()), "manifest needs {n}");
     }
 }
@@ -211,23 +211,51 @@ async fn rpc_router_routes_shielded_and_native_manifest() {
 #[tokio::test]
 async fn evm_compat_surface_shapes() {
     let a = EvmAdapter::new();
-    assert_eq!(a.dispatch("eth_chainId", &json!(null)).unwrap(), json!("0x167d"));
-    assert_eq!(a.dispatch("net_version", &json!(null)).unwrap(), json!("5757"));
-    assert!(a.dispatch("web3_clientVersion", &json!(null)).unwrap().is_string());
-    assert!(a.dispatch("net_listening", &json!(null)).unwrap().is_boolean());
-    assert!(a.dispatch("net_peerCount", &json!(null)).unwrap().is_string());
-    assert!(a.dispatch("eth_syncing", &json!(null)).unwrap().is_boolean());
-    assert!(a.dispatch("eth_gasPrice", &json!(null)).unwrap().is_string());
+    assert_eq!(
+        a.dispatch("eth_chainId", &json!(null)).unwrap(),
+        json!("0x167d")
+    );
+    assert_eq!(
+        a.dispatch("net_version", &json!(null)).unwrap(),
+        json!("5757")
+    );
+    assert!(a
+        .dispatch("web3_clientVersion", &json!(null))
+        .unwrap()
+        .is_string());
+    assert!(a
+        .dispatch("net_listening", &json!(null))
+        .unwrap()
+        .is_boolean());
+    assert!(a
+        .dispatch("net_peerCount", &json!(null))
+        .unwrap()
+        .is_string());
+    assert!(a
+        .dispatch("eth_syncing", &json!(null))
+        .unwrap()
+        .is_boolean());
+    assert!(a
+        .dispatch("eth_gasPrice", &json!(null))
+        .unwrap()
+        .is_string());
     assert!(a
         .dispatch("eth_maxPriorityFeePerGas", &json!(null))
         .unwrap()
         .is_string());
-    assert_eq!(a.dispatch("eth_estimateGas", &json!([])).unwrap(), json!("0x5208"));
-    assert!(a.dispatch("eth_blockNumber", &json!(null)).unwrap().is_string());
+    assert_eq!(
+        a.dispatch("eth_estimateGas", &json!([])).unwrap(),
+        json!("0x5208")
+    );
+    assert!(a
+        .dispatch("eth_blockNumber", &json!(null))
+        .unwrap()
+        .is_string());
     // No uncles on this chain: known blocks report 0x0, unknown hashes are null.
     let zero_hash = format!("0x{}", "00".repeat(32));
     assert_eq!(
-        a.dispatch("eth_getUncleCountByBlockHash", &json!([zero_hash])).unwrap(),
+        a.dispatch("eth_getUncleCountByBlockHash", &json!([zero_hash]))
+            .unwrap(),
         Value::Null
     );
     assert_eq!(
@@ -245,7 +273,10 @@ async fn evm_compat_surface_shapes() {
     assert_eq!(un, json!(true));
     // Unknown ERC-20 selector echoes 0x.
     let call = a
-        .dispatch("eth_call", &json!([{"data": "0xdeadbeef00000000"}, "latest"]))
+        .dispatch(
+            "eth_call",
+            &json!([{"data": "0xdeadbeef00000000"}, "latest"]),
+        )
         .unwrap();
     assert_eq!(call, json!("0x"));
 }

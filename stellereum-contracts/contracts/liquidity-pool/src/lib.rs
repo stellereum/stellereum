@@ -276,7 +276,10 @@ mod tests {
         // Constant-product invariant: the fee stays in the pool, so k grows.
         let k_after_ab = 11_000i64 * (40_000 - 3_626) as i64;
         assert_eq!(k_after_ab, 400_114_000);
-        assert!(k_after_ab > 10_000i64 * 40_000, "k must grow by the fee leg");
+        assert!(
+            k_after_ab > 10_000i64 * 40_000,
+            "k must grow by the fee leg"
+        );
 
         // Swap B -> A (Reverse Swap): sell 3,000 Token B
         let quote_ba = swap_quote_b_for_a(3_000);

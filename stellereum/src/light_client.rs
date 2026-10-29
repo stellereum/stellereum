@@ -2566,12 +2566,18 @@ mod tests {
         let trie_proof = trie.generate_proof(&present).expect("proof");
         let mut tampered =
             crate::cpat2::ArchiveProof::inclusion(7, root, present, &trie_proof).expect("archive");
-        assert!(lc.verify_archive_proof(&tampered).is_ok(), "sanity: untampered verifies");
+        assert!(
+            lc.verify_archive_proof(&tampered).is_ok(),
+            "sanity: untampered verifies"
+        );
         let last = tampered.proof_nodes.len() - 1;
         let mut raw = hex::decode(&tampered.proof_nodes[last]).expect("nodes are hex");
         raw[0] ^= 0xFF;
         tampered.proof_nodes[last] = hex::encode(raw);
-        assert!(!tampered.verify(), "sanity: tampered nodes break the proof itself");
+        assert!(
+            !tampered.verify(),
+            "sanity: tampered nodes break the proof itself"
+        );
         assert!(matches!(
             lc.verify_archive_proof(&tampered),
             Err(LightError::NotIncluded { .. })

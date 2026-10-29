@@ -1572,7 +1572,11 @@ fn snark_proof_leaves_inputs_and_outputs_public_no_hiding() {
     let m = tiny_model();
     let (pk_bytes, vk) = test_setup(&m, ATTEST_TEST_SEED);
     let (out, proof) = prove_for(&m, &[3, 4], &pk_bytes, &vk);
-    assert_eq!(proof.public_inputs, vec![3u64, 4], "inputs ride in the clear");
+    assert_eq!(
+        proof.public_inputs,
+        vec![3u64, 4],
+        "inputs ride in the clear"
+    );
     assert_eq!(
         proof.public_outputs,
         out.iter().map(|&x| x as u64).collect::<Vec<_>>(),

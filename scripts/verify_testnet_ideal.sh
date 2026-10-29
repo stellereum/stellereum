@@ -44,14 +44,15 @@ for ws in $RUST_WS; do
   pass "stage 1: $ws"
 done
 
-# ---- STAGE 2: rustfmt (advisory, non-failing — tree predates fmt) ----
-info "stage 2: rustfmt check (advisory)"
+# ---- STAGE 2: rustfmt (hard gate — tree was fmt-cleaned 2026-10-29) ----
+info "stage 2: rustfmt check"
 for ws in $RUST_WS; do
   if [ -f "$ROOT/$ws/Cargo.toml" ]; then
     (cd "$ROOT/$ws" && cargo fmt --check) >/dev/null 2>&1 \
-      && info "fmt clean: $ws" || info "fmt dirty (advisory): $ws"
+      && info "fmt clean: $ws" || fail "stage 2: fmt dirty in $ws (run cargo fmt)"
   fi
 done
+pass "stage 2: rustfmt clean"
 
 # ---- STAGE 3: tests ----
 info "stage 3: tests"

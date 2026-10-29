@@ -442,10 +442,12 @@ impl std::fmt::Display for MempoolError {
             MempoolError::SponsorBadSignature => "invalid sponsor signature",
             MempoolError::SponsorInsufficientBalance => "sponsor cannot pay the transaction fee",
             MempoolError::Malformed(reason) => return write!(f, "malformed transaction: {reason}"),
-            MempoolError::TxTooLarge { wire_bytes, cap } => return write!(
+            MempoolError::TxTooLarge { wire_bytes, cap } => {
+                return write!(
                 f,
                 "transaction too large: estimated {wire_bytes} wire bytes exceeds block cap {cap}"
-            ),
+            )
+            }
             MempoolError::TxTooManyProofs { proof_units, cap } => {
                 return write!(
                     f,

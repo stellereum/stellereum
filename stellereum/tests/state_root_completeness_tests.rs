@@ -628,7 +628,8 @@ async fn monolithic_snapshot_restore_roundtrip_preserves_root_and_refuses_garbag
         .await
         .expect("valid snapshot restores");
     assert_eq!(
-        dst.get_state_root().await, root,
+        dst.get_state_root().await,
+        root,
         "restore must reproduce the snapshotted root"
     );
     assert_eq!(dst.get_account(&a).await.unwrap().balance, 1_000_000);
@@ -638,10 +639,7 @@ async fn monolithic_snapshot_restore_roundtrip_preserves_root_and_refuses_garbag
     // leave the live engine untouched.
     let victim = InMemoryStateEngine::new();
     let keep = funded_key(43).verifying_key().to_bytes();
-    victim
-        .credit_native(&keep, 999_999)
-        .await
-        .expect("credit");
+    victim.credit_native(&keep, 999_999).await.expect("credit");
     let root_before = victim.get_state_root().await;
 
     let cut = bytes.len() / 2;
@@ -657,7 +655,8 @@ async fn monolithic_snapshot_restore_roundtrip_preserves_root_and_refuses_garbag
         "refused restore must not touch accounts"
     );
     assert_eq!(
-        victim.get_state_root().await, root_before,
+        victim.get_state_root().await,
+        root_before,
         "refused restore must not move the root"
     );
 
@@ -667,7 +666,8 @@ async fn monolithic_snapshot_restore_roundtrip_preserves_root_and_refuses_garbag
         .expect_err("garbage snapshot must be refused");
     assert!(!err.is_empty(), "refusal must say why");
     assert_eq!(
-        victim.get_state_root().await, root_before,
+        victim.get_state_root().await,
+        root_before,
         "refused restore must not move the root"
     );
 }

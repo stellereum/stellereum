@@ -1,7 +1,25 @@
 # ROADMAP — what needs doing (HDAE canonical, curated, 2026-10-29)
 
 Maintained by the lead only. Mark `[x]` with gate-output hash/date, never on intent.
-Machine state: `STATUS.md`. Why: `docs/specs/`.
+Machine state: `STATUS.md`. Features: `FEATURES.md` (38 E2E rows). Why: `docs/specs/`.
+
+## Remote topology (all private, `immtes/`)
+
+Monorepo stays LOCAL (dev home). Pushed mirrors, branch per milestone
+(`hdae-baseline-*, hdae-enterprise-*`; main/agent branches never touched):
+
+| repo | content |
+|---|---|
+| `stellereum` | core node (`stellereum/`) |
+| `infnode` | network (renamed from infmail-valid-backend) |
+| `stellereum-contracts` | contracts + contract-sdk (renamed, was `stellereum-sdk`) |
+| `stell-wallet` | wallet CLI |
+| `stellereum-indexer` | indexer |
+| `stellereum-hdae` | shared infra: AGENTS, specs, gates, matrix, handoffs, docs (main branch) |
+
+No remote yet: standalone `stellereum-sdk/` (client tx-builders, zero in-tree
+consumers — external-facing, publish candidate), `scripts/tools/stelops`,
+`explorer-site`. Monorepo local commits: baseline → rename → enterprise → fmt.
 
 ## Done (verified)
 

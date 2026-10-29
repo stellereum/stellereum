@@ -1,9 +1,9 @@
 # 01 — Architecture Overview (HDAE canonical, 2026-10-29)
 
-Supersedes: all `docs/handoff/*` diaries and `docs/audits/audit-*.md` working notes
+Supersedes: all `handoff/*` diaries and `docs/audits/audit-*.md` working notes
 (full list in `.archive/README.md`). Canonical audit: root
 `COMPREHENSIVE_AUDIT_REPORT.md` (PART I byte-frozen). Master protocol spec:
-`docs/handoff/STELLEREUM_PQ_BFT_V5_MASTER_SPEC.txt`.
+`handoff/STELLEREUM_PQ_BFT_V5_MASTER_SPEC.txt`.
 
 ## Workspaces (no root workspace; gates loop over all six)
 
@@ -19,9 +19,10 @@ Supersedes: all `docs/handoff/*` diaries and `docs/audits/audit-*.md` working no
 
 ## Canonical vs copies
 
-- `stellereum/` is the ONLY canonical node tree (60 src files). `stellereum_head/`
-  (48 files) and `w8/` (55 files) are **diverged stale copies** — never build,
-  never deploy, never import from them. See `CRATE_ISOLATION_PLAN.md`.
+- `stellereum/` is the ONLY canonical node tree (60 src files). The diverged
+  stale copies `stellereum_head/` (48 files) and `w8/` (55 files) were REMOVED
+  2026-10-29 (recoverable from git history if archaeology is ever needed).
+  See `CRATE_ISOLATION_PLAN.md`.
 - Live topology: A `212.113.103.105`, B local `:8546`, C `77.110.96.68:2222`,
   D `138.124.102.200`. N=4, quorum 2f+1, set 4/4 non-fragile.
 

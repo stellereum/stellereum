@@ -18,10 +18,10 @@
 #[macro_use]
 extern crate std;
 
-use stellereum_sdk::address::{
+use stellereum_contract_sdk::address::{
     is_any_reserved, is_system_burn, PROTOCOL_RESERVED_DOMAINS, SYSTEM_BURN_DOMAINS,
 };
-use stellereum_sdk::{
+use stellereum_contract_sdk::{
     emit, setup_wasm_panic_handler, sload, sstore, ERR_ALREADY_EXISTS,
     ERR_INVALID_ARGUMENT, ERR_UNAUTHORIZED, SUCCESS,
 };
@@ -333,8 +333,8 @@ pub extern "C" fn transfer(packed_arg: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellereum_sdk::address::{DOMAIN_BURN, DOMAIN_STAKE, DOMAIN_TRASH, DOMAIN_VAULT};
-    use stellereum_sdk::reset_mock_state;
+    use stellereum_contract_sdk::address::{DOMAIN_BURN, DOMAIN_STAKE, DOMAIN_TRASH, DOMAIN_VAULT};
+    use stellereum_contract_sdk::reset_mock_state;
 
     #[test]
     fn test_length_price_grid() {

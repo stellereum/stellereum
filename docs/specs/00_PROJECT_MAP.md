@@ -20,7 +20,7 @@ stellereum-project/
 ├── scripts/                  # verify_testnet_ideal.sh, harness_status.sh, stell-sync.sh,
 │                             # watchdog, agents/{spawn,merge,TASK_PROMPT}
 ├── docs/specs/               # THIS MAP + 01-04 + CRATE_ISOLATION_PLAN (truth)
-├── docs/handoff/             # V5_MASTER_SPEC.txt (kept); rest archived
+├── handoff/                    # ALL session handoffs, one folder (history only)
 ├── docs/audits/              # COMPREHENSIVE_AUDIT_REPORT.md (PART I byte-frozen)
 ├── .archive/                 # retired diaries (never read for truth)
 └── multinode/                # LIVE node B data — DO NOT TOUCH

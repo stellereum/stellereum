@@ -1,0 +1,313 @@
+================================================================================
+STELLEREUM — ПОЛНЫЙ КОНТЕКСТ СЕССИИ (handoff)
+Сгенерировано: 2026-09-30. Читать целиком перед продолжением работы.
+Дополняет: ~/STELLEREUM_SESSION_MEMORY.md (1581 строка, детали по фазам).
+================================================================================
+
+--------------------------------------------------------------------------------
+0. ЦЕЛЬ ПРОЕКТА (паспорт, кратко)
+--------------------------------------------------------------------------------
+Stellereum (Stellereum Network) — Ultra-High Performance L1 Multi-Blockchain.
+Нативный токен STELL: стейкинг, газ, ИИ-агенты, системные расчёты.
+Позиционирование: Lightweight, AI-Native, MEV-Resistant & Orderbook-Optimized L1.
+
+Стек по паспорту (10 секций):
+  1. Архитектура: акторная модель, бесконечный шардинг (мастерчейн+шардчейны,
+     авто-split/merge), Bag of Cells / DAG (ячейки 128B, Patricia-деревья).
+  2. AI-Native VM: SVM + zk-SNARK/zkML лёгкая верификация + session keys для агентов.
+  3. Нативный Orderbook-Actor CLOB: системные контракты стакана в SVM, low-level
+     инструкции, sys-calls обхода Patricia, QUIC до валидаторов, async matching.
+  4. Micro-gas: дешёвые инструкции, лимиты глубины стакана как анти-спам.
+  5. Shared-Liquidity Workchain + Shared Sequencer: атомарные кросс-шардовые tx,
+     пруфы Меркла, tight coupling, shared sequencing для L2.
+  6. MEV-preemption: пороговая подпись / Fast BLS на сборке блоков, запечатывание
+     mempool до фиксации, БЕЗ TEE/SGX.
+  7. Pipelined Execution + In-Memory State Engine: разделение консенсуса и
+     исполнения, горячее состояние в RAM, фоновая запись (задумано io_uring),
+     латентность 100-200 мс.
+  8. Native Teleport Bridges: валидаторные шлюзы, timelocks/лимиты, zk-SNARK
+     проверка, мосты TON/Arbitrum/Ethereum/Solana.
+  9. Опциональная приватность: Pedersen commitments (Curve25519/Ristretto,
+     AVX2/NEON), stealth-адреса, viewing keys, БЕЗ RingCT.
+ 10. Оракулы 3-tier: pull (Pyth/Red), DEX TWAP, stale protection, circuit breaker,
+     USDT-peg.
+
+Токеномика: hard cap 1 000 000 000 STELL; genesis $0.25; распределение:
+25% Genesis Vault, 15% Liquidity, 35% Validator Rewards, 15% Ecosystem, 10% Team.
+Отказ (НЕ строить): Stellereum Storage, Proxy/анонимайзеры, нефинансовые сервисы,
+TEE/SGX, RingCT/Monero-style тяжёлые пруфы.
+
+ДОМЕН: куплен stellereum.org (только .org; .com/.io дорого — отложено).
+Проверка товарных знаков (похожесть на Stellar) — не закрыта.
+
+--------------------------------------------------------------------------------
+1. ЭКОСИСТЕМА И ПУТИ
+--------------------------------------------------------------------------------
+infnode    → P2P транспорт (QUIC/TLS + Kademlia DHT + storage)   [сетевой слой]
+   ├─ infmail     → почта поверх infnode
+   └─ stellereum  → L1 блокчейн поверх infnode
+         └─ stell-wallet → SPV CLI-кошелёк `stell` (в репо stellereum НЕ лежит;
+                            README про crates/stell-wallet — устаревший дрейф)
+
+Пути:
+  /home/imm/infmail-valid-backend/crates/infnode  — транспорт (workspace с infmail)
+  /home/imm/infmail-valid-backend/crates/infmail  — почта
+  /home/imm/stellereum                            — блокчейн (path-зависимость от infnode)
+  /home/imm/STELLEREUM_SESSION_MEMORY.md          — основная память (1581 стр.)
+  /home/imm/STELLEREUM_CHAT_CONTEXT.txt           — ЭТОТ файл
+  /home/imm/stellereum/LAUNCH_STRATEGY.txt        — стратегия/дорожная карта
+
+ВАЖНО: блокчейн НЕ встраивается в код infnode. Только публичный API
+(kv_store_local/get_local_kv, store_blob/fetch_blob, request_to, pubsub).
+
+--------------------------------------------------------------------------------
+2. ЖИВОЙ СТЕНД
+--------------------------------------------------------------------------------
+Сервер: root@212.113.103.105 (SSH по ключу). 178.155.74.242 — NAT-IP ЭТОЙ машины.
+Хост: 1 vCPU, ~9.8G диск, 2 ноды на одной машине.
+
+  nodeA: /root/nodeA, RPC 127.0.0.1:8545, explorer 8080, QUIC 9410, env /root/env.A
+  nodeB: /root/nodeB, RPC 127.0.0.1:8546, explorer 8081, QUIC 9411, env /root/env.B
+  бинарь: /root/stellereum/target/release/stellereum (isolated build dir)
+  скрипты: /root/stell-node.sh (start/stop/restart/status/wipe/start4/status4/wipe4)
+  watchdog: /root/stall_watchdog.sh + /root/watchdog.log (рестарт при 180с стопора)
+  logrotate: /etc/logrotate.d/stellereum (+ почасовый cron)
+  prune-orphans: /root/prune-chunk-orphans.py + cron */15
+  оба узла: shard 1 (мастерчейн-блоки shard_id=0; --shard это DHT-неймспейс!)
+
+Текущая эпоха (COMMITMENT_VERSION 4): 21ffbf7a47bfb3a0
+  (v3 была d0f01b289be22152..., v2 a927873ae7ea04df...)
+ВАЙП: rm -rf /root/nodeA/data /root/nodeB/data — обязателен при смене
+commitment-версии (меняется genesis root и формат снапшотов).
+
+env.A/env.B: STELL_RPC_LISTEN, STELL_FAUCET(=1 только A), STELL_FAUCET_KEY=0x11*32,
+  STELL_FAUCET_TOKEN, STELL_RPC_AUTH_TOKEN, STELL_ARCHIVE=0, STELL_KEEP_BLOCKS=8000,
+  STELL_ROUND_TIMEOUT_MS=800. Бэкапы: /root/env.*.bak.*
+
+--------------------------------------------------------------------------------
+3. ЧТО СДЕЛАНО В ЭТОЙ СЕССИИ (по темам, с коммитами)
+--------------------------------------------------------------------------------
+Транспорт/ливнесс (главная линия):
+  74c9cfe 5 критичных дыр аудита (F1 подделка состояния snapshot, F2 накрутка
+         раундов до verify, F3 desync по advertised head, F4 раскол root от
+         локального slashing, +RPC/faucet auth, rate-limit, body-limit)
+  3dde3e7 Committed broadcast не отправлялся НИКОГДА (use-after-reset)
+  fc40b19 sync только по FAR (>3 раунда)
+  fa7e26a фильтр stale-тела + has_live_proposal + логирование broadcast
+  9ddc2a3 lock-hint rescue (nil-голос несёт locked hash)
+  ed40ad0 асимметричный лок: locked re-proposal + polka-unlock
+  cd9d52b GCD-нормализация расписания предлагающих
+  9d984e7 follow verified peer rounds даже на +1 (убил офсет в 1 раунд)
+  3f86076 разрыв equal-round deadlock + переотправка proposal
+  862ac6b precommit штампуется раундом POLKA (31/180 брака)
+  295745b ограниченный hold на равных раундах
+  3a29bad STELL_ROUND_TIMEOUT_MS (на стенде 800мс)
+  bdac480 сетевые вызовы в цикле ограничены половиной раунда
+  e9f1a54 убран evict на один медленный broadcast (каскад 2300 закрытий/ноду)
+
+infnode (8 коммитов, ветка main, HEAD 1bc2fe8):
+  close quinn-соединений при drop; learned-addr не отравляется эфемерным портом;
+  idle 300->30с; лимит потоков 64->256 + reset; replay-gate не роняет кадры;
+  strict tie-break (нижний id единственный инициирует); мультипоточный рантайм.
+  + последние фиксы (в WIP ветке отдельного репо): детерминированный content-id
+  для чанков (перепубликация перезаписывает, а не копирует) + TTL-sweep kv.json
+  (dedup:* живут 5 мин). Результат: kv entries 788k->46k, чанки N->N при
+  повторе публикации; тесты infnode 50/0.
+
+P0 корректность блокчейна (найдено аудитом — модули были, лив-путь терял данные):
+  1b5435a лив-путь применяет transfers/payouts (commit_native, atomic+undo) +
+          VmContext.timestamp = block.timestamp
+  9ccf4c8 CLOB-эскроу на лив-пути (settle_clob_effects) + ЕДИНОЕ ядро
+          apply_block_transition для live и reorg (иначе reorg молча форкал)
+
+Паспорт (достижимость фич):
+  95df70c session keys фаза 0+1 (конверт внутри signature:Vec<u8>, 5 точек
+          admission, expiry/scope/value по block.timestamp) + оракул on-chain
+          (новый OpCode append-only, OracleState committed, гейты в
+          place_order/place_settled) + COMMITMENT_VERSION 3->4
+
+P3 производительность:
+  caf18b7 многопроходный отбор (contiguous nonce-последовательности)
+  2729771 батчинг голосов (ConsensusMsg::Batch + outbox 100мс)
+  examples/p3_baseline.rs, scripts/tps_load.py, scripts/chain_diag.sh
+
+Хозяйство:
+  7fb5ae8 status учитывает adopt + logrotate; f18f951 снапшот на высоте engine;
+  01117f6 flush на сигнале + барьер каждые 25 высот; 2fccc16 retry healing;
+  9210c2b/22cd3f5/34d71e8 персист/публикация тел; 8ae3c0e/0fd574c персист mempool;
+  e3b710e faucet nonce mex (заполняет дыры после вайпа mempool)
+
+--------------------------------------------------------------------------------
+4. ТЕКУЩЕЕ СОСТОЯНИЕ (на момент файла)
+--------------------------------------------------------------------------------
+Ветка: wip/passport-agents (main = 95df70c).
+  f223573 — WIP-снапшот работы ДВУХ оборванных агентов + session phase 2
+            (сохранён, чтобы резум не потерял: +3608 строк, 25 файлов).
+
+Незакоммиченные/в WIP проекты:
+  MEV+BLS агент: src/bls.rs, src/mev.rs, src/consensus.rs, src/mempool.rs,
+                 tests/bls_qc_compat_tests.rs, tests/mev_preemption_tests.rs
+  Достижимость:  src/pmm.rs, src/bridge.rs, src/rpc.rs, src/main.rs (CLI/RPC)
+  Session phase 2: src/zkml.rs, src/state_engine.rs, src/storage.rs,
+                 src/commitment.rs, tests/session_registry_tests.rs (агент
+                 отчитался 899/0, но код был не закоммичен)
+
+Стенд: запущен на бинаре 95df70c (эпоха 21ffbf7a47bfb3a0), HEALTHY, высоты идут.
+Диск: 63% (после освобождения 2.1G).
+
+Тесты: последний подтверждённый полный прогон — 899 passed / 0 failed
+(на дереве с session phase 2; затем добавились правки двух оборванных агентов,
+которые НЕ верифицированы компиляцией после их смерти).
+
+--------------------------------------------------------------------------------
+5. ГЛАВНЫЙ ОТКРЫТЫЙ БЛОКЕР: ТРАНСПОРТ
+--------------------------------------------------------------------------------
+Замеры (агент, 5.7 мин, 2 ноды, 1 CPU):
+  высоты 5.6/мин; раунды медиана 2.1с, среднее 4.1с
+  broadcast latency: медиана 770мс, p90 1.5-1.9с (норма на localhost — сотни мкс)
+  probe успех: A 54% (B 99%) — АСИММЕТРИЯ направлений
+  conn churn 34 закрытия/мин; Recv-Q 0; CPU 29%/25%
+  вывод: лимит — RTT/латентность, НЕ кворум и НЕ CPU.
+
+Что уже исключено: Recv-Q голодание (был 35КБ, теперь 0), replay-флуд (0),
+idle-exit закрытие живых соединений (убрано), simultaneous-open (tie-break),
+evict-каскад (убран), learned-addr (эфемерный порт больше не пишется),
+однопоточный рантайм (теперь 4 воркера), governance write-back (убиравший
+полный пересчёт commitment каждый тик).
+
+Остаётся открытым: почему запрос на localhost стоит 0.35-2с. Следующие шаги:
+  (a) инструментировать request_on/handle_stream подэтапами (open_bi? write?
+      read? server handle?) — сейчас известен только полный elapsed;
+  (b) проверить, не остались ли дублирующиеся conn (A dials + B accepts) и не
+      ходит ли трафик по «мёртвому» из набора;
+  (c) kv.json (67МБ, переписывается каждые 7с) — синхронный sled-IO на async
+      потоке; TTL-sweep уже сделан в infnode, надо задеплоить и замерить;
+  (d) подумать про прямой транспорт консенсуса (не pubsub через DHT), если
+      pubsub-слой принципиально не даёт стабильный RTT на 1 CPU.
+
+--------------------------------------------------------------------------------
+6. ГОТОВЫЕ ДИЗАЙНЫ (реализовывать по ним)
+--------------------------------------------------------------------------------
+A) SESSION KEYS (паспорт §2, «нативные аккаунты»; пользователь сказал: это НЕ
+   про ботов, определение придёт позже — НЕ выдумывать лишнего).
+   Вердикт по bincode (ДОКАЗАН): добавить поле в Transaction/Block НЕЛЬЗЯ —
+   старые блоки/снапшоты перестанут декодироваться (#[serde(default)] под
+   bincode не работает, Option тоже стоит байт). Решение: конверт ВНУТРИ
+   signature:Vec<u8> = 64B | 64B ++ "SK1" ++ bincode(grant).
+   Фаза 0+1 СДЕЛАНА (95df70c): домен+chain_id+scope+max_value_per_tx,
+   verify выбирает ключ, привязка в signing_message/compute_tx_hash условная,
+   AdmissionCtx во всех 5 точках, expiry/scope/cap по block.timestamp.
+   Фаза 2 СДЕЛАНА (в WIP): SessionKeyRegistry (отдельное sled-дерево),
+   условный digest (генезис-KAT не меняется), бюджет по факту применения,
+   SysCallRevokeSession (append, index 28), 6 тестов.
+   ОСТАЁТСЯ: превентивный отзыв неиспользованного гранта (tombstone),
+   ограничение «делегированный tx не может отозвать другие ключи мастера»
+   (сейчас правило tx.from==master), убрать try_read в admission (локальность),
+   chain-id enforcement против конфига ноды, накопление бюджета в блоке
+   несколькими tx (частично есть).
+
+B) ШАРДИНГ + ОРАКУЛ (планы M1/M2/M3, из памяти §10.12).
+   Шардинг: один процесс = два run_consensus_node (shard 0 и 1) на одном infnode
+   Node (KV-межшард работает только внутри процесса!). consensus_topic сделать
+   shard-scoped. НОВЫХ полей в Block нельзя (bincode) — использовать
+   cross_shard_out как produces+consumes. ShardRegistry из env, все проверки
+   под `registry.is_sharded()` (иначе старые тесты падают). M1: tx target_shard=1
+   попадает в блок shard_id=1. M2: перевод 0->1 атомарно + replay-защита +
+   равные root. Отдельные store/mempool пути на шард, иначе клоббер finalized.
+   Авто-split/merge НЕ тащить в консенсус (недетерминирован по load).
+   Оракул: УЖЕ СДЕЛАН on-chain (95df70c). Осталось: регистрация publisher'ов и
+   сброс breaker'а через GovAction (сейчас тесты сидят set вручную); TWAP-тир
+   остался в легаси-движке OracleSafetyEngine.
+
+C) MEV + BLS (паспорт §6, оборванный агент): mev.rs (Shamir, seal/unseal/commit)
+   и bls.rs (реальный BLS12-381, HybridCertificate) есть, но не в лив-пути.
+   План: MEV-запечатывание на admission/unseal на build (честный MVP, без
+   security theater), BLS-сертификат РЯДОМ с Ed25519-списком в QuorumCertificate
+   через bincode-совместимый конверт, строгая проверка (pairing+membership+
+   quorum power), фолбэк на Ed25519 при любой ошибке, флаг default OFF.
+
+D) ДОСТИЖИМОСТЬ (паспорт §3/§8): PMM-опкоды + stell_pmm* RPC (сейчас
+   pmm_buy/sell без вызовов в src/); CLI orderbook/bridge/wallet должны
+   ОТПРАВЛЯТЬ транзакцию, а не печатать (bridge сейчас "Simulated deposit");
+   bridge как committed-домен и адаптеры цепей — отдельная задача.
+
+--------------------------------------------------------------------------------
+7. БЭКЛОГ ИННОВАЦИЙ (обсуждать ОТДЕЛЬНО, когда базовый блокчейн готов)
+--------------------------------------------------------------------------------
+Пользователь: «нововведения будем обсуждать когда полноценный блокчейн будет».
+[ ] ИННОВАЦИЯ 1: Communication Grants — реестр грантов (scope, срок, revoke) + доставка
+[ ] ИННОВАЦИЯ 2: Нативный AA — аккаунт-контракт по умолчанию (WASM-движок есть)
+[ ] ИННОВАЦИЯ 3: Опциональная приватность — режимы (прозрачный/скрытый получатель/сумма)
+[ ] ИННОВАЦИЯ 4: Безопасные мосты — optimistic verification, окно оспаривания, timelock, лимиты
+[ ] ИННОВАЦИЯ 5: Идентичность имя→адрес (нативный ENS)
+
+Порядок работ (со слов пользователя): базовый блокчейн по паспорту ->
+инновации -> оптимизации -> безопасность. Нативные аккаунты — отдельное
+определение, не равно session keys.
+
+--------------------------------------------------------------------------------
+8. ПРОЦЕДУРЫ (не нарушать)
+--------------------------------------------------------------------------------
+Деплой на стенд:
+  1) локально: cargo build --release --bin stellereum
+  2) scp target/release/stellereum root@212.113.103.105:/root/stell.new
+  3) ssh: /root/stell-node.sh stop; sleep 5; проверить ps=0;
+     cp /root/stell.new /root/stellereum/target/release/stellereum;
+     /root/stell-node.sh start
+     (при смене COMMITMENT_VERSION — rm -rf /root/node{A,B}/data перед start)
+  4) проверить: второй ssh + ss -lunp, strings/хеш бинаря, статус HEALTHY.
+  ВАЖНО: (а) рестарт делать через скрипт (он ждёт дренаж), не через nohup;
+         (б) kill короче 15-20с теряет недописанные данные;
+         (в) ETXTBSY при копировании, если процесс жив — сначала stop.
+
+Проверка бинаря: sha256sum локально и на сервере (strings ненадёжен, комментарии
+вырезаются). Запуск проверять через ss -lunp (порты 9410/9411) и второй ssh.
+
+Рестарт-стриктура: watchdog автоматически рестартует при 180с без прогресса
+(в /root/watchdog.log). Это КОСТЫЛЬ, а не решение — транспорт всё ещё течёт.
+
+Тесты: cargo test (полный). Флейки под нагрузкой: hunt_pmm_race,
+pruning block_store_survives_a_reopen, fuzz timing (PER_INPUT=1s) — перепроверять
+изолированно перед выводом о регрессии.
+
+Агенты: разрешено до 4-7 параллельно. Правила: разделять зоны файлов, не
+реветить чужие правки, WIP-снапшот перед резумом, отчёты с file:line.
+
+--------------------------------------------------------------------------------
+9. МЕТРИКИ
+--------------------------------------------------------------------------------
+TPS-стенд (замеры): submit пик ~1435 tx/s; блок на 260 tx подтверждён;
+e2e 2-3 tx/s (из-за ливнеса/латентности); исполнение in-process ~118k tx/s
+(не бутылочное). Микро-бенчи паспорта (SVM 871M ops/s и т.п.) — in-process,
+не e2e; e2e упрётся в транспорт до его починки.
+
+Транспорт: median broadcast 770мс, p90 1.5-1.9с; conn churn 34/мин;
+высоты 5.6/мин; раунды 2-4с.
+
+Диск: было 100% -> освобождено ~3GB (63%). Источники роста были: chunk-дубли
+(перешифровка при публикации) + kv.json (dedup:* без удаления) — оба фикса в
+infnode готовы (в WIP), надо задеплоить и замерить.
+
+--------------------------------------------------------------------------------
+10. СЛЕДУЮЩИЕ ШАГИ (в порядке приоритета)
+--------------------------------------------------------------------------------
+1. Включить двух оборванных агентов (MEV+BLS, достижимость) с сохранённой
+   памятью (их работа в f223573) — довести до компиляции/тестов.
+2. Довести WIP до зелёного сюита, закоммитить; отдельно решить судьбу
+   COMMITMENT_VERSION (сейчас 4; session phase 2 условный — не менял).
+3. Транспорт: инструментировать подэтапы request_on/handle_stream и найти
+   источник 0.35-2с на localhost (главный блокер скорости и стабильности).
+4. Задеплоить infnode-фиксы роста диска (content-id чанков + kv sweep).
+5. Далее по паспорту: MEV+BLS, PMM/CLI достижимость, шардинг M1-M3,
+   мосты-адаптеры, приватность-опкод, io_uring/латентность.
+6. Только после базового: 5 инноваций (Communication Grants, нативный AA,
+   приватность-режимы, мосты с optimistic verification, нативный ENS).
+
+--------------------------------------------------------------------------------
+11. ССЫЛКИ
+--------------------------------------------------------------------------------
+Память: /home/imm/STELLEREUM_SESSION_MEMORY.md (§10.1-10.14 — эта сессия).
+Код: /home/imm/stellereum (ветка wip/passport-agents, main=95df70c).
+Транспорт: /home/imm/infmail-valid-backend/crates/infnode (main=1bc2fe8).
+Стенд: root@212.113.103.105, /root/stell-node.sh, /root/watchdog.log.
+================================================================================

@@ -13,7 +13,7 @@
 #[macro_use]
 extern crate std;
 
-use stellereum_sdk::{
+use stellereum_contract_sdk::{
     emit, setup_wasm_panic_handler, sload, sstore,
     ERR_INSUFFICIENT_BALANCE, ERR_INVALID_ARGUMENT, ERR_UNAUTHORIZED, SUCCESS,
 };
@@ -277,7 +277,7 @@ pub extern "C" fn burn(arg: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellereum_sdk::reset_mock_state;
+    use stellereum_contract_sdk::reset_mock_state;
 
     #[test]
     fn test_token_lifecycle() {

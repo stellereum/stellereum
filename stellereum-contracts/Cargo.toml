@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/stellereum-sdk",
+    "crates/stellereum-contract-sdk",
     "crates/e2e-tests",
     "contracts/stl-dns",
     "contracts/sts20-token",
@@ -9,7 +9,7 @@ members = [
     "contracts/account-object",
 ]
 default-members = [
-    "crates/stellereum-sdk",
+    "crates/stellereum-contract-sdk",
     "contracts/stl-dns",
     "contracts/sts20-token",
     "contracts/liquidity-pool",

@@ -4,6 +4,8 @@ target/
 node_modules/
 explorer-site/node_modules/
 multinode/
+stell-observe/
+tmp/
 *.log
 *.tmp
 *.key

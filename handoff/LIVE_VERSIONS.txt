@@ -1,0 +1,3 @@
+nodeA|9900707a57e84f079a48b6a470b52ce0cb95e717559bf92b3616f6ed07b77b59|d96c08a-sec-p0p1-audit-perf-indexer-v2|0x267a0|2026-10-16T22:05:00Z|hardened-pq-fips206+bridge-fix+bft-fix+parallel-exec+indexer-v2
+nodeB|9900707a57e84f079a48b6a470b52ce0cb95e717559bf92b3616f6ed07b77b59|d96c08a-sec-p0p1-audit-perf-indexer-v2|0x267a0|2026-10-16T22:05:00Z|hardened-pq-fips206+bridge-fix+bft-fix+parallel-exec
+nodeC|9900707a57e84f079a48b6a470b52ce0cb95e717559bf92b3616f6ed07b77b59|d96c08a-sec-p0p1-audit-perf-indexer-v2|0x267a0|2026-10-16T22:05:00Z|hardened-pq-fips206+bridge-fix+bft-fix+parallel-exec

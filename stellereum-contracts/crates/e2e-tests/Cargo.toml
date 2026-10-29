@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 stellereum = { path = "../../../stellereum" }
-stellereum-sdk = { path = "../stellereum-sdk" }
+stellereum-contract-sdk = { path = "../stellereum-contract-sdk" }
 tokio = { version = "1.38", features = ["full"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"

@@ -1,0 +1,429 @@
+================================================================================
+STELLEREUM BLOCKCHAIN — ПОЛНАЯ СПЕЦИФИКАЦИЯ ПО КОДУ (2026-10-14)
+Репо: /home/imm/stellereum. Метод: только чтение + один новый файл, без коммитов,
+ноды не трогалась. Язык: русский. cargo check --offline: PASS (см. §12).
+Живые параметры стенда на дату: Chain ID 5757, Pure PQ Falcon-512, валидаторы
+A (Хельсинки 212.113.103.105) + B (Ryzen 178.155.74.242), observer C
+(77.110.96.68) ОСТАНОВЛЕН и вне сета, высота ~92–93k, темп ~1–2 с/блок,
+корни A/B совпадают, форков 0.
+================================================================================
+
+--------------------------------------------------------------------------------
+1. ЧТО ТАКОЕ STELLEREUM (один абзац архитектуры)
+--------------------------------------------------------------------------------
+Stellereum — L1-блокчейн на Rust поверх P2P-транспорта infnode (QUIC/TLS +
+Kademlia DHT). Ядро — TON-стиль: акторная модель с bounce-семантикой, состояние
+в Bag-of-Cells графах (128-байтные ячейки) поверх бинарного Patricia-Merkle
+дерева cpat2, Masterchain (шард 0: конфиг, валидаторы, секвенсор, кросс-шард
+хаб) + шардчейны с in-VM CLOB-стаканами. Исполнение — микросборщик SVM с
+микро-газом (≈280k nano за перевод), Sealevel-lite параллелизм (DisjointScheduler),
+нулевой оверхед MEV-преемпшн задуман пороговым (сейчас отложен, см. §3),
+AI-натив: zkML-верификация + делегированные session keys, опциональная
+конфиденциальность (Pedersen/Ristretto, stealth, viewing keys), 3-уровневый
+оракул с circuit breaker, нативный Teleport-мост (кворум 2/3 distinct +
+таймлок + rate limit), EVM-адаптер для MetaMask/Chainlist. Нативный токен STELL:
+9 decimals (nano-STELL), hard cap 1 млрд (src/tokenomics.rs:13), Genesis Vault
+250M STELL по $0.25 (25%), награды валидаторам 35% / 350M, ликвидность 15%,
+экосистема 15%, команда 10% (12m cliff + 24m linear). Блок: ≤10 000 tx и
+≤120M газа (src/runtime.rs:28,43). Подробнее: README.md, PROTOCOL.md,
+docs/OPERATIONS.md, docs/RPC.md, docs/PERF_1K.md.
+
+--------------------------------------------------------------------------------
+2. КОНСЕНСУС (BFT / PQ-BFT v5)
+--------------------------------------------------------------------------------
+Модель: классический BFT Tendermint-типа, per-height машина
+`HeightConsensus` (src/consensus.rs:1793-1858): Propose → Prevote → Precommit →
+Commit; финализация в `ValidatorRuntime::try_finalize` только по precommit-
+кворуму ДЛЯ ТОГО ЖЕ блока, при обязательном prevote-кворуме за тот же блок
+(PROTOCOL.md I4; регрессии `consensus::a_block_cannot_be_decided_on_precommits_alone`,
+`a_locked_validator_will_not_decide_a_different_block`).
+Безопасность: Tendermint-locking — залоченный валидатор не prevote/precommit
+чужой блок (`decide_prevote`, src/consensus.rs:1898; lock: (hash, round),
+src/consensus.rs:1821). Equivocation-доказательства дедуплицируются по паре
+конфликтующих голосов (PROTOCOL.md, `hunt_slashing.rs`).
+Proposer schedule: детерминированный взвешенный round-robin по
+отсортированным id — `(height + round) % total_power` (src/consensus.rs:738-768);
+GCD-правка убрала зависание, когда scheduled proposer никогда не предлагает.
+Принят любой раунд 0..=qc_round (re-proposed locked блоки, харденинг f7ba7b8).
+Кворум: `quorum_power() = floor(2*total_power/3)+1` (src/consensus.rs:703).
+При unit-power: N=1→1, N=2→2, N=3→3 (!), N=4→3, N=5→4 (таблица docs/OPERATIONS.md §5).
+Т.е. сети 2 и 3 требуют 100% подписей — падение ЛЮБОГО валидатора = стоп цепи.
+Таймауты: базовый раунд-таймаут `STELL_ROUND_TIMEOUT_MS` (дефолт 3 с — OPERATIONS §4
+«view change … каждые 3 секунды», PERF_1K §3), backoff +500 мс/раунд с капом
++10 с (src/main.rs:598-607); производственный пол `STELL_MIN_BLOCK_MS`
+дефолт 400 мс (testnet/genesis.env:151), 0 = снять. Сообщение пира двигает
+раунд максимум на +1; раунды двигаются только по СОБСТВЕННОМУ таймауту
+(`next_round`), никогда по чужому клейму (защита от round-DoS, hunt_round_dos).
+Deadlock breaker (f7ba7b8): `STELL_DEADLOCK_TIMEOUT_SECS` (дефолт 300, src/main.rs:3843):
+прыжок к max(peer rounds), stale-голоса питают round-sync; тесты
+tests/deadlock_breaker_tests.rs 5/5.
+µQC / Tier-1 финальность (PQ-BFT v5): компактный комитет k=16 через BLAKE3
+stake-weighted sortition (src/consensus.rs:345,462-485), порог
+`pq_micro_quorum_threshold(k) = floor(2k/3)+1` → 11/16 (src/consensus.rs:450-459).
+Маркеры в QC: `PQ_UQC_MARKER_ID=[0xFD;32]` (блочный µQC),
+`PQ_QC_MARKER_ID=[0xFE;32]` (эпохальный CEC), wire-конверт `QC_UQC_MAGIC`
+(src/consensus.rs:334-338). ВНИМАНИЕ (честно, урок ночи 13→14.10): при N≤16
+комитет = весь сет, т.е. эффективный порог — UNANIMOUS 3/3 при N=3, строже
+power-математики; флаг `fragile=false` при 2000/2000/1000 вводил в заблуждение
+(docs/handoff/STELLEREUM_SESSION_2026-10-14.txt §6.2). План: power-weighted
+PQ-кворум вместо поголовного µQC (§10).
+Tier-2: Compact Epoch Certificate раз в 128 блоков (MMR-корень эпохи, весь состав)
+— для мостов/крупных переводов (мастер-спек v5 §3.2). Голоса: по дефолту Ed25519
+QC (`qc_bls_enabled()`), BLS12-381 — настоящий пэринговый (48B G1 ключи, 96B G2
+подписи, `e(sig,G1)==e(H(m),pk)`, src/bls.rs, PROTOCOL.md) — opt-in; битвектор
+сайнеров обязателен (его ест downtime-slashing). Timestamp-кламп:
+`parent_ts..=parent_ts+3600` (MAX_TIMESTAMP_JUMP_SECS, src/runtime.rs, сессия
+13.10 §1.4) — лечит рассинхрон после многочасового стопа.
+
+--------------------------------------------------------------------------------
+3. ЧТО РЕАЛИЗОВАНО ПО МОДУЛЯМ (файл: 2–4 строки + статус)
+--------------------------------------------------------------------------------
+- src/consensus.rs (3468 строк) — HeightConsensus, Vote/QC, lock/polka, sortition
+  µQC, proposer schedule, deadlock breaker, set-freshness gate. Статус: DONE.
+- src/runtime.rs (4890) — ValidatorRuntime: propose/verify/apply, сборка блоков
+  (MAX_BLOCK_TXS/GAS), Falcon-голоса/предложения, governed-параметры. DONE.
+- src/sharding.rs (3826) — Transaction/PqSignatureEnvelope (explicit/implicit),
+  Masterchain+шарды, кросc-шард маршрутизация, `STELL_SHARDS`. DONE ядро;
+  dynamic split/merge СОЗНАТЕЛЬНО ВНЕ (недетерминирован по load — нужен M4).
+- src/svm.rs (2400) — WASM-движок wasmi, OpCode/SysCall (Stake/Unbond/Claim/
+  CancelOrder/Bridge/Oracle/PMM/Actor/zkML), газ-таблица, clone-commit. DONE.
+- src/state_engine.rs (7311) — InMemoryStateEngine, Patricia-trie + commitment
+  digest, fees/rewards→slash→rotation порядок, receipt-вердикты. DONE.
+- src/mempool.rs (2309) — admission (подпись, base fee, платёжеспособность,
+  квоты, eviction), NONCE_FUTURE_WINDOW=16 (2309:423), per-sender 256 / pool
+  10k, MAX_BLOCK_WIRE_BYTES 24MB, proof-units 2048. DONE (nonce НЕ проверяется
+  в add_checked — только продюсером; см. RPC.md).
+- src/staking.rs (2299) — ledger, bond/delegate/unbond, слэшинг, эжекция <MIN,
+  fragile-оценка, топ-250 детерминированно. DONE.
+- src/governance.rs (992) — proposals/vote/apply, quorum 6666 bps + floor 3333,
+  voting 3 дня, PROPOSAL_MIN_STAKE 10k. DONE движок (в коммитменте с v3);
+  RPC-write методов НЕТ (только чтение).
+- src/bridge.rs (2117) — TeleportBridgeEngine: 2/3 DISTINCT (quorum_threshold,
+  2117:403), replay-set, таймлок 1ч ≥50k, rate 500k/ч, mint caps 500k/ч + 100M,
+  challenge-bond/окно спора. DONE on-chain политика; PARTIAL: вотчеры-демоны
+  TON/EVM/Solana (добыча evidence) — вне кода, refund-дизайн открыт (F-G).
+- src/bridge_adapters.rs (1090) — проверка evidence TON (BoC), EVM (MPT),
+  Solana (SHA-256 Merkle). DONE проверка; PARTIAL без живых вотчеров.
+- src/token.rs (787) — STS-токены (mint/transfer, supply cap), изоляция от
+  native. DONE.
+- src/tokenomics.rs (178) — константы 1B/250M/$0.25, BLOCK_REWARD 0.317 STELL,
+  аллокации, GenesisVault mint-формула. DONE.
+- src/orderbook.rs (401) — CLOB-актор: limit/market, partial fill, price-time
+  приоритет, depth caps, escrow. DONE.
+- src/pmm.rs (499) — PrimaryMarketMaker: base $0.25, depth cap 125M, redemption
+  buffer 2000 bps. DONE.
+- src/oracle.rs (542) — 3-tier: pull-oracle свежесть ≤15 мин (542:10), TWAP
+  60 мин, breaker >10% / USDT<0.95 (542:11-12); publishers + committed feeds
+  в коммитменте с v4. DONE.
+- src/crypto_privacy.rs (1738) — Pedersen C=vG+rH, stealth dual-key DH one-time,
+  viewing keys (+encrypt для аудитора), session budget. DONE фаза-1; PARTIAL:
+  range proofs/solvency открыты (F-A): уравнение + spent-set есть, отрицательные
+  балансы легальны — чинить ДО unshield.
+- src/post_quantum.rs (2074) — Falcon-512 (pk 897B, sig 666B, q=12289, N=512),
+  Hybrid 929/730B, STELL_PURE_PQ fail-closed, NTT-кэш. DONE.
+- src/zkml.rs (1760) — ReLU-инференс с Fiat-Shamir (<1мс), Groth16/arkworks 0.5
+  BLS12-381 путь, session keys (SCOPE_*), chain id 5757 (1760:83). DONE ядро;
+  PARTIAL паспорт: production-церемония/MPC, глубина моделей, ZK-обёртка.
+- src/evm_adapter.rs (8528) — eth_chainId 0x167d/net_version 5757, блоки,
+  балансы nano→Wei, nonce, EIP-1559 feeHistory, eth_call ERC-20, фильтры
+  (TTL+лимиты), RLP+Keccak+secp256k1 ecrecover, eth_sendRawTransaction
+  (EIP-155/1559 verify → intent-pool → EV1-конверт L1). DONE код (88 тестов);
+  PARTIAL раскатка: XFF за прокси (нужен nginx), Chainlist PR.
+- src/rpc.rs (3767) — все stell_* (см. §8), токены faucet/auth, персист faucet,
+  reconcile nonce. DONE.
+- src/explorer.rs (1278) — gateway: HTML, /healthz//readyz//metrics, /api/*,
+  /rpc nest, лимитер 30/s/IP + CORS*. DONE.
+- src/network.rs (2560) — infnode QUIC/DHT black-box, бакеты stell_blocks/
+  stell_head/stell_headers, DHT retention (KEEP 8000, prune 100/2048, TTL 100y).
+  DONE.
+- src/sync.rs (2211) — block-sync (до 200k, QC-верификация), snapshot-sync
+  (pointer/latest-snapshot, tail-anchor окно 8 при гэпе>500, per-chunk resume,
+  8/2 конкурентности, ретраи с jitter), node-bootstrap 4 стадии. DONE; PARTIAL:
+  холодный синк С НУЛЯ по чистому протоколу недоказан (C шёл со слепка).
+- src/parallel_exec.rs (460) — DisjointScheduler, extract_access_keys. DONE
+  (корректность подтверждена аудитом).
+- src/dns_seeds.rs (1233) — свой async UDP TXT-резолвер, seeds.stellereum.org,
+  DHT-доступ без права менять validators. DONE.
+- src/turnstile.rs (424) — Cloudflare siteverify (8с таймаут), CaptchaGate для
+  публичного крана (400 без токена / 403 bad token). DONE.
+- src/node_keys.rs (311) — identity/e2e/falcon ключи, 0700/0600, Argon2id,
+  plaintext-WARN без passphrase. DONE.
+- src/light_client.rs (967) — Checkpoint/LightHeader, verify_validator_quorum,
+  SPV-пруфы аккаунтов/токенов. PARTIAL: структуры+верификация есть, развёрнутого
+  лайт-клиента нет (зафиксированный гэп PROTOCOL.md §5).
+- Прочие: src/bls.rs (635, настоящий BLS) DONE opt-in; src/snark.rs (767) DONE;
+  src/mev.rs (558, Shamir T-of-N, node-local round key) PARTIAL — пороговое
+  преемпшн ОТЛОЖЕНО (нужны wire-слоты = хардфорк); src/mev_v4.rs (877) PARTIAL;
+  src/storage.rs (2374, sled ACID) DONE; src/wallet.rs (774, vault Argon2id+
+  XChaCha20) DONE (но без REPL/orderbook/stealth CLI — это в stell-wallet);
+  src/metrics.rs (993) DONE; src/contract.rs (580) DONE; src/chain.rs (452),
+  src/cell.rs (348), src/cpat2.rs (464), src/commitment.rs (964, v5) DONE;
+  src/client_ip.rs (536, XFF-готовность) DONE код, PARTIAL деплой;
+  src/consensus_net.rs (1590, broadcast/probe/evict) DONE; src/remote_signer.rs
+  (935, HSM-вынос ключа) DONE; src/bootstrap.rs (310, gated first-start) DONE.
+
+--------------------------------------------------------------------------------
+4. СКОРОСТЬ (измеренные цифры + что ограничивает)
+--------------------------------------------------------------------------------
+In-engine (docs/PERF_1K.md, Ryzen 5 3600, release-бенчи): полный газ-блок =
+428 plain-переводов (428×280k=119.84M ≤120M; 429-й не лезет — tests/packing_1k_tests.rs:28);
+apply_mixed_428 = 8.45 мс wall → 50.7k tx/s in-process (100/1000: 3.94/13.16 мс);
+селекция 35–550 мкс (pool 428/1k/10k); исполнение = ~2% от 427-мс бюджета —
+НЕ бутылочное горлышко. Симулятор: первый блок ~1.66 мс (README). V5-спек:
+250k tx/s in-engine, 15 мс/блок (исторический замер; старый harness: Token
+~613k tx/s, Native ~26k tx/s). E2E: 211 TPS замерено на стенде (REMAINING, сюит
+1146/0); live-финализация сейчас ~1–2 с/блок (A/B; была ~0.95–1 бл/с до C-шторма).
+Рецепт 1k TPS: 428 tx / 0.427 с ≈ 1002 TPS — закрывается EITHER back-to-back
+полными блоками на полу 400 мс (1070 TPS), OR MAX_BLOCK_GAS 280M (1000 tx @1с),
+OR mix 600 tx @600 мс (PERF_1K §3). Confidential-оговорка: Transfer2 verify
+8.94 мс (32-bit) / 12.89 мс (64-bit) serial — блок с долей shielded f требует
+8.5мс+f·428·11мс: f=10% ~55 мс (влезает), f=100% ~4.7 с (~90 TPS) — proof-bound;
+лечится 32-битными пруфами (prove_auto) и batch_verify. Что ограничивает
+сейчас: (1) транспорт/gossip — DHT-фоновый хвост p90 ~8.9 с, консенсус-хвост
+убит; (2) этаж раунда MIN_BLOCK_MS 400 + тик ~460 мс = ≥0.66 с/высота минимум,
+снижать только после падения resp (p50 ~660 мс vs таймаут 800 мс — запаса нет);
+(3) шардинг выключен на стенде (STELL_SHARDS не задан) — весь TPS через один
+шард; (4) слабые ноды (C: 1 vCPU) + шторм стримов давали 2.6→26 с/блок до
+bound'ов fetch-8/snapshot-2/serial-чанков.
+
+--------------------------------------------------------------------------------
+5. КРИПТОГРАФИЯ
+--------------------------------------------------------------------------------
+Falcon-512 (NIST Level 1): pk 897B / sig 666B, q=12289, N=512, norm-bound²
+34034726 (src/post_quantum.rs:88-100); NTT-предвычисления валидаторных ключей
+(52 мкс/verify с кэшем, 16 подписей <0.15 мс на 12 потоках — v5 §3.3). Режимы
+адресов: 0x01 Ed25519 (32B pk/64B sig), 0x02 Falcon-512, 0x03 ML-DSA-44
+(1312/2420B), 0x04 Hybrid (929/730B); адрес = BLAKE3("STL_ADDR_V4"||scheme||
+pk||salt) 32B; account pinning: Tx#1 приносит ключ (+surcharge 45k газа,
+src/mempool.rs:17), Tx#2..N — 0 байт ключа (экономия 55%); Pending Nonce Buffer
+16 слотов/аккаунт (src/mempool.rs:13). Pure PQ: STELL_PURE_PQ=1 — отказ
+классике fail-closed (кошелёк строит build_pq_payload_tx, always-explicit
+carrier + surcharge). Ed25519 — голоса/QC по умолчанию (batch-verify);
+secp256k1 — только EVM-адаптер: ecrecover + Keccak-256 + RLP + EIP-155/1559
+verify, chain_id==5757 строго (src/evm_adapter.rs:400,465,580). Stealth:
+dual-key DH one-time адреса (generate/is_for_recipient/derive_one_time,
+src/crypto_privacy.rs:139-280); viewing keys: derive_from_seed, spend-key
+деривация, encrypt/decrypt сумм для аудитора (Travel Rule — отправитель всегда
+публичен; src/crypto_privacy.rs:309-423). Pedersen: C=v·G+r·H (H=hash_to_point),
+batch verify, уравнение ΣC_in−ΣC_out=fee·G; range proofs V2 + ownership map —
+ЧАСТИЧНО (см. F-A в §10: сейчас только уравнение + spent-set). Session keys:
+домен STELL_SESSKEY_V1, scopes TRANSFER/SVM_PAYLOAD/ACTOR_SEND/ALL
+(src/zkml.rs:72-102), gas-cap + expiry, on-chain реестр условно в коммитменте
+(непустой — иначе байт-идентично). BLS12-381 (bls12_381 crate, pure Rust):
+настоящий пэринг, signer-bitvector обязателен; HybridCertificate/is_bls_active —
+soft-fork активация (PROTOCOL.md).
+
+--------------------------------------------------------------------------------
+6. СТЕЙКИНГ / ВАЛИДАТОРЫ
+--------------------------------------------------------------------------------
+MIN_VALIDATOR_BOND = 1000 STELL (src/staking.rs:36); генезис-бонд = MIN
+(src/runtime.rs:96); power = self_bond+delegated (power unit при генезисе).
+Кворум-математика (floor(2T/3)+1): текущий сет {A:2000, B:2000} (C изгнан,
+self 902<MIN): total 4e12 nano, quorum 2666666666667, fragile=true (честно);
+сет 2000/2000/1000 давал quorum 3333333333334, fragile=false — НО это вводило
+в заблуждение из-за unanimous µQC при N=3 (см. §2). Полный 2-of-3 при N=3
+невозможен в принципе (сумма пар 2T < 3·(2T/3+1)); настоящий отказоустойчивый
+кворум = 4-й валидатор (3/4). Слэшинг: equivocation 5% (500 bps, без cooldown),
+downtime 0.1% (10 bps) после 10 consecutive miss, cooldown 100 высот (первое
+нарушение — без cooldown), прощение при повторной подписи; ожог РЕАЛЬНЫЙ —
+дебет из staking pool (не счётчик; src/staking.rs:181-190,1071-1141). C флэппился
+→ ~98 STELL слэшей → eject ниже MIN (ledger_tool: members 2). Эжекция: self<MIN
+вне сета (фильтры to_validator_set, src/staking.rs:821,837); WARN за 100 STELL
+до eject (STELL_SLASH_EJECT_WARN_GAP) + буфер 100 STELL при bond
+(src/staking.rs:42-62) — тесты staking 32/32. Unbonding 2 суток (172800 с,
+src/staking.rs:179; при 400мс это ~5× больше блоков, чем при 3с — OPERATIONS §5).
+Кап: MAX_ACTIVE_VALIDATORS=250, TARGET_MIN=150 (src/staking.rs:149-154),
+топ-250 по стейку детерминированно (TON-Elector стиль); обычные full/RPC —
+безлимитны. Награда 0.317 STELL/блок делится на active (tokenomics). AppliedParams
+(governed block_reward/min_bond/commission) реально читаются продюсером и
+VmContext (governance_applied_tests).
+
+--------------------------------------------------------------------------------
+7. СЕТЬ
+--------------------------------------------------------------------------------
+Топология: A Хельсинки ↔ B Ryzen по QUIC/UDP 9410 (RTT ~67 мс, r0-финализация);
+C (друг, 1vCPU/3.8G/9.8G, капы CPUQuota 60%/MemoryMax 2G/KEEP 4000/ARCHIVE 0)
+— изгнан и остановлен до доказательства холодного синка. P2P: infnode —
+шифрованный QUIC-транспорт + Kademlia DHT + blob-хранилище (bodies bincode,
+адресация по хэшу, анонс в DHT KV; src/network.rs:2,14-26); БЕЗ Reed-Solomon/
+1MB-чунков в нашем коде (README честно фиксирует). Head — реплицированный DHT
+blob `stell_head` (`stell:height:<shard>`), тела — `stell_blocks`, заголовки —
+`stell_headers`. DNS-сиды: свой async UDP TXT-резолвер (src/dns_seeds.rs),
+`STELL_DNS_SEEDS=seeds.stellereum.org`, TXT ≤512B, ≤32 пиров, порт ≥1024,
+резолв-таймаут 5с; найденные пиры = DHT-синк, НЕ меняют validators (защита
+консенсуса). Observer: STELL_OBSERVER=1 пропускает self-add (иначе свежий ключ
+минтит свой генезис 3/d365 вместо сетевого 2/c840 — структурная ловушка,
+закрыта + тесты observer_flag_*); observer следует/валидирует, не предлагает/
+не голосует; stale-set → громкий WARN + observer без голосов (set-freshness
+gate). Snapshot-sync: pointer на exact latest-snapshot (снапшоты на некруглых
+высотах!), state + ВСЕ домены (accounts+staking, domains, session, bridge,
+confidential, zkML, cross-shard), tail-anchor пери-height precommit-QC при
+гэпе>500 вместо полного walk (окно 8, src/sync.rs:269), per-chunk resume
+(таймауты 20с/чунк, 6 ретраев, whole-blob 300с×3), конкурентность fetch 8 /
+snapshot 2, jitter/backoff, live-adopt fast path, prune_lane отдельно;
+node-bootstrap: preflight(gated: clean dir + OBSERVER + faucet key + peers +
+non-empty validators) → snapshot w/ ledger → tail-anchor → walk → live
+(src/main.rs:4015, OPERATIONS §10). Probe: core.ping каждые ~30с, evict мёртвых
+коннов (2с бюджет vs 120с self-heal); join переподписка каждые 5с;
+broadcast логирует ok/denied/transport-err/TIMEOUT (consensus_net.rs:199-247).
+
+--------------------------------------------------------------------------------
+8. RPC / API
+--------------------------------------------------------------------------------
+Транспорт: HTTP POST / на STELL_RPC_LISTEN (127.0.0.1:8545) + дубль /rpc на
+explorer-порту (8080) за лимитером; тело ≤1 MiB (-32600), батчи запрещены,
+id эхосится; коды -32700/-32600/-32601/-32000/-32001 (docs/RPC.md §1).
+stell_* (все из dispatch src/rpc.rs): stell_chainId (=5757, hardcoded,
+zkml::DEFAULT_CHAIN_ID, src/zkml.rs:83 — два деплоя одного бинаря НЕ различить);
+stell_nodeId (inf1:+blake3(ed-pub)[..20]); stell_blockNumber (hex finalized);
+stell_syncing (peer sighting ≤5 мин); stell_getStateRoot (trie root; чтение с
+побочкой I3 — дописывает digest); stell_latestBlocks (≤100, in-memory, не
+персист); stell_getBlock {height:number} (то же окно; -32004 вне окна; тел
+блоков по RPC НЕТ); stell_getBalance[Spv] (Spv только object-форма + proof;
+branch_prefix legacy); stell_tokenBalance/Supply/[Spv]/listTokens (limit 100/
+max 1000; namespace sha256("STS_BAL"‖…)); stell_getTransactionReceipt/Status
+(success/failed/pending-local/unknown; receipts ≤50k, oldest-first);
+stell_sendRawTransaction {tx:bincode-hex} (+token при STELL_RPC_AUTH_TOKEN;
+проверка подписи+base fee+платёжеспособность+квоты+eviction; nonce НЕ проверяет —
+дроп у продюсера); stell_faucet {address[,amount]} (drip 10 STELL дефолт,
+сейчас 1000 на A — осознанно; cap 1000/адрес; персист faucet_state_v1 + clamp
+вниз; НЕ пишет балансы — обычный трансфер через консенсус; токен fail-closed);
+stell_stakeOf; stell_getValidators {validators,power,total,quorum,fragile}
+(quorum=u64::MAX при пустом сете — fail closed); stell_proposal {id} /
+stell_governanceParams (только чтение; write-методов НЕТ); stell_mempoolSize
+(честный — shared Mempool; диагностика 0-стоит/ненулевой-стоит/10000-полон).
+Лимиты: мемпул 10k/256-на-сендера, блок 10k tx/120M газа/24MB wire/2048 proof
+units; faucet 20 drips/час/IP + Turnstile. EVM-адаптер: eth_chainId/net_version/
+blockNumber/getBalance/nonce/gasPrice/maxPriorityFee/estimateGas/feeHistory/
+call(ERC-20)/getLogs+filters(RLP/Keccak/secp256k1; chain 5757 strict) —
+ограничения декларировать (no batch, no contract exec). Эксплорер: GET / (UI),
+/healthz (liveness, без локов), /readyz (200/503 + failed_checks:
+no_peers/no_finality/finality_stalled/height_zero/height_stalled; пороги
+STELL_READY_MAX_STALL_SECS=30, MIN_PEERS=1), /metrics (registry + 5 gateway
+gauges incl. stell_ready), /api/stats|blocks|balance|spv|contracts|tx/:hash|
+confidential/:commitment, POST /api/faucet/:address (405 на GET) и
+POST /api/faucet-public/:address за капчей; везде 30/s/IP + CORS:* (speed bump,
+не access control — нужен reverse proxy). Кран-гейт: STELL_FAUCET=1 только на
+одной ноде (иначе N независимых nonce-счётчиков с одного аккаунта).
+
+--------------------------------------------------------------------------------
+9. КОШЕЛЁК (репо /home/imm/stell-wallet — обзорно)
+--------------------------------------------------------------------------------
+Структура: src/{main.rs,client.rs,rpc.rs,pq.rs,notes.rs,security.rs,wallets.rs},
+tests/wallet_multi_management_tests.rs (3; весь сьют 109/0), README с двумя
+режимами. Режимы: local (in-process симуляция, state_cache.bin — только
+self-consistency, НЕ финал) vs --rpc-url (chain-verified: SPV-пруфы локально
+против node root, poll receipt до Confirmed/Failed; токены STELL_RPC_AUTH_TOKEN
+/ STELL_FAUCET_TOKEN). Команды: new/restore (24 слова, project-wordlist+KDF —
+НЕ BIP-39-совместим), balance/receive (адрес + demo-stealth + QR), pay,
+faucet, stake (PQ-ветка build_pq_payload_tx, газ 327k, always-explicit carrier),
+wallets|list|accounts, new/restore/switch|use, REPL stell[name]>. Мультикошелёк
+(готово): ~/.stellereum/wallets/<name>.json + active-указатель + парольная
+проверка switch + legacy-миграция. Безопасность: Argon2id 64MB/3/4, XChaCha20-
+Poly1305, AAD-привязка схемы, 0600/0700, zeroize+mlock, атомарные записи;
+аудитом закрыты: derive_storage_key без энтропии, общий shielded_notes.json
+(per-wallet изоляция), открытый stealth_outputs.json (зашифрован), scheme-
+confusion. Живые баги, чиненные в стейк-танец: газ первой Falcon-tx (+45k
+surcharge), stake-классика→PurePQ-отказ, implicit-конверт→always-explicit.
+Открыто: per-wallet notes уже изолированы; XFF за прокси — на стороне ноды.
+
+--------------------------------------------------------------------------------
+10. ЧТО НЕ ДОДЕЛАНО + ПЛАН
+--------------------------------------------------------------------------------
+P0 сеть/консенсус: (1) Деплой f7ba7b8 везде + унификация бинарей (A/B vs C
+c536873c — свести к одному!). (2) Возврат C: долив до MIN+буфер (faucet-cap его
+адреса исчерпан → другой адрес + rotate-key или governance-исключение — РЕШИТЬ;
+карантин: сначала bootstrap-доказательство как observer). (3) 4-й валидатор —
+единственный путь к настоящему 2-of-3 (3/4); координация через join-network.sh/
+add-peer.sh + quorum-guard (rc: observer→bond→промо; никаких ручных 6 часов).
+(4) Power-weighted PQ-кворум вместо поголовного µQC при N≤16 (сейчас unanimous
+de facto). (5) Холодный синк-доказательство с нуля по чистому протоколу (C шёл
+со слепка — недоказан). (6) F-A: range proofs + solvency shielded-пула ДО
+unshield (HIGH, блокирует entry-exit). (7) F-G: bridge refund-дизайн
+(refund-after-expiry vs challenge; двойная трата через цепи). (8) Вотчеры-
+демоны TON/EVM/Solana + header store on-chain + optimistic-ядро (окно 30–60 мин,
+Challenge/Resolve, бонды/награды, per-chain изоляция, governance-пауза) —
+путь к «почти нативному» мосту (§D REMAINING слои 0–4); затем LP fast lane и
+мосты Base/TON. (9) MEV: настоящее пороговое преемпшн (асимметрия раунда, шары
+после коммитмента, sealed gossip) — wire-слоты = хардфорк; BLS default-ON +
+stripping — при uniform. (10) Кран: drip 1000→10 revert (РЕШИТЬ, требует
+рестарта A).
+P1 интеграции: XFF + nginx (код готов — client_ip.rs; блокер Chainlist-трафика);
+Chainlist PR (eth-прокси evm.stellereum.org, декларация no-batch/no-exec,
+оживление статики); DeFiLlama-адаптер (TVL = stake + bridge escrow + PMM/CLOB);
+L2-триада (Private dark pools / AI-compute zkML / Speed-gaming; shared sequencer
+L1 — валидаторы упорядочивают батчи, атомарная кросс-L2 в одном блоке);
+L2-гейт Base (wSTELL ERC-20, Aerodrome, Coinbase Smart Wallet, фиат-рампа) и
+TON (900M+ через нативные стандарты, НЕ через AA). P2 инновации: Communication
+Grants (реестр scope/срок/revoke + доставка); нативный AA (смарт-аккаунт,
+ротация, paymaster-gasless; чужие TON-Connect/WalletConnect — напрямую, не в AA);
+опциональная приватность как РЕЖИМ (прозрачный дефолт + viewing keys; биржевые
+депозиты — только прозрачные); identity name.stl как NFT (анти-сквоттинг,
+expiry, передача). Паспортные остатки: SNARK-церемония/MPC + глубина моделей +
+ZK-обёртка; DA/бриджинг L2-состояния (отдельный дизайн); io_uring отложен
+(sled не умеет); dynamic split/merge — только через голосование в блоках (M4);
+zk-deposit плейсхолдер fail-closed. Операционка: faucet-key ротация из env,
+бэкапы nodeA/B (.bakc/.bak.rt), watchdog 180с, health_check.sh, disk-guard cron.
+
+--------------------------------------------------------------------------------
+11. ИЗВЕСТНЫЕ ОГРАНИЧЕНИЯ И РИСКИ (честно)
+--------------------------------------------------------------------------------
+1) 2/2 хрупкость: при N=2 кворум=2 — падение/лаг ОДНОГО = стоп цепи; survivor не
+деградирует в соло, sync тоже gated кворумом; «убить ноду чтобы survivor пошёл» —
+не работает (OPERATIONS §5). 2) Unanimous µQC при N=3: комитет=весь сет → 3/3;
+fragile=false при 2000/2000/1000 вводил в заблуждение; C-критичен пока голосует.
+3) Slash-eject у MIN: downtime 0.1%/10 miss довёл C 1000→902 → eject; генезис-
+валидатор на MIN живёт в ~100 STELL от изгнания — доливать с буфером ≥100.
+4) A/B-рассинхрон r1550 vs r318: капы +8/4с + stale/absurd-дропы = взаимная
+глухота навсегда; лечится только скоординированным рестартом (дроп bodyless-
+локов + r0). 5) Перезапуск воскрешает stale round (checkpoint.round) — два узла
+после deadlock рестартуют в разных раундах; recovery = wipe ОБОИХ data dir
+сразу (PROTOCOL.md). 6) Retro-publish bounded (30с, 128/проход, глубина 4096):
+узел, отставший глубже, с этого пира не догонится. 7) Рост диска: archive по
+дефолту БЕЗГРАНИЧЕН (2.9GB замер; ~216k блоков/сутки при 400мс; хвосты
+~2.5–3.5GB/мес; C на 4.5G ≈1.5 мес); prune STELL_ARCHIVE=0 + KEEP (конвергенция
+постепенная, 20k/проход); снапшоты каждые 100 высот тоже копятся; метрики диска
+НЕТ (только du/alert на дериватив); persist-queue 8192 дропает при медленном
+диске (stderr, не tracing — Kat пропустят). 8) chain_id=5757 hardcoded — не
+разделяет testnet/mainnet одного бинаря; разделять на сети. 9) Faucet-ключ —
+ed25519 seed в env/процессе в открытом виде, тестовый 0x11..11 публичен;
+STELL_FAUCET_KEY обязан совпадать байт-в-байт (иначе тихий сплит); пустой dir
+стартует новую цепь МОЛЧА (guard ловит только рестарты). 10) Приватность ≠
+анонимность: отправитель всегда публичен, скрытый получатель — только с
+гигиеной; F-A открыт (минус-балансы легальны). 11) Мемпул не переживает рестарт
+→ faucet nonce-gap (резерв сгорел, on-chain не догнал); чинится clamp-down +
+reconcile mex + spill каждые 15с/SIGTERM. 12) Приёмка блоков best-effort с
+одной строкой отказа; proposal-reject виден только в info. 13) stell_syncing —
+vantage-local (партиция = false). 14) BLS QC opt-in — при 100+ валидаторах
+Ed25519-сертификаты толстые; µQC-16 держит 250 валидаторов при 250мс–1с, но
+только после power-weighted переделки. 15) Товарный знак «Stellar» не проверен;
+stellereum.org куплен (.org).
+
+--------------------------------------------------------------------------------
+12. ПРОВЕРКА СБОРКИ + ТЕСТЫ (факты)
+--------------------------------------------------------------------------------
+cargo check --offline (2026-10-14, /home/imm/stellereum): PASS —
+«Finished `dev` profile [unoptimized] target(s) in 0.22s», только 7 warnings
+(unused_mut в src/main.rs:1244,1251 и др.; не блокеры). По требованию менялся
+только этот отчёт; git-коммитов нет; ноды не трогалась.
+Тесты: 145 файлов в tests/ (от actor_* до zz_committed_rt), ~1100+ #[test]-
+точек; именованные сюиты: consensus/adversarial_4node/adversarial_economic/
+adversarial_regression, hunt_* (~25 файлов), catch_up/partition_heal/catchup_
+storm, snapshot_fanout/resume, quorum_fragility, validator_set_freshness/
+quorum, slashing_rotation, staking_*, bridge_*/dispute/persistence, oracle_/
+governance_applied, clob_*/pmm_*, privacy_live/onchain + confidential_preverify,
+post_quantum_audit + pure_pq_enforcement, evm_adapter (88/0), explorer_smoke,
+light_client, node_keys_*, observer_and_recovery, deadlock_breaker (5/5),
+freshness (7/7), node_bootstrap (1+6), packing_1k, fee_market_live, faucet_
+turnstile, metrics, remote_signer/signing, pruning_live, batch_verify,
+performance, tick_offload, session_*. Якоря зелени: 999/0 (2026-10-04, HEAD
+1d595c1, PROTOCOL.md), 1146/0 (2026-10-05, REMAINING), 1427 L1 (аудит 13.10),
+lib 446/446 + wallet 109/0 (сессия 14.10). Команда перепроверки:
+cargo test --no-fail-fast 2>&1 | grep -E '^test result:' (сумма passed).
+Ключевые пины: tests/genesis_root_known_answer_tests.rs (корень генезиса),
+tests/state_root_completeness_tests.rs (I1), receipt/block-parity сюиты (I8–I12).
+================================================================================
+КОНЕЦ ОТЧЁТА. Следующее окно (по §10): деплой f7ba7b8 + унификация бинарей →
+возврат C (долив+bootstrap) → 4-й валидатор → XFF/nginx → холодный синк →
+Chainlist/DeFiLlama.
+================================================================================

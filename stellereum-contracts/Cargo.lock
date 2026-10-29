@@ -6,7 +6,7 @@ version = 4
 name = "account-object"
 version = "0.1.0"
 dependencies = [
- "stellereum-sdk",
+ "stellereum-contract-sdk",
 ]
 
 [[package]]
@@ -682,7 +682,7 @@ dependencies = [
  "ed25519-dalek",
  "rand 0.8.8",
  "stellereum",
- "stellereum-sdk",
+ "stellereum-contract-sdk",
  "tokio",
 ]
 
@@ -1460,7 +1460,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 name = "liquidity-pool"
 version = "0.1.0"
 dependencies = [
- "stellereum-sdk",
+ "stellereum-contract-sdk",
 ]
 
 [[package]]
@@ -2457,14 +2457,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "stellereum-sdk"
+name = "stellereum-contract-sdk"
 version = "0.1.0"
 
 [[package]]
 name = "stl-dns"
 version = "0.1.0"
 dependencies = [
- "stellereum-sdk",
+ "stellereum-contract-sdk",
 ]
 
 [[package]]
@@ -2487,7 +2487,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 name = "sts20-token"
 version = "0.1.0"
 dependencies = [
- "stellereum-sdk",
+ "stellereum-contract-sdk",
 ]
 
 [[package]]

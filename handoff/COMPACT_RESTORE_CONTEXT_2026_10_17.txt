@@ -1,0 +1,145 @@
+================================================================================
+STELLEREUM — COMPACT RESTORE CONTEXT (СНИМОК ПАМЯТИ ДЛЯ РАСПАКОВКИ)
+Дата: 17 октября 2026. Место: /home/imm/COMPACT_RESTORE_CONTEXT.txt
+Ветка: wip/passport-agents (stellereum) | main (stell-wallet)
+Стенд: 3 физических сервера в WAN (Хельсинки, РФ Ryzen, Knanserver)
+Высота цепи: >159,000 блоков | Темп: 0.4 - 0.8с | TPS ingress: 290-382 tx/s
+================================================================================
+
+--------------------------------------------------------------------------------
+1. ТОПОЛОГИЯ И УЗЛЫ СЕТИ (ГДЕ ЧТО НАХОДИТСЯ)
+--------------------------------------------------------------------------------
+
+1. СЕРВЕР 1 — Node A (Финляндия, Хельсинки, хостинг Aeza):
+   - IP: 212.113.103.105 | Hostname: depressed-salmon.aeza.network
+   - SSH: ssh root@212.113.103.105 (без пароля, по ключу ~/.ssh/stell_test_ed25519)
+   - Директория ноды: /root/nodeA | Env-файл: /root/env.A
+   - Бинарник: /root/stellereum/target/release/stellereum
+   - Служба: systemctl status stell-nodeA.service (валидатор, 2000 STELL, --parallel-exec)
+   - Индексатор V2: /usr/local/bin/stellereum-indexer (служба stell-indexer.service, порт 8088)
+   - Nginx сайты:
+     * https://explorer.stellereum.org (флагманский эксплорер)
+     * https://testnet.stellereum.org (зеркало)
+     * https://faucet-testnet.stellereum.org (кран с Cloudflare Turnstile)
+     * https://rpc.stellereum.org (EVM и Stellereum JSON-RPC, 127.0.0.1:8545)
+     * https://explorer.stellereum.org/api/v2/ (легковесный Rust-индексатор)
+
+2. СЕРВЕР 2 — Node B (РФ, домашний ПК на AMD Ryzen):
+   - IP: 178.155.74.242 | Hostname: mainserver (ЛОКАЛЬНАЯ МАШИНА СЕССИИ)
+   - Директория: /home/imm/multinode/nodeB | Env-файл: /home/imm/multinode/nodeB/env.B
+   - Служба: systemctl --user status stell-nodeB.service (валидатор, 2000 STELL, --parallel-exec)
+   - RPC: http://127.0.0.1:8546 | Explorer: http://127.0.0.1:8081 | P2P: UDP 9410
+   - Приватный ключ Node B: f155499a0833b8c23e8d840a6a7c698db79ad8dd4930e5d90cdb721316debee0
+   - Адрес: 9c675ebc6cd20c9226da2fcbf6c167647e4e948b78368f038058b6b419175fcd
+
+3. СЕРВЕР 3 — Node C (Сервер друга):
+   - IP: 77.110.96.68 | Hostname: knanserver.aeza.network
+   - SSH: ssh -p 2222 root@77.110.96.68 (ключ ~/.ssh/id_ed25519.pub добавлен в authorized_keys, пароль бэкап: Tww5Yfcubk10)
+   - Директория ноды: /root/nodeC | Env-файл: /root/nodeC/env.C
+   - Бинарник: /root/nodeC/stellereum
+   - Служба: systemctl status stell-nodeC.service (валидатор, бонд 1999 STELL, --parallel-exec)
+   - Адрес: 021776cdf2b3b644e91dbe44fbef4a29f5a8ebf80b01055d3e7cc83a85659694
+   - Приватный ключ Node C: cc5e4d16ad3503f9e80c541ee853664ec48ce402fb99883b2389b3aa214605ab
+
+КВОРУМ ВАЛИДАТОРОВ:
+Total Power = 5 999 044 471 404 nano-STELL (3 равноправных валидатора по ~2000 STELL)
+Кворум = 3 999 362 980 937 (любые 2 валидатора из 3 образуют кворум 2/3)
+Флаг fragile = FALSE (кворум отказоустойчив, сеть не падает при выходе одной ноды).
+
+--------------------------------------------------------------------------------
+2. ЧТО БЫЛО СДЕЛАНО В СЕССИИ (РЕЗУЛЬТАТЫ)
+--------------------------------------------------------------------------------
+
+1. ПОЛНОСТЬЮ ЗАКРЫТЫ ВСЕ УЯЗВИМОСТИ АУДИТА (P0 и P1):
+   - P0-1: Falcon-512 ($2^{21}$ энтропийный коллапс): устранены сдвиги и автоморфизмы одного базиса. Внедрена NIST FIPS 206 NTRU-Solve генерация с полной 256-битной энтропией (falcon-rust). Для совместимости со старыми данными сохранена ветка STELL_LEGACY_GENESIS_ROOT=1. В структуре FalconKeypair реализован кастомный fmt::Debug с маскировкой [REDACTED].
+   - P0-2: Атака на мост Teleport (Ложные челленджи): убран fraud_signal = true при мусорных пруфах; невалидные пруфы уходят в отсрочку, депозит не сжигается, челленджер получает 0% награды, а его бонд сжигается.
+   - P0-3: BFT Nil-Polka lock reset: честные ноды больше не сбрасывают замок безопасности по nil-кворуму (found == (r, None)). Сброс возможен только при подтверждении польки за другой реальный блок.
+   - P0-4: µQC committee_size = 1 подделка: введена строгая проверка cert.committee_size == (validators.len() as u32).min(16).
+   - P0-5: Необеспеченный генезис-стейкинг: fund_genesis теперь честно дебетует балансы валидаторов и кредитует STAKING_POOL.
+   - P1-6: EVM-адаптер: случайные криптостойкие 64-бит ID фильтров (защита от угона); стабы ERC-20 transfer/approve/allowance в eth_call; проверка calldata.is_ascii(); асинхронный /metrics через spawn_blocking; fail-closed stell_mempoolDump.
+   - P1-7: P2P & Мемпул: Pure-PQ строгий чек в батчах транзакций; PendingActivationBuffer проверяет баланс и резервирует средства до буферизации.
+   - P1-8: Хранилище: в AsyncPersistence::push блокирующий сон заменен на tokio::task::block_in_place; якорь tail_anchor аутентифицирует state_root против тела блока.
+
+2. ЭКОНОМИКА ПРИВАТНОСТИ (1.75x SURCHARGE):
+   - В src/svm.rs все конфиденциальные операции ZK/Pedersen увеличены ровно в 1.75 раза:
+     * GAS_CONFIDENTIAL_TRANSFER = 2_625
+     * GAS_CONFIDENTIAL_TRANSFER2 = 3_500
+     * GAS_CONFIDENTIAL_T2_PER_COMMITMENT = 1_750
+     * GAS_CONFIDENTIAL_T2_PER_BIT = 44
+     * GAS_CONFIDENTIAL_SHIELD = 3_500
+     * GAS_CONFIDENTIAL_UNSHIELD = 3_500
+     * GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT = 525
+
+3. РАЗГОН СЕТИ И УСТРАНЕНИЕ СКАЧКОВ ВРЕМЕНИ БЛОКОВ (0.4 - 0.8с):
+   - MAX_BLOCK_GAS поднят до 500_000_000 (в 4.16 раза больше емкости).
+   - STELL_MEMPOOL_PER_SENDER поднят с 256 до 1024, общий кап пула — 50 000.
+   - STELL_MIN_BLOCK_MS снижен с 250мс до 100мс на всех нодах.
+   - Включен многопоточный Rayon флаг --parallel-exec.
+   - ВСКРЫТА И УСТРАНЕНА ПРИЧИНА СКАЧКОВ В 2.6с И 14.1с:
+     а) Тайм-аут ожидания бродкаста STELL_BROADCAST_JOIN_MS снижен с 500мс до 120мс (ноды A и B не ждут медленную ноду C).
+     б) В src/main.rs сетевые вызовы net.probe_peers() (раз в 30с) и net.join() (раз в 60с) вынесены из тела тика консенсуса в независимые tokio::spawn задачи (раньше они вешали поток на 1.6 - 2.6 секунды!).
+     в) В infnode (src/node.rs) параметр KV_FLUSH_DEBOUNCE_MS поднят с 10 секунд до 300 секунд (5 минут) и поддержан через INFNODE_KV_DEBOUNCE_MS. Раньше раз в 10 секунд нода перезаписывала 37 МБ JSON (kv.json), что приводило к 14-секундному дисковому локу!
+
+4. БОЕВОЙ СТРЕСС-ТЕСТ:
+   - Отправка 1 000 транзакций Falcon-512: Ingress TPS = 290.3 tx/s (1000 tx за 3.44 секунды).
+   - Все 1 000 транзакций смайнены ончейн в 16 блоков (по 104-144 tx/блок) со статусом success.
+   - Корни стейта между Node A и Node B совпадают на 100% байт-в-байт.
+
+5. СВЕРХБЫСТРЫЙ RUST-ИНДЕКСАТОР V2 (STELLEREUM-INDEXER):
+   - Написан с нуля в /home/imm/stellereum-indexer на Axum + SQLite WAL.
+   - Потребление памяти: ВСЕГО 3.8 - 5.2 МБ RAM! Бинарник 7.7 МБ.
+   - Поддерживает все эндпоинты по схемам gram.org:
+     * GET /api/v2/overview (Supply, Circulating, Staked, 24h Tx, TPS, Cap)
+     * GET /api/v2/validators (Rank, Name, Stake, Weight %, Uptime, Falcon Key)
+     * GET /api/v2/stats (tps, block_time, seqno, indexed_txs)
+     * GET /api/v2/verified (GVAULT, TELEPORT, CLOB, PMM, STAKE)
+     * GET /api/v2/tokens (STELL, USDT, wTON)
+     * GET /api/v2/stats/charts (почасовые txs, график времени блоков)
+     * GET /api/v2/whales (Rich list)
+     * GET /api/v2/blocks (пагинация блоков)
+     * GET /api/v2/block/:height_or_hash (детали блока + транзакции)
+     * GET /api/v2/tx/:hash (карточка транзакции)
+     * GET /api/v2/account/:address/txs (история кошелька с пагинацией)
+     * GET /api/v2/search?q=... (мгновенный поиск)
+   - Задеплоен на Node A: служба stell-indexer.service, порт 8088, прокси https://explorer.stellereum.org/api/v2/. Протестирован 450 параллельными запросами: 100% успех.
+
+6. КОШЕЛЁК STELL-WALLET:
+   - В /home/imm/stell-wallet устранены конфликты компиляции.
+   - Добавлен и проверен полноценный HTTP-RPC режим (--rpc-url https://rpc.stellereum.org).
+   - Добавлена и верифицирована SPV Merkle-проверка как для неактивированных (16 байт), так и для активированных Falcon-512 аккаунтов (49 байт).
+   - Проверено live: new, faucet, pay (Tx #1, Tx #2), balance, receipt.
+   - Запушено в GitHub: immtes/stell-wallet (main -> 818dea9).
+
+--------------------------------------------------------------------------------
+3. АКТИВНЫЙ ТРЕКЕР ЗАДАЧ (ЧТО ДЕЛАТЬ ДАЛЬШЕ)
+--------------------------------------------------------------------------------
+
+[x] 1. Починить ноду C (синхронизировать высоту с A/B, убрать сброс стримов, вернуть в кворум) - ВЫПОЛНЕНО.
+[x] 2. Чекнуть все страницы gram.org на API и схемы данных (главная, /validators, /stats, /verified) - ВЫПОЛНЕНО.
+[x] 3. Допилить индексатор-смотрильщик V2 со всеми возможностями как у Gram и прогнать агентами - ВЫПОЛНЕНО.
+[x] 4. Завершить применение фикса kv_debounce_ms в infnode и задеплоить бинарь на ноды (убить 14-секундный I/O лаг) - ВЫПОЛНЕНО.
+[x] 5. Доделать шардинг (кросс-шардовый процессинг Shard 0 <-> Shard 1, outbox, Merkle-пруф, inbox, ack, bounce) - ВЫПОЛНЕНО.
+[x] 6. Финальный аудит безопасности + замер скорости работы + стресс-тест двух шардов - ВЫПОЛНЕНО (2,320 TPS, все тесты GREEN).
+[x] 7. Включить STELL_SHARDS=0,1 в env-файлах на живых нодах A, B, C и запустить постоянный параллельный процессинг Shard 1 в тестнете - ВЫПОЛНЕНО.
+[x] 8. Внедрить все 5 рекомендаций аудита (атомарное освобождение reserved в мемпуле, усиление замка BFT, авто-миграция и композитный ключ SQLite в индексере V2, синхронизация bridge_dispute_tests) - ВЫПОЛНЕНО (коммит 734c8bd).
+[x] 9. Полный аудит готовности тестнета: 10/10 RPC, 8/8 V2 API, 3/3 Web портала - 100% PASS.
+[x] 10. Базовые смарт-контракты экосистемы (STS-20 токен с налогом/минтом/сжиганием, AMM Liquidity Pool и Account Object AA) - НАПИСАНЫ, ПРОТЕСТИРОВАНЫ (коммит 622758b).
+[x] 11. Боевой деплой смарт-контрактов в живую сеть тестнета (#193k+) через Falcon-512 транзакции - ВЫПОЛНЕНО (коммит c15f3a6, 5 контрактов активны в сети).
+[x] 12. Генератор NFT карточек .stl доменов по стандарту Fragment/Telegram (Roboto Mono Bold, сжатие, троеточие в центре, круглый логотип Stellereum, рандомизация Hue) - ГОТОВО (коммит a9f589d).
+
+--------------------------------------------------------------------------------
+4. ВАЖНЫЕ КОМАНДЫ ДЛЯ БЫСТРОГО СТАРТА ПОСЛЕ СЖАТИЯ
+--------------------------------------------------------------------------------
+- Проверить статус нод:
+  ssh root@212.113.103.105 "systemctl status stell-nodeA.service --no-pager | head -5"
+  systemctl --user status stell-nodeB.service --no-pager | head -5
+  ssh -p 2222 root@77.110.96.68 "systemctl status stell-nodeC.service --no-pager | head -5"
+- Проверить статистику и корни стейта:
+  curl -s http://127.0.0.1:8081/api/stats
+  ssh root@212.113.103.105 "curl -s http://127.0.0.1:8080/api/stats"
+- Проверить индексатор V2:
+  curl -s https://explorer.stellereum.org/api/v2/stats
+  curl -s https://explorer.stellereum.org/api/v2/validators
+- Собрать релиз stellereum:
+  cargo build --release --bin stellereum --manifest-path /home/imm/stellereum/Cargo.toml
+================================================================================

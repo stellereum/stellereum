@@ -85,11 +85,11 @@ async fn test_rust_wasm_stl_dns_onchain() {
     assert_eq!(winner, 20);
 
     // Test canonical reserved burn domain (burn.stl) and vault.stl
-    let burn_id = stellereum_sdk::address::DOMAIN_BURN;
+    let burn_id = stellereum_contract_sdk::address::DOMAIN_BURN;
     let (burn_target, _) = engine.call_contract(&contract_addr, "resolve", burn_id, 100_000).await.unwrap();
     assert_eq!(burn_target, 0, "System burn domain must resolve to Black Hole 0");
 
-    let vault_id = stellereum_sdk::address::DOMAIN_VAULT;
+    let vault_id = stellereum_contract_sdk::address::DOMAIN_VAULT;
     let (vault_target, _) = engine.call_contract(&contract_addr, "resolve", vault_id, 100_000).await.unwrap();
     assert_eq!(vault_target, 99, "Protocol vault must resolve to Treasury 99");
 }

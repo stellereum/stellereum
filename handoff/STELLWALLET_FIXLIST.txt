@@ -1,0 +1,50 @@
+================================================================================
+STELL-WALLET — ЧТО ЧИНИТЬ (проверено сборкой 2026-10-05, коммит 5f9040f)
+Репо: /home/imm/stell-wallet (отдельно), remote immtes/stell-wallet.
+Здесь ни разу не собирался. Встроенный кошелёк (stellereum wallet ...) рабочий.
+================================================================================
+
+[КРИТИЧНО]
+1. НЕ СОБИРАЕТСЯ. src/main.rs:507 вызывает account.delegate_bot_session с 3
+   аргументами, а src/wallet.rs:521 (в stellereum) теперь требует 6 (добавились
+   scope, chain_id и др. с фазами session keys). Ошибка E0061, единственная —
+   чинится одним вызовом, но дальше вскроется runtime-совместимость (п.2-4).
+
+[АРХИТЕКТУРА — ГЛАВНОЕ]
+2. Нет HTTP-RPC режима ВООБЩЕ. Кошелёк — in-process light client (свой движок
+   состояния + опциональный P2P-адаптер через infnode). Юзер на ноутбуке НЕ
+   может просто указать URL ноды: надо либо дописать RPC-клиент (образец —
+   scripts/tps_load.py на stdlib: balance/nonce, sendRawTransaction, poll
+   receipt, faucet), либо чинить P2P-коннект (конфиг пиров, endpoints стенда,
+   DNS-federation). Без этого "поюзать на тестнете" = только с локальной нодой.
+3. broadcast_tx врёт: статус "Confirmed" ставится ЛОКАЛЬНО сразу, без ожидания
+   цепи. Добавить poll stell_getTransactionReceipt до FINALIZED (иначе юзер
+   думает "ушло", а tx может висеть/отвалиться).
+4. get_balance_spv проверяет пруф против СВОЕГО локального корня, а не цепи.
+   Настоящий SPV: взять root + proof С НОДЫ (stell_getBalanceSpv / light-client
+   пруфы есть на сервере) и сверить локально. Сейчас это SPV по форме.
+
+[ФИЧИ]
+5. НЕТ ПОДДЕРЖКИ ТОКЕНОВ (проверено grep — ноль упоминаний). Добавить:
+   transfer/approve/balance (SysCallTokenTransfer/Approve/BalanceOf уже живут
+   в цепи) + CLI-команды + отображение балансов.
+6. НЕТ CLI-КОМАНДЫ для конфиденциального перевода. Билдер есть
+   (create_confidential_transfer + broadcast_confidential в client.rs),
+   команды в main.rs нет. Добавить `stell confidential-pay` (+ показ viewing key).
+7. Проверить ВСЕ вызовы против живого стенда: authorisation по
+   STELL_RPC_AUTH_TOKEN / STELL_FAUCET_TOKEN (стенд требует!), методы
+   ( Reporting: часть RPC могла поменяться с сентября), формат SPV-пруфов.
+
+[ДОКИ/МЕЛОЧИ]
+8. README местами врёт (бейджи mlock/ZeroizeOnDrop/Argon2 — сверить с
+   security.rs; часть заявлений уже опровергнута для встроенного кошелька).
+9. Прогнать tests/wallet_security_tests.rs после чинок + ручной e2e на стенде:
+   new → faucet → balance → pay → receipt → confidential → order.
+
+ПОРЯДОК: 1 (5 мин) → 2+3+4 (ядро, день-два) → 5+6 (фичи) → 7+9 (проверка) → 8.
+================================================================================
+
+[ПРОВЕРЕНО LIVE 2026-10-06] new/faucet/balance(SPV vs chain root)/pay/receipt/
+confidential-pay/session-print/bot-demo-full-loop — всё работает на стенде.
+Остаток: token live-перевод (нет токенов с саплаем); wallet session не публикует
+грант (только печатает). Бинарь stell задеплоен на стенд: /root/stell.

@@ -10,4 +10,4 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-stellereum-sdk = { path = "../../crates/stellereum-sdk" }
+stellereum-contract-sdk = { path = "../../crates/stellereum-contract-sdk" }

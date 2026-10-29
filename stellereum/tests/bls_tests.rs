@@ -260,3 +260,79 @@ fn test_aggregate_with_zero_signed_participants_is_refused() {
         "a certificate where nobody signed must not verify"
     );
 }
+
+#[test]
+fn test_bitmask_oversize_and_handbuilt_identity_fail_closed() {
+    // ATTACK: bitmask / oversize-envelope abuse. A relay can hand-build
+    // `BlsAggregateSignature` (public fields) with a bitvector whose
+    // `total_validators` does not match the verifier's key list, pad the
+    // trailing bits beyond the set, or splice the identity point as the
+    // aggregate. Every shape must fail CLOSED at verify (never panic, never
+    // verify), while the genuine certificate still verifies.
+    use bls12_381::G2Affine;
+
+    let keys: Vec<BlsSecretKey> = (0..4).map(|_| BlsSecretKey::generate()).collect();
+    let pks: Vec<BlsPublicKey> = keys.iter().map(|k| k.public_key()).collect();
+    let msg: &[u8] = b"bitmask-oversize-probe";
+    let sigs: Vec<(usize, BlsSignature)> =
+        keys.iter().enumerate().map(|(i, k)| (i, k.sign(msg))).collect();
+    let agg = aggregate_signatures(&sigs, 4).expect("genuine aggregate builds");
+    assert!(verify_aggregate_signature(&pks, msg, &agg));
+
+    // (1) total_validators mismatch: same bytes measured against a
+    // shorter/longer key list must refuse (attacker must not re-frame the set).
+    assert!(
+        !verify_aggregate_signature(&pks[..3], msg, &agg),
+        "truncated key list must refuse"
+    );
+    let mut longer = pks.clone();
+    longer.push(BlsSecretKey::generate().public_key());
+    assert!(
+        !verify_aggregate_signature(&longer, msg, &agg),
+        "extended key list must refuse"
+    );
+    // Hand-built envelope with total=8 carrying the same 4 signatures.
+    let mut wide = SignerBitVector::new(8);
+    for i in 0..4 {
+        wide.set(i, true);
+    }
+    let wide_agg = BlsAggregateSignature {
+        signature: agg.signature,
+        participants: wide,
+    };
+    assert!(
+        !verify_aggregate_signature(&pks, msg, &wide_agg),
+        "oversize bitvector (total 8 vs 4 keys) must refuse"
+    );
+
+    // (2) Wire-length confusion: 2 bytes for a 4-validator set never parses;
+    // 0 bytes never parses; the exact 1 byte does.
+    assert!(SignerBitVector::from_bitmask(vec![0u8; 2], 4).is_none());
+    assert!(SignerBitVector::from_bitmask(vec![], 4).is_none());
+    assert!(SignerBitVector::from_bitmask(vec![0u8; 1], 4).is_some());
+
+    // (3) Trailing pad bits beyond total_validators grant no power: n=5 needs
+    // 1 byte but only bits 0..5 are addressable.
+    let mut pad = SignerBitVector::new(5);
+    pad.set(5, true);
+    pad.set(6, true);
+    pad.set(7, true);
+    assert!(!pad.is_set(5) && !pad.is_set(6) && !pad.is_set(7));
+    assert_eq!(pad.signed_count(), 0);
+    assert_eq!(pad.absent_indices().len(), 5);
+
+    // (4) Hand-built identity aggregate with FULL participation still refuses.
+    let identity = BlsSignature(G2Affine::identity().to_compressed());
+    let mut full = SignerBitVector::new(4);
+    for i in 0..4 {
+        full.set(i, true);
+    }
+    let forged = BlsAggregateSignature {
+        signature: identity,
+        participants: full,
+    };
+    assert!(
+        !verify_aggregate_signature(&pks, msg, &forged),
+        "identity aggregate must never verify"
+    );
+}

@@ -1564,3 +1564,109 @@ async fn xpc_two_phase_commit_stays_off_until_an_activation_height() {
         "2PC-gated flows stay out on a fresh engine"
     );
 }
+
+// ===========================================================================
+// Cross-shard double-claim pin (ECON hunt): the SAME credited `source_tx_hash`
+// replayed from a workchain shard stays refused.
+// (`bridge_intents_from_a_workchain_are_refused` pins a FRESH hash from a
+// workchain; nothing pinned the SAME hash credited on the masterchain and
+// then re-sourced from a workchain. The global replay set plus the C7 shard
+// gate must fail closed: no second mint, no replay-set growth, escrow
+// untouched, and the masterchain replay afterwards is still refused.)
+// ===========================================================================
+
+#[tokio::test]
+async fn bridge_same_source_tx_replayed_from_workchain_stays_refused() {
+    let (e, vals) = setup(3).await;
+    e.enable_cross_shard();
+    let payer = key(0x0C);
+    let payer_pk = payer.verifying_key().to_bytes();
+    e.credit_native(&payer_pk, STELL).await.expect("fund payer");
+
+    let recipient = [0xB2u8; 32];
+    let amount = 1_000 * STELL;
+    let dep = deposit([0x83u8; 32], recipient, amount);
+    let att = attest(&dep, &vals[..2]);
+
+    // Control: the masterchain quorum credit applies exactly once.
+    let out = e
+        .apply_block_transition(
+            &bridge_block(
+                1,
+                TS,
+                vec![bridge_tx(&payer, 0, ops(Some(att.clone()), dep.clone()))],
+                payer_pk,
+            ),
+            0,
+        )
+        .await;
+    assert_eq!(out.status, vec![true], "control quorum deposit must apply");
+    assert_eq!(balance(&e, &recipient).await, amount);
+    assert!(
+        e.bridge_read().await.processed_source_txs.contains(&[0x83u8; 32]),
+        "the credited source tx must be in the committed replay set"
+    );
+    let escrow_after_credit = balance(&e, &BRIDGE_ESCROW).await;
+
+    // Attack: the EXACT same claim re-sourced from a workchain shard.
+    let out = e
+        .apply_block_transition(
+            &bridge_block(
+                2,
+                TS + 1,
+                vec![workchain_bridge_tx(
+                    &payer,
+                    1,
+                    ops(Some(att.clone()), dep.clone()),
+                )],
+                payer_pk,
+            ),
+            0,
+        )
+        .await;
+    assert_eq!(
+        out.status,
+        vec![false],
+        "cross-shard replay of a credited source_tx must be refused"
+    );
+    assert_eq!(
+        balance(&e, &recipient).await,
+        amount,
+        "the workchain replay must not mint a second credit"
+    );
+    {
+        let br = e.bridge_read().await;
+        assert_eq!(
+            br.processed_source_txs.len(),
+            1,
+            "the refused replay must not grow the replay set"
+        );
+        assert!(
+            br.processed_source_txs.contains(&[0x83u8; 32]),
+            "the original entry survives the cross-shard attempt"
+        );
+    }
+    assert_eq!(
+        balance(&e, &BRIDGE_ESCROW).await,
+        escrow_after_credit,
+        "escrow moves only for masterchain settlement"
+    );
+
+    // The global replay set survived: a masterchain replay is still refused.
+    let out = e
+        .apply_block_transition(
+            &bridge_block(3, TS + 2, vec![bridge_tx(&payer, 2, ops(Some(att), dep))], payer_pk),
+            0,
+        )
+        .await;
+    assert_eq!(
+        out.status,
+        vec![false],
+        "the same source_tx is still refused on the masterchain"
+    );
+    assert_eq!(
+        balance(&e, &recipient).await,
+        amount,
+        "no second mint from either shard path"
+    );
+}

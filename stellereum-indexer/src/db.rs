@@ -19,7 +19,17 @@ pub fn resolve_address_variants(address: &str) -> (String, String, String) {
     };
     let with_0x = format!("0x{}", clean.to_lowercase());
     let clean_lower = clean.to_lowercase();
-    let pattern = format!("%{}%", clean_lower);
+    // Audit B-IDX-1: escape LIKE metacharacters (`%`, `_`, `\`) so user
+    // input cannot widen the match (cross-account disclosure). Queries using
+    // this pattern carry an explicit `ESCAPE '\'` clause.
+    let mut escaped = String::with_capacity(clean_lower.len());
+    for c in clean_lower.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    let pattern = format!("%{escaped}%");
     (with_0x, clean_lower, pattern)
 }
 
@@ -293,8 +303,39 @@ impl Database {
 
     pub fn insert_block(&self, b: &BlockRecord) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        // Audit B-IDX-2: same (shard,height) with a DIFFERENT hash is a
+        // reorg — the new canonical hash must win (INSERT OR IGNORE kept
+        // stale forks forever). Dependents at this height are invalidated
+        // with it (same-height scope; cross-shard height overlap needs the
+        // shard-scoped schema migration tracked in ROADMAP).
+        let existing: Option<String> = match conn.query_row(
+            "SELECT hash FROM blocks WHERE shard_id = ?1 AND height = ?2",
+            params![b.shard_id, b.height],
+            |row| row.get(0),
+        ) {
+            Ok(h) => Some(h),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(old) = existing {
+            if old == b.hash {
+                return Ok(()); // idempotent fast path
+            }
+            conn.execute(
+                "DELETE FROM transactions WHERE block_height = ?1",
+                params![b.height],
+            )?;
+            conn.execute(
+                "DELETE FROM contract_events WHERE block_height = ?1",
+                params![b.height],
+            )?;
+            conn.execute(
+                "DELETE FROM blocks WHERE shard_id = ?1 AND height = ?2",
+                params![b.shard_id, b.height],
+            )?;
+        }
         conn.execute(
-            "INSERT OR IGNORE INTO blocks (shard_id, height, hash, timestamp, tx_count, proposer, state_root)
+            "INSERT INTO blocks (shard_id, height, hash, timestamp, tx_count, proposer, state_root)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![b.shard_id, b.height, b.hash, b.timestamp, b.tx_count, b.proposer, b.state_root],
         )?;
@@ -770,7 +811,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT tx_hash, block_height, tx_index, from_addr, to_addr, amount, fee_charged, gas_limit, status, timestamp
-             FROM transactions WHERE tx_hash = ?1",
+             FROM transactions WHERE tx_hash = ?1 COLLATE NOCASE",
         )?;
         let mut rows = stmt.query_map(params![hash], |row| {
             let from_addr: String = row.get(3)?;
@@ -842,7 +883,7 @@ impl Database {
              FROM transactions
              WHERE LOWER(from_addr) = ?1 OR LOWER(to_addr) = ?1
                 OR LOWER(from_addr) = ?2 OR LOWER(to_addr) = ?2
-                OR LOWER(from_addr) LIKE ?3 OR LOWER(to_addr) LIKE ?3
+                OR LOWER(from_addr) LIKE ?3 ESCAPE '\\' OR LOWER(to_addr) LIKE ?3 ESCAPE '\\'
              ORDER BY block_height DESC, tx_index DESC
              LIMIT ?4 OFFSET ?5",
         )?;
@@ -884,7 +925,7 @@ impl Database {
             "SELECT COUNT(*) FROM transactions
              WHERE LOWER(from_addr) = ?1 OR LOWER(to_addr) = ?1
                 OR LOWER(from_addr) = ?2 OR LOWER(to_addr) = ?2
-                OR LOWER(from_addr) LIKE ?3 OR LOWER(to_addr) LIKE ?3",
+                OR LOWER(from_addr) LIKE ?3 ESCAPE '\\' OR LOWER(to_addr) LIKE ?3 ESCAPE '\\'",
         )?;
         let count: u64 =
             stmt.query_row(params![with_0x, clean_lower, pattern], |row| row.get(0))?;

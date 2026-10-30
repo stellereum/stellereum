@@ -138,8 +138,47 @@ fn resolve_addr(host_port: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("cannot resolve {host_port:?}: no addresses"))
 }
 
+/// Policy: an API token must never travel over cleartext HTTP to a REMOTE
+/// host. Loopback (`127.0.0.1`/`localhost`/`::1`) is exempt: the bytes never
+/// leave the host (secure-context model — same as Bitcoin Core's localhost
+/// RPC), and the token still authenticates the client to the node.
+/// Token-less http stays allowed everywhere (nothing secret). Pure function
+/// so the rule is unit-pinned (audit B-WALLET-5). Residual: a sniffer in the
+/// same network namespace sees loopback (shared-host threat only).
+pub fn check_http_token_policy(url: &str, api_token: Option<&str>) -> Result<(), String> {
+    let Some(token) = api_token else {
+        return Ok(());
+    };
+    if token.is_empty() {
+        return Ok(());
+    }
+    if !url.starts_with("http://") {
+        return Ok(()); // https: encrypted transport
+    }
+    // Loopback exemption: EXACT host match (never substring — a
+    // `localhost.evil.com` DNS-rebinding name must not pass).
+    let host = url
+        .strip_prefix("http://")
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    let host_only = host
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host)
+        .trim_matches(|c| c == '[' || c == ']');
+    if host_only == "127.0.0.1" || host_only == "localhost" || host_only == "::1" {
+        return Ok(());
+    }
+    Err("refusing to send API token over cleartext http to a non-loopback host: \
+         use https or unset the token"
+        .to_string())
+}
+
 /// Raw HTTP/1.1 POST with HTTPS and HTTP support.
 fn http_post(url: &str, body: &str, api_token: Option<&str>) -> Result<String, String> {
+    check_http_token_policy(url, api_token)?;
     if url.starts_with("https://") {
         let mut req = ureq::post(url)
             .timeout(Duration::from_secs(15))
@@ -210,6 +249,16 @@ pub fn rpc_call(cfg: &RpcConfig, method: &str, params: Value) -> Result<Value, S
     let resp_text = http_post(&cfg.url, &body, cfg.auth_token.as_deref())?;
     let resp: Value =
         serde_json::from_str(&resp_text).map_err(|e| format!("invalid JSON from node: {e}"))?;
+    // Audit B-WALLET-5: verify the response id echoes the request (replay
+    // mixing across concurrent calls otherwise).
+    match resp.get("id") {
+        Some(rid) if *rid == serde_json::json!(id) => {}
+        _ => {
+            return Err(format!(
+                "node response id mismatch for {method} (replay refused)"
+            ))
+        }
+    }
     if let Some(err) = resp.get("error") {
         let msg = err
             .get("message")
@@ -697,17 +746,25 @@ pub fn send_raw_transaction(cfg: &RpcConfig, tx_bincode_hex: &str) -> Result<Str
 pub fn parse_receipt_status(v: &Value) -> TxFinality {
     match v.get("status").and_then(|s| s.as_str()) {
         Some("success") => {
-            let height = v.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
+            // Audit B-WALLET-1: a bare `success` (no height/hash) is NOT
+            // finality — a malicious node forges "Confirmed" otherwise.
+            // Both height AND non-empty block_hash required; else Pending.
+            let height = v.get("height").and_then(|h| h.as_u64());
             let block_hash = v
                 .get("block_hash")
                 .and_then(|h| h.as_str())
-                .unwrap_or("")
-                .to_string();
-            let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
-            TxFinality::Confirmed {
-                height,
-                block_hash,
-                index,
+                .filter(|h| !h.is_empty())
+                .map(|h| h.to_string());
+            match (height, block_hash) {
+                (Some(height), Some(block_hash)) => {
+                    let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                    TxFinality::Confirmed {
+                        height,
+                        block_hash,
+                        index,
+                    }
+                }
+                _ => TxFinality::Pending,
             }
         }
         Some("failed") => {

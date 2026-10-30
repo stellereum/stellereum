@@ -63,7 +63,11 @@ pub fn get_active_wallet_name(base_dir: Option<&Path>) -> Option<String> {
         if let Ok(content) = fs::read_to_string(&ptr) {
             let trimmed = content.trim();
             if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+                // Audit B-WALLET-3: the pointer file is writable without going
+                // through `set_active_wallet_name` — sanitize on READ too, or
+                // `/tmp/pwn` / `../evil` payloads escape `wallets/` via join.
+                // Invalid content = no active wallet (fall through to default).
+                return sanitize_wallet_name(trimmed).ok();
             }
         }
     }
@@ -164,11 +168,15 @@ pub fn resolve_active_wallet_path(
         if !trimmed.is_empty() {
             let as_path = PathBuf::from(trimmed);
             if as_path.exists() {
+                // Explicit operator-chosen path (their own env): honored.
                 return as_path;
             }
-            let named_path = wallets_dir(base_dir).join(format!("{trimmed}.json"));
-            if named_path.exists() {
-                return named_path;
+            // Audit B-WALLET-3: sanitize the name branch like the pointer.
+            if let Ok(name) = sanitize_wallet_name(trimmed) {
+                let named_path = wallets_dir(base_dir).join(format!("{name}.json"));
+                if named_path.exists() {
+                    return named_path;
+                }
             }
         }
     }

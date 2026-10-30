@@ -30,9 +30,13 @@ use client::LightClient;
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::scalar::Scalar;
 use notes::{
-    add_note, calculate_shielded_balance, get_unspent_notes, load_notes, mark_notes_spent,
-    select_notes_for_unshield, ShieldedNote,
+    add_note_with_secret, calculate_shielded_balance, get_unspent_notes_with_secret,
+    load_notes_with_secret, mark_notes_spent_with_secret, select_notes_for_unshield_with_secret,
+    ShieldedNote,
 };
+
+// Audit B-WALLET-2: tests use secret-bound stores (legacy decrypt removed).
+const TEST_SECRET: [u8; 32] = [0x5Eu8; 32];
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
@@ -98,10 +102,10 @@ async fn test_automated_note_saving_on_shield() {
         height: 1,
         spent: false,
     };
-    add_note(&notes_path, note).expect("add_note must succeed");
+    add_note_with_secret(&notes_path, note, &TEST_SECRET).expect("add_note must succeed");
 
     // Verify stored note integrity
-    let loaded = load_notes(&notes_path).expect("load_notes must succeed");
+    let loaded = load_notes_with_secret(&notes_path, &TEST_SECRET).expect("load_notes must succeed");
     assert_eq!(loaded.len(), 1);
     assert_eq!(loaded[0].commitment, commitment_hex);
     assert_eq!(loaded[0].amount, shield_amount);
@@ -150,23 +154,23 @@ fn test_balance_calculation_of_shielded_notes() {
         spent: false,
     };
 
-    add_note(&notes_path, n1).unwrap();
-    add_note(&notes_path, n2.clone()).unwrap();
-    add_note(&notes_path, n3).unwrap();
+    add_note_with_secret(&notes_path, n1, &TEST_SECRET).unwrap();
+    add_note_with_secret(&notes_path, n2.clone(), &TEST_SECRET).unwrap();
+    add_note_with_secret(&notes_path, n3, &TEST_SECRET).unwrap();
 
-    let unspent = get_unspent_notes(&notes_path).unwrap();
+    let unspent = get_unspent_notes_with_secret(&notes_path, &TEST_SECRET).unwrap();
     assert_eq!(unspent.len(), 3);
     assert_eq!(calculate_shielded_balance(&unspent), 40_000_000_000);
 
     // Spend n2 (10 STELL)
-    mark_notes_spent(&notes_path, &[n2.commitment]).unwrap();
+    mark_notes_spent_with_secret(&notes_path, &[n2.commitment], &TEST_SECRET).unwrap();
 
-    let unspent_after = get_unspent_notes(&notes_path).unwrap();
+    let unspent_after = get_unspent_notes_with_secret(&notes_path, &TEST_SECRET).unwrap();
     assert_eq!(unspent_after.len(), 2);
     assert_eq!(calculate_shielded_balance(&unspent_after), 30_000_000_000);
 
     // All notes loaded includes spent one
-    let all_notes = load_notes(&notes_path).unwrap();
+    let all_notes = load_notes_with_secret(&notes_path, &TEST_SECRET).unwrap();
     assert_eq!(all_notes.len(), 3);
     assert!(
         all_notes
@@ -221,7 +225,7 @@ async fn test_automatic_note_selection_on_unshield() {
         .await
         .unwrap();
 
-    add_note(
+    add_note_with_secret(
         &notes_path,
         ShieldedNote {
             commitment: c1.clone(),
@@ -230,9 +234,10 @@ async fn test_automatic_note_selection_on_unshield() {
             height: 1,
             spent: false,
         },
+        &TEST_SECRET,
     )
     .unwrap();
-    add_note(
+    add_note_with_secret(
         &notes_path,
         ShieldedNote {
             commitment: c2.clone(),
@@ -241,9 +246,10 @@ async fn test_automatic_note_selection_on_unshield() {
             height: 1,
             spent: false,
         },
+        &TEST_SECRET,
     )
     .unwrap();
-    add_note(
+    add_note_with_secret(
         &notes_path,
         ShieldedNote {
             commitment: c3.clone(),
@@ -252,11 +258,12 @@ async fn test_automatic_note_selection_on_unshield() {
             height: 1,
             spent: false,
         },
+        &TEST_SECRET,
     )
     .unwrap();
 
     // Test 1: Single exact note match for 15 STELL
-    let sel_single = select_notes_for_unshield(&notes_path, 15_000_000_000)
+    let sel_single = select_notes_for_unshield_with_secret(&notes_path, 15_000_000_000, &TEST_SECRET)
         .expect("Must find exact 15 STELL note");
     assert_eq!(sel_single.len(), 1);
     assert_eq!(sel_single[0].amount, 15_000_000_000);
@@ -264,7 +271,7 @@ async fn test_automatic_note_selection_on_unshield() {
 
     // Test 2: Multi-note combination match for 10 STELL (4 STELL + 6 STELL)
     let sel_combo =
-        select_notes_for_unshield(&notes_path, 10_000_000_000).expect("Must combine 4 + 6 STELL");
+        select_notes_for_unshield_with_secret(&notes_path, 10_000_000_000, &TEST_SECRET).expect("Must combine 4 + 6 STELL");
     assert_eq!(sel_combo.len(), 2);
     let total_combo: u64 = sel_combo.iter().map(|n| n.amount).sum();
     assert_eq!(total_combo, 10_000_000_000);
@@ -306,10 +313,10 @@ async fn test_automatic_note_selection_on_unshield() {
 
     // Mark the auto-selected notes spent in the store
     let spent_comms: Vec<String> = sel_combo.iter().map(|n| n.commitment.clone()).collect();
-    mark_notes_spent(&notes_path, &spent_comms).unwrap();
+    mark_notes_spent_with_secret(&notes_path, &spent_comms, &TEST_SECRET).unwrap();
 
     // Verify remaining unspent notes in store
-    let remaining_unspent = get_unspent_notes(&notes_path).unwrap();
+    let remaining_unspent = get_unspent_notes_with_secret(&notes_path, &TEST_SECRET).unwrap();
     assert_eq!(remaining_unspent.len(), 1);
     assert_eq!(remaining_unspent[0].commitment, c3);
     assert_eq!(
@@ -318,14 +325,14 @@ async fn test_automatic_note_selection_on_unshield() {
     );
 
     // Test 4: Insufficient funds rejection
-    let err_exceed = select_notes_for_unshield(&notes_path, 20_000_000_000);
+    let err_exceed = select_notes_for_unshield_with_secret(&notes_path, 20_000_000_000, &TEST_SECRET);
     assert!(err_exceed.is_err());
     assert!(err_exceed
         .unwrap_err()
         .contains("Insufficient shielded balance"));
 
     // Test 5: Exact combination unattainable rejection (only 15 STELL remains, request 7 STELL)
-    let err_no_subset = select_notes_for_unshield(&notes_path, 7_000_000_000);
+    let err_no_subset = select_notes_for_unshield_with_secret(&notes_path, 7_000_000_000, &TEST_SECRET);
     assert!(err_no_subset.is_err());
     assert!(err_no_subset
         .unwrap_err()
@@ -571,7 +578,13 @@ fn test_cli_stealth_pay_and_shield_balance_workflow() {
 
     // 4. Check shield-balance
     let bal_out = Command::new(bin)
-        .args(["--wallet", wallet_path.to_str().unwrap(), "shield-balance"])
+        .args([
+            "--wallet",
+            wallet_path.to_str().unwrap(),
+            "shield-balance",
+            "--password",
+            "TestPass#2026",
+        ])
         .output()
         .expect("exec shield-balance");
     assert!(bal_out.status.success());
@@ -586,6 +599,8 @@ fn test_cli_stealth_pay_and_shield_balance_workflow() {
             "--wallet",
             wallet_path.to_str().unwrap(),
             "confidential-balance",
+            "--password",
+            "TestPass#2026",
         ])
         .output()
         .expect("exec confidential-balance");
@@ -687,7 +702,13 @@ fn test_cli_stealth_pay_and_shield_balance_workflow() {
 
     // 8. Shield balance is now 0 STELL
     let bal_after = Command::new(bin)
-        .args(["--wallet", wallet_path.to_str().unwrap(), "shield-balance"])
+        .args([
+            "--wallet",
+            wallet_path.to_str().unwrap(),
+            "shield-balance",
+            "--password",
+            "TestPass#2026",
+        ])
         .output()
         .expect("exec shield-balance after");
     assert!(bal_after.status.success());

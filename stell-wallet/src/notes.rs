@@ -430,7 +430,89 @@ pub fn notes_path_for_wallet(wallet_path: &Path) -> PathBuf {
 /// Loads all shielded notes from disk. If the file does not exist, returns an empty list.
 /// Decrypts XChaCha20-Poly1305 encrypted HardenedNotesStore container, or falls back to
 /// legacy plaintext JSON.
-pub fn load_notes(path: &Path) -> Result<Vec<ShieldedNote>, String> {
+/// Saves shielded notes to disk encrypted with XChaCha20-Poly1305 and enforces atomic persistence.
+///
+/// Legacy-compatibility path: the encryption key is bound to the sibling wallet
+/// keystore via [`derive_storage_key`] (fail-closed when no wallet is found).
+/// Callers that already hold the decrypted master secret MUST prefer
+/// [`save_notes_with_secret`] (or [`save_notes_with_password`]), which are bound to a
+/// real secret instead of public keystore bytes.
+/// Loads shielded notes from disk, decrypting with password if encrypted, or falling back
+/// to legacy unencrypted plaintext JSON for smooth migration.
+pub fn load_notes_with_password(path: &Path, password: &str) -> Result<Vec<ShieldedNote>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let data = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read shielded notes from {:?}: {e}", path))?;
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Ok(store) = serde_json::from_str::<HardenedNotesStore>(trimmed) {
+        store.decrypt(password)
+    } else {
+        // Audit B-WALLET-4: no plaintext fallback (forgery vector).
+        Err(format!(
+            "refusing unauthenticated plaintext notes at {path:?}:              re-import ancient files via a secret-bound store"
+        ))
+    }
+}
+
+/// Saves shielded notes to disk encrypted with password using Argon2id + XChaCha20-Poly1305.
+pub fn save_notes_with_password(
+    path: &Path,
+    notes: &[ShieldedNote],
+    password: &str,
+) -> Result<(), String> {
+    let store = HardenedNotesStore::encrypt(notes, password)?;
+    store.save(path)
+}
+
+/// Loads shielded notes from disk, decrypting with a 32-byte master secret if encrypted,
+/// or falling back to legacy unencrypted plaintext JSON for smooth migration.
+pub fn load_notes_with_secret(path: &Path, secret: &[u8; 32]) -> Result<Vec<ShieldedNote>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let data = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read shielded notes from {:?}: {e}", path))?;
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Ok(store) = serde_json::from_str::<HardenedNotesStore>(trimmed) {
+        store.decrypt_with_secret(secret)
+    } else {
+        // Audit B-WALLET-4: no plaintext fallback (forgery vector).
+        Err(format!(
+            "refusing unauthenticated plaintext notes at {path:?}:              re-import ancient files via a secret-bound store"
+        ))
+    }
+}
+
+/// Saves shielded notes to disk encrypted with a 32-byte master secret using Blake3 KDF + XChaCha20-Poly1305.
+pub fn save_notes_with_secret(
+    path: &Path,
+    notes: &[ShieldedNote],
+    secret: &[u8; 32],
+) -> Result<(), String> {
+    let store = HardenedNotesStore::encrypt_with_secret(notes, secret)?;
+    store.save(path)
+}
+
+/// Automatically appends a new shielded note into the store (secret-bound variant).
+///
+/// Preferred over [`add_note`] whenever the caller already holds the decrypted wallet
+/// master secret: the whole file is re-encrypted under a key derived from that secret
+/// (BLAKE3 KDF + XChaCha20-Poly1305) instead of the legacy wallet-bytes binding.
+/// Migration-only legacy decrypt (audit B-WALLET-4): reads the
+/// wallet-bound container AND ancient plaintext. Callable ONLY via
+/// `migrate_notes_to_secret` (explicit operator trust + secret in hand) —
+/// never silently. The public `load_notes` path was removed.
+fn decrypt_legacy_notes_file(path: &Path) -> Result<Vec<ShieldedNote>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -486,130 +568,63 @@ pub fn load_notes(path: &Path) -> Result<Vec<ShieldedNote>, String> {
         serde_json::from_slice(&decrypted)
             .map_err(|e| format!("Failed to parse decrypted notes JSON: {e}"))
     } else {
-        // Fallback: legacy plaintext JSON
+        // Migration-only explicit trust (see doc above).
         serde_json::from_str(trimmed)
             .map_err(|e| format!("Failed to parse shielded notes JSON from {:?}: {e}", path))
     }
 }
 
-/// Saves shielded notes to disk encrypted with XChaCha20-Poly1305 and enforces atomic persistence.
-///
-/// Legacy-compatibility path: the encryption key is bound to the sibling wallet
-/// keystore via [`derive_storage_key`] (fail-closed when no wallet is found).
-/// Callers that already hold the decrypted master secret MUST prefer
-/// [`save_notes_with_secret`] (or [`save_notes_with_password`]), which are bound to a
-/// real secret instead of public keystore bytes.
-pub fn save_notes(path: &Path, notes: &[ShieldedNote]) -> Result<(), String> {
-    let mut salt = [0u8; 16];
-    OsRng.fill_bytes(&mut salt);
-
-    let key = derive_storage_key(path, &salt)?;
-    let cipher = XChaCha20Poly1305::new((&key).into());
-
-    let mut nonce = [0u8; 24];
-    OsRng.fill_bytes(&mut nonce);
-    let xnonce = XNonce::from_slice(&nonce);
-
-    let plaintext =
-        serde_json::to_vec(notes).map_err(|e| format!("Failed to serialize notes: {e}"))?;
-
-    let payload = Payload {
-        msg: &plaintext,
-        aad: NOTES_AAD,
-    };
-
-    let ciphertext = cipher
-        .encrypt(xnonce, payload)
-        .map_err(|e| format!("XChaCha20-Poly1305 encryption failed: {e:?}"))?;
-
-    let tag_split = ciphertext.len().saturating_sub(16);
-    let (ct_body, auth_tag) = ciphertext.split_at(tag_split);
-
-    let store = HardenedNotesStore {
-        version: NOTES_STORE_VERSION,
-        cipher: NOTES_STORE_CIPHER.to_string(),
-        kdf: "Blake3(STELL_NOTES_STORAGE_KEY_V1)".to_string(),
-        salt_hex: hex::encode(salt),
-        nonce_hex: hex::encode(nonce),
-        ciphertext_hex: hex::encode(ct_body),
-        auth_tag_hex: hex::encode(auth_tag),
-    };
-
-    let json = serde_json::to_string_pretty(&store)
-        .map_err(|e| format!("Failed to serialize HardenedNotesStore: {e}"))?;
-
-    atomic_save_file(path, json.as_bytes())
-}
-
-/// Loads shielded notes from disk, decrypting with password if encrypted, or falling back
-/// to legacy unencrypted plaintext JSON for smooth migration.
-pub fn load_notes_with_password(path: &Path, password: &str) -> Result<Vec<ShieldedNote>, String> {
+/// Migration-only legacy decrypt for stealth outputs (same contract as
+/// `decrypt_legacy_notes_file`). Callable ONLY via `migrate_stealth_to_secret`.
+fn decrypt_legacy_stealth_file(path: &Path) -> Result<Vec<StealthOutput>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
     let data = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read shielded notes from {:?}: {e}", path))?;
+        .map_err(|e| format!("Failed to read stealth outputs from {:?}: {e}", path))?;
     let trimmed = data.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-
-    if let Ok(store) = serde_json::from_str::<HardenedNotesStore>(trimmed) {
-        store.decrypt(password)
+    if let Ok(store) = serde_json::from_str::<HardenedStealthStore>(trimmed) {
+        decrypt_stealth_store_with_storage_key(path, &store)
     } else {
-        // Fallback: legacy plaintext JSON
         serde_json::from_str(trimmed)
-            .map_err(|e| format!("Failed to parse legacy shielded notes JSON: {e}"))
+            .map_err(|e| format!("Failed to parse stealth outputs JSON: {e}"))
     }
 }
 
-/// Saves shielded notes to disk encrypted with password using Argon2id + XChaCha20-Poly1305.
-pub fn save_notes_with_password(
-    path: &Path,
-    notes: &[ShieldedNote],
-    password: &str,
-) -> Result<(), String> {
-    let store = HardenedNotesStore::encrypt(notes, password)?;
-    store.save(path)
-}
-
-/// Loads shielded notes from disk, decrypting with a 32-byte master secret if encrypted,
-/// or falling back to legacy unencrypted plaintext JSON for smooth migration.
-pub fn load_notes_with_secret(path: &Path, secret: &[u8; 32]) -> Result<Vec<ShieldedNote>, String> {
+/// ONE-TIME migration: legacy wallet-bound store -> secret-bound store.
+/// Audit B-WALLET-2/4: the legacy key derives from PUBLIC keystore bytes.
+/// Requires the master secret — an attacker without it can neither read nor
+/// migrate. After migration the legacy decrypt path is never used again.
+/// Returns Ok(true) if migrated, Ok(false) if already secret-bound/missing.
+pub fn migrate_notes_to_secret(path: &Path, secret: &[u8; 32]) -> Result<bool, String> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(false);
     }
-    let data = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read shielded notes from {:?}: {e}", path))?;
-    let trimmed = data.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
+    // Already secret-bound? Secret-load succeeding means migrated (or native).
+    if load_notes_with_secret(path, secret).is_ok() {
+        return Ok(false);
     }
-
-    if let Ok(store) = serde_json::from_str::<HardenedNotesStore>(trimmed) {
-        store.decrypt_with_secret(secret)
-    } else {
-        // Fallback: legacy plaintext JSON
-        serde_json::from_str(trimmed)
-            .map_err(|e| format!("Failed to parse legacy shielded notes JSON: {e}"))
-    }
+    let notes = decrypt_legacy_notes_file(path)?;
+    save_notes_with_secret(path, &notes, secret)?;
+    Ok(true)
 }
 
-/// Saves shielded notes to disk encrypted with a 32-byte master secret using Blake3 KDF + XChaCha20-Poly1305.
-pub fn save_notes_with_secret(
-    path: &Path,
-    notes: &[ShieldedNote],
-    secret: &[u8; 32],
-) -> Result<(), String> {
-    let store = HardenedNotesStore::encrypt_with_secret(notes, secret)?;
-    store.save(path)
+/// ONE-TIME migration for stealth outputs (same contract as notes).
+pub fn migrate_stealth_to_secret(path: &Path, secret: &[u8; 32]) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if load_stealth_outputs_with_secret(path, secret).is_ok() {
+        return Ok(false);
+    }
+    let outputs = decrypt_legacy_stealth_file(path)?;
+    save_stealth_outputs_with_secret(path, &outputs, secret)?;
+    Ok(true)
 }
 
-/// Automatically appends a new shielded note into the store (secret-bound variant).
-///
-/// Preferred over [`add_note`] whenever the caller already holds the decrypted wallet
-/// master secret: the whole file is re-encrypted under a key derived from that secret
-/// (BLAKE3 KDF + XChaCha20-Poly1305) instead of the legacy wallet-bytes binding.
 pub fn add_note_with_secret(
     path: &Path,
     note: ShieldedNote,
@@ -640,23 +655,7 @@ pub fn add_note_with_password(
 }
 
 /// Automatically appends a new shielded note into the store.
-pub fn add_note(path: &Path, note: ShieldedNote) -> Result<(), String> {
-    let mut notes = load_notes(path)?;
-    // If commitment already exists, update it if unspent or deduplicate
-    if let Some(existing) = notes.iter_mut().find(|n| n.commitment == note.commitment) {
-        *existing = note;
-    } else {
-        notes.push(note);
-    }
-    save_notes(path, &notes)
-}
-
 /// Returns all unspent notes from the note store.
-pub fn get_unspent_notes(path: &Path) -> Result<Vec<ShieldedNote>, String> {
-    let notes = load_notes(path)?;
-    Ok(notes.into_iter().filter(|n| !n.spent).collect())
-}
-
 /// Returns all unspent notes from a secret-bound store.
 pub fn get_unspent_notes_with_secret(
     path: &Path,
@@ -685,14 +684,6 @@ pub fn calculate_shielded_balance(notes: &[ShieldedNote]) -> u64 {
 
 /// Selects unspent notes matching `target_amount` (nano-STELL).
 /// Prefers a single exact-match note; otherwise finds a subset whose sum matches `target_amount`.
-pub fn select_notes_for_unshield(
-    path: &Path,
-    target_amount: u64,
-) -> Result<Vec<ShieldedNote>, String> {
-    let unspent = get_unspent_notes(path)?;
-    select_from_unspent(&unspent, target_amount)
-}
-
 /// Secret-bound variant of [`select_notes_for_unshield`].
 pub fn select_notes_for_unshield_with_secret(
     path: &Path,
@@ -787,19 +778,6 @@ fn select_from_unspent(
 }
 
 /// Marks notes with matching commitments as spent in the store.
-pub fn mark_notes_spent(path: &Path, commitments: &[String]) -> Result<(), String> {
-    let mut notes = load_notes(path)?;
-    for note in &mut notes {
-        if commitments
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(&note.commitment))
-        {
-            note.spent = true;
-        }
-    }
-    save_notes(path, &notes)
-}
-
 /// Secret-bound variant of [`mark_notes_spent`].
 pub fn mark_notes_spent_with_secret(
     path: &Path,
@@ -1134,66 +1112,9 @@ fn decrypt_stealth_store_with_storage_key(
 }
 
 /// Loads stealth outputs, decrypting the XChaCha20-Poly1305 [`HardenedStealthStore`]
-/// container (legacy wallet-bound key) or falling back to legacy plaintext JSON for
-/// smooth migration of pre-encryption files.
-pub fn load_stealth_outputs(path: &Path) -> Result<Vec<StealthOutput>, String> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let data = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read stealth outputs from {:?}: {e}", path))?;
-    let trimmed = data.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-    if let Ok(store) = serde_json::from_str::<HardenedStealthStore>(trimmed) {
-        decrypt_stealth_store_with_storage_key(path, &store)
-    } else {
-        // Fallback: legacy plaintext JSON (pre-encryption files)
-        serde_json::from_str(trimmed)
-            .map_err(|e| format!("Failed to parse stealth outputs JSON: {e}"))
-    }
-}
-
+/// container. Audit B-WALLET-4: no plaintext fallback (forgery vector).
 /// Saves stealth outputs encrypted with XChaCha20-Poly1305 (legacy wallet-bound key)
 /// using atomic persistence (.tmp -> 0600 -> sync_all -> rename).
-pub fn save_stealth_outputs(path: &Path, outputs: &[StealthOutput]) -> Result<(), String> {
-    let mut salt = [0u8; 16];
-    OsRng.fill_bytes(&mut salt);
-
-    let key = derive_stealth_storage_key(path, &salt)?;
-    let cipher = XChaCha20Poly1305::new((&key).into());
-
-    let mut nonce = [0u8; 24];
-    OsRng.fill_bytes(&mut nonce);
-    let xnonce = XNonce::from_slice(&nonce);
-
-    let plaintext = serde_json::to_vec(outputs)
-        .map_err(|e| format!("Failed to serialize stealth outputs: {e}"))?;
-    let payload = Payload {
-        msg: &plaintext,
-        aad: STEALTH_AAD,
-    };
-    let ciphertext = cipher
-        .encrypt(xnonce, payload)
-        .map_err(|e| format!("XChaCha20-Poly1305 encryption failed: {e:?}"))?;
-    let tag_split = ciphertext.len().saturating_sub(16);
-    let (ct_body, auth_tag) = ciphertext.split_at(tag_split);
-
-    let store = HardenedStealthStore {
-        version: STEALTH_STORE_VERSION,
-        cipher: STEALTH_STORE_CIPHER.to_string(),
-        kdf: "Blake3(STELL_STEALTH_STORAGE_KEY_V1)".to_string(),
-        salt_hex: hex::encode(salt),
-        nonce_hex: hex::encode(nonce),
-        ciphertext_hex: hex::encode(ct_body),
-        auth_tag_hex: hex::encode(auth_tag),
-    };
-    let json = serde_json::to_string_pretty(&store)
-        .map_err(|e| format!("Failed to serialize HardenedStealthStore: {e}"))?;
-    atomic_save_file(path, json.as_bytes())
-}
-
 /// Loads stealth outputs decrypting with a password (or legacy plaintext migration).
 pub fn load_stealth_outputs_with_password(
     path: &Path,
@@ -1228,10 +1149,10 @@ pub fn save_stealth_outputs_with_password(
 
 /// Loads stealth outputs decrypting with a 32-byte master secret.
 ///
-/// Migration chain: secret-encrypted -> legacy wallet-bound [`HardenedStealthStore`] ->
-/// legacy plaintext JSON. The wallet-bound fallback keeps pre-migration files readable
-/// right after upgrading; new writes via [`save_stealth_outputs_with_secret`] are always
-/// secret-bound.
+/// Migration chain: secret-encrypted -> legacy wallet-bound [`HardenedStealthStore`].
+/// The wallet-bound fallback keeps pre-migration files readable right after upgrading;
+/// new writes via [`save_stealth_outputs_with_secret`] are always secret-bound.
+/// Plaintext has NO fallback (audit B-WALLET-4 forgery vector).
 pub fn load_stealth_outputs_with_secret(
     path: &Path,
     secret: &[u8; 32],
@@ -1254,8 +1175,11 @@ pub fn load_stealth_outputs_with_secret(
             },
         }
     } else {
-        serde_json::from_str(trimmed)
-            .map_err(|e| format!("Failed to parse legacy stealth outputs JSON: {e}"))
+        // Audit B-WALLET-4: no plaintext tail on the migration chain.
+        Err(format!(
+            "refusing unauthenticated plaintext stealth outputs at {path:?}: \
+             re-import ancient files via a secret-bound store"
+        ))
     }
 }
 
@@ -1276,15 +1200,6 @@ fn stealth_is_duplicate(outputs: &[StealthOutput], output: &StealthOutput) -> bo
     })
 }
 
-pub fn add_stealth_output(path: &Path, output: StealthOutput) -> Result<bool, String> {
-    let mut outputs = load_stealth_outputs(path)?;
-    if stealth_is_duplicate(&outputs, &output) {
-        return Ok(false);
-    }
-    outputs.push(output);
-    save_stealth_outputs(path, &outputs)?;
-    Ok(true)
-}
 
 /// Secret-bound variant of [`add_stealth_output`] (preferred when the master secret is
 /// available, e.g. right after unlocking the keystore).
@@ -1317,10 +1232,6 @@ pub fn add_stealth_output_with_password(
     Ok(true)
 }
 
-pub fn get_unspent_stealth_outputs(path: &Path) -> Result<Vec<StealthOutput>, String> {
-    let outputs = load_stealth_outputs(path)?;
-    Ok(outputs.into_iter().filter(|o| !o.spent).collect())
-}
 
 /// Secret-bound variant of [`get_unspent_stealth_outputs`].
 pub fn get_unspent_stealth_outputs_with_secret(
@@ -1331,20 +1242,6 @@ pub fn get_unspent_stealth_outputs_with_secret(
     Ok(outputs.into_iter().filter(|o| !o.spent).collect())
 }
 
-pub fn mark_stealth_output_spent(path: &Path, one_time_pub: &str) -> Result<bool, String> {
-    let mut outputs = load_stealth_outputs(path)?;
-    let mut found = false;
-    for o in &mut outputs {
-        if o.one_time_pub.eq_ignore_ascii_case(one_time_pub) {
-            o.spent = true;
-            found = true;
-        }
-    }
-    if found {
-        save_stealth_outputs(path, &outputs)?;
-    }
-    Ok(found)
-}
 
 /// Secret-bound variant of [`mark_stealth_output_spent`].
 pub fn mark_stealth_output_spent_with_secret(
@@ -1370,34 +1267,7 @@ pub fn mark_stealth_output_spent_with_secret(
 mod tests {
     use super::*;
 
-    /// Writes a dummy wallet keystore next to a store file so the legacy
-    /// wallet-bound KDF has binding material (fail-closed otherwise).
-    fn write_dummy_wallet_binding(store_path: &Path) {
-        let parent = store_path.parent().expect("store path must have a parent");
-        let _ = fs::create_dir_all(parent);
-        let fname = store_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        // Mirror `bound_wallet_bytes` inference: per-wallet stores bind to
-        // `<stem>.json`, legacy stores bind to `wallet.json`.
-        let wallet_name =
-            if fname.starts_with("shielded_notes_") || fname.starts_with("stealth_outputs_") {
-                let stem = fname
-                    .strip_prefix("shielded_notes_")
-                    .or_else(|| fname.strip_prefix("stealth_outputs_"))
-                    .and_then(|s| s.strip_suffix(".json"))
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("wallet");
-                format!("{stem}.json")
-            } else {
-                "wallet.json".to_string()
-            };
-        let wallet_path = parent.join(wallet_name);
-        if !wallet_path.exists() {
-            let _ = fs::write(&wallet_path, b"{\"dummy\":\"wallet-binding-for-tests\"}");
-        }
-    }
+
 
     #[test]
     fn test_stealth_outputs_store_lifecycle() {
@@ -1405,7 +1275,8 @@ mod tests {
             std::env::temp_dir().join(format!("stell_stealth_test_{}", rand::random::<u64>()));
         let _ = fs::create_dir_all(&temp_dir);
         let stealth_file = temp_dir.join("stealth_outputs.json");
-        write_dummy_wallet_binding(&stealth_file);
+        // Audit B-WALLET-2: secret-bound (no wallet file needed).
+        let secret = [0x5Eu8; 32];
 
         let out1 = StealthOutput {
             one_time_pub: "11".repeat(32),
@@ -1417,16 +1288,20 @@ mod tests {
             spent: false,
         };
 
-        assert!(add_stealth_output(&stealth_file, out1.clone()).unwrap());
+        assert!(add_stealth_output_with_secret(&stealth_file, out1.clone(), &secret).unwrap());
         // Duplicate rejected
-        assert!(!add_stealth_output(&stealth_file, out1.clone()).unwrap());
+        assert!(!add_stealth_output_with_secret(&stealth_file, out1.clone(), &secret).unwrap());
 
-        let unspent = get_unspent_stealth_outputs(&stealth_file).unwrap();
+        let unspent = get_unspent_stealth_outputs_with_secret(&stealth_file, &secret).unwrap();
         assert_eq!(unspent.len(), 1);
         assert_eq!(unspent[0].one_time_pub, out1.one_time_pub);
 
-        assert!(mark_stealth_output_spent(&stealth_file, &out1.one_time_pub).unwrap());
-        let unspent_after = get_unspent_stealth_outputs(&stealth_file).unwrap();
+        assert!(
+            mark_stealth_output_spent_with_secret(&stealth_file, &out1.one_time_pub, &secret)
+                .unwrap()
+        );
+        let unspent_after =
+            get_unspent_stealth_outputs_with_secret(&stealth_file, &secret).unwrap();
         assert!(unspent_after.is_empty());
 
         // File on disk must be an encrypted XChaCha20-Poly1305 container, atomically
@@ -1468,44 +1343,13 @@ mod tests {
             std::env::temp_dir().join(format!("stell_nobind_test_{}", rand::random::<u64>()));
         let _ = fs::create_dir_all(&temp_dir);
         // Deliberately NO wallet.json here.
-        let notes_file = temp_dir.join("shielded_notes.json");
-        let stealth_file = temp_dir.join("stealth_outputs.json");
-
-        let note = ShieldedNote {
-            commitment: "c1".to_string(),
-            amount: 1,
-            blinding: "b1".to_string(),
-            height: 0,
-            spent: false,
-        };
-        let save_err = save_notes(&notes_file, &[note]).unwrap_err();
-        assert!(
-            save_err.contains("not bound to any wallet"),
-            "must fail closed, got: {save_err}"
-        );
-        assert!(
-            !notes_file.exists(),
-            "failed save must not leave a file behind"
-        );
-
-        let out = StealthOutput {
-            one_time_pub: "11".repeat(32),
-            ephemeral_pub: "22".repeat(32),
-            shared_secret: "33".repeat(32),
-            amount: 1,
-            height: 0,
-            tx_hash: "44".repeat(32),
-            spent: false,
-        };
-        let s_err = save_stealth_outputs(&stealth_file, &[out]).unwrap_err();
-        assert!(
-            s_err.contains("not bound to any wallet"),
-            "must fail closed, got: {s_err}"
-        );
-        assert!(!stealth_file.exists());
+        // Audit B-WALLET-2: the legacy wallet-bound entry points are REMOVED
+        // (no silent public-key stores). Secret-bound paths need no wallet
+        // file at all — the secret, not files, gates access.
 
         // Secret-bound paths do NOT need a wallet file and keep working.
         let secret = [0x5Au8; 32];
+        let wrong = [0x6Fu8; 32];
         let secret_notes = temp_dir.join("secret_notes.json");
         save_notes_with_secret(
             &secret_notes,
@@ -1524,6 +1368,10 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+        assert!(
+            load_notes_with_secret(&secret_notes, &wrong).is_err(),
+            "wrong secret must refuse even with no wallet file present"
         );
 
         let _ = fs::remove_dir_all(&temp_dir);
@@ -1631,9 +1479,14 @@ mod tests {
         assert!(raw.contains("XChaCha20-Poly1305"));
         assert!(!raw.contains("42000000000"));
 
-        // Legacy plaintext stealth file migrates transparently into the secret loader.
+        // Legacy plaintext stealth file is REFUSED (audit B-WALLET-4) and
+        // migrates explicitly via the secret in hand.
         let legacy = temp_dir.join("legacy_stealth.json");
         fs::write(&legacy, serde_json::to_string_pretty(&outputs).unwrap()).unwrap();
+        assert!(load_stealth_outputs_with_secret(&legacy, &secret).is_err());
+        assert!(
+            migrate_stealth_to_secret(&legacy, &secret).expect("migrate legacy stealth"),
+            "migration must report done");
         assert_eq!(
             load_stealth_outputs_with_secret(&legacy, &secret).unwrap(),
             outputs
@@ -1690,7 +1543,7 @@ mod tests {
             std::env::temp_dir().join(format!("stell_notes_test_{}", rand::random::<u64>()));
         let _ = fs::create_dir_all(&temp_dir);
         let notes_file = temp_dir.join("shielded_notes.json");
-        write_dummy_wallet_binding(&notes_file);
+        let secret = [0x5Eu8; 32];
 
         let n1 = ShieldedNote {
             commitment: "c1".to_string(),
@@ -1714,11 +1567,11 @@ mod tests {
             spent: false,
         };
 
-        add_note(&notes_file, n1).unwrap();
-        add_note(&notes_file, n2).unwrap();
-        add_note(&notes_file, n3).unwrap();
+        add_note_with_secret(&notes_file, n1, &secret).unwrap();
+        add_note_with_secret(&notes_file, n2, &secret).unwrap();
+        add_note_with_secret(&notes_file, n3, &secret).unwrap();
 
-        let all = load_notes(&notes_file).unwrap();
+        let all = load_notes_with_secret(&notes_file, &secret).unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(calculate_shielded_balance(&all), 35_000_000_000);
 
@@ -1742,18 +1595,23 @@ mod tests {
         );
 
         // Exact single match
-        let sel10 = select_notes_for_unshield(&notes_file, 10_000_000_000).unwrap();
+        let sel10 =
+            select_notes_for_unshield_with_secret(&notes_file, 10_000_000_000, &secret)
+                .unwrap();
         assert_eq!(sel10.len(), 1);
         assert_eq!(sel10[0].commitment, "c2");
 
         // Combination match: 15 STELL = 5 + 10
-        let sel15 = select_notes_for_unshield(&notes_file, 15_000_000_000).unwrap();
+        let sel15 =
+            select_notes_for_unshield_with_secret(&notes_file, 15_000_000_000, &secret)
+                .unwrap();
         assert_eq!(sel15.len(), 2);
         assert_eq!(sel15.iter().map(|n| n.amount).sum::<u64>(), 15_000_000_000);
 
         // Mark spent
-        mark_notes_spent(&notes_file, &["c2".to_string()]).unwrap();
-        let unspent = get_unspent_notes(&notes_file).unwrap();
+        mark_notes_spent_with_secret(&notes_file, &["c2".to_string()], &secret).unwrap();
+        let unspent =
+            get_unspent_notes_with_secret(&notes_file, &secret).unwrap();
         assert_eq!(unspent.len(), 2);
         assert_eq!(calculate_shielded_balance(&unspent), 25_000_000_000);
 
@@ -1888,20 +1746,15 @@ mod tests {
         let legacy_json = serde_json::to_string_pretty(&legacy_notes).unwrap();
         fs::write(&notes_file, legacy_json.as_bytes()).unwrap();
 
-        // 2. load_notes gracefully reads legacy unencrypted JSON
-        let loaded = load_notes(&notes_file).expect("Must load legacy unencrypted notes");
-        assert_eq!(loaded, legacy_notes);
-
-        // 3. load_notes_with_password gracefully reads legacy unencrypted JSON
-        let loaded_pw = load_notes_with_password(&notes_file, "AnyPassword123")
-            .expect("Must migrate legacy with password");
-        assert_eq!(loaded_pw, legacy_notes);
-
-        // 4. load_notes_with_secret gracefully reads legacy unencrypted JSON
+        // 2. Direct reads REFUSE plaintext (audit B-WALLET-4: no silent trust).
+        assert!(load_notes_with_password(&notes_file, "AnyPassword123").is_err());
         let secret = [0x77u8; 32];
-        let loaded_sec =
-            load_notes_with_secret(&notes_file, &secret).expect("Must migrate legacy with secret");
-        assert_eq!(loaded_sec, legacy_notes);
+        assert!(load_notes_with_secret(&notes_file, &secret).is_err());
+
+        // 3. Explicit migration (secret in hand = explicit trust) upgrades it.
+        assert!(
+            migrate_notes_to_secret(&notes_file, &secret).expect("migrate plaintext"),
+            "migration must report done");
 
         // 5. Encrypt with password and save
         save_notes_with_password(&notes_file, &legacy_notes, "SecretPass#2026")

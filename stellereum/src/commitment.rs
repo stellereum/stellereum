@@ -2364,12 +2364,12 @@ mod tests {
         s.contracts.next_nonce = n_contracts as u64;
         // Governance with one live proposal (exercises the voters/weights maps).
         // The proposer is validator zero, the only one bonded above the floor.
-        let gov_ledger = s.staking.clone();
+        let mut gov_ledger = s.staking.clone();
         let mut proposer = [0u8; 32];
         proposer[8] = 0x5A;
         s.governance
             .propose(
-                &gov_ledger,
+                &mut gov_ledger,
                 proposer,
                 "raise-the-roof".to_string(),
                 crate::governance::GovAction::Signal("test".to_string()),

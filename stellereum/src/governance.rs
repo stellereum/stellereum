@@ -23,6 +23,7 @@ use crate::consensus::ValidatorId;
 use crate::staking::StakingLedger;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Quorum: minimum share of total stake that must participate (2/3), in bps.
 /// 6,666 bps = 66.66%, so an exact 2/3 turnout passes.
@@ -466,6 +467,18 @@ pub struct Proposal {
     /// vote. The base is now fixed when the proposal opens and every later
     /// finalize measures the same recorded turnout against the same base.
     pub electorate: u128,
+    /// Audit G1: frozen per-voter weights (voter -> weight at propose time).
+    /// Late-bonded stake votes at ZERO: without this, stake bonded mid-vote
+    /// counts at full weight against the frozen base (turnout inflation —
+    /// flash-bond pushes sub-quorum proposals over the line). `None` =
+    /// pre-upgrade proposal (falls back to live weights, exactly the old
+    /// behavior) so persisted governance state migrates without a fork.
+    pub electorate_weights: Option<BTreeMap<[u8; 32], u128>>,
+    /// Audit G2: the proposer's own stake locked while the proposal is open
+    /// (skin-in-the-game: proposing then fully exiting is refused by the
+    /// staking-side lock). Released at finalize alongside voter weights.
+    /// `0` = pre-upgrade proposal (nothing locked, old behavior).
+    pub proposer_lock: u64,
     /// E7: per-voter locked weight (voter -> weight recorded at vote time).
     ///
     /// The mirror of the staking-side lock: `vote` inserts here AND calls
@@ -815,7 +828,7 @@ impl Governance {
     /// Submit a proposal. Requires the proposer to hold >= PROPOSAL_MIN_STAKE.
     pub fn propose(
         &mut self,
-        ledger: &StakingLedger,
+        ledger: &mut StakingLedger,
         proposer: ValidatorId,
         title: String,
         action: GovAction,
@@ -840,7 +853,19 @@ impl Governance {
         // E7: freeze the quorum base now. Every finalize of this proposal
         // measures turnout against THIS electorate, so later exits entries
         // cannot move the goalposts.
-        let electorate = Self::total_voting_power(ledger);
+        // Audit G1: freeze per-voter weights too (same instant, same ledger
+        // read): late-bonded stake must not vote against this base. The sum
+        // below equals `total_voting_power` by construction (same addends,
+        // grouped per voter instead of globally).
+        let mut electorate_weights: BTreeMap<[u8; 32], u128> = BTreeMap::new();
+        for (vid, v) in ledger.validators.iter() {
+            *electorate_weights.entry(*vid).or_insert(0) += v.self_bond as u128;
+        }
+        for ((_, d), amount) in ledger.delegations.iter() {
+            *electorate_weights.entry(*d).or_insert(0) += *amount as u128;
+        }
+        electorate_weights.retain(|_, w| *w > 0);
+        let electorate: u128 = electorate_weights.values().sum();
         // Hygiene (audit G1): an empty electorate must never open a vote.
         // Unreachable through this path today (the stake gate above implies a
         // non-zero electorate), but a zero base would make `quorum_needed`
@@ -849,6 +874,22 @@ impl Governance {
         if electorate == 0 {
             return Err(GovError::InvalidAction);
         }
+        // Audit G2: lock the proposer's OWN stake (self-bond + delegations
+        // out — the same formula as vote weight) for the proposal's lifetime.
+        // Others' delegations TO the proposer are not theirs to lock.
+        let proposer_own: u128 = ledger
+            .validators
+            .get(&proposer)
+            .map(|v| v.self_bond as u128)
+            .unwrap_or(0)
+            + ledger
+                .delegations
+                .iter()
+                .filter(|((_, d), _)| *d == proposer)
+                .map(|(_, amount)| *amount as u128)
+                .sum::<u128>();
+        let proposer_lock = u64::try_from(proposer_own).unwrap_or(u64::MAX);
+        ledger.lock_governance(proposer, proposer_lock);
         self.proposals.insert(
             id,
             Proposal {
@@ -864,6 +905,8 @@ impl Governance {
                 voters: HashMap::new(),
                 status: ProposalStatus::Open,
                 electorate,
+                electorate_weights: Some(electorate_weights),
+                proposer_lock,
                 weights: HashMap::new(),
             },
         );
@@ -905,18 +948,26 @@ impl Governance {
         // made BY OTHERS to this validator) and then also add the delegator
         // loop — that double-counts stake and lets a self-delegating validator
         // (or a delegator of another validator) inflate its vote.
-        let self_bond = ledger
-            .validators
-            .get(&voter)
-            .map(|v| v.self_bond as u128)
-            .unwrap_or(0);
-        let delegated_out: u128 = ledger
-            .delegations
-            .iter()
-            .filter(|((_, d), _)| *d == voter)
-            .map(|(_, amount)| *amount as u128)
-            .sum();
-        let weight = self_bond + delegated_out;
+        // Audit G1: weight comes from the PROPOSE-time snapshot when present
+        // (late-bonded stake votes at zero — it is simply absent from the
+        // map). `None` = pre-upgrade proposal: live weights, old behavior.
+        let weight = match &p.electorate_weights {
+            Some(snap) => snap.get(&voter).copied().ok_or(GovError::NotStaker)?,
+            None => {
+                let self_bond = ledger
+                    .validators
+                    .get(&voter)
+                    .map(|v| v.self_bond as u128)
+                    .unwrap_or(0);
+                let delegated_out: u128 = ledger
+                    .delegations
+                    .iter()
+                    .filter(|((_, d), _)| *d == voter)
+                    .map(|(_, amount)| *amount as u128)
+                    .sum();
+                self_bond + delegated_out
+            }
+        };
         if weight == 0 {
             return Err(GovError::NotStaker);
         }
@@ -987,8 +1038,13 @@ impl Governance {
         // E7: release every lock exactly once. This is the only transition
         // out of `Open` (re-finalize early-returns above), so no voter can
         // be unlocked twice and no lock can survive its proposal.
-        let locked: Vec<([u8; 32], u128)> =
-            p.weights.iter().map(|(voter, w)| (*voter, *w)).collect();
+        // Audit G2: the proposer's own-stake lock releases here too.
+        let locked: Vec<([u8; 32], u128)> = p
+            .weights
+            .iter()
+            .map(|(voter, w)| (*voter, *w))
+            .chain(std::iter::once((p.proposer, p.proposer_lock as u128)))
+            .collect();
         for (voter, weight) in locked {
             ledger.unlock_governance(voter, u64::try_from(weight).unwrap_or(u64::MAX));
         }
@@ -1385,7 +1441,7 @@ mod tests {
         let mut g = Governance::new();
         // 1,100 < 10,000 min -> rejected
         assert_eq!(
-            g.propose(&l, poor, "t".into(), GovAction::Signal("t".into()), 0),
+            g.propose(&mut l, poor, "t".into(), GovAction::Signal("t".into()), 0),
             Err(GovError::InsufficientStake)
         );
     }
@@ -1396,7 +1452,7 @@ mod tests {
         let mut g = Governance::new();
         let id = g
             .propose(
-                &l,
+                &mut l,
                 ids[0],
                 "raise reward".into(),
                 GovAction::SetBlockReward(stell(9)),
@@ -1422,7 +1478,7 @@ mod tests {
         let (mut l, ids) = ledger_with(3, 10_000);
         let mut g = Governance::new();
         let id = g
-            .propose(&l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
+            .propose(&mut l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
             .unwrap();
         // only 1 of 3 votes (~33% < 2/3 quorum)
         g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
@@ -1437,7 +1493,7 @@ mod tests {
         let (mut l, ids) = ledger_with(3, 10_000);
         let mut g = Governance::new();
         let id = g
-            .propose(&l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
+            .propose(&mut l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
             .unwrap();
         // all vote but yes does not exceed no
         g.vote(&mut l, ids[0], id, VoteChoice::No, 1).unwrap();
@@ -1454,7 +1510,7 @@ mod tests {
         let (mut l, ids) = ledger_with(3, 10_000);
         let mut g = Governance::new();
         let id = g
-            .propose(&l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
+            .propose(&mut l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
             .unwrap();
         g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
         assert_eq!(
@@ -1482,7 +1538,7 @@ mod tests {
             .unwrap();
         let mut g = Governance::new();
         let id = g
-            .propose(&l, [1u8; 32], "x".into(), GovAction::Signal("t".into()), 0)
+            .propose(&mut l, [1u8; 32], "x".into(), GovAction::Signal("t".into()), 0)
             .unwrap();
         let w1 = g.vote(&mut l, [1u8; 32], id, VoteChoice::Yes, 1).unwrap();
         let w2 = g.vote(&mut l, [2u8; 32], id, VoteChoice::No, 1).unwrap();
@@ -1495,12 +1551,12 @@ mod tests {
 
     #[test]
     fn invalid_action_values_rejected() {
-        let (l, ids) = ledger_with(1, 10_000);
+        let (mut l, ids) = ledger_with(1, 10_000);
         let mut g = Governance::new();
         // 150% slash is nonsense
         assert_eq!(
             g.propose(
-                &l,
+                &mut l,
                 ids[0],
                 "bad".into(),
                 GovAction::SetEquivocationSlashBps(15_000),
@@ -1511,7 +1567,7 @@ mod tests {
         // zero quorum is nonsense
         assert_eq!(
             g.propose(
-                &l,
+                &mut l,
                 ids[0],
                 "bad".into(),
                 GovAction::SetGovernanceQuorumBps(0),
@@ -1526,7 +1582,7 @@ mod tests {
         let (mut l, ids) = ledger_with(3, 10_000);
         let mut g = Governance::new();
         let id = g
-            .propose(&l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
+            .propose(&mut l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
             .unwrap();
         g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
         g.vote(&mut l, ids[1], id, VoteChoice::Yes, 1).unwrap();
@@ -1539,12 +1595,12 @@ mod tests {
 
     #[test]
     fn quorum_floor_rejected_at_propose_time() {
-        let (l, ids) = ledger_with(1, 10_000);
+        let (mut l, ids) = ledger_with(1, 10_000);
         let mut g = Governance::new();
         // 1 bps (0.01%) must be refused at propose time.
         assert_eq!(
             g.propose(
-                &l,
+                &mut l,
                 ids[0],
                 "bad".into(),
                 GovAction::SetGovernanceQuorumBps(1),
@@ -1555,7 +1611,7 @@ mod tests {
         // Just below the 3333 bps floor is also refused.
         assert_eq!(
             g.propose(
-                &l,
+                &mut l,
                 ids[0],
                 "bad".into(),
                 GovAction::SetGovernanceQuorumBps(GOVERNANCE_QUORUM_FLOOR_BPS - 1),
@@ -1566,7 +1622,7 @@ mod tests {
         // The floor error message must name the floor.
         let err = g
             .propose(
-                &l,
+                &mut l,
                 ids[0],
                 "bad".into(),
                 GovAction::SetGovernanceQuorumBps(1),
@@ -1580,7 +1636,7 @@ mod tests {
         // The floor itself is accepted.
         assert!(g
             .propose(
-                &l,
+                &mut l,
                 ids[0],
                 "ok".into(),
                 GovAction::SetGovernanceQuorumBps(GOVERNANCE_QUORUM_FLOOR_BPS),
@@ -1612,6 +1668,8 @@ mod tests {
                 voters: HashMap::new(),
                 status: ProposalStatus::Passed,
                 electorate: 0,
+                electorate_weights: None,
+                proposer_lock: 0,
                 weights: HashMap::new(),
             },
         );
@@ -1630,7 +1688,7 @@ mod tests {
         let mut g = Governance::new();
         let id = g
             .propose(
-                &l,
+                &mut l,
                 ids[0],
                 "q".into(),
                 GovAction::SetGovernanceQuorumBps(5_000),
@@ -1652,7 +1710,7 @@ mod tests {
         let mut g = Governance::new();
         let id = g
             .propose(
-                &l,
+                &mut l,
                 ids[0],
                 "q".into(),
                 GovAction::SetGovernanceQuorumBps(5_000),
@@ -1675,7 +1733,7 @@ mod tests {
         l.delegate(del(2), vid(1), stell(5_000)).unwrap();
         let mut g = Governance::new();
         let id = g
-            .propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
+            .propose(&mut l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
             .unwrap();
         // The validator owns its 10k self-bond; the 5k delegated by del(2) is
         // del(2)'s stake, NOT the validator's. Vote weight must be exactly 10k.
@@ -1695,7 +1753,7 @@ mod tests {
         l.delegate(vid(1), vid(1), stell(5_000)).unwrap();
         let mut g = Governance::new();
         let id = g
-            .propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
+            .propose(&mut l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
             .unwrap();
         // self-bond 10k + own delegation out 5k = 15k (counted once each)
         let w = g.vote(&mut l, vid(1), id, VoteChoice::Yes, 1).unwrap();
@@ -1716,7 +1774,7 @@ mod tests {
         l.delegate(vid(1), vid(2), stell(5_000)).unwrap(); // vid1 delegates 5k to vid2
         let mut g = Governance::new();
         let id = g
-            .propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
+            .propose(&mut l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
             .unwrap();
         // vid1's own stake is 10k (self) + 5k (delegated out); it must NOT also
         // gain the 5k as if it were still consensus power on vid1.
@@ -1734,7 +1792,7 @@ mod tests {
         assert_eq!(Governance::total_voting_power(&l), stell(19_000) as u128);
         let mut g = Governance::new();
         let id = g
-            .propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
+            .propose(&mut l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
             .unwrap();
         g.vote(&mut l, vid(1), id, VoteChoice::Yes, 1).unwrap(); // 10k
         g.vote(&mut l, del(1), id, VoteChoice::Yes, 1).unwrap(); // 9k
@@ -1764,7 +1822,7 @@ mod tests {
         assert_eq!(Governance::total_voting_power(&l), stell(29_000) as u128);
         let mut g = Governance::new();
         let id = g
-            .propose(&l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
+            .propose(&mut l, vid(1), "x".into(), GovAction::Signal("t".into()), 0)
             .unwrap();
         // The quorum base is frozen at propose time.
         assert_eq!(g.get(id).unwrap().electorate, stell(29_000) as u128);
@@ -1833,7 +1891,7 @@ mod tests {
         let mut g = Governance::new();
         let id = g
             .propose(
-                &l,
+                &mut l,
                 vid(1),
                 "abstain only".into(),
                 GovAction::Signal("s".into()),
@@ -1991,6 +2049,8 @@ mod tests {
                 voters: HashMap::new(),
                 status: ProposalStatus::Passed,
                 electorate,
+                electorate_weights: None,
+                proposer_lock: 0,
                 weights: HashMap::new(),
             },
         );

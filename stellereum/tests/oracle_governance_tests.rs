@@ -76,7 +76,7 @@ async fn pass(e: &InMemoryStateEngine, proposer: [u8; 32], action: GovAction) ->
     let mut ledger = e.staking_read().await.clone();
     let mut gov = e.governance_write().await;
     let id = gov
-        .propose(&ledger, proposer, "oracle governance".into(), action, 0)
+        .propose(&mut ledger, proposer, "oracle governance".into(), action, 0)
         .expect("propose");
     gov.vote(&mut ledger, proposer, id, VoteChoice::Yes, 1)
         .expect("vote");
@@ -549,11 +549,11 @@ async fn publisher_payload_is_folded_into_the_governance_digest() {
 #[tokio::test]
 async fn zero_key_registration_is_rejected_at_proposal_time() {
     let (e, voter) = gov_engine().await;
-    let ledger = e.staking_read().await.clone();
+    let mut ledger = e.staking_read().await.clone();
     let mut gov = e.governance_write().await;
     assert_eq!(
         gov.propose(
-            &ledger,
+            &mut ledger,
             voter,
             "zero publisher".into(),
             GovAction::RegisterOraclePublisher([0u8; 32]),

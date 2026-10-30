@@ -38,7 +38,6 @@ consumers — external-facing, publish candidate), `scripts/tools/stelops`,
 - [x] Stale-test repairs: wallet Falcon determinism pin, p3 halt-height race pin
 
 ## P0 — speed + repo bootstrap
-
 - [x] Deploy VEL fixes (prebuild + vote pipeline, build `573d86f5`) to all 4 nodes
   (2026-10-29 rolling, `.old` kept): no divergence/panics, all finalizing.
   Tempo 8.2 s/blk (dirty window) → ~2.5 s/blk sustained; rounds 6200+ → single
@@ -49,6 +48,10 @@ consumers — external-facing, publish candidate), `scripts/tools/stelops`,
   `immtes/stellereum-contracts`, `immtes/stell-wallet`, `immtes/stellereum-indexer`
 - [ ] Hour tempo verdict (meter running `/tmp/opencode/tempo-hour.log`): sustained
   mean/p50/p99 + views/block. r0-decide rate: slow-proposer slots (C/D 1-vCPU) vs misses.
+- [ ] Contract auth redesign (audit B-CT P0): the 4 wasm contracts authenticate
+  NOTHING (integer `from`/`owner`/`caller_id` replayable; `host.caller` exists
+  in node but unused). Failing `poc_p0_*` tests are the acceptance criteria.
+  SDK `caller()`/`value()` + mocks landed; contracts marked demo-grade.
 
 ## P1 — product gaps
 

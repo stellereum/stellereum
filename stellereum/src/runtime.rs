@@ -2499,15 +2499,15 @@ impl ValidatorRuntime {
         action: crate::governance::GovAction,
         now: u64,
     ) -> Result<u64, crate::governance::GovError> {
-        let ledger = self
+        let mut ledger = self
             .staking
-            .try_read()
+            .try_write()
             .map_err(|_| crate::governance::GovError::NotStaker)?;
         let g = self
             .governance
             .as_mut()
             .ok_or(crate::governance::GovError::NotStaker)?;
-        g.propose(&ledger, proposer, title, action, now)
+        g.propose(&mut ledger, proposer, title, action, now)
     }
 
     /// Cast a governance vote.

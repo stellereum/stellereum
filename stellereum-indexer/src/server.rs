@@ -23,6 +23,10 @@ pub struct AppState {
     /// chain-shaped reads (the shard topology, the validator set) from it, so
     /// the explorer never has to talk to the node directly.
     pub rpc_url: String,
+    /// Bearer token gating the state-changing verify endpoint (audit B-IDX-3).
+    /// `None` = endpoint refuses everything (default-deny); set
+    /// `INDEXER_VERIFY_TOKEN` to enable operator/API use. Reads stay public.
+    pub verify_token: Option<String>,
 }
 
 impl AppState {
@@ -33,6 +37,7 @@ impl AppState {
             abis: Arc::new(AbiCache::new()),
             rpc_url: std::env::var("INDEXER_RPC_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8545".to_string()),
+            verify_token: None,
         }
     }
 
@@ -42,6 +47,7 @@ impl AppState {
             db,
             abis: Arc::new(AbiCache::new()),
             rpc_url,
+            verify_token: None,
         }
     }
 }
@@ -69,6 +75,27 @@ pub struct EventsQuery {
 
 /// Maximum number of events one page may carry.
 const MAX_EVENT_PAGE: u32 = 200;
+
+/// Maximum pagination offset (audit B-IDX-4): an unbounded OFFSET forces a
+/// full table scan for an empty page (CPU DoS). Explorer pagination never
+/// legitimately exceeds one million rows deep.
+const MAX_OFFSET: u32 = 1_000_000;
+
+/// Fail-closed offset gate: `Err(response)` on absurd offsets.
+#[allow(clippy::result_large_err)] // GATE: axum Response is the framework's
+// native error carrier (handlers return it by value everywhere); boxing
+// would only add noise.
+fn check_offset(offset: u32) -> Result<u32, axum::response::Response> {
+    if offset > MAX_OFFSET {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "offset exceeds cap 1000000"})),
+        )
+            .into_response())
+    } else {
+        Ok(offset)
+    }
+}
 
 pub fn create_router(state: AppState) -> Router {
     Router::new()
@@ -580,7 +607,10 @@ async fn get_blocks(
     Query(p): Query<Pagination>,
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(50).min(200);
-    let offset = p.offset.unwrap_or(0);
+    let offset = match check_offset(p.offset.unwrap_or(0)) {
+            Ok(o) => o,
+            Err(r) => return r,
+        };
     match state.db.get_blocks(limit, offset) {
         Ok(blocks) => (
             StatusCode::OK,
@@ -631,7 +661,10 @@ async fn get_recent_txs(
     Query(p): Query<Pagination>,
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(50).min(200);
-    let offset = p.offset.unwrap_or(0);
+    let offset = match check_offset(p.offset.unwrap_or(0)) {
+            Ok(o) => o,
+            Err(r) => return r,
+        };
     // Fetch latest transactions across blocks
     let txs = state
         .db
@@ -641,6 +674,7 @@ async fn get_recent_txs(
         StatusCode::OK,
         Json(json!({ "transactions": txs, "limit": limit, "offset": offset })),
     )
+        .into_response()
 }
 
 async fn get_tx(State(state): State<AppState>, Path(hash): Path<String>) -> impl IntoResponse {
@@ -705,7 +739,10 @@ async fn get_account_actions(
 ) -> impl IntoResponse {
     let clean = address.strip_prefix("0x").unwrap_or(&address);
     let limit = p.limit.unwrap_or(50).min(200);
-    let offset = p.offset.unwrap_or(0);
+    let offset = match check_offset(p.offset.unwrap_or(0)) {
+            Ok(o) => o,
+            Err(r) => return r,
+        };
     match state.db.get_account_txs(clean, limit, offset) {
         Ok(txs) => (StatusCode::OK, Json(json!({ "address": clean, "actions": txs, "transactions": txs, "limit": limit, "offset": offset }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
@@ -897,7 +934,10 @@ async fn get_contract_events(
     Query(p): Query<Pagination>,
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(50).min(MAX_EVENT_PAGE);
-    let offset = p.offset.unwrap_or(0);
+    let offset = match check_offset(p.offset.unwrap_or(0)) {
+            Ok(o) => o,
+            Err(r) => return r,
+        };
     let filter = EventFilter {
         contract: Some(address.clone()),
         ..Default::default()
@@ -966,7 +1006,10 @@ async fn get_events(
     Query(q): Query<EventsQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(50).min(MAX_EVENT_PAGE);
-    let offset = q.offset.unwrap_or(0);
+    let offset = match check_offset(q.offset.unwrap_or(0)) {
+            Ok(o) => o,
+            Err(r) => return r,
+        };
     let filter = EventFilter {
         from_block: q.from_block,
         to_block: q.to_block,
@@ -1015,7 +1058,10 @@ async fn get_contracts(
     Query(p): Query<Pagination>,
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(50).min(MAX_EVENT_PAGE);
-    let offset = p.offset.unwrap_or(0);
+    let offset = match check_offset(p.offset.unwrap_or(0)) {
+            Ok(o) => o,
+            Err(r) => return r,
+        };
     match state.db.list_contracts(limit, offset) {
         Ok(rows) => {
             let total = state.db.count_contracts().unwrap_or(rows.len() as u64);
@@ -1133,9 +1179,27 @@ pub struct VerifyRequest {
 /// the endpoint says so explicitly instead of inventing a verdict.
 async fn verify_contract_source(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Path(address): Path<String>,
     Json(body): Json<VerifyRequest>,
 ) -> impl IntoResponse {
+    // Audit B-IDX-3: the only state-changing endpoint requires the operator
+    // token (anonymous 1MiB writes = DB-fill + node-RPC spend). Default-deny:
+    // unset token refuses everything with 401.
+    let authorized = match state.verify_token.as_deref() {
+        Some(expected) if !expected.is_empty() => headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|got| got == expected),
+        _ => false,
+    };
+    if !authorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "verify endpoint requires X-Api-Key (set INDEXER_VERIFY_TOKEN)"})),
+        )
+            .into_response();
+    }
     let key = normalize_contract_key(&address);
     if key.is_empty() || key.len() > 64 {
         return (

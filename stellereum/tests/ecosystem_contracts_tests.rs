@@ -748,3 +748,25 @@ async fn test_stl_domain_registry_auction_and_dns_lifecycle() {
         "Domain now resolves to 999 set by new owner"
     );
 }
+
+// B-VM audit PoC (read-only, no behavior change). PASSES by demonstrating the
+// flaw; the secure decoder would REJECT trailing bytes.
+#[test]
+fn bvm_poc_abi_decode_return_ignores_trailing_bytes() {
+    use stellereum::contract_abi::{AbiMethod, AbiType, AbiValue, ContractAbi};
+    let mut abi = ContractAbi::new();
+    abi.add_method(AbiMethod::view("get", vec![], AbiType::I64));
+    // Canonical bare I64 payload is 8 bytes; append 1 trailing byte.
+    // src/contract_abi.rs:1111-1116 decodes without an is_empty() check.
+    let mut bytes = 7i64.to_be_bytes().to_vec();
+    bytes.push(0xFF);
+    // FIXED (audit B-VM): trailing bytes after a bare scalar refuse.
+    let err = abi.decode_return("get", &bytes).unwrap_err();
+    assert!(
+        matches!(err, stellereum::contract_abi::AbiError::TrailingBytes { got: 1 }),
+        "expected TrailingBytes(1), got {err:?}"
+    );
+    // Control: exact bytes still decode.
+    let v = abi.decode_return("get", &7i64.to_be_bytes()).unwrap();
+    assert_eq!(v, AbiValue::I64(7));
+}

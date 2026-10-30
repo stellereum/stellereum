@@ -29,6 +29,12 @@ mod host {
         pub fn sload(key: i64) -> i64;
         pub fn sstore(key: i64, val: i64);
         pub fn emit(topic: i64, val: i64);
+        /// Authenticated tx sender (32 bytes) written to `dest_ptr`.
+        /// Audit B-CT: contracts MUST authenticate with this, never with
+        /// caller-supplied integer ids (replayable — all ids are public).
+        pub fn caller(dest_ptr: i32);
+        /// Native value attached to the call.
+        pub fn value() -> i64;
     }
 }
 
@@ -50,6 +56,27 @@ pub fn emit(topic: i64, val: i64) {
     unsafe { host::emit(topic, val) }
 }
 
+#[cfg(target_arch = "wasm32")]
+static mut CALLER_BUF: [u8; 32] = [0u8; 32];
+
+/// Authenticated transaction sender (audit B-CT: the ONLY trustworthy
+/// caller identity — never accept `from`/`owner`/`caller_id` args for auth).
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+pub fn caller() -> [u8; 32] {
+    unsafe {
+        host::caller(core::ptr::addr_of_mut!(CALLER_BUF) as i32);
+        core::ptr::read(core::ptr::addr_of!(CALLER_BUF))
+    }
+}
+
+/// Native value attached to the current call.
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+pub fn value() -> u64 {
+    unsafe { host::value() as u64 }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod host_mock {
     use std::cell::RefCell;
@@ -58,6 +85,8 @@ mod host_mock {
     thread_local! {
         static STORAGE: RefCell<HashMap<i64, i64>> = RefCell::new(HashMap::new());
         static EVENTS: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
+        static CALLER: RefCell<[u8; 32]> = const { RefCell::new([0u8; 32]) };
+        static VALUE: RefCell<u64> = const { RefCell::new(0) };
     }
 
     pub fn sload(key: i64) -> i64 {
@@ -75,6 +104,28 @@ mod host_mock {
     pub fn reset_mock_state() {
         STORAGE.with(|s| s.borrow_mut().clear());
         EVENTS.with(|e| e.borrow_mut().clear());
+        CALLER.with(|c| *c.borrow_mut() = [0u8; 32]);
+        VALUE.with(|v| *v.borrow_mut() = 0);
+    }
+
+    /// Set the mock authenticated caller (test double for `host.caller`).
+    pub fn set_mock_caller(caller: [u8; 32]) {
+        CALLER.with(|c| *c.borrow_mut() = caller);
+    }
+
+    /// Read the mock authenticated caller.
+    pub fn mock_caller() -> [u8; 32] {
+        CALLER.with(|c| *c.borrow())
+    }
+
+    /// Set the mock attached value (test double for `host.value`).
+    pub fn set_mock_value(value: u64) {
+        VALUE.with(|v| *v.borrow_mut() = value);
+    }
+
+    /// Read the mock attached value.
+    pub fn mock_value() -> u64 {
+        VALUE.with(|v| *v.borrow())
     }
 
     pub fn get_mock_events() -> Vec<(i64, i64)> {
@@ -105,6 +156,32 @@ pub fn reset_mock_state() {
     host_mock::reset_mock_state();
 }
 
+/// Mock-authenticated caller (test double; on wasm32 reads `host.caller`).
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+pub fn caller() -> [u8; 32] {
+    host_mock::mock_caller()
+}
+
+/// Mock attached value (test double; on wasm32 reads `host.value`).
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+pub fn value() -> u64 {
+    host_mock::mock_value()
+}
+
+/// Set the mock authenticated caller (tests only).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_mock_caller(caller: [u8; 32]) {
+    host_mock::set_mock_caller(caller)
+}
+
+/// Set the mock attached value (tests only).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_mock_value(value: u64) {
+    host_mock::set_mock_value(value)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn get_mock_events() -> Vec<(i64, i64)> {
     host_mock::get_mock_events()
@@ -120,4 +197,23 @@ macro_rules! setup_wasm_panic_handler {
             core::arch::wasm32::unreachable()
         }
     };
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod caller_mock_tests {
+    use super::*;
+
+    #[test]
+    fn mock_caller_value_roundtrip_and_reset() {
+        reset_mock_state();
+        assert_eq!(caller(), [0u8; 32]);
+        assert_eq!(value(), 0);
+        set_mock_caller([0xABu8; 32]);
+        set_mock_value(12345);
+        assert_eq!(caller(), [0xABu8; 32]);
+        assert_eq!(value(), 12345);
+        reset_mock_state();
+        assert_eq!(caller(), [0u8; 32]);
+        assert_eq!(value(), 0);
+    }
 }

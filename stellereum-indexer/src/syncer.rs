@@ -88,13 +88,16 @@ impl Syncer {
 
             let shard_id = b["shard_id"].as_u64().unwrap_or(0) as u32;
 
-            // Check if we already have this block
-            if self
+            // Skip only the IDENTICAL block; a different hash at a known
+            // (shard,height) is a reorg — re-process so insert_block
+            // replaces it and dependents re-index (audit B-IDX-2).
+            if let Some(known) = self
                 .db
                 .get_block_by_shard_and_height(shard_id, height)?
-                .is_some()
             {
-                continue;
+                if known.hash == hash {
+                    continue;
+                }
             }
 
             let block_record = BlockRecord {

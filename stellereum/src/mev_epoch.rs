@@ -2251,6 +2251,14 @@ impl EpochSealManager {
         if !commitment.tx_hashes.contains(&envelope.tx_hash) {
             return Err("the sealed transaction is not part of the committed order".to_string());
         }
+        // Audit M1: bind the envelope's epoch to ours. Without this, an
+        // envelope sealed to a FOREIGN epoch releases a partial computed
+        // under OUR share for an attacker-chosen commitment.
+        if envelope.epoch != self.epoch {
+            return Err(
+                "sealed envelope is for a different epoch than ours: release refused".to_string(),
+            );
+        }
         let Some(material) = self.material.as_ref() else {
             return Err("no epoch key material for this epoch".to_string());
         };
@@ -2294,10 +2302,13 @@ impl EpochSealManager {
     /// malicious peer cannot make us accept decryption material for a
     /// transaction that was never committed to.
     pub fn ingest_release(&mut self, release: ShareRelease) -> Result<usize, String> {
+        // Audit M2: bind height AND round, not just (epoch, root) — otherwise
+        // a release replays into any round sharing the same order root
+        // (all-empty rounds share root [0;32]).
         let known = self
             .commitments
-            .values()
-            .any(|c| c.order_root == release.order_root && c.epoch == release.epoch);
+            .get(&(release.height, release.round))
+            .is_some_and(|c| c.order_root == release.order_root && c.epoch == release.epoch);
         if !known {
             return Err("share release does not match any order commitment we know".to_string());
         }

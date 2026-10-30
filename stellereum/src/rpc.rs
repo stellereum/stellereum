@@ -5317,12 +5317,12 @@ async fn dispatch(
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let mut g = st.governance.write().await;
-            let ledger = st.engine.staking_read().await;
+            let mut ledger = st.engine.staking_write().await;
             let proposer = params["proposer"]
                 .as_str()
                 .and_then(|s| parse_addr(s).ok())
                 .unwrap_or([1u8; 32]);
-            match g.propose(&ledger, proposer, title, action, now) {
+            match g.propose(&mut ledger, proposer, title, action, now) {
                 Ok(pid) => ok(id, json!({ "proposal_id": pid, "status": "Open" })),
                 Err(e) => err(id, -32000, format!("propose failed: {:?}", e)),
             }
@@ -8766,7 +8766,7 @@ mod tests {
         );
         assert_eq!(
             call(&st, "eth_estimateGas", json!([])).await,
-            json!("0x5208")
+            json!("0x445c0")
         );
         let fh = call(&st, "eth_feeHistory", json!([4, "latest", [25.0, 75.0]])).await;
         assert_eq!(fh["oldestBlock"], json!("0x27"));
@@ -14168,6 +14168,8 @@ mod tests {
                     voters: Default::default(),
                     status: crate::governance::ProposalStatus::Passed,
                     electorate: 1,
+                    electorate_weights: None,
+                    proposer_lock: 0,
                     weights: Default::default(),
                 },
             );

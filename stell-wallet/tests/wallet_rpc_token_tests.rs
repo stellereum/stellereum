@@ -71,10 +71,25 @@ fn serve_sequence(
                     .unwrap()
                     .push(String::from_utf8_lossy(&buf).into_owned());
             }
-            let body = serde_json::json!({
-                "jsonrpc": "2.0", "id": 1, "result": result
-            })
-            .to_string();
+            let body_len = content_len.unwrap_or(0);
+            let hend = find_headers_end(&buf).unwrap_or(0);
+            let body = match serde_json::from_slice::<serde_json::Value>(
+                &buf[hend..(hend + body_len).min(buf.len())],
+            )
+            .ok()
+            .and_then(|v| v.get("id").cloned())
+            {
+                // Audit B-WALLET-5: echo the request id (replay mixing is
+                // refused client-side when ids mismatch).
+                Some(id) => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": result
+                })
+                .to_string(),
+                None => serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "result": result
+                })
+                .to_string(),
+            };
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -248,10 +263,44 @@ fn rpc_call_maps_node_error_to_err() {
         let Ok((mut stream, _)) = listener.accept() else {
             return;
         };
-        let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf);
-        let body =
-            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"unauthorized: nope"}}"#;
+        // Read headers + full body (single read races partial arrivals).
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break 0usize,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(hend) = buf
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|i| i + 4)
+                    {
+                        let head = String::from_utf8_lossy(&buf[..hend]).into_owned();
+                        let len = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                (k.trim().eq_ignore_ascii_case("content-length"))
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= hend + len {
+                            break len;
+                        }
+                    }
+                }
+                Err(_) => break 0usize,
+            }
+        };
+        let text = String::from_utf8_lossy(&buf);
+        // Audit B-WALLET-5: echo the request id (client refuses mismatches).
+        let req_id = text
+            .find("\r\n\r\n")
+            .and_then(|i| serde_json::from_str::<serde_json::Value>(&text[i + 4..]).ok())
+            .and_then(|v| v.get("id").cloned())
+            .unwrap_or(serde_json::json!(1));
+        let body = serde_json::json!({"jsonrpc":"2.0","id":req_id,"error":{"code":-32001,"message":"unauthorized: nope"}}).to_string();
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),

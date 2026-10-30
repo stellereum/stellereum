@@ -23,8 +23,8 @@ use security::{HardenedKeystore, SecureSecret};
 #[path = "../src/wallets.rs"]
 mod wallets;
 use wallets::{
-    get_active_wallet_name, list_wallets, sanitize_wallet_name, save_named_wallet, switch_wallet,
-    wallets_dir,
+    get_active_wallet_name, list_wallets, resolve_active_wallet_path, sanitize_wallet_name,
+    save_named_wallet, switch_wallet, wallets_dir,
 };
 
 fn create_temp_env(test_name: &str) -> PathBuf {
@@ -168,5 +168,49 @@ fn test_legacy_wallet_auto_migration() {
     let perms = fs::metadata(&default_path).unwrap().permissions().mode() & 0o777;
     assert_eq!(perms, 0o600);
 
+    let _ = fs::remove_dir_all(&base);
+}
+
+// B-WALLET PoC-1: active_wallet pointer traversal (wallets.rs:60-71,176-181).
+// `get_active_wallet_name` returns raw file content unsanitized; `resolve_*`
+// joins it as `{name}.json`. An attacker writing `../evil` or an absolute
+// path escapes `wallets/` and loads an arbitrary keystore.
+// Secure: resolved path must stay inside `wallets/` or be the legacy file.
+#[test]
+fn poc_active_wallet_pointer_traversal_escapes_wallets_dir() {
+    let base = create_temp_env("poc_traversal");
+    let wdir = wallets_dir(Some(&base));
+    fs::create_dir_all(&wdir).expect("mkdir wallets");
+    let secret = SecureSecret::new([0xAA; 32]);
+    let ks = HardenedKeystore::encrypt(
+        &secret,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pw123456",
+    )
+    .expect("encrypt");
+    save_named_wallet("good", &ks, Some(&base)).expect("save good");
+    // Plant escape targets so the `exists()` gates in resolve_* pass.
+    let evil_sibling = base.join("evil.json");
+    fs::write(&evil_sibling, b"{}").expect("plant sibling");
+    let abs_target = std::env::temp_dir().join(format!(
+        "b_wallet_pwn_{}.json",
+        std::process::id()
+    ));
+    fs::write(&abs_target, b"{}").expect("plant abs");
+    let ptr = base.join("active_wallet");
+    for payload in ["../evil", abs_target.to_string_lossy().trim_end_matches(".json")] {
+        let payload = payload.to_string();
+        fs::write(&ptr, &payload).expect("write pointer");
+        let resolved = resolve_active_wallet_path(None, Some(&base));
+        let resolved_s = resolved.to_string_lossy().to_string();
+        let inside_wallets = resolved.starts_with(&wdir);
+        let is_legacy = resolved == base.join("wallet.json");
+        println!("payload={payload:?} resolved={resolved_s:?} inside_wallets={inside_wallets}");
+        assert!(
+            inside_wallets || is_legacy,
+            "POC-REAL (traversal): payload {payload:?} escaped wallets/ -> {resolved_s:?}"
+        );
+    }
+    let _ = fs::remove_file(&abs_target);
     let _ = fs::remove_dir_all(&base);
 }

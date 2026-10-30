@@ -1112,7 +1112,15 @@ impl ContractAbi {
         match ty {
             AbiType::I64 | AbiType::U64 | AbiType::I32 | AbiType::Bool | AbiType::Address => {
                 let mut cur = Cursor::new(bytes);
-                AbiValue::decode_payload(ty, &mut cur)
+                let v = AbiValue::decode_payload(ty, &mut cur)?;
+                // Audit B-VM: strict — trailing bytes after a bare scalar
+                // are a decode confusion vector (RPC/client misread).
+                if !cur.is_empty() {
+                    return Err(AbiError::TrailingBytes {
+                        got: cur.remaining(),
+                    });
+                }
+                Ok(v)
             }
             AbiType::Bytes | AbiType::String => {
                 if bytes.len() >= 4 {

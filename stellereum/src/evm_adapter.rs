@@ -13,7 +13,7 @@
 //! - `eth_gasPrice`: Returns base fee in Wei as hex ("0x3eb2788000").
 //! - `eth_maxPriorityFeePerGas`: Returns max priority fee per gas ("0x3b9aca00" or "0x0").
 //! - `eth_feeHistory`: Returns standard EIP-1559 fee history object for block count and newest block.
-//! - `eth_estimateGas`: Returns standard gas estimate ("0x5208" for transfer).
+//! - `eth_estimateGas`: Returns floor-aware gas estimate ("0x445c0" = 280k admission floor for transfers; pure EVM figure would be "0x5208").
 //!
 //! Also provides exact JSON-RPC 2.0 serialization types for:
 //! - `EvmBlock`
@@ -127,7 +127,8 @@ pub const DEFAULT_MAX_PRIORITY_FEE_HEX: &str = "0x3b9aca00";
 pub const ZERO_MAX_PRIORITY_FEE_HEX: &str = "0x0";
 pub const DEFAULT_MAX_PRIORITY_FEE: u128 = 0x3b9aca00;
 
-/// Standard transfer gas estimate ("0x5208" = 21,000 gas).
+/// Pure-EVM transfer gas figure ("0x5208" = 21,000 gas). Served estimates are
+/// floored to the admission floor (see `eth_estimate_gas_amount`).
 pub const STANDARD_TRANSFER_GAS: u64 = 21_000;
 pub const STANDARD_TRANSFER_GAS_HEX: &str = "0x5208";
 
@@ -307,7 +308,7 @@ pub fn eth_maxPriorityFeePerGas() -> &'static str {
     eth_max_priority_fee_per_gas()
 }
 
-/// Returns standard gas estimate for transfer ("0x5208").
+/// Returns the pure-EVM transfer gas figure ("0x5208"); served estimates are floored.
 pub fn eth_estimate_transfer_gas() -> &'static str {
     STANDARD_TRANSFER_GAS_HEX
 }
@@ -796,6 +797,12 @@ pub fn secp_envelope_evm_hash(tx: &crate::sharding::Transaction) -> Option<Strin
 pub fn verify_secp_settlement(tx: &crate::sharding::Transaction) -> Result<[u8; 20], String> {
     if !is_secp_settlement_tx(tx) {
         return Err("not a secp settlement envelope".to_string());
+    }
+    // Audit B-VM: bind the FULL address. `stell_to_evm_address` compares only
+    // the low 20 bytes, so a hostile nonzero 12-byte prefix would alias any
+    // EVM identity. EVM-derived Stell addresses are always zero-prefixed.
+    if tx.from[..12] != [0u8; 12] {
+        return Err("secp envelope Stell prefix must be zero".to_string());
     }
     let mut r = [0u8; 32];
     let mut s = [0u8; 32];
@@ -1596,21 +1603,21 @@ pub fn extract_calldata(params: &Value) -> Option<&str> {
     }
 }
 
-pub fn extract_address_from_calldata(rest: &str) -> String {
+/// Extract the 32-byte word after the selector as an EVM address.
+/// Audit B-VM: STRICT — EVM words are exactly 32 bytes (64 hex chars).
+/// Short/trailing/non-hex input returns None (the old code zero-padded
+/// anything, so `"1234"` emulated a balance for `0x000..1234` — wallet
+/// simulation confusion). Callers map None to empty (`"0x"`, as for
+/// unknown selectors).
+pub fn extract_address_from_calldata(rest: &str) -> Option<String> {
     let clean = rest.trim();
-    if !clean.is_ascii() {
-        return "0x0000000000000000000000000000000000000000".to_string();
+    if clean.len() != 64 || !clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
     }
-    if clean.len() >= 64 {
-        if clean[..24].chars().all(|c| c == '0') {
-            format!("0x{}", &clean[24..64].to_lowercase())
-        } else {
-            format!("0x{}", &clean[..64].to_lowercase())
-        }
-    } else if clean.len() >= 40 {
-        format!("0x{}", &clean[clean.len() - 40..].to_lowercase())
+    if clean[..24].chars().all(|c| c == '0') {
+        Some(format!("0x{}", &clean[24..64].to_lowercase()))
     } else {
-        format!("0x{:0>40}", clean.to_lowercase())
+        Some(format!("0x{}", &clean[..64].to_lowercase()))
     }
 }
 
@@ -2333,7 +2340,10 @@ impl EvmAdapter {
             SELECTOR_TRANSFER | SELECTOR_APPROVE | SELECTOR_TRANSFER_FROM => abi_encode_bool(true),
             SELECTOR_ALLOWANCE => abi_encode_u128(u128::MAX),
             SELECTOR_BALANCE_OF => {
-                let address = extract_address_from_calldata(rest);
+                let address = match extract_address_from_calldata(rest) {
+                    Some(a) => a,
+                    None => return "0x".to_string(),
+                };
                 let bal = self.get_balance(&address);
                 abi_encode_u128(bal)
             }
@@ -2380,7 +2390,10 @@ impl EvmAdapter {
             SELECTOR_TRANSFER | SELECTOR_APPROVE | SELECTOR_TRANSFER_FROM => abi_encode_bool(true),
             SELECTOR_ALLOWANCE => abi_encode_u128(u128::MAX),
             SELECTOR_BALANCE_OF => {
-                let address = extract_address_from_calldata(rest);
+                let address = match extract_address_from_calldata(rest) {
+                    Some(a) => a,
+                    None => return "0x".to_string(),
+                };
                 // Check local overrides first
                 let raw = address.trim();
                 let stripped = raw
@@ -4377,7 +4390,9 @@ pub fn eth_estimate_gas_amount(params: &Value) -> Result<u64, JsonRpcError> {
     };
 
     let Some(obj) = call_obj else {
-        return Ok(STANDARD_TRANSFER_GAS);
+        // Audit B-VM: floor applies to the empty-params path too (same
+        // admission contract as below).
+        return Ok(STANDARD_TRANSFER_GAS.max(crate::svm::GAS_BASIC_TRANSFER));
     };
 
     let data_str = obj
@@ -4395,6 +4410,15 @@ pub fn eth_estimate_gas_amount(params: &Value) -> Result<u64, JsonRpcError> {
             if stripped.is_empty() {
                 (false, Vec::new())
             } else {
+                // Audit B-VM: bound estimate calldata (unbounded hex decode
+                // + per-byte sum is unauth CPU/RAM DoS; same 128KiB ceiling
+                // as raw-tx ingest).
+                if stripped.len() > 2 * MAX_EVM_RAW_TX_BYTES {
+                    return Err(JsonRpcError::invalid_params(format!(
+                        "calldata exceeds cap {} bytes",
+                        MAX_EVM_RAW_TX_BYTES
+                    )));
+                }
                 let bytes = hex::decode(stripped).map_err(|e| {
                     JsonRpcError::invalid_params(format!("invalid hex data in call: {e}"))
                 })?;
@@ -4424,7 +4448,14 @@ pub fn eth_estimate_gas_amount(params: &Value) -> Result<u64, JsonRpcError> {
         .map(|&b| if b == 0 { 4 } else { 16 })
         .sum();
 
-    let total = base_gas + calldata_gas;
+    // Audit B-VM: floor-aware (RPC.md contract). The pure EVM figure (21k)
+    // sits below the Stell admission floor and wallets forwarding it get
+    // rejected for under-declared gas. Units differ across the bridge, but
+    // quoting max() is safe in both directions: EVM tooling tolerates the
+    // over-estimate, and our admission never sees an under-declared figure.
+    let total = base_gas
+        .saturating_add(calldata_gas)
+        .max(crate::svm::GAS_BASIC_TRANSFER);
     Ok(total)
 }
 
@@ -8057,7 +8088,7 @@ mod tests {
         let est_empty = adapter
             .dispatch("eth_estimateGas", &json!([]))
             .expect("estimate empty");
-        assert_eq!(est_empty, json!("0x5208"));
+        assert_eq!(est_empty, json!("0x445c0"));
 
         // 4. eth_estimateGas for transfer (standard to/from/value call object) -> "0x5208"
         let est_tx = adapter
@@ -8070,7 +8101,7 @@ mod tests {
                 }]),
             )
             .expect("estimate transfer");
-        assert_eq!(est_tx, json!("0x5208"));
+        assert_eq!(est_tx, json!("0x445c0"));
 
         // 5. eth_estimateGas with empty data "0x" -> "0x5208"
         let est_empty_data = adapter
@@ -8082,7 +8113,7 @@ mod tests {
                 }]),
             )
             .expect("estimate empty data");
-        assert_eq!(est_empty_data, json!("0x5208"));
+        assert_eq!(est_empty_data, json!("0x445c0"));
 
         // 6. eth_estimateGas with non-empty calldata (e.g. 4 bytes non-zero -> 21000 + 4*16 = 21064 = 0x5248)
         let est_call = adapter
@@ -8094,7 +8125,7 @@ mod tests {
                 }]),
             )
             .expect("estimate call data");
-        assert_eq!(est_call, json!("0x5248"));
+        assert_eq!(est_call, json!("0x445c0")); // floored (pure 0x5248 < 280k floor)
 
         // 7. eth_estimateGas contract creation (no to field, with bytecode: 53000 + calldata gas)
         // 2 non-zero bytes (0x60, 0x80) -> 53000 + 32 = 53032 = 0xcf28
@@ -8106,7 +8137,7 @@ mod tests {
                 }]),
             )
             .expect("estimate contract creation");
-        assert_eq!(est_create, json!("0xcf28"));
+        assert_eq!(est_create, json!("0x445c0")); // floored (pure 0xcf28 < 280k floor)
 
         // 8. Invalid hex in data -> error
         let err = adapter

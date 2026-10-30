@@ -990,7 +990,7 @@ Parameters: `[{to, data, ...}]` (same call object as `eth_call`).
 
 ```json
 {"method":"eth_estimateGas","params":[{"to":"0x3535...","data":"0xaabbccdd"}]}
-→ {"result":"0x5248"}
+→ {"result":"0x445c0"}
 ```
 
 This is an **admission** estimate, not execution metering: EVM calldata is

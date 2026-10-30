@@ -584,25 +584,26 @@ fn test_eth_estimate_gas_transfers_and_calls() {
     assert_eq!(STANDARD_TRANSFER_GAS_HEX, "0x5208");
     assert_eq!(eth_estimate_transfer_gas(), "0x5208");
 
-    // 2. Empty / null parameters return standard 21_000 ("0x5208")
-    assert_eq!(eth_estimate_gas(&Value::Null).unwrap(), "0x5208");
-    assert_eq!(eth_estimate_gas(&json!([])).unwrap(), "0x5208");
-    assert_eq!(eth_estimateGas(&json!([])).unwrap(), "0x5208");
-    assert_eq!(adapter.eth_estimate_gas(&json!([])).unwrap(), "0x5208");
-    assert_eq!(adapter.eth_estimateGas(&json!([])).unwrap(), "0x5208");
+    // 2. Empty / null parameters return the floored estimate ("0x445c0" = 280000;
+    // audit B-VM: max(pure EVM figure, admission floor))
+    assert_eq!(eth_estimate_gas(&Value::Null).unwrap(), "0x445c0");
+    assert_eq!(eth_estimate_gas(&json!([])).unwrap(), "0x445c0");
+    assert_eq!(eth_estimateGas(&json!([])).unwrap(), "0x445c0");
+    assert_eq!(adapter.eth_estimate_gas(&json!([])).unwrap(), "0x445c0");
+    assert_eq!(adapter.eth_estimateGas(&json!([])).unwrap(), "0x445c0");
     assert_eq!(
         adapter.dispatch("eth_estimateGas", &json!([])).unwrap(),
-        json!("0x5208")
+        json!("0x445c0")
     );
 
-    // 3. Standard native transfer call object: from, to, value -> "0x5208"
+    // 3. Standard native transfer call object: floored to "0x445c0"
     let tx_obj = json!([{
         "from": "0x1111111111111111111111111111111111111111",
         "to": "0x2222222222222222222222222222222222222222",
         "value": "0xde0b6b3a7640000"
     }]);
     let est = adapter.dispatch("eth_estimateGas", &tx_obj).unwrap();
-    assert_eq!(est, json!("0x5208"));
+    assert_eq!(est, json!("0x445c0"));
 
     // 4. Object without array wrapper
     let direct_obj = json!({
@@ -610,7 +611,7 @@ fn test_eth_estimate_gas_transfers_and_calls() {
         "to": "0x2222222222222222222222222222222222222222",
         "value": "0x1"
     });
-    assert_eq!(eth_estimate_gas(&direct_obj).unwrap(), "0x5208");
+    assert_eq!(eth_estimate_gas(&direct_obj).unwrap(), "0x445c0");
 
     // 5. Empty data "0x" or ""
     let empty_data = json!([{
@@ -619,7 +620,7 @@ fn test_eth_estimate_gas_transfers_and_calls() {
     }]);
     assert_eq!(
         adapter.dispatch("eth_estimateGas", &empty_data).unwrap(),
-        json!("0x5208")
+        json!("0x445c0")
     );
 
     // 6. With block tag in params: [{"to": "..."}, "latest"]
@@ -627,16 +628,16 @@ fn test_eth_estimate_gas_transfers_and_calls() {
         "to": "0x2222222222222222222222222222222222222222",
         "value": "0x1"
     }, "latest"]);
-    assert_eq!(eth_estimate_gas(&with_tag).unwrap(), "0x5208");
+    assert_eq!(eth_estimate_gas(&with_tag).unwrap(), "0x445c0");
 
-    // 7. Non-empty calldata: 4 non-zero bytes (e.g. 0x12345678) -> 21000 + 4*16 = 21064 = 0x5248
+    // 7. Non-empty calldata: floored to 0x44080 (pure figure 21064 would be rejectable)
     let call_data = json!([{
         "to": "0x2222222222222222222222222222222222222222",
         "data": "0x12345678"
     }]);
     assert_eq!(
         adapter.dispatch("eth_estimateGas", &call_data).unwrap(),
-        json!("0x5248")
+        json!("0x445c0")
     );
 
     // 8. Calldata with zero bytes (4 gas per zero, 16 per non-zero): 0x00010200 -> 21000 + 2*4 + 2*16 = 21040 = 0x5230
@@ -646,7 +647,7 @@ fn test_eth_estimate_gas_transfers_and_calls() {
     }]);
     assert_eq!(
         adapter.dispatch("eth_estimateGas", &mixed_data).unwrap(),
-        json!("0x5230")
+        json!("0x445c0")
     );
 
     // 9. Input field alias for data
@@ -656,16 +657,16 @@ fn test_eth_estimate_gas_transfers_and_calls() {
     }]);
     assert_eq!(
         adapter.dispatch("eth_estimateGas", &input_field).unwrap(),
-        json!("0x5248")
+        json!("0x445c0")
     );
 
     // 10. Contract creation: no "to" field + bytecode in data -> 53000 + calldata gas
-    // "0x6080" has 2 non-zero bytes: 53000 + 32 = 53032 = 0xcf28
+    // "0x6080" has 2 non-zero bytes: pure figure 53032 floored to 0x44080
     assert_eq!(CONTRACT_CREATION_BASE_GAS, 53_000);
     let create_call = json!([{ "data": "0x6080" }]);
     assert_eq!(
         adapter.dispatch("eth_estimateGas", &create_call).unwrap(),
-        json!("0xcf28")
+        json!("0x445c0")
     );
 
     // Contract creation with explicit empty "to": "0x"
@@ -674,7 +675,7 @@ fn test_eth_estimate_gas_transfers_and_calls() {
         adapter
             .dispatch("eth_estimateGas", &create_empty_to)
             .unwrap(),
-        json!("0xcf28")
+        json!("0x445c0")
     );
 
     // 11. Error handling: invalid hex in data
@@ -942,7 +943,7 @@ fn test_metamask_gas_jsonrpc_string_dispatch_end_to_end() {
     let resp3_raw = adapter.handle_raw_json(req3);
     let resp3: JsonRpcResponse<String> = serde_json::from_str(&resp3_raw).unwrap();
     assert_eq!(resp3.id, json!(3));
-    assert_eq!(resp3.result.unwrap(), "0x5208");
+    assert_eq!(resp3.result.unwrap(), "0x445c0");
 
     // 4. eth_feeHistory
     let req4 =
@@ -974,7 +975,7 @@ fn test_metamask_gas_jsonrpc_string_dispatch_end_to_end() {
         .unwrap()
         .get("oldestBlock")
         .is_some());
-    assert_eq!(batch_resp[3].result, Some(json!("0x5208")));
+    assert_eq!(batch_resp[3].result, Some(json!("0x445c0")));
 }
 
 #[test]
@@ -1018,7 +1019,8 @@ fn test_metamask_gas_indicator_calculation_simulation() {
         )
         .unwrap();
     let gas_limit = parse_hex_u64(est_gas_hex.as_str().unwrap()).unwrap();
-    assert_eq!(gas_limit, 21_000);
+    // Audit B-VM: floored to the admission floor (280000), not raw 21k.
+    assert_eq!(gas_limit, 280_000);
 
     // Step 6: Estimated transaction max fee in Wei
     let max_cost_wei = (gas_limit as u128) * max_fee_medium;
@@ -2444,7 +2446,8 @@ async fn test_evm_adapter_module_level_helpers() {
     // 2. extract_address_from_calldata & normalize_address
     let addr = extract_address_from_calldata(
         "0000000000000000000000001111111111111111111111111111111111111111",
-    );
+    )
+    .unwrap();
     assert_eq!(addr, "0x1111111111111111111111111111111111111111");
     assert_eq!(
         normalize_address("1111111111111111111111111111111111111111"),
@@ -2459,7 +2462,7 @@ async fn test_evm_adapter_module_level_helpers() {
     // 4. Gas & fee helpers
     assert_eq!(eth_gas_price(), "0x3eb2788000");
     assert_eq!(eth_max_priority_fee_per_gas(), "0x3b9aca00");
-    assert_eq!(eth_estimate_gas(&json!([])).unwrap(), "0x5208");
+    assert_eq!(eth_estimate_gas(&json!([])).unwrap(), "0x445c0");
     assert!(eth_fee_history(&json!([1, "latest"])).is_ok());
 
     // 5. Module-level filter functions
@@ -5322,4 +5325,140 @@ async fn test_eth_get_logs_and_storage_via_rpc_layer() {
         .call("eth_getStorageAt", json!(["0xbad", "0x0", "latest"]))
         .await;
     assert!(bad.get("error").is_some());
+}
+
+// ============================================================================
+// B-VM audit PoCs (read-only, no behavior change). Each test PASSES on the
+// current code by demonstrating the flaw; the secure behavior would REJECT.
+// ============================================================================
+
+#[test]
+fn bvm_poc_estimate_gas_unbounded_calldata_is_accepted() {
+    use stellereum::evm_adapter as evm;
+    // 100k zero bytes of calldata: no length cap in eth_estimate_gas_amount
+    // (src/evm_adapter.rs:4388-4405); the node hex-decodes + sums it all.
+    let big = format!("0x{}", "00".repeat(100_000));
+    let params = json!([{ "to": "0x0000000000000000000000000000000000000001", "data": big }]);
+    let res = evm::eth_estimate_gas_amount(&params).unwrap();
+    assert!(
+        res > 400_000,
+        "unbounded calldata priced without cap: {res}"
+    );
+}
+
+#[test]
+fn bvm_poc_short_calldata_word_is_zero_padded_not_rejected() {
+    use stellereum::evm_adapter as evm;
+    // FIXED (audit B-VM): short words refuse (EVM requires 32-byte words).
+    let got = evm::extract_address_from_calldata("1234");
+    assert_eq!(got, None);
+    // ... so balanceOf on a short word reverts (empty) instead of answering.
+    let out = evm::EvmAdapter::new().emulate_erc20_call("0x70a082311234");
+    assert_eq!(out, "0x", "short balanceOf word must revert, not answer");
+}
+
+#[test]
+fn bvm_poc_secp_prefix_aliasing_accepts_nonzero_prefix() {
+    use stellereum::evm_adapter as evm;
+    let privkey =
+        hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+            .unwrap();
+    let secp_key = k256::ecdsa::SigningKey::from_slice(&privkey).unwrap();
+    let sender20 =
+        evm::pubkey_to_address(secp_key.verifying_key().to_encoded_point(false).as_bytes())
+            .unwrap();
+    // Honest zero-prefixed sender; the signature is made OVER these bytes.
+    let mut from_zero = [0u8; 32];
+    from_zero[12..32].copy_from_slice(&sender20);
+    let evm_hash = format!("0x{}", hex::encode([0xABu8; 32]));
+    let evm_bytes = evm::parse_hash_bytes(&evm_hash).unwrap();
+    let unsigned = stellereum::sharding::Transaction {
+        from: from_zero,
+        to: [0xAA; 32],
+        amount: 0,
+        gas_limit: 21_000,
+        nonce: 4242,
+        source_shard: 0,
+        target_shard: 0,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let sighash = evm::keccak256(&unsigned.signing_message());
+    let (sig, recid) = secp_key.sign_prehash_recoverable(&sighash).unwrap();
+    let raw = sig.to_bytes();
+    let mut r = [0u8; 32];
+    let mut s = [0u8; 32];
+    r.copy_from_slice(&raw[..32]);
+    s.copy_from_slice(&raw[32..64]);
+    let mut recid_byte = recid.to_byte();
+    if !evm::is_low_s(&s) {
+        let mut out = [0u8; 32];
+        let mut borrow: i32 = 0;
+        for i in (0..32).rev() {
+            let v = evm::SECP256K1_N[i] as i32 - s[i] as i32 - borrow;
+            if v < 0 {
+                out[i] = (v + 256) as u8;
+                borrow = 1;
+            } else {
+                out[i] = v as u8;
+                borrow = 0;
+            }
+        }
+        s = out;
+        recid_byte ^= 1;
+    }
+    let mut envelope = Vec::with_capacity(evm::SECP_ENVELOPE_LEN);
+    envelope.extend_from_slice(evm::SECP_ENVELOPE_MAGIC);
+    envelope.extend_from_slice(&evm_bytes);
+    envelope.extend_from_slice(&r);
+    envelope.extend_from_slice(&s);
+    envelope.push(recid_byte);
+    let tx_alias = stellereum::sharding::Transaction {
+        from: from_zero,
+        to: [0xAA; 32],
+        amount: 0,
+        gas_limit: 21_000,
+        nonce: 4242,
+        source_shard: 0,
+        target_shard: 0,
+        signature: envelope,
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    // Control: honest zero-prefixed sender verifies.
+    assert!(
+        evm::verify_secp_settlement(&tx_alias).is_ok(),
+        "zero-prefixed same key must verify"
+    );
+    // Attack: same low-20 bytes, hostile 12-byte prefix over the SIGNED bytes.
+    let mut from_alias = [0xFFu8; 32];
+    from_alias[12..32].copy_from_slice(&sender20);
+    let tx_spoofed = stellereum::sharding::Transaction {
+        from: from_alias,
+        ..tx_alias.clone()
+    };
+    assert!(
+        evm::verify_secp_settlement(&tx_spoofed).is_err(),
+        "FIXED (audit B-VM): non-zero Stell prefix must refuse (aliasing closed)"
+    );
+}
+
+#[test]
+fn bvm_poc_wei_truncation_and_verbatim_gas_below_floor() {
+    use stellereum::evm_adapter as evm;
+    // wei_to_nano truncates sub-nano to ZERO — documented, the only safe
+    // direction (rounding up would CREATE value). Pinned, not changed.
+    assert_eq!(evm::wei_to_nano(1), 0);
+    assert_eq!(evm::wei_to_nano(999_999_999), 0);
+    // FIXED (audit B-VM): the estimate honors the RPC.md contract
+    // (max(pure EVM figure, admission floor)) so forwarded figures are
+    // never rejected for under-declared gas.
+    let params = json!([{ "to": "0x0000000000000000000000000000000000000001" }]);
+    let est = evm::eth_estimate_gas_amount(&params).unwrap();
+    assert_eq!(est, stellereum::svm::GAS_BASIC_TRANSFER);
+    assert!(
+        est >= stellereum::svm::GAS_BASIC_TRANSFER,
+        "estimate must clear the Stell admission floor"
+    );
 }

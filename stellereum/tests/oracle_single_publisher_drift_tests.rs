@@ -297,3 +297,37 @@ async fn block_with_same_key_six_percent_feed_fails_open_breaker() {
         1_060_000
     );
 }
+
+// ===========================================================================
+// B-GOV/O1: single-source baseline walk. One compromised publisher key walks
+// the committed baseline +5%/feed forever with no latch and no TWAP anchor.
+// DESIRED: cumulative drift >10% from genesis trips the breaker or is refused.
+// FAILS on current code (each +500bps step commits, breaker stays clear).
+// ===========================================================================
+
+#[test]
+fn bgov_single_publisher_walk_drifts_past_ten_percent_without_latch() {
+    let mut o = state_with_publishers();
+    o.commit_feed(&feed(&key_a(), 1_000_000, BLOCK_TIME - 30), BLOCK_TIME)
+        .expect("genesis baseline commits");
+    // Three exact +5% same-key steps: each is == 500bps, not > 500, so each
+    // passes the per-publisher cap; each is < 1000bps so none latches.
+    for (price, ts) in [
+        (1_050_000u64, BLOCK_TIME - 20),
+        (1_102_500u64, BLOCK_TIME - 10),
+        (1_157_625u64, BLOCK_TIME - 5),
+    ] {
+        o.commit_feed(&feed(&key_a(), price, ts), BLOCK_TIME)
+            .unwrap_or_else(|e| panic!("same-key +5% step to {price} must commit on current code: {e}"));
+    }
+    let cumulative = deviation_bps(committed_price(&o), 1_000_000);
+    assert!(
+        cumulative > MAX_PRICE_DEVIATION_BPS,
+        "test bug: three +5% steps must drift >10% cumulatively, got {cumulative}bps"
+    );
+    assert!(
+        o.breaker_tripped,
+        "B-GOV/O1 REAL: single key walked +15.8% (1M -> {}) with NO latch",
+        committed_price(&o)
+    );
+}

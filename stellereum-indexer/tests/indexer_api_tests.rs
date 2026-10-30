@@ -590,6 +590,7 @@ async fn test_events_are_decoded_with_the_contract_abi() {
         db: db.clone(),
         abis: abis.clone(),
         rpc_url: "http://127.0.0.1:1".to_string(),
+        verify_token: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -742,9 +743,11 @@ async fn test_contract_source_verify_round_trip() {
         axum::serve(mock_listener, mock).await.unwrap();
     });
 
-    // 2. Indexer pointed at the mock node.
+    // 2. Indexer pointed at the mock node (verify endpoint gated by token).
     let db = Database::open(":memory:").expect("in-memory db");
-    let app = create_router(AppState::with_rpc(db.clone(), mock_url));
+    let mut app_state = AppState::with_rpc(db.clone(), mock_url);
+    app_state.verify_token = Some("roundtrip-token".to_string());
+    let app = create_router(app_state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
@@ -763,8 +766,10 @@ async fn test_contract_source_verify_round_trip() {
     assert_eq!(v["verified"], false);
 
     // 4. Submit the known `.wat`: the NODE confirms, the indexer stores.
+    // (Audit B-IDX-3: verify requires the operator token.)
     let res = client
         .post(format!("{base}/api/v2/contract/{addr_hex}/verify"))
+        .header("X-Api-Key", "roundtrip-token")
         .json(&serde_json::json!({
             "source": VERIFY_WAT,
             "compiler": "wat2wasm-1.0",
@@ -797,6 +802,7 @@ async fn test_contract_source_verify_round_trip() {
     let tampered = VERIFY_WAT.replace("i64.const 1", "i64.const 2");
     let res = client
         .post(format!("{base}/api/v2/contract/{addr_hex}/verify"))
+        .header("X-Api-Key", "roundtrip-token")
         .json(&serde_json::json!({"source": tampered, "compiler": "wat2wasm-1.0"}))
         .send()
         .await
@@ -808,6 +814,7 @@ async fn test_contract_source_verify_round_trip() {
     // 7. A wrong-compiler claim is REFUSED too.
     let res = client
         .post(format!("{base}/api/v2/contract/{addr_hex}/verify"))
+        .header("X-Api-Key", "roundtrip-token")
         .json(&serde_json::json!({"source": VERIFY_WAT, "compiler": "solc-0.8.24"}))
         .send()
         .await

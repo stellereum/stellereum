@@ -39,10 +39,16 @@ async fn main() -> Result<()> {
     });
 
     // Start Axum REST server
+    // Audit B-IDX-3: the verify endpoint is default-deny without this.
+    let verify_token = std::env::var("INDEXER_VERIFY_TOKEN").ok();
+    if verify_token.is_none() {
+        info!("verify endpoint DISABLED (set INDEXER_VERIFY_TOKEN to enable contract-source verification)");
+    }
     let app_state = AppState {
         db,
         abis,
         rpc_url: rpc_url.clone(),
+        verify_token,
     };
     let app = create_router(app_state);
 

@@ -273,6 +273,8 @@ fn smuggled_proposal(id: u64, electorate: u128, yes: u128, no: u128, voting_end:
         voters: HashMap::new(),
         status: ProposalStatus::Open,
         electorate,
+        electorate_weights: None,
+        proposer_lock: 0,
         weights: HashMap::new(),
     }
 }
@@ -307,13 +309,13 @@ fn tiny_electorate_truncation_is_harmless_empty_never_passes() {
 
 #[test]
 fn propose_on_an_empty_ledger_fails_before_any_electorate_read() {
-    let l = StakingLedger::new();
+    let mut l = StakingLedger::new();
     let mut g = Governance::new();
     // No stake at all: the NotStaker gate fires first (the electorate==0
     // refuse behind it is unreachable-today defense in depth).
     assert_eq!(
         g.propose(
-            &l,
+            &mut l,
             [0x09u8; 32],
             "t".into(),
             GovAction::Signal("t".into()),
@@ -322,11 +324,11 @@ fn propose_on_an_empty_ledger_fails_before_any_electorate_read() {
         Err(GovError::NotStaker)
     );
     // Quorum floor still enforced at the propose gate.
-    let (l2, ids) = ledger_with(1, 10_000);
+    let (mut l2, ids) = ledger_with(1, 10_000);
     let mut g2 = Governance::new();
     assert_eq!(
         g2.propose(
-            &l2,
+            &mut l2,
             ids[0],
             "bad".into(),
             GovAction::SetGovernanceQuorumBps(GOVERNANCE_QUORUM_FLOOR_BPS - 1),
@@ -341,10 +343,10 @@ fn vote_replay_is_refused_per_proposal_but_independent_across_proposals() {
     let (mut l, ids) = ledger_with(3, 10_000);
     let mut g = Governance::new();
     let a = g
-        .propose(&l, ids[0], "a".into(), GovAction::Signal("a".into()), 0)
+        .propose(&mut l, ids[0], "a".into(), GovAction::Signal("a".into()), 0)
         .unwrap();
     let b = g
-        .propose(&l, ids[0], "b".into(), GovAction::Signal("b".into()), 0)
+        .propose(&mut l, ids[0], "b".into(), GovAction::Signal("b".into()), 0)
         .unwrap();
     g.vote(&mut l, ids[1], a, VoteChoice::Yes, 1).unwrap();
     // Same proposal, changed mind: still a replay.

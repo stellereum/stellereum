@@ -138,7 +138,7 @@ async fn governed_block_reward_is_what_the_produced_block_pays() {
     let mut gov = engine.governance_write().await;
     let id = gov
         .propose(
-            &ledger,
+            &mut ledger,
             proposer,
             "raise reward".into(),
             GovAction::SetBlockReward(governed),
@@ -383,10 +383,10 @@ async fn each_domain_mutation_moves_state_root() {
     // Re-baseline: the bond itself is a staking-domain mutation, not counted.
     prev = e.get_state_root().await;
     {
-        let ledger = e.staking_read().await.clone();
+        let mut ledger = e.staking_read().await.clone();
         let mut gov = e.governance_write().await;
         gov.propose(
-            &ledger,
+            &mut ledger,
             gov_val,
             "g".into(),
             GovAction::Signal("s".into()),
@@ -484,7 +484,7 @@ fn gov_param_bounds_reject_chain_breaking_values() {
     ] {
         let mut gov = Governance::new();
         assert_eq!(
-            gov.propose(&ledger, ids[0], "t".into(), action, 0),
+            gov.propose(&mut ledger, ids[0], "t".into(), action, 0),
             Err(GovError::InvalidAction),
             "propose-time validate must refuse it"
         );
@@ -498,7 +498,7 @@ fn gov_param_bounds_reject_chain_breaking_values() {
         // REPLACE the stored action with the chain-breaking one: exactly the
         // "smuggled proposal" shape the execute-time backstop exists for.
         let id = gov
-            .propose(&ledger, ids[0], "t".into(), GovAction::SetMinGasLimit(1), 0)
+            .propose(&mut ledger, ids[0], "t".into(), GovAction::SetMinGasLimit(1), 0)
             .expect("propose");
         gov.proposals.get_mut(&id).expect("proposal").action = action;
         for v in &ids {
@@ -536,7 +536,7 @@ fn gov_param_bounds_accept_sane_values() {
     let mut run_ok = |action: GovAction| {
         let mut gov = Governance::new();
         let id = gov
-            .propose(&ledger, ids[0], "t".into(), action, 0)
+            .propose(&mut ledger, ids[0], "t".into(), action, 0)
             .expect("propose");
         for v in &ids {
             gov.vote(&mut ledger, *v, id, VoteChoice::Yes, 1)
@@ -569,11 +569,11 @@ fn governed_min_gas_limit_validates_bounds_and_applies() {
     use stellereum::svm::GAS_BASIC_TRANSFER;
     // Bounds: 0 and above-max refused at propose time.
     for bad in [0u64, MAX_MIN_GAS_LIMIT + 1, u64::MAX] {
-        let (ledger, ids) = ledger_with(2, 20_000);
+        let (mut ledger, ids) = ledger_with(2, 20_000);
         let mut gov = Governance::new();
         assert_eq!(
             gov.propose(
-                &ledger,
+                &mut ledger,
                 ids[0],
                 "t".into(),
                 GovAction::SetMinGasLimit(bad),
@@ -610,7 +610,7 @@ fn quorum_floor_3333_and_anyone_can_execute() {
         let mut gov = Governance::new();
         let err = gov
             .propose(
-                &ledger,
+                &mut ledger,
                 ids[0],
                 "t".into(),
                 GovAction::SetGovernanceQuorumBps(bad),
@@ -646,6 +646,8 @@ fn quorum_floor_3333_and_anyone_can_execute() {
                 voters: HashMap::new(),
                 status: ProposalStatus::Passed,
                 electorate: 0,
+                electorate_weights: None,
+                proposer_lock: 0,
                 weights: HashMap::new(),
             },
         );
@@ -661,7 +663,7 @@ fn quorum_floor_3333_and_anyone_can_execute() {
         let mut gov = Governance::new();
         let id = gov
             .propose(
-                &ledger,
+                &mut ledger,
                 ids[0],
                 "t".into(),
                 GovAction::SetGovernanceQuorumBps(3_333),
@@ -682,7 +684,7 @@ fn quorum_floor_3333_and_anyone_can_execute() {
         let mut gov = Governance::new();
         let id = gov
             .propose(
-                &ledger,
+                &mut ledger,
                 ids[0],
                 "t".into(),
                 GovAction::Signal("t".into()),

@@ -344,13 +344,19 @@ enum Commands {
         #[arg(short, long, default_value_t = 0)]
         shard: u32,
     },
-    /// Display unspent shielded notes and total confidential balance
+    /// Display unspent shielded notes and total confidential balance.
+    /// Audit B-WALLET-2: requires the keystore password (notes are
+    /// secret-bound; passwordless reads of legacy files are gone).
     #[command(
         name = "shield-balance",
         alias = "confidential-balance",
         alias = "shielded-balance"
     )]
-    ShieldBalance,
+    ShieldBalance {
+        /// Password (prompted securely if omitted)
+        #[arg(short, long)]
+        password: Option<String>,
+    },
     /// Unshield by revealing openings or automatically selecting stored notes (SysCallConfidentialUnshield).
     #[command(alias = "unshield")]
     ConfidentialUnshield {
@@ -2859,7 +2865,10 @@ async fn execute_command(
 
             let nano_amount = parse_stell_to_nano(&amount).map_err(|e| anyhow::anyhow!("{e}"))?;
             let notes_path = notes::notes_path_for_wallet(wallet_path);
-            let note_counter = notes::load_notes(&notes_path)
+            // Audit B-WALLET-2: migrate legacy store, then read secret-bound.
+            // (Counter must match the write path below or blindings repeat.)
+            let _ = notes::migrate_notes_to_secret(&notes_path, &sec_secret.bytes);
+            let note_counter = notes::load_notes_with_secret(&notes_path, &sec_secret.bytes)
                 .map(|n| n.len() as u64)
                 .unwrap_or(0);
 
@@ -2897,7 +2906,7 @@ async fn execute_command(
                 height,
                 spent: false,
             };
-            if let Err(e) = notes::add_note(&notes_path, note) {
+            if let Err(e) = notes::add_note_with_secret(&notes_path, note, &sec_secret.bytes) {
                 eprintln!(
                     "{}",
                     format!("Warning: failed to record note in {:?}: {e}", notes_path).yellow()
@@ -2932,10 +2941,26 @@ async fn execute_command(
             }
         }
 
-        Commands::ShieldBalance => {
+        Commands::ShieldBalance { password } => {
             let notes_path = notes::notes_path_for_wallet(wallet_path);
+            // Audit B-WALLET-2: balance needs the secret (notes are
+            // secret-bound). Legacy files migrate transparently on first
+            // password unlock; passwordless reads are gone for good.
+            let keystore = HardenedKeystore::load(wallet_path)
+                .map_err(|e| anyhow::anyhow!("Wallet not found: {e}"))?;
+            let pass =
+                prompt_password_safely(password, "Enter keystore password to view shielded balance")?;
+            let sec_secret = keystore
+                .decrypt(&pass)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let migrated = notes::migrate_notes_to_secret(&notes_path, &sec_secret.bytes)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if migrated {
+                println!("• Migrated legacy notes store to secret-bound encryption.");
+            }
             let unspent =
-                notes::get_unspent_notes(&notes_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+                notes::get_unspent_notes_with_secret(&notes_path, &sec_secret.bytes)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             let total = notes::calculate_shielded_balance(&unspent);
 
             println!("╔═══════════════════════════════════════════════════════════════╗");
@@ -2998,8 +3023,12 @@ async fn execute_command(
                     })?;
                     let target_nano =
                         parse_stell_to_nano(&amt_str).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let selected = notes::select_notes_for_unshield(&notes_path, target_nano)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let selected = notes::select_notes_for_unshield_with_secret(
+                        &notes_path,
+                        target_nano,
+                        &sec_secret.bytes,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                     let cs = selected
                         .iter()
                         .map(|n| parse_hex32(&n.commitment, "Commitment"))
@@ -3032,9 +3061,13 @@ async fn execute_command(
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            // Mark spent in note store
+            // Mark spent in note store (secret-bound).
             let spent_hexes: Vec<String> = cs.iter().map(hex::encode).collect();
-            let _ = notes::mark_notes_spent(&notes_path, &spent_hexes);
+            let _ = notes::mark_notes_spent_with_secret(
+                &notes_path,
+                &spent_hexes,
+                &sec_secret.bytes,
+            );
 
             let total_unshielded_nano: u64 = ams.iter().sum();
             let total_stell = (total_unshielded_nano as f64) / 1_000_000_000.0;
@@ -5158,7 +5191,11 @@ async fn run_repl_console(
                 );
             }
             "shield-balance" | "confidential-balance" | "shielded-balance" | "conf-bal" => {
-                run_cmd!(Commands::ShieldBalance, &wallet_path, &client);
+                run_cmd!(
+                    Commands::ShieldBalance { password: None },
+                    &wallet_path,
+                    &client
+                );
             }
             "confidential-pay" | "conf-pay" => {
                 if parts.len() < 3 {

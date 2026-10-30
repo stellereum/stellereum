@@ -56,18 +56,18 @@ fn oracle_with_publisher(sk: &SigningKey) -> (OracleState, [u8; 32]) {
 
 #[test]
 fn e4_oversize_title_rejected_at_propose_time() {
-    let (l, a, _, _) = ledger_29k();
+    let (mut l, a, _, _) = ledger_29k();
     let mut g = Governance::new();
     let big = "t".repeat(257);
     assert_eq!(
-        g.propose(&l, a, big, GovAction::Signal("ok".into()), 0),
+        g.propose(&mut l, a, big, GovAction::Signal("ok".into()), 0),
         Err(GovError::InvalidAction),
         "E4: 257B title must be refused"
     );
     // Boundary: 256B is accepted.
     let ok_title = "t".repeat(256);
     assert!(
-        g.propose(&l, a, ok_title, GovAction::Signal("ok".into()), 0)
+        g.propose(&mut l, a, ok_title, GovAction::Signal("ok".into()), 0)
             .is_ok(),
         "E4: 256B title must be accepted"
     );
@@ -95,6 +95,8 @@ fn e4_oversize_title_fails_closed_at_execute_time() {
             voters: HashMap::new(),
             status: ProposalStatus::Passed,
             electorate: 0,
+            electorate_weights: None,
+            proposer_lock: 0,
             weights: HashMap::new(),
         },
     );
@@ -111,15 +113,15 @@ fn e4_oversize_title_fails_closed_at_execute_time() {
 
 #[test]
 fn e4_oversize_signal_rejected_at_propose_time() {
-    let (l, a, _, _) = ledger_29k();
+    let (mut l, a, _, _) = ledger_29k();
     let mut g = Governance::new();
     assert_eq!(
-        g.propose(&l, a, "t".into(), GovAction::Signal("s".repeat(1025)), 0),
+        g.propose(&mut l, a, "t".into(), GovAction::Signal("s".repeat(1025)), 0),
         Err(GovError::InvalidAction),
         "E4: 1025B signal must be refused"
     );
     assert!(
-        g.propose(&l, a, "t".into(), GovAction::Signal("s".repeat(1024)), 0)
+        g.propose(&mut l, a, "t".into(), GovAction::Signal("s".repeat(1024)), 0)
             .is_ok(),
         "E4: 1024B signal must be accepted"
     );
@@ -146,6 +148,8 @@ fn e4_oversize_signal_fails_closed_at_execute_time() {
             voters: HashMap::new(),
             status: ProposalStatus::Passed,
             electorate: 0,
+            electorate_weights: None,
+            proposer_lock: 0,
             weights: HashMap::new(),
         },
     );
@@ -163,12 +167,12 @@ fn e4_oversize_signal_fails_closed_at_execute_time() {
 
 #[test]
 fn e6_zero_key_publisher_fails_closed_at_execute_time() {
-    let (l, a, _, _) = ledger_29k();
+    let (mut l, a, _, _) = ledger_29k();
     let mut g = Governance::new();
     // Propose-time already refuses it (pinned); the hole is execute-time.
     assert_eq!(
         g.propose(
-            &l,
+            &mut l,
             a,
             "z".into(),
             GovAction::RegisterOraclePublisher([0u8; 32]),
@@ -194,6 +198,8 @@ fn e6_zero_key_publisher_fails_closed_at_execute_time() {
             voters: HashMap::new(),
             status: ProposalStatus::Passed,
             electorate: 0,
+            electorate_weights: None,
+            proposer_lock: 0,
             weights: HashMap::new(),
         },
     );
@@ -239,7 +245,7 @@ fn e7_vote_then_exit_cannot_flip_rejected_to_passed() {
     let (mut l1, a1, b1, _) = ledger_29k();
     let mut g1 = Governance::new();
     let id1 = g1
-        .propose(&l1, a1, "t".into(), GovAction::Signal("t".into()), 0)
+        .propose(&mut l1, a1, "t".into(), GovAction::Signal("t".into()), 0)
         .unwrap();
     assert_eq!(g1.get(id1).unwrap().electorate, stell(29_000) as u128);
     g1.vote(&mut l1, a1, id1, VoteChoice::Yes, 1).unwrap(); // 10k
@@ -258,7 +264,7 @@ fn e7_vote_then_exit_cannot_flip_rejected_to_passed() {
     let (mut l2, a2, b2, _) = ledger_29k();
     let mut g2 = Governance::new();
     let id2 = g2
-        .propose(&l2, a2, "t".into(), GovAction::Signal("t".into()), 0)
+        .propose(&mut l2, a2, "t".into(), GovAction::Signal("t".into()), 0)
         .unwrap();
     g2.vote(&mut l2, a2, id2, VoteChoice::Yes, 1).unwrap();
     g2.vote(&mut l2, b2, id2, VoteChoice::Yes, 1).unwrap();
@@ -356,4 +362,75 @@ fn e10_legitimate_assets_still_commit() {
         );
         assert_eq!(o.feeds[asset].price_micro_usd, price);
     }
+}
+
+// ---------- B-GOV/G1: frozen electorate admits late-bond inflation ----------
+//
+// The E7 fix froze the quorum base at propose time and locks VOTERS' stake,
+// but stake bonded AFTER propose votes at full weight without raising the
+// base. Turnout can therefore exceed the electorate the quorum was computed
+// against: a late-bonded whale boosts its own proposal mid-vote.
+// DESIRED: turnout <= electorate. FAILS on current code (40k > 30k).
+
+#[test]
+fn bgov_late_bond_inflates_turnout_past_frozen_electorate() {
+    let a = [0xA1u8; 32];
+    let b = [0xB2u8; 32];
+    let c = [0xC3u8; 32];
+    let d = [0xD4u8; 32];
+    let mut l = StakingLedger::new();
+    for id in [a, b, c] {
+        l.bond(id, stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+    }
+    let mut g = Governance::new();
+    let id = g
+        .propose(&mut l, a, "x".into(), GovAction::Signal("t".into()), 0)
+        .expect("propose");
+    assert_eq!(g.get(id).unwrap().electorate, stell(30_000) as u128);
+    g.vote(&mut l, a, id, VoteChoice::Yes, 1).unwrap();
+    g.vote(&mut l, b, id, VoteChoice::Yes, 1).unwrap();
+    g.vote(&mut l, c, id, VoteChoice::Yes, 1).unwrap();
+    // New money bonded mid-vote votes at ZERO (frozen snapshot): refused.
+    l.bond(d, stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+    assert!(
+        g.vote(&mut l, d, id, VoteChoice::Yes, 2).is_err(),
+        "FIXED (audit G1): post-creation bond must not vote against a frozen base"
+    );
+    let p = g.get(id).unwrap();
+    assert!(
+        p.turnout() <= p.electorate,
+        "B-GOV/G1 REAL: turnout {} exceeds frozen electorate {}",
+        p.turnout(),
+        p.electorate
+    );
+}
+
+// ---------- B-GOV/G2: proposer stake is never locked ----------
+//
+// `vote` locks the voter's weight, but `propose` locks nothing: the proposer
+// can fully unbond the 10k-STELL stake that qualified the proposal while the
+// vote is still open, leaving a live proposal with no skin in the game
+// (bond -> propose -> exit recycles one stake into serial proposals).
+// DESIRED: proposer exit while its proposal is open is refused.
+// FAILS on current code (unbond succeeds).
+
+#[test]
+fn bgov_proposer_may_exit_while_proposal_open() {
+    let a = [0xA1u8; 32];
+    let mut l = StakingLedger::new();
+    l.bond(a, stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+    let mut g = Governance::new();
+    let _id = g
+        .propose(&mut l, a, "x".into(), GovAction::Signal("t".into()), 0)
+        .expect("propose");
+    assert_eq!(
+        l.locked_governance_of(&a),
+        stell(10_000),
+        "FIXED (audit G2): proposer holds full-stake lock while proposal open"
+    );
+    let err = l.unbond(a, stell(10_000), 1);
+    assert!(
+        err == Err(stellereum::staking::StakingError::LockedInGovernanceVote),
+        "B-GOV/G2 REAL: proposer fully exited while its proposal is open: {err:?}"
+    );
 }

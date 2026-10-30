@@ -1,4 +1,11 @@
-//! Automated Market Maker (AMM) Constant Product Liquidity Pool (Hardened)
+//! STATUS: DEMO-GRADE — NO AUTHENTICATION (audit B-CT P0). All `from`/
+//! `owner`/`caller_id`/`admin_id` args are caller-supplied and replayable:
+//! the contract never reads the authenticated `host.caller`. DO NOT deploy
+//! with value. Auth redesign (host.caller-bound, SDK `caller()` ready) is
+//! tracked in docs/ROADMAP.md P0; the failing `poc_p0_*` tests are the
+//! executable acceptance criteria.
+//!
+////! Automated Market Maker (AMM) Constant Product Liquidity Pool (Hardened)
 //!
 //! Features:
 //! - Complete Bidirectional Swaps: Token A -> Token B (`swap_a_for_b`) and Token B -> Token A (`swap_b_for_a`).

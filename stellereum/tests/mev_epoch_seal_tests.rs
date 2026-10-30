@@ -1224,3 +1224,68 @@ fn _random_bytes() -> [u8; 32] {
     OsRng.fill_bytes(&mut out);
     out
 }
+
+// ===========================================================================
+// B-GOV/M1: `release_partial` has no epoch binding. A sealed envelope from a
+// FOREIGN epoch (same tx_hash, valid ephemeral point) gets a partial from
+// this epoch's share. DESIRED: Err. FAILS on current code (Ok).
+// ===========================================================================
+
+#[test]
+fn bgov_release_partial_must_refuse_foreign_epoch_envelope() {
+    let members: Vec<Member> = (0..4).map(|_| member()).collect();
+    let (_committee, materials, mut managers) = run_dkg(3, &members);
+    let key = materials[0].public_key();
+    let (plaintext, tx_hash) = signed_tx(&members[0].signing, 0);
+    let envelope = seal_transaction(&key, &plaintext, tx_hash, meta_for(members[0].id, 0)).unwrap();
+    let mut manager = managers.remove(0);
+    manager
+        .commit_order(10, 0, vec![tx_hash], &members[0].signing)
+        .expect("commitment is made");
+    // Same committed tx_hash, same valid ephemeral point — but sealed for a
+    // completely different epoch. The AAD would never authenticate under this
+    // epoch, yet the gate does not look at the envelope epoch at all.
+    let mut foreign = envelope.clone();
+    foreign.epoch = 999;
+    assert_eq!(foreign.tx_hash, tx_hash);
+    assert!(
+        manager.release_partial(10, 0, &foreign).is_err(),
+        "B-GOV/M1 REAL: partial released for epoch-999 envelope with epoch-3 share"
+    );
+}
+
+// ===========================================================================
+// B-GOV/M2: `ingest_release` binds only (epoch, order_root), not
+// (height, round). A release crafted for height 200/round 5 is accepted while
+// the only known commitment is height 100/round 0 with the same root.
+// DESIRED: Err. FAILS on current code (Ok, partials ingested).
+// ===========================================================================
+
+#[test]
+fn bgov_ingest_release_must_bind_height_and_round() {
+    let members: Vec<Member> = (0..4).map(|_| member()).collect();
+    let (committee, materials, mut managers) = run_dkg(5, &members);
+    let key = materials[0].public_key();
+    let (plaintext, tx_hash) = signed_tx(&members[0].signing, 0);
+    let envelope = seal_transaction(&key, &plaintext, tx_hash, meta_for(members[0].id, 0)).unwrap();
+    let mut manager = managers.remove(0);
+    let commitment = manager
+        .commit_order(100, 0, vec![tx_hash], &members[0].signing)
+        .expect("commitment is made");
+    let partial = DecryptionPartial {
+        validator_index: committee.index_of(&members[1].id).unwrap(),
+        point: compute_partial(&materials[1].share, &envelope.ephemeral_pk).unwrap(),
+    };
+    // Same epoch + same root, but a height/round this node never committed to.
+    let replay = stellereum::mev_epoch::ShareRelease {
+        epoch: commitment.epoch,
+        height: 200,
+        round: 5,
+        order_root: commitment.order_root,
+        partials: vec![(tx_hash, partial)],
+    };
+    assert!(
+        manager.ingest_release(replay).is_err(),
+        "B-GOV/M2 REAL: release for height 200/round 5 accepted against a height-100 commitment"
+    );
+}

@@ -7,6 +7,9 @@ Source of truth: `stellereum/src/consensus.rs`, `runtime.rs`, `main.rs`,
 
 - N=4 live, quorum = 2f+1 over voting power (4/4 set, non-fragile).
 - Leader selection: V5 sortition bound to **parent hash** (verified property).
+  VRF-gated rule (default off): at/after `STELL_VRF_ACTIVATION_HEIGHT` with a
+  verified proof, the seed is the VRF election output; otherwise (and for all
+  pre-activation history, which verifies forever) it stays parent-hash.
 - QC model: µQC with k=64 micro-quorums; QCs strictly per-round single-quorum.
 - Tick 50ms (`TICK_MS`), base timeout 3500ms, r0 fast path; nil path at 2×timeout.
 - Lock rule + `adopt_committed` (H+1 activation for uniformity) + atomic commit

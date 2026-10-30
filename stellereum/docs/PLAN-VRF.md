@@ -1,6 +1,6 @@
 # PLAN-VRF — VRF sortition (A6/C1 structural fix)
 
-Status: **PHASE 1 BUILT** (types + beacon math + metering, no consensus change).
+Status: **PHASE 1 WIRED, HEIGHT-GATED** (deterministic-Schnorr proofs + election seed plumbing behind `STELL_VRF_ACTIVATION_HEIGHT`, default off; pre-activation output byte-identical; call sites pinned Disabled pending phase-3 threading).
 Phases 2–3 are specified below for a follow-up.
 
 ## 1. Problem (verified)

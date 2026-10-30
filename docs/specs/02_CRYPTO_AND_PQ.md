@@ -13,7 +13,7 @@ Source of truth in code: `stellereum/src/post_quantum.rs`, `bls.rs`,
 | Key exchange (mail/overlay) | X25519 + ChaCha20Poly1305 | infnode/infmail |
 | Hashing | BLAKE3 (primary), SHA-2/3 where protocol pins | Address checksum = BLAKE3 |
 | KDF (wallet) | Argon2id + XChaCha20Poly1305 | POSIx 0600/0700 enforced |
-| VRF | planned (`vrf.rs` stub surface, PLAN-VRF) | NOT live — do not claim otherwise |
+| VRF | phase-1 wiring live behind `STELL_VRF_ACTIVATION_HEIGHT` (default off); deterministic-Schnorr proofs, NOT audited ECVRF — do not present as ECVRF |
 
 ## Key/signature sizes (pinned)
 

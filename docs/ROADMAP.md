@@ -32,6 +32,11 @@ consumers — external-facing, publish candidate), `scripts/tools/stelops`,
   removed); indexer LIKE-escape, reorg replace+invalidate, verify auth,
   offset cap, hash NOCASE. Deferred (structural, tracked): oracle TWAP
   anchor (O1), contract auth rewrite (CT-P0), wallet notes UX migration note.
+- [x] Structural wave (`9d2bfbd`, pushed `hdae-structural-2026-10-30` to core):
+  replay height-gate (default-off) + wallet pre-check; VRF sortition gate
+  (default-off, byte-identical pre-activation); BLS PoP strict parse
+  (default-off); audit package refreshed (repro green except 2 fixed
+  estimate-contract tests).
 - [ ] Full feature-matrix re-run (38 rows + new suites)
 - [x] Polish wave 1 (details in git history): RPC drift, crypto/state pins
 - [x] Session bloat archived (30 files), specs 00-04 + isolation plan written

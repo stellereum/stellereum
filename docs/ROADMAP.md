@@ -23,15 +23,17 @@ consumers — external-facing, publish candidate), `scripts/tools/stelops`,
 
 ## Done (verified)
 
-- [x] clippy `-D warnings` 0/0 all 7 workspaces (2026-10-29, holds after polish wave 1)
-- [x] Full suite green: 218 targets stellereum, infmail, e2e 7/7, wallet, indexer, sdk, stelops
-- [x] Polish wave 1 (5 agents, integrated 9d7ab9b, pushed `hdae-polish-*` to core+contracts):
-  RPC 140-method drift pinned (7 new tests) · crypto gap pins: VRF-not-wired,
-  BLS-refusal message, zkML-no-hiding (99 green) · contracts gate pins:
-  workchain-bridge refusal, 2PC-off + AMM/u128 strengthened · consensus quorum
-  value pins (4) + constant docs · state proof pins: archive-tamper at LC layer,
-  snapshot roundtrip+garbage · lead: zkML spec section, Groth16 header fix
-- [ ] Full feature-matrix re-run (38 rows; agents verified own rows green)
+- [x] clippy `-D warnings` 0/0 all 7 workspaces (holds after wave-2 fixes)
+- [x] Full suite green: stellereum lib 1040/1040, infmail, e2e, wallet, indexer, sdk, stelops
+- [x] Security wave-2 fixes (`cffef70`, pushed `hdae-fixes2-*`):
+  SDK `caller()`/`value()`+mocks; EVM prefix bind, ABI trailing strictness,
+  calldata cap, short-word strictness, gas-floor honoring; gov snapshot
+  weights + proposer lock; wallet secret-bound migration (legacy decrypt
+  removed); indexer LIKE-escape, reorg replace+invalidate, verify auth,
+  offset cap, hash NOCASE. Deferred (structural, tracked): oracle TWAP
+  anchor (O1), contract auth rewrite (CT-P0), wallet notes UX migration note.
+- [ ] Full feature-matrix re-run (38 rows + new suites)
+- [x] Polish wave 1 (details in git history): RPC drift, crypto/state pins
 - [x] Session bloat archived (30 files), specs 00-04 + isolation plan written
 - [x] Gate scripts + justfile + agents infra + AGENTS.md constitution
 - [x] Prune timers on all 4 nodes, snapshot fresh, divergence-watch pattern

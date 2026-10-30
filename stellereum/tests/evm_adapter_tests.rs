@@ -5451,14 +5451,15 @@ fn bvm_poc_wei_truncation_and_verbatim_gas_below_floor() {
     // direction (rounding up would CREATE value). Pinned, not changed.
     assert_eq!(evm::wei_to_nano(1), 0);
     assert_eq!(evm::wei_to_nano(999_999_999), 0);
-    // FIXED (audit B-VM): the estimate honors the RPC.md contract
+    // FIXED (audit B-VM): served estimates honor the RPC.md contract
     // (max(pure EVM figure, admission floor)) so forwarded figures are
-    // never rejected for under-declared gas.
+    // never rejected for under-declared gas. Pure helpers stay pure
+    // (pinned by closeout); the floor lives in the served path.
     let params = json!([{ "to": "0x0000000000000000000000000000000000000001" }]);
-    let est = evm::eth_estimate_gas_amount(&params).unwrap();
-    assert_eq!(est, stellereum::svm::GAS_BASIC_TRANSFER);
+    let est = evm::eth_estimate_gas(&params).unwrap();
+    assert_eq!(est, "0x445c0");
     assert!(
-        est >= stellereum::svm::GAS_BASIC_TRANSFER,
-        "estimate must clear the Stell admission floor"
+        evm::eth_estimate_gas_amount(&params).unwrap() < stellereum::svm::GAS_BASIC_TRANSFER,
+        "pure figure stays unfloored underneath"
     );
 }

@@ -78,6 +78,74 @@ pub fn set_consensus_chain_id_for_tests(chain_id: u64) {
     CHAIN_ID_OVERRIDE.with(|c| c.set(chain_id));
 }
 
+// ============================================================================
+// Height-gated verify for legacy unbound transaction envelopes (PLAN-BINDING)
+// ============================================================================
+//
+// Phase-3 enforcement, consensus side: at and after the configured activation
+// height `H_bind`, a transaction envelope that binds NO chain id (legacy
+// unbound: `tx.chain_id().is_none()`) is REFUSED, even if its Ed25519/PQ
+// signature is cryptographically valid. Before `H_bind` the same envelope
+// verifies under the old rules (history compat: pre-activation blocks never
+// re-verify under new rules). Bound envelopes verify at every height, but
+// only on the chain they bind (a testnet-bound envelope never verifies on
+// mainnet, before or after activation).
+//
+// Activation is default-OFF (`ChainBindingActivation::never()` when
+// `STELL_CHAIN_BIND_ACTIVATION_HEIGHT` is unset): nothing refuses until a
+// governance-agreed height is explicitly configured — the same opt-in
+// pattern as the XPC activation switch (`STELL_XPC_ACTIVATION_HEIGHT`).
+// Wire format untouched (verify-only); quorum and timeout values untouched.
+
+/// Height-gated envelope verify for ONE transaction at `chain_height`.
+///
+/// Activation comes from the environment
+/// (`STELL_CHAIN_BIND_ACTIVATION_HEIGHT`, default never). Tests and
+/// deterministic callers prefer
+/// [`verify_transaction_envelope_at_height_with_activation`].
+pub fn verify_transaction_envelope_at_height(
+    tx: &crate::sharding::Transaction,
+    chain_height: u64,
+) -> Result<(), String> {
+    let activation = crate::chain_binding::ChainBindingActivation::from_env();
+    verify_transaction_envelope_at_height_with_activation(tx, chain_height, &activation)
+}
+
+/// Height-gated envelope verify for ONE transaction at `chain_height` under
+/// an explicit `activation`.
+///
+/// * unbound + refusal inactive (`chain_height < H_bind`, or never
+///   configured) => legacy signature check only (compat);
+/// * unbound + refusal active (`chain_height >= H_bind`) => `Err` starting
+///   with [`crate::chain_binding::UNBOUND_REFUSED_ERR_PREFIX`];
+/// * bound => strict chain match against [`consensus_chain_id`] at EVERY
+///   height (cross-chain replay refuses pre- and post-activation), then the
+///   signature check.
+pub fn verify_transaction_envelope_at_height_with_activation(
+    tx: &crate::sharding::Transaction,
+    chain_height: u64,
+    activation: &crate::chain_binding::ChainBindingActivation,
+) -> Result<(), String> {
+    let chain_id = consensus_chain_id();
+    crate::chain_binding::check_admission(
+        tx.chain_id().is_some(),
+        chain_height,
+        activation,
+        chain_id,
+    )?;
+    let strict = activation.refusal_active(chain_height);
+    if tx.verify_signature_for_chain(chain_id, strict) {
+        return Ok(());
+    }
+    if tx.chain_id().is_some() {
+        return Err(format!(
+            "rejected: transaction chain-id mismatch: envelope binds chain {} but this chain is {chain_id}",
+            tx.chain_id().unwrap_or(0),
+        ));
+    }
+    Err("rejected: transaction signature invalid".to_string())
+}
+
 /// Anti-DoS bound: ignore votes for rounds more than this far ahead of ours.
 pub const MAX_ROUND_AHEAD: Round = 1_000;
 
@@ -775,6 +843,40 @@ pub fn derive_sortition_committee(
     committee_size: u32,
     prev_block_hash: &[u8; 32],
 ) -> Vec<ValidatorId> {
+    derive_sortition_committee_gated(
+        validators,
+        height,
+        round,
+        committee_size,
+        prev_block_hash,
+        &crate::vrf::VrfActivation::Disabled,
+        None,
+    )
+}
+
+/// VRF-gated sortition committee selector (phase-1 wiring).
+///
+/// Byte-identical to [`derive_sortition_committee`] while the gate is
+/// `Disabled` (or the height is pre-activation, or no verified VRF output is
+/// supplied): the seed is the parent-hash [`sortition_seed`]. At
+/// `height >= activation` WITH a registry-verified VRF output, the seed is
+/// `vrf::vrf_election_seed(output, height, round)` instead — the same stake-
+/// weighted draw machinery, different entropy. Deterministic: same
+/// `(validators, height, round, seed)` ⇒ same committee on every node; no
+/// wall clock, no local randomness anywhere in this path.
+///
+/// Live callers pass `Disabled` + `None` today (v5 bytes pinned); phase 3
+/// threads the configured activation and the winning ticket's verified
+/// output here.
+pub fn derive_sortition_committee_gated(
+    validators: &ValidatorSet,
+    height: Height,
+    round: Round,
+    committee_size: u32,
+    prev_block_hash: &[u8; 32],
+    activation: &crate::vrf::VrfActivation,
+    verified_vrf_output: Option<&[u8; 32]>,
+) -> Vec<ValidatorId> {
     if committee_size == 0 || validators.is_empty() || validators.total_power() == 0 {
         return Vec::new();
     }
@@ -801,8 +903,15 @@ pub fn derive_sortition_committee(
     let mut total_power: u64 = pool.iter().map(|(_, p)| *p).sum();
 
     // Per-(height, round) seed: the parent block hash is the only entropy
-    // that is not known before the chain reaches this height.
-    let seed = sortition_seed(prev_block_hash, height, round);
+    // that is not known before the chain reaches this height — unless the
+    // VRF gate is active with a registry-verified output (see below).
+    let seed = sortition_seed_gated(
+        prev_block_hash,
+        height,
+        round,
+        activation,
+        verified_vrf_output,
+    );
 
     for step in 0..target_k {
         if total_power == 0 || pool.is_empty() {
@@ -853,6 +962,34 @@ pub fn sortition_seed(prev_block_hash: &[u8; 32], height: Height, round: Round) 
     hasher.update(&height.to_le_bytes());
     hasher.update(&round.to_le_bytes());
     *hasher.finalize().as_bytes()
+}
+
+/// VRF-gated sortition seed (phase-1 wiring, XPC-activation-height pattern).
+///
+/// * Gate `Disabled`, or `height` below the activation boundary, or no
+///   verified VRF output supplied ⇒ the v5 parent-hash [`sortition_seed`]
+///   (live bytes, unchanged).
+/// * Gate active at `height` WITH a registry-verified output ⇒
+///   `vrf::vrf_election_seed(output, height, round)`.
+///
+/// The `verified_vrf_output` MUST be minted by
+/// `vrf::verify_vrf_seed_for_validator` (proof verified under the
+/// Falcon-bound registry key); unverified bytes are never passed here —
+/// without a `Some`, an active height falls back to the parent-hash seed
+/// rather than attacker-chosen entropy. Pure and deterministic.
+pub fn sortition_seed_gated(
+    prev_block_hash: &[u8; 32],
+    height: Height,
+    round: Round,
+    activation: &crate::vrf::VrfActivation,
+    verified_vrf_output: Option<&[u8; 32]>,
+) -> [u8; 32] {
+    if let Some(output) = verified_vrf_output {
+        if activation.is_active_at(height) {
+            return crate::vrf::vrf_election_seed(output, height, round);
+        }
+    }
+    sortition_seed(prev_block_hash, height, round)
 }
 
 /// Encode a post-quantum micro-certificate (µQC) into its canonical wire envelope.
@@ -2306,12 +2443,18 @@ impl VoteSet {
             let parent_hash = parent_hash.expect("checked above");
             let committee_size = micro_committee_size(validators.len());
             if committee_size > 0 {
-                let committee = derive_sortition_committee(
+                // Phase-1 VRF wiring: gate pinned Disabled, so this is the v5
+                // parent-hash draw byte-for-byte (the configured activation
+                // and the winning ticket's verified output thread here in
+                // phase 3).
+                let committee = derive_sortition_committee_gated(
                     validators,
                     qc.height,
                     qc.round,
                     committee_size,
                     parent_hash,
+                    &crate::vrf::VrfActivation::Disabled,
+                    None,
                 );
                 let get_sig_for_committee_member = |val_id: &ValidatorId| -> Option<Vec<u8>> {
                     if let Some(sig) = falcon_sigs.get(val_id) {
@@ -2607,12 +2750,16 @@ impl QuorumCertificate {
         // block-apply path additionally pins that parent to the hash committed
         // in the block header (`QuorumCertificate::binds_to_parent`), so a
         // certificate cannot pick a favourable committee of its own.
-        let committee = derive_sortition_committee(
+        // Phase-1 VRF wiring: gate pinned Disabled (v5 bytes); phase 3
+        // threads the activation + verified beacon output here.
+        let committee = derive_sortition_committee_gated(
             validators,
             cert.height,
             cert.round,
             cert.committee_size,
             &cert.sortition_parent,
+            &crate::vrf::VrfActivation::Disabled,
+            None,
         );
         let expected_len = (cert.committee_size as usize).min(validators.len());
         if committee.len() != expected_len || committee.is_empty() {
@@ -2704,12 +2851,16 @@ impl QuorumCertificate {
         // 2-of-3 bitmask that the old `floor(2*3/3)+1 = 3` rule threw out may
         // still carry quorum POWER, which is exactly the fragile-unanimous
         // case this fixes.
-        let committee = derive_sortition_committee(
+        // Phase-1 VRF wiring: gate pinned Disabled (v5 bytes); phase 3
+        // threads the activation + verified beacon output here.
+        let committee = derive_sortition_committee_gated(
             validators,
             cert.height,
             cert.round,
             cert.committee_size,
             &cert.sortition_parent,
+            &crate::vrf::VrfActivation::Disabled,
+            None,
         );
         let committee_total: u64 = committee.iter().map(|id| validators.power_of(id)).sum();
         if committee_total == 0 {

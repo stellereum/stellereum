@@ -23,6 +23,16 @@
 > `Residual` names what is left. The invariant IDs refer to
 > [`INVARIANTS.md`](INVARIANTS.md); the issue IDs refer to
 > [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
+>
+> **Spot-check 2026-10-30 (AUDITPREP).** Five mitigations were re-verified
+> against the current tree and all five still hold as written: the order
+> commitment (`runtime.rs:4623` `check_order_commitment`, `mev.rs:384`), the
+> failure-fee contract (`state_engine.rs:937`), the burst-deferral queue
+> (`consensus_net.rs:1888` test pin; `INBOUND_DEFERRED_CAP = 1024` now lives
+> in `src/main.rs:1134`), the disabled scheme `0x03` (`post_quantum.rs:159`
+> / `:181` / `:2367`), and the BoC length-prefix shape (`cell.rs:165`,
+> `:176` `with_capacity` before validation — KI-35 stays open). No stale row
+> was found among the five.
 
 ---
 

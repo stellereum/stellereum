@@ -664,6 +664,34 @@ impl WalletAccount {
         )
     }
 
+    /// Height-gated envelope admissibility for a wallet-built transaction
+    /// (PLAN-BINDING phase 3, wallet side of the same predicate consensus
+    /// enforces in
+    /// [`crate::consensus::verify_transaction_envelope_at_height_with_activation`]).
+    ///
+    /// Pure: `is_bound` is derived from the envelope itself
+    /// (`tx.chain_id().is_some()` covers CH1, session grants, PQ chain
+    /// binding and EVM settlement), so the wallet never hand-rolls the
+    /// bound/unbound classification. Intended as a submit-time pre-check:
+    /// `Ok(())` means the envelope passes the binding gate at
+    /// `chain_height`; `Err` carries the stable
+    /// [`crate::chain_binding::UNBOUND_REFUSED_ERR_PREFIX`] refusal string
+    /// the RPC returns post-activation. Signature validity is NOT checked
+    /// here — consensus verifies signatures.
+    pub fn check_envelope_binding_at_height(
+        tx: &Transaction,
+        chain_height: u64,
+        activation: &crate::chain_binding::ChainBindingActivation,
+        chain_id: u64,
+    ) -> Result<(), String> {
+        crate::chain_binding::check_admission(
+            tx.chain_id().is_some(),
+            chain_height,
+            activation,
+            chain_id,
+        )
+    }
+
     /// LEGACY escape hatch: builds the old UNBOUND (replayable) transfer.
     /// Kept for offline signing and backward compatibility ONLY — every use
     /// logs a loud warning, and the rollout plan ends with admission

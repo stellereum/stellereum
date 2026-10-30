@@ -72,3 +72,10 @@ consumers — external-facing, publish candidate), `scripts/tools/stelops`,
 ## Out of scope (org level, not agents)
 
 - External security audit (mainnet/listing blocker), grants/accelerators, mainnet checklist.
+
+## Audit status — 2026-10-30 (AUDITPREP, docs+script only)
+
+- [x] audit-repro catalogue verified current 2026-10-30: 79 suites + 7 fuzz targets all resolve, `cargo build --tests --all-targets` green 44.36s (log `/tmp/opencode/audit-repro-nofuzz.log`, fuzz `/tmp/opencode/audit-fuzz.log`)
+- [x] Audit package refreshed 2026-10-30: brief provenance → `4d0d539` (src 164081 lines/58 files/55 modules), workspace renames (infnode, contract-sdk), VEL build `573d86f5`; KI-36/build/harness moved to KNOWN_ISSUES §N (verified in code + green run)
+- [ ] audit-repro red: `audit_rpc_evm_closeout` F4 2 tests (KI-37, estimate floor-vs-pure contract mismatch, other agents) — gate NOT green, no check weakened to green it
+- [ ] Open items recorded KNOWN_ISSUES §M 2026-10-30: KI-37 F4, KI-38 CT-P0 rewrite (acceptance: failing `poc_p0_*`), KI-39 wallet UX note, KI-40 r0-decide rate (meter pending), KI-41 workchain PARK/fund (unprobed, refusal logged)

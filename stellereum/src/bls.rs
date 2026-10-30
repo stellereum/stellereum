@@ -474,6 +474,20 @@ pub const BLS_KEYS_FILE_ENV: &str = "STELL_BLS_KEYS_FILE";
 pub const BLS_KEYS_INLINE_ENV: &str = "STELL_BLS_KEYS";
 /// Environment variable with this node's BLS secret seed (64 hex chars).
 pub const BLS_SK_SEED_ENV: &str = "STELL_BLS_SK_SEED";
+/// Environment variable selecting the PoP-strict registry parse
+/// (`parse_registry_entries_strict_pop`): when ON, every registry entry must
+/// carry a valid PoP or it is refused at parse. Default OFF (unset/anything
+/// but `1`/`true`/`on`): the v1 parse runs byte-identically to before.
+pub const BLS_POP_REQUIRED_ENV: &str = "STELL_BLS_POP_REQUIRED";
+
+/// Whether the PoP-strict registry parse is required. Default OFF: shares
+/// the [`bls_flag_on`] literal set with the QC flag so the two gates can
+/// never disagree about what "enabled" means.
+pub fn bls_pop_required() -> bool {
+    std::env::var(BLS_POP_REQUIRED_ENV)
+        .map(|v| bls_flag_on(&v))
+        .unwrap_or(false)
+}
 
 /// Fail-closed startup gate for the QC-BLS path (audit-pq-crypto HIGH).
 ///
@@ -592,17 +606,35 @@ impl QcBlsConfig {
         let enabled = std::env::var(BLS_QC_ENV)
             .map(|v| bls_flag_on(&v))
             .unwrap_or(false);
+        // Gated PoP-strict parse (phase 1, default OFF): when
+        // `STELL_BLS_POP_REQUIRED` is on, entries without a valid PoP are
+        // refused at parse and never enter the registry. When the gate is
+        // off (the default) both calls below are exactly the pre-PoP v1
+        // parse — byte-identical behavior, Ed25519 baseline untouched.
+        let strict = bls_pop_required();
         let mut registry = BlsKeyRegistry::new();
         if let Ok(path) = std::env::var(BLS_KEYS_FILE_ENV) {
             match std::fs::read_to_string(&path) {
-                Ok(text) => parse_registry_entries(&text, &mut registry),
+                Ok(text) => {
+                    if strict {
+                        let mut stats = BlsRegistryStats::default();
+                        parse_registry_entries_strict_pop(&text, &mut registry, &mut stats);
+                    } else {
+                        parse_registry_entries(&text, &mut registry);
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(%e, path, "bls: cannot read BLS key registry file; BLS path disabled");
                 }
             }
         }
         if let Ok(inline) = std::env::var(BLS_KEYS_INLINE_ENV) {
-            parse_registry_entries(&inline, &mut registry);
+            if strict {
+                let mut stats = BlsRegistryStats::default();
+                parse_registry_entries_strict_pop(&inline, &mut registry, &mut stats);
+            } else {
+                parse_registry_entries(&inline, &mut registry);
+            }
         }
         let local_vote_seed = std::env::var(BLS_SK_SEED_ENV)
             .ok()
@@ -903,6 +935,92 @@ pub fn parse_registry_entries_v2(
         out.insert(ed, pk);
         note_bls_legacy_entry();
         stats.legacy += 1;
+    }
+}
+
+/// Parse a registry text REFUSING every entry without a valid PoP (the
+/// gated strict path behind [`BLS_POP_REQUIRED_ENV`], default OFF).
+///
+/// Same line/entry separators as [`parse_registry_entries_v2`], but the
+/// contract is tightened: an entry inserts ONLY when it carries three tokens
+/// `<ed_hex> <bls_hex> <pop_hex>` with `pop` a 96-byte non-identity G2 point
+/// verifying under [`bls_verify_pop`] for that `(ed, bls)` pair. Everything
+/// else — a bare 2-token legacy entry, non-hex, wrong lengths, a non-curve
+/// key, a non-96-byte / non-curve PoP, or a PoP over another preimage — is
+/// skipped with a warning, counted `rejected`, and metered. In particular
+/// there is NO v1 fallback for a malformed third token: under this gate a
+/// garbage PoP is a refusal, never a legacy acceptance.
+///
+/// Refused keys never enter the registry, so [`QcBlsConfig::canonical_keys`]
+/// (and therefore the BLS power count) can never count them — the rogue-key
+/// fail-closed posture, enforced at parse rather than at verify time. Live
+/// QC counting is untouched: this function is only reached from
+/// [`QcBlsConfig::from_env`] when [`bls_pop_required`] is on.
+pub fn parse_registry_entries_strict_pop(
+    text: &str,
+    out: &mut BlsKeyRegistry,
+    stats: &mut BlsRegistryStats,
+) {
+    for raw in text.split(['\n', ',', ';']) {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line
+            .split(|c: char| c.is_whitespace() || c == ':' || c == '=')
+            .collect();
+        if parts.len() < 3 {
+            tracing::warn!(
+                line,
+                "bls: registry entry without PoP refused (strict PoP gate); skipped"
+            );
+            note_bls_pop_rejected();
+            stats.rejected += 1;
+            continue;
+        }
+        let (Ok(ed), Ok(bls)) = (hex::decode(parts[0]), hex::decode(parts[1])) else {
+            tracing::warn!(line, "bls: registry entry is not hex; skipped");
+            note_bls_pop_rejected();
+            stats.rejected += 1;
+            continue;
+        };
+        let (Ok(ed), Ok(bls)) = (
+            <[u8; 32]>::try_from(ed),
+            <[u8; PUBLIC_KEY_LEN]>::try_from(bls),
+        ) else {
+            tracing::warn!(line, "bls: registry entry has wrong length; skipped");
+            note_bls_pop_rejected();
+            stats.rejected += 1;
+            continue;
+        };
+        let Some(pk) = BlsPublicKey::from_bytes(&bls) else {
+            tracing::warn!(
+                line,
+                "bls: registry BLS key is not a valid G1 point; skipped"
+            );
+            note_bls_pop_rejected();
+            stats.rejected += 1;
+            continue;
+        };
+        // Strict: the third token MUST be a verifying 96-byte PoP. No v1
+        // fallback for malformed third tokens.
+        let pop_ok = hex::decode(parts[2])
+            .ok()
+            .and_then(|b| <[u8; SIGNATURE_LEN]>::try_from(b).ok())
+            .and_then(|arr| BlsSignature::from_bytes(&arr))
+            .is_some_and(|pop| bls_verify_pop(&pk, &ed, &pop));
+        if !pop_ok {
+            tracing::warn!(
+                line,
+                "bls: registry PoP missing or invalid (strict PoP gate); skipped"
+            );
+            note_bls_pop_rejected();
+            stats.rejected += 1;
+            continue;
+        }
+        out.insert(ed, pk);
+        note_bls_pop_verified();
+        stats.pop_verified += 1;
     }
 }
 

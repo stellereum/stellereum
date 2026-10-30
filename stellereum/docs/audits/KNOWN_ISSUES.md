@@ -20,11 +20,15 @@
 > ergonomics, hardening) → `INFO` (a fact about the design, not a defect).
 >
 > **Anchor.** `file:line` plus the symbol; the symbol is the contract. See
-> [`EXTERNAL_AUDIT_BRIEF.md`](EXTERNAL_AUDIT_BRIEF.md) §1 for the tree
-> fingerprint these were read from.
+> [`EXTERNAL_AUDIT_BRIEF.md`](EXTERNAL_AUDIT_BRIEF.md) §1 and §9 for the tree
+> fingerprint this revision was read from (`4d0d539`, `9df243678628fa7d →
+> 855bbc10fab92c46`, 2026-10-30) and the repro run that backs every
+> "closed" claim below.
 >
 > **Nothing in this file is a to-do for the audit-prep work.** Other agents
-> own the fixes; this package only records them.
+> own the fixes; this package only records them. Items verified fixed in code
+> *and* green in the repro run are moved out to §M (closed), not deleted, so
+> the history stays readable.
 
 ---
 
@@ -374,7 +378,7 @@ the unarmed case.
 | **Severity** | MEDIUM |
 | **File** | `src/oracle.rs` — the "FULL-FIX PRECONDITION (deferred, explicitly out of scope)" comment (≈ line 294) |
 | **Exploitability** | `REMOTE` (an oracle publisher key, which itself costs a governance proposal + quorum) |
-| **Status** | Open. The shipped rule: the **same** publisher key may move an asset at most 5% per feed (half the global 10%), and a >10% single step latches the global circuit breaker (a 3-day governance reset). The full fix — a multi-publisher median/quorum, or a TWAP-anchored commit guard — needs committed TWAP history or publisher stake, i.e. new consensus state. |
+| **Status** | Open. The shipped rule: the **same** publisher key may move an asset at most 5% per feed (half the global 10%), and a >10% single step latches the global circuit breaker (a 3-day governance reset). The full fix — a multi-publisher median/quorum, or a TWAP-anchored commit guard — needs committed TWAP history or publisher stake, i.e. new consensus state. Tracked as open item **O1 (oracle TWAP anchor)** in monorepo-root `docs/ROADMAP.md`; the read-path TWAP calculator exists (`src/oracle.rs:458` `calculate_twap`, `TWAP_WINDOW_SECS` at `:34`) but the commit path is explicitly not TWAP-anchored (`src/oracle.rs:25`, `:288`). |
 
 ---
 
@@ -634,57 +638,6 @@ against the remaining input), and check the memory limits the deployment
 imposes (a container with a memory cgroup limit turns the allocation into a
 hard abort).
 
-### KI-36 — The consensus round-window area has a **moving set of red tests** while one liveness change lands
-
-| | |
-| --- | --- |
-| **Severity** | INFO (a test-hygiene / in-flight-change defect) |
-| **File** | `tests/consensus_rephase_tests.rs` `rephase_lets_a_stuck_node_commit_the_quorum_the_network_formed`; `src/consensus.rs:3070` `scan_floor`, `:3241` `try_polka_at`, `:3278` `note_polka` |
-| **Exploitability** | none |
-| **Status** | **In flight. Not fixed by this package** (other agents own the fixes). |
-
-Two liveness changes landed in the consensus round-window area and their
-regression updates are still in flight:
-
-1. the **network anchor** (`src/consensus.rs:3070` `scan_floor`): the scan
-   floor is anchored on the **lowest of (our round, the highest round any peer
-   has been observed in)**, so a node that has *received* votes from an older
-   round finds that round's quorum without waiting for the deadlock breaker;
-2. the **polka ledger** (`src/consensus.rs:3278` `note_polka`): the moment a
-   quorum-completing prevote is admitted, the polka is *recorded* — even if
-   its round is far behind the local round counter — and the precommit that
-   follows carries the certificate of it.
-
-The first change made `tests/consensus_rephase_tests.rs`'s
-`rephase_lets_a_stuck_node_commit_the_quorum_the_network_formed` red: it
-asserted that the narrow window *cannot* see round 412, and it now can. The
-**property the test intends to pin still holds — more strongly** (the stuck
-node commits the quorum the network formed, and now it does so without the
-deadlock breaker); the *intermediate* assertion was what was stale. That
-assertion has since been rewritten upstream, and the test is green again.
-
-**The red moves.** On the fingerprint measured in the brief §9 the red was
-`consensus_rephase` (1 test). On later fingerprints the red was
-`consensus::phase_convergence_tests::a_late_polka_is_recorded_even_after_the_round_was_left`
-and `…::a_precommit_quorum_in_the_polka_round_decides_the_height`, then
-`consensus::tests::round_advance_keeps_the_vote_sets_of_the_current_height` —
-i.e. the same area, the same change, and the regressions being updated as it
-lands. A red there is a **test** that has not been updated yet, not a broken
-consensus. But do not take this document's word for it: run the script.
-
-**Audit action:** this is exactly the kind of red an auditor will hit on the
-first `./scripts/audit-repro.sh`, so it is worth knowing that the red is in
-the *test*, not in the consensus. It is also a useful example of a change
-that is *liveness-improving* and still needs its regression updated.
-
-**What to check:** the network-anchor change makes the quorum scan reach
-further back than `ROUND_LOOKBACK` when the node is *ahead* of the network.
-The auditor's question is whether the new floor can be pushed by a peer —
-`scan_floor` bounds it with `MAX_SCAN_SPAN` and anchors it on the **maximum**
-observed peer round so a peer can neither narrow nor widen it
-(`src/consensus.rs:3070`). That reasoning is worth checking against the
-code, not against this document.
-
 ---
 
 ## J. Deferred / not-started features (not defects)
@@ -712,13 +665,13 @@ them and should know they are stale.
 
 | ID | Claim | Reality | Severity |
 | --- | --- | --- | --- |
-| SD-01 | `PROTOCOL.md` §"Security posture": *"The examples do not compile against the current `Block` … so a bare `cargo test` fails while building the examples."* | **True, but for a different reason.** On this tree three targets fail to compile: `examples/passport_audit.rs` and `examples/vuln_hunt2.rs` (both call `ZkMlProof::prove_inference`, which was renamed to `prove_reexec`) and `benches/zkml_attestation.rs` (it imports `stellereum::snark`, the module now called `stellereum::zkml_attestation`). The **library, all 79 test targets and all 7 fuzz targets build and pass.** The consequence for an auditor: `cargo build --all-targets` is **red** on this tree — use `cargo build --tests` or `cargo test` instead. The stale *reason* (the `order_merkle_root` field) is no longer the cause. | MEDIUM (it blocks a naive `cargo test --all-targets`) |
-| SD-02 | `PROTOCOL.md`: *"the integration suites carry 65 pre-existing failures"*. | **Stale.** Measured on this tree: the library suite (837 tests) and all 78 security-focused integration suites are green — see [`EXTERNAL_AUDIT_BRIEF.md`](EXTERNAL_AUDIT_BRIEF.md) §9 for the measured numbers. | INFO |
+| SD-02 | `PROTOCOL.md`: *"the integration suites carry 65 pre-existing failures"*. | **Stale.** Measured 2026-10-30 (brief §9): the library suite (1,045 tests) is green; 77 of the 78 security-focused integration suites are green and the 1 red one (`audit_rpc_evm_closeout`, 2 tests) is a live code-vs-test contract mismatch, not a pre-existing background failure — see KI-37. | INFO |
 | SD-03 | `PROTOCOL.md` §7: *"Restoring from a snapshot does not rebuild the commitment."* | **Stale.** The restore path now fetches and rebuilds every committed domain (`src/sync.rs`, the F-J follow-up; `tests/audit_state_sync_closeout_tests.rs`). | INFO |
 | SD-04 | `PROTOCOL.md` §7: *"No live-network shard split."* | **Still true** (see KI-30). The split/merge state machine is demonstrated over a synthetic account set only. | — |
-| SD-05 | The audit figures *"2043 fuzz corpus files"*. | **Accurate for the committed corpus.** `fuzz/corpus/` holds exactly **2,043** files at HEAD `1d21b43` (1,614 `consensus_msg_decode` + 262 `block_decode` + 178 `transaction_decode` + 9 `frame_decode`). The count grows as the fuzz smoke runs — the extra files are *untracked* seeds, so a dirty tree shows a higher number. The honest reading is not "2,043 files of coverage" but "the coverage is deep on the consensus wire format and thin everywhere else" (see the brief §10). | INFO |
+| SD-05 | The audit figures *"2043 fuzz corpus files"*. | **Superseded by growth.** At the old HEAD that count was exact; on the current tree the working-tree corpus is **4,427 files before the smoke run and 4,584 after it** (2,293 → 2,334 `consensus_msg_decode`, 633 → 681 `transaction_decode`, 594 → 633 `block_decode`, 9 `frame_decode`, plus the newer targets 5 / 350 → 353 / 543 → 569). The extra files are *untracked* seeds the smoke runs keep adding. The honest reading is unchanged: deepest on the consensus wire format, thinnest on the certificate envelopes (5 files). | INFO |
 | SD-06 | `src/mev_epoch.rs`'s module header points at **`docs/MEV.md`** for "the full statement" of what the epoch seal does and does not protect against. | **Resolved — the file now exists.** `docs/MEV.md` ("MEV PROTECTION — THE EPOCH SEAL") was added alongside the live threshold scheme and carries the honest residual statement (§4.3); the module headers (`src/mev_epoch.rs:60`, `src/mev.rs:44`) resolve again. The authoritative statement is the module headers **plus** `docs/MEV.md`; KI-34 quotes both. | INFO |
-| SD-07 | `PROTOCOL.md` §"Security posture" still says the examples do not compile and that the integration suites carry 65 pre-existing failures. | **Stale on this tree** — see SD-01 and SD-02 for the measured numbers, and the brief §9 for the run that produced them. | INFO |
+
+*(SD-01 and SD-07 retired 2026-10-30 — the claims they tracked are fixed; see §M.)*
 
 ---
 
@@ -741,4 +694,95 @@ rather than papered over.
 cargo test --lib governance::tests::            # the arming default + the path safety
 cargo test --test light_client_wiring_tests     # the anchor, the CLI, the lying server
 cargo test --lib zkml::tests::                  # the capability statement
+```
+
+---
+
+## M. Open items recorded 2026-10-30 (AUDITPREP)
+
+Five items entered or re-entered this file during the 2026-10-30 audit-prep
+pass (repro run at brief §9). None of them is fixed by the audit-prep work —
+other agents own the fixes; this section records them with the code anchor so
+the next reader does not have to rediscover them.
+
+### KI-37 — `eth_estimateGas` F4 contract is red: the "pure figure" comes back floored
+
+| | |
+| --- | --- |
+| **Severity** | MEDIUM (gate-weakening + wallet-facing honesty; the failure direction itself is fail-safe) |
+| **File** | `src/evm_adapter.rs` `eth_estimate_gas_amount` (the `.max(crate::svm::GAS_BASIC_TRANSFER)` floor); `tests/audit_rpc_evm_closeout.rs:387` `f4_estimate_serves_pure_figure_at_zero_floor`, `:413` `f4_estimate_never_below_admission_floor` |
+| **Exploitability** | none directly (an over-estimate is admittable; no party gains) |
+| **Status** | **Open, owned by other agents.** The floor-aware estimate change (audit B-VM) made `eth_estimate_gas_impl` return `max(pure, 280_000)` on every path, while the two F4 tests still pin the unfloored EVM arithmetic (`0x5208`/`0x5248`). Repro 2026-10-30: 28 passed, 2 failed (`left: "0x445c0"`). |
+
+**Audit action:** settle the contract one way or the other — either the pure
+figure stays pure and only `eth_estimate_gas_with_floor` applies the floor,
+or the tests are updated to the floored values — and do it without deleting
+the F4 pins. Until then `audit_rpc_evm_closeout` is the one red suite in an
+otherwise green gate.
+
+### KI-38 — The wasm contracts authenticate NOTHING (CT-P0 rewrite)
+
+| | |
+| --- | --- |
+| **Severity** | HIGH for any deployment that uses them; INFO for the chain (they are demo-grade product code, not protocol) |
+| **File** | `stellereum-contracts/contracts/sts20-token/src/lib.rs:2` (*"`owner`/`caller_id`/`admin_id` args are caller-supplied and replayable: the contract never reads the authenticated `host.caller`"*) and the sibling `liquidity-pool`, `stl-dns`, `account-object` contracts; PoCs `stellereum-contracts/contracts/sts20-token/tests/poc_p0_unauth_transfer.rs`, `poc_p0_forged_burn.rs` (*"This test FAILS on current code"*) |
+| **Exploitability** | `REMOTE` (any caller) — a stranger crafts a transfer-from-admin and it succeeds; no allowance/spender check exists |
+| **Status** | **Open, tracked as CT-P0 in monorepo-root `docs/ROADMAP.md`.** The SDK side landed (`stellereum-contract-sdk/src/lib.rs:66` `caller()`, `:76` `value()`, `:81` `host_mock` with `set_mock_caller`), but no contract reads `host.caller` yet. The failing `poc_p0_*` tests are the acceptance criteria for the rewrite. Contracts are marked demo-grade: DO NOT deploy with value. |
+
+**Audit action:** confirm no live deployment funds these contracts, and review
+the rewrite (host.caller-bound auth) when it lands — the PoCs, not this
+document, are the verdict.
+
+### KI-39 — Wallet notes UX migration (secret-bound store landed; the UX note is deferred)
+
+| | |
+| --- | --- |
+| **Severity** | LOW |
+| **File** | `stell-wallet/src/notes.rs:602` `migrate_notes_to_secret`, `:441`–`:474` (legacy plaintext fallback), `stell-wallet/src/main.rs:2947` (transparent migration on first read) |
+| **Exploitability** | `LOCAL` (a stale plaintext notes file on a previously-used host) |
+| **Status** | **Code landed, UX follow-through deferred** (ROADMAP: "wallet secret-bound migration (legacy decrypt removed)", with the "wallet notes UX migration note" deferred). Legacy files migrate transparently to the secret-bound store; passwordless reads of legacy files are refused. What remains is the user-facing migration note, not a cryptographic gap. |
+
+### KI-40 — r0 rarely decides on slow-proposer slots (tempo residual, not a defect)
+
+| | |
+| --- | --- |
+| **Severity** | LOW (liveness/tempo, deployment-specific) |
+| **File** | `docs/specs/04_NETWORK_AND_CONSENSUS.md:29` (residual = WAN RTT floor + 1-vCPU members — "physics, not bugs"); tick 50 ms, base timeout 3500 ms, r0 fast path (`04_NETWORK_AND_CONSENSUS.md:11`) |
+| **Exploitability** | none (no adversary gains; slow finality, not a fork) |
+| **Status** | **Open ops observation.** VEL prebuild + vote pipeline (build `573d86f5`, rolling 2026-10-29) improved tempo 8.2 s/blk (dirty window) → ~2.5 s/blk sustained, rounds converging — but r0 still rarely decides on slow-proposer slots (members C/D, 1-vCPU) + WAN. The hour-tempo verdict (meter running, mean/p50/p99 + views/block, r0-decide rate) is pending in ROADMAP P0. |
+
+**Audit action:** none on the consensus code — the question is operational
+(slot scheduling on weak members), and the meter, not this document, settles
+it. Revisit after the hour-tempo verdict lands.
+
+### KI-41 — Workchain wedged/empty: PARK or fund (deployment decision, unverified here)
+
+| | |
+| --- | --- |
+| **Severity** | MEDIUM (deployment completeness, not a code defect) |
+| **File** | monorepo-root `docs/ROADMAP.md` P1 ("execute PARK (S4 runbook) or fund + serve shard-1 RPC (currently wedged/empty)"); `docs/SHARDING.md` §0 (what split/migration is demonstrated vs designed) |
+| **Exploitability** | `OPERATOR` (deployment choice) |
+| **Status** | **Open, unverified by this pass.** Live-cluster state was deliberately not probed (read-mostly ops rule), so this records the ROADMAP position, not a fresh measurement: shard-1 RPC is wedged/empty and the decision is PARK per the S4 runbook vs fund-and-serve. |
+
+---
+
+## N. Closed since the last brief (verified 2026-10-30, in code + in the repro run)
+
+Items moved out of the open sections because the fix is **in the code**
+(symbol located, line cited) **and** the pinning suite is **green in the
+2026-10-30 repro run** (brief §9). History is kept here so a fixed item is
+never mistaken for a dropped one.
+
+| ID | What it was | Fix verified in code | Repro evidence |
+| --- | --- | --- | --- |
+| **KI-36** | The consensus round-window area carried a moving set of red tests while the network-anchor / polka-ledger liveness change landed. | `tests/consensus_rephase_tests.rs:118`–`:289` rewritten around the anchored semantics (10 tests); the anchor reasoning still stands — `src/consensus.rs:3776` `scan_floor` bounds with `MAX_SCAN_SPAN`, anchors on the maximum observed peer round. | `consensus_rephase` 10/10 green (216 ms). |
+| **(build)** ex-SD-01 | Three `example`/`bench` targets called the pre-rename zkML API, reddening `cargo build --tests --all-targets`. | `examples/passport_audit.rs:154` and `examples/vuln_hunt2.rs:131` use the renamed API (`forge_structural_proof`); `benches/zkml_attestation.rs:4`–`:10` documents the `snark` removal in its own header. | `build (cargo build --tests --all-targets)` green (44.36 s). Ex-SD-01/SD-07 retired. |
+| **(harness)** | `tests/support/live_stand.rs` did not compile (moved `block`), erroring `pq_equivocation_report`. | `tests/support/live_stand.rs:578` destructures `Msg::Proposal { round, block }` and borrows correctly. | `pq_equivocation_report` 4/4 green (77.42 s). |
+
+**How to check these yourself:**
+
+```bash
+./scripts/audit-repro.sh --no-fuzz    # build + all 79 suites; expect only KI-37 red
+cargo test --no-fail-fast --test consensus_rephase_tests
+cargo test --no-fail-fast --test pq_equivocation_report_tests
 ```

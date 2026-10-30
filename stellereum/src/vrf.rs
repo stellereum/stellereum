@@ -70,6 +70,85 @@ pub const VRF_SCALAR_DOMAIN: &[u8] = b"STELL_VRF_SCALAR_V1";
 /// Domain tag for the Falcon-signed VRF key binding.
 pub const VRF_BINDING_DST: &[u8] = b"STELL_VRF_BINDKEY_V1";
 
+/// Domain tag for the Schnorr-derived VRF proof hashes (nonce + challenge).
+pub const VRF_PROOF_DOMAIN: &[u8] = b"STELL_VRF_PROOF_V1";
+
+/// Domain tag for the VRF output hash `output = BLAKE3(domain || R || pk || seed)`.
+pub const VRF_OUTPUT_DOMAIN: &str = "STELL_VRF_OUTPUT_V1";
+
+/// Domain tag for the post-activation election seed
+/// `seed = BLAKE3(domain || vrf_output || height || round)`.
+/// Distinct from `STELL_SORTITION_V5` so a VRF seed can never collide with a
+/// parent-hash seed.
+pub const VRF_ELECTION_DOMAIN: &str = "STELL_SORTITION_VRF_V1";
+
+/// Environment variable naming the VRF sortition activation height
+/// (mirrors `STELL_XPC_ACTIVATION_HEIGHT`).
+pub const VRF_ACTIVATION_HEIGHT_ENV: &str = "STELL_VRF_ACTIVATION_HEIGHT";
+
+/// Length of a serialised VRF proof: `R (32B) || z (32B)`.
+pub const VRF_PROOF_LEN: usize = 64;
+
+// ============================================================================
+// Activation gate (XPC-activation-height pattern)
+// ============================================================================
+
+/// Height gate for VRF sortition.
+///
+/// `Disabled` (the default) keeps the parent-hash draw byte-identical to
+/// today; `FromHeight(h)` switches the election seed to the verified VRF
+/// output for heights `>= h`. Consensus-visible boundary: every node of a
+/// deployment must configure the same value, like `XpcActivation`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VrfActivation {
+    /// VRF sortition off — parent-hash election only.
+    #[default]
+    Disabled,
+    /// VRF seed active for heights >= the boundary.
+    FromHeight(u64),
+}
+
+impl VrfActivation {
+    /// True when a block at `height` must elect via the verified VRF seed.
+    pub fn is_active_at(&self, height: u64) -> bool {
+        match *self {
+            VrfActivation::Disabled => false,
+            VrfActivation::FromHeight(h) => height >= h,
+        }
+    }
+
+    /// The activation boundary height, if VRF sortition is on.
+    pub fn boundary(&self) -> Option<u64> {
+        match *self {
+            VrfActivation::Disabled => None,
+            VrfActivation::FromHeight(h) => Some(h),
+        }
+    }
+}
+
+/// Read the gate from the environment (mirrors `xpc_activation_from_env` in
+/// `main.rs`, which this module cannot call — threading CLI plumbing is
+/// phase-3 work outside this scope). Missing or unparsable ⇒ `Disabled`.
+pub fn vrf_activation_from_env() -> VrfActivation {
+    let raw = std::env::var(VRF_ACTIVATION_HEIGHT_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    match raw {
+        None => VrfActivation::Disabled,
+        Some(v) => match v.parse::<u64>() {
+            Ok(h) => VrfActivation::FromHeight(h),
+            Err(_) => {
+                eprintln!(
+                    "[vrf] {VRF_ACTIVATION_HEIGHT_ENV}={v:?} is not a height: \
+                     VRF sortition stays INACTIVE"
+                );
+                VrfActivation::Disabled
+            }
+        },
+    }
+}
+
 // ============================================================================
 // Keys (live alongside the validator's Falcon key)
 // ============================================================================
@@ -248,6 +327,149 @@ impl VrfRegistry {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+}
+
+// ============================================================================
+// Phase-1 wiring VRF: deterministic Schnorr-derived prove/verify
+// ============================================================================
+//
+// SECURITY SCOPE (read before auditing): this is a deterministic Schnorr
+// signature over the seed input used AS a VRF
+// (`output = BLAKE3(R || pk || seed)`, proof = `(R, z)`), NOT an audited
+// RFC 9381 ECVRF. It gives exactly what the height-gated wiring needs —
+// unforgeability without the signer's secret, determinism across nodes
+// (derived nonce, no wall clock, no OS randomness in the election path),
+// and verification against the Falcon-bound registry key — but it has NOT
+// had ECVRF review (ciphersuite separation, hash-to-curve,
+// batch-verification rules). Phase 2 replaces the `vrf_prove`/`vrf_verify`
+// bodies with an audited ECVRF crate behind these SAME signatures; the
+// activation gate, registry binding and election-seed layers are unchanged
+// by that swap.
+
+/// A VRF proof envelope: the output bound to the proof that produced it.
+///
+/// Carried by the caller (phase-3 gossip); the verifier MUST re-derive the
+/// output from the proof bytes — a `VrfProof` whose `output` field does not
+/// match its `proof` bytes is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VrfProof {
+    pub output: [u8; 32],
+    pub proof: [u8; VRF_PROOF_LEN],
+}
+
+fn vrf_scalar(parts: &[&[u8]]) -> Scalar {
+    let mut h = Sha512::new();
+    h.update(VRF_PROOF_DOMAIN);
+    for p in parts {
+        h.update(p);
+    }
+    let digest = h.finalize();
+    let mut wide = [0u8; 64];
+    wide[..32].copy_from_slice(&digest[..32]);
+    let mut h2 = Sha512::new();
+    h2.update(VRF_PROOF_DOMAIN);
+    h2.update(b"wide-hi");
+    for p in parts {
+        h2.update(p);
+    }
+    let digest2 = h2.finalize();
+    wide[32..].copy_from_slice(&digest2[..32]);
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+fn vrf_output_bytes(
+    r_bytes: &[u8; 32],
+    pk_bytes: &[u8; 32],
+    seed_input: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(VRF_OUTPUT_DOMAIN);
+    hasher.update(r_bytes);
+    hasher.update(pk_bytes);
+    hasher.update(seed_input);
+    *hasher.finalize().as_bytes()
+}
+
+/// Prove: deterministically derive `(output, proof)` for `seed_input`.
+///
+/// Pure: same secret + same seed ⇒ same bytes on every node (the nonce is
+/// derived from the secret seed and the input, never OS randomness).
+pub fn vrf_prove(secret: &VrfSecret, seed_input: &[u8; 32]) -> VrfProof {
+    let s = secret.scalar();
+    let pk = secret.public_key().to_bytes();
+    let k = vrf_scalar(&[b"nonce", &secret.0, seed_input]);
+    let r_bytes = RistrettoPoint::mul_base(&k).compress().to_bytes();
+    let c = vrf_scalar(&[b"challenge", &r_bytes, &pk, seed_input]);
+    let z = k + c * s;
+    let mut proof = [0u8; VRF_PROOF_LEN];
+    proof[..32].copy_from_slice(&r_bytes);
+    proof[32..].copy_from_slice(&z.to_bytes());
+    let output = vrf_output_bytes(&r_bytes, &pk, seed_input);
+    VrfProof { output, proof }
+}
+
+/// Verify a proof against the RAW registered VRF public key bytes.
+///
+/// Returns the verified output on success, `None` (fail-closed, no panic) on
+/// any failure: bad curve point, identity key, non-canonical `z`, Schnorr
+/// equation miss, or an `output` field that does not match the proof bytes.
+pub fn vrf_verify(
+    vrf_pk: &[u8; 32],
+    seed_input: &[u8; 32],
+    proof: &VrfProof,
+) -> Option<[u8; 32]> {
+    let pk_point =
+        curve25519_dalek::ristretto::CompressedRistretto(*vrf_pk).decompress()?;
+    if pk_point.is_identity() {
+        return None;
+    }
+    let mut r_bytes = [0u8; 32];
+    r_bytes.copy_from_slice(&proof.proof[..32]);
+    let mut z_bytes = [0u8; 32];
+    z_bytes.copy_from_slice(&proof.proof[32..]);
+    let r_point =
+        curve25519_dalek::ristretto::CompressedRistretto(r_bytes).decompress()?;
+    let z: Scalar = Option::<Scalar>::from(Scalar::from_canonical_bytes(z_bytes))?;
+    let pk_bytes = pk_point.compress().to_bytes();
+    let c = vrf_scalar(&[b"challenge", &r_bytes, &pk_bytes, seed_input]);
+    let c_p = pk_point * c;
+    if RistrettoPoint::mul_base(&z) != r_point + c_p {
+        return None;
+    }
+    let expected = vrf_output_bytes(&r_bytes, &pk_bytes, seed_input);
+    if expected != proof.output {
+        return None;
+    }
+    Some(expected)
+}
+
+/// Verify a VRF proof against the REGISTRY-bound key for `validator_id`.
+///
+/// The two refusals that make this "registry-bound": unknown validator
+/// (never registered) ⇒ `None`; registered-but-bad proof ⇒ `None`. Only a
+/// proof that verifies under the Falcon-authorized key mints a `Some(output)`,
+/// and only that `Some` may feed the post-activation election seed.
+pub fn verify_vrf_seed_for_validator(
+    registry: &VrfRegistry,
+    validator_id: &[u8; 32],
+    seed_input: &[u8; 32],
+    proof: &VrfProof,
+) -> Option<[u8; 32]> {
+    let vrf_pk = registry.get(validator_id)?;
+    vrf_verify(&vrf_pk, seed_input, proof)
+}
+
+/// Post-activation election seed:
+/// `BLAKE3(domain || vrf_output || height || round)`.
+///
+/// Binding height+round keeps every (height, round) draw distinct even if a
+/// VRF output ever repeated; `VRF_ELECTION_DOMAIN` keeps VRF seeds disjoint
+/// from `STELL_SORTITION_V5` parent-hash seeds.
+pub fn vrf_election_seed(vrf_output: &[u8; 32], height: u64, round: u32) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(VRF_ELECTION_DOMAIN);
+    hasher.update(vrf_output);
+    hasher.update(&height.to_le_bytes());
+    hasher.update(&round.to_le_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 // ============================================================================
@@ -554,6 +776,140 @@ mod tests {
             sortition_seed(&parent, 9, 2),
             sortition_seed(&[0x6Bu8; 32], 9, 2),
             "a new parent must re-draw the seed"
+        );
+    }
+
+    #[test]
+    fn vrf_prove_is_deterministic_and_verifies() {
+        let sk = VrfSecret::from_seed(&[0x42u8; 32]);
+        let pk = sk.public_key().to_bytes();
+        let seed = [0x5Au8; 32];
+        let a = vrf_prove(&sk, &seed);
+        let b = vrf_prove(&sk, &seed);
+        assert_eq!(a, b, "same secret + seed => same proof bytes on every node");
+        assert_eq!(
+            vrf_verify(&pk, &seed, &a),
+            Some(a.output),
+            "honest proof verifies under the registered key"
+        );
+        // Different seed => different output (height/round binding is real).
+        let other = vrf_prove(&sk, &[0x5Bu8; 32]);
+        assert_ne!(a.output, other.output);
+    }
+
+    #[test]
+    fn vrf_verify_refuses_forgeries_fail_closed() {
+        let sk = VrfSecret::from_seed(&[0x42u8; 32]);
+        let pk = sk.public_key().to_bytes();
+        let seed = [0x5Au8; 32];
+        let good = vrf_prove(&sk, &seed);
+        // Flipped proof byte refuses.
+        let mut bad_byte = good.clone();
+        bad_byte.proof[7] ^= 0x01;
+        assert_eq!(vrf_verify(&pk, &seed, &bad_byte), None);
+        // Swapped output refuses (output is bound to the proof bytes).
+        let mut bad_out = good.clone();
+        bad_out.output[0] ^= 0x01;
+        assert_eq!(vrf_verify(&pk, &seed, &bad_out), None);
+        // Wrong seed input refuses.
+        assert_eq!(vrf_verify(&pk, &[0x5Bu8; 32], &good), None);
+        // Wrong key refuses.
+        let other_pk = VrfSecret::from_seed(&[0x43u8; 32]).public_key().to_bytes();
+        assert_eq!(vrf_verify(&other_pk, &seed, &good), None);
+        // Identity key refuses.
+        let id_pt = RistrettoPoint::mul_base(&Scalar::from(0u64))
+            .compress()
+            .to_bytes();
+        assert_eq!(vrf_verify(&id_pt, &seed, &good), None);
+        // Non-canonical z refuses.
+        let mut bad_z = good.clone();
+        bad_z.proof[32..].copy_from_slice(&[0xFFu8; 32]);
+        assert_eq!(vrf_verify(&pk, &seed, &bad_z), None);
+    }
+
+    #[test]
+    fn vrf_registry_binding_gates_seed_minting() {
+        let falcon = crate::post_quantum::FalconKeypair::generate_from_seed_bytes(&[0x77u8; 32]);
+        let sk = VrfSecret::from_seed(&[0x42u8; 32]);
+        let vrf_pk = sk.public_key().to_bytes();
+        let validator_id = [0x11u8; 32];
+        let sig = falcon.sign(&vrf_binding_preimage(&validator_id, &vrf_pk));
+        let mut reg = VrfRegistry::new();
+        reg.register(
+            &VrfBinding {
+                validator_id,
+                vrf_pk,
+                falcon_sig: sig,
+            },
+            falcon.public_key(),
+        )
+        .expect("honest binding registers");
+        let seed = [0x5Au8; 32];
+        let proof = vrf_prove(&sk, &seed);
+        assert_eq!(
+            verify_vrf_seed_for_validator(&reg, &validator_id, &seed, &proof),
+            Some(proof.output),
+            "registered validator mints a verified seed"
+        );
+        // Unregistered validator refuses (never stored, never minted).
+        assert_eq!(
+            verify_vrf_seed_for_validator(&reg, &[0x22u8; 32], &seed, &proof),
+            None
+        );
+        // Registered id but foreign proof refuses.
+        let foreign = vrf_prove(&VrfSecret::from_seed(&[0x99u8; 32]), &seed);
+        assert_eq!(
+            verify_vrf_seed_for_validator(&reg, &validator_id, &seed, &foreign),
+            None
+        );
+    }
+
+    #[test]
+    fn vrf_activation_gate_follows_xpc_pattern() {
+        assert!(!VrfActivation::Disabled.is_active_at(0));
+        assert!(!VrfActivation::Disabled.is_active_at(u64::MAX));
+        assert_eq!(VrfActivation::Disabled.boundary(), None);
+        let a = VrfActivation::FromHeight(100);
+        assert!(!a.is_active_at(99));
+        assert!(a.is_active_at(100));
+        assert!(a.is_active_at(101));
+        assert_eq!(a.boundary(), Some(100));
+        assert_eq!(VrfActivation::default(), VrfActivation::Disabled);
+        // Env parsing: missing => Disabled; valid => FromHeight; garbage => Disabled.
+        let key = VRF_ACTIVATION_HEIGHT_ENV;
+        let saved = std::env::var(key).ok();
+        std::env::remove_var(key);
+        assert_eq!(vrf_activation_from_env(), VrfActivation::Disabled);
+        std::env::set_var(key, "500");
+        assert_eq!(
+            vrf_activation_from_env(),
+            VrfActivation::FromHeight(500)
+        );
+        std::env::set_var(key, "not-a-height");
+        assert_eq!(vrf_activation_from_env(), VrfActivation::Disabled);
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn vrf_election_seed_is_deterministic_and_domain_separated() {
+        let out = [0xabu8; 32];
+        assert_eq!(vrf_election_seed(&out, 7, 0), vrf_election_seed(&out, 7, 0));
+        assert_ne!(
+            vrf_election_seed(&out, 7, 0),
+            vrf_election_seed(&[0xacu8; 32], 7, 0)
+        );
+        assert_ne!(
+            vrf_election_seed(&out, 7, 0),
+            vrf_election_seed(&out, 8, 0),
+            "height must move the seed"
+        );
+        assert_ne!(
+            vrf_election_seed(&out, 7, 0),
+            vrf_election_seed(&out, 7, 1),
+            "round must move the seed"
         );
     }
 }

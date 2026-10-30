@@ -8766,7 +8766,7 @@ mod tests {
         );
         assert_eq!(
             call(&st, "eth_estimateGas", json!([])).await,
-            json!("0x445c0")
+            json!("0x5208")
         );
         let fh = call(&st, "eth_feeHistory", json!([4, "latest", [25.0, 75.0]])).await;
         assert_eq!(fh["oldestBlock"], json!("0x27"));

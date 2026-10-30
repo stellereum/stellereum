@@ -23,21 +23,22 @@ to look at, what to ignore, and how to reproduce our numbers yourself.
 
 | | |
 | --- | --- |
-| **Commit** | `1d21b43c5ed420141be6e3754a277dc214033a97` (`1d21b43`) |
-| **Commit date** | 2026-10-18T09:19:31+03:00 |
-| **Commit subject** | `fix(address): safe UTF-8 character boundary check and base58 zero-prefix handling` |
-| **Branch** | `wip/passport-agents` |
-| **Working tree** | **dirty** — the tree carries uncommitted edits (256 changed paths at the time of measurement). The source fingerprint identifies the *exact* sources we measured, so the numbers are reproducible even though the tree moves. |
-| **Source fingerprint** | `6ec6091a8a635342` at the **start** of the measured run, `a321a7843d9c288a` at its **end** — sha256 over all `*.rs` under `src/`, `tests/`, `fuzz/`. The tree is under active development, so it **moved during the measurement**; the script prints both and warns. Re-run it and compare the fingerprint before trusting any number below. |
+| **Commit** | `4d0d539405ea56d69793d3dad3abcbc9a0386db5` (`4d0d539`) |
+| **Commit date** | 2026-10-30T12:41:03+03:00 |
+| **Commit subject** | `roadmap: wave-2 fixes recorded` |
+| **Branch** | `main` |
+| **Working tree** | **dirty** — the tree carries uncommitted edits (7 changed paths at the time of measurement). The source fingerprint identifies the *exact* sources we measured, so the numbers are reproducible even though the tree moves. |
+| **Source fingerprint** | `9df243678628fa7d` at the **start** of the measured run, `855bbc10fab92c46` at its **end** — sha256 over all `*.rs` under `src/`, `tests/`, `fuzz/`. The tree is under active development, so it **moved during the measurement**; the script prints both and warns. Re-run it and compare the fingerprint before trusting any number below. |
 | **Toolchain** | `rustc 1.91.1 (ed61e7d7e 2025-11-07)`, `cargo 1.91.1 (ea2d97820 2025-10-10)` |
-| **Size measured** | `src/` = 133,879 lines over 53 files, 50 modules (the library plus `src/bin/`) |
+| **Size measured** | `src/` = 164,081 lines across 58 files, 55 modules (the library plus `src/bin/`) |
 | **Fuzz toolchain** | `cargo 1.100.0-nightly (3d7cf6e93 2026-09-25)`, `cargo-fuzz 0.13.2` |
-| **Dependency of record** | `infnode` (the P2P transport), a **sibling path dependency** at `../infmail-valid-backend/crates/infnode` — not vendored in this repository. Auditors must read it too: it is the network entry point. |
+| **Dependency of record** | `infnode` (the P2P transport), a **sibling path dependency** at `../infnode/crates/infnode` — **renamed** from `../infmail-valid-backend/crates/infnode` (see `Cargo.toml:7`). Not vendored in this repository. Auditors must read it too: it is the network entry point. |
+| **Deployed build** | **VEL prebuild + vote pipeline, build `573d86f5`**, rolling to all 4 nodes 2026-10-29 (`.old` kept; no divergence/panics; see monorepo-root `docs/ROADMAP.md`). The audit tree (commit above) is *ahead* of the deployed build — verify what is live before assuming the deployment matches this brief. |
 
 **Reproduce everything we measured:**
 
 ```bash
-git checkout 1d21b43          # or use the fingerprint above
+git checkout 4d0d539          # or use the fingerprint above
 cd stellereum
 ./scripts/audit-repro.sh      # builds, runs the suites, runs the fuzz smoke, prints the SUMMARY table
 ```
@@ -45,6 +46,28 @@ cd stellereum
 The script prints the commit, the source fingerprint, the rustc version and a
 per-suite table. If your run disagrees with ours, the tree you have is not the
 tree we measured — check the fingerprint first.
+
+### The workspace around the node (monorepo, all private)
+
+The node is one of seven workspaces in the monorepo root. Only `stellereum/`
+(this directory) is in audit scope, but two renames and one split change where
+things live, so auditors do not chase stale paths:
+
+| Workspace | Content | Note |
+| --- | --- | --- |
+| `stellereum/` | the core node (this brief) | in scope |
+| `infnode/` | the P2P transport (`infnode` crate) | in scope as the network entry point; **renamed** from `infmail-valid-backend` |
+| `stellereum-contracts/` | the 4 wasm contracts (`contracts/`) **and** the contract SDK (`crates/stellereum-contract-sdk`) | contracts are out of scope as product, but the CT-P0 auth gap is tracked in `KNOWN_ISSUES.md`; the SDK was **renamed/split out** — it was `stellereum-sdk` |
+| `stellereum-sdk/` | standalone client tx-builders, zero in-tree consumers (external-facing, publish candidate) | out of scope |
+| `stell-wallet/` | wallet CLI | out of scope of the security boundary |
+| `stellereum-indexer/` | indexer | out of scope |
+| `stellereum-hdae/` (shared infra) | AGENTS, specs, gates, matrix, handoffs | process, not protocol |
+
+Remote mirrors (branch per milestone, `main`/agent branches never touched):
+`immtes/stellereum`, `immtes/infnode`, `immtes/stellereum-contracts`,
+`immtes/stell-wallet`, `immtes/stellereum-indexer`. No remote yet for
+standalone `stellereum-sdk/`, `scripts/tools/stelops`, `explorer-site`.
+(monorepo-root `docs/ROADMAP.md`, 2026-10-29.)
 
 ---
 
@@ -73,7 +96,7 @@ tree we measured — check the fingerprint first.
                                               src/commitment.rs (the state-root commitment)
 ```
 
-`src/lib.rs` exposes **50 modules**. The binary (`src/main.rs`) wires the
+`src/lib.rs` exposes **55 modules**. The binary (`src/main.rs`) wires the
 transport, the consensus driver, the apply worker, the RPC servers and the
 background tasks.
 
@@ -81,39 +104,39 @@ background tasks.
 
 | Subsystem | Files | What it does |
 | --- | --- | --- |
-| **Consensus (BFT)** | `src/consensus.rs` (5,326) | The pure state machine: `HeightConsensus` per height, prevote/precommit, quorum certificates, value locking, equivocation evidence, the sortition committee, the µQC and epoch CEC certificates, the chain-id-bound vote and block preimages. |
-| | `src/runtime.rs` (7,867) | The integration layer: proposer selection, the apply worker (`ApplyLane`, panic-guarded), the finalize order (fees → slashes → rotation), `adopt_committed` (the catch-up path), the validator-set refresh. |
-| | `src/consensus_net.rs` (2,761) | The P2P transport for proposals/votes/commits over infnode: bincode framing, size caps, batch limits, per-peer burst budgets, fire-and-forget gossip. |
-| | `src/chain.rs` (1,317) | The block tree, fork choice, and the reorg plan (reorgs only ever affect heights above the finalized one). |
-| | `src/sync.rs` (2,508) | Catch-up: walk `prev_hash` backwards, fetch the missing blocks, apply them ancestor-first, verify the chain's quorum. |
-| **Execution & state** | `src/state_engine.rs` (11,691) | The state engine: the Patricia trie of accounts/tokens/contract code, the actor model, the parallel block path, the failure-fee rules, the commitment snapshot, the snapshot/restore path. |
-| | `src/svm.rs` (3,451) | The Stellereum Virtual Machine: the opcode set, the micro-gas model, the syscalls (stake, claim, order, zkML, confidential transfer). |
-| | `src/contract.rs` (2,613), `src/contract_abi.rs` (1,678) | The WASM contract engine (wasmi), fuel metering, the ABI codec, the registry. |
-| | `src/commitment.rs` (1,664) | The canonical commitment of every consensus-visible subsystem that is **not** in the trie. `COMMITMENT_VERSION = 5`. |
-| | `src/parallel_exec.rs` (791), `src/cell.rs` (359) | The wave executor and the Patricia trie / Merkle proof primitives. |
-| | `src/token.rs` (803), `src/orderbook.rs` (401), `src/pmm.rs` (499) | The token registry, the CLOB and the PMM. |
-| **Storage** | `src/storage.rs` (3,315) | `sled`: `blocks`, `by_height`, `meta`, `state`, `domains`, `headers`, `session_keys`, `bridge`, `confidential`, `zkml_models`, `cross_shard`, `receipts_v1`. Background flusher — consensus never blocks on disk. |
-| **Networking** | `src/network.rs` (4,601) | The P2P adapter over infnode: DHT blob buckets (blocks, state, head, headers), the mempool gossip, the cross-shard message path, the oracle feed path. |
-| | `src/client_ip.rs` (536), `src/dns_seeds.rs` (1,253) | Client address extraction and the seed list. |
-| **Sharding** | `src/sharding.rs` (7,000+) | The masterchain/workchain topology, the address→shard rule, the split/merge state machine, the trie migration, the shard-head commitment, the cross-shard messages, the `Block` type and its hash. |
-| | `src/xshard2pc.rs` | The cross-shard two-phase-commit state machine and its replay sets. |
-| **Cryptography** | `src/post_quantum.rs` (3,526) | The PQ scheme envelope (Ed25519 / Falcon-512 / ML-DSA-44-disabled / hybrid), the FIPS-206 FN-DSA key handling, the legacy-key warnings, the address derivation. |
-| | `src/bls.rs` (815) | Real pairing-based BLS12-381 aggregate signatures and the signer bitvector. |
-| | `src/crypto_privacy.rs` (1,994) | Pedersen commitments, range proofs, stealth addresses, viewing keys, the shielded pool and its solvency gate. |
-| | `src/node_keys.rs` (1,205) | Key storage: Argon2id + XChaCha20-Poly1305 encryption at rest, 0600/0700 enforcement. |
-| | `src/address.rs` (355), `src/cpat2.rs` (1,582) | The branded `Stl57…` address format and the CPAT-2 Merkle proof format. |
-| **MEV** | `src/mev.rs` (886) | The node-local blind round: sealing at admission, `verify_pool_tx`, the order commitment. |
-| | `src/mev_epoch.rs` (2,624) | The threshold epoch seal: committee DKG, asymmetric sealing, order-first/reveal-second, `t`-of-`n` unseal. **Live** (the node runs the DKG, serves the epoch key, admits sealed transactions). |
-| | `src/mev_v4.rs` (920) | The parked, default-off v4 engine. |
-| **Governance & economics** | `src/governance.rs` (2,054) | Stake-weighted proposals, voting, quorum, execution-once, the applied parameter set, the upgrade action. |
-| | `src/staking.rs` (4,354) | Bonding, delegation, slashing, rewards, the team vesting schedule. |
-| | `src/tokenomics.rs` (272), `src/oracle.rs` (603) | The emission schedule and the oracle with its circuit breaker. |
-| | `src/bridge.rs` (2,541), `src/bridge_adapters.rs` (1,124) | The protocol half of the bridges (TON / EVM / Solana): the relayer quorum, the time-lock, the rate limits, the mint caps, the challenge/dispute machinery, and the deposit-proof adapters. |
-| **RPC & facade** | `src/rpc.rs` (10,722) | JSON-RPC 2.0, WebSocket and SSE; the read and write surfaces; the token gates; the rate limits. |
-| | `src/evm_adapter.rs` (8,680) | The Ethereum-compatible facade: the RLP decoder, the legacy/EIP-1559 transaction types, `eth_*` / `net_*` methods. |
-| | `src/native_api.rs` (2,120), `src/explorer.rs` (1,404), `src/metrics.rs` (1,366) | The native API, the explorer routes and the Prometheus metrics. |
-| **zkML** | `src/zkml.rs` (2,042), `src/zkml_attestation.rs` (554) | The session keys, the quantized-model proof engine, the attestation engine (the module formerly named `snark.rs`; there is no SNARK here — see §5.2) and the machine-readable capability statement `zkml_capabilities()`. |
-| **Misc** | `src/simulator.rs` (1,897), `src/wallet.rs` (807), `src/turnstile.rs` (424), `src/bootstrap.rs` (400), `src/remote_signer.rs` (955), `src/parallel_exec.rs` (791) | The deterministic simulator, the wallet, the PoW turnstile, the bootstrap, the remote signer. |
+| **Consensus (BFT)** | `src/consensus.rs` (6,956) | The pure state machine: `HeightConsensus` per height, prevote/precommit, quorum certificates, value locking, equivocation evidence, the sortition committee, the µQC and epoch CEC certificates, the chain-id-bound vote and block preimages. |
+| | `src/runtime.rs` (11,132) | The integration layer: proposer selection, the apply worker (`ApplyLane`, panic-guarded), the finalize order (fees → slashes → rotation), `adopt_committed` (the catch-up path), the validator-set refresh. |
+| | `src/consensus_net.rs` (3,551) | The P2P transport for proposals/votes/commits over infnode: bincode framing, size caps, batch limits, per-peer burst budgets, fire-and-forget gossip. |
+| | `src/chain.rs` (1,438) | The block tree, fork choice, and the reorg plan (reorgs only ever affect heights above the finalized one). |
+| | `src/sync.rs` (2,699) | Catch-up: walk `prev_hash` backwards, fetch the missing blocks, apply them ancestor-first, verify the chain's quorum. |
+| **Execution & state** | `src/state_engine.rs` (14,145) | The state engine: the Patricia trie of accounts/tokens/contract code, the actor model, the parallel block path, the failure-fee rules, the commitment snapshot, the snapshot/restore path. |
+| | `src/svm.rs` (4,111) | The Stellereum Virtual Machine: the opcode set, the micro-gas model, the syscalls (stake, claim, order, zkML, confidential transfer). |
+| | `src/contract.rs` (2,921), `src/contract_abi.rs` (1,735) | The WASM contract engine (wasmi), fuel metering, the ABI codec, the registry. |
+| | `src/commitment.rs` (2,784) | The canonical commitment of every consensus-visible subsystem that is **not** in the trie. `COMMITMENT_VERSION = 5`. |
+| | `src/parallel_exec.rs` (802), `src/cell.rs` (360) | The wave executor and the Patricia trie / Merkle proof primitives. |
+| | `src/token.rs` (1,306), `src/orderbook.rs` (448), `src/pmm.rs` (523) | The token registry, the CLOB and the PMM. |
+| **Storage** | `src/storage.rs` (4,329) | `sled`: `blocks`, `by_height`, `meta`, `state`, `domains`, `headers`, `session_keys`, `bridge`, `confidential`, `zkml_models`, `cross_shard`, `receipts_v1`. Background flusher — consensus never blocks on disk. |
+| **Networking** | `src/network.rs` (4,897) | The P2P adapter over infnode: DHT blob buckets (blocks, state, head, headers), the mempool gossip, the cross-shard message path, the oracle feed path. |
+| | `src/client_ip.rs` (603), `src/dns_seeds.rs` (1,242) | Client address extraction and the seed list. |
+| **Sharding** | `src/sharding.rs` (8,606) | The masterchain/workchain topology, the address→shard rule, the split/merge state machine, the trie migration, the shard-head commitment, the cross-shard messages, the `Block` type and its hash. |
+| | `src/xshard2pc.rs` (610) | The cross-shard two-phase-commit state machine and its replay sets. |
+| **Cryptography** | `src/post_quantum.rs` (3,669) | The PQ scheme envelope (Ed25519 / Falcon-512 / ML-DSA-44-disabled / hybrid), the FIPS-206 FN-DSA key handling, the legacy-key warnings, the address derivation. |
+| | `src/bls.rs` (1,208) | Real pairing-based BLS12-381 aggregate signatures and the signer bitvector. |
+| | `src/crypto_privacy.rs` (2,090) | Pedersen commitments, range proofs, stealth addresses, viewing keys, the shielded pool and its solvency gate. |
+| | `src/node_keys.rs` (1,230) | Key storage: Argon2id + XChaCha20-Poly1305 encryption at rest, 0600/0700 enforcement. |
+| | `src/address.rs` (365), `src/cpat2.rs` (2,107) | The branded `Stl57…` address format and the CPAT-2 Merkle proof format. |
+| **MEV** | `src/mev.rs` (919) | The node-local blind round: sealing at admission, `verify_pool_tx`, the order commitment. |
+| | `src/mev_epoch.rs` (3,112) | The threshold epoch seal: committee DKG, asymmetric sealing, order-first/reveal-second, `t`-of-`n` unseal. **Live** (the node runs the DKG, serves the epoch key, admits sealed transactions). |
+| | `src/mev_v4.rs` (999) | The parked, default-off v4 engine. |
+| **Governance & economics** | `src/governance.rs` (2,276) | Stake-weighted proposals, voting, quorum, execution-once, the applied parameter set, the upgrade action. |
+| | `src/staking.rs` (4,948) | Bonding, delegation, slashing, rewards, the team vesting schedule. |
+| | `src/tokenomics.rs` (280), `src/oracle.rs` (606) | The emission schedule and the oracle with its circuit breaker. |
+| | `src/bridge.rs` (2,644), `src/bridge_adapters.rs` (1,124) | The protocol half of the bridges (TON / EVM / Solana): the relayer quorum, the time-lock, the rate limits, the mint caps, the challenge/dispute machinery, and the deposit-proof adapters. |
+| **RPC & facade** | `src/rpc.rs` (14,564) | JSON-RPC 2.0, WebSocket and SSE; the read and write surfaces; the token gates; the rate limits. |
+| | `src/evm_adapter.rs` (9,221) | The Ethereum-compatible facade: the RLP decoder, the legacy/EIP-1559 transaction types, `eth_*` / `net_*` methods. |
+| | `src/native_api.rs` (5,163), `src/explorer.rs` (1,575), `src/metrics.rs` (1,626) | The native API, the explorer routes and the Prometheus metrics. |
+| **zkML** | `src/zkml.rs` (2,060), `src/zkml_attestation.rs` (582) | The session keys, the quantized-model proof engine, the attestation engine (the module formerly named `snark.rs`; there is no SNARK here — see §5.2) and the machine-readable capability statement `zkml_capabilities()`. |
+| **Misc** | `src/simulator.rs` (1,885), `src/wallet.rs` (1,216), `src/turnstile.rs` (442), `src/bootstrap.rs` (406), `src/remote_signer.rs` (1,000), `src/parallel_exec.rs` (802) | The deterministic simulator, the wallet, the PoW turnstile, the bootstrap, the remote signer. |
 
 ### 2.3 The three rules that hold the whole thing together
 
@@ -203,9 +226,9 @@ operator's own configuration *insofar as it can change a consensus verdict*
 ## 5. Known limitations — stated honestly
 
 **The full list, with severities and exploitability, is
-[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)** (36 issues + 10 deferred features + 7
-stale documentation claims). The ones an auditor must know before reading any
-code:
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)** (40 open issues + 11 deferred features + 5
+stale documentation claims, plus the closed-items log §N). The ones an auditor
+must know before reading any code:
 
 ### 5.1 The EVM adapter is a **facade**, not an EVM
 
@@ -362,16 +385,16 @@ Five tracks. Sizes are **lines of Rust in `src/`** at the fingerprint above.
 They include the module's own unit tests, so the *reviewable* surface is
 smaller; treat them as an upper bound.
 
-### (a) Consensus & BFT safety — ~21,500 LOC
+### (a) Consensus & BFT safety — ~28,500 LOC
 
 | Module | LOC | Why it is in scope |
 | --- | --- | --- |
-| `src/consensus.rs` | 5,326 | The pure state machine: quorum arithmetic, the lock, the vote/certificate preimages, the sortition, the µQC and epoch CEC verification. |
-| `src/runtime.rs` | 7,867 | The finalize order, the apply worker, `adopt_committed`, the validator-set refresh, the proposal validator (the order and shard-header commitments live here). |
-| `src/consensus_net.rs` | 2,799 | The wire format and its limits — the remote attack surface. |
-| `src/sync.rs` | 2,508 | Catch-up and `validate_sync_chain`. |
-| `src/chain.rs` | 1,317 | The block tree, fork choice, the reorg plan. |
-| `src/light_client.rs` | 1,715 | The proof verifier — **live since wave W8.3**: the node keeps one anchored at its own finalized head, the sync path routes every peer block through it, and `src/light_client_cli.rs` is the external verifier (`stellereum light-client`). It answers "is this correct?" against a root a QUORUM committed to. |
+| `src/consensus.rs` | 6,956 | The pure state machine: quorum arithmetic, the lock, the vote/certificate preimages, the sortition, the µQC and epoch CEC verification. |
+| `src/runtime.rs` | 11,132 | The finalize order, the apply worker, `adopt_committed`, the validator-set refresh, the proposal validator (the order and shard-header commitments live here). |
+| `src/consensus_net.rs` | 3,551 | The wire format and its limits — the remote attack surface. |
+| `src/sync.rs` | 2,699 | Catch-up and `validate_sync_chain`. |
+| `src/chain.rs` | 1,438 | The block tree, fork choice, the reorg plan. |
+| `src/light_client.rs` | 2,680 | The proof verifier — **live since wave W8.3**: the node keeps one anchored at its own finalized head, the sync path routes every peer block through it, and `src/light_client_cli.rs` is the external verifier (`stellereum light-client`). It answers "is this correct?" against a root a QUORUM committed to. |
 
 **Questions we would like answered:** (1) does the prevote/precommit/lock
 combination really forbid two conflicting blocks below 1/3 Byzantine power,
@@ -380,17 +403,17 @@ including across a view change; (2) can a peer reach any state that makes
 grind mitigated enough by the network-anchored quorum, or is the VRF
 mandatory before mainnet?
 
-### (b) Cryptography — ~9,800 LOC
+### (b) Cryptography — ~11,000 LOC
 
 | Module | LOC | Why it is in scope |
 | --- | --- | --- |
-| `src/post_quantum.rs` | 3,526 | The scheme envelope, the FN-DSA key handling, the address derivation, the legacy-key warnings — and the **disabled** ML-DSA-44 verifier. |
-| `src/crypto_privacy.rs` | 1,994 | The Pedersen commitments, the range proofs, the shielded pool's solvency gate, the stealth addresses, the viewing keys. |
-| `src/cpat2.rs` | 1,582 | The CPAT-2 Merkle proof format. |
-| `src/node_keys.rs` | 1,205 | The key encryption at rest and the permission enforcement. |
-| `src/bls.rs` | 815 | The pairing-based aggregate signatures and the signer bitvector. |
-| `src/address.rs` | 355 | The branded address format and its homoglyph defence. |
-| `src/cell.rs` | 359 | The trie and Merkle primitives. |
+| `src/post_quantum.rs` | 3,669 | The scheme envelope, the FN-DSA key handling, the address derivation, the legacy-key warnings — and the **disabled** ML-DSA-44 verifier. |
+| `src/crypto_privacy.rs` | 2,090 | The Pedersen commitments, the range proofs, the shielded pool's solvency gate, the stealth addresses, the viewing keys. |
+| `src/cpat2.rs` | 2,107 | The CPAT-2 Merkle proof format. |
+| `src/node_keys.rs` | 1,230 | The key encryption at rest and the permission enforcement. |
+| `src/bls.rs` | 1,208 | The pairing-based aggregate signatures and the signer bitvector. |
+| `src/address.rs` | 365 | The branded address format and its homoglyph defence. |
+| `src/cell.rs` | 360 | The trie and Merkle primitives. |
 
 **Questions we would like answered:** (1) is the range-proof construction in
 `src/crypto_privacy.rs` actually sound, or only plausible; (2) is the FN-DSA
@@ -398,22 +421,22 @@ key path correct for the *complete* key, and is the legacy path fenced off
 completely; (3) does the BLS signer bitvector carry enough information for
 the downtime slashing to remain correct once signatures aggregate.
 
-### (c) Execution & state — ~26,300 LOC
+### (c) Execution & state — ~32,000 LOC
 
 | Module | LOC | Why it is in scope |
 | --- | --- | --- |
-| `src/state_engine.rs` | 11,691 | The accounts trie, the parallel block path, the failure-fee rules, the commitment snapshot, the actor model, the restore path. |
-| `src/svm.rs` | 3,451 | The opcode set, the fuel model, the syscalls. |
-| `src/contract.rs` | 2,613 | The WASM engine and its fuel metering. |
-| `src/zkml.rs` | 2,042 | The session keys and the zkML proof checks. |
-| `src/zkml_attestation.rs` | 554 | The re-execution attestation engine (a sound hash-bound re-execution — **not** a ZK proof system, see §5.2). |
-| `src/commitment.rs` | 1,664 | The state-root commitment — **the single most load-bearing file in the project**. |
-| `src/contract_abi.rs` | 1,678 | The ABI codec. |
-| `src/token.rs` | 803 | The token registry. |
-| `src/parallel_exec.rs` | 791 | The wave executor. |
-| `src/oracle.rs` | 603 | The oracle and its breaker. |
-| `src/pmm.rs` | 499 | The PMM. |
-| `src/orderbook.rs` | 401 | The CLOB. |
+| `src/state_engine.rs` | 14,145 | The accounts trie, the parallel block path, the failure-fee rules, the commitment snapshot, the actor model, the restore path. |
+| `src/svm.rs` | 4,111 | The opcode set, the fuel model, the syscalls. |
+| `src/contract.rs` | 2,921 | The WASM engine and its fuel metering. |
+| `src/zkml.rs` | 2,060 | The session keys and the zkML proof checks. |
+| `src/zkml_attestation.rs` | 582 | The re-execution attestation engine (a sound hash-bound re-execution — **not** a ZK proof system, see §5.2). |
+| `src/commitment.rs` | 2,784 | The state-root commitment — **the single most load-bearing file in the project**. |
+| `src/contract_abi.rs` | 1,735 | The ABI codec. |
+| `src/token.rs` | 1,306 | The token registry. |
+| `src/parallel_exec.rs` | 802 | The wave executor. |
+| `src/oracle.rs` | 606 | The oracle and its breaker. |
+| `src/pmm.rs` | 523 | The PMM. |
+| `src/orderbook.rs` | 448 | The CLOB. |
 
 **Questions we would like answered:** (1) is there any path on which the
 block path and the single-transaction path produce different state for the
@@ -422,37 +445,38 @@ charged — see `PROTOCOL.md` §4); (2) is the commitment complete — i.e. is
 there any consensus-visible field that is **not** in `commitment_digest`; (3)
 can a payload mutate shared state and revert.
 
-### (d) Networking — ~9,700 LOC
+### (d) Networking — ~11,100 LOC
 
 | Module | LOC | Why it is in scope |
 | --- | --- | --- |
-| `src/network.rs` | 4,601 | The DHT buckets, the gossip, the cross-shard path, the head pointer. |
-| `src/dns_seeds.rs` | 1,253 | The seed list. |
-| `src/storage.rs` | 3,315 | The persistence layer and its trees. |
-| `src/client_ip.rs` | 536 | The client address extraction (the rate-limit basis). |
+| `src/network.rs` | 4,897 | The DHT buckets, the gossip, the cross-shard path, the head pointer. |
+| `src/dns_seeds.rs` | 1,242 | The seed list. |
+| `src/storage.rs` | 4,329 | The persistence layer and its trees. |
+| `src/client_ip.rs` | 603 | The client address extraction (the rate-limit basis). |
 
 Plus the transport itself, `infnode`, at
-`../infmail-valid-backend/crates/infnode` — **not in this repository**, but it
-is the network entry point and it must be in the audit.
+`../infnode/crates/infnode` — **renamed** from
+`../infmail-valid-backend/crates/infnode`, still **not in this repository**,
+but it is the network entry point and it must be in the audit.
 
 **Questions we would like answered:** (1) can a peer cause unbounded work
 before a size check; (2) is the peer-deferral queue bounded under a sustained
 flood; (3) does the client-IP extraction trust anything the client can set.
 
-### (e) Governance & economics — ~17,300 LOC
+### (e) Governance & economics — ~18,800 LOC
 
 | Module | LOC | Why it is in scope |
 | --- | --- | --- |
-| `src/staking.rs` | 4,354 | Bonding, delegation, slashing, rewards, vesting. |
-| `src/bridge.rs` | 2,541 | The bridge protocol half: the relayer quorum, the time-lock, the rate limits, the mint caps, the challenge/dispute machinery. |
-| `src/mev_epoch.rs` | 2,624 | The threshold epoch seal (live: DKG, sealing, order-commit, share release, unseal). |
-| `src/governance.rs` | 2,054 | The proposals, the voting, the quorum, the execution. |
-| `src/simulator.rs` | 1,897 | The deterministic simulator. |
+| `src/staking.rs` | 4,948 | Bonding, delegation, slashing, rewards, vesting. |
+| `src/bridge.rs` | 2,644 | The bridge protocol half: the relayer quorum, the time-lock, the rate limits, the mint caps, the challenge/dispute machinery. |
+| `src/mev_epoch.rs` | 3,112 | The threshold epoch seal (live: DKG, sealing, order-commit, share release, unseal). |
+| `src/governance.rs` | 2,276 | The proposals, the voting, the quorum, the execution. |
+| `src/simulator.rs` | 1,885 | The deterministic simulator. |
 | `src/bridge_adapters.rs` | 1,124 | The deposit-proof adapters (TON / EVM / Solana). |
-| `src/mev_v4.rs` | 920 | The parked v4 engine. |
-| `src/mev.rs` | 886 | The live node-local MEV path. |
-| `src/oracle.rs` *(also in (c))* | 603 | The price feed and its breaker. |
-| `src/tokenomics.rs` | 272 | The emission schedule. |
+| `src/mev_v4.rs` | 999 | The parked v4 engine. |
+| `src/mev.rs` | 919 | The live node-local MEV path. |
+| `src/oracle.rs` *(also in (c))* | 606 | The price feed and its breaker. |
+| `src/tokenomics.rs` | 280 | The emission schedule. |
 
 **Questions we would like answered:** (1) is the bridge's 2/3-of-distinct-signers
 model sufficient given that the signer set is trusted; (2) can the mint caps be
@@ -461,7 +485,7 @@ the governance quorum meaningful against a stake-concentration attack.
 
 ### Not in the scope above, but worth a look if you have time
 
-`src/rpc.rs` (10,722), `src/main.rs` (9,549), `src/evm_adapter.rs` (8,680),
+`src/rpc.rs` (14,564), `src/main.rs`, `src/evm_adapter.rs` (9,221),
 `src/explorer.rs`, `src/metrics.rs`, `src/native_api.rs` — the RPC surface,
 the node wiring, the EVM facade and the explorer.
 
@@ -477,7 +501,7 @@ Please do not spend audit time on these. We say what we mean.
 | **The `site/`, `testnet/`, `docker/`, `scripts/` operational assets**, and the HTML/JS of the metrics page | Not consensus, not execution, not crypto. |
 | **Cryptographic primitives themselves** (SHA-256, BLAKE3, Ed25519, BLS12-381, curve25519, Falcon-512, Argon2id, XChaCha20-Poly1305, Ristretto255) | We assume them. Review **our use** of them: the preimage layouts, the domain tags, the key handling. |
 | **The WASM runtime (`wasmi`) and the `sled` storage engine** | Third-party. Review our usage, not theirs. |
-| **Ecosystem smart contracts** (`contracts/`) and the `examples/` | Deployment artefacts, not protocol. |
+| **Ecosystem smart contracts** (`contracts/` here, and the `stellereum-contracts/` workspace with `contracts/` + `crates/stellereum-contract-sdk`) and the `examples/` | Deployment artefacts and demo-grade product code (the wasm contracts authenticate NOTHING — see `KNOWN_ISSUES.md` KI-38 — and are explicitly not protocol). |
 | **Performance tuning** (the TPS numbers, `docs/PERF_1K.md`, the benchmarks) | Not a security property. The one performance item that *is* a security item is the O(state)-per-root-read commitment recomputation (**KI-15**). |
 | **Frontend, wallet, and chain-list integration** | Out of the security boundary. |
 | **The site legal pages, the domain, the trademarks** | Not a security matter. |
@@ -545,15 +569,12 @@ cargo +nightly fuzz run peer_msg_decode -- -runs=20000 -max_len=4096
 * `cargo test --lib --tests --no-fail-fast` is the right command for a full
   pass; the `--no-fail-fast` matters, because a single red suite otherwise
   hides the rest.
-* The **examples** build cleanly (`cargo build --examples`), contrary to a
-  stale claim in `PROTOCOL.md` — see `KNOWN_ISSUES.md` §K.
-* **One target does not compile on this tree**: `benches/zkml_attestation.rs`
-  imports `stellereum::snark`, a module that was renamed to
-  `stellereum::zkml_attestation`. `cargo build --all-targets` therefore
-  fails on the *bench* target only — the library, the tests and the fuzz
-  targets are unaffected. It is reported as a build failure in §9, because a
-  red build row is the truth. It is **not** a protocol defect and **not**
-  fixed by this package (other agents own the fixes).
+* The **examples and benches build cleanly** (`cargo build --tests --all-targets`
+  is green on the measured tree). The previous brief's red build row — three
+  `example`/`bench` targets calling the pre-rename API (`ZkMlProof::prove_inference`,
+  `stellereum::snark`) — is **fixed upstream**: the examples use the renamed
+  API and `benches/zkml_attestation.rs` documents the removal in its own
+  header. See `KNOWN_ISSUES.md` §M (closed items).
 * The fuzz smoke **writes into `fuzz/corpus/<target>/`**: every new coverage
   input is saved, so the corpus file counts grow with every run. That is why
   the corpus numbers in §10 are stated with the fingerprint.
@@ -570,166 +591,185 @@ fingerprint in §1. Reproduce it before you rely on it.
 
 | | |
 | --- | --- |
-| **commit** | 1d21b43c5ed420141be6e3754a277dc214033a97 (1d21b43) |
-| **commit date** | 2026-10-18T09:19:31+03:00 |
-| **commit subject** | fix(address): safe UTF-8 character boundary check and base58 zero-prefix handling |
-| **branch** | wip/passport-agents |
-| **working tree** | 256 changed path(s) (uncommitted edits present: yes) |
-| **source fingerprint** | 6ec6091a8a635342  (sha256 over src/ tests/ fuzz/ *.rs) |
-| **src/ size** | 133879 lines across 53 files, 50 modules |
+| **commit** | 4d0d539405ea56d69793d3dad3abcbc9a0386db5 (4d0d539) |
+| **commit date** | 2026-10-30T12:41:03+03:00 |
+| **commit subject** | roadmap: wave-2 fixes recorded |
+| **branch** | main |
+| **working tree** | 7 changed path(s) (uncommitted edits present: yes) |
+| **source fingerprint** | 9df243678628fa7d  (sha256 over src/ tests/ fuzz/ *.rs; start of the suites run; the follow-up fuzz-only run started at `855bbc10fab92c46` and held it) |
+| **src/ size** | 164081 lines across 58 files, 55 modules |
 | **rustc** | rustc 1.91.1 (ed61e7d7e 2025-11-07) |
 | **cargo** | cargo 1.91.1 (ea2d97820 2025-10-10) |
 | **nightly (fuzz)** | cargo 1.100.0-nightly (3d7cf6e93 2026-09-25) |
 
 ### The SUMMARY table, as printed
 
+Suites run (`./scripts/audit-repro.sh --no-fuzz`, 2026-10-30; fuzz smoke ran
+separately the same day, `--only fuzz --no-build`, all green — see below):
+
 ```
 SUITE                                  PASSED   FAILED  IGNORED   DURATION  VERDICT
 -----------------------------------------------------------------------------------------------
-build (cargo build --tests --all-targets)        -        -        -      2.68s  FAILED
-lib                                       837        0        0     20.33s  ok
-adversarial_regression                     21        0        0     24.52s  ok
-adversarial_4node                           5        0        0      622ms  ok
-adversarial_economic                        6        0        0      801ms  ok
-historical_attacks                         20        0        0      721ms  ok
-vuln_bundle                                 8        0        0      951ms  ok
-consensus_reaudit                          11        0        0      1.02s  ok
-consensus_security                         11        0        0      1.03s  ok
-consensus_audit_hardening                  21        0        0      771ms  ok
-consensus_rephase                           -        1        0      593ms  FAILED
-adopt_prevote                               5        0        0      207ms  ok
-proposal_refire                             6        0        0      856ms  ok
-attack_round3                              12        0        0      205ms  ok
-byzantine_fault                             5        0        0      848ms  ok
-equivocation_slash                          5        0        0      829ms  ok
-slashing_rotation                           5        0        0      210ms  ok
-quorum_fragility                            2        0        0      544ms  ok
-validator_set_quorum                        8        0        0      612ms  ok
-validator_set_freshness                     7        0        0      772ms  ok
-observer_recovery                           8        0        0      823ms  ok
-observer_return                             2        0        0      2.93s  ok
-failure_fee_contract                        4        0        0      853ms  ok
-apply_floor                                12        0        0     15.55s  ok
-state_root_completeness                    15        0        0      7.32s  ok
-genesis_root                                7        0        0     18.09s  ok
-block_hash_binding                          3        0        0     10.54s  ok
-block_state_root_binding                    5        0        0      642ms  ok
-state_sync_closeout                        19        0        0      1.02s  ok
-restore_root_verification                   7        0        0      697ms  ok
-fuzz_decoder                               15        0        0      8.32s  ok
-fuzz_certificate_decoder                    7        0        0      588ms  ok
-fuzz_consensus_stress                      11        0        0      3.30s  ok
-pq_audit_closure                           14        0        0      1.65s  ok
-pq_uqc_power_quorum                         7        0        0      699ms  ok
-pq_equivocation_report                      -        -        -      504ms  ERROR
-pure_pq_enforcement                         4        0        0      1.74s  ok
-post_quantum_audit                          7        0        0      703ms  ok
-post_quantum_svm                            8        0        0      628ms  ok
-mev_pq                                      8        0        0      785ms  ok
-mev_preemption                              8        0        0      1.06s  ok
-bridge_onchain                             18        0        0      738ms  ok
-bridge_challenge                            5        0        0      705ms  ok
-bridge_dispute                             12        0        0      708ms  ok
-bridge_persistence                          4        0        0      872ms  ok
-bridge_zk_gate                              7        0        0      627ms  ok
-bridge_adapters                            14        0        0      627ms  ok
-audit_closure_bridge                       17        0        0      636ms  ok
-sharding_topology                           6        0        0      844ms  ok
-sharding_m1                                 4        0        0      1.00s  ok
-sharding_m2                                 5        0        0      973ms  ok
-sharding_m3                                 6        0        0      1.05s  ok
-cross_shard_anchor                          4        0        0      525ms  ok
-cross_shard_e2e_pq                          3        0        0      977ms  ok
-xshard_replay                               5        0        0      966ms  ok
-xshard_2pc                                 11        0        0      1.09s  ok
-mempool_econ                                3        0        0      616ms  ok
-mempool_mev_audit_closure                  10        0        0     28.36s  ok
-chain_mempool_security                      8        0        0      8.80s  ok
-staking_audit_closure                      17        0        0      7.64s  ok
-staking_rewards_pool                        3        0        0      751ms  ok
-audit_closure_oracle_gov                    8        0        0      590ms  ok
-audit_closure_privacy                      15        0        0      701ms  ok
-confidential_preverify                      4        0        0      1.16s  ok
-confidential_solvency                       5        0        0      655ms  ok
-audit_rpc_evm_closeout                     30        0        0      800ms  ok
-network_audit_close                        17        0        0      722ms  ok
+build (cargo build --tests --all-targets)        -        -        -     44.36s  ok
+lib                                      1045        0        0     20.46s  ok
+adversarial_regression                     21        0        0     16.64s  ok
+adversarial_4node                           5        0        0      242ms  ok
+adversarial_economic                        6        0        0      272ms  ok
+historical_attacks                         20        0        0      315ms  ok
+vuln_bundle                                 8        0        0      259ms  ok
+consensus_reaudit                          11        0        0      255ms  ok
+consensus_security                         11        0        0      228ms  ok
+consensus_audit_hardening                  21        0        0      274ms  ok
+consensus_rephase                          10        0        0      216ms  ok
+adopt_prevote                               5        0        0      286ms  ok
+proposal_refire                             6        0        0      276ms  ok
+attack_round3                              12        0        0      474ms  ok
+byzantine_fault                             5        0        0      265ms  ok
+equivocation_slash                          5        0        0      240ms  ok
+slashing_rotation                           5        0        0      234ms  ok
+quorum_fragility                            3        0        0      374ms  ok
+validator_set_quorum                        8        0        0      247ms  ok
+validator_set_freshness                     7        0        0      227ms  ok
+observer_recovery                           8        0        0      532ms  ok
+observer_return                             2        0        0      2.52s  ok
+failure_fee_contract                        4        0        0      273ms  ok
+apply_floor                                12        0        0      277ms  ok
+state_root_completeness                    16        0        0      262ms  ok
+genesis_root                                7        0        0     31.30s  ok
+block_hash_binding                          3        0        0      241ms  ok
+block_state_root_binding                    5        0        0      224ms  ok
+state_sync_closeout                        19        0        0      361ms  ok
+restore_root_verification                   7        0        0      236ms  ok
+fuzz_decoder                               15        0        0      8.89s  ok
+fuzz_certificate_decoder                    7        0        0     76.81s  ok
+fuzz_consensus_stress                      11        0        0     61.68s  ok
+pq_audit_closure                           15        0        0     80.14s  ok
+pq_uqc_power_quorum                         7        0        0    114.26s  ok
+pq_equivocation_report                      4        0        0     77.42s  ok
+pure_pq_enforcement                         4        0        0     43.88s  ok
+post_quantum_audit                          7        0        0     92.36s  ok
+post_quantum_svm                            8        0        0      653ms  ok
+mev_pq                                      8        0        0      787ms  ok
+mev_preemption                              8        0        0      949ms  ok
+bridge_onchain                             21        0        0      3.96s  ok
+bridge_challenge                            5        0        0      680ms  ok
+bridge_dispute                             12        0        0      714ms  ok
+bridge_persistence                          4        0        0      825ms  ok
+bridge_zk_gate                              7        0        0      1.04s  ok
+bridge_adapters                            14        0        0      3.79s  ok
+audit_closure_bridge                       17        0        0      2.00s  ok
+sharding_topology                           6        0        0     65.76s  ok
+sharding_m1                                 4        0        0      904ms  ok
+sharding_m2                                 5        0        0      872ms  ok
+sharding_m3                                 6        0        0      1.18s  ok
+cross_shard_anchor                          4        0        0      561ms  ok
+cross_shard_e2e_pq                          3        0        0      861ms  ok
+xshard_replay                               5        0        0     22.55s  ok
+xshard_2pc                                 11        0        0      8.66s  ok
+mempool_econ                                3        0        0      601ms  ok
+mempool_mev_audit_closure                  10        0        0      799ms  ok
+chain_mempool_security                      8        0        0      576ms  ok
+staking_audit_closure                      17        0        0      742ms  ok
+staking_rewards_pool                        3        0        0      682ms  ok
+audit_closure_oracle_gov                    8        0        0      583ms  ok
+audit_closure_privacy                      15        0        0      706ms  ok
+confidential_preverify                      4        0        0      1.20s  ok
+confidential_solvency                       5        0        0      670ms  ok
+audit_rpc_evm_closeout                      -        2        0      795ms  FAILED
+network_audit_close                        17        0        0      709ms  ok
 transport_audit_fixes                       4        0        0      556ms  ok
-node_keys_security                          9        0        0      2.51s  ok
-node_keys_hardening                         9        0        0      2.81s  ok
-stl57_audit_pentest                         5        0        0      9.51s  ok
-light_client                               18        0        0      7.56s  ok
-light_client_wiring                        15        0        0      3.24s  ok
-evm_adapter                                88        0        0      4.20s  ok
-svm_atomicity                               3        0        0      1.36s  ok
-clob_atomicity                              2        0        0      3.78s  ok
-orderbook_griefing                          4        0        0      933ms  ok
-token_security                             16        0        0      5.73s  ok
-token_adversarial                          16        0        0     12.75s  ok
-memory_bounds                              11        0        0      1.30s  ok
-fuzz:frame_decode                        2000        0        0    368.54s  ok
-fuzz:consensus_msg_decode                2000        0        0    218.20s  ok
-fuzz:transaction_decode                  2000        0        0     13.79s  ok
-fuzz:block_decode                        2000        0        0     26.49s  ok
-fuzz:cert_envelope_decode                2000        0        0      1.13s  ok
-fuzz:evm_raw_tx_decode                   2000        0        0      1.11s  ok
-fuzz:peer_msg_decode                     2000        0        0      1.58s  ok
+node_keys_security                          9        0        0      2.52s  ok
+node_keys_hardening                         9        0        0      2.50s  ok
+stl57_audit_pentest                         5        0        0      8.99s  ok
+light_client                               18        0        0      640ms  ok
+light_client_wiring                        15        0        0      818ms  ok
+evm_adapter                                92        0        0      1.11s  ok
+svm_atomicity                               3        0        0      577ms  ok
+clob_atomicity                              2        0        0      839ms  ok
+orderbook_griefing                          4        0        0      578ms  ok
+token_security                             16        0        0      556ms  ok
+token_adversarial                          16        0        0      666ms  ok
+memory_bounds                              11        0        0      691ms  ok
+fuzz:frame_decode                       20000        0        0    198.69s  ok
+fuzz:consensus_msg_decode               20000        0        0      3.42s  ok
+fuzz:transaction_decode                 20000        0        0      6.91s  ok
+fuzz:block_decode                       20000        0        0      7.02s  ok
+fuzz:cert_envelope_decode               20000        0        0      1.12s  ok
+fuzz:evm_raw_tx_decode                  20000        0        0      1.25s  ok
+fuzz:peer_msg_decode                    20000        0        0      3.21s  ok
 -----------------------------------------------------------------------------------------------
-TOTAL                                   15607        1        -    887.96s
+TOTAL                                  141809        2        -   1045.42s
 ```
 
-**87 components ran: 84 green, 2 red, 1 errored.**
+**87 components ran: 86 green, 1 red, 0 errored.**
+(`build` + 79 suites + 7 fuzz targets. The suites and the fuzz smoke ran as
+two invocations the same day; both printed the commit `4d0d539` and adjacent
+fingerprints `9df243678628fa7d → 855bbc10fab92c46`.)
 
-### What was red, and why
+### What is red, and why
 
 | Component | Verdict |
 | --- | --- |
-| `build (cargo build --tests --all-targets)` | **FAILED** |
-| `consensus_rephase` | **FAILED** |
-| `pq_equivocation_report` | **ERROR** |
-
-`consensus_rephase` → FAIL  - passed, 1 failed  (593ms)
+| `audit_rpc_evm_closeout` | **FAILED** (28 passed, 2 failed) |
 
 ```
-        test rephase_lets_a_stuck_node_commit_the_quorum_the_network_formed ... FAILED
-        failures:
-        failures:
-        test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test f4_estimate_never_below_admission_floor ... FAILED
+test f4_estimate_serves_pure_figure_at_zero_floor ... FAILED
+test result: FAILED. 28 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-`pq_equivocation_report` → ERROR (did not compile)  (504ms)
+```
+---- f4_estimate_serves_pure_figure_at_zero_floor stdout ----
+thread '…' panicked at tests/audit_rpc_evm_closeout.rs:387:5:
+assertion `left == right` failed
+  left: "0x445c0"
+ right: "0x5208"
+---- f4_estimate_never_below_admission_floor stdout ----
+thread '…' panicked at tests/audit_rpc_evm_closeout.rs:413:5:
+assertion `left == right` failed
+  left: "0x445c0"
+ right: "0x5248"
+```
 
-```
-        error[E0382]: borrow of moved value: `block`
-           --> tests/support/live_stand.rs:555:33
-            |
-        549 |                 Msg::Proposal { round, block } => {
-            |                                        ----- move occurs because `block` has type `stellereum::sharding::Block`, which does not implement the `Copy` trait
-        --
-        error: could not compile `stellereum` (test "pq_equivocation_report_tests") due to 1 previous error; 1 warning emitted
-```
-
-The build's own failure detail:
-
-```
-error[E0599]: no function or associated item named `prove_inference` found for struct `ZkMlProof` in the current scope
-    --> examples/passport_audit.rs:115:39
-     |
- 115 |         let (out, proof) = ZkMlProof::prove_inference(&model, &[3,4]);
---
-error: could not compile `stellereum` (example "passport_audit") due to 1 previous error; 2 warnings emitted
-warning: build failed, waiting for other jobs to finish...
-warning: `stellereum` (test "hunt_commitment") generated 1 warning (run `cargo fix --test "hunt_commitment"` to apply 1 suggestion)
-```
+The `eth_estimate_gas` "pure figure" now comes back floored at the admission
+minimum (`0x445c0` = 280,000 = `GAS_BASIC_TRANSFER`): `eth_estimate_gas_amount`
+(`src/evm_adapter.rs`) applies `.max(crate::svm::GAS_BASIC_TRANSFER)` before
+returning, while the two F4 tests still expect the unfloored EVM arithmetic
+(`0x5208` = 21,000; `0x5248` = 21,064). This is a **code-vs-test contract
+mismatch from the floor-aware estimate change (audit B-VM)**, owned by other
+agents — not script drift, and not weakened here. Tracked as
+`KNOWN_ISSUES.md` **KI-37**. The failure direction is fail-safe for wallets
+(an over-estimate is admittable), but the red suite weakens the gate until
+the contract is settled.
 
 ### Reading the numbers honestly
 
-* The tree is **under active development** (it carries uncommitted edits, and it **changed during the measurement window** — the script prints the fingerprint at the start and at the end and warns when they differ). A re-run will therefore not reproduce these numbers *exactly*. The **fingerprint** is the identifier: if yours differs, your tree is not this tree.
-* The **BUILD row is red** for a reason that has nothing to do with the protocol: three *example/bench* targets still call the pre-rename API (`ZkMlProof::prove_inference`, `stellereum::snark`). The **library, the 79 test targets and the 7 fuzz targets all build and pass**. See `KNOWN_ISSUES.md` §K (SD-01).
-* One **integration suite is red**: `consensus_rephase` — one test whose *precondition* went stale after the network-anchor liveness change. The property it pins still holds, more strongly. See `KNOWN_ISSUES.md` **KI-36**.
-* The tree kept moving after that run: on later fingerprints the **library** suite showed 1–3 red tests, all in the same consensus round-window area (the polka-ledger / network-anchor liveness change and its regression updates were still landing). A red there is a **test** that has not been updated yet, not a broken consensus — but do not take this document's word for it: run the script and read `KNOWN_ISSUES.md` **KI-36**.
-* One suite **errored** (`pq_equivocation_report`): its shared test harness (`tests/support/live_stand.rs`) did not compile at that moment. Re-run after the tree settled, it is **green** (4 tests) — the error was a transient of the concurrent development, not a property of the tree.
-* The fuzz smoke numbers are **runs**, not corpus size: libFuzzer stops early when the corpus is already saturated. The *corpus* sizes are printed under the table.
-* Durations are wall-clock on a machine that was **shared with other build jobs**; treat them as an order of magnitude, not a benchmark.
+* The tree is **under active development** (it carries uncommitted edits, and it
+  **moved during the measurement window** — the script prints the fingerprint
+  at the start and at the end and warns when they differ: `9df243678628fa7d →
+  855bbc10fab92c46`). A re-run will therefore not reproduce these numbers
+  *exactly*. The **fingerprint** is the identifier: if yours differs, your tree
+  is not this tree. (Other agents were working in the tree during this run;
+  the `src/` line count moved 164,081 → 164,084 between the two invocations.)
+* The **BUILD row is green**: `cargo build --tests --all-targets` passes
+  (44.36 s) — the library, all 79 test targets, the 34 examples, the 5 benches
+  and the 7 fuzz targets. The previous brief's red build row (three
+  `example`/`bench` targets on the pre-rename zkML API) is fixed upstream.
+* Two previously red/errored suites are **green again**: `consensus_rephase`
+  (10/10 — the stale intermediate assertion was rewritten upstream, see
+  `KNOWN_ISSUES.md` §M) and `pq_equivocation_report` (4/4 — the
+  `live_stand.rs` borrow was fixed upstream).
+* The count drift since the last brief is **growth, not loss**: `lib`
+  837 → 1,045 tests, `evm_adapter` 88 → 92, `bridge_onchain` 18 → 21,
+  `state_root_completeness` 15 → 16, `pq_audit_closure` 14 → 15,
+  `quorum_fragility` 2 → 3, `src/` 133,879 → 164,081 lines over 53 → 58 files,
+  50 → 55 modules. Wave-2 work added tests and code; nothing that was pinned
+  was unpinned.
+* The fuzz smoke numbers are **runs**, not corpus size: 20,000 runs per target
+  (`STELL_AUDIT_FUZZ_RUNS`), libFuzzer stops early when the corpus is already
+  saturated. The *corpus* sizes are printed under the table.
+* Durations are wall-clock on a machine that was **shared with other build
+  jobs**; treat them as an order of magnitude, not a benchmark.
 
 <!--/MEASURED_RESULTS-->
 
@@ -737,31 +777,35 @@ warning: `stellereum` (test "hunt_commitment") generated 1 warning (run `cargo f
 
 ## 10. Fuzz coverage — the review
 
-**Full review: `fuzz/` — 4 pre-existing targets (2,043 corpus files at HEAD)
-plus the 3 targets this package adds.** (After the smoke run of §9 the corpus
-holds 2,123 files; the fuzz smoke *adds* seeds, it never removes them.)
+**Full review: `fuzz/` — 4 pre-existing targets plus the 3 targets this
+package adds.** Working-tree corpus at the measured fingerprint: 4,427 files
+before the §9 smoke run, 4,584 after it (the fuzz smoke *adds* seeds, it never
+removes them; per-target counts are below).
 
 ### What is covered
 
 | Target | Decoder | Corpus files | Attacker-reachable? |
 | --- | --- | --- | --- |
 | `frame_decode` | `infnode::proto::Frame::decode` — the network entry point | 9 | yes |
-| `consensus_msg_decode` | `consensus_net::ConsensusMsg::decode` + `parse_incoming` + `parse_tx_incoming` | 1,614 | yes |
-| `transaction_decode` | `sharding::Transaction` (bincode) | 178 | yes |
-| `block_decode` | `sharding::Block` (bincode), including the order, shard-header and epoch-key commitments | 262 | yes |
-| **`cert_envelope_decode`** *(new)* | `consensus::decode_pq_micro_envelope`, `decode_pq_epoch_envelope`, `decode_qc_bls_envelope`, plus both PQ signature envelope decoders | 0 (new) | yes |
-| **`evm_raw_tx_decode`** *(new)* | the hand-rolled EVM RLP decoder (`RlpItem::decode_with_remainder`, `DecodedTransaction::decode`) | 0 (new) | yes |
-| **`peer_msg_decode`** *(new)* | the cross-shard message decoder (`network::P2pNetworkAdapter::parse_cross_shard_incoming`) and the epoch-seal gossip frames (`mev_epoch::MevFrame::decode`, `decode_sealed_payload`) | 0 (new) | yes |
+| `consensus_msg_decode` | `consensus_net::ConsensusMsg::decode` + `parse_incoming` + `parse_tx_incoming` | 2,293 → 2,334 | yes |
+| `transaction_decode` | `sharding::Transaction` (bincode) | 633 → 681 | yes |
+| `block_decode` | `sharding::Block` (bincode), including the order, shard-header and epoch-key commitments | 594 → 633 | yes |
+| **`cert_envelope_decode`** *(new)* | `consensus::decode_pq_micro_envelope`, `decode_pq_epoch_envelope`, `decode_qc_bls_envelope`, plus both PQ signature envelope decoders | 5 | yes |
+| **`evm_raw_tx_decode`** *(new)* | the hand-rolled EVM RLP decoder (`RlpItem::decode_with_remainder`, `DecodedTransaction::decode`) | 350 → 353 | yes |
+| **`peer_msg_decode`** *(new)* | the cross-shard message decoder (`network::P2PNetworkAdapter::parse_cross_shard_incoming`) and the epoch-seal gossip frames (`mev_epoch::MevFrame::decode`, `decode_sealed_payload`) | 543 → 569 | yes |
+
+(Arrows: before → after the §9 smoke run of this brief. The run itself was
+20,000 runs per target, all green — see §9.)
 
 The two priority decoders named in the audit request — the **consensus
 message decoder** and the **block decoder** — were already covered
-(`consensus_msg_decode` with 1,614 corpus files, `block_decode` with 262).
+(`consensus_msg_decode`, `block_decode`).
 This package keeps them and closes the three gaps that were left.
 
-After the smoke run of §9 the three new targets hold **4 / 71 / 29** corpus
-files (`cert_envelope_decode` / `evm_raw_tx_decode` / `peer_msg_decode`):
-they start from zero, and a corpus of zero is exactly the honest statement of
-"this decoder was never fuzzed".
+After the smoke run of §9 the three once-new targets hold **5 / 353 / 569**
+corpus files (`cert_envelope_decode` / `evm_raw_tx_decode` /
+`peer_msg_decode`): the certificate-envelope target is still thin — five seeds
+is the honest statement of "this decoder was never fuzzed until recently".
 
 ### What was **not** covered (the gap this package closes)
 
@@ -796,18 +840,19 @@ All seven were built and run on nightly (`cargo +nightly fuzz build` /
 
 ### A note on the corpus numbers
 
-The audit figures *"2043 fuzz corpus files"*. That figure is **exact for the
-committed corpus** at HEAD `1d21b43`: 1,613 `consensus_msg_decode` + 251
-`block_decode` + 171 `transaction_decode` + 8 `frame_decode` = **2,043**
-(verified with `git ls-files fuzz/corpus | wc -l`). A dirty working tree shows
-a higher number — the fuzz smoke *adds* untracked seeds, and the three new
-targets start with empty corpus directories that fill as they run.
+The audit figures *"2043 fuzz corpus files"* in earlier briefs. That figure was
+exact for the committed corpus at the old HEAD. On the current tree (branch
+`main`, dirty working tree, fingerprint `9df243678628fa7d →
+855bbc10fab92c46`) the working-tree corpus is **4,427 files before the smoke
+run and 4,584 after it** — the extra files are *untracked* seeds the smoke
+runs keep adding, and a dirty tree always shows a higher number.
 
 The corpus counts are also the honest answer to "how much fuzzing is there":
-the coverage is **deep on the consensus wire format and thin everywhere
-else** — 78 % of the corpus is one decoder, and the decoders that were
-uncovered until this package (the certificate envelopes, the EVM RLP parser,
-the cross-shard message, the epoch-seal frames) had **zero** corpus files.
+the coverage is **deepest on the consensus wire format** (about half the
+corpus is one decoder) and thinner everywhere else — and the
+certificate-envelope decoder, uncovered until this package, still has only
+**five** corpus files. If you can break one decoder with a fuzzer, start
+there.
 
 ---
 

@@ -315,7 +315,9 @@ pub fn eth_estimate_transfer_gas() -> &'static str {
 
 /// Estimates gas for a call transaction parameter or returns standard transfer gas.
 pub fn eth_estimate_gas(params: &Value) -> Result<String, JsonRpcError> {
-    eth_estimate_gas_impl(params)
+    // Audit B-VM: served estimates honor the admission floor (RPC.md
+    // contract); the pure figure lives in `eth_estimate_gas_amount`.
+    eth_estimate_gas_with_floor(params, crate::svm::GAS_BASIC_TRANSFER)
 }
 
 #[allow(non_snake_case)]
@@ -3141,7 +3143,7 @@ impl EvmAdapter {
     }
 
     pub fn eth_estimate_gas(&self, params: &Value) -> Result<String, JsonRpcError> {
-        eth_estimate_gas_impl(params)
+        eth_estimate_gas_with_floor(params, crate::svm::GAS_BASIC_TRANSFER)
     }
 
     #[allow(non_snake_case)]
@@ -4390,9 +4392,7 @@ pub fn eth_estimate_gas_amount(params: &Value) -> Result<u64, JsonRpcError> {
     };
 
     let Some(obj) = call_obj else {
-        // Audit B-VM: floor applies to the empty-params path too (same
-        // admission contract as below).
-        return Ok(STANDARD_TRANSFER_GAS.max(crate::svm::GAS_BASIC_TRANSFER));
+        return Ok(STANDARD_TRANSFER_GAS);
     };
 
     let data_str = obj
@@ -4453,9 +4453,9 @@ pub fn eth_estimate_gas_amount(params: &Value) -> Result<u64, JsonRpcError> {
     // rejected for under-declared gas. Units differ across the bridge, but
     // quoting max() is safe in both directions: EVM tooling tolerates the
     // over-estimate, and our admission never sees an under-declared figure.
-    let total = base_gas
-        .saturating_add(calldata_gas)
-        .max(crate::svm::GAS_BASIC_TRANSFER);
+    // NOTE: the floor itself is applied by `eth_estimate_gas_with_floor`
+    // (served paths); this pure figure stays unfloored (pinned by closeout).
+    let total = base_gas.saturating_add(calldata_gas);
     Ok(total)
 }
 

@@ -1,9 +1,11 @@
-//! STATUS: DEMO-GRADE — NO AUTHENTICATION (audit B-CT P0). All `from`/
-//! `owner`/`caller_id`/`admin_id` args are caller-supplied and replayable:
-//! the contract never reads the authenticated `host.caller`. DO NOT deploy
-//! with value. Auth redesign (host.caller-bound, SDK `caller()` ready) is
-//! tracked in docs/ROADMAP.md P0; the failing `poc_p0_*` tests are the
-//! executable acceptance criteria.
+//! STATUS: DEMO-GRADE, CT-P0 AUTHENTICATED (audit KI-38 fix). `transfer`
+//! and `set_target` bind the caller-supplied `caller_id` to the authenticated
+//! `host.caller` via `caller_is` (existing owner/treasury checks kept, now
+//! forgery-proof: public owner ids replay nothing). Auth refusal is the
+//! existing `ERR_UNAUTHORIZED` return (set_target precedent). Auction
+//! mechanics (`start_auction`/`place_bid`/`finalize_auction`) move no funds
+//! and stay permissionless (residual). DO NOT deploy with value without a
+//! full audit.
 //!
 ////! Stellereum Name Service (SNS / STL-DNS) Contract (Hardened)
 //!
@@ -29,8 +31,8 @@ use stellereum_contract_sdk::address::{
     is_any_reserved, is_system_burn, PROTOCOL_RESERVED_DOMAINS, SYSTEM_BURN_DOMAINS,
 };
 use stellereum_contract_sdk::{
-    emit, setup_wasm_panic_handler, sload, sstore, ERR_ALREADY_EXISTS, ERR_INVALID_ARGUMENT,
-    ERR_UNAUTHORIZED, SUCCESS,
+    caller_is, emit, setup_wasm_panic_handler, sload, sstore, ERR_ALREADY_EXISTS,
+    ERR_INVALID_ARGUMENT, ERR_UNAUTHORIZED, SUCCESS,
 };
 
 setup_wasm_panic_handler!();
@@ -280,14 +282,15 @@ pub extern "C" fn set_target(packed_arg: i64) -> i64 {
     let owner = sload(base + 1);
     let reserved_flag = sload(base + 3);
 
-    // Enforce authorization:
+    // Enforce authorization (CT-P0: public ids replay nothing — the live
+    // host.caller must own the claimed caller_id):
     // If protocol reserved (flag 2), only Treasury can set target
     if reserved_flag == 2 {
         let treasury = sload(SLOT_TREASURY);
-        if caller_id != treasury {
+        if caller_id != treasury || !caller_is(caller_id) {
             return ERR_UNAUTHORIZED;
         }
-    } else if caller_id != owner {
+    } else if caller_id != owner || !caller_is(caller_id) {
         return ERR_UNAUTHORIZED;
     }
 
@@ -323,14 +326,17 @@ pub extern "C" fn transfer(packed_arg: i64) -> i64 {
     let owner = sload(base + 1);
     let reserved_flag = sload(base + 3);
 
-    // Strict caller authentication:
+    // Strict caller authentication (CT-P0: public owner/treasury ids replay
+    // nothing — the live host.caller must own the claimed caller_id).
+    // Refusal is ERR_UNAUTHORIZED (the set_target precedent), so forged
+    // transfers fail closed without moving the domain.
     if reserved_flag == 2 {
         let treasury = sload(SLOT_TREASURY);
-        if caller_id != treasury {
-            panic!("unauthorized: only treasury can transfer protocol domain");
+        if caller_id != treasury || !caller_is(caller_id) {
+            return ERR_UNAUTHORIZED;
         }
-    } else if caller_id != owner {
-        panic!("unauthorized: caller is not current owner");
+    } else if caller_id != owner || !caller_is(caller_id) {
+        return ERR_UNAUTHORIZED;
     }
 
     sstore(base + 1, new_owner);
@@ -345,7 +351,7 @@ pub extern "C" fn transfer(packed_arg: i64) -> i64 {
 mod tests {
     use super::*;
     use stellereum_contract_sdk::address::{DOMAIN_BURN, DOMAIN_STAKE, DOMAIN_TRASH, DOMAIN_VAULT};
-    use stellereum_contract_sdk::reset_mock_state;
+    use stellereum_contract_sdk::{id_to_caller, reset_mock_state, set_mock_caller};
 
     #[test]
     fn test_length_price_grid() {
@@ -385,11 +391,12 @@ mod tests {
         // Winner is User 20
         assert_eq!(resolve(1), 20);
 
-        // Set separate target to 555 by owner User 20
+        // Set separate target to 555 by owner User 20 (authenticated).
+        set_mock_caller(id_to_caller(20));
         assert_eq!(set_target(10_000_000_000 + 20 * 100_000 + 555), SUCCESS);
         assert_eq!(resolve(1), 555);
 
-        // Transfer to user 33 by owner User 20
+        // Transfer to user 33 by owner User 20 (authenticated).
         assert_eq!(transfer(10_000_000_000 + 20 * 100_000 + 33), SUCCESS);
         assert_eq!(resolve(1), 33);
     }
@@ -408,6 +415,8 @@ mod tests {
         assert_eq!(resolve(DOMAIN_STAKE), 99);
 
         // Protocol domain can be updated by treasury to new address 777
+        // (authenticated as treasury 99).
+        set_mock_caller(id_to_caller(99));
         assert_eq!(
             transfer(DOMAIN_STAKE * 10_000_000_000 + 99 * 100_000 + 777),
             SUCCESS

@@ -156,6 +156,111 @@ pub fn round_zero_timeout_ms() -> u64 {
         .unwrap_or(650)
 }
 
+/// Straggler grace (proposer-rework §2c, docs/PROPOSER_REWORK.md): bounded
+/// additive EXECUTION hold while a behind-but-live peer (or an unheard
+/// scheduled proposal) may still deliver.
+///
+/// This is deliberately NOT part of the deterministic timeout VALUE
+/// (`deterministic_timeout_for` stays byte-identical, same-on-all-nodes):
+/// same category as the already-accepted local holds (peer-active wait,
+/// retransmit). Tendermint safety is time-free; only liveness uses timing,
+/// and the grace only ever WIDENS honest-round overlap, so heterogeneous
+/// timeouts cannot fork.
+///
+/// Env, all default-off (0 = current behavior, the added term is 0 and every
+/// gate below is byte-identical):
+/// * `STELL_STRAGGLER_GRACE_MS` — hold length when fresh straggler evidence
+///   exists (default 0 = disabled).
+/// * `STELL_STRAGGLER_GRACE_CAP_MS` — per-round upper bound (default 30000).
+/// * `STELL_STRAGGLER_FRESHNESS_MS` — how recent the evidence must be
+///   (default: 5x the round-timeout base). Silent peers age out, so a dead
+///   peer cannot park the chain — only a live-but-slow one buys extra time.
+pub const STRAGGLER_GRACE_MS_DEFAULT: u64 = 0;
+pub const STRAGGLER_GRACE_CAP_MS_DEFAULT: u64 = 30_000;
+
+pub fn straggler_grace_ms() -> u64 {
+    std::env::var("STELL_STRAGGLER_GRACE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.clamp(0, 600_000))
+        .unwrap_or(STRAGGLER_GRACE_MS_DEFAULT)
+}
+
+pub fn straggler_grace_cap_ms() -> u64 {
+    std::env::var("STELL_STRAGGLER_GRACE_CAP_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.clamp(0, 600_000))
+        .unwrap_or(STRAGGLER_GRACE_CAP_MS_DEFAULT)
+}
+
+pub fn straggler_freshness_ms(round_timeout_ms: u64) -> u64 {
+    std::env::var("STELL_STRAGGLER_FRESHNESS_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.clamp(1_000, 3_600_000))
+        .unwrap_or_else(|| round_timeout_ms.saturating_mul(5).clamp(1_000, 3_600_000))
+}
+
+/// Pure straggler-hold decision (no clock read: caller passes the observed
+/// age in ms). Returns hold ms in `[0, min(grace, cap)]`.
+///
+/// Evidence (both require FRESH observation, `age_ms < freshness_ms`):
+/// * clause 1 (behind-vote): a live peer's newest vote names an older
+///   `(height, round)` than ours — its vote for our round may still be in
+///   flight, so hold the round open one grace before view-changing.
+/// * clause 2 (scheduled-proposal): we hold no live proposal and a peer is
+///   live at our height but not ahead of us — the scheduled value may still
+///   be in flight, so wait instead of racing to the next round proposalless.
+///   (Approximation of "scheduled proposer not demonstrably ahead" using the
+///   single-slot peer signal available in the loop; same-height-not-ahead is
+///   the only case where waiting can help — an ahead peer is followed via the
+///   future-rule jumps, never waited on.)
+pub fn straggler_hold_ms(
+    our_height: u64,
+    our_round: u32,
+    has_live_proposal: bool,
+    peer_seen: Option<(u64, u32, u64)>,
+    grace_ms: u64,
+    cap_ms: u64,
+    freshness_ms: u64,
+) -> u64 {
+    if grace_ms == 0 {
+        return 0;
+    }
+    let Some((ph, pr, age_ms)) = peer_seen else {
+        return 0;
+    };
+    if age_ms >= freshness_ms {
+        return 0;
+    }
+    let behind = ph < our_height || (ph == our_height && pr < our_round);
+    let same_height_not_ahead = ph == our_height && pr <= our_round;
+    let evidence = behind || (!has_live_proposal && same_height_not_ahead);
+    if !evidence {
+        return 0;
+    }
+    grace_ms.min(cap_ms)
+}
+
+/// Cap an additive execution hold (straggler grace) to the slack between the
+/// deterministic view-change deadline and the pre-existing 2× peer-active
+/// hold bound (`hold_bounded`: the gate fires at `max(effective, 2 * base)`
+/// while a peer is active, so the effective rung is ~2× the configured base
+/// — docs/TEMPO_PROFILE.md §5.3).
+///
+/// An UNSUBSUMED grace stacks past that bound (rung dwell up to
+/// `effective + grace`); SUBSUMED, it only fills the slack up to the bound
+/// the node already waits on, never past it. The deterministic core is
+/// untouched (same-on-all-nodes); only the local hold shrinks.
+///
+/// Pure (no clock read), so `hold_ms == 0` returns 0 for every input — with
+/// the straggler envs unset the gate below stays byte-identical (pinned by
+/// `grace_zero_hold_zero_deadline_unchanged`).
+pub fn cap_hold_to_two_x_bound(hold_ms: u64, effective_ms: u64, base_ms: u64) -> u64 {
+    hold_ms.min(base_ms.saturating_mul(2).saturating_sub(effective_ms))
+}
+
 /// Effective snapshot creation interval (`STELL_SNAPSHOT_INTERVAL`, default 1000 blocks).
 pub fn snapshot_interval() -> u64 {
     std::env::var("STELL_SNAPSHOT_INTERVAL")
@@ -204,6 +309,14 @@ use stellereum::sharding::{
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::tokenomics::{GenesisVault, TeamVestingSchedule, BLOCK_REWARD_NANO};
 use stellereum::zkml::{QuantizedLayer, QuantizedLinearModel, SessionKeyAuthorization, ZkMlProof};
+
+/// Fail-loud consensus-traffic liveness alarm (tiny helper, no consensus/wire
+/// impact). Included by path so `src/lib.rs` stays untouched; the drain loop
+/// below owns all state and wiring, this only decides and counts — and the
+/// same file is included by `tests/liveness_alarm_tests.rs` for the pure-fn
+/// matrix.
+#[path = "liveness_alarm.rs"]
+mod liveness_alarm;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -366,7 +479,12 @@ async fn start_workchain_shard(
     match storage.get_meta("genesis_state_root") {
         Ok(Some(prev)) if prev != genesis_root => {
             anyhow::bail!(
-                "genesis state root mismatch for the shard {shard} store (wipe ./data or restore the original config)"
+                "{}",
+                stellereum::bootstrap::genesis_mismatch_msg(
+                    Some(shard),
+                    &genesis_root,
+                    &prev
+                )
             );
         }
         _ => {
@@ -1956,27 +2074,67 @@ async fn try_catch_up(
             );
         }
     }
-    let (peer_height, peer_hash) = [dht, rt.peer_hint]
+    let our_height = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+    let dht_hint_head = [dht, rt.peer_hint]
         .into_iter()
         .flatten()
-        .max_by_key(|(h, _)| *h)?;
-    let our_height = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+        .max_by_key(|(h, _)| *h);
+    // BLIND-QC-PROBE (live-recovery 2026-10-30, audit note): when neither the
+    // DHT head read nor the proposal-observed peer hint is ahead of us, do NOT
+    // conclude "in sync". Both go blind together: the shared head key is
+    // last-writer-wins so a node can read back its OWN head (echo chamber),
+    // and a node that receives no proposals never sets peer_hint (deaf
+    // follower). Observed live: B sat one height behind a converged quorum
+    // (654 vs 655) retrying a no-op catch-up every 2s forever while its
+    // broadcasts were absorbed as stale elsewhere — "a silent follower can
+    // never be rescued". Fallback: directly probe the precommit-QC sidecar
+    // for tip+1 (a B-initiated DHT read, NAT-proof like every request_to). A
+    // present, height-bound QC proves finality with no head advertisement at
+    // all; walk_chain below re-verifies everything (per-block QC against the
+    // set in force at that height, parent/root continuity, tip connection),
+    // so a forged or stale sidecar is refused exactly as before. Fail-closed:
+    // miss/nil-QC/height-mismatch returns None. Liveness-only: no wire, no
+    // quorum, no apply change. Bounded by the caller's catch-up budget.
+    let (peer_height, peer_hash) = match dht_hint_head {
+        Some((ph, phash)) if stellereum::network::peer_head_is_ahead(our_height, ph) => {
+            (ph, phash)
+        }
+        _ => {
+            let probe_h = our_height.saturating_add(1);
+            match adapter.fetch_block_qc(shard, probe_h).await {
+                Some(qc) if qc.height == probe_h => match qc.block_hash {
+                    Some(bh) => {
+                        eprintln!(
+                            "[sync] blind-QC-probe: tip+1 height {probe_h} carries a QC sidecar; walking one height to adopt it"
+                        );
+                        (probe_h, bh)
+                    }
+                    None => return None,
+                },
+                _ => {
+                    static BLIND_MISS_N: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let n =
+                        BLIND_MISS_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n.is_multiple_of(30) {
+                        tracing::debug!(
+                            "[sync] blind-QC-probe miss {n} (no QC sidecar for tip+1)"
+                        );
+                    }
+                    return None;
+                }
+            }
+        }
+    };
     // The head key is shared and last-writer-wins, so this may be our OWN head
     // coming back (our local manifest shadows peers on read), or a stale peer.
     // Only a STRICTLY ahead head means someone knows more than us
     // (`peer_head_is_ahead`); anything else is "nothing to do", never a reason
     // to move — and a height-0 node must never treat its own echo as a peer.
-    if !stellereum::network::peer_head_is_ahead(our_height, peer_height) {
-        static ECHO_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = ECHO_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n.is_multiple_of(30) {
-            tracing::debug!(
-                "[sync] advertised head {peer_height} is not ahead of ours {our_height} \
-                 (echo {n}; own echo or stale peer — ignoring)"
-            );
-        }
-        return None;
-    }
+    // (peer_height, peer_hash) is ahead by construction here: either the DHT/hint
+    // head passed peer_head_is_ahead above, or the blind-QC-probe pinned tip+1
+    // (strictly ahead of a non-wrapping tip; on a u64::MAX tip probe saturates
+    // to tip itself and the walk below refuses it on continuity).
     // Bounded: a peer claiming to be millions of blocks ahead is either a
     // different chain or a lie, and we refuse to walk it.
     if peer_height - our_height > 1_000_000 {
@@ -2833,6 +2991,23 @@ async fn run_consensus_node(
         rt.state.with_finalized_headers(header_registry);
     }
 
+    // A14 chain-binding rollout, phase 3: the activation switch. Kept next to
+    // the XPC activation above on purpose — same shape (an env height
+    // boundary, default-off), same rule (every node of a deployment must be
+    // configured with the SAME value; changing it mid-run needs a restart to
+    // take effect uniformly). Unset/unparsable/`0` keeps phase-1 behaviour
+    // (admit + meter) on every path; a set height arms refusal at RPC,
+    // mempool and apply (see docs/PLAN-BINDING.md).
+    match stellereum::chain_binding::ChainBindingActivation::from_env() {
+        a if a.height == stellereum::chain_binding::CHAIN_BINDING_NEVER => info!(
+            "[binding] chain-binding refusal inactive (STELL_CHAIN_BIND_ACTIVATION_HEIGHT unset): unbound transactions are admitted + metered"
+        ),
+        a => tracing::warn!(
+            "[binding] chain-binding refusal ARMED from height {}: unbound transactions are refused at RPC, mempool and apply (see docs/PLAN-BINDING.md)",
+            a.height
+        ),
+    }
+
     // Restore the FULL persisted state (accounts + all domains) if available.
     // `restored_state_height` is the height whose post-state the engine holds (0 for
     // a fresh start). It can lag the finalized head below, and entering consensus
@@ -3397,6 +3572,12 @@ async fn run_consensus_node(
     let mut peer_round_seen: Option<(u64, u32, std::time::Instant)> = None;
     // Align snapshots to round hundreds so probes ((peer_height/100)*100) hit them.
     let mut last_snapshot_height: u64 = (rt.hc.height / 100) * 100;
+    // Cross-shard replay bytes bound to the SUBMITTED snapshot height (see the
+    // snapshot block below): captured at submit quiescence (post-`height`,
+    // worker idle, before the next apply is submitted) and consumed verbatim
+    // at poll. Single-flight (at most one submit outstanding), so one slot is
+    // enough: every successful submit overwrites it before its poll reads it.
+    let mut pending_snapshot_xshard: Option<(u64, Vec<u8>)> = None;
     // Highest height whose body is already on the DHT. A cursor, not a correctness
     // requirement: publishing is idempotent and content-addressed.
     let mut retro_published_upto: u64 = 0;
@@ -3422,6 +3603,15 @@ async fn run_consensus_node(
     // Starts fresh so the first intervals behave exactly as before.
     let mut last_inbound_msg: std::time::Instant = std::time::Instant::now();
     let mut retro_tip_at_last_pass: u64 = rt.finalized.last().map(|(h, _)| *h).unwrap_or(0);
+    // Consensus-traffic RX clock for the fail-loud liveness alarm (audit
+    // note: an isolated validator churned silently for 18 days on the wrong
+    // pubsub topic). Stamped on EVERY consumed Proposal/Vote inner — accepted
+    // or refused — because receipt alone proves the transport delivers this
+    // node's topic. Starts fresh like `last_inbound_msg` above.
+    let mut last_consensus_rx_ms: u64 = liveness_alarm::now_ms();
+    // Throttle for the liveness alarm line: at most one per
+    // LIVENESS_ALARM_THROTTLE_MS (None = never emitted, always due).
+    let mut last_liveness_emit_ms: Option<u64> = None;
     // Behind-and-talking peer clock (behind-peer retro gate, local policy):
     // stamped when a VERIFIED vote/proposal arrives from a peer at a height
     // BELOW ours (accepted votes/proposals, plus verified-but-out-of-scope
@@ -3501,6 +3691,10 @@ async fn run_consensus_node(
     // Independent cadence for sled retention (see the finalize block): it must
     // not starve with snapshots when the apply worker is continuously busy.
     let mut last_prune_height: u64 = 0;
+    // A14 phase 3: one-shot mempool drain at the activation crossing (see the
+    // gossip-ingress section). Set on the first tick at/after activation;
+    // pre-activation ticks leave it false.
+    let mut chain_binding_drained = false;
 
     // Push what we already have before waiting for anything from a peer.
     retro_publish_pass(
@@ -3979,6 +4173,36 @@ async fn run_consensus_node(
         }
 
         // Ingest gossiped transactions into the fee-priority mempool.
+        // A14 phase 3 (chain binding): ingress height + one-shot activation
+        // drain.
+        // GATE: `ingress_height` is finalized-tip+1 — the earliest height a
+        // newly admitted tx could be included at — derived from COMMITTED
+        // `rt.finalized`, never gossip-supplied. The drain runs ONCE, on the
+        // first tick at/after activation (a node starting post-activation
+        // with unbound txs in its restored pool drains on its first tick,
+        // before the propose section below); `insert` already refuses new
+        // unbound arrivals while armed, so re-draining would only rescan.
+        // Default-off: `refusal_active` is always false, so this whole block
+        // is a no-op and every context below behaves byte-identically.
+        let binding_activation = stellereum::chain_binding::ChainBindingActivation::from_env();
+        let ingress_height = rt
+            .finalized
+            .last()
+            .map(|(h, _)| (*h).saturating_add(1))
+            .unwrap_or(0);
+        if !chain_binding_drained && binding_activation.refusal_active(ingress_height) {
+            let dropped = rt
+                .mempool
+                .write()
+                .await
+                .drop_unbound_at_activation(ingress_height, &binding_activation);
+            if dropped > 0 {
+                tracing::warn!(
+                    "[binding] activation drain at height {ingress_height}: dropped {dropped} unbound tx(s) from the mempool (see docs/PLAN-BINDING.md)"
+                );
+            }
+            chain_binding_drained = true;
+        }
         while let Ok(raw) = tx_rx.try_recv() {
             // The epoch-seal frames share the transaction-gossip channel:
             // the sealed ciphertext, the DKG contribution, the order
@@ -4009,7 +4233,7 @@ async fn run_consensus_node(
                     // pool-level pin is the backstop; this is the explicit
                     // first line.
                     let mut gctx =
-                        stellereum::mempool::AdmissionCtx::wall_now().with_onchain_nonce(onchain);
+                        stellereum::mempool::AdmissionCtx::wall_now().with_onchain_nonce(onchain).with_chain_height(ingress_height);
                     // PAYMASTER: gossiped sponsored transactions carry their
                     // sponsor's balance head (fail-closed without it).
                     if let Some(sbal) = rt.state.sponsor_balance_of(&tx).await {
@@ -4042,7 +4266,7 @@ async fn run_consensus_node(
             }
             // Same P2/F-02 pinning as the gossip path above.
             let mut octx =
-                stellereum::mempool::AdmissionCtx::wall_now().with_onchain_nonce(onchain);
+                stellereum::mempool::AdmissionCtx::wall_now().with_onchain_nonce(onchain).with_chain_height(ingress_height);
             // PAYMASTER: same sponsor head as the gossip path above.
             if let Some(sbal) = rt.state.sponsor_balance_of(&tx).await {
                 octx = octx.with_sponsor_balance(sbal);
@@ -4295,10 +4519,35 @@ async fn run_consensus_node(
                     && pr + 1 >= round
                     && at.elapsed() < round_timeout
         );
+        // Straggler grace on the nil wait (docs/PROPOSER_REWORK.md §2c): the
+        // same bounded hold — don't nil a round whose scheduled value may
+        // still be in flight. Default-off (grace 0 → zero added, the deadline
+        // below is byte-identical to today).
+        let nil_grace = {
+            let g = straggler_grace_ms();
+            if g == 0 {
+                Duration::from_millis(0)
+            } else {
+                let seen = peer_round_seen.map(|(ph, pr, at)| {
+                    let age_ms: u64 =
+                        at.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                    (ph, pr, age_ms)
+                });
+                Duration::from_millis(straggler_hold_ms(
+                    height,
+                    round,
+                    rt.hc.has_live_proposal(),
+                    seen,
+                    g,
+                    straggler_grace_cap_ms(),
+                    straggler_freshness_ms(round_timeout.as_millis() as u64),
+                ))
+            }
+        };
         if can_vote
             && !rt.hc.has_live_proposal()
             && last_prevoted != Some((height, round))
-            && round_started.elapsed() >= 2 * round_timeout
+            && round_started.elapsed() >= 2 * round_timeout + nil_grace
             && !peer_alive_in_round
         {
             if let Some(v) = rt.make_prevote() {
@@ -4446,6 +4695,18 @@ async fn run_consensus_node(
                 for msg in
                     stellereum::consensus_net::prioritize_inbound_for_verify(flatten_incoming(msg))
                 {
+                    // Liveness-alarm RX clock: ANY consumed Proposal/Vote —
+                    // accepted or refused, Batch-carried or singleton — proves
+                    // the transport delivers our topic right now. Stamped
+                    // BEFORE any verification/refusal below (a refusal still
+                    // proves receipt); Committed is deliberately excluded (it
+                    // is catch-up proof, and the alarm watches live traffic).
+                    if matches!(
+                        msg,
+                        ConsensusMsg::Proposal { .. } | ConsensusMsg::Vote { .. }
+                    ) {
+                        last_consensus_rx_ms = liveness_alarm::now_ms();
+                    }
                     let is_catchup = matches!(msg, ConsensusMsg::Committed { .. });
                     if is_catchup {
                         // VERIFICATION F2-hardening: Committed bypasses the
@@ -4881,6 +5142,37 @@ async fn run_consensus_node(
         // SEC-06: deferred messages already reside in `inbound_deferred` with
         // their scheduled `wake_at` times; no re-parking needed.
 
+        // FAIL-LOUD LIVENESS ALARM (audit note: a production validator sat
+        // isolated 18 days on the wrong pubsub topic — zero votes/proposals,
+        // nothing in any log). A validator with configured peers that
+        // consumes no Proposal/Vote for the silence threshold screams on
+        // stderr (throttled to one line per minute) instead of churning
+        // silently. Liveness-only: reads clocks/counters, never touches
+        // consensus, the wire, or quorum accounting. `can_vote` is the exact
+        // franchise the propose/prevote gates above used — reused, not
+        // reinvented — so observers and stale-set nodes stay silent by
+        // construction, as do solo stands (no configured peers).
+        {
+            let peer_count = adapter.node.cfg.peers.len();
+            let now_ms = liveness_alarm::now_ms();
+            if liveness_alarm::should_liveness_alarm(
+                last_consensus_rx_ms,
+                now_ms,
+                can_vote,
+                peer_count,
+                liveness_alarm::liveness_alarm_silence_ms(),
+            ) && liveness_alarm::liveness_alarm_due(last_liveness_emit_ms, now_ms)
+            {
+                last_liveness_emit_ms = Some(now_ms);
+                liveness_alarm::note_liveness_alarm();
+                let n = liveness_alarm::liveness_alarm_count();
+                let silent_s = now_ms.saturating_sub(last_consensus_rx_ms) / 1000;
+                eprintln!(
+                    "[liveness] ALARM #{n}: validator with {peer_count} configured peer(s) received no consensus Proposal/Vote for {silent_s}s; possible pubsub-topic isolation (e.g. wrong single-shard vs sharded topic) — check network/topic config"
+                );
+            }
+        }
+
         // Verified-only catch-up fast path (round efficiency, no safety
         // change): `catchup_due` is set only by votes that passed signature +
         // membership + scope checks, and `peer_hint` is written only after
@@ -5277,7 +5569,23 @@ async fn run_consensus_node(
                         && height % 100 == 0))
                     && height > last_snapshot_height
                 {
+                    // Submit-time cross-shard binding: the worker bundle holds
+                    // accounts/domains/aux at post-`height` (root-gated), but
+                    // the replay set is captured HERE, on the tick, at the
+                    // same quiescent instant (this height just installed, the
+                    // next apply is not submitted yet, so the worker is idle
+                    // and nothing mutates the engine under the clone).
+                    // Capturing at POLL time instead read a replay set
+                    // advanced by later heights and persisted it under this
+                    // height's label: the restored engine then rooted
+                    // differently from `header(height+1)` and the next boot
+                    // died in `verify_restored_root` (restore root mismatch
+                    // crash-loop). The bytes travel with the submit
+                    // (single-flight) and are never re-read at poll.
+                    let xshard = bincode::serialize(&rt.cross_shard_replay_snapshot().await)
+                        .unwrap_or_default();
                     if rt.submit_snapshot(height, root) {
+                        pending_snapshot_xshard = Some((height, xshard));
                         info!(
                             "[snapshot] submitted capture for height {height} \
                              (last_snapshot_height={last_snapshot_height})"
@@ -5307,8 +5615,29 @@ async fn run_consensus_node(
                         bundle.accounts.accounts.len(),
                     );
                     last_snapshot_height = bundle.height;
-                    let cross_shard = bincode::serialize(&rt.cross_shard_replay_snapshot().await)
-                        .unwrap_or_default();
+                    // Submit-time bytes (see above): never a fresh read — a
+                    // fresh read here is post-`bundle.height` state under an
+                    // older label. A missing/mismatched stash is impossible
+                    // (single-flight: the submit stashes before its poll
+                    // reads); fall fail-closed (empty bytes fail the restore
+                    // loudly) rather than substituting newer state.
+                    let cross_shard = match pending_snapshot_xshard.take() {
+                        Some((h, bytes)) if h == bundle.height => bytes,
+                        Some((h, _)) => {
+                            tracing::error!(
+                                "[snapshot] height {}: cross-shard stash mismatch (stashed for {h}); persisting empty so the restore fails closed instead of mixing heights",
+                                bundle.height,
+                            );
+                            Vec::new()
+                        }
+                        None => {
+                            tracing::error!(
+                                "[snapshot] height {}: no submit-time cross-shard stash (submit/poll desync?); persisting empty so the restore fails closed instead of mixing heights",
+                                bundle.height,
+                            );
+                            Vec::new()
+                        }
+                    };
                     let tip_header = rt
                         .finalized
                         .last()
@@ -5720,7 +6049,53 @@ async fn run_consensus_node(
         } else {
             backoff_ms
         });
-        if round_started.elapsed() > effective_timeout && !hold_bounded {
+        // Straggler grace (docs/PROPOSER_REWORK.md §2c): bounded ADDITIVE hold
+        // past the deterministic deadline while fresh evidence shows a live
+        // straggler (behind peer vote, or no live proposal with a peer live
+        // at our height). The deterministic core above stays byte-identical
+        // (same-on-all-nodes); this only ever WIDENS honest-round overlap, so
+        // heterogeneous holds cannot fork (safety is time-free). Default-off
+        // (grace 0 → zero added, the gate below is byte-identical to today).
+        // Dead peers age out of the freshness window, so they cannot park us.
+        let straggler_hold = {
+            let g = straggler_grace_ms();
+            if g == 0 {
+                Duration::from_millis(0)
+            } else {
+                let seen = peer_round_seen.map(|(ph, pr, at)| {
+                    let age_ms: u64 =
+                        at.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                    (ph, pr, age_ms)
+                });
+                Duration::from_millis(straggler_hold_ms(
+                    rt.hc.height,
+                    rt.hc.round,
+                    rt.hc.has_live_proposal(),
+                    seen,
+                    g,
+                    straggler_grace_cap_ms(),
+                    straggler_freshness_ms(round_timeout.as_millis() as u64),
+                ))
+            }
+        };
+        // ROUND-TIMER ACCOUNTING (docs/TEMPO_PROFILE.md §5.3 root cause): the
+        // gate below fires at `max(effective_timeout, 2 * round_timeout)`
+        // while a peer is active, so an unsubsumed grace stacks PAST the 2×
+        // bound (`effective + grace`) instead of filling it. Cap the hold to
+        // the slack between the deterministic deadline and that bound — the
+        // hold still holds (peer-active wait, grace-while-evidence-fresh),
+        // the timeout still times out, and with grace unset the hold is
+        // already zero so this `min` is a no-op (default behavior
+        // byte-identical). The nil wait is NOT a dwell term (it spends the
+        // vote but never gates the view change), so it is untouched.
+        let hold_slack = (2 * round_timeout)
+            .checked_sub(effective_timeout)
+            .unwrap_or_default();
+        let straggler_hold = straggler_hold.min(hold_slack);
+        if !straggler_hold.is_zero() && round_started.elapsed() > effective_timeout {
+            stellereum::metrics::global().inc_straggler_grace_extends();
+        }
+        if round_started.elapsed() > effective_timeout + straggler_hold && !hold_bounded {
             // infnode pubsub is best-effort: a vote can be dropped in transit.
             // Broadcasting each vote exactly once means a single lost message
             // leaves the peer one signature short forever, and since the two
@@ -6269,6 +6644,50 @@ enum WalletCommands {
         /// Sender Ed25519 private key in hex
         #[arg(long)]
         from_key: String,
+        /// Recipient 32-byte address in hex
+        #[arg(long)]
+        to: String,
+        /// Transfer amount in nano-STELL (1 STELL = 1_000_000_000 nano-STELL)
+        #[arg(long)]
+        amount: u64,
+        /// Target shard ID (0 = Masterchain, 1 = Base Workchain).
+        /// Defaults to same-shard: cross-shard needs an explicit flag.
+        #[arg(long, default_value_t = 0)]
+        target_shard: u32,
+        /// JSON-RPC endpoint to submit to
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+        /// Explicit nonce; by default the account's current nonce is queried
+        #[arg(long)]
+        nonce: Option<u64>,
+        /// Only print the signed transaction instead of submitting it
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Print the raw JSON-RPC responses
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
+    },
+    /// Send a post-quantum STELL transfer (Falcon-512, PQ1 explicit envelope).
+    ///
+    /// The ONLY transfer command that verifies when `STELL_PURE_PQ=1` (live +
+    /// local-cluster): plain `wallet send` builds legacy ed25519 txs, which
+    /// pure-PQ nodes refuse with `invalid transaction signature`.
+    /// The Falcon-512 keypair is derived from `--falcon-seed` with the SAME
+    /// raw derivation `Faucet::new` uses (`generate_from_seed_bytes`, no
+    /// wallet KDF), so passing the shared faucet seed spends the
+    /// genesis-funded faucet PQ account. The tx shape is byte-identical to a
+    /// faucet drip (`sign_pq_explicit_transfer`: unbound, always-explicit,
+    /// base fee + activation surcharge) — it fits the existing verifier, no
+    /// consensus change. Fail-closed: a bad seed is refused here, never
+    /// silently downgraded to an ed25519 (or unsigned) transaction.
+    /// Key-derivation caveat: run with the SAME `STELL_LEGACY_GENESIS_ROOT`
+    /// as the nodes (local-cluster: `1`), or the derived address misses the
+    /// funded account and the node refuses for insufficient balance.
+    SendPq {
+        /// Falcon-512 seed in hex (32 bytes). For the genesis-funded faucet
+        /// account this is the shared `STELL_FAUCET_KEY` seed (dev only).
+        #[arg(long)]
+        falcon_seed: String,
         /// Recipient 32-byte address in hex
         #[arg(long)]
         to: String,
@@ -7233,14 +7652,12 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     }
                     Ok(Some(prev)) => {
                         anyhow::bail!(
-                            "genesis state root mismatch for this data directory:\n  \
-                             stored: {}\n  config: {}\n\
-                             This node was previously run with different genesis parameters \
-                             (validator set, balances, or STELL_FAUCET_KEY). Continuing would \
-                             put it on a different chain. Wipe ./data to start a new chain, or \
-                             restore the original configuration.",
-                            hex::encode(&prev),
-                            hex::encode(genesis_root),
+                            "{}",
+                            stellereum::bootstrap::genesis_mismatch_msg(
+                                None,
+                                &genesis_root,
+                                &prev
+                            )
                         );
                     }
                     _ => {
@@ -7283,7 +7700,23 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         }
                         eprintln!("[storage] signal received; flushing persistence...");
                         ap.request_flush();
-                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                        // Wait-for-drain (not a fixed sleep): real flushes take
+                        // 55-110s+, so the old fixed 15s sleep exited mid-write
+                        // and bricked the node on next boot (torn sled state:
+                        // snapshot at S vs headers past S). The helper polls
+                        // the persist queue with an overall cap (240s) plus a
+                        // settle grace after it reads empty, staying inside
+                        // systemd's TimeoutStopSec=300s. Keeps exit(0).
+                        let outcome =
+                            stellereum::storage::wait_for_persist_drain(|| ap.pending()).await;
+                        if outcome.drained {
+                            eprintln!("[storage] persistence drained; exiting");
+                        } else {
+                            eprintln!(
+                                "[storage] shutdown drain cap reached ({} blocks pending); exiting",
+                                outcome.last_pending
+                            );
+                        }
                         std::process::exit(0);
                     });
                 }
@@ -8101,6 +8534,126 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     target_shard,
                 );
                 println!("✅ Transaction Signed:");
+                println!("  Hash:   {}", hex::encode(tx.compute_tx_hash()));
+                println!("  From:   {}", hex::encode(tx.from));
+                println!("  To:     {}", hex::encode(tx.to));
+                println!("  Amount: {} nano-STELL", tx.amount);
+                println!("  Nonce:  {nonce}");
+                println!("  Target Shard: {}", tx.target_shard);
+
+                if dry_run {
+                    return Ok(());
+                }
+
+                let raw = hex::encode(bincode::serialize(&tx)?);
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "stell_sendRawTransaction",
+                    "params": { "tx": raw }
+                })
+                .to_string();
+                let resp: serde_json::Value = ureq::post(&rpc).send_string(&body)?.into_json()?;
+                if let Some(e) = resp.get("error") {
+                    anyhow::bail!("rejected by node: {e}");
+                }
+                println!(
+                    "  Submitted, mempool tx hash: {}",
+                    resp["result"].as_str().unwrap_or("?")
+                );
+            }
+
+            WalletCommands::SendPq {
+                falcon_seed,
+                to,
+                amount,
+                target_shard,
+                rpc,
+                nonce,
+                dry_run,
+                verbose,
+            } => {
+                // Raw seed derivation ONLY (same as Faucet::new and
+                // `wallet sign --scheme falcon`): never the light-wallet KDF
+                // (that yields a different address that holds no funds), and
+                // NEVER an ed25519 fallback — a bad seed bails below.
+                let seed = parse_wallet_seed(&falcon_seed, "falcon seed")?;
+                let seed = zeroize::Zeroizing::new(seed);
+                let pq_key =
+                    stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed);
+                let sender = stellereum::post_quantum::derive_pq_address(
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    &pq_key.public_key,
+                    &stellereum::post_quantum::DEFAULT_SALT,
+                );
+                let to_bytes =
+                    hex::decode(&to).map_err(|e| anyhow::anyhow!("Invalid to hex: {e}"))?;
+                if to_bytes.len() != 32 {
+                    anyhow::bail!("Recipient must be 32 bytes");
+                }
+                let to_arr: [u8; 32] = to_bytes.try_into().unwrap();
+
+                let query = |method: &str,
+                             params: serde_json::Value|
+                 -> anyhow::Result<serde_json::Value> {
+                    let body = serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+                    })
+                    .to_string();
+                    if verbose {
+                        eprintln!("  rpc -> {method}: {body}");
+                    }
+                    let resp: serde_json::Value =
+                        ureq::post(&rpc).send_string(&body)?.into_json()?;
+                    if verbose {
+                        eprintln!("  rpc <- {method}: {resp}");
+                    }
+                    if let Some(e) = resp.get("error") {
+                        anyhow::bail!("RPC error: {e}");
+                    }
+                    Ok(resp
+                        .get("result")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null))
+                };
+
+                // The account address is the PQ address, not the seed: querying
+                // with anything else silently returns a fresh account (nonce 0)
+                // and every transaction after the first is a replay.
+                let nonce = match nonce {
+                    Some(n) => n,
+                    None => {
+                        let acc = query(
+                            "stell_getBalance",
+                            serde_json::json!({ "address": hex::encode(sender) }),
+                        )?;
+                        acc.get("nonce").and_then(|n| n.as_u64()).ok_or_else(|| {
+                            anyhow::anyhow!("node did not return an account nonce")
+                        })?
+                    }
+                };
+
+                // Faucet-identical shape: unbound explicit PQ1 envelope, base
+                // fee + activation surcharge, masterchain source. Fits the
+                // existing verifier (sharding.rs verify path) with no new
+                // acceptance surface.
+                let gas = stellereum::svm::GAS_BASIC_TRANSFER
+                    + stellereum::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
+                let tx = stellereum::rpc::sign_pq_explicit_transfer(
+                    &pq_key,
+                    to_arr,
+                    amount,
+                    gas,
+                    nonce,
+                    stellereum::sharding::MASTERCHAIN_SHARD,
+                    target_shard,
+                );
+                // Client-side self-check (fail-closed): never submit a tx that
+                // does not verify — an unsigned/unverifiable spend is refused
+                // here, not metered into the mempool.
+                if !tx.verify_signature() {
+                    anyhow::bail!("refusing to submit: built PQ transaction does not verify");
+                }
+                println!("✅ PQ Transaction Signed (Falcon-512, explicit PQ1 envelope):");
                 println!("  Hash:   {}", hex::encode(tx.compute_tx_hash()));
                 println!("  From:   {}", hex::encode(tx.from));
                 println!("  To:     {}", hex::encode(tx.to));
@@ -9842,6 +10395,204 @@ mod round_timeout_tests {
         // Deterministic down-proposer gate: ledger evidence only.
         assert!(should_use_down_proposer_timeout_deterministic(10));
         assert!(!should_use_down_proposer_timeout_deterministic(0));
+    }
+}
+
+#[cfg(test)]
+mod straggler_grace_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_keep_current_behavior() {
+        assert_eq!(STRAGGLER_GRACE_MS_DEFAULT, 0);
+        assert_eq!(STRAGGLER_GRACE_CAP_MS_DEFAULT, 30_000);
+        // Grace 0 => hold 0 whatever the evidence (byte-identical gates).
+        assert_eq!(straggler_hold_ms(9, 4, false, Some((9, 3, 100)), 0, 30_000, 50_000), 0);
+        assert_eq!(straggler_hold_ms(9, 4, true, Some((8, 0, 100)), 0, 30_000, 50_000), 0);
+    }
+
+    #[test]
+    fn no_evidence_no_hold() {
+        // No peer seen at all: never wait (a silent network must time out).
+        assert_eq!(straggler_hold_ms(9, 4, false, None, 5_000, 5_000, 50_000), 0);
+    }
+
+    #[test]
+    fn stale_evidence_no_hold() {
+        // Peer seen but aged out: dead peers cannot park the chain.
+        assert_eq!(
+            straggler_hold_ms(9, 4, false, Some((9, 3, 50_000)), 5_000, 5_000, 50_000),
+            0
+        );
+        // Boundary is strict: age == freshness is stale.
+        assert_eq!(
+            straggler_hold_ms(9, 4, false, Some((9, 3, 50_000)), 5_000, 5_000, 50_000),
+            0
+        );
+    }
+
+    #[test]
+    fn behind_peer_holds_one_grace() {
+        // Clause 1: live peer voting an older round — its current-round vote
+        // may still be in flight.
+        assert_eq!(
+            straggler_hold_ms(9, 4, false, Some((9, 3, 100)), 5_000, 5_000, 50_000),
+            5_000
+        );
+        // Older height counts too.
+        assert_eq!(
+            straggler_hold_ms(9, 4, true, Some((8, 9, 100)), 5_000, 5_000, 50_000),
+            5_000
+        );
+    }
+
+    #[test]
+    fn unheard_proposal_holds_only_without_live() {
+        // Clause 2: no live proposal + peer live at our height, not ahead.
+        assert_eq!(
+            straggler_hold_ms(9, 4, false, Some((9, 4, 100)), 5_000, 5_000, 50_000),
+            5_000
+        );
+        // Holding a proposal: the value-vote path owns this round, no hold.
+        assert_eq!(
+            straggler_hold_ms(9, 4, true, Some((9, 4, 100)), 5_000, 5_000, 50_000),
+            0
+        );
+    }
+
+    #[test]
+    fn ahead_peer_never_holds() {
+        // A peer ahead of us is followed via future-rule jumps, never waited
+        // on (waiting would deadlock us behind it).
+        assert_eq!(
+            straggler_hold_ms(9, 4, false, Some((9, 5, 100)), 5_000, 5_000, 50_000),
+            0
+        );
+        assert_eq!(
+            straggler_hold_ms(9, 4, false, Some((10, 0, 100)), 5_000, 5_000, 50_000),
+            0
+        );
+    }
+
+    #[test]
+    fn cap_binds_grace() {
+        assert_eq!(
+            straggler_hold_ms(9, 4, false, Some((9, 3, 100)), 100_000, 5_000, 50_000),
+            5_000
+        );
+        assert_eq!(
+            straggler_hold_ms(9, 4, false, Some((9, 3, 100)), 2_000, 5_000, 50_000),
+            2_000
+        );
+    }
+}
+
+/// Round-timer accounting: WHY the effective rung is ~2× the configured base
+/// (docs/TEMPO_PROFILE.md §5.3), and the minimal subsumption fix.
+///
+/// The view-change gate (`hold_bounded` + `effective_timeout +
+/// straggler_hold`) fires at `max(effective, 2 * base)` while a peer is
+/// active — during a veto stall votes flow continuously, so the peer-active
+/// hold is always engaged and every rung dwells ~2× base. Backoff, adaptive
+/// extension, retransmit and (default-off) grace are ruled out as the 2×
+/// source by the composition below: at round 0 they contribute nothing, yet
+/// the gate still sits at 2× base.
+#[cfg(test)]
+mod round_timer_accounting_tests {
+    use super::*;
+
+    /// The full per-rung deadline composition for a fixed
+    /// (base, round, missed) input: deterministic core, then the peer-active
+    /// hold bound. Mirrors the gate
+    /// (`elapsed > effective + hold && !hold_bounded` with
+    /// `hold_bounded ⇔ peer active && elapsed < 2 * base` ⇒ fires at
+    /// `max(effective + hold, 2 * base)` when a peer is active).
+    fn composed_deadline_ms(base_ms: u64, round: u32, missed: u32, hold_ms: u64) -> u64 {
+        let effective = deterministic_timeout_for(base_ms, round, missed);
+        let capped_hold = cap_hold_to_two_x_bound(hold_ms, effective, base_ms);
+        (effective + capped_hold).max(base_ms.saturating_mul(2))
+    }
+
+    #[test]
+    fn effective_rung_is_twice_base_while_peer_active() {
+        // TEMPO configuration: base 10s, round 0, no missed streak.
+        assert_eq!(deterministic_timeout_for(10_000, 0, 0), 10_000);
+        // Backoff (round 0) and adaptive (missed 0) contribute nothing…
+        assert_eq!(deterministic_timeout_for(10_000, 0, 0), 10_000);
+        // …while non-zero inputs add exactly their ladder terms (the
+        // ladder is real, it is just zero at round 0 with no missed streak).
+        assert_eq!(
+            deterministic_timeout_for(10_000, 0, 4),
+            10_000 + 4 * stellereum::consensus::ADAPTIVE_EXTENSION_PER_MISS_MS
+        );
+        // …yet with a live peer (hold engaged, grace off) the rung dwells
+        // 2× base: 20_000ms, the measured 19–21s rungs.
+        assert_eq!(composed_deadline_ms(10_000, 0, 0, 0), 20_000);
+        // Same shape at the 3.5s base the unanimity3 tests pin.
+        assert_eq!(deterministic_timeout_for(3_500, 0, 0), 3_500);
+        assert_eq!(composed_deadline_ms(3_500, 0, 0, 0), 7_000);
+        // Backoff alone cannot explain 2× either: round 4 adds only 2s, and
+        // the hold bound still dominates the composition.
+        assert_eq!(deterministic_timeout_for(10_000, 4, 0), 12_000);
+        assert_eq!(composed_deadline_ms(10_000, 4, 0, 0), 20_000);
+        // Retransmit is ruled out structurally: it only re-sends, it never
+        // gates the view change (no term in the composition above).
+    }
+
+    #[test]
+    fn grace_zero_hold_zero_deadline_unchanged() {
+        // CONSTRAINT: no default behavior change when the straggler envs are
+        // unset. hold 0 ⇒ capped hold 0 ⇒ deadline `effective + 0` for every
+        // (effective, base) shape, including past-the-bound (high rounds) and
+        // below-the-bound (round-0 cap) deadlines.
+        for (effective, base) in [
+            (10_000, 10_000),
+            (650, 10_000),
+            (800, 800),
+            (13_000, 3_000),
+            (3_500, 3_500),
+            (0, 1_000),
+        ] {
+            assert_eq!(
+                cap_hold_to_two_x_bound(0, effective, base),
+                0,
+                "grace 0 must cap to 0 for effective={effective} base={base}"
+            );
+        }
+    }
+
+    #[test]
+    fn grace_subsumed_into_two_x_bound_not_added_past_it() {
+        // Saturated regime (the rollout shape: grace ≫ slack): total never
+        // passes 2× base. Unsubsumed this would be 100 + 1500 = 1600.
+        assert_eq!(cap_hold_to_two_x_bound(1_500, 100, 100), 100);
+        // Round-0 cap shape (TEMPO heights stall proposalless at 650ms):
+        // slack (2×10s − 650ms) still covers the whole grace, so small
+        // grace is FULLY preserved — the fix only trims stacking past 2×.
+        assert_eq!(cap_hold_to_two_x_bound(1_500, 650, 10_000), 1_500);
+        // Partial slack: grace fills exactly to the bound and stops.
+        assert_eq!(cap_hold_to_two_x_bound(1_500, 1_000, 1_000), 1_000);
+        // Deterministic core already past the bound (high rounds / big
+        // backoff): no room for grace, no stacking past it.
+        assert_eq!(cap_hold_to_two_x_bound(1_500, 13_000, 3_000), 0);
+        // Bound edge: effective exactly at 2× base ⇒ zero slack.
+        assert_eq!(cap_hold_to_two_x_bound(1_500, 2_000, 1_000), 0);
+    }
+
+    #[test]
+    fn subsumed_composition_never_passes_two_x_while_peer_active() {
+        // End-to-end on the gate composition: even with grace enabled, a
+        // held round fires at most at 2× base (was effective + grace).
+        assert_eq!(composed_deadline_ms(10_000, 0, 0, 5_000), 20_000);
+        assert_eq!(composed_deadline_ms(100, 0, 0, 1_500), 200);
+        // …while a silent round still waits past its deterministic deadline
+        // (subsumption only trims the stack, it never removes the grace).
+        let effective = deterministic_timeout_for(1_000, 0, 0);
+        assert_eq!(effective, 1_000);
+        assert_eq!(
+            effective + cap_hold_to_two_x_bound(1_500, effective, 1_000),
+            2_000
+        );
     }
 }
 

@@ -1,9 +1,11 @@
-//! STATUS: DEMO-GRADE — NO AUTHENTICATION (audit B-CT P0). All `from`/
-//! `owner`/`caller_id`/`admin_id` args are caller-supplied and replayable:
-//! the contract never reads the authenticated `host.caller`. DO NOT deploy
-//! with value. Auth redesign (host.caller-bound, SDK `caller()` ready) is
-//! tracked in docs/ROADMAP.md P0; the failing `poc_p0_*` tests are the
-//! executable acceptance criteria.
+//! STATUS: DEMO-GRADE, CT-P0 AUTHENTICATED (audit KI-38 fix). Every
+//! value-moving entry point (`transfer`, `transfer_from`, `approve`, `mint`,
+//! `burn`) binds the caller-supplied `from`/`owner`/`spender`/`admin_id` to the
+//! authenticated `host.caller` via `caller_is` (canonical id encoding — a
+//! stranger's address never matches the victim's id). Reads
+//! (`balance_of`, `allowance`, metadata) stay public. Still DEMO-GRADE:
+//! integer ids, no privacy, session/auction layers out of scope.
+//! DO NOT deploy with value without a full audit.
 //!
 ////! Hardened STS-20 Fungible Token Contract (Pure Rust)
 //!
@@ -21,8 +23,8 @@
 extern crate std;
 
 use stellereum_contract_sdk::{
-    emit, setup_wasm_panic_handler, sload, sstore, ERR_INSUFFICIENT_BALANCE, ERR_INVALID_ARGUMENT,
-    ERR_UNAUTHORIZED, SUCCESS,
+    caller_is, emit, setup_wasm_panic_handler, sload, sstore, ERR_INSUFFICIENT_BALANCE,
+    ERR_INVALID_ARGUMENT, ERR_UNAUTHORIZED, SUCCESS,
 };
 
 setup_wasm_panic_handler!();
@@ -136,6 +138,12 @@ pub extern "C" fn approve(packed_arg: i64) -> i64 {
     if owner <= 0 || spender <= 0 || amount < 0 {
         return ERR_INVALID_ARGUMENT;
     }
+    // CT-P0: only the owner (authenticated via host.caller) may grant an
+    // allowance on their funds. A forged owner id never matches the stranger's
+    // caller address.
+    if !caller_is(owner) {
+        return ERR_UNAUTHORIZED;
+    }
 
     sstore(allowance_slot(owner, spender), amount);
     emit(TOPIC_APPROVAL, amount);
@@ -157,6 +165,12 @@ pub extern "C" fn transfer(packed_arg: i64) -> i64 {
     if from <= 0 || !(0..1_000).contains(&to) || amount <= 0 || amount >= 100_000 {
         panic!("invalid transfer bounds");
     }
+    // CT-P0: `from` is authenticated — only the owner (host.caller bound to
+    // the canonical address of `from`) may move their own tokens. Strangers
+    // get ERR_UNAUTHORIZED and balances are untouched.
+    if !caller_is(from) {
+        return ERR_UNAUTHORIZED;
+    }
 
     execute_transfer(from, to, amount)
 }
@@ -172,6 +186,12 @@ pub extern "C" fn transfer_from(packed_arg: i64) -> i64 {
     let to = rem2 / 100_000;
     let amount = rem2 % 100_000;
 
+    // CT-P0: the spender is authenticated — a forged spender id never matches
+    // the stranger's caller address. Allowance check below stays as the
+    // capability leg (existing pattern).
+    if !caller_is(spender) {
+        return ERR_UNAUTHORIZED;
+    }
     let a_slot = allowance_slot(from, spender);
     let allowed = sload(a_slot);
     if allowed < amount {
@@ -236,7 +256,12 @@ pub extern "C" fn mint(arg: i64) -> i64 {
     }
     let admin = sload(SLOT_ADMIN_ACCOUNT);
     if admin_id != admin {
-        panic!("unauthorized: caller is not admin");
+        return ERR_UNAUTHORIZED;
+    }
+    // CT-P0: forged admin_id (public) is worthless without the admin's caller
+    // address. Refusal is a return code (not a trap) so callers can branch.
+    if !caller_is(admin) {
+        return ERR_UNAUTHORIZED;
     }
 
     let supply = sload(SLOT_TOTAL_SUPPLY);
@@ -264,7 +289,12 @@ pub extern "C" fn burn(arg: i64) -> i64 {
     }
     let admin = sload(SLOT_ADMIN_ACCOUNT);
     if admin_id != admin {
-        panic!("unauthorized: caller is not admin");
+        return ERR_UNAUTHORIZED;
+    }
+    // CT-P0: see mint — forged admin_id without the admin caller is refused
+    // with a return code (poc_p0_forged_burn asserts rc < 0, not a trap).
+    if !caller_is(admin) {
+        return ERR_UNAUTHORIZED;
     }
 
     let admin_slot = balance_slot(admin);
@@ -284,7 +314,7 @@ pub extern "C" fn burn(arg: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellereum_contract_sdk::reset_mock_state;
+    use stellereum_contract_sdk::{id_to_caller, reset_mock_state, set_mock_caller};
 
     #[test]
     fn test_token_lifecycle() {
@@ -294,7 +324,8 @@ mod tests {
         assert_eq!(balance_of(1), 1_000_000);
         assert_eq!(decimals(0), 9);
 
-        // Transfer 10,000 from 1 to 2
+        // Transfer 10,000 from 1 to 2 (authenticated as owner 1).
+        set_mock_caller(id_to_caller(1));
         let packed = 100_000_000 + 2 * 100_000 + 10_000;
         assert_eq!(transfer(packed), 1);
 
@@ -303,11 +334,11 @@ mod tests {
         assert_eq!(balance_of(99), 50);
         assert_eq!(balance_of(1), 990_000);
 
-        // Burn 40,000
+        // Burn 40,000 (authenticated as admin 1)
         assert_eq!(burn(40_000), 950_000);
         assert_eq!(total_supply(0), 960_000);
 
-        // Mint 50,000
+        // Mint 50,000 (authenticated as admin 1)
         assert_eq!(mint(50_000), 1_000_000);
         assert_eq!(total_supply(0), 1_010_000);
 
@@ -317,6 +348,8 @@ mod tests {
         assert_eq!(allowance(1_000_000 + 5), 2_000);
 
         // User 5 executes transfer_from 1 to 3 for 1,000 tokens
+        // (authenticated as spender 5).
+        set_mock_caller(id_to_caller(5));
         let tf_packed = 5 * 100_000_000_000 + 10_000_000 + 3 * 100_000 + 1_000;
         assert_eq!(transfer_from(tf_packed), 1);
         assert_eq!(allowance(1_000_000 + 5), 1_000);

@@ -187,6 +187,33 @@ pub fn get_mock_events() -> Vec<(i64, i64)> {
     host_mock::get_mock_events()
 }
 
+/// Canonical 32-byte host address for a demo-scale integer account id.
+///
+/// Contracts route balances by small `i64` ids but MUST authenticate with the
+/// 32-byte `host.caller` (audit B-CT: ids are public and replayable, the
+/// caller address is not). This is the single binding between the two: `id`
+/// occupies bytes `[0..8]` little-endian, bytes `[8..32]` are zero. There is
+/// no registry and no fallback — an id authenticates IFF the live `caller()`
+/// equals this encoding.
+#[inline(always)]
+pub fn id_to_caller(id: i64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let le = id.to_le_bytes();
+    out[..8].copy_from_slice(&le);
+    out
+}
+
+/// Fail-closed authentication for integer account ids (audit CT-P0).
+///
+/// Returns true IFF `id` is a valid account (`id > 0`) AND the authenticated
+/// `host.caller` is the canonical address for `id`. In particular the zero
+/// address (no authenticated sender on any host; also the mock default)
+/// never authenticates: `caller_is(0)` and `caller_is(negative)` are false.
+#[inline(always)]
+pub fn caller_is(id: i64) -> bool {
+    id > 0 && caller() == id_to_caller(id)
+}
+
 /// Helper macro for registering wasm panic handler in cdylib crates
 #[macro_export]
 macro_rules! setup_wasm_panic_handler {
@@ -215,5 +242,32 @@ mod caller_mock_tests {
         reset_mock_state();
         assert_eq!(caller(), [0u8; 32]);
         assert_eq!(value(), 0);
+    }
+
+    #[test]
+    fn id_to_caller_encoding_is_stable() {
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        assert_eq!(id_to_caller(1), one);
+        assert_eq!(id_to_caller(0), [0u8; 32]);
+        // Little-endian id in bytes [0..8], zero elsewhere.
+        let mut big = [0u8; 32];
+        big[..8].copy_from_slice(&99_999i64.to_le_bytes());
+        assert_eq!(id_to_caller(99_999), big);
+    }
+
+    #[test]
+    fn caller_is_fail_closed() {
+        reset_mock_state();
+        // Zero address (mock default = no authenticated sender) owns nothing.
+        assert!(!caller_is(0));
+        assert!(!caller_is(-5));
+        assert!(!caller_is(1));
+        set_mock_caller(id_to_caller(1));
+        assert!(caller_is(1));
+        assert!(!caller_is(2));
+        assert!(!caller_is(0));
+        reset_mock_state();
+        assert!(!caller_is(1));
     }
 }

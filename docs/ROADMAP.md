@@ -1,7 +1,7 @@
 # ROADMAP — what needs doing (HDAE canonical, curated, 2026-10-29)
 
 Maintained by the lead only. Mark `[x]` with gate-output hash/date, never on intent.
-Machine state: `STATUS.md`. Features: `FEATURES.md` (38 E2E rows). Why: `docs/specs/`.
+Machine state: `STATUS.md`. Features: `FEATURES.md` (39 E2E rows). Why: `docs/specs/`.
 
 ## Remote topology (all private, `immtes/`)
 
@@ -37,9 +37,9 @@ consumers — external-facing, publish candidate), `scripts/tools/stelops`,
   (default-off, byte-identical pre-activation); BLS PoP strict parse
   (default-off); audit package refreshed (repro green except 2 fixed
   estimate-contract tests).
-- [ ] Full feature-matrix re-run (38 rows + new suites)
+- [ ] Full feature-matrix re-run (39 rows + new suites)
 - [x] Polish wave 1 (details in git history): RPC drift, crypto/state pins
-- [x] Session bloat archived (30 files), specs 00-04 + isolation plan written
+- [x] Session bloat archived (29 files), specs 00-04 + isolation plan written
 - [x] Gate scripts + justfile + agents infra + AGENTS.md constitution
 - [x] Prune timers on all 4 nodes, snapshot fresh, divergence-watch pattern
 - [x] Stale-test repairs: wallet Falcon determinism pin, p3 halt-height race pin

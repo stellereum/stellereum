@@ -1758,27 +1758,15 @@ impl Node {
                 let s = self.app_subs.read().await;
                 s.get(&topic).cloned().unwrap_or_default()
             };
-            // TEMP DIAGNOSTIC (stand blackhole hunt): count receipt vs delivery.
-            // Remove after root cause is found.
-            {
-                let n = self.metrics.msgs_dropped_no_sub.fetch_add(
-                    if senders.is_empty() { 1 } else { 0 },
+            // Delivery accounting: count receipts with no local subscriber
+            // (topic mismatch / late subscribe). Counter only — the former
+            // throttled [diag] eprintlns were removed after the blackhole
+            // root cause (unsharded-vs-sharded topic mismatch) was found.
+            if senders.is_empty() {
+                self.metrics.msgs_dropped_no_sub.fetch_add(
+                    1,
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                if senders.is_empty() && n.is_multiple_of(100) {
-                    eprintln!("[diag] pubsub.msg for topic with NO subscribers: {topic}");
-                }
-                if senders.len() != 1 {
-                    static DIAG_N: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
-                    let n = DIAG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n.is_multiple_of(200) {
-                        eprintln!(
-                            "[diag] pubsub.msg topic {topic} has {} subscriber(s) (sample {n})",
-                            senders.len()
-                        );
-                    }
-                }
             }
             for msg in &ordered {
                 for tx in &senders {

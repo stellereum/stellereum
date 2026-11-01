@@ -634,6 +634,62 @@ struct LegacyFaucetState {
     dispensed: std::collections::HashMap<[u8; 32], u64>,
 }
 
+/// Build + sign a post-quantum EXPLICIT-envelope transfer (PQ1, Falcon-512)
+/// from a raw Falcon-512 keypair.
+///
+/// This is the single definition of the faucet-shaped PQ transfer: the sender
+/// is `derive_pq_address(Falcon512, pubkey, DEFAULT_SALT)` (== `Faucet::account()`
+/// under pure-PQ for the faucet's own keypair), the signature covers the
+/// UNBOUND `signing_message()` (byte-identical to every drip the faucet has
+/// ever built — unbound admission is active while
+/// `STELL_CHAIN_BIND_ACTIVATION_HEIGHT` is unset), and the pubkey rides
+/// EXPLICITLY so the very first spend from a fresh account verifies with no
+/// registry state (always-explicit = no activation tracking needed).
+///
+/// Callers: `Faucet::build_transfer` (same-shard drips, `source == target ==
+/// self.shard`) and the `wallet send-pq` CLI (masterchain source, any target
+/// shard). The keypair MUST be derived with
+/// `FalconKeypair::generate_from_seed_bytes` on the RAW 32-byte seed — the
+/// same derivation `Faucet::new` uses. (The light-wallet KDF derivation
+/// produces a DIFFERENT keypair/address from the same seed and cannot spend
+/// faucet-genesis funds.)
+pub fn sign_pq_explicit_transfer(
+    pq_key: &crate::post_quantum::FalconKeypair,
+    to: [u8; 32],
+    amount: u64,
+    gas_limit: u64,
+    nonce: u64,
+    source_shard: ShardId,
+    target_shard: ShardId,
+) -> Transaction {
+    let from = crate::post_quantum::derive_pq_address(
+        crate::post_quantum::PqScheme::Falcon512,
+        &pq_key.public_key,
+        &crate::post_quantum::DEFAULT_SALT,
+    );
+    let mut tx = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit,
+        nonce,
+        source_shard,
+        target_shard,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    let sig = pq_key.sign(&msg);
+    let env = crate::sharding::PqSignatureEnvelope::new_explicit(
+        crate::post_quantum::PqScheme::Falcon512,
+        pq_key.public_key.clone(),
+        sig,
+    );
+    tx.signature = env.encode();
+    tx
+}
+
 impl Faucet {
     /// Default drip, in nano-STELL: 10 STELL unless `STELL_FAUCET_DRIP_STELL`
     /// carries a whole-STELL override. The single default every node binary
@@ -795,29 +851,15 @@ impl Faucet {
         // declared gas must clear the base fee (raised x500 with the base
         // transfer fee - a hardcoded 21_000 here silently broke every drip).
         let tx = if crate::post_quantum::is_pure_pq_enforced() {
-            let from = self.account();
-            let mut unsigned_tx = Transaction {
-                from,
-                to: who,
+            sign_pq_explicit_transfer(
+                &self.pq_key,
+                who,
                 amount,
-                gas_limit: crate::svm::GAS_BASIC_TRANSFER
-                    + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS,
+                crate::svm::GAS_BASIC_TRANSFER + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS,
                 nonce,
-                source_shard: self.shard,
-                target_shard: self.shard,
-                signature: Vec::new(),
-                payload: Vec::new(),
-                priority_fee_per_gas: 0,
-            };
-            let msg = unsigned_tx.signing_message();
-            let sig = self.pq_key.sign(&msg);
-            let env = crate::sharding::PqSignatureEnvelope::new_explicit(
-                crate::post_quantum::PqScheme::Falcon512,
-                self.pq_key.public_key.clone(),
-                sig,
-            );
-            unsigned_tx.signature = env.encode();
-            unsigned_tx
+                self.shard,
+                self.shard,
+            )
         } else {
             Transaction::sign(
                 &self.key,
@@ -3028,6 +3070,21 @@ fn note_unbound_admission(tx: &Transaction) {
     crate::metrics::global().inc_unbound_tx();
 }
 
+/// A14 phase 3 (chain binding) enforcement at RPC ingress: `Some` carries the
+/// stable [`crate::chain_binding::UNBOUND_REFUSED_ERR_PREFIX`] refusal the
+/// wallet matches on. Call sites pass finalized-tip+1 as `next_height` (see
+/// their `// GATE:` comments) and always refuse with this message verbatim —
+/// no extra prefix, so the pinned string stays matchable. Default-off (the
+/// activation env unset) always returns `None`.
+fn chain_binding_refusal(tx: &Transaction, next_height: u64, chain_id: u64) -> Option<String> {
+    crate::chain_binding::check_admission_from_env(
+        tx.chain_id().is_some(),
+        next_height,
+        chain_id,
+    )
+    .err()
+}
+
 async fn admit_signed_payload_tx(
     st: &RpcState,
     id: Value,
@@ -3076,6 +3133,21 @@ async fn admit_signed_payload_tx(
     if !tx.verify_signature() {
         return err(id, -32000, "invalid transaction signature");
     }
+    // A14 phase 3: refuse unbound envelopes at/after activation, with the
+    // check's message verbatim. A refused tx is never admitted, so it counts
+    // as refused (`stell_unbound_refused_total`), not as metered admission.
+    // GATE: height is finalized-tip+1 — the earliest height this tx could be
+    // included at — derived from COMMITTED `st.height`, never caller params.
+    // Default-off (env unset) always passes, so phase-1 admit+meter below is
+    // byte-identical.
+    let next_height = st
+        .height
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    if let Some(reason) = chain_binding_refusal(&tx, next_height, st.chain_id) {
+        crate::metrics::global().inc_unbound_refused();
+        return err(id, -32000, reason);
+    }
     // A14 phase 1: unbound admission is loud + metered, never silent.
     note_unbound_admission(&tx);
     if !tx.payload.iter().any(carries) {
@@ -3088,7 +3160,7 @@ async fn admit_signed_payload_tx(
     // admission carries the sponsor's balance head too (fail-closed: a
     // sponsored transaction with no head is refused). Legacy transactions
     // carry no head and behave exactly as before.
-    let mut actx = AdmissionCtx::wall_now();
+    let mut actx = AdmissionCtx::wall_now().with_chain_height(next_height);
     if let Some(sbal) = st.engine.sponsor_balance_of(&tx).await {
         actx = actx.with_sponsor_balance(sbal);
     }
@@ -4098,6 +4170,18 @@ async fn dispatch(
                 Ok(tx) => tx,
                 Err(reason) => return err(id, -32603, reason),
             };
+            // A14 phase 3: the mapped L1 leg passes the same admission gate
+            // as every other submit path, with the check's message verbatim.
+            // GATE: height is finalized-tip+1 from COMMITTED `st.height`,
+            // never caller params. Default-off always passes.
+            let next_height = st
+                .height
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1);
+            if let Some(reason) = chain_binding_refusal(&stell_tx, next_height, st.chain_id) {
+                crate::metrics::global().inc_unbound_refused();
+                return err(id, -32000, reason);
+            }
             let acct = st.engine.get_account(&stell_tx.from).await;
             let balance = acct.as_ref().map(|a| a.balance).unwrap_or(0);
             let onchain_nonce = acct.as_ref().map(|a| a.nonce).unwrap_or(0);
@@ -4116,7 +4200,11 @@ async fn dispatch(
                     );
                     return err(id, -32000, format!("rejected: {gap}"));
                 }
-                pool.add_checked_ctx(stell_tx.clone(), balance, AdmissionCtx::wall_now())
+                pool.add_checked_ctx(
+                    stell_tx.clone(),
+                    balance,
+                    AdmissionCtx::wall_now().with_chain_height(next_height),
+                )
             };
             let _stell_hash = match admitted {
                 Ok(h) => h,
@@ -5516,6 +5604,21 @@ async fn dispatch(
             if !tx.verify_signature() {
                 return err(id, -32000, "invalid transaction signature");
             }
+            // A14 phase 3: refuse unbound envelopes at/after activation, with
+            // the check's message verbatim (refused counts as refused, not as
+            // metered admission).
+            // GATE: height is finalized-tip+1 — the earliest height this tx
+            // could be included at — derived from COMMITTED `st.height`,
+            // never caller params. Default-off always passes: phase-1
+            // admit+meter below is byte-identical.
+            let next_height = st
+                .height
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1);
+            if let Some(reason) = chain_binding_refusal(&tx, next_height, st.chain_id) {
+                crate::metrics::global().inc_unbound_refused();
+                return err(id, -32000, reason);
+            }
             // A14 phase 1: unbound admission is loud + metered, never silent.
             note_unbound_admission(&tx);
             let acct = st.engine.get_account(&tx.from).await;
@@ -5523,7 +5626,7 @@ async fn dispatch(
             let onchain_nonce = acct.as_ref().map(|a| a.nonce).unwrap_or(0);
             // PAYMASTER: carry the sponsor's balance head for sponsored
             // transactions (fail-closed without it); legacy ignores it.
-            let mut actx = AdmissionCtx::wall_now();
+            let mut actx = AdmissionCtx::wall_now().with_chain_height(next_height);
             if let Some(sbal) = st.engine.sponsor_balance_of(&tx).await {
                 actx = actx.with_sponsor_balance(sbal);
             }
@@ -9221,6 +9324,196 @@ mod tests {
             .collect();
         nonces.sort_unstable();
         assert_eq!(nonces, vec![0, 1], "faucet txs must not reuse a nonce");
+    }
+
+    /// Fail-safe pure-PQ override: resets on drop so a panicking assertion
+    /// cannot leak enforcement into unrelated tests on this thread.
+    struct PurePqGuard;
+    impl PurePqGuard {
+        fn enforce() -> Self {
+            crate::post_quantum::set_pure_pq_override(Some(true));
+            Self
+        }
+    }
+    impl Drop for PurePqGuard {
+        fn drop(&mut self) {
+            crate::post_quantum::set_pure_pq_override(None);
+        }
+    }
+
+    fn faucet_pq_keypair() -> crate::post_quantum::FalconKeypair {
+        crate::post_quantum::FalconKeypair::generate_from_seed_bytes(&[0x11u8; 32])
+    }
+
+    #[test]
+    fn pq_explicit_transfer_verifies_under_pure_pq() {
+        let _guard = PurePqGuard::enforce();
+        let kp = faucet_pq_keypair();
+        let to = [0xABu8; 32];
+        let gas = crate::svm::GAS_BASIC_TRANSFER + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
+        let tx = sign_pq_explicit_transfer(&kp, to, 1_000_000_000, gas, 0, 0, 0);
+        // The sender is the faucet's own PQ account: this tx spends genesis
+        // funds, which is exactly what `wallet send-pq --falcon-seed` relies on.
+        let faucet = Faucet::new([0x11u8; 32], 0, 10, 25);
+        assert_eq!(
+            tx.from,
+            faucet.account(),
+            "helper sender must equal the pure-PQ faucet account"
+        );
+        assert_eq!(tx.to, to);
+        assert_eq!(tx.nonce, 0);
+        assert_eq!(tx.gas_limit, gas, "activation surcharge must ride the tx");
+        assert!(
+            tx.is_pq(),
+            "the tx must carry a PQ1 envelope, never bare ed"
+        );
+        let env = tx.pq_envelope().expect("PQ envelope decodes");
+        assert_eq!(env.scheme, crate::post_quantum::PqScheme::Falcon512);
+        assert!(
+            !env.is_implicit,
+            "always explicit: first spend needs no registry"
+        );
+        assert!(
+            env.pubkey.is_some(),
+            "explicit carrier must embed the pubkey"
+        );
+        assert!(
+            tx.verify_signature(),
+            "faucet-shaped PQ tx must verify under PURE_PQ"
+        );
+    }
+
+    #[tokio::test]
+    async fn pq_explicit_transfer_matches_faucet_drip_shape() {
+        // The refactor pin: `Faucet::build_transfer` must build the same tx
+        // SHAPE the shared helper builds (same fields, same envelope, both
+        // verify). Signatures legitimately differ: Falcon signing is
+        // randomized (`test_falcon_nonces_never_repeat`), so byte-equality of
+        // the sig is the wrong assertion — structural identity is the pin.
+        let _guard = PurePqGuard::enforce();
+        let seed = [0x11u8; 32];
+        let faucet = Faucet::new(seed, 0, 10_000_000_000, 1_000_000_000_000);
+        let who = [0xCDu8; 32];
+        let (drip_tx, amount) = faucet
+            .build_transfer(who, Some(1_000_000_000), None)
+            .await
+            .expect("first drip fits the cap");
+        let kp = crate::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed);
+        let helper_tx = sign_pq_explicit_transfer(
+            &kp,
+            who,
+            amount,
+            crate::svm::GAS_BASIC_TRANSFER + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS,
+            0,
+            0,
+            0,
+        );
+        for (field, a, b) in [
+            ("from", drip_tx.from.to_vec(), helper_tx.from.to_vec()),
+            ("to", drip_tx.to.to_vec(), helper_tx.to.to_vec()),
+        ] {
+            assert_eq!(a, b, "field {field} must match");
+        }
+        assert_eq!(drip_tx.amount, helper_tx.amount);
+        assert_eq!(drip_tx.gas_limit, helper_tx.gas_limit);
+        assert_eq!(drip_tx.nonce, helper_tx.nonce);
+        assert_eq!(drip_tx.source_shard, helper_tx.source_shard);
+        assert_eq!(drip_tx.target_shard, helper_tx.target_shard);
+        assert_eq!(drip_tx.payload.len(), helper_tx.payload.len());
+        let drip_env = drip_tx.pq_envelope().expect("drip envelope decodes");
+        let helper_env = helper_tx.pq_envelope().expect("helper envelope decodes");
+        assert_eq!(drip_env.scheme, helper_env.scheme);
+        assert_eq!(drip_env.is_implicit, helper_env.is_implicit);
+        assert_eq!(drip_env.pubkey, helper_env.pubkey);
+        assert!(drip_tx.verify_signature());
+        assert!(helper_tx.verify_signature());
+    }
+
+    #[test]
+    fn ed_signed_transfer_is_refused_under_pure_pq() {
+        let _guard = PurePqGuard::enforce();
+        let ed = SigningKey::from_bytes(&[0x22u8; 32]);
+        let tx = crate::sharding::Transaction::sign(&ed, [0xABu8; 32], 1_000, 1000, 0, 0, 0);
+        assert!(
+            !tx.verify_signature(),
+            "legacy ed25519 txs must be refused when PURE_PQ is enforced"
+        );
+    }
+
+    #[test]
+    fn tampered_pq_transfer_is_refused() {
+        let _guard = PurePqGuard::enforce();
+        let kp = faucet_pq_keypair();
+        let gas = crate::svm::GAS_BASIC_TRANSFER + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
+        let tx = sign_pq_explicit_transfer(&kp, [0xABu8; 32], 1_000_000_000, gas, 0, 0, 0);
+        assert!(tx.verify_signature(), "baseline must verify");
+
+        let mut bad_sig = tx.clone();
+        let last = bad_sig.signature.len() - 1;
+        bad_sig.signature[last] ^= 0x01;
+        assert!(
+            !bad_sig.verify_signature(),
+            "a tampered PQ signature must be refused"
+        );
+
+        let mut bad_amt = tx.clone();
+        bad_amt.amount += 1;
+        assert!(
+            !bad_amt.verify_signature(),
+            "a tampered amount must be refused"
+        );
+
+        let mut bad_to = tx.clone();
+        bad_to.to[0] ^= 0xFF;
+        assert!(
+            !bad_to.verify_signature(),
+            "a tampered recipient must be refused"
+        );
+    }
+
+    #[test]
+    fn cross_shard_pq_shape_verifies_under_pure_pq() {
+        // The 2PC demo's first leg: source = masterchain, target = workchain 1.
+        let _guard = PurePqGuard::enforce();
+        let kp = faucet_pq_keypair();
+        let gas = crate::svm::GAS_BASIC_TRANSFER + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
+        let tx = sign_pq_explicit_transfer(&kp, [0xABu8; 32], 1_000_000_000, gas, 0, 0, 1);
+        assert_eq!(tx.source_shard, 0);
+        assert_eq!(tx.target_shard, 1);
+        assert!(
+            tx.verify_signature(),
+            "cross-shard PQ tx must verify under PURE_PQ"
+        );
+    }
+
+    #[test]
+    fn pq_explicit_transfer_admits_under_pure_pq() {
+        // The one mempool gate the in-process e2e cannot cover (it must run
+        // with pure-PQ off so the harness's ed votes verify): under
+        // enforcement the pool REQUIRES a PQ envelope with a post-quantum
+        // scheme. The `send-pq` shape passes; a bare ed tx is refused.
+        let _guard = PurePqGuard::enforce();
+        let kp = faucet_pq_keypair();
+        let gas = crate::svm::GAS_BASIC_TRANSFER + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS;
+        let tx = sign_pq_explicit_transfer(&kp, [0xABu8; 32], 1_000_000_000, gas, 0, 0, 0);
+        let mut pool = crate::mempool::Mempool::default();
+        let ctx = crate::mempool::AdmissionCtx::wall_now().with_onchain_nonce(0);
+        assert!(
+            pool.add_checked_ctx(tx, 1_000_000_000_000_000u64, ctx)
+                .is_ok(),
+            "faucet-shaped PQ tx must admit under PURE_PQ"
+        );
+
+        let ed = SigningKey::from_bytes(&[0x22u8; 32]);
+        let ed_tx = crate::sharding::Transaction::sign(&ed, [0xABu8; 32], 1_000, 1000, 0, 0, 0);
+        let mut pool2 = crate::mempool::Mempool::default();
+        let ctx2 = crate::mempool::AdmissionCtx::wall_now().with_onchain_nonce(0);
+        assert!(
+            pool2
+                .add_checked_ctx(ed_tx, 1_000_000_000_000_000u64, ctx2)
+                .is_err(),
+            "bare ed tx must NOT admit under PURE_PQ"
+        );
     }
 
     #[tokio::test]

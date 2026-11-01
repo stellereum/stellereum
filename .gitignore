@@ -6,6 +6,7 @@ explorer-site/node_modules/
 multinode/
 stell-observe/
 tmp/
+run/
 *.log
 *.tmp
 *.key

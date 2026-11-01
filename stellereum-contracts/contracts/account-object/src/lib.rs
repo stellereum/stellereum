@@ -1,9 +1,14 @@
-//! STATUS: DEMO-GRADE — NO AUTHENTICATION (audit B-CT P0). All `from`/
-//! `owner`/`caller_id`/`admin_id` args are caller-supplied and replayable:
-//! the contract never reads the authenticated `host.caller`. DO NOT deploy
-//! with value. Auth redesign (host.caller-bound, SDK `caller()` ready) is
-//! tracked in docs/ROADMAP.md P0; the failing `poc_p0_*` tests are the
-//! executable acceptance criteria.
+//! STATUS: DEMO-GRADE, CT-P0 AUTHENTICATED (audit KI-38 fix). Ownership,
+//! guardian, tenant and recovery entries bind the caller-supplied `caller_id`
+//! to the authenticated `host.caller` via `caller_is` (existing
+//! require_owner-style checks, now forgery-proof: public ids replay nothing).
+//! Session spend/update/revoke carry no caller field and stay bearer-style
+//! (residual, no PoC). DO NOT deploy with value without a full audit.
+//!
+//! NOTE (CT-P0): entry points are `extern "C-unwind"` (not `"C"`) so a native
+//! test harness observes auth traps via `catch_unwind` (poc_p0_takeover pins
+//! the trap). Wasm behavior is unchanged: the panic handler lowers panics to
+//! `unreachable`, which the host reports as a trapped/reverted call.
 //!
 ////! Account Object (Hardened Native Account Abstraction) Contract
 //!
@@ -22,7 +27,7 @@
 extern crate std;
 
 use stellereum_contract_sdk::{
-    emit, setup_wasm_panic_handler, sload, sstore, ERR_INVALID_ARGUMENT, SUCCESS,
+    caller_is, emit, setup_wasm_panic_handler, sload, sstore, ERR_INVALID_ARGUMENT, SUCCESS,
 };
 
 setup_wasm_panic_handler!();
@@ -69,14 +74,16 @@ fn session_base(session_id: i64) -> i64 {
 #[inline(always)]
 fn require_owner(caller_id: i64) {
     let owner = sload(SLOT_OWNER);
-    if caller_id <= 0 || caller_id != owner {
+    // CT-P0: the public owner id replays nothing — the live host.caller must
+    // be the canonical address of the claimed caller_id (fail-closed trap).
+    if caller_id <= 0 || caller_id != owner || !caller_is(caller_id) {
         panic!("unauthorized: caller is not owner");
     }
 }
 
 /// Initialize Account Object for Owner
 #[no_mangle]
-pub extern "C" fn init(owner_id: i64) -> i64 {
+pub extern "C-unwind" fn init(owner_id: i64) -> i64 {
     if owner_id <= 0 {
         return ERR_INVALID_ARGUMENT;
     }
@@ -100,24 +107,24 @@ pub extern "C" fn init(owner_id: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn get_owner(_arg: i64) -> i64 {
+pub extern "C-unwind" fn get_owner(_arg: i64) -> i64 {
     sload(SLOT_OWNER)
 }
 
 #[no_mangle]
-pub extern "C" fn get_guardian(_arg: i64) -> i64 {
+pub extern "C-unwind" fn get_guardian(_arg: i64) -> i64 {
     sload(SLOT_GUARDIAN)
 }
 
 #[no_mangle]
-pub extern "C" fn get_pending_owner(_arg: i64) -> i64 {
+pub extern "C-unwind" fn get_pending_owner(_arg: i64) -> i64 {
     sload(SLOT_PENDING_OWNER)
 }
 
 /// Transfer Account Object to a new wallet owner
 /// packed: caller_id * 10_000_000_000 + new_owner
 #[no_mangle]
-pub extern "C" fn transfer_ownership(packed: i64) -> i64 {
+pub extern "C-unwind" fn transfer_ownership(packed: i64) -> i64 {
     if packed <= 0 {
         panic!("invalid packed argument");
     }
@@ -142,7 +149,7 @@ pub extern "C" fn transfer_ownership(packed: i64) -> i64 {
 /// Rotate Guardian account
 /// packed: caller_id * 10_000_000_000 + new_guardian
 #[no_mangle]
-pub extern "C" fn rotate_guardian(packed: i64) -> i64 {
+pub extern "C-unwind" fn rotate_guardian(packed: i64) -> i64 {
     if packed <= 0 {
         panic!("invalid packed argument");
     }
@@ -162,7 +169,7 @@ pub extern "C" fn rotate_guardian(packed: i64) -> i64 {
 /// Social Recovery - Step 1: Propose Recovery Owner (Authorized by Guardian only)
 /// packed: caller_id * 10_000_000_000 + new_owner
 #[no_mangle]
-pub extern "C" fn initiate_recovery(packed: i64) -> i64 {
+pub extern "C-unwind" fn initiate_recovery(packed: i64) -> i64 {
     if packed <= 0 {
         panic!("invalid packed argument");
     }
@@ -170,7 +177,8 @@ pub extern "C" fn initiate_recovery(packed: i64) -> i64 {
     let new_owner = packed % 10_000_000_000;
 
     let guardian = sload(SLOT_GUARDIAN);
-    if guardian <= 0 || caller_id != guardian {
+    // CT-P0: guardian id is public — bind it to host.caller like require_owner.
+    if guardian <= 0 || caller_id != guardian || !caller_is(caller_id) {
         panic!("unauthorized: caller is not designated guardian");
     }
     if new_owner <= 0 {
@@ -187,7 +195,7 @@ pub extern "C" fn initiate_recovery(packed: i64) -> i64 {
 
 /// Cancel a pending social recovery (Owner veto right)
 #[no_mangle]
-pub extern "C" fn cancel_recovery(caller_id: i64) -> i64 {
+pub extern "C-unwind" fn cancel_recovery(caller_id: i64) -> i64 {
     require_owner(caller_id);
     sstore(SLOT_PENDING_OWNER, 0);
     sstore(SLOT_RECOVERY_TIMESTAMP, 0);
@@ -197,7 +205,7 @@ pub extern "C" fn cancel_recovery(caller_id: i64) -> i64 {
 
 /// Social Recovery - Step 2: Finalize Recovery
 #[no_mangle]
-pub extern "C" fn finalize_recovery(now_timestamp: i64) -> i64 {
+pub extern "C-unwind" fn finalize_recovery(now_timestamp: i64) -> i64 {
     let pending = sload(SLOT_PENDING_OWNER);
     if pending <= 0 {
         panic!("no pending recovery");
@@ -221,7 +229,7 @@ pub extern "C" fn finalize_recovery(now_timestamp: i64) -> i64 {
 /// Delegate usage rights to tenant
 /// packed: caller_id * 10_000_000_000 + tenant_id * 10_000 + duration_hours
 #[no_mangle]
-pub extern "C" fn set_tenant(packed: i64) -> i64 {
+pub extern "C-unwind" fn set_tenant(packed: i64) -> i64 {
     if packed <= 0 {
         return ERR_INVALID_ARGUMENT;
     }
@@ -247,7 +255,7 @@ pub extern "C" fn set_tenant(packed: i64) -> i64 {
 
 /// Revoke rental
 #[no_mangle]
-pub extern "C" fn revoke_rental(caller_id: i64) -> i64 {
+pub extern "C-unwind" fn revoke_rental(caller_id: i64) -> i64 {
     require_owner(caller_id);
     sstore(SLOT_TENANT, 0);
     sstore(SLOT_RENTAL_DEADLINE, 0);
@@ -256,7 +264,7 @@ pub extern "C" fn revoke_rental(caller_id: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn get_active_tenant(now_timestamp: i64) -> i64 {
+pub extern "C-unwind" fn get_active_tenant(now_timestamp: i64) -> i64 {
     let deadline = sload(SLOT_RENTAL_DEADLINE);
     if deadline == 0 || now_timestamp >= deadline {
         return 0;
@@ -265,7 +273,7 @@ pub extern "C" fn get_active_tenant(now_timestamp: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn is_rental_active(now_timestamp: i64) -> i64 {
+pub extern "C-unwind" fn is_rental_active(now_timestamp: i64) -> i64 {
     if get_active_tenant(now_timestamp) > 0 {
         1
     } else {
@@ -276,7 +284,7 @@ pub extern "C" fn is_rental_active(now_timestamp: i64) -> i64 {
 /// Create a new session with strict bounds and authorization
 /// packed: (session_id * 10_000_000_000) + (service_id * 100_000) + budget
 #[no_mangle]
-pub extern "C" fn create_session(packed: i64) -> i64 {
+pub extern "C-unwind" fn create_session(packed: i64) -> i64 {
     if packed <= 0 {
         panic!("invalid packed argument");
     }
@@ -319,7 +327,7 @@ pub extern "C" fn create_session(packed: i64) -> i64 {
 /// Update an existing session's budget (Restricted: budget can only be decreased)
 /// packed: (session_id * 10_000_000_000) + new_budget
 #[no_mangle]
-pub extern "C" fn update_session_budget(packed: i64) -> i64 {
+pub extern "C-unwind" fn update_session_budget(packed: i64) -> i64 {
     if packed <= 0 {
         panic!("invalid packed argument");
     }
@@ -357,7 +365,7 @@ pub extern "C" fn update_session_budget(packed: i64) -> i64 {
 /// Spend using active session with strict amount boundary check
 /// packed: (session_id * 1_000_000) + amount
 #[no_mangle]
-pub extern "C" fn spend_with_session(packed: i64) -> i64 {
+pub extern "C-unwind" fn spend_with_session(packed: i64) -> i64 {
     if packed <= 0 {
         panic!("invalid packed argument");
     }
@@ -399,7 +407,7 @@ pub extern "C" fn spend_with_session(packed: i64) -> i64 {
 
 /// Revoke session immediately with terminal tombstone
 #[no_mangle]
-pub extern "C" fn revoke_session(session_id: i64) -> i64 {
+pub extern "C-unwind" fn revoke_session(session_id: i64) -> i64 {
     if session_id <= 0 || session_id > MAX_SESSIONS {
         panic!("invalid session_id");
     }
@@ -414,7 +422,7 @@ pub extern "C" fn revoke_session(session_id: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn is_session_active(session_id: i64) -> i64 {
+pub extern "C-unwind" fn is_session_active(session_id: i64) -> i64 {
     if session_id <= 0 || session_id > MAX_SESSIONS {
         return 0;
     }
@@ -431,7 +439,7 @@ pub extern "C" fn is_session_active(session_id: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn get_session_budget(session_id: i64) -> i64 {
+pub extern "C-unwind" fn get_session_budget(session_id: i64) -> i64 {
     if session_id <= 0 || session_id > MAX_SESSIONS {
         return 0;
     }
@@ -450,7 +458,7 @@ pub extern "C" fn get_session_budget(session_id: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellereum_contract_sdk::reset_mock_state;
+    use stellereum_contract_sdk::{id_to_caller, reset_mock_state, set_mock_caller};
 
     #[test]
     fn test_account_object_lifecycle() {
@@ -460,10 +468,12 @@ mod tests {
         assert_eq!(get_guardian(0), 0);
 
         // Rotate guardian: owner 42 authorizes guardian 777
+        set_mock_caller(id_to_caller(42));
         assert_eq!(rotate_guardian(42 * 10_000_000_000 + 777), 777);
         assert_eq!(get_guardian(0), 777);
 
         // Social recovery: guardian 777 proposes new owner 888
+        set_mock_caller(id_to_caller(777));
         assert_eq!(initiate_recovery(777 * 10_000_000_000 + 888), 888);
         assert_eq!(get_pending_owner(0), 888);
 
@@ -473,10 +483,12 @@ mod tests {
         assert_eq!(get_owner(0), 888);
 
         // Transfer ownership: owner 888 transfers to 999
+        set_mock_caller(id_to_caller(888));
         assert_eq!(transfer_ownership(888 * 10_000_000_000 + 999), 999);
         assert_eq!(get_owner(0), 999);
 
         // Set tenant: owner 999 delegates to tenant 555 for 168 hours
+        set_mock_caller(id_to_caller(999));
         let rent_arg = 999 * 10_000_000_000 + 555 * 10_000 + 168;
         assert_eq!(set_tenant(rent_arg), 555);
 

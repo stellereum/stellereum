@@ -304,6 +304,43 @@ pub fn stage_line(stage: u32, msg: &str) -> String {
     format!("[bootstrap] stage {stage}/4: {msg}")
 }
 
+/// Short hex prefix for 3am log lines: first 16 hex chars with a trailing
+/// `...` when longer. Keeps the fail-closed genesis-guard lines short while
+/// still distinguishing roots.
+fn short_root_hex(raw: &[u8]) -> String {
+    let full = hex::encode(raw);
+    if full.len() > 16 {
+        format!("{}...", &full[..16])
+    } else {
+        full
+    }
+}
+
+/// Fail-closed genesis-guard message (message text only: no I/O, no env).
+///
+/// `expected` is the freshly computed root (this config), `found` is the
+/// stored root from the data directory. `shard` names the shard store when
+/// the guard is per-shard, or `None` for the masterchain data directory.
+///
+/// The text names both roots (16-hex-char prefixes), the shard when given,
+/// and the usual suspects (`STELL_FAUCET_KEY(/_FILE)`,
+/// `STELL_LEGACY_GENESIS_ROOT`, the `validators:` list, `STELL_SHARDS`)
+/// plus the wipe-or-restore recovery. Callers must still refuse to start
+/// (comparison semantics unchanged — this only formats the refusal).
+pub fn genesis_mismatch_msg(shard: Option<u32>, expected: &[u8; 32], found: &[u8]) -> String {
+    let expected_hex = short_root_hex(expected);
+    let found_hex = short_root_hex(found);
+    let scope = match shard {
+        Some(s) => format!("for the shard {s} store"),
+        None => "for this data directory".to_string(),
+    };
+    format!(
+        "genesis state root mismatch {scope}:\n  expected (config): {expected_hex}\n  found (stored): {found_hex}\n\
+         Suspects: STELL_FAUCET_KEY(/_FILE), STELL_LEGACY_GENESIS_ROOT, validators: list, STELL_SHARDS. \
+         Wipe ./data to start a new chain, or restore the original config."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

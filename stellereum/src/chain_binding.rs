@@ -11,12 +11,17 @@
 //! refusal string wallets discover the requirement through, and the pure
 //! mempool-drain helper for in-flight unbound transactions at activation.
 //!
-//! NOTHING here is wired into admission yet: every admission path behaves
+//! NOTHING here used to be wired into admission: every admission path behaved
 //! byte-identically with or without this module. Phase 3 wires
-//! [`check_admission`] into `rpc.rs` (`stell_sendRawTransaction`,
-//! `admit_signed_payload_tx` and every `note_unbound_admission` call site),
-//! `mempool.rs::insert`/`add_checked_ctx`, and the block-apply gates in
-//! `state_engine.rs`. Until then this module is spec-as-code with tests.
+//! [`check_admission`] (via [`check_admission_from_env`], which reads the
+//! ambient [`CHAIN_BINDING_ACTIVATION_ENV`]) into `rpc.rs`
+//! (`stell_sendRawTransaction`, `admit_signed_payload_tx`,
+//! `eth_sendRawTransaction`), `mempool.rs::insert` (gated on
+//! `AdmissionCtx::chain_height`, so height-less callers keep legacy
+//! behaviour), the block-apply gates in `state_engine.rs` (committed block
+//! height), and the one-shot activation drain in `main.rs`. With the env
+//! unset every one of those paths still admits exactly as before
+//! (default-off is byte-identical).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -134,6 +139,23 @@ pub fn check_admission(
         return Ok(());
     }
     Err(unbound_refused_err(activation.height, chain_id))
+}
+
+/// Phase-3 wiring helper: [`check_admission`] against the ambient environment
+/// ([`CHAIN_BINDING_ACTIVATION_ENV`], default-off). Every production admission
+/// path calls this (never [`check_admission`] with a hand-rolled activation)
+/// so there is exactly ONE env name and ONE default-off rule: unset /
+/// unparsable / `0` admits everything, byte-identically to the pre-wiring
+/// behaviour. The caller supplies the height (committed block height at
+/// propose/apply, finalized-tip+1 at RPC ingress — see the `// GATE:`
+/// comment at each call site, never a caller-supplied value) and the local
+/// chain id (used only for the refusal message).
+pub fn check_admission_from_env(
+    is_bound: bool,
+    chain_height: u64,
+    chain_id: u64,
+) -> Result<(), String> {
+    check_admission(is_bound, chain_height, &ChainBindingActivation::from_env(), chain_id)
 }
 
 /// Split one mempool snapshot at activation: bound transactions stay queued,

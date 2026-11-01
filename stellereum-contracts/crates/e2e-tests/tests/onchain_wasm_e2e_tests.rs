@@ -58,6 +58,8 @@ fn load_wasm(name: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
+#[allow(clippy::identity_op)] // GATE: `id * BASE + ...` names the packed leading field; `1 *` is intentional.
+                              // (pre-existing idiom across these pins)
 async fn test_rust_wasm_stl_dns_onchain() {
     let (engine, sk, _) = funded_engine().await;
 
@@ -150,6 +152,8 @@ async fn test_rust_wasm_stl_dns_onchain() {
 }
 
 #[tokio::test]
+#[allow(clippy::identity_op)] // GATE: `id * BASE + ...` names the packed leading field; `1 *` is intentional.
+                              // (pre-existing idiom across these pins)
 async fn test_rust_wasm_sts20_token_onchain() {
     let (engine, sk, _) = funded_engine().await;
 
@@ -173,7 +177,10 @@ async fn test_rust_wasm_sts20_token_onchain() {
         .unwrap();
     assert_eq!(supply, 1_000_000);
 
-    // Transfer 10,000 with 50 bps fee
+    // CT-P0: transfer binds from_id to the authenticated host.caller; a plain
+    // tx signer is never the canonical id address, so the move is refused
+    // (ERR_UNAUTHORIZED return — the tx applies but nothing moves). Exact fee
+    // math is pinned natively (token lifecycle with mock caller).
     let transfer_arg = 1 * 100_000_000 + 2 * 100_000 + 10_000;
     let (applied, _) = engine
         .apply_block_parallel(
@@ -187,16 +194,24 @@ async fn test_rust_wasm_sts20_token_onchain() {
         .call_contract(&contract_addr, "balance_of", 2, 100_000)
         .await
         .unwrap();
-    assert_eq!(bal2, 9_950);
+    assert_eq!(bal2, 0, "CT-P0: refused transfer credits nothing");
 
     let (bal_treasury, _) = engine
         .call_contract(&contract_addr, "balance_of", 99, 100_000)
         .await
         .unwrap();
-    assert_eq!(bal_treasury, 50);
+    assert_eq!(bal_treasury, 0, "CT-P0: refused transfer accrues no fee");
+
+    let (bal1, _) = engine
+        .call_contract(&contract_addr, "balance_of", 1, 100_000)
+        .await
+        .unwrap();
+    assert_eq!(bal1, 1_000_000, "CT-P0: refused transfer debits nothing");
 }
 
 #[tokio::test]
+#[allow(clippy::identity_op)] // GATE: `id * BASE + ...` names the packed leading field; `1 *` is intentional.
+                              // (pre-existing idiom across these pins)
 async fn test_rust_wasm_liquidity_pool_onchain() {
     let (engine, sk, _) = funded_engine().await;
 
@@ -213,7 +228,10 @@ async fn test_rust_wasm_liquidity_pool_onchain() {
         .await;
     assert_eq!(applied, 1);
 
-    // Deposit 10,000 Token A and 40,000 Token B
+    // CT-P0: deposit binds user_id to the authenticated host.caller; a plain
+    // tx signer is never the canonical id address, so funding is refused
+    // (ERR_UNAUTHORIZED return — the tx applies but nothing moves). Exact
+    // share math is pinned natively (pool lifecycle with mock caller).
     let dep_arg = 1 * 10_000_000_000 + 10_000 * 100_000 + 40_000;
     let (applied, _) = engine
         .apply_block_parallel(&[call_tx(&sk, 2, pool, "deposit", dep_arg)], 0)
@@ -232,18 +250,18 @@ async fn test_rust_wasm_liquidity_pool_onchain() {
         .call_contract(&pool, "shares_of", 1, 100_000)
         .await
         .unwrap();
-    assert_eq!(res_a, 10_000);
-    assert_eq!(res_b, 40_000);
-    assert_eq!(shares, 25_000);
+    assert_eq!(res_a, 0, "CT-P0: refused deposit funds nothing");
+    assert_eq!(res_b, 0, "CT-P0: refused deposit funds nothing");
+    assert_eq!(shares, 0, "CT-P0: refused deposit mints no shares");
 
-    // Swap quote for 1,000 Token A
+    // Swap quote for 1,000 Token A on the empty pool: exact zero.
     let (quote, _) = engine
         .call_contract(&pool, "swap_quote", 1_000, 100_000)
         .await
         .unwrap();
-    assert_eq!(quote, 3_626);
+    assert_eq!(quote, 0);
 
-    // Execute swap
+    // Execute swap: refused on the empty pool, reserves untouched.
     let (applied, _) = engine
         .apply_block_parallel(&[call_tx(&sk, 3, pool, "swap_a_for_b", 1_000)], 0)
         .await;
@@ -253,10 +271,12 @@ async fn test_rust_wasm_liquidity_pool_onchain() {
         .call_contract(&pool, "get_reserve_a", 0, 100_000)
         .await
         .unwrap();
-    assert_eq!(res_a_after, 11_000);
+    assert_eq!(res_a_after, 0);
 }
 
 #[tokio::test]
+#[allow(clippy::identity_op)] // GATE: `id * BASE + ...` names the packed leading field; `1 *` is intentional.
+                              // (pre-existing idiom across these pins)
 async fn test_rust_wasm_account_object_onchain() {
     let (engine, sk, _) = funded_engine().await;
 

@@ -86,6 +86,7 @@ pub const DIVERGENCE_TOTAL: &str = "stell_divergence_total";
 /// only its own vote when the set requires more). Monotonic counter, never
 /// reset: alert on `increase(...) > 0`.
 pub const WEAK_QC_REFUSED_TOTAL: &str = "stell_weak_qc_refused_total";
+pub const STRAGGLER_GRACE_EXTENDS_TOTAL: &str = "stell_straggler_grace_extends_total";
 /// Transactions pending in the mempool.
 pub const MEMPOOL_SIZE: &str = "stell_mempool_size";
 /// Transactions in the pool that took the SEALED (epoch-seal) path.
@@ -141,6 +142,13 @@ pub const SLOW_VALIDATION_TOTAL: &str = "stell_slow_validation_total";
 /// phase 3 refuses unbound admission outright, so the series going flat is
 /// the rollout completing.
 pub const UNBOUND_TX_TOTAL: &str = "stell_unbound_tx_total";
+/// Unbound (replayable, no chain id) transactions REFUSED by the chain-binding
+/// gate once refusal is active (A14 rollout, phase 3: RPC submit, mempool
+/// insert, block-apply admission and the activation drain all count here).
+/// Monotonic counter, never reset: alert on any increase before the published
+/// activation height (it means a node armed the gate early); after activation
+/// it counts blocked replays.
+pub const UNBOUND_REFUSED_TOTAL: &str = "stell_unbound_refused_total";
 
 /// Label carrying the vote kind (`prevote` / `precommit`).
 pub const LABEL_KIND: &str = "kind";
@@ -506,6 +514,13 @@ impl Registry {
                 buckets: &[],
             },
             MetricDef {
+                name: STRAGGLER_GRACE_EXTENDS_TOTAL,
+                help: "Ticks a straggler grace hold kept a round open past its deterministic timeout (docs/PROPOSER_REWORK.md)",
+                kind: MetricKind::Counter,
+                labels: &[],
+                buckets: &[],
+            },
+            MetricDef {
                 name: MEMPOOL_SIZE,
                 help: "Transactions currently pending in the mempool",
                 kind: MetricKind::Gauge,
@@ -660,6 +675,13 @@ impl Registry {
                 buckets: &[],
             },
             MetricDef {
+                name: UNBOUND_REFUSED_TOTAL,
+                help: "Unbound replayable transactions refused by the chain-binding gate (RPC, mempool, apply, activation drain)",
+                kind: MetricKind::Counter,
+                labels: &[],
+                buckets: &[],
+            },
+            MetricDef {
                 name: BUILD_INFO,
                 help: "Build identity of this binary (always 1; see version, hash and dirty labels)",
                 kind: MetricKind::Gauge,
@@ -700,6 +722,7 @@ impl Registry {
             FORK_TOTAL,
             DIVERGENCE_TOTAL,
             WEAK_QC_REFUSED_TOTAL,
+            STRAGGLER_GRACE_EXTENDS_TOTAL,
             MEMPOOL_SIZE,
             BLOCK_TXS,
             STATE_ROOT_COMMITS_TOTAL,
@@ -713,6 +736,7 @@ impl Registry {
             PERSIST_QUEUE_DEPTH,
             PERSIST_QUEUE_DROPPED_TOTAL,
             UNBOUND_TX_TOTAL,
+            UNBOUND_REFUSED_TOTAL,
         ] {
             reg.seed(name, &[]);
         }
@@ -941,6 +965,14 @@ impl Registry {
         self.add(WEAK_QC_REFUSED_TOTAL, &[], 1.0);
     }
 
+    /// One tick a straggler grace hold kept the round open past its
+    /// deterministic timeout (docs/PROPOSER_REWORK.md §2c). Monotonic counter,
+    /// never reset: the extends/sec rate is the liveness signal that the
+    /// grace is engaging (vs a silent stall).
+    pub fn inc_straggler_grace_extends(&self) {
+        self.add(STRAGGLER_GRACE_EXTENDS_TOTAL, &[], 1.0);
+    }
+
     /// A proposal was refused because its post-state root disagrees with ours
     /// (same finalized hash, different execution outcome — the 2026-10-22
     /// #288000 split). Monotonic counter, never reset: alert on any increase.
@@ -993,6 +1025,13 @@ impl Registry {
     /// `note_unbound_admission`); monotonic counter, never reset.
     pub fn inc_unbound_tx(&self) {
         self.add(UNBOUND_TX_TOTAL, &[], 1.0);
+    }
+
+    /// One unbound (replayable, no chain id) transaction REFUSED by the
+    /// chain-binding gate while refusal is active (see [`UNBOUND_REFUSED_TOTAL`]);
+    /// monotonic counter, never reset.
+    pub fn inc_unbound_refused(&self) {
+        self.add(UNBOUND_REFUSED_TOTAL, &[], 1.0);
     }
 
     /// `n` persist jobs dropped because the bounded queue was full.
@@ -1124,6 +1163,8 @@ impl Registry {
             divergences: scalar(DIVERGENCE_TOTAL, &[]),
             state_root_commits: scalar(STATE_ROOT_COMMITS_TOTAL, &[]),
             unbound_tx: scalar(UNBOUND_TX_TOTAL, &[]),
+            unbound_refused: scalar(UNBOUND_REFUSED_TOTAL, &[]),
+            straggler_grace_extends: scalar(STRAGGLER_GRACE_EXTENDS_TOTAL, &[]),
         }
     }
 }
@@ -1164,6 +1205,8 @@ pub struct Snapshot {
     pub divergences: f64,
     pub state_root_commits: f64,
     pub unbound_tx: f64,
+    pub unbound_refused: f64,
+    pub straggler_grace_extends: f64,
 }
 
 impl Snapshot {
@@ -1188,6 +1231,8 @@ impl Snapshot {
             "divergences": self.divergences,
             "state_root_commits": self.state_root_commits,
             "unbound_tx": self.unbound_tx,
+            "unbound_refused": self.unbound_refused,
+            "straggler_grace_extends": self.straggler_grace_extends,
         })
         .to_string()
     }

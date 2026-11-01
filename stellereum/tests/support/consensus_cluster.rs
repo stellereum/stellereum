@@ -83,7 +83,7 @@
 #![allow(dead_code)]
 
 use ed25519_dalek::SigningKey;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use stellereum::consensus::{
     BlockHash, Height, HeightConsensus, QuorumCertificate, Round, ValidatorId, ValidatorSet, Vote,
@@ -141,6 +141,94 @@ impl Rng {
 // Configuration
 // ===========================================================================
 
+/// SIM-ONLY straggler-aware round extension (proposer-rework experiment).
+///
+/// This policy is HARNESS-ONLY test code: it is never consulted by any
+/// production path (`src/` is untouched). It models the recommended design —
+/// slow the round rate while a straggler is detected via observed peer rounds
+/// instead of racing a fixed backoff — so a scenario can compare stall vs.
+/// fix on the same seed with everything else identical.
+///
+/// Two evidence-gated clauses, both bounded by `cap_ms` and both requiring
+/// FRESH evidence (a silent peer stops stretching rounds once its last
+/// observed vote ages past `freshness_ms`, so a dead peer cannot park the
+/// chain — only a live-but-slow one buys extra time):
+///
+/// * (1) BEHIND-VOTE: some other validator was recently observed voting at an
+///   older (height, round) than ours — its vote for our round may still be in
+///   flight, so grant it `grace_ms` before view-changing.
+/// * (2) SCHEDULED-PROPOSAL: we hold no live proposal and the scheduled
+///   proposer of our (height, round) is not demonstrably ahead of us (never
+///   heard, or last seen at-or-behind our round, recently) — its proposal may
+///   still be in flight, so wait for the scheduled value instead of racing to
+///   the next round proposalless.
+///
+/// Disabled by default: every pre-existing scenario runs with `enabled: false`
+/// and is bit-identical to before (no RNG, wire, or timing change on that
+/// path — only passive counters are recorded).
+#[derive(Clone, Copy, Debug)]
+pub struct StragglerPolicy {
+    /// Master switch. `false` = control behaviour, exactly the old harness.
+    pub enabled: bool,
+    /// Extra round time granted per engagement, in virtual ms.
+    pub grace_ms: u64,
+    /// Hard cap on the extra time (single clause; the two clauses do not
+    /// stack — one grace per round at most).
+    pub cap_ms: u64,
+    /// How recent (virtual ms) a peer sighting must be to count as evidence.
+    pub freshness_ms: u64,
+    /// SIM-ONLY round-timer accounting fix (TEMPO §5.3): subsume the grace
+    /// into the pre-existing 2× peer-active hold bound instead of adding it
+    /// past the deterministic deadline. `false` = production-today stacking
+    /// (`deadline = base + grace`); `true` = fixed
+    /// (`deadline = base + min(grace, max(0, 2 * cluster_base - base))`).
+    /// Default `false`, so every pre-existing scenario is unaffected; the
+    /// accounting scenario opts in explicitly. (The production hold itself —
+    /// `hold_bounded` — needs no harness model here: the scenario operates in
+    /// the saturated regime `grace >= slack`, where the hold is masked in
+    /// both compositions and the deadlines above match production exactly.)
+    pub subsume_grace: bool,
+}
+
+impl Default for StragglerPolicy {
+    fn default() -> Self {
+        StragglerPolicy {
+            enabled: false,
+            grace_ms: 0,
+            cap_ms: 0,
+            freshness_ms: 20_000,
+            subsume_grace: false,
+        }
+    }
+}
+
+impl StragglerPolicy {
+    /// A bounded grace: `grace_ms` extra round time on fresh straggler
+    /// evidence, capped at `cap_ms`, evidence fresher than `freshness_ms`.
+    pub fn fixed(grace_ms: u64, cap_ms: u64, freshness_ms: u64) -> Self {
+        StragglerPolicy {
+            enabled: true,
+            grace_ms,
+            cap_ms,
+            freshness_ms,
+            subsume_grace: false,
+        }
+    }
+
+    /// Same bounded grace, but subsumed into the 2× hold bound (the
+    /// round-timer accounting fix): the deadline can fill the slack up to
+    /// `2 * cluster_base`, never stack past it.
+    pub fn fixed_subsumed(grace_ms: u64, cap_ms: u64, freshness_ms: u64) -> Self {
+        StragglerPolicy {
+            enabled: true,
+            grace_ms,
+            cap_ms,
+            freshness_ms,
+            subsume_grace: true,
+        }
+    }
+}
+
 /// What a Byzantine validator does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Byzantine {
@@ -151,6 +239,19 @@ pub enum Byzantine {
     /// quorum still forms, and the conflicting pair is recorded as
     /// equivocation evidence.
     DoublePrevote,
+    /// Broadcast a SECOND, CONFLICTING proposal for the SAME (height, round)
+    /// whenever this member is the proposer: the honest block is cloned, its
+    /// timestamp bumped by one second and the copy re-signed with the same
+    /// key, so the second body is genuine (passes authentication and
+    /// validation) but names a DIFFERENT hash, and it is put on the wire
+    /// AFTER the honest one.
+    ///
+    /// The production proposal path keeps the FIRST value
+    /// (`HeightConsensus::receive_proposal` refuses "proposal already
+    /// recorded for this round"), so every honest node votes the first body
+    /// and refuses the second: no fork, liveness preserved. The refused
+    /// second proposal is the proof the attack ran (`proposals_refused`).
+    DoubleProposal,
     /// Cast a NIL prevote at every (height, round), immediately, instead of
     /// the production prevote (value with a live proposal, nil after twice
     /// the round timeout without one).
@@ -322,6 +423,26 @@ pub struct NodeReport {
     pub prevotes_received: u64,
     /// How many precommits the node RECEIVED (and accepted).
     pub precommits_received: u64,
+    /// SIM-ONLY: vote arrivals observed in the drain, accepted or not.
+    /// The denominator of the stale-arrival share.
+    pub vote_arrivals: u64,
+    /// SIM-ONLY: arrivals whose vote named our height but an OLDER round than
+    /// the one we were in when they landed — "one round stale", the incident
+    /// signature (votes absorbed into old buckets, never counting).
+    pub vote_arrivals_stale: u64,
+    /// SIM-ONLY: ticks on which the straggler grace kept this node's round
+    /// open past its base timeout (the "mechanism really ran" pin).
+    pub grace_extends: u64,
+    /// SIM-ONLY: view changes taken (round timeouts that fired). The "rounds
+    /// used" half of the liveness metric: voting without deciding shows up
+    /// as thousands of view changes per finalized height.
+    pub view_changes: u64,
+    /// SIM-ONLY: arrivals in (height, round) buckets that never decided
+    /// anything on this node. Arrival LATENESS (landing after the local round
+    /// moved on) is what the incident reported; WASTE is the load-bearing
+    /// half — the late-quorum path can still absorb and count a late arrival,
+    /// but a wasted one never belonged to any quorum.
+    pub vote_wasted: u64,
     /// How many proposals the node received.
     pub proposals_received: u64,
     /// How many proposals the node REFUSED.
@@ -379,7 +500,8 @@ impl NodeReport {
              precommits(cast/recv)={}/{} proposals(recv/refused)={}/{} \
              prevote_qc(round/power)={:?}/{:?} precommit_expected_round={:?} \
              precommit_round={:?} precommit_qc(round/power)={:?}/{:?} \
-             quorum_power={} locked={:?} sync_jumps={} blockers={:?}",
+             quorum_power={} locked={:?} sync_jumps={} blockers={:?} \
+             arrivals(stale/total)={}/{} grace_extends={} view_changes={} wasted={}",
             self.index,
             self.id,
             self.height,
@@ -402,7 +524,33 @@ impl NodeReport {
             self.locked.map(|h| hex::encode(&h[..4])),
             self.sync_jumps,
             self.blockers,
+            self.vote_arrivals_stale,
+            self.vote_arrivals,
+            self.grace_extends,
+            self.view_changes,
+            self.vote_wasted,
         )
+    }
+
+    /// SIM-ONLY: share of vote arrivals that landed stale (older round than
+    /// the one we were in at receipt). 1.0 = every vote arrived a round late.
+    pub fn stale_share(&self) -> f64 {
+        if self.vote_arrivals == 0 {
+            0.0
+        } else {
+            self.vote_arrivals_stale as f64 / self.vote_arrivals as f64
+        }
+    }
+
+    /// SIM-ONLY: share of vote arrivals that never belonged to any decision
+    /// (their bucket formed no quorum on this node). 1.0 = every vote was
+    /// absorbed into a dead bucket — the stall, in one number.
+    pub fn wasted_share(&self) -> f64 {
+        if self.vote_arrivals == 0 {
+            0.0
+        } else {
+            self.vote_wasted as f64 / self.vote_arrivals as f64
+        }
     }
 }
 
@@ -604,6 +752,24 @@ struct Member {
     /// The round the node's CURRENT height started in (the offset the
     /// decide rounds are measured against).
     height_start_round: Round,
+    /// SIM-ONLY straggler bookkeeping: the newest (height, round, virtual ms)
+    /// at which each peer was observed voting. Updated for every vote on the
+    /// wire (accepted or not — like production `observe_peer_vote`, the round
+    /// counter is true information even when the vote itself is not votable).
+    /// Read ONLY by the SIM-ONLY straggler grace; production code never sees
+    /// it. Recording is passive (no RNG, no wire change), so control runs
+    /// with the policy disabled behave exactly as before.
+    sim_sightings: HashMap<ValidatorId, (Height, Round, u64)>,
+    /// SIM-ONLY: per-(height, round) vote arrival counts, accepted or not.
+    /// Passive (no RNG, no wire change). Lets the report separate arrival
+    /// LATENESS (a vote landing after its round moved on — which the
+    /// late-quorum path can still absorb and count) from true WASTE (votes in
+    /// buckets that never decide anything).
+    arrivals_by_bucket: HashMap<(Height, Round), u64>,
+    /// SIM-ONLY: the ABSOLUTE (height, cert round) of every height this node
+    /// decided itself. (The public `decide_rounds` are deltas against the
+    /// height's start round; waste accounting needs the absolute bucket.)
+    decide_abs: Vec<(Height, Round)>,
     stats: MemberStats,
 }
 
@@ -633,6 +799,15 @@ struct MemberStats {
     /// cleared on every view change and a report taken between two rounds
     /// would otherwise show nothing.
     last_precommit_cast: Option<Round>,
+    /// SIM-ONLY: vote arrivals observed in the drain (accepted or not).
+    vote_arrivals: u64,
+    /// SIM-ONLY: arrivals naming our height but an older round (stale).
+    vote_arrivals_stale: u64,
+    /// SIM-ONLY: ticks the straggler grace held the round open past base.
+    grace_extends: u64,
+    /// SIM-ONLY: view changes taken (round timeouts fired). The "rounds
+    /// used" half of the liveness metric.
+    view_changes: u64,
 }
 
 /// A deterministic multi-node consensus cluster.
@@ -667,6 +842,10 @@ pub struct ConsensusCluster {
     /// proposal instead of waiting for the next tick's prevote step.
     /// Default true (AFTER); set false for the BEFORE comparison.
     vote_pipeline: bool,
+    /// SIM-ONLY straggler-aware round extension (default: disabled = exact
+    /// old harness behaviour). Scenarios opt in via
+    /// [`Self::with_straggler_policy`].
+    straggler: StragglerPolicy,
 }
 
 impl ConsensusCluster {
@@ -768,6 +947,9 @@ impl ConsensusCluster {
                 byzantine_round: None,
                 decide_rounds: Vec::new(),
                 height_start_round: base_round,
+                sim_sightings: HashMap::new(),
+                arrivals_by_bucket: HashMap::new(),
+                decide_abs: Vec::new(),
                 stats: MemberStats::default(),
             });
         }
@@ -796,6 +978,7 @@ impl ConsensusCluster {
             genesis_balance,
             fast_forward: true,
             vote_pipeline: true,
+            straggler: StragglerPolicy::default(),
         }
     }
 
@@ -809,6 +992,60 @@ impl ConsensusCluster {
     pub fn with_vote_pipeline(mut self, on: bool) -> Self {
         self.vote_pipeline = on;
         self
+    }
+
+    /// SIM-ONLY straggler-aware round extension (see [`StragglerPolicy`]).
+    /// Default is disabled (exact old harness behaviour).
+    pub fn with_straggler_policy(mut self, policy: StragglerPolicy) -> Self {
+        self.straggler = policy;
+        self
+    }
+
+    /// SIM-ONLY: extra round time for node `i` this tick under the straggler
+    /// policy (0 when disabled or when no fresh straggler evidence exists).
+    /// At most one grace per round (the clauses do not stack); always bounded
+    /// by the policy cap.
+    fn straggler_grace_ms(&self, i: usize) -> u64 {
+        let p = self.straggler;
+        if !p.enabled || p.grace_ms == 0 {
+            return 0;
+        }
+        let me = &self.members[i];
+        let (my_h, my_r) = (me.rt.hc.height, me.rt.hc.round);
+        let now = self.now_ms;
+        let fresh = |seen_ms: u64| now.saturating_sub(seen_ms) <= p.freshness_ms;
+        // Clause (1) BEHIND-VOTE: a live peer's newest observed vote names an
+        // older (height, round) than ours — its vote for our round may still
+        // be in flight.
+        let behind = me
+            .sim_sightings
+            .iter()
+            .any(|(id, (h, r, t))| *id != me.id && (*h, *r) < (my_h, my_r) && fresh(*t));
+        if behind {
+            return p.grace_ms.min(p.cap_ms);
+        }
+        // Clause (2) SCHEDULED-PROPOSAL: we hold no live proposal and the
+        // scheduled proposer of our (height, round) is not demonstrably ahead
+        // of us — its proposal may still be in flight, so wait for the
+        // scheduled value instead of racing to the next round proposalless.
+        // (A proposer that is ahead of us means WE are the straggler; the
+        // future-round rule, not waiting, is our way back.)
+        if !me.rt.hc.has_live_proposal() {
+            if let Some(proposer) = self.validators.proposer_for(my_h, my_r) {
+                if proposer != me.id {
+                    let waiting = match me.sim_sightings.get(&proposer) {
+                        // Never heard from the proposer: optimistic wait
+                        // (bounded by the cap; startup only in practice).
+                        None => true,
+                        Some((h, r, t)) => (*h, *r) <= (my_h, my_r) && fresh(*t),
+                    };
+                    if waiting {
+                        return p.grace_ms.min(p.cap_ms);
+                    }
+                }
+            }
+        }
+        0
     }
 
     /// Whether the SPD fast-forward applies this tick: the field AND the
@@ -845,6 +1082,21 @@ impl ConsensusCluster {
     /// The cluster's base (non-late) starting round.
     pub fn base_round(&self) -> Round {
         self.base_round
+    }
+
+    /// Take a member DOWN (or bring it back) MID-SCENARIO.
+    ///
+    /// The `down` profile flag is static (dead from genesis); this flips it
+    /// while the virtual clock runs, modelling a kill at time T: the node
+    /// stops proposing and voting, and no NEW messages are addressed to it.
+    /// A re-activated node restarts its round timer from now, so it does not
+    /// spend a stale timeout the instant it returns. Restart past the flag
+    /// flip is best-effort (the scenario suite only pins the kill path).
+    pub fn set_down(&mut self, index: usize, down: bool) {
+        self.members[index].profile.down = down;
+        if !down {
+            self.members[index].round_started_ms = self.now_ms;
+        }
     }
 
     /// Seed every node's mempool with the same transaction, so the blocks
@@ -1053,6 +1305,23 @@ impl ConsensusCluster {
         let round = self.members[i].rt.hc.round;
         self.members[i].proposed = Some((h, round));
         self.members[i].stats.proposals_sent += 1;
+        // An equivocating proposer signs a SECOND body for the same slot
+        // (timestamp +1s, re-signed: genuine, but a different hash). It is
+        // built BEFORE the honest broadcast but put on the wire AFTER it, so
+        // every honest node accepts the first body and refuses the second —
+        // the production one-value rule, exercised end to end. (This point is
+        // only reachable when THIS call proposed: the `proposed` guard above
+        // returns early on the same-tick fast-forward re-entry, so there is
+        // exactly one equivocation per (height, round).)
+        let equivocation = if self.members[i].profile.byzantine == Byzantine::DoubleProposal {
+            let mut evil = block.clone();
+            evil.timestamp = evil.timestamp.saturating_add(1);
+            evil.validator_signatures.clear();
+            evil.sign_block(&self.members[i].key);
+            Some(evil)
+        } else {
+            None
+        };
         self.broadcast(
             i,
             Wire::Proposal {
@@ -1062,6 +1331,18 @@ impl ConsensusCluster {
             },
             stamp,
         );
+        if let Some(evil) = equivocation {
+            self.members[i].stats.proposals_sent += 1;
+            self.broadcast(
+                i,
+                Wire::Proposal {
+                    proposer,
+                    block: evil,
+                    round,
+                },
+                stamp,
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1102,7 +1383,16 @@ impl ConsensusCluster {
         let live = self.members[i].rt.hc.has_live_proposal();
         if !live {
             let waited = self.now_ms.saturating_sub(self.members[i].round_started_ms);
-            if waited < self.timeout_of(i).saturating_mul(2) {
+            // SIM-ONLY: under the straggler policy the nil wait stretches with
+            // the same grace as the view change (don't nil a round whose
+            // scheduled value may still be in flight — the vote equivalent of
+            // the scheduled-proposal clause). Value votes are unaffected (they
+            // fire immediately on a live proposal).
+            let mut nil_wait = self.timeout_of(i).saturating_mul(2);
+            if self.straggler.enabled {
+                nil_wait = nil_wait.saturating_add(self.straggler_grace_ms(i));
+            }
+            if waited < nil_wait {
                 return;
             }
         }
@@ -1269,6 +1559,32 @@ impl ConsensusCluster {
                         // the round moves under it.
                         self.members[i].round_started_ms = self.now_ms;
                     }
+                    // SIM-ONLY straggler bookkeeping + stale-arrival counters.
+                    // Passive: no RNG, no wire change, so control runs are
+                    // unaffected. Staleness is judged at ARRIVAL time against
+                    // the round we were in before this vote moved us.
+                    {
+                        let m = &mut self.members[i];
+                        m.stats.vote_arrivals += 1;
+                        *m.arrivals_by_bucket
+                            .entry((height, vote.round))
+                            .or_insert(0) += 1;
+                        if height == m.rt.hc.height && vote.round < round_before {
+                            m.stats.vote_arrivals_stale += 1;
+                        }
+                        // Newest sighting per peer (monotonic per voter — a
+                        // delayed old vote never rewinds it, mirroring
+                        // production `note_peer_round`).
+                        let entry = m
+                            .sim_sightings
+                            .entry(vote.voter)
+                            .or_insert((height, vote.round, self.now_ms));
+                        if (height, vote.round) > (entry.0, entry.1) {
+                            *entry = (height, vote.round, self.now_ms);
+                        } else if (height, vote.round) == (entry.0, entry.1) {
+                            entry.2 = self.now_ms;
+                        }
+                    }
                 }
                 Wire::Committed {
                     height,
@@ -1373,6 +1689,9 @@ impl ConsensusCluster {
         self.members[i]
             .decide_rounds
             .push(cert.round.saturating_sub(start));
+        // SIM-ONLY: the absolute deciding bucket, for waste accounting
+        // (which arrival buckets ever belonged to a decision).
+        self.members[i].decide_abs.push((h, cert.round));
         // The commit broadcast: a peer that missed the deciding vote learns
         // the outcome and adopts the block (this is the catch-up path the
         // production loop uses).
@@ -1414,6 +1733,31 @@ impl ConsensusCluster {
             let hc = &self.members[i].rt.hc;
             if hc.round == 0 && !hc.has_live_proposal() {
                 eff = eff.min(650);
+            }
+        }
+        // SIM-ONLY straggler grace (no-op unless the scenario opted in):
+        // hold the round open while fresh evidence says a straggler's vote
+        // or the scheduled proposal may still be in flight. Counted only
+        // when the grace actually saves the round (the base timeout had
+        // already expired), so `grace_extends` pins "the mechanism engaged",
+        // not "the condition was true".
+        let base_eff = eff;
+        let grace = self.straggler_grace_ms(i);
+        if grace > 0 {
+            // SIM-ONLY accounting fix (`subsume_grace`): fill the slack up
+            // to the pre-existing 2× bound instead of stacking past the
+            // deadline — mirrors production `cap_hold_to_two_x_bound`
+            // (slack = 2 * cluster base − deterministic deadline here;
+            // `eff` already holds the base/factor/round-0-cap composition).
+            // Default-off: `false` keeps the production-today stacking.
+            let grace = if self.straggler.subsume_grace {
+                grace.min((self.round_timeout_ms.saturating_mul(2)).saturating_sub(base_eff))
+            } else {
+                grace
+            };
+            eff = eff.saturating_add(grace);
+            if stamp.saturating_sub(self.members[i].round_started_ms) >= base_eff {
+                self.members[i].stats.grace_extends += 1;
             }
         }
         if stamp.saturating_sub(self.members[i].round_started_ms) < eff {
@@ -1458,6 +1802,7 @@ impl ConsensusCluster {
         }
         self.members[i].rt.next_round();
         self.members[i].round_started_ms = stamp;
+        self.members[i].stats.view_changes += 1;
         self.members[i].last_prevoted = None;
         self.members[i].last_precommitted = None;
         self.members[i].last_prevote = None;
@@ -1559,6 +1904,22 @@ impl ConsensusCluster {
             // A precommit is EXPECTED at the polka's round: the round in
             // which the prevote quorum formed.
             let precommit_expected_round = prevote_qc_round;
+            // SIM-ONLY waste accounting: an arrival bucket (h, r) is USEFUL
+            // iff h finalized on this node AND (r is the cert round of h, or
+            // h was adopted rather than decided here — catch-up arrivals for
+            // an adopted height did their job by definition). Everything else
+            // never belonged to any quorum: the stall, counted vote by vote.
+            let deciding: HashMap<Height, Round> = m.decide_abs.iter().copied().collect();
+            let finalized_h: HashSet<Height> =
+                m.rt.finalized.iter().map(|(h, _)| *h).collect();
+            let mut vote_wasted = 0u64;
+            for ((h, r), c) in &m.arrivals_by_bucket {
+                let useful =
+                    finalized_h.contains(h) && deciding.get(h).is_none_or(|cr| cr == r);
+                if !useful {
+                    vote_wasted += c;
+                }
+            }
             nodes.push(NodeReport {
                 index: m.index,
                 id: hex::encode(&m.id[..4]),
@@ -1589,6 +1950,11 @@ impl ConsensusCluster {
                 state_root: m.rt.state.get_state_root().await,
                 sync_jumps: m.stats.sync_jumps,
                 cast_votes: self.cast_votes[m.index].clone(),
+                vote_arrivals: m.stats.vote_arrivals,
+                vote_arrivals_stale: m.stats.vote_arrivals_stale,
+                grace_extends: m.stats.grace_extends,
+                view_changes: m.stats.view_changes,
+                vote_wasted,
             });
         }
         if common_height == u64::MAX {

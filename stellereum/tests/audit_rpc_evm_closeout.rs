@@ -748,6 +748,15 @@ fn f10_metrics_exposes_nothing_sensitive() {
             || line.starts_with("stell_proposer_missed_total")
             || line.starts_with("stell_slow_validation_total")
             || line.starts_with("stell_unbound_tx_total")
+            // A14 phase-3 chain-binding gate: label-free refusal counter
+            // (`UNBOUND_REFUSED_TOTAL`, no labels, no secrets — verified in
+            // src/metrics.rs). Explicit opt-in per this test's design.
+            || line.starts_with("stell_unbound_refused_total")
+            // Straggler grace (docs/PROPOSER_REWORK.md §2c): label-free tick
+            // counter (`STRAGGLER_GRACE_EXTENDS_TOTAL`, no labels, no secrets
+            // — verified in src/metrics.rs). Explicit opt-in per this test's
+            // design.
+            || line.starts_with("stell_straggler_grace_extends_total")
             || line.starts_with("stell_build_info")
             || line.starts_with("stellereum_");
         assert!(known, "unexpected scrape line: {line}");

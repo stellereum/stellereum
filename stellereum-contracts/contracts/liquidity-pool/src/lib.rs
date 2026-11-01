@@ -1,9 +1,9 @@
-//! STATUS: DEMO-GRADE — NO AUTHENTICATION (audit B-CT P0). All `from`/
-//! `owner`/`caller_id`/`admin_id` args are caller-supplied and replayable:
-//! the contract never reads the authenticated `host.caller`. DO NOT deploy
-//! with value. Auth redesign (host.caller-bound, SDK `caller()` ready) is
-//! tracked in docs/ROADMAP.md P0; the failing `poc_p0_*` tests are the
-//! executable acceptance criteria.
+//! STATUS: DEMO-GRADE, CT-P0 AUTHENTICATED (audit KI-38 fix). `deposit`
+//! and `withdraw` bind the caller-supplied `user_id` to the authenticated
+//! `host.caller` via `caller_is` (a stranger's forged id never matches their
+//! address, so no stranger can mint or drain another user's shares). Swaps are
+//! permissionless AMM mechanics by design (curve-priced, no victim).
+//! DO NOT deploy with value without a full audit.
 //!
 ////! Automated Market Maker (AMM) Constant Product Liquidity Pool (Hardened)
 //!
@@ -21,8 +21,8 @@
 extern crate std;
 
 use stellereum_contract_sdk::{
-    emit, setup_wasm_panic_handler, sload, sstore, ERR_ALREADY_EXISTS, ERR_INSUFFICIENT_BALANCE,
-    ERR_INVALID_ARGUMENT,
+    caller_is, emit, setup_wasm_panic_handler, sload, sstore, ERR_ALREADY_EXISTS,
+    ERR_INSUFFICIENT_BALANCE, ERR_INVALID_ARGUMENT, ERR_UNAUTHORIZED,
 };
 
 setup_wasm_panic_handler!();
@@ -103,6 +103,11 @@ pub extern "C" fn deposit(packed: i64) -> i64 {
     if user_id <= 0 || amount_a <= 0 || amount_b <= 0 {
         return ERR_INVALID_ARGUMENT;
     }
+    // CT-P0: shares are minted to the authenticated caller only — a forged
+    // user_id never matches the stranger's caller address.
+    if !caller_is(user_id) {
+        return ERR_UNAUTHORIZED;
+    }
 
     let total_shares = sload(SLOT_TOTAL_SHARES);
     let res_a = sload(SLOT_RESERVE_A);
@@ -151,6 +156,10 @@ pub extern "C" fn withdraw(packed: i64) -> i64 {
     if user_id <= 0 || shares <= 0 {
         return ERR_INVALID_ARGUMENT;
     }
+    // CT-P0: only the share owner (host.caller bound) may burn their shares.
+    if !caller_is(user_id) {
+        return ERR_UNAUTHORIZED;
+    }
 
     let u_slot = user_slot(user_id);
     let user_shares = sload(u_slot);
@@ -164,6 +173,14 @@ pub extern "C" fn withdraw(packed: i64) -> i64 {
 
     let payout_a = (((shares as u128) * (res_a as u128)) / (total_shares as u128)) as i64;
     let payout_b = (((shares as u128) * (res_b as u128)) / (total_shares as u128)) as i64;
+
+    // P1: refuse dust redemptions that would burn shares for ~nothing (floor
+    // legs paying 0 of a non-empty reserve). Same fail-closed convention as
+    // `deposit` (zero-share mint) and the swap legs (zero-amount quote):
+    // ERR_INVALID_ARGUMENT, shares and reserves untouched.
+    if (res_a > 0 && payout_a == 0) || (res_b > 0 && payout_b == 0) {
+        return ERR_INVALID_ARGUMENT;
+    }
 
     sstore(u_slot, user_shares - shares);
     sstore(SLOT_TOTAL_SHARES, total_shares - shares);
@@ -257,7 +274,7 @@ pub extern "C" fn swap_b_for_a(dy: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellereum_contract_sdk::reset_mock_state;
+    use stellereum_contract_sdk::{id_to_caller, reset_mock_state, set_mock_caller};
 
     #[test]
     fn test_amm_pool_lifecycle() {
@@ -266,6 +283,8 @@ mod tests {
         assert_eq!(init(30), ERR_ALREADY_EXISTS); // Double init rejected
 
         // Initial deposit from User 1: 10,000 Token A and 40,000 Token B
+        // (authenticated as user 1).
+        set_mock_caller(id_to_caller(1));
         let dep1 = 10_000_000_000 + 10_000 * 100_000 + 40_000;
         let minted1 = deposit(dep1);
         assert_eq!(minted1, 25_000); // (10_000 + 40_000) / 2

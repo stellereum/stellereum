@@ -340,9 +340,13 @@ struct ApplyJob {
 
 /// A quiescent state capture: every root-committed domain cloned at a FIFO
 /// idle point (after the previous apply installed, before the next starts),
-/// so the bytes can never mix heights. Cross-shard RUNTIME mirrors are NOT
-/// included (they are transport-driven and deliberately uncommitted — their
-/// raciness cannot move the root); the tick captures those separately.
+/// so the bytes can never mix heights. The cross-shard replay set is NOT
+/// captured here even though its engine halves ARE root-committed (see
+/// `commitment::write_cross_shard_domain`): the tick captures it at submit
+/// quiescence (the same post-`height` instant) and the poll site reuses those
+/// bytes verbatim — a fresh read at poll would be newer state under this
+/// height's label and brick the next boot in `verify_restored_root` (see the
+/// snapshot block in main.rs).
 pub struct SnapBundle {
     pub height: u64,
     /// The canonical state capture: the accounts (address-sorted) AND the D2

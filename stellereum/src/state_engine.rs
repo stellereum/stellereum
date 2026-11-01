@@ -2978,6 +2978,34 @@ impl InMemoryStateEngine {
         tx: &crate::sharding::Transaction,
         timestamp: u64,
     ) -> Result<(), String> {
+        // No block context on the single-transaction path: assume the worst
+        // (post-activation) when the gate is armed — fail-closed. Default-off
+        // (env unset) admits byte-identically to before, at every height.
+        // Block application must use [`Self::apply_transaction_at_height`]
+        // with the COMMITTED block height instead.
+        self.apply_transaction_at_height(tx, timestamp, u64::MAX)
+            .await
+    }
+
+    /// [`Self::apply_transaction`] at an explicit chain height (A14 phase 3:
+    /// the chain-binding gate refuses unbound envelopes at/after the
+    /// configured activation height).
+    ///
+    /// GATE: `chain_height` MUST be the COMMITTED block height the
+    /// transaction is applied at — never a caller-supplied or wall-clock
+    /// value — or mixed-version nodes diverge on the refusal (see
+    /// `docs/REPLAY_ANALYSIS.md` scenario (f)).
+    ///
+    /// A refused envelope is an ADMISSION-stage refusal, exactly like the
+    /// neighbouring chain-id mismatch: it returns `Err` before any floor,
+    /// nonce or balance effect — no fee, no nonce consumption, nothing moves
+    /// (see the failure-fee contract in `tests/failure_fee_contract_tests.rs`).
+    pub async fn apply_transaction_at_height(
+        &self,
+        tx: &crate::sharding::Transaction,
+        timestamp: u64,
+        chain_height: u64,
+    ) -> Result<(), String> {
         if tx.is_pq_implicit()
             && crate::sharding::Transaction::global_implicit_registry()
                 .lookup(&tx.from)
@@ -3004,6 +3032,16 @@ impl InMemoryStateEngine {
                 ));
             }
         }
+        // A14 phase 3 (chain binding, last line of defense): an unbound
+        // envelope admitted pre-activation (or smuggled past ingress) is
+        // refused here at/after the activation height, with the check's
+        // message verbatim. Admission-stage, exactly like the chain-id
+        // mismatch above: `Err` before any state effect — no fee, no nonce.
+        crate::chain_binding::check_admission_from_env(
+            tx.chain_id().is_some(),
+            chain_height,
+            self.chain_id,
+        )?;
 
         // F-01 floor inputs BEFORE the accounts lock (lock order:
         // governance/penalty -> accounts, same as `commit_native`). They are
@@ -4434,8 +4472,27 @@ impl InMemoryStateEngine {
         txs: &[crate::sharding::Transaction],
         timestamp: u64,
     ) -> (usize, usize, u64, Vec<bool>, Vec<u64>) {
+        // No block context on the legacy path: assume post-activation when
+        // armed (fail-closed); default-off is byte-identical at every height.
+        self.apply_block_parallel_fees_at_height(txs, timestamp, u64::MAX)
+            .await
+    }
+
+    /// [`Self::apply_block_parallel_fees`] at an explicit chain height (A14
+    /// phase 3: the admission pass below refuses unbound envelopes at/after
+    /// the configured activation height).
+    ///
+    /// GATE: `chain_height` MUST be the COMMITTED block height — never a
+    /// caller-supplied value. [`Self::apply_block_transition`] passes
+    /// `block.height`.
+    pub async fn apply_block_parallel_fees_at_height(
+        &self,
+        txs: &[crate::sharding::Transaction],
+        timestamp: u64,
+        chain_height: u64,
+    ) -> (usize, usize, u64, Vec<bool>, Vec<u64>) {
         let (applied, failed, fees, status, tx_fees, _events) = self
-            .apply_block_parallel_fees_with_events(txs, timestamp)
+            .apply_block_parallel_fees_with_events_at_height(txs, timestamp, chain_height)
             .await;
         (applied, failed, fees, status, tx_fees)
     }
@@ -4444,6 +4501,31 @@ impl InMemoryStateEngine {
         &self,
         txs: &[crate::sharding::Transaction],
         timestamp: u64,
+    ) -> (
+        usize,
+        usize,
+        u64,
+        Vec<bool>,
+        Vec<u64>,
+        Vec<Vec<crate::contract::ContractEvent>>,
+    ) {
+        // No block context on the legacy path: assume post-activation when
+        // armed (fail-closed); default-off is byte-identical at every height.
+        self.apply_block_parallel_fees_with_events_at_height(txs, timestamp, u64::MAX)
+            .await
+    }
+
+    /// [`Self::apply_block_parallel_fees_with_events`] at an explicit chain
+    /// height (A14 phase 3).
+    ///
+    /// GATE: `chain_height` MUST be the COMMITTED block height — never a
+    /// caller-supplied value. [`Self::apply_block_transition`] passes
+    /// `block.height`.
+    pub async fn apply_block_parallel_fees_with_events_at_height(
+        &self,
+        txs: &[crate::sharding::Transaction],
+        timestamp: u64,
+        chain_height: u64,
     ) -> (
         usize,
         usize,
@@ -4539,6 +4621,12 @@ impl InMemoryStateEngine {
                 .collect()
         };
         let mut admitted = vec![false; txs.len()];
+        // A14 phase 3 (chain binding): read once per block — every
+        // transaction of this block is judged against the same activation.
+        // GATE: judged at `chain_height`, the COMMITTED block height passed
+        // down from [`Self::apply_block_transition`] (`block.height`) — never
+        // a caller-supplied value. Default-off (env unset) passes everything.
+        let binding_activation = crate::chain_binding::ChainBindingActivation::from_env();
         {
             let map = self.accounts.read().await;
             // Held for the whole pass (it is read-only) so the loop stays
@@ -4570,6 +4658,24 @@ impl InMemoryStateEngine {
                         if cid != self.chain_id {
                             continue;
                         }
+                    }
+                    // A14 phase 3 (chain binding, last line of defense): an
+                    // unbound envelope still pooled pre-activation (or
+                    // smuggled past ingress) is NOT admitted at/after the
+                    // activation height. Admission-stage, exactly like the
+                    // neighbouring chain-id/signature/nonce refusals: plain
+                    // `failed += 1` downstream — no fee, no nonce, nothing
+                    // moves (see the `fail_with_floor!` comment and the
+                    // failure-fee contract).
+                    if crate::chain_binding::check_admission(
+                        tx.chain_id().is_some(),
+                        chain_height,
+                        &binding_activation,
+                        self.chain_id,
+                    )
+                    .is_err()
+                    {
+                        continue;
                     }
                     if tx.check_session_policy(timestamp).is_err() {
                         continue;
@@ -6190,9 +6296,15 @@ impl InMemoryStateEngine {
         let _consumed = self.apply_cross_shard_consumptions(block).await;
 
         // 1. The transactions themselves (batched signature verify, admission,
-        //    payload execution, native commit, trie write).
+        //    payload execution, native commit, trie write). The COMMITTED
+        //    block height goes down as the chain-binding gate's clock (A14
+        //    phase 3); see `apply_block_parallel_fees_with_events_at_height`.
         let (applied, failed, fees, status, tx_fees, events) = self
-            .apply_block_parallel_fees_with_events(&block.transactions, block.timestamp)
+            .apply_block_parallel_fees_with_events_at_height(
+                &block.transactions,
+                block.timestamp,
+                block.height,
+            )
             .await;
 
         // 1a. §9 2PC, SOURCE side: the PREPARED state of every transfer this

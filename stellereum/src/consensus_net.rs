@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -504,6 +504,13 @@ struct PeerHealth {
     fails: u32,
     /// When the last failure happened (cooldown measured from here).
     last_fail: Option<std::time::Instant>,
+    /// Earliest time a new dial to this peer may be attempted (exponential
+    /// dial backoff, see [`dial_backoff_ms`]). Set on each failure once the
+    /// skip threshold is reached, cleared on success (entry removed). This
+    /// extends the fixed [`PEER_SKIP_COOLDOWN`): a peer that stays dead is
+    /// retried on a growing schedule instead of every cooldown window, so a
+    /// down peer stops costing a handshake-timeout dial every few seconds.
+    backoff_until: Option<std::time::Instant>,
 }
 
 /// Skip a peer after this many consecutive failures.
@@ -591,6 +598,205 @@ pub fn probe_evict_after() -> u32 {
 /// still means "evict on first timeout", never "never evict".
 pub fn probe_timeout_should_evict(consecutive_timeouts: u32, evict_after: u32) -> bool {
     consecutive_timeouts >= evict_after.max(1)
+}
+
+/// Base dial-backoff delay in ms (default 2000, `STELL_DIAL_BACKOFF_BASE_MS`):
+/// a peer that reaches [`PEER_SKIP_THRESHOLD`] consecutive dial/handshake
+/// failures waits this long (jittered, see [`dial_backoff_jittered_ms`])
+/// before its first retry, doubling per further consecutive failure.
+pub const DIAL_BACKOFF_BASE_MS_DEFAULT: u64 = 2000;
+/// Cap for the exponential dial backoff in ms (default 300000 = 5min,
+/// `STELL_DIAL_BACKOFF_MAX_MS`). A peer that never recovers is re-dialed at
+/// most this rarely — silent for known-dead peers, while a returning peer's
+/// first success resets the streak to zero immediately.
+pub const DIAL_BACKOFF_MAX_MS_DEFAULT: u64 = 300_000;
+/// Process-wide dial budget in dial attempts per second (default 4,
+/// `STELL_DIAL_BUDGET_PER_SEC`). A min-interval gate shared by every dial
+/// initiation in this process (both joins + probes), so a fleet of dead
+/// peers can never turn one tick into a dial storm.
+pub const DIAL_BUDGET_PER_SEC_DEFAULT: u32 = 4;
+
+/// Parse helper for [`dial_backoff_base_ms`]: garbage/zero falls back to the
+/// default (clamped, never disabled). Time-injected so tests need no env.
+pub fn parse_dial_backoff_base_ms(raw: Option<String>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DIAL_BACKOFF_BASE_MS_DEFAULT)
+}
+
+/// Effective dial-backoff base (`STELL_DIAL_BACKOFF_BASE_MS`, default 2000).
+pub fn dial_backoff_base_ms() -> u64 {
+    parse_dial_backoff_base_ms(std::env::var("STELL_DIAL_BACKOFF_BASE_MS").ok())
+}
+
+/// Parse helper for [`dial_backoff_max_ms`]: garbage/zero falls back to the
+/// default (clamped, never disabled). Time-injected so tests need no env.
+pub fn parse_dial_backoff_max_ms(raw: Option<String>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DIAL_BACKOFF_MAX_MS_DEFAULT)
+}
+
+/// Effective dial-backoff cap (`STELL_DIAL_BACKOFF_MAX_MS`, default 300000).
+pub fn dial_backoff_max_ms() -> u64 {
+    parse_dial_backoff_max_ms(std::env::var("STELL_DIAL_BACKOFF_MAX_MS").ok())
+}
+
+/// Parse helper for [`dial_budget_per_sec`]: garbage/zero falls back to the
+/// default (clamped to >= 1, never disabled). Time-injected so tests need
+/// no env.
+pub fn parse_dial_budget_per_sec(raw: Option<String>) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(DIAL_BUDGET_PER_SEC_DEFAULT)
+}
+
+/// Effective process-wide dial budget (`STELL_DIAL_BUDGET_PER_SEC`, default 4).
+pub fn dial_budget_per_sec() -> u32 {
+    parse_dial_budget_per_sec(std::env::var("STELL_DIAL_BUDGET_PER_SEC").ok())
+}
+
+/// Pure exponential dial backoff (unit-tested): below [`PEER_SKIP_THRESHOLD`]
+/// consecutive failures there is no backoff (0 — healthy peers see zero
+/// behavior change); at/above it the delay is `base * 2^(fails - THRESHOLD)`
+/// capped at `cap`. Success resets the streak to zero, so this is only ever
+/// called with a live failure count and a zero count always yields zero.
+pub fn dial_backoff_ms(consec_fails: u32, base_ms: u64, cap_ms: u64) -> u64 {
+    if consec_fails < PEER_SKIP_THRESHOLD {
+        return 0;
+    }
+    let base = base_ms.max(1);
+    let cap = cap_ms.max(1);
+    let shift = consec_fails
+        .saturating_sub(PEER_SKIP_THRESHOLD)
+        .min(20);
+    base.saturating_mul(1u64 << shift).min(cap)
+}
+
+/// Pure equal-jitter mapping (unit-tested): spreads one backoff level over
+/// `[backoff/2, backoff]` using caller-provided randomness (`jitter_seed`,
+/// e.g. `rand::random::<u64>()`), so co-dead peers desynchronize their
+/// retries instead of re-hammering in lockstep. A zero backoff stays zero.
+pub fn dial_backoff_jittered_ms(backoff_ms: u64, jitter_seed: u64) -> u64 {
+    if backoff_ms == 0 {
+        return 0;
+    }
+    let half = backoff_ms / 2;
+    half + jitter_seed % (backoff_ms - half + 1)
+}
+
+/// Pure dial-suppression decision (unit-tested): a peer is suppressed while
+/// its fixed failure cooldown holds OR while its exponential backoff has not
+/// expired yet. Healthy peers (no backoff, cold cooldown) are never
+/// suppressed.
+pub fn peer_dial_suppressed(
+    fails: u32,
+    last_fail: Option<std::time::Instant>,
+    backoff_until: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    peer_in_cooldown(fails, last_fail, now)
+        || backoff_until.is_some_and(|t| now < t)
+}
+
+/// Pure global-budget decision (unit-tested): at most `per_sec` dials per
+/// second process-wide, enforced as a min-interval gate
+/// (`interval = 1000/per_sec` ms). `None` (no dial yet) always allows.
+pub fn dial_budget_should_allow(
+    last_ms: Option<u64>,
+    now_ms: u64,
+    per_sec: u32,
+) -> bool {
+    let interval = 1000u64 / u64::from(per_sec.max(1));
+    match last_ms {
+        None => true,
+        Some(last) => now_ms.saturating_sub(last) >= interval,
+    }
+}
+
+/// Stateful min-interval dial-budget gate (the testable core of the
+/// process-wide budget; the live gate below is one shared instance of this
+/// shape). Mutex-only, never held across await.
+pub struct DialBudget {
+    per_sec: u32,
+    last_ms: Mutex<Option<u64>>,
+}
+
+impl DialBudget {
+    /// New gate with `per_sec` dial attempts per second (clamped to >= 1).
+    pub fn new(per_sec: u32) -> Self {
+        Self {
+            per_sec: per_sec.max(1),
+            last_ms: Mutex::new(None),
+        }
+    }
+
+    /// Try to take one dial slot at `now_ms` (epoch-ms). Returns true and
+    /// stamps the slot when due, false (no stamp, caller must skip the dial)
+    /// when the budget is exhausted.
+    pub fn try_acquire_at(&self, now_ms: u64) -> bool {
+        match self.last_ms.lock() {
+            Ok(mut last) => {
+                if dial_budget_should_allow(*last, now_ms, self.per_sec) {
+                    *last = Some(now_ms);
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(_) => true,
+        }
+    }
+}
+
+/// Process-wide last-dial timestamp backing [`try_acquire_dial_slot`].
+static DIAL_BUDGET_LAST_MS: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
+
+/// Try to take one process-wide dial slot now. Returns true when this dial
+/// may proceed, false when the global budget (`STELL_DIAL_BUDGET_PER_SEC`,
+/// default 4/s) is exhausted and the caller must skip the dial (debug log,
+/// never warn: budget deferral is normal backpressure, not failure).
+pub(crate) fn try_acquire_dial_slot() -> bool {
+    let slot = DIAL_BUDGET_LAST_MS.get_or_init(|| Mutex::new(None));
+    match slot.lock() {
+        Ok(mut last) => {
+            let now = epoch_ms();
+            if dial_budget_should_allow(*last, now, dial_budget_per_sec()) {
+                *last = Some(now);
+                true
+            } else {
+                false
+            }
+        }
+        Err(_) => true,
+    }
+}
+
+/// Jittered backoff expiry for a fresh failure at `now` with `fails`
+/// consecutive failures (`None` below the skip threshold: healthy peers
+/// carry no backoff state at all).
+fn peer_backoff_until(now: std::time::Instant, fails: u32) -> Option<std::time::Instant> {
+    let backoff = dial_backoff_ms(fails, dial_backoff_base_ms(), dial_backoff_max_ms());
+    if backoff == 0 {
+        None
+    } else {
+        Some(
+            now + Duration::from_millis(dial_backoff_jittered_ms(
+                backoff,
+                rand::random::<u64>(),
+            )),
+        )
+    }
+}
+
+/// True when `pid` is already a known-dead peer (failure streak at/above the
+/// skip threshold). Per-attempt outcome logs consult this to stay quiet for
+/// known-dead peers (debug) while staying loud for live ones (warn).
+fn health_is_known_dead(health: &Mutex<HashMap<[u8; 20], PeerHealth>>, pid: &[u8; 20]) -> bool {
+    match health.lock() {
+        Ok(h) => h.get(pid).is_some_and(|e| e.fails >= PEER_SKIP_THRESHOLD),
+        Err(_) => false,
+    }
 }
 
 /// Pure join-backoff decision (audit-network handshake-storm fix): a peer in
@@ -771,40 +977,74 @@ impl ConsensusNetwork {
         let now = std::time::Instant::now();
         match self.peer_health.lock() {
             Ok(h) => match h.get(pid) {
-                Some(ph) => peer_in_cooldown(ph.fails, ph.last_fail, now),
+                Some(ph) => peer_dial_suppressed(ph.fails, ph.last_fail, ph.backoff_until, now),
                 _ => false,
             },
             Err(_) => false,
         }
     }
 
-    /// Record one send/probe outcome for the backoff ledger.
-    fn peer_record(&self, pid: [u8; 20], ok: bool) {
-        Self::record_health(&self.peer_health, pid, ok);
+    /// Record one send/probe outcome for the backoff ledger. Returns the
+    /// pre-update failure streak (see [`Self::record_health`]).
+    fn peer_record(&self, pid: [u8; 20], ok: bool) -> u32 {
+        Self::record_health(&self.peer_health, pid, ok)
     }
 
     /// Ledger update shared by the inline paths ([`Self::peer_record`]) and
     /// the DETACHED per-peer tasks ([`Self::send_one_peer`]), which only hold
     /// an `Arc` to the ledger — never `&self`, because they may outlive the
     /// flush that spawned them.
-    fn record_health(health: &Mutex<HashMap<[u8; 20], PeerHealth>>, pid: [u8; 20], ok: bool) {
+    ///
+    /// Returns the failure streak BEFORE this update (0 when the peer was
+    /// healthy): callers use it to keep per-attempt logs quiet for
+    /// known-dead peers (a streak already at/above the threshold logs at
+    /// debug) while the ledger itself keeps exactly one loud line per
+    /// transition (warn healthy->failing here, info failing->healthy here).
+    fn record_health(health: &Mutex<HashMap<[u8; 20], PeerHealth>>, pid: [u8; 20], ok: bool) -> u32 {
         let now = std::time::Instant::now();
-        if let Ok(mut h) = health.lock() {
-            if ok {
-                h.remove(&pid);
-            } else {
-                let e = h.entry(pid).or_default();
-                e.fails = e.fails.saturating_add(1);
-                e.last_fail = Some(now);
-                if e.fails == PEER_SKIP_THRESHOLD {
-                    tracing::warn!(
-                        "[net] peer {} failing {}x in a row: skipping sends/probes for {:?}",
-                        hex::encode(pid),
-                        e.fails,
-                        PEER_SKIP_COOLDOWN,
-                    );
+        match health.lock() {
+            Ok(mut h) => {
+                if ok {
+                    match h.remove(&pid) {
+                        Some(prev) if prev.fails >= PEER_SKIP_THRESHOLD => {
+                            tracing::info!(
+                                "[net] peer {} recovered after {} consecutive failures: resuming dials",
+                                hex::encode(pid),
+                                prev.fails,
+                            );
+                            prev.fails
+                        }
+                        Some(prev) => prev.fails,
+                        None => 0,
+                    }
+                } else {
+                    let fails_before = h.get(&pid).map_or(0, |e| e.fails);
+                    let e = h.entry(pid).or_default();
+                    e.fails = e.fails.saturating_add(1);
+                    e.last_fail = Some(now);
+                    e.backoff_until = peer_backoff_until(now, e.fails);
+                    if e.fails == PEER_SKIP_THRESHOLD {
+                        tracing::warn!(
+                            "[net] peer {} failing {}x in a row: skipping sends/probes for {:?}",
+                            hex::encode(pid),
+                            e.fails,
+                            PEER_SKIP_COOLDOWN,
+                        );
+                    } else if e.fails > PEER_SKIP_THRESHOLD {
+                        // Known-dead peer: one debug line per backoff-level
+                        // change, never a warn — the loud line already fired
+                        // at the healthy->failing transition above.
+                        tracing::debug!(
+                            "[net] peer {} still failing ({}x in a row): next dial no earlier than {:?}",
+                            hex::encode(pid),
+                            e.fails,
+                            e.backoff_until,
+                        );
+                    }
+                    fails_before
                 }
             }
+            Err(_) => 0,
         }
     }
 
@@ -889,6 +1129,18 @@ impl ConsensusNetwork {
                 );
                 continue;
             }
+            // Global dial budget (see `DIAL_BUDGET_PER_SEC_DEFAULT`): at most
+            // N dials/sec process-wide even with many dead peers, so one
+            // join window can never become a dial storm. Deferral is normal
+            // backpressure (debug), never failure (warn).
+            if !try_acquire_dial_slot() {
+                tracing::debug!(
+                    "[net] join {} deferred (global dial budget {}/s exhausted)",
+                    hex::encode(pid),
+                    dial_budget_per_sec(),
+                );
+                continue;
+            }
             let node = Arc::clone(&self.adapter.node);
             let health = Arc::clone(&self.peer_health);
             let payload = payload.clone();
@@ -925,6 +1177,28 @@ impl ConsensusNetwork {
                 );
                 continue;
             }
+            // Backoff suppression (dial-backoff fix): a known-dead peer is
+            // not re-probed until its backoff expires — a probe IS a dial
+            // (full `request_to` round trip with a handshake-timeout tax to
+            // a dead endpoint). Suppressed probes cost nothing and log at
+            // debug; the ledger's transition lines stay the only loud ones.
+            if self.peer_skipped(&pid) {
+                tracing::debug!(
+                    "[net] probe {} skipped (dial backoff, no dial)",
+                    hex::encode(pid)
+                );
+                continue;
+            }
+            // Global dial budget: probes share the process-wide N-dials/sec
+            // gate with joins (see `try_acquire_dial_slot`).
+            if !try_acquire_dial_slot() {
+                tracing::debug!(
+                    "[net] probe {} deferred (global dial budget {}/s exhausted)",
+                    hex::encode(pid),
+                    dial_budget_per_sec(),
+                );
+                continue;
+            }
             let t = std::time::Instant::now();
             let r = tokio::time::timeout(
                 send_timeout(),
@@ -935,9 +1209,19 @@ impl ConsensusNetwork {
             .await;
             match r {
                 Ok(Ok(_)) => {
-                    self.peer_record(pid, true);
+                    let fails_before = self.peer_record(pid, true);
                     self.probe_timeout_clear(&pid);
-                    tracing::info!("[net] probe {} ok in {:?}", hex::encode(pid), t.elapsed());
+                    if fails_before >= PEER_SKIP_THRESHOLD {
+                        // Recovery already logged its one loud line inside
+                        // `record_health`; keep this attempt quiet.
+                        tracing::debug!(
+                            "[net] probe {} ok in {:?} (recovered)",
+                            hex::encode(pid),
+                            t.elapsed()
+                        );
+                    } else {
+                        tracing::info!("[net] probe {} ok in {:?}", hex::encode(pid), t.elapsed());
+                    }
                 }
                 Ok(Err(e)) => {
                     self.peer_record(pid, false);
@@ -945,11 +1229,21 @@ impl ConsensusNetwork {
                     // breaks the TIMEOUT streak: eviction is for consecutive
                     // timeouts, not for any failure.
                     self.probe_timeout_clear(&pid);
-                    tracing::warn!(
-                        "[net] probe {} err in {:?}: {e}",
-                        hex::encode(pid),
-                        t.elapsed()
-                    );
+                    if health_is_known_dead(&self.peer_health, &pid) {
+                        // Known-dead peer: the transition warn already fired;
+                        // per-attempt errors stay at debug.
+                        tracing::debug!(
+                            "[net] probe {} err in {:?}: {e}",
+                            hex::encode(pid),
+                            t.elapsed()
+                        );
+                    } else {
+                        tracing::warn!(
+                            "[net] probe {} err in {:?}: {e}",
+                            hex::encode(pid),
+                            t.elapsed()
+                        );
+                    }
                 }
                 Err(_) => {
                     self.peer_record(pid, false);
@@ -962,6 +1256,16 @@ impl ConsensusNetwork {
                             t.elapsed(),
                         );
                         self.adapter.node.invalidate_peer_conn(pid).await;
+                    } else if health_is_known_dead(&self.peer_health, &pid) {
+                        // Single (or sub-threshold) timeout on a known-dead
+                        // peer: record + move on quietly. The connection
+                        // stays; a transient stall must not cascade into a
+                        // conn-close/redial storm.
+                        tracing::debug!(
+                            "[net] probe {} TIMEOUT after {:?}; keeping conn ({streak}/{after} consecutive timeouts)",
+                            hex::encode(pid),
+                            t.elapsed(),
+                        );
                     } else {
                         // Single (or sub-threshold) timeout: record + move on.
                         // The connection stays; a transient stall must not
@@ -1185,15 +1489,30 @@ impl ConsensusNetwork {
             elapsed,
         );
         let hexid = hex::encode(pid);
+        // Quiet-known-dead rule (dial-backoff fix): the ledger keeps exactly
+        // one loud line per transition (warn healthy->failing, info
+        // failing->healthy inside `record_health`); per-attempt outcomes for
+        // an already-known-dead peer log at debug so a down peer stops
+        // emitting a warn per broadcast flush.
+        let loud_attempt = !health_is_known_dead(&health, &pid);
         match r {
             Ok(Ok(resp)) if resp.starts_with(b"{\"ok\":false") => {
                 Self::record_health(&health, pid, false);
-                tracing::warn!(
-                    "[consensus] broadcast to {} denied/fast-fail in {:?}: {}",
-                    hexid,
-                    elapsed,
-                    String::from_utf8_lossy(&resp),
-                );
+                if loud_attempt {
+                    tracing::warn!(
+                        "[consensus] broadcast to {} denied/fast-fail in {:?}: {}",
+                        hexid,
+                        elapsed,
+                        String::from_utf8_lossy(&resp),
+                    );
+                } else {
+                    tracing::debug!(
+                        "[consensus] broadcast to {} denied/fast-fail in {:?} (known-dead peer): {}",
+                        hexid,
+                        elapsed,
+                        String::from_utf8_lossy(&resp),
+                    );
+                }
             }
             Ok(Ok(_)) => {
                 // HEALTH LEDGER (audit W6.7): a FIRE-AND-FORGET send only
@@ -1205,15 +1524,19 @@ impl ConsensusNetwork {
                 // message) was never skipped and never evicted. Only an
                 // ACKNOWLEDGED send may mark a peer healthy; a fire-and-
                 // forget success leaves the ledger untouched.
+                let mut recovered = false;
                 if send_outcome_records_health(fire_and_forget) {
-                    Self::record_health(&health, pid, true);
+                    let fails_before = Self::record_health(&health, pid, true);
+                    recovered = fails_before >= PEER_SKIP_THRESHOLD;
                 }
                 let took = elapsed;
                 // Slow-but-successful is exactly what hid the tick stall:
                 // the consensus loop AWAITS every broadcast, so a peer
                 // that answers in 1-2s (under the 2s cap, therefore never
                 // logged) stretches a tick to seconds with no warning.
-                if took >= std::time::Duration::from_millis(300) {
+                // (A recovery already logged its one loud line; keep that
+                // attempt quiet.)
+                if took >= std::time::Duration::from_millis(300) && !recovered {
                     tracing::warn!(
                         "[consensus] broadcast to {} slow: {:?} (still under the cap)",
                         hexid,
@@ -1239,11 +1562,19 @@ impl ConsensusNetwork {
             // redials fresh instead of hanging on the same dead conn.
             Ok(Err(e)) => {
                 Self::record_health(&health, pid, false);
-                tracing::warn!(
-                    "[consensus] broadcast to {} transport-err in {:?}: {e}",
-                    hexid,
-                    elapsed,
-                );
+                if loud_attempt {
+                    tracing::warn!(
+                        "[consensus] broadcast to {} transport-err in {:?}: {e}",
+                        hexid,
+                        elapsed,
+                    );
+                } else {
+                    tracing::debug!(
+                        "[consensus] broadcast to {} transport-err in {:?} (known-dead peer): {e}",
+                        hexid,
+                        elapsed,
+                    );
+                }
                 // NO eviction here. Eviction closes the shared connection,
                 // which kills the peer's frame_loop for it too; one slow
                 // response then cascaded into ~2300 conn_closed events per
@@ -1254,11 +1585,19 @@ impl ConsensusNetwork {
             }
             Err(_) => {
                 Self::record_health(&health, pid, false);
-                tracing::warn!(
-                    "[consensus] broadcast to {} TIMEOUT after {:?}",
-                    hexid,
-                    elapsed,
-                );
+                if loud_attempt {
+                    tracing::warn!(
+                        "[consensus] broadcast to {} TIMEOUT after {:?}",
+                        hexid,
+                        elapsed,
+                    );
+                } else {
+                    tracing::debug!(
+                        "[consensus] broadcast to {} TIMEOUT after {:?} (known-dead peer)",
+                        hexid,
+                        elapsed,
+                    );
+                }
                 // See above: time out, log, move on -- do not evict.
             }
         }
@@ -1545,6 +1884,17 @@ impl TxGossip {
                 );
                 continue;
             }
+            // Global dial budget, shared with the consensus join (see
+            // `try_acquire_dial_slot`): deferral is backpressure (debug),
+            // never failure (warn).
+            if !try_acquire_dial_slot() {
+                tracing::debug!(
+                    "[txgossip] join {} deferred (global dial budget {}/s exhausted)",
+                    hex::encode(pid),
+                    dial_budget_per_sec(),
+                );
+                continue;
+            }
             let node = Arc::clone(&self.adapter.node);
             let health = Arc::clone(&self.peer_health);
             let payload = payload.clone();
@@ -1567,7 +1917,7 @@ impl TxGossip {
         let now = std::time::Instant::now();
         match self.peer_health.lock() {
             Ok(h) => match h.get(pid) {
-                Some(ph) => peer_in_cooldown(ph.fails, ph.last_fail, now),
+                Some(ph) => peer_dial_suppressed(ph.fails, ph.last_fail, ph.backoff_until, now),
                 _ => false,
             },
             Err(_) => false,
@@ -1626,10 +1976,15 @@ impl TxGossip {
         .await;
         let elapsed = t.elapsed();
         let hexid = hex::encode(pid);
+        // Quiet-known-dead rule (mirrors the consensus path): the ledger
+        // keeps exactly one loud line per transition; per-attempt outcomes
+        // for an already-known-dead peer log at debug.
+        let loud_attempt = !health_is_known_dead(&health, &pid);
         match r {
             Ok(Ok(_)) => {
-                Self::record_health(&health, pid, true);
-                if elapsed >= std::time::Duration::from_millis(300) {
+                let fails_before = Self::record_health(&health, pid, true);
+                let recovered = fails_before >= PEER_SKIP_THRESHOLD;
+                if elapsed >= std::time::Duration::from_millis(300) && !recovered {
                     tracing::warn!(
                         "[txgossip] broadcast to {hexid} slow: {elapsed:?} (still under the cap)"
                     );
@@ -1639,35 +1994,71 @@ impl TxGossip {
             }
             Ok(Err(e)) => {
                 Self::record_health(&health, pid, false);
-                tracing::warn!("[txgossip] broadcast to {hexid} transport-err in {elapsed:?}: {e}");
+                if loud_attempt {
+                    tracing::warn!("[txgossip] broadcast to {hexid} transport-err in {elapsed:?}: {e}");
+                } else {
+                    tracing::debug!("[txgossip] broadcast to {hexid} transport-err in {elapsed:?} (known-dead peer): {e}");
+                }
             }
             Err(_) => {
                 Self::record_health(&health, pid, false);
-                tracing::warn!("[txgossip] broadcast to {hexid} TIMEOUT after {elapsed:?}");
+                if loud_attempt {
+                    tracing::warn!("[txgossip] broadcast to {hexid} TIMEOUT after {elapsed:?}");
+                } else {
+                    tracing::debug!("[txgossip] broadcast to {hexid} TIMEOUT after {elapsed:?} (known-dead peer)");
+                }
             }
         }
     }
 
     /// Ledger update shared by the inline path and the DETACHED per-peer
-    /// tasks, which only hold an `Arc` to the ledger.
-    fn record_health(health: &Mutex<HashMap<[u8; 20], PeerHealth>>, pid: [u8; 20], ok: bool) {
+    /// tasks, which only hold an `Arc` to the ledger. Same contract as the
+    /// consensus path's ledger (see [`ConsensusNetwork::record_health`]):
+    /// returns the pre-update failure streak; exactly one loud line per
+    /// transition (warn healthy->failing, info failing->healthy), debug
+    /// per backoff-level change afterwards.
+    fn record_health(health: &Mutex<HashMap<[u8; 20], PeerHealth>>, pid: [u8; 20], ok: bool) -> u32 {
         let now = std::time::Instant::now();
-        if let Ok(mut h) = health.lock() {
-            if ok {
-                h.remove(&pid);
-            } else {
-                let e = h.entry(pid).or_default();
-                e.fails = e.fails.saturating_add(1);
-                e.last_fail = Some(now);
-                if e.fails == PEER_SKIP_THRESHOLD {
-                    tracing::warn!(
-                        "[txgossip] peer {} failing {}x in a row: skipping sends for {:?}",
-                        hex::encode(pid),
-                        e.fails,
-                        PEER_SKIP_COOLDOWN,
-                    );
+        match health.lock() {
+            Ok(mut h) => {
+                if ok {
+                    match h.remove(&pid) {
+                        Some(prev) if prev.fails >= PEER_SKIP_THRESHOLD => {
+                            tracing::info!(
+                                "[txgossip] peer {} recovered after {} consecutive failures: resuming dials",
+                                hex::encode(pid),
+                                prev.fails,
+                            );
+                            prev.fails
+                        }
+                        Some(prev) => prev.fails,
+                        None => 0,
+                    }
+                } else {
+                    let fails_before = h.get(&pid).map_or(0, |e| e.fails);
+                    let e = h.entry(pid).or_default();
+                    e.fails = e.fails.saturating_add(1);
+                    e.last_fail = Some(now);
+                    e.backoff_until = peer_backoff_until(now, e.fails);
+                    if e.fails == PEER_SKIP_THRESHOLD {
+                        tracing::warn!(
+                            "[txgossip] peer {} failing {}x in a row: skipping sends for {:?}",
+                            hex::encode(pid),
+                            e.fails,
+                            PEER_SKIP_COOLDOWN,
+                        );
+                    } else if e.fails > PEER_SKIP_THRESHOLD {
+                        tracing::debug!(
+                            "[txgossip] peer {} still failing ({}x in a row): next dial no earlier than {:?}",
+                            hex::encode(pid),
+                            e.fails,
+                            e.backoff_until,
+                        );
+                    }
+                    fails_before
                 }
             }
+            Err(_) => 0,
         }
     }
 
@@ -1998,6 +2389,182 @@ mod tests {
         assert!(
             join_should_dial(false),
             "cooldown cleared (returning peer): dial again"
+        );
+    }
+
+    #[test]
+    fn dial_backoff_grows_exponentially_and_caps() {
+        // Below the skip threshold there is no backoff: healthy peers see
+        // zero behavior change.
+        assert_eq!(dial_backoff_ms(0, 2000, 300_000), 0);
+        assert_eq!(dial_backoff_ms(1, 2000, 300_000), 0);
+        assert_eq!(dial_backoff_ms(PEER_SKIP_THRESHOLD - 1, 2000, 300_000), 0);
+        // At threshold: base; then doubling per consecutive failure.
+        assert_eq!(dial_backoff_ms(PEER_SKIP_THRESHOLD, 2000, 300_000), 2_000);
+        assert_eq!(dial_backoff_ms(PEER_SKIP_THRESHOLD + 1, 2000, 300_000), 4_000);
+        assert_eq!(dial_backoff_ms(PEER_SKIP_THRESHOLD + 2, 2000, 300_000), 8_000);
+        assert_eq!(
+            dial_backoff_ms(PEER_SKIP_THRESHOLD + 3, 2000, 300_000),
+            16_000
+        );
+        // The cap binds a long-dead peer: no overflow, no unbounded growth.
+        assert_eq!(
+            dial_backoff_ms(PEER_SKIP_THRESHOLD + 10, 2000, 300_000),
+            300_000
+        );
+        assert_eq!(dial_backoff_ms(u32::MAX, 2000, 300_000), 300_000);
+        // Custom knobs are honored (env parsing below pins the defaults).
+        assert_eq!(dial_backoff_ms(PEER_SKIP_THRESHOLD, 500, 10_000), 500);
+        assert_eq!(
+            dial_backoff_ms(PEER_SKIP_THRESHOLD + 1, 500, 10_000),
+            1_000
+        );
+        assert_eq!(
+            dial_backoff_ms(PEER_SKIP_THRESHOLD + 10, 500, 10_000),
+            10_000
+        );
+    }
+
+    #[test]
+    fn dial_backoff_jitter_stays_in_bounds() {
+        // Equal jitter: every sample lands in [backoff/2, backoff], so
+        // co-dead peers desynchronize without ever exceeding the level.
+        for backoff in [1u64, 2, 100, 2_000, 16_000, 300_000] {
+            for seed in [0u64, 1, 7, 12345, u64::MAX] {
+                let j = dial_backoff_jittered_ms(backoff, seed);
+                assert!(
+                    j >= backoff / 2 && j <= backoff,
+                    "jittered {j} out of [{}, {backoff}]",
+                    backoff / 2,
+                );
+            }
+        }
+        // Zero backoff stays zero (healthy peers never wait).
+        assert_eq!(dial_backoff_jittered_ms(0, 999), 0);
+        // The seed actually spreads: not every seed maps to the same delay.
+        let spread: std::collections::HashSet<u64> =
+            (0..32).map(|s| dial_backoff_jittered_ms(2_000, s)).collect();
+        assert!(
+            spread.len() > 1,
+            "jitter must desynchronize retries, got a single value"
+        );
+    }
+
+    #[test]
+    fn dial_backoff_env_parsing_pins_defaults() {
+        assert_eq!(
+            parse_dial_backoff_base_ms(None),
+            DIAL_BACKOFF_BASE_MS_DEFAULT
+        );
+        assert_eq!(parse_dial_backoff_base_ms(Some("garbage".into())), 2_000);
+        assert_eq!(parse_dial_backoff_base_ms(Some("0".into())), 2_000);
+        assert_eq!(parse_dial_backoff_base_ms(Some("500".into())), 500);
+        assert_eq!(
+            parse_dial_backoff_max_ms(None),
+            DIAL_BACKOFF_MAX_MS_DEFAULT
+        );
+        assert_eq!(parse_dial_backoff_max_ms(Some("nope".into())), 300_000);
+        assert_eq!(parse_dial_backoff_max_ms(Some("0".into())), 300_000);
+        assert_eq!(parse_dial_backoff_max_ms(Some("60_000".into())), 300_000);
+        assert_eq!(parse_dial_backoff_max_ms(Some("60000".into())), 60_000);
+        assert_eq!(
+            parse_dial_budget_per_sec(None),
+            DIAL_BUDGET_PER_SEC_DEFAULT
+        );
+        assert_eq!(parse_dial_budget_per_sec(Some("junk".into())), 4);
+        assert_eq!(parse_dial_budget_per_sec(Some("0".into())), 4);
+        assert_eq!(parse_dial_budget_per_sec(Some("10".into())), 10);
+    }
+
+    #[test]
+    fn dial_budget_gate_allows_n_per_second() {
+        // 4/s => one slot per 250ms. First dial always allowed.
+        assert!(dial_budget_should_allow(None, 1_000, 4));
+        assert!(!dial_budget_should_allow(Some(1_000), 1_000, 4));
+        assert!(!dial_budget_should_allow(Some(1_000), 1_249, 4));
+        assert!(dial_budget_should_allow(Some(1_000), 1_250, 4));
+        // A faster budget shortens the interval; a clamped (>= 1) one never
+        // divides by zero.
+        assert!(dial_budget_should_allow(Some(1_000), 1_100, 10));
+        assert!(!dial_budget_should_allow(Some(1_000), 1_000, 0));
+        assert!(dial_budget_should_allow(Some(1_000), 2_000, 0));
+        // The stateful gate stamps on allow and holds back within the window.
+        let gate = DialBudget::new(4);
+        assert!(gate.try_acquire_at(5_000));
+        assert!(!gate.try_acquire_at(5_100));
+        assert!(gate.try_acquire_at(5_250));
+        // Independent gates do not share state (regression: one global would
+        // serialize unrelated test clocks).
+        let other = DialBudget::new(4);
+        assert!(other.try_acquire_at(5_100));
+    }
+
+    #[test]
+    fn dead_peer_dials_back_off() {
+        use std::time::{Duration, Instant};
+        // A dead peer's dial suppression OUTLIVES the fixed 3s cooldown: the
+        // exponential backoff keeps stretching the silence while the peer
+        // stays down, and success resets the streak to zero.
+        let health = Mutex::new(HashMap::new());
+        let pid = [7u8; 20];
+        // Healthy peer: no backoff, no suppression.
+        assert_eq!(dial_backoff_ms(0, 2000, 300_000), 0);
+        // Three consecutive dial failures: threshold reached, suppressed now.
+        for _ in 0..PEER_SKIP_THRESHOLD {
+            ConsensusNetwork::record_health(&health, pid, false);
+        }
+        let now = Instant::now();
+        let entry = health.lock().unwrap().get(&pid).copied().unwrap();
+        assert_eq!(entry.fails, PEER_SKIP_THRESHOLD);
+        assert!(peer_dial_suppressed(
+            entry.fails,
+            entry.last_fail,
+            entry.backoff_until,
+            now
+        ));
+        // Keep failing: with defaults (base 2s) the 6th consecutive failure
+        // already backs off 16s (jittered to [8s, 16s]) — far past the fixed
+        // 3s cooldown, so the peer stays silent after the cooldown ages out.
+        for _ in 0..3 {
+            ConsensusNetwork::record_health(&health, pid, false);
+        }
+        let entry = health.lock().unwrap().get(&pid).copied().unwrap();
+        assert_eq!(entry.fails, PEER_SKIP_THRESHOLD + 3);
+        let past_cooldown = entry.last_fail.unwrap() + PEER_SKIP_COOLDOWN + Duration::from_secs(1);
+        assert!(
+            !peer_in_cooldown(entry.fails, entry.last_fail, past_cooldown),
+            "the fixed cooldown must have aged out here"
+        );
+        assert!(
+            peer_dial_suppressed(entry.fails, entry.last_fail, entry.backoff_until, past_cooldown),
+            "but the exponential backoff must still suppress the dial"
+        );
+        // Success resets to zero: the ledger entry is gone, dials resume.
+        let fails_before = ConsensusNetwork::record_health(&health, pid, true);
+        assert_eq!(fails_before, PEER_SKIP_THRESHOLD + 3);
+        assert!(!health.lock().unwrap().contains_key(&pid));
+        assert!(!peer_dial_suppressed(0, None, None, Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn dead_peer_keeps_flush_latency_bounded() {
+        // Flush-latency bound: one dead peer's multi-second stall must not
+        // hold the flush past the join budget. The slow task is DETACHED
+        // (still runs to completion), only the waiter moves on.
+        let fast = tokio::spawn(async { 1u32 });
+        let slow = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            2u32
+        });
+        let t0 = Instant::now();
+        let (done, detached) =
+            join_with_timeout(vec![fast, slow], Duration::from_millis(50)).await;
+        let elapsed = t0.elapsed();
+        assert_eq!(done, vec![1u32], "the fast peer must still join");
+        assert_eq!(detached, 1, "the dead peer must detach, not block");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "flush must return on the join budget, not the dead peer (took {elapsed:?})"
         );
     }
 

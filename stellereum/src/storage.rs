@@ -3117,6 +3117,19 @@ impl AsyncPersistence {
         self.push(PersistJob::Flush);
     }
 
+    /// Jobs pushed but not yet dequeued by the background writer.
+    ///
+    /// Shutdown-path seam: the graceful-shutdown handler polls this until it
+    /// reads empty (see [`wait_for_persist_drain`]). Reads zero at DEQUEUE —
+    /// the dequeued job's own sled write (in particular the trailing `Flush`
+    /// barrier's fsync) is still in flight at that instant, which is why the
+    /// drain wait adds a bounded settle grace after observing zero rather
+    /// than exiting immediately.
+    pub fn pending(&self) -> u64 {
+        self.queue_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Snapshot the current state of an engine and enqueue it (convenience).
     ///
     /// Byte-identical to `engine.create_snapshot()`: the capture is the SAME
@@ -3130,6 +3143,111 @@ impl AsyncPersistence {
         let snap = serialize_off_tick(accounts).await.unwrap_or_default();
         self.enqueue_state(height, snap);
     }
+}
+
+/// Graceful-shutdown drain budget: overall cap on waiting for the persist
+/// queue to empty (shutdown path only).
+///
+/// The units carry `TimeoutStopSec=300s`: the process must be gone well
+/// inside it, or systemd SIGKILLs it mid-write — the torn-sled brick this
+/// replaces (fixed 15s sleep, then `exit(0)` mid-flush). Worst case below is
+/// `SHUTDOWN_DRAIN_CAP_SECS + SHUTDOWN_SETTLE_GRACE_SECS` = 250s < 300s.
+pub const SHUTDOWN_DRAIN_CAP_SECS: u64 = 240;
+/// Poll cadence while waiting for the queue to drain. The query is one
+/// atomic load, so sub-second polling costs nothing and exits promptly on
+/// drain instead of sleeping past it.
+pub const SHUTDOWN_DRAIN_POLL_MS: u64 = 500;
+/// Operator-visible progress cadence while waiting for the drain.
+pub const SHUTDOWN_DRAIN_LOG_EVERY_SECS: u64 = 15;
+/// Extra grace AFTER the queue reads empty. [`AsyncPersistence::pending`]
+/// hits zero at DEQUEUE — the trailing `Flush` barrier's own sled fsync is
+/// still in flight at that instant — and the runtime snapshot worker
+/// (`submit_snapshot`/`poll_snapshot`) is not queryable from the shutdown
+/// path (no runtime handle is captured there), so a bounded settle covers
+/// both without refactoring unrelated code.
+pub const SHUTDOWN_SETTLE_GRACE_SECS: u64 = 10;
+
+/// Tuning for [`wait_for_persist_drain`]. `Default` is the production
+/// shutdown budget above; the struct (not loose args) exists so tests can
+/// shrink every knob to milliseconds without touching production values.
+#[derive(Clone, Copy, Debug)]
+pub struct ShutdownDrainConfig {
+    /// Give up and report `drained: false` after this long.
+    pub cap: std::time::Duration,
+    /// Delay between queue-depth polls.
+    pub poll: std::time::Duration,
+    /// Minimum gap between `[storage] shutdown drain` progress lines.
+    pub log_every: std::time::Duration,
+    /// Extra wait after the queue first reads empty (see
+    /// [`SHUTDOWN_SETTLE_GRACE_SECS`]).
+    pub settle_grace: std::time::Duration,
+}
+
+impl Default for ShutdownDrainConfig {
+    fn default() -> Self {
+        Self {
+            cap: std::time::Duration::from_secs(SHUTDOWN_DRAIN_CAP_SECS),
+            poll: std::time::Duration::from_millis(SHUTDOWN_DRAIN_POLL_MS),
+            log_every: std::time::Duration::from_secs(SHUTDOWN_DRAIN_LOG_EVERY_SECS),
+            settle_grace: std::time::Duration::from_secs(SHUTDOWN_SETTLE_GRACE_SECS),
+        }
+    }
+}
+
+/// Outcome of [`wait_for_persist_drain`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShutdownDrainOutcome {
+    /// True when the queue read empty before the cap (settle grace included
+    /// in the wait); false when the cap fired first — e.g. consensus kept
+    /// finalizing (and enqueueing) during the wait, or the disk is wedged.
+    /// The caller still exits: the cap is the bounded worst case inside the
+    /// systemd stop timeout.
+    pub drained: bool,
+    /// Queue depth observed when the wait ended (0 when drained).
+    pub last_pending: u64,
+}
+
+/// Wait until `pending` reports an empty persist queue, then observe the
+/// settle grace and report. `pending` is any queue-depth query — in
+/// production `|| ap.pending()`, in tests a fake counter.
+///
+/// Evidence contract for operators: while waiting, one
+/// `[storage] shutdown drain: N blocks pending...` line every `log_every`.
+pub async fn wait_for_persist_drain_with(
+    pending: impl Fn() -> u64,
+    cfg: ShutdownDrainConfig,
+) -> ShutdownDrainOutcome {
+    let start = std::time::Instant::now();
+    let mut last_log = start;
+    loop {
+        let n = pending();
+        if n == 0 {
+            tokio::time::sleep(cfg.settle_grace).await;
+            return ShutdownDrainOutcome {
+                drained: true,
+                last_pending: 0,
+            };
+        }
+        if start.elapsed() >= cfg.cap {
+            return ShutdownDrainOutcome {
+                drained: false,
+                last_pending: n,
+            };
+        }
+        if last_log.elapsed() >= cfg.log_every {
+            eprintln!("[storage] shutdown drain: {n} blocks pending...");
+            last_log = std::time::Instant::now();
+        }
+        tokio::time::sleep(cfg.poll).await;
+    }
+}
+
+/// Production-budget [`wait_for_persist_drain_with`]: the shared shutdown
+/// helper every graceful-shutdown site calls after `request_flush()`.
+/// Keeps `exit(0)` semantics at the call site; worst case
+/// cap + settle grace, comfortably inside the 300s stop timeout.
+pub async fn wait_for_persist_drain(pending: impl Fn() -> u64) -> ShutdownDrainOutcome {
+    wait_for_persist_drain_with(pending, ShutdownDrainConfig::default()).await
 }
 
 /// The engine's consensus state, cloned under the read lock and NOT serialized.
@@ -3382,6 +3500,79 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn fast_drain_cfg() -> ShutdownDrainConfig {
+        ShutdownDrainConfig {
+            cap: std::time::Duration::from_secs(5),
+            poll: std::time::Duration::from_millis(1),
+            log_every: std::time::Duration::from_secs(60),
+            settle_grace: std::time::Duration::from_millis(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_returns_at_once_when_queue_empty() {
+        let out = wait_for_persist_drain_with(|| 0, fast_drain_cfg()).await;
+        assert_eq!(
+            out,
+            ShutdownDrainOutcome {
+                drained: true,
+                last_pending: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_waits_until_queue_empties() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let depth = Arc::new(AtomicU64::new(3));
+        let writer = depth.clone();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                writer.fetch_sub(1, Ordering::Relaxed);
+            }
+        });
+        let out =
+            wait_for_persist_drain_with(|| depth.load(Ordering::Relaxed), fast_drain_cfg()).await;
+        assert_eq!(
+            out,
+            ShutdownDrainOutcome {
+                drained: true,
+                last_pending: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_caps_when_queue_never_empties() {
+        let cfg = ShutdownDrainConfig {
+            cap: std::time::Duration::from_millis(50),
+            ..fast_drain_cfg()
+        };
+        let start = std::time::Instant::now();
+        let out = wait_for_persist_drain_with(|| 7, cfg).await;
+        assert_eq!(
+            out,
+            ShutdownDrainOutcome {
+                drained: false,
+                last_pending: 7
+            }
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "cap must bound the wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_persistence_pending_starts_empty() {
+        let dir = tmp();
+        let st = Arc::new(Storage::open(&dir).unwrap());
+        let ap = AsyncPersistence::start(st);
+        assert_eq!(ap.pending(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn load_state_restores_balances() {
         let dir = tmp();
@@ -3461,6 +3652,250 @@ mod tests {
         );
         // SPV proof for the restored token balance still verifies against the root.
         assert!(engine2.get_token_balance_proof(&tid, &who).await.is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Snapshot label/content binding (restart crash-loop regression).
+    ///
+    /// Live shape: a snapshot labeled S must hold ONLY post-S state, because
+    /// the boot check (`verify_restored_root`) compares it against
+    /// `header(S+1).state_root`. The old poll-time cross-shard capture read a
+    /// replay set advanced by later heights and persisted it under label S;
+    /// the restored engine then rooted differently from the anchor and every
+    /// restart died with `restore root mismatch`. The fix (main.rs snapshot
+    /// block) captures the replay bytes at submit quiescence and reuses them
+    /// verbatim at poll, so this test pins the healthy end-to-end shape:
+    /// persist a fully consistent snapshot for S (accounts, domains, aux AND
+    /// the replay set, all captured pre-apply), anchor it with the S+1 header
+    /// committing to the pre-apply root, advance the live engine with a REAL
+    /// block apply, then reboot-load from the store and require the verify to
+    /// pass. Non-empty replay sets throughout: empty sets are
+    /// digest-invisible and would make this test vacuous.
+    #[tokio::test]
+    async fn snapshot_at_s_verifies_after_real_apply_to_s_plus_1() {
+        use crate::sharding::{CrossShardKey, CrossShardReplaySnapshot};
+
+        const S: u64 = 100;
+        let dir = tmp();
+        let st = Storage::open(&dir).unwrap();
+        let sk = SigningKey::generate(&mut OsRng);
+
+        // Live engine at post-S state, with NON-EMPTY replay sets.
+        let engine = InMemoryStateEngine::new();
+        let who = [11u8; 32];
+        engine.update_account(AccountState::new(who, 1_000_000)).await;
+        engine
+            .restore_cross_shard_replay(&CrossShardReplaySnapshot {
+                engine_consumed: vec![CrossShardKey {
+                    source_shard: 1,
+                    finalized_in_block: [2u8; 32],
+                    msg_id: [3u8; 32],
+                }],
+                completed: vec![[4u8; 32]],
+                ..Default::default()
+            })
+            .await;
+        let root_s = engine.get_state_root().await;
+
+        // Capture the FULL snapshot exactly as the live path does (accounts +
+        // domains + every aux domain + the replay set, all pre-apply).
+        let accounts = clone_account_snapshot(&engine).await;
+        let state_bytes = serialize_off_tick(accounts)
+            .await
+            .expect("encode accounts");
+        let staking = engine.staking_read().await.clone();
+        let gov = engine.governance_read().await.clone();
+        let domains = DomainSnapshot::capture(&engine, &staking, &gov).await;
+        let domain_bytes = serialize_off_tick(domains)
+            .await
+            .expect("encode domains");
+        let session_keys = engine.session_keys_snapshot().await;
+        let bridge = engine.bridge_snapshot().await;
+        let confidential = engine.confidential_snapshot().await;
+        let zkml_models = engine.zkml_models_snapshot().await;
+        let cross_shard = {
+            let mut engine_consumed = engine.cross_shard_consumed_snapshot().await;
+            engine_consumed.sort();
+            let mut completed = engine.cross_shard_completed_snapshot().await;
+            completed.sort();
+            let xpc = engine.xpc_snapshot().await;
+            bincode::serialize(&CrossShardReplaySnapshot {
+                engine_consumed,
+                completed,
+                xpc,
+                ..Default::default()
+            })
+            .expect("encode cross-shard")
+        };
+        st.put_state(S, &state_bytes).unwrap();
+        st.put_domains(S, &domain_bytes).unwrap();
+        st.put_session_keys(S, &session_keys).unwrap();
+        st.put_bridge(S, &bridge).unwrap();
+        st.put_confidential(S, &confidential).unwrap();
+        st.put_zkml_models(S, &zkml_models).unwrap();
+        st.put_cross_shard(S, &cross_shard).unwrap();
+
+        // Anchor: the S+1 header commits to the PRE-apply (post-S) root — the
+        // proposer rule `expected_restore_root` relies on.
+        let mut anchor = block(S + 1, [9u8; 32], &sk, None);
+        anchor.state_root = root_s;
+        let anchor_hash = anchor.compute_hash();
+        st.put_header(&BlockHeaderRecord::of(&anchor)).unwrap();
+        st.set_finalized(S + 1, &anchor_hash).unwrap();
+
+        // Advance the live engine with a REAL block apply (the block reward
+        // moves the root) plus newer replay activity, the way S+1
+        // finalization would: the persisted snapshot must stay S-pinned
+        // regardless.
+        let mut next = block(S + 1, [9u8; 32], &sk, None);
+        next.state_root = root_s;
+        engine.apply_block_transition(&next, 500).await;
+        engine
+            .restore_cross_shard_replay(&CrossShardReplaySnapshot {
+                engine_consumed: vec![CrossShardKey {
+                    source_shard: 1,
+                    finalized_in_block: [5u8; 32],
+                    msg_id: [6u8; 32],
+                }],
+                completed: vec![[7u8; 32]],
+                ..Default::default()
+            })
+            .await;
+        assert_ne!(
+            engine.get_state_root().await,
+            root_s,
+            "the S+1 apply must move the live root, or the test proves nothing"
+        );
+
+        // Reboot: fresh engine, load from the store, verify must pass.
+        let fresh = InMemoryStateEngine::new();
+        let loaded = load_full_state_into(&st, &fresh)
+            .await
+            .expect("consistent snapshot S must restore");
+        assert_eq!(loaded.map(|(h, _, _)| h), Some(S));
+        assert_eq!(fresh.get_state_root().await, root_s);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Mixed-height snapshot must fail the restore verify: accounts/domains at
+    /// S, replay bytes from post-S+1 activity, label S. This is the exact
+    /// persisted shape the old poll-time cross-shard capture produced (see the
+    /// test above for the fixed shape). `load_full_state_into` must refuse it
+    /// with `restore root mismatch` instead of installing a forked engine.
+    #[tokio::test]
+    async fn mixed_height_cross_shard_snapshot_fails_restore_verify() {
+        use crate::sharding::{CrossShardKey, CrossShardReplaySnapshot};
+
+        const S: u64 = 100;
+        let dir = tmp();
+        let st = Storage::open(&dir).unwrap();
+        let sk = SigningKey::generate(&mut OsRng);
+
+        let engine = InMemoryStateEngine::new();
+        let who = [11u8; 32];
+        engine.update_account(AccountState::new(who, 1_000_000)).await;
+        engine
+            .restore_cross_shard_replay(&CrossShardReplaySnapshot {
+                engine_consumed: vec![CrossShardKey {
+                    source_shard: 1,
+                    finalized_in_block: [2u8; 32],
+                    msg_id: [3u8; 32],
+                }],
+                completed: vec![[4u8; 32]],
+                ..Default::default()
+            })
+            .await;
+        let root_s = engine.get_state_root().await;
+
+        // Accounts/domains/aux captured at S (pre-apply), exactly as live.
+        let accounts = clone_account_snapshot(&engine).await;
+        let state_bytes = serialize_off_tick(accounts)
+            .await
+            .expect("encode accounts");
+        let staking = engine.staking_read().await.clone();
+        let gov = engine.governance_read().await.clone();
+        let domains = DomainSnapshot::capture(&engine, &staking, &gov).await;
+        let domain_bytes = serialize_off_tick(domains)
+            .await
+            .expect("encode domains");
+        let session_keys = engine.session_keys_snapshot().await;
+        let bridge = engine.bridge_snapshot().await;
+        let confidential = engine.confidential_snapshot().await;
+        let zkml_models = engine.zkml_models_snapshot().await;
+        let cross_shard_s = {
+            let mut engine_consumed = engine.cross_shard_consumed_snapshot().await;
+            engine_consumed.sort();
+            let mut completed = engine.cross_shard_completed_snapshot().await;
+            completed.sort();
+            let xpc = engine.xpc_snapshot().await;
+            bincode::serialize(&CrossShardReplaySnapshot {
+                engine_consumed,
+                completed,
+                xpc,
+                ..Default::default()
+            })
+            .expect("encode cross-shard")
+        };
+
+        // S+1 activity moves the engine on (real apply + newer replay set).
+        let mut next = block(S + 1, [9u8; 32], &sk, None);
+        next.state_root = root_s;
+        engine.apply_block_transition(&next, 500).await;
+        engine
+            .restore_cross_shard_replay(&CrossShardReplaySnapshot {
+                engine_consumed: vec![CrossShardKey {
+                    source_shard: 1,
+                    finalized_in_block: [5u8; 32],
+                    msg_id: [6u8; 32],
+                }],
+                completed: vec![[7u8; 32]],
+                ..Default::default()
+            })
+            .await;
+        // Replay bytes captured AFTER the advance (the old poll-time bug).
+        let cross_shard_newer = {
+            let mut engine_consumed = engine.cross_shard_consumed_snapshot().await;
+            engine_consumed.sort();
+            let mut completed = engine.cross_shard_completed_snapshot().await;
+            completed.sort();
+            let xpc = engine.xpc_snapshot().await;
+            bincode::serialize(&CrossShardReplaySnapshot {
+                engine_consumed,
+                completed,
+                xpc,
+                ..Default::default()
+            })
+            .expect("encode cross-shard")
+        };
+        assert_ne!(
+            cross_shard_newer, cross_shard_s,
+            "the replay set must advance, or the mixed-height shape is vacuous"
+        );
+
+        // Persisted under label S with the S+1 anchor, like the old bug did.
+        st.put_state(S, &state_bytes).unwrap();
+        st.put_domains(S, &domain_bytes).unwrap();
+        st.put_session_keys(S, &session_keys).unwrap();
+        st.put_bridge(S, &bridge).unwrap();
+        st.put_confidential(S, &confidential).unwrap();
+        st.put_zkml_models(S, &zkml_models).unwrap();
+        st.put_cross_shard(S, &cross_shard_newer).unwrap();
+        let mut anchor = block(S + 1, [9u8; 32], &sk, None);
+        anchor.state_root = root_s;
+        st.put_header(&BlockHeaderRecord::of(&anchor)).unwrap();
+        st.set_finalized(S + 1, &anchor.compute_hash()).unwrap();
+
+        let fresh = InMemoryStateEngine::new();
+        let err = load_full_state_into(&st, &fresh)
+            .await
+            .expect_err("mixed-height snapshot must be refused");
+        assert!(
+            err.to_string()
+                .contains(&format!("restore root mismatch at height {S}")),
+            "unexpected error: {err}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

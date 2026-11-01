@@ -276,6 +276,20 @@ pub struct AdmissionCtx {
     /// this via [`AdmissionCtx::with_sponsor_balance`], reading the sponsor
     /// account exactly like they already read the sender account.
     pub sponsor_balance: Option<u64>,
+    /// A14 chain-binding rollout, phase 3: the chain height this transaction
+    /// would be admitted/included at, when the caller knows it.
+    ///
+    /// `insert` enforces [`crate::chain_binding::check_admission`] against
+    /// this height and the ambient `STELL_CHAIN_BIND_ACTIVATION_HEIGHT` env:
+    /// unbound envelopes are refused with `UnboundRefused` at/after
+    /// activation instead of occupying pool space the proposer must then
+    /// skip (defense in depth for P2P-received transactions, which never
+    /// pass the RPC refusal). `None` (every legacy caller, and every path
+    /// that cannot name an inclusion height) keeps exactly today's behavior:
+    /// no check runs, so default-off **and** height-less admission stay
+    /// byte-identical. Live ingress paths (RPC submit, gossip, overlay)
+    /// MUST set this via [`AdmissionCtx::with_chain_height`].
+    pub chain_height: Option<u64>,
 }
 
 impl AdmissionCtx {
@@ -285,6 +299,7 @@ impl AdmissionCtx {
             onchain_nonce: None,
             shard: None,
             sponsor_balance: None,
+            chain_height: None,
         }
     }
 
@@ -298,6 +313,7 @@ impl AdmissionCtx {
             onchain_nonce: None,
             shard: None,
             sponsor_balance: None,
+            chain_height: None,
         }
     }
 
@@ -321,6 +337,15 @@ impl AdmissionCtx {
     /// a sponsored transaction WITHOUT it is refused fail-closed.
     pub fn with_sponsor_balance(mut self, sponsor_balance: u64) -> Self {
         self.sponsor_balance = Some(sponsor_balance);
+        self
+    }
+
+    /// Carry the chain height the transaction would be included at so
+    /// [`Mempool::insert`] enforces the chain-binding gate itself (A14 phase
+    /// 3). Pure builder: every other head is untouched. Callers that cannot
+    /// name an inclusion height leave it `None` and keep legacy behaviour.
+    pub fn with_chain_height(mut self, chain_height: u64) -> Self {
+        self.chain_height = Some(chain_height);
         self
     }
 }
@@ -388,6 +413,12 @@ pub enum MempoolError {
     /// Anti-DoS: a sponsored transaction with no funded sponsor behind it
     /// must never occupy pool space.
     SponsorInsufficientBalance,
+    /// A14 chain-binding rollout, phase 3: the envelope binds no chain id
+    /// (legacy unbound) and the gate is armed at the carried height. The
+    /// inner string is the stable
+    /// [`crate::chain_binding::UNBOUND_REFUSED_ERR_PREFIX`] refusal every
+    /// admission path returns, so wallets match one string.
+    UnboundRefused(String),
     /// Transaction payload or structure is malformed or violates protocol mode.
     Malformed(String),
     /// The transaction alone exceeds the block wire cap (`MAX_BLOCK_WIRE_BYTES`):
@@ -441,6 +472,7 @@ impl std::fmt::Display for MempoolError {
             MempoolError::SponsorBadGrant => "invalid sponsor grant",
             MempoolError::SponsorBadSignature => "invalid sponsor signature",
             MempoolError::SponsorInsufficientBalance => "sponsor cannot pay the transaction fee",
+            MempoolError::UnboundRefused(reason) => return write!(f, "{reason}"),
             MempoolError::Malformed(reason) => return write!(f, "malformed transaction: {reason}"),
             MempoolError::TxTooLarge { wire_bytes, cap } => {
                 return write!(
@@ -1558,6 +1590,45 @@ impl Mempool {
         self.insert(tx, sender_balance, true, ctx)
     }
 
+    /// Drop every pooled UNBOUND transaction once refusal is active (A14 phase
+    /// 3: in-flight unbound transactions are dropped at activation, never
+    /// grandfathered — a grandfathered unbound tx included post-height would
+    /// fork mixed-version nodes). Returns how many were dropped.
+    ///
+    /// The partition itself runs through
+    /// [`crate::chain_binding::partition_at_activation`] (pure, order
+    /// preserving) so the drop accounting stays in one place
+    /// (`unbound_dropped_at_activation`); each dropped hash is then evicted
+    /// through [`Mempool::evict`], which keeps the fee index, the per-sender
+    /// quota and the F-03 reservations in step. Pre-activation (or
+    /// default-off) this is a no-op returning 0 — the pool is untouched.
+    /// Called ONCE when crossing the activation height (see the main-loop
+    /// call site); re-running it later is harmless but pointless, because
+    /// `insert` already refuses new unbound arrivals while armed.
+    pub fn drop_unbound_at_activation(
+        &mut self,
+        chain_height: u64,
+        activation: &crate::chain_binding::ChainBindingActivation,
+    ) -> usize {
+        if !activation.refusal_active(chain_height) {
+            return 0;
+        }
+        let items: Vec<(TxHash, bool)> = self
+            .txs
+            .iter()
+            .map(|(hash, tx)| (*hash, tx.chain_id().is_some()))
+            .collect();
+        let (_kept, dropped) =
+            crate::chain_binding::partition_at_activation(items, chain_height, activation);
+        for hash in &dropped {
+            self.evict(hash);
+        }
+        for _ in 0..dropped.len() {
+            crate::metrics::global().inc_unbound_refused();
+        }
+        dropped.len()
+    }
+
     /// Drop transactions that can never be executed, given the current on-chain
     /// state, and return how many were removed.
     ///
@@ -1691,6 +1762,27 @@ impl Mempool {
         check_balance: bool,
         ctx: AdmissionCtx,
     ) -> Result<TxHash, MempoolError> {
+        // A14 phase 3 (chain binding, defense in depth for P2P-received
+        // transactions): refuse unbound envelopes at/after the configured
+        // activation height instead of pooling them.
+        // GATE: `ctx.chain_height` is the height the caller believes this tx
+        // would be included at (RPC ingress: finalized-tip+1; gossip/overlay:
+        // same), derived from COMMITTED state — never a peer-supplied value.
+        // `None` (every legacy caller) skips the check outright, and with the
+        // activation env unset `check_admission_from_env` passes everything,
+        // so both height-less and default-off admission stay byte-identical.
+        // Cheap (pure predicate) and placed before any crypto so refused
+        // replays are also cheap to refuse.
+        if let Some(chain_height) = ctx.chain_height {
+            if let Err(reason) = crate::chain_binding::check_admission_from_env(
+                tx.chain_id().is_some(),
+                chain_height,
+                crate::consensus::consensus_chain_id(),
+            ) {
+                crate::metrics::global().inc_unbound_refused();
+                return Err(MempoolError::UnboundRefused(reason));
+            }
+        }
         let pure_pq = self
             .pure_pq_enforced
             .unwrap_or_else(crate::post_quantum::is_pure_pq_enforced);

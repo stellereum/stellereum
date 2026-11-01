@@ -312,6 +312,14 @@ pub enum StakingError {
     /// `delegate`/`withdraw_delegator`/`stake_delegate` reject it
     /// fail-closed and the self-bond key stays exclusive to `withdraw`.
     ZeroAddress,
+    /// Fail-closed bps gate (staking-economics audit 2026-11-01, low (b)):
+    /// [`StakingLedger::slash`] refuses `slash_bps > BPS_DENOMINATOR` with
+    /// this instead of burning more than 100% of the slashable base. All
+    /// live callers pass constants `<= 10_000` (`EQUIVOCATION_SLASH_BPS`,
+    /// `MICRO_COMMITTEE_SLASH_BPS`, `DOWNTIME_SLASH_BPS`), so the gate is a
+    /// no-op on every reachable path — defense-in-depth only. Appended last
+    /// so existing serialized error indices are untouched.
+    BadSlashBps,
 }
 
 impl std::fmt::Display for StakingError {
@@ -350,6 +358,7 @@ impl std::fmt::Display for StakingError {
             StakingError::ZeroAddress => {
                 "the zero address cannot hold a delegation (self-bond key is reserved)"
             }
+            StakingError::BadSlashBps => "slash basis points must be <= 10000 (100%)",
         };
         write!(f, "{s}")
     }
@@ -1416,6 +1425,29 @@ impl StakingLedger {
             .min(MAX_ACTIVE_VALIDATORS)
     }
 
+    /// Saturating total power of the CURRENT elected set (same post-cap
+    /// ranking as [`Self::to_validator_set`]).
+    ///
+    /// CALLER-SIDE HARDENING for the staking-economics audit 2026-11-01 low
+    /// (a): [`crate::consensus::ValidatorSet::total_power`] sums with a
+    /// panicking `Iterator::sum` (frozen — `consensus.rs` is out of scope),
+    /// and the staking layer CAN feed it unbounded values: `bond` accepts any
+    /// `u64` amount, so 250 validators at `u64::MAX` each would make
+    /// `to_validator_set().total_power()` panic in debug (wrap in release).
+    /// This helper folds the exact same elected set with `saturating_add`,
+    /// so it saturates at `u64::MAX` instead of panicking — unreachable at
+    /// live supplies (1 B cap), fail-closed by policy everywhere else.
+    /// Staking-layer consumers that need the elected total MUST use this,
+    /// never `to_validator_set().total_power()`. (No production staking code
+    /// calls `total_power` today: [`Self::quorum_fragility`] already folds
+    /// with `saturating_add` via [`validator_powers_fragility`].)
+    pub fn elected_total_power_saturating(&self) -> u64 {
+        self.to_validator_set()
+            .validators
+            .values()
+            .fold(0u64, |acc, &p| acc.saturating_add(p))
+    }
+
     /// Quorum-safety of the CURRENT elected set (same post-cap ranking as
     /// [`Self::to_validator_set`): `Some(reason)` when the set is fragile —
     /// see [`validator_powers_fragility`]. This is the verdict `main.rs`
@@ -1438,12 +1470,26 @@ impl StakingLedger {
     /// delegated), burning it. Self-bond is consumed first, then delegated.
     /// Returns the amount burned.
     ///
+    /// FAIL-CLOSED BPS GATE (staking-economics audit 2026-11-01, low (b)):
+    /// `slash_bps > BPS_DENOMINATOR` is refused with
+    /// [`StakingError::BadSlashBps`] and moves nothing — without the gate a
+    /// `bps > 10_000` would burn MORE than 100% of the slashable base (the
+    /// `burn` formula is linear in `bps` while every consumption below is
+    /// clamped by real stake, so the excess would silently vanish into
+    /// `remaining` instead of `total_burned`). All live callers pass
+    /// constants `<= 10_000`, so the gate never fires on reachable paths.
+    ///
     /// ROUNDING (audit L1, verified conservative): the per-delegator `cut`
     /// floors, so `slashed_total ≤ take` by `< n_delegators` nanos. Map and
     /// aggregate stay mutually consistent (both reduced by `slashed_total`);
     /// the unfloorable nanos simply REMAIN STAKED — the dust favors the
     /// slashed party, never the protocol. Pinned by closure-suite test.
     pub fn slash(&mut self, validator: ValidatorId, slash_bps: u64) -> Result<u64, StakingError> {
+        // Fail-closed bps gate BEFORE any state lookup: burning more than
+        // 100% is never meaningful, so refuse it regardless of membership.
+        if slash_bps > BPS_DENOMINATOR {
+            return Err(StakingError::BadSlashBps);
+        }
         let (self_bond, delegated_now) = {
             let v = self
                 .validators
@@ -1451,12 +1497,18 @@ impl StakingLedger {
                 .ok_or(StakingError::NotValidator)?;
             (v.self_bond, v.delegated)
         };
+        // Saturating sums (econ audit 2026-11-01): `Iterator::sum` panics on
+        // overflow in debug and wraps in release. Per-validator pending
+        // unbondings are bounded by bonded stake at live supplies, but the
+        // ledger must never panic on adversarial state. Saturation can only
+        // OVERSTATE the slashable base, and every consumption below is
+        // clamped with `min`, so `actually_burned` never exceeds real stake
+        // (fail-closed; the stake↔burned conservation is preserved exactly).
         let unbonding_self: u64 = self
             .unbonding
             .iter()
             .filter(|e| e.validator == validator && e.owner.is_none())
-            .map(|e| e.amount)
-            .sum();
+            .fold(0u64, |acc, e| acc.saturating_add(e.amount));
         // Audit P1: in-flight delegator stake (unbonding, owner set) is part
         // of the slashable base — it secured the chain during the infraction
         // window. Excluding it let exiting stake escape the burn entirely.
@@ -1464,8 +1516,7 @@ impl StakingLedger {
             .unbonding
             .iter()
             .filter(|e| e.validator == validator && e.owner.is_some())
-            .map(|e| e.amount)
-            .sum();
+            .fold(0u64, |acc, e| acc.saturating_add(e.amount));
         let total = self_bond
             .saturating_add(delegated_now)
             .saturating_add(unbonding_self)
@@ -1482,9 +1533,19 @@ impl StakingLedger {
             if entry.validator == validator && entry.owner.is_some() {
                 let cut =
                     (entry.amount as u128 * slash_bps as u128 / BPS_DENOMINATOR as u128) as u64;
-                let cut = cut.min(entry.amount);
+                // Cap the cumulative haircut at `burn` (econ audit 2026-11-01):
+                // with saturating unbonding sums the base can UNDERSTATE the
+                // true pending total, and an uncapped haircut would then
+                // consume more stake than `burn` accounts for — destroying
+                // value that neither stays staked nor reaches `total_burned`.
+                // In-range the cap is a no-op (the haircut sum provably never
+                // exceeds `burn` there: a sum of floors never exceeds the
+                // floor of the sum).
+                let cut = cut
+                    .min(entry.amount)
+                    .min(burn.saturating_sub(unbond_cut_total));
                 entry.amount -= cut;
-                unbond_cut_total += cut;
+                unbond_cut_total = unbond_cut_total.saturating_add(cut);
             }
         }
         self.unbonding.retain(|e| e.amount > 0);
@@ -1543,7 +1604,7 @@ impl StakingLedger {
                         } else {
                             self.delegations.insert(key, amount - cut);
                         }
-                        slashed_total += cut;
+                        slashed_total = slashed_total.saturating_add(cut);
                     }
                 }
                 if let Some(v) = self.validators.get_mut(&validator) {

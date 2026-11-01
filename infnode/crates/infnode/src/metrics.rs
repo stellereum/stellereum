@@ -39,6 +39,14 @@ pub struct Metrics {
     /// R6: сколько раз kv.json реально перезаписывалось (после debounce).
     /// Считает эффективность dirty-флажка: N dht.store за окно => 1 persist.
     pub kv_persists_total: AtomicU64,
+    /// F8 hardening: handshake initiations refused by the per-IP bucket.
+    pub handshake_throttled: AtomicU64,
+    /// F8 hardening: pre-auth connections closed on deadline without CHALLENGE.
+    pub preauth_timeouts: AtomicU64,
+    /// F8 hardening: handshakes refused while the source IP is strike-banned.
+    pub auth_bans_hit: AtomicU64,
+    /// F8 hardening: strike bans currently/ever imposed.
+    pub auth_bans_total: AtomicU64,
     pub start_unix: std::sync::atomic::AtomicI64,
 }
 
@@ -185,6 +193,30 @@ pub fn render(
         "infnode_kv_persists_total",
         "kv.json full rewrites (after debounce)",
         m.kv_persists_total.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_handshake_throttled_total",
+        "handshakes refused by per-IP bucket",
+        m.handshake_throttled.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_preauth_timeouts_total",
+        "pre-auth connections closed on deadline",
+        m.preauth_timeouts.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_auth_bans_hit_total",
+        "handshakes refused while IP strike-banned",
+        m.auth_bans_hit.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_auth_bans_total",
+        "strike bans imposed",
+        m.auth_bans_total.load(Ordering::Relaxed),
     );
     fmt_metric(
         &mut out,

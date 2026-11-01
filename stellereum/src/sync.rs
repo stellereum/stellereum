@@ -727,6 +727,12 @@ pub fn validate_sync_chain_for_shard_with_sets(
     resolve_set: &dyn Fn(u64) -> Option<crate::consensus::ValidatorSet>,
     expected_shard: u32,
 ) -> Result<(), String> {
+    // An empty walk proves nothing: accepting it would let a caller treat "no
+    // blocks" as "a valid chain", re-anchoring consensus on heights no block
+    // exists for. Every legitimate caller holds at least one block here.
+    if blocks.is_empty() {
+        return Err("block sync: empty chain cannot be validated".to_string());
+    }
     // A resolver that cannot name a set fails closed: without a set there is
     // no quorum to meet, so the first height already refuses. (The live
     // runtime resolver always answers — see `validator_set_for_height`.)

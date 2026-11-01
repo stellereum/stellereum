@@ -1132,6 +1132,30 @@ fn estimate_fee_budget() -> &'static crate::explorer::RateLimiter {
     LIMITER.get_or_init(|| crate::explorer::RateLimiter::new(estimate_fee_rate_limit()))
 }
 
+/// Static attribution for callers without a peer IP (audit residual: the
+/// `peer_ip=None` bypass).
+///
+/// `dispatch` is reached with `peer_ip=None` only from in-process callers
+/// (`RpcState::call`, `handle_rpc_call` — tests and in-tree dispatch): both
+/// production transports always resolve an IP (`rpc_handler` via
+/// `resolve_client_ip`, `ws_handler` via the upgrade peer, see below). The
+/// old code SKIPPED the estimate-fee and per-client subscription caps for
+/// `None`, so an unattributed caller was exempt. Unattributed callers now
+/// share ONE static bucket with the SAME caps — throttled, never exempt
+/// (same shape as the faucet's `"unknown"` fallback in
+/// `Faucet::check_ip_throttle`).
+///
+/// The key is `0.0.0.0` (unspecified): it can never be a real TCP peer
+/// address, so it can never collide with — or be chosen by — a real client's
+/// bucket. Normal clients (`Some(ip)`) take the exact same path as before.
+pub const LOCAL_BUCKET_IP: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+/// Static client identity for unattributed subscription creators (see
+/// [`LOCAL_BUCKET_IP`]): in-process `stell_subscribe` calls share one
+/// per-client budget (`MAX_SUBSCRIPTIONS_PER_CLIENT`) instead of bypassing it.
+pub const LOCAL_SUBSCRIBER_ID: &str = "local";
+
 /// Hard ceiling on the gas a fee ESTIMATE may burn.
 ///
 /// The estimate path used to raise the simulation's gas limit to
@@ -2262,6 +2286,26 @@ fn err(id: Value, code: i64, message: impl Into<String>) -> Json<RpcResponse> {
     })
 }
 
+/// Truncate caller-controlled text reflected in an error message.
+///
+/// Error strings are served back over the network, so reflecting an unbounded
+/// caller string verbatim lets one request turn a ~1 MiB body into a ~1 MiB
+/// error (bandwidth amplification and log bloat). Short legitimate inputs
+/// (typos, wrong names) pass through byte-identical; only over-long
+/// reflections are shortened, with an explicit marker.
+fn snip_for_error(s: &str) -> String {
+    const MAX_REFLECTED_ERROR_CHARS: usize = 256;
+    if s.len() <= MAX_REFLECTED_ERROR_CHARS {
+        s.to_string()
+    } else {
+        let mut end = MAX_REFLECTED_ERROR_CHARS;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...[truncated {} chars]", &s[..end], s.len())
+    }
+}
+
 /// Parse a 32-byte hex string (with or without 0x).
 fn parse_hash(s: &str) -> Result<[u8; 32], String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
@@ -2338,7 +2382,10 @@ fn parse_single_getter_arg(val: &Value) -> Result<i64, String> {
                 }
             }
         }
-        return Err(format!("cannot parse argument into integer: {s}"));
+        return Err(format!(
+            "cannot parse argument into integer: {}",
+            snip_for_error(s)
+        ));
     }
     Err(format!("unsupported argument type: {val}"))
 }
@@ -2527,7 +2574,7 @@ fn parse_rpc_address(s: &str) -> Result<[u8; 32], String> {
             }
         }
     }
-    Err(format!("invalid address: {s}"))
+    Err(format!("invalid address: {}", snip_for_error(s)))
 }
 
 /// Parse address for RPC methods, supporting TON-style workchain / shard prefixes (e.g. "-1:<addr>", "0:<addr>", "1:<addr>").
@@ -2685,7 +2732,10 @@ fn parse_opcode_value(val: &Value) -> Result<crate::svm::OpCode, String> {
             }
         }
     }
-    Err(format!("unrecognized opcode format: {val:?}"))
+    Err(format!(
+        "unrecognized opcode format: {}",
+        snip_for_error(&format!("{val:?}"))
+    ))
 }
 
 fn parse_estimate_payload(p: &Value, to_addr: [u8; 32]) -> Result<Vec<crate::svm::OpCode>, String> {
@@ -4530,6 +4580,32 @@ async fn dispatch(
             {
                 return err(id, -32001, "unauthorized: missing or invalid faucet token");
             }
+            // A zero drip is meaningless but would still burn a faucet nonce,
+            // IP-budget quota and a mempool slot. Refuse it before anything
+            // is reserved or counted.
+            if params["amount"].as_u64() == Some(0) {
+                return err(id, -32602, "invalid amount: must be a positive integer");
+            }
+            let addr = match params["address"].as_str().or_else(|| params.as_str()) {
+                Some(a) => a,
+                None => return err(id, -32602, "missing address"),
+            };
+            // Shard scope BEFORE any nonce is reserved: a recipient that
+            // routes to another shard is refused here (not queued), so the
+            // refusal burns no nonce and touches no lifetime cap — the next
+            // servable drip keeps the exact nonce it would have had.
+            // Address validation also runs BEFORE the per-IP throttle below:
+            // validation is free, quota is not — malformed requests must
+            // never consume budget (same order as the public faucet path).
+            let (a, drip_shard) = match resolve_faucet_recipient(st, &faucet, addr).await {
+                Ok(v) => v,
+                Err(e) => {
+                    if e.starts_with("invalid address") {
+                        return err(id, -32602, e);
+                    }
+                    return err(id, -32000, e);
+                }
+            };
             // Per-source throttle, same budget as the explorer path (audit
             // follow-up: this path skipped it entirely, so the token holder
             // could rotate addresses without limit here). Unattributed callers
@@ -4543,23 +4619,6 @@ async fn dispatch(
                     return err(id, -32000, "per-IP faucet budget exhausted for this hour");
                 }
             }
-            let addr = match params["address"].as_str().or_else(|| params.as_str()) {
-                Some(a) => a,
-                None => return err(id, -32602, "missing address"),
-            };
-            // Shard scope BEFORE any nonce is reserved: a recipient that
-            // routes to another shard is refused here (not queued), so the
-            // refusal burns no nonce and touches no lifetime cap — the next
-            // servable drip keeps the exact nonce it would have had.
-            let (a, drip_shard) = match resolve_faucet_recipient(st, &faucet, addr).await {
-                Ok(v) => v,
-                Err(e) => {
-                    if e.starts_with("invalid address") {
-                        return err(id, -32602, e);
-                    }
-                    return err(id, -32000, e);
-                }
-            };
             // Reconcile inputs for the atomic mex inside build_transfer: the
             // on-chain nonce plus our own pending nonces from the shared
             // mempool. Without this, reserved-but-never-executed drips (wiped
@@ -5522,14 +5581,17 @@ async fn dispatch(
             // has a token), so its rate is capped SEPARATELY and far below
             // the generic per-IP budget. Without this cap a single client
             // could keep the node cloning state at the generic limit.
-            if let Some(ip) = peer_ip {
-                if !estimate_fee_budget().check(ip) {
-                    return err(
-                        id,
-                        -32000,
-                        "estimate-fee budget exhausted for this IP (the simulation is expensive; retry shortly)",
-                    );
-                }
+            // Fail-closed attribution (audit residual): `None` (in-process
+            // dispatch) used to skip the budget entirely. It now draws from
+            // the static local bucket ([`LOCAL_BUCKET_IP`]) with the SAME
+            // per-IP caps — throttled, never exempt.
+            let ip = peer_ip.unwrap_or(LOCAL_BUCKET_IP);
+            if !estimate_fee_budget().check(ip) {
+                return err(
+                    id,
+                    -32000,
+                    "estimate-fee budget exhausted for this IP (the simulation is expensive; retry shortly)",
+                );
             }
             handle_estimate_fee(st, id, params).await
         }
@@ -7021,8 +7083,15 @@ async fn dispatch(
                 // global, so the flood is a denial of service for everyone
                 // else). The per-IP cap keeps one client from taking the
                 // node's whole budget.
-                let client = peer_ip.map(|ip| ip.to_string());
-                match hub().subscribe_for(topic, client.as_deref()) {
+                // Fail-closed attribution (audit residual): `None`
+                // (in-process dispatch) used to create UNATTRIBUTED
+                // subscriptions that skipped the per-client cap. They now
+                // share the static "local" bucket ([`LOCAL_SUBSCRIBER_ID`])
+                // with the same cap — throttled, never exempt.
+                let client = peer_ip
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| LOCAL_SUBSCRIBER_ID.to_string());
+                match hub().subscribe_for(topic, Some(client.as_str())) {
                     Ok(sub_id) => ok(id, json!(sub_id)),
                     Err(e) => err(id, -32000, e),
                 }
@@ -7045,9 +7114,25 @@ async fn dispatch(
             }
         }
         // The live subscriptions of this node (diagnostics / introspection).
+        // Privacy: the registry records which client (IP) owns each
+        // subscription for the per-client budget, and the ids are bearer
+        // capabilities for the unauthenticated `stell_unsubscribe`. Neither
+        // is enumerable here: serve the diagnostics shape (id, filter,
+        // age, attachment) without the owner field.
         "stell_getSubscriptions" => {
-            let subs = hub().list();
-            ok(id, json!(subs))
+            let view: Vec<Value> = hub()
+                .list()
+                .iter()
+                .map(|s| {
+                    json!({
+                        "id": s.id,
+                        "topic": s.topic,
+                        "created_at": s.created_at,
+                        "attached": s.attached,
+                    })
+                })
+                .collect();
+            ok(id, json!(view))
         }
 
         // ---- the native interface namespace ------------------------------
@@ -7066,7 +7151,11 @@ async fn dispatch(
             }
         }
 
-        _ => err(id, -32601, format!("method not found: {method}")),
+        _ => err(
+            id,
+            -32601,
+            format!("method not found: {}", snip_for_error(method)),
+        ),
     }
 }
 
@@ -7683,7 +7772,10 @@ fn parse_subscribe_params(params: &Value) -> Result<SubscriptionTopic, String> {
         "newTxs" | "new_txs" | "transactions" => Ok(SubscriptionTopic::NewTxs),
         "invalidations" | "invalidation" | "reorgs" => Ok(SubscriptionTopic::Invalidations),
         "events" | "logs" | "contractEvents" => parse_events_filter(&filter),
-        other => Err(format!("unknown subscription type: {other}")),
+        other => Err(format!(
+            "unknown subscription type: {}",
+            snip_for_error(other)
+        )),
     }
 }
 
@@ -7692,6 +7784,17 @@ fn parse_subscribe_params(params: &Value) -> Result<SubscriptionTopic, String> {
 /// The contract is validated (Stl57 / hex / EVM address) and stored in its
 /// canonical 32-byte hex form, so a filter compares byte-exact against the
 /// events the chain emits.
+/// Maximum event topics one `events` subscription filter may carry.
+///
+/// Each topic is a heap `String` retained for the subscription's whole
+/// lifetime (up to `SUBSCRIPTION_TTL_SECS`) and scanned on every matching
+/// notification. An unbounded list inside the 1 MiB body would let one
+/// client lodge megabytes per subscription — and, at
+/// `MAX_SUBSCRIPTIONS_PER_CLIENT` subscriptions, hundreds of megabytes per
+/// IP. 32 is far above legitimate use (a wallet watches a handful of topics)
+/// and matches `MAX_PROOF_STORAGE_KEYS`.
+pub const MAX_SUBSCRIPTION_TOPICS: usize = 32;
+
 fn parse_events_filter(filter: &Value) -> Result<SubscriptionTopic, String> {
     let mut contract = None;
     let mut topics: Vec<String> = Vec::new();
@@ -7709,6 +7812,11 @@ fn parse_events_filter(filter: &Value) -> Result<SubscriptionTopic, String> {
         match v {
             Value::Null => {}
             Value::Array(items) => {
+                if items.len() > MAX_SUBSCRIPTION_TOPICS {
+                    return Err(format!(
+                        "too many topics: at most {MAX_SUBSCRIPTION_TOPICS} per subscription"
+                    ));
+                }
                 for it in items {
                     let t = match it {
                         Value::String(s) => s.trim().to_string(),
@@ -7730,6 +7838,11 @@ fn parse_events_filter(filter: &Value) -> Result<SubscriptionTopic, String> {
                     if !t.is_empty() {
                         topics.push(t.to_string());
                     }
+                }
+                if topics.len() > MAX_SUBSCRIPTION_TOPICS {
+                    return Err(format!(
+                        "too many topics: at most {MAX_SUBSCRIPTION_TOPICS} per subscription"
+                    ));
                 }
             }
             _ => return Err("invalid topics parameter".to_string()),
@@ -7781,7 +7894,12 @@ fn parse_stream_topics(q: &StreamQuery) -> Result<Vec<SubscriptionTopic>, String
                 }
                 parse_events_filter(&Value::Object(filter))?
             }
-            other => return Err(format!("unknown subscription type: {other}")),
+            other => {
+                return Err(format!(
+                    "unknown subscription type: {}",
+                    snip_for_error(other)
+                ))
+            }
         };
         out.push(topic);
     }
@@ -7896,6 +8014,81 @@ pub async fn sse_handler(
         }
     }
     Ok(resp)
+}
+
+// ===========================================================================
+// WS PER-MESSAGE EXPENSIVE-READ BUDGET (audit residual: post-upgrade flood)
+//
+// The HTTP upgrade request passes the gateway/standalone per-IP limiters
+// ONCE, at upgrade time. After that the socket is a loop: every text frame
+// dispatches a full JSON-RPC call with NO per-message cost check, so one
+// socket could flood expensive reads at frame speed. `dispatch` already caps
+// `stell_estimateFee` and per-client subscriptions per message, but the proof
+// endpoints and `stell_runGetMethod` had NO per-message cap on ANY transport
+// beyond the coarse per-request middleware (which a WS socket bypasses after
+// the upgrade).
+//
+// Heavy methods therefore draw from their OWN per-IP budget on EVERY WS
+// message, mirroring the `estimate_fee_budget` pattern (same `RateLimiter`,
+// same per-IP fixed window — NOT a redesign). Which methods qualify was
+// decided by code reading (cost per call):
+//   * `stell_estimateFee` — clones the WHOLE engine state and runs a full
+//     SVM execution on the clone (`handle_estimate_fee`); the most expensive
+//     read on the node.
+//   * `stell_subscribe` — each creation fills the process-wide registry
+//     (`subscribe_for`, bounded by `MAX_SUBSCRIPTIONS`); an uncapped socket
+//     could eat the node's whole subscription budget.
+//   * `stell_getProof` — trie walk plus proof build plus self-verification,
+//     up to `MAX_PROOF_STORAGE_KEYS` (32) storage paths (`handle_get_proof`).
+//   * `stell_getArchiveProof` — rebuilds a proof from the durable snapshot
+//     history (`handle_get_archive_proof`).
+//   * `stell_getBalanceSpv` / `stell_tokenBalanceSpv` — account/token proof
+//     generation against the live trie.
+//   * `stell_runGetMethod` — executes contract code (`run_get_method[_typed]`,
+//     fuel-bounded but still execution).
+// Cheap lookups (balance, headers, chain id, events, ...) draw nothing.
+//
+// Over budget → a clean `-32000` error frame on the SAME socket (the socket
+// stays open: the existing policy never drops on rate-limit, it answers).
+// Keyed by peer IP with the static [`LOCAL_BUCKET_IP`] fallback, so
+// unattributed sockets are throttled, never exempt.
+// ===========================================================================
+
+/// Default per-IP budget for expensive WS reads (per second).
+///
+/// 5/s mirrors the estimate-fee budget: a wallet/indexer sends heavy reads
+/// rarely, while a flood must not pin the node. Override with
+/// `STELL_WS_EXPENSIVE_READ_RATE_LIMIT`. Local policy, not consensus: nodes
+/// MAY differ.
+pub const WS_EXPENSIVE_READ_RATE_LIMIT_DEFAULT: u32 = 5;
+
+/// Effective WS expensive-read per-IP budget.
+fn ws_expensive_read_rate_limit() -> u32 {
+    std::env::var("STELL_WS_EXPENSIVE_READ_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(WS_EXPENSIVE_READ_RATE_LIMIT_DEFAULT)
+}
+
+/// The process-wide WS expensive-read limiter.
+fn ws_expensive_read_budget() -> &'static crate::explorer::RateLimiter {
+    static LIMITER: std::sync::OnceLock<crate::explorer::RateLimiter> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| crate::explorer::RateLimiter::new(ws_expensive_read_rate_limit()))
+}
+
+/// True when a WS message's method is an expensive read (see above).
+fn is_ws_expensive_method(method: &str) -> bool {
+    matches!(
+        method,
+        "stell_estimateFee"
+            | "stell_subscribe"
+            | "stell_getProof"
+            | "stell_getArchiveProof"
+            | "stell_getBalanceSpv"
+            | "stell_tokenBalanceSpv"
+            | "stell_runGetMethod"
+    )
 }
 
 /// WebSocket transport: JSON-RPC requests in, subscription notifications out.
@@ -8081,6 +8274,25 @@ async fn ws_handle_text(
     let id = req.id.clone().unwrap_or(Value::Null);
     let method = req.method.clone();
     let params = req.params.clone();
+    // PER-MESSAGE expensive-read budget (see above): the upgrade request was
+    // checked once, but every heavy frame after it draws from the per-IP WS
+    // budget. Over budget → a clean error frame on the SAME socket (the
+    // socket stays open: answers, never drops, on rate-limit).
+    if is_ws_expensive_method(&method) {
+        let ip = peer_ip.unwrap_or(LOCAL_BUCKET_IP);
+        if !ws_expensive_read_budget().check(ip) {
+            let denied = err(
+                id,
+                -32000,
+                "expensive-read budget exhausted for this IP on this socket (retry shortly)",
+            );
+            let out = serde_json::to_string(&denied.0).unwrap_or_default();
+            return socket
+                .send(axum::extract::ws::Message::Text(out))
+                .await
+                .is_ok();
+        }
+    }
     let resp = dispatch(st.as_ref(), id, &method, &params, header_token, peer_ip).await;
     // Track the subscriptions this connection owns: they are pushed to it and
     // they die with it.

@@ -2735,6 +2735,24 @@ fn vrf_activation_from_env() -> stellereum::vrf::VrfActivation {
     stellereum::vrf::vrf_activation_from_env()
 }
 
+/// Startup-heal retry budget: missing bodies are transient (a peer that just
+/// restarted is still publishing its window), so the heal loop retries with
+/// backoff instead of exiting on the first miss.
+const HEAL_MAX_ATTEMPTS: u32 = 3;
+
+/// Fail-closed decision for the startup-heal loop (pure: unit-tested below).
+///
+/// Returns true only on the final attempt: earlier failures must retry
+/// (transient), the final failure must refuse to join consensus on unhealed
+/// state. The caller loud-errors + `process::exit(1)` on true so supervisors
+/// restart into a clean retry; it must NEVER label the unhealed engine with
+/// the finalized height (snapshotting S-state under the F label poisons
+/// the store -- the next boot loads "state at F" that is really S, skips
+/// healing (`S == F`), and votes from stale state while reporting healthy).
+fn heal_failure_should_exit(attempt: u32) -> bool {
+    attempt >= HEAL_MAX_ATTEMPTS
+}
+
 #[allow(clippy::too_many_arguments)]
 // GATE: 15 consensus wiring inputs are required together; grouping would change call sites and sync semantics.
 #[allow(unused_assignments)]
@@ -3027,14 +3045,21 @@ async fn run_consensus_node(
     // pattern). `STELL_VRF_ACTIVATION_HEIGHT=<h>` arms the VRF election seed
     // for heights `>= h`; unset/unparsable keeps `Disabled` (byte-identical
     // parent-hash election). The height is CONSENSUS-VISIBLE — every node of
-    // a deployment must be configured with the SAME value. Threading into
-    // `HeightConsensus` construction is PHASE 3 (blocked: `HeightConsensus`
-    // lives in `src/consensus.rs` and its four live sortition call sites —
-    // `derive_sortition_committee` plus the three µQC paths — pin
-    // `VrfActivation::Disabled`+`None`; changing them is out of scope here),
-    // so an armed height is logged loudly and election stays on the parent
-    // hash until that threading lands.
-    match vrf_activation_from_env().boundary() {
+    // a deployment must be configured with the SAME value. Phase-3 threaded
+    // entry points exist (`VoteSet::certificate_with_parent_vrf`,
+    // `QuorumCertificate::{verify_micro_cert_with_vrf,
+    // micro_cert_valid_signers_with_vrf}`, `ValidatorRuntime::vrf_beacon_seal_for`);
+    // the four live `HeightConsensus` assembly sites plus the live verify /
+    // attribution sites (`verify_unified`, `signers_set`) still pin
+    // `VrfActivation::Disabled`+`None` (reported gap, not changed here), so an
+    // armed height is logged loudly and carried on the runtime while election
+    // stays on the parent-hash draw.
+    // Carry is safe and default-off-preserving: no live consensus path reads
+    // `rt.vrf_activation` yet, so `Disabled` (unset env) behaves
+    // byte-identically to before; an armed value is stored but not consulted.
+    let vrf_activation = vrf_activation_from_env();
+    rt = rt.with_vrf_activation(vrf_activation);
+    match vrf_activation.boundary() {
         Some(h) => tracing::warn!(
             "[vrf] VRF sortition ARMED from height {h} (STELL_VRF_ACTIVATION_HEIGHT={h}): election switches to the verified VRF seed at/above the boundary once phase-3 threading lands; pre-activation heights stay on the parent-hash draw"
         ),
@@ -3277,7 +3302,7 @@ async fn run_consensus_node(
                     // together, neither had published yet, both refused, chain
                     // dead until manual wipe.
                     let mut healed = false;
-                    for attempt in 1..=3u32 {
+                    for attempt in 1..=HEAL_MAX_ATTEMPTS {
                         match heal_engine_to_head(
                             &adapter,
                             &mut rt,
@@ -3301,21 +3326,29 @@ async fn run_consensus_node(
                                 break;
                             }
                             Err(e) => {
-                                if attempt == 3 {
-                                    tracing::warn!(
-                                        "[storage] healing could not reach older pruned history: {e}; \
-                                         anchoring engine state to finalized head {fh} and joining consensus"
+                                if heal_failure_should_exit(attempt) {
+                                    // Fail CLOSED: the engine is still at
+                                    // `restored_state_height < fh` and its
+                                    // history is unverifiable (pruned/missing
+                                    // bodies). Labelling it with `fh` here
+                                    // would poison the store: the next boot
+                                    // loads "state at F" that is really S,
+                                    // skips healing (S == F), and votes from
+                                    // stale state while reporting healthy.
+                                    // Refuse to join consensus instead; the
+                                    // operator wipes or restores a verified
+                                    // backup. Matches the restore-refusal
+                                    // `process::exit(1)` pattern above.
+                                    eprintln!(
+                                        "[storage] REFUSING to join consensus on unhealed state: \
+                                         healing failed after {HEAL_MAX_ATTEMPTS} attempts: {e} \
+                                         (engine at {restored_state_height}, head at {fh}; \
+                                         wipe the data directory or restore a verified backup)"
                                     );
-                                    ap.snapshot_state(&rt.state, fh).await;
-                                    let ledger = rt.staking_read().await.clone();
-                                    let gov = rt.governance.clone().unwrap_or_default();
-                                    ap.snapshot_domains(&rt.state, &ledger, &gov, fh).await;
-                                    restored_state_height = fh;
-                                    healed = true;
-                                    break;
+                                    std::process::exit(1);
                                 }
                                 eprintln!(
-                                    "[storage] healing waiting for bodies (attempt {attempt}/3): {e}"
+                                    "[storage] healing waiting for bodies (attempt {attempt}/{HEAL_MAX_ATTEMPTS}): {e}"
                                 );
                                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                             }
@@ -11751,5 +11784,32 @@ mod tick_offload_tests {
             Commands::Run { pure_pq, .. } => assert!(pure_pq),
             _ => panic!("expected Commands::Run"),
         }
+    }
+}
+
+#[cfg(test)]
+mod heal_fail_closed_tests {
+    use super::*;
+
+    #[test]
+    fn heal_failure_exits_only_on_final_attempt() {
+        // Transient misses retry: attempts 1..MAX must NOT exit.
+        for attempt in 1..HEAL_MAX_ATTEMPTS {
+            assert!(
+                !heal_failure_should_exit(attempt),
+                "attempt {attempt} must retry, not exit"
+            );
+        }
+        // Exhausted budget refuses: the caller loud-errors + process::exit(1)
+        // instead of labelling unhealed state with the finalized height.
+        assert!(heal_failure_should_exit(HEAL_MAX_ATTEMPTS));
+        assert!(heal_failure_should_exit(HEAL_MAX_ATTEMPTS + 1));
+    }
+
+    #[test]
+    fn heal_retry_budget_is_three() {
+        // The 3-attempt retry behavior is pinned: changing the budget changes
+        // restart/wipe operator expectations, so it must change loudly here.
+        assert_eq!(HEAL_MAX_ATTEMPTS, 3);
     }
 }

@@ -1,11 +1,73 @@
 use anyhow::{bail, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const NODEID_LEN: usize = 20;
 pub const MAX_FRAME: usize = 32 * 1024 * 1024;
 pub const MAX_AUTH_FRAME: usize = 64 * 1024;
 pub const TS_WINDOW_MS: i64 = 600_000;
+
+/// Fail-closed ingress caps (audit 2026-11-01). The 32 MiB `MAX_FRAME` is a
+/// transport envelope: individual services accept far less, so one peer
+/// cannot turn a single request into a multi-megabyte allocation or a
+/// mesh-wide amplification.
+pub const MAX_DHT_KEY_LEN: usize = 512;
+pub const MAX_DHT_VALUE_LEN: usize = 1024 * 1024;
+pub const MAX_PUBSUB_DATA_LEN: usize = 1024 * 1024;
+pub const MAX_STORAGE_CHUNK_LEN: usize = 2 * 1024 * 1024;
+pub const MAX_NONCE_LEN: usize = 1024;
+pub const MAX_TOPIC_LEN: usize = 256;
+pub const MAX_ENDPOINTS_PER_NODE: usize = 8;
+pub const MAX_ENDPOINT_LEN: usize = 256;
+pub const MAX_ROUTES_PER_UPDATE: usize = 512;
+pub const MAX_DHT_LOOKUP_TTL: u64 = 8;
+pub const MAX_PUBSUB_TTL: u64 = 16;
+pub const MAX_DHT_SYNC_LIMIT: usize = 10_000;
+pub const MAX_REMOTE_TTL_SECS: u64 = 30 * 24 * 3600;
+pub const MAX_SEEN_IDS: usize = 200_000;
+pub const MAX_OUTBOX_PER_PEER: usize = 1024;
+
+pub fn topic_ok(topic: &str) -> bool {
+    !topic.is_empty() && topic.len() <= MAX_TOPIC_LEN
+}
+
+pub fn dht_key_ok(key: &str) -> bool {
+    !key.is_empty() && key.len() <= MAX_DHT_KEY_LEN
+}
+
+pub fn dht_value_ok(value: &str) -> bool {
+    value.len() <= MAX_DHT_VALUE_LEN
+}
+
+pub fn pubsub_data_ok(data: &str) -> bool {
+    data.len() <= MAX_PUBSUB_DATA_LEN
+}
+
+/// Claim a handshake nonce: true = fresh (inserted), false = replayed or
+/// malformed. Entries older than `TS_WINDOW_MS` are pruned; the map is
+/// hard-bounded so a flood of distinct nonces cannot grow memory without
+/// limit (at the cap the handshake is refused — fail closed).
+pub fn claim_nonce(seen: &mut HashMap<String, i64>, nonce: &str, now: i64) -> bool {
+    if nonce.len() < 8
+        || nonce.len() > 128
+        || !nonce.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    // Prune on every claim: handshakes are rare (not per-request), so an O(n)
+    // scan here never lands on a hot path, and the window stays exact.
+    let cutoff = now.saturating_sub(TS_WINDOW_MS);
+    seen.retain(|_, ts| *ts > cutoff);
+    if seen.contains_key(nonce) {
+        return false;
+    }
+    if seen.len() >= MAX_SEEN_IDS {
+        return false;
+    }
+    seen.insert(nonce.to_string(), now);
+    true
+}
 
 pub mod kind {
     pub const PING: u8 = 0;
@@ -138,6 +200,11 @@ impl Frame {
         // защита от переполнения usize и out-of-bounds при нечётких/злонамеренных пакетах
         if plen > MAX_FRAME {
             bail!("payload too large");
+        }
+        // Поле nonce легитимно несёт 24 байта (XChaCha nonce); 64 КиБ
+        // злонамеренного nonce на каждом из 1024 стримов — десятки мегабайт.
+        if nlen > MAX_NONCE_LEN {
+            bail!("nonce too large");
         }
         // проверяем что сумма длин не переполняет usize и точно совпадает с длиной
         let total = HDR

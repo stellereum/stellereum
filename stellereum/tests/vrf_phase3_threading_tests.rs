@@ -839,3 +839,145 @@ async fn runtime_proof_seam_mints_and_falls_back() {
     .with_vrf_secret_seed(ed_seed(0x77u8.wrapping_add(0xA0), 0));
     assert!(genesis.vrf_beacon_seal_for(0, ROUND, &net.parent).is_some());
 }
+
+// --- 7. activation-boundary exact (H-1 vs H) + old wire bytes ---------------
+//
+// Missing behavior-matrix cells: the height gate decides, not proof presence.
+// At `H-1` a VALID seal + armed activation + live registry still assembles
+// legacy (`None`, byte-identical) and a hand-sealed cert still verifies
+// legacy (seal ignored). At `H` the same inputs embed and elect VRF. And old
+// WIRE bytes (canonical envelope, no seal field on the wire) decode to `None`
+// and verify legacy at an armed height with a live registry — the
+// mixed-version new-node + old-cert cell over bytes, not JSON.
+#[test]
+fn activation_boundary_exact_h_minus_one_vs_h() {
+    let net = setup_net(4, 0x99, 10);
+    let active = VrfActivation::FromHeight(ACTIVATION_H);
+    let h_before = ACTIVATION_H - 1;
+
+    // Assembly at H-1 with a VALID seal for H-1: seal ignored, legacy bytes.
+    // NOTE: one shared VoteSet — Falcon signatures randomize per signing, so
+    // two separately-built sets differ in signature bytes, not in election.
+    let seal_before = seal_for(&net, 0, h_before, ROUND);
+    let set = vote_set_for(&net, h_before, ROUND);
+    let threaded = set
+        .certificate_with_parent_vrf(
+            net.block_hash,
+            &net.vs,
+            Some(&net.parent),
+            &active,
+            Some(&net.reg),
+            Some(seal_before),
+        )
+        .expect("must form");
+    let legacy = set
+        .certificate(net.block_hash, &net.vs, &net.parent)
+        .expect("legacy certificate must form");
+    assert_eq!(threaded, legacy, "H-1 assembly must be struct-identical");
+    let threaded_cert = threaded.pq_micro_certificate().expect("attached");
+    assert_eq!(threaded_cert.vrf_beacon, None);
+    assert_eq!(
+        encode_pq_micro_envelope(&threaded_cert),
+        encode_pq_micro_envelope(&legacy.pq_micro_certificate().expect("attached")),
+        "H-1 canonical bytes must be legacy bytes"
+    );
+
+    // Verify at H-1 IGNORES a hand-attached valid seal (legacy committee).
+    let msg_before = msg_for(h_before, ROUND, &net.block_hash);
+    let legacy_committee_before =
+        derive_sortition_committee(&net.vs, h_before, ROUND, 4, &net.parent);
+    let legacy_cert = legacy.pq_micro_certificate().expect("attached");
+    let sealed_before = PqMicroCertificate::new(
+        legacy_cert.scheme,
+        legacy_cert.height,
+        legacy_cert.round,
+        legacy_cert.committee_size,
+        legacy_cert.signers_bitmask.clone(),
+        legacy_cert.signatures.clone(),
+        legacy_cert.sortition_parent,
+    )
+    .with_vrf_beacon(seal_for(&net, 0, h_before, ROUND));
+    assert!(
+        legacy.verify_micro_cert_with_vrf(
+            &sealed_before,
+            &net.vs,
+            &msg_before,
+            None,
+            &active,
+            Some(&net.reg)
+        ),
+        "H-1 verify must ignore the seal and accept legacy"
+    );
+    assert_eq!(
+        legacy.micro_cert_valid_signers_with_vrf(
+            &sealed_before,
+            &net.vs,
+            &msg_before,
+            None,
+            &active,
+            Some(&net.reg)
+        ),
+        Some(legacy_committee_before)
+    );
+
+    // Assembly at H with the same shape EMBEDS the seal (control: gate flips).
+    let seal_at = seal_for(&net, 0, ACTIVATION_H, ROUND);
+    let set = vote_set_for(&net, ACTIVATION_H, ROUND);
+    let qc_at = set
+        .certificate_with_parent_vrf(
+            net.block_hash,
+            &net.vs,
+            Some(&net.parent),
+            &active,
+            Some(&net.reg),
+            Some(seal_at.clone()),
+        )
+        .expect("must form");
+    assert_eq!(
+        qc_at.pq_micro_certificate().expect("attached").vrf_beacon,
+        Some(seal_at)
+    );
+}
+
+#[test]
+fn old_wire_bytes_verify_legacy_at_armed_height() {
+    let net = setup_net(4, 0x9A, 10);
+    let active = VrfActivation::FromHeight(ACTIVATION_H);
+    let msg = msg_for(ACTIVATION_H, ROUND, &net.block_hash);
+    let legacy = legacy_qc_at(&net, ACTIVATION_H, ROUND);
+    let legacy_cert = legacy.pq_micro_certificate().expect("attached");
+
+    // Old WIRE bytes: the canonical envelope carries no seal field at all.
+    let wire = encode_pq_micro_envelope(&legacy_cert);
+    let decoded =
+        decode_pq_micro_envelope(&wire).expect("old canonical wire must decode");
+    assert_eq!(decoded.vrf_beacon, None);
+    assert_eq!(decoded, legacy_cert);
+    let legacy_committee =
+        derive_sortition_committee(&net.vs, ACTIVATION_H, ROUND, 4, &net.parent);
+
+    // New node at an ARMED height with a LIVE registry still verifies old
+    // wire bytes under the legacy draw (mixed-version new-node + old-cert cell).
+    assert!(
+        legacy.verify_micro_cert_with_vrf(
+            &decoded,
+            &net.vs,
+            &msg,
+            None,
+            &active,
+            Some(&net.reg)
+        ),
+        "old wire bytes must verify legacy at an armed height"
+    );
+    assert_eq!(
+        legacy.micro_cert_valid_signers_with_vrf(
+            &decoded,
+            &net.vs,
+            &msg,
+            None,
+            &active,
+            Some(&net.reg)
+        ),
+        Some(legacy_committee)
+    );
+}

@@ -183,10 +183,13 @@ async fn test_evm_estimate_gas_21k() {
     let adapter = evm::EvmAdapter::new();
 
     // Standard transfer with empty params or simple object -> 21,000 ("0x5208")
+    // F4 design (audit closure): the SERVED eth_estimateGas path applies the
+    // 280k admission floor, so it returns 0x445c0, not pure 0x5208. The pure
+    // amount lives in eth_estimate_gas_amount (pinned elsewhere).
     let est_empty = adapter
         .dispatch("eth_estimateGas", &json!([]))
         .expect("empty estimate");
-    assert_eq!(est_empty, json!("0x5208"));
+    assert_eq!(est_empty, json!("0x445c0"));
 
     let est_tx = adapter
         .dispatch(
@@ -198,9 +201,10 @@ async fn test_evm_estimate_gas_21k() {
             }]),
         )
         .expect("transfer estimate");
-    assert_eq!(est_tx, json!("0x5208"));
+    assert_eq!(est_tx, json!("0x445c0"));
 
-    // Calldata gas: 4 bytes non-zero -> 21,000 + 4 * 16 = 21,064 = 0x5248
+    // Calldata gas: pure would be 21,000 + 4 * 16 = 21,064 = 0x5248, but the
+    // served path floors at 0x445c0 (F4) and pure < floor, so floor wins.
     let est_call = adapter
         .dispatch(
             "eth_estimateGas",
@@ -210,7 +214,7 @@ async fn test_evm_estimate_gas_21k() {
             }]),
         )
         .expect("calldata estimate");
-    assert_eq!(est_call, json!("0x5248"));
+    assert_eq!(est_call, json!("0x445c0"));
 }
 
 #[tokio::test]

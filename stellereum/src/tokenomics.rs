@@ -60,13 +60,25 @@ impl GenesisVault {
     pub fn calculate_mint(asset_amount: u64, asset_decimals: u32, price_micro_usd: u64) -> u64 {
         // Value in micro USD = (asset_amount * price_micro_usd) / 10^asset_decimals
         let divisor = 10u128.pow(asset_decimals);
-        let value_micro_usd = ((asset_amount as u128) * (price_micro_usd as u128)) / divisor;
+        // Saturating (econ audit 2026-11-01): the naive `*` panicked on
+        // overflow for absurd inputs (u64::MAX-scale amount AND price: the
+        // SECOND multiply overflowed u128 even though each u64×u64 product
+        // fits). Saturation fails closed — the resulting over-cap mint is
+        // refused by `deposit_and_mint` instead of panicking or wrapping.
+        let value_micro_usd = (asset_amount as u128)
+            .saturating_mul(price_micro_usd as u128)
+            .saturating_div(divisor);
 
         // STELL tokens = value_micro_usd / 0.25 USD = value_micro_usd / 250_000
         // in nano-STELL (9 decimals):
-        let stell_nano =
-            (value_micro_usd * 1_000_000_000u128) / (BASE_STELL_PRICE_MICRO_USD as u128);
-        stell_nano as u64
+        let stell_nano = value_micro_usd
+            .saturating_mul(1_000_000_000u128)
+            .saturating_div(BASE_STELL_PRICE_MICRO_USD as u128);
+        // Saturating (econ audit 2026-11-01): a bare `as u64` silently wrapped
+        // absurd inputs to dust, which then sailed UNDER the vault cap below.
+        // Saturation fails closed — the resulting over-cap mint is refused by
+        // `deposit_and_mint` instead of minting a wrapped pittance.
+        u128::min(stell_nano, u64::MAX as u128) as u64
     }
 
     /// Deposit incoming asset and mint STELL from Genesis Vault
@@ -89,12 +101,24 @@ impl GenesisVault {
 
         let mint_nano = Self::calculate_mint(asset_amount, decimals, asset_price_micro_usd);
 
-        if self.total_minted_nano + mint_nano > GENESIS_VAULT_CAP {
+        // Fail-closed arithmetic (econ audit 2026-11-01): the bare `+` panicked
+        // on overflow in debug (and the `+=`s below too). `checked_add`
+        // refuses instead of wrapping, so an absurd mint can never pass the
+        // cap check on a wrapped value.
+        let new_total = self
+            .total_minted_nano
+            .checked_add(mint_nano)
+            .ok_or_else(|| {
+                "Genesis Vault mint overflows u64: refusing instead of wrapping".to_string()
+            })?;
+        if new_total > GENESIS_VAULT_CAP {
             return Err("Genesis Vault allocation cap reached (250,000,000 STELL)".to_string());
         }
 
-        self.total_minted_nano += mint_nano;
-        *target_deposit += asset_amount;
+        self.total_minted_nano = new_total;
+        *target_deposit = target_deposit.checked_add(asset_amount).ok_or_else(|| {
+            "Genesis Vault deposit overflows u64: refusing instead of wrapping".to_string()
+        })?;
 
         Ok(mint_nano)
     }

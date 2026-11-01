@@ -1098,9 +1098,37 @@ impl Storage {
         }
     }
 
+    /// Heights whose auxiliary domain snapshots must survive any prune:
+    /// every height holding a state or a domains snapshot. The loader only
+    /// ever reads an aux blob at a height it also reads state+domains from
+    /// (`load_full_state_into` at the paired height, `rebuild_historical_trie`
+    /// at the proven height), so an aux row is live exactly when its height
+    /// is snapshotted — and deleting the aux row of a retained snapshot
+    /// height strands that height (the restored root no longer matches, or a
+    /// committed replay set is silently dropped). State/domains preserve their
+    /// own newest entry; the aux trees preserve every snapshotted height, and
+    /// only prune rows no snapshot height needs.
+    fn aux_retained_heights(&self) -> std::collections::BTreeSet<u64> {
+        let mut keep = std::collections::BTreeSet::new();
+        for tree in [&self.state, &self.domains] {
+            for k in tree.iter().keys().filter_map(|k| k.ok()) {
+                if k.len() == 8 {
+                    keep.insert(u64::from_be_bytes(k.as_ref().try_into().unwrap()));
+                }
+            }
+        }
+        keep
+    }
+
     /// Drop session-key snapshots older than `keep_from`. Called from
-    /// `prune_domains_below` so the third tree follows the same window.
+    /// `prune_domains_below` so the third tree follows the same window. Never
+    /// drops a row at a snapshotted height (see [`Self::aux_retained_heights`]):
+    /// state/domains preserve their newest entry so a node always stays
+    /// bootable, and the aux trees must keep the rows those heights restore
+    /// with — deleting the newest aux blob while state/domains keep theirs
+    /// would strand the retained height behind a root mismatch.
     pub fn prune_session_keys_below(&self, keep_from: u64) -> Result<usize> {
+        let keep = self.aux_retained_heights();
         let mut removed = 0;
         let keys: Vec<sled::IVec> = self
             .session_keys
@@ -1108,7 +1136,11 @@ impl Storage {
             .keys()
             .filter_map(|k| k.ok())
             .filter(|k| {
-                k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from
+                if k.len() != 8 {
+                    return false;
+                }
+                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
+                h < keep_from && !keep.contains(&h)
             })
             .collect();
         for k in keys {
@@ -1140,8 +1172,10 @@ impl Storage {
     }
 
     /// Drop bridge snapshots older than `keep_from`. Called from
-    /// `prune_domains_below` so this tree follows the same window.
+    /// `prune_domains_below` so this tree follows the same window. Never
+    /// drops a row at a snapshotted height: see [`Self::aux_retained_heights`].
     pub fn prune_bridge_below(&self, keep_from: u64) -> Result<usize> {
+        let keep = self.aux_retained_heights();
         let mut removed = 0;
         let keys: Vec<sled::IVec> = self
             .bridge
@@ -1149,7 +1183,11 @@ impl Storage {
             .keys()
             .filter_map(|k| k.ok())
             .filter(|k| {
-                k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from
+                if k.len() != 8 {
+                    return false;
+                }
+                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
+                h < keep_from && !keep.contains(&h)
             })
             .collect();
         for k in keys {
@@ -1181,8 +1219,10 @@ impl Storage {
     }
 
     /// Drop shielded-ledger snapshots older than `keep_from`. Called from
-    /// `prune_domains_below` so this tree follows the same window.
+    /// `prune_domains_below` so this tree follows the same window. Never
+    /// drops a row at a snapshotted height: see [`Self::aux_retained_heights`].
     pub fn prune_confidential_below(&self, keep_from: u64) -> Result<usize> {
+        let keep = self.aux_retained_heights();
         let mut removed = 0;
         let keys: Vec<sled::IVec> = self
             .confidential
@@ -1190,7 +1230,11 @@ impl Storage {
             .keys()
             .filter_map(|k| k.ok())
             .filter(|k| {
-                k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from
+                if k.len() != 8 {
+                    return false;
+                }
+                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
+                h < keep_from && !keep.contains(&h)
             })
             .collect();
         for k in keys {
@@ -1218,8 +1262,10 @@ impl Storage {
     }
 
     /// Drop registry snapshots older than `keep_from`. Called from
-    /// `prune_domains_below` so this tree follows the same window.
+    /// `prune_domains_below` so this tree follows the same window. Never
+    /// drops a row at a snapshotted height: see [`Self::aux_retained_heights`].
     pub fn prune_zkml_models_below(&self, keep_from: u64) -> Result<usize> {
+        let keep = self.aux_retained_heights();
         let mut removed = 0;
         let keys: Vec<sled::IVec> = self
             .zkml_models
@@ -1227,7 +1273,11 @@ impl Storage {
             .keys()
             .filter_map(|k| k.ok())
             .filter(|k| {
-                k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from
+                if k.len() != 8 {
+                    return false;
+                }
+                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
+                h < keep_from && !keep.contains(&h)
             })
             .collect();
         for k in keys {
@@ -1265,8 +1315,14 @@ impl Storage {
     }
 
     /// Drop replay snapshots older than `keep_from`. Called from
-    /// `prune_domains_below` so this tree follows the same window.
+    /// `prune_domains_below` so this tree follows the same window. Never
+    /// drops a row at a snapshotted height (see [`Self::aux_retained_heights`]):
+    /// deleting the replay blob of a retained paired height would leave a
+    /// bootable-looking snapshot whose restore roots differently (or silently
+    /// re-opens consumed inbounds) — a self-inflicted refusal at best, a
+    /// double-mint at worst.
     pub fn prune_cross_shard_below(&self, keep_from: u64) -> Result<usize> {
+        let keep = self.aux_retained_heights();
         let mut removed = 0;
         let keys: Vec<sled::IVec> = self
             .cross_shard
@@ -1274,7 +1330,11 @@ impl Storage {
             .keys()
             .filter_map(|k| k.ok())
             .filter(|k| {
-                k.len() == 8 && u64::from_be_bytes(k.as_ref().try_into().unwrap()) < keep_from
+                if k.len() != 8 {
+                    return false;
+                }
+                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
+                h < keep_from && !keep.contains(&h)
             })
             .collect();
         for k in keys {
@@ -1346,22 +1406,15 @@ impl Storage {
         };
         let computed = engine.get_state_root().await;
         if computed != expected {
-            if snapshot_height == 0 {
-                // Stale or un-seeded genesis snapshot: purge it rather than refusing boot.
-                tracing::warn!(
-                    "stale genesis snapshot at height 0 ignored, falling back to genesis"
-                );
-                let k = 0u64.to_be_bytes();
-                let _ = self.state.remove(k);
-                let _ = self.domains.remove(k);
-                let _ = self.session_keys.remove(k);
-                let _ = self.bridge.remove(k);
-                let _ = self.confidential.remove(k);
-                let _ = self.zkml_models.remove(k);
-                let _ = self.cross_shard.remove(k);
-                let _ = self.flush();
-                return Ok(());
-            }
+            // No height-0 exception: a genesis snapshot whose bytes hash
+            // differently from what the finalized block at height 1 commits
+            // to is corrupt, stale, or mislabeled, and accepting it installs
+            // unverified genesis state under a chain that already disagrees.
+            // The old path purged the height-0 trees and returned Ok, which
+            // both destroyed evidence AND installed the same mismatched bytes
+            // into the live engine (the caller holds them in hand) — a
+            // fail-open bypass of this very check. Refuse loudly instead; the
+            // operator wipes or restores a verified backup.
             return Err(anyhow!(
                 "restore root mismatch at height {snapshot_height}: snapshot hashes to {} but the finalized block at {} commits to {} (truncated, corrupt or wrong-height snapshot rejected)",
                 hex::encode(computed),

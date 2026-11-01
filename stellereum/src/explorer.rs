@@ -593,6 +593,22 @@ async fn api_faucet(
         )
             .into_response();
     }
+    // Address validation + shard scope BEFORE the per-IP throttle below:
+    // validation is free, quota is not — malformed requests must never
+    // consume budget (same order as the public faucet path). On a sharded
+    // node a recipient that routes to another shard is refused here — the
+    // drip could never execute there, and queuing it would only burn the
+    // faucet's nonce sequence.
+    let (a, drip_shard) =
+        match crate::rpc::resolve_faucet_recipient(&st.rpc, &faucet, &addr_param).await {
+            Ok(v) => v,
+            Err(e) if e.starts_with("invalid address") => {
+                return (StatusCode::BAD_REQUEST, e).into_response();
+            }
+            Err(e) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, e).into_response();
+            }
+        };
     // Per-IP drip throttle (shared with the RPC path's token gate).
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -605,24 +621,9 @@ async fn api_faucet(
         )
             .into_response();
     }
-    // Same atomic mex-reconcile as the JSON-RPC faucet path: without it,
+    // Atomic mex-reconcile (same as the JSON-RPC faucet path): without it,
     // reserved-but-never-executed drips (wiped mempool across a restart)
-    // leave a permanent nonce gap that explorer drips wait behind forever
-    // (audit 2026-10-06).
-    // Address validation + shard scope BEFORE any nonce is reserved (same rule
-    // as `stell_faucet`): on a sharded node a recipient that routes to another
-    // shard is refused here — the drip could never execute there, and queuing
-    // it would only burn the faucet's nonce sequence.
-    let (a, drip_shard) =
-        match crate::rpc::resolve_faucet_recipient(&st.rpc, &faucet, &addr_param).await {
-            Ok(v) => v,
-            Err(e) if e.starts_with("invalid address") => {
-                return (StatusCode::BAD_REQUEST, e).into_response();
-            }
-            Err(e) => {
-                return (StatusCode::SERVICE_UNAVAILABLE, e).into_response();
-            }
-        };
+    // leave a permanent nonce gap that explorer drips wait behind forever.
     let faucet_addr = faucet.account();
     let onchain = st
         .rpc

@@ -33,6 +33,52 @@ pub struct NodeInfo {
     pub last_seen: i64,
 }
 
+/// Fail-closed gate for gossip-fed routing records (audit 2026-11-01):
+/// an endpoint is dialable only if it parses as a socket address.
+pub fn endpoint_ok(ep: &str) -> bool {
+    if ep.is_empty() || ep.len() > crate::proto::MAX_ENDPOINT_LEN {
+        return false;
+    }
+    ep.parse::<std::net::SocketAddr>().is_ok()
+}
+
+/// Fail-closed gate for routing records arriving over the network
+/// (`dht.update`, `dht.find_node` answers, `dht.find_value` hints):
+/// the ed key must be a 32-byte hex key that actually derives `id`
+/// (otherwise anyone could bind an honest node id to their own key and
+/// hijack discovery), an optional x key must be valid if present, and
+/// endpoints are filtered to dialable ones.
+pub fn node_info_valid(
+    id: &[u8; NODEID_LEN],
+    ed_hex: &str,
+    x_hex: &str,
+    endpoints: &[String],
+) -> bool {
+    let ed: [u8; 32] = match hex::decode(ed_hex) {
+        Ok(b) => match b.try_into() {
+            Ok(k) => k,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    let derived = blake3::hash(&ed);
+    if derived.as_bytes()[..NODEID_LEN] != id[..] {
+        return false;
+    }
+    if !x_hex.is_empty() {
+        let Ok(x) = hex::decode(x_hex) else {
+            return false;
+        };
+        if x.len() != 32 {
+            return false;
+        }
+    }
+    if endpoints.len() > crate::proto::MAX_ENDPOINTS_PER_NODE {
+        return false;
+    }
+    true
+}
+
 /// XOR-дистанция между двумя ID (как big-endian 160-бит число).
 pub fn xor_distance(a: &[u8; NODEID_LEN], b: &[u8; NODEID_LEN]) -> [u8; NODEID_LEN] {
     let mut d = [0u8; NODEID_LEN];
@@ -700,7 +746,11 @@ mod kv_sweep_tests {
             [7u8; 20],
             now + 999_999_999,
         );
-        assert!(kv.stored_at("mail:fut:index") <= now);
+        // Fresh read, not the stale `now` above: `store_replica` clamps to
+        // ITS OWN now_ms(), which can tick one ms past the captured value —
+        // comparing against the stale one flakes on the millisecond boundary.
+        // A +999M leak would still fail this by nine orders of magnitude.
+        assert!(kv.stored_at("mail:fut:index") <= now_ms());
         // ...and an already-dead entry is not resurrected.
         kv.store_replica("mail:dead:index", "v".into(), ttl, [7u8; 20], now - ttl - 1);
         assert!(kv.get("mail:dead:index").is_none());

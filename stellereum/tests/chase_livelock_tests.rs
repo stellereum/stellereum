@@ -523,6 +523,11 @@ async fn lock_hint_rescue_converges() {
     // The rescue: B learns the demand from A's nil hint and re-proposes X
     // verbatim at its own slot.
     b.note_lock_hint(1, VoteKind::Prevote, None, Some(xh));
+    // F1 one-proposal-per-round (72bcfd8 2026-10-30): B already proposed Y in
+    // its current round, so serving X in the SAME round would overwrite Y --
+    // an equivocation the guard refuses (the demand stays queued). The rescue
+    // must go out at B's NEXT slot, which is always a fresh round.
+    b.hc.next_round();
     while b.hc.proposer().unwrap() != bid {
         b.hc.next_round();
     }

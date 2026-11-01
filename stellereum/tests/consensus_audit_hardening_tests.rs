@@ -118,6 +118,9 @@ fn f02_forged_single_validator_committee_size_rejected() {
         signers_bitmask: vec![1],
         signatures: vec![vec![0x77; 666]],
         sortition_parent: [0u8; 32],
+        // Predates the phase-3 VRF seal (mechanical fallout of the new
+        // trailing field): legacy draw.
+        vrf_beacon: None,
     };
     qc.attach_pq_micro_certificate(&uqc);
     assert!(
@@ -360,6 +363,9 @@ fn qc_power_parity_single_heavy_neither_assembles_nor_verifies() {
         signers_bitmask: bitmask,
         signatures: vec![fks[0].sign(&msg)],
         sortition_parent: [0x6Bu8; 32],
+        // Predates the phase-3 VRF seal (mechanical fallout of the new
+        // trailing field): legacy draw.
+        vrf_beacon: None,
     };
     let mut qc = stellereum::consensus::QuorumCertificate {
         height: HH,
@@ -478,6 +484,9 @@ fn f9_decode_rejects_malformed_envelopes() {
         signers_bitmask: vec![0b101],
         signatures: vec![vec![1u8; 8], vec![2u8; 8]],
         sortition_parent: [0x6Bu8; 32],
+        // Predates the phase-3 VRF seal (mechanical fallout of the new
+        // trailing field): legacy draw.
+        vrf_beacon: None,
     };
     let good = encode_pq_micro_envelope(&cert);
     assert!(

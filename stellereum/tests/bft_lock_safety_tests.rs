@@ -292,7 +292,15 @@ fn symmetric_split_lock_never_converges_without_unlocked_power() {
             (Y, None, Some(Y))
         };
         for (h, v) in [(&mut ha, a_vote), (&mut hb, b_vote)] {
-            h.round = r;
+            // Advance via the state machine, not `h.round = r`: `next_round`
+            // clears the prior round's proposal, which the F1
+            // one-proposal-per-round guard (72bcfd8 2026-10-30) otherwise
+            // refuses to overwrite -- a stale direct assignment leaves the
+            // previous round's body in place and `decide_prevote` votes it.
+            // Both nodes start at round 0, so one step per contested round
+            // lands exactly on `r`.
+            h.next_round();
+            assert_eq!(h.round, r, "one state-machine step per contested round");
             let proposer = h.proposer().expect("schedule must name a proposer");
             h.receive_proposal(proposer, proposal).ok();
             assert_eq!(

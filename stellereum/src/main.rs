@@ -2720,6 +2720,21 @@ fn xpc_activation_from_env() -> stellereum::xshard2pc::XpcActivation {
     }
 }
 
+/// VRF sortition activation, read from the environment (phase-1 wiring).
+///
+/// Same shape as [`xpc_activation_from_env`] (an env height boundary,
+/// default-off): `STELL_VRF_ACTIVATION_HEIGHT=<h>` arms the VRF election seed
+/// for heights `>= h`; unset/empty/unparsable keeps `Disabled`, which is
+/// byte-identical to today's parent-hash election. Single source of truth is
+/// `stellereum::vrf::vrf_activation_from_env`; this wrapper is the main.rs-owned
+/// startup seam phase 3 will thread into `HeightConsensus` construction
+/// (blocked today: `HeightConsensus::new` lives in `src/consensus.rs` and its
+/// four live sortition call sites pin `Disabled`+`None` — see the startup log
+/// below).
+fn vrf_activation_from_env() -> stellereum::vrf::VrfActivation {
+    stellereum::vrf::vrf_activation_from_env()
+}
+
 #[allow(clippy::too_many_arguments)]
 // GATE: 15 consensus wiring inputs are required together; grouping would change call sites and sync semantics.
 #[allow(unused_assignments)]
@@ -3005,6 +3020,26 @@ async fn run_consensus_node(
         a => tracing::warn!(
             "[binding] chain-binding refusal ARMED from height {}: unbound transactions are refused at RPC, mempool and apply (see docs/PLAN-BINDING.md)",
             a.height
+        ),
+    }
+
+    // VRF sortition activation (phase-1 wiring, XPC-activation-height
+    // pattern). `STELL_VRF_ACTIVATION_HEIGHT=<h>` arms the VRF election seed
+    // for heights `>= h`; unset/unparsable keeps `Disabled` (byte-identical
+    // parent-hash election). The height is CONSENSUS-VISIBLE — every node of
+    // a deployment must be configured with the SAME value. Threading into
+    // `HeightConsensus` construction is PHASE 3 (blocked: `HeightConsensus`
+    // lives in `src/consensus.rs` and its four live sortition call sites —
+    // `derive_sortition_committee` plus the three µQC paths — pin
+    // `VrfActivation::Disabled`+`None`; changing them is out of scope here),
+    // so an armed height is logged loudly and election stays on the parent
+    // hash until that threading lands.
+    match vrf_activation_from_env().boundary() {
+        Some(h) => tracing::warn!(
+            "[vrf] VRF sortition ARMED from height {h} (STELL_VRF_ACTIVATION_HEIGHT={h}): election switches to the verified VRF seed at/above the boundary once phase-3 threading lands; pre-activation heights stay on the parent-hash draw"
+        ),
+        None => info!(
+            "[vrf] VRF sortition inactive (STELL_VRF_ACTIVATION_HEIGHT unset): parent-hash election on every height"
         ),
     }
 

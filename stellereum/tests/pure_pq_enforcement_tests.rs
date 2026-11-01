@@ -140,6 +140,9 @@ fn make_pq_uqc() -> (ValidatorSet, QuorumCertificate) {
         signers_bitmask: bitmask,
         signatures,
         sortition_parent: parent,
+        // Predates the phase-3 VRF seal (mechanical fallout of the new
+        // trailing field): legacy draw.
+        vrf_beacon: None,
     };
 
     let payload = encode_pq_micro_envelope(&uqc);

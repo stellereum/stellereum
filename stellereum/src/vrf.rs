@@ -351,10 +351,113 @@ impl VrfRegistry {
 /// Carried by the caller (phase-3 gossip); the verifier MUST re-derive the
 /// output from the proof bytes — a `VrfProof` whose `output` field does not
 /// match its `proof` bytes is refused.
+///
+/// `Serialize`/`Deserialize` are implemented (manually — `serde` only
+/// provides array impls up to 32 elements, while the proof is 64 bytes) so
+/// phase-3 certificate seals can carry this envelope verbatim (see
+/// `consensus::VrfBeaconSeal`): the proof bytes the verifier checks are
+/// exactly the bytes the prover minted — no re-encoding, no field dropped.
+/// This is a format change only; the prove/verify math below is untouched.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VrfProof {
     pub output: [u8; 32],
     pub proof: [u8; VRF_PROOF_LEN],
+}
+
+impl serde::Serialize for VrfProof {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        // The 64 proof bytes go out as an explicit sequence (positional for
+        // bincode, an array for JSON): `serde` has no `[u8; 64]` impl, and a
+        // `&[u8]` would serialize as opaque bytes, which JSON cannot read
+        // back. A sequence round-trips through both.
+        struct ProofSeq<'a>(&'a [u8; VRF_PROOF_LEN]);
+        impl serde::Serialize for ProofSeq<'_> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(VRF_PROOF_LEN))?;
+                for b in self.0.iter() {
+                    seq.serialize_element(b)?;
+                }
+                seq.end()
+            }
+        }
+        let mut st = serializer.serialize_struct("VrfProof", 2)?;
+        st.serialize_field("output", &self.output)?;
+        st.serialize_field("proof", &ProofSeq(&self.proof))?;
+        st.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for VrfProof {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ProofVisitor;
+        impl<'de> serde::de::Visitor<'de> for ProofVisitor {
+            type Value = VrfProof;
+            fn expecting(
+                &self,
+                f: &mut std::fmt::Formatter<'_>,
+            ) -> std::fmt::Result {
+                write!(f, "a VRF proof envelope (output + 64 proof bytes)")
+            }
+            // Positional formats (bincode): `(output, proof-bytes…)`.
+            fn visit_seq<A>(self, mut seq: A) -> Result<VrfProof, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                use serde::de::Error;
+                let output: [u8; 32] = seq
+                    .next_element()?
+                    .ok_or_else(|| Error::invalid_length(0, &self))?;
+                let bytes: Vec<u8> = seq
+                    .next_element()?
+                    .ok_or_else(|| Error::invalid_length(1, &self))?;
+                let proof: [u8; VRF_PROOF_LEN] = bytes
+                    .try_into()
+                    .map_err(|_| Error::invalid_length(VRF_PROOF_LEN, &self))?;
+                Ok(VrfProof { output, proof })
+            }
+            // Self-describing formats (JSON): `{"output":[…],"proof":[…]}`.
+            fn visit_map<A>(self, mut map: A) -> Result<VrfProof, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                use serde::de::Error;
+                let mut output: Option<[u8; 32]> = None;
+                let mut proof: Option<[u8; VRF_PROOF_LEN]> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "output" => output = Some(map.next_value()?),
+                        "proof" => {
+                            let bytes: Vec<u8> = map.next_value()?;
+                            proof = Some(
+                                bytes
+                                    .try_into()
+                                    .map_err(|_| Error::invalid_length(VRF_PROOF_LEN, &self))?,
+                            );
+                        }
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                let output =
+                    output.ok_or_else(|| Error::missing_field("output"))?;
+                let proof = proof.ok_or_else(|| Error::missing_field("proof"))?;
+                Ok(VrfProof { output, proof })
+            }
+        }
+        deserializer.deserialize_struct("VrfProof", &["output", "proof"], ProofVisitor)
+    }
 }
 
 fn vrf_scalar(parts: &[&[u8]]) -> Scalar {

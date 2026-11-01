@@ -357,3 +357,57 @@ logic; test-only corrections require proof the test (not the gate) is wrong.
 
 `cargo clippy -p stellereum --all-targets -- -D warnings` → `Finished dev profile`,
 0 warnings, 0 errors. No `--fix` was run.
+
+## 9. Adversarial battery — 2026-11-01 (fail-closed, activation unwired)
+
+Suite: `stellereum/tests/vrf_bls_adversarial_tests.rs` (9 tests, new file only;
+zero `src/` changes). Each case asserts refusal (`None` / `Err` / `false`),
+never accept, never panic. VRF = deterministic-Schnorr (`stellereum/src/vrf.rs:396-443`);
+BLS QC counting still hard-refused (`stellereum/src/bls.rs:515-534`).
+
+| # | Adversarial case | Expected | Observed | Refusing code path |
+|---|---|---|---|---|
+| 1 | Forged VRF proof (random `[0x77;64]`/`[0x88;32]`, all-zeros, all-`0xFF`) | `None` | `None` (refused) | `vrf_verify` `stellereum/src/vrf.rs:415-443` (bad point / Schnorr miss / output mismatch); registry-bound `verify_vrf_seed_for_validator` `stellereum/src/vrf.rs:451-459` |
+| 2 | Proof replay across inputs/heights/rounds (prove over `seed(1M,2)`, verify over `seed(1M+1,2)` / `seed(1M,3)`) | `None` + distinct election seeds + gated fallback to parent seed | `None`; `vrf_election_seed` height/round-distinct; `sortition_seed_gated(...,None)` == `sortition_seed` | `vrf_verify` challenge binds `seed_input` `stellereum/src/vrf.rs:433`; `vrf_election_seed` `stellereum/src/vrf.rs:467-473`; gated fallback `stellereum/src/consensus.rs:980-993` |
+| 3 | Wrong-key proof (valid proof, wrong `VrfPublicKey` / foreign secret / unregistered id / cross-id) | `None` | `None` (all four refused) | `vrf_verify` key-mismatch `stellereum/src/vrf.rs:435-437`; `verify_vrf_seed_for_validator` registry miss `stellereum/src/vrf.rs:456` |
+| 4 | Tampered election seed (flipped proof byte, substituted `output[0]`, identity key, non-canonical `z=[0xFF;32]`) | `None` | `None` (all refused) | `vrf_verify` `stellereum/src/vrf.rs:420-442` (decompress fail / pairing-equation miss / output re-derive mismatch / canonical-`z` check) |
+| 5 | Forged BLS PoP (wrong identity, wrong key, truncated-preimage sig, random 96B, PoP-for-other-id) | `false` / `rejected=1`, never registered | refused; strict `pop_verified=0,rejected=1` | `bls_verify_pop` `stellereum/src/bls.rs:842-844`; strict parse `stellereum/src/bls.rs:959-1025` |
+| 6 | BLS aggregate with one rogue member (rogue key substituted in key list; rogue sig mixed into aggregate; rogue id in `ValidatorSet`) | `false` / `canonical_keys=None` | refused in all three framings; honest control still verifies | `verify_aggregate_signature` pairing mismatch `stellereum/src/bls.rs:344-382`; `parse_registry_entries_strict_pop` rogue refusal `stellereum/src/bls.rs:972-1020`; `canonical_keys` missing-member `None` `stellereum/src/bls.rs:650-670` |
+| 7 | Mixed-version envelopes (v1 2-token line into strict parser; truncated/wrong-magic/oversized/empty QC envelope; `HybridCertificate` version confusion) | strict `rejected=1,legacy=0`; `decode=None`; `is_format_valid=false` | refused; lenient v2 still counts `legacy=1` (compat) | strict parser `stellereum/src/bls.rs:972-979`; `decode_qc_bls_envelope` `stellereum/src/consensus.rs:262-306`; `is_format_valid` `stellereum/src/bls.rs:428-435` |
+| 8 | Empty/oversized inputs (`aggregate([])`, index 9/4, duplicate signer, identity G1/G2, bad bitmask lens, pad bits 5-7, empty registry text, zero-participant verify, `u32::MAX` envelope total, VRF identity key) | `Err` / `None` / `false` / `signed_count=0`, no panic | all refused, no panic | `aggregate_signatures` `stellereum/src/bls.rs:300-336`; `SignerBitVector::from_bitmask` `stellereum/src/bls.rs:225-233`; `BlsPublicKey::from_bytes` `stellereum/src/bls.rs:98-106`; `BlsSignature::from_bytes` `stellereum/src/bls.rs:127-139`; `verify_aggregate_signature` `stellereum/src/bls.rs:348-366` |
+| 9 | Boundary activation heights (`VRF Disabled/FromHeight(u64::MAX,0,1)`; `is_bls_active(0,1,MAX)`; env `MAX/0/1/garbage`; election at `(u64::MAX,u32::MAX)`) | exact gate semantics, no panic/overflow | `Disabled` never active; `FromHeight(MAX)` active only at `MAX`; `FromHeight(0)` always active; env round-trips; `vrf_election_seed(MAX,MAX)` deterministic + round-distinct; gated-`None` falls back | `VrfActivation::is_active_at` `stellereum/src/vrf.rs:111-118`; `vrf_activation_from_env` `stellereum/src/vrf.rs:132-150`; `is_bls_active` `stellereum/src/bls.rs:55-57`; `vrf_election_seed` `stellereum/src/vrf.rs:467-473` |
+
+CRITICAL findings: NONE. No adversarial case accepted when it should refuse;
+no vulnerability to report (no accepting `file:line` exists). If a future run
+shows a `Some`/`true` above, do NOT fix in this lane — report it as CRITICAL
+with the exact accepting `file:line` + reproducer.
+
+Gate outputs (paste, 2026-11-01):
+
+```text
+cargo test -p stellereum --test vrf_bls_adversarial_tests
+running 9 tests
+test boundary_activation_heights_fail_closed ... ok
+test empty_and_oversized_inputs_refused ... ok
+test mixed_version_envelopes_strict_parser_refused ... ok
+test forged_bls_pop_refused ... ok
+test bls_aggregate_with_rogue_member_refused ... ok
+test forged_vrf_proof_random_bytes_refused ... ok
+test vrf_proof_replay_across_inputs_refused ... ok
+test vrf_wrong_key_proof_refused ... ok
+test vrf_tampered_election_seed_refused ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+```text
+cargo clippy -p stellereum --all-targets -- -D warnings
+Checking stellereum v0.1.0 (/home/imm/stellereum-project/stellereum)
+Finished `dev` profile [unoptimized] target(s) in 0.56s
+0 warnings, 0 errors. No --fix was run.
+```
+
+Residual risks (still open, not closed by this battery):
+1. VRF proofs remain deterministic-Schnorr, NOT audited ECVRF (`stellereum/src/vrf.rs:332-347`) — unforgeability holds, ECVRF review does not.
+2. Uniform-height/registry configuration is unenforced consensus-critical (`stellereum/src/vrf.rs:100-101`, `stellereum/src/bls.rs:650-670`) — divergence at activation is a flag-day halt by design.
+3. Registry parsing stays warn-and-skip (`BlsRegistryStats`/counters only); only the QC flag refuses at startup.
+4. No live-network RPC/log/plumbing for VRF activation or PoP migration (§3 UNVERIFIED items unchanged); `H_vrf`/`H_bls` still unscheduled in code.

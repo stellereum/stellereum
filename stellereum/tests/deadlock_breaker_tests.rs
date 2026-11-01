@@ -49,8 +49,22 @@ fn stale_vote_feeds_round_counter_without_voting() {
     // ...but the verified round still lands in the counter (no voting).
     assert!(far.verify());
     let moved = hc.observe_peer_round(far.voter, far.round);
-    assert!(moved, "behind node must chase a verified ahead peer");
+    // F3 corroboration (72bcfd8 2026-10-30): a SINGLE far-future vote is one
+    // peer's claim, not the network's position -- it feeds the counter but no
+    // longer moves the round (trickle-drag: one dribbled vote per timeout
+    // would ratchet +8/timeout and silence us).
+    assert!(
+        !moved,
+        "single uncorroborated far vote must feed the counter but not move us"
+    );
+    assert_eq!(hc.round, 318, "no chase on an uncorroborated far round");
     assert_eq!(hc.max_peer_round(), Some(1550));
+    // A SECOND distinct validator vouching for the same far round is the
+    // network's real position: corroboration re-opens the bounded chase.
+    let corroborator = Vote::sign(&ks[1], 92078, 1550, VoteKind::Prevote, Some([1u8; 32]));
+    assert!(corroborator.verify());
+    let moved2 = hc.observe_peer_round(id(&ks[1]), corroborator.round);
+    assert!(moved2, "corroborated far round must chase");
     // Bounded chase: +8 per message, NOT a jump to 1550.
     assert_eq!(hc.round, 318 + 8, "stale sync stays capped at +8");
     // The far vote formed no quorum.

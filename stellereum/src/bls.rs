@@ -685,6 +685,11 @@ fn parse_registry_entries(text: &str, out: &mut BlsKeyRegistry) {
     // BLS power is hard-refused at startup by `refuse_bls_qc_if_enabled`.
     // When a PoP-carrying format lands, THIS function is where verification
     // must happen (refuse entries without a valid PoP) — not at verify time.
+    //
+    // Metering: accepted/skipped entries feed the process-wide migration
+    // counters (`bls_registry_migration_counts`) as legacy/rejected, exactly
+    // like the PoP paths, so the live default-off parse does not leave the
+    // readiness signal blind.
     for raw in text.split(['\n', ',', ';']) {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -695,10 +700,12 @@ fn parse_registry_entries(text: &str, out: &mut BlsKeyRegistry) {
             .collect();
         if parts.len() < 2 {
             tracing::warn!(line, "bls: registry entry malformed; skipped");
+            note_bls_pop_rejected();
             continue;
         }
         let (Ok(ed), Ok(bls)) = (hex::decode(parts[0]), hex::decode(parts[1])) else {
             tracing::warn!(line, "bls: registry entry is not hex; skipped");
+            note_bls_pop_rejected();
             continue;
         };
         let (Ok(ed), Ok(bls)) = (
@@ -706,16 +713,21 @@ fn parse_registry_entries(text: &str, out: &mut BlsKeyRegistry) {
             <[u8; PUBLIC_KEY_LEN]>::try_from(bls),
         ) else {
             tracing::warn!(line, "bls: registry entry has wrong length; skipped");
+            note_bls_pop_rejected();
             continue;
         };
         match BlsPublicKey::from_bytes(&bls) {
             Some(pk) => {
                 out.insert(ed, pk);
+                note_bls_legacy_entry();
             }
-            None => tracing::warn!(
-                line,
-                "bls: registry BLS key is not a valid G1 point; skipped"
-            ),
+            None => {
+                tracing::warn!(
+                    line,
+                    "bls: registry BLS key is not a valid G1 point; skipped"
+                );
+                note_bls_pop_rejected();
+            }
         }
     }
 }
@@ -886,11 +898,13 @@ pub fn parse_registry_entries_v2(
         if parts.len() < 2 {
             tracing::warn!(line, "bls: registry entry malformed; skipped");
             stats.rejected += 1;
+            note_bls_pop_rejected();
             continue;
         }
         let (Ok(ed), Ok(bls)) = (hex::decode(parts[0]), hex::decode(parts[1])) else {
             tracing::warn!(line, "bls: registry entry is not hex; skipped");
             stats.rejected += 1;
+            note_bls_pop_rejected();
             continue;
         };
         let (Ok(ed), Ok(bls)) = (
@@ -899,6 +913,7 @@ pub fn parse_registry_entries_v2(
         ) else {
             tracing::warn!(line, "bls: registry entry has wrong length; skipped");
             stats.rejected += 1;
+            note_bls_pop_rejected();
             continue;
         };
         let Some(pk) = BlsPublicKey::from_bytes(&bls) else {
@@ -907,6 +922,7 @@ pub fn parse_registry_entries_v2(
                 "bls: registry BLS key is not a valid G1 point; skipped"
             );
             stats.rejected += 1;
+            note_bls_pop_rejected();
             continue;
         };
         // Optional third token: the PoP. Verified when it parses as a
@@ -917,6 +933,7 @@ pub fn parse_registry_entries_v2(
                     let Some(pop) = BlsSignature::from_bytes(&pop_arr) else {
                         tracing::warn!(line, "bls: registry PoP is not a valid G2 point; skipped");
                         stats.rejected += 1;
+                        note_bls_pop_rejected();
                         continue;
                     };
                     if !bls_verify_pop(&pk, &ed, &pop) {

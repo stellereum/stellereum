@@ -102,6 +102,21 @@ pub fn unbound_refused_err(activation_height: u64, chain_id: u64) -> String {
     )
 }
 
+/// Prefix shared by every chain-id mismatch refusal (mempool admission and
+/// state-engine apply use the identical sentence so operators grep once).
+/// A foreign-bound envelope is cryptographically valid on ITS network — the
+/// refusal is about the replay domain, never the signature.
+pub const CHAIN_ID_MISMATCH_ERR_PREFIX: &str = "Transaction chain_id mismatch:";
+
+/// Cross-network replay refusal naming BOTH chains, byte-identical to the
+/// state-engine apply gate (`state_engine.rs`) so operators grep once.
+/// Pure so every surface refuses identically.
+pub fn chain_id_mismatch_err(envelope_chain: u64, our_chain: u64) -> String {
+    format!(
+        "{CHAIN_ID_MISMATCH_ERR_PREFIX} chain id {envelope_chain} does not match this chain ({our_chain})"
+    )
+}
+
 /// Human-readable requirement line for wallet discovery (RPC help text, CLI
 /// `--help`, onboarding docs): which chain id to bind to and what happens
 /// without it. Pure so every surface prints the same sentence.

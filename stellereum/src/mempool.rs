@@ -419,6 +419,12 @@ pub enum MempoolError {
     /// [`crate::chain_binding::UNBOUND_REFUSED_ERR_PREFIX`] refusal every
     /// admission path returns, so wallets match one string.
     UnboundRefused(String),
+    /// Cross-network replay barrier: the envelope binds a FOREIGN chain id.
+    /// A foreign-bound tx is cryptographically valid on ITS network, so this
+    /// is refused purely on the replay domain (never on signature), mirroring
+    /// the state-engine apply gate word-for-word. The inner string carries the
+    /// stable [`crate::chain_binding::CHAIN_ID_MISMATCH_ERR_PREFIX`] refusal.
+    ChainIdMismatch(String),
     /// Transaction payload or structure is malformed or violates protocol mode.
     Malformed(String),
     /// The transaction alone exceeds the block wire cap (`MAX_BLOCK_WIRE_BYTES`):
@@ -473,6 +479,7 @@ impl std::fmt::Display for MempoolError {
             MempoolError::SponsorBadSignature => "invalid sponsor signature",
             MempoolError::SponsorInsufficientBalance => "sponsor cannot pay the transaction fee",
             MempoolError::UnboundRefused(reason) => return write!(f, "{reason}"),
+            MempoolError::ChainIdMismatch(reason) => return write!(f, "{reason}"),
             MempoolError::Malformed(reason) => return write!(f, "malformed transaction: {reason}"),
             MempoolError::TxTooLarge { wire_bytes, cap } => {
                 return write!(
@@ -1817,6 +1824,21 @@ impl Mempool {
             ) {
                 crate::metrics::global().inc_unbound_refused();
                 return Err(MempoolError::UnboundRefused(reason));
+            }
+        }
+        // Cross-network replay barrier (fail-closed, always on — unlike the
+        // activation-gated unbound rule above, a foreign chain id is never
+        // admissible on any network): a BOUND envelope naming another chain
+        // is refused here instead of pooling it for apply to refuse later.
+        // Cheap (one u64 compare, no crypto) and placed with the other
+        // pre-crypto gates. Unbound envelopes (None) keep the legacy path —
+        // presence is what this checks, existence is the gate above.
+        if let Some(envelope_chain) = tx.chain_id() {
+            let ours = crate::consensus::consensus_chain_id();
+            if envelope_chain != ours {
+                return Err(MempoolError::ChainIdMismatch(
+                    crate::chain_binding::chain_id_mismatch_err(envelope_chain, ours),
+                ));
             }
         }
         let pure_pq = self

@@ -8581,6 +8581,22 @@ mod tests {
             .unwrap_or(r.0.result.unwrap_or(Value::Null))
     }
 
+    /// `call` with an explicit peer IP. Tests that hammer the per-IP
+    /// estimate-fee budget use DISTINCT loopback IPs so they don't share one
+    /// 5/s bucket and flake in parallel runs — same production path, same
+    /// caps, just attributed separately (mirrors distinct real clients).
+    async fn call_as(
+        st: &Arc<RpcState>,
+        peer_ip: std::net::IpAddr,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        let r = dispatch(st, Value::from(1), method, &params, None, Some(peer_ip)).await;
+        r.0.error
+            .map(|e| json!({"error": e.message}))
+            .unwrap_or(r.0.result.unwrap_or(Value::Null))
+    }
+
     /// `test_state` with the node message-signing key configured (seed 0x42)
     /// and an optional auth token: the harness for the wallet-signing arms.
     async fn signing_state(token: Option<&str>) -> Arc<RpcState> {
@@ -13353,8 +13369,7 @@ mod tests {
         let to = [2u8; 32];
 
         // 1. Plain transfer with explicit shards
-        let res = call(
-            &st,
+        let res = call_as(&st, "127.0.0.11".parse().unwrap(),
             "stell_estimateFee",
             json!({
                 "from": hex::encode(from),
@@ -13375,8 +13390,7 @@ mod tests {
         assert_eq!(res["status"], json!("ok"));
 
         // 2. TON workchain prefix rules: "-1:..." routes to masterchain (shard 0)
-        let res_ton = call(
-            &st,
+        let res_ton = call_as(&st, "127.0.0.11".parse().unwrap(),
             "stell_estimateFee",
             json!({
                 "from": format!("-1:{}", hex::encode(from)),
@@ -13391,8 +13405,7 @@ mod tests {
         assert_eq!(res_ton["status"], json!("ok"));
 
         // 3. Cross-shard prefix: "1:..." routes to shard 1
-        let res_cross = call(
-            &st,
+        let res_cross = call_as(&st, "127.0.0.11".parse().unwrap(),
             "stell_estimateFee",
             json!({
                 "from": format!("-1:{}", hex::encode(from)),
@@ -13409,7 +13422,7 @@ mod tests {
         let key = ed25519_dalek::SigningKey::from_bytes(&from);
         let raw_tx = crate::sharding::Transaction::sign(&key, to, 1000, 280000, 0, 0, 0);
         let tx_hex = hex::encode(bincode::serialize(&raw_tx).unwrap());
-        let res_raw = call(&st, "stell_estimateFee", json!({ "tx": tx_hex })).await;
+        let res_raw = call_as(&st, "127.0.0.11".parse().unwrap(), "stell_estimateFee", json!({ "tx": tx_hex })).await;
         assert_eq!(res_raw["gas_limit"], json!(280000));
         assert_eq!(res_raw["estimated_fee"], json!(280000));
         assert_eq!(res_raw["base_fee"], json!(280000));
@@ -13437,8 +13450,7 @@ mod tests {
         let token_id = st.engine.create_token(who, meta, 50_000).await.unwrap();
 
         // 1. Estimate fee with opcode array payload
-        let res_op = call(
-            &st,
+        let res_op = call_as(&st, "127.0.0.12".parse().unwrap(),
             "stell_estimateFee",
             json!({
                 "from": hex::encode(who),
@@ -13467,8 +13479,7 @@ mod tests {
         assert_eq!(res_op["is_cross_shard"], json!(false));
 
         // 2. Estimate fee with friendly token_id parameter
-        let res_friendly = call(
-            &st,
+        let res_friendly = call_as(&st, "127.0.0.12".parse().unwrap(),
             "stell_estimateFee",
             json!({
                 "from": hex::encode(who),
@@ -13500,8 +13511,7 @@ mod tests {
         let caller = [0x99u8; 32];
 
         // 1. Estimate fee with OpCode array
-        let res = call(
-            &st,
+        let res = call_as(&st, "127.0.0.13".parse().unwrap(),
             "stell_estimateFee",
             json!({
                 "from": hex::encode(caller),
@@ -13531,8 +13541,7 @@ mod tests {
         assert!(res["estimated_fee"].as_u64().unwrap() >= 280000);
 
         // 2. Estimate fee with friendly method parameter
-        let res_friendly = call(
-            &st,
+        let res_friendly = call_as(&st, "127.0.0.13".parse().unwrap(),
             "stell_estimateFee",
             json!({
                 "from": hex::encode(caller),

@@ -52,6 +52,31 @@
 //! Appendix B.4 test vectors in `tests/vrf_ecvrf_tests.rs`). It gossips
 //! proofs beside votes; phase 3 switches election to the lottery.
 //! See `docs/PLAN-VRF.md`.
+//!
+//! # ECVRF-EDWARDS25519 is CLASSICAL (quantum-breakable) — LEGACY/OFF-ONLY
+//! # in this FULL-PQ architecture
+//!
+//! This chain is FULL post-quantum. ECVRF over Edwards25519 is CLASSICAL
+//! crypto: a cryptographically relevant quantum computer running Shor's
+//! algorithm breaks the Edwards25519 discrete-log problem, forging arbitrary
+//! VRF proofs and outputs. Same class as BLS12-381 (see [`crate::bls`]:
+//! never a PQ primitive, never a PQ fallback.
+//!
+//! PQ POLICY (stated in code so it can be enforced programmatically via
+//! [`VRF_IS_POST_QUANTUM`]):
+//!
+//! * Sortition MUST NOT consume ECVRF output on the PQ path while this module
+//!   is marked classical. The live [`crate::consensus::derive_sortition_committee`]
+//!   draw stays on the parent-hash seed by default; VRF stays default-off
+//!   (`VrfActivation::Disabled`), and any future activation of the VRF lottery
+//!   on the PQ path requires this marker to read `true` first.
+//! * Any use of ECVRF output while marked classical is therefore a NON-PQ,
+//!   LEGACY-ONLY mode. It requires an explicit non-PQ opt-in whose mechanism
+//!   is a LEAD DECISION — this module deliberately does NOT invent the opt-in
+//!   mechanism (no new env knob, no height auto-arming, no silent
+//!   fallback-to-consuming). When the lead defines it, gate it on
+//!   [`VRF_IS_POST_QUANTUM`] being `false` so the non-PQ nature of the path
+//!   is checked, not assumed.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -121,6 +146,14 @@ pub const VRF_SUBSEED_DOMAIN: &[u8] = b"VRF_SUBSEED_V1";
 /// the ECVRF envelope. Carriers (`VrfProof`, `VrfBeaconSeal`) size
 /// themselves from this constant, so no call-site change is needed.
 pub const VRF_PROOF_LEN: usize = 80;
+
+/// Quantum-status marker: ECVRF-EDWARDS25519 is CLASSICAL (discrete-log over
+/// Edwards25519, broken by Shor), NOT post-quantum. Pinned `false` by tests;
+/// sortition MUST NOT consume ECVRF output on the PQ path while this reads
+/// `false`, and any future non-PQ opt-in mechanism (a lead decision, not
+/// defined here) must branch on this marker so the classical nature of the
+/// path is enforced programmatically.
+pub const VRF_IS_POST_QUANTUM: bool = false;
 
 // ============================================================================
 // Activation gate (XPC-activation-height pattern)
@@ -1874,6 +1907,18 @@ mod tests {
             vrf_election_seed(&out, 7, 0),
             vrf_election_seed(&out, 7, 1),
             "round must move the seed"
+        );
+    }
+
+    /// PQ-policy marker: ECVRF-EDWARDS25519 is CLASSICAL, never post-quantum.
+    /// Pinned so sortition wiring must branch on `VRF_IS_POST_QUANTUM`.
+    #[test]
+    fn vrf_is_marked_classical_not_post_quantum() {
+        // GATE: pins the classical marker at RUNTIME (black_box defeats the
+        // const-fold; the test must fail loudly if the marker is flipped).
+        assert!(
+            !std::hint::black_box(VRF_IS_POST_QUANTUM),
+            "ECVRF-Edwards25519 is Shor-breakable: the marker must stay false"
         );
     }
 }

@@ -134,3 +134,7 @@ fail-closed Schnorr proof system that is unfit for lottery election for
 exactly one reason — the secret holder chooses among N valid tickets, turning
 any stake into near-certain election (§2 table) — and that reason is both
 sufficient for NO-GO and fully removed by the planned audited-ECVRF swap.
+
+## 5. Classical status + LaV endgame (FULL-PQ verdict)
+
+ECVRF-EDWARDS25519 is CLASSICAL: Shor breaks the Edwards25519 discrete log and forges arbitrary proofs/outputs, so in the FULL-PQ architecture VRF stays default-off (`VrfActivation::Disabled`, parent-hash draw live) and sortition MUST NOT consume ECVRF output on the PQ path while `VRF_IS_POST_QUANTUM` reads `false` (pinned by `vrf_is_marked_classical_not_post_quantum`); any non-PQ use is LEGACY-ONLY behind a lead-defined opt-in, never a default. The PQ-native endgame is the LaV lattice VRF (`docs/PQ_VRF_LAV_FEASIBILITY.md`): long-term stateless with uniqueness YES under Module-LWR, but ~10.27 KB proofs, unpublished timings, unaudited research code, and 4–6 person-months plus external audit before any consensus wiring — so LaV stays research-only and nothing about the classical verdict changes until an audited, standardized PQ VRF lands.

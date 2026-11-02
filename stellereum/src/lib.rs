@@ -6,6 +6,7 @@ pub mod cell;
 pub mod chain;
 pub mod chain_binding;
 pub mod client_ip;
+pub mod cn_vrf;
 pub mod commitment;
 pub mod consensus;
 pub mod consensus_net;

@@ -2893,6 +2893,24 @@ async fn run_consensus_node(
             }
         }
     }
+    // VRF secret provisioning (phase-3 activation): derive this validator's
+    // VRF seed deterministically from its ed25519 seed —
+    // `vrf_seed = BLAKE3("VRF_SUBSEED_V1" || ed_seed_32)` (see
+    // `stellereum::vrf::derive_vrf_secret_seed`) — and install it via
+    // `with_vrf_secret_seed` below. Deterministic: the same ed seed derives
+    // the same VRF key forever (across restarts, no new secret to
+    // distribute); a distinct keypair from ed (separate scalar derivation);
+    // the same secrecy level (seed-derived, stored alongside the ed key).
+    // Remote-signer deployments hold no local VRF seed: nothing is installed,
+    // so `vrf_beacon_seal_for` returns `None` there (legacy fallback, loud).
+    let validator_ed_seed = key.to_bytes();
+    let provisioned_vrf_seed: Option<[u8; 32]> = if remote_signer.is_some() {
+        None
+    } else {
+        Some(stellereum::vrf::derive_vrf_secret_seed(
+            &validator_ed_seed,
+        ))
+    };
     let mut rt = ValidatorRuntime::new(key, validators, state.clone(), 1)
         .with_mempool(rpc.mempool.clone())
         // The epoch-seal frames (the DKG contribution, the order commitment
@@ -3041,32 +3059,59 @@ async fn run_consensus_node(
         ),
     }
 
-    // VRF sortition activation (phase-1 wiring, XPC-activation-height
+    // VRF sortition activation (phase-3 threading, XPC-activation-height
     // pattern). `STELL_VRF_ACTIVATION_HEIGHT=<h>` arms the VRF election seed
     // for heights `>= h`; unset/unparsable keeps `Disabled` (byte-identical
     // parent-hash election). The height is CONSENSUS-VISIBLE — every node of
-    // a deployment must be configured with the SAME value. Phase-3 threaded
-    // entry points exist (`VoteSet::certificate_with_parent_vrf`,
-    // `QuorumCertificate::{verify_micro_cert_with_vrf,
-    // micro_cert_valid_signers_with_vrf}`, `ValidatorRuntime::vrf_beacon_seal_for`);
-    // the four live `HeightConsensus` assembly sites plus the live verify /
-    // attribution sites (`verify_unified`, `signers_set`) still pin
-    // `VrfActivation::Disabled`+`None` (reported gap, not changed here), so an
-    // armed height is logged loudly and carried on the runtime while election
-    // stays on the parent-hash draw.
-    // Carry is safe and default-off-preserving: no live consensus path reads
-    // `rt.vrf_activation` yet, so `Disabled` (unset env) behaves
-    // byte-identically to before; an armed value is stored but not consulted.
+    // a deployment must be configured with the SAME value. The live verify /
+    // attribution sites (`verify_unified`, `signers_set`) now consult this
+    // activation plus the startup-loaded registry below (threaded entry
+    // points `verify_micro_cert_with_vrf` /
+    // `micro_cert_valid_signers_with_vrf` take explicit values); the
+    // `HeightConsensus` assembly sites still build the legacy parent-hash
+    // committee until seals are carried into them (proposers mint seals via
+    // `ValidatorRuntime::vrf_beacon_seal_for` + `certificate_with_parent_vrf`).
+    // Carry is default-off-preserving: `Disabled` (unset env) with an empty
+    // registry behaves byte-identically to before on every path.
     let vrf_activation = vrf_activation_from_env();
     rt = rt.with_vrf_activation(vrf_activation);
     match vrf_activation.boundary() {
         Some(h) => tracing::warn!(
-            "[vrf] VRF sortition ARMED from height {h} (STELL_VRF_ACTIVATION_HEIGHT={h}): election switches to the verified VRF seed at/above the boundary once phase-3 threading lands; pre-activation heights stay on the parent-hash draw"
+            "[vrf] VRF sortition ARMED from height {h} (STELL_VRF_ACTIVATION_HEIGHT={h}): election switches to the verified VRF seed at/above the boundary for registry-known sealed certificates; pre-activation heights stay on the parent-hash draw"
         ),
         None => info!(
             "[vrf] VRF sortition inactive (STELL_VRF_ACTIVATION_HEIGHT unset): parent-hash election on every height"
         ),
     }
+    // Install the provisioned VRF seed (or log the seedless fallback) and
+    // load the operator VRF registry into the live verify/attribution path.
+    match provisioned_vrf_seed {
+        Some(seed) => {
+            let vrf_pk = stellereum::vrf::VrfSecret::from_seed(&seed)
+                .public_key()
+                .to_bytes();
+            rt = rt.with_vrf_secret_seed(seed);
+            info!(
+                "[vrf] VRF secret provisioned from validator seed (VRF pubkey {}): operators collect this line from every validator to build STELL_VRF_KEYS",
+                hex::encode(vrf_pk)
+            );
+        }
+        None => tracing::warn!(
+            "[vrf] no local VRF seed provisioned (remote-signer deployment): VRF proofs unavailable, legacy parent-hash election on every height"
+        ),
+    }
+    let vrf_registry = stellereum::vrf::vrf_registry_from_env();
+    if vrf_registry.is_empty() {
+        info!(
+            "[vrf] VRF registry empty (STELL_VRF_KEYS unset): verifies fall back to legacy"
+        );
+    } else {
+        info!(
+            "[vrf] VRF registry loaded: {} key(s) from STELL_VRF_KEYS",
+            vrf_registry.len()
+        );
+    }
+    stellereum::consensus::set_live_vrf_registry(vrf_registry);
 
     // Restore the FULL persisted state (accounts + all domains) if available.
     // `restored_state_height` is the height whose post-state the engine holds (0 for

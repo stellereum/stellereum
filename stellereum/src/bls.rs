@@ -1051,14 +1051,17 @@ static BLS_POP_REJECTED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic:
 
 fn note_bls_pop_verified() {
     BLS_POP_VERIFIED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::metrics::global().inc_bls_pop_verified();
 }
 
 fn note_bls_legacy_entry() {
     BLS_LEGACY_ENTRY_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::metrics::global().inc_bls_legacy_entry();
 }
 
 fn note_bls_pop_rejected() {
     BLS_POP_REJECTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::metrics::global().inc_bls_pop_rejected();
 }
 
 /// Registry-migration counters `(pop_verified, legacy, rejected)` for this
@@ -1221,5 +1224,36 @@ mod internal_tests {
         // Migration counters move exactly once per entry.
         let (v, l, r) = bls_registry_migration_counts();
         assert!(v >= 1 && l >= 1 && r >= 1, "counters must meter each class");
+    }
+
+    /// Phase-2 readiness export: every parse event must move BOTH the
+    /// process tuple AND the Prometheus scrape in lockstep, or the
+    /// `legacy == 0 && rejected == 0` readiness alert reads a stale zero.
+    /// At-least assertions (not exact): sibling tests parse concurrently in
+    /// the same process and both counters only ever grow.
+    #[test]
+    fn registry_parse_meters_global_metrics_in_lockstep() {
+        let before = crate::metrics::global().snapshot();
+        let sk = BlsSecretKey::from_seed(&[0x53u8; 32]);
+        let ed = [0x33u8; 32];
+        let line_legacy = format!(
+            "{} {}",
+            hex::encode(ed),
+            hex::encode(sk.public_key().to_bytes())
+        );
+        let mut reg = BlsKeyRegistry::new();
+        let mut stats = BlsRegistryStats::default();
+        // One legacy accept + one malformed skip.
+        parse_registry_entries_v2(&format!("{line_legacy}\nnot-hex at all"), &mut reg, &mut stats);
+        assert_eq!((stats.legacy, stats.rejected), (1, 1));
+        let after = crate::metrics::global().snapshot();
+        assert!(
+            after.bls_legacy_entries >= before.bls_legacy_entries + 1.0,
+            "scrape must meter the legacy accept"
+        );
+        assert!(
+            after.bls_pop_rejected >= before.bls_pop_rejected + 1.0,
+            "scrape must meter the warn-and-skip reject"
+        );
     }
 }

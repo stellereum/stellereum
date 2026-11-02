@@ -86,6 +86,18 @@ pub const VRF_ELECTION_DOMAIN: &str = "STELL_SORTITION_VRF_V1";
 /// (mirrors `STELL_XPC_ACTIVATION_HEIGHT`).
 pub const VRF_ACTIVATION_HEIGHT_ENV: &str = "STELL_VRF_ACTIVATION_HEIGHT";
 
+/// Environment variable carrying the operator-configured VRF key registry
+/// (mirrors `STELL_PEER_PQ_KEYS` in `main.rs`):
+/// `validatorEdHex:vrfPubHex,...` — the validator's ed25519 id (hex of the
+/// 32 consensus-identity bytes) mapped to its VRF public key (hex of the 32
+/// proof-key bytes the operator collected from the validator's
+/// `[vrf] VRF secret provisioned` startup line).
+pub const VRF_KEYS_ENV: &str = "STELL_VRF_KEYS";
+
+/// Domain tag for the operator-local VRF subseed derivation:
+/// `vrf_seed = BLAKE3("VRF_SUBSEED_V1" || ed_seed_32)`.
+pub const VRF_SUBSEED_DOMAIN: &[u8] = b"VRF_SUBSEED_V1";
+
 /// Length of a serialised VRF proof: `R (32B) || z (32B)`.
 pub const VRF_PROOF_LEN: usize = 64;
 
@@ -146,6 +158,113 @@ pub fn vrf_activation_from_env() -> VrfActivation {
                 VrfActivation::Disabled
             }
         },
+    }
+}
+
+/// Derive this validator's VRF secret seed from its ed25519 seed.
+///
+/// `BLAKE3("VRF_SUBSEED_V1" || ed_seed_32)` — deterministic (the same ed seed
+/// derives the same VRF key forever, across restarts, with no new secret to
+/// distribute), and a DISTINCT keypair from the ed key: ed25519 derives its
+/// scalar via SHA-512 over the seed while the VRF scalar goes through the
+/// separate `VRF_SCALAR_DOMAIN`-tagged derivation over this subseed, so the
+/// two scalars (and keypairs) never coincide. Same secrecy level as the ed
+/// seed itself: derived directly from it and stored alongside it (`VrfSecret`
+/// wipes on drop).
+pub fn derive_vrf_secret_seed(ed_seed: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(VRF_SUBSEED_DOMAIN);
+    h.update(ed_seed);
+    *h.finalize().as_bytes()
+}
+
+/// Parse a `STELL_VRF_KEYS` registry value (`validatorEdHex:vrfPubHex,...`).
+///
+/// Entry shape mirrors the `STELL_PEER_PQ_KEYS` parse in `main.rs`
+/// (comma-separated, colon-separated hex pair). Fail-closed per entry, never
+/// panics: garbage entries (malformed shape, bad hex, wrong lengths, or a vrf
+/// key that is not a valid non-identity curve point) are skipped with a loud
+/// stderr warning and contribute nothing. Empty input ⇒ empty registry (the
+/// legacy fallback everywhere).
+pub fn parse_vrf_keys_config(raw: &str) -> VrfRegistry {
+    let mut reg = VrfRegistry::new();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return reg;
+    }
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let mut parts = entry.split(':');
+        let (ed_hex, vrf_hex) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(a), Some(b), None) => (a.trim(), b.trim()),
+            _ => {
+                eprintln!(
+                    "[vrf] {VRF_KEYS_ENV} entry {entry:?} malformed (want validatorEdHex:vrfPubHex): skipped"
+                );
+                continue;
+            }
+        };
+        let ed_bytes = match hex::decode(ed_hex) {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!(
+                    "[vrf] {VRF_KEYS_ENV} entry {entry:?}: validator id is not hex: skipped"
+                );
+                continue;
+            }
+        };
+        let vrf_bytes = match hex::decode(vrf_hex) {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!(
+                    "[vrf] {VRF_KEYS_ENV} entry {entry:?}: vrf key is not hex: skipped"
+                );
+                continue;
+            }
+        };
+        let ed_id: [u8; 32] = match ed_bytes.try_into() {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!(
+                    "[vrf] {VRF_KEYS_ENV} entry {entry:?}: validator id is not 32 bytes: skipped"
+                );
+                continue;
+            }
+        };
+        let vrf_pk: [u8; 32] = match vrf_bytes.try_into() {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!(
+                    "[vrf] {VRF_KEYS_ENV} entry {entry:?}: vrf key is not 32 bytes: skipped"
+                );
+                continue;
+            }
+        };
+        if !reg.insert_config_key(ed_id, vrf_pk) {
+            eprintln!(
+                "[vrf] {VRF_KEYS_ENV} entry {entry:?}: vrf key is not a valid curve point: skipped"
+            );
+        }
+    }
+    reg
+}
+
+/// Read the VRF key registry from the environment (startup seam).
+///
+/// Missing/empty ⇒ empty registry (legacy fallback everywhere — the
+/// default-off path). Garbage entries are skipped entry-wise (see
+/// [`parse_vrf_keys_config`]), never fatal to startup.
+pub fn vrf_registry_from_env() -> VrfRegistry {
+    match std::env::var(VRF_KEYS_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        None => VrfRegistry::new(),
+        Some(v) => parse_vrf_keys_config(&v),
     }
 }
 
@@ -314,6 +433,22 @@ impl VrfRegistry {
         self.keys.insert(binding.validator_id, binding.vrf_pk);
         note_vrf_binding_registered();
         Ok(())
+    }
+
+    /// Insert an operator-configured key (startup `STELL_VRF_KEYS` trust).
+    ///
+    /// Unlike [`Self::register`], this takes no Falcon binding: the
+    /// operator's own config file/env IS the trust root here (same posture as
+    /// the `STELL_PEER_PQ_KEYS` peer-key map in `main.rs`). The curve point is
+    /// still validated — identity and non-decompressible bytes refuse
+    /// (`false`, nothing stored) — so garbage config can never mint a key the
+    /// verifier would choke on.
+    pub fn insert_config_key(&mut self, validator_id: [u8; 32], vrf_pk: [u8; 32]) -> bool {
+        if VrfPublicKey::from_bytes(&vrf_pk).is_none() {
+            return false;
+        }
+        self.keys.insert(validator_id, vrf_pk);
+        true
     }
 
     pub fn get(&self, validator_id: &[u8; 32]) -> Option<[u8; 32]> {

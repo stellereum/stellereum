@@ -1314,6 +1314,41 @@ pub fn clear_validator_pq_keys_for_tests() {
     }
 }
 
+/// Process-global VRF key registry, loaded once at startup from
+/// `STELL_VRF_KEYS` (see `vrf::vrf_registry_from_env`) and consulted by the
+/// live verify/attribution paths (`pq_path_verify`, `signers_set`).
+///
+/// Default (never loaded, or loaded empty) ⇒ no registry ⇒ the
+/// `vrf_output_for_cert` fallback matrix resolves every seal to the legacy
+/// parent-hash draw — byte-identical to before. Same posture as
+/// `PQ_VALIDATOR_KEYS`: operator config is the trust root; entries were
+/// curve-validated at load, and only registry-known keys can elect the VRF
+/// committee (unknown keys fall back to legacy, known-key forgeries refuse).
+static VRF_LIVE_REGISTRY: std::sync::RwLock<Option<crate::vrf::VrfRegistry>> =
+    std::sync::RwLock::new(None);
+
+/// Install the startup-loaded VRF registry (called once from `main.rs`).
+pub fn set_live_vrf_registry(reg: crate::vrf::VrfRegistry) {
+    let mut lock = VRF_LIVE_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+    *lock = Some(reg);
+}
+
+/// Snapshot the live VRF registry for one verify/attribution call.
+///
+/// `None` when no registry was loaded or it holds no keys — the call sites
+/// then take the "missing registry ⇒ legacy" fallback cell exactly.
+fn live_vrf_registry_snapshot() -> Option<crate::vrf::VrfRegistry> {
+    let lock = VRF_LIVE_REGISTRY.read().unwrap_or_else(|e| e.into_inner());
+    lock.clone().filter(|r| !r.is_empty())
+}
+
+/// Clear the live VRF registry (test hygiene).
+#[cfg(any(test, debug_assertions))]
+pub fn clear_live_vrf_registry_for_tests() {
+    let mut lock = VRF_LIVE_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+    *lock = None;
+}
+
 // ============================================================================
 // Validator set
 // ============================================================================
@@ -2894,17 +2929,22 @@ impl QuorumCertificate {
                     {
                         continue;
                     }
-                    // Live path: legacy draw (Disabled + no registry), so
-                    // pre-activation bytes verify exactly as today. Phase-3
-                    // callers with an armed activation and a registry use
+                    // Live path: the deployment's activation (env) + the
+                    // startup-loaded registry (global). Disabled/empty ⇒ the
+                    // legacy draw, byte-identical to today; armed + known key
+                    // + verifying seal ⇒ the VRF committee (phase-3
+                    // threading, fallback matrix in `vrf_output_for_cert`).
+                    // Callers with explicit values use
                     // `verify_micro_cert_with_vrf`.
+                    let live_activation = crate::vrf::vrf_activation_from_env();
+                    let live_registry = live_vrf_registry_snapshot();
                     if self.verify_micro_cert(
                         &cert,
                         validators,
                         msg,
                         pq_keys,
-                        &crate::vrf::VrfActivation::Disabled,
-                        None,
+                        &live_activation,
+                        live_registry.as_ref(),
                     ) {
                         return true;
                     }
@@ -3450,15 +3490,18 @@ impl QuorumCertificate {
                     {
                         continue;
                     }
-                    // Live path: legacy draw (Disabled + no registry).
+                    // Live path: same live activation + registry as
+                    // `pq_path_verify` above (Disabled/empty ⇒ legacy draw).
                     // Phase-3 callers use `micro_cert_valid_signers_with_vrf`.
+                    let live_activation = crate::vrf::vrf_activation_from_env();
+                    let live_registry = live_vrf_registry_snapshot();
                     if let Some(ids) = self.micro_cert_valid_signers(
                         &cert,
                         validators,
                         &msg,
                         None,
-                        &crate::vrf::VrfActivation::Disabled,
-                        None,
+                        &live_activation,
+                        live_registry.as_ref(),
                     ) {
                         signers.extend(ids);
                     }

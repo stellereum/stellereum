@@ -411,3 +411,91 @@ Residual risks (still open, not closed by this battery):
 2. Uniform-height/registry configuration is unenforced consensus-critical (`stellereum/src/vrf.rs:100-101`, `stellereum/src/bls.rs:650-670`) — divergence at activation is a flag-day halt by design.
 3. Registry parsing stays warn-and-skip (`BlsRegistryStats`/counters only); only the QC flag refuses at startup.
 4. No live-network RPC/log/plumbing for VRF activation or PoP migration (§3 UNVERIFIED items unchanged); `H_vrf`/`H_bls` still unscheduled in code.
+
+## 10. VRF activation implementation — 2026-11-01 (end-to-end, default-off)
+
+Status: provisioning + registry loader + live verify/attribution threading
+LANDED (new `src/` code + `stellereum/tests/vrf_activation_e2e_tests.rs`,
+7 tests). BLS untouched. No crypto changes (`vrf.rs` prove/verify math
+identical), no quorum/lock/round/bucketing changes. Default-off preserved:
+env-unset + empty registry is byte-identical to the legacy path (pinned by
+`default_off_identity_byte_identical_certs`: struct AND canonical-envelope
+byte-compare, plus live `verify_unified` / `signers_set` on legacy certs).
+
+Env names (all default-off):
+- `STELL_VRF_ACTIVATION_HEIGHT=<h>` (existing): `Disabled` unless set to a
+  `u64`; armed at heights `>= h` (`stellereum/src/vrf.rs:87-150`).
+- `STELL_VRF_KEYS=validatorEdHex:vrfPubHex,...` (NEW): the operator VRF key
+  registry (`stellereum/src/vrf.rs`, `VRF_KEYS_ENV`). Entry shape mirrors the
+  `STELL_PEER_PQ_KEYS` parse in `stellereum/src/main.rs`. Garbage entries
+  (malformed shape, bad hex, wrong lengths, non-curve/identity vrf key) are
+  skipped with a loud `[vrf] ... skipped` stderr line, never fatal, never
+  stored (`parse_vrf_keys_config`); unset/empty ⇒ empty registry ⇒ legacy
+  fallback everywhere (`vrf_registry_from_env`).
+
+Seed derivation (no new secrets to distribute): at startup where the
+validator ed25519 seed is available (`run_consensus_node`, before
+`ValidatorRuntime::new`), `vrf_seed = BLAKE3("VRF_SUBSEED_V1" || ed_seed_32)`
+(`derive_vrf_secret_seed`), installed via the existing
+`with_vrf_secret_seed`. Deterministic (same ed seed ⇒ same VRF key forever,
+across restarts), a DISTINCT keypair from ed (separate scalar derivation —
+ed25519 SHA-512 vs `VRF_SCALAR_DOMAIN`-tagged VRF derivation), same secrecy
+level (seed-derived, stored alongside, wiped on `VrfSecret` drop).
+Remote-signer deployments (no local seed): nothing installed + loud
+`[vrf] no local VRF seed provisioned` warn → legacy fallback. The derived
+VRF pubkey is logged at INFO on every startup (`[vrf] VRF secret
+provisioned ...`): operators collect these lines to build `STELL_VRF_KEYS`.
+
+Registry format: `hex(validator_ed_id_32):hex(vrf_pk_32)` per validator,
+comma-separated. Inserted via `VrfRegistry::insert_config_key` (operator
+config IS the trust root, same posture as peer PQ keys; curve point still
+validated — identity/non-decompressible refuse). Loaded once at startup into
+the process-global live registry (`set_live_vrf_registry` in
+`stellereum/src/consensus.rs`, beside `PQ_VALIDATOR_KEYS`).
+
+Threading: the live verify/attribution sites (`pq_path_verify`,
+`signers_set` micro-cert branch — the two call sites that pinned
+`Disabled`+`None`) now consult the env activation + the global registry
+snapshot and call the existing gated entry points. `HeightConsensus`
+assembly sites still build legacy committees (no seal carried yet); seals
+flow via `vrf_beacon_seal_for` + `certificate_with_parent_vrf` (runtime seam
++ explicit entry points, unchanged).
+
+Fallback matrix (unchanged, re-pinned — `vrf_output_for_cert` untouched):
+pre-activation → legacy; activation set + seal absent/unverifiable/
+unknown-key → legacy; forged seal from a KNOWN key → REFUSE the whole cert
+(`forged_seal_from_known_key_still_refuses` re-pins both assembly
+non-embedding and verify refusal; unsealed certs still verify classically
+through `verify_unified`'s fallback paths, as before).
+
+Behavior matrix confirmation (2026-11-01 gate): `cargo clippy -p stellereum
+--all-targets -- -D warnings` → 0/0; new suite 7/7; plus green:
+`vrf_sortition_gate` (4), `vrf_audit` (8), `vrf_activation` (3),
+`vrf_bls_adversarial` (9), `vrf_phase3_threading` (9), `bls_pop` (6),
+`bls_qc_compat` (11), `bls_tests` (14), `bls_registry_audit` (6),
+`sortition_integration` (9); extra insurance `pq_uqc_power_quorum` (23),
+`pure_pq_enforcement` (7), `vote_qc_assembly_audit` (4), `v34_verification`
+(13), `p3_byzantine` (21) green. Pre-existing UNRELATED lib failures
+(`rpc::tests::test_estimate_fee_*`, fail identically with these changes
+stashed) were NOT touched.
+
+What remains for flag-day (NOT done here):
+1. Choose and publish `H_vrf` (no height scheduled in code); every node of a
+   deployment must configure the SAME `STELL_VRF_ACTIVATION_HEIGHT`.
+2. Rollout order: (a) upgrade all nodes to this binary (mixed-version safe:
+   pre-`H_vrf` verifies legacy on both); (b) operators collect every
+   validator's `[vrf] VRF secret provisioned` pubkey line; (c) distribute the
+   identical `STELL_VRF_KEYS` registry to every verifier; (d) set
+   `STELL_VRF_ACTIVATION_HEIGHT=H_vrf` everywhere and restart. At/above
+   `H_vrf`, sealed certs elect VRF committees and old binaries halt loudly
+   (expected flag-day shape, `PLAN-VRF` §4).
+3. Operator duties: keep `STELL_VRF_KEYS` identical on all verifiers (a wrong
+   vrf pubkey for a validator turns its honest seals into REFUSEs, not
+   fallbacks); never reuse an ed seed across validators (derived VRF keys
+   would collide); remote-signer deployments stay legacy until a VRF-capable
+   signer lands (no VRF material is derived from remote keys).
+4. NOT closed: audited-ECVRF swap (uniqueness/self-grinding gap stands —
+   `VRF_CRYPTANALYSIS.md` §4 NO-GO for VRF-sortition election still applies);
+   100%-power binding readiness has no on-chain/RPC meter (`H_vrf` must not
+   be set until every voting-power key is registry-known, else unknown-key
+   seals fall back to the grindable parent-hash draw).

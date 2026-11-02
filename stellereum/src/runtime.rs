@@ -5683,7 +5683,9 @@ impl ValidatorRuntime {
             // GENUINE future proposal must align, not reject — the scan is
             // deliberate, pinned by test. Abuse is bounded elsewhere: the
             // jump runs through `sync_round_to`, which caps each jump at
-            // ROUND_LOOKBACK and budgets 4 jumps/sec (audit 2026-10-06), and
+            // ROUND_LOOKBACK and budgets MAX_SYNC_JUMPS_PER_ROUND jumps per
+            // round (audit 2026-10-06; per-round since the wall-clock
+            // budget removal), and
             // the body is signature-authenticated before this point, so only
             // the slot owner can pull us to their own slots.
             let mut target = None;

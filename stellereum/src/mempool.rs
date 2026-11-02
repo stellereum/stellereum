@@ -743,6 +743,31 @@ impl Mempool {
     /// `apply_in_flight` blocks the next propose. Bounds worst-case lane
     /// stall per height; gas alone does not (cheap gas, costly verify).
     pub const MAX_BLOCK_PROOF_UNITS: usize = 2048;
+    /// Denominator of the sealed-transaction share of the pool (audit:
+    /// mempool economics — free sealed fill): sealed envelopes may occupy at
+    /// most `max_size / MAX_SEALED_SHARE_DENOM` slots (see
+    /// [`Mempool::sealed_cap`]).
+    ///
+    /// WHY (fail-closed containment, not pricing): the sealed path admits
+    /// CIPHERTEXT with no funding check — no balance, no fee floor, no
+    /// signature over funds — and the transparent `from` it charges the
+    /// per-sender quota to is self-declared, so sender-sprawl (free keygen +
+    /// fresh `from` per envelope) sails past the per-sender limit. Reachable
+    /// via RPC and via P2P gossip, that is a free pool fill: forged envelopes
+    /// (valid curve point + random bytes + random hash) could occupy the whole
+    /// combined `max_size` cap and squeeze every honest plain transaction out.
+    /// The cap bounds the damage to the sealed quota; the plain pool always
+    /// keeps its own `max_size` slots (`insert` counts plain txs only).
+    pub const MAX_SEALED_SHARE_DENOM: usize = 4;
+
+    /// Global ceiling on SEALED transactions in this pool: at most one
+    /// quarter of `max_size` (at least one slot, so tiny test pools still
+    /// admit a sealed transaction). Enforced in [`Mempool::add_sealed`] with
+    /// [`MempoolError::Full`]: a refused seal is gossipable-no-more pool
+    /// pressure, never a silent drop of honest traffic.
+    pub fn sealed_cap(&self) -> usize {
+        (self.max_size / Self::MAX_SEALED_SHARE_DENOM).max(1)
+    }
 
     /// Set the base fee (minimum accepted fee). Builder-style.
     pub fn with_base_fee(mut self, base_fee: u64) -> Self {
@@ -1154,7 +1179,10 @@ impl Mempool {
     /// Fail closed: a malformed envelope, an envelope for another epoch, or
     /// an envelope whose transaction hash is already known is REFUSED with a
     /// clear error, so a bad seal can never occupy pool space, never be
-    /// gossiped on, and can never stall a proposer.
+    /// gossiped on, and can never stall a proposer. A seal is ALSO refused
+    /// once the sealed quota ([`Mempool::sealed_cap`]) is full — the sealed
+    /// path carries no funding proof, so an uncapped seal would be a free,
+    /// sender-spoofable pool fill (audit: mempool economics).
     pub fn add_sealed(
         &mut self,
         envelope: crate::mev_epoch::SealedEnvelope,
@@ -1181,6 +1209,14 @@ impl Mempool {
         let sender_count = self.per_sender.get(&sender).copied().unwrap_or(0);
         if sender_count >= self.per_sender_limit {
             return Err(MempoolError::TooManyFromSender);
+        }
+        // Sealed-quota containment (audit: mempool economics — free sealed
+        // fill): the sealed path proves no funds, so the sealed count — not
+        // just the combined pool size — is capped. Without this, forged
+        // envelopes (free keygen, spoofed `from` per envelope) fill the whole
+        // combined cap and evict honest plain transactions by pressure.
+        if self.sealed.len() >= self.sealed_cap() {
+            return Err(MempoolError::Full);
         }
         if self.sealed.len() + self.txs.len() >= self.max_size {
             return Err(MempoolError::Full);

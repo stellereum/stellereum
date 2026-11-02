@@ -58,6 +58,36 @@ pub const GAS_CONTRACT_CODE_PER_BYTE: u64 = GAS_PER_BYTE;
 pub const GAS_CONTRACT_CALL: u64 = 1_000;
 /// Extra gas charged per argument of a multi-argument contract call.
 pub const GAS_CONTRACT_CALL_PER_ARG: u64 = 10;
+/// Gas charged per byte of method name + calldata carried by a contract-call
+/// opcode. Anti-DoS: both ride the signed payload (block space every node
+/// stores) and cost per-byte work on every node (UTF-8 scan, export lookup,
+/// calldata clone, `host.calldata` copy), so a fixed-price call would make a
+/// megabyte method name cost the same as `sum3`. Same rate as the deploy
+/// per-byte price and the PQ wire price: one byte price for one byte of wire.
+pub const GAS_CONTRACT_CALL_PER_BYTE: u64 = 2;
+/// Hard cap on a contract-call method name (bytes). Wasm export names are
+/// short identifiers; anything larger is a wire-bloat probe. Fail-closed in
+/// the dispatch arms below.
+pub const MAX_CONTRACT_METHOD_LEN: usize = 256;
+/// Hard cap on calldata bytes per contract call (matches
+/// [`crate::contract::MAX_RETURN_DATA`]: a call cannot carry more blob than a
+/// contract can return). Fail-closed in the dispatch arms below.
+pub const MAX_CONTRACT_CALLDATA_BYTES: usize = 64 * 1024;
+
+/// Variable half of `SysCallCallContract` / `SysCallCallContractArgs`: base +
+/// per-arg + per byte of method name and calldata carried. Single definition
+/// shared by the `opcode_gas` table and the execution arms (they must agree
+/// bit-identically — pinned by `syscall_charges_match_the_priced_table`-style
+/// tests).
+#[inline(always)]
+pub fn contract_call_gas(method_len: usize, args_len: usize, calldata_len: usize) -> u64 {
+    GAS_CONTRACT_CALL
+        .saturating_add((args_len as u64).saturating_mul(GAS_CONTRACT_CALL_PER_ARG))
+        .saturating_add(
+            ((method_len.saturating_add(calldata_len)) as u64)
+                .saturating_mul(GAS_CONTRACT_CALL_PER_BYTE),
+        )
+}
 /// Gas to bond or delegate stake.
 pub const GAS_STAKE_BOND: u64 = 2_000;
 /// Gas to start unbonding / withdraw delegations.
@@ -359,9 +389,15 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         ),
         OpCode::SysCallTokenBalanceOf { .. } => GAS_TOKEN_BALANCE,
         OpCode::SysCallDeployContract { code } => contract_deploy_gas(code.len()),
-        OpCode::SysCallCallContract { .. } => GAS_CONTRACT_CALL,
-        OpCode::SysCallCallContractArgs { args, .. } => GAS_CONTRACT_CALL
-            .saturating_add((args.len() as u64).saturating_mul(GAS_CONTRACT_CALL_PER_ARG)),
+        OpCode::SysCallCallContract { method, .. } => {
+            contract_call_gas(method.len(), 1, 0)
+        }
+        OpCode::SysCallCallContractArgs {
+            method,
+            args,
+            calldata,
+            ..
+        } => contract_call_gas(method.len(), args.len(), calldata.len()),
         OpCode::SysCallStake { .. } | OpCode::SysCallDelegate { .. } => GAS_STAKE_BOND,
         OpCode::SysCallUnbond { .. } | OpCode::SysCallUndelegate { .. } => GAS_STAKE_UNBOND,
         OpCode::SysCallBeginUndelegate { .. } => GAS_STAKE_UNBOND,
@@ -1902,7 +1938,16 @@ impl Svm {
                     method,
                     arg,
                 } => {
-                    charge!(GAS_CONTRACT_CALL);
+                    // Wire caps BEFORE any clone/commit: an unbounded method
+                    // name would otherwise force every node through a UTF-8
+                    // scan + export lookup for fixed gas. Same fail-closed
+                    // shape as the confidential IO caps above.
+                    if method.len() > MAX_CONTRACT_METHOD_LEN {
+                        return VmExecutionResult::Reverted(format!(
+                            "contract call rejected: method name exceeds {MAX_CONTRACT_METHOD_LEN} bytes"
+                        ));
+                    }
+                    charge!(contract_call_gas(method.len(), 1, 0));
                     ensure_working(&mut working_contracts, ctx.contracts.as_deref());
                     let Some(reg) = working_contracts.as_mut() else {
                         return VmExecutionResult::Reverted(
@@ -1957,9 +2002,28 @@ impl Svm {
                     args,
                     calldata,
                 } => {
-                    charge!(GAS_CONTRACT_CALL.saturating_add(
-                        (args.len() as u64).saturating_mul(GAS_CONTRACT_CALL_PER_ARG),
-                    ));
+                    // Wire caps BEFORE the registry clone below: an oversized
+                    // method/calldata/args vector would otherwise force a full
+                    // registry clone plus a UTF-8 scan for fixed gas. The
+                    // contract layer re-checks arity; this early reject just
+                    // avoids paying the clone for a call that cannot succeed.
+                    if method.len() > MAX_CONTRACT_METHOD_LEN {
+                        return VmExecutionResult::Reverted(format!(
+                            "contract call rejected: method name exceeds {MAX_CONTRACT_METHOD_LEN} bytes"
+                        ));
+                    }
+                    if calldata.len() > MAX_CONTRACT_CALLDATA_BYTES {
+                        return VmExecutionResult::Reverted(format!(
+                            "contract call rejected: calldata exceeds {MAX_CONTRACT_CALLDATA_BYTES} bytes"
+                        ));
+                    }
+                    if args.len() > crate::contract::MAX_CONTRACT_CALL_ARGS {
+                        return VmExecutionResult::Reverted(format!(
+                            "contract call rejected: too many arguments (max {})",
+                            crate::contract::MAX_CONTRACT_CALL_ARGS
+                        ));
+                    }
+                    charge!(contract_call_gas(method.len(), args.len(), calldata.len()));
                     ensure_working(&mut working_contracts, ctx.contracts.as_deref());
                     let Some(reg) = working_contracts.as_mut() else {
                         return VmExecutionResult::Reverted(

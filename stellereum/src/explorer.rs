@@ -456,7 +456,14 @@ fn render_index(site_key: Option<&str>) -> String {
                 "%TS_WIDGET%",
                 &format!(
                     "\n  <div class=\"cf-turnstile\" data-sitekey=\"{}\" data-theme=\"dark\" data-size=\"flexible\"></div>",
-                    key.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;")
+                    // Attribute-context escaping (defense in depth: the key is
+                    // operator-controlled, but the page is served as HTML, so a
+                    // pasted key must never break out of the attribute).
+                    key.replace('&', "&amp;")
+                        .replace('"', "&quot;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;")
+                        .replace('\'', "&#x27;")
                 ),
             )
             .replace("%TS_REQUIRED%", "true"),
@@ -1141,6 +1148,14 @@ async fn api_tx(
             let authed = match &st.rpc.auth_token {
                 None => false,
                 Some(expected) => {
+                    if query.contains_key("token") || query.contains_key("apiKey") {
+                        // Tokens in URLs land in access/proxy logs and browser
+                        // history; headers are the safe path (same rule as the
+                        // faucet gate above). Still accepted for compat.
+                        tracing::warn!(
+                            "[explorer] auth token passed via URL query on /api/tx; prefer Authorization header"
+                        );
+                    }
                     let provided = query
                         .get("token")
                         .or_else(|| query.get("apiKey"))

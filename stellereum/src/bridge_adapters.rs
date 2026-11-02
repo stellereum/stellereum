@@ -673,6 +673,14 @@ fn check_depth(
     finalized: u64,
     min_confirmations: u64,
 ) -> Result<(), String> {
+    // A header ahead of the finalized head is from the future, not buried:
+    // refuse explicitly instead of letting `saturating_sub` report a 0 depth
+    // that a zero-minimum adapter would accept (audit BR-OR-04).
+    if header_height > finalized {
+        return Err(format!(
+            "{evidence_name}: header is ahead of the finalized head (refusing)"
+        ));
+    }
     let depth = finalized.saturating_sub(header_height);
     if depth < min_confirmations {
         return Err(format!(

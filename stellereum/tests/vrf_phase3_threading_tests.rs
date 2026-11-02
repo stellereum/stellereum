@@ -981,3 +981,351 @@ fn old_wire_bytes_verify_legacy_at_armed_height() {
         Some(legacy_committee)
     );
 }
+
+// --- 8. live-site agreement (verify_unified/signers_set read env + registry) ---
+//
+// The two live sites (`pq_path_verify`, used by `verify_unified`, and the
+// micro-cert branch of `signers_set`) resolve the election from the process
+// environment (`STELL_VRF_ACTIVATION_HEIGHT`) plus the startup-loaded global
+// registry (`set_live_vrf_registry`) — the same fallback matrix as
+// `vrf_output_for_cert`. These cases pin the live path against the explicit
+// (activation, registry) path: post-activation they agree on the VRF
+// committee, pre-activation they are byte-identical legacy, and a forged seal
+// from a known key refuses fail-closed.
+//
+// Process-global state (env var, PQ-key registry, live VRF registry) is
+// shared by every test in this binary, so the live cases below serialize on
+// `SERIAL_LIVE` and restore env on drop. Marker-only QCs (a single
+// `PQ_UQC_MARKER_ID` envelope entry, no classical signatures) isolate the
+// micro-cert path through the live sites: a full assembly QC would still pass
+// `verify_unified` on its classical Ed25519 quorum even when the micro-cert
+// branch refuses, which would mask a live-site regression here.
+
+static SERIAL_LIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvRestoreLive {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvRestoreLive {
+    fn save(keys: &[&'static str]) -> Self {
+        let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        Self { saved }
+    }
+}
+
+impl Drop for EnvRestoreLive {
+    fn drop(&mut self) {
+        for (k, v) in &self.saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
+/// Marker-only QC: the micro-cert envelope alone, so `verify_unified` (via
+/// `pq_path_verify`) and `signers_set` (via the micro-cert branch) decide on
+/// the envelope path only.
+///
+/// The payload is attached with `attach_pq_micro_certificate` (the same
+/// function assembly uses): unsealed certs encode to the canonical envelope,
+/// sealed ones travel as `MAGIC || bincode(cert)`. Hand-rolling the payload
+/// with `encode_pq_micro_envelope` would silently DROP the seal (the
+/// canonical envelope has no seal field) and every sealed case would exercise
+/// the legacy fallback instead of the VRF path.
+fn marker_only_qc_live(cert: &PqMicroCertificate, block_hash: Option<[u8; 32]>) -> QuorumCertificate {
+    let mut qc = QuorumCertificate {
+        height: cert.height,
+        round: cert.round,
+        kind: KIND,
+        block_hash,
+        signatures: Vec::new(),
+    };
+    qc.attach_pq_micro_certificate(cert);
+    qc
+}
+
+fn live_env_key() -> &'static str {
+    stellereum::vrf::VRF_ACTIVATION_HEIGHT_ENV
+}
+
+#[test]
+fn live_sites_agree_post_activation_small_and_scaled() {
+    let _guard = SERIAL_LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestoreLive::save(&[live_env_key()]);
+    stellereum::consensus::clear_live_vrf_registry_for_tests();
+
+    // Small network: full-set committee on both draws.
+    let net = setup_net(4, 0xA1, 10);
+    let active = VrfActivation::FromHeight(ACTIVATION_H);
+    let seal = seal_for(&net, 0, ACTIVATION_H, ROUND);
+    let set = vote_set_for(&net, ACTIVATION_H, ROUND);
+    let qc = set
+        .certificate_with_parent_vrf(
+            net.block_hash,
+            &net.vs,
+            Some(&net.parent),
+            &active,
+            Some(&net.reg),
+            Some(seal.clone()),
+        )
+        .expect("must form");
+    let cert = qc.pq_micro_certificate().expect("attached");
+    assert_eq!(cert.vrf_beacon, Some(seal.clone()));
+
+    std::env::set_var(live_env_key(), ACTIVATION_H.to_string());
+    assert_eq!(stellereum::vrf::vrf_activation_from_env(), active);
+    stellereum::consensus::set_live_vrf_registry(net.reg.clone());
+
+    let msg = msg_for(ACTIVATION_H, ROUND, &net.block_hash);
+    let expected = derive_sortition_committee_gated(
+        &net.vs,
+        ACTIVATION_H,
+        ROUND,
+        4,
+        &net.parent,
+        &active,
+        Some(&seal.proof.output),
+    );
+    assert!(
+        qc.verify_micro_cert_with_vrf(&cert, &net.vs, &msg, None, &active, Some(&net.reg)),
+        "explicit path must verify the sealed certificate"
+    );
+    let marker = marker_only_qc_live(&cert, net.block_hash);
+    assert!(
+        marker.verify_unified(&net.vs),
+        "live pq path must accept the sealed certificate post-activation"
+    );
+    let expected_set: std::collections::HashSet<[u8; 32]> =
+        expected.iter().copied().collect();
+    assert_eq!(
+        marker.signers_set(&net.vs),
+        expected_set,
+        "live attribution must land on the proposer's VRF committee"
+    );
+    // Full assembly QC agrees through the live sites as well (classical +
+    // envelope union covers the VRF committee here).
+    assert!(qc.verify_unified(&net.vs));
+    let live_full: std::collections::HashSet<[u8; 32]> =
+        qc.signers_set(&net.vs).into_iter().collect();
+    for id in &expected {
+        assert!(live_full.contains(id), "full-QC live attribution must cover {id:?}");
+    }
+
+    stellereum::consensus::clear_live_vrf_registry_for_tests();
+
+    // Scaled network: the VRF draw genuinely diverges from the legacy draw.
+    let net = setup_net(65, 0xA2, 10);
+    assert_eq!(micro_committee_size(65), 64);
+    let seal = seal_for(&net, 0, ACTIVATION_H, ROUND);
+    let vrf_committee = derive_sortition_committee_gated(
+        &net.vs,
+        ACTIVATION_H,
+        ROUND,
+        64,
+        &net.parent,
+        &active,
+        Some(&seal.proof.output),
+    );
+    let legacy_committee =
+        derive_sortition_committee(&net.vs, ACTIVATION_H, ROUND, 64, &net.parent);
+    assert_eq!(vrf_committee.len(), 64);
+    assert_ne!(
+        vrf_committee, legacy_committee,
+        "fixture must exercise a real draw divergence"
+    );
+    let set = vote_set_for(&net, ACTIVATION_H, ROUND);
+    let qc = set
+        .certificate_with_parent_vrf(
+            net.block_hash,
+            &net.vs,
+            Some(&net.parent),
+            &active,
+            Some(&net.reg),
+            Some(seal.clone()),
+        )
+        .expect("scaled certificate must form");
+    let cert = qc.pq_micro_certificate().expect("attached");
+    assert_eq!(cert.vrf_beacon, Some(seal.clone()));
+    std::env::set_var(live_env_key(), ACTIVATION_H.to_string());
+    stellereum::consensus::set_live_vrf_registry(net.reg.clone());
+    let msg = msg_for(ACTIVATION_H, ROUND, &net.block_hash);
+    assert!(
+        qc.verify_micro_cert_with_vrf(&cert, &net.vs, &msg, None, &active, Some(&net.reg)),
+        "scaled sealed certificate must verify on the explicit path"
+    );
+    let marker = marker_only_qc_live(&cert, net.block_hash);
+    assert!(
+        marker.verify_unified(&net.vs),
+        "live pq path must accept the diverged VRF committee"
+    );
+    let vrf_set: std::collections::HashSet<[u8; 32]> =
+        vrf_committee.iter().copied().collect();
+    assert_eq!(
+        marker.signers_set(&net.vs),
+        vrf_set,
+        "live attribution must match the diverged VRF committee"
+    );
+    // …while the legacy draw refuses it (flag-day shape for non-trivial draws).
+    assert!(
+        !qc.verify_micro_cert_with_vrf(&cert, &net.vs, &msg, None, &VrfActivation::Disabled, None),
+        "legacy draw must refuse a diverged VRF committee"
+    );
+
+    stellereum::consensus::clear_live_vrf_registry_for_tests();
+}
+
+#[test]
+fn live_sites_pre_activation_byte_identical() {
+    let _guard = SERIAL_LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestoreLive::save(&[live_env_key()]);
+    stellereum::consensus::clear_live_vrf_registry_for_tests();
+
+    // Armed env + loaded registry, but the height is pre-activation: the
+    // height gate (not proof presence) decides — legacy bytes.
+    let net = setup_net(4, 0xA3, 10);
+    let active = VrfActivation::FromHeight(ACTIVATION_H);
+    let h_before = ACTIVATION_H - 1;
+    std::env::set_var(live_env_key(), ACTIVATION_H.to_string());
+    stellereum::consensus::set_live_vrf_registry(net.reg.clone());
+
+    let seal_before = seal_for(&net, 0, h_before, ROUND);
+    let set = vote_set_for(&net, h_before, ROUND);
+    let threaded = set
+        .certificate_with_parent_vrf(
+            net.block_hash,
+            &net.vs,
+            Some(&net.parent),
+            &active,
+            Some(&net.reg),
+            Some(seal_before),
+        )
+        .expect("must form");
+    let legacy = set
+        .certificate(net.block_hash, &net.vs, &net.parent)
+        .expect("legacy certificate must form");
+    assert_eq!(threaded, legacy, "H-1 assembly must be struct-identical");
+    let threaded_cert = threaded.pq_micro_certificate().expect("attached");
+    let legacy_cert = legacy.pq_micro_certificate().expect("attached");
+    assert_eq!(threaded_cert.vrf_beacon, None);
+    assert_eq!(
+        encode_pq_micro_envelope(&threaded_cert),
+        encode_pq_micro_envelope(&legacy_cert),
+        "H-1 canonical bytes must be legacy bytes"
+    );
+
+    // The live sites agree on the legacy draw at H-1.
+    assert!(
+        threaded.verify_unified(&net.vs),
+        "live verify must accept the H-1 certificate"
+    );
+    let legacy_committee = derive_sortition_committee(&net.vs, h_before, ROUND, 4, &net.parent);
+    let legacy_set: std::collections::HashSet<[u8; 32]> =
+        legacy_committee.iter().copied().collect();
+    let marker = marker_only_qc_live(&legacy_cert, net.block_hash);
+    assert!(
+        marker.verify_unified(&net.vs),
+        "live pq path must verify legacy at H-1"
+    );
+    assert_eq!(marker.signers_set(&net.vs), legacy_set);
+
+    // Default-off live path (env unset, registry cleared) agrees too.
+    std::env::remove_var(live_env_key());
+    stellereum::consensus::clear_live_vrf_registry_for_tests();
+    assert_eq!(
+        stellereum::vrf::vrf_activation_from_env(),
+        VrfActivation::Disabled
+    );
+    assert!(threaded.verify_unified(&net.vs));
+    assert_eq!(marker.signers_set(&net.vs), legacy_set);
+}
+
+#[test]
+fn live_sites_fallback_matrix_and_forged_refuse() {
+    let _guard = SERIAL_LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = EnvRestoreLive::save(&[live_env_key()]);
+    stellereum::consensus::clear_live_vrf_registry_for_tests();
+
+    let net = setup_net(4, 0xA4, 10);
+    let active = VrfActivation::FromHeight(ACTIVATION_H);
+    let h = ACTIVATION_H;
+    assert!(active.is_active_at(h), "fixture height must be armed");
+    std::env::set_var(live_env_key(), ACTIVATION_H.to_string());
+    stellereum::consensus::set_live_vrf_registry(net.reg.clone());
+
+    let legacy = legacy_qc_at(&net, h, ROUND);
+    let legacy_cert = legacy.pq_micro_certificate().expect("attached");
+    let legacy_committee = derive_sortition_committee(&net.vs, h, ROUND, 4, &net.parent);
+    let legacy_set: std::collections::HashSet<[u8; 32]> =
+        legacy_committee.iter().copied().collect();
+    let base = || {
+        PqMicroCertificate::new(
+            legacy_cert.scheme,
+            legacy_cert.height,
+            legacy_cert.round,
+            legacy_cert.committee_size,
+            legacy_cert.signers_bitmask.clone(),
+            legacy_cert.signatures.clone(),
+            legacy_cert.sortition_parent,
+        )
+    };
+
+    // Unknown-key seal + armed env + loaded registry ⇒ legacy fallback: the
+    // missing key is a rollout gap, not evidence of forgery.
+    let foreign_secret = VrfSecret::from_seed(&[0xEEu8; 32]);
+    let seed_input = sortition_seed(&net.parent, h, ROUND);
+    let foreign_proof = vrf_prove(&foreign_secret, &seed_input);
+    let unknown_seal = VrfBeaconSeal::new([0x99u8; 32], foreign_proof);
+    let with_unknown = base().with_vrf_beacon(unknown_seal);
+    let marker = marker_only_qc_live(&with_unknown, net.block_hash);
+    assert!(
+        marker.verify_unified(&net.vs),
+        "unknown-key seal must fall back to legacy on the live path"
+    );
+    assert_eq!(marker.signers_set(&net.vs), legacy_set);
+
+    // FORGED proof bytes under a KNOWN key ⇒ the whole micro-cert refuses.
+    let seal = seal_for(&net, 0, h, ROUND);
+    let mut bad_proof = seal.proof.clone();
+    bad_proof.proof[7] ^= 0x01;
+    let forged_seal = VrfBeaconSeal::new(net.ids[0], bad_proof);
+    let forged_cert = base().with_vrf_beacon(forged_seal);
+    let marker = marker_only_qc_live(&forged_cert, net.block_hash);
+    assert!(
+        !marker.verify_unified(&net.vs),
+        "forged proof bytes must refuse on the live path"
+    );
+    assert!(
+        marker.signers_set(&net.vs).is_empty(),
+        "forged proof must attribute nobody on the live path"
+    );
+
+    // Substituted `output` (proof verifies, field mismatches) ⇒ refuse too.
+    let mut bad_out = seal.proof.clone();
+    bad_out.output[3] ^= 0x40;
+    let swapped_seal = VrfBeaconSeal::new(net.ids[0], bad_out);
+    let swapped_cert = base().with_vrf_beacon(swapped_seal);
+    let marker = marker_only_qc_live(&swapped_cert, net.block_hash);
+    assert!(
+        !marker.verify_unified(&net.vs),
+        "substituted output must refuse on the live path"
+    );
+    assert!(
+        marker.signers_set(&net.vs).is_empty(),
+        "substituted output must attribute nobody on the live path"
+    );
+
+    // Missing registry (nothing to check against) + armed env + valid seal ⇒
+    // legacy fallback, verifies.
+    stellereum::consensus::clear_live_vrf_registry_for_tests();
+    let with_valid = base().with_vrf_beacon(seal);
+    let marker = marker_only_qc_live(&with_valid, net.block_hash);
+    assert!(
+        marker.verify_unified(&net.vs),
+        "missing registry must fall back to legacy on the live path"
+    );
+    assert_eq!(marker.signers_set(&net.vs), legacy_set);
+}
+

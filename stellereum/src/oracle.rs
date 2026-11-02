@@ -370,6 +370,55 @@ impl OracleState {
         std::mem::replace(&mut self.breaker_tripped, false)
     }
 
+    /// Freshness of the COMMITTED feed for `asset` against the BLOCK
+    /// timestamp (frozen-feed gate, audit BR-OR-03).
+    ///
+    /// `commit_feed` checks freshness at commit time, but a publisher that
+    /// simply stops publishing leaves the last committed price in `feeds`
+    /// indefinitely. A read path that prices orders against that entry without
+    /// re-checking its age trades against a frozen oracle. No committed feed
+    /// for `asset` admits (there is no price to be stale); a future-dated or
+    /// over-age committed feed refuses. Pure: latches nothing, commits
+    /// nothing.
+    pub fn is_feed_fresh_at(&self, asset: &str, block_time: u64) -> Result<(), String> {
+        let feed = self.feeds.get(asset).ok_or_else(|| {
+            format!("no committed price feed for asset '{asset}'")
+        })?;
+        check_freshness(feed.timestamp, block_time).map_err(|e| {
+            format!("frozen oracle feed for {asset}: {e}")
+        })
+    }
+
+    /// Time-aware admission gate: [`OracleState::gate_order`] plus the
+    /// frozen-feed refusal above (audit BR-OR-03).
+    ///
+    /// Additive-only: the legacy `gate_order(pair, price)` keeps its exact
+    /// semantics (no clock, so it cannot age-check) for the wired callers in
+    /// `svm`/`native_api`/`state_engine`. New integrations that have the
+    /// block timestamp MUST prefer this: every committed feed the pair depends
+    /// on (base asset, plus USDT when the pair is quoted in it) must be fresh
+    /// at `block_time`, otherwise the order is refused without latching.
+    /// Assets with no committed feed admit exactly as before.
+    pub fn gate_order_at(
+        &self,
+        pair_id: u32,
+        price_micro_usd: u64,
+        block_time: u64,
+    ) -> Result<(), String> {
+        if self.breaker_tripped {
+            return Err("Circuit breaker is currently active. Trades paused.".to_string());
+        }
+        if pair_quote_asset(pair_id).is_some() && self.feeds.contains_key("USDT") {
+            self.is_feed_fresh_at("USDT", block_time)?;
+        }
+        if let Some(asset) = pair_base_asset(pair_id) {
+            if self.feeds.contains_key(asset) {
+                self.is_feed_fresh_at(asset, block_time)?;
+            }
+        }
+        self.gate_order(pair_id, price_micro_usd)
+    }
+
     /// Priority gate for order admission: breaker latch, USDT peg and price
     /// deviation against the committed price.
     ///
@@ -556,9 +605,21 @@ impl OracleSafetyEngine {
         }
 
         // Tier 1: Try Pull-Oracle
+        //
+        // AUDIT BR-OR-01/BR-OR-02: the feed must name THIS asset and carry a
+        // positive price. Without the asset check a correctly signed feed for
+        // asset B priced asset A (cross-asset confusion: one signed BTC feed
+        // could move — or, via the Tier-3 deviation rule, halt — STELL
+        // trading). Without the price check a zero-price feed from a trusted
+        // publisher was returned verbatim when no TWAP reference existed,
+        // while the commit path (`commit_feed`) refuses zero prices outright.
+        // A feed failing either check is ignored (TWAP fallback), never
+        // chosen: refusing to invent a price is the fail-closed direction.
         let mut chosen_price: Option<u64> = None;
         if let Some(update) = feed {
-            if update.verify()
+            if update.asset == asset
+                && update.price_micro_usd > 0
+                && update.verify()
                 && self.trusted_publishers.contains(&update.publisher_pubkey)
                 // Check freshness (reject if older than 15 minutes / in the future)
                 && check_freshness(update.timestamp, current_time).is_ok()

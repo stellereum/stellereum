@@ -1606,11 +1606,14 @@ pub fn extract_calldata(params: &Value) -> Option<&str> {
 }
 
 /// Extract the 32-byte word after the selector as an EVM address.
-/// Audit B-VM: STRICT — EVM words are exactly 32 bytes (64 hex chars).
-/// Short/trailing/non-hex input returns None (the old code zero-padded
-/// anything, so `"1234"` emulated a balance for `0x000..1234` — wallet
-/// simulation confusion). Callers map None to empty (`"0x"`, as for
-/// unknown selectors).
+/// Audit B-VM: STRICT — EVM words are exactly 32 bytes (64 hex chars) with the
+/// address in the low 20 bytes (12 leading zero bytes). Short/trailing/
+/// non-hex input returns None (the old code zero-padded anything, so `"1234"`
+/// emulated a balance for `0x000..1234` — wallet simulation confusion), and a
+/// word whose top 12 bytes are NONZERO is likewise malformed ABI (not an
+/// address at all): it returns None so callers map it to empty (`"0x"`, as for
+/// unknown selectors) instead of aliasing the embedded low 20 bytes to a
+/// balance that was never addressed.
 pub fn extract_address_from_calldata(rest: &str) -> Option<String> {
     let clean = rest.trim();
     if clean.len() != 64 || !clean.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -1619,7 +1622,7 @@ pub fn extract_address_from_calldata(rest: &str) -> Option<String> {
     if clean[..24].chars().all(|c| c == '0') {
         Some(format!("0x{}", &clean[24..64].to_lowercase()))
     } else {
-        Some(format!("0x{}", &clean[..64].to_lowercase()))
+        None
     }
 }
 

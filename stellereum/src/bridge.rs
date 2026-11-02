@@ -1807,6 +1807,13 @@ impl TonWatcher {
     }
 
     pub fn is_finalized(&self, tx: &TonInboundTx) -> bool {
+        // A transaction anchored ahead of the finalized head is from the
+        // future, not buried: refuse even when `min_confirmations` is 0
+        // (audit BR-OR-04: `saturating_sub` would otherwise report 0
+        // confirmations and a zero-minimum watcher would accept it).
+        if tx.masterchain_seqno > self.finalized_mc_seqno {
+            return false;
+        }
         self.confirmations(tx) >= self.min_confirmations
     }
 
@@ -1814,6 +1821,11 @@ impl TonWatcher {
     pub fn accept(&mut self, tx: &TonInboundTx) -> Result<u64, String> {
         if self.credited.contains(&tx.tx_hash) {
             return Err("Duplicate TON deposit (replay)".to_string());
+        }
+        // Explicit future-head refusal (fail closed regardless of the
+        // configured minimum): depth arithmetic alone cannot see the future.
+        if tx.masterchain_seqno > self.finalized_mc_seqno {
+            return Err("TON deposit references a block beyond the finalized head".to_string());
         }
         if !self.is_finalized(tx) {
             return Err(format!(
@@ -2065,6 +2077,10 @@ impl EvmWatcher {
     }
 
     pub fn is_finalized(&self, event: &EvmDepositEvent) -> bool {
+        // Same future-head rule as `TonWatcher` (audit BR-OR-04).
+        if event.block_number > self.finalized_block {
+            return false;
+        }
         self.confirmations(event) >= self.min_confirmations
     }
 
@@ -2072,6 +2088,10 @@ impl EvmWatcher {
     pub fn accept(&mut self, event: &EvmDepositEvent) -> Result<u64, String> {
         if event.chain != self.chain {
             return Err("EVM chain mismatch".to_string());
+        }
+        // Explicit future-head refusal (fail closed regardless of minimum).
+        if event.block_number > self.finalized_block {
+            return Err("EVM deposit references a block beyond the finalized head".to_string());
         }
         let key = (event.tx_hash, event.log_index);
         if self.credited.contains(&key) {
@@ -2144,6 +2164,17 @@ impl EvmReleaseOrder {
 
     pub fn is_approved(&self, relayer: &MultisigRelayer, now: u64) -> bool {
         if now > self.expires_at {
+            return false;
+        }
+        // Audit BR-OR-05: the signing preimage tags every non-EVM chain as
+        // "UNK", so a Ton order and a Solana order over identical fields share
+        // one signing message (signature transplant across chains). This order
+        // type is EVM-only (Ton has `TonMultisigReleaseOrder`); refuse anything
+        // else fail-closed.
+        if !matches!(
+            self.chain,
+            SupportedChain::Ethereum | SupportedChain::Arbitrum
+        ) {
             return false;
         }
         relayer.count_signers(&self.signing_message(), &self.signatures) >= relayer.threshold

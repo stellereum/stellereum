@@ -2893,24 +2893,25 @@ async fn run_consensus_node(
             }
         }
     }
-    // VRF secret provisioning (phase-3 activation): derive this validator's
-    // VRF seed deterministically from its ed25519 seed —
-    // `vrf_seed = BLAKE3("VRF_SUBSEED_V1" || ed_seed_32)` (see
-    // `stellereum::vrf::derive_vrf_secret_seed`) — and install it via
-    // `with_vrf_secret_seed` below. Deterministic: the same ed seed derives
-    // the same VRF key forever (across restarts, no new secret to
+    // VRF secret provisioning (phase-3 activation): precedence
+    // `STELL_VRF_SECRET_FILE` (0600-checked file) > `STELL_VRF_SECRET`
+    // (inline hex) > derived `BLAKE3("VRF_SUBSEED_V1" || ed_seed_32)` (see
+    // `stellereum::vrf::provision_vrf_secret_seed`) — installed via
+    // `with_vrf_secret_seed` below. Deterministic fallback: the same ed seed
+    // derives the same VRF key forever (across restarts, no new secret to
     // distribute); a distinct keypair from ed (separate scalar derivation);
-    // the same secrecy level (seed-derived, stored alongside the ed key).
-    // Remote-signer deployments hold no local VRF seed: nothing is installed,
-    // so `vrf_beacon_seal_for` returns `None` there (legacy fallback, loud).
-    let validator_ed_seed = key.to_bytes();
-    let provisioned_vrf_seed: Option<[u8; 32]> = if remote_signer.is_some() {
-        None
-    } else {
-        Some(stellereum::vrf::derive_vrf_secret_seed(
-            &validator_ed_seed,
-        ))
-    };
+    // the same secrecy level (seed-derived, stored alongside the ed key,
+    // zeroized after use). Remote-signer deployments hold no local VRF seed:
+    // nothing is installed, so `vrf_beacon_seal_for` returns `None` there
+    // (legacy fallback, loud). An explicit-but-broken source warns loudly
+    // and falls through — never fatal to startup.
+    let validator_ed_seed = zeroize::Zeroizing::new(key.to_bytes());
+    let provisioned_vrf_seed: Option<[u8; 32]> =
+        stellereum::vrf::provision_vrf_secret_seed(if remote_signer.is_some() {
+            None
+        } else {
+            Some(&*validator_ed_seed)
+        });
     let mut rt = ValidatorRuntime::new(key, validators, state.clone(), 1)
         .with_mempool(rpc.mempool.clone())
         // The epoch-seal frames (the DKG contribution, the order commitment
@@ -3087,10 +3088,14 @@ async fn run_consensus_node(
     // load the operator VRF registry into the live verify/attribution path.
     match provisioned_vrf_seed {
         Some(seed) => {
+            // Own the seed in a wiping wrapper (faucet pattern): the copy
+            // installed into the runtime lives there (alongside the ed key);
+            // this binding is wiped on scope exit.
+            let seed = zeroize::Zeroizing::new(seed);
             let vrf_pk = stellereum::vrf::VrfSecret::from_seed(&seed)
                 .public_key()
                 .to_bytes();
-            rt = rt.with_vrf_secret_seed(seed);
+            rt = rt.with_vrf_secret_seed(*seed);
             info!(
                 "[vrf] VRF secret provisioned from validator seed (VRF pubkey {}): operators collect this line from every validator to build STELL_VRF_KEYS",
                 hex::encode(vrf_pk)
@@ -3110,6 +3115,30 @@ async fn run_consensus_node(
             "[vrf] VRF registry loaded: {} key(s) from STELL_VRF_KEYS",
             vrf_registry.len()
         );
+        // Readiness is ADVISORY only: voting power WITHOUT a registry key
+        // stays on the legacy parent-hash draw per certificate — no global
+        // height H is set here (see `vrf_registry_ready_for_power`). Warn
+        // loudly so operators collect the missing VRF pubkeys (every node
+        // logs its own at startup) into STELL_VRF_KEYS.
+        let power_entries: Vec<([u8; 32], u64)> = rt
+            .validators
+            .validators
+            .iter()
+            .map(|(id, power)| (*id, *power))
+            .collect();
+        let (registered_power, total_power) =
+            stellereum::vrf::vrf_registered_power(&vrf_registry, &power_entries);
+        if stellereum::vrf::vrf_registry_ready_for_power(&vrf_registry, &power_entries) {
+            info!(
+                "[vrf] VRF registry readiness: 100% of voting power registered ({total_power}/{total_power})"
+            );
+        } else {
+            tracing::warn!(
+                "[vrf] VRF registry INCOMPLETE: {registered_power}/{total_power} voting power registered — \
+                 unregistered power falls back to the legacy parent-hash draw; collect the missing \
+                 VRF pubkeys (nodes log theirs at startup) into STELL_VRF_KEYS"
+            );
+        }
     }
     stellereum::consensus::set_live_vrf_registry(vrf_registry);
 

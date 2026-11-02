@@ -269,6 +269,212 @@ pub fn vrf_registry_from_env() -> VrfRegistry {
 }
 
 // ============================================================================
+// Secret provisioning (startup seam: file > inline env > derived subseed)
+// ============================================================================
+
+/// Environment variable carrying this validator's VRF secret seed inline
+/// (64-char hex, cleartext in the process environment — prefer
+/// [`VRF_SECRET_FILE_ENV`]).
+pub const VRF_SECRET_ENV: &str = "STELL_VRF_SECRET";
+
+/// Environment variable naming a FILE that carries this validator's VRF
+/// secret seed (hex, first line). The file MUST be owner-only (`0600`) or
+/// loading fails closed for that source (see [`load_vrf_secret_from_file`]).
+pub const VRF_SECRET_FILE_ENV: &str = "STELL_VRF_SECRET_FILE";
+
+/// Parse one VRF secret seed from hex text (trims whitespace, accepts an
+/// optional `0x` prefix). The input buffer is zeroized before returning
+/// (mirrors `parse_faucet_seed_hex` in `rpc.rs`).
+pub fn parse_vrf_secret_hex(raw: &str) -> Result<[u8; 32], String> {
+    let owned = zeroize::Zeroizing::new(raw.trim().to_string());
+    let hex_part: &str = owned.strip_prefix("0x").unwrap_or(owned.as_str()).trim();
+    let mut bytes = zeroize::Zeroizing::new(
+        hex::decode(hex_part).map_err(|e| format!("[vrf] invalid VRF secret hex: {e}"))?,
+    );
+    if bytes.len() != 32 {
+        return Err(format!(
+            "[vrf] invalid VRF secret length: expected 32 bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes);
+    zeroize::Zeroize::zeroize(&mut *bytes);
+    Ok(seed)
+}
+
+/// Load a VRF secret seed from a file: 0600-checked (owner-only, fail-closed
+/// for this source), first non-empty line, hex. File bytes are zeroized
+/// after parsing (mirrors `load_faucet_seed_from_file` in `rpc.rs`).
+pub fn load_vrf_secret_from_file(path: &std::path::Path) -> Result<[u8; 32], String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path).map_err(|e| {
+            format!(
+                "[vrf] cannot stat VRF secret file {}: {e}",
+                path.display()
+            )
+        })?;
+        if !meta.is_file() {
+            return Err(format!(
+                "[vrf] REFUSING: VRF secret path {} is not a file",
+                path.display()
+            ));
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "[vrf] REFUSING: VRF secret file {} has insecure permissions 0o{:03o} \
+                 (group/other must have NO access — chmod 0600 {})",
+                path.display(),
+                mode,
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if !path.is_file() {
+            return Err(format!(
+                "[vrf] REFUSING: VRF secret path {} is not a file",
+                path.display()
+            ));
+        }
+    }
+    let mut raw = zeroize::Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
+        format!(
+            "[vrf] cannot read VRF secret file {}: {e}",
+            path.display()
+        )
+    })?);
+    let line = zeroize::Zeroizing::new(
+        raw.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string(),
+    );
+    zeroize::Zeroize::zeroize(&mut *raw);
+    if line.is_empty() {
+        return Err(format!(
+            "[vrf] REFUSING: VRF secret file {} is empty",
+            path.display()
+        ));
+    }
+    parse_vrf_secret_hex(&line)
+        .map_err(|e| format!("{e} (in {})", path.display()))
+}
+
+/// Resolve this validator's VRF secret seed: the testable core of startup
+/// provisioning (explicit inputs — reads no process environment).
+///
+/// Precedence (first hit wins):
+/// 1. `file_env` (`STELL_VRF_SECRET_FILE` value, a path): 0600-checked file.
+///    A broken file (missing / bad perms / bad hex / empty) warns LOUDLY
+///    (stderr + `tracing`) and falls through — never fatal to startup.
+/// 2. `inline_env` (`STELL_VRF_SECRET` value, hex): bad hex warns loudly and
+///    falls through.
+/// 3. `ed_seed` (the local validator ed25519 seed): derive deterministically
+///    via [`derive_vrf_secret_seed`].
+/// 4. `None` (remote-signer deployments hold no local seed, and no explicit
+///    source was set): `None` + loud warn — the caller keeps the legacy
+///    fallback (`vrf_beacon_seal_for` returns `None`, parent-hash election).
+pub fn resolve_vrf_secret_seed(
+    ed_seed: Option<&[u8; 32]>,
+    file_env: Option<&str>,
+    inline_env: Option<&str>,
+) -> Option<[u8; 32]> {
+    if let Some(path) = file_env.filter(|s| !s.trim().is_empty()) {
+        match load_vrf_secret_from_file(std::path::Path::new(path.trim())) {
+            Ok(seed) => return Some(seed),
+            Err(e) => {
+                eprintln!("{e} (falling through to the next VRF secret source)");
+                tracing::warn!("{e} (falling through to the next VRF secret source)");
+            }
+        }
+    }
+    if let Some(hex_str) = inline_env.filter(|s| !s.trim().is_empty()) {
+        match parse_vrf_secret_hex(hex_str) {
+            Ok(seed) => return Some(seed),
+            Err(e) => {
+                eprintln!("{e} (falling through to the next VRF secret source)");
+                tracing::warn!("{e} (falling through to the next VRF secret source)");
+            }
+        }
+    }
+    match ed_seed {
+        Some(seed) => Some(derive_vrf_secret_seed(seed)),
+        None => {
+            let msg = "[vrf] no local VRF seed provisioned (remote-signer deployment \
+                 with no STELL_VRF_SECRET_FILE/STELL_VRF_SECRET): VRF proofs \
+                 unavailable, legacy parent-hash election on every height";
+            eprintln!("{msg}");
+            tracing::warn!("{msg}");
+            None
+        }
+    }
+}
+
+/// Provision this validator's VRF secret seed from the live process
+/// environment (startup seam — called once from `main.rs`).
+///
+/// Pass `None` for `ed_seed` on remote-signer deployments (no local seed);
+/// otherwise pass the local validator ed25519 seed for the derived fallback.
+/// See [`resolve_vrf_secret_seed`] for the precedence matrix.
+pub fn provision_vrf_secret_seed(ed_seed: Option<&[u8; 32]>) -> Option<[u8; 32]> {
+    let file_val = std::env::var(VRF_SECRET_FILE_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let mut inline_val = std::env::var(VRF_SECRET_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let out = resolve_vrf_secret_seed(ed_seed, file_val.as_deref(), inline_val.as_deref());
+    // The inline hex is secret material: wipe the owned copy (the file value
+    // is only a path — nothing to wipe). Parsing already wiped its buffers.
+    if let Some(mut s) = inline_val.take() {
+        zeroize::Zeroize::zeroize(&mut s);
+    }
+    out
+}
+
+/// Voting-power coverage of the VRF registry: `(registered_power,
+/// total_power)` over `validators` (`(validator_id, power)` pairs).
+///
+/// Only registry-known keys count; zero-power entries contribute nothing.
+/// Saturating: absurd totals clamp instead of wrapping.
+pub fn vrf_registered_power(
+    registry: &VrfRegistry,
+    validators: &[([u8; 32], u64)],
+) -> (u64, u64) {
+    let mut total = 0u64;
+    let mut registered = 0u64;
+    for (id, power) in validators {
+        total = total.saturating_add(*power);
+        if *power > 0 && registry.get(id).is_some() {
+            registered = registered.saturating_add(*power);
+        }
+    }
+    (registered, total)
+}
+
+/// Readiness helper: true when EVERY validator with nonzero voting power has
+/// a key in the registry — i.e. the VRF seed could elect the whole set.
+///
+/// Advisory ONLY (tests and the startup warn path query it): power without a
+/// registry key stays on the legacy parent-hash draw per certificate — no
+/// global height `H` is set here, and this never gates startup. Empty power
+/// (no validators) reads as ready (nothing to cover).
+pub fn vrf_registry_ready_for_power(
+    registry: &VrfRegistry,
+    validators: &[([u8; 32], u64)],
+) -> bool {
+    validators
+        .iter()
+        .all(|(id, power)| *power == 0 || registry.get(id).is_some())
+}
+
+// ============================================================================
 // Keys (live alongside the validator's Falcon key)
 // ============================================================================
 

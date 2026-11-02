@@ -100,12 +100,15 @@
 //! worse than none:
 //!
 //! 1. **It does not check that the validator set was ever legitimately
-//!    elected.** The set is whatever the operator configured. There is no
-//!    staking-ledger audit, no election certificate, no rotation handling —
-//!    `LightClient` has no way to update its set once constructed. If the
-//!    configured set is wrong, or a quorum of it is Byzantine, then everything
-//!    this client concludes is wrong, and it will conclude it confidently. The
-//!    set is the entire trust anchor.
+//!    elected.** The set is whatever the operator configured, plus whatever
+//!    the operator later rotated in (see "Validator-set rotation" below).
+//!    There is no staking-ledger audit and no election certificate: the block
+//!    hash carries no commitment to the NEXT validator set, so a rotation's
+//!    new-set CONTENTS are pinned out-of-band exactly like the genesis set
+//!    (never taken from the server being verified). If the configured set is
+//!    wrong, or a quorum of it is Byzantine, then everything this client
+//!    concludes is wrong, and it will conclude it confidently. The set is the
+//!    entire trust anchor.
 //! 2. **It does not verify the trie's internal node hashing.** Proof
 //!    verification is delegated to the trie — `PatriciaTrie::verify_merkle_proof`
 //!    for the legacy answer shape, `cpat2::verify_proof` /
@@ -1101,6 +1104,71 @@ impl ProofAnswer {
 }
 
 // ============================================================================
+// Validator-set rotation
+// ============================================================================
+
+/// Evidence that the validator set changes at one rotation point.
+///
+/// The chain carries NO set-transition signal in its own types: a block hash
+/// commits to shard/height/parent/state-root/transactions and a handful of
+/// commitments, but NOT to the next validator set (see
+/// `Block::compute_hash`), so there is no in-band "epoch boundary" record for
+/// a light client to read. The rotation point is therefore an ordinary
+/// finalized header — the first header the NEW set is in force for — and the
+/// evidence is its finality proof under the OLD set.
+///
+/// The rotation rule is deliberately narrow and fail-closed:
+///
+/// * the rotation header must chain normally onto the tip (height `tip + 1`,
+///   parent = tip hash, window not full) — a rotation cannot skip, rewind,
+///   or fork the chain it rotates on;
+/// * the rotation header's precommit quorum certificate (and any block
+///   signatures it carries) must verify under the CURRENT (old) validator
+///   set — i.e. a supermajority of OLD power signed the rotation point;
+/// * the replacement set must carry power of its own (non-empty, reachable
+///   quorum), or no certificate could ever verify under it again.
+///
+/// What the rule does and does not prove: the OLD-set quorum authenticates
+/// the rotation POINT (this height, this block hash, this state root) — the
+/// same finality the client demands of every other header. It does NOT
+/// authenticate the new set's CONTENTS, because the chain never commits to
+/// them: the replacement set must be pinned out-of-band (the same file the
+/// operator pinned at genesis, refreshed) or cross-checked across independent
+/// nodes — never taken from the server being verified. A rotation whose QC
+/// fails under the old set, a rotation to a powerless set, and any header
+/// certified only by the superseded set after the rotation are all refused.
+///
+/// New subtype only: no existing wire type changes shape for this. The proof
+/// travels as a [`LightHeader`] (served by `stell_getFinalizedHeader`) plus a
+/// [`ValidatorSet`] (pinned out-of-band, cross-checked against
+/// `stell_getValidators` from independent nodes).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValidatorSetRotation {
+    /// The first header the new set is in force for: chained onto the tip,
+    /// finalized by a quorum of the CURRENT set.
+    pub rotation: LightHeader,
+    /// The set that takes effect AT `rotation.height`.
+    pub next_set: ValidatorSet,
+}
+
+impl ValidatorSetRotation {
+    /// Bundle a rotation point with its successor set. Nothing is verified
+    /// here: verification happens in [`LightClient::rotate_validator_set`],
+    /// which is the only thing that may install the set.
+    pub fn new(rotation: LightHeader, next_set: ValidatorSet) -> Self {
+        Self {
+            rotation,
+            next_set,
+        }
+    }
+
+    /// The height the new set takes effect at (the rotation header's height).
+    pub fn effective_height(&self) -> u64 {
+        self.rotation.height
+    }
+}
+
+// ============================================================================
 // Light client
 // ============================================================================
 
@@ -1109,9 +1177,18 @@ impl ProofAnswer {
 ///
 /// Holds no state, no block bodies and no proof cache. Its whole memory is the
 /// header window, which is capped, so its footprint does not grow with uptime.
+///
+/// The validator set is versioned by height: [`LightClient::set_height`]
+/// names the height the current [`LightClient::validators`] took effect at,
+/// so a verifier can always say which set certified which header. Rotation
+/// (see [`LightClient::rotate_validator_set`]) is the only thing that moves
+/// it.
 #[derive(Clone, Debug)]
 pub struct LightClient {
     pub validators: ValidatorSet,
+    /// Height the current `validators` took effect at: the anchor height at
+    /// construction, the rotation header's height after each rotation.
+    set_height: u64,
     /// What this client is anchored on: the chain's GENESIS (trusted by
     /// construction) or a quorum-certified finalized block.
     pub anchor: LightAnchor,
@@ -1141,8 +1218,10 @@ impl LightClient {
             return Err("light client: header cap must be at least 1".to_string());
         }
         checkpoint.verify(&validators)?;
+        let set_height = checkpoint.height;
         Ok(Self {
             validators,
+            set_height,
             anchor: LightAnchor::Checkpoint(checkpoint),
             headers: VecDeque::new(),
             max_headers,
@@ -1182,8 +1261,10 @@ impl LightClient {
                     .to_string(),
             );
         }
+        let set_height = genesis.height;
         Ok(Self {
             validators,
+            set_height,
             anchor: LightAnchor::Genesis(genesis),
             headers: VecDeque::new(),
             max_headers,
@@ -1504,6 +1585,76 @@ impl LightClient {
 
         self.anchor = LightAnchor::Checkpoint(cp);
         self.headers.clear();
+        Ok(())
+    }
+
+    // ---------- validator-set rotation ----------
+
+    /// Height the current validator set took effect at.
+    ///
+    /// Every header at or above this height was (or will be) verified against
+    /// [`LightClient::validators`]; headers below it were verified against a
+    /// superseded set. A third party replaying the chain from genesis replays
+    /// the same sequence: set changes only move this marker forward, through
+    /// [`LightClient::rotate_validator_set`].
+    pub fn validator_set_height(&self) -> u64 {
+        self.set_height
+    }
+
+    /// Rotate to a successor validator set at a quorum-certified rotation point.
+    ///
+    /// The anchor is `(set, height)`: a header at `h + 1` verifies against the
+    /// set in force at `h + 1`, and the set in force changes only here. The
+    /// `proof.rotation` header must chain normally onto the tip (height
+    /// `tip + 1`, parent = tip hash, window not full) AND carry a precommit
+    /// quorum — plus any block-signature quorum it claims — from the CURRENT
+    /// (old) set: a supermajority of OLD power must have signed the rotation
+    /// point. The rotation header is retained in the window, and from its
+    /// height on the NEW set is the only authority.
+    ///
+    /// Refuses, fail-closed, when:
+    /// * the replacement set has no power (nothing could ever verify under
+    ///   it again — the client would be bricking itself into trust-nothing);
+    /// * the rotation header does not chain onto the tip (gap, rewind, fork,
+    ///   or a full window — same shape gate as [`Self::apply_header`]);
+    /// * the rotation header's finality evidence does not verify under the
+    ///   CURRENT set (forged rotation, or a header certified by some other
+    ///   set — including the NEW set signing its own adoption);
+    /// * the rotation header would roll state back to a superseded root.
+    ///
+    /// After a rotation, headers certified only by the superseded set are
+    /// refused: [`Self::apply_header`] verifies against the NEW set, and the
+    /// shape gate additionally pins every new header to the rotated tip, so a
+    /// stale-set header is either uncertified under the set in force or a
+    /// replay of a height already taken.
+    ///
+    /// TRUST ASSUMPTION (not checked here — see [`ValidatorSetRotation`]): the
+    /// old-set quorum authenticates the rotation POINT, not the replacement
+    /// set's contents. Pass a set you pinned out-of-band, not one the server
+    /// you are verifying handed you.
+    pub fn rotate_validator_set(&mut self, proof: ValidatorSetRotation) -> Result<(), String> {
+        if proof.next_set.quorum_power() == u64::MAX {
+            return Err(
+                "light client: refusing rotation to a validator set with no power; \
+                 no certificate could ever verify under it"
+                    .to_string(),
+            );
+        }
+        // The rotation point is a normal successor header: no gaps, no
+        // rewinds, no forks, bounded window. Runs before any signature work.
+        self.check_header_shape(&proof.rotation)?;
+        // Finality under the CURRENT (old) set. A rotation the old quorum did
+        // not sign is not a rotation — including a header the NEW set signed
+        // for itself, which verifies here only if the old set also backs it.
+        proof
+            .rotation
+            .verify(&self.validators)
+            .map_err(|e| format!("light client: refusing rotation: {e}"))?;
+        self.check_no_rollback(&proof.rotation)?;
+        let effective = proof.rotation.height;
+        self.headers.push_back(proof.rotation);
+        self.validators = proof.next_set;
+        self.set_height = effective;
         Ok(())
     }
 

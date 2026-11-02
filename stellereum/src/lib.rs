@@ -26,6 +26,9 @@ pub mod metrics;
 pub mod mev;
 pub mod mev_epoch;
 pub mod mev_v4;
+// GATE: sandbox prototype — test builds only, never production surface.
+#[cfg(test)]
+mod mev_pq_plan;
 pub mod mmr;
 pub mod native_api;
 pub mod network;

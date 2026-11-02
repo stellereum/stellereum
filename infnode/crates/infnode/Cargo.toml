@@ -33,3 +33,4 @@ x25519-dalek = { workspace = true }
 x509-parser = { workspace = true }
 zeroize = { workspace = true }
 reed-solomon-erasure = { version = "6.0.0", default-features = false }
+ml-kem = "0.3"

@@ -2,6 +2,36 @@
 //! Selective confidentiality using curve25519-dalek.
 //! Allows hiding order/transfer amounts, single-use stealth addresses,
 //! viewing audit keys for compliance/fund management, and homomorphic balance verification.
+//!
+//! PQ ENFORCEMENT (live-path gate — this module is NOT experimental):
+//! Ristretto is classical group crypto (Shor-breakable). Inventory:
+//! `docs/CLASSICAL_INVENTORY.md` row 82 (HOLE: no pure-PQ gate before this
+//! change). Live callers (prove live, not dead): `svm.rs`
+//! `SysCallConfidentialTransfer2`/`Shield`/`Unshield` handlers,
+//! `state_engine.rs` shielded state + parallel preverify,
+//! `commitment.rs` confidential domain, `mempool.rs` proof-unit accounting,
+//! `native_api.rs` shield/stealth builders, `wallet.rs` stealth fields,
+//! `sharding.rs:3497` stealth-sig fallback. Gating this module breaks
+//! shielded transfers in pure-PQ mode BY DESIGN (they revert fail-closed).
+//! When `crate::post_quantum::is_pure_pq_enforced()` (`STELL_PURE_PQ=1` /
+//! `--pure-pq`) every fallible Ristretto verifier/applier below refuses
+//! fail-closed (`false` / `None` / `Err(PurePqRefused)` / all-`false` batch)
+//! with NO silent fallback to classical. Default behavior (gate off) is
+//! byte-identical: existing privacy tests pin it unmodified.
+//! Infallible constructors/provers (`commit`, `RangeProof::prove`,
+//! `sign_one_time`, key generators) keep their signatures for stability and
+//! stay usable offline; chain safety comes from verifier refusal, mirroring
+//! the consensus dual-stack precedent (sign side allowed, verify side gated).
+//!
+//! PQ MIGRATION PATH (reference only — NOT implemented here):
+//! replace Pedersen `v*G + r*H` with a hash-based commitment (e.g.
+//! SHA-256/BLAKE3/SHAKE `C = Hash(value || blinding || domain)`, Grover-only
+//! so still fine) with hash-opening proofs instead of discrete-log range
+//! proofs, and replace the Ristretto Schnorr stealth auth with Falcon-512
+//! signatures via `crate::post_quantum` (the PQ signer already used for votes
+//! and faucet drips). Stealth-address DH (`r*ViewPub`) needs a PQ KEM
+//! (ML-KEM — none wired in-tree yet). See `docs/CLASSICAL_INVENTORY.md`
+//! Phase-3 item 12 and `docs/program/CLASSICAL_REMOVAL_PHASE23.md`.
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -15,6 +45,24 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+
+/// Pure-PQ refusal flag for this module: true exactly when
+/// `crate::post_quantum::is_pure_pq_enforced()` holds (`STELL_PURE_PQ=1` /
+/// `--pure-pq`, thread-local override under `cfg(test)`).
+/// Every fallible Ristretto op below consults this and refuses fail-closed.
+pub fn privacy_pq_refused() -> bool {
+    crate::post_quantum::is_pure_pq_enforced()
+}
+
+/// Fail-closed guard for `Result<_, ConfidentialError>` entry points.
+/// No secret material is touched or reported: the refusal carries no
+/// commitment bytes, blindings, or keys.
+fn ensure_classical_allowed() -> Result<(), ConfidentialError> {
+    if privacy_pq_refused() {
+        return Err(ConfidentialError::PurePqRefused);
+    }
+    Ok(())
+}
 
 // §9 batched Ristretto verification (IMPLEMENTED — MSM throughput layer).
 //
@@ -83,8 +131,13 @@ impl PedersenCommitment {
         Scalar::random(&mut rng)
     }
 
-    /// Verify opening of commitment
+    /// Verify opening of commitment.
+    ///
+    /// Pure-PQ: refuses (`false`) when [`privacy_pq_refused`].
     pub fn verify(&self, value: u64, blinding: &Scalar) -> bool {
+        if privacy_pq_refused() {
+            return false;
+        }
         let expected = Self::commit(value, blinding);
         self.commitment == expected.commitment
     }
@@ -102,12 +155,23 @@ impl PedersenCommitment {
     /// rather than bit-identical to the scalar reference. The MSM wins live
     /// in the weighted sums (`BitProof` t-pairs, `2^i*C_i` reconstruction),
     /// not here. Measured: no gap here, so no cleverness here.
+    ///
+    /// Pure-PQ: all-`false` when [`privacy_pq_refused`] (inherited from
+    /// `verify`, made explicit so the batch cannot verify while scalar cannot).
     pub fn batch_verify(openings: &[(PedersenCommitment, u64, Scalar)]) -> Vec<bool> {
+        if privacy_pq_refused() {
+            return vec![false; openings.len()];
+        }
         openings.iter().map(|(c, v, r)| c.verify(*v, r)).collect()
     }
 
-    /// Add two commitments homomorphically: C1 + C2 = Commit(v1 + v2, r1 + r2)
+    /// Add two commitments homomorphically: C1 + C2 = Commit(v1 + v2, r1 + r2).
+    ///
+    /// Pure-PQ: `None` when [`privacy_pq_refused`].
     pub fn add(&self, other: &Self) -> Option<Self> {
+        if privacy_pq_refused() {
+            return None;
+        }
         let p1 = CompressedRistretto(self.commitment).decompress()?;
         let p2 = CompressedRistretto(other.commitment).decompress()?;
         let sum = p1 + p2;
@@ -116,8 +180,13 @@ impl PedersenCommitment {
         })
     }
 
-    /// Subtract two commitments homomorphically: C1 - C2
+    /// Subtract two commitments homomorphically: C1 - C2.
+    ///
+    /// Pure-PQ: `None` when [`privacy_pq_refused`].
     pub fn sub(&self, other: &Self) -> Option<Self> {
+        if privacy_pq_refused() {
+            return None;
+        }
         let p1 = CompressedRistretto(self.commitment).decompress()?;
         let p2 = CompressedRistretto(other.commitment).decompress()?;
         let diff = p1 - p2;
@@ -137,8 +206,13 @@ pub struct StealthAddress {
 }
 
 impl StealthAddress {
-    /// Sender generates stealth address using recipient's view pubkey and spend pubkey
+    /// Sender generates stealth address using recipient's view pubkey and spend pubkey.
+    ///
+    /// Pure-PQ: `None` when [`privacy_pq_refused`] (ECDH over Ristretto).
     pub fn generate(recipient_view_pub: &[u8; 32], recipient_spend_pub: &[u8; 32]) -> Option<Self> {
+        if privacy_pq_refused() {
+            return None;
+        }
         let view_pt = CompressedRistretto(*recipient_view_pub).decompress()?;
         let spend_pt = CompressedRistretto(*recipient_spend_pub).decompress()?;
 
@@ -162,8 +236,13 @@ impl StealthAddress {
         })
     }
 
-    /// Recipient checks if the stealth address belongs to them using view private key
+    /// Recipient checks if the stealth address belongs to them using view private key.
+    ///
+    /// Pure-PQ: `None` when [`privacy_pq_refused`].
     pub fn is_for_recipient(&self, view_priv: &Scalar, spend_pub: &[u8; 32]) -> Option<bool> {
+        if privacy_pq_refused() {
+            return None;
+        }
         let ephem_pt = CompressedRistretto(self.ephemeral_pub).decompress()?;
         let spend_pt = CompressedRistretto(*spend_pub).decompress()?;
 
@@ -187,11 +266,16 @@ impl StealthAddress {
     /// key received a perfectly usable private key — for a DIFFERENT address
     /// than the one it believes it is spending from, i.e. funds that go to an
     /// address nobody controls. A mismatch now yields `None`.
+    ///
+    /// Pure-PQ: `None` when [`privacy_pq_refused`].
     pub fn derive_one_time_private_key(
         &self,
         view_priv: &Scalar,
         spend_priv: &Scalar,
     ) -> Option<Scalar> {
+        if privacy_pq_refused() {
+            return None;
+        }
         let ephem_pt = CompressedRistretto(self.ephemeral_pub).decompress()?;
         let shared_secret = ephem_pt * view_priv;
         let s_hash = Sha256::digest(shared_secret.compress().as_bytes());
@@ -239,11 +323,16 @@ impl StealthAddress {
     }
 
     /// Verify a Schnorr signature against a one-time public key.
+    ///
+    /// Pure-PQ: `false` when [`privacy_pq_refused`] (Ristretto Schnorr).
     pub fn verify_one_time_signature(
         one_time_pub: &[u8; 32],
         message: &[u8],
         signature: &[u8],
     ) -> bool {
+        if privacy_pq_refused() {
+            return false;
+        }
         if signature.len() != 64 {
             return false;
         }
@@ -383,27 +472,45 @@ impl ViewingKey {
     }
 
     /// Check if a stealth address belongs to this viewing key given recipient's spend pubkey.
+    ///
+    /// Pure-PQ: `None` when [`privacy_pq_refused`].
     pub fn is_for_recipient(&self, stealth: &StealthAddress, spend_pub: &[u8; 32]) -> Option<bool> {
+        if privacy_pq_refused() {
+            return None;
+        }
         let view_priv = self.private_scalar();
         stealth.is_for_recipient(&view_priv, spend_pub)
     }
 
     /// Derive one-time private key using this viewing key and recipient's spend private key.
+    ///
+    /// Pure-PQ: `None` when [`privacy_pq_refused`].
     pub fn derive_one_time_private_key(
         &self,
         stealth: &StealthAddress,
         spend_priv: &Scalar,
     ) -> Option<Scalar> {
+        if privacy_pq_refused() {
+            return None;
+        }
         let view_priv = self.private_scalar();
         stealth.derive_one_time_private_key(&view_priv, spend_priv)
     }
 
-    /// Encrypt amount and blinding factor for an auditor holding `view_pub`
+    /// Encrypt amount and blinding factor for an auditor holding `view_pub`.
+    ///
+    /// Pure-PQ: `Err` (static refusal, no secret material) when
+    /// [`privacy_pq_refused`] — the ECDH runs over Ristretto.
     pub fn encrypt_amount_for_auditor(
         view_pub_bytes: &[u8; 32],
         value: u64,
         blinding: &Scalar,
     ) -> Result<EncryptedViewingPayload, String> {
+        if privacy_pq_refused() {
+            return Err(
+                "Ristretto privacy refused under STELL_PURE_PQ=1 (pure-PQ mode)".to_string(),
+            );
+        }
         let view_pt = CompressedRistretto(*view_pub_bytes)
             .decompress()
             .ok_or_else(|| "Invalid view pubkey".to_string())?;
@@ -436,11 +543,19 @@ impl ViewingKey {
         })
     }
 
-    /// Auditor decrypts value and blinding factor using their viewing key
+    /// Auditor decrypts value and blinding factor using their viewing key.
+    ///
+    /// Pure-PQ: `Err` (static refusal, no secret material) when
+    /// [`privacy_pq_refused`].
     pub fn decrypt_amount(
         &self,
         payload: &EncryptedViewingPayload,
     ) -> Result<(u64, Scalar), String> {
+        if privacy_pq_refused() {
+            return Err(
+                "Ristretto privacy refused under STELL_PURE_PQ=1 (pure-PQ mode)".to_string(),
+            );
+        }
         let ephem_pt = CompressedRistretto(payload.ephemeral_pub)
             .decompress()
             .ok_or_else(|| "Invalid ephemeral pubkey".to_string())?;
@@ -517,8 +632,13 @@ impl ConfidentialTransfer {
         }
     }
 
-    /// Verify homomorphic conservation of value: sum(C_in) - sum(C_out) == fee * G
+    /// Verify homomorphic conservation of value: sum(C_in) - sum(C_out) == fee * G.
+    ///
+    /// Pure-PQ: `false` when [`privacy_pq_refused`].
     pub fn verify_balance_conservation(&self) -> bool {
+        if privacy_pq_refused() {
+            return false;
+        }
         if self.input_commitments.is_empty() || self.output_commitments.is_empty() {
             return false;
         }
@@ -571,6 +691,9 @@ impl ConfidentialTransfer {
         input_ranges: &[RangeProof],
         output_ranges: &[RangeProof],
     ) -> bool {
+        if privacy_pq_refused() {
+            return false;
+        }
         if !self.verify_balance_conservation() {
             return false;
         }
@@ -608,6 +731,7 @@ impl ConfidentialTransfer {
         input_ranges: &[RangeProof],
         output_ranges: &[RangeProof],
     ) -> Result<(), ConfidentialError> {
+        ensure_classical_allowed()?;
         if input_ranges.len() != self.input_commitments.len()
             || output_ranges.len() != self.output_commitments.len()
         {
@@ -794,6 +918,9 @@ impl BitProof {
     }
 
     pub fn verify(commitment: &PedersenCommitment, proof: &BitProof) -> bool {
+        if privacy_pq_refused() {
+            return false;
+        }
         let c = match CompressedRistretto(commitment.commitment).decompress() {
             Some(p) => p,
             None => return false,
@@ -824,7 +951,12 @@ impl BitProof {
     /// Scalar reference twin of [`Self::verify`]: the original two-muls-per-t
     /// formulation, kept verbatim as the consensus fallback and the
     /// differential-test oracle. Always agrees with `verify` bit-for-bit.
+    ///
+    /// Pure-PQ: `false` when [`privacy_pq_refused`].
     pub fn verify_scalar(commitment: &PedersenCommitment, proof: &BitProof) -> bool {
+        if privacy_pq_refused() {
+            return false;
+        }
         let c = match CompressedRistretto(commitment.commitment).decompress() {
             Some(p) => p,
             None => return false,
@@ -937,6 +1069,9 @@ impl RangeProof {
     }
 
     pub fn verify(commitment: &PedersenCommitment, proof: &RangeProof) -> bool {
+        if privacy_pq_refused() {
+            return false;
+        }
         if proof.bits == 0 || proof.bits > 64 {
             return false;
         }
@@ -965,7 +1100,12 @@ impl RangeProof {
     /// cores via rayon with an order-preserving collect — deterministic
     /// bit-identically on every node. Below the threshold the scalar loop
     /// wins (pool round-trip dominates microsecond verifies).
+    ///
+    /// Pure-PQ: all-`false` when [`privacy_pq_refused`].
     pub fn batch_verify(pairs: &[(&PedersenCommitment, &RangeProof)]) -> Vec<bool> {
+        if privacy_pq_refused() {
+            return vec![false; pairs.len()];
+        }
         const PAR_VERIFY_MIN_PAIRS: usize = 4;
         if pairs.len() >= PAR_VERIFY_MIN_PAIRS {
             use rayon::prelude::*;
@@ -1069,7 +1209,12 @@ impl ConfidentialTransfer {
     /// terms (measured; see the §9 note). A random linear combination across
     /// transfers could share one MSM but would make the result probabilistic,
     /// which the consensus rule forbids. Thin batch API, honestly ~1x.
+    ///
+    /// Pure-PQ: all-`false` when [`privacy_pq_refused`].
     pub fn batch_verify_balance_conservation(transfers: &[ConfidentialTransfer]) -> Vec<bool> {
+        if privacy_pq_refused() {
+            return vec![false; transfers.len()];
+        }
         transfers
             .iter()
             .map(ConfidentialTransfer::verify_balance_conservation)
@@ -1090,9 +1235,14 @@ impl ConfidentialTransfer {
     /// node. Below the threshold the sequential loop wins (the pool
     /// round-trip dominates microsecond verifies). This is the primitive the
     /// block-path range-proof pre-pass is built on.
+    ///
+    /// Pure-PQ: all-`false` when [`privacy_pq_refused`].
     pub fn batch_verify_balanced_with_ranges(
         bundles: &[(&ConfidentialTransfer, &[RangeProof], &[RangeProof])],
     ) -> Vec<bool> {
+        if privacy_pq_refused() {
+            return vec![false; bundles.len()];
+        }
         const PAR_BALANCED_VERIFY_MIN_BUNDLES: usize = 4;
         if bundles.len() >= PAR_BALANCED_VERIFY_MIN_BUNDLES {
             use rayon::prelude::*;
@@ -1158,6 +1308,12 @@ pub enum ConfidentialError {
     /// [0, 2^bits) and may encode a negative/wrapped value. Carries the
     /// commitment bytes whose proof failed.
     InvalidRangeProof([u8; 32]),
+    /// Pure-PQ enforcement refused a classical Ristretto op: the chain runs
+    /// with `STELL_PURE_PQ=1` / `--pure-pq` and shielded (Ristretto) crypto
+    /// is Shor-breakable. No fallback was attempted; resubmit on a PQ path
+    /// once the hash-commitment + Falcon migration lands (see module header).
+    /// Carries no secret material by construction (unit variant).
+    PurePqRefused,
 }
 
 impl std::fmt::Display for ConfidentialError {
@@ -1208,6 +1364,12 @@ impl std::fmt::Display for ConfidentialError {
                     "range proof failed: commitment {} not proven in [0, 2^bits) \
                      (possible negative/wrapped value)",
                     hex::encode(c)
+                )
+            }
+            ConfidentialError::PurePqRefused => {
+                write!(
+                    f,
+                    "Ristretto privacy refused under STELL_PURE_PQ=1 (pure-PQ mode)"
                 )
             }
         }
@@ -1332,6 +1494,7 @@ impl ConfidentialState {
         recipient: &[u8; 32],
         tx: &ConfidentialTransfer,
     ) -> Result<(), ConfidentialError> {
+        ensure_classical_allowed()?;
         if tx.input_commitments.is_empty() || tx.output_commitments.is_empty() {
             return Err(ConfidentialError::EmptyTransfer);
         }
@@ -1420,6 +1583,7 @@ impl ConfidentialState {
         input_ranges: &[RangeProof],
         output_ranges: &[RangeProof],
     ) -> Result<(), ConfidentialError> {
+        ensure_classical_allowed()?;
         if tx.input_commitments.is_empty() || tx.output_commitments.is_empty() {
             return Err(ConfidentialError::EmptyTransfer);
         }
@@ -1505,7 +1669,12 @@ impl ConfidentialState {
     /// `commit(amount, blinding) == commitment`. The exact check behind both
     /// shield entry and unshield exit (no range proof can bind a VALUE —
     /// only an opening can).
+    ///
+    /// Pure-PQ: `false` when [`privacy_pq_refused`].
     pub fn verify_opening(commitment: &[u8; 32], amount: u64, blinding: &[u8; 32]) -> bool {
+        if privacy_pq_refused() {
+            return false;
+        }
         let b = match Scalar::from_canonical_bytes(*blinding).into_option() {
             Some(b) => b,
             None => return false,
@@ -1529,6 +1698,7 @@ impl ConfidentialState {
         sender: &[u8; 32],
         inputs: &[UnshieldInput],
     ) -> Result<u64, ConfidentialError> {
+        ensure_classical_allowed()?;
         if inputs.is_empty() {
             return Err(ConfidentialError::EmptyTransfer);
         }

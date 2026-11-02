@@ -2515,6 +2515,7 @@ dependencies = [
  "infnode",
  "k256",
  "lazy_static",
+ "ml-kem",
  "pqcrypto-falcon",
  "rand 0.8.8",
  "rayon",

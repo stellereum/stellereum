@@ -499,3 +499,40 @@ What remains for flag-day (NOT done here):
    100%-power binding readiness has no on-chain/RPC meter (`H_vrf` must not
    be set until every voting-power key is registry-known, else unknown-key
    seals fall back to the grindable parent-hash draw).
+
+## 11. BLS is classical — LEGACY-ONLY in a FULL-PQ chain
+
+Quantum status: BLS12-381 is CLASSICAL crypto. Its security rests on the
+discrete-log problem in the G1/G2 pairing groups (and GT), which Shor's
+algorithm breaks on a cryptographically relevant quantum computer. A quantum
+adversary forges arbitrary BLS signatures and quorum aggregates. BLS is
+therefore in the same class as the retired ECVRF: usable only as a legacy,
+non-PQ optimization — never as post-quantum quorum evidence. Pinned in code
+by `BLS_IS_POST_QUANTUM: bool = false` (`stellereum/src/bls.rs`), asserted by
+`bls_is_marked_classical_not_post_quantum` (unit) and
+`bls_is_marked_not_post_quantum` (`stellereum/tests/bls_classical_tests.rs`).
+
+Policy: consensus MUST NOT count BLS aggregate QCs on the PQ path. Today the
+live `QuorumCertificate` BLS envelope is inert metadata by default —
+`STELL_BLS_QC=1` is hard-refused at startup
+(`refuse_bls_qc_if_enabled`, `stellereum/src/bls.rs:515-534`, called from
+`Commands::Run`), and `bls_envelope_verified_signers`
+(`stellereum/src/consensus.rs:3393-3438`) returns `None` unless the flag is
+explicitly enabled, so default verification falls through to the Ed25519
+baseline (and to `false` under pure-PQ enforcement, which rejects classical
+paths before BLS is even consulted). Pinned by
+`default_startup_still_refuses_bls_qc_counting`
+(`stellereum/tests/bls_classical_tests.rs`).
+
+What any future non-PQ use would need (explicit opt-in, never default):
+
+1. An explicit non-PQ opt-in mechanism decided by the LEAD — not invented
+   here. No new env knob, no height auto-arming, and no silent
+   fallback-to-counting was added; the marker exists precisely so the future
+   gate can branch on `BLS_IS_POST_QUANTUM == false` (checked, not assumed).
+2. The rogue-key precondition stays: counting BLS power is unsound on the
+   bare `<ed> <bls>` registry and requires PoP-verified admission
+   (`parse_registry_entries_strict_pop` / `BlsRegistry`) first.
+3. The default path must remain byte-identical Ed25519 (pure-PQ enforcement
+   must keep rejecting the BLS path), with any non-PQ mode confined behind
+   the lead-defined opt-in.

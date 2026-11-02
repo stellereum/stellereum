@@ -32,6 +32,31 @@
 //! start on existing data directories. [`HybridCertificate`] and
 //! [`is_bls_active`] model the transition: Ed25519 below the activation height,
 //! BLS aggregate at or above it.
+//!
+//! # BLS12-381 is CLASSICAL (quantum-breakable) — LEGACY-ONLY in this architecture
+//!
+//! This chain is FULL post-quantum. BLS12-381 pairings are CLASSICAL crypto:
+//! a cryptographically relevant quantum computer running Shor's algorithm
+//! breaks the discrete-log problem in G1/G2/GT, forging arbitrary BLS
+//! signatures and quorum aggregates. This is the same class of problem as the
+//! retired ECVRF — never a PQ primitive, never a PQ fallback.
+//!
+//! PQ POLICY (stated in code so it can be enforced programmatically via
+//! [`BLS_IS_POST_QUANTUM`]):
+//!
+//! * Consensus MUST NOT count BLS aggregate QCs on the PQ path. The live
+//!   `QuorumCertificate` BLS envelope is inert metadata by default: counting
+//!   BLS power (`STELL_BLS_QC=1`) is hard-refused at startup by
+//!   [`refuse_bls_qc_if_enabled`], and [`bls_envelope_verified_signers`] (in
+//!   `consensus.rs`, outside this module) returns `None` unless the flag is
+//!   explicitly enabled, so the default verify path falls through to the
+//!   Ed25519 baseline.
+//! * Any future activation of BLS counting is a NON-PQ, LEGACY-ONLY mode. It
+//!   requires an explicit non-PQ opt-in whose mechanism is a LEAD DECISION —
+//!   this module deliberately does NOT invent the opt-in mechanism (no new env
+//!   knob, no height auto-arming, no silent fallback-to-counting). When the
+//!   lead defines it, gate it on [`BLS_IS_POST_QUANTUM`] being `false` so the
+//!   non-PQ nature of the path is checked, not assumed.
 
 use bls12_381::hash_to_curve::{ExpandMsgXmd, HashToCurve};
 use bls12_381::{pairing, G1Affine, G1Projective, G2Affine, G2Projective, Scalar};
@@ -47,6 +72,12 @@ const DST: &[u8] = b"STELL_BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_";
 pub const PUBLIC_KEY_LEN: usize = 48;
 /// Compressed G2 point, the signature size.
 pub const SIGNATURE_LEN: usize = 96;
+
+/// Quantum-status marker: BLS12-381 is CLASSICAL (pairing-based, broken by
+/// Shor), NOT post-quantum. Pinned `false` by tests; any future non-PQ opt-in
+/// mechanism (a lead decision, not defined here) must branch on this marker
+/// so the classical nature of the path is enforced programmatically.
+pub const BLS_IS_POST_QUANTUM: bool = false;
 
 /// Default height at which BLS aggregation is activated in consensus.
 pub const DEFAULT_BLS_ACTIVATION_HEIGHT: u64 = 10_000;
@@ -1500,6 +1531,18 @@ mod internal_tests {
         // Migration counters move exactly once per entry.
         let (v, l, r) = bls_registry_migration_counts();
         assert!(v >= 1 && l >= 1 && r >= 1, "counters must meter each class");
+    }
+
+    /// PQ-policy marker: BLS12-381 is CLASSICAL, never post-quantum. Pinned so
+    /// any future activation wiring must branch on `BLS_IS_POST_QUANTUM`.
+    #[test]
+    fn bls_is_marked_classical_not_post_quantum() {
+        // GATE: pins the classical marker at RUNTIME (black_box defeats the
+        // const-fold; the test must fail loudly if the marker is flipped).
+        assert!(
+            !std::hint::black_box(BLS_IS_POST_QUANTUM),
+            "BLS12-381 pairings are Shor-breakable: the marker must stay false"
+        );
     }
 
     /// Phase-2 readiness export: every parse event must move BOTH the

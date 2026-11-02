@@ -5144,7 +5144,11 @@ impl ValidatorRuntime {
             let ok = match cached {
                 Some(v) => v,
                 None => {
-                    let v = Transaction::verify_signatures_batch(&block.transactions);
+                    // PERF_PROFILE §6.2: parallel intake batch — byte-identical
+                    // verdict to the serial batch (par_chunks().all(serial);
+                    // small blocks take the serial path verbatim).
+                    let v =
+                        Transaction::verify_signatures_batch_parallel(&block.transactions);
                     if let Ok(mut g) = self.batch_verify_cache.lock() {
                         if g.len() > 1024 {
                             g.clear();
@@ -5316,7 +5320,9 @@ impl ValidatorRuntime {
             .lock()
             .ok()
             .and_then(|g| g.get(&Self::batch_verify_cache_key(block)).copied())
-            .unwrap_or_else(|| Transaction::verify_signatures_batch(&block.transactions));
+            .unwrap_or_else(|| {
+                Transaction::verify_signatures_batch_parallel(&block.transactions)
+            });
         stages.push(("tx_batch_verify".into(), t.elapsed().as_millis() as u64));
         let t = std::time::Instant::now();
         {
@@ -7775,7 +7781,9 @@ impl ValidatorRuntime {
                 hex::encode(root_before)
             ));
         }
-        if !crate::sharding::Transaction::verify_signatures_batch(&block.transactions) {
+        // PERF_PROFILE §6.2: parallel intake batch — byte-identical verdict
+        // to the serial batch (see sharding.rs: same primitive apply uses).
+        if !crate::sharding::Transaction::verify_signatures_batch_parallel(&block.transactions) {
             return Err("committed block contains a bad transaction signature".to_string());
         }
         // Actor-mailbox cap (adopt side): the same deterministic refusal as

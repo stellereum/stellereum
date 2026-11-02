@@ -403,3 +403,54 @@ fn tempo_batch_verify_20tx() {
     println!("[tempo][validate] batch_verify_20tx={} ok={ok} ({:.3} ms/tx)", medal_ms(ms), ms / 20.0);
     assert!(ok);
 }
+
+/// Block-scale intake-verify probe (PERF_PROFILE §6.2): the proposal-intake
+/// path batch-verifies every foreign block's signatures. Fixed fixtures of
+/// N plain transfers from N DISTINCT senders (the live block shape, not the
+/// single-sender 20tx probe above); reports SERIAL
+/// (`verify_signatures_batch`, the intake path before the §6.2 change) vs
+/// PARALLEL (`verify_signatures_batch_parallel`, the §6.2 live path) wall ms
+/// and ns/op side by side. REPORTS, not gates: correctness asserts only
+/// (both verdicts true) — a slow machine must still be green.
+fn intake_verify_fixture(n: usize, key_base: u64) -> Vec<Transaction> {
+    let to = [0x11u8; 32];
+    (0..n as u64)
+        .map(|i| {
+            let mut seed = [0xA5u8; 32];
+            seed[..8].copy_from_slice(&(key_base + i).to_le_bytes());
+            let sk = SigningKey::from_bytes(&seed);
+            Transaction::sign(&sk, to, 1_000, 21_000, 0, 0, 0)
+        })
+        .collect()
+}
+
+fn intake_verify_serial_vs_parallel_row(n: usize, key_base: u64) {
+    let txs = intake_verify_fixture(n, key_base);
+    assert!(Transaction::verify_signatures_batch(&txs));
+    assert!(Transaction::verify_signatures_batch_parallel(&txs));
+    let repeats = if n >= 1000 { 5 } else { 10 };
+    let serial_ms = median_ms(repeats, 2, || {
+        assert!(Transaction::verify_signatures_batch(&txs));
+    });
+    let parallel_ms = median_ms(repeats, 2, || {
+        assert!(Transaction::verify_signatures_batch_parallel(&txs));
+    });
+    let serial_ns_per_op = serial_ms * 1e6 / n as f64;
+    let parallel_ns_per_op = parallel_ms * 1e6 / n as f64;
+    println!(
+        "[tempo][validate][intake_verify] n={n} serial={} ({serial_ns_per_op:.0} ns/op) parallel={} ({parallel_ns_per_op:.0} ns/op) speedup={:.2}x",
+        medal_ms(serial_ms),
+        medal_ms(parallel_ms),
+        serial_ms / parallel_ms.max(1e-9),
+    );
+}
+
+#[test]
+fn tempo_batch_verify_blockscale_428() {
+    intake_verify_serial_vs_parallel_row(428, 500_000);
+}
+
+#[test]
+fn tempo_batch_verify_blockscale_1000() {
+    intake_verify_serial_vs_parallel_row(1_000, 600_000);
+}

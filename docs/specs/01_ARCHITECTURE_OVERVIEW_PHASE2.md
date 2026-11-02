@@ -88,5 +88,65 @@ Pinned deps (consensus-relevant): `ed25519-dalek v2` (`stellereum/Cargo.toml:13`
    verdict classical-until-ML-KEM-vendored `pq_transport.rs:60-70`, TLS X25519
    flagged classical in inventory).
 - `cn_vrf.rs:1-4` is sandbox-only: pure functions + KATs, no consensus call
-   site (zero `cn_vrf::` callers outside `cn_vrf.rs` by grep; header
-   `cn_vrf.rs:1-4`).
+  site (zero `cn_vrf::` callers outside `cn_vrf.rs` by grep; header
+  `cn_vrf.rs:1-4`).
+
+## 5. Light CLI commands (code truth)
+
+- Subcommands (`main.rs:6751-6817`): `LightClient` (`:6751`, opts
+  `from`/`verify`/`validators`/`wait_seconds=30`/`verbose` — out-of-band set
+  REQUIRED, fail-closed), `LightAnchor` (`:6775`, re-verifies checkpoint
+  precommit quorum under set), `LightVerify` (`:6790`, LightHeader-as-successor
+  or Checkpoint-as-newer-anchor), `LightRotate` (`:6805`, parses
+  `ValidatorSetRotation`, rule enforced by
+  `LightClient::rotate_validator_set`).
+- Runners (`light_client_cli.rs`): `LightClientOptions` (`:58-68`),
+  `run` (`:318`, fetch `height+1` anchoring header, quorum-check, Merkle-proof
+  verify), `validator_set_digest` (`:438`, what `light-anchor` prints as set
+  hash), `anchor_show` (`:524`), `verify_header_file` (`:556`),
+  `rotate_anchor` (`:599`); loaders `load_validator_set` (`:181`),
+  `load_checkpoint_file` (`:452`), `load_light_header_file` (`:463`),
+  `load_rotation_proof_file` (`:481`). Trust model: root NEVER from server
+  (`light_client_cli.rs:11-50`, `LIGHT_CLIENT_VERIFY.md §3`); node-side anchor
+  at genesis (`main.rs:2976-2992`), sync-path re-anchor
+  (`:1924-1942,:2345-2432`).
+
+## 6. Explorer + WS caps (code truth)
+
+- Explorer: `RateLimiter::new(per_sec)` (`explorer.rs:47`),
+  `DEFAULT_RATE_LIMIT_PER_SEC 30` (`:29`, via `default_rate_limit_per_sec`
+  `:32`); `MAX_FINALS_LIMIT 100` (`:960`), `DEFAULT_FINALS_LIMIT 20` (`:962`),
+  `MAX_ACCOUNT_TXS 20` (`:964`), `MAX_ACCOUNT_DELEGATIONS 50` (`:966`);
+  readiness envs `STELL_READY_MAX_STALL_SECS` (`:89`) /
+  `STELL_READY_MIN_PEERS` (`:94`).
+- WS/subscriptions (`rpc.rs:7216-7357`): `MAX_SUBSCRIPTIONS 4096` (`:7333`,
+  per-node memory DoS bound), `MAX_SUBSCRIPTIONS_PER_CLIENT 64` (`:7344`),
+  `SUBSCRIPTION_ID_BYTES 16` (`:7347`, 32-hex-char id), `SUBSCRIPTION_TTL_SECS
+  3600` (`:7357`); topics `newHeads/newTxs/invalidations/events` (`:16-28`);
+  `MAX_RPC_BODY 1 MiB` (`:74`), `MAX_RECENT_BLOCKS 100` (`:1060`),
+  `MAX_FINALIZED_HEADERS 512` (`:1108`), `MAX_RECEIPTS 50_000` (`:1111`),
+  `MAX_EVENTS_RETURNED 1_000` (`:1237`); per-client caps enforced for
+  unattributed creators (`:1156-1177`), estimate-fee limiter
+  `ESTIMATE_FEE_RATE_LIMIT_DEFAULT 5` (`:1133-1146`).
+
+## 7. Contracts audit findings + residuals (code truth)
+
+- Crates (`stellereum-contracts/README.md:5`, `Cargo.toml`): live contracts
+  `contracts/account-object, liquidity-pool, stl-dns, sts20-token`
+  (`stellereum-contracts/contracts/`); SDK/indexer/wallet roles per §1 table.
+- Audit state: `stellereum-contracts/README.md:1` + `SECURITY.md:1-9` —
+  testnet-only, DRAFT security policy (contact placeholder
+  `security@example.invalid`), NO independent external audit completed.
+- Findings registry (root audit, not contracts-only):
+  `docs/audits/COMPREHENSIVE_AUDIT_REPORT.md:1043-1048` — 35 rows: 26 FIXED,
+  5 HOLDS-VERIFIED, 2 ACCEPTED (P4-F-PQ-1 interop wall; P1-G2..G4 filed
+  without content, closed R3 per `:1079` + code note
+  `consensus_net.rs:3080-3095`), 1 ESCALATED (P2-LEGACY-REPLAY wallet default
+  unbound, pins `p2_mempool_pentest.rs:142` / `vp2_verify.rs:725,753`).
+- Residuals: external audit NOT conducted (`:117`, owner org);
+  legacy cross-chain replay live (`:1154`, A14); snapshot-anchor w/o
+  genesis-anchor (`:1190`, C10); live split not conducted + 2PC gate not
+  finalized live (`:102`, A2/A3); adopt-path prevote-quorum unwired
+  (`:1221`, needs wire change). Red-closure gate green
+  (`docs/AUDIT_RED_CLOSURE.md:33-37,154-160`: `audit-repro.sh --no-fuzz`
+  PASS 1845/0, `audit_rpc_evm_closeout` 30/30).

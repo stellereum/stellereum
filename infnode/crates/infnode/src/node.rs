@@ -1126,15 +1126,38 @@ impl Node {
         // forward secrecy: свежий эфемерный X25519 на каждое соединение
         let eph_sec = XSecret::random_from_rng(rand::rngs::OsRng);
         let eph_pub = XPub::from(&eph_sec);
-        let payload = json!({
-            "nonce": rand_hex(16),
-            "at": now_ms(),
-            "eph": hex::encode(eph_pub.as_bytes()),
-            "ed": hex::encode(self.keys.verifying.as_bytes()),
-            "x": hex::encode(self.keys.e2e_pub.as_bytes()),
-        })
-        .to_string()
-        .into_bytes();
+        // PQ handshake offer (opt-in STELL_INF_PQ_HANDSHAKE=1): ephemeral
+        // ML-KEM-768 ek alongside the classical fields. Flag OFF => None and
+        // the classical payload below is byte-identical to before.
+        let pq_offer = if proto::pq_handshake_enabled() {
+            Some(pq_initiator_offer()?)
+        } else {
+            None
+        };
+        let payload = if let Some(offer) = &pq_offer {
+            json!({
+                "nonce": rand_hex(16),
+                "at": now_ms(),
+                "eph": hex::encode(eph_pub.as_bytes()),
+                "ed": hex::encode(self.keys.verifying.as_bytes()),
+                "x": hex::encode(self.keys.e2e_pub.as_bytes()),
+                "pq_ver": proto::PQ_TRANSCRIPT_VERSION,
+                "pq_suite": proto::PQ_SUITE_MLKEM768_HYBRID,
+                "pq_ek": hex::encode(&offer.ek),
+            })
+            .to_string()
+            .into_bytes()
+        } else {
+            json!({
+                "nonce": rand_hex(16),
+                "at": now_ms(),
+                "eph": hex::encode(eph_pub.as_bytes()),
+                "ed": hex::encode(self.keys.verifying.as_bytes()),
+                "x": hex::encode(self.keys.e2e_pub.as_bytes()),
+            })
+            .to_string()
+            .into_bytes()
+        };
         let mut f = Frame {
             kind: proto::kind::CHALLENGE,
             seq: self.next_seq(),
@@ -1190,8 +1213,21 @@ impl Node {
                 bail!("auth without eph");
             }
         }
+        // PQ handshake answer (opt-in): verify the transcript tag BEFORE
+        // session derivation; absent PQ fields => classical fallback (window,
+        // plan §5). Refusals carry clear errors, never silent downgrade.
+        let pq_agreed = if proto::pq_handshake_enabled() {
+            pq_initiator_answer(&pq_offer, &f.sign_data(), eph_pub.as_bytes(), &auth)?
+        } else {
+            None
+        };
         // forward secrecy: сессионный ключ из static+эфемерных ECDH
-        let key = derive_session_key(&self.keys, &peer.cfg, &eph_sec, &auth.payload)?;
+        let classical = derive_session_key(&self.keys, &peer.cfg, &eph_sec, &auth.payload)?;
+        // PQ-hybrid: breaks only if BOTH classical X3DH and ML-KEM break.
+        let key = match pq_agreed {
+            Some(a) => proto::pq_hybrid_session_key(&classical, &a.shared, &a.digest),
+            None => classical,
+        };
         self.sessions.write().await.insert(conn.stable_id(), key);
         self.add_route(pid, addr.to_string(), &peer.cfg.ed_pub)
             .await;
@@ -6179,7 +6215,7 @@ async fn handle_stream(
         // Строгий гейт payload (fail-closed): nonce/at/eph/ed/x обязаны быть
         // на месте и свежими. Раньше проверялись только подпись фрейма и его
         // ts — повтор кадра в окне ±10 мин создавал новую сессию.
-        let (ch_nonce, _ch_eph, ch_ed, ch_x) = match challenge_fields(&ch) {
+        let (ch_nonce, ch_eph, ch_ed, ch_x) = match challenge_fields(&ch) {
             Ok(v) => v,
             Err(e) => {
                 node.rep_record_auth_failure(&claimed).await;
@@ -6322,12 +6358,39 @@ async fn handle_stream(
         // forward secrecy: вычисляем сессионный ключ и отдаём свой эфемерный в AUTH
         let srv_eph = XSecret::random_from_rng(rand::rngs::OsRng);
         let srv_eph_pub = XPub::from(&srv_eph);
-        let key = match derive_session_key_server(&node.keys, &peer.cfg, &srv_eph, &f.payload) {
+        let auth_at = now_ms();
+        // PQ handshake offer (opt-in): absent PQ fields => classical path
+        // (window tolerance, plan §5). Present => encapsulate now and answer
+        // below with a hybrid session key. Malformed/mis-versioned offers are
+        // refused with a clear error, debiting reputation like every other
+        // auth failure on this path.
+        let mut pq_state: Option<(Vec<u8>, PqAgreed)> = None;
+        if proto::pq_handshake_enabled() {
+            match pq_responder_accept(
+                &ch_eph,
+                &ch,
+                &f.sign_data(),
+                srv_eph_pub.as_bytes(),
+                auth_at,
+                &node.id,
+            ) {
+                Ok(s) => pq_state = s,
+                Err(e) => {
+                    node.rep_record_auth_failure(&claimed).await;
+                    return Err(e);
+                }
+            }
+        }
+        let classical = match derive_session_key_server(&node.keys, &peer.cfg, &srv_eph, &f.payload) {
             Ok(k) => k,
             Err(e) => {
                 node.rep_record_auth_failure(&claimed).await;
                 return Err(e);
             }
+        };
+        let key = match &pq_state {
+            Some((_, a)) => proto::pq_hybrid_session_key(&classical, &a.shared, &a.digest),
+            None => classical,
         };
         node.sessions.write().await.insert(conn.stable_id(), key);
         // Per-connection window: nothing to reset. See connect_with_auth.
@@ -6343,14 +6406,29 @@ async fn handle_stream(
         node.remember_peer_addr(&peer, conn.remote_address()).await;
         node.add_route(claimed, conn.remote_address().to_string(), &peer.cfg.ed_pub)
             .await;
-        let payload = json!({
-            "node": node.id_hex,
-            "name": node.cfg.name,
-            "at": now_ms(),
-            "eph": hex::encode(srv_eph_pub.as_bytes()),
-        })
-        .to_string()
-        .into_bytes();
+        let payload = if let Some((ct, agreed)) = &pq_state {
+            json!({
+                "node": node.id_hex,
+                "name": node.cfg.name,
+                "at": auth_at,
+                "eph": hex::encode(srv_eph_pub.as_bytes()),
+                "pq_ver": proto::PQ_TRANSCRIPT_VERSION,
+                "pq_suite": proto::PQ_SUITE_MLKEM768_HYBRID,
+                "pq_ct": hex::encode(ct),
+                "pq_tag": hex::encode(agreed.tag),
+            })
+            .to_string()
+            .into_bytes()
+        } else {
+            json!({
+                "node": node.id_hex,
+                "name": node.cfg.name,
+                "at": now_ms(),
+                "eph": hex::encode(srv_eph_pub.as_bytes()),
+            })
+            .to_string()
+            .into_bytes()
+        };
         let mut a = Frame {
             kind: proto::kind::AUTH,
             seq: node.next_seq(),
@@ -7018,6 +7096,251 @@ fn derive_session_key_server(
     Ok(proto::session_key(
         &shared_w, &shared_x, &shared_y, &shared_z, lo, hi,
     ))
+}
+
+/// PQ HANDSHAKE helpers (opt-in `STELL_INF_PQ_HANDSHAKE=1`, default OFF).
+/// KEX: ephemeral ML-KEM-768 per handshake (vendored crate, no new deps).
+/// Auth (INTERIM, honest): transcript MAC keyed by the ML-KEM shared secret
+/// over the `proto::PqTranscript` digest — the same digest bytes a future
+/// Falcon-512 backend will sign (see `proto.rs` PQ docs; Falcon is
+/// lead-gated per `docs/PQ_TRANSPORT_PLAN.md` §7). Verified BEFORE any
+/// session key is derived; refusals carry clear errors and never silently
+/// downgrade. Mixed-mode window policy is `proto::pq_mixed_policy` (plan §5:
+/// verify dual-or-classical, route by classical id). `NodeId` unchanged
+/// (see `keyring.rs`). Flag OFF => none of this runs: payloads and KDF stay
+/// byte-identical to classical.
+pub struct PqInitOffer {
+    /// Initiator ephemeral decapsulation key, kept until the AUTH answer.
+    pub dk: ml_kem::DecapsulationKey768,
+    /// Initiator ephemeral encapsulation key, sent in CHALLENGE (`pq_ek`).
+    pub ek: Vec<u8>,
+}
+
+/// Agreed PQ material (identical on both sides after a verified handshake).
+pub struct PqAgreed {
+    /// ML-KEM shared secret (implicit-rejection fallback never reaches here:
+    /// a tampered ct yields a wrong key that fails tag verification).
+    pub shared: [u8; 32],
+    /// Transcript digest both sides authenticated.
+    pub digest: [u8; 32],
+    /// Transcript tag sent in AUTH (`pq_tag`).
+    pub tag: [u8; 32],
+}
+
+/// Fresh ephemeral ML-KEM-768 keypair from OS randomness via `from_seed`
+/// (`generate_keypair` needs the crate's `getrandom` feature, which is not
+/// enabled; seeding from `OsRng` bytes is equivalent — the seed is the sole
+/// secret input).
+pub fn pq_initiator_offer() -> Result<PqInitOffer> {
+    use ml_kem::kem::{FromSeed, KeyExport};
+    use rand::RngCore;
+    let mut seed = [0u8; 64];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    let (dk, ek) = ml_kem::MlKem768::from_seed(&seed.into());
+    Ok(PqInitOffer {
+        dk,
+        ek: ek.to_bytes().as_slice().to_vec(),
+    })
+}
+
+/// Encapsulate to a peer's 1184-byte `ek`; returns `(ct_bytes, shared)`.
+/// Fresh random `m` comes from `OsRng` (see `pq_initiator_offer` for why the
+/// deterministic entry point is used: it is what `encapsulate_with_rng`
+/// does internally, and that trait is unreachable with `rand 0.8`).
+pub fn pq_encapsulate(ek_bytes: &[u8]) -> Result<(Vec<u8>, [u8; 32])> {
+    if ek_bytes.len() != 1184 {
+        bail!("pq ek malformed");
+    }
+    let key = ml_kem::kem::Key::<ml_kem::EncapsulationKey768>::try_from(ek_bytes)
+        .map_err(|_| anyhow!("pq ek malformed"))?;
+    let ek = ml_kem::EncapsulationKey768::new(&key).map_err(|_| anyhow!("pq ek malformed"))?;
+    use rand::RngCore;
+    let mut m = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut m);
+    let (ct, ss) = ek.encapsulate_deterministic(&m.into());
+    let mut shared = [0u8; 32];
+    shared.copy_from_slice(ss.as_slice());
+    Ok((ct.as_slice().to_vec(), shared))
+}
+
+/// Decapsulate a 1088-byte `ct`; returns the shared secret. The KEM is
+/// infallible by signature: a tampered ct yields the implicit-rejection
+/// fallback key (never an error) which then fails tag verification — the
+/// fail-closed refuse path, never a silent accept.
+pub fn pq_decapsulate(dk: &ml_kem::DecapsulationKey768, ct_bytes: &[u8]) -> Result<[u8; 32]> {
+    use ml_kem::kem::Decapsulate;
+    if ct_bytes.len() != 1088 {
+        bail!("pq ct malformed");
+    }
+    let ct: ml_kem::kem::Ciphertext<ml_kem::MlKem768> =
+        ct_bytes.try_into().map_err(|_| anyhow!("pq ct malformed"))?;
+    let ss = dk.decapsulate(&ct);
+    let mut shared = [0u8; 32];
+    shared.copy_from_slice(ss.as_slice());
+    Ok(shared)
+}
+
+/// Build the shared transcript from full-size KEX values + frame bindings.
+pub fn pq_build_transcript(
+    ek_full: &[u8],
+    ct_full: &[u8],
+    eph_init: &[u8; 32],
+    eph_resp: &[u8; 32],
+    ch_sign_data: &[u8],
+    auth_bind: &[u8],
+) -> proto::PqTranscript {
+    proto::PqTranscript {
+        pq_init: proto::pq_hash_field(ek_full),
+        pq_resp: proto::pq_hash_field(ct_full),
+        eph_init: *eph_init,
+        eph_resp: *eph_resp,
+        chan_bind: proto::PQ_CHAN_BIND_PLACEHOLDER,
+        nonce_init: proto::pq_hash_field(ch_sign_data),
+        nonce_resp: proto::pq_hash_field(auth_bind),
+    }
+}
+
+/// Responder-side AUTH binding: `eph_resp || at_le || resp_id`. Known before
+/// the AUTH frame is built (no circularity) and recomputable by the dialer
+/// from the received AUTH payload.
+pub fn pq_auth_bind(eph_resp: &[u8; 32], auth_at: i64, resp_id: &[u8; NODEID_LEN]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(32 + 8 + NODEID_LEN);
+    v.extend_from_slice(eph_resp);
+    v.extend_from_slice(&auth_at.to_le_bytes());
+    v.extend_from_slice(resp_id);
+    v
+}
+
+fn pq_read_u64(v: &serde_json::Value, k: &str) -> Result<u64> {
+    v.get(k)
+        .and_then(|x| x.as_u64())
+        .ok_or_else(|| anyhow!("pq {k} malformed"))
+}
+
+/// Accept-side PQ offer check. `Ok(None)` = no PQ fields: pure classical
+/// (window tolerance, plan §5). `Ok(Some)` = verified offer material for the
+/// AUTH answer + hybrid key. `Err` = explicitly offered PQ that is malformed
+/// or versioned wrong: refuse with a clear error (no silent downgrade).
+pub fn pq_responder_accept(
+    ch_eph: &[u8; 32],
+    ch: &serde_json::Value,
+    ch_sign_data: &[u8],
+    srv_eph: &[u8; 32],
+    auth_at: i64,
+    resp_id: &[u8; NODEID_LEN],
+) -> Result<Option<(Vec<u8>, PqAgreed)>> {
+    if ch.get("pq_ek").is_none() {
+        return Ok(None);
+    }
+    let ver = pq_read_u64(ch, "pq_ver")?;
+    let suite = pq_read_u64(ch, "pq_suite")?;
+    if ver != proto::PQ_TRANSCRIPT_VERSION as u64
+        || suite != proto::PQ_SUITE_MLKEM768_HYBRID as u64
+    {
+        bail!("unsupported pq suite/version");
+    }
+    let ek_hex = ch
+        .get("pq_ek")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow!("pq ek malformed"))?;
+    let ek = hex::decode(ek_hex).map_err(|_| anyhow!("pq ek malformed"))?;
+    if ek.len() != 1184 {
+        bail!("pq ek malformed");
+    }
+    let (ct, shared) = pq_encapsulate(&ek)?;
+    let t = pq_build_transcript(
+        &ek,
+        &ct,
+        ch_eph,
+        srv_eph,
+        ch_sign_data,
+        &pq_auth_bind(srv_eph, auth_at, resp_id),
+    );
+    let digest = t.digest(
+        proto::PQ_TRANSCRIPT_VERSION,
+        proto::PQ_SUITE_MLKEM768_HYBRID,
+    );
+    let tag = proto::pq_auth_tag(&shared, &digest);
+    Ok(Some((ct, PqAgreed { shared, digest, tag })))
+}
+
+/// Dial-side PQ answer check. `Ok(None)` = classical responder: window
+/// fallback to the X3DH key (plan §5). `Ok(Some)` = verified agreement.
+/// `Err` = fail-closed refusal: explicitly offered PQ that fails shape,
+/// suite, or tag checks, or an answer that arrives with no offer outstanding.
+pub fn pq_initiator_answer(
+    offer: &Option<PqInitOffer>,
+    ch_sign_data: &[u8],
+    own_eph: &[u8; 32],
+    auth: &proto::Frame,
+) -> Result<Option<PqAgreed>> {
+    let av: serde_json::Value = serde_json::from_slice(&auth.payload)?;
+    if av.get("pq_ct").is_none() {
+        return Ok(None);
+    }
+    let offer = offer
+        .as_ref()
+        .ok_or_else(|| anyhow!("pq answer without offer"))?;
+    let ver = pq_read_u64(&av, "pq_ver").unwrap_or(u64::MAX);
+    let suite = pq_read_u64(&av, "pq_suite").unwrap_or(u64::MAX);
+    let suite_ok =
+        ver == proto::PQ_TRANSCRIPT_VERSION as u64 && suite == proto::PQ_SUITE_MLKEM768_HYBRID as u64;
+    let ct = av
+        .get("pq_ct")
+        .and_then(|x| x.as_str())
+        .and_then(|s| hex::decode(s).ok())
+        .unwrap_or_default();
+    let tag_raw = av
+        .get("pq_tag")
+        .and_then(|x| x.as_str())
+        .and_then(|s| hex::decode(s).ok())
+        .unwrap_or_default();
+    let auth_eph = av
+        .get("eph")
+        .and_then(|x| x.as_str())
+        .and_then(|s| hex::decode(s).ok())
+        .unwrap_or_default();
+    let auth_at = av.get("at").and_then(|x| x.as_i64()).unwrap_or(-1);
+    let wellformed = ct.len() == 1088 && tag_raw.len() == 32 && auth_eph.len() == 32 && auth_at >= 0;
+    let mut tag_ok = false;
+    let mut agreed = PqAgreed {
+        shared: [0u8; 32],
+        digest: [0u8; 32],
+        tag: [0u8; 32],
+    };
+    if wellformed && suite_ok {
+        let mut eph_resp = [0u8; 32];
+        eph_resp.copy_from_slice(&auth_eph);
+        let shared = pq_decapsulate(&offer.dk, &ct)?;
+        let t = pq_build_transcript(
+            &offer.ek,
+            &ct,
+            own_eph,
+            &eph_resp,
+            ch_sign_data,
+            &pq_auth_bind(&eph_resp, auth_at, &auth.src),
+        );
+        let digest = t.digest(
+            proto::PQ_TRANSCRIPT_VERSION,
+            proto::PQ_SUITE_MLKEM768_HYBRID,
+        );
+        let mut tag = [0u8; 32];
+        tag.copy_from_slice(&tag_raw);
+        tag_ok = proto::pq_verify_tag(&proto::pq_auth_tag(&shared, &digest), &tag);
+        agreed = PqAgreed { shared, digest, tag };
+    }
+    match proto::pq_mixed_policy(
+        true,
+        Some(proto::PqOfferCheck {
+            wellformed,
+            suite_ok,
+            tag_ok,
+        }),
+    ) {
+        Ok(proto::PqMode::Pq) => Ok(Some(agreed)),
+        Ok(proto::PqMode::Classical) => Ok(None),
+        Err(e) => bail!("{e}"),
+    }
 }
 
 fn parse_dht_node(v: &serde_json::Value) -> Option<crate::dht::NodeInfo> {

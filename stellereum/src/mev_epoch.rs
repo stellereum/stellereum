@@ -65,6 +65,7 @@
 //! transaction, and the fee of a dropped sealed transaction is charged as a
 //! node-local admission bond, not as an on-chain transfer.
 
+use crate::post_quantum::{FalconKeypair, PqScheme, verify_pq_signature};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
@@ -1133,6 +1134,144 @@ fn decrypt_share_package(
     let mut out = [0u8; 32];
     out.copy_from_slice(&plaintext);
     Ok(out)
+}
+
+// ===========================================================================
+// PQ transport leg — RANK-1 fallback step: Falcon-authenticated framing
+// around the X25519 share-package leg.
+// ===========================================================================
+//
+// STATUS: the full RANK-1 swap (PQ-KEM encaps replacing the X25519 DH in
+// `encrypt/decrypt_share_package`) is BLOCKED: `ml-kem` is a direct
+// dependency of the sibling `infnode` crate only — it is NOT addressable
+// from this crate without adding a new dependency, which is forbidden. What
+// lands here is the fallback step the plan calls for in that case: every
+// `DkgContribution` is wrapped in a Falcon-512 signature over its canonical
+// bytes (the D2 binding preimage: epoch, index, commitments, packages), and
+// the authenticated ingest path refuses anything that does not verify.
+//
+// SHAPE PRESERVED: Feldman VSS, the Ristretto threshold arithmetic, the
+// X25519 package encryption, `DkgContribution`/`EncryptedShare` (wire
+// format untouched), `ingest`, `finalize`, and the sealing path are all
+// UNCHANGED. The new code is purely additive: with
+// `PREFER_PQ_MEV_TRANSPORT = false` the ingest entry point below behaves
+// exactly like the classical `ingest` (byte-identical default).
+//
+// ACTIVATION: flip `PREFER_PQ_MEV_TRANSPORT` to `true` (a future,
+// audited wiring diff) and route gossip through `ingest_pq_transport` with
+// the contributor's Falcon-512 key from the validator registry. Never
+// silent: a contribution without a valid Falcon envelope is refused when
+// the flag is on, exactly as a contribution without our share package is
+// refused today.
+
+/// PQ transport selector: `false` keeps the classical X25519 package leg
+/// (default, byte-identical); `true` requires Falcon-authenticated
+/// contributions at ingest.
+pub const PREFER_PQ_MEV_TRANSPORT: bool = false;
+
+/// Domain separator of the PQ-transport Falcon signature preimage.
+pub const PQ_TRANSPORT_SIG_DOMAIN: &[u8; 26] = b"STELL_MEV_PQ_TRANSPORT_SG1";
+
+/// One Falcon-authenticated DKG contribution for the PQ transport leg.
+///
+/// The `contribution` is the UNCHANGED classical contribution (same
+/// `canonical_bytes`, same wire form); `falcon_pk`/`falcon_sig` are the
+/// contributor's Falcon-512 public key (897 bytes) and signature (666
+/// bytes) over [`pq_transport_auth_message`]. Kept OUT of
+/// `DkgContribution` so the classical wire format is byte-identical.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PqTransportEnvelope {
+    pub contribution: DkgContribution,
+    pub falcon_pk: Vec<u8>,
+    pub falcon_sig: Vec<u8>,
+}
+
+/// The Falcon signature preimage of a contribution: the transport domain
+/// followed by the length-prefixed canonical bytes (the same framing
+/// contract as `hash_parts`: domain first, every part `u32-BE-len ||
+/// bytes`).
+pub fn pq_transport_auth_message(contribution: &DkgContribution) -> Vec<u8> {
+    let canonical = contribution.canonical_bytes();
+    let mut msg = Vec::with_capacity(PQ_TRANSPORT_SIG_DOMAIN.len() + 4 + canonical.len());
+    msg.extend_from_slice(PQ_TRANSPORT_SIG_DOMAIN);
+    msg.extend_from_slice(&(canonical.len() as u32).to_be_bytes());
+    msg.extend_from_slice(&canonical);
+    msg
+}
+
+/// Wrap a contribution in its contributor's Falcon-512 authentication.
+pub fn pq_transport_seal(
+    keypair: &FalconKeypair,
+    contribution: DkgContribution,
+) -> PqTransportEnvelope {
+    let msg = pq_transport_auth_message(&contribution);
+    let falcon_sig = keypair.sign(&msg);
+    PqTransportEnvelope {
+        contribution,
+        falcon_pk: keypair.public_key().to_vec(),
+        falcon_sig,
+    }
+}
+
+/// Verify an envelope against the contributor's EXPECTED Falcon-512 key.
+///
+/// Fail-closed: a key mismatch, a malformed key/signature length, or a
+/// signature failure is refused — and ANY mutation of the contribution
+/// (commitments, packages, epoch, index, identity) changes the preimage,
+/// so it is refused too. The caller supplies the expected key (from the
+/// validator registry in production); the envelope's self-carried key is
+/// never trusted on its own.
+pub fn pq_transport_verify(
+    envelope: &PqTransportEnvelope,
+    expected_falcon_pk: &[u8],
+) -> Result<(), String> {
+    if envelope.falcon_pk.as_slice() != expected_falcon_pk {
+        return Err("pq transport envelope carries an unexpected falcon key".to_string());
+    }
+    let msg = pq_transport_auth_message(&envelope.contribution);
+    if !verify_pq_signature(
+        PqScheme::Falcon512,
+        expected_falcon_pk,
+        &msg,
+        &envelope.falcon_sig,
+    ) {
+        return Err("pq transport falcon signature does not verify".to_string());
+    }
+    Ok(())
+}
+
+impl EpochDkg {
+    /// Ingest a Falcon-authenticated contribution: verify first, then run
+    /// the UNCHANGED classical ingest (Feldman VSS + X25519 package
+    /// decrypt). Always verifies, regardless of the transport flag — this
+    /// is the PQ leg.
+    pub fn ingest_authenticated(
+        &mut self,
+        envelope: &PqTransportEnvelope,
+        enc_secret: &[u8; 32],
+        expected_falcon_pk: &[u8],
+    ) -> Result<(), String> {
+        pq_transport_verify(envelope, expected_falcon_pk)?;
+        self.ingest(envelope.contribution.clone(), enc_secret)
+    }
+
+    /// The transport-swapped ingest entry point.
+    ///
+    /// Const-gated: with `PREFER_PQ_MEV_TRANSPORT = false` (default) this
+    /// is exactly the classical `ingest` — byte-identical behavior. With
+    /// the flag on, contributions must carry a valid Falcon envelope.
+    pub fn ingest_pq_transport(
+        &mut self,
+        envelope: &PqTransportEnvelope,
+        enc_secret: &[u8; 32],
+        expected_falcon_pk: &[u8],
+    ) -> Result<(), String> {
+        if PREFER_PQ_MEV_TRANSPORT {
+            self.ingest_authenticated(envelope, enc_secret, expected_falcon_pk)
+        } else {
+            self.ingest(envelope.contribution.clone(), enc_secret)
+        }
+    }
 }
 
 // ===========================================================================

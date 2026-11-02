@@ -176,6 +176,15 @@ impl NodeKeys {
     }
 
     pub fn id(&self) -> [u8; NODEID_LEN] {
+        // PQ FOLLOW-UP (not done here, per PQ_TRANSPORT_PLAN.md §3.4/§4):
+        // `NodeId` stays `blake3(ed_pub)[..20]` — canonical and byte-identical
+        // even with `STELL_INF_PQ_HANDSHAKE=1`. The PQ handshake carries the
+        // ML-KEM ephemeral key alongside the classical identity and routes by
+        // the classical id (window semantics). Promoting a PQ long-term id
+        // (`pq_id = blake3("infnode-pqid-v1" || falcon_pk)[..20]`, dual-announce
+        // window, first-PQ-wins sticky binding, re-ceremony) needs a vendored
+        // Falcon-512 crate + `pq-identity.key` management and is lead-gated;
+        // changing `id()` before that would fork DHT/pins/TLS/federation.
         let h = blake3::hash(self.verifying.as_bytes());
         let mut id = [0u8; NODEID_LEN];
         id.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);

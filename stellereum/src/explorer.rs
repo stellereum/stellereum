@@ -1444,6 +1444,570 @@ async fn api_tx(
     (StatusCode::NOT_FOUND, Json(json!({ "status": "unknown" }))).into_response()
 }
 
+/// Max payload ops labeled by `GET /api/tx-detail/:hash` (decoded intent is
+/// a bounded summary, never a full program dump).
+pub const MAX_TXDETAIL_INTENT_OPS: usize = 50;
+/// Max receipt events rendered by `GET /api/tx-detail/:hash`.
+pub const MAX_TXDETAIL_EVENTS: usize = 20;
+/// Max tx refs returned by `GET /api/block-detail/:query`.
+pub const MAX_BLOCKDETAIL_TXS: usize = 100;
+/// Max QC signer keys returned by `GET /api/block-detail/:query`.
+pub const MAX_BLOCKDETAIL_QC_KEYS: usize = 20;
+
+/// Truncate free text to `max_chars` characters (bounded rendering of
+/// operator-controlled strings: token names, method names).
+fn truncate_text(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars).collect()
+    }
+}
+
+/// One-line human label for a single payload opcode (the decoded-intent leg
+/// of the tx-detail view). Indexed data only: addresses render as hex,
+/// numbers as numbers, free text truncated, and byte blobs (code, proofs,
+/// calldata, evidence envelopes) render as lengths — never echoed raw, so the
+/// view stays bounded no matter what the payload carries.
+fn describe_intent_op(op: &crate::svm::OpCode) -> String {
+    use crate::svm::OpCode as Op;
+    match op {
+        Op::Nop => "nop".to_string(),
+        Op::Push(v) => format!("push {v}"),
+        Op::Pop => "pop".to_string(),
+        Op::Add => "add".to_string(),
+        Op::Sub => "sub".to_string(),
+        Op::Mul => "mul".to_string(),
+        Op::Div => "div".to_string(),
+        Op::LoadBalance => "load-balance".to_string(),
+        Op::Transfer { recipient, amount } => {
+            format!("transfer to={} amount={amount}", hex::encode(recipient))
+        }
+        Op::SysCallPlaceOrder {
+            pair_id,
+            is_buy,
+            price,
+            amount,
+        } => format!(
+            "place-order pair={pair_id} side={} price={price} amount={amount}",
+            if *is_buy { "buy" } else { "sell" }
+        ),
+        Op::SysCallCancelOrder { order_id } => format!("cancel-order {order_id}"),
+        Op::SysCallVerifyZkMl => "verify-zkml-legacy".to_string(),
+        Op::SysCallPatriciaLookup(_) => "patricia-lookup".to_string(),
+        Op::SysCallTokenTransfer { token_id, to, amount } => format!(
+            "token-transfer token={} to={} amount={amount}",
+            hex::encode(token_id),
+            hex::encode(to)
+        ),
+        Op::SysCallTokenTransferFrom {
+            token_id,
+            from,
+            to,
+            amount,
+        } => format!(
+            "token-transfer-from token={} from={} to={} amount={amount}",
+            hex::encode(token_id),
+            hex::encode(from),
+            hex::encode(to)
+        ),
+        Op::SysCallTokenMint {
+            token_id,
+            to,
+            amount,
+        } => format!(
+            "token-mint token={} to={} amount={amount}",
+            hex::encode(token_id),
+            hex::encode(to)
+        ),
+        Op::SysCallTokenBurn {
+            token_id,
+            from,
+            amount,
+        } => format!(
+            "token-burn token={} from={} amount={amount}",
+            hex::encode(token_id),
+            hex::encode(from)
+        ),
+        Op::SysCallTokenApprove {
+            token_id,
+            spender,
+            amount,
+        } => format!(
+            "token-approve token={} spender={} amount={amount}",
+            hex::encode(token_id),
+            hex::encode(spender)
+        ),
+        Op::SysCallTokenBalanceOf { token_id, account } => format!(
+            "token-balance-of token={} account={}",
+            hex::encode(token_id),
+            hex::encode(account)
+        ),
+        Op::SysCallDeployContract { code } => {
+            format!("deploy-contract bytes={}", code.len())
+        }
+        Op::SysCallCallContract {
+            contract,
+            method,
+            arg,
+        } => format!(
+            "call-contract contract={} method={} arg={arg}",
+            hex::encode(contract),
+            truncate_text(&String::from_utf8_lossy(method), 64)
+        ),
+        Op::SysCallStake { validator, amount } => format!(
+            "stake validator={} amount={amount}",
+            hex::encode(validator)
+        ),
+        Op::SysCallUnbond { validator, amount } => format!(
+            "unbond validator={} amount={amount}",
+            hex::encode(validator)
+        ),
+        Op::SysCallDelegate { validator, amount } => format!(
+            "delegate validator={} amount={amount}",
+            hex::encode(validator)
+        ),
+        Op::SysCallUndelegate { validator } => {
+            format!("undelegate validator={}", hex::encode(validator))
+        }
+        Op::SysCallClaimRewards { validator } => {
+            format!("claim-rewards validator={}", hex::encode(validator))
+        }
+        Op::Halt => "halt".to_string(),
+        Op::SysCallSubmitPriceFeed(_) => "submit-price-feed".to_string(),
+        Op::SysCallRevokeSession { session_pubkey } => {
+            format!("revoke-session key={}", hex::encode(session_pubkey))
+        }
+        Op::SysCallPmmBuy { usdt_micro } => format!("pmm-buy usdt_micro={usdt_micro}"),
+        Op::SysCallPmmSell { stell_nano } => format!("pmm-sell stell_nano={stell_nano}"),
+        Op::SysCallPublishSessionGrant(_) => "publish-session-grant".to_string(),
+        Op::SysCallBridge(_) => "bridge-intent".to_string(),
+        Op::SysCallConfidentialTransfer {
+            recipient,
+            transfer,
+        } => format!(
+            "confidential-transfer to={} inputs={} outputs={} fee={}",
+            hex::encode(recipient),
+            transfer.input_commitments.len(),
+            transfer.output_commitments.len(),
+            transfer.fee
+        ),
+        Op::SysCallActorSend {
+            recipient,
+            value,
+            body,
+            bounce,
+            gas_budget,
+        } => format!(
+            "actor-send to={} value={value} ops={} bounce={bounce} gas_budget={gas_budget}",
+            hex::encode(recipient),
+            body.len()
+        ),
+        Op::SysCallVerifyZkMlReexec { model_id, .. } => {
+            format!("verify-zkml-reexec model={}", hex::encode(model_id))
+        }
+        Op::SysCallRegisterZkMlModel { model_id, .. } => {
+            format!("register-zkml-model model={}", hex::encode(model_id))
+        }
+        Op::SysCallRegisterZkMlSpec { model_id, .. } => {
+            format!("register-zkml-spec model={}", hex::encode(model_id))
+        }
+        Op::SysCallVerifyZkMlAttestation { model_id, .. } => {
+            format!("verify-zkml-attestation model={}", hex::encode(model_id))
+        }
+        Op::SysCallTokenCreate {
+            name,
+            symbol,
+            decimals,
+            initial_supply,
+            max_supply,
+        } => format!(
+            "token-create {}({}) decimals={decimals} supply={initial_supply} max={}",
+            truncate_text(name, 64),
+            truncate_text(symbol, 64),
+            max_supply.map(|m| m.to_string()).unwrap_or_else(|| "none".to_string())
+        ),
+        Op::SysCallConfidentialTransfer2 {
+            recipient,
+            transfer,
+            input_ranges,
+            output_ranges,
+        } => format!(
+            "confidential-transfer2 to={} inputs={} outputs={} fee={} ranges={}/{}",
+            hex::encode(recipient),
+            transfer.input_commitments.len(),
+            transfer.output_commitments.len(),
+            transfer.fee,
+            input_ranges.len(),
+            output_ranges.len()
+        ),
+        Op::SysCallConfidentialShield {
+            commitment, amount, ..
+        } => format!(
+            "confidential-shield commitment={} amount={amount}",
+            hex::encode(commitment)
+        ),
+        Op::SysCallConfidentialUnshield { inputs } => {
+            format!("confidential-unshield inputs={}", inputs.len())
+        }
+        Op::SysCallRotateValidatorKey {
+            old_validator,
+            new_validator,
+        } => format!(
+            "rotate-validator-key old={} new={}",
+            hex::encode(old_validator),
+            hex::encode(new_validator)
+        ),
+        Op::SysCallBeginUndelegate { validator, amount } => format!(
+            "begin-undelegate validator={} amount={amount}",
+            hex::encode(validator)
+        ),
+        Op::SysCallClaimDelegatorRewards { validator } => format!(
+            "claim-delegator-rewards validator={}",
+            hex::encode(validator)
+        ),
+        Op::SysCallVerifyPqSignature {
+            scheme_id,
+            pubkey,
+            message,
+            signature,
+        } => format!(
+            "verify-pq-signature scheme={scheme_id} pubkey_bytes={} msg_bytes={} sig_bytes={}",
+            pubkey.len(),
+            message.len(),
+            signature.len()
+        ),
+        Op::SysCallWithdrawSelfBond { validator } => format!(
+            "withdraw-self-bond validator={}",
+            hex::encode(validator)
+        ),
+        Op::SysCallReportEquivocation { .. } => "report-equivocation".to_string(),
+        Op::SysCallReportPqEquivocation { .. } => "report-pq-equivocation".to_string(),
+        Op::SysCallCallContractArgs {
+            contract,
+            method,
+            args,
+            calldata,
+        } => format!(
+            "call-contract-args contract={} method={} args={} calldata_bytes={}",
+            hex::encode(contract),
+            truncate_text(&String::from_utf8_lossy(method), 64),
+            args.len(),
+            calldata.len()
+        ),
+        Op::SysCallReportProposalEquivocation { .. } => {
+            "report-proposal-equivocation".to_string()
+        }
+        Op::SysCallStakeWithCommission {
+            validator,
+            amount,
+            commission_bps,
+        } => format!(
+            "stake-with-commission validator={} amount={amount} commission_bps={commission_bps}",
+            hex::encode(validator)
+        ),
+    }
+}
+
+/// First `MAX_TXDETAIL_INTENT_OPS` intent labels plus whether the payload
+/// held more (bounded summary, never a full program dump).
+fn capped_intent_ops(payload: &[crate::svm::OpCode]) -> (Vec<String>, bool) {
+    let truncated = payload.len() > MAX_TXDETAIL_INTENT_OPS;
+    let rows = payload
+        .iter()
+        .take(MAX_TXDETAIL_INTENT_OPS)
+        .map(describe_intent_op)
+        .collect();
+    (rows, truncated)
+}
+
+/// First `MAX_TXDETAIL_EVENTS` receipt events plus whether more were indexed.
+fn capped_tx_events(
+    events: &[crate::contract::ContractEvent],
+) -> (Vec<serde_json::Value>, bool) {
+    let truncated = events.len() > MAX_TXDETAIL_EVENTS;
+    let rows = events
+        .iter()
+        .take(MAX_TXDETAIL_EVENTS)
+        .map(|e| {
+            json!({
+                "contract": hex::encode(e.contract),
+                "topic": e.topic,
+                "value": e.value,
+            })
+        })
+        .collect();
+    (rows, truncated)
+}
+
+/// `GET /api/tx-detail/:hash` — human transaction detail.
+///
+/// Same indexed sources as `GET /api/tx/:hash` (mempool body + finalized
+/// receipts, no new pipeline) with a stable human shape: status, parties,
+/// fees, decoded intent. `memo` is always `null`: the node indexes no memo
+/// bytes, and a view must say so instead of inventing one. `intent` reuses
+/// `describe_transaction` (confidential shapes included); `intent_ops` is the
+/// first [`MAX_TXDETAIL_INTENT_OPS`] per-op labels; receipt events are capped
+/// at [`MAX_TXDETAIL_EVENTS`].
+///
+/// The pending-body redaction of `/api/tx/:hash` applies unchanged:
+/// unauthenticated callers see `tx_hash`/`nonce`/`status` only, never the
+/// pre-finalization payload. Unknown hashes are 404 `{"status":"unknown"}`;
+/// malformed hashes are 400. Nothing is fabricated.
+async fn api_tx_detail(
+    State(st): State<Arc<GatewayState>>,
+    AxumPath(hash_hex): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let s = hash_hex.strip_prefix("0x").unwrap_or(&hash_hex);
+    if s.len() != 64 {
+        return (StatusCode::BAD_REQUEST, "bad tx hash").into_response();
+    }
+    let Ok(raw) = hex::decode(s) else {
+        return (StatusCode::BAD_REQUEST, "bad tx hash").into_response();
+    };
+    let Ok(hash): Result<[u8; 32], _> = raw.try_into() else {
+        return (StatusCode::BAD_REQUEST, "bad tx hash").into_response();
+    };
+    let body = st.rpc.mempool.read().await.get(&hash).cloned();
+    let receipt = st.rpc.receipts.read().await.get(&hash).cloned();
+    // No body: receipt-only when finalized, else fail closed.
+    let Some(tx) = body else {
+        if let Some(r) = receipt {
+            let (events, events_truncated) = capped_tx_events(&r.events);
+            return Json(json!({
+                "tx_hash": hex::encode(r.tx_hash),
+                "status": if r.success { "success" } else { "failed" },
+                "height": r.height,
+                "block_hash": hex::encode(r.block_hash),
+                "index": r.index,
+                "sender": null,
+                "recipient": null,
+                "amount": null,
+                "nonce": null,
+                "gas_limit": r.gas_limit.to_string(),
+                "fee_charged": r.fee_charged.to_string(),
+                "priority_fee_per_gas": null,
+                "source_shard": null,
+                "target_shard": null,
+                "memo": null,
+                "intent": null,
+                "intent_summary": "receipt-only",
+                "intent_ops": Vec::<String>::new(),
+                "intent_ops_truncated": false,
+                "payload_ops": null,
+                "return_value": r.return_value,
+                "gas_used": r.gas_used,
+                "contract_address": r.contract_address.map(hex::encode),
+                "events": events,
+                "events_truncated": events_truncated,
+            }))
+            .into_response();
+        }
+        return (StatusCode::NOT_FOUND, Json(json!({ "status": "unknown" }))).into_response();
+    };
+    // Body present: finalized receipts are public; pending bodies keep the
+    // `/api/tx/:hash` redaction (same token check, same fail-closed default
+    // when no auth token is configured).
+    let authed = match &st.rpc.auth_token {
+        None => receipt.is_some(),
+        Some(expected) => {
+            if receipt.is_some() {
+                true
+            } else {
+                let provided = query
+                    .get("token")
+                    .or_else(|| query.get("apiKey"))
+                    .map(|v| v.as_str())
+                    .or_else(|| extract_header_token(&headers));
+                provided
+                    .map(|p| constant_time_eq(p, expected))
+                    .unwrap_or(false)
+            }
+        }
+    };
+    if !authed {
+        return Json(json!({
+            "tx_hash": hex::encode(hash),
+            "nonce": tx.nonce,
+            "status": "pending",
+        }))
+        .into_response();
+    }
+    let shielded = st.rpc.engine.confidential_read().await;
+    let intent = describe_transaction(&tx, &shielded);
+    drop(shielded);
+    let (intent_ops, intent_ops_truncated) = capped_intent_ops(&tx.payload);
+    let intent_summary = if tx.payload.is_empty() {
+        "value-transfer".to_string()
+    } else {
+        describe_intent_op(&tx.payload[0])
+    };
+    let (status, height, block_hash, index, fee_charged, return_value, gas_used, contract_address, events) =
+        match receipt {
+            Some(r) => (
+                if r.success { "success" } else { "failed" },
+                Some(r.height),
+                Some(hex::encode(r.block_hash)),
+                Some(r.index),
+                Some(r.fee_charged.to_string()),
+                r.return_value,
+                r.gas_used,
+                r.contract_address.map(hex::encode),
+                r.events,
+            ),
+            None => ("pending", None, None, None, None, None, None, None, Vec::new()),
+        };
+    let (events, events_truncated) = capped_tx_events(&events);
+    Json(json!({
+        "tx_hash": hex::encode(hash),
+        "status": status,
+        "height": height,
+        "block_hash": block_hash,
+        "index": index,
+        "sender": hex::encode(tx.from),
+        "recipient": hex::encode(tx.to),
+        "amount": tx.amount.to_string(),
+        "nonce": tx.nonce,
+        "gas_limit": tx.gas_limit.to_string(),
+        "fee_charged": fee_charged,
+        "priority_fee_per_gas": tx.priority_fee_per_gas.to_string(),
+        "source_shard": tx.source_shard,
+        "target_shard": tx.target_shard,
+        "memo": null,
+        "intent": intent,
+        "intent_summary": intent_summary,
+        "intent_ops": intent_ops,
+        "intent_ops_truncated": intent_ops_truncated,
+        "payload_ops": tx.payload.len(),
+        "return_value": return_value,
+        "gas_used": gas_used,
+        "contract_address": contract_address,
+        "events": events,
+        "events_truncated": events_truncated,
+    }))
+    .into_response()
+}
+
+/// `GET /api/block-detail/:query` — human block detail.
+///
+/// `query` is a decimal height (`14`) or a 64-hex block hash (optional `0x`
+/// prefix). The `recent_blocks` window supplies height/hash/txs/timestamp;
+/// the finalized-header window adds proposer/round/QC summary (matched by
+/// height AND hash, so a same-height mismatch enriches nothing); the receipt
+/// index supplies tx refs at that height (capped at [`MAX_BLOCKDETAIL_TXS`]).
+/// Finality latency is the timestamp delta to the greatest lower height in
+/// the window (`null` when this node holds no predecessor). Unknown
+/// heights/hashes are 404 `{"status":"unknown"}`; malformed input is 400.
+/// Read-only, bounded, never fabricated.
+async fn api_block_detail(
+    State(st): State<Arc<GatewayState>>,
+    AxumPath(query): AxumPath<String>,
+) -> Response {
+    enum Key {
+        Height(u64),
+        Hash([u8; 32]),
+    }
+    let key = match query.parse::<u64>() {
+        Ok(h) => Key::Height(h),
+        Err(_) => {
+            let s = query.strip_prefix("0x").unwrap_or(&query);
+            if s.len() != 64 {
+                return (StatusCode::BAD_REQUEST, "bad block height or hash").into_response();
+            }
+            let Ok(raw) = hex::decode(s) else {
+                return (StatusCode::BAD_REQUEST, "bad block height or hash").into_response();
+            };
+            let Ok(h): Result<[u8; 32], _> = raw.try_into() else {
+                return (StatusCode::BAD_REQUEST, "bad block height or hash").into_response();
+            };
+            Key::Hash(h)
+        }
+    };
+    let rows: Vec<crate::rpc::BlockSummary> =
+        st.rpc.recent_blocks.read().await.iter().cloned().collect();
+    let row = match &key {
+        Key::Height(h) => rows.iter().find(|b| b.height == *h).cloned(),
+        Key::Hash(h) => {
+            let hx = hex::encode(h);
+            rows
+                .iter()
+                .find(|b| b.hash.eq_ignore_ascii_case(&hx))
+                .cloned()
+        }
+    };
+    let Some(row) = row else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "status": "unknown" }))).into_response();
+    };
+    let header = crate::rpc::finalized_headers()
+        .read()
+        .await
+        .iter()
+        .find(|r| r.height == row.height && hex::encode(r.block_hash).eq_ignore_ascii_case(&row.hash))
+        .cloned();
+    let latency = rows
+        .iter()
+        .filter(|b| b.height < row.height)
+        .max_by_key(|b| b.height)
+        .map(|prev| row.timestamp.saturating_sub(prev.timestamp));
+    let (refs_total, refs_capped, refs_truncated) = {
+        let idx = st.rpc.receipts.read().await;
+        let mut all: Vec<([u8; 32], u32)> = idx
+            .for_height(row.height)
+            .iter()
+            .map(|r| (r.tx_hash, r.index))
+            .collect();
+        all.sort_by_key(|(_, i)| *i);
+        let total = all.len();
+        let truncated = total > MAX_BLOCKDETAIL_TXS;
+        let capped: Vec<String> = all
+            .into_iter()
+            .take(MAX_BLOCKDETAIL_TXS)
+            .map(|(h, _)| hex::encode(h))
+            .collect();
+        (total, capped, truncated)
+    };
+    let (proposer, round, qc) = match header {
+        Some(h) => {
+            let n = h.cert.signatures.len();
+            let keys_truncated = n > MAX_BLOCKDETAIL_QC_KEYS;
+            let keys: Vec<String> = h
+                .cert
+                .signatures
+                .iter()
+                .take(MAX_BLOCKDETAIL_QC_KEYS)
+                .map(|(v, _)| hex::encode(v))
+                .collect();
+            (
+                Some(hex::encode(h.proposer)),
+                Some(h.cert.round),
+                Some(json!({
+                    "kind": format!("{:?}", h.cert.kind),
+                    "signatures": n,
+                    "keys": keys,
+                    "keys_truncated": keys_truncated,
+                })),
+            )
+        }
+        None => (None, None, None),
+    };
+    Json(json!({
+        "height": row.height,
+        "hash": row.hash,
+        "timestamp": row.timestamp,
+        "tx_count": row.tx_count,
+        "proposer": proposer,
+        "round": round,
+        "qc": qc,
+        "finality_latency_secs": latency,
+        "tx_refs": refs_capped,
+        "tx_refs_total": refs_total,
+        "tx_refs_truncated": refs_truncated,
+    }))
+    .into_response()
+}
+
 /// `GET /api/confidential/:commitment` — spent-status of one shielded input
 /// commitment (`{"commitment": hex, "spent": bool}`), read from the committed
 /// `ConfidentialState`. Read-only.
@@ -1755,8 +2319,10 @@ pub fn router(gateway: Arc<GatewayState>) -> Router {
         .route("/api/stats", get(api_stats))
         .route("/api/version", get(api_version))
         .route("/api/blocks", get(api_blocks))
+        .route("/api/block-detail/:query", get(api_block_detail))
         .route("/api/balance/:address", get(api_balance))
         .route("/api/tx/:hash", get(api_tx))
+        .route("/api/tx-detail/:hash", get(api_tx_detail))
         .route("/api/confidential/:commitment", get(api_confidential_spent))
         // State-changing on GET is a crawler/prefetch/CSRF footgun (audit
         // 2026-10-06): the faucet mints money, so it is POST-only. GET keeps

@@ -134,6 +134,97 @@ else
   printf '%s\t%s\t%s\t%s\t%s\n' "fuzz-economics-ext" "stellereum" "SKIP" "0" "fuzz_economics_ext.rs absent at runtime" >> "$TSV"
   echo "[matrix] fuzz-economics-ext -> SKIP (file absent)"
 fi
+# ---- wave-4 batteries (conditional: siblings landing concurrently) ----
+if [ -f "$ROOT/stellereum/tests/consensus_byzantine_tests.rs" ]; then
+  row byzantine stellereum 300 -- --test consensus_byzantine_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "byzantine" "stellereum" "SKIP" "0" "consensus_byzantine_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] byzantine -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/liveness_breaker_tests.rs" ]; then
+  row liveness-breaker stellereum 600 -- --test liveness_breaker_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "liveness-breaker" "stellereum" "SKIP" "0" "liveness_breaker_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] liveness-breaker -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/sync_adversarial_tests.rs" ]; then
+  row sync-adversarial stellereum 600 -- --test sync_adversarial_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "sync-adversarial" "stellereum" "SKIP" "0" "sync_adversarial_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] sync-adversarial -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/staking_invariants_tests.rs" ]; then
+  row staking-invariants stellereum 600 -- --test staking_invariants_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "staking-invariants" "stellereum" "SKIP" "0" "staking_invariants_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] staking-invariants -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/storage_crash_tests.rs" ]; then
+  row storage-crash stellereum 600 -- --test storage_crash_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "storage-crash" "stellereum" "SKIP" "0" "storage_crash_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] storage-crash -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/shard2_soak_tests.rs" ]; then
+  row shard2-soak stellereum 600 -- --test shard2_soak_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "shard2-soak" "stellereum" "SKIP" "0" "shard2_soak_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] shard2-soak -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/pq_gates_staking_light_tests.rs" ]; then
+  row pq-gates stellereum 300 -- --test pq_gates_staking_light_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "pq-gates" "stellereum" "SKIP" "0" "pq_gates_staking_light_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] pq-gates -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/light_cli_tests.rs" ]; then
+  row light-cli stellereum 300 -- --test light_cli_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "light-cli" "stellereum" "SKIP" "0" "light_cli_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] light-cli -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/rpc_ws_tests.rs" ]; then
+  row rpc-ws stellereum 300 -- --test rpc_ws_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "rpc-ws" "stellereum" "SKIP" "0" "rpc_ws_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] rpc-ws -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/fee_batching_parity_tests.rs" ]; then
+  row fee-parity stellereum 300 -- --test fee_batching_parity_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "fee-parity" "stellereum" "SKIP" "0" "fee_batching_parity_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] fee-parity -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/infnode/crates/infnode/tests/eclipse_tests.rs" ]; then
+  row eclipse infnode 600 -- -p infnode --test eclipse_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "eclipse" "infnode" "SKIP" "0" "eclipse_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] eclipse -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/privacy_pq_tests.rs" ]; then
+  row privacy-pq stellereum 300 -- --test privacy_pq_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "privacy-pq" "stellereum" "SKIP" "0" "privacy_pq_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] privacy-pq -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/infnode/crates/infnode/tests/kem_kat_tests.rs" ]; then
+  row kem-kat infnode 300 -- -p infnode --test kem_kat_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "kem-kat" "infnode" "SKIP" "0" "kem_kat_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] kem-kat -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/src/mev_pq_plan.rs" ]; then
+  row mev-plan stellereum 300 -- --lib mev_pq_plan
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "mev-plan" "stellereum" "SKIP" "0" "mev_pq_plan.rs absent at runtime" >> "$TSV"
+  echo "[matrix] mev-plan -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum-contracts/contracts/sts20-token/tests/regression_audit_60_80.rs" ] && [ -f "$ROOT/stellereum-contracts/contracts/stl-dns/tests/regression_audit_60_80.rs" ] && [ -f "$ROOT/stellereum-contracts/contracts/liquidity-pool/tests/regression_audit_60_80.rs" ] && [ -f "$ROOT/stellereum-contracts/contracts/account-object/tests/regression_audit_60_80.rs" ]; then
+  row contracts-regression stellereum-contracts 300 -- --test regression_audit_60_80
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "contracts-regression" "stellereum-contracts" "SKIP" "0" "regression_audit_60_80.rs absent at runtime" >> "$TSV"
+  echo "[matrix] contracts-regression -> SKIP (file absent)"
+fi
 
 python3 - "$TSV" "$ROOT" <<'EOF'
 import json, sys

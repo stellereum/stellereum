@@ -328,3 +328,262 @@ async fn account_summary_empty_store() {
     let (status, _) = http_get(addr, "/api/account/not-hex").await;
     assert!(status.contains("400"), "bad address must fail closed: {status}");
 }
+
+// --- Explorer 9.0: tx-detail + block-detail human views (additive; the
+// above suites pin the pre-existing endpoints byte-for-byte) ---
+
+/// Finalized tx-detail: status/fees/parties/decoded-intent from the indexed
+/// mempool body + receipt; `memo` is explicitly null (no memo bytes indexed).
+#[tokio::test]
+async fn tx_detail_finalized_happy_path() {
+    let st = seeded_state().await;
+    let tx_hash = {
+        let pool = st.mempool.read().await;
+        let txs = pool.all();
+        assert_eq!(txs.len(), 1, "seeded fixture holds one pending tx");
+        txs[0].compute_tx_hash()
+    };
+    st.receipts.write().await.insert(TxReceipt {
+        tx_hash,
+        height: 14,
+        block_hash: [0xABu8; 32],
+        index: 0,
+        success: true,
+        gas_limit: 1000,
+        fee_charged: 10,
+        ..Default::default()
+    });
+    let addr = spawn(st).await;
+    let (status, body) = http_get(addr, &format!("/api/tx-detail/{}", hex::encode(tx_hash))).await;
+    assert!(status.contains("200"), "status: {status}");
+    let j = body_json(&body);
+    assert_eq!(j["status"], "success");
+    assert_eq!(j["height"], 14);
+    assert_eq!(j["block_hash"], hex::encode([0xABu8; 32]));
+    assert_eq!(j["index"], 0);
+    let key = ed25519_dalek::SigningKey::from_bytes(&SENDER_KEY);
+    let sender = hex::encode(key.verifying_key().to_bytes());
+    assert_eq!(j["sender"], sender);
+    assert_eq!(j["recipient"], hex::encode(OTHER));
+    assert_eq!(j["amount"], "42");
+    assert_eq!(j["nonce"], 0);
+    assert_eq!(j["gas_limit"], "1000");
+    assert_eq!(j["fee_charged"], "10");
+    assert!(j["memo"].is_null(), "no memo bytes are indexed: {j}");
+    assert_eq!(j["intent"]["kind"], "transparent");
+    assert_eq!(j["intent_summary"], "value-transfer");
+    assert_eq!(j["payload_ops"], 0);
+    assert_eq!(j["intent_ops"], serde_json::json!([]));
+    assert_eq!(j["intent_ops_truncated"], false);
+}
+
+/// Decoded intent: a delegate payload renders its human label.
+#[tokio::test]
+async fn tx_detail_decoded_intent_delegate() {
+    let st = seeded_state().await;
+    let key = ed25519_dalek::SigningKey::from_bytes(&SENDER_KEY);
+    let tx = stellereum::sharding::Transaction::sign_with_payload(
+        &key,
+        OTHER,
+        1,
+        1000,
+        77,
+        0,
+        0,
+        vec![stellereum::svm::OpCode::SysCallDelegate {
+            validator: VALIDATOR,
+            amount: 5,
+        }],
+    );
+    let h = tx.compute_tx_hash();
+    st.mempool.write().await.add(tx).unwrap();
+    st.receipts.write().await.insert(TxReceipt {
+        tx_hash: h,
+        height: 13,
+        block_hash: [0xABu8; 32],
+        index: 1,
+        success: true,
+        gas_limit: 1000,
+        fee_charged: 7,
+        ..Default::default()
+    });
+    let addr = spawn(st).await;
+    let (status, body) = http_get(addr, &format!("/api/tx-detail/{}", hex::encode(h))).await;
+    assert!(status.contains("200"), "status: {status}");
+    let j = body_json(&body);
+    assert_eq!(j["status"], "success");
+    assert_eq!(j["fee_charged"], "7");
+    assert_eq!(j["payload_ops"], 1);
+    let expect = format!("delegate validator={} amount=5", hex::encode(VALIDATOR));
+    assert_eq!(j["intent_summary"], expect);
+    assert_eq!(j["intent_ops"][0], expect);
+    assert_eq!(j["intent_ops_truncated"], false);
+}
+
+/// Pending without a token stays redacted (same gate as `/api/tx/:hash`);
+/// malformed hashes are 400, unknown hashes are 404 — never fabricated.
+#[tokio::test]
+async fn tx_detail_pending_redacted_and_errors() {
+    let st = seeded_state().await;
+    let tx_hash = {
+        let pool = st.mempool.read().await;
+        pool.all()[0].compute_tx_hash()
+    };
+    let addr = spawn(st).await;
+    let (status, body) = http_get(addr, &format!("/api/tx-detail/{}", hex::encode(tx_hash))).await;
+    assert!(status.contains("200"), "status: {status}");
+    let j = body_json(&body);
+    assert_eq!(j["status"], "pending");
+    assert_eq!(j["tx_hash"], hex::encode(tx_hash));
+    assert!(j.get("nonce").is_some(), "redacted view keeps the nonce");
+    assert!(j.get("sender").is_none(), "pending body stays redacted: {body}");
+
+    let (status, _) = http_get(addr, "/api/tx-detail/zzzz").await;
+    assert!(status.contains("400"), "malformed hash must fail closed: {status}");
+
+    let (status, body) = http_get(addr, &format!("/api/tx-detail/{}", hex::encode([0xEEu8; 32]))).await;
+    assert!(status.contains("404"), "unknown hash must fail closed: {status}");
+    assert_eq!(body_json(&body)["status"], "unknown");
+}
+
+/// Caps: long payloads and long event lists render bounded with flags.
+#[tokio::test]
+async fn tx_detail_caps_enforced() {
+    let st = seeded_state().await;
+    let key = ed25519_dalek::SigningKey::from_bytes(&SENDER_KEY);
+    let tx = stellereum::sharding::Transaction::sign_with_payload(
+        &key,
+        OTHER,
+        1,
+        1000,
+        78,
+        0,
+        0,
+        vec![stellereum::svm::OpCode::Nop; 60],
+    );
+    let h = tx.compute_tx_hash();
+    st.mempool.write().await.add(tx).unwrap();
+    let events: Vec<stellereum::contract::ContractEvent> = (0..25)
+        .map(|i| stellereum::contract::ContractEvent {
+            contract: [0xEEu8; 32],
+            topic: i,
+            value: i,
+        })
+        .collect();
+    st.receipts.write().await.insert(TxReceipt {
+        tx_hash: h,
+        height: 11,
+        block_hash: [0xABu8; 32],
+        index: 0,
+        success: true,
+        gas_limit: 1000,
+        fee_charged: 3,
+        events,
+        ..Default::default()
+    });
+    let addr = spawn(st).await;
+    let (status, body) = http_get(addr, &format!("/api/tx-detail/{}", hex::encode(h))).await;
+    assert!(status.contains("200"), "status: {status}");
+    let j = body_json(&body);
+    assert_eq!(j["payload_ops"], 60);
+    assert_eq!(j["intent_ops"].as_array().unwrap().len(), 50);
+    assert_eq!(j["intent_ops_truncated"], true);
+    assert_eq!(j["events"].as_array().unwrap().len(), 20);
+    assert_eq!(j["events_truncated"], true);
+}
+
+/// Block detail by height and by hash, with QC/proposer enrichment from the
+/// finalized-header window and latency from the recent-blocks window.
+#[tokio::test]
+async fn block_detail_happy_path() {
+    let st = seeded_state().await;
+    // Unique heights: the finalized-header window is process-wide, so the
+    // enrichment row must not collide with any other test's headers.
+    let qc = stellereum::consensus::QuorumCertificate {
+        height: 700_131,
+        round: 3,
+        kind: stellereum::consensus::VoteKind::Precommit,
+        block_hash: None,
+        signatures: vec![
+            ([0x11u8; 32], vec![1u8, 2, 3]),
+            ([0x12u8; 32], vec![4u8]),
+        ],
+    };
+    let block = stellereum::sharding::Block {
+        height: 700_131,
+        proposer: [0x05u8; 32],
+        timestamp: 5555,
+        precommit_qc: Some(qc),
+        ..Default::default()
+    };
+    let bh = block.compute_hash();
+    st.record_block(700_130, [0x06u8; 32], 1, 5540).await;
+    st.record_block(700_131, bh, 2, 5555).await;
+    st.record_finalized_header(&block).await;
+    let addr = spawn(st).await;
+
+    let (status, body) = http_get(addr, "/api/block-detail/14").await;
+    assert!(status.contains("200"), "status: {status}");
+    let j = body_json(&body);
+    assert_eq!(j["height"], 14);
+    assert_eq!(j["hash"], hex::encode([0xABu8; 32]));
+    assert_eq!(j["tx_count"], 5);
+    assert_eq!(j["tx_refs_total"], 0);
+    assert_eq!(j["tx_refs"], serde_json::json!([]));
+    assert_eq!(j["tx_refs_truncated"], false);
+    assert_eq!(j["finality_latency_secs"], 10);
+    assert!(j["proposer"].is_null(), "no header recorded for 14: {j}");
+
+    let (status, body) = http_get(addr, &format!("/api/block-detail/{}", hex::encode([0xABu8; 32]))).await;
+    assert!(status.contains("200"), "hash lookup: {status}");
+    assert_eq!(body_json(&body)["height"], 14);
+
+    let (status, body) = http_get(addr, "/api/block-detail/700131").await;
+    assert!(status.contains("200"), "status: {status}");
+    let j = body_json(&body);
+    assert_eq!(j["height"], 700_131);
+    assert_eq!(j["hash"], hex::encode(bh));
+    assert_eq!(j["proposer"], hex::encode([0x05u8; 32]));
+    assert_eq!(j["round"], 3);
+    assert_eq!(j["qc"]["kind"], "Precommit");
+    assert_eq!(j["qc"]["signatures"], 2);
+    assert_eq!(j["qc"]["keys"][0], hex::encode([0x11u8; 32]));
+    assert_eq!(j["qc"]["keys"][1], hex::encode([0x12u8; 32]));
+    assert_eq!(j["qc"]["keys_truncated"], false);
+    assert_eq!(j["finality_latency_secs"], 15);
+}
+
+/// Unknown heights/hashes are 404 (never fabricated), malformed input is
+/// 400, and long tx-ref lists are capped with a total.
+#[tokio::test]
+async fn block_detail_errors_and_caps() {
+    let st = seeded_state().await;
+    for i in 0u64..120 {
+        let mut h = [0xCDu8; 32];
+        h[0..8].copy_from_slice(&i.to_le_bytes());
+        st.receipts.write().await.insert(TxReceipt {
+            tx_hash: h,
+            height: 12,
+            block_hash: [0xABu8; 32],
+            index: i as u32,
+            success: true,
+            gas_limit: 1000,
+            fee_charged: 1,
+            ..Default::default()
+        });
+    }
+    let addr = spawn(st).await;
+    let (status, body) = http_get(addr, "/api/block-detail/12").await;
+    assert!(status.contains("200"), "status: {status}");
+    let j = body_json(&body);
+    assert_eq!(j["tx_refs_total"], 120);
+    assert_eq!(j["tx_refs"].as_array().unwrap().len(), 100);
+    assert_eq!(j["tx_refs_truncated"], true);
+
+    let (status, body) = http_get(addr, "/api/block-detail/999998").await;
+    assert!(status.contains("404"), "unknown height must fail closed: {status}");
+    assert_eq!(body_json(&body)["status"], "unknown");
+
+    let (status, _) = http_get(addr, "/api/block-detail/zzzz").await;
+    assert!(status.contains("400"), "malformed query must fail closed: {status}");
+}

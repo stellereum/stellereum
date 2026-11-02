@@ -251,6 +251,195 @@ impl Frame {
     }
 }
 
+// PQ HANDSHAKE (opt-in `STELL_INF_PQ_HANDSHAKE=1`, default OFF).
+// Additive only: every item below is new; no existing function, layout, or
+// domain string above is modified, so flag OFF (or absent) leaves the
+// classical handshake byte-identical.
+//
+// Design (mirrors `pq_transport.rs` shapes + `docs/PQ_TRANSPORT_PLAN.md` §3/§5):
+// - KEX: ephemeral ML-KEM-768 per handshake (vendored `ml-kem` crate; keygen
+//   via `from_seed` over fresh OS randomness, encap via deterministic entry
+//   point over a fresh random `m` — byte-equivalent to `encapsulate_with_rng`,
+//   which is unavailable: `ml-kem` is built without its `getrandom` feature
+//   and `rand 0.8`'s `OsRng` does not implement `rand_core 0.10`'s `CryptoRng`).
+// - Auth (INTERIM, honest): the transcript digest is MACed with
+//   `blake3::keyed_hash` keyed by the ML-KEM shared secret. This proves the
+//   peer processed THIS `{ek, ct, eph, frames}` binding and is verified BEFORE
+//   any session key is derived (fail closed, mirrors the classical
+//   sig-before-session ordering). It is NOT a Falcon-512 signature: no
+//   Falcon crate is vendored (lead-gated per plan §7), so long-term PQ
+//   identity stays classical (`NodeId` unchanged, see `keyring.rs`). The
+//   transcript layout is final-shaped so a future Falcon backend signs the
+//   SAME digest bytes without wire churn.
+// - Mixed-mode (plan §5, window semantics): a peer that offers no PQ fields
+//   handshakes classically in both directions; a classical-only node NEVER
+//   treats unknown `pq_*` JSON fields as errors (payload parsing reads known
+//   keys only). Explicitly offered PQ that is malformed, versioned wrong, or
+//   mistagged is REFUSED with a clear error (no silent downgrade).
+// - Channel binding is a zeroed 32-byte field until the QUIC/TLS exporter
+//   label is pinned (same caveat as `pq_transport.rs`); the domain string
+//   pins the label slot meanwhile. Follow-up, not silent.
+
+/// Env gate for the PQ handshake. Exact match `"1"`; anything else (unset,
+/// empty, `"0"`, …) is OFF.
+pub const PQ_HANDSHAKE_ENV: &str = "STELL_INF_PQ_HANDSHAKE";
+
+/// True exactly when `STELL_INF_PQ_HANDSHAKE=1`.
+pub fn pq_handshake_enabled() -> bool {
+    std::env::var(PQ_HANDSHAKE_ENV)
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Wire version of the PQ handshake transcript.
+pub const PQ_TRANSCRIPT_VERSION: u16 = 1;
+/// Suite id for the interim ML-KEM-768-hybrid handshake. Distinct from the
+/// reserved Falcon-512 production suite (`0xF1`) and the `pq_transport.rs`
+/// test-only suite (`0xFF`); KAT vectors can never validate as either.
+pub const PQ_SUITE_MLKEM768_HYBRID: u8 = 0x4D;
+/// Domain string baked into every transcript digest (pins the channel-binding
+/// label slot until the TLS exporter is wired).
+pub const PQ_DOMAIN: &[u8] = b"infnode-pqhs-v1";
+/// Domain for the hybrid session-key derivation.
+pub const PQ_SESSION_DOMAIN: &[u8] = b"infnode-pq-session-v1";
+/// Channel-binding placeholder (zeros) until the QUIC/TLS exporter output is
+/// bound here. Follow-up; kept explicit rather than silently weak.
+pub const PQ_CHAN_BIND_PLACEHOLDER: [u8; 32] = [0u8; 32];
+
+/// Fixed-shape PQ handshake transcript (all fields 32 bytes, same field order
+/// as `pq_transport.rs` `PqPlanTranscript` so the layout is shared):
+/// long-term-PQ hashes, ephemeral KEX pubs, channel binding, frame bindings.
+pub struct PqTranscript {
+    /// `blake3` of the full initiator KEM encapsulation key (1184 B).
+    pub pq_init: [u8; 32],
+    /// `blake3` of the full responder KEM ciphertext (1088 B).
+    pub pq_resp: [u8; 32],
+    /// Initiator ephemeral X25519 pub.
+    pub eph_init: [u8; 32],
+    /// Responder ephemeral X25519 pub.
+    pub eph_resp: [u8; 32],
+    /// Channel binding (currently [`PQ_CHAN_BIND_PLACEHOLDER`]).
+    pub chan_bind: [u8; 32],
+    /// `blake3` of the CHALLENGE frame `sign_data` (binds the whole frame).
+    pub nonce_init: [u8; 32],
+    /// `blake3` of responder auth binding (`eph_resp || at_le || resp_id`).
+    pub nonce_resp: [u8; 32],
+}
+
+impl PqTranscript {
+    fn push(out: &mut Vec<u8>, f: &[u8; 32]) {
+        out.extend_from_slice(&(f.len() as u16).to_le_bytes());
+        out.extend_from_slice(f);
+    }
+    /// Canonical encoding: domain || `version` le16 || `suite` u8 ||
+    /// length-prefixed fields.
+    pub fn encode(&self, version: u16, suite: u8) -> Vec<u8> {
+        let mut v = Vec::with_capacity(PQ_DOMAIN.len() + 3 + 7 * 34);
+        v.extend_from_slice(PQ_DOMAIN);
+        v.extend_from_slice(&version.to_le_bytes());
+        v.push(suite);
+        Self::push(&mut v, &self.pq_init);
+        Self::push(&mut v, &self.pq_resp);
+        Self::push(&mut v, &self.eph_init);
+        Self::push(&mut v, &self.eph_resp);
+        Self::push(&mut v, &self.chan_bind);
+        Self::push(&mut v, &self.nonce_init);
+        Self::push(&mut v, &self.nonce_resp);
+        v
+    }
+    /// Digest both sides authenticate (production: same bytes Falcon signs).
+    pub fn digest(&self, version: u16, suite: u8) -> [u8; 32] {
+        *blake3::hash(&self.encode(version, suite)).as_bytes()
+    }
+}
+
+/// Canonical 32-byte field hash for variable-length PQ inputs.
+pub fn pq_hash_field(data: &[u8]) -> [u8; 32] {
+    *blake3::hash(data).as_bytes()
+}
+
+/// Interim transcript authenticator: `blake3` keyed hash with the ML-KEM
+/// shared secret as key over the transcript digest. See module docs: stand-in
+/// for the Falcon-512 signature over the same digest (lead-gated).
+pub fn pq_auth_tag(shared: &[u8; 32], digest: &[u8; 32]) -> [u8; 32] {
+    *blake3::keyed_hash(shared, digest).as_bytes()
+}
+
+/// Constant-time tag comparison (no early exit).
+pub fn pq_verify_tag(expected: &[u8; 32], got: &[u8; 32]) -> bool {
+    let mut d: u8 = 0;
+    for i in 0..32 {
+        d |= expected[i] ^ got[i];
+    }
+    d == 0
+}
+
+/// Hybrid session key: breaks only if BOTH the classical X3DH key and the
+/// ML-KEM shared secret break. Either input flipping changes the output.
+pub fn pq_hybrid_session_key(
+    classical: &[u8; 32],
+    pq_shared: &[u8; 32],
+    digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(PQ_SESSION_DOMAIN);
+    h.update(classical);
+    h.update(pq_shared);
+    h.update(digest);
+    *h.finalize().as_bytes()
+}
+
+/// Negotiated handshake mode after applying the mixed-mode window policy.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum PqMode {
+    /// Classical X3DH handshake (peer offered no PQ, or local node is
+    /// classical-only and ignores offered `pq_*` fields per plan §5).
+    Classical,
+    /// PQ-hybrid handshake (offer verified, hybrid session key).
+    Pq,
+}
+
+/// Status of explicitly offered PQ fields, as observed by the verifier.
+pub struct PqOfferCheck {
+    /// Payload parses and all lengths/types are well-formed.
+    pub wellformed: bool,
+    /// `pq_ver`/`pq_suite` match [`PQ_TRANSCRIPT_VERSION`] /
+    /// [`PQ_SUITE_MLKEM768_HYBRID`].
+    pub suite_ok: bool,
+    /// Transcript tag verifies against the recomputed digest.
+    pub tag_ok: bool,
+}
+
+/// Mixed-mode window policy, exactly per `docs/PQ_TRANSPORT_PLAN.md` §5:
+/// window builds verify dual-or-classical and route by classical id;
+/// classical-only nodes NEVER see PQ fields as errors. Fails closed with a
+/// clear error when PQ is explicitly offered but invalid (malformed fields,
+/// unknown suite/version, bad tag) — this "refuse, never silently downgrade"
+/// arm is the deliberate choice for the case the plan leaves implicit
+/// (downgrade resistance during the window).
+pub fn pq_mixed_policy(
+    local_pq: bool,
+    offer: Option<PqOfferCheck>,
+) -> Result<PqMode, &'static str> {
+    let Some(o) = offer else {
+        return Ok(PqMode::Classical);
+    };
+    if !local_pq {
+        // Classical-only node: PQ fields are additive JSON, ignored, never an error.
+        return Ok(PqMode::Classical);
+    }
+    if !o.wellformed {
+        return Err("pq fields malformed");
+    }
+    if !o.suite_ok {
+        return Err("unsupported pq suite/version");
+    }
+    if !o.tag_ok {
+        return Err("pq transcript auth failed");
+    }
+    Ok(PqMode::Pq)
+}
+
 /// Decoder fuzz regressions (Agent 1, stellereum): Frame::decode is the
 /// network entry point — it must never panic on peer bytes (plen/nlen abuse,
 /// truncations, bit flips). Appended without touching existing code.

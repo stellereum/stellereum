@@ -10347,6 +10347,42 @@ impl InMemoryStateEngine {
         Ok(())
     }
 
+    /// Faucet (PQ) helpers: genesis funding with a PQ faucet key.
+    ///
+    /// The faucet's PQ account is the Falcon-512 address derived from the
+    /// 32-byte faucet seed with the SAME raw derivation `rpc::Faucet::new`
+    /// uses (`FalconKeypair::generate_from_seed_bytes`, no wallet KDF): a PQ
+    /// drip (`Faucet::build_transfer` under pure-PQ, byte-identical to
+    /// `sign_pq_explicit_transfer`) spends exactly this account, so genesis
+    /// MUST credit it for PQ payouts to verify and finalize. The light-wallet
+    /// KDF derives a DIFFERENT address from the same seed and cannot spend
+    /// these funds.
+    ///
+    /// Default behavior is untouched: these are new primitives for PQ faucet
+    /// flows and tests; no existing funding path calls them.
+    pub fn faucet_pq_account_from_seed(seed: &[u8; 32]) -> [u8; 32] {
+        let kp = crate::post_quantum::FalconKeypair::generate_from_seed_bytes(seed);
+        crate::post_quantum::derive_pq_address(
+            crate::post_quantum::PqScheme::Falcon512,
+            &kp.public_key,
+            &crate::post_quantum::DEFAULT_SALT,
+        )
+    }
+
+    /// Genesis funding with a PQ faucet key: credit the PQ faucet account for
+    /// `seed` (see [`Self::faucet_pq_account_from_seed`]). Mirrors the
+    /// `credit_native(&faucet.account(), GENESIS_FAUCET_BALANCE)` step in
+    /// `src/main.rs` for the pure-PQ serving account (under pure-PQ the two
+    /// credit exactly the same address).
+    pub async fn fund_faucet_genesis_pq(
+        &self,
+        seed: &[u8; 32],
+        balance: u64,
+    ) -> Result<(), String> {
+        self.credit_native(&Self::faucet_pq_account_from_seed(seed), balance)
+            .await
+    }
+
     /// Apply the native half of a PMM swap: mint STELL to buyers, burn it from
     /// sellers, and commit every touched account to the state trie.
     ///

@@ -954,6 +954,255 @@ async fn api_contracts(
     Json(json!({ "contracts": addrs, "total": total, "offset": offset }))
 }
 
+/// Hard cap for `GET /api/finals?limit=` (fail-closed: oversized clamps,
+/// zero/non-numeric refuses). Small: the backing window itself is capped at
+/// `MAX_RECENT_BLOCKS` (100), so a larger limit could never return more.
+pub const MAX_FINALS_LIMIT: usize = 100;
+/// Default rows for `GET /api/finals` without `?limit=`.
+pub const DEFAULT_FINALS_LIMIT: usize = 20;
+/// Max tx refs returned by `GET /api/account/:address`.
+pub const MAX_ACCOUNT_TXS: usize = 20;
+/// Max delegations returned by `GET /api/account/:address`.
+pub const MAX_ACCOUNT_DELEGATIONS: usize = 50;
+/// Scan budget for the staking-map walks in the account view (bounded
+/// iteration: a hostile ledger must not pin the handler).
+const ACCOUNT_SCAN_BUDGET: usize = 20_000;
+
+/// `GET /api/validator/:address` — human validator summary.
+///
+/// Read-only over the indexed staking ledger (`RpcState::staking`, same
+/// derivation as `stell_getValidators` so the power/set can never disagree
+/// with RPC). Unknown addresses are DATA (`known: false`), not an error;
+/// malformed addresses fail closed (400). No new index, no env knob.
+async fn api_validator(
+    State(st): State<Arc<GatewayState>>,
+    AxumPath(addr): AxumPath<String>,
+) -> Response {
+    let Some(a) = parse_addr(&addr) else {
+        return (StatusCode::BAD_REQUEST, "bad address").into_response();
+    };
+    let ledger = st.rpc.staking.read().await;
+    let rec = ledger.validators.get(&a).cloned();
+    let jail = ledger.jail_record(&a);
+    let in_set = ledger.to_validator_set().validators.contains_key(&a);
+    let pending = ledger
+        .commission_schedule_of(&a)
+        .and_then(|s| s.pending)
+        .map(|p| {
+            json!({
+                "new_bps": p.new_bps,
+                "announced_height": p.announced_height,
+                "effective_height": p.effective_height,
+            })
+        })
+        .unwrap_or(serde_json::Value::Null);
+    let hex_addr = hex::encode(a);
+    let moniker = format!("val-{}", &hex_addr[..8]);
+    match rec {
+        Some(r) => Json(json!({
+            "validator": hex_addr,
+            "known": true,
+            "moniker": moniker,
+            "in_set": in_set,
+            "power": r.total().to_string(),
+            "self_bond": r.self_bond.to_string(),
+            "delegated": r.delegated.to_string(),
+            "commission_bps": r.commission_bps,
+            "jailed": jail.is_some(),
+            "jailed_at_height": jail.map(|j| j.jailed_at_height),
+            "release_height": jail.map(|j| j.release_height),
+            "pending_commission": pending,
+        }))
+        .into_response(),
+        None => Json(json!({
+            "validator": hex_addr,
+            "known": false,
+            "moniker": moniker,
+            "in_set": false,
+            "power": "0",
+            "self_bond": null,
+            "delegated": null,
+            "commission_bps": null,
+            "jailed": false,
+            "jailed_at_height": null,
+            "release_height": null,
+            "pending_commission": null,
+        }))
+        .into_response(),
+    }
+}
+
+/// `GET /api/finals[?limit=N]` — recent-finals feed, newest first.
+///
+/// Each row joins the `recent_blocks` window with the receipt index
+/// (`receipts` count per height) and the inter-block interval. `limit`
+/// defaults to [`DEFAULT_FINALS_LIMIT`], clamps to [`MAX_FINALS_LIMIT`];
+/// zero/non-numeric fails closed (400). Empty store is `[]`.
+async fn api_finals(
+    State(st): State<Arc<GatewayState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let limit: usize = match query.get("limit") {
+        None => DEFAULT_FINALS_LIMIT,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n >= 1 => n.min(MAX_FINALS_LIMIT),
+            _ => return (StatusCode::BAD_REQUEST, "limit must be an integer 1..=100")
+                .into_response(),
+        },
+    };
+    let blocks: Vec<crate::rpc::BlockSummary> = {
+        let rb = st.rpc.recent_blocks.read().await;
+        rb.iter().take(limit).cloned().collect()
+    };
+    if blocks.is_empty() {
+        return Json(json!([])).into_response();
+    }
+    let counts: std::collections::HashMap<u64, usize> = {
+        let receipts = st.rpc.receipts.read().await;
+        let mut m: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for r in receipts.values() {
+            *m.entry(r.height).or_insert(0) += 1;
+        }
+        m
+    };
+    let rows: Vec<serde_json::Value> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let interval = if i + 1 < blocks.len() {
+                let prev_ts = blocks[i + 1].timestamp;
+                Some(b.timestamp.saturating_sub(prev_ts))
+            } else {
+                None
+            };
+            json!({
+                "height": b.height,
+                "hash": b.hash,
+                "txs": b.tx_count,
+                "timestamp": b.timestamp,
+                "interval_secs": interval,
+                "receipts": counts.get(&b.height).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    Json(json!(rows)).into_response()
+}
+
+/// `GET /api/account/:address` — human account summary.
+///
+/// Balances/nonce from the state engine, staking position from the indexed
+/// staking ledger, tx refs from the pending mempool (bounded to
+/// [`MAX_ACCOUNT_TXS`], newest nonce first). Unknown addresses are DATA
+/// (zero balance, empty position), not an error; malformed fails closed
+/// (400). All ledger walks are scan-budgeted; outputs are capped with
+/// `*_truncated` flags.
+async fn api_account(
+    State(st): State<Arc<GatewayState>>,
+    AxumPath(addr): AxumPath<String>,
+) -> Response {
+    let Some(a) = parse_addr(&addr) else {
+        return (StatusCode::BAD_REQUEST, "bad address").into_response();
+    };
+    let hex_addr = hex::encode(a);
+    let (balance, nonce) = st
+        .rpc
+        .engine
+        .get_account(&a)
+        .await
+        .map(|acc| (acc.balance, acc.nonce))
+        .unwrap_or((0, 0));
+    let ledger = st.rpc.staking.read().await;
+    let as_validator = match ledger.validators.get(&a) {
+        Some(r) => json!({
+            "self_bond": r.self_bond.to_string(),
+            "delegated": r.delegated.to_string(),
+            "power": r.total().to_string(),
+            "commission_bps": r.commission_bps,
+            "jailed": ledger.jail.contains_key(&a),
+            "in_set": ledger.to_validator_set().validators.contains_key(&a),
+        }),
+        None => serde_json::Value::Null,
+    };
+    let mut delegations: Vec<(String, u64)> = Vec::new();
+    let mut delegation_count: usize = 0;
+    let mut delegations_truncated = false;
+    let mut scanned: usize = 0;
+    for ((v, d), amt) in ledger.delegations.iter() {
+        scanned += 1;
+        if scanned > ACCOUNT_SCAN_BUDGET {
+            delegations_truncated = true;
+            break;
+        }
+        if *d == a {
+            delegation_count += 1;
+            if delegations.len() <= MAX_ACCOUNT_DELEGATIONS {
+                delegations.push((hex::encode(v), *amt));
+            }
+        }
+    }
+    if delegations.len() > MAX_ACCOUNT_DELEGATIONS {
+        delegations.truncate(MAX_ACCOUNT_DELEGATIONS);
+        delegations_truncated = true;
+    }
+    delegations.sort_by(|x, y| x.0.cmp(&y.0));
+    let mut withdrawable: u64 = 0;
+    let mut wscanned: usize = 0;
+    for ((v, o), amt) in ledger.withdrawable.iter() {
+        wscanned += 1;
+        if wscanned > ACCOUNT_SCAN_BUDGET {
+            break;
+        }
+        if (*v == a && *o == [0u8; 32]) || *o == a {
+            withdrawable = withdrawable.saturating_add(*amt);
+        }
+    }
+    drop(ledger);
+    let pending: Vec<crate::sharding::Transaction> = {
+        let pool = st.rpc.mempool.read().await;
+        pool.all()
+            .into_iter()
+            .filter(|t| t.from == a || t.to == a)
+            .collect()
+    };
+    let recent_tx_count = pending.len();
+    let mut pending_sorted = pending;
+    pending_sorted.sort_by(|x, y| y.nonce.cmp(&x.nonce));
+    let truncated = recent_tx_count > MAX_ACCOUNT_TXS;
+    let recent: Vec<serde_json::Value> = pending_sorted
+        .into_iter()
+        .take(MAX_ACCOUNT_TXS)
+        .map(|t| {
+            let out = t.from == a;
+            json!({
+                "tx_hash": hex::encode(t.compute_tx_hash()),
+                "direction": if out { "out" } else { "in" },
+                "counterparty": hex::encode(if out { t.to } else { t.from }),
+                "amount": t.amount.to_string(),
+                "nonce": t.nonce,
+                "status": "pending",
+            })
+        })
+        .collect();
+    let delegation_rows: Vec<serde_json::Value> = delegations
+        .into_iter()
+        .map(|(v, amt)| json!({ "validator": v, "amount": amt.to_string() }))
+        .collect();
+    Json(json!({
+        "address": hex_addr,
+        "balance": balance.to_string(),
+        "nonce": nonce,
+        "as_validator": as_validator,
+        "delegation_count": delegation_count,
+        "delegations": delegation_rows,
+        "delegations_truncated": delegations_truncated,
+        "withdrawable": withdrawable.to_string(),
+        "recent_tx_count": recent_tx_count,
+        "recent_txs": recent,
+        "recent_txs_truncated": truncated,
+    }))
+    .into_response()
+}
+
 /// Human-readable confidential display (backend part; read-only rendering,
 /// no consensus change).
 ///
@@ -1525,6 +1774,9 @@ pub fn router(gateway: Arc<GatewayState>) -> Router {
         )
         .route("/api/spv/:address", get(api_spv))
         .route("/api/contracts", get(api_contracts))
+        .route("/api/validator/:address", get(api_validator))
+        .route("/api/finals", get(api_finals))
+        .route("/api/account/:address", get(api_account))
         // SSE transport of the streaming subscriptions (`text/event-stream`).
         // The same handler the RPC server exposes on `/events`; mounted here
         // so a browser can `EventSource("/events")` against the public

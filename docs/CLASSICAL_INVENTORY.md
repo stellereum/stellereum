@@ -192,3 +192,13 @@ infnode `tests/` (frame_fuzz, p2p_audit :404-405, accept_hardening :164-165, rep
   enforcement. Touch only to strengthen.
 - Test compat pin `consensus.rs:6944` (classical QC verifies unchanged): keep until the ed QC path is deleted, so
   deletion is a deliberate, reviewed step.
+
+## PQ-first appendix (2026-11-02, append-only — no rows changed above)
+
+- `stellereum/src/simulator.rs` `derive_keypair` (§F / Phase-1 item 4) now
+  has PQ-first companions sharing the SAME caller seeds: `derive_pq_seed`
+  (domain `STELLEREUM_SIM_PQ_KEY_V1`) + `derive_falcon_keypair` (production
+  `FalconKeypair::generate_from_seed_bytes`, deterministic, no OS
+  randomness). The Ed25519 `derive_keypair` itself is byte-identical, so all
+  simulator addresses, state roots, and existing examples are unchanged.
+  Documented PQ-first in `docs/SIMULATOR.md` §6.

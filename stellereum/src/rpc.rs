@@ -1084,6 +1084,21 @@ pub fn finalized_headers() -> Arc<RwLock<std::collections::VecDeque<FinalizedHea
         .clone()
 }
 
+/// The process-wide PQ key registry view served by `stell_getPqKey` /
+/// `stell_getPqRegistryStatus`.
+///
+/// A node has ONE PQ rotation story (like it has ONE header chain, see
+/// [`finalized_headers`]): the registry is a property of the node, not of an
+/// RPC instance, so the read arms consult this handle instead of a per-state
+/// copy. The arms take only `.read()` — they never mutate. Writes arrive
+/// through the staking hooks / future announcement wiring (and tests), never
+/// through RPC: there is deliberately no state-mutating PQ endpoint.
+pub fn pq_registry_handle() -> &'static RwLock<crate::pq_registry::PqRegistry> {
+    static PQ_REGISTRY: std::sync::OnceLock<RwLock<crate::pq_registry::PqRegistry>> =
+        std::sync::OnceLock::new();
+    PQ_REGISTRY.get_or_init(|| RwLock::new(crate::pq_registry::PqRegistry::new()))
+}
+
 /// Max number of FINALIZED HEADERS (with their quorum certificates) retained
 /// for the light client.
 ///
@@ -5386,6 +5401,98 @@ async fn dispatch(
             ok(
                 id,
                 json!({ "validators": list, "total_power": vs.total_power().to_string(), "quorum": vs.quorum_power().to_string(), "fragile": fragility.is_some(), "fragile_reason": fragility }),
+            )
+        }
+
+        // ---- PQ registry visibility (rotation story) ----
+        // Read-only projections of the on-chain PQ key registry for wallets,
+        // explorers and rotation watchers: the authoritative key AT a height
+        // plus the pending rotation, and the registry-level constants. Mirrors
+        // the `stell_getValidatorStatus` idiom: public read (no `auth_token`
+        // gate) over the state engine's staking ledger + the process-wide
+        // registry view ([`pq_registry_handle`]). Cheap BTreeMap lookups with
+        // a small bounded hex encoding, so these ride the standard per-IP
+        // standalone limiter like every other cheap read — NOT the
+        // expensive-read family (no new budget, no new env knob). Fail-closed:
+        // unknown validator, a height outside every validity window, or a
+        // height above this node's tip is a JSON-RPC error, never fabricated
+        // data. No state mutation on any path (registry `.read()` only).
+        "stell_getPqKey" => {
+            let v = match params["validator"]
+                .as_str()
+                .and_then(|s| parse_hash(s).ok())
+            {
+                Some(v) => v,
+                None => return err(id, -32602, "missing validator"),
+            };
+            let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+            let h = match params.get("height") {
+                None | Some(Value::Null) => tip,
+                Some(hv) => match hv.as_u64() {
+                    Some(h) => h,
+                    None => {
+                        return err(id, -32602, "invalid height (must be an unsigned integer)")
+                    }
+                },
+            };
+            if h > tip {
+                return err(
+                    id,
+                    -32004,
+                    format!(
+                        "height {h} is above this node's tip ({tip}): no future keys, refusing"
+                    ),
+                );
+            }
+            let ledger = st.engine.staking_read().await;
+            let reg = pq_registry_handle().read().await;
+            // Membership-gated height-indexed read (the same `pq_active_key`
+            // the consensus verification paths use): unknown validator or a
+            // height outside every validity window is `None` → error.
+            let Some((scheme, pubkey)) = ledger.pq_active_key(&reg, &v, h) else {
+                return err(
+                    id,
+                    -32004,
+                    "unknown validator or no PQ key at that height: refusing",
+                );
+            };
+            // `pq_active_key` delegates to the record, so it must exist; a
+            // missing record here is an internal inconsistency, still refused
+            // fail-closed (never fabricate the metadata around a real key).
+            let Some(rec) = reg.record_of(&v) else {
+                return err(
+                    id,
+                    -32004,
+                    "unknown validator or no PQ key at that height: refusing",
+                );
+            };
+            ok(
+                id,
+                json!({
+                    "validator": hex::encode(v),
+                    "scheme": scheme.name(),
+                    "scheme_id": scheme.id(),
+                    "pubkey_hex": hex::encode(&pubkey),
+                    "activated_at": rec.activated_at,
+                    "pending": rec.pending.as_ref().map(|p| json!({
+                        "scheme": p.scheme.name(),
+                        "scheme_id": p.scheme.id(),
+                        "pubkey_hex": hex::encode(&p.pubkey),
+                        "announced_height": p.announced_height,
+                        "effective_height": p.effective_height,
+                    })),
+                }),
+            )
+        }
+        "stell_getPqRegistryStatus" => {
+            let reg = pq_registry_handle().read().await;
+            ok(
+                id,
+                json!({
+                    "count": reg.len(),
+                    "delay_heights": crate::pq_registry::PQ_ROTATION_DELAY_HEIGHTS,
+                    "history_limit": crate::pq_registry::PQ_KEY_HISTORY_LIMIT,
+                }),
             )
         }
 

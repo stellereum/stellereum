@@ -42,6 +42,7 @@ use std::fmt;
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+use crate::post_quantum::FalconKeypair;
 use crate::sharding::{ShardId, Transaction};
 
 // ---------------------------------------------------------------------------
@@ -319,6 +320,39 @@ pub fn derive_keypair(seed: &[u8], label: &[u8], index: u32) -> SigningKey {
     hasher.update(&index.to_be_bytes());
     let bytes = *hasher.finalize().as_bytes();
     SigningKey::from_bytes(&bytes)
+}
+
+/// Domain separator of the deterministic PQ key derivation.
+///
+/// Deliberately distinct from [`SIM_KEY_DOMAIN`] so the Falcon-512 seed bytes
+/// never equal the Ed25519 secret bytes for the same `(seed, label, index)`,
+/// while remaining a pure function of the SAME caller seed.
+pub const SIM_PQ_KEY_DOMAIN: &str = "STELLEREUM_SIM_PQ_KEY_V1";
+
+/// Derive the 32-byte Falcon-512 seed for `(seed, label, index)`.
+///
+/// Same caller seed and same `(label, index)` role separation as
+/// [`derive_keypair`]; only the domain separator differs (see
+/// [`SIM_PQ_KEY_DOMAIN`).
+pub fn derive_pq_seed(seed: &[u8], label: &[u8], index: u32) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(SIM_PQ_KEY_DOMAIN);
+    hasher.update(&(seed.len() as u64).to_be_bytes());
+    hasher.update(seed);
+    hasher.update(&(label.len() as u64).to_be_bytes());
+    hasher.update(label);
+    hasher.update(&index.to_be_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Derive a deterministic Falcon-512 keypair from the same seed as
+/// [`derive_keypair`].
+///
+/// PQ-first companion for simulator/devnet keygen: the same `(seed, label,
+/// index)` always yields the same keypair (via
+/// [`FalconKeypair::generate_from_seed_bytes`]), with no OS randomness and no
+/// wall clock. The existing Ed25519 [`derive_keypair`] path is untouched.
+pub fn derive_falcon_keypair(seed: &[u8], label: &[u8], index: u32) -> FalconKeypair {
+    FalconKeypair::generate_from_seed_bytes(&derive_pq_seed(seed, label, index))
 }
 
 // ---------------------------------------------------------------------------
@@ -1664,6 +1698,29 @@ mod tests {
 
         let c = ChainSimulator::genesis(b"other-seed", 4, SimConfig::default()).unwrap();
         assert_ne!(a.state_root(), c.state_root());
+    }
+
+    #[test]
+    fn pq_keygen_is_deterministic_for_the_same_seed() {
+        let a = derive_falcon_keypair(&seed(), b"validator", 1);
+        let b = derive_falcon_keypair(&seed(), b"validator", 1);
+        assert_eq!(a.public_key(), b.public_key());
+
+        let other_seed = derive_falcon_keypair(b"other-seed", b"validator", 1);
+        assert_ne!(a.public_key(), other_seed.public_key());
+
+        let other_role = derive_falcon_keypair(&seed(), b"faucet", 1);
+        assert_ne!(a.public_key(), other_role.public_key());
+
+        let other_index = derive_falcon_keypair(&seed(), b"validator", 2);
+        assert_ne!(a.public_key(), other_index.public_key());
+    }
+
+    #[test]
+    fn pq_seed_is_domain_separated_from_the_ed25519_key() {
+        let ed = derive_keypair(&seed(), b"validator", 1);
+        let pq = derive_pq_seed(&seed(), b"validator", 1);
+        assert_ne!(ed.to_bytes(), pq);
     }
 
     #[test]

@@ -91,6 +91,49 @@ row account-object-onchain     stellereum-contracts 300 -- -p e2e-tests --test o
 row adversarial-e2e            stellereum-contracts 300 -- -p e2e-tests --test adversarial_pentest_tests
 # ---- indexer ----
 row indexer-api                stellereum-indexer 300 -- --test indexer_api_tests
+# ---- wave-1..3 + PQ extensions ----
+row verify-once                stellereum 300 -- --test verify_once_tests
+row p2p-reputation             infnode 300 -- -p infnode --test reputation_tests
+row validator-ux               stellereum 300 -- --test validator_ux_tests
+row snapshot-set-binding       stellereum 300 -- --test snapshot_set_tests
+row fee-determinism            stellereum 300 -- --lib test_estimate_fee
+row pq-registry                stellereum 300 -- --test pq_registry_tests
+row light-rotation             stellereum 600 -- --test light_client_rotation_tests
+row chaos-n4                   stellereum 600 -- --test chaos_n4_tests
+row slash-drill                stellereum 600 -- --test slash_drill_tests
+if [ -f "$ROOT/stellereum/tests/tempo_recipe_tests.rs" ]; then
+  row tempo-recipe stellereum 600 -- --test tempo_recipe_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "tempo-recipe" "stellereum" "SKIP" "0" "tempo_recipe_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] tempo-recipe -> SKIP (file absent)"
+fi
+row cn-vrf-kats                stellereum 300 -- --test cn_vrf_tests
+row bls-classical              stellereum 300 -- --test bls_classical_tests
+row vrf-marker                 stellereum 300 -- --lib vrf_is_marked_classical_not_post_quantum
+if [ -f "$ROOT/stellereum/tests/explorer_ux_tests.rs" ]; then
+  row explorer-ux stellereum 300 -- --test explorer_ux_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "explorer-ux" "stellereum" "SKIP" "0" "explorer_ux_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] explorer-ux -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/wallet_pq_tests.rs" ]; then
+  row wallet-pq stellereum 300 -- --test wallet_pq_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "wallet-pq" "stellereum" "SKIP" "0" "wallet_pq_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] wallet-pq -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/faucet_pq_tests.rs" ]; then
+  row faucet-pq stellereum 300 -- --test faucet_pq_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "faucet-pq" "stellereum" "SKIP" "0" "faucet_pq_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] faucet-pq -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/fuzz_economics_ext.rs" ]; then
+  row fuzz-economics-ext stellereum 600 -- --test fuzz_economics_ext
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "fuzz-economics-ext" "stellereum" "SKIP" "0" "fuzz_economics_ext.rs absent at runtime" >> "$TSV"
+  echo "[matrix] fuzz-economics-ext -> SKIP (file absent)"
+fi
 
 python3 - "$TSV" "$ROOT" <<'EOF'
 import json, sys

@@ -1,8 +1,7 @@
 //! On-chain WASM contract lifecycle through the real transaction/block path.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use stellereum::cell::PatriciaTrie;
+use stellereum::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{contract_key, AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
@@ -16,38 +15,72 @@ const DOUBLE_WASM: &[u8] = &[
     0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x42, 0x02, 0x7e, 0x0b, //
 ];
 
-async fn funded() -> (InMemoryStateEngine, SigningKey, [u8; 32]) {
+/// Deterministic PQ sender: derived Falcon-512 address, pre-registered in the
+/// global implicit-key registry so the implicit envelope verifies. The test
+/// purpose (WASM lifecycle through the real tx/block path) is scheme-agnostic;
+/// implicit (not activation) keeps `tx_cost = amount + gas`, so funding and
+/// gas thresholds are unchanged from the legacy run.
+const USER_SEED: u8 = 0x41;
+
+fn pq_pair(seed: u8) -> ([u8; 32], Vec<u8>) {
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ fixture registration must succeed");
+    (from, pk)
+}
+
+fn pq_sign_with_payload(
+    seed: u8,
+    nonce: u64,
+    gas: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let (from, pk) = pq_pair(seed);
+    let mut tx = Transaction {
+        from,
+        to: [0u8; 32],
+        amount: 0,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    assert!(tx.is_pq(), "PQ fixture must build the PQ envelope");
+    assert!(tx.verify_signature(), "PQ fixture signature must verify");
+    tx
+}
+
+async fn funded() -> (InMemoryStateEngine, u8, [u8; 32]) {
     let engine = InMemoryStateEngine::new();
-    let sk = SigningKey::generate(&mut OsRng);
-    let addr = sk.verifying_key().to_bytes();
+    let (addr, _) = pq_pair(USER_SEED);
     engine
         .update_account(AccountState::new(addr, 1_000_000_000_000))
         .await;
-    (engine, sk, addr)
+    (engine, USER_SEED, addr)
 }
 
-fn deploy_tx(sk: &SigningKey, nonce: u64, code: Vec<u8>) -> Transaction {
-    Transaction::sign_with_payload(
-        sk,
-        [0u8; 32],
-        0,
-        5_000_000,
+fn deploy_tx(seed: u8, nonce: u64, code: Vec<u8>) -> Transaction {
+    pq_sign_with_payload(
+        seed,
         nonce,
-        1,
-        1,
+        5_000_000,
         vec![OpCode::SysCallDeployContract { code }],
     )
 }
 
-fn call_tx(sk: &SigningKey, nonce: u64, contract: [u8; 32], method: &str, arg: i64) -> Transaction {
-    Transaction::sign_with_payload(
-        sk,
-        [0u8; 32],
-        0,
-        5_000_000,
+fn call_tx(seed: u8, nonce: u64, contract: [u8; 32], method: &str, arg: i64) -> Transaction {
+    pq_sign_with_payload(
+        seed,
         nonce,
-        1,
-        1,
+        5_000_000,
         vec![OpCode::SysCallCallContract {
             contract,
             method: method.as_bytes().to_vec(),
@@ -58,10 +91,10 @@ fn call_tx(sk: &SigningKey, nonce: u64, contract: [u8; 32], method: &str, arg: i
 
 #[tokio::test]
 async fn deploy_then_call_onchain() {
-    let (engine, sk, _) = funded().await;
+    let (engine, seed, _) = funded().await;
 
     let (applied, failed) = engine
-        .apply_block_parallel(&[deploy_tx(&sk, 0, DOUBLE_WASM.to_vec())], 0)
+        .apply_block_parallel(&[deploy_tx(seed, 0, DOUBLE_WASM.to_vec())], 0)
         .await;
     assert_eq!((applied, failed), (1, 0), "deploy must be applied");
     assert_eq!(engine.contract_count().await, 1);
@@ -84,7 +117,7 @@ async fn deploy_then_call_onchain() {
 
     // Execute it via a real transaction.
     let (applied, failed) = engine
-        .apply_block_parallel(&[call_tx(&sk, 1, addr, "double", 21)], 0)
+        .apply_block_parallel(&[call_tx(seed, 1, addr, "double", 21)], 0)
         .await;
     assert_eq!((applied, failed), (1, 0), "call must be applied");
     assert_eq!(
@@ -101,7 +134,7 @@ async fn deploy_then_call_onchain() {
 async fn reverting_payload_discards_the_deploy() {
     // Deploy a valid contract and then hit a failing token syscall in the SAME
     // payload: the whole execution (including the deploy) must be discarded.
-    let (engine, sk, _) = funded().await;
+    let (engine, seed, _) = funded().await;
     let missing_token = [0xABu8; 32];
     let payload = vec![
         OpCode::SysCallDeployContract {
@@ -113,7 +146,7 @@ async fn reverting_payload_discards_the_deploy() {
             amount: 1,
         },
     ];
-    let tx = Transaction::sign_with_payload(&sk, [0u8; 32], 0, 5_000_000, 0, 1, 1, payload);
+    let tx = pq_sign_with_payload(seed, 0, 5_000_000, payload);
     let (applied, failed) = engine.apply_block_parallel(&[tx], 0).await;
     assert_eq!(applied, 0, "reverting payload must not be applied");
     assert_eq!(failed, 1);
@@ -126,9 +159,9 @@ async fn reverting_payload_discards_the_deploy() {
 
 #[tokio::test]
 async fn invalid_wasm_is_rejected_onchain() {
-    let (engine, sk, _) = funded().await;
+    let (engine, seed, _) = funded().await;
     let (applied, failed) = engine
-        .apply_block_parallel(&[deploy_tx(&sk, 0, vec![0xDE, 0xAD, 0xBE, 0xEF])], 0)
+        .apply_block_parallel(&[deploy_tx(seed, 0, vec![0xDE, 0xAD, 0xBE, 0xEF])], 0)
         .await;
     assert_eq!(applied, 0, "invalid wasm deploy must fail");
     assert_eq!(failed, 1);
@@ -137,21 +170,17 @@ async fn invalid_wasm_is_rejected_onchain() {
 
 #[tokio::test]
 async fn out_of_fuel_call_reverts() {
-    let (engine, sk, _) = funded().await;
+    let (engine, seed, _) = funded().await;
     engine
-        .apply_block_parallel(&[deploy_tx(&sk, 0, DOUBLE_WASM.to_vec())], 0)
+        .apply_block_parallel(&[deploy_tx(seed, 0, DOUBLE_WASM.to_vec())], 0)
         .await;
     let addr = engine.all_contract_addresses().await[0];
 
     // gas_limit barely covers the base call cost -> almost no wasmi fuel left.
-    let tx = Transaction::sign_with_payload(
-        &sk,
-        [0u8; 32],
-        0,
+    let tx = pq_sign_with_payload(
+        seed,
+        1,
         1_050,
-        1,
-        1,
-        1,
         vec![OpCode::SysCallCallContract {
             contract: addr,
             method: b"double".to_vec(),

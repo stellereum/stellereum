@@ -569,3 +569,68 @@ fn rotation_announcement_signature_verifies_under_consensus_key() {
         &[0u8; 10]
     ));
 }
+
+// ---- RPC visibility contract (rotation story) ----
+// `stell_getPqKey` / `stell_getPqRegistryStatus` (rpc.rs) are thin read-only
+// projections of THESE read APIs: `record_of` fields (scheme / pubkey /
+// activated_at / pending) + `get_active_key` at the requested height for the
+// served key + `len` for the status count. Pinned here at the registry level
+// so a registry change that would alter an RPC answer fails here first.
+// Local registries only (no shared global state — safe under parallel test
+// execution).
+
+#[test]
+fn rpc_projection_inputs_scheme_key_window_and_pending() {
+    let id = vid(0xE1);
+    let old = falcon_key(0xA5);
+    let new = falcon_key(0x5A);
+    let (mut ledger, mut reg) = registered_pair(id, &old, 10);
+    ledger
+        .pq_announce_rotation(&mut reg, id, PqScheme::Falcon512, new.clone(), 100)
+        .expect("announce must succeed");
+    let eff = 100 + PQ_ROTATION_DELAY_HEIGHTS;
+
+    // What `stell_getPqKey` projects around the served key.
+    let rec = reg.record_of(&id).expect("record must exist");
+    assert_eq!(rec.scheme.name(), "Falcon-512");
+    assert_eq!(rec.scheme.id(), 2);
+    assert_eq!(rec.pubkey, old);
+    assert_eq!(rec.activated_at, 10);
+    let pending = rec.pending.as_ref().expect("rotation must be pending");
+    assert_eq!(pending.scheme, PqScheme::Falcon512);
+    assert_eq!(pending.pubkey, new);
+    assert_eq!(pending.announced_height, 100);
+    assert_eq!(pending.effective_height, eff);
+
+    // The served key itself is the height-indexed read, pre/post effective.
+    assert_eq!(
+        reg.get_active_key(&id, eff - 1),
+        Some((PqScheme::Falcon512, old.clone()))
+    );
+    assert_eq!(
+        reg.get_active_key(&id, eff),
+        Some((PqScheme::Falcon512, new.clone()))
+    );
+
+    // Unknown validator serves nothing (the RPC errors, never fabricates).
+    assert_eq!(reg.get_active_key(&vid(0xE2), eff), None);
+    assert!(reg.record_of(&vid(0xE2)).is_none());
+}
+
+#[test]
+fn rpc_status_count_inputs_len_semantics() {
+    // What `stell_getPqRegistryStatus` reports as `count`.
+    let mut reg = PqRegistry::new();
+    assert!(reg.is_empty());
+    assert_eq!(reg.len(), 0);
+    let mut ledger = bonded_ledger(&[vid(1), vid(2)]);
+    ledger
+        .pq_register_key(&mut reg, vid(1), PqScheme::Falcon512, falcon_key(1), 0, 0)
+        .expect("register must succeed");
+    assert_eq!(reg.len(), 1);
+    assert!(!reg.is_empty());
+    ledger
+        .pq_register_key(&mut reg, vid(2), PqScheme::Falcon512, falcon_key(2), 0, 0)
+        .expect("register must succeed");
+    assert_eq!(reg.len(), 2);
+}

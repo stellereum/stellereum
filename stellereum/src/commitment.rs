@@ -2002,7 +2002,7 @@ mod tests {
         let mut s = empty_snapshot();
         s.staking.validator_pq_keys.insert(
             [0x33u8; 32],
-            (crate::post_quantum::PqScheme::Ed25519, vec![0xAB; 32]),
+            (crate::post_quantum::PqScheme::Falcon512, vec![0xAB; 32]),
         );
         assert_ne!(
             digest_of(&s),
@@ -2012,7 +2012,7 @@ mod tests {
         );
 
         // The SCHEME is part of the commitment: the same key bytes mean
-        // different things under Ed25519 and under the hybrid scheme.
+        // different things under Falcon512 and under the hybrid scheme.
         let mut other = empty_snapshot();
         other.staking.validator_pq_keys.insert(
             [0x33u8; 32],
@@ -2072,7 +2072,7 @@ mod tests {
             a.staking.pq_equivocation_dedup.insert(key);
             a.staking
                 .validator_pq_keys
-                .insert(key, (crate::post_quantum::PqScheme::Ed25519, vec![i; 32]));
+                .insert(key, (crate::post_quantum::PqScheme::Falcon512, vec![i; 32]));
             a.staking
                 .vesting_schedules
                 .insert(key, crate::tokenomics::TeamVestingSchedule::new(i as u64));
@@ -2083,7 +2083,7 @@ mod tests {
             b.staking.pq_equivocation_dedup.insert(key);
             b.staking
                 .validator_pq_keys
-                .insert(key, (crate::post_quantum::PqScheme::Ed25519, vec![i; 32]));
+                .insert(key, (crate::post_quantum::PqScheme::Falcon512, vec![i; 32]));
             b.staking
                 .vesting_schedules
                 .insert(key, crate::tokenomics::TeamVestingSchedule::new(i as u64));
@@ -2199,7 +2199,7 @@ mod tests {
         let mut used = empty_snapshot();
         used.staking.validator_pq_keys.insert(
             [0x33u8; 32],
-            (crate::post_quantum::PqScheme::Ed25519, vec![0xAB; 32]),
+            (crate::post_quantum::PqScheme::Falcon512, vec![0xAB; 32]),
         );
         assert_ne!(digest_of(&used), digest_of(&empty_snapshot()));
 
@@ -2208,7 +2208,7 @@ mod tests {
         let mut emptied = empty_snapshot();
         emptied.staking.validator_pq_keys.insert(
             [0x33u8; 32],
-            (crate::post_quantum::PqScheme::Ed25519, vec![0xAB; 32]),
+            (crate::post_quantum::PqScheme::Falcon512, vec![0xAB; 32]),
         );
         emptied.staking.validator_pq_keys.remove(&[0x33u8; 32]);
         assert_eq!(
@@ -2250,12 +2250,12 @@ mod tests {
         let mut short = empty_snapshot();
         short.staking.validator_pq_keys.insert(
             [0x33u8; 32],
-            (crate::post_quantum::PqScheme::Ed25519, vec![0xAB; 32]),
+            (crate::post_quantum::PqScheme::Falcon512, vec![0xAB; 32]),
         );
         let mut long = empty_snapshot();
         long.staking.validator_pq_keys.insert(
             [0x33u8; 32],
-            (crate::post_quantum::PqScheme::Ed25519, vec![0xAB; 33]),
+            (crate::post_quantum::PqScheme::Falcon512, vec![0xAB; 33]),
         );
         assert_ne!(
             digest_of(&short),

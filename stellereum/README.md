@@ -4,16 +4,16 @@
 
 <p align="center">
   <a href="https://github.com/immtes/stellereum/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/immtes/stellereum/ci.yml?label=CI" alt="CI"/></a>
-  <img src="https://img.shields.io/badge/tests-936%20passing%20%28cargo%20test%20--lib%29-brightgreen" alt="lib tests, measured 2026-10-25"/>
+  <img src="https://img.shields.io/badge/tests-1067%20passing%20%28cargo%20test%20--lib%29-brightgreen" alt="lib tests, measured 2026-11-02"/>
   <img src="https://img.shields.io/badge/fuzz-7%20decode%20harnesses-blue" alt="fuzz targets"/>
   <img src="https://img.shields.io/badge/testnet-local--only%20%28public%20RPC%20502%20on%202026--10--25%29-yellow" alt="testnet status"/>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-orange" alt="License"/></a>
   <a href="docs/RPC.md"><img src="https://img.shields.io/badge/docs-RPC%20%7C%20ops%20%7C%20sharding-lightgrey" alt="Docs"/></a>
 </p>
 
-> **Badge freshness (no stale numbers):** `970` = `cargo test --lib` → `970 passed; 0 failed` on 2026-10-25 (re-run to refresh; the tree moves fast — it read 936 earlier the same day). `7` = `ls fuzz/fuzz_targets/*.rs`. Public RPC `https://rpc.stellereum.org` returned HTTP 502 on 2026-10-25, so there is no live tip to link — run the local stack below instead. Public RPC `https://rpc.stellereum.org` returned HTTP 502 on 2026-10-25, so there is no live tip to link — run the local stack below instead.
+> **Badge freshness (no stale numbers):** `1067` = `cargo test --lib` → `1067 passed; 0 failed` on 2026-11-02 in `stellereum/` (re-run to refresh; the tree moves fast — it read 970/936 on 2026-10-25). `7` = `ls fuzz/fuzz_targets/*.rs` (re-verified 2026-11-02). `39` = `grep -c "^row " scripts/feature_matrix.sh`. `276` = `ls stellereum/tests/*.rs | wc -l` (2026-11-02). Public RPC `https://rpc.stellereum.org` returned HTTP 502 on 2026-10-25 (last check; not re-probed 2026-11-02), so there is no live tip to link — run the local stack below instead.
 
-**Pitch.** Stellereum is an in-development Rust L1 for high-frequency trading and AI agents: TON-style actor accounts and BoC state, a masterchain plus auto-splitting workchain shards, BFT finality with post-quantum validator keys, a native on-chain order book, and private transfers — all runnable on lightweight hardware. Stage: fully working local simulator and deterministic devnet, multi-node testnet configs shipped, no production network and no external audit yet. `chainId 5757`; testnet only.
+**Pitch.** Stellereum is an in-development Rust L1 for high-frequency trading and AI agents: TON-style actor accounts and BoC state, a masterchain plus a single active shard (workchain shard-1 PARKED — empty, no user txs; `docs/BFT_COMPARISON.md`, `docs/specs/04_NETWORK_AND_CONSENSUS.md`), Tendermint-style prevote/precommit BFT at `floor(2W/3)+1` voting power with Falcon-512 PQ validator keys enforced via `STELL_PURE_PQ=1` (`is_pure_pq_enforced()`), a native on-chain order book, and private transfers — all runnable on lightweight hardware. CN-VRF is sandbox-only KATs (`src/cn_vrf.rs`, `tests/cn_vrf_tests.rs`) per `docs/PQ_CN_VRF_SPEC.md` (SPEC ONLY, consensus wiring FORBIDDEN before external audit); classical-removal Phase 2+3 is design-only per `docs/CLASSICAL_REMOVAL_PHASE23.md` against the 25-hole list in `docs/CLASSICAL_INVENTORY.md`. Stage: fully working local simulator and deterministic devnet, multi-node testnet configs shipped, no production network and no external audit yet. `chainId 5757`; testnet only.
 
 ```text
                     ┌─────────────────────────────────────────┐
@@ -22,14 +22,14 @@
                     │ order-root + epoch-key block commitments│
                     └───────┬─────────────────────────┬───────┘
                             │ prefix routing          │
-            ┌───────────────▼────────┐ ┌──────────────▼─────────┐
-            │ WORKCHAIN SHARD 1      │ │ WORKCHAIN SHARD 2 … ≤16│
-            │ actor accounts · BoC   │ │ split ≥500 / merge ≤50 │
-            │ CLOB order book · SVM  │ │ address space 2^60     │
+             ┌───────────────▼────────┐ ┌──────────────▼─────────┐
+             │ WORKCHAIN SHARD 1      │ │ (shards 2…16 PARKED —   │
+             │ PARKED (empty,         │ │  design only, not live)  │
+             │ no user txs) · BoC    │ │ address space 2^60       │
             └────────────────────────┘ └────────────────────────┘
    ┌──────┐  ┌──────────┐  ┌───────────────────────────────────┐
-   │  PQ  │  │ MEMPOOL  │  │  BFT: sortition-seeded µQC, quorum │
-   │ keys │─▶│ sealed   │─▶│  floor(2P/3)+1 incl. network-majority│
+    │  PQ  │  │ MEMPOOL  │  │  BFT: Tendermint-style prevote/precommit, │
+    │ keys │─▶│ sealed   │─▶│  quorum floor(2W/3)+1 voting power      │
    └──────┘  └──────────┘  └───────────────────────────────────┘
    ┌────────────────────────────────────────────────────────────┐
    │ JSON-RPC/WS :8545 (stell_*) · explorer gateway :8080      │
@@ -68,7 +68,7 @@ cargo build                                   # 1. build the node
 
 | Figure | Value | How obtained (re-run it) |
 | :--- | :--- | :--- |
-| Lib tests | **970 passed, 0 failed** | `cargo test --lib`, 2026-10-25, debug |
+| Lib tests | **1067 passed, 0 failed** | `cargo test --lib`, 2026-11-02, debug, in `stellereum/` |
 | Block apply, mixed 428 tx | **8.45 ms wall (~50k tx/s in-process)** | BENCH, release, Ryzen 5 3600 (`benches/packing.rs`, via [`docs/PERF_1K.md`](docs/PERF_1K.md)) |
 | Mempool select, pool 428/1k/10k | **35.0 / 60.2 / 550.5 µs** | BENCH, same host/profile |
 | Simulator block finality | **~1.7 ms** | in-process `sim`, NOT network (sample in old docs) |

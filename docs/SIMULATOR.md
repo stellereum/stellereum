@@ -130,3 +130,19 @@ cargo test --test sim_happy3 --test sim_slow_voter_unanimity \
 ```
 
 All green, then update the numbers in §2 from the `[sim]` output lines.
+
+## 6. PQ-first keygen note (2026-11-02, additive — Ed25519 path untouched)
+
+`stellereum/src/simulator.rs` now offers deterministic Falcon-512 keygen
+beside the existing Ed25519 `derive_keypair`:
+
+- `derive_pq_seed(seed, label, index) -> [u8; 32]` — same caller seed and
+  same `(label, index)` role separation as `derive_keypair`, under the
+  distinct domain `STELLEREUM_SIM_PQ_KEY_V1` (so PQ seed bytes never equal
+  the Ed25519 secret bytes for the same inputs).
+- `derive_falcon_keypair(seed, label, index) -> FalconKeypair` — via the
+  production `FalconKeypair::generate_from_seed_bytes`; same seed always
+  yields the same keypair, no OS randomness, no wall clock.
+
+The Ed25519 `derive_keypair`, all simulator addresses/state roots, and every
+working example above are unchanged.

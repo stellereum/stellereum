@@ -329,3 +329,250 @@ fn bls_qc_startup_refusal_is_unchanged() {
         );
     }
 }
+
+// ---- Phase 2 API: PoP-bound registration + aggregate-verify ----------------
+//
+// These pin the new `src/bls.rs` surface (`BlsRegistration`, `BlsRegistry`,
+// `aggregate_verify`, `BlsRegistry::verify_aggregate_qc`) WITHOUT touching
+// consensus counting: every assertion here calls the new API directly, and
+// the startup refusal above still holds.
+
+#[test]
+fn registration_carries_live_pop_and_refuses_forgeries() {
+    let sk = BlsSecretKey::from_seed(&[0x51u8; 32]);
+    let other_sk = BlsSecretKey::from_seed(&[0x52u8; 32]);
+    let id = ed(0x11);
+    let good_pop = bls_sign_pop(&sk, &id);
+
+    // Happy: minted registration verifies, and `from_parts` accepts the same
+    // material back.
+    let reg = BlsRegistration::register(&sk, &id);
+    assert!(reg.verify_pop(), "freshly minted PoP must verify");
+    assert_eq!(reg.public_key(), sk.public_key());
+    assert_eq!(*reg.ed_id(), id);
+    assert!(
+        BlsRegistration::from_parts(&id, Some(sk.public_key().to_bytes()), Some(good_pop.to_bytes()))
+            .is_some(),
+        "well-formed (pk, pop) must construct"
+    );
+
+    // Missing PoP refuses (no "register now, prove later" state).
+    assert!(
+        BlsRegistration::from_parts(&id, Some(sk.public_key().to_bytes()), None).is_none(),
+        "missing PoP must refuse"
+    );
+    // Missing key refuses.
+    assert!(
+        BlsRegistration::from_parts(&id, None, Some(good_pop.to_bytes())).is_none(),
+        "missing key must refuse"
+    );
+
+    // Wrong sk: a PoP minted by another secret refuses against this key.
+    let wrong_sk_pop = bls_sign_pop(&other_sk, &id);
+    assert!(
+        BlsRegistration::from_parts(
+            &id,
+            Some(sk.public_key().to_bytes()),
+            Some(wrong_sk_pop.to_bytes())
+        )
+        .is_none(),
+        "PoP from the wrong secret must refuse"
+    );
+
+    // Tampered pk: a flipped byte refuses — whether the bytes fall off the
+    // curve (parse refusal) or land on another point (verify refusal), the
+    // outcome is `None` either way.
+    let mut tampered = sk.public_key().to_bytes();
+    tampered[0] ^= 0xFF;
+    assert!(
+        BlsRegistration::from_parts(&id, Some(tampered), Some(good_pop.to_bytes())).is_none(),
+        "tampered pk must refuse"
+    );
+
+    // Replayed pop on a different pk: the PoP is key-bound, so a valid PoP
+    // for `other_sk` refuses when presented under `sk`'s key...
+    let other_pk = other_sk.public_key();
+    let pop_for_other = bls_sign_pop(&other_sk, &id);
+    assert!(
+        BlsRegistration::from_parts(
+            &id,
+            Some(other_pk.to_bytes()),
+            Some(pop_for_other.to_bytes())
+        )
+        .is_some(),
+        "sanity: the replayed PoP is valid for its own pair"
+    );
+    assert!(
+        BlsRegistration::from_parts(
+            &id,
+            Some(sk.public_key().to_bytes()),
+            Some(pop_for_other.to_bytes())
+        )
+        .is_none(),
+        "replayed PoP on a different pk must refuse"
+    );
+
+    // Registry admission mirrors construction: admits good, refuses bad.
+    let mut reg_store = BlsRegistry::new();
+    assert!(reg_store.is_empty());
+    assert!(reg_store.insert(&reg), "valid registration must admit");
+    assert!(reg_store.contains(&id));
+    assert_eq!(reg_store.len(), 1);
+    assert_eq!(reg_store.get(&id), Some(sk.public_key()));
+    assert!(
+        !reg_store.insert_verified(&id, &sk.public_key(), &wrong_sk_pop),
+        "registry must refuse a spliced (pk, pop) pair"
+    );
+    assert_eq!(reg_store.len(), 1, "refusal must leave the registry unchanged");
+}
+
+#[test]
+fn aggregate_verify_happy_path_and_qc_wrapper() {
+    let sks: Vec<BlsSecretKey> = (0u8..5u8).map(|i| BlsSecretKey::from_seed(&[i; 32])).collect();
+    let pks: Vec<BlsPublicKey> = sks.iter().map(|k| k.public_key()).collect();
+    let msg = b"qc-aggregate-happy";
+    let sigs: Vec<(usize, BlsSignature)> =
+        sks.iter().enumerate().map(|(i, k)| (i, k.sign(msg))).collect();
+    let agg = aggregate_signatures(&sigs, sks.len()).expect("honest aggregate builds");
+
+    // Raw primitive: verifies for the exact signer set and message.
+    assert!(aggregate_verify(&pks, msg, &agg.signature));
+    // Wrong message refuses.
+    assert!(!aggregate_verify(&pks, b"tampered message", &agg.signature));
+    // A different key list (subset) refuses: the pairing binds the sum.
+    assert!(!aggregate_verify(&pks[..4], msg, &agg.signature));
+
+    // Registry-gated QC wrapper: honest set verifies through admitted keys.
+    let mut reg = BlsRegistry::new();
+    for (i, sk) in sks.iter().enumerate() {
+        assert!(reg.insert(&BlsRegistration::register(sk, &ed(i as u8))));
+    }
+    let ids: Vec<[u8; 32]> = (0u8..5u8).map(ed).collect();
+    assert!(reg.verify_aggregate_qc(&ids, msg, &agg.signature));
+    // Unknown id refuses (missing member, no guessing).
+    assert!(!reg.verify_aggregate_qc(&[[0xFFu8; 32]], msg, &agg.signature));
+    // Duplicate id refuses (one validator's power must never count twice).
+    let mut dup = ids.clone();
+    dup[0] = dup[1];
+    assert!(!reg.verify_aggregate_qc(&dup, msg, &agg.signature));
+    // Empty signer set refuses (no vacuous truth).
+    assert!(!reg.verify_aggregate_qc(&[], msg, &agg.signature));
+    assert!(reg.keys_for(&[]).is_none());
+}
+
+#[test]
+fn rogue_key_attack_fails_against_pop_gated_api() {
+    // Cancellation forgery (the textbook rogue-key attack): with honest keys
+    // pk1, pk2 and the attacker's own secret t, register
+    // pk_rogue = t*G - pk1 - pk2. Then the attacker's lone signature
+    // sigma = t*H(m), claimed as "all three signed m", satisfies
+    // e(G, sigma) == e(pk1 + pk2 + pk_rogue, H(m)) because the key sum is t*G.
+    use bls12_381::{G1Affine, G1Projective};
+
+    fn proj(pk: &BlsPublicKey) -> G1Projective {
+        let aff: Option<G1Affine> = Option::from(G1Affine::from_compressed(&pk.to_bytes()));
+        G1Projective::from(aff.expect("honest key must decompress"))
+    }
+
+    let sk1 = BlsSecretKey::from_seed(&[0xA1u8; 32]);
+    let sk2 = BlsSecretKey::from_seed(&[0xA2u8; 32]);
+    let rogue_sk = BlsSecretKey::from_seed(&[0xADu8; 32]);
+    let (pk1, pk2) = (sk1.public_key(), sk2.public_key());
+    let (id1, id2, rogue_id) = (ed(0x11), ed(0x12), ed(0x99));
+
+    let rogue_pt = proj(&rogue_sk.public_key()) - proj(&pk1) - proj(&pk2);
+    let rogue_pk = BlsPublicKey::from_bytes(&G1Affine::from(rogue_pt).to_compressed())
+        .expect("cancellation key must be a valid non-identity point");
+
+    let msg = b"rogue-key-forgery-probe";
+    let forged = rogue_sk.sign(msg);
+    // Sanity: the raw pairing check ALONE cannot see the fraud — this is the
+    // attack working, and exactly why registration must gate rogue keys out.
+    assert!(
+        aggregate_verify(&[pk1, pk2, rogue_pk], msg, &forged),
+        "sanity: the cancellation forgery defeats the raw pairing check"
+    );
+
+    // The PoP gate defeats it: a PoP for pk_rogue needs its discrete log
+    // (t - sk1 - sk2), which the attacker does not know. The best forgery —
+    // the attacker's own signature over the rogue preimage — refuses.
+    let forged_pop = bls_sign_pop(&rogue_sk, &rogue_id);
+    assert!(!bls_verify_pop(&rogue_pk, &rogue_id, &forged_pop));
+    assert!(
+        BlsRegistration::from_parts(
+            &rogue_id,
+            Some(rogue_pk.to_bytes()),
+            Some(forged_pop.to_bytes())
+        )
+        .is_none(),
+        "rogue key must not construct a registration"
+    );
+    let mut reg = BlsRegistry::new();
+    assert!(
+        !reg.insert_verified(&rogue_id, &rogue_pk, &forged_pop),
+        "rogue key must not enter the registry"
+    );
+    assert!(!reg.contains(&rogue_id));
+
+    // Honest validators register fine...
+    assert!(reg.insert(&BlsRegistration::register(&sk1, &id1)));
+    assert!(reg.insert(&BlsRegistration::register(&sk2, &id2)));
+
+    // ...but any set containing the rogue never resolves: QC verify refuses
+    // (missing member => no BLS power counted, the safe direction).
+    assert!(reg.keys_for(&[id1, id2, rogue_id]).is_none());
+    assert!(!reg.verify_aggregate_qc(&[id1, id2, rogue_id], msg, &forged));
+
+    // And the honest-only QC still verifies through the gated API — gating
+    // removes the attacker without breaking honest quorum math.
+    let honest_sigs: Vec<(usize, BlsSignature)> =
+        [&sk1, &sk2].iter().enumerate().map(|(i, k)| (i, k.sign(msg))).collect();
+    let honest_agg = aggregate_signatures(&honest_sigs, 2).expect("honest aggregate builds");
+    assert!(reg.verify_aggregate_qc(&[id1, id2], msg, &honest_agg.signature));
+}
+
+#[test]
+fn aggregate_verify_empty_and_overcap_fail_closed() {
+    let sk = BlsSecretKey::from_seed(&[0xD0u8; 32]);
+    let sig = sk.sign(b"m");
+
+    // Empty key list refuses: no vacuous truth, no identity bypass.
+    assert!(!aggregate_verify(&[], b"m", &sig));
+    assert!(BlsRegistry::new().keys_for(&[]).is_none());
+
+    // Over-cap refuses BEFORE any pairing work (DoS bound).
+    let too_many = vec![sk.public_key(); MAX_BLS_AGGREGATE_KEYS + 1];
+    assert!(
+        !aggregate_verify(&too_many, b"m", &sig),
+        "over-cap key list must refuse"
+    );
+    assert!(
+        BlsRegistry::new()
+            .keys_for(&vec![[0x01u8; 32]; MAX_BLS_AGGREGATE_KEYS + 1])
+            .is_none(),
+        "over-cap id list must not resolve"
+    );
+
+    // At-cap still verifies: the cap is a bound, not a ban. (4096 keygens +
+    // signs + one pairing; deterministic seeds, no OsRng.)
+    let many_sks: Vec<BlsSecretKey> = (0..MAX_BLS_AGGREGATE_KEYS)
+        .map(|i| {
+            let mut seed = [0xE0u8; 32];
+            seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            BlsSecretKey::from_seed(&seed)
+        })
+        .collect();
+    let many_pks: Vec<BlsPublicKey> = many_sks.iter().map(|k| k.public_key()).collect();
+    let many_sigs: Vec<(usize, BlsSignature)> = many_sks
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (i, k.sign(b"cap")))
+        .collect();
+    let many_agg =
+        aggregate_signatures(&many_sigs, MAX_BLS_AGGREGATE_KEYS).expect("at-cap aggregate builds");
+    assert!(aggregate_verify(&many_pks, b"cap", &many_agg.signature));
+    assert!(
+        !aggregate_verify(&many_pks, b"other", &many_agg.signature),
+        "at-cap aggregate must still bind the message"
+    );
+}

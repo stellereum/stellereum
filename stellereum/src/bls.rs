@@ -1076,6 +1076,282 @@ pub fn bls_registry_migration_counts() -> (u64, u64, u64) {
     )
 }
 
+// ============================================================================
+// PoP-bound registration + aggregate-verify for the FUTURE QC path (phase 2).
+//
+// What this section is: the clean, documented API the QC-activation step will
+// need — a registration type that always carries a live PoP
+// ([`BlsRegistration`]), a PoP-only admission registry ([`BlsRegistry`]), a
+// raw same-message aggregate check ([`aggregate_verify`]), and the
+// registry-gated QC primitive ([`BlsRegistry::verify_aggregate_qc`]).
+//
+// What this section is NOT: it is not wired into any consensus counting path.
+// Vote signing (`local_vote_bls_sign`), certificate verification, and the
+// `STELL_BLS_QC=1` startup refusal (`refuse_bls_qc_if_enabled`) are untouched,
+// so default behavior (all BLS flags off) is byte-identical to before: this
+// code only runs when a caller — today, only tests — calls it. It never reads
+// process environment itself; activation wiring (which flag arms it, which
+// height arms it) is a future step owned by the consensus agent.
+//
+// Rogue-key posture: the pairing check alone CANNOT tell an honest key from a
+// cancellation-crafted one, so rogue-key resistance lives at REGISTRATION —
+// every key admitted here proved secret knowledge via [`bls_verify_pop`] —
+// never at verify time. `aggregate_verify` therefore documents a caller
+// contract (inputs must be PoP-verified) and only fail-closes on malformed
+// inputs; [`BlsRegistry::verify_aggregate_qc`] enforces the contract by
+// resolving keys exclusively from the PoP-only registry.
+// ============================================================================
+
+/// Maximum number of keys one [`aggregate_verify`] call will sum.
+///
+/// Fail-closed bound, not a protocol limit: validator sets are far smaller,
+/// and an unbounded sum is a cheap remote-CPU lever (each key is a G1 add
+/// before the pairing). Over-cap inputs refuse BEFORE any pairing work.
+/// Frozen like [`BLS_POP_DST`]: raising it changes no signature bytes, but
+/// every verifier must enforce the same bound or QC acceptance diverges.
+pub const MAX_BLS_AGGREGATE_KEYS: usize = 4096;
+
+/// A BLS key registration: the validator's BLS public key PLUS the
+/// proof-of-possession binding it to the validator's Ed25519 identity.
+///
+/// INVARIANT: the carried `pop` verifies under [`bls_verify_pop`] for the
+/// carried `(pk, ed_id)` pair. Fields are private so the invariant cannot be
+/// bypassed by struct-literal construction: both constructors verify, and
+/// [`BlsRegistration::from_parts`] returns `None` (refuses) on missing or
+/// invalid material. There is no "register now, prove later" state — a
+/// `BlsRegistration` value always carries a live PoP.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct BlsRegistration {
+    ed_id: [u8; 32],
+    pk: BlsPublicKey,
+    pop: BlsSignature,
+}
+
+impl BlsRegistration {
+    /// Mint a registration for `ed_id` from the BLS secret. Infallible: a
+    /// freshly minted PoP over its own preimage always verifies (debug-
+    /// asserted so a future hash-to-curve change fails loudly in tests
+    /// rather than minting dead registrations in production).
+    pub fn register(sk: &BlsSecretKey, ed_id: &[u8; 32]) -> Self {
+        let pk = sk.public_key();
+        let pop = bls_sign_pop(sk, ed_id);
+        debug_assert!(bls_verify_pop(&pk, ed_id, &pop));
+        Self {
+            ed_id: *ed_id,
+            pk,
+            pop,
+        }
+    }
+
+    /// Build from registry/wire parts, refusing anything without a live PoP.
+    ///
+    /// `None` key or PoP bytes (a missing token at parse) refuses exactly
+    /// like an invalid one; non-curve bytes refuse at parse; a PoP over
+    /// another preimage, another key, or a truncated preimage refuses at
+    /// verify. Whatever the cause, the result is `None` and nothing registers.
+    pub fn from_parts(
+        ed_id: &[u8; 32],
+        pk_bytes: Option<[u8; PUBLIC_KEY_LEN]>,
+        pop_bytes: Option<[u8; SIGNATURE_LEN]>,
+    ) -> Option<Self> {
+        let pk = BlsPublicKey::from_bytes(&pk_bytes?)?;
+        let pop = BlsSignature::from_bytes(&pop_bytes?)?;
+        let reg = Self {
+            ed_id: *ed_id,
+            pk,
+            pop,
+        };
+        if !reg.verify_pop() {
+            return None;
+        }
+        Some(reg)
+    }
+
+    /// Re-verify the carried PoP against the carried key and identity.
+    /// Fail-closed: `false` on any mismatch, never a partial accept.
+    pub fn verify_pop(&self) -> bool {
+        bls_verify_pop(&self.pk, &self.ed_id, &self.pop)
+    }
+
+    /// The validator identity this key is bound to.
+    pub fn ed_id(&self) -> &[u8; 32] {
+        &self.ed_id
+    }
+
+    /// The registered BLS public key (PoP-verified for [`ed_id`](Self::ed_id)).
+    pub fn public_key(&self) -> BlsPublicKey {
+        self.pk
+    }
+
+    /// The carried proof-of-possession.
+    pub fn pop(&self) -> BlsSignature {
+        self.pop
+    }
+}
+
+/// Verify a same-message aggregate against an explicit key list — the
+/// primitive QC counting will need.
+///
+/// CALLER CONTRACT (rogue-key safety): every key in `pks` MUST have a valid
+/// PoP verified at registration time (via [`BlsRegistration`] /
+/// [`BlsRegistry` / `parse_registry_entries_strict_pop`]). The pairing
+/// identity `e(G1, agg) == e(sum(pk_i), H(m))` holds for ANY key list whose
+/// sum matches — including a cancellation-crafted rogue key — so this
+/// function cannot, on its own, tell the attacker out. What it DOES is
+/// fail closed on every malformed input: empty list (no vacuous truth, no
+/// identity-aggregate bypass), over-cap list (before any pairing work),
+/// non-curve or identity aggregate, unparseable member key, or an
+/// identity-sum key list.
+///
+/// Prefer [`BlsRegistry::verify_aggregate_qc`], which enforces the contract
+/// by resolving keys only from the PoP-only registry.
+pub fn aggregate_verify(pks: &[BlsPublicKey], msg: &[u8], agg_sig: &BlsSignature) -> bool {
+    if pks.is_empty() {
+        return false;
+    }
+    if pks.len() > MAX_BLS_AGGREGATE_KEYS {
+        return false;
+    }
+    let Some(sig_pt) = sig_point(agg_sig) else {
+        return false;
+    };
+    if bool::from(sig_pt.is_identity()) {
+        return false;
+    }
+    let mut sum_pk = G1Projective::identity();
+    for pk in pks {
+        let Some(pt) = pk.point() else {
+            return false;
+        };
+        sum_pk += pt;
+    }
+    // Defence in depth: a cancellation-crafted key list sums to the identity,
+    // and `e(G1, sig) == 1` only for the (already refused) identity sig — but
+    // name the refusal explicitly rather than relying on the pairing to miss.
+    if bool::from(G1Affine::from(sum_pk).is_identity()) {
+        return false;
+    }
+    let h = G2Affine::from(hash_to_g2(msg));
+    pairing(&G1Affine::generator(), &sig_pt) == pairing(&G1Affine::from(sum_pk), &h)
+}
+
+/// PoP-only BLS key registry: the admission desk for the future QC path.
+///
+/// Every key in here proved secret knowledge AND identity binding at
+/// admission ([`BlsRegistry::insert`] re-verifies the carried PoP even
+/// though [`BlsRegistration`] already checked it at construction, so a
+/// hand-spliced `(pk, pop)` pair refuses here too). Keys that fail the PoP
+/// never enter, so [`BlsRegistry::keys_for`] — and therefore
+/// [`BlsRegistry::verify_aggregate_qc`] — can never count BLS power for them:
+/// the rogue-key fail-closed posture, enforced at registration rather than
+/// at verify time.
+///
+/// NOT consulted by any consensus counting path today (see the section
+/// header): admitting keys here changes no vote, certificate, or startup
+/// behavior. `QcBlsConfig::canonical_keys` remains the live lookup.
+#[derive(Clone, Debug, Default)]
+pub struct BlsRegistry {
+    keys: BlsKeyRegistry,
+}
+
+impl BlsRegistry {
+    /// Empty registry: resolves nothing, verifies nothing (fail-closed).
+    pub fn new() -> Self {
+        Self {
+            keys: BlsKeyRegistry::new(),
+        }
+    }
+
+    /// Admit a registration. Re-verifies the carried PoP and inserts ONLY on
+    /// success; returns `false` (registry unchanged) otherwise.
+    pub fn insert(&mut self, reg: &BlsRegistration) -> bool {
+        if !reg.verify_pop() {
+            return false;
+        }
+        self.keys.insert(reg.ed_id, reg.pk);
+        true
+    }
+
+    /// Admit raw parts: parse + PoP-verify + insert in one fail-closed step.
+    /// Anything [`BlsRegistration::from_parts`] refuses is refused here.
+    pub fn insert_verified(
+        &mut self,
+        ed_id: &[u8; 32],
+        pk: &BlsPublicKey,
+        pop: &BlsSignature,
+    ) -> bool {
+        if !bls_verify_pop(pk, ed_id, pop) {
+            return false;
+        }
+        self.keys.insert(*ed_id, *pk);
+        true
+    }
+
+    /// Look up one admitted key. `None` means never-registered-or-refused:
+    /// callers must fall back (fail closed), never guess.
+    pub fn get(&self, ed_id: &[u8; 32]) -> Option<BlsPublicKey> {
+        self.keys.get(ed_id).copied()
+    }
+
+    /// Whether `ed_id` holds an admitted (PoP-verified) key.
+    pub fn contains(&self, ed_id: &[u8; 32]) -> bool {
+        self.keys.contains_key(ed_id)
+    }
+
+    /// Number of admitted keys.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether no key has been admitted yet.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Keys for `ids` in the CALLER's order (the QC caller passes canonical
+    /// bitvector order). `None` if the list is empty, over-cap, or ANY member
+    /// is missing: a partial key list must never reach the pairing check.
+    pub fn keys_for(&self, ids: &[[u8; 32]]) -> Option<Vec<BlsPublicKey>> {
+        if ids.is_empty() || ids.len() > MAX_BLS_AGGREGATE_KEYS {
+            return None;
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(*self.keys.get(id)?);
+        }
+        Some(out)
+    }
+
+    /// The primitive QC counting will need: resolve `ids` from the PoP-only
+    /// registry and [`aggregate_verify`] the aggregate over `msg`.
+    ///
+    /// Refuses (returns `false`) on: empty or over-cap id list, a DUPLICATE
+    /// id (one validator's power must never count twice), any id missing
+    /// from the registry (refused-at-registration keys are unresolvable by
+    /// construction), or a pairing mismatch. On `true`, every counted key
+    /// carried a valid PoP at admission.
+    pub fn verify_aggregate_qc(
+        &self,
+        ids: &[[u8; 32]],
+        msg: &[u8],
+        agg_sig: &BlsSignature,
+    ) -> bool {
+        if ids.is_empty() || ids.len() > MAX_BLS_AGGREGATE_KEYS {
+            return false;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for id in ids {
+            if !seen.insert(id) {
+                return false;
+            }
+        }
+        let Some(pks) = self.keys_for(ids) else {
+            return false;
+        };
+        aggregate_verify(&pks, msg, agg_sig)
+    }
+}
+
 #[cfg(test)]
 mod internal_tests {
     use super::*;

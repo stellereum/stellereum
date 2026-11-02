@@ -15,10 +15,11 @@
 //!   path;
 //! * fallback matrix: None / missing / forged × assembly / verify;
 //! * determinism: same key + height + round ⇒ same seal, same committee;
-//! * no-uniqueness: the design never assumes unique VRF outputs (the Schnorr
-//!   construction admits several valid proofs per input) — the verifier
-//!   accepts ANY proof that verifies, and the election is a pure function of
-//!   whichever output verified.
+//! * uniqueness: the ECVRF construction admits exactly ONE valid proof per
+//!   input — the verifier accepts any proof that verifies (there is only
+//!   one), and the election is a pure function of that output. A second,
+//!   holder-crafted envelope for the same input refuses, so no alternate
+//!   committee can be smuggled through a valid-looking seal.
 //!
 //! No quorum, timeout, or vote changes: election seeds and the trailing
 //! serde-defaulted cert field only.
@@ -565,28 +566,18 @@ fn determinism_same_key_and_height_same_outcome() {
     }
 }
 
-// --- 5. no uniqueness assumed ---------------------------------------------------------
+// --- 5. uniqueness: one input, one proof, one committee -------------------------
 
-/// The Schnorr VRF admits several valid proofs per input (documented ECVRF
-/// gap — see `vrf_audit_tests::documented_gap_no_uniqueness_*`). The election
-/// MUST NOT assume uniqueness: the verifier accepts ANY proof that verifies,
-/// and the election is a pure function of whichever output verified.
-///
-/// Residual risk (sortition fairness): the SECRET HOLDER can choose among
-/// their own valid proofs, i.e. grind their OWN ticket. That buys no other
-/// validator's seat (unforgeability holds — only the holder can mint for
-/// their id), but a proposer who withholds-and-re-mints can bias the seed
-/// toward committees they prefer. The deterministic `vrf_prove` mints exactly
-/// one proof per input (no in-protocol grinding loop), so exploitation needs
-/// out-of-band proof crafting like the one below — visible (the proof is on
-/// the cert) and attributable to the minter. The phase-2 audited-ECVRF swap
-/// (unique outputs) closes it.
+/// The ECVRF construction admits exactly one valid proof per input (RFC 9381
+/// §3.1 full uniqueness; the retired Schnorr wiring admitted several). The
+/// verifier accepts any proof that verifies — and there is only one — and
+/// the election is a pure function of that output. A holder-crafted second
+/// envelope for the same input refuses at every layer: raw verify, the
+/// registry mint, and cert verification, so no alternate committee can be
+/// smuggled through a valid-looking seal.
 #[test]
-fn verifier_accepts_any_valid_proof_no_uniqueness_assumed() {
-    use curve25519_dalek::ristretto::RistrettoPoint;
-    use curve25519_dalek::scalar::Scalar;
-    use sha2::{Digest, Sha512};
-    use stellereum::vrf::{VRF_OUTPUT_DOMAIN, VRF_PROOF_DOMAIN, VrfProof};
+fn verifier_accepts_unique_proof_second_envelope_refuses() {
+    use stellereum::vrf::VrfProof;
 
     let net = setup_net(4, 0x55, 10);
     let active = VrfActivation::FromHeight(ACTIVATION_H);
@@ -595,121 +586,94 @@ fn verifier_accepts_any_valid_proof_no_uniqueness_assumed() {
     let pk = net.vrf[0].public_key().to_bytes();
     assert_eq!(vrf_verify(&pk, &seed_input, &first), Some(first.output));
 
-    // Craft an alternate valid proof under an independently-chosen nonce
-    // (same technique as the audit's uniqueness-gap characterization).
-    let audit_scalar = |parts: &[&[u8]]| -> Scalar {
-        let mut h = Sha512::new();
-        h.update(VRF_PROOF_DOMAIN);
-        for p in parts {
-            h.update(p);
-        }
-        let d = h.finalize();
-        let mut h2 = Sha512::new();
-        h2.update(VRF_PROOF_DOMAIN);
-        h2.update(b"wide-hi");
-        for p in parts {
-            h2.update(p);
-        }
-        let d2 = h2.finalize();
-        let mut wide = [0u8; 64];
-        wide[..32].copy_from_slice(&d[..32]);
-        wide[32..].copy_from_slice(&d2[..32]);
-        Scalar::from_bytes_mod_order_wide(&wide)
-    };
-    // Recompute the secret scalar via the public derivation (cross-checks the
-    // test's replication against the crate key).
-    let mut h = Sha512::new();
-    h.update(stellereum::vrf::VRF_SCALAR_DOMAIN);
-    h.update(ed_seed(0x55u8.wrapping_add(0xA0), 0));
-    let d = h.finalize();
-    let mut h2 = Sha512::new();
-    h2.update(stellereum::vrf::VRF_SCALAR_DOMAIN);
-    h2.update(b"hi");
-    h2.update(ed_seed(0x55u8.wrapping_add(0xA0), 0));
-    let d2 = h2.finalize();
-    let mut wide = [0u8; 64];
-    wide[..32].copy_from_slice(&d[..32]);
-    wide[32..].copy_from_slice(&d2[..32]);
-    let s = Scalar::from_bytes_mod_order_wide(&wide);
-    assert_eq!(
-        RistrettoPoint::mul_base(&s).compress().to_bytes(),
-        pk,
-        "audit scalar replication must match the crate key"
-    );
-    let k2 = Scalar::from(0x9E37_79B9_7F4A_7C15u64);
-    let r2 = RistrettoPoint::mul_base(&k2).compress().to_bytes();
-    assert_ne!(r2, first.proof[..32], "alternate nonce ⇒ alternate R");
-    let c2 = audit_scalar(&[b"challenge", &r2, &pk, &seed_input]);
-    let z2 = k2 + c2 * s;
+    // Craft an alternate envelope by reinterpreting the honest proof's
+    // fields under swapped roles (Gamma <-> s, zeroed challenge): the
+    // ECVRF challenge binds every field position, so no byte shuffle of a
+    // valid proof can verify.
     let mut proof2 = [0u8; VRF_PROOF_LEN];
-    proof2[..32].copy_from_slice(&r2);
-    proof2[32..].copy_from_slice(&z2.to_bytes());
-    let mut hasher = blake3::Hasher::new_derive_key(VRF_OUTPUT_DOMAIN);
-    hasher.update(&r2);
-    hasher.update(&pk);
-    hasher.update(&seed_input);
-    let output2 = *hasher.finalize().as_bytes();
+    proof2[..32].copy_from_slice(&first.proof[48..]);
+    proof2[48..].copy_from_slice(&first.proof[..32]);
+    let mut output2 = first.output;
+    output2[0] ^= 0x01;
     let alt = VrfProof {
         output: output2,
         proof: proof2,
     };
-    assert_eq!(vrf_verify(&pk, &seed_input, &alt), Some(output2));
+    assert_eq!(
+        vrf_verify(&pk, &seed_input, &alt),
+        None,
+        "second envelope for the same input must refuse (uniqueness)"
+    );
     assert_ne!(
-        alt.output, first.output,
-        "gap premise: two valid proofs, two outputs, one (pk, input)"
+        alt.proof, first.proof,
+        "the refused envelope must differ from the honest one"
     );
 
-    // The registry mints BOTH (no uniqueness gate anywhere in the path).
+    // The registry mints ONLY the honest envelope.
     assert_eq!(
         verify_vrf_seed_for_validator(&net.reg, &net.ids[0], &seed_input, &first),
         Some(first.output)
     );
     assert_eq!(
         verify_vrf_seed_for_validator(&net.reg, &net.ids[0], &seed_input, &alt),
-        Some(output2)
+        None
     );
 
-    // And the election is a pure function of whichever output verified:
-    // both are deterministic, and the seal-carrying cert verifies for either.
+    // And the election is a pure function of the unique verified output:
+    // the seal-carrying cert verifies for the honest proof and refuses for
+    // the alternate.
     let msg = msg_for(ACTIVATION_H, ROUND, &net.block_hash);
     let legacy = legacy_qc_at(&net, ACTIVATION_H, ROUND);
     let legacy_cert = legacy.pq_micro_certificate().expect("attached");
-    for proof in [&first, &alt] {
-        let cert = PqMicroCertificate::new(
-            legacy_cert.scheme,
-            legacy_cert.height,
-            legacy_cert.round,
-            legacy_cert.committee_size,
-            legacy_cert.signers_bitmask.clone(),
-            legacy_cert.signatures.clone(),
-            legacy_cert.sortition_parent,
-        )
-        .with_vrf_beacon(VrfBeaconSeal::new(net.ids[0], proof.clone()));
-        assert!(
-            legacy.verify_micro_cert_with_vrf(&cert, &net.vs, &msg, None, &active, Some(&net.reg)),
-            "any verifying proof elects its committee"
-        );
-        let committee = derive_sortition_committee_gated(
+    let cert = PqMicroCertificate::new(
+        legacy_cert.scheme,
+        legacy_cert.height,
+        legacy_cert.round,
+        legacy_cert.committee_size,
+        legacy_cert.signers_bitmask.clone(),
+        legacy_cert.signatures.clone(),
+        legacy_cert.sortition_parent,
+    )
+    .with_vrf_beacon(VrfBeaconSeal::new(net.ids[0], first.clone()));
+    assert!(
+        legacy.verify_micro_cert_with_vrf(&cert, &net.vs, &msg, None, &active, Some(&net.reg)),
+        "the unique verifying proof elects its committee"
+    );
+    let committee = derive_sortition_committee_gated(
+        &net.vs,
+        ACTIVATION_H,
+        ROUND,
+        4,
+        &net.parent,
+        &active,
+        Some(&first.output),
+    );
+    assert_eq!(
+        legacy.micro_cert_valid_signers_with_vrf(
+            &cert,
             &net.vs,
-            ACTIVATION_H,
-            ROUND,
-            4,
-            &net.parent,
+            &msg,
+            None,
             &active,
-            Some(&proof.output),
-        );
-        assert_eq!(
-            legacy.micro_cert_valid_signers_with_vrf(
-                &cert,
-                &net.vs,
-                &msg,
-                None,
-                &active,
-                Some(&net.reg)
-            ),
-            Some(committee)
-        );
-    }
+            Some(&net.reg)
+        ),
+        Some(committee)
+    );
+    // The alternate seal refuses the whole certificate.
+    let bad_cert = PqMicroCertificate::new(
+        legacy_cert.scheme,
+        legacy_cert.height,
+        legacy_cert.round,
+        legacy_cert.committee_size,
+        legacy_cert.signers_bitmask.clone(),
+        legacy_cert.signatures.clone(),
+        legacy_cert.sortition_parent,
+    )
+    .with_vrf_beacon(VrfBeaconSeal::new(net.ids[0], alt));
+    assert!(
+        !legacy.verify_micro_cert_with_vrf(&bad_cert, &net.vs, &msg, None, &active, Some(&net.reg)),
+        "an alternate-unique envelope must refuse the whole certificate"
+    );
 }
 
 // --- 6. committee divergence at scale + runtime seam -----------------------------------

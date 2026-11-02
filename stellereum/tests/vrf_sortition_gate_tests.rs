@@ -30,12 +30,15 @@ const PIN_COMM_PRE_0: &str =
     "0202020202020202020202020202020202020202020202020202020202020202";
 const PIN_COMM_PRE_1: &str =
     "0404040404040404040404040404040404040404040404040404040404040404";
-// VRF output of secret [0x42;32] over the seed above; election seed and
-// committee at the activation boundary (height 1_000_000, round 2).
+// VRF output of secret [0x42;32] over the seed below; election seed and
+// committee at the activation boundary (height 1_000_000, round 0).
+// Re-pinned for the ECVRF construction (RFC 9381): round 0 is used because
+// the round-2 fixture draws the same committee on both paths under ECVRF
+// outputs, while round 0 exercises a real divergence.
 const PIN_VRF_OUTPUT: &str =
-    "0359c092aa6f3b3a232c1d8c2d67e13113891dc21e8b242dcc1e76aece72c00a";
+    "97c5254c831eba193e3a62c33fc871b5e9378d668c38183aa12b52c7078adf12";
 const PIN_ELECTION_SEED_H1M: &str =
-    "bdd392b1f3a62762e511617e2d75d5ac55e16a00fcd68a056181f021526531c4";
+    "ec52fb8aa2913c81fe2a1e8e385e6d57f0872f0a2450e32ce7aeb59a61251891";
 const PIN_COMM_POST_0: &str =
     "0202020202020202020202020202020202020202020202020202020202020202";
 const PIN_COMM_POST_1: &str =
@@ -160,28 +163,28 @@ fn post_activation_uses_vrf_seed() {
     assert!(active.is_active_at(ACTIVATION_H));
 
     // The VRF signs the height/round seed input (same bytes on every node).
-    let seed_input = sortition_seed(&parent, ACTIVATION_H, 2);
+    let seed_input = sortition_seed(&parent, ACTIVATION_H, 0);
     let proof = vrf_prove(&secrets[0], &seed_input);
     assert_eq!(proof.output, h32(PIN_VRF_OUTPUT));
     let verified =
         verify_vrf_seed_for_validator(&reg, &ids[0], &seed_input, &proof).expect("mints");
 
     // The gated seed IS the VRF election seed (pinned), NOT the parent seed.
-    let gated = sortition_seed_gated(&parent, ACTIVATION_H, 2, &active, Some(&verified));
+    let gated = sortition_seed_gated(&parent, ACTIVATION_H, 0, &active, Some(&verified));
     assert_eq!(gated, h32(PIN_ELECTION_SEED_H1M));
-    assert_eq!(gated, vrf_election_seed(&verified, ACTIVATION_H, 2));
+    assert_eq!(gated, vrf_election_seed(&verified, ACTIVATION_H, 0));
     assert_ne!(
         gated,
-        sortition_seed(&parent, ACTIVATION_H, 2),
+        sortition_seed(&parent, ACTIVATION_H, 0),
         "post-activation must leave the parent-hash seed"
     );
 
     // The committee follows the VRF seed (pinned, and different from the
-    // pre-activation committee for this fixture).
+    // parent-hash draw for this fixture).
     let committee = derive_sortition_committee_gated(
         &vs,
         ACTIVATION_H,
-        2,
+        0,
         2,
         &parent,
         &active,
@@ -190,12 +193,12 @@ fn post_activation_uses_vrf_seed() {
     assert_eq!(committee, vec![h32(PIN_COMM_POST_0), h32(PIN_COMM_POST_1)]);
     assert_ne!(
         committee,
-        derive_sortition_committee(&vs, ACTIVATION_H, 2, 2, &parent),
+        derive_sortition_committee(&vs, ACTIVATION_H, 0, 2, &parent),
         "post-activation committee must not equal the parent-hash draw here"
     );
 
     // Height binding: neighbouring heights draw distinct seeds.
-    let next = sortition_seed_gated(&parent, ACTIVATION_H + 1, 2, &active, Some(&verified));
+    let next = sortition_seed_gated(&parent, ACTIVATION_H + 1, 0, &active, Some(&verified));
     assert_ne!(gated, next);
 }
 

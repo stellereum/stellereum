@@ -1094,6 +1094,92 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
             put_u128(h, b"reward_cp_value", *cp);
         }
     }
+
+    // ---- Downtime-jail, commission-schedule and redelegation-lock domains ----
+    //
+    // THREE CONDITIONAL DOMAINS, each one gated on ITS OWN map being
+    // non-empty — exactly the contract every domain above uses: an EMPTY map
+    // writes ZERO bytes, so a chain that never jailed a validator, never
+    // announced a commission change and never redelegated digests
+    // byte-for-byte identically to before and `COMMITMENT_VERSION` stays put
+    // (the pinned genesis KAT stays valid).
+    //
+    // APPENDED AFTER every pre-existing staking domain in STRUCT FIELD ORDER
+    // (jail, commission_schedule, redelegation_lock — the order the fields
+    // are declared in `StakingLedger`), so every already-committed preimage
+    // keeps exactly the byte sequence it had.
+    //
+    // WHY EACH ONE MATTERS (an uncommitted field is a silent fork):
+    //
+    //  * `jail`: a jailed validator is EXCLUDED from the validator set until
+    //    `unjail` re-admits it. Two nodes that disagreed about the jail map
+    //    would derive DIFFERENT validator sets — and the set is what every
+    //    quorum check runs against — under one root.
+    //  * `commission_schedule`: the pending change and the cooldown basis
+    //    decide the FUTURE commission rate, which decides future delegator
+    //    payouts (real coins). A stale schedule pays delegators differently.
+    //  * `redelegation_lock`: the lock decides whether the next `redelegate`
+    //    from a position is ADMITTED at all — one node accepts a transaction
+    //    the other refuses, under the same root.
+    if !l.jail.is_empty() {
+        put_bytes(h, b"staking_jail_domain", b"STAKING_JAIL_V1");
+        let mut jailed: BTreeMap<&[u8; 32], &crate::staking::JailRecord> = BTreeMap::new();
+        for (k, v) in &l.jail {
+            jailed.insert(k, v);
+        }
+        put_u64(h, b"jail_len", jailed.len() as u64);
+        for (id, r) in jailed {
+            put_addr(h, b"jail_validator", id);
+            put_u64(h, b"jail_jailed_at", r.jailed_at_height);
+            put_u64(h, b"jail_release", r.release_height);
+        }
+    }
+
+    if !l.commission_schedule.is_empty() {
+        put_bytes(h, b"staking_commission_domain", b"STAKING_COMMISSION_V1");
+        let mut scheds: BTreeMap<&[u8; 32], &crate::staking::CommissionSchedule> = BTreeMap::new();
+        for (k, v) in &l.commission_schedule {
+            scheds.insert(k, v);
+        }
+        put_u64(h, b"commission_len", scheds.len() as u64);
+        for (id, s) in scheds {
+            put_addr(h, b"commission_validator", id);
+            match s.last_effective_height {
+                Some(x) => {
+                    put_u64(h, b"commission_last_present", 1);
+                    put_u64(h, b"commission_last", x);
+                }
+                None => put_u64(h, b"commission_last_present", 0),
+            }
+            match &s.pending {
+                Some(p) => {
+                    put_bool(h, b"commission_has_pending", true);
+                    put_u64(h, b"commission_pending_bps", p.new_bps);
+                    put_u64(h, b"commission_pending_effective", p.effective_height);
+                    put_u64(h, b"commission_pending_announced", p.announced_height);
+                }
+                None => put_bool(h, b"commission_has_pending", false),
+            }
+        }
+    }
+
+    if !l.redelegation_lock.is_empty() {
+        put_bytes(
+            h,
+            b"staking_redelegation_lock_domain",
+            b"STAKING_REDELEGATION_LOCK_V1",
+        );
+        let mut locks: BTreeMap<&([u8; 32], [u8; 32]), &u64> = BTreeMap::new();
+        for (k, v) in &l.redelegation_lock {
+            locks.insert(k, v);
+        }
+        put_u64(h, b"redelegation_lock_len", locks.len() as u64);
+        for ((val, owner), until) in locks {
+            put_addr(h, b"relock_validator", val);
+            put_addr(h, b"relock_owner", owner);
+            put_u64(h, b"relock_until", *until);
+        }
+    }
 }
 
 fn unbonding_digest<S: PreimageSink>(h: &mut S, e: &UnbondingEntry) {

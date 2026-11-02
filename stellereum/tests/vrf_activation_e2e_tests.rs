@@ -8,8 +8,9 @@
 //! env activation + the startup-loaded registry). Default-off (env unset,
 //! empty registry) is byte-identical to the legacy path.
 //!
-//! No crypto changes here: `vrf_prove` / `vrf_verify` math is untouched; this
-//! suite only wires provisioning, loading and threading. No BLS changes.
+//! No crypto changes here: `vrf_prove` / `vrf_verify` keep their signatures
+//! (ECVRF-EDWARDS25519-SHA512-Elligator2 bodies, RFC 9381); this suite only
+//! wires provisioning, loading and threading. No BLS changes.
 //!
 //! Process-global state (env vars, PQ-key registry, live VRF registry) is
 //! shared by every test in this binary, so ALL tests serialize on `SERIAL`

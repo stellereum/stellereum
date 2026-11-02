@@ -1,29 +1,30 @@
-//! Cryptanalysis track for `stellereum::vrf` (deterministic-Schnorr VRF).
+//! Cryptanalysis track for `stellereum::vrf` (ECVRF-EDWARDS25519-SHA512-
+//! Elligator2, RFC 9381).
 //!
 //! Extends — never duplicates — `vrf_audit_tests.rs` (determinism, soundness
-//! sweep, nonce diversity, uniqueness gap) and `vrf_bls_adversarial_tests.rs`
-//! (fail-closed battery). New games here:
+//! sweep, nonce diversity, uniqueness) and `vrf_bls_adversarial_tests.rs`
+//! (fail-closed battery). Games here:
 //!
 //! * (a) key substitution: adversary keypair + victim identity — the proof
 //!   verifies under the ATTACKER key but registry-gated minting refuses,
 //!   pinning the trust boundary (identity lives in the Falcon binding only);
-//! * (b) grinding quantification: M inputs x N holder-ground alternate proofs,
-//!   output-uniformity statistic (chi-square over the first byte) plus the
-//!   measured best-of-N committee bias vs the closed form `1-(1-p)^N`;
-//! * (c) domain separation: nonce/challenge/output/election/beacon tags are
-//!   pairwise distinct AND behaviorally binding (any tag flip breaks verify);
-//! * (d) small-subgroup / identity / edge keys: Ristretto rejects everything
-//!   below the prime-order group; identity refuses at every layer;
-//! * (e) malleability on a FRESH proof: all 512 single-bit mutants refuse,
-//!   plus halves-swap/duplication, cross-proof splices, output-bit sweep,
+//! * (b) grinding quantification: M inputs x N holder secrets — output
+//!   uniformity (chi-square over the first byte) plus the measured
+//!   best-of-N committee rate, which MUST equal the honest rate exactly
+//!   (uniqueness: no amplification; the retired Schnorr wiring measured
+//!   `1-(1-p)^N` here);
+//! * (c) domain separation: tags are pairwise distinct AND behaviorally
+//!   binding (retired-construction envelopes and role-swapped output
+//!   domains refuse; beacon/election role-swap never collides);
+//! * (d) small-subgroup / identity / edge keys: Edwards rejects low-order
+//!   keys at parse AND at verify; garbage refuses; flat-pattern sweep is
+//!   fail-closed;
+//! * (e) malleability on a FRESH proof: all 640 single-bit mutants refuse,
+//!   plus field-swap/duplication, cross-proof splices, output-bit sweep,
 //!   and serde truncation/extension refusal.
 //!
 //! All fixtures are deterministic (no OS randomness, no wall clock).
 
-use curve25519_dalek::ristretto::RistrettoPoint;
-use curve25519_dalek::scalar::Scalar;
-use curve25519_dalek::traits::IsIdentity;
-use sha2::{Digest, Sha512};
 use stellereum::post_quantum::FalconKeypair;
 use stellereum::vrf::{
     verify_vrf_seed_for_validator, vrf_binding_preimage, vrf_election_seed, vrf_prove, vrf_verify,
@@ -49,107 +50,26 @@ fn cry_input(j: usize) -> [u8; 32] {
     s
 }
 
-// --- public-algorithm replicas (mirror src/vrf.rs derivations) ----------------
+// --- holder-secret grinder: N distinct secrets, one registered key --------------
+//
+// Under ECVRF uniqueness the holder's try-and-select runs over SECRETS (each
+// secret mints exactly one envelope per input), not over nonces. Only the
+// registered secret's envelope verifies under the registered key.
 
-fn cry_scalar(seed: &[u8; 32]) -> Scalar {
-    let mut h = Sha512::new();
-    h.update(VRF_SCALAR_DOMAIN);
-    h.update(seed);
-    let d = h.finalize();
-    let mut h2 = Sha512::new();
-    h2.update(VRF_SCALAR_DOMAIN);
-    h2.update(b"hi");
-    h2.update(seed);
-    let d2 = h2.finalize();
-    let mut wide = [0u8; 64];
-    wide[..32].copy_from_slice(&d[..32]);
-    wide[32..].copy_from_slice(&d2[..32]);
-    Scalar::from_bytes_mod_order_wide(&wide)
-}
-
-fn cry_challenge(r: &[u8; 32], pk: &[u8; 32], input: &[u8; 32]) -> Scalar {
-    cry_challenge_under(VRF_PROOF_DOMAIN, b"challenge", r, pk, input)
-}
-
-fn cry_challenge_under(
-    domain: &[u8],
-    tag: &[u8],
-    r: &[u8; 32],
-    pk: &[u8; 32],
-    input: &[u8; 32],
-) -> Scalar {
-    let mut h = Sha512::new();
-    h.update(domain);
-    h.update(tag);
-    h.update(r);
-    h.update(pk);
-    h.update(input);
-    let d = h.finalize();
-    let mut h2 = Sha512::new();
-    h2.update(domain);
-    h2.update(b"wide-hi");
-    h2.update(tag);
-    h2.update(r);
-    h2.update(pk);
-    h2.update(input);
-    let d2 = h2.finalize();
-    let mut wide = [0u8; 64];
-    wide[..32].copy_from_slice(&d[..32]);
-    wide[32..].copy_from_slice(&d2[..32]);
-    Scalar::from_bytes_mod_order_wide(&wide)
-}
-
-fn cry_output(r: &[u8; 32], pk: &[u8; 32], input: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(VRF_OUTPUT_DOMAIN);
-    hasher.update(r);
-    hasher.update(pk);
-    hasher.update(input);
-    *hasher.finalize().as_bytes()
-}
-
-/// Adversary nonce `k_j`: a PRF over (secret seed, input, j). Any scalar is a
-/// valid Schnorr nonce at verify time — nothing pins the prover to the crate's
-/// derived `k` — so this models exactly what a grinding holder can mint.
-fn grind_scalar(secret_seed: &[u8; 32], input: &[u8; 32], j: u64) -> Scalar {
-    let mut h = Sha512::new();
-    h.update(b"STELL_VRF_GRIND_V1");
-    h.update(secret_seed);
-    h.update(input);
-    h.update(j.to_le_bytes());
-    let d = h.finalize();
-    let mut h2 = Sha512::new();
-    h2.update(b"STELL_VRF_GRIND_V1");
-    h2.update(b"hi");
-    h2.update(secret_seed);
-    h2.update(input);
-    h2.update(j.to_le_bytes());
-    let d2 = h2.finalize();
-    let mut wide = [0u8; 64];
-    wide[..32].copy_from_slice(&d[..32]);
-    wide[32..].copy_from_slice(&d2[..32]);
-    Scalar::from_bytes_mod_order_wide(&wide)
-}
-
-/// Build an alternate valid proof under nonce `k` (holder-only: needs `s`).
-fn alt_proof(s: &Scalar, pk: &[u8; 32], input: &[u8; 32], k: Scalar) -> stellereum::vrf::VrfProof {
-    let r = RistrettoPoint::mul_base(&k).compress().to_bytes();
-    let c = cry_challenge(&r, pk, input);
-    let z = k + c * s;
-    let mut proof = [0u8; VRF_PROOF_LEN];
-    proof[..32].copy_from_slice(&r);
-    proof[32..].copy_from_slice(&z.to_bytes());
-    let output = cry_output(&r, pk, input);
-    stellereum::vrf::VrfProof { output, proof }
+/// The grinder's t-th secret for a fixed holder seed (distinct keys).
+fn grind_secret(holder_seed: &[u8; 32], t: u64) -> [u8; 32] {
+    let mut s = *holder_seed;
+    for (i, b) in t.to_le_bytes().iter().enumerate() {
+        s[i] = s[i].wrapping_add(*b);
+    }
+    s[31] = s[31].wrapping_add((t >> 8) as u8);
+    s
 }
 
 fn ticket_u128(output: &[u8; 32]) -> u128 {
     let mut b = [0u8; 16];
     b.copy_from_slice(&output[..16]);
     u128::from_le_bytes(b)
-}
-
-fn best_of_n(p: f64, n: u64) -> f64 {
-    1.0 - (1.0 - p).powi(n as i32)
 }
 
 // --- (a) key substitution: proof verifies under attacker key, never identity -
@@ -232,24 +152,23 @@ fn key_substitution_proof_binds_key_not_identity() {
     );
 }
 
-// --- (b) grinding quantification: uniformity + best-of-N bias -----------------
+// --- (b) grinding quantification: uniformity + best-of-N (no lift) ------------
+// Under ECVRF uniqueness the holder's try-and-select runs over SECRETS:
+// N distinct secrets minted per input, exactly one envelope verifying per
+// (registered key, input). Best-of-N MUST collapse to the honest draw —
+// this is the measurement that flips vs the retired Schnorr wiring (which
+// measured best-of-32 tracking the closed form 1-(1-p)^32 here).
 
 #[test]
 fn grinding_uniformity_and_best_of_n_bias() {
     const M: usize = 128; // distinct seed inputs
-    const N: u64 = 32; // holder-ground alternates per input
+    const N: u64 = 32; // holder secrets tried per input
     let secret_seed = cry_seed(500);
     let secret = VrfSecret::from_seed(&secret_seed);
     let pk = secret.public_key().to_bytes();
-    let s = cry_scalar(&secret_seed);
-    assert_eq!(
-        RistrettoPoint::mul_base(&s).compress().to_bytes(),
-        pk,
-        "replica scalar must match crate key"
-    );
 
-    // Mint M x N alternate outputs (plus the M honest ones for the control).
-    let mut first_bytes: Vec<u8> = Vec::with_capacity(M * N as usize);
+    // M honest outputs (the control) + per-input best-of-N over secrets.
+    let mut first_bytes: Vec<u8> = Vec::with_capacity(M);
     let mut bit_balance = 0usize; // outputs with output[0] < 128
     let mut best_tickets = Vec::with_capacity(M);
     let mut honest_tickets = Vec::with_capacity(M);
@@ -258,35 +177,36 @@ fn grinding_uniformity_and_best_of_n_bias() {
         let honest = vrf_prove(&secret, &input);
         assert_eq!(vrf_verify(&pk, &input, &honest), Some(honest.output));
         honest_tickets.push(ticket_u128(&honest.output));
-        let mut best = u128::MAX;
-        for g in 0..N {
-            let k = grind_scalar(&secret_seed, &input, g);
-            // Grind nonces must be usable (non-identity R) and pairwise
-            // distinct per input, else the "N candidates" model collapses.
-            let r = RistrettoPoint::mul_base(&k).compress().to_bytes();
-            let dec = curve25519_dalek::ristretto::CompressedRistretto(r).decompress();
-            assert!(
-                dec.map(|p| !p.is_identity()).unwrap_or(false),
-                "grind nonce must give non-identity R"
-            );
-            let alt = alt_proof(&s, &pk, &input, k);
-            assert_eq!(
-                vrf_verify(&pk, &input, &alt),
-                Some(alt.output),
-                "holder-ground alternate must verify (no uniqueness)"
-            );
-            first_bytes.push(alt.output[0]);
-            if alt.output[0] < 128 {
-                bit_balance += 1;
-            }
-            best = best.min(ticket_u128(&alt.output));
+        first_bytes.push(honest.output[0]);
+        if honest.output[0] < 128 {
+            bit_balance += 1;
         }
+        // Try-and-select over N secrets: keep the minimum ticket over the
+        // outputs that VERIFY under the registered key.
+        let mut best = u128::MAX;
+        let mut verifying = 0u32;
+        for g in 0..N {
+            let gs = grind_secret(&secret_seed, g);
+            if gs == secret_seed {
+                continue; // the registered secret is measured separately
+            }
+            let cand = vrf_prove(&VrfSecret::from_seed(&gs), &input);
+            if vrf_verify(&pk, &input, &cand) == Some(cand.output) {
+                verifying += 1;
+                best = best.min(ticket_u128(&cand.output));
+            }
+        }
+        assert_eq!(
+            verifying, 0,
+            "no foreign secret may verify under the registered key (input {j})"
+        );
+        best = best.min(ticket_u128(&honest.output));
         best_tickets.push(best);
     }
     let total = first_bytes.len();
-    assert_eq!(total, M * N as usize);
+    assert_eq!(total, M);
 
-    // Uniformity: first-byte histogram over all M*N outputs, chi-square with
+    // Uniformity: first-byte histogram over all M outputs, chi-square with
     // 255 df (uniform expectation: total/256 per bin, mean stat = 255).
     let mut bins = [0u32; 256];
     for b in &first_bytes {
@@ -302,67 +222,69 @@ fn grinding_uniformity_and_best_of_n_bias() {
         hi = hi.max(b);
     }
     let balance_frac = bit_balance as f64 / total as f64;
-    // Mean best-ticket fraction of the 2^128 range (honest mean is 0.5;
-    // best-of-32 uniform order stat mean is 1/33 ≈ 0.0303).
+    // Mean best-ticket fraction of the 2^128 range: uniqueness pins it at
+    // the honest 0.5 (best-of-32 uniform order stat would sit at 1/33).
     let mean_best =
         best_tickets.iter().map(|t| *t as f64 / u128::MAX as f64).sum::<f64>() / M as f64;
 
-    // Committee bias: thresholds straight from `lottery_threshold`
-    // (p ≈ 0.05 / 0.25 / 0.50), honest single-draw rate vs measured
-    // best-of-32 rate vs closed form 1-(1-p)^32.
+    // Committee rates: thresholds straight from `lottery_threshold`
+    // (p ≈ 0.05 / 0.25 / 0.50). Best-of-N MUST equal the honest rate
+    // exactly — and the honest rate tracks the nominal p.
     let configs: [(&str, u64, u64, u64, f64); 3] = [
         ("stake1/total100/exp5", 1, 100, 5, 0.05),
         ("stake1/total4/exp1", 1, 4, 1, 0.25),
         ("stake1/total2/exp1", 1, 2, 1, 0.50),
     ];
-    eprintln!("GRIND: M={M} inputs x N={N} alternates = {total} outputs");
+    eprintln!("GRIND: M={M} inputs x N={N} secrets = {total} honest outputs");
     eprintln!("GRIND: first-byte chi2={chi2:.1} (df=255, uniform mean 255)");
     eprintln!("GRIND: first-byte bin min={lo} max={hi} expected={expected:.1}");
     eprintln!("GRIND: first-bit balance frac={balance_frac:.4} (uniform 0.5)");
-    eprintln!("GRIND: mean best-of-{N} ticket frac={mean_best:.5} (uniform-order-stat 0.03030)");
+    eprintln!("GRIND: mean best-of-{N} ticket frac={mean_best:.5} (honest 0.5)");
     for (name, stake, total_stake, exp_seats, p) in configs {
         let thr = stellereum::vrf::lottery_threshold(stake, total_stake, exp_seats);
         assert!(thr > 0 && thr < u128::MAX, "config must be a strict interior threshold");
         let honest_rate = honest_tickets.iter().filter(|t| **t < thr).count() as f64 / M as f64;
         let best_rate = best_tickets.iter().filter(|t| **t < thr).count() as f64 / M as f64;
-        let closed = best_of_n(p, N);
+        let retired = 1.0 - (1.0 - p).powi(N as i32);
         eprintln!(
             "GRIND: {name} p={p:.2} thr-top-half={:032x} honest-rate={honest_rate:.4} \
-             measured-best-of-{N}={best_rate:.4} closed-form={closed:.4}",
+             measured-best-of-{N}={best_rate:.4} retired-closed-form={retired:.4}",
             thr >> 64
         );
-        // Grinding never hurts the holder: best <= honest ticket per input,
-        // so every honestly-elected input stays elected when grinding.
-        assert!(
-            best_rate >= honest_rate,
-            "best-of-N must elect a superset of the honest draw ({name})"
+        // Uniqueness: grinding selects nothing — best elects exactly the
+        // honest set, never a superset.
+        assert_eq!(
+            best_rate, honest_rate,
+            "best-of-N must elect exactly the honest draw ({name})"
         );
-        // Measured amplification tracks the closed form (loose band: M=128
-        // sampling noise at p=0.05 is ~0.035 sigma; 0.20 is ~6 sigma).
-        assert!(
-            (best_rate - closed).abs() < 0.20,
-            "measured best-of-N rate must track 1-(1-p)^N ({name})"
-        );
-        // Honest rate tracks the nominal p (loose band, same noise scale).
+        // Honest rate tracks the nominal p (loose band: M=128 sampling
+        // noise at p=0.05 is ~0.035 sigma; 0.15 is ~4 sigma).
         assert!(
             (honest_rate - p).abs() < 0.15,
             "honest single-draw rate must track p ({name})"
+        );
+        // The retired amplification is gone: where 1-(1-p)^N would exceed
+        // the honest rate by a wide margin, best-of-N stays at p.
+        assert!(
+            (best_rate - retired).abs() > 0.05 || (retired - p).abs() < 0.05,
+            "best-of-N rate {best_rate:.3} must not track the retired 1-(1-p)^N={retired:.3} ({name})"
         );
     }
 
     // Uniformity gates (generous: chi2 mean 255, sd ~22.6; 500 is +10 sd —
     // a failure here means the output hash is structurally broken).
+    // (No per-bin occupancy pin at M=128: 0.5/bin expected, so empty bins
+    // are the norm, not a signal.)
     assert!(chi2 < 500.0, "output first byte must be ~uniform, chi2={chi2:.1}");
-    assert!(lo > 0, "with {expected:.0}/bin no bin should be empty (min={lo})");
     assert!(
-        (balance_frac - 0.5).abs() < 0.10,
+        (balance_frac - 0.5).abs() < 0.15,
         "first bit must be balanced, frac={balance_frac:.4}"
     );
-    // Grinding buys a real downward shift of the ticket (holder advantage is
-    // constructive, not theoretical): mean best far below the honest 0.5.
+    // Uniqueness: the mean ticket stays at the honest 0.5 — no downward
+    // grind shift (the retired wiring sat below 0.15 here).
     assert!(
-        mean_best < 0.15,
-        "best-of-{N} must shift the ticket down hard, mean={mean_best:.5}"
+        (mean_best - 0.5).abs() < 0.15,
+        "best-of-{N} mean {mean_best:.5} must stay honest (no grind shift)"
     );
     assert!(mean_best > 0.0, "tickets must not collapse to zero");
 }
@@ -388,61 +310,55 @@ fn domain_tags_distinct_and_binding() {
             }
         }
     }
-    // Role tags inside the proof domain are distinct too.
+    // Role tags of the retired construction stay distinct (harmless pin:
+    // the byte strings are still reserved and never reused elsewhere).
     assert_ne!(b"nonce".as_slice(), b"challenge".as_slice());
 
     let secret_seed = cry_seed(600);
     let secret = VrfSecret::from_seed(&secret_seed);
     let pk = secret.public_key().to_bytes();
-    let s = cry_scalar(&secret_seed);
     let input = cry_input(60);
     let honest = vrf_prove(&secret, &input);
     assert_eq!(vrf_verify(&pk, &input, &honest), Some(honest.output));
 
-    // 1. Proof built with nonce/challenge role tags SWAPPED refuses: the
-    //    "nonce" preimage hashed with b"challenge" (and vice versa) yields a
-    //    Schnorr equation the real verifier (correct tags) rejects.
+    // 1. A retired-construction envelope (Schnorr `R` in the Gamma field,
+    //    `z` in the `s` field, zeroed challenge) refuses: the ECVRF
+    //    challenge binds Gamma, so reinterpreting Schnorr-shaped bytes
+    //    under the ECVRF roles cannot verify. Cross-construction replay
+    //    is impossible.
     {
-        let k_bad = cry_challenge_under(VRF_PROOF_DOMAIN, b"challenge", &secret_seed, &pk, &input);
-        // NOTE: deliberately feeds (secret_seed, pk, input) where the nonce
-        // derivation expects (secret, input) — any tag/position confusion
-        // must break the proof, whichever way it is wired.
-        let r_bad = RistrettoPoint::mul_base(&k_bad).compress().to_bytes();
-        let c_bad = cry_challenge_under(VRF_PROOF_DOMAIN, b"nonce", &r_bad, &pk, &input);
-        let z_bad = k_bad + c_bad * s;
         let mut proof = [0u8; VRF_PROOF_LEN];
-        proof[..32].copy_from_slice(&r_bad);
-        proof[32..].copy_from_slice(&z_bad.to_bytes());
-        let swapped = stellereum::vrf::VrfProof {
-            output: cry_output(&r_bad, &pk, &input),
+        // Gamma field: reuse the honest Gamma (a valid curve point, but
+        // the challenge over (Y, H, Gamma, U, V) will not match c = 0).
+        proof[..32].copy_from_slice(&honest.proof[..32]);
+        // c field: zeroed.
+        // s field: reuse the honest s bytes under the wrong role.
+        proof[48..].copy_from_slice(&honest.proof[48..]);
+        let mut wrong_out = honest.output;
+        wrong_out[0] ^= 0x01;
+        let legacy = stellereum::vrf::VrfProof {
+            output: wrong_out,
             proof,
         };
         assert_eq!(
-            vrf_verify(&pk, &input, &swapped),
+            vrf_verify(&pk, &input, &legacy),
             None,
-            "nonce/challenge tag confusion must break verification"
+            "retired-construction-shaped envelope must refuse"
         );
     }
 
-    // 2. Challenge built under a one-bit-flipped proof domain refuses.
+    // 2. Challenge built for a DIFFERENT hashed point refuses: transplant
+    //    another input's Gamma into an otherwise-honest envelope and the
+    //    challenge (which binds Gamma) mismatches.
     {
-        let mut bad_domain = VRF_PROOF_DOMAIN.to_vec();
-        bad_domain[0] ^= 0x01;
-        let k = grind_scalar(&secret_seed, &input, 7);
-        let r = RistrettoPoint::mul_base(&k).compress().to_bytes();
-        let c_bad = cry_challenge_under(&bad_domain, b"challenge", &r, &pk, &input);
-        let z_bad = k + c_bad * s;
-        let mut proof = [0u8; VRF_PROOF_LEN];
-        proof[..32].copy_from_slice(&r);
-        proof[32..].copy_from_slice(&z_bad.to_bytes());
-        let bad = stellereum::vrf::VrfProof {
-            output: cry_output(&r, &pk, &input),
-            proof,
-        };
+        let other = vrf_prove(&secret, &cry_input(61));
+        assert_ne!(other.proof, honest.proof);
+        let mut bad = honest.clone();
+        bad.proof[..32].copy_from_slice(&other.proof[..32]);
         assert_eq!(
             vrf_verify(&pk, &input, &bad),
             None,
-            "flipped proof-domain challenge must not verify under the real domain"
+            "transplanted Gamma must break the challenge binding"
         );
     }
 
@@ -496,25 +412,28 @@ fn edge_keys_identity_small_subgroup_and_extremes() {
     let honest = vrf_prove(&secret, &input);
     assert_eq!(vrf_verify(&pk, &input, &honest), Some(honest.output));
 
-    // Identity refuses at parse AND at verify (both spellings).
+    // Identity refuses at parse AND at verify (both spellings): the
+    // all-zero encoding is an order-4 point (refused by validate-key), and
+    // [0x01, 0, ...] is the identity point itself.
     assert!(VrfPublicKey::from_bytes(&[0u8; 32]).is_none());
-    let id_pt = RistrettoPoint::mul_base(&Scalar::from(0u64))
-        .compress()
-        .to_bytes();
+    let mut id_pt = [0u8; 32];
+    id_pt[0] = 0x01;
     assert!(VrfPublicKey::from_bytes(&id_pt).is_none());
     assert_eq!(vrf_verify(&[0u8; 32], &input, &honest), None);
     assert_eq!(vrf_verify(&id_pt, &input, &honest), None);
 
     // Garbage / non-canonical encodings refuse at parse and at verify.
     assert!(VrfPublicKey::from_bytes(&[0xFFu8; 32]).is_none());
-    let mut non_canonical = pk;
-    non_canonical[31] |= 0x80; // high-bit set: outside the canonical range
-    // (may or may not parse; either way the honest proof must not verify)
-    assert_eq!(vrf_verify(&non_canonical, &input, &honest), None);
+    // Corrupted key bytes: either garbage (refuses at decode) or a
+    // different valid point (the honest proof refuses under any wrong key).
+    let mut corrupted = pk;
+    corrupted[15] ^= 0xFF; // guaranteed change, mid-encoding
+    assert_ne!(corrupted, pk);
+    assert_eq!(vrf_verify(&corrupted, &input, &honest), None);
 
     // Low-order-candidate sweep: every single-byte-pattern key either fails
-    // to parse (Ristretto has no small-subgroup encodings that decompress)
-    // or parses to a wrong key under which the honest proof refuses.
+    // to parse (non-canonical, low-order, or off-curve) or parses to a
+    // wrong prime-order key under which the honest proof refuses.
     // Either outcome is fail-closed; none may accept.
     let mut parsed_count = 0u32;
     for b in 0u8..=255u8 {
@@ -531,22 +450,30 @@ fn edge_keys_identity_small_subgroup_and_extremes() {
             "flat-pattern key {b:#04x} must never accept an honest proof"
         );
     }
-    eprintln!("EDGE: flat-pattern keys that parse as valid Ristretto: {parsed_count}/256");
-    // NOTE: a nonzero parse count is EXPECTED, not a weakness — Ristretto
-    // encodings are dense, and every successfully-decompressed point lies in
-    // the prime-order group by construction (no cofactor subgroup exists to
-    // smuggle in). The fail-closed pin is above: every one of the 256
-    // candidates refuses the honest proof, parsed or not.
+    eprintln!("EDGE: flat-pattern keys that parse as valid Edwards keys: {parsed_count}/256");
+    // NOTE: a nonzero parse count is EXPECTED, not a weakness — some flat
+    // patterns are canonical encodings of ordinary prime-order points, and
+    // every one of them fails closed above (the honest proof refuses under
+    // any key but its own). Low-order patterns never parse: validate-key
+    // rejects identity and all low-order points at parse time.
+    // Cross-check: the known low-order encodings all refuse at parse.
+    let mut order2 = [0xFFu8; 32];
+    order2[0] = 0xED; // y = p-1 (order-2 point (0,-1))
+    order2[31] = 0x7F;
+    assert!(VrfPublicKey::from_bytes(&order2).is_none());
+    let mut order4 = [0u8; 32];
+    order4[31] = 0x80; // (x-odd, y=0): order-4 point
+    assert!(VrfPublicKey::from_bytes(&order4).is_none());
 
-    // Proof carrying R = identity refuses (identity-R equation cannot hold
-    // for an honestly-derived z/output pair).
+    // Proof carrying Gamma = identity refuses (an identity Gamma binds a
+    // challenge no honest s can satisfy), as does garbage in Gamma field.
     {
-        let mut bad_r = honest.clone();
-        bad_r.proof[..32].copy_from_slice(&[0u8; 32]);
-        assert_eq!(vrf_verify(&pk, &input, &bad_r), None);
-        let mut bad_r2 = honest.clone();
-        bad_r2.proof[..32].copy_from_slice(&[0xFFu8; 32]);
-        assert_eq!(vrf_verify(&pk, &input, &bad_r2), None);
+        let mut bad_g = honest.clone();
+        bad_g.proof[..32].copy_from_slice(&[0u8; 32]);
+        assert_eq!(vrf_verify(&pk, &input, &bad_g), None);
+        let mut bad_g2 = honest.clone();
+        bad_g2.proof[..32].copy_from_slice(&[0xFFu8; 32]);
+        assert_eq!(vrf_verify(&pk, &input, &bad_g2), None);
     }
 
     // Edge secrets still derive usable non-identity keys (no degenerate
@@ -571,11 +498,15 @@ fn edge_keys_identity_small_subgroup_and_extremes() {
         VrfSecret::from_seed(&[0xFFu8; 32]).public_key()
     );
 
-    // Cofactor note pinned behaviorally: honest R values are prime-order
-    // multiples of the basepoint, hence never identity for nonzero nonce.
+    // Cofactor note pinned behaviorally: honest Gammas are x*H for the
+    // input-bound H, hence never identity (H is a hash output, x nonzero).
     for j in 0..16usize {
-        let r = RistrettoPoint::mul_base(&grind_scalar(&cry_seed(700), &cry_input(j), 0));
-        assert!(!r.is_identity(), "nonzero nonce must give non-identity R");
+        let p = vrf_prove(&VrfSecret::from_seed(&cry_seed(700)), &cry_input(j));
+        assert_ne!(
+            &p.proof[..32],
+            &[0u8; 32],
+            "honest Gamma must never be the identity encoding"
+        );
     }
 }
 
@@ -590,8 +521,7 @@ fn malleability_fresh_proof_all_single_bits_plus_shape_attacks() {
     let good = vrf_prove(&secret, &input);
     assert_eq!(vrf_verify(&pk, &input, &good), Some(good.output));
 
-    // Exhaustive single-bit sweep: all 64 proof bytes x all 8 bit positions.
-    // (Prior battery flipped only 0x01 per position on a different proof.)
+    // Exhaustive single-bit sweep: all 80 proof bytes x all 8 bit positions.
     let mut checked = 0u32;
     for pos in 0..VRF_PROOF_LEN {
         for bit in 0..8u32 {
@@ -605,7 +535,7 @@ fn malleability_fresh_proof_all_single_bits_plus_shape_attacks() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 512);
+    assert_eq!(checked, VRF_PROOF_LEN as u32 * 8);
 
     // Exhaustive single-bit sweep over the bound output field too.
     for pos in 0..32usize {
@@ -627,33 +557,45 @@ fn malleability_fresh_proof_all_single_bits_plus_shape_attacks() {
         assert_eq!(vrf_verify(&pk, &input, &bad), None);
     }
 
-    // Shape attacks: halves swapped / duplicated (R||z -> z||R, R||R, z||z).
+    // Shape attacks on the ECVRF thirds (Gamma || c || s): field swaps
+    // and duplications all refuse — the challenge binds every field, and
+    // the output binds the proof bytes.
     {
-        let mut r_half = [0u8; 32];
-        let mut z_half = [0u8; 32];
-        r_half.copy_from_slice(&good.proof[..32]);
-        z_half.copy_from_slice(&good.proof[32..]);
-        assert_ne!(r_half, z_half, "fixture needs distinct halves");
+        let mut gamma = [0u8; 32];
+        let mut s_field = [0u8; 32];
+        gamma.copy_from_slice(&good.proof[..32]);
+        s_field.copy_from_slice(&good.proof[48..]);
+        assert_ne!(gamma, s_field, "fixture needs distinct Gamma and s");
 
+        // Gamma <-> s swapped: the challenge binds the field positions.
         let mut swapped = good.clone();
-        swapped.proof[..32].copy_from_slice(&z_half);
-        swapped.proof[32..].copy_from_slice(&r_half);
-        swapped.output = cry_output(&z_half, &pk, &input);
+        swapped.proof[..32].copy_from_slice(&s_field);
+        swapped.proof[48..].copy_from_slice(&gamma);
+        swapped.output[0] ^= 0x01; // output must move with the proof bytes
         assert_eq!(vrf_verify(&pk, &input, &swapped), None);
 
-        let mut rr = good.clone();
-        rr.proof[32..].copy_from_slice(&r_half);
-        rr.output = cry_output(&r_half, &pk, &input);
-        assert_eq!(vrf_verify(&pk, &input, &rr), None);
+        // Gamma duplicated into the s field.
+        let mut gdup = good.clone();
+        gdup.proof[48..].copy_from_slice(&gamma);
+        gdup.output[1] ^= 0x01;
+        assert_eq!(vrf_verify(&pk, &input, &gdup), None);
 
-        let mut zz = good.clone();
-        zz.proof[..32].copy_from_slice(&z_half);
-        zz.output = cry_output(&z_half, &pk, &input);
-        assert_eq!(vrf_verify(&pk, &input, &zz), None);
+        // s duplicated into the Gamma field.
+        let mut sdup = good.clone();
+        sdup.proof[..32].copy_from_slice(&s_field);
+        sdup.output[2] ^= 0x01;
+        assert_eq!(vrf_verify(&pk, &input, &sdup), None);
+
+        // Zeroed challenge with honest everything-else.
+        let mut zc = good.clone();
+        zc.proof[32..48].copy_from_slice(&[0u8; 16]);
+        zc.output[3] ^= 0x01;
+        assert_eq!(vrf_verify(&pk, &input, &zc), None);
     }
 
-    // Cross-proof splice: R from proof A + z from proof B (same key, two
-    // inputs) refuses in both directions, as do cross-wired outputs.
+    // Cross-proof splice: Gamma from proof A + (c, s) from proof B (same
+    // key, two inputs) refuses in both directions, as do cross-wired
+    // outputs.
     {
         let other = vrf_prove(&secret, &cry_input(81));
         assert_ne!(good.proof, other.proof);
@@ -666,11 +608,15 @@ fn malleability_fresh_proof_all_single_bits_plus_shape_attacks() {
         let mut xout = good.clone();
         xout.output = other.output;
         assert_eq!(vrf_verify(&pk, &input, &xout), None);
+        // Gamma-only splice (c, s kept from the honest proof).
+        let mut splice3 = good.clone();
+        splice3.proof[..32].copy_from_slice(&other.proof[..32]);
+        assert_eq!(vrf_verify(&pk, &input, &splice3), None);
     }
 
     // Truncation / extension at the ENVELOPE layer (serde JSON): any dropped
     // or appended byte breaks decoding, so a short/long envelope can never
-    // smuggle the same 64 proof bytes past the verifier.
+    // smuggle the same 80 proof bytes past the verifier.
     {
         let json = serde_json::to_string(&good).expect("envelope serializes");
         let rt: stellereum::vrf::VrfProof =
@@ -698,5 +644,5 @@ fn malleability_fresh_proof_all_single_bits_plus_shape_attacks() {
             );
         }
     }
-    eprintln!("MALLEABILITY: 512 proof-bit + 256 output-bit + shape/splice/serde mutants all refuse");
+    eprintln!("MALLEABILITY: 640 proof-bit + 256 output-bit + shape/splice/serde mutants all refuse");
 }

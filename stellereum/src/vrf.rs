@@ -18,11 +18,11 @@
 //! certificates: [`crate::consensus::derive_sortition_committee`] behaves
 //! byte-identically with or without this module.
 //!
-//! # Construction choice: ECVRF over Ristretto255 (phases 2–3), beacon math now
+//! # Construction choice: ECVRF over Edwards25519 (RFC 9381), beacon math now
 //!
-//! Chosen: per-validator ECVRF (RFC 9381 `ECVRF-EDWARDS25519-SHA512-Elligator2`
-//! family) over the Ristretto255 group, with the VRF public key bound to the
-//! validator id by a Falcon-512 signature ([`VrfBinding`]).
+//! Chosen: per-validator ECVRF (RFC 9381 `ECVRF-EDWARDS25519-SHA512-Elligator2`,
+//! `suite_string = 0x04`) over the Edwards25519 group, with the VRF public key
+//! bound to the validator id by a Falcon-512 signature ([`VrfBinding`]).
 //!
 //! Why not a hash-chained beacon alone: a beacon `b_h = H(b_{h-1} || ...)`
 //! whose update input the block proposer chooses is grindable by exactly the
@@ -31,7 +31,7 @@
 //! unpredictable to everyone but the key holder and unforgeable by the
 //! proposer, so no amount of parent-hash search changes anyone else's ticket.
 //!
-//! Why Ristretto (classical) alongside PQ Falcon keys: there is no
+//! Why Edwards25519 (classical) alongside PQ Falcon keys: there is no
 //! standardized PQ VRF over Falcon lattices (a Falcon signature is
 //! randomized, not verifiably pseudorandom, and proving "this output is THE
 //! VRF output for this input" needs DLEQ-style proofs lattices do not give
@@ -44,15 +44,19 @@
 //! A PQ-native VRF (e.g. hash-based, NIST-standardized) can replace the group
 //! without changing the binding/seed/threshold layers specified here.
 //!
-//! Phase 2 implements prove/verify against an audited ECVRF crate (NOT
-//! hand-rolled here — hand-rolling DLEQ/Elligator2 in one change is exactly
-//! the unsafe shortcut this plan refuses) and gossips proofs beside votes;
-//! phase 3 switches election to the lottery. See `docs/PLAN-VRF.md`.
+//! Phase 2 implements prove/verify below as a from-spec RFC 9381
+//! implementation (no audited-ECVRF crate is vendored in this offline tree,
+//! so the Elligator2 map and the GF(2^255-19) field layer it needs are
+//! implemented in this module from the RFC 9380/9381 pseudocode — NOT via an
+//! external crate — and validated byte-for-byte against the RFC 9381
+//! Appendix B.4 test vectors in `tests/vrf_ecvrf_tests.rs`). It gossips
+//! proofs beside votes; phase 3 switches election to the lottery.
+//! See `docs/PLAN-VRF.md`.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use curve25519_dalek::ristretto::RistrettoPoint;
+use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::scalar::Scalar;
 use curve25519_dalek::traits::IsIdentity;
 use sha2::{Digest, Sha512};
@@ -64,16 +68,28 @@ use sha2::{Digest, Sha512};
 /// Domain tag for the beacon chain update `beacon_h = H(prev || vrf_output)`.
 pub const VRF_BEACON_DOMAIN: &str = "STELL_VRF_BEACON_V1";
 
-/// Domain tag for the VRF secret -> scalar derivation.
+/// Domain tag for the legacy secret -> scalar derivation.
+///
+/// Retained for API/test compatibility. ECVRF key expansion follows
+/// RFC 8032 §5.1.5 exactly (`SHA-512(seed)`, clamped) with no extra domain,
+/// so that the RFC 9381 Appendix B test vectors reproduce byte-for-byte.
 pub const VRF_SCALAR_DOMAIN: &[u8] = b"STELL_VRF_SCALAR_V1";
 
 /// Domain tag for the Falcon-signed VRF key binding.
 pub const VRF_BINDING_DST: &[u8] = b"STELL_VRF_BINDKEY_V1";
 
-/// Domain tag for the Schnorr-derived VRF proof hashes (nonce + challenge).
+/// Domain tag for the legacy Schnorr proof hashes (nonce + challenge).
+///
+/// Retained for API/test compatibility. The ECVRF construction below does
+/// NOT use this tag: challenge generation follows RFC 9381 §5.4.3 with the
+/// suite-separated `SHA-512(suite || 0x02 || ... || 0x00)` hash.
 pub const VRF_PROOF_DOMAIN: &[u8] = b"STELL_VRF_PROOF_V1";
 
-/// Domain tag for the VRF output hash `output = BLAKE3(domain || R || pk || seed)`.
+/// Domain tag for the legacy Schnorr VRF output hash.
+///
+/// Retained for API/test compatibility. The ECVRF beta follows RFC 9381
+/// §5.2 (`SHA-512(suite || 0x03 || cofactor*Gamma || 0x00)`, 64 bytes); the
+/// `VrfProof.output` ticket is its leading 32 bytes.
 pub const VRF_OUTPUT_DOMAIN: &str = "STELL_VRF_OUTPUT_V1";
 
 /// Domain tag for the post-activation election seed
@@ -98,8 +114,13 @@ pub const VRF_KEYS_ENV: &str = "STELL_VRF_KEYS";
 /// `vrf_seed = BLAKE3("VRF_SUBSEED_V1" || ed_seed_32)`.
 pub const VRF_SUBSEED_DOMAIN: &[u8] = b"VRF_SUBSEED_V1";
 
-/// Length of a serialised VRF proof: `R (32B) || z (32B)`.
-pub const VRF_PROOF_LEN: usize = 64;
+/// Length of a serialised ECVRF proof (RFC 9381 §5.1, step 8):
+/// `Gamma (32B) || c (16B, little-endian) || s (32B, little-endian)`.
+///
+/// 80 bytes, not 64: the phase-1 Schnorr envelope (`R || z`) is replaced by
+/// the ECVRF envelope. Carriers (`VrfProof`, `VrfBeaconSeal`) size
+/// themselves from this constant, so no call-site change is needed.
+pub const VRF_PROOF_LEN: usize = 80;
 
 // ============================================================================
 // Activation gate (XPC-activation-height pattern)
@@ -478,7 +499,8 @@ pub fn vrf_registry_ready_for_power(
 // Keys (live alongside the validator's Falcon key)
 // ============================================================================
 
-/// A validator's VRF public key: a compressed Ristretto255 point (32 bytes).
+/// A validator's VRF public key: an Edwards25519 compressed point (32 bytes,
+/// RFC 8032 §5.1.2 encoding).
 ///
 /// Registered alongside — never instead of — the validator's PQ Falcon key.
 /// See [`VrfBinding`] for the authorization that ties the two together.
@@ -486,10 +508,14 @@ pub fn vrf_registry_ready_for_power(
 pub struct VrfPublicKey(pub [u8; 32]);
 
 impl VrfPublicKey {
-    /// Parse and reject the identity point (it would make every ticket zero).
+    /// Parse and apply the RFC 9381 validate-key rule (§5.4.5 with
+    /// `validate_key = TRUE`): the bytes must decompress to a curve point
+    /// whose cofactor multiple is not the identity — i.e. identity AND every
+    /// low-order point refuse. Edwards25519 (unlike Ristretto) admits
+    /// low-order encodings, so parsing alone cannot exclude them.
     pub fn from_bytes(bytes: &[u8; 32]) -> Option<Self> {
-        let pt = curve25519_dalek::ristretto::CompressedRistretto(*bytes).decompress()?;
-        if pt.is_identity() {
+        let pt = decompress_canonical(bytes)?;
+        if pt.mul_by_cofactor().is_identity() {
             return None;
         }
         Some(Self(*bytes))
@@ -500,9 +526,9 @@ impl VrfPublicKey {
     }
 }
 
-/// A validator's VRF secret: a 32-byte seed. The Ristretto scalar is derived
-/// on demand (`SHA-512(seed || domain)` reduced wide — uniform over the
-/// scalar field); only the seed is stored, and it is wiped on drop.
+/// A validator's VRF secret: a 32-byte seed. The secret scalar is derived
+/// on demand per RFC 8032 §5.1.5 (`SHA-512(seed)`, clamped — see
+/// [`ecvrf_secret_scalar`]); only the seed is stored, and it is wiped on drop.
 pub struct VrfSecret([u8; 32]);
 
 impl VrfSecret {
@@ -520,25 +546,13 @@ impl VrfSecret {
     }
 
     fn scalar(&self) -> Scalar {
-        let mut h = Sha512::new();
-        h.update(VRF_SCALAR_DOMAIN);
-        h.update(self.0);
-        let digest = h.finalize();
-        let mut wide = [0u8; 64];
-        wide[..32].copy_from_slice(&digest[..32]);
-        let mut h2 = Sha512::new();
-        h2.update(VRF_SCALAR_DOMAIN);
-        h2.update(b"hi");
-        h2.update(self.0);
-        let d2 = h2.finalize();
-        wide[32..].copy_from_slice(&d2[..32]);
-        Scalar::from_bytes_mod_order_wide(&wide)
+        ecvrf_secret_scalar(&self.0)
     }
 
     /// The public key for this secret.
     pub fn public_key(&self) -> VrfPublicKey {
         VrfPublicKey(
-            RistrettoPoint::mul_base(&self.scalar())
+            EdwardsPoint::mul_base(&self.scalar())
                 .compress()
                 .to_bytes(),
         )
@@ -671,21 +685,520 @@ impl VrfRegistry {
 }
 
 // ============================================================================
-// Phase-1 wiring VRF: deterministic Schnorr-derived prove/verify
+// ECVRF-EDWARDS25519-SHA512-Elligator2 (RFC 9381 §5.5, `suite_string = 0x04`)
 // ============================================================================
 //
-// SECURITY SCOPE (read before auditing): this is a deterministic Schnorr
-// signature over the seed input used AS a VRF
-// (`output = BLAKE3(R || pk || seed)`, proof = `(R, z)`), NOT an audited
-// RFC 9381 ECVRF. It gives exactly what the height-gated wiring needs —
-// unforgeability without the signer's secret, determinism across nodes
-// (derived nonce, no wall clock, no OS randomness in the election path),
-// and verification against the Falcon-bound registry key — but it has NOT
-// had ECVRF review (ciphersuite separation, hash-to-curve,
-// batch-verification rules). Phase 2 replaces the `vrf_prove`/`vrf_verify`
-// bodies with an audited ECVRF crate behind these SAME signatures; the
-// activation gate, registry binding and election-seed layers are unchanged
-// by that swap.
+// This section implements ECVRF proving/verification exactly per RFC 9381:
+// key expansion per RFC 8032 §5.1.5, encode-to-curve per RFC 9381 §5.4.1.2
+// (hash-to-curve suite `edwards25519_XMD:SHA-512_ELL2_NU_`, RFC 9380 §8.5:
+// expand_message_xmd(SHA-512) + Elligator2 map + cofactor clearing),
+// deterministic nonce per RFC 9381 §5.4.2.2, challenge per §5.4.3, decode
+// per §5.4.4, and key validation per §5.4.5 (`validate_key = TRUE`).
+//
+// Uniqueness (RFC 9381 §3.1) holds: for fixed (pk, alpha) there is exactly
+// one verifiable output, because the curve point `H = encode(alpha)` is a
+// deterministic function of the input and `Gamma = x*H` binds the proof to
+// the secret scalar — the holder has no free nonce to grind over (contrast
+// the retired Schnorr wiring, where any `k'` minted another valid proof).
+// What grinding REMAINS is key grinding: N distinct secrets give N distinct
+// tickets, but only the Falcon-registered key mints for a validator id, and
+// each key's ticket is a single uniform draw — the honest lottery model.
+//
+// AUDIT SCOPE: the GF(2^255-19) field layer (`Fe`) and the Elligator2 map
+// below are implemented in this module from the RFC 9380 pseudocode
+// (G.2.1/G.2.2) because no audited-ECVRF crate is vendored in this offline
+// tree. They are validated byte-for-byte against the RFC 9381 Appendix B.4
+// vectors (secret key, public key, `uniform_bytes`, `u`, `H`, `k`, `U`,
+// `V`, `pi`, `beta`) in `tests/vrf_ecvrf_tests.rs` — any arithmetic slip
+// fails those vectors. Side-channel (constant-time) posture of this code is
+// UNKNOWN (same row as the prior construction): dalek scalar/point ops are
+// constant-time, the `Fe` helpers are straight-line but not hardened.
+//
+// --- field element: GF(2^255 - 19), radix 2^51 ---
+
+/// Prime field element: 5 little-endian radix-2^51 limbs.
+///
+/// Limbs are kept `< 2^51` by [`fe_carry`] after every op that can grow
+/// them; [`fe_mul`]/[`fe_sq`] normalize their inputs defensively, so any
+/// call sequence stays in range (products accumulate in `u128`, whose
+/// worst case is `19 * 5 * (2^51)^2 < 2^110`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fe([u64; 5]);
+
+/// (p + 3) / 8 = 2^252 - 2, little-endian bytes (sqrt exponent, p ≡ 5 mod 8).
+const FE_EXP_C1: [u8; 32] = {
+    let mut e = [0xFFu8; 32];
+    e[0] = 0xFE;
+    e[31] = 0x0F;
+    e
+};
+
+/// (p - 5) / 8 = 2^252 - 3, little-endian bytes (Elligator2 sqrt exponent).
+const FE_EXP_C4: [u8; 32] = {
+    let mut e = [0xFFu8; 32];
+    e[0] = 0xFD;
+    e[31] = 0x0F;
+    e
+};
+
+/// p - 2, little-endian bytes (Fermat inverse exponent).
+const FE_EXP_P_MINUS_2: [u8; 32] = {
+    let mut e = [0xFFu8; 32];
+    e[0] = 0xEB;
+    e[31] = 0x7F;
+    e
+};
+
+/// (p - 1) / 4 = 2^253 - 5, little-endian bytes (sqrt(-1) = 2^((p-1)/4)).
+const FE_EXP_P_M1_DIV_4: [u8; 32] = {
+    let mut e = [0xFFu8; 32];
+    e[0] = 0xFB;
+    e[31] = 0x1F;
+    e
+};
+
+const FE_MASK51: u64 = (1u64 << 51) - 1;
+
+fn fe_add(a: &Fe, b: &Fe) -> Fe {
+    Fe([
+        a.0[0].wrapping_add(b.0[0]),
+        a.0[1].wrapping_add(b.0[1]),
+        a.0[2].wrapping_add(b.0[2]),
+        a.0[3].wrapping_add(b.0[3]),
+        a.0[4].wrapping_add(b.0[4]),
+    ])
+}
+
+fn fe_sub(a: &Fe, b: &Fe) -> Fe {
+    // Limb management mirrors `curve25519-dalek`'s u64 backend
+    // (`backend/serial/u64/field.rs`, same prime, same radix): to avoid
+    // underflow, first add a multiple of p — 16p limb-wise, which exceeds
+    // any unreduced limb — then weak-reduce. The bias is a multiple of p,
+    // so the value is preserved exactly mod p.
+    fe_carry(&Fe([
+        a.0[0].wrapping_add(36028797018963664).wrapping_sub(b.0[0]),
+        a.0[1].wrapping_add(36028797018963952).wrapping_sub(b.0[1]),
+        a.0[2].wrapping_add(36028797018963952).wrapping_sub(b.0[2]),
+        a.0[3].wrapping_add(36028797018963952).wrapping_sub(b.0[3]),
+        a.0[4].wrapping_add(36028797018963952).wrapping_sub(b.0[4]),
+    ]))
+}
+
+fn fe_neg(a: &Fe) -> Fe {
+    fe_sub(&Fe([0, 0, 0, 0, 0]), a)
+}
+
+/// Weak reduction: every limb below ~2^51 (parallel carry-outs, top fold
+/// 2^255 = 19). Same shape as dalek's `reduce`; inputs must fit `u64`
+/// (all call sites guarantee this: `fe_mul` accumulates in `u128` first,
+///
+/// `fe_sub` biases below 2^64, `fe_add` stays below 2^53 for reduced inputs).
+fn fe_carry(a: &Fe) -> Fe {
+    let l = a.0;
+    let c0 = l[0] >> 51;
+    let c1 = l[1] >> 51;
+    let c2 = l[2] >> 51;
+    let c3 = l[3] >> 51;
+    let c4 = l[4] >> 51;
+    Fe([
+        (l[0] & FE_MASK51).wrapping_add(c4.wrapping_mul(19)),
+        (l[1] & FE_MASK51).wrapping_add(c0),
+        (l[2] & FE_MASK51).wrapping_add(c1),
+        (l[3] & FE_MASK51).wrapping_add(c2),
+        (l[4] & FE_MASK51).wrapping_add(c3),
+    ])
+}
+
+fn fe_mul(a: &Fe, b: &Fe) -> Fe {
+    // Normalize defensively: the schoolbook below needs limbs < 2^63.
+    let a = fe_carry(a);
+    let b = fe_carry(b);
+    let mut c = [0u128; 5];
+    for i in 0..5 {
+        for j in 0..5 {
+            let p = a.0[i] as u128 * b.0[j] as u128;
+            if i + j < 5 {
+                c[i + j] += p;
+            } else {
+                // Wrap-around: 2^255 == 19.
+                c[i + j - 5] += p * 19;
+            }
+        }
+    }
+    for i in 0..4 {
+        let carry = c[i] >> 51;
+        c[i] &= FE_MASK51 as u128;
+        c[i + 1] += carry;
+    }
+    let carry = c[4] >> 51;
+    c[4] &= FE_MASK51 as u128;
+    c[0] += carry * 19;
+    fe_carry(&Fe([
+        c[0] as u64,
+        c[1] as u64,
+        c[2] as u64,
+        c[3] as u64,
+        c[4] as u64,
+    ]))
+}
+
+fn fe_sq(a: &Fe) -> Fe {
+    fe_mul(a, a)
+}
+
+/// Freeze to the canonical representative in [0, p): single conditional
+/// subtract, valid because weakly-reduced limbs imply value < 2p.
+fn fe_freeze(a: &Fe) -> Fe {
+    // Transcription of dalek's `as_bytes` head: h + 19 carries iff h >= p.
+    let mut limbs = fe_carry(a).0;
+    let mut q = (limbs[0].wrapping_add(19)) >> 51;
+    q = (limbs[1].wrapping_add(q)) >> 51;
+    q = (limbs[2].wrapping_add(q)) >> 51;
+    q = (limbs[3].wrapping_add(q)) >> 51;
+    q = (limbs[4].wrapping_add(q)) >> 51;
+    // r = h - p*q = h + 19q - 2^255 q: carry, discarding the 2^255 q top.
+    limbs[0] = limbs[0].wrapping_add(19 * q);
+    limbs[1] = limbs[1].wrapping_add(limbs[0] >> 51);
+    limbs[0] &= FE_MASK51;
+    limbs[2] = limbs[2].wrapping_add(limbs[1] >> 51);
+    limbs[1] &= FE_MASK51;
+    limbs[3] = limbs[3].wrapping_add(limbs[2] >> 51);
+    limbs[2] &= FE_MASK51;
+    limbs[4] = limbs[4].wrapping_add(limbs[3] >> 51);
+    limbs[3] &= FE_MASK51;
+    limbs[4] &= FE_MASK51;
+    Fe(limbs)
+}
+
+/// Canonical 32-byte little-endian encoding.
+fn fe_to_bytes(a: &Fe) -> [u8; 32] {
+    let limbs = fe_freeze(a).0;
+    // Bit-packing of five 51-bit limbs (same layout as dalek `as_bytes`).
+    let mut s = [0u8; 32];
+    s[0] = limbs[0] as u8;
+    s[1] = (limbs[0] >> 8) as u8;
+    s[2] = (limbs[0] >> 16) as u8;
+    s[3] = (limbs[0] >> 24) as u8;
+    s[4] = (limbs[0] >> 32) as u8;
+    s[5] = (limbs[0] >> 40) as u8;
+    s[6] = ((limbs[0] >> 48) | (limbs[1] << 3)) as u8;
+    s[7] = (limbs[1] >> 5) as u8;
+    s[8] = (limbs[1] >> 13) as u8;
+    s[9] = (limbs[1] >> 21) as u8;
+    s[10] = (limbs[1] >> 29) as u8;
+    s[11] = (limbs[1] >> 37) as u8;
+    s[12] = ((limbs[1] >> 45) | (limbs[2] << 6)) as u8;
+    s[13] = (limbs[2] >> 2) as u8;
+    s[14] = (limbs[2] >> 10) as u8;
+    s[15] = (limbs[2] >> 18) as u8;
+    s[16] = (limbs[2] >> 26) as u8;
+    s[17] = (limbs[2] >> 34) as u8;
+    s[18] = (limbs[2] >> 42) as u8;
+    s[19] = ((limbs[2] >> 50) | (limbs[3] << 1)) as u8;
+    s[20] = (limbs[3] >> 7) as u8;
+    s[21] = (limbs[3] >> 15) as u8;
+    s[22] = (limbs[3] >> 23) as u8;
+    s[23] = (limbs[3] >> 31) as u8;
+    s[24] = (limbs[3] >> 39) as u8;
+    s[25] = ((limbs[3] >> 47) | (limbs[4] << 4)) as u8;
+    s[26] = (limbs[4] >> 4) as u8;
+    s[27] = (limbs[4] >> 12) as u8;
+    s[28] = (limbs[4] >> 20) as u8;
+    s[29] = (limbs[4] >> 28) as u8;
+    s[30] = (limbs[4] >> 36) as u8;
+    s[31] = (limbs[4] >> 44) as u8;
+    s
+}
+
+fn fe_from_u64(x: u64) -> Fe {
+    Fe([x, 0, 0, 0, 0])
+}
+
+/// `OS2IP` of 48 big-endian bytes, reduced mod p (RFC 9380 hash_to_field
+/// tail for L = 48).
+fn fe_from_be48(bytes: &[u8; 48]) -> Fe {
+    let m = fe_from_u64(256);
+    let mut f = Fe([0, 0, 0, 0, 0]);
+    for byte in bytes.iter() {
+        f = fe_add(&fe_mul(&f, &m), &fe_from_u64(*byte as u64));
+    }
+    f
+}
+
+/// Square-and-multiply with a 32-byte little-endian exponent (MSB first).
+fn fe_pow(base: &Fe, exp_le: &[u8; 32]) -> Fe {
+    let mut r = Fe([1, 0, 0, 0, 0]);
+    for i in (0..256).rev() {
+        r = fe_sq(&r);
+        if (exp_le[i / 8] >> (i % 8)) & 1 == 1 {
+            r = fe_mul(&r, base);
+        }
+    }
+    r
+}
+
+fn fe_inv(a: &Fe) -> Fe {
+    // Fermat: a^(p-2). Maps 0 -> 0 (inv0 semantics); callers only invert
+    // provably-nonzero denominators.
+    fe_pow(a, &FE_EXP_P_MINUS_2)
+}
+
+fn fe_equal(a: &Fe, b: &Fe) -> bool {
+    let x = fe_freeze(a).0;
+    let y = fe_freeze(b).0;
+    let mut diff = 0u64;
+    for i in 0..5 {
+        diff |= x[i] ^ y[i];
+    }
+    diff == 0
+}
+
+fn fe_is_zero(a: &Fe) -> bool {
+    let x = fe_freeze(a).0;
+    x[0] | x[1] | x[2] | x[3] | x[4] == 0
+}
+
+/// `sgn0` for GF(p): the least significant bit (p is odd, so parity is a
+/// well-defined function of the residue class).
+fn fe_sgn0(a: &Fe) -> u8 {
+    fe_to_bytes(a)[0] & 1
+}
+
+/// Branch-free select: `false` -> x, `true` -> y.
+fn fe_cmov(x: &Fe, y: &Fe, choice: bool) -> Fe {
+    let mask = (choice as u64).wrapping_neg();
+    Fe([
+        x.0[0] ^ (mask & (x.0[0] ^ y.0[0])),
+        x.0[1] ^ (mask & (x.0[1] ^ y.0[1])),
+        x.0[2] ^ (mask & (x.0[2] ^ y.0[2])),
+        x.0[3] ^ (mask & (x.0[3] ^ y.0[3])),
+        x.0[4] ^ (mask & (x.0[4] ^ y.0[4])),
+    ])
+}
+
+/// Square root with `sgn0 == 0` (p ≡ 5 mod 8): `v = a^((p+3)/8)`, corrected
+/// by `sqrt(-1) = 2^((p-1)/4)` when `v^2 == -a`. `None` on nonsquare input.
+fn fe_sqrt_sgn0(a: &Fe) -> Option<Fe> {
+    let mut v = fe_pow(a, &FE_EXP_C1);
+    if !fe_equal(&fe_sq(&v), a) {
+        let sqrt_m1 = fe_pow(&fe_from_u64(2), &FE_EXP_P_M1_DIV_4);
+        v = fe_mul(&v, &sqrt_m1);
+        if !fe_equal(&fe_sq(&v), a) {
+            return None;
+        }
+    }
+    if fe_sgn0(&v) == 1 {
+        v = fe_neg(&v);
+    }
+    Some(v)
+}
+
+// --- Elligator2 map (RFC 9380 G.2.1 curve25519 + G.2.2 edwards25519) ---
+
+/// Montgomery curve25519 parameter J = 486662.
+fn fe_curve25519_j() -> Fe {
+    fe_from_u64(486662)
+}
+
+/// Straight-line Elligator2 for curve25519 (RFC 9380 Appendix G.2.1,
+/// q ≡ 5 mod 8, K = 1): returns `(xn, xd, y)` with affine point
+/// `(xn/xd, y/1)` on `t^2 = s^3 + 486662 s^2 + s`.
+fn elligator2_curve25519(u: &Fe) -> (Fe, Fe, Fe) {
+    let j = fe_curve25519_j();
+    let one = Fe([1, 0, 0, 0, 0]);
+    // c3 = sqrt(-1), c2 = 2^((p+3)/8).
+    let c3 = fe_pow(&fe_from_u64(2), &FE_EXP_P_M1_DIV_4);
+    let c2 = fe_pow(&fe_from_u64(2), &FE_EXP_C1);
+    let tv1 = fe_add(&fe_sq(u), &fe_sq(u)); // 2u^2
+    let xd = fe_add(&tv1, &one); // 1 + 2u^2 (never 0: -inv2 is nonsquare)
+    let x1n = fe_neg(&j); // -J
+    let tv2 = fe_sq(&xd);
+    let gxd = fe_mul(&tv2, &xd); // xd^3
+    let mut gx1 = fe_mul(&j, &tv1); // J*tv1 = x1n + J*xd
+    gx1 = fe_mul(&gx1, &x1n);
+    gx1 = fe_add(&gx1, &tv2);
+    gx1 = fe_mul(&gx1, &x1n); // x1n^3 + J*x1n^2*xd + x1n*xd^2
+    let tv3_sq = fe_sq(&gxd); // gxd^2
+    let tv2_quad = fe_sq(&tv3_sq); // gxd^4
+    let mut tv3 = fe_mul(&tv3_sq, &gxd); // gxd^3
+    tv3 = fe_mul(&tv3, &gx1); // gx1*gxd^3
+    let tv2_prod = fe_mul(&tv2_quad, &tv3); // gx1*gxd^7
+    let mut y11 = fe_pow(&tv2_prod, &FE_EXP_C4);
+    y11 = fe_mul(&y11, &tv3);
+    let y12 = fe_mul(&y11, &c3);
+    let e1 = fe_equal(&fe_mul(&fe_sq(&y11), &gxd), &gx1);
+    let y1 = fe_cmov(&y12, &y11, e1);
+    let x2n = fe_mul(&x1n, &tv1);
+    let y21 = fe_mul(&fe_mul(&y11, u), &c2);
+    let y22 = fe_mul(&y21, &c3);
+    let gx2 = fe_mul(&gx1, &tv1);
+    let e2 = fe_equal(&fe_mul(&fe_sq(&y21), &gxd), &gx2);
+    let y2 = fe_cmov(&y22, &y21, e2);
+    let e3 = fe_equal(&fe_mul(&fe_sq(&y1), &gxd), &gx1);
+    let xn = fe_cmov(&x2n, &x1n, e3);
+    let mut y = fe_cmov(&y2, &y1, e3);
+    let e4 = fe_sgn0(&y) == 1;
+    if e3 ^ e4 {
+        y = fe_neg(&y);
+    }
+    (xn, xd, y)
+}
+
+/// Twisted-Edwards Elligator2 for edwards25519 (RFC 9380 Appendix G.2.2):
+/// Montgomery map above, then the RFC 7748 §4.1 birational map
+/// (`v = c1*xM/yM`, `w = (xM-1)/(xM+1)`, `c1 = sqrt(-486664)`,
+/// `sgn0(c1) == 0`), decoded through `curve25519-dalek` so downstream
+/// scalar arithmetic stays in the audited implementation.
+fn elligator2_edwards25519(u: &Fe) -> Option<EdwardsPoint> {
+    // (xMn/xMd, yMn/1) on curve25519.
+    let (xmn, xmd, ymn) = elligator2_curve25519(u);
+    let ymd = Fe([1, 0, 0, 0, 0]);
+    // c1 = sqrt(-486664) with sgn0 == 0 (math constant, always square).
+    let neg_a = fe_sub(&Fe([0, 0, 0, 0, 0]), &fe_from_u64(486664));
+    let c1 = fe_sqrt_sgn0(&neg_a)?;
+    let xn = fe_mul(&fe_mul(&xmn, &ymd), &c1);
+    let xd = fe_mul(&xmd, &ymn);
+    let yn = fe_sub(&xmn, &xmd);
+    let yd = fe_add(&xmn, &xmd);
+    // Exceptional case (xM = -1 or yM = 0): the map value is the identity.
+    let e = fe_is_zero(&fe_mul(&xd, &yd));
+    let zero = Fe([0, 0, 0, 0, 0]);
+    let one = Fe([1, 0, 0, 0, 0]);
+    let xn = fe_cmov(&xn, &zero, e);
+    let xd = fe_cmov(&xd, &one, e);
+    let yn = fe_cmov(&yn, &one, e);
+    let yd = fe_cmov(&yd, &one, e);
+    let v = fe_mul(&xn, &fe_inv(&xd));
+    let w = fe_mul(&yn, &fe_inv(&yd));
+    let mut enc = fe_to_bytes(&w);
+    if fe_sgn0(&v) == 1 {
+        enc[31] |= 0x80;
+    }
+    CompressedEdwardsY(enc).decompress()
+}
+
+// --- ECVRF auxiliary functions (RFC 9381 §5.4) ---
+
+/// RFC 9381 ciphersuite identifier for ECVRF-EDWARDS25519-SHA512-Elligator2.
+const ECVRF_SUITE_ID: u8 = 0x04;
+
+/// Edwards decompress with a canonical-encoding requirement: the bytes must
+/// be the RFC 8032 compression of the point they decode to. This rejects
+/// non-canonical encodings (`y >= p`, which dalek's equation check alone
+/// would reduce mod p and accept) so every point has exactly one accepted
+/// byte form in this system — malleability between alias encodings cannot
+/// cross the parse boundary, and garbage like `[0xFF; 32]` refuses.
+fn decompress_canonical(bytes: &[u8; 32]) -> Option<EdwardsPoint> {
+    let pt = CompressedEdwardsY(*bytes).decompress()?;
+    if pt.compress().to_bytes() != *bytes {
+        return None;
+    }
+    Some(pt)
+}
+/// `h2c_suite_ID = "edwards25519_XMD:SHA-512_ELL2_NU_"` and
+/// `suite_string = 0x04`.
+const ECVRF_H2C_DST: &[u8] = b"ECVRF_edwards25519_XMD:SHA-512_ELL2_NU_\x04";
+
+/// `expand_message_xmd` with SHA-512 for exactly 48 output bytes
+/// (`ell = 1`; RFC 9380 §5.3.1 with `DST_prime = DST || I2OSP(len(DST),1)`).
+fn expand_message_xmd_48(dst: &[u8], msg: &[u8]) -> [u8; 48] {
+    debug_assert!(dst.len() <= 255);
+    let mut h0 = Sha512::new();
+    h0.update([0u8; 128]); // Z_pad (SHA-512 block size)
+    h0.update(msg);
+    h0.update([0x00u8, 0x30u8]); // I2OSP(48, 2), big-endian
+    h0.update([0u8; 1]);
+    h0.update(dst);
+    h0.update([dst.len() as u8]);
+    let b0 = h0.finalize();
+    let mut h1 = Sha512::new();
+    h1.update(b0);
+    h1.update([1u8]); // I2OSP(1, 1)
+    h1.update(dst);
+    h1.update([dst.len() as u8]);
+    let b1 = h1.finalize();
+    let mut out = [0u8; 48];
+    out.copy_from_slice(&b1[..48]);
+    out
+}
+
+/// `ECVRF_encode_to_curve(PK_string, alpha)` (RFC 9381 §5.4.1.2): the
+/// hash-to-curve suite's `encode` = `hash_to_field` (count 1, L = 48,
+/// k = 128) + Elligator2 map + cofactor clearing (RFC 9380 §3, §8.5).
+fn ecvrf_encode_to_curve(pk_string: &[u8; 32], alpha: &[u8]) -> Option<EdwardsPoint> {
+    let mut msg = Vec::with_capacity(32 + alpha.len());
+    msg.extend_from_slice(pk_string);
+    msg.extend_from_slice(alpha);
+    let uniform = expand_message_xmd_48(ECVRF_H2C_DST, &msg);
+    let u = fe_from_be48(&uniform);
+    let q = elligator2_edwards25519(&u)?;
+    Some(q.mul_by_cofactor())
+}
+
+/// Secret scalar + public key per RFC 8032 §5.1.5: `x = clamp(SHA-512(seed))`.
+/// The clamped 32 bytes are reduced mod q for dalek arithmetic — the same
+/// point and the same `(k + c*x) mod q`, since `q*B = O`.
+fn ecvrf_secret_scalar(seed: &[u8; 32]) -> Scalar {
+    let h = Sha512::digest(seed);
+    let mut x = [0u8; 32];
+    x.copy_from_slice(&h[..32]);
+    x[0] &= 0xF8;
+    x[31] &= 0x7F;
+    x[31] |= 0x40;
+    Scalar::from_bytes_mod_order(x)
+}
+
+/// `ECVRF_nonce_generation` per RFC 9381 §5.4.2.2 (RFC 8032 derivation):
+/// `k = LE(SHA-512(SHA-512(SK)[32..64] || H_string)) mod q`.
+fn ecvrf_nonce(sk_seed: &[u8; 32], h_string: &[u8; 32]) -> Scalar {
+    let hsk = Sha512::digest(sk_seed);
+    let mut h = Sha512::new();
+    h.update(&hsk[32..64]);
+    h.update(h_string);
+    let k_string = h.finalize();
+    let mut wide = [0u8; 64];
+    wide.copy_from_slice(&k_string);
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+/// `ECVRF_challenge_generation` (RFC 9381 §5.4.3) for this suite:
+/// `c = LE(SHA-512(suite || 0x02 || Y || H || Gamma || U || V || 0x00)[..16])`.
+fn ecvrf_challenge(
+    y_string: &[u8; 32],
+    h_string: &[u8; 32],
+    gamma_string: &[u8; 32],
+    u_string: &[u8; 32],
+    v_string: &[u8; 32],
+) -> [u8; 16] {
+    let mut h = Sha512::new();
+    h.update([ECVRF_SUITE_ID]);
+    h.update([0x02]);
+    h.update(y_string);
+    h.update(h_string);
+    h.update(gamma_string);
+    h.update(u_string);
+    h.update(v_string);
+    h.update([0x00]);
+    let digest = h.finalize();
+    let mut c = [0u8; 16];
+    c.copy_from_slice(&digest[..16]);
+    c
+}
+
+/// `ECVRF_proof_to_hash` (RFC 9381 §5.2):
+/// `beta = SHA-512(suite || 0x03 || point_to_string(8*Gamma) || 0x00)`
+/// (64 bytes; the `VrfProof.output` ticket is its leading half).
+fn ecvrf_proof_to_hash(gamma: &EdwardsPoint) -> [u8; 64] {
+    let mut h = Sha512::new();
+    h.update([ECVRF_SUITE_ID]);
+    h.update([0x03]);
+    h.update(gamma.mul_by_cofactor().compress().to_bytes());
+    h.update([0x00]);
+    let digest = h.finalize();
+    let mut beta = [0u8; 64];
+    beta.copy_from_slice(&digest);
+    beta
+}
 
 /// A VRF proof envelope: the output bound to the proof that produced it.
 ///
@@ -694,7 +1207,7 @@ impl VrfRegistry {
 /// match its `proof` bytes is refused.
 ///
 /// `Serialize`/`Deserialize` are implemented (manually — `serde` only
-/// provides array impls up to 32 elements, while the proof is 64 bytes) so
+/// provides array impls up to 32 elements, while the proof is 80 bytes) so
 /// phase-3 certificate seals can carry this envelope verbatim (see
 /// `consensus::VrfBeaconSeal`): the proof bytes the verifier checks are
 /// exactly the bytes the prover minted — no re-encoding, no field dropped.
@@ -711,8 +1224,8 @@ impl serde::Serialize for VrfProof {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        // The 64 proof bytes go out as an explicit sequence (positional for
-        // bincode, an array for JSON): `serde` has no `[u8; 64]` impl, and a
+        // The VRF_PROOF_LEN proof bytes go out as an explicit sequence (positional for
+        // bincode, an array for JSON): `serde` has no `[u8; 80]` impl, and a
         // `&[u8]` would serialize as opaque bytes, which JSON cannot read
         // back. A sequence round-trips through both.
         struct ProofSeq<'a>(&'a [u8; VRF_PROOF_LEN]);
@@ -801,89 +1314,92 @@ impl<'de> serde::Deserialize<'de> for VrfProof {
     }
 }
 
-fn vrf_scalar(parts: &[&[u8]]) -> Scalar {
-    let mut h = Sha512::new();
-    h.update(VRF_PROOF_DOMAIN);
-    for p in parts {
-        h.update(p);
-    }
-    let digest = h.finalize();
-    let mut wide = [0u8; 64];
-    wide[..32].copy_from_slice(&digest[..32]);
-    let mut h2 = Sha512::new();
-    h2.update(VRF_PROOF_DOMAIN);
-    h2.update(b"wide-hi");
-    for p in parts {
-        h2.update(p);
-    }
-    let digest2 = h2.finalize();
-    wide[32..].copy_from_slice(&digest2[..32]);
-    Scalar::from_bytes_mod_order_wide(&wide)
-}
-
-fn vrf_output_bytes(
-    r_bytes: &[u8; 32],
-    pk_bytes: &[u8; 32],
-    seed_input: &[u8; 32],
-) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(VRF_OUTPUT_DOMAIN);
-    hasher.update(r_bytes);
-    hasher.update(pk_bytes);
-    hasher.update(seed_input);
-    *hasher.finalize().as_bytes()
-}
-
-/// Prove: deterministically derive `(output, proof)` for `seed_input`.
+/// Prove: deterministically derive `(output, proof)` for `alpha`
+/// (RFC 9381 §5.1).
 ///
-/// Pure: same secret + same seed ⇒ same bytes on every node (the nonce is
-/// derived from the secret seed and the input, never OS randomness).
-pub fn vrf_prove(secret: &VrfSecret, seed_input: &[u8; 32]) -> VrfProof {
-    let s = secret.scalar();
-    let pk = secret.public_key().to_bytes();
-    let k = vrf_scalar(&[b"nonce", &secret.0, seed_input]);
-    let r_bytes = RistrettoPoint::mul_base(&k).compress().to_bytes();
-    let c = vrf_scalar(&[b"challenge", &r_bytes, &pk, seed_input]);
-    let z = k + c * s;
+/// Pure: same secret + same input ⇒ same bytes on every node (the nonce is
+/// derived per RFC 9381 §5.4.2.2 from the secret seed and the hashed curve
+/// point — no wall clock, no OS randomness in the election path).
+/// `alpha` is the 32-byte election seed input at every call site (the RFC
+/// algorithm accepts arbitrary inputs; the slice form keeps that generality
+/// for tests, including the empty-input RFC vector).
+pub fn vrf_prove(secret: &VrfSecret, alpha: &[u8]) -> VrfProof {
+    let x = secret.scalar();
+    let y = EdwardsPoint::mul_base(&x);
+    let y_string = y.compress().to_bytes();
+    let h = ecvrf_encode_to_curve(&y_string, alpha)
+        .expect("ECVRF hash-to-curve maps every input to a decodable point");
+    let h_string = h.compress().to_bytes();
+    let gamma = h * x;
+    let gamma_string = gamma.compress().to_bytes();
+    let k = ecvrf_nonce(&secret.0, &h_string);
+    let u_point = EdwardsPoint::mul_base(&k);
+    let v_point = h * k;
+    let c_bytes = ecvrf_challenge(
+        &y_string,
+        &h_string,
+        &gamma_string,
+        &u_point.compress().to_bytes(),
+        &v_point.compress().to_bytes(),
+    );
+    let c = Scalar::from(u128::from_le_bytes(c_bytes));
+    let s = k + c * x;
+    let beta = ecvrf_proof_to_hash(&gamma);
     let mut proof = [0u8; VRF_PROOF_LEN];
-    proof[..32].copy_from_slice(&r_bytes);
-    proof[32..].copy_from_slice(&z.to_bytes());
-    let output = vrf_output_bytes(&r_bytes, &pk, seed_input);
+    proof[..32].copy_from_slice(&gamma_string);
+    proof[32..48].copy_from_slice(&c_bytes);
+    proof[48..].copy_from_slice(&s.to_bytes());
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&beta[..32]);
     VrfProof { output, proof }
 }
 
-/// Verify a proof against the RAW registered VRF public key bytes.
+/// Verify a proof against the RAW registered VRF public key bytes
+/// (RFC 9381 §5.3, `validate_key = TRUE`).
 ///
 /// Returns the verified output on success, `None` (fail-closed, no panic) on
-/// any failure: bad curve point, identity key, non-canonical `z`, Schnorr
-/// equation miss, or an `output` field that does not match the proof bytes.
+/// any failure: bad curve point, low-order/identity key, proof-decode
+/// failure (bad `Gamma`, non-canonical `s`), challenge mismatch, or an
+/// `output` field that is not the leading half of the recomputed beta.
 pub fn vrf_verify(
     vrf_pk: &[u8; 32],
-    seed_input: &[u8; 32],
+    alpha: &[u8],
     proof: &VrfProof,
 ) -> Option<[u8; 32]> {
-    let pk_point =
-        curve25519_dalek::ristretto::CompressedRistretto(*vrf_pk).decompress()?;
-    if pk_point.is_identity() {
+    let y = decompress_canonical(vrf_pk)?;
+    // ECVRF_validate_key (§5.4.5): reject keys the cofactor kills.
+    if y.mul_by_cofactor().is_identity() {
         return None;
     }
-    let mut r_bytes = [0u8; 32];
-    r_bytes.copy_from_slice(&proof.proof[..32]);
-    let mut z_bytes = [0u8; 32];
-    z_bytes.copy_from_slice(&proof.proof[32..]);
-    let r_point =
-        curve25519_dalek::ristretto::CompressedRistretto(r_bytes).decompress()?;
-    let z: Scalar = Option::<Scalar>::from(Scalar::from_canonical_bytes(z_bytes))?;
-    let pk_bytes = pk_point.compress().to_bytes();
-    let c = vrf_scalar(&[b"challenge", &r_bytes, &pk_bytes, seed_input]);
-    let c_p = pk_point * c;
-    if RistrettoPoint::mul_base(&z) != r_point + c_p {
+    let mut gamma_string = [0u8; 32];
+    gamma_string.copy_from_slice(&proof.proof[..32]);
+    let gamma = decompress_canonical(&gamma_string)?;
+    let mut c_bytes = [0u8; 16];
+    c_bytes.copy_from_slice(&proof.proof[32..48]);
+    let c = Scalar::from(u128::from_le_bytes(c_bytes));
+    let mut s_bytes = [0u8; 32];
+    s_bytes.copy_from_slice(&proof.proof[48..]);
+    let s: Scalar = Option::<Scalar>::from(Scalar::from_canonical_bytes(s_bytes))?;
+    let h = ecvrf_encode_to_curve(vrf_pk, alpha)?;
+    let h_string = h.compress().to_bytes();
+    // U = s*B - c*Y; V = s*H - c*Gamma.
+    let u_point = EdwardsPoint::mul_base(&s) - y * c;
+    let v_point = h * s - gamma * c;
+    let c_prime = ecvrf_challenge(
+        vrf_pk,
+        &h_string,
+        &gamma_string,
+        &u_point.compress().to_bytes(),
+        &v_point.compress().to_bytes(),
+    );
+    if c_prime != c_bytes {
         return None;
     }
-    let expected = vrf_output_bytes(&r_bytes, &pk_bytes, seed_input);
-    if expected != proof.output {
+    let beta = ecvrf_proof_to_hash(&gamma);
+    if beta[..32] != proof.output {
         return None;
     }
-    Some(expected)
+    Some(proof.output)
 }
 
 /// Verify a VRF proof against the REGISTRY-bound key for `validator_id`.
@@ -895,11 +1411,11 @@ pub fn vrf_verify(
 pub fn verify_vrf_seed_for_validator(
     registry: &VrfRegistry,
     validator_id: &[u8; 32],
-    seed_input: &[u8; 32],
+    alpha: &[u8],
     proof: &VrfProof,
 ) -> Option<[u8; 32]> {
     let vrf_pk = registry.get(validator_id)?;
-    vrf_verify(&vrf_pk, seed_input, proof)
+    vrf_verify(&vrf_pk, alpha, proof)
 }
 
 /// Post-activation election seed:
@@ -1048,12 +1564,12 @@ mod tests {
         assert_ne!(pk, other, "different seed => different key");
         // Compressed point parses (non-identity with overwhelming probability).
         assert!(VrfPublicKey::from_bytes(&pk.to_bytes()).is_some());
-        // Identity is refused.
-        assert!(VrfPublicKey::from_bytes(&[0u8; 32]).is_none());
-        let id_pt = RistrettoPoint::mul_base(&Scalar::from(0u64))
-            .compress()
-            .to_bytes();
+        // Identity is refused (Edwards encoding of (0, 1)).
+        let mut id_pt = [0u8; 32];
+        id_pt[0] = 0x01;
         assert!(VrfPublicKey::from_bytes(&id_pt).is_none());
+        // The all-zero encoding is an order-4 point: refused by validate-key.
+        assert!(VrfPublicKey::from_bytes(&[0u8; 32]).is_none());
     }
 
     #[test]
@@ -1260,15 +1776,19 @@ mod tests {
         // Wrong key refuses.
         let other_pk = VrfSecret::from_seed(&[0x43u8; 32]).public_key().to_bytes();
         assert_eq!(vrf_verify(&other_pk, &seed, &good), None);
-        // Identity key refuses.
-        let id_pt = RistrettoPoint::mul_base(&Scalar::from(0u64))
-            .compress()
-            .to_bytes();
+        // Identity key refuses (Edwards encoding of (0, 1)).
+        let mut id_pt = [0u8; 32];
+        id_pt[0] = 0x01;
         assert_eq!(vrf_verify(&id_pt, &seed, &good), None);
-        // Non-canonical z refuses.
-        let mut bad_z = good.clone();
-        bad_z.proof[32..].copy_from_slice(&[0xFFu8; 32]);
-        assert_eq!(vrf_verify(&pk, &seed, &bad_z), None);
+        // Non-canonical s refuses (s >= q is rejected at decode; all-0xFF
+        // is far above the group order).
+        let mut bad_s = good.clone();
+        bad_s.proof[48..].copy_from_slice(&[0xFFu8; 32]);
+        assert_eq!(vrf_verify(&pk, &seed, &bad_s), None);
+        // All-0xFF challenge refuses (challenge binds every hashed point).
+        let mut bad_c = good.clone();
+        bad_c.proof[32..48].copy_from_slice(&[0xFFu8; 16]);
+        assert_eq!(vrf_verify(&pk, &seed, &bad_c), None);
     }
 
     #[test]

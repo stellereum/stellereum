@@ -34,6 +34,7 @@ pub mod orderbook;
 pub mod parallel_exec;
 pub mod pmm;
 pub mod post_quantum;
+pub mod pq_registry;
 pub mod remote_signer;
 pub mod rpc;
 pub mod runtime;

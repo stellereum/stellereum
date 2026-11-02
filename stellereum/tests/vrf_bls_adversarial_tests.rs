@@ -1,9 +1,10 @@
 //! Hostile battery for the default-off VRF + BLS paths (activation unwired).
 //!
 //! Every case below must FAIL CLOSED: `None` / `Err` / `false`, never `Some` /
-//! `Ok(true)` / accept, never panic. VRF is deterministic-Schnorr (not audited
-//! ECVRF); BLS QC counting is hard-refused at startup. These tests pin the
-//! refusal posture so activation cannot silently widen it.
+//! `Ok(true)` / accept, never panic. VRF is ECVRF-EDWARDS25519-SHA512-
+//! Elligator2 (RFC 9381, full uniqueness); BLS QC counting is hard-refused
+//! at startup. These tests pin the refusal posture so activation cannot
+//! silently widen it.
 
 use stellereum::bls::{
     aggregate_signatures, bls_pop_preimage, bls_sign_pop, bls_verify_pop, is_bls_active,
@@ -19,7 +20,7 @@ use stellereum::post_quantum::FalconKeypair;
 use stellereum::vrf::{
     verify_vrf_seed_for_validator, vrf_activation_from_env, vrf_binding_preimage,
     vrf_election_seed, vrf_prove, vrf_verify, VrfActivation, VrfBinding, VrfRegistry, VrfSecret,
-    VRF_ACTIVATION_HEIGHT_ENV,
+    VRF_ACTIVATION_HEIGHT_ENV, VRF_PROOF_LEN,
 };
 
 // --- fixtures (copied patterns from vrf_sortition_gate_tests / bls_pop_tests) ---
@@ -85,7 +86,7 @@ fn forged_vrf_proof_random_bytes_refused() {
 
     // Deterministic "random" corpora: all-zeros, all-ones, patterned, flipped.
     let mut forged = good.clone();
-    forged.proof.copy_from_slice(&[0x77u8; 64]);
+    forged.proof.copy_from_slice(&[0x77u8; VRF_PROOF_LEN]);
     forged.output = [0x88u8; 32];
     assert_eq!(vrf_verify(&pk, &seed, &forged), None);
     assert_eq!(
@@ -94,12 +95,12 @@ fn forged_vrf_proof_random_bytes_refused() {
     );
 
     let mut zeros = good.clone();
-    zeros.proof = [0u8; 64];
+    zeros.proof = [0u8; VRF_PROOF_LEN];
     zeros.output = [0u8; 32];
     assert_eq!(vrf_verify(&pk, &seed, &zeros), None);
 
     let mut ones = good;
-    ones.proof = [0xFFu8; 64];
+    ones.proof = [0xFFu8; VRF_PROOF_LEN];
     ones.output = [0xFFu8; 32];
     assert_eq!(vrf_verify(&pk, &seed, &ones), None);
 }
@@ -203,10 +204,10 @@ fn vrf_tampered_election_seed_refused() {
     // Identity public key refuses even with an honest proof.
     assert_eq!(vrf_verify(&[0u8; 32], &seed, &good), None);
 
-    // Non-canonical z refuses.
-    let mut bad_z = good.clone();
-    bad_z.proof[32..].copy_from_slice(&[0xFFu8; 32]);
-    assert_eq!(vrf_verify(&pk, &seed, &bad_z), None);
+    // Non-canonical s refuses (s >= q is rejected at decode).
+    let mut bad_s = good.clone();
+    bad_s.proof[48..].copy_from_slice(&[0xFFu8; 32]);
+    assert_eq!(vrf_verify(&pk, &seed, &bad_s), None);
 }
 
 // --- BLS: forged PoP refuses ---

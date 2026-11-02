@@ -1762,9 +1762,14 @@ async fn try_snapshot_sync(
             }
         };
         let anchor = if use_tail_anchor {
-            match stellereum::sync::verify_snapshot_anchor_tail(
+            // F5 set-at-height: each window height's QC is checked against the
+            // set in force AT THAT height (`validator_set_for_height`), never
+            // the live set. On today's single-set chains the resolver answers
+            // the same set at every height, so this is behavior-identical to
+            // the single-set wrapper it replaces.
+            match stellereum::sync::verify_snapshot_anchor_tail_with_sets(
                 boundary + 1,
-                &rt.validators,
+                |h| Some(rt.validator_set_for_height(h)),
                 anchor_fetch,
             )
             .await
@@ -1829,8 +1834,22 @@ async fn try_snapshot_sync(
                 async move { a.fetch_domain_snapshot(shard, boundary, kind).await }
             }
         };
-        if let Err(e) =
-            stellereum::sync::fast_sync_state(&rt.state, trusted_root, fetch, fetch_domain).await
+        // F5 set-at-height trust gate: the snapshot must additionally commit
+        // to the validator set at `boundary`, and to exactly the set that
+        // verified its anchor (resolved at the boundary height). On today's
+        // single-set chains the snapshot commits to the one set in force, so
+        // this is behavior-identical to the non-binding path it replaces.
+        let anchor_set = rt.validator_set_for_height(boundary);
+        if let Err(e) = stellereum::sync::fast_sync_state_with_set_binding(
+            &rt.state,
+            trusted_root,
+            fetch,
+            fetch_domain,
+            boundary,
+            &anchor_set,
+        )
+        .await
+        .map(|_| ())
         {
             eprintln!("[sync] snapshot at {boundary} rejected: {e}");
             consecutive_misses = consecutive_misses.saturating_add(1);

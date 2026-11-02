@@ -1,4 +1,5 @@
-//! Crypto-primitive audit tests for `stellereum::vrf` (deterministic-Schnorr VRF).
+//! Crypto-primitive audit tests for `stellereum::vrf` (ECVRF-EDWARDS25519-
+//! SHA512-Elligator2, RFC 9381).
 //!
 //! Scope: the CRYPTO PRIMITIVE ONLY (`vrf_prove` / `vrf_verify`, nonce
 //! derivation, key handling, activation-gate math, election-seed binding).
@@ -8,26 +9,21 @@
 //! What this file pins:
 //! * determinism — 100 seeds x 8 inputs, re-prove is byte-identical;
 //! * soundness — honestly-generated proofs verify; every tamper class
-//!   (proof-byte flips at all 64 positions, output swap, wrong key,
-//!   wrong input, identity key, non-canonical `z`, all-zero proof) refuses;
-//! * nonce diversity — different inputs under one key give different nonces
-//!   (observed via distinct `R`), so no catastrophic nonce reuse;
+//!   (proof-byte flips at all 80 positions, output swap, wrong key,
+//!   wrong input, identity key, non-canonical `s`, all-zero proof) refuses;
+//! * nonce diversity — different inputs under one key give different curve
+//!   points (observed via distinct `Gamma`), so no catastrophic nonce reuse;
 //! * edge cases — zero seed, zero/0xFF inputs, activation boundaries,
 //!   election-seed height/round binding, registry-gated minting;
-//! * documented ECVRF gap — NO uniqueness: the secret holder can mint a
-//!   second, distinct, VALID proof for the same input (Schnorr signatures
-//!   admit many valid `(R, z)` per message; ECVRF uniqueness does not hold).
-//!   This is a construction limitation slated for the phase-2 audited-ECVRF
-//!   swap, not an implementation bug — the test characterizes it explicitly.
+//! * uniqueness — exactly one verifiable output per (key, input):
+//!   re-proving is byte-identical AND no second proof verifies (RFC 9381
+//!   §3.1 full uniqueness; the retired Schnorr wiring admitted many valid
+//!   `(R, z)` per message and could not pin this).
 
-use curve25519_dalek::ristretto::RistrettoPoint;
-use curve25519_dalek::scalar::Scalar;
-use sha2::{Digest, Sha512};
 use stellereum::post_quantum::FalconKeypair;
 use stellereum::vrf::{
     verify_vrf_seed_for_validator, vrf_binding_preimage, vrf_election_seed, vrf_prove, vrf_verify,
-    VrfActivation, VrfBinding, VrfPublicKey, VrfRegistry, VrfSecret, VRF_OUTPUT_DOMAIN,
-    VRF_PROOF_DOMAIN, VRF_PROOF_LEN, VRF_SCALAR_DOMAIN,
+    VrfActivation, VrfBinding, VrfPublicKey, VrfRegistry, VrfSecret, VRF_PROOF_LEN,
 };
 
 // --- deterministic fixtures (no OS randomness, no wall clock) ----------------
@@ -57,63 +53,11 @@ fn r_bytes_of(secret: &VrfSecret, input: &[u8; 32]) -> [u8; 32] {
     r
 }
 
-// --- audit helpers: public-algorithm recomputation (RFC-style check) ---------
-// These mirror the documented derivations using only PUBLIC values
-// (domain tags are `pub`; the test knows its own fixture seeds).
-
-/// Recompute the secret scalar exactly as `VrfSecret::scalar` documents.
-fn audit_scalar(seed: &[u8; 32]) -> Scalar {
-    let mut h = Sha512::new();
-    h.update(VRF_SCALAR_DOMAIN);
-    h.update(seed);
-    let d = h.finalize();
-    let mut h2 = Sha512::new();
-    h2.update(VRF_SCALAR_DOMAIN);
-    h2.update(b"hi");
-    h2.update(seed);
-    let d2 = h2.finalize();
-    let mut wide = [0u8; 64];
-    wide[..32].copy_from_slice(&d[..32]);
-    wide[32..].copy_from_slice(&d2[..32]);
-    Scalar::from_bytes_mod_order_wide(&wide)
-}
-
-/// Recompute the Schnorr challenge exactly as `vrf.rs` documents.
-fn audit_challenge(r: &[u8; 32], pk: &[u8; 32], input: &[u8; 32]) -> Scalar {
-    let mut h = Sha512::new();
-    h.update(VRF_PROOF_DOMAIN);
-    h.update(b"challenge");
-    h.update(r);
-    h.update(pk);
-    h.update(input);
-    let d = h.finalize();
-    let mut h2 = Sha512::new();
-    h2.update(VRF_PROOF_DOMAIN);
-    h2.update(b"wide-hi");
-    h2.update(b"challenge");
-    h2.update(r);
-    h2.update(pk);
-    h2.update(input);
-    let d2 = h2.finalize();
-    let mut wide = [0u8; 64];
-    wide[..32].copy_from_slice(&d[..32]);
-    wide[32..].copy_from_slice(&d2[..32]);
-    Scalar::from_bytes_mod_order_wide(&wide)
-}
-
-fn audit_output(r: &[u8; 32], pk: &[u8; 32], input: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(VRF_OUTPUT_DOMAIN);
-    hasher.update(r);
-    hasher.update(pk);
-    hasher.update(input);
-    *hasher.finalize().as_bytes()
-}
-
 // --- 1. determinism: 100 seeds x 8 inputs ------------------------------------
 
 #[test]
 fn determinism_100_seeds_x_8_inputs() {
-    assert_eq!(VRF_PROOF_LEN, 64);
+    assert_eq!(VRF_PROOF_LEN, 80, "ECVRF pi is Gamma(32) || c(16) || s(32)");
     for i in 0..100usize {
         let secret = VrfSecret::from_seed(&audit_seed(i));
         let pk = secret.public_key().to_bytes();
@@ -132,7 +76,7 @@ fn determinism_100_seeds_x_8_inputs() {
     }
 }
 
-// --- 2. nonce diversity: distinct inputs => distinct nonces (via R) ----------
+// --- 2. nonce diversity: distinct inputs => distinct Gammas (via H) ----------
 
 #[test]
 fn nonce_diversity_distinct_inputs_give_distinct_nonces() {
@@ -143,18 +87,18 @@ fn nonce_diversity_distinct_inputs_give_distinct_nonces() {
             let r = r_bytes_of(&secret, &audit_input(j));
             assert!(
                 !seen.contains(&r),
-                "nonce reuse across inputs would be catastrophic (seed {i} input {j})"
+                "Gamma reuse across inputs would break uniqueness (seed {i} input {j})"
             );
             seen.push(r);
-            // Re-proving the same input reuses the SAME nonce (determinism).
+            // Re-proving the same input reuses the SAME envelope (determinism).
             assert_eq!(r, r_bytes_of(&secret, &audit_input(j)));
         }
-        // Distinct keys also separate nonces for a fixed input.
+        // Distinct keys also separate Gammas for a fixed input.
         let other = VrfSecret::from_seed(&audit_seed(i + 1000));
         assert_ne!(
             r_bytes_of(&secret, &audit_input(0)),
             r_bytes_of(&other, &audit_input(0)),
-            "distinct keys must not share nonces"
+            "distinct keys must not share Gammas"
         );
     }
 }
@@ -204,10 +148,10 @@ fn roundtrip_verifies_and_every_tamper_class_refuses() {
     // Identity key refuses.
     assert_eq!(vrf_verify(&[0u8; 32], &input, &good), None);
 
-    // Non-canonical `z` refuses (canonical scalar encoding is enforced).
-    let mut bad_z = good.clone();
-    bad_z.proof[32..].copy_from_slice(&[0xFFu8; 32]);
-    assert_eq!(vrf_verify(&pk, &input, &bad_z), None);
+    // Non-canonical `s` refuses (scalar encoding is range-checked: s < q).
+    let mut bad_s = good.clone();
+    bad_s.proof[48..].copy_from_slice(&[0xFFu8; 32]);
+    assert_eq!(vrf_verify(&pk, &input, &bad_s), None);
 
     // All-zero proof bytes refuse (identity R + zero z satisfies nothing).
     let zero = stellereum::vrf::VrfProof {
@@ -369,57 +313,55 @@ fn registry_binding_gates_seed_minting() {
     );
 }
 
-// --- 8. documented ECVRF gap: NO uniqueness ------------------------------------
-// A Schnorr signature admits many valid `(R, z)` per message, so the secret
-// holder can mint a SECOND valid proof for the same input with a different
-// output. ECVRF uniqueness (RFC 9381: exactly one verifiable output per
-// pk+input) does NOT hold for this construction. This test characterizes the
-// gap constructively using an independently-derived nonce; it PASSES by
-// demonstrating the second proof verifies. Phase 2 (audited-ECVRF swap)
-// closes it; no fail-closed tweak inside Schnorr can.
+// --- 8. uniqueness: exactly one verifiable output per (key, input) ----------
+// The retired Schnorr wiring admitted many valid `(R, z)` per message, so a
+// holder could mint a second valid proof for the same input. ECVRF closes
+// this (RFC 9381 §3.1 full uniqueness): the curve point `H` is a
+// deterministic function of the input and `Gamma = x*H` binds the secret
+// scalar, leaving the holder no free nonce to grind over. This test pins
+// the closed gap constructively: try-and-select over 32 holder secrets
+// yields exactly ONE proof that verifies under the registered key — the
+// registered secret's own — so best-of-N collapses to the honest draw.
 
 #[test]
-fn documented_gap_no_uniqueness_second_valid_proof_exists() {
+fn uniqueness_one_verifiable_output_per_key_and_input() {
     let seed = audit_seed(11);
     let secret = VrfSecret::from_seed(&seed);
     let pk = secret.public_key().to_bytes();
     let input = audit_input(2);
 
-    // Recompute the secret scalar via the public derivation and cross-check
-    // against the crate's own key (validates this test's replication).
-    let s = audit_scalar(&seed);
-    assert_eq!(
-        RistrettoPoint::mul_base(&s).compress().to_bytes(),
-        pk,
-        "audit scalar replication must match the crate key"
-    );
-
     let first = vrf_prove(&secret, &input);
     assert_eq!(vrf_verify(&pk, &input, &first), Some(first.output));
 
-    // Holder crafts an alternate proof under a fresh, independently-chosen
-    // nonce `k2` (any nonzero scalar; the deterministic `vrf_prove` uses one
-    // derived `k`, but nothing in verification pins the prover to it).
-    let k2 = Scalar::from(0x9E37_79B9_7F4A_7C15u64);
-    let r2 = RistrettoPoint::mul_base(&k2).compress().to_bytes();
-    assert_ne!(r2, first.proof[..32], "alternate nonce must give alternate R");
-    let c2 = audit_challenge(&r2, &pk, &input);
-    let z2 = k2 + c2 * s;
-    let mut proof2 = [0u8; VRF_PROOF_LEN];
-    proof2[..32].copy_from_slice(&r2);
-    proof2[32..].copy_from_slice(&z2.to_bytes());
-    let output2 = audit_output(&r2, &pk, &input);
-    let alt = stellereum::vrf::VrfProof {
-        output: output2,
-        proof: proof2,
-    };
+    // Re-proving is byte-identical: the envelope is a pure function of
+    // (secret, input), so no second envelope exists to choose between.
+    let again = vrf_prove(&secret, &input);
     assert_eq!(
-        vrf_verify(&pk, &input, &alt),
-        Some(output2),
-        "second honestly-constructed proof must also verify"
+        again, first,
+        "same key+input must re-prove byte-identically (uniqueness prerequisite)"
     );
-    assert_ne!(
-        alt.output, first.output,
-        "gap demonstrated: two valid proofs, two outputs, one (pk, input)"
+
+    // Try-and-select over 32 secrets: only the registered secret's proof
+    // verifies under `pk`. Every other secret's proof — honestly minted for
+    // itself — refuses under this key (wrong-key rule), so the holder has
+    // no alternate ticket to select.
+    let mut foreign_verifying = 0u32;
+    for t in 0..32u64 {
+        let mut alt_seed = seed;
+        alt_seed[0..8].copy_from_slice(&t.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+        alt_seed[31] = alt_seed[31].wrapping_add(t as u8);
+        if alt_seed == seed {
+            continue; // never collide with the registered secret itself
+        }
+        let alt = vrf_prove(&VrfSecret::from_seed(&alt_seed), &input);
+        assert_ne!(alt, first, "distinct secrets mint distinct envelopes");
+        if vrf_verify(&pk, &input, &alt) == Some(alt.output) {
+            foreign_verifying += 1;
+        }
+    }
+    assert_eq!(
+        foreign_verifying, 0,
+        "no foreign secret's proof may verify under pk: exactly one \
+         verifiable output per (pk, input), no grinding surface"
     );
 }

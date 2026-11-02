@@ -2188,6 +2188,120 @@ impl DomainSnapshotV3 {
     }
 }
 
+/// Pre-jail/commission/lock ledger shape: identical to
+/// [`crate::staking::StakingLedger`] except WITHOUT the three trailing maps
+/// (`jail`, `commission_schedule`, `redelegation_lock`) appended after the
+/// lazy delegator-reward accumulator.
+///
+/// This is what the live network persisted between the F1 lazy-accumulator
+/// upgrade and the downtime-jail/commission/lock upgrade: bincode has no
+/// field names, so those bytes do not decode as the current struct
+/// (`UnexpectedEof` on the missing trailing maps) and must not be decoded as
+/// [`DomainSnapshotV3`] either (a shorter ledger shape would read the two
+/// accumulator maps as governance — refused loudly instead). NEVER written;
+/// `upgrade` fills the three new maps EMPTY, which is EXACT: none of the
+/// paths that create a jail record, a commission schedule or a redelegation
+/// lock existed when those bytes were written.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StakingLedgerV4 {
+    pub validators: HashMap<crate::consensus::ValidatorId, crate::staking::ValidatorStake>,
+    pub delegations: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub delegator_rewards: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub unbonding: Vec<crate::staking::UnbondingEntry>,
+    pub withdrawable: HashMap<(crate::consensus::ValidatorId, [u8; 32]), u64>,
+    pub total_burned: u64,
+    #[serde(default)]
+    pub rewards_pool: u64,
+    #[serde(default)]
+    pub rewards_minted: u64,
+    #[serde(default)]
+    pub locked_governance: HashMap<[u8; 32], u64>,
+    #[serde(default)]
+    pub pq_equivocation_dedup: std::collections::HashSet<[u8; 32]>,
+    #[serde(default)]
+    pub equivocation_dedup: std::collections::HashSet<[u8; 32]>,
+    #[serde(default)]
+    pub validator_pq_keys:
+        HashMap<crate::consensus::ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>,
+    #[serde(default)]
+    pub min_validator_bond: Option<u64>,
+    #[serde(default)]
+    pub vesting_schedules:
+        std::collections::BTreeMap<[u8; 32], crate::tokenomics::TeamVestingSchedule>,
+    #[serde(default)]
+    pub reward_accumulators:
+        HashMap<crate::consensus::ValidatorId, crate::staking::ValidatorRewardState>,
+    #[serde(default)]
+    pub delegator_reward_checkpoints:
+        HashMap<(crate::consensus::ValidatorId, [u8; 32]), u128>,
+}
+
+impl StakingLedgerV4 {
+    pub fn upgrade(self) -> crate::staking::StakingLedger {
+        crate::staking::StakingLedger {
+            validators: self.validators,
+            delegations: self.delegations,
+            delegator_rewards: self.delegator_rewards,
+            reward_accumulators: self.reward_accumulators,
+            delegator_reward_checkpoints: self.delegator_reward_checkpoints,
+            // Exact: no jail, commission-schedule or redelegation-lock rows
+            // can exist in pre-feature bytes (the paths that create them did
+            // not exist), so empty is not a guess.
+            jail: HashMap::new(),
+            commission_schedule: HashMap::new(),
+            redelegation_lock: HashMap::new(),
+            unbonding: self.unbonding,
+            withdrawable: self.withdrawable,
+            total_burned: self.total_burned,
+            rewards_pool: self.rewards_pool,
+            rewards_minted: self.rewards_minted,
+            locked_governance: self.locked_governance,
+            pq_equivocation_dedup: self.pq_equivocation_dedup,
+            equivocation_dedup: self.equivocation_dedup,
+            validator_pq_keys: self.validator_pq_keys,
+            vesting_schedules: self.vesting_schedules,
+            min_validator_bond: self.min_validator_bond,
+        }
+    }
+}
+
+/// Pre-jail/commission/lock domain shape: identical to [`DomainSnapshot`]
+/// except the staking ledger is [`StakingLedgerV4`] (the shape the live
+/// network persisted after the F1 lazy accumulator and before the
+/// downtime-jail/commission/lock maps). Upgrades with the three new maps
+/// empty — EXACT, since none of the paths that create them existed when
+/// those bytes were written (see [`StakingLedgerV4`]).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DomainSnapshotV7 {
+    pub tokens: crate::token::TokenRegistry,
+    pub contracts: crate::contract::ContractRegistry,
+    pub orderbooks: crate::orderbook::OrderbookManager,
+    pub pmm: crate::pmm::PrimaryMarketMaker,
+    pub pmm_usdt_token: Option<[u8; 32]>,
+    pub pmm_treasury: [u8; 32],
+    pub order_escrow: HashMap<(u32, u64), crate::state_engine::EscrowRecord>,
+    pub staking: StakingLedgerV4,
+    pub governance: crate::governance::Governance,
+    pub oracle: crate::oracle::OracleState,
+}
+
+impl DomainSnapshotV7 {
+    pub fn upgrade(self) -> DomainSnapshot {
+        DomainSnapshot {
+            tokens: self.tokens,
+            contracts: self.contracts,
+            orderbooks: self.orderbooks,
+            pmm: self.pmm,
+            pmm_usdt_token: self.pmm_usdt_token,
+            pmm_treasury: self.pmm_treasury,
+            order_escrow: self.order_escrow,
+            staking: self.staking.upgrade(),
+            governance: self.governance,
+            oracle: self.oracle,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Legacy contract / governance shapes.
 //
@@ -2408,6 +2522,20 @@ pub fn decode_domain_snapshot(bytes: &[u8]) -> Result<DomainSnapshot> {
         );
         return Ok(v6.upgrade());
     }
+    // V7: pre-jail/commission/lock ledger shape (current contracts, the
+    // ledger with the lazy accumulator but without the three trailing maps).
+    // Upgrades with the three new maps empty — EXACT: none of the paths that
+    // create them existed when those bytes were written. Tried here, at the
+    // head of the current-contract group (after the legacy-contract V4/V5/V6
+    // legs, before V3): the grouping rule above (legacy contracts first)
+    // decides the position, and closeness to the current shape decides the
+    // order within the group. LOUD so operators see the migration.
+    if let Ok(v7) = bincode::deserialize::<DomainSnapshotV7>(bytes) {
+        tracing::warn!(
+            "[domains] restored pre-jail/commission/lock V7 staking state: the jail records, the commission schedules and the redelegation locks start EMPTY (exact — none of the paths that create them existed when written)"
+        );
+        return Ok(v7.upgrade());
+    }
     // V3: pre-lazy-accumulator ledger shape (what the live network persisted
     // before the F1 delegator-reward accumulator appended its two trailing
     // maps). Upgrades with both maps empty — EXACT: the eager implementation
@@ -2448,7 +2576,7 @@ pub const DOMAIN_SNAPSHOT_STRICT_MAX_BYTES: u64 = 512 * 1024 * 1024;
 ///
 /// Accepts ONLY the current [`DomainSnapshot`] shape, with trailing bytes
 /// rejected (same wire contract as `ConsensusMsg::decode`: fixint bincode,
-/// exact-length). Any legacy shape (`DomainSnapshotV1`..`V6`, pre-ABI
+/// exact-length). Any legacy shape (`DomainSnapshotV1`..`V7`, pre-ABI
 /// governance, pre-lazy ledgers) or unknown/future version is a hard `Err`
 /// naming the refusal — NO warn-and-upgrade fallback, NO silent skip.
 ///

@@ -2484,6 +2484,161 @@ impl StakingLedger {
         }
     }
 
+    /// On-chain PQ key registry hooks (see `crate::pq_registry`).
+    ///
+    /// Thin membership-gated delegates over a caller-held
+    /// [`crate::pq_registry::PqRegistry`]: the registry owns the rotation
+    /// state machine, the ledger owns membership + the committed
+    /// `validator_pq_keys` mirror (kept in sync on `register`/`apply` so the
+    /// existing commitment/slash readers keep working unchanged — announce
+    /// deliberately leaves the mirror on the OLD key until the effective
+    /// height). Auth (caller == validator, announcement signature) is
+    /// enforced by the future opcode handler, not here — the `rotate_key`
+    /// precedent. No stake moves on any path (debug-asserted where a supply
+    /// read is cheap).
+    ///
+    /// CALL-SITE NOTE (consensus-key rotation): [`Self::rotate_key`] does NOT
+    /// touch the registry (signature frozen); invoke
+    /// [`crate::pq_registry::PqRegistry::migrate_validator`] alongside it so
+    /// pending rotations and history travel with the record.
+    /// Register a validator's first PQ key in `registry` (effective at
+    /// `activation_height`; see [`crate::pq_registry::PqRegistry::register`]).
+    /// Mirrors the key into committed `validator_pq_keys` on success.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: hook threads (registry, validator, scheme, key, two heights); a params struct would churn the hook call sites for no benefit.
+    pub fn pq_register_key(
+        &mut self,
+        registry: &mut crate::pq_registry::PqRegistry,
+        validator: ValidatorId,
+        scheme: crate::post_quantum::PqScheme,
+        pubkey: Vec<u8>,
+        activation_height: u64,
+        now_height: u64,
+    ) -> Result<(), crate::pq_registry::PqRegistryError> {
+        let supply_before = self.ledger_stake_supply();
+        let known = self.validators.contains_key(&validator);
+        registry.register(
+            validator,
+            scheme,
+            pubkey.clone(),
+            activation_height,
+            now_height,
+            known,
+        )?;
+        self.validator_pq_keys.insert(validator, (scheme, pubkey));
+        debug_assert_eq!(
+            supply_before,
+            self.ledger_stake_supply(),
+            "pq register must move no stake"
+        );
+        Ok(())
+    }
+
+    /// Announce a PQ key rotation in `registry` (effective at
+    /// `now_height + PQ_ROTATION_DELAY_HEIGHTS`; see
+    /// [`crate::pq_registry::PqRegistry::announce_rotation`]). The committed
+    /// mirror keeps the OLD key until `pq_apply_rotation` — the old key
+    /// stays authoritative through the delay window.
+    ///
+    /// First rotation-aware use for a validator whose key predates tracking
+    /// (genesis / legacy `register_pq_key`) auto-adopts the committed current
+    /// key (or the Ed25519 fallback) as the tracked baseline with
+    /// pre-tracking provenance — adoption never changes authority.
+    pub fn pq_announce_rotation(
+        &mut self,
+        registry: &mut crate::pq_registry::PqRegistry,
+        validator: ValidatorId,
+        scheme: crate::post_quantum::PqScheme,
+        pubkey: Vec<u8>,
+        now_height: u64,
+    ) -> Result<(), crate::pq_registry::PqRegistryError> {
+        let supply_before = self.ledger_stake_supply();
+        if !self.validators.contains_key(&validator) {
+            return Err(crate::pq_registry::PqRegistryError::UnknownValidator);
+        }
+        if registry.record_of(&validator).is_none() {
+            let (cur_scheme, cur_pubkey) = self
+                .get_pq_key(&validator)
+                .expect("membership checked above; fallback always yields a key");
+            registry.adopt_legacy_key(validator, cur_scheme, cur_pubkey, true)?;
+        }
+        registry.announce_rotation(validator, scheme, pubkey, now_height, true)?;
+        debug_assert_eq!(
+            supply_before,
+            self.ledger_stake_supply(),
+            "pq announce must move no stake"
+        );
+        Ok(())
+    }
+
+    /// Promote a due pending rotation (see
+    /// [`crate::pq_registry::PqRegistry::apply_rotation`]) and mirror the new
+    /// current key into committed `validator_pq_keys`.
+    pub fn pq_apply_rotation(
+        &mut self,
+        registry: &mut crate::pq_registry::PqRegistry,
+        validator: ValidatorId,
+        now_height: u64,
+    ) -> Result<(), crate::pq_registry::PqRegistryError> {
+        let supply_before = self.ledger_stake_supply();
+        if !self.validators.contains_key(&validator) {
+            return Err(crate::pq_registry::PqRegistryError::UnknownValidator);
+        }
+        registry.apply_rotation(validator, now_height, true)?;
+        if let Some((scheme, pubkey)) = registry.current_key_of(&validator) {
+            self.validator_pq_keys.insert(validator, (scheme, pubkey));
+        }
+        debug_assert_eq!(
+            supply_before,
+            self.ledger_stake_supply(),
+            "pq apply must move no stake"
+        );
+        Ok(())
+    }
+
+    /// Promote every rotation due at `now_height` (deterministic id order;
+    /// see [`crate::pq_registry::PqRegistry::apply_due_rotations`]), mirroring
+    /// each member validator's new key into `validator_pq_keys`. Returns the
+    /// member validators whose rotation activated. Records of non-members
+    /// still advance in the registry (same blocks, same registry on every
+    /// node) but never touch the committed mirror.
+    pub fn pq_apply_due_rotations(
+        &mut self,
+        registry: &mut crate::pq_registry::PqRegistry,
+        now_height: u64,
+    ) -> Vec<ValidatorId> {
+        let applied = registry.apply_due_rotations(now_height);
+        applied
+            .into_iter()
+            .filter(|v| {
+                let member = self.validators.contains_key(v);
+                if member {
+                    if let Some((scheme, pubkey)) = registry.current_key_of(v) {
+                        self.validator_pq_keys.insert(*v, (scheme, pubkey));
+                    }
+                }
+                member
+            })
+            .collect()
+    }
+
+    /// Resolve the authoritative PQ key for `validator` AT `height` (see
+    /// [`crate::pq_registry::PqRegistry::get_active_key`]). Fail-closed:
+    /// unknown validator → `None`. This is the read the consensus
+    /// verification paths will use (lead wiring); it is NOT consulted by any
+    /// staking path today.
+    pub fn pq_active_key(
+        &self,
+        registry: &crate::pq_registry::PqRegistry,
+        validator: &ValidatorId,
+        height: u64,
+    ) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)> {
+        if !self.validators.contains_key(validator) {
+            return None;
+        }
+        registry.get_active_key(validator, height)
+    }
+
     /// Slash for post-quantum equivocation using `CompactPqEquivocationEvidence`.
     ///
     /// THE WIRED PATH (audit O1/F4 wiring, PQ arm). Production caller:

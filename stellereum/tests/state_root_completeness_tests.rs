@@ -603,6 +603,120 @@ async fn staking_lazy_reward_accumulator_moves_the_root() {
     );
 }
 
+/// The staking ledger's downtime-jail records, commission schedules and
+/// redelegation locks are CONSENSUS STATE.
+///
+///  * a jail record EXCLUDES the validator from the validator set (every
+///    quorum check runs against the set), so two nodes that disagreed about
+///    the jail map would verify quorums differently under one root;
+///  * a commission schedule decides the FUTURE commission rate (pending
+///    change + cooldown basis), which decides future delegator payouts of
+///    real coins — a stale schedule pays differently;
+///  * a redelegation lock decides whether the next `redelegate` from a
+///    position is ADMITTED at all: one node accepts a transaction the other
+///    refuses, under the same root.
+///
+/// All three were uncommitted, which is exactly the class of divergence this
+/// file exists to catch.
+#[tokio::test]
+async fn staking_jail_commission_and_redelegation_lock_move_the_root() {
+    let e = InMemoryStateEngine::new();
+    let key = funded_key(51);
+    let val = key.verifying_key().to_bytes();
+    e.credit_native(&val, 1_000_000_000_000)
+        .await
+        .expect("credit");
+    e.staking_write()
+        .await
+        .bond(val, 2_000_000_000_000, 0)
+        .unwrap();
+
+    let committed = e.get_state_root().await;
+
+    // 1. The downtime-jail record of the validator.
+    {
+        let mut ledger = e.staking_write().await;
+        ledger.jail.insert(
+            val,
+            stellereum::staking::JailRecord {
+                jailed_at_height: 1,
+                release_height: 100,
+            },
+        );
+    }
+    let after_jail = e.get_state_root().await;
+    assert_ne!(
+        after_jail, committed,
+        "a jail record excludes the validator from the set, so it must move the root"
+    );
+
+    // ...and so must the release height inside it.
+    {
+        let mut ledger = e.staking_write().await;
+        ledger
+            .jail
+            .get_mut(&val)
+            .expect("jail record exists")
+            .release_height = 101;
+    }
+    let after_release = e.get_state_root().await;
+    assert_ne!(
+        after_release, after_jail,
+        "the release height decides when the validator rejoins the set"
+    );
+
+    // 2. The commission schedule of the validator.
+    {
+        let mut ledger = e.staking_write().await;
+        ledger.commission_schedule.insert(
+            val,
+            stellereum::staking::CommissionSchedule {
+                last_effective_height: Some(7),
+                pending: None,
+            },
+        );
+    }
+    let after_schedule = e.get_state_root().await;
+    assert_ne!(
+        after_schedule, after_release,
+        "the commission cooldown basis decides the next admissible change, so it \
+          must move the root"
+    );
+
+    // ...and so must a pending announced change.
+    {
+        let mut ledger = e.staking_write().await;
+        ledger
+            .commission_schedule
+            .get_mut(&val)
+            .expect("schedule exists")
+            .pending = Some(stellereum::staking::PendingCommissionChange {
+            new_bps: 500,
+            effective_height: 200,
+            announced_height: 100,
+        });
+    }
+    let after_pending = e.get_state_root().await;
+    assert_ne!(
+        after_pending, after_schedule,
+        "a pending commission change decides the future rate, so it must move the root"
+    );
+
+    // 3. The redelegation lock on a position.
+    {
+        let mut ledger = e.staking_write().await;
+        ledger
+            .redelegation_lock
+            .insert((val, [0x55u8; 32]), 12345);
+    }
+    assert_ne!(
+        e.get_state_root().await,
+        after_pending,
+        "a redelegation lock decides whether the next redelegate is admitted, so it \
+          must move the root"
+    );
+}
+
 /// Monolithic snapshot/restore round-trip: a snapshot restores byte-identical
 /// state (same root, same balances), while truncated or garbage bytes are
 /// refused fail-closed with the live engine untouched.

@@ -88,3 +88,77 @@ Sources: `stellereum/src/contract.rs`, `svm.rs`, `evm_adapter.rs`,
 - Staking: bond floor (`staking.rs:59`), buffer (`:72`), 250 max / 150 target
   validators (`:199,:204`), slash 500/10 bps (`:231,:235`), commission delay
   7200 (`:294`), emission cap (`:225`), F1 accumulator (`:636-668`).
+
+## 6. Fee-batching parity harness (no static ns/tx in tree)
+
+- Harness: `stellereum/benches/fee_path.rs:10-24` (428-tx fixtures isolating
+  per-tx FEE overhead: `fee_plain_seq` / `fee_mixed_seq` / `fee_oom_seq` /
+  `apply_plain_wave` parallel) prints
+  `[bench][fee][<name>] n=428 wall=<ms> (<ns>/tx)` (`:168`) via
+  `Instant` samples (`:158-161`); engine funding (`:24`).
+- Parity tests (correctness, not speed):
+  `stellereum/tests/fee_batching_parity_tests.rs:5-12` —
+  `plain_block_matches_sequential_singles` (`:68-114`, N=64, all-success
+  plain block == sequential `apply_transaction`), `mixed_fee_vectors_are_pinned`
+  (`:201+`) + `mixed_fee_vectors_parallel_waves` (`:234+`) over
+  `mixed_fixture` (`:158-186`: success/failure/sponsored/nonce-gap rows,
+  `FLOOR 500_000` `:35` vs `GAS_BASIC_TRANSFER`).
+- No before/after ns/tx values are pinned in files; measured walls are
+  runtime-only (UNVERIFIED static count added: 0).
+
+## 7. Shard-2 soak (2-shard live cluster)
+
+- Suite: `stellereum/tests/shard2_soak_tests.rs:7-14` (running 2-shard
+  cluster, `SOAK_HEIGHTS 10` `:33`, `SHARD0/1` `:31-32` via `ShardRegistry`).
+- Pins: both-shards-finalize (`:83-103`, every height finalized, height ==
+  `SOAK_HEIGHTS+1`); cross-shard conserves supply end-to-end
+  (`:110-179`, consumption record `:148`, post-soak accounting `:167-179`);
+  rotation propagates to workchain (`:187-243`, staged `:231`, installed
+  `:237-243`); freeze-and-heal (`:252-293`, frozen shard finalizes nothing
+  `:276`, healed catches up `:283`, post-heal credit `:290-293`).
+- Activation gate (not soak): `xpc_activation_from_env`
+  (`main.rs:2723-2736`, `XpcActivation::Disabled` default / `FromHeight(h)`).
+
+## 8. Breaker bounds (virtual-clock pins)
+
+- Nil-breaker: `NIL_CIRCUIT_BREAKER_K 3` (`consensus.rs:3826`, applied
+  `:4677-4679`); bound fn `breaker_fire_bound_ms = K*2*BASE_MS`
+  (`liveness_breaker_tests.rs:64-65`, `BASE_MS 1000` `:55`, `TICK_MS 100`
+  `:53`); pin `full_stall_trips_nil_breaker_within_bound_and_heals`
+  (`:135-212`, asserts K==3 `:137`, no-fire before K `:140-145`,
+  `measured_ms <= bound_ms` `:206-212`); `flapping_proposer_never_commits_nil`
+  (`:252+`, `consecutive_nil_rounds < K` `:354`); healthy path
+  `healthy_fast_rounds_never_fire_breaker` (`:473+`).
+- Deadlock/timeout: `deadlock_timeout_defaults_to_300s`
+  (`deadlock_breaker_tests.rs:118`), `MAX_DEADLOCK_JUMP 65536` bound +
+  `cap_hold_to_two_x_bound` (`liveness_breaker_tests.rs:16-22`);
+  `straggler_hold_extends_exactly_per_cap` (`:366+`, cap-formula bound
+  `:431-442`); `ROUND_LOOKBACK 8` (`:10`).
+
+## 9. Staking model — ops + checks (code truth)
+
+- Consts: `MIN_VALIDATOR_BOND` (`staking.rs:59`), `STELL_MIN_BOND_BUFFER`
+  (`:72`, floor fn `:75`), `MAX_ACTIVE_VALIDATORS 250` (`:199`),
+  `TARGET_MIN_VALIDATORS 150` (`:204`), pools `STAKING_POOL [0x53;32]`
+  (`:211`) / `REWARDS_POOL [0x52;32]` (`:220`),
+  `REWARDS_EMISSION_CAP` (`:225`), `MIN_DELEGATION` (`:227`),
+  `UNBONDING_PERIOD_SECS` (`:229`), slashes `EQUIVOCATION 500` (`:231`) /
+  `MICRO_COMMITTEE 10000` (`:233`) / `DOWNTIME 10` (`:235`),
+  `DOWNTIME_MISS_THRESHOLD 10` (`:237`), commission
+  `DEFAULT 1000 BPS` (`:265`) / `MAX_DELTA 500` (`:285`) /
+  `EFFECT_DELAY 7200` (`:294`) / `COOLDOWN 7200` (`:300`),
+  `JAIL_RELEASE_DELAY 1000` (`:278`).
+- Ops: `bond` (`:1051`, refuses `BondBelowMinimum` `:1061`,
+  `AlreadyValidator` `:1067`), `bond_genesis` (`:1098`), `unbond` (`:1502`,
+  governance-lock check `:1520`, jail check `:1575`),
+  `delegate` (`:1542`), `slash` (`:2058`), `slash_equivocation` (`:2244`),
+  `slash_equivocation_verified` (`:2292`), `slash_proposal_equivocation_verified`
+  (`:2407`), `slash_pq_equivocation` (`:2712`), `slash_downtime` (`:2822`);
+  `validator_set_gains` (`:830`), `reentry_liveness_risk` (`:858`).
+- Checks (fail-closed): `CooldownNotElapsed` (`:310`/`1031`/`1196`/`1729`),
+  `LockedInGovernanceVote` (`:337`/`1390`/`1520`/`1627`/`1724`),
+  `Jailed`/`NotJailed` (`:370-372`/`1169-1194`/`1737`/`2995`),
+  `BondBelowMinimum/DelegationBelowMinimum/InsufficientBond` (`:394-410`),
+  `BadSlashBps/BadCommission/CommissionDeltaExceeded/CommissionNotDue`
+  (`:284-299`/`425-434`), vesting floor `check_vesting_balance_floor`
+  (`:3246`).

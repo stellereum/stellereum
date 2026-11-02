@@ -48,3 +48,27 @@ untouched: this worker is NEW-FILES-ONLY. Lead merges. Phase-2 files:
 - No commits/stashes/pushes performed (lead-only). No existing file modified.
   New files: the 5 in this report (this map + 4 specs), all under
   `docs/specs/` with `_PHASE2` suffix to avoid colliding with Phase-1 names.
+
+## Addendum 8.5→9.0 (2026-11-02, append-only, no verified rewrites)
+
+- 02 `02_CRYPTO_AND_PQ_PHASE2.md`: §7 CN-VRF API (`cn_vrf.rs:58-681`,
+  `EPOCH_LEN`, zero `src/` callers); §8 `mev_pq_plan.rs` test-only
+  (`lib.rs:31` `cfg(test)`, ranked R1/R2/R3 `:45-68`); §9 ml-kem crate
+  (`infnode/.../Cargo.toml:36`, lock `0.3.4` `:1580-1582`) + KEM KATs
+  (`kem_kat_tests.rs:144-238`, 1184/1088/768/1568 B) + UNWIRED proof
+  (`pq_transport.rs:734-770`, stale `:60-70` noted); §10 privacy_pq/pq-gates
+  harness (UNVERIFIED static: 0, runtime-only).
+- 04 `04_NETWORK_AND_CONSENSUS_PHASE2.md`: §7 eclipse WIRED
+  (`network.rs:3352,3358,3392,3585`, `eclipse_tests.rs:240-419`); §8 transport
+  caps restated (no new consts).
+- 03 `03_VM_AND_EXECUTION_PHASE2.md`: §6 fee-batching harness
+  (`benches/fee_path.rs:168`, parity `fee_batching_parity_tests.rs:68-234`);
+  §7 shard2 soak (`shard2_soak_tests.rs:83-293`, gate `main.rs:2723-2736`);
+  §8 breaker bounds (`consensus.rs:3826`, `liveness_breaker_tests.rs:64-212`);
+  §9 staking ops/checks (`staking.rs:59-3246`).
+- 01 `01_ARCHITECTURE_OVERVIEW_PHASE2.md`: §5 light CLI
+  (`main.rs:6751-6817`, `light_client_cli.rs:58-599`); §6 explorer/WS caps
+  (`explorer.rs:29-966`, `rpc.rs:7333-7357`); §7 contracts audit
+  (`COMPREHENSIVE_AUDIT_REPORT.md:1043-1221`, 35-row census + residuals).
+- UNVERIFIED static count added this pass: 0 (bench ns/tx + soak walls are
+  runtime-only by construction; harnesses cited, no measurements claimed).

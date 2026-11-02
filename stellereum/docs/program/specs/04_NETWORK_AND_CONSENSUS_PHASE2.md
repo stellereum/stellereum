@@ -81,3 +81,32 @@ Sources: `stellereum/src/consensus.rs`, `consensus_net.rs`, `network.rs`,
   per-peer reputation lives in infnode
   (`infnode/crates/infnode/src/reputation.rs:1-27`: score clamp, soft-throttle
   + temp-ban at the accept gate).
+
+## 7. Eclipse-resistant discovery — WIRED (not planned)
+
+- Status 2026-11-02: WIRED in `stellereum/src/network.rs` (not a plan item).
+  Entry: `pinned_identity_set` (`:3443`, ONLY trusted source — ed-pub pinned +
+  TLS-verified) → `filter_discovered_to_pinned` (`:3392-3400`, drops unknown
+  ed-pubs) → live wrapper `discover_peers_filtered` (`:3585-3593`).
+- Bounds: `MAX_ENDPOINT_RECORDS 512` (`:3352`, healthy-network headroom +
+  `PeerEndpointTable::enforce_cap` `:3457-3473`), `ENDPOINT_BACKOFF_THRESHOLD 5`
+  (`:3358`, `backed_off` `:3446`), endpoint record shape (`PeerEndpoint`
+  `:3476-3455: endpoint/last_seen_ms/consecutive_failures`, prefer-success
+  order `:3596+`).
+- Rationale comment (`:3333-3340`): attacker-chosen identities are the eclipse
+  first step; filter is the containment.
+- Tests (live, not sim): `infnode/crates/infnode/tests/eclipse_tests.rs` —
+  `eclipse_flood_dials_honest_unaffected_attacker_throttled` (`:240-407`,
+  per-identity throttle, ban-escalation `:372-373`, no shared-IP blast radius
+  `:407`), `eclipse_sybil_burst_per_ip_and_per_identity_limits` (`:419+`);
+  per-IP bounding proven via reputation suite (header `:18-22`, G3 no-eviction-cap
+  note honest about unbounded-distinct-churn).
+
+## 8. Transport caps restated (no new consts this pass)
+
+- Consensus/tx caps + batch + vote-dedup + join/send budgets are exactly the
+  §6 table (`consensus_net.rs:43,47,71,74,81,88,150,526-532,560-568`;
+  `MAX_CROSS_SHARD_MSG` `network.rs:2344`; replication
+  `network.rs:4222,4226,4234,4349-4357`). No new transport consts landed;
+  stream-shed remains superseded-vote drop
+  (`SUPERSEDED_ROUND_LAG 2` `:158`, predicate `:185-191`).

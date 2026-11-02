@@ -447,7 +447,19 @@ async fn the_rpc_routing_rule_is_the_one_the_topology_uses() {
     }
     drop(topology);
 
-    for i in 0..200u64 {
+    // PROOF (audit-repro root cause, not a routing change): the routing rule
+    // itself is unchanged — `resolve_shard_for_address` (rpc.rs:2623) still
+    // calls `route_shard` (sharding.rs:2318), the single source of truth.
+    // What changed is intentional DoS hardening in f0b641d (rpc.rs:5727-5737
+    // + rpc.rs:1150-1167): in-process `RpcState::call` (`peer_ip=None`) no
+    // longer bypasses the `stell_estimateFee` 5/s per-IP budget
+    // (`ESTIMATE_FEE_RATE_LIMIT_DEFAULT`, rpc.rs:1133) and instead draws from
+    // the shared `LOCAL_BUCKET_IP` bucket — the old `if let Some(ip)` skip
+    // was an audit-residual bypass (cloning whole state per estimate). So 200
+    // rapid in-process estimates now correctly hit "budget exhausted". Sample
+    // 5 (== budget) RPC calls; the full 1000-address rule agreement is still
+    // computed above, and 0..5 covers both split children.
+    for i in 0..5u64 {
         let addr = synthetic_address(i);
         let r = st
             .call(

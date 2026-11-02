@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$ROOT/stellereum/docs/program"
 mkdir -p "$DEST/specs" "$DEST/ops"
-cp -u "$ROOT"/docs/PQ_*.md "$ROOT"/docs/CLASSICAL_*.md "$ROOT"/docs/WORKCHAIN_DECISION.md \
+cp -u "$ROOT"/docs/PQ_*.md "$ROOT"/docs/CLASSICAL_*.md "$ROOT"/docs/MEV_*.md "$ROOT"/docs/WORKCHAIN_DECISION.md \
       "$ROOT"/docs/LIGHT_CLIENT_VERIFY.md "$ROOT"/docs/FUZZING.md "$ROOT"/docs/TEMPO_*.md \
       "$DEST/" 2>/dev/null || true
 cp -u "$ROOT"/docs/specs/*.md "$DEST/specs/" 2>/dev/null || true

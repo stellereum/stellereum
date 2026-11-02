@@ -1369,6 +1369,12 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
             let pk_bytes = read_wasm_memory(&mut caller, pubkey_ptr, 32)?;
             let msg_bytes = read_wasm_memory(&mut caller, msg_ptr, mlen)?;
             let sig_bytes = read_wasm_memory(&mut caller, sig_ptr, 64)?;
+            // P2-6 pure-PQ gate (fail-closed): classical ed25519 verification
+            // is refused under enforcement. Fuel + memory effects above stay
+            // identical; only the cryptographic verdict is forced to false.
+            if crate::post_quantum::is_pure_pq_enforced() {
+                return Ok(0);
+            }
 
             let pk_arr: [u8; 32] = match pk_bytes.try_into() {
                 Ok(a) => a,
@@ -2607,6 +2613,71 @@ mod tests {
         // Fuel check
         let fuel_err = reg.call(&addr, "verify_sig", 0, 10).unwrap_err();
         assert!(matches!(fuel_err, ContractError::OutOfFuel));
+    }
+
+    /// P2-6 pure-PQ gate: a VALID ed25519 signature verifies (1) with
+    /// enforcement off but is refused (0) with enforcement on. The guard
+    /// resets the thread-local override on drop so the flag flip cannot leak
+    /// into other tests in this suite.
+    #[test]
+    fn test_host_ed25519_verify_refused_under_pure_pq() {
+        struct PurePqGuard;
+        impl PurePqGuard {
+            fn enforce() -> Self {
+                crate::post_quantum::set_pure_pq_override(Some(true));
+                Self
+            }
+        }
+        impl Drop for PurePqGuard {
+            fn drop(&mut self) {
+                crate::post_quantum::set_pure_pq_override(None);
+            }
+        }
+        use ed25519_dalek::Signer;
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let pk = sk.verifying_key().to_bytes();
+        let msg = b"contract pq gate pin";
+        let sig = sk.sign(msg).to_bytes();
+
+        let wat_src = format!(
+            r#"(module
+                 (import "host" "ed25519_verify" (func $ed25519_verify (param i32 i32 i32 i32) (result i32)))
+                 (memory (export "memory") 1)
+                 (data (i32.const 0) "{}")
+                 (data (i32.const 32) "{}")
+                 (data (i32.const 64) "{}")
+                 (func (export "verify_sig") (param $dummy i64) (result i64)
+                   (i64.extend_i32_u
+                     (call $ed25519_verify (i32.const 0) (i32.const 32) (i32.const {}) (i32.const 64)))))"#,
+            escape_wat_bytes(&pk),
+            escape_wat_bytes(msg),
+            escape_wat_bytes(&sig),
+            msg.len()
+        );
+        let wasm = wat::parse_str(&wat_src).unwrap();
+
+        // Baseline (enforcement off): valid sig verifies.
+        {
+            let mut reg = ContractRegistry::new();
+            let addr = reg.deploy([3u8; 32], wasm.clone(), 0).unwrap();
+            let (res, ..) = reg.call(&addr, "verify_sig", 0, 100_000).unwrap();
+            assert_eq!(res, 1, "valid ed sig must verify when pure-PQ is off");
+        }
+        // Enforced: the SAME valid sig is refused (fail-closed 0).
+        {
+            let _guard = PurePqGuard::enforce();
+            let mut reg = ContractRegistry::new();
+            let addr = reg.deploy([3u8; 32], wasm.clone(), 0).unwrap();
+            let (res, ..) = reg.call(&addr, "verify_sig", 0, 100_000).unwrap();
+            assert_eq!(res, 0, "valid ed sig must be refused under pure-PQ");
+        }
+        // Boundary (flag flip isolation): after guard drop we are back off.
+        {
+            let mut reg = ContractRegistry::new();
+            let addr = reg.deploy([3u8; 32], wasm, 0).unwrap();
+            let (res, ..) = reg.call(&addr, "verify_sig", 0, 100_000).unwrap();
+            assert_eq!(res, 1, "post-guard behavior must be off again");
+        }
     }
 
     #[test]

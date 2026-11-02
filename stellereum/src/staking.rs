@@ -2318,6 +2318,21 @@ impl StakingLedger {
             return Ok(0);
         }
         // 2. Signatures — both votes must verify under the accused key.
+        //
+        // GATE-FIRST (pure-PQ fail-closed): classical-only evidence (either
+        // vote without a Falcon half) is refused up front — no slash is
+        // computed from it. With enforcement off this gate is skipped and the
+        // check below is byte-identical to before (`Vote::verify` itself
+        // already requires Falcon under pure-PQ, so the two refusals agree).
+        if crate::post_quantum::is_pure_pq_enforced()
+            && (a.falcon_signature().is_none() || b.falcon_signature().is_none())
+        {
+            tracing::warn!(
+                "equivocation REFUSED (pure-PQ: classical-only evidence) for {}: refusing to slash",
+                hex::encode(voter),
+            );
+            return Ok(0);
+        }
         if !a.verify() || !b.verify() {
             tracing::warn!(
                 "equivocation REFUSED (vote signature does not verify) for {}: refusing to slash",
@@ -2471,6 +2486,12 @@ impl StakingLedger {
     /// Retrieve the registered post-quantum key and scheme for a validator, if any,
     /// falling back to Ed25519 (with the 32-byte `ValidatorId` as public key) if the
     /// validator exists in the ledger.
+    ///
+    /// GATE-FIRST P2-10 (pure-PQ fail-closed): when
+    /// [`crate::post_quantum::is_pure_pq_enforced`] is on, the Ed25519 fallback
+    /// is REFUSED (`None`) — an unregistered validator surfaces as a loud
+    /// caller-side refusal instead of yielding classical key material. With
+    /// enforcement off the fallback is byte-identical to before.
     pub fn get_pq_key(
         &self,
         validator: &ValidatorId,
@@ -2478,6 +2499,13 @@ impl StakingLedger {
         if let Some((s, pk)) = self.validator_pq_keys.get(validator) {
             Some((*s, pk.clone()))
         } else if self.validators.contains_key(validator) {
+            if crate::post_quantum::is_pure_pq_enforced() {
+                tracing::warn!(
+                    "PQ key REFUSED (pure-PQ: no registered PQ key) for {}: refusing classical Ed25519 fallback",
+                    hex::encode(validator),
+                );
+                return None;
+            }
             Some((crate::post_quantum::PqScheme::Ed25519, validator.to_vec()))
         } else {
             None
@@ -2557,9 +2585,17 @@ impl StakingLedger {
             return Err(crate::pq_registry::PqRegistryError::UnknownValidator);
         }
         if registry.record_of(&validator).is_none() {
-            let (cur_scheme, cur_pubkey) = self
-                .get_pq_key(&validator)
-                .expect("membership checked above; fallback always yields a key");
+            // NOTE (P2-10 consequence): `get_pq_key` refuses the Ed25519
+            // fallback under pure-PQ, so a member with no registered PQ key
+            // yields `None` here — fail closed instead of panicking on the old
+            // "fallback always yields a key" assumption.
+            let Some((cur_scheme, cur_pubkey)) = self.get_pq_key(&validator) else {
+                tracing::warn!(
+                    "pq announce REFUSED (pure-PQ: member {} has no registered PQ key — nothing to adopt)",
+                    hex::encode(validator),
+                );
+                return Err(crate::pq_registry::PqRegistryError::UnknownValidator);
+            };
             registry.adopt_legacy_key(validator, cur_scheme, cur_pubkey, true)?;
         }
         registry.announce_rotation(validator, scheme, pubkey, now_height, true)?;
@@ -2690,15 +2726,33 @@ impl StakingLedger {
             return Err(StakingError::NotValidator);
         }
 
-        // 3. Registered key resolution:
+        // 3. Registered key resolution (GATE-FIRST P2-11: NO classical
+        // fallback under pure-PQ — unregistered validators yield
+        // `InvalidSignature`, never an Ed25519 key the evidence could verify
+        // against; likewise a registered classical/disabled scheme is refused).
         let (scheme, pubkey) = if let Some((s, pk)) = self.validator_pq_keys.get(&evidence.voter) {
             (*s, pk.clone())
+        } else if crate::post_quantum::is_pure_pq_enforced() {
+            tracing::warn!(
+                "PQ equivocation REFUSED (pure-PQ: no registered PQ key) for {}: refusing classical fallback",
+                hex::encode(evidence.voter),
+            );
+            return Err(StakingError::InvalidSignature);
         } else {
             (
                 crate::post_quantum::PqScheme::Ed25519,
                 evidence.voter.to_vec(),
             )
         };
+        if crate::post_quantum::is_pure_pq_enforced()
+            && (!scheme.is_post_quantum() || scheme.is_disabled())
+        {
+            tracing::warn!(
+                "PQ equivocation REFUSED (pure-PQ: classical scheme evidence) for {}: refusing to slash",
+                hex::encode(evidence.voter),
+            );
+            return Err(StakingError::InvalidSignature);
+        }
 
         // 4. Construct vote sign message preimages:
         let msg_a = crate::consensus::vote_sign_bytes(

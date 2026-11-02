@@ -22,7 +22,7 @@ extern crate std;
 
 use stellereum_contract_sdk::{
     caller_is, emit, setup_wasm_panic_handler, sload, sstore, ERR_ALREADY_EXISTS,
-    ERR_INSUFFICIENT_BALANCE, ERR_INVALID_ARGUMENT, ERR_UNAUTHORIZED,
+    ERR_INSUFFICIENT_BALANCE, ERR_INVALID_ARGUMENT, ERR_OVERFLOW, ERR_UNAUTHORIZED,
 };
 
 setup_wasm_panic_handler!();
@@ -130,13 +130,30 @@ pub extern "C" fn deposit(packed: i64) -> i64 {
         return ERR_INVALID_ARGUMENT;
     }
 
-    sstore(SLOT_TOTAL_SHARES, total_shares + minted_shares);
-    sstore(SLOT_RESERVE_A, res_a + amount_a);
-    sstore(SLOT_RESERVE_B, res_b + amount_b);
-
+    // Audit 6.0->8.0: checked reserve/share accounting — fail closed with
+    // ERR_OVERFLOW instead of trapping on i64 overflow.
+    let new_total = match total_shares.checked_add(minted_shares) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    let new_res_a = match res_a.checked_add(amount_a) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    let new_res_b = match res_b.checked_add(amount_b) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
     let u_slot = user_slot(user_id);
     let current_shares = sload(u_slot);
-    sstore(u_slot, current_shares + minted_shares);
+    let new_user_shares = match current_shares.checked_add(minted_shares) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    sstore(SLOT_TOTAL_SHARES, new_total);
+    sstore(SLOT_RESERVE_A, new_res_a);
+    sstore(SLOT_RESERVE_B, new_res_b);
+    sstore(u_slot, new_user_shares);
 
     emit(TOPIC_DEPOSIT, minted_shares);
     minted_shares
@@ -183,9 +200,24 @@ pub extern "C" fn withdraw(packed: i64) -> i64 {
     }
 
     sstore(u_slot, user_shares - shares);
-    sstore(SLOT_TOTAL_SHARES, total_shares - shares);
-    sstore(SLOT_RESERVE_A, res_a - payout_a);
-    sstore(SLOT_RESERVE_B, res_b - payout_b);
+    // Audit 6.0->8.0: checked close-out — payouts are floored proportions so
+    // `payout <= reserve` holds by construction; any violation (or a
+    // corrupted total) fails closed instead of wrapping.
+    let new_total = match total_shares.checked_sub(shares) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    let new_res_a = match res_a.checked_sub(payout_a) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    let new_res_b = match res_b.checked_sub(payout_b) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    sstore(SLOT_TOTAL_SHARES, new_total);
+    sstore(SLOT_RESERVE_A, new_res_a);
+    sstore(SLOT_RESERVE_B, new_res_b);
 
     emit(TOPIC_WITHDRAW, payout_a);
     payout_a
@@ -246,8 +278,19 @@ pub extern "C" fn swap_a_for_b(dx: i64) -> i64 {
     let x = sload(SLOT_RESERVE_A);
     let y = sload(SLOT_RESERVE_B);
 
-    sstore(SLOT_RESERVE_A, x + dx);
-    sstore(SLOT_RESERVE_B, y - dy);
+    // Audit 6.0->8.0: `dx` is an unbounded caller-supplied i64 — `x + dx`
+    // must not wrap. `dy <= y` holds by quote construction; a violation fails
+    // closed as invalid rather than wrapping the reserve.
+    let new_x = match x.checked_add(dx) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    let new_y = match y.checked_sub(dy) {
+        Some(v) => v,
+        None => return ERR_INVALID_ARGUMENT,
+    };
+    sstore(SLOT_RESERVE_A, new_x);
+    sstore(SLOT_RESERVE_B, new_y);
 
     emit(TOPIC_SWAP_A_FOR_B, dy);
     dy
@@ -264,8 +307,17 @@ pub extern "C" fn swap_b_for_a(dy: i64) -> i64 {
     let x = sload(SLOT_RESERVE_A);
     let y = sload(SLOT_RESERVE_B);
 
-    sstore(SLOT_RESERVE_B, y + dy);
-    sstore(SLOT_RESERVE_A, x - dx);
+    // Audit 6.0->8.0: same unbounded-input guard as the A->B leg.
+    let new_y = match y.checked_add(dy) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    let new_x = match x.checked_sub(dx) {
+        Some(v) => v,
+        None => return ERR_INVALID_ARGUMENT,
+    };
+    sstore(SLOT_RESERVE_B, new_y);
+    sstore(SLOT_RESERVE_A, new_x);
 
     emit(TOPIC_SWAP_B_FOR_A, dx);
     dx

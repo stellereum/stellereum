@@ -3880,14 +3880,39 @@ impl InMemoryStateEngine {
     /// moved nothing, so its receipt files `fee_charged: 0`).
     #[allow(clippy::type_complexity)]
     // GATE: commit undo log mirrors account tuple layout; alias would churn callers.
-    async fn commit_native(
+    /// Batched-fee variant of [`Self::commit_native`]: the fee-floor inputs
+    /// arrive precomputed instead of being re-read per transaction.
+    ///
+    /// The block path (`apply_block_parallel_fees`) snapshots the governed
+    /// base, the D2 penalty mirror and the vesting floors ONCE per block and
+    /// evaluates `floor_parts_for` per transaction up front; those inputs are
+    /// passed here, so this variant performs ZERO lock acquisitions for the
+    /// fee prefix. Bit-identical to `commit_native` on the deterministic
+    /// block path: the penalty mirror is only folded at the end of the block
+    /// function, the governed base has no in-block writer, and
+    /// `vesting_schedules` has none either (register/unregister are
+    /// test-setup only), so the block snapshot equals every per-transaction
+    /// live read it replaces. Concurrent external writes racing a block
+    /// apply are already non-deterministic today (sibling transactions of
+    /// one block would observe different floors); batching only narrows the
+    /// window to a single snapshot.
+    ///
+    /// Callers outside the block path must keep using `commit_native`, which
+    /// reads the live inputs and delegates here.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: batching the fee prefix adds parameters; the shared commit core
+    // below is untouched (moved verbatim), so semantics are provable by diff.
+    async fn commit_native_with_floor(
         &self,
         tx: &crate::sharding::Transaction,
         gas_charged: u64,
         transfers: &[([u8; 32], u64)],
         payouts: &[([u8; 32], [u8; 32], u64)],
         burns: &[([u8; 32], u64)],
-        now: u64,
+        floor_base: u64,
+        surcharge: u64,
+        sender_vesting_floor: Option<u64>,
+        vesting_floors: &HashMap<[u8; 32], u64>,
     ) -> Result<(Vec<([u8; 32], u64, u64)>, u64), String> {
         // The VM ran against the sender's balance without knowing about the fee
         // and about the plain `amount` transfer, so the combined debit has to be
@@ -3906,7 +3931,10 @@ impl InMemoryStateEngine {
         // the floor anyway. Same formula as admission
         // (`Mempool::effective_floor_for_tx`); see `consensus_floor_parts`.
         // Fail-closed: the floor can only raise the fee, never lower it.
-        let (floor_base, surcharge) = self.consensus_floor_parts(tx).await;
+        //
+        // BATCHED: `floor_base`/`surcharge` arrive precomputed from the
+        // block's one-time snapshot (`fee_floors`); see the fn docs for why
+        // they equal the live reads they replace.
         let fee = gas_charged.min(tx.gas_limit).max(floor_base);
         let fee_with_surcharge = fee.saturating_add(surcharge);
         let charge = tx
@@ -3926,28 +3954,24 @@ impl InMemoryStateEngine {
             .and_then(|t| t.checked_add(surcharge))
             .ok_or_else(|| "Arithmetic overflow in transaction cost".to_string())?;
 
-        // Team-vesting locked floors, snapshotted BEFORE the accounts lock
-        // (lock order: staking -> accounts, same as `consensus_floor_parts`
-        // above). `None` = untracked = no gate. The floor is evaluated at the
-        // block timestamp `now`, so every node agrees on it for this block.
-        // Empty on every live chain today (no vested allocations exist), in
-        // which case this snapshot is two `None`s and the gate below is a
-        // no-op with zero behavior change.
-        let (sender_vesting_floor, payout_vesting_floors): (Option<u64>, Vec<([u8; 32], u64)>) = {
-            let ledger = self.staking.read().await;
-            let sender_floor = ledger
-                .vesting_schedules
-                .get(&tx.from)
-                .map(|s| s.locked_amount(now));
+        // Team-vesting locked floors, looked up in the caller-supplied
+        // block snapshot (lock order concern gone: no locks are taken for
+        // the fee prefix here). `None` = untracked = no gate. Empty on every
+        // live chain today (no vested allocations exist), in which case this
+        // is two empty lookups and the gate below is a no-op with zero
+        // behavior change. Bit-identical to the live read: `vesting_schedules`
+        // has no in-block writer, so the block snapshot taken before the
+        // admission pass equals the per-transaction read at every commit.
+        let payout_vesting_floors: Vec<([u8; 32], u64)> = {
             let mut floors = Vec::new();
             for (payer, _, _) in payouts {
-                if let Some(s) = ledger.vesting_schedules.get(payer) {
+                if let Some(floor) = vesting_floors.get(payer) {
                     if !floors.iter().any(|(p, _)| p == payer) {
-                        floors.push((*payer, s.locked_amount(now)));
+                        floors.push((*payer, *floor));
                     }
                 }
             }
-            (sender_floor, floors)
+            floors
         };
 
         let mut map = self.accounts.write().await;
@@ -4351,6 +4375,55 @@ impl InMemoryStateEngine {
         Ok((out, fee_with_surcharge))
     }
 
+    /// Shared native commit point (see [`Self::commit_native_with_floor`]
+    /// for the full contract): reads the fee-floor inputs live and delegates
+    /// to the batched variant. This is the single-transaction path
+    /// (`apply_transaction`) and every non-block caller stays on these live
+    /// reads — only the block path passes a block snapshot.
+    async fn commit_native(
+        &self,
+        tx: &crate::sharding::Transaction,
+        gas_charged: u64,
+        transfers: &[([u8; 32], u64)],
+        payouts: &[([u8; 32], [u8; 32], u64)],
+        burns: &[([u8; 32], u64)],
+        now: u64,
+    ) -> Result<(Vec<([u8; 32], u64, u64)>, u64), String> {
+        // Live fee-floor inputs: the governed base + this engine's D2
+        // penalty mirror + the PQ surcharge predicate.
+        let (floor_base, surcharge) = self.consensus_floor_parts(tx).await;
+        // Live vesting floors at the block timestamp `now` (lock order:
+        // staking -> accounts, same as before).
+        let (sender_vesting_floor, vesting_floors): (Option<u64>, HashMap<[u8; 32], u64>) = {
+            let ledger = self.staking.read().await;
+            let sender_floor = ledger
+                .vesting_schedules
+                .get(&tx.from)
+                .map(|s| s.locked_amount(now));
+            let mut floors = HashMap::new();
+            for (payer, _, _) in payouts {
+                if let Some(s) = ledger.vesting_schedules.get(payer) {
+                    floors
+                        .entry(*payer)
+                        .or_insert_with(|| s.locked_amount(now));
+                }
+            }
+            (sender_floor, floors)
+        };
+        self.commit_native_with_floor(
+            tx,
+            gas_charged,
+            transfers,
+            payouts,
+            burns,
+            floor_base,
+            surcharge,
+            sender_vesting_floor,
+            &vesting_floors,
+        )
+        .await
+    }
+
     /// Apply a whole block's transactions with **batched signature verification**
     /// and grouped execution (see `apply_block_parallel_fees`).
     ///
@@ -4398,8 +4471,7 @@ impl InMemoryStateEngine {
         wave: &[usize],
         admitted: &[bool],
         session_valid: Option<&HashMap<usize, bool>>,
-        governed_base: u64,
-        penalties: &HashMap<[u8; 32], u64>,
+        fee_floors: &[(u64, u64)],
         vesting_floors: &HashMap<[u8; 32], u64>,
         applied: &mut usize,
         failed: &mut usize,
@@ -4449,8 +4521,7 @@ impl InMemoryStateEngine {
                 .par_iter()
                 .map(|&i| {
                     let tx = &txs[i];
-                    let (floor_base, surcharge) =
-                        Self::floor_parts_for(governed_base, penalties, tx);
+                    let (floor_base, surcharge) = fee_floors[i];
                     let session_ok = session_valid
                         .map(|sv| sv.get(&i).copied().unwrap_or(false))
                         .unwrap_or(true);
@@ -4523,7 +4594,7 @@ impl InMemoryStateEngine {
             let mut map = self.accounts.write().await;
             for &i in wave {
                 let tx = &txs[i];
-                let (floor_base, surcharge) = Self::floor_parts_for(governed_base, penalties, tx);
+                let (floor_base, surcharge) = fee_floors[i];
                 let session_ok = session_valid
                     .map(|sv| sv.get(&i).copied().unwrap_or(false))
                     .unwrap_or(true);
@@ -4819,9 +4890,10 @@ impl InMemoryStateEngine {
         //    transaction while the guards below are held): the governed base
         //    + this engine's D2 penalty snapshot. Same formula as admission
         //    (`Mempool::effective_floor_for_tx`); see `consensus_floor_parts`.
-        //    `commit_native` re-reads the live map, which still equals this
-        //    snapshot — the mirror is only updated at the end of this
-        //    function, never mid-block.
+        //    The block path consumes them through the `fee_floors` batch
+        //    below (bit-identical: the mirror is only updated at the end of
+        //    this function, never mid-block); only `commit_native` — the
+        //    single-transaction path — re-reads the live map.
         let governed_base: u64 = self
             .governance_read()
             .await
@@ -4842,6 +4914,21 @@ impl InMemoryStateEngine {
                 .map(|(acct, sched)| (*acct, sched.locked_amount(timestamp)))
                 .collect()
         };
+        // FEE-PATH BATCH (execution 9.0): the per-transaction fee-floor
+        // inputs, computed ONCE per block from the snapshot above.
+        // `floor_parts_for` is pure in `(governed_base, penalties, tx)`, so
+        // these are bit-identical to the per-transaction evaluations they
+        // replace (admission, prechecks, `fail_with_floor!`,
+        // `apply_plain_wave`, and — via `commit_native_with_floor` — the
+        // commit fee prefix, which additionally skips three per-transaction
+        // lock acquisitions whose live reads equal this snapshot: the
+        // penalty mirror is only folded at the end of this function, the
+        // governed base has no in-block writer, and `vesting_schedules`
+        // has none either).
+        let fee_floors: Vec<(u64, u64)> = txs
+            .iter()
+            .map(|tx| Self::floor_parts_for(governed_base, &penalties, tx))
+            .collect();
         let mut admitted = vec![false; txs.len()];
         // A14 phase 3 (chain binding): read once per block — every
         // transaction of this block is judged against the same activation.
@@ -4928,8 +5015,7 @@ impl InMemoryStateEngine {
                     // simulated balance. The user's nonce advances; the
                     // sponsor's never does.
                     if let Some(auth) = tx.sponsored_grant() {
-                        let (floor_base, surcharge) =
-                            Self::floor_parts_for(governed_base, &penalties, tx);
+                        let (floor_base, surcharge) = fee_floors[i];
                         let fee_reserved = tx.gas_limit.max(floor_base);
                         let Some(fee_total) = fee_reserved.checked_add(surcharge) else {
                             continue;
@@ -4969,8 +5055,7 @@ impl InMemoryStateEngine {
                     // below-floor transaction is only admitted when its sender
                     // can pay the floor (`commit_native` charges it anyway).
                     // Same formula as admission; see `consensus_floor_parts`.
-                    let (floor_base, surcharge) =
-                        Self::floor_parts_for(governed_base, &penalties, tx);
+                    let (floor_base, surcharge) = fee_floors[i];
                     let fee_reserved = tx.gas_limit.max(floor_base);
                     let Some(total) = tx
                         .amount
@@ -5053,7 +5138,7 @@ impl InMemoryStateEngine {
         macro_rules! fail_with_floor {
             ($tx:expr, $idx:expr) => {{
                 failed += 1;
-                let (floor_base, surcharge) = Self::floor_parts_for(governed_base, &penalties, $tx);
+                let (floor_base, surcharge) = fee_floors[$idx];
                 let fee = $tx.gas_limit.max(floor_base).saturating_add(surcharge);
                 if let Some(auth) = $tx.sponsored_grant() {
                     let (debited, charged_state) = self
@@ -5121,8 +5206,7 @@ impl InMemoryStateEngine {
                         &wave,
                         &admitted,
                         session_valid.as_ref(),
-                        governed_base,
-                        &penalties,
+                        &fee_floors,
                         &vesting_floors,
                         &mut applied,
                         &mut failed,
@@ -5173,11 +5257,7 @@ impl InMemoryStateEngine {
                                         } else if sender.balance < tx.amount {
                                             4
                                         } else {
-                                            let (floor_base, surcharge) = Self::floor_parts_for(
-                                                governed_base,
-                                                &penalties,
-                                                tx,
-                                            );
+                                            let (floor_base, surcharge) = fee_floors[i];
                                             let fee_total = tx
                                                 .gas_limit
                                                 .max(floor_base)
@@ -5294,13 +5374,16 @@ impl InMemoryStateEngine {
                                 }
                             };
                         match self
-                            .commit_native(
+                            .commit_native_with_floor(
                                 tx,
                                 tx.gas_limit,
                                 &transfers,
                                 &payouts,
                                 &burns,
-                                timestamp,
+                                fee_floors[i].0,
+                                fee_floors[i].1,
+                                vesting_floors.get(&tx.from).copied(),
+                                &vesting_floors,
                             )
                             .await
                         {
@@ -5367,8 +5450,7 @@ impl InMemoryStateEngine {
                                 } else if sender.balance < tx.amount {
                                     4
                                 } else {
-                                    let (floor_base, surcharge) =
-                                        Self::floor_parts_for(governed_base, &penalties, tx);
+                                    let (floor_base, surcharge) = fee_floors[i];
                                     let fee_total =
                                         tx.gas_limit.max(floor_base).saturating_add(surcharge);
                                     let sponsor_balance =
@@ -5528,7 +5610,17 @@ impl InMemoryStateEngine {
                 // inside `commit_native` — a below-floor declaration is charged
                 // the floor anyway, never executed below it.
                 match self
-                    .commit_native(tx, tx.gas_limit, &transfers, &payouts, &burns, timestamp)
+                    .commit_native_with_floor(
+                        tx,
+                        tx.gas_limit,
+                        &transfers,
+                        &payouts,
+                        &burns,
+                        fee_floors[i].0,
+                        fee_floors[i].1,
+                        vesting_floors.get(&tx.from).copied(),
+                        &vesting_floors,
+                    )
                     .await
                 {
                     Ok((touched, fee)) => {

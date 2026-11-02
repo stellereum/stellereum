@@ -8234,6 +8234,322 @@ fn is_ws_expensive_method(method: &str) -> bool {
     )
 }
 
+// ===========================================================================
+// WS HARDENING (audit residual, rpc 8.5->9.0): bounded subscriptions per
+// connection, size-capped messages, per-message general budget symmetric to
+// the HTTP transport limiters, and stale-connection reaping with a live
+// connection count. No new env knobs: every bound is a const below.
+// ===========================================================================
+
+/// Maximum bytes of one WS message (text or binary, UTF-8 decoded length).
+///
+/// Mirrors [`MAX_RPC_BODY`] (1 MiB): the HTTP extractor refuses bodies above
+/// it before buffering, and a WS frame must not smuggle a bigger request
+/// past the upgrade. Oversize frames are refused with a clean `-32600` error
+/// frame on the SAME socket (the socket stays open: answers, never drops).
+pub const WS_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// Maximum subscriptions owned by ONE WebSocket connection (DoS bound).
+///
+/// The global [`MAX_SUBSCRIPTIONS`] cap bounds the node's memory and the
+/// per-client ([`MAX_SUBSCRIPTIONS_PER_CLIENT`]) cap bounds one IP, but
+/// neither bounds one SOCKET: without this a single connection could hold 64
+/// live subscriptions and pin 64 broadcast slots. 16 is far above what one
+/// socket needs (heads + txs + invalidations + a handful of event filters)
+/// and far below either global cap. The 17th `stell_subscribe` on a full
+/// connection is refused fail-closed (`-32000`); the socket stays open.
+pub const WS_MAX_SUBS_PER_CONNECTION: usize = 16;
+
+/// Default per-IP budget for ordinary WS messages (per second).
+///
+/// Symmetric to [`STANDALONE_RATE_LIMIT_DEFAULT`] (300/s): the HTTP upgrade
+/// passes the transport limiter once, so every frame after it draws from
+/// THIS budget with the same per-IP fixed-window shape instead. Heavy
+/// methods draw from the expensive-read budget ON TOP (see above), exactly
+/// like an HTTP client sits under both the transport limiter and the
+/// `stell_estimateFee` budget. Over budget is a clean `-32000` error frame;
+/// the socket stays open.
+pub const WS_GENERAL_RATE_LIMIT_DEFAULT: u32 = 300;
+
+/// The process-wide WS general limiter (mirrors `estimate_fee_budget`).
+fn ws_general_budget() -> &'static crate::explorer::RateLimiter {
+    static LIMITER: std::sync::OnceLock<crate::explorer::RateLimiter> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| {
+        crate::explorer::RateLimiter::new(WS_GENERAL_RATE_LIMIT_DEFAULT)
+    })
+}
+
+/// Live WebSocket sessions on this node (incremented on upgrade, decremented
+/// when the session ends for ANY reason: close, error, or idle reap).
+///
+/// The reaping test and operators use this to prove no connection leaks:
+/// after every client goes away the count returns to its baseline.
+static WS_LIVE_CONNECTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of currently live WebSocket sessions (see above).
+pub fn ws_live_connections() -> usize {
+    WS_LIVE_CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// RAII guard: the session counts as live until this drops.
+struct WsLiveGuard;
+
+impl WsLiveGuard {
+    fn new() -> Self {
+        WS_LIVE_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        WsLiveGuard
+    }
+}
+
+impl Drop for WsLiveGuard {
+    fn drop(&mut self) {
+        WS_LIVE_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Seconds of total inactivity after which a WS session is reaped.
+///
+/// A connection that sees neither a client frame NOR a forwarded
+/// notification for this long is stale (a dead peer whose FIN never
+/// arrived): the session breaks out of its select loop, drops its owned
+/// subscriptions, and the live count drops, so a dead peer cannot leak a
+/// registry entry or a counter slot.
+pub const WS_IDLE_TIMEOUT_SECS: u64 = 300;
+
+// Compile-time shape of the WS hardening bounds (fail the build, not a
+// test, if a future edit inverts them).
+const _: () = assert!(WS_MAX_SUBS_PER_CONNECTION > 0);
+const _: () = assert!(WS_MAX_SUBS_PER_CONNECTION <= MAX_SUBSCRIPTIONS_PER_CLIENT);
+const _: () = assert!(MAX_SUBSCRIPTIONS_PER_CLIENT < MAX_SUBSCRIPTIONS);
+const _: () = assert!(WS_GENERAL_RATE_LIMIT_DEFAULT > 0);
+const _: () = assert!(WS_IDLE_TIMEOUT_SECS > 0);
+
+/// Test-only override of [`WS_IDLE_TIMEOUT_SECS`] (0 = use the const).
+///
+/// Integration tests cannot wait 300 s, so they set a 1 s timeout, prove the
+/// reap, and restore 0. Production never touches this: no env knob, no
+/// config, no HTTP behavior change.
+static WS_IDLE_TIMEOUT_OVERRIDE_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Set the WS idle timeout for tests (0 restores the const default).
+pub fn set_ws_idle_timeout_for_tests(secs: u64) {
+    WS_IDLE_TIMEOUT_OVERRIDE_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Effective WS idle timeout (the const, unless a test overrode it).
+fn ws_idle_timeout() -> std::time::Duration {
+    let ov = WS_IDLE_TIMEOUT_OVERRIDE_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    std::time::Duration::from_secs(if ov == 0 { WS_IDLE_TIMEOUT_SECS } else { ov })
+}
+
+// ===========================================================================
+// RATE-LIMIT AUDIT TABLE (rpc 9.0): every public method mapped to a bucket.
+//
+// Buckets (enforcement — see the code cited, not just this comment):
+//   * `transport`    — the per-IP transport limiter: standalone 300/s
+// Buckets (enforcement — see the code cited, not just this comment):
+//   * `transport`    — the per-IP transport limiter, the outer layer EVERY
+//     request sits under: standalone 300/s (`standalone_rate_limit`),
+//     gateway 30/s (`explorer`), and the WS per-message general budget
+//     mirroring standalone (`ws_general_budget`). Every public method draws
+//     from it on every transport (WS draws per frame, not just at upgrade).
+//   * `expensive`    — the 5/s per-IP estimate-fee budget enforced in
+//     `dispatch` (`estimate_fee_budget`) on ALL transports: `stell_estimateFee`.
+//   * `expensive-ws` — the 5/s per-IP WS per-message budget
+//     (`ws_expensive_read_budget`, `is_ws_expensive_method`): the 7 heavy
+//     methods below, ON WS FRAMES ONLY. On HTTP these same methods have no
+//     per-method budget beyond `transport`.
+//   * `subscription` — the registry caps in `subscribe_for`: global
+//     `MAX_SUBSCRIPTIONS` + per-client `MAX_SUBSCRIPTIONS_PER_CLIENT`,
+//     plus per-connection `WS_MAX_SUBS_PER_CONNECTION` on WS frames.
+//   * `faucet`       — the hourly per-IP throttle + lifetime caps
+//     (`Faucet::check_ip_throttle`, `FAUCET_IP_MAX_PER_HOUR`).
+//   * `auth`         — `auth_token`-gated when configured (still under
+//     `transport` like everything else).
+//
+// Method -> buckets (mirrored by `rpc_rate_buckets` below; the coverage test
+// `rate_bucket_table_covers_every_public_method` asserts every row):
+//   transport only (EVM, 36): eth_chainId, net_version, web3_clientVersion,
+//     net_listening, net_peerCount, eth_syncing, eth_gasPrice,
+//     eth_maxPriorityFeePerGas, eth_estimateGas, eth_feeHistory, eth_getCode,
+//     eth_getBalance, eth_getTransactionCount, eth_blockNumber,
+//     eth_getBlockByNumber, eth_getBlockByHash, eth_getTransactionReceipt,
+//     eth_getTransactionByHash, eth_getBlockTransactionCountByHash,
+//     eth_getBlockTransactionCountByNumber,
+//     eth_getTransactionByBlockHashAndIndex,
+//     eth_getTransactionByBlockNumberAndIndex, eth_getUncleCountByBlockHash,
+//     eth_getUncleCountByBlockNumber, eth_getUncleByBlockHashAndIndex,
+//     eth_getUncleByBlockNumberAndIndex, eth_call, eth_newBlockFilter,
+//     eth_newPendingTransactionFilter, eth_newFilter, eth_getFilterChanges,
+//     eth_getFilterLogs, eth_uninstallFilter, eth_getLogs, eth_getStorageAt,
+//     eth_sendRawTransaction.
+//   transport only (stell, 53): stell_chainId, stell_nodeId, stell_blockNumber,
+//     stell_syncing, stell_getStateRoot, stell_latestBlocks, stell_getShards,
+//     stell_getShardTopology, stell_getBlock, stell_getBlockTransactions,
+//     stell_epochKey, stell_sendSealedTransaction, stell_mevStats,
+//     stell_getBalance, stell_getHistoricalRoot, stell_getFinalizedHeader,
+//     stell_getFinalizedCheckpoint, stell_getEpochRoot, stell_bridgeDeposit,
+//     stell_bridgeDispute, stell_tokenBalance, stell_tokenSupply,
+//     stell_tokenResolve, stell_listTokens, stell_getTransactionReceipt,
+//     stell_getEvents, stell_getTransactionStatus, stell_stakeOf,
+//     stell_getValidatorStatus, stell_zkmlCapabilities, stell_getValidators,
+//     stell_getPqKey, stell_getPqRegistryStatus, stell_proposal,
+//     stell_listProposals, stell_governanceParams, stell_mempoolSize,
+//     stell_baseFee, stell_verifyMessage, stell_verifyTypedData,
+//     stell_sendRawTransaction, stell_pmmState, stell_orderBook,
+//     stell_sessionBudget, stell_getContractAbi, stell_verifyContractSource,
+//     stell_getContractSource, stell_registerContractSource,
+//     stell_getContractReceipt, stell_getInvalidations, stell_invalidationFeed,
+//     stell_unsubscribe, stell_getSubscriptions.
+//   transport + expensive + expensive-ws (1): stell_estimateFee.
+//   transport + expensive-ws (5): stell_getProof, stell_getArchiveProof,
+//     stell_getBalanceSpv, stell_tokenBalanceSpv, stell_runGetMethod.
+//   transport + expensive-ws + subscription (1): stell_subscribe.
+//   transport + faucet (1): stell_faucet.
+//   transport + auth (11): stell_mempoolDump, stell_submitProposal, stell_vote,
+//     stell_executeProposal, stell_signMessage, stell_signTypedData,
+//     stell_deployContract, stell_callContract, stell_submitPriceFeed,
+//     stell_pmmBuy, stell_pmmSell.
+//   transport only (native namespace, 35, via `is_native_method`):
+//     stell_tokenTransfer, stell_tokenBalanceOf, stell_tokenMetadata,
+//     stell_tokenAllowance, stell_tokenMint, stell_tokenBurn, stell_tokenApprove,
+//     stell_tokenTransferFrom, stell_tokenCreate, stell_stakeBond,
+//     stell_stakeUnbond, stell_stakeWithdraw, stell_delegate, stell_undelegate,
+//     stell_claimRewards, stell_bridgeDepositPrepare, stell_bridgeWithdraw,
+//     stell_bridgeStatus, stell_bridgeAttestStatus, stell_bridgeReleaseEstimate,
+//     stell_bridgeDeposits, stell_orderBookPlace, stell_orderBookCancel,
+//     stell_orderBookSnapshot, stell_placeOrder, stell_cancelOrder,
+//     stell_sessionKeyRegister, stell_sessionKeyRevoke, stell_sessionKeys,
+//     stell_oraclePrice, stell_oracleFeeds, stell_shieldedTransfer,
+//     stell_shieldedBalance, stell_unshield, stell_nativeApi.
+//   (no bucket: unknown method names -> `-32601`; there is no method without
+//   a row above.)
+
+/// Buckets rate-limiting a public RPC method (see the audit table above).
+///
+/// The return is the FULL bucket set: every entry contains `"transport"`
+/// (the outer per-IP limiter on every transport), plus the special buckets
+/// from the table. Unknown method names map to `&[]` (the `-32601` arm has
+/// no bucket). Pure classifier: it drives NO enforcement itself, so HTTP
+/// behavior is byte-identical with or without it; the WS path consults it
+/// only in comments/tests, enforcement lives in the limiters cited above.
+pub fn rpc_rate_buckets(method: &str) -> &'static [&'static str] {
+    match method {
+        "stell_estimateFee" => &["transport", "expensive", "expensive-ws"],
+        "stell_subscribe" => &["transport", "expensive-ws", "subscription"],
+        "stell_getProof"
+        | "stell_getArchiveProof"
+        | "stell_getBalanceSpv"
+        | "stell_tokenBalanceSpv"
+        | "stell_runGetMethod" => &["transport", "expensive-ws"],
+        "stell_faucet" => &["transport", "faucet"],
+        "stell_mempoolDump"
+        | "stell_submitProposal"
+        | "stell_vote"
+        | "stell_executeProposal"
+        | "stell_signMessage"
+        | "stell_signTypedData"
+        | "stell_deployContract"
+        | "stell_callContract"
+        | "stell_submitPriceFeed"
+        | "stell_pmmBuy"
+        | "stell_pmmSell" => &["transport", "auth"],
+        _ if crate::native_api::is_native_method(method) => &["transport"],
+        "eth_chainId"
+        | "net_version"
+        | "web3_clientVersion"
+        | "net_listening"
+        | "net_peerCount"
+        | "eth_syncing"
+        | "eth_gasPrice"
+        | "eth_maxPriorityFeePerGas"
+        | "eth_estimateGas"
+        | "eth_feeHistory"
+        | "eth_getCode"
+        | "eth_getBalance"
+        | "eth_getTransactionCount"
+        | "eth_blockNumber"
+        | "eth_getBlockByNumber"
+        | "eth_getBlockByHash"
+        | "eth_getTransactionReceipt"
+        | "eth_getTransactionByHash"
+        | "eth_getBlockTransactionCountByHash"
+        | "eth_getBlockTransactionCountByNumber"
+        | "eth_getTransactionByBlockHashAndIndex"
+        | "eth_getTransactionByBlockNumberAndIndex"
+        | "eth_getUncleCountByBlockHash"
+        | "eth_getUncleCountByBlockNumber"
+        | "eth_getUncleByBlockHashAndIndex"
+        | "eth_getUncleByBlockNumberAndIndex"
+        | "eth_call"
+        | "eth_newBlockFilter"
+        | "eth_newPendingTransactionFilter"
+        | "eth_newFilter"
+        | "eth_getFilterChanges"
+        | "eth_getFilterLogs"
+        | "eth_uninstallFilter"
+        | "eth_getLogs"
+        | "eth_getStorageAt"
+        | "eth_sendRawTransaction"
+        | "stell_chainId"
+        | "stell_nodeId"
+        | "stell_blockNumber"
+        | "stell_syncing"
+        | "stell_getStateRoot"
+        | "stell_latestBlocks"
+        | "stell_getShards"
+        | "stell_getShardTopology"
+        | "stell_getBlock"
+        | "stell_getBlockTransactions"
+        | "stell_epochKey"
+        | "stell_sendSealedTransaction"
+        | "stell_mevStats"
+        | "stell_getBalance"
+        | "stell_getHistoricalRoot"
+        | "stell_getFinalizedHeader"
+        | "stell_getFinalizedCheckpoint"
+        | "stell_getEpochRoot"
+        | "stell_bridgeDeposit"
+        | "stell_bridgeDispute"
+        | "stell_tokenBalance"
+        | "stell_tokenSupply"
+        | "stell_tokenResolve"
+        | "stell_listTokens"
+        | "stell_getTransactionReceipt"
+        | "stell_getEvents"
+        | "stell_getTransactionStatus"
+        | "stell_stakeOf"
+        | "stell_getValidatorStatus"
+        | "stell_zkmlCapabilities"
+        | "stell_getValidators"
+        | "stell_getPqKey"
+        | "stell_getPqRegistryStatus"
+        | "stell_proposal"
+        | "stell_listProposals"
+        | "stell_governanceParams"
+        | "stell_mempoolSize"
+        | "stell_baseFee"
+        | "stell_verifyMessage"
+        | "stell_verifyTypedData"
+        | "stell_sendRawTransaction"
+        | "stell_pmmState"
+        | "stell_orderBook"
+        | "stell_sessionBudget"
+        | "stell_getContractAbi"
+        | "stell_verifyContractSource"
+        | "stell_getContractSource"
+        | "stell_registerContractSource"
+        | "stell_getContractReceipt"
+        | "stell_getInvalidations"
+        | "stell_invalidationFeed"
+        | "stell_unsubscribe"
+        | "stell_getSubscriptions" => &["transport"],
+        _ => &[],
+    }
+}
+
 /// WebSocket transport: JSON-RPC requests in, subscription notifications out.
 ///
 /// The socket speaks the SAME JSON-RPC dialect as the HTTP endpoint, so a
@@ -8268,15 +8584,37 @@ enum WsIn {
 
 /// The WebSocket session: serve one client until it goes away.
 async fn handle_ws(
-    mut socket: axum::extract::ws::WebSocket,
+    socket: axum::extract::ws::WebSocket,
     st: Arc<RpcState>,
     header_token: Option<String>,
     peer_ip: Option<std::net::IpAddr>,
 ) {
+    handle_ws_with_timeout(socket, st, header_token, peer_ip, ws_idle_timeout()).await
+}
+
+/// The WebSocket session with an explicit idle timeout (the const
+/// [`WS_IDLE_TIMEOUT_SECS`] in production; short in tests via
+/// [`set_ws_idle_timeout_for_tests`]).
+///
+/// Reaping: any loop iteration without a client frame AND without a
+/// forwarded notification lets the deadline fire, and the session ends —
+/// owned subscriptions are removed and the live count drops, so a dead peer
+/// cannot leak a registry entry or a counter slot.
+async fn handle_ws_with_timeout(
+    mut socket: axum::extract::ws::WebSocket,
+    st: Arc<RpcState>,
+    header_token: Option<String>,
+    peer_ip: Option<std::net::IpAddr>,
+    idle_timeout: std::time::Duration,
+) {
+    let _live = WsLiveGuard::new();
     let mut rx = hub().notifications();
     // Subscriptions created ON THIS connection (the client may also subscribe
     // over plain HTTP; those are not pushed here).
     let mut owned: HashSet<String> = HashSet::new();
+    // Any select arm that fires counts as activity; only the deadline firing
+    // means the connection has been fully idle for `idle_timeout`.
+    let mut deadline = tokio::time::Instant::now() + idle_timeout;
     loop {
         // The receive future borrows the socket; the send happens after the
         // select, so the two never overlap.
@@ -8284,7 +8622,9 @@ async fn handle_ws(
             biased;
             msg = socket.recv() => WsIn::Message(msg),
             note = rx.recv() => WsIn::Note(note),
+            _ = tokio::time::sleep_until(deadline) => break,
         };
+        deadline = tokio::time::Instant::now() + idle_timeout;
         match next {
             WsIn::Message(Some(Ok(m))) => match m {
                 axum::extract::ws::Message::Text(t) => {
@@ -8374,6 +8714,23 @@ async fn ws_handle_text(
     header_token: Option<&str>,
     peer_ip: Option<std::net::IpAddr>,
 ) -> bool {
+    // SIZE CAP (see `WS_MAX_MESSAGE_BYTES`): mirror the HTTP body limit
+    // BEFORE parsing, so a giant frame cannot buy a giant JSON build.
+    if text.len() > WS_MAX_MESSAGE_BYTES {
+        let resp = err(
+            Value::Null,
+            -32600,
+            format!(
+                "request too large: {} bytes (max {WS_MAX_MESSAGE_BYTES})",
+                text.len()
+            ),
+        );
+        let out = serde_json::to_string(&resp.0).unwrap_or_default();
+        return socket
+            .send(axum::extract::ws::Message::Text(out))
+            .await
+            .is_ok();
+    }
     let parsed: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
@@ -8417,6 +8774,26 @@ async fn ws_handle_text(
     let id = req.id.clone().unwrap_or(Value::Null);
     let method = req.method.clone();
     let params = req.params.clone();
+    // PER-MESSAGE GENERAL BUDGET (see `WS_GENERAL_RATE_LIMIT_DEFAULT`): the
+    // upgrade request was checked once, but every ordinary frame after it
+    // draws from the per-IP general budget — the same outer layer an HTTP
+    // request sits under. Over budget → a clean error frame on the SAME
+    // socket (the socket stays open: answers, never drops, on rate-limit).
+    {
+        let ip = peer_ip.unwrap_or(LOCAL_BUCKET_IP);
+        if !ws_general_budget().check(ip) {
+            let denied = err(
+                id,
+                -32000,
+                "general budget exhausted for this IP on this socket (retry shortly)",
+            );
+            let out = serde_json::to_string(&denied.0).unwrap_or_default();
+            return socket
+                .send(axum::extract::ws::Message::Text(out))
+                .await
+                .is_ok();
+        }
+    }
     // PER-MESSAGE expensive-read budget (see above): the upgrade request was
     // checked once, but every heavy frame after it draws from the per-IP WS
     // budget. Over budget → a clean error frame on the SAME socket (the
@@ -8435,6 +8812,25 @@ async fn ws_handle_text(
                 .await
                 .is_ok();
         }
+    }
+    // PER-CONNECTION SUBSCRIPTION CAP (see `WS_MAX_SUBS_PER_CONNECTION`):
+    // fail-closed BEFORE dispatch so a refused subscribe consumes neither a
+    // registry slot nor any per-client budget. Over cap → a clean `-32000`
+    // error frame; the socket stays open. On success the new id is tracked
+    // below so it is pushed to this socket and dies with it.
+    if method == "stell_subscribe" && owned.len() >= WS_MAX_SUBS_PER_CONNECTION {
+        let denied = err(
+            id,
+            -32000,
+            format!(
+                "per-connection subscription limit reached ({WS_MAX_SUBS_PER_CONNECTION} live subscriptions on this connection)"
+            ),
+        );
+        let out = serde_json::to_string(&denied.0).unwrap_or_default();
+        return socket
+            .send(axum::extract::ws::Message::Text(out))
+            .await
+            .is_ok();
     }
     let resp = dispatch(st.as_ref(), id, &method, &params, header_token, peer_ip).await;
     // Track the subscriptions this connection owns: they are pushed to it and
@@ -15259,5 +15655,242 @@ mod tests {
             "[perf] record_receipts 20k txs (best of 5): reference={best_reference:.2}ms batched={best_batched:.2}ms speedup={:.2}x",
             if best_batched > 0.0 { best_reference / best_batched } else { f64::INFINITY },
         );
+    }
+
+    /// WS hardening consts stay consistent with the HTTP surface they mirror.
+    /// (The positivity/ordering shape is enforced at compile time next to
+    /// the consts; this test pins the cross-surface equalities.)
+    #[test]
+    fn ws_hardening_consts_are_sane() {
+        // The WS frame cap mirrors the HTTP body cap: no transport smuggles
+        // a bigger request than the other.
+        assert_eq!(WS_MAX_MESSAGE_BYTES, MAX_RPC_BODY);
+        // The per-message general budget mirrors the standalone transport
+        // budget: same per-IP fixed-window shape, same ceiling.
+        assert_eq!(
+            WS_GENERAL_RATE_LIMIT_DEFAULT, STANDALONE_RATE_LIMIT_DEFAULT,
+            "WS general budget must stay symmetric to the standalone HTTP budget"
+        );
+    }
+
+    /// Rate-limit audit: EVERY public method maps to at least one bucket —
+    /// no unbucketed method. The list below is the full `dispatch` surface
+    /// (EVM + stell arms, both invalidation aliases) plus the whole native
+    /// namespace; if a method is added to `dispatch` without a bucket entry
+    /// here, extend BOTH the table and this list.
+    #[test]
+    fn rate_bucket_table_covers_every_public_method() {
+        const TRANSPORT_ONLY: &[&str] = &[
+            // EVM adapter surface (all sit under the transport limiter only).
+            "eth_chainId",
+            "net_version",
+            "web3_clientVersion",
+            "net_listening",
+            "net_peerCount",
+            "eth_syncing",
+            "eth_gasPrice",
+            "eth_maxPriorityFeePerGas",
+            "eth_estimateGas",
+            "eth_feeHistory",
+            "eth_getCode",
+            "eth_getBalance",
+            "eth_getTransactionCount",
+            "eth_blockNumber",
+            "eth_getBlockByNumber",
+            "eth_getBlockByHash",
+            "eth_getTransactionReceipt",
+            "eth_getTransactionByHash",
+            "eth_getBlockTransactionCountByHash",
+            "eth_getBlockTransactionCountByNumber",
+            "eth_getTransactionByBlockHashAndIndex",
+            "eth_getTransactionByBlockNumberAndIndex",
+            "eth_getUncleCountByBlockHash",
+            "eth_getUncleCountByBlockNumber",
+            "eth_getUncleByBlockHashAndIndex",
+            "eth_getUncleByBlockNumberAndIndex",
+            "eth_call",
+            "eth_newBlockFilter",
+            "eth_newPendingTransactionFilter",
+            "eth_newFilter",
+            "eth_getFilterChanges",
+            "eth_getFilterLogs",
+            "eth_uninstallFilter",
+            "eth_getLogs",
+            "eth_getStorageAt",
+            "eth_sendRawTransaction",
+            // stell reads/writes under the transport limiter only.
+            "stell_chainId",
+            "stell_nodeId",
+            "stell_blockNumber",
+            "stell_syncing",
+            "stell_getStateRoot",
+            "stell_latestBlocks",
+            "stell_getShards",
+            "stell_getShardTopology",
+            "stell_getBlock",
+            "stell_getBlockTransactions",
+            "stell_epochKey",
+            "stell_sendSealedTransaction",
+            "stell_mevStats",
+            "stell_getBalance",
+            "stell_getHistoricalRoot",
+            "stell_getFinalizedHeader",
+            "stell_getFinalizedCheckpoint",
+            "stell_getEpochRoot",
+            "stell_bridgeDeposit",
+            "stell_bridgeDispute",
+            "stell_tokenBalance",
+            "stell_tokenSupply",
+            "stell_tokenResolve",
+            "stell_listTokens",
+            "stell_getTransactionReceipt",
+            "stell_getEvents",
+            "stell_getTransactionStatus",
+            "stell_stakeOf",
+            "stell_getValidatorStatus",
+            "stell_zkmlCapabilities",
+            "stell_getValidators",
+            "stell_getPqKey",
+            "stell_getPqRegistryStatus",
+            "stell_proposal",
+            "stell_listProposals",
+            "stell_governanceParams",
+            "stell_mempoolSize",
+            "stell_baseFee",
+            "stell_verifyMessage",
+            "stell_verifyTypedData",
+            "stell_sendRawTransaction",
+            "stell_pmmState",
+            "stell_orderBook",
+            "stell_sessionBudget",
+            "stell_getContractAbi",
+            "stell_verifyContractSource",
+            "stell_getContractSource",
+            "stell_registerContractSource",
+            "stell_getContractReceipt",
+            "stell_getInvalidations",
+            "stell_invalidationFeed",
+            "stell_unsubscribe",
+            "stell_getSubscriptions",
+        ];
+        const EXPENSIVE_HTTP_AND_WS: &[&str] = &["stell_estimateFee"];
+        const EXPENSIVE_WS_EXTRA: &[&str] = &[
+            "stell_getProof",
+            "stell_getArchiveProof",
+            "stell_getBalanceSpv",
+            "stell_tokenBalanceSpv",
+            "stell_runGetMethod",
+        ];
+        const SUBSCRIPTION_CAPPED: &[&str] = &["stell_subscribe"];
+        const FAUCET_CAPPED: &[&str] = &["stell_faucet"];
+        const AUTH_GATED: &[&str] = &[
+            "stell_mempoolDump",
+            "stell_submitProposal",
+            "stell_vote",
+            "stell_executeProposal",
+            "stell_signMessage",
+            "stell_signTypedData",
+            "stell_deployContract",
+            "stell_callContract",
+            "stell_submitPriceFeed",
+            "stell_pmmBuy",
+            "stell_pmmSell",
+        ];
+        const NATIVE_NAMESPACE: &[&str] = &[
+            "stell_tokenTransfer",
+            "stell_tokenBalanceOf",
+            "stell_tokenMetadata",
+            "stell_tokenAllowance",
+            "stell_tokenMint",
+            "stell_tokenBurn",
+            "stell_tokenApprove",
+            "stell_tokenTransferFrom",
+            "stell_tokenCreate",
+            "stell_stakeBond",
+            "stell_stakeUnbond",
+            "stell_stakeWithdraw",
+            "stell_delegate",
+            "stell_undelegate",
+            "stell_claimRewards",
+            "stell_bridgeDepositPrepare",
+            "stell_bridgeWithdraw",
+            "stell_bridgeStatus",
+            "stell_bridgeAttestStatus",
+            "stell_bridgeReleaseEstimate",
+            "stell_bridgeDeposits",
+            "stell_orderBookPlace",
+            "stell_orderBookCancel",
+            "stell_orderBookSnapshot",
+            "stell_placeOrder",
+            "stell_cancelOrder",
+            "stell_sessionKeyRegister",
+            "stell_sessionKeyRevoke",
+            "stell_sessionKeys",
+            "stell_oraclePrice",
+            "stell_oracleFeeds",
+            "stell_shieldedTransfer",
+            "stell_shieldedBalance",
+            "stell_unshield",
+            "stell_nativeApi",
+        ];
+        // Every native method the dispatcher knows must be transport-bucketed.
+        for m in crate::native_api::METHODS {
+            assert!(
+                NATIVE_NAMESPACE.contains(&m.name),
+                "native method `{}` missing from the audit list",
+                m.name
+            );
+            assert!(
+                crate::native_api::is_native_method(m.name),
+                "audit list entry `{}` is not a native method",
+                m.name
+            );
+        }
+        let mut all: Vec<&str> = Vec::new();
+        all.extend_from_slice(TRANSPORT_ONLY);
+        all.extend_from_slice(EXPENSIVE_HTTP_AND_WS);
+        all.extend_from_slice(EXPENSIVE_WS_EXTRA);
+        all.extend_from_slice(SUBSCRIPTION_CAPPED);
+        all.extend_from_slice(FAUCET_CAPPED);
+        all.extend_from_slice(AUTH_GATED);
+        all.extend_from_slice(NATIVE_NAMESPACE);
+        // No method listed twice under two categories (the bucket SETS may
+        // overlap, but each method has exactly one audit row).
+        let mut seen = std::collections::HashSet::new();
+        for m in &all {
+            assert!(seen.insert(*m), "method `{m}` listed in two audit rows");
+        }
+        // The table covers 143 public methods; a dispatch arm added without
+        // updating the table keeps this count stale on purpose — bump it.
+        assert_eq!(all.len(), 143, "audit list size drifted: recount dispatch");
+        for m in &all {
+            let buckets = rpc_rate_buckets(m);
+            assert!(
+                !buckets.is_empty(),
+                "public method `{m}` has no rate-limit bucket"
+            );
+            assert!(
+                buckets.contains(&"transport"),
+                "public method `{m}` must sit under the transport limiter"
+            );
+            for b in buckets {
+                assert!(
+                    ["transport", "expensive", "expensive-ws", "subscription", "faucet", "auth"]
+                        .contains(b),
+                    "method `{m}` names an unknown bucket `{b}`"
+                );
+            }
+        }
+        // Spot-check the special rows (the table is not just "transport").
+        assert!(rpc_rate_buckets("stell_estimateFee").contains(&"expensive"));
+        assert!(rpc_rate_buckets("stell_getProof").contains(&"expensive-ws"));
+        assert!(!rpc_rate_buckets("stell_getProof").contains(&"expensive"));
+        assert!(rpc_rate_buckets("stell_subscribe").contains(&"subscription"));
+        assert!(rpc_rate_buckets("stell_faucet").contains(&"faucet"));
+        assert!(rpc_rate_buckets("stell_mempoolDump").contains(&"auth"));
+        assert!(!rpc_rate_buckets("stell_getBalance").contains(&"auth"));
+        // Unknown methods map to nothing (the `-32601` arm has no bucket).
+        assert!(rpc_rate_buckets("stell_nopeNotReal").is_empty());
+        assert!(rpc_rate_buckets("").is_empty());
     }
 }

@@ -1,6 +1,7 @@
-//! P0 PoC: STS-20 `burn`/`mint` authorize via a caller-supplied `admin_id`.
-//! Anyone who knows the public admin id (1) can burn admin funds.
-//! Invariant: forged burn must fail and leave balances intact. FAILS today.
+//! P0 PoC (fixed by CT-P0 auth, kept as regression pin): STS-20 `burn`/`mint`
+//! used to authorize via a caller-supplied `admin_id`.
+//! Anyone who knows the public admin id (1) could burn admin funds.
+//! Invariant: forged burn must fail and leave balances intact.
 
 use sts20_token::{balance_of, burn, init};
 use stellereum_contract_sdk::reset_mock_state;

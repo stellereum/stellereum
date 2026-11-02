@@ -1,6 +1,7 @@
-//! P0 PoC: STL-DNS `transfer`/`set_target` trust a caller-supplied `caller_id`.
-//! The owner id is public (via resolve), so anyone can forge it and steal.
-//! Invariant: transfer forged with the owner's public id must fail. FAILS today.
+//! P0 PoC (fixed by CT-P0 auth, kept as regression pin): STL-DNS
+//! `transfer`/`set_target` used to trust a caller-supplied `caller_id`.
+//! The owner id is public (via resolve), so anyone could forge it and steal.
+//! Invariant: transfer forged with the owner's public id must fail.
 
 use stl_dns::{finalize_auction, init, resolve, start_auction, transfer};
 use stellereum_contract_sdk::reset_mock_state;

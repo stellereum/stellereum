@@ -36,11 +36,20 @@
 //!
 //! The validator set is the entire trust anchor: if the set is wrong, or a
 //! quorum of it is Byzantine, everything this client concludes is wrong — and
-//! it concludes it confidently. There is no validator-set rotation story
-//! here (see `crate::light_client`'s module docs).
+//! it concludes it confidently. Validator-set rotation IS supported, but only
+//! through [`crate::light_client::ValidatorSetRotation`] enforced by
+//! [`LightClient::rotate_validator_set`]: the rotation header must chain
+//! normally onto the tip and carry a precommit quorum from the CURRENT set, so
+//! a supermajority of OLD power signs the rotation point (see
+//! `crate::light_client`'s module docs and `docs/LIGHT_CLIENT_VERIFY.md` §3).
+//! The offline CLI exposes it via `light-anchor` (show), `light-verify`
+//! (check a header/checkpoint file against the anchor) and `light-rotate`
+//! (install a rotation proof file). The replacement set's CONTENTS are pinned
+//! out-of-band exactly like the genesis set — never taken from the server.
 
 use crate::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, VoteKind};
-use crate::light_client::{Checkpoint, LightClient, LightError, ProofAnswer};
+use crate::light_client::{Checkpoint, LightAnchor, LightClient, LightError, ProofAnswer};
+use crate::light_client::{LightHeader, ValidatorSetRotation};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -86,46 +95,23 @@ fn parse_hex32(s: &str) -> anyhow::Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("expected 32 bytes, got {}", s.len() / 2))
 }
 
-/// Load the OUT-OF-BAND validator set.
+/// Parse a validator set from an already-parsed JSON value.
 ///
-/// Accepted shapes (all hex pubkeys, power as a number or a decimal string):
-///
-/// ```json
-/// {"validators": [{"validator": "<64 hex>", "power": "1000"}, ...]}
-/// [["<64 hex>", 1000], ...]
-/// [{"validator": "<64 hex>", "power": 1000}, ...]
-/// ```
-///
-/// The first shape is exactly what `stell_getValidators` serves, so an
-/// operator can dump it ONCE and pin the file. Pinning matters: a set taken
-/// from the server at verification time is circular — the server would be
-/// able to certify its own chain.
-pub fn load_validator_set(path: &Path) -> anyhow::Result<ValidatorSet> {
-    let raw = std::fs::read_to_string(path).map_err(|e| {
-        anyhow::anyhow!("cannot read the validator set file {}: {e}", path.display())
-    })?;
-    let v: Value = serde_json::from_str(&raw).map_err(|e| {
-        anyhow::anyhow!(
-            "the validator set file {} is not valid JSON: {e}",
-            path.display()
-        )
-    })?;
+/// Accepts the same shapes as [`load_validator_set`]; `ctx` names the file
+/// (or embedded section) for fail-closed errors.
+pub fn validator_set_from_value(v: &Value, ctx: &str) -> anyhow::Result<ValidatorSet> {
     let entries: Vec<Value> = match &v {
         Value::Object(map) => map
             .get("validators")
             .and_then(|x| x.as_array())
             .cloned()
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "the validator set file {} has no \"validators\" array",
-                    path.display()
-                )
+                anyhow::anyhow!("the validator set {ctx} has no \"validators\" array")
             })?,
         Value::Array(a) => a.clone(),
         _ => {
             return Err(anyhow::anyhow!(
-                "the validator set file {} must be an object or an array",
-                path.display()
+                "the validator set {ctx} must be an object or an array"
             ))
         }
     };
@@ -171,12 +157,38 @@ pub fn load_validator_set(path: &Path) -> anyhow::Result<ValidatorSet> {
     }
     if set.is_empty() {
         anyhow::bail!(
-            "the validator set file {} holds NO validator: no quorum certificate can ever \
-             be verified against it",
-            path.display()
+            "the validator set {ctx} holds NO validator: no quorum certificate can ever \
+             be verified against it"
         );
     }
     Ok(set)
+}
+
+/// Load the OUT-OF-BAND validator set.
+///
+/// Accepted shapes (all hex pubkeys, power as a number or a decimal string):
+///
+/// ```json
+/// {"validators": [{"validator": "<64 hex>", "power": "1000"}, ...]}
+/// [["<64 hex>", 1000], ...]
+/// [{"validator": "<64 hex>", "power": 1000}, ...]
+/// ```
+///
+/// The first shape is exactly what `stell_getValidators` serves, so an
+/// operator can dump it ONCE and pin the file. Pinning matters: a set taken
+/// from the server at verification time is circular — the server would be
+/// able to certify its own chain.
+pub fn load_validator_set(path: &Path) -> anyhow::Result<ValidatorSet> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        anyhow::anyhow!("cannot read the validator set file {}: {e}", path.display())
+    })?;
+    let v: Value = serde_json::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!(
+            "the validator set file {} is not valid JSON: {e}",
+            path.display()
+        )
+    })?;
+    validator_set_from_value(&v, &format!("file {}", path.display()))
 }
 
 /// The header the node served, as the light client needs it.
@@ -415,4 +427,193 @@ pub fn run(opts: &LightClientOptions) -> anyhow::Result<()> {
             anyhow::bail!("light client: REFUSED — {detail}")
         }
     }
+}
+
+// ============================================================================
+// Offline anchor / verify / rotate (light-client 8.0, docs/LIGHT_CLIENT_VERIFY.md)
+// ============================================================================
+
+/// Deterministic digest of the validator set: blake3 over the sorted
+/// `(validator_id, power)` entries. What `light-anchor` prints as `set hash`.
+pub fn validator_set_digest(set: &ValidatorSet) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("STELL_LIGHT_SET_V1");
+    for (id, power) in set.validators.iter() {
+        h.update(id);
+        h.update(&power.to_le_bytes());
+    }
+    *h.finalize().as_bytes()
+}
+
+/// Load a quorum-certified checkpoint from a JSON file.
+///
+/// The file holds a [`Checkpoint`] in serde JSON form (as served by
+/// `stell_getFinalizedCheckpoint`). Fail-closed: unreadable or malformed
+/// files are refused here, never defaulted.
+pub fn load_checkpoint_file(path: &Path) -> anyhow::Result<Checkpoint> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("cannot read checkpoint file {}: {e}", path.display()))?;
+    serde_json::from_str::<Checkpoint>(&raw)
+        .map_err(|e| anyhow::anyhow!("checkpoint file {} is not a Checkpoint: {e}", path.display()))
+}
+
+/// Load a finalized header from a JSON file.
+///
+/// The file holds a [`LightHeader`] in serde JSON form (as served by
+/// `stell_getFinalizedHeader`). Fail-closed like [`load_checkpoint_file`].
+pub fn load_light_header_file(path: &Path) -> anyhow::Result<LightHeader> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("cannot read header file {}: {e}", path.display()))?;
+    serde_json::from_str::<LightHeader>(&raw)
+        .map_err(|e| anyhow::anyhow!("header file {} is not a LightHeader: {e}", path.display()))
+}
+
+/// Load a rotation proof from a JSON file.
+///
+/// The file holds `{"rotation": <LightHeader>, "next_set": <validator set>}`
+/// where the set uses the same out-of-band shapes as [`load_validator_set`]
+/// (`"next_validators"` is accepted as an alias for `"next_set"`). The
+/// supermajority-of-old-set rule itself is enforced by
+/// [`LightClient::rotate_validator_set`] — this only parses, never judges.
+///
+/// A bare [`ValidatorSetRotation`] serde blob is NOT accepted on purpose:
+/// [`ValidatorSet`] serializes its map with non-string keys, which JSON
+/// cannot round-trip, so the pinned file shape is the only stable form.
+pub fn load_rotation_proof_file(path: &Path) -> anyhow::Result<ValidatorSetRotation> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        anyhow::anyhow!("cannot read rotation proof file {}: {e}", path.display())
+    })?;
+    let v: Value = serde_json::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!(
+            "rotation proof file {} is not valid JSON: {e}",
+            path.display()
+        )
+    })?;
+    let rotation_value = v.get("rotation").ok_or_else(|| {
+        anyhow::anyhow!(
+            "rotation proof file {} has no \"rotation\" header",
+            path.display()
+        )
+    })?;
+    let rotation: LightHeader = serde_json::from_value(rotation_value.clone()).map_err(|e| {
+        anyhow::anyhow!(
+            "rotation proof file {} has a bad rotation header: {e}",
+            path.display()
+        )
+    })?;
+    let next_value = v
+        .get("next_set")
+        .or_else(|| v.get("next_validators"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "rotation proof file {} has no \"next_set\" validator set",
+                path.display()
+            )
+        })?;
+    let next_set = validator_set_from_value(
+        next_value,
+        &format!("rotation proof file {}", path.display()),
+    )?;
+    Ok(ValidatorSetRotation::new(rotation, next_set))
+}
+
+/// Show the current anchor: `(set hash, height)` plus the quorum numbers.
+///
+/// Loads the out-of-band set and the checkpoint, then constructs a
+/// [`LightClient`] — which re-verifies the checkpoint's precommit QC under
+/// the set — so a bad anchor fails closed here instead of printing.
+pub fn anchor_show(validators_path: &Path, checkpoint_path: &Path) -> anyhow::Result<String> {
+    let set = load_validator_set(validators_path)?;
+    let checkpoint = load_checkpoint_file(checkpoint_path)?;
+    let client = LightClient::new(set.clone(), checkpoint.clone()).map_err(|e| {
+        anyhow::anyhow!("the anchor was REFUSED by the light client: {e}")
+    })?;
+    let anchor = match client.anchor() {
+        LightAnchor::Checkpoint(cp) => cp,
+        LightAnchor::Genesis(_) => {
+            return Err(anyhow::anyhow!("unexpected genesis anchor"));
+        }
+    };
+    Ok(format!(
+        "anchor height: {}\nanchor block: {}\nanchor root: {}\nset hash: {}\nvalidators: {}\ntotal power: {}\nquorum: {}\nset height: {}",
+        anchor.height,
+        hex::encode(anchor.block_hash),
+        hex::encode(anchor.state_root),
+        hex::encode(validator_set_digest(&set)),
+        set.len(),
+        set.total_power(),
+        set.quorum_power(),
+        client.validator_set_height(),
+    ))
+}
+
+/// Verify a header/checkpoint file against the anchor.
+///
+/// The file may hold a [`LightHeader`] (accepted via
+/// [`LightClient::apply_header` on top of the tip) or a [`Checkpoint`]
+/// (adopted via [`LightClient::advance_to_checkpoint`]. Both paths verify a
+/// precommit quorum under the set in force and refuse gaps, forks,
+/// rollbacks and sub-quorum evidence fail-closed.
+pub fn verify_header_file(
+    validators_path: &Path,
+    checkpoint_path: &Path,
+    header_path: &Path,
+) -> anyhow::Result<String> {
+    let set = load_validator_set(validators_path)?;
+    let checkpoint = load_checkpoint_file(checkpoint_path)?;
+    let mut client =
+        LightClient::new(set, checkpoint).map_err(|e| anyhow::anyhow!("bad anchor: {e}"))?;
+    let tip_before = client.tip_height();
+    if let Ok(header) = load_light_header_file(header_path) {
+        let h = header.height;
+        let hash = hex::encode(header.block_hash);
+        client
+            .apply_header(header)
+            .map_err(|e| anyhow::anyhow!("header at height {h} REFUSED: {e}"))?;
+        return Ok(format!(
+            "verified header at height {h} ({hash}) on top of tip {tip_before}"
+        ));
+    }
+    let cp = load_checkpoint_file(header_path).map_err(|e| {
+        anyhow::anyhow!(
+            "header file {} is neither a LightHeader nor a Checkpoint: {e}",
+            header_path.display()
+        )
+    })?;
+    let h = cp.height;
+    let hash = hex::encode(cp.block_hash);
+    client
+        .advance_to_checkpoint(cp)
+        .map_err(|e| anyhow::anyhow!("checkpoint at height {h} REFUSED: {e}"))?;
+    Ok(format!(
+        "verified checkpoint at height {h} ({hash}) over tip {tip_before}"
+    ))
+}
+
+/// Rotate the anchor with a rotation proof file.
+///
+/// Loads the anchor, then installs the proof via
+/// [`LightClient::rotate_validator_set`] — the supermajority-of-old-set rule,
+/// the chaining/shape gate and the powerless-set refusal all live there and
+/// are NOT reimplemented here. The replacement set's contents remain the
+/// caller's out-of-band responsibility (see [`ValidatorSetRotation`]).
+pub fn rotate_anchor(
+    validators_path: &Path,
+    checkpoint_path: &Path,
+    rotation_path: &Path,
+) -> anyhow::Result<String> {
+    let set = load_validator_set(validators_path)?;
+    let checkpoint = load_checkpoint_file(checkpoint_path)?;
+    let mut client =
+        LightClient::new(set, checkpoint).map_err(|e| anyhow::anyhow!("bad anchor: {e}"))?;
+    let proof = load_rotation_proof_file(rotation_path)?;
+    let h = proof.rotation.height;
+    let hash = hex::encode(proof.rotation.block_hash);
+    client
+        .rotate_validator_set(proof)
+        .map_err(|e| anyhow::anyhow!("rotation at height {h} REFUSED: {e}"))?;
+    Ok(format!(
+        "rotated to height {h} ({hash}); set height: {}; validators: {}",
+        client.validator_set_height(),
+        client.validators.len(),
+    ))
 }

@@ -6767,6 +6767,53 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         verbose: bool,
     },
+    /// Show the light-client anchor (set hash, height) from OFFLINE files.
+    ///
+    /// Loads the out-of-band validator set and the checkpoint and re-verifies
+    /// the checkpoint's precommit quorum under the set. Fail-closed: a bad
+    /// anchor is refused instead of printed.
+    LightAnchor {
+        /// OUT-OF-BAND validator set (JSON). REQUIRED — the trust anchor.
+        #[arg(long)]
+        validators: PathBuf,
+        /// Quorum-certified checkpoint (JSON, as served by
+        /// `stell_getFinalizedCheckpoint`).
+        #[arg(long)]
+        checkpoint: PathBuf,
+    },
+    /// Verify a header/checkpoint file against the OFFLINE anchor.
+    ///
+    /// The header file may hold a LightHeader (checked as the tip's successor)
+    /// or a Checkpoint (adopted as a newer anchor). Both paths enforce the
+    /// precommit-quorum rule under the set in force. Fail-closed on bad proof,
+    /// wrong tip or stale set.
+    LightVerify {
+        /// OUT-OF-BAND validator set (JSON). REQUIRED — the trust anchor.
+        #[arg(long)]
+        validators: PathBuf,
+        /// Quorum-certified checkpoint (JSON) the client is anchored on.
+        #[arg(long)]
+        checkpoint: PathBuf,
+        /// Header or checkpoint file (JSON) to verify against the anchor.
+        #[arg(long)]
+        header: PathBuf,
+    },
+    /// Rotate the OFFLINE anchor with a rotation proof file.
+    ///
+    /// The proof file holds a ValidatorSetRotation (`rotation` header plus
+    /// `next_set`). The supermajority-of-old-set rule is enforced by
+    /// `LightClient::rotate_validator_set` — the CLI only parses, never judges.
+    LightRotate {
+        /// OUT-OF-BAND validator set (JSON). REQUIRED — the current anchor set.
+        #[arg(long)]
+        validators: PathBuf,
+        /// Quorum-certified checkpoint (JSON) the client is anchored on.
+        #[arg(long)]
+        checkpoint: PathBuf,
+        /// Rotation proof file (JSON): the successor header plus the next set.
+        #[arg(long)]
+        rotation: PathBuf,
+    },
     /// Network discovery and connectivity guide
     Network,
     /// Node identity keys for validator/observer onboarding (one-command join).
@@ -9831,6 +9878,32 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 verbose,
             };
             stellereum::light_client_cli::run(&opts)?;
+        }
+        Commands::LightAnchor {
+            validators,
+            checkpoint,
+        } => {
+            let report =
+                stellereum::light_client_cli::anchor_show(&validators, &checkpoint)?;
+            println!("{report}");
+        }
+        Commands::LightVerify {
+            validators,
+            checkpoint,
+            header,
+        } => {
+            let report =
+                stellereum::light_client_cli::verify_header_file(&validators, &checkpoint, &header)?;
+            println!("{report}");
+        }
+        Commands::LightRotate {
+            validators,
+            checkpoint,
+            rotation,
+        } => {
+            let report =
+                stellereum::light_client_cli::rotate_anchor(&validators, &checkpoint, &rotation)?;
+            println!("{report}");
         }
         Commands::Network => {
             println!("╔═══════════════════════════════════════════════════════════════╗");

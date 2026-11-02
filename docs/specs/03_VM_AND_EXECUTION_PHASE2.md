@@ -11,12 +11,16 @@ Sources: `stellereum/src/contract.rs`, `svm.rs`, `evm_adapter.rs`,
   place 1200 (`:41`), zkML-verify 5000 (`:42`), patricia lookup 50 (`:43`);
   session-grant publish 1500 (`:113`).
 - Contract caps: 2 MiB code (`contract.rs:45`), 8 call args (`:50`), 50M fuel
-  (`:53`); 13 `linker.func_wrap("host", …)` registrations (first at `:1193`,
-  13 sites by grep count — full name list UNVERIFIED this pass).
+  (`:53`); 13 `linker.func_wrap("host", …)` registrations
+  (`contract.rs:1193-1413`): `sload` `:1193`, `sstore` `:1201`, `emit` `:1220`,
+  `caller` `:1241`, `value` `:1251`, `block_time` `:1259`, `block_hash` `:1267`,
+  `calldata` `:1277`, `sha256` `:1296`, `blake3` `:1321`,
+  `ed25519_verify` `:1346`, `return_data` `:1390`, `send_message` `:1412`.
 - EVM adapter: `CHAIN_ID 5757` (`evm_adapter.rs:51`, hex `0x167d` `:81`);
   serves dynamic `effective_chain_id` (`:57-58` → `zkml.rs:234-235`).
-  Gas-model/EIP-1559 mirroring detail UNVERIFIED (fee-history surface noted in
-  module docs, not re-read line-by-line).
+  Gas-model/EIP-1559: NO base-fee engine behind the adapter — static defaults
+  `BASE_FEE_HEX`/`DEFAULT_BASE_FEE` (`evm_adapter.rs:115-123`); `eth_feeHistory`
+  surface at `:328-368` (typed `:329-340`, direct helper `:350-368`).
 
 ## 2. Apply order
 
@@ -25,9 +29,10 @@ Sources: `stellereum/src/contract.rs`, `svm.rs`, `evm_adapter.rs`,
   decided-block path `:6123` (`apply_decided`); equivocation slashes `:2188`,
   downtime slashes `:5983`.
 - Documented order inside transition: fees/rewards → unbonding → downtime slash
-  (comment `runtime.rs:6737`); exact interleaving with tx execution is code at
-  `:6562,:6863-6899` — linear claim "fees first, then txs" UNVERIFIED; readers
-  must read `:6872-6899`.
+  (comment `runtime.rs:6737`); exact interleave: txs → actor mailbox → fees →
+  reward → unbonding → downtime slash (`state_engine.rs:6437`, transition fn
+  `:6480`, runtime wrapper `:6872-6899`, order restated `:6898`) — the linear
+  "fees first, then txs" phrasing is corrected (txs run first).
 - Failure-fee (F-01): `failure_fee_state` (`state_engine.rs:1153`), mirrors at
   `:862,:1132-1220,:1314-1322`; invariant: failed txs still debit floor-or-0.
 
@@ -42,18 +47,24 @@ Sources: `stellereum/src/contract.rs`, `svm.rs`, `evm_adapter.rs`,
   unbound-activation gate from committed height (`:1810-1828`,
   `consensus_chain_id()` `:1823`).
 - Replay: refused cheap pre-crypto (comment `:1817-1818`); nonce mechanics live
-  in `failure_fee_state`/sender-nonce paths (`state_engine.rs:1153+`) — a single
-  `NONCE_WINDOW` const UNVERIFIED (name not found; window behavior = the
-  `MAX_*_NONCES_PER_ACCOUNT` caps above).
+  in `failure_fee_state`/sender-nonce paths (`state_engine.rs:1153+`) — no
+  `NONCE_WINDOW` const exists in tree (grep zero hits); window behavior = the
+  `MAX_*_NONCES_PER_ACCOUNT` caps above (`mempool.rs:20,45`).
 - Fee gate: priority ordering + wire/proof-unit caps before crypto (`mempool.rs:1861-1869`);
   pure-PQ scheme gate (`:1844-1859`).
 
 ## 4. Faucet / paymaster-sponsor / sessions (one-liners)
 
-- Faucet: genesis/dev funding path (`runtime.rs:179`, `:3588`); no standalone
-  `faucet()` const located — amounts/mechanics UNVERIFIED.
+- Faucet: `Faucet` drip `STELL_FAUCET_DRIP_STELL`, default 10 STELL
+  (`rpc.rs:274-275`, default `default_drip_nano` `:693-700`); public drip
+  `PUBLIC_DRIP_NANO` 5 STELL (`:599-602`) + 45-min cooldown
+  `PUBLIC_DRIP_COOLDOWN_SECS` (`:604-607`); genesis funding (`runtime.rs:179`),
+  test funding (`:3588`).
 - Paymaster/sponsor: rejection census tracks `rej_sponsor` (`runtime.rs:892`);
-  policy detail UNVERIFIED (no `PAYMASTER` const located in `svm.rs` this pass).
+  policy = `check_sponsor_policy` (`sharding.rs:3892-3916`: 64 B ed25519 inner,
+  expiry, allowed-targets, max-fee cap); sponsored path
+  `runtime.rs:2694-2697,2787-2819` (no `PAYMASTER` const in `svm.rs` — policy
+  lives in `sharding.rs`, accounting in `runtime.rs`).
 - Sessions: `GAS_PUBLISH_SESSION_GRANT 1500` (`svm.rs:113`); domain
   `STELL_SESSKEY_V1` (`zkml.rs:209`); native API `stell_sessionKeyRegister`
   + `stell_sessionBudget` (`native_api.rs:329-333`, `native_api.rs:9`).

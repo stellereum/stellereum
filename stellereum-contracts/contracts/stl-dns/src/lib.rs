@@ -270,6 +270,12 @@ pub extern "C" fn set_target(packed_arg: i64) -> i64 {
     let caller_id = rem1 / 100_000;
     let new_target = rem1 % 100_000;
 
+    // Audit 6.0->8.0: explicit domain guard (defense in depth — the packed>0
+    // gate already forces domain_id >= 0, but a zero/negative domain must
+    // never reach storage math).
+    if domain_id <= 0 {
+        return ERR_INVALID_ARGUMENT;
+    }
     let base = domain_base(domain_id);
     if is_system_burn(domain_id) || sload(base + 3) == 1 {
         return ERR_UNAUTHORIZED;
@@ -311,6 +317,13 @@ pub extern "C" fn transfer(packed_arg: i64) -> i64 {
     let caller_id = rem1 / 100_000;
     let new_owner = rem1 % 100_000;
 
+    // Audit 6.0->8.0: explicit domain guard (see set_target) plus a
+    // fail-closed floor on the new owner. Owner 0 is the black hole: no
+    // caller ever authenticates as id 0 (caller_is(0) is false), so a
+    // zero-owner transfer would lock the domain forever with no recovery.
+    if domain_id <= 0 || new_owner <= 0 {
+        return ERR_INVALID_ARGUMENT;
+    }
     let base = domain_base(domain_id);
 
     // System burn domains can never be transferred

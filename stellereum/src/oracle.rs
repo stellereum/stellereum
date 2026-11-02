@@ -149,6 +149,13 @@ impl PriceFeedUpdate {
     }
 
     pub fn verify(&self) -> bool {
+        // P2-8 pure-PQ gate (fail-closed): classical ed25519 feed signatures
+        // are refused under enforcement. Callers (`commit_feed`, pull-oracle
+        // read path) already map `false` to refuse/fallback, so gating here
+        // covers both with no behavior change when not enforced.
+        if crate::post_quantum::is_pure_pq_enforced() {
+            return false;
+        }
         let Ok(vk) = VerifyingKey::from_bytes(&self.publisher_pubkey) else {
             return false;
         };
@@ -663,5 +670,70 @@ impl OracleSafetyEngine {
         }
 
         Ok(price)
+    }
+}
+
+#[cfg(test)]
+mod pq_gate_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    struct PurePqGuard;
+    impl PurePqGuard {
+        fn enforce() -> Self {
+            crate::post_quantum::set_pure_pq_override(Some(true));
+            Self
+        }
+    }
+    impl Drop for PurePqGuard {
+        fn drop(&mut self) {
+            crate::post_quantum::set_pure_pq_override(None);
+        }
+    }
+
+    fn signed_feed() -> (PriceFeedUpdate, OracleState) {
+        let sk = SigningKey::from_bytes(&[0x31u8; 32]);
+        let feed = PriceFeedUpdate::sign("STELL", 250_000, 1_000, &sk);
+        let mut state = OracleState::default();
+        state.publishers.insert(sk.verifying_key().to_bytes());
+        (feed, state)
+    }
+
+    /// P2-8 pure-PQ gate: a VALID ed25519 feed verifies/commits with
+    /// enforcement off but `verify()` is false and `commit_feed` errs with
+    /// enforcement on. Guard reset proves mid-suite flag-flip isolation.
+    #[test]
+    fn pure_pq_refuses_classical_feed() {
+        let (feed, mut state) = signed_feed();
+
+        // Baseline (off): valid ed feed verifies and commits.
+        assert!(feed.verify(), "valid ed feed must verify when pure-PQ is off");
+        assert!(
+            state.commit_feed(&feed, 1_001).is_ok(),
+            "valid ed feed must commit when pure-PQ is off"
+        );
+
+        // Enforced: the SAME valid feed is refused fail-closed.
+        {
+            let _guard = PurePqGuard::enforce();
+            assert!(
+                !feed.verify(),
+                "valid ed feed must NOT verify under pure-PQ"
+            );
+            let mut enforced_state = OracleState::default();
+            enforced_state
+                .publishers
+                .insert(feed.publisher_pubkey);
+            assert!(
+                enforced_state.commit_feed(&feed, 1_001).is_err(),
+                "ed feed must not commit under pure-PQ"
+            );
+        }
+
+        // Boundary: after guard drop we are back off.
+        assert!(
+            feed.verify(),
+            "post-guard behavior must be off again"
+        );
     }
 }

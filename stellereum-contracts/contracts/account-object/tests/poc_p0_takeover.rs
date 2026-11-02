@@ -1,6 +1,7 @@
-//! P0 PoC: account-object ownership is a caller-supplied `caller_id`.
-//! `get_owner` is public, so anyone can replay it and seize the account.
-//! Invariant: takeover forged with public owner id must fail. FAILS today.
+//! P0 PoC (fixed by CT-P0 auth, kept as regression pin): account-object
+//! ownership used to be a caller-supplied `caller_id`.
+//! `get_owner` is public, so anyone could replay it and seize the account.
+//! Invariant: takeover forged with public owner id must fail.
 
 use account_object::{get_owner, init, transfer_ownership};
 use stellereum_contract_sdk::reset_mock_state;

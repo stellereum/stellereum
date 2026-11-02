@@ -1575,10 +1575,11 @@ impl ConsensusCluster {
                         // Newest sighting per peer (monotonic per voter — a
                         // delayed old vote never rewinds it, mirroring
                         // production `note_peer_round`).
-                        let entry = m
-                            .sim_sightings
-                            .entry(vote.voter)
-                            .or_insert((height, vote.round, self.now_ms));
+                        let entry = m.sim_sightings.entry(vote.voter).or_insert((
+                            height,
+                            vote.round,
+                            self.now_ms,
+                        ));
                         if (height, vote.round) > (entry.0, entry.1) {
                             *entry = (height, vote.round, self.now_ms);
                         } else if (height, vote.round) == (entry.0, entry.1) {
@@ -1910,12 +1911,10 @@ impl ConsensusCluster {
             // an adopted height did their job by definition). Everything else
             // never belonged to any quorum: the stall, counted vote by vote.
             let deciding: HashMap<Height, Round> = m.decide_abs.iter().copied().collect();
-            let finalized_h: HashSet<Height> =
-                m.rt.finalized.iter().map(|(h, _)| *h).collect();
+            let finalized_h: HashSet<Height> = m.rt.finalized.iter().map(|(h, _)| *h).collect();
             let mut vote_wasted = 0u64;
             for ((h, r), c) in &m.arrivals_by_bucket {
-                let useful =
-                    finalized_h.contains(h) && deciding.get(h).is_none_or(|cr| cr == r);
+                let useful = finalized_h.contains(h) && deciding.get(h).is_none_or(|cr| cr == r);
                 if !useful {
                     vote_wasted += c;
                 }

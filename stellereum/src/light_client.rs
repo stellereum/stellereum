@@ -579,6 +579,14 @@ impl LightHeader {
     /// finality proof, and the two layers are independent rather than additive.
     /// A non-empty list that fails is refused, because a header carrying
     /// signatures which do not add up is a header making a claim it cannot back.
+    ///
+    /// GATE-FIRST P2-16 (pure-PQ fail-closed): when
+    /// [`crate::post_quantum::is_pure_pq_enforced`] is on, only power
+    /// attested by a REGISTERED post-quantum key (verified via
+    /// `verify_pq_signature` against the block hash) counts — classical-only
+    /// quorums are refused. With enforcement off the ed path below runs
+    /// exactly as before (dual-read: a registered PQ signature also counts,
+    /// mirroring the tx-verifier precedent in `sharding.rs`).
     pub fn verify_validator_quorum(&self, validators: &ValidatorSet) -> Result<(), String> {
         if self.signatures.is_empty() {
             return Ok(());
@@ -587,6 +595,7 @@ impl LightHeader {
         if required == u64::MAX {
             return Err("validator set has no power; refusing to count signatures".to_string());
         }
+        let pure_pq = crate::post_quantum::is_pure_pq_enforced();
         let mut seen: HashSet<ValidatorId> = HashSet::new();
         let mut members = 0usize;
         let mut power = 0u64;
@@ -597,6 +606,24 @@ impl LightHeader {
             let vp = validators.power_of(pubkey);
             if vp == 0 {
                 continue; // membership first: a valid signature is not evidence
+            }
+            if let Some((scheme, pk)) = crate::consensus::get_validator_pq_key(pubkey) {
+                if pure_pq && (!scheme.is_post_quantum() || scheme.is_disabled()) {
+                    continue; // classical/disabled registration lends no power in pure-PQ
+                }
+                if crate::post_quantum::verify_pq_signature(scheme, &pk, &self.block_hash, sig_bytes)
+                {
+                    members += 1;
+                    power = power.saturating_add(vp);
+                    continue;
+                }
+                if pure_pq {
+                    continue; // registered key but bad PQ signature: no ed fallthrough in pure-PQ
+                }
+                // Not enforced: fall through to the classical check below so a
+                // validator mid-rotation still counts its ed attestation.
+            } else if pure_pq {
+                continue; // no registered PQ key: classical attestation refused in pure-PQ
             }
             if let Ok(vk) = VerifyingKey::from_bytes(pubkey) {
                 if let Ok(sig) = Signature::from_slice(sig_bytes) {

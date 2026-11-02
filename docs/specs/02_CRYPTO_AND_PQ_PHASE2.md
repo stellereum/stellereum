@@ -15,8 +15,9 @@ Pointers: `docs/CLASSICAL_INVENTORY.md:1`, `docs/PQ_CN_VRF_SPEC.md:1`.
   `use pqcrypto_falcon as _` (`:23`), dep `pqcrypto-falcon 0.4.1`
   (`stellereum/Cargo.toml:55`).
 - Verify-only posture: node links the Falcon C archive for verify; keygen/signer
-  code present in-module (`:1190-1222` header) — operator key tooling path
-  UNVERIFIED this pass (no claim made about absence of signing in binaries).
+  code present in-module (`:1190-1222` header — FIPS-206 `ffSampling` signer,
+  C entry points for caller-seeded randomness; operator key tooling = this
+  in-module signer, linked archive via `use pqcrypto_falcon as _` `:23`).
 - CN-VRF re-pins the same sizes: `pk == 897`, `pi == 666` (`cn_vrf.rs:67-69`).
 
 ## 2. Pure-PQ enforcement points
@@ -40,22 +41,28 @@ Pointers: `docs/CLASSICAL_INVENTORY.md:1`, `docs/PQ_CN_VRF_SPEC.md:1`.
   secp256k1, X25519, P-256, BLS12-381, RSA/DSA/DH). Tree deps confirm classical
   crates: `ed25519-dalek` + `x25519-dalek` (`stellereum/Cargo.toml:13-14`),
   `bls12_381 0.9` (`:41`), `argon2 0.5` (`:46`); infnode workspace also carries
-  ed25519/x25519 (inventory `:17-19`; line refs inside inventory UNVERIFIED here).
-- No PQ KEM in tree per inventory (`:21`); PQ sigs present. KEM absence
-  UNVERIFIED by independent grep this pass — trusted via inventory pointer.
+  ed25519/x25519 (confirmed `infnode/Cargo.toml:17,40`,
+  `infnode/crates/infnode/Cargo.toml:14,32`; inventory `:17-19`).
+- No PQ KEM op in tree: `Cargo.lock` carries no `ml-kem`/`mlkem`/`kyber` package
+  (verdict `pq_transport.rs:60-70`); only ML-KEM-768 framing consts in parked
+  `mev_v4.rs:84-112` (dead engine, `STELL_MEV_V4` default-off) + an
+  explicitly-unavailable rank-1 KEM entry (`pq_transport.rs:391-396`, test-pinned
+  `:639-641`); PQ sigs present. Inventory `:21` corroborates.
 
 ## 4. Classical markers (do not present as PQ)
 
 - BLS: `PUBLIC_KEY_LEN 48` (`bls.rs:72`), `SIGNATURE_LEN 96` (`:74`),
   `BLS_IS_POST_QUANTUM = false` (`:80`), activation-gated
   `DEFAULT_BLS_ACTIVATION_HEIGHT 10000` / `is_bls_active` (`:83-86`).
-  No-PoP structural status: tracked in prior spec; per-line PoP-absence marker
-  UNVERIFIED this pass (no explicit `NO PoP` comment line located).
+  No-PoP structural status: `parse_registry_entries` accepts any non-identity
+  G1 with NO proof-of-possession — rogue-key rationale at `bls.rs:527-531`;
+  strict-PoP parse opt-in via `STELL_BLS_POP_REQUIRED` (`:508-518`).
 - ECVRF: Edwards25519 ECVRF per RFC 9381 (`vrf.rs:21-23`); explicitly
   CLASSICAL/legacy/off-only (`:56-73`); activation env
   `STELL_VRF_ACTIVATION_HEIGHT` (`:128`); default Disabled (runtime gate
-  `runtime.rs:1677` comment). Deterministic-Schnorr construction detail
-  UNVERIFIED (term not located in `vrf.rs` header this pass).
+  `runtime.rs:1677` comment). Deterministic-Schnorr construction: "legacy
+  Schnorr proof hashes" domain `vrf.rs:106`, output-hash domain `:113`,
+  phase-1 envelope note (`R || z`, 80 B) `:145`.
 - Domains: `VRF_BEACON_DOMAIN` (`vrf.rs:94`), `VRF_SCALAR_DOMAIN` (`:101`),
   `VRF_BINDING_DST` (`:104`), `VRF_PROOF_DOMAIN` (`:111`),
   `VRF_OUTPUT_DOMAIN` (`:118`), `VRF_ELECTION_DOMAIN` (`:124`).
@@ -68,9 +75,9 @@ Pointers: `docs/CLASSICAL_INVENTORY.md:1`, `docs/PQ_CN_VRF_SPEC.md:1`.
   `EPOCH_LEN 7200` (`:58`); DSTs `STELL_CNVRF_COMMIT_V1` / `OPEN_V1` / `BETA_V1`
   (`:61-65`); nonce custody 0600 (`:633-646`, load `:681-726`).
 - Live-protocol wiring status: code truth is `cn_vrf.rs` sandbox + spec pointer;
-  any claim of activation高度 or sortition use is UNVERIFIED (no activation
-  const located in `cn_vrf.rs`; sortition gate only knows `vrf::VrfActivation`
-  per `consensus.rs:1080-1086`).
+  no activation-height const exists in `cn_vrf.rs` (only `EPOCH_LEN 7200` at
+  `:58`); the sortition gate only knows `vrf::VrfActivation`
+  (`consensus.rs:1080-1086`); zero `cn_vrf::` callers outside `cn_vrf.rs`.
 
 ## 6. PQ registry + rotation
 

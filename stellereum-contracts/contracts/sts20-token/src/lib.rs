@@ -24,7 +24,7 @@ extern crate std;
 
 use stellereum_contract_sdk::{
     caller_is, emit, setup_wasm_panic_handler, sload, sstore, ERR_INSUFFICIENT_BALANCE,
-    ERR_INVALID_ARGUMENT, ERR_UNAUTHORIZED, SUCCESS,
+    ERR_INVALID_ARGUMENT, ERR_OVERFLOW, ERR_UNAUTHORIZED, SUCCESS,
 };
 
 setup_wasm_panic_handler!();
@@ -179,6 +179,9 @@ pub extern "C" fn transfer(packed_arg: i64) -> i64 {
 /// packed_arg: spender_id * 100_000_000_000 + from_id * 10_000_000 + to_id * 100_000 + amount
 #[no_mangle]
 pub extern "C" fn transfer_from(packed_arg: i64) -> i64 {
+    if packed_arg <= 0 {
+        return ERR_INVALID_ARGUMENT;
+    }
     let spender = packed_arg / 100_000_000_000;
     let rem1 = packed_arg % 100_000_000_000;
     let from = rem1 / 10_000_000;
@@ -186,6 +189,13 @@ pub extern "C" fn transfer_from(packed_arg: i64) -> i64 {
     let to = rem2 / 100_000;
     let amount = rem2 % 100_000;
 
+    // Audit 6.0->8.0: validate the value-moving fields BEFORE touching the
+    // allowance. Previously a bad `from`/`to`/`amount` burned the grant via
+    // `sstore` and then failed inside `execute_transfer`. Bounds mirror
+    // `transfer` (wire format unchanged).
+    if from <= 0 || !(0..1_000).contains(&to) || amount <= 0 || amount >= 100_000 {
+        return ERR_INVALID_ARGUMENT;
+    }
     // CT-P0: the spender is authenticated — a forged spender id never matches
     // the stranger's caller address. Allowance check below stays as the
     // capability leg (existing pattern).
@@ -226,17 +236,32 @@ fn execute_transfer(from: i64, to: i64, amount: i64) -> i64 {
     let fee = (amount * TAX_BPS + BPS_DENOMINATOR - 1) / BPS_DENOMINATOR;
     let net = amount - fee;
 
+    // Audit 6.0->8.0 (CT-P1 dust): a transfer whose fee consumes the whole
+    // amount (e.g. amount=1 -> fee=1, net=0) credits nothing to the recipient
+    // while debiting the sender. Refuse fail-closed, funds untouched.
+    if net <= 0 {
+        return ERR_INVALID_ARGUMENT;
+    }
+
     sstore(from_slot, from_bal - amount);
 
     let to_slot = balance_slot(to);
     let to_bal = sload(to_slot);
-    sstore(to_slot, to_bal + net);
+    let new_to_bal = match to_bal.checked_add(net) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    sstore(to_slot, new_to_bal);
 
     if fee > 0 {
         let treasury = sload(SLOT_TREASURY_ACCOUNT);
         let treasury_slot = balance_slot(treasury);
         let treasury_bal = sload(treasury_slot);
-        sstore(treasury_slot, treasury_bal + fee);
+        let new_treasury_bal = match treasury_bal.checked_add(fee) {
+            Some(v) => v,
+            None => return ERR_OVERFLOW,
+        };
+        sstore(treasury_slot, new_treasury_bal);
     }
 
     emit(TOPIC_TRANSFER, amount);
@@ -265,11 +290,21 @@ pub extern "C" fn mint(arg: i64) -> i64 {
     }
 
     let supply = sload(SLOT_TOTAL_SUPPLY);
-    sstore(SLOT_TOTAL_SUPPLY, supply + amount);
+    // Audit 6.0->8.0: fail closed with ERR_OVERFLOW instead of trapping on
+    // i64 overflow (release profile has overflow-checks=true, so raw `+`
+    // would trap the tx; an explicit error lets callers branch).
+    let new_supply = match supply.checked_add(amount) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
+    sstore(SLOT_TOTAL_SUPPLY, new_supply);
 
     let admin_slot = balance_slot(admin);
     let bal = sload(admin_slot);
-    let new_bal = bal + amount;
+    let new_bal = match bal.checked_add(amount) {
+        Some(v) => v,
+        None => return ERR_OVERFLOW,
+    };
     sstore(admin_slot, new_bal);
 
     emit(TOPIC_MINT, amount);

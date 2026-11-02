@@ -566,6 +566,12 @@ pub fn verify_quorum_signatures(
     sigs: &[([u8; 32], Vec<u8>)],
     validators: &[[u8; 32]],
 ) -> Result<usize, String> {
+    // P2-9 pure-PQ gate (fail-closed): classical ed25519 quorum evidence is
+    // refused under enforcement, never falling through to ed25519 verify.
+    // Non-enforced behavior below is byte-identical.
+    if crate::post_quantum::is_pure_pq_enforced() {
+        return Err("pure-PQ enforced: classical bridge quorum refused".to_string());
+    }
     if validators.is_empty() {
         return Err("no committed validator/relayer set - refusing (fail closed)".to_string());
     }
@@ -2671,5 +2677,55 @@ mod tests {
             6
         );
         assert_eq!(discriminant(&BridgeIntent::Resolve { dispute_id: 0 }), 7);
+    }
+
+    /// P2-9 pure-PQ gate: a VALID ed25519 quorum verifies with enforcement
+    /// off but is refused (Err) with enforcement on. Guard resets the
+    /// thread-local override on drop (mid-suite flag-flip isolation).
+    #[test]
+    fn pure_pq_refuses_classical_quorum() {
+        struct PurePqGuard;
+        impl PurePqGuard {
+            fn enforce() -> Self {
+                crate::post_quantum::set_pure_pq_override(Some(true));
+                Self
+            }
+        }
+        impl Drop for PurePqGuard {
+            fn drop(&mut self) {
+                crate::post_quantum::set_pure_pq_override(None);
+            }
+        }
+        let a = SigningKey::generate(&mut OsRng);
+        let b = SigningKey::generate(&mut OsRng);
+        let c = SigningKey::generate(&mut OsRng);
+        let validators = vec![
+            a.verifying_key().to_bytes(),
+            b.verifying_key().to_bytes(),
+            c.verifying_key().to_bytes(),
+        ];
+        let msg = b"bridge pq gate pin";
+        let sigs = vec![sig(&a, msg), sig(&b, msg)];
+
+        // Baseline (off): valid 2-of-3 quorum verifies.
+        assert_eq!(
+            verify_quorum_signatures(msg, &sigs, &validators).unwrap(),
+            2,
+            "valid ed quorum must verify when pure-PQ is off"
+        );
+        // Enforced: the SAME valid quorum is refused fail-closed.
+        {
+            let _guard = PurePqGuard::enforce();
+            assert!(
+                verify_quorum_signatures(msg, &sigs, &validators).is_err(),
+                "valid ed quorum must be refused under pure-PQ"
+            );
+        }
+        // Boundary: after guard drop we are back off.
+        assert_eq!(
+            verify_quorum_signatures(msg, &sigs, &validators).unwrap(),
+            2,
+            "post-guard behavior must be off again"
+        );
     }
 }

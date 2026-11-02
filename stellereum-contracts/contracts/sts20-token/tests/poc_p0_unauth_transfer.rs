@@ -1,6 +1,7 @@
-//! P0 PoC: STS-20 `transfer` moves funds without any caller/allowance check.
+//! P0 PoC (fixed by CT-P0 auth, kept as regression pin): STS-20 `transfer`
+//! used to move funds without any caller/allowance check.
 //! Security invariant: a stranger (user 99, no approval) must NOT be able
-//! to move tokens out of admin (user 1). This test FAILS on current code.
+//! to move tokens out of admin (user 1).
 
 use sts20_token::{balance_of, init, transfer};
 use stellereum_contract_sdk::reset_mock_state;

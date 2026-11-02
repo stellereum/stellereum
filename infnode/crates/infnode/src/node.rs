@@ -25,6 +25,7 @@ use x509_parser::parse_x509_certificate;
 use crate::config::{NodeConfig, PeerConfig};
 use crate::keyring::NodeKeys;
 use crate::proto::{self, now_ms, ts_ok, Frame, NODEID_LEN};
+use crate::reputation::{RepConfig, RepEntry, REP_MAP_CAP, REP_MAP_HARD_CAP};
 
 /// Токен-бакет для rate limiting запросов пира.
 #[derive(Clone)]
@@ -378,6 +379,11 @@ pub struct Node {
     auth_failures: Mutex<HashMap<IpAddr, Vec<std::time::Instant>>>,
     /// F8: strike-ban expiry per source IP.
     auth_bans: Mutex<HashMap<IpAddr, std::time::Instant>>,
+    /// F8-rep: per-identity reputation (node id -> entry). Extends the
+    /// IP-level accept hardening (buckets/strikes): bans follow the offender
+    /// identity across IPs and never hit well-behaved peers sharing an
+    /// address. See `crate::reputation` for the score model.
+    peer_rep: Mutex<HashMap<[u8; NODEID_LEN], RepEntry>>,
 }
 
 /// R6: гейт на КАЖДЫЙ персистимый файл. Держится только на время
@@ -634,6 +640,7 @@ impl Node {
             handshake_buckets: Mutex::new(HashMap::new()),
             auth_failures: Mutex::new(HashMap::new()),
             auth_bans: Mutex::new(HashMap::new()),
+            peer_rep: Mutex::new(HashMap::new()),
         });
         node.load_persistent().await;
         node.load_routing().await;
@@ -810,6 +817,145 @@ impl Node {
             bans.insert(ip, now + cooldown);
             self.metrics.auth_bans_total.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// F8-rep: core identity-score update. Positive `delta` rewards, negative
+    /// penalises (see `crate::reputation` for the event mapping). On crossing
+    /// at/below the ban score with no ban active, imposes an escalating temp
+    /// ban (`base * 2^(bans-1)`, capped). Fail-closed: scores clamp, bans are
+    /// time-gated and always forgive (no permanent ban).
+    async fn rep_apply(&self, pid: [u8; NODEID_LEN], delta: i64) {
+        let cfg = RepConfig::load();
+        let now = std::time::Instant::now();
+        let mut map = self.peer_rep.lock().await;
+        if !map.contains_key(&pid) && map.len() >= REP_MAP_CAP {
+            // Memory bound: evict neutral entries first, then everything but
+            // active bans. The IP layer still binds the sender's address.
+            map.retain(|_, e| e.banned_at(now) || e.score != 0);
+            if map.len() >= REP_MAP_HARD_CAP {
+                map.retain(|_, e| e.banned_at(now));
+            }
+        }
+        let e = map.entry(pid).or_insert_with(|| RepEntry::fresh(now));
+        e.touch(&cfg, now);
+        e.score = e
+            .score
+            .saturating_add(delta)
+            .clamp(crate::reputation::REP_SCORE_MIN, crate::reputation::REP_SCORE_MAX);
+        e.updated = now;
+        if delta < 0 && e.score <= cfg.ban_score && !e.banned_at(now) {
+            e.bans = e.bans.saturating_add(1);
+            let secs = crate::reputation::ban_duration_secs(e.bans, cfg.ban_secs, cfg.max_ban_secs);
+            if let Some(until) = now.checked_add(Duration::from_secs(secs)) {
+                e.ban_until = Some(until);
+            }
+            self.metrics.rep_bans.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// F8-rep: decayed score for an identity (0 = neutral or unknown).
+    pub async fn rep_score(&self, pid: &[u8; NODEID_LEN]) -> i64 {
+        let cfg = RepConfig::load();
+        let now = std::time::Instant::now();
+        let mut map = self.peer_rep.lock().await;
+        match map.get_mut(pid) {
+            Some(e) => {
+                e.touch(&cfg, now);
+                e.score
+            }
+            None => 0,
+        }
+    }
+
+    /// F8-rep: true while the identity holds an unexpired temp ban. Expired
+    /// bans are reaped lazily with forgiveness (see `RepEntry::touch`).
+    pub async fn rep_is_banned(&self, pid: &[u8; NODEID_LEN]) -> bool {
+        let cfg = RepConfig::load();
+        let now = std::time::Instant::now();
+        let mut map = self.peer_rep.lock().await;
+        match map.get_mut(pid) {
+            Some(e) => {
+                e.touch(&cfg, now);
+                e.banned_at(now)
+            }
+            None => false,
+        }
+    }
+
+    /// F8-rep: true while the decayed score sits at/below the soft threshold
+    /// AND no ban is active (a banned identity reports via `rep_is_banned`).
+    /// Soft throttle refuses handshakes but imposes no ban — decay alone
+    /// lifts the identity out.
+    pub async fn rep_is_throttled(&self, pid: &[u8; NODEID_LEN]) -> bool {
+        let cfg = RepConfig::load();
+        let now = std::time::Instant::now();
+        let mut map = self.peer_rep.lock().await;
+        match map.get_mut(pid) {
+            Some(e) => {
+                e.touch(&cfg, now);
+                !e.banned_at(now) && e.score <= cfg.soft_score
+            }
+            None => false,
+        }
+    }
+
+    /// F8-rep: escalation memory — bans imposed on this identity so far
+    /// (reset on full recovery). Test/monitoring accessor.
+    pub async fn rep_ban_count(&self, pid: &[u8; NODEID_LEN]) -> u32 {
+        let cfg = RepConfig::load();
+        let now = std::time::Instant::now();
+        let mut map = self.peer_rep.lock().await;
+        match map.get_mut(pid) {
+            Some(e) => {
+                e.touch(&cfg, now);
+                e.bans
+            }
+            None => 0,
+        }
+    }
+
+    /// F8-rep: credit a valid handshake / accepted message.
+    pub async fn rep_record_valid(&self, pid: &[u8; NODEID_LEN]) {
+        let d = RepConfig::load().reward_valid;
+        self.rep_apply(*pid, d).await;
+    }
+
+    /// F8-rep: debit a failed authentication attempt (bad sig, stale,
+    /// replay, key mismatch, unknown identity).
+    pub async fn rep_record_auth_failure(&self, pid: &[u8; NODEID_LEN]) {
+        let d = RepConfig::load().pen_auth;
+        self.rep_apply(*pid, -d).await;
+    }
+
+    /// F8-rep: debit an oversize transport frame (envelope over the caps).
+    /// App-layer policy refusals (oversized DHT value, bad TTL, ACL deny)
+    /// are NOT abuse signals and never call this.
+    pub async fn rep_record_oversize(&self, pid: &[u8; NODEID_LEN]) {
+        let d = RepConfig::load().pen_oversize;
+        self.rep_apply(*pid, -d).await;
+    }
+
+    /// F8-rep: debit a per-peer rate-limit violation.
+    pub async fn rep_record_rate_violation(&self, pid: &[u8; NODEID_LEN]) {
+        let d = RepConfig::load().pen_rate;
+        self.rep_apply(*pid, -d).await;
+    }
+
+    /// F8-rep: debit a protocol violation (bad signature, stale frame, src
+    /// mismatch, decrypt failure, unauthenticated non-CHALLENGE frame).
+    pub async fn rep_record_protocol_violation(&self, pid: &[u8; NODEID_LEN]) {
+        let d = RepConfig::load().pen_proto;
+        self.rep_apply(*pid, -d).await;
+    }
+
+    /// F8-rep: identity temp bans imposed so far.
+    pub fn rep_bans_total(&self) -> u64 {
+        self.metrics.rep_bans.load(Ordering::Relaxed)
+    }
+
+    /// F8-rep: handshakes/requests refused on identity reputation so far.
+    pub fn rep_refusals_total(&self) -> u64 {
+        self.metrics.rep_refusals.load(Ordering::Relaxed)
     }
 
     pub fn resolve(&self, sel: &str) -> Result<[u8; NODEID_LEN]> {
@@ -5829,6 +5975,7 @@ async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NO
                     Ok(Some(pid)) => {
                         let ip = conn.remote_address().ip();
                         node.record_auth_success(&ip).await;
+                        node.rep_record_valid(&pid).await;
                         authed = Some(pid);
                     }
                     Ok(None) => {}
@@ -5929,12 +6076,40 @@ async fn handle_stream(
     } else {
         (proto::MAX_FRAME, Duration::from_secs(5))
     };
-    let bytes = timeout(read_to, recv.read_to_end(read_limit))
-        .await
-        .map_err(|_| anyhow!("frame read timeout"))??;
+    let bytes = match timeout(read_to, recv.read_to_end(read_limit)).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            // F8-rep: an oversize transport frame on an authed connection is
+            // attributable to the proven identity (pre-auth there is no
+            // identity yet — the IP strike in the caller covers it).
+            // Transport closures/timeouts are NOT abuse signals: no penalty.
+            if let Some(pid) = authed {
+                if crate::reputation::oversize_looking(&e.to_string()) {
+                    node.rep_record_oversize(&pid).await;
+                }
+            }
+            return Err(e.into());
+        }
+        Err(_) => return Err(anyhow!("frame read timeout")),
+    };
     let read_ms = t_read.elapsed().as_millis() as u64;
     let t_proc = std::time::Instant::now();
-    let f = Frame::decode(&bytes)?;
+    let f = match Frame::decode(&bytes) {
+        Ok(f) => f,
+        Err(e) => {
+            // F8-rep: undecodable frames on an authed connection come from
+            // the proven identity: oversize-looking → oversize debit, else
+            // protocol debit. Pre-auth: identity unknown, IP strike covers.
+            if let Some(pid) = authed {
+                if crate::reputation::oversize_looking(&e.to_string()) {
+                    node.rep_record_oversize(&pid).await;
+                } else {
+                    node.rep_record_protocol_violation(&pid).await;
+                }
+            }
+            return Err(e);
+        }
+    };
     node.metrics.frames_in.fetch_add(1, Ordering::Relaxed);
     node.metrics
         .bytes_in
@@ -5977,29 +6152,74 @@ async fn handle_stream(
 
     if f.kind == proto::kind::CHALLENGE {
         let claimed = f.src;
-        let ch: serde_json::Value = serde_json::from_slice(&f.payload)?;
+        // F8-rep identity gate (extends the IP accept hardening): a banned
+        // or soft-throttled identity is refused here even from a fresh IP, so
+        // the offender cannot dodge by redialling, while honest peers on the
+        // same address are unaffected. These refusals carry NO extra penalty
+        // (the score that caused them is enough; penalising would make soft
+        // throttle permanent and defeat decay).
+        if node.rep_is_banned(&claimed).await {
+            node.metrics.rep_refusals.fetch_add(1, Ordering::Relaxed);
+            bail!("reputation banned");
+        }
+        if node.rep_is_throttled(&claimed).await {
+            node.metrics.rep_refusals.fetch_add(1, Ordering::Relaxed);
+            bail!("reputation throttled");
+        }
+        // F8-rep: every failure below attributes an auth-failure debit to the
+        // claimed identity (uniform, fail-closed; see `crate::reputation` for
+        // the framing tradeoff shared with the IP strikes).
+        let ch: serde_json::Value = match serde_json::from_slice(&f.payload) {
+            Ok(v) => v,
+            Err(e) => {
+                node.rep_record_auth_failure(&claimed).await;
+                return Err(e.into());
+            }
+        };
         // Строгий гейт payload (fail-closed): nonce/at/eph/ed/x обязаны быть
         // на месте и свежими. Раньше проверялись только подпись фрейма и его
         // ts — повтор кадра в окне ±10 мин создавал новую сессию.
-        let (ch_nonce, _ch_eph, ch_ed, ch_x) = challenge_fields(&ch)?;
+        let (ch_nonce, _ch_eph, ch_ed, ch_x) = match challenge_fields(&ch) {
+            Ok(v) => v,
+            Err(e) => {
+                node.rep_record_auth_failure(&claimed).await;
+                return Err(e);
+            }
+        };
         // Рамочный ts — ДО любых side-эффектов (регистрация TOFU-пира,
         // сессии, маршруты): протухший кадр не оставляет следов.
         if !ts_ok(f.ts) {
+            node.rep_record_auth_failure(&claimed).await;
             bail!("stale challenge");
         }
         // read-guard в {} освобождается ДО взятия write-lock в add_dynamic_peer (иначе deadlock)
         let known = node.peers.read().await.contains_key(&claimed);
         let peer = if known {
-            let peer = node
-                .peers
-                .read()
-                .await
-                .get(&claimed)
-                .cloned()
-                .ok_or_else(|| anyhow!("peer disappeared"))?;
+            let peer = match node.peers.read().await.get(&claimed).cloned() {
+                Some(p) => p,
+                None => {
+                    node.rep_record_auth_failure(&claimed).await;
+                    bail!("peer disappeared");
+                }
+            };
             // Привязка payload к пинну: известный пир обязан предъявить СВОИ
             // ключи, а не чужие валидные (раньше ed/x из payload игнорировались).
-            if ch_ed != peer.cfg.ed_bytes()? || ch_x != peer.cfg.x_bytes()? {
+            let pinned_ed = match peer.cfg.ed_bytes() {
+                Ok(b) => b,
+                Err(e) => {
+                    node.rep_record_auth_failure(&claimed).await;
+                    return Err(e);
+                }
+            };
+            let pinned_x = match peer.cfg.x_bytes() {
+                Ok(b) => b,
+                Err(e) => {
+                    node.rep_record_auth_failure(&claimed).await;
+                    return Err(e);
+                }
+            };
+            if ch_ed != pinned_ed || ch_x != pinned_x {
+                node.rep_record_auth_failure(&claimed).await;
                 bail!("challenge key mismatch");
             }
             peer
@@ -6008,11 +6228,19 @@ async fn handle_stream(
             let ed_hex = hex::encode(ch_ed);
             let x_hex = hex::encode(ch_x);
             let ed: [u8; 32] = ch_ed;
-            let vk = VerifyingKey::from_bytes(&ed)?;
+            let vk = match VerifyingKey::from_bytes(&ed) {
+                Ok(v) => v,
+                Err(e) => {
+                    node.rep_record_auth_failure(&claimed).await;
+                    return Err(e.into());
+                }
+            };
             if claimed != blake3::hash(vk.as_bytes()).as_bytes()[..NODEID_LEN] {
+                node.rep_record_auth_failure(&claimed).await;
                 bail!("claimed node id does not match public key");
             }
             if !f.verify(&vk) {
+                node.rep_record_auth_failure(&claimed).await;
                 bail!("unknown node could not sign the challenge");
             }
             // детект MITM: если этот node_id уже видели с ДРУГИМ ключом — отказ + громкое предупреждение
@@ -6025,6 +6253,7 @@ async fn handle_stream(
                         known.ed_hex,
                         ed_hex
                     );
+                    node.rep_record_auth_failure(&claimed).await;
                     bail!("node key changed (possible MITM)");
                 }
             }
@@ -6041,7 +6270,10 @@ async fn handle_stream(
                 role: None,
                 storage_roles: vec![],
             };
-            node.add_dynamic_peer(claimed, pcfg).await?;
+            if let Err(e) = node.add_dynamic_peer(claimed, pcfg).await {
+                node.rep_record_auth_failure(&claimed).await;
+                return Err(e);
+            }
             // TOFU: показываем оператору отпечаток для ручной проверки (как SSH fingerprint)
             eprintln!(
                 "[{}] !! TOFU: unknown node inf1:{} ed={} from {} accepted — verify the fingerprint!",
@@ -6050,17 +6282,32 @@ async fn handle_stream(
                 ed_hex,
                 conn.remote_address()
             );
-            node.peers
-                .read()
-                .await
-                .get(&claimed)
-                .cloned()
-                .ok_or_else(|| anyhow!("dynamic peer did not appear"))?
+            match node.peers.read().await.get(&claimed).cloned() {
+                Some(p) => p,
+                None => {
+                    node.rep_record_auth_failure(&claimed).await;
+                    bail!("dynamic peer did not appear");
+                }
+            }
         } else {
+            node.rep_record_auth_failure(&claimed).await;
             bail!("unknown node claiming {}", hex::encode(claimed));
         };
-        let vk = VerifyingKey::from_bytes(&peer.cfg.ed_bytes()?)?;
+        let vk = match peer.cfg.ed_bytes() {
+            Ok(b) => match VerifyingKey::from_bytes(&b) {
+                Ok(v) => v,
+                Err(e) => {
+                    node.rep_record_auth_failure(&claimed).await;
+                    return Err(e.into());
+                }
+            },
+            Err(e) => {
+                node.rep_record_auth_failure(&claimed).await;
+                return Err(e);
+            }
+        };
         if !f.verify(&vk) || !ts_ok(f.ts) {
+            node.rep_record_auth_failure(&claimed).await;
             bail!("challenge bad sig/ts");
         }
         // Anti-replay: nonce одноразовый. Проверяется ПОСЛЕ подписи, чтобы
@@ -6068,13 +6315,20 @@ async fn handle_stream(
         {
             let mut seen = node.challenge_nonces.lock().await;
             if !crate::proto::claim_nonce(&mut seen, &ch_nonce, now_ms()) {
+                node.rep_record_auth_failure(&claimed).await;
                 bail!("challenge replay");
             }
         }
         // forward secrecy: вычисляем сессионный ключ и отдаём свой эфемерный в AUTH
         let srv_eph = XSecret::random_from_rng(rand::rngs::OsRng);
         let srv_eph_pub = XPub::from(&srv_eph);
-        let key = derive_session_key_server(&node.keys, &peer.cfg, &srv_eph, &f.payload)?;
+        let key = match derive_session_key_server(&node.keys, &peer.cfg, &srv_eph, &f.payload) {
+            Ok(k) => k,
+            Err(e) => {
+                node.rep_record_auth_failure(&claimed).await;
+                return Err(e);
+            }
+        };
         node.sessions.write().await.insert(conn.stable_id(), key);
         // Per-connection window: nothing to reset. See connect_with_auth.
         node.add_conn(claimed, conn.clone()).await;
@@ -6115,8 +6369,18 @@ async fn handle_stream(
         return Ok(Some(claimed));
     }
 
-    let pid = authed.ok_or_else(|| anyhow!("unauthenticated frame"))?;
+    let pid = match authed {
+        Some(p) => p,
+        None => {
+            // F8-rep: an unauthenticated non-CHALLENGE frame is attributable
+            // only to its claimed source (CHALLENGE frames returned above).
+            node.rep_record_protocol_violation(&f.src).await;
+            bail!("unauthenticated frame");
+        }
+    };
     if f.src != pid {
+        // F8-rep: proven identity speaking under another id.
+        node.rep_record_protocol_violation(&pid).await;
         bail!("src mismatch");
     }
     let peer = node
@@ -6128,9 +6392,13 @@ async fn handle_stream(
         .ok_or_else(|| anyhow!("unknown peer"))?;
     let vk = VerifyingKey::from_bytes(&peer.cfg.ed_bytes()?)?;
     if !f.verify(&vk) {
+        // F8-rep: forged frame from the proven identity.
+        node.rep_record_protocol_violation(&pid).await;
         bail!("bad signature");
     }
     if !ts_ok(f.ts) {
+        // F8-rep: stale frame from the proven identity.
+        node.rep_record_protocol_violation(&pid).await;
         bail!("stale frame");
     }
     {
@@ -6192,6 +6460,8 @@ async fn handle_stream(
 
     match f.kind {
         proto::kind::PING => {
+            // F8-rep: valid, authentic message from the proven identity.
+            node.rep_record_valid(&pid).await;
             let mut r = Frame {
                 kind: proto::kind::PONG,
                 seq: f.seq,
@@ -6223,6 +6493,8 @@ async fn handle_stream(
             // rate limiting (защита от флуда)
             let rate = peer.cfg.rate_limit_per_sec;
             if !peer.rate.lock().await.allow(rate) {
+                // F8-rep: per-peer rate-limit violation by the proven identity.
+                node.rep_record_rate_violation(&pid).await;
                 let resp = json!({ "ok": false, "err": "rate limit exceeded" })
                     .to_string()
                     .into_bytes();
@@ -6244,7 +6516,16 @@ async fn handle_stream(
                 report_stages(&f, t_proc.elapsed());
                 return Ok(None);
             }
-            let plain = e2e_decrypt(&key, &f.nonce, &f.payload)?;
+            let plain = match e2e_decrypt(&key, &f.nonce, &f.payload) {
+                Ok(p) => p,
+                Err(e) => {
+                    // F8-rep: undecryptable frame from the proven identity.
+                    node.rep_record_protocol_violation(&pid).await;
+                    return Err(e);
+                }
+            };
+            // F8-rep: valid, authentic message from the proven identity.
+            node.rep_record_valid(&pid).await;
             // ACL применяется КО ВСЕМУ (включая pubsub/dht), иначе TOFU-нода
             // могла бы публиковать/подписываться в обход ограничений.
             let svc_name = proto::svc_name(f.svc).unwrap_or("?").to_string();

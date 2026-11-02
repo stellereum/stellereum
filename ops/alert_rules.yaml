@@ -1,0 +1,181 @@
+# Stellereum consensus / node alert rules (Prometheus format).
+#
+# Load with:  prometheus --config.file=... (rule_files: ["ops/alert_rules.yaml"])
+# or `promtool check rules ops/alert_rules.yaml`.
+#
+# METRIC PROVENANCE (do not invent names): every `stell_*` series below is a
+# public constant in stellereum/src/metrics.rs and is rendered by
+# `Registry::render` under GET /metrics (see also stellereum/src/explorer.rs).
+# Verified 2026-11-02 by grepping the quoted literal in metrics.rs:
+#   stell_consensus_height, stell_consensus_round, stell_weak_qc_refused_total,
+#   stell_mempool_size, stell_data_dir_bytes, stell_peer_latency_seconds,
+#   stell_fork_total, stell_divergence_total, stell_nil_breaker_fires_total,
+#   stell_nil_rounds_total, stell_persist_queue_dropped_total,
+#   stell_slow_validation_total, stell_validator_set_fragile,
+#   stell_validator_set_size
+#
+# Peer-count note: there is NO dedicated peer-count gauge in metrics.rs.
+# PeersLost derives the count from the per-peer label set of
+# stell_peer_latency_seconds (SELF-MEASURED latency series, one per peer id).
+# Stale series linger until the peer is re-observed, so this alert is a
+# lower-bound tripwire, not an exact census. See ops/alerts.md.
+#
+# Disk note: stell_data_dir_bytes is a byte GAUGE, not a percentage.
+# DISK_THRESHOLD_BYTES below is 0.8 x 100 GiB. Set it to 0.8 x YOUR volume
+# size (bytes). A predict_linear growth companion is included.
+
+groups:
+  - name: stellereum-finals
+    interval: 30s
+    rules:
+      - alert: FinalsStalled
+        expr: delta(stell_consensus_height[10m]) <= 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Finalized height has not grown for >10m on {{ $labels.instance }}"
+          runbook: "ops/alerts.md#finalsstalled"
+
+      - alert: RoundExplosion
+        expr: max_over_time(stell_consensus_round[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Consensus round stuck above 10 on {{ $labels.instance }} (rounds reset each height)"
+          runbook: "ops/alerts.md#roundexplosion"
+
+      - alert: NilRoundsStall
+        expr: increase(stell_nil_rounds_total[10m]) >= 3
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: ">=3 nil rounds in 10m on {{ $labels.instance }} (finality stalling)"
+          runbook: "ops/alerts.md#nilroundsstall"
+
+      - alert: NilBreakerFired
+        expr: increase(stell_nil_breaker_fires_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Nil-storm circuit breaker fired on {{ $labels.instance }}"
+          runbook: "ops/alerts.md#downtime-evidence-spike"
+
+  - name: stellereum-integrity
+    interval: 30s
+    rules:
+      - alert: QCFailures
+        expr: increase(stell_weak_qc_refused_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Weak/unilateral QC refusals on {{ $labels.instance }} (finalization firewall engaged)"
+          runbook: "ops/alerts.md#qcfailures"
+
+      - alert: ForkSpike
+        expr: increase(stell_fork_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Conflicting-block sightings on {{ $labels.instance }}"
+          runbook: "ops/alerts.md#downtime-evidence-spike"
+
+      - alert: DivergenceSpike
+        expr: increase(stell_divergence_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Post-state-root divergence refusals on {{ $labels.instance }}"
+          runbook: "ops/alerts.md#downtime-evidence-spike"
+
+      - alert: ValidatorSetFragile
+        expr: stell_validator_set_fragile == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Validator set quorum fragile on {{ $labels.instance }} (size {{ $value }} series stell_validator_set_size)"
+          runbook: "ops/alerts.md#validatorsetfragile"
+
+  - name: stellereum-pool
+    interval: 30s
+    rules:
+      # Mempool global buffer ceiling is MAX_GLOBAL_BUFFERED_TXS = 2048
+      # (stellereum/src/mempool.rs). Warn at ~80%, critical at ~93%.
+      - alert: MempoolSaturatedWarn
+        expr: stell_mempool_size > 1600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mempool >1600 txs on {{ $labels.instance }} (~80% of 2048 cap)"
+          runbook: "ops/alerts.md#mempoolsaturated"
+
+      - alert: MempoolSaturatedCrit
+        expr: stell_mempool_size > 1900
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Mempool >1900 txs on {{ $labels.instance }} (admission about to shed load)"
+          runbook: "ops/alerts.md#mempoolsaturated"
+
+      - alert: SlowValidationSpike
+        expr: increase(stell_slow_validation_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Proposal validations breaching backpressure threshold on {{ $labels.instance }}"
+          runbook: "ops/alerts.md#downtime-evidence-spike"
+
+      - alert: PersistQueueDrops
+        expr: increase(stell_persist_queue_dropped_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Persist queue dropping jobs on {{ $labels.instance }} (disk too slow)"
+          runbook: "ops/alerts.md#downtime-evidence-spike"
+
+  - name: stellereum-disk
+    interval: 1m
+    rules:
+      # 0.8 x 100 GiB = 85899345920. REPLACE with 0.8 x your volume bytes.
+      - alert: DiskAbove80Pct
+        expr: stell_data_dir_bytes > 85899345920
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data dir past 80% budget on {{ $labels.instance }} ({{ $value }} bytes)"
+          runbook: "ops/alerts.md#diskabove80pct"
+
+      - alert: DiskGrowthFast
+        expr: predict_linear(stell_data_dir_bytes[1h], 6 * 3600) > 107374182400
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data dir on pace to exceed 100 GiB within 6h on {{ $labels.instance }}"
+          runbook: "ops/alerts.md#diskabove80pct"
+
+  - name: stellereum-net
+    interval: 30s
+    rules:
+      # Derived peer count: number of distinct `peer` label values currently
+      # exposing SELF-MEASURED latency. Tune `3` to your minimum peer floor.
+      - alert: PeersLost
+        expr: count(count by (peer) (stell_peer_latency_seconds)) < 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fewer than 3 observed peers on {{ $labels.instance }} (stale series linger; see runbook)"
+          runbook: "ops/alerts.md#peerslost"

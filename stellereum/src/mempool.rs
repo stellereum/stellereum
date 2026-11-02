@@ -2074,6 +2074,19 @@ impl Mempool {
         if !tx.verify_signature_with_registry(self.implicit_registry()) {
             return Err(MempoolError::BadSignature);
         }
+        // Verify-once attestation (PERF_PROFILE §6.1): admission just
+        // verified this exact signature, so attest it for block apply to
+        // skip re-verifying when bytes AND chain context still match.
+        // PQ-implicit transactions admitted under a CUSTOM (node-local test)
+        // registry are NOT attested — apply verifies against the global
+        // registry, so a custom-registry verdict must never be replayed there
+        // (fail-closed).
+        if !tx.is_pq_implicit() || self.implicit_registry.is_none() {
+            crate::state_engine::record_verified_signature(
+                &tx,
+                crate::consensus::consensus_chain_id(),
+            );
+        }
         // Base-fee and balance checks (checked/network path only). The balance
         // check mirrors admission execution (`state_engine` charges
         // amount + gas_limit + PQ_ACTIVATION_SURCHARGE_GAS for activation

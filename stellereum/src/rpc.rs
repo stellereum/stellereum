@@ -5320,6 +5320,42 @@ async fn dispatch(
                 }),
             )
         }
+        // ---- validator UX (unjail / redelegate / commission schedule) ----
+        // Read-only: serves the jail record and the commission schedule so
+        // operators and wallets can see release heights, pending raises and
+        // the delegator-exit window without touching state.
+        "stell_getValidatorStatus" => {
+            let v = match params["validator"]
+                .as_str()
+                .and_then(|s| parse_hash(s).ok())
+            {
+                Some(v) => v,
+                None => return err(id, -32602, "missing validator"),
+            };
+            let l = st.engine.staking_read().await;
+            let rec = l.validators.get(&v);
+            let jail = l.jail_record(&v);
+            let sched = l.commission_schedule_of(&v);
+            ok(
+                id,
+                json!({
+                    "validator": hex::encode(v),
+                    "known": rec.is_some(),
+                    "jailed": jail.is_some(),
+                    "jailed_at_height": jail.map(|j| j.jailed_at_height),
+                    "release_height": jail.map(|j| j.release_height),
+                    "in_set": l.to_validator_set().validators.contains_key(&v),
+                    "self_bond": rec.map(|r| r.self_bond.to_string()),
+                    "commission_bps": rec.map(|r| r.commission_bps),
+                    "pending_commission": sched.and_then(|s| s.pending.map(|p| json!({
+                        "new_bps": p.new_bps,
+                        "announced_height": p.announced_height,
+                        "effective_height": p.effective_height,
+                    }))),
+                    "last_commission_change_height": sched.and_then(|s| s.last_effective_height),
+                }),
+            )
+        }
         // ---- zkML capability statement (audit W8.3 / blocker A5) ----
         //
         // The zkML opcodes are a sound RE-EXECUTION attestation, NOT a
@@ -8595,6 +8631,25 @@ mod tests {
         r.0.error
             .map(|e| json!({"error": e.message}))
             .unwrap_or(r.0.result.unwrap_or(Value::Null))
+    }
+
+    /// Mint a process-unique loopback IP for estimate-fee tests.
+    ///
+    /// The estimate-fee budget is a process-global per-IP fixed-window (1s)
+    /// limiter, so two tests sharing one IP in the same second share one
+    /// bucket. Hand-picked constants (`.11`/`.12`/...) isolate by convention;
+    /// a minted IP isolates by construction: its bucket is empty no matter
+    /// what else runs in this process, in any order, on any thread. Tests
+    /// still go through [`call_as`] (same production path, same caps).
+    fn fresh_estimate_ip() -> std::net::IpAddr {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x010100);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            127,
+            ((n >> 16) & 0xFF) as u8,
+            ((n >> 8) & 0xFF) as u8,
+            (n & 0xFF) as u8,
+        ))
     }
 
     /// `test_state` with the node message-signing key configured (seed 0x42)
@@ -13367,9 +13422,12 @@ mod tests {
         let st = test_state().await;
         let from = [1u8; 32];
         let to = [2u8; 32];
+        // Own bucket (see `fresh_estimate_ip`): the 4 estimates below must
+        // never share a 5/s window with another test, in any run order.
+        let ip = fresh_estimate_ip();
 
         // 1. Plain transfer with explicit shards
-        let res = call_as(&st, "127.0.0.11".parse().unwrap(),
+        let res = call_as(&st, ip,
             "stell_estimateFee",
             json!({
                 "from": hex::encode(from),
@@ -13390,7 +13448,7 @@ mod tests {
         assert_eq!(res["status"], json!("ok"));
 
         // 2. TON workchain prefix rules: "-1:..." routes to masterchain (shard 0)
-        let res_ton = call_as(&st, "127.0.0.11".parse().unwrap(),
+        let res_ton = call_as(&st, ip,
             "stell_estimateFee",
             json!({
                 "from": format!("-1:{}", hex::encode(from)),
@@ -13405,7 +13463,7 @@ mod tests {
         assert_eq!(res_ton["status"], json!("ok"));
 
         // 3. Cross-shard prefix: "1:..." routes to shard 1
-        let res_cross = call_as(&st, "127.0.0.11".parse().unwrap(),
+        let res_cross = call_as(&st, ip,
             "stell_estimateFee",
             json!({
                 "from": format!("-1:{}", hex::encode(from)),
@@ -13422,7 +13480,7 @@ mod tests {
         let key = ed25519_dalek::SigningKey::from_bytes(&from);
         let raw_tx = crate::sharding::Transaction::sign(&key, to, 1000, 280000, 0, 0, 0);
         let tx_hex = hex::encode(bincode::serialize(&raw_tx).unwrap());
-        let res_raw = call_as(&st, "127.0.0.11".parse().unwrap(), "stell_estimateFee", json!({ "tx": tx_hex })).await;
+        let res_raw = call_as(&st, ip, "stell_estimateFee", json!({ "tx": tx_hex })).await;
         assert_eq!(res_raw["gas_limit"], json!(280000));
         assert_eq!(res_raw["estimated_fee"], json!(280000));
         assert_eq!(res_raw["base_fee"], json!(280000));
@@ -13448,9 +13506,11 @@ mod tests {
             description: String::new(),
         };
         let token_id = st.engine.create_token(who, meta, 50_000).await.unwrap();
+        // Own bucket (see `fresh_estimate_ip`).
+        let ip = fresh_estimate_ip();
 
         // 1. Estimate fee with opcode array payload
-        let res_op = call_as(&st, "127.0.0.12".parse().unwrap(),
+        let res_op = call_as(&st, ip,
             "stell_estimateFee",
             json!({
                 "from": hex::encode(who),
@@ -13479,7 +13539,7 @@ mod tests {
         assert_eq!(res_op["is_cross_shard"], json!(false));
 
         // 2. Estimate fee with friendly token_id parameter
-        let res_friendly = call_as(&st, "127.0.0.12".parse().unwrap(),
+        let res_friendly = call_as(&st, ip,
             "stell_estimateFee",
             json!({
                 "from": hex::encode(who),
@@ -13509,9 +13569,11 @@ mod tests {
             .await
             .unwrap();
         let caller = [0x99u8; 32];
+        // Own bucket (see `fresh_estimate_ip`).
+        let ip = fresh_estimate_ip();
 
         // 1. Estimate fee with OpCode array
-        let res = call_as(&st, "127.0.0.13".parse().unwrap(),
+        let res = call_as(&st, ip,
             "stell_estimateFee",
             json!({
                 "from": hex::encode(caller),
@@ -13541,7 +13603,7 @@ mod tests {
         assert!(res["estimated_fee"].as_u64().unwrap() >= 280000);
 
         // 2. Estimate fee with friendly method parameter
-        let res_friendly = call_as(&st, "127.0.0.13".parse().unwrap(),
+        let res_friendly = call_as(&st, ip,
             "stell_estimateFee",
             json!({
                 "from": hex::encode(caller),
@@ -14803,23 +14865,39 @@ mod tests {
     #[tokio::test]
     async fn estimate_fee_has_its_own_per_ip_budget() {
         let st = test_state().await;
-        let ip: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        // Own bucket (see `fresh_estimate_ip`): the hammering must start from
+        // an empty window no matter what else runs in this process.
+        let ip = fresh_estimate_ip();
         // The budget is finite: after it is exhausted the call is refused.
+        // The limiter is a per-second fixed window on wall-clock seconds, so
+        // ONE hammer of budget+1 rapid calls can straddle a second boundary,
+        // take a fresh window, and see no refusal. Rapid consecutive rounds
+        // cannot ALL straddle (boundaries are 1s apart, a round is
+        // milliseconds), so repeating the hammer on the SAME ip forces the
+        // refusal without weakening the limit: every round still allows at
+        // most ESTIMATE_FEE_RATE_LIMIT_DEFAULT per window. (The exact
+        // in-window 5-ok/6th-refused threshold is pinned deterministically by
+        // the `check_at` unit test; this test pins the production path.)
         let mut refused = false;
-        for _ in 0..(ESTIMATE_FEE_RATE_LIMIT_DEFAULT as usize + 4) {
-            let r = call_from(
-                &st,
-                "stell_estimateFee",
-                json!({ "from": hex::encode([0x11u8; 32]), "to": hex::encode([0x22u8; 32]) }),
-                ip,
-            )
-            .await;
-            if r["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("budget exhausted")
-            {
-                refused = true;
+        for _ in 0..4 {
+            for _ in 0..(ESTIMATE_FEE_RATE_LIMIT_DEFAULT as usize + 1) {
+                let r = call_from(
+                    &st,
+                    "stell_estimateFee",
+                    json!({ "from": hex::encode([0x11u8; 32]), "to": hex::encode([0x22u8; 32]) }),
+                    ip,
+                )
+                .await;
+                if r["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("budget exhausted")
+                {
+                    refused = true;
+                    break;
+                }
+            }
+            if refused {
                 break;
             }
         }
@@ -14828,7 +14906,7 @@ mod tests {
             "the estimate-fee budget must be enforced per IP (it clones the whole state)"
         );
         // A DIFFERENT IP is unaffected by the first one's exhaustion.
-        let other: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        let other = fresh_estimate_ip();
         let r = call_from(
             &st,
             "stell_estimateFee",

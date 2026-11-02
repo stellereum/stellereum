@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod migration;
 pub mod node;
 pub mod proto;
+pub mod reputation;
 pub mod rewards;
 pub mod services;
 pub mod totp;

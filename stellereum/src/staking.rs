@@ -188,8 +188,7 @@ pub fn buffer_warn_message_for(total_self_bond: u64, buffer: u64) -> Option<Stri
     ))
 }
 
-/// Maximum active validators (consensus set cap): 250.
-///
+/// Maximum active validators (consensus set cap): 250.///
 /// Rationale (multi-chain research 2026): TON caps at 400 (380 live),
 /// Cosmos Hub at 180, Polygon PoS at 105, BNB at 45, Sui ~102-127,
 /// Aptos ~129, NEAR top-100 block producers / ~213 total.
@@ -241,21 +240,64 @@ pub const DOWNTIME_MISS_THRESHOLD: u32 = 10;
 pub const DOWNTIME_PENALTY_COOLDOWN: u64 = 100;
 /// Default validator commission on delegated rewards (10%).
 ///
-/// PRODUCT DECISION — COMMISSION IS IMMUTABLE AFTER BOND (audit I3, closed
-/// explicitly): set once at `bond`, priced for newcomers by governance
-/// (`SetDefaultCommissionBps`); neither `add_bond` nor any opcode changes it.
-/// A validator can neither raise NOR lower commission, so delegators lock
-/// into the genesis rate — transparent at `delegate` time (the rate is
-/// ledger state, readable before delegating), and 100% commission is allowed
-/// but pays delegators exactly 0 rather than stealing. No theft vector.
-/// EXACT PRECONDITION FOR A `SetCommission` OPCODE: ship it WITH a
-/// delegator-exit window (announce N heights before the new rate takes
-/// effect, during which `unbond`/`undelegate` bypass any new-bonding delay
-/// so captives can leave); without the window a raise is a rug. Until then,
-/// immutability is the safe default — pinned by closure-suite test.
+/// PRODUCT DECISION — COMMISSION CHANGES ONLY THROUGH THE BOUNDED
+/// ANNOUNCE/APPLY PATH (audit I3, evolved 2026-11-02): the rate is still set
+/// once at `bond` and priced for newcomers by governance
+/// (`SetDefaultCommissionBps`), and neither `add_bond` nor any top-up opcode
+/// changes it. What changed is that the ledger now exposes
+/// [`StakingLedger::announce_commission`] + [`StakingLedger::apply_commission`]:
+/// a raise is announced `COMMISSION_EFFECT_DELAY_HEIGHTS` heights before it
+/// takes effect (the delegator-exit window the original decision demanded as
+/// the EXACT PRECONDITION for any `SetCommission` opcode — `unbond` and
+/// `redelegate` stay fully available during it, so captives can leave), each
+/// step moves at most `COMMISSION_MAX_DELTA_BPS`, at most one effective change
+/// per `COMMISSION_CHANGE_COOLDOWN_HEIGHTS`, and everything else is refused
+/// fail-closed. A 100% commission is still allowed but still pays delegators
+/// exactly 0 rather than stealing. Announcing the CURRENT rate cancels a
+/// pending change. Reward math still reads the rate at distribution time, so
+/// a change — like the direct field writes the adversarial tests simulate —
+/// applies to new emission only, never retroactively.
+///
+/// NOTE (wiring, out of scope): no SVM opcode exposes this yet (svm.rs is
+/// owned by another scope); the path is ledger-complete and RPC-observable
+/// (`stell_getValidatorStatus`) so operators and wallets can use it the
+/// moment an opcode lands.
 pub const DEFAULT_COMMISSION_BPS: u64 = 1_000;
 /// Basis-point denominator for every `*_bps` field (commission, slashes).
 pub const BPS_DENOMINATOR: u64 = 10_000;
+
+/// Jail release delay in heights: a downtime-jailed validator becomes
+/// eligible for [`StakingLedger::unjail`] this many heights after the jailing
+/// penalty fired (1,000 heights ≈ 50 min at 3 s blocks).
+///
+/// Deterministic const (never env): jail admission and release are consensus
+/// (every node applying the same blocks must reach the same jailed set), and
+/// the delay deliberately exceeds [`DOWNTIME_PENALTY_COOLDOWN`] (100) so a
+/// validator cannot unjail inside the same outage window that would
+/// immediately re-slash it.
+pub const JAIL_RELEASE_DELAY_HEIGHTS: u64 = 1_000;
+
+/// Maximum commission change per [`StakingLedger::announce_commission`], in
+/// basis points (500 = 5 percentage points). A raise from 10% to 100% takes
+/// at least 18 announced steps — a rug cannot land in one transaction.
+/// Fail-closed: a larger delta is refused with
+/// [`StakingError::CommissionDeltaExceeded`].
+pub const COMMISSION_MAX_DELTA_BPS: u64 = 500;
+
+/// Delegator-exit window in heights: an announced commission change takes
+/// effect this many heights after the announcement (7,200 heights ≈ 6 h at
+/// 3 s blocks). During the window the announced rate is queryable
+/// ([`StakingLedger::commission_schedule_of`], `stell_getValidatorStatus`)
+/// and `undelegate`/`redelegate` stay fully available, so no delegator is
+/// ever surprised by a raise — the exit window the immutability decision
+/// demanded as the EXACT PRECONDITION for any `SetCommission` path.
+pub const COMMISSION_EFFECT_DELAY_HEIGHTS: u64 = 7_200;
+
+/// Minimum heights between two EFFECTIVE commission changes for one
+/// validator (7,200 ≈ 6 h). Announcing while the cooldown from the last
+/// effective change has not elapsed is refused fail-closed with
+/// [`StakingError::CommissionNotDue`].
+pub const COMMISSION_CHANGE_COOLDOWN_HEIGHTS: u64 = 7_200;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StakingError {
@@ -320,6 +362,28 @@ pub enum StakingError {
     /// no-op on every reachable path — defense-in-depth only. Appended last
     /// so existing serialized error indices are untouched.
     BadSlashBps,
+    /// A validator is currently jailed (downtime) and excluded from the
+    /// consensus set: `delegate` to it, `redelegate` to it and reward
+    /// distributions for it are refused until [`StakingLedger::unjail`]
+    /// re-admits it. Exits (`unbond`/`undelegate`/`redelegate` away) stay
+    /// available — jail never holds funds hostage.
+    Jailed,
+    /// [`StakingLedger::unjail`] called for a validator that is not jailed.
+    NotJailed,
+    /// An announced commission change exceeds the per-change bound
+    /// ([`COMMISSION_MAX_DELTA_BPS`]) — or, on `announce`, violates the
+    /// absolute cap the same way [`StakingError::BadCommission`] does for
+    /// bonds. Refused fail-closed, ledger untouched.
+    CommissionDeltaExceeded,
+    /// No commission change is due: `apply` with nothing pending, `apply`
+    /// before the announced effective height, or `announce` inside the
+    /// post-change cooldown ([`COMMISSION_CHANGE_COOLDOWN_HEIGHTS`]).
+    /// Refused fail-closed, ledger untouched.
+    CommissionNotDue,
+    /// A redelegation with an invalid shape: source and destination are the
+    /// same validator. Refused fail-closed (a same-validator "move" would
+    /// otherwise launder the anti-long-range lock timestamp).
+    InvalidRedelegation,
 }
 
 impl std::fmt::Display for StakingError {
@@ -359,6 +423,17 @@ impl std::fmt::Display for StakingError {
                 "the zero address cannot hold a delegation (self-bond key is reserved)"
             }
             StakingError::BadSlashBps => "slash basis points must be <= 10000 (100%)",
+            StakingError::Jailed => "validator is jailed (downtime) and excluded from the set until unjailed",
+            StakingError::NotJailed => "validator is not jailed",
+            StakingError::CommissionDeltaExceeded => {
+                "commission change exceeds the per-change bound: refusing instead of repricing"
+            }
+            StakingError::CommissionNotDue => {
+                "no commission change is due (nothing pending, effective height not reached, or change cooldown active)"
+            }
+            StakingError::InvalidRedelegation => {
+                "redelegation source and destination must differ"
+            }
         };
         write!(f, "{s}")
     }
@@ -473,6 +548,60 @@ pub struct UnbondingEntry {
     pub owner: Option<[u8; 32]>,
     pub amount: u64,
     pub release_at: u64,
+}
+
+/// A downtime jail record: `validator` is excluded from the consensus set
+/// from `jailed_at_height` until [`StakingLedger::unjail`] re-admits it, and
+/// re-admission is only possible at or after `release_height`
+/// (`jailed_at_height + `[`JAIL_RELEASE_DELAY_HEIGHTS`]).
+///
+/// Jailing is automatic and evidence-driven: [`StakingLedger::note_missed_heights`]
+/// installs this record whenever a downtime slash fires (the live path in
+/// `state_engine.rs::apply_downtime_slash*` flows through there, so every
+/// node jails identically). It is NOT installed by direct `slash`/
+/// `slash_downtime` calls (no height is known there) — the same wired/unwired
+/// distinction as the equivocation primitives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JailRecord {
+    /// Height at which the jailing downtime penalty fired.
+    pub jailed_at_height: u64,
+    /// First height at which [`StakingLedger::unjail`] may succeed.
+    pub release_height: u64,
+}
+
+/// An announced-but-not-yet-effective commission change: the delegator-exit
+/// window made concrete. `announced_height` is when the validator called
+/// [`StakingLedger::announce_commission`]; the rate takes effect at
+/// `effective_height` (`announced_height +`
+/// [`COMMISSION_EFFECT_DELAY_HEIGHTS`]) via [`StakingLedger::apply_commission`].
+/// Between the two, delegators can read it
+/// ([`StakingLedger::commission_schedule_of`], `stell_getValidatorStatus`)
+/// and exit (`undelegate`/`redelegate` stay fully available).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCommissionChange {
+    /// The announced rate, in basis points (`<= `[`BPS_DENOMINATOR`]).
+    pub new_bps: u64,
+    /// First height at which `apply` may install it.
+    pub effective_height: u64,
+    /// Height at which it was announced.
+    pub announced_height: u64,
+}
+
+/// Per-validator commission schedule: the rate-limiter state for the bounded
+/// mutable-commission path.
+///
+/// `last_effective_height` is `None` for validators that bonded before this
+/// path existed (or never changed commission): their first announcement is
+/// always due (no phantom cooldown from height 0). `pending` carries the
+/// announced change, if any; announcing again REPLACES the pending change
+/// (intent update, nothing took effect yet), while announcing the CURRENT
+/// rate clears it (cancel).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommissionSchedule {
+    /// Height of the last EFFECTIVE change, `None` if never changed.
+    pub last_effective_height: Option<u64>,
+    /// Announced change awaiting its effective height, if any.
+    pub pending: Option<PendingCommissionChange>,
 }
 
 /// Per-validator staking record.
@@ -872,6 +1001,38 @@ pub struct StakingLedger {
     /// slash), so a delegator never earns on stake it did not have.
     #[serde(default)]
     pub delegator_reward_checkpoints: HashMap<(ValidatorId, [u8; 32]), u128>,
+    /// Downtime jail records by validator. A jailed validator is excluded
+    /// from [`Self::to_validator_set`] (and [`Self::elected_count`]) until
+    /// [`Self::unjail`] re-admits it. Installed automatically by
+    /// [`Self::note_missed_heights`] when a downtime slash fires; empty on
+    /// every ledger that never suffered one, so the conditional commitment
+    /// treatment (commitment.rs, out of scope — follow-up conditional domain)
+    /// keeps the genesis root untouched.
+    ///
+    /// SERIALIZATION (upgrade hazard, reported): appended at the END with
+    /// `#[serde(default)]` like every prior addition; old snapshots decode
+    /// via the versioned `DomainSnapshotV*` fallback chain and
+    /// `StakingLedgerV3::upgrade` fills these empty (exact: no jail,
+    /// schedule or lock rows can exist in pre-feature bytes). A storage.rs
+    /// `DomainSnapshotV7`-style fallback for CURRENT-shape bytes (with the
+    /// lazy accumulator but without these maps) is still required before any
+    /// live data-dir upgrade — flagged as a cross-scope follow-up.
+    #[serde(default)]
+    pub jail: HashMap<ValidatorId, JailRecord>,
+    /// Per-validator commission schedules (bounded mutable commission with a
+    /// delegator-exit window). Empty until the first
+    /// [`Self::announce_commission`]; see [`CommissionSchedule`].
+    #[serde(default)]
+    pub commission_schedule: HashMap<ValidatorId, CommissionSchedule>,
+    /// Anti-long-range redelegation locks: (validator, delegator) ->
+    /// timestamp before which the position now at `validator` may not be
+    /// redelegated AGAIN. Set to `now + `[`UNBONDING_PERIOD_SECS`] on every
+    /// [`Self::redelegate`] INTO `validator`; `redelegate` FROM a locked
+    /// position is refused with [`StakingError::CooldownNotElapsed`], while
+    /// `undelegate` (which starts the full unbond wait itself) stays
+    /// available. Empty until the first redelegation.
+    #[serde(default)]
+    pub redelegation_lock: HashMap<(ValidatorId, [u8; 32]), u64>,
 }
 
 impl StakingLedger {
@@ -989,6 +1150,217 @@ impl StakingLedger {
         Ok(())
     }
 
+    /// Whether `validator` is currently jailed (downtime) and therefore
+    /// excluded from the consensus set.
+    pub fn is_jailed(&self, validator: &ValidatorId) -> bool {
+        self.jail.contains_key(validator)
+    }
+
+    /// The jail record for `validator`, if jailed. Read-only query path for
+    /// operators (`stell_getValidatorStatus` serves this).
+    pub fn jail_record(&self, validator: &ValidatorId) -> Option<JailRecord> {
+        self.jail.get(validator).copied()
+    }
+
+    /// Re-admit a downtime-jailed validator to the consensus set (effective
+    /// at the H+1 activation boundary like every other stake mutation).
+    ///
+    /// Fail-closed conditions (ALL must hold):
+    ///  1. the validator IS jailed, else [`StakingError::NotJailed`];
+    ///  2. `now_height >= release_height` (the downtime window plus the
+    ///     [`JAIL_RELEASE_DELAY_HEIGHTS`] cooldown has passed), else
+    ///     [`StakingError::CooldownNotElapsed`];
+    ///  3. `self_bond >= `[`required_bond_floor_nano`]` (MIN+buffer — the
+    ///     bare-MIN ejection edge: a validator that cannot absorb one more
+    ///     downtime slash may not rejoin), else
+    ///     [`StakingError::BondBelowMinimum`]. A jailed operator below the
+    ///     floor tops up via [`Self::add_bond`] first (top-ups stay allowed
+    ///     while jailed; exits do too — jail never holds funds hostage).
+    ///
+    /// Effects: the jail record is removed, the downtime streak is reset
+    /// (`missed = 0` — the validator re-proves liveness going forward; while
+    /// jailed it was unelected and therefore untracked, so no streak could
+    /// accrue), and a LOUD re-entry WARN fires (same treatment as a set
+    /// gain). The penalty history (`last_downtime_penalty`,
+    /// `total_slashed`) is PRESERVED — unjailing never launders a record.
+    /// No stake moves, so the conservation invariant holds trivially
+    /// (debug-asserted).
+    pub fn unjail(&mut self, validator: ValidatorId, now_height: u64) -> Result<(), StakingError> {
+        let supply_before = self.ledger_stake_supply();
+        let record = self
+            .jail
+            .get(&validator)
+            .copied()
+            .ok_or(StakingError::NotJailed)?;
+        if now_height < record.release_height {
+            return Err(StakingError::CooldownNotElapsed);
+        }
+        let self_bond = self
+            .validators
+            .get(&validator)
+            .map(|v| v.self_bond)
+            .unwrap_or(0);
+        if self_bond < required_bond_floor_nano() {
+            return Err(StakingError::BondBelowMinimum);
+        }
+        self.jail.remove(&validator);
+        if let Some(v) = self.validators.get_mut(&validator) {
+            v.missed = 0;
+        }
+        tracing::warn!(
+            "VALIDATOR-UNJAIL validator {} re-admitted at height {now_height} (jailed at {}, self_bond {self_bond}): verify it is actually online and voting — an offline re-entrant in a micro-quorum halts the chain",
+            hex::encode(validator),
+            record.jailed_at_height,
+        );
+        self.warn_if_quorum_fragile("unjail");
+        debug_assert_eq!(
+            supply_before,
+            self.ledger_stake_supply(),
+            "unjail must move no stake"
+        );
+        Ok(())
+    }
+
+    /// The commission schedule for `validator`, if it ever announced a
+    /// change. Read-only query path for operators deciding whether to stay
+    /// delegated through a pending raise (`stell_getValidatorStatus`).
+    pub fn commission_schedule_of(&self, validator: &ValidatorId) -> Option<CommissionSchedule> {
+        self.commission_schedule.get(validator).copied()
+    }
+
+    /// Announce a commission change (phase 1 of 2). The rate does NOT move:
+    /// a [`PendingCommissionChange`] is recorded with
+    /// `effective_height = now_height + `[`COMMISSION_EFFECT_DELAY_HEIGHTS`],
+    /// and [`Self::apply_commission`] installs it once that height is
+    /// reached. The window between is the delegator-exit window — the rate
+    /// is queryable and `undelegate`/`redelegate` stay fully available.
+    ///
+    /// Fail-closed (ledger untouched on any refusal):
+    ///  - unknown validator → [`StakingError::NotValidator`];
+    ///  - `new_bps > `[`BPS_DENOMINATOR`] → [`StakingError::BadCommission`];
+    ///  - `|new − current| > `[`COMMISSION_MAX_DELTA_BPS`] →
+    ///    [`StakingError::CommissionDeltaExceeded`];
+    ///  - announced inside the post-change cooldown (`now_height <
+    ///    last_effective + `[`COMMISSION_CHANGE_COOLDOWN_HEIGHTS`] with a
+    ///    previous effective change on record) →
+    ///    [`StakingError::CommissionNotDue`].
+    ///
+    /// Announcing the CURRENT rate cancels a pending change (no-op success,
+    /// no cooldown imposed). Announcing a different rate REPLACES a pending
+    /// one (intent update — nothing took effect yet, so there is nothing to
+    /// unwind); the new effective height is recomputed from this call.
+    /// No stake moves (debug-asserted).
+    pub fn announce_commission(
+        &mut self,
+        validator: ValidatorId,
+        new_bps: u64,
+        now_height: u64,
+    ) -> Result<(), StakingError> {
+        let supply_before = self.ledger_stake_supply();
+        let current = self
+            .validators
+            .get(&validator)
+            .map(|v| v.commission_bps)
+            .ok_or(StakingError::NotValidator)?;
+        if new_bps > BPS_DENOMINATOR {
+            return Err(StakingError::BadCommission);
+        }
+        if new_bps == current {
+            // Cancel-by-reannounce: a pending change that never took effect
+            // is dropped, and no cooldown is imposed for the no-op.
+            if let Some(s) = self.commission_schedule.get_mut(&validator) {
+                s.pending = None;
+            }
+            debug_assert_eq!(
+                supply_before,
+                self.ledger_stake_supply(),
+                "announce must move no stake"
+            );
+            return Ok(());
+        }
+        if new_bps.abs_diff(current) > COMMISSION_MAX_DELTA_BPS {
+            return Err(StakingError::CommissionDeltaExceeded);
+        }
+        let last = self
+            .commission_schedule
+            .get(&validator)
+            .and_then(|s| s.last_effective_height);
+        if let Some(prev) = last {
+            if now_height < prev.saturating_add(COMMISSION_CHANGE_COOLDOWN_HEIGHTS) {
+                return Err(StakingError::CommissionNotDue);
+            }
+        }
+        let effective_height = now_height.saturating_add(COMMISSION_EFFECT_DELAY_HEIGHTS);
+        self.commission_schedule
+            .entry(validator)
+            .or_default()
+            .pending = Some(PendingCommissionChange {
+            new_bps,
+            effective_height,
+            announced_height: now_height,
+        });
+        tracing::warn!(
+            "COMMISSION-ANNOUNCE validator {}: {} bps -> {new_bps} bps effective at height {effective_height} (announced at {now_height}): delegators may undelegate/redelegate before then",
+            hex::encode(validator),
+            current,
+        );
+        debug_assert_eq!(
+            supply_before,
+            self.ledger_stake_supply(),
+            "announce must move no stake"
+        );
+        Ok(())
+    }
+
+    /// Install a due announced commission change (phase 2 of 2).
+    ///
+    /// Fail-closed: unknown validator → [`StakingError::NotValidator`];
+    /// nothing pending, or `now_height` before the announced effective
+    /// height → [`StakingError::CommissionNotDue`]. On success the rate moves
+    /// (new emission only — past accruals are untouched, exactly like the
+    /// direct field writes the adversarial tests pin) and the cooldown basis
+    /// advances. No stake moves (debug-asserted).
+    pub fn apply_commission(
+        &mut self,
+        validator: ValidatorId,
+        now_height: u64,
+    ) -> Result<(), StakingError> {
+        let supply_before = self.ledger_stake_supply();
+        // Validator first (unknown key is NotValidator even with no schedule),
+        // then the due check.
+        if !self.validators.contains_key(&validator) {
+            return Err(StakingError::NotValidator);
+        }
+        let pending = self
+            .commission_schedule
+            .get(&validator)
+            .and_then(|s| s.pending)
+            .ok_or(StakingError::CommissionNotDue)?;
+        if now_height < pending.effective_height {
+            return Err(StakingError::CommissionNotDue);
+        }
+        let v = self
+            .validators
+            .get_mut(&validator)
+            .ok_or(StakingError::NotValidator)?;
+        v.commission_bps = pending.new_bps;
+        if let Some(s) = self.commission_schedule.get_mut(&validator) {
+            s.pending = None;
+            s.last_effective_height = Some(now_height);
+        }
+        tracing::warn!(
+            "COMMISSION-APPLIED validator {}: new rate {} bps effective at height {now_height}",
+            hex::encode(validator),
+            pending.new_bps,
+        );
+        debug_assert_eq!(
+            supply_before,
+            self.ledger_stake_supply(),
+            "apply must move no stake"
+        );
+        Ok(())
+    }
+
     /// Rotate a validator's consensus key: move the ENTIRE record (self-bond,
     /// delegations, rewards, unbonding entries, withdrawable balances AND the
     /// slashing/downtime history) from `old` to `new`, atomically. Nothing is
@@ -1098,6 +1470,29 @@ impl StakingLedger {
         if let Some(pq_key) = self.validator_pq_keys.remove(&old) {
             self.validator_pq_keys.insert(new, pq_key);
         }
+        // Jail, commission schedule and redelegation locks travel with the
+        // record: rotation must neither launder a jail nor strand (or fork)
+        // the rate-limiter and lock state. The gov-lock precedent above
+        // applies — same stake, same standing, new key.
+        if let Some(rec) = self.jail.remove(&old) {
+            self.jail.insert(new, rec);
+        }
+        if let Some(sched) = self.commission_schedule.remove(&old) {
+            self.commission_schedule.insert(new, sched);
+        }
+        let moved_locks: Vec<([u8; 32], u64)> = self
+            .redelegation_lock
+            .iter()
+            .filter(|((v, _), _)| *v == old)
+            .map(|((_, d), t)| (*d, *t))
+            .collect();
+        for (d, _t) in &moved_locks {
+            self.redelegation_lock.remove(&(old, *d));
+        }
+        for (d, t) in moved_locks {
+            let entry = self.redelegation_lock.entry((new, d)).or_insert(0);
+            *entry = (*entry).max(t);
+        }
         Ok(())
     }
 
@@ -1173,6 +1568,12 @@ impl StakingLedger {
         if self_bond < MIN_VALIDATOR_BOND {
             return Err(StakingError::NotValidator);
         }
+        // A jailed validator is out of the set: new delegations cannot park
+        // on it (its power counts for nothing until `unjail`). Exits stay
+        // available; only entry is refused.
+        if self.jail.contains_key(&validator) {
+            return Err(StakingError::Jailed);
+        }
         // Fail-closed arithmetic BEFORE any mutation: a refused delegation
         // leaves the ledger byte-identical (the lazy settle below is a
         // bookkeeping move, but it must not happen on a refused call).
@@ -1245,6 +1646,140 @@ impl StakingLedger {
             amount,
             release_at: now.saturating_add(UNBONDING_PERIOD_SECS),
         });
+        Ok(())
+    }
+
+    /// Timestamp before which the position (`validator`, `delegator`) may not
+    /// be redelegated AGAIN; 0 when no redelegation lock exists. Read-only
+    /// query path for wallets planning a move.
+    pub fn redelegation_locked_until(&self, validator: &ValidatorId, delegator: &[u8; 32]) -> u64 {
+        self.redelegation_lock
+            .get(&(*validator, *delegator))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Move `amount` of `delegator`'s stake from validator `from` to validator
+    /// `to` WITHOUT the full unbond wait: voting power shifts immediately
+    /// (effective at the H+1 activation boundary), no withdrawal round-trip.
+    ///
+    /// ANTI-LONG-RANGE RULE (documented contract): a redelegation is a fast
+    /// path, not a free hop. The moved amount is locked against FURTHER
+    /// redelegation until `now + `[`UNBONDING_PERIOD_SECS`] — the same window
+    /// an unbond would take — so stake cannot be hopped between validators
+    /// inside one unbonding period to double-attribute voting history across
+    /// forks. Redelegating FROM a locked position is refused fail-closed
+    /// with [`StakingError::CooldownNotElapsed`]. `undelegate` is NOT gated
+    /// by this lock: it starts the full unbond wait itself, so it cannot
+    /// abuse the fast path (it IS the slow path).
+    ///
+    /// Fail-closed (ledger byte-identical on any refusal; arithmetic checked
+    /// BEFORE any mutation like `delegate`):
+    ///  - zero delegator → [`StakingError::ZeroAddress`];
+    ///  - `from == to` → [`StakingError::InvalidRedelegation`] (a
+    ///    same-validator "move" would otherwise launder the lock timestamp);
+    ///  - `amount == 0` or `amount > held` →
+    ///    [`StakingError::InsufficientDelegation`];
+    ///  - unknown `from`, unknown `to`, `to` jailed, or `to.self_bond < MIN`
+    ///    → [`StakingError::NotValidator`] / [`StakingError::Jailed`]
+    ///    (stake may FLEE a jailed validator — `from` jailed is allowed —
+    ///    but may never be parked ON one);
+    ///  - governance-locked portion → [`StakingError::LockedInGovernanceVote`]
+    ///    (same per-owner check as `undelegate`);
+    ///  - position still redelegation-locked →
+    ///    [`StakingError::CooldownNotElapsed`];
+    ///  - aggregate overflow → [`StakingError::ArithmeticOverflow`].
+    ///
+    /// Reward accounting is the `delegate`/`undelegate` settle pattern on
+    /// BOTH sides: the `from` position's accrued rewards are materialised
+    /// verbatim (they survive the move), and the moved stake earns at `to`
+    /// only from the NEXT distribution on (it never claims a share of pools
+    /// distributed before it arrived). Conservation holds exactly: the same
+    /// nanos leave one aggregate and enter the other (debug-asserted via
+    /// [`Self::ledger_stake_supply`]).
+    pub fn redelegate(
+        &mut self,
+        delegator: [u8; 32],
+        from: ValidatorId,
+        to: ValidatorId,
+        amount: u64,
+        now: u64,
+    ) -> Result<(), StakingError> {
+        let supply_before = self.ledger_stake_supply();
+        if delegator == [0u8; 32] {
+            return Err(StakingError::ZeroAddress);
+        }
+        if from == to {
+            return Err(StakingError::InvalidRedelegation);
+        }
+        let from_key = (from, delegator);
+        let held = self.delegations.get(&from_key).copied().unwrap_or(0);
+        if amount == 0 || amount > held {
+            return Err(StakingError::InsufficientDelegation);
+        }
+        // E7: the locked portion of the position cannot move while its vote
+        // is open (same per-owner conservative check as `undelegate`).
+        let locked = self.locked_governance.get(&delegator).copied().unwrap_or(0);
+        if amount > held.saturating_sub(locked) {
+            return Err(StakingError::LockedInGovernanceVote);
+        }
+        // Anti-long-range: the fast path cannot be chained inside one
+        // unbonding period.
+        if now < self.redelegation_locked_until(&from, &delegator) {
+            return Err(StakingError::CooldownNotElapsed);
+        }
+        if !self.validators.contains_key(&from) {
+            return Err(StakingError::NotValidator);
+        }
+        {
+            let dst = self.validators.get(&to).ok_or(StakingError::NotValidator)?;
+            if self.jail.contains_key(&to) {
+                return Err(StakingError::Jailed);
+            }
+            if dst.self_bond < MIN_VALIDATOR_BOND {
+                return Err(StakingError::NotValidator);
+            }
+        }
+        // Fail-closed arithmetic BEFORE any mutation: a refused move leaves
+        // the ledger byte-identical.
+        let to_delegated = self.validators.get(&to).map(|v| v.delegated).unwrap_or(0);
+        let to_held = self.delegations.get(&(to, delegator)).copied().unwrap_or(0);
+        let new_to_delegated = to_delegated
+            .checked_add(amount)
+            .ok_or(StakingError::ArithmeticOverflow)?;
+        let new_to_held = to_held
+            .checked_add(amount)
+            .ok_or(StakingError::ArithmeticOverflow)?;
+        // LAZY (F1): settle BOTH sides before the stakes move — the `from`
+        // accrual is preserved verbatim, and the moved stake only earns at
+        // `to` from the next distribution on.
+        self.settle_delegator_rewards(delegator, from);
+        self.settle_delegator_rewards(delegator, to);
+        if let Some(v) = self.validators.get_mut(&from) {
+            v.delegated = v.delegated.saturating_sub(amount);
+        }
+        if let Some(v) = self.validators.get_mut(&to) {
+            v.delegated = new_to_delegated;
+        }
+        if held - amount == 0 {
+            self.delegations.remove(&from_key);
+        } else {
+            self.delegations.insert(from_key, held - amount);
+        }
+        self.delegations.insert((to, delegator), new_to_held);
+        // Arm the anti-long-range lock on the ARRIVAL position: this stake
+        // may not take the fast path again until one full unbonding period
+        // has passed. `max` (not overwrite) so concurrent positions keep the
+        // furthest release.
+        let release = now.saturating_add(UNBONDING_PERIOD_SECS);
+        let entry = self.redelegation_lock.entry((to, delegator)).or_insert(0);
+        *entry = (*entry).max(release);
+        self.warn_if_quorum_fragile("redelegate");
+        debug_assert_eq!(
+            supply_before,
+            self.ledger_stake_supply(),
+            "redelegate must conserve stake exactly"
+        );
         Ok(())
     }
 
@@ -1346,6 +1881,37 @@ impl StakingLedger {
             .unwrap_or(0)
     }
 
+    /// Conserved stake supply of the whole ledger: every self-bond plus every
+    /// delegation plus every in-flight unbonding plus every matured-but-
+    /// unwithdrawn amount (saturating, so adversarial state can never panic
+    /// a debug assertion).
+    ///
+    /// CONSERVATION CONTRACT: `bond`/`add_bond` move value IN from outside
+    /// (the caller debits the account and credits the pool); `slash` moves
+    /// value OUT (`total_burned` rises by exactly the burned amount, and the
+    /// supply falls by exactly the same); `distribute_reward` MINTS backing
+    /// (`rewards_pool`/`rewards_minted` rise — the pending entries are new
+    /// value, deliberately NOT in this sum); every other transition
+    /// (`unbond`/`undelegate`/`redelegate`/`process_unbonding`/`withdraw`/
+    /// `unjail`/commission paths/`rotate_key`) must leave this sum EXACTLY
+    /// unchanged. The moving paths debug-assert that; the test suite asserts
+    /// it in release mode (`tests/validator_ux_tests.rs`).
+    pub fn ledger_stake_supply(&self) -> u64 {
+        let mut total = 0u64;
+        for v in self.validators.values() {
+            total = total
+                .saturating_add(v.self_bond)
+                .saturating_add(v.delegated);
+        }
+        for e in &self.unbonding {
+            total = total.saturating_add(e.amount);
+        }
+        for a in self.withdrawable.values() {
+            total = total.saturating_add(*a);
+        }
+        total
+    }
+
     /// Lock `amount` of `owner`'s stake for an open governance vote (E7).
     ///
     /// Called by [`crate::governance::Governance::vote`] with the exact
@@ -1386,7 +1952,10 @@ impl StakingLedger {
     }
 
     /// Build a consensus `ValidatorSet` weighted by total bonded stake. Only
-    /// validators with a self-bond at or above the minimum are included.
+    /// validators with a self-bond at or above the minimum are included, and
+    /// JAILED validators are excluded until [`Self::unjail`] re-admits them
+    /// (a jailed key holds stake but contributes no votes — counting it
+    /// would credit quorum headroom that cannot sign).
     /// The set is sorted by total stake (descending, id tiebreak) and
     /// truncated to [`MAX_ACTIVE_VALIDATORS`] (250) — TON-style Elector cap.
     /// Full nodes are unaffected (unlimited).
@@ -1403,7 +1972,7 @@ impl StakingLedger {
         let mut ranked: Vec<(ValidatorId, u64)> = self
             .validators
             .iter()
-            .filter(|(_, v)| v.self_bond >= min_bond)
+            .filter(|(id, v)| v.self_bond >= min_bond && !self.jail.contains_key(*id))
             .map(|(id, v)| (*id, v.total()))
             .filter(|(_, power)| *power > 0)
             .collect();
@@ -1415,12 +1984,14 @@ impl StakingLedger {
         ValidatorSet::from_list(ranked)
     }
 
-    /// Number of validators that would be elected (post-cap), for RPC/metrics.
+    /// Number of validators that would be elected (post-cap, post-jail), for RPC/metrics.
     pub fn elected_count(&self) -> usize {
         let min_bond = self.min_validator_bond.unwrap_or(MIN_VALIDATOR_BOND);
         self.validators
-            .values()
-            .filter(|v| v.self_bond >= min_bond && v.total() > 0)
+            .iter()
+            .filter(|(id, v)| {
+                v.self_bond >= min_bond && v.total() > 0 && !self.jail.contains_key(*id)
+            })
             .count()
             .min(MAX_ACTIVE_VALIDATORS)
     }
@@ -2113,6 +2684,32 @@ impl StakingLedger {
         for v in penalise {
             if let Ok(burned) = self.slash(v, DOWNTIME_SLASH_BPS) {
                 slashed = slashed.saturating_add(burned);
+                // JAIL ON DOWNTIME SLASH (validator-UX gap): the offender is
+                // excluded from the set until `unjail` re-admits it. The
+                // trigger is the evidence-driven penalty itself (same decided
+                // set every node derives from the same blocks), so all nodes
+                // jail identically at the same height. Refreshing an existing
+                // record (repeat outage after an unjail) moves the release
+                // forward; it never shortens it. A slash that burns 0
+                // installs no jail (nothing happened).
+                if burned > 0 {
+                    let release = height.saturating_add(JAIL_RELEASE_DELAY_HEIGHTS);
+                    self.jail
+                        .entry(v)
+                        .and_modify(|r| {
+                            r.jailed_at_height = height;
+                            r.release_height = r.release_height.max(release);
+                        })
+                        .or_insert(JailRecord {
+                            jailed_at_height: height,
+                            release_height: release,
+                        });
+                    tracing::warn!(
+                        "VALIDATOR-JAILED validator {} jailed at height {height} after a downtime slash (burned {burned}): excluded from the set until height {release} AND self_bond back at MIN+buffer ({}); top up with add_bond, then unjail",
+                        hex::encode(v),
+                        required_bond_floor_nano(),
+                    );
+                }
             }
         }
         slashed
@@ -2182,6 +2779,12 @@ impl StakingLedger {
                 .ok_or(StakingError::NotValidator)?;
             (v.total(), v.delegated, v.commission_bps)
         };
+        // A jailed validator is out of the set and earns no proposals: paying
+        // it would reward an offline key. Refused fail-closed (nothing
+        // minted, nothing credited — the caller must not mint on `Err`).
+        if self.jail.contains_key(&validator) {
+            return Err(StakingError::Jailed);
+        }
         if reward == 0 {
             return Ok(());
         }
@@ -2493,6 +3096,12 @@ impl StakingLedgerV1 {
             pq_equivocation_dedup: HashSet::new(),
             equivocation_dedup: HashSet::new(),
             validator_pq_keys: HashMap::new(),
+            // Exact: no jail, commission-schedule or redelegation-lock rows
+            // can exist in pre-feature bytes (the paths that create them did
+            // not exist).
+            jail: HashMap::new(),
+            commission_schedule: HashMap::new(),
+            redelegation_lock: HashMap::new(),
             // Exact: no vesting-tracked accounts can exist in a pre-gate
             // snapshot (the registry did not exist), so empty is not a guess.
             vesting_schedules: BTreeMap::new(),
@@ -2548,6 +3157,11 @@ impl StakingLedgerV2 {
             pq_equivocation_dedup: self.pq_equivocation_dedup,
             equivocation_dedup: HashSet::new(),
             validator_pq_keys: self.validator_pq_keys,
+            // Exact: no jail, commission-schedule or redelegation-lock rows
+            // can exist in pre-feature bytes.
+            jail: HashMap::new(),
+            commission_schedule: HashMap::new(),
+            redelegation_lock: HashMap::new(),
             vesting_schedules: BTreeMap::new(),
             min_validator_bond: None,
         }
@@ -2601,6 +3215,12 @@ impl StakingLedgerV3 {
             // delegators start with no checkpoint (rate 0).
             reward_accumulators: HashMap::new(),
             delegator_reward_checkpoints: HashMap::new(),
+            // Exact: no jail, commission-schedule or redelegation-lock rows
+            // can exist in pre-feature bytes (the paths that create them did
+            // not exist), so empty is not a guess.
+            jail: HashMap::new(),
+            commission_schedule: HashMap::new(),
+            redelegation_lock: HashMap::new(),
             unbonding: self.unbonding,
             withdrawable: self.withdrawable,
             total_burned: self.total_burned,

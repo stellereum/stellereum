@@ -337,21 +337,32 @@ pub struct SnapshotAnchor {
 /// and the snapshot is REFUSED (fail closed to the body walk, which replays
 /// with the correct set-at-height).
 ///
+/// F5 SET-AT-HEIGHT (validator-set rotation): the single-set entry
+/// [`verify_snapshot_anchor`] below is kept for backward compatibility, but
+/// live callers MUST use [`verify_snapshot_anchor_with_sets`] so every
+/// height's QC is checked against the set in force AT THAT height
+/// (`ValidatorRuntime::validator_set_for_height`). A height with no
+/// resolvable set is fail-closed (refused), never guessed.
+///
 /// `fetch_header(height)` resolves the published header (+QC) at a height and
 /// returns `None` when nothing is published. Any gap is a refusal, never a
 /// skip. `max_span` bounds the walk so a far-ahead peer cannot force an
 /// unbounded verify loop.
-pub async fn verify_snapshot_anchor<F, Fut>(
+pub async fn verify_snapshot_anchor_with_sets<F, Fut, R>(
     our_finalized: Option<(u64, [u8; 32])>,
     genesis_root: [u8; 32],
     next_height: u64,
-    validators: &crate::consensus::ValidatorSet,
+    resolve_set: R,
     max_span: u64,
     mut fetch_header: F,
 ) -> Result<SnapshotAnchor, String>
 where
     F: FnMut(u64) -> Fut,
     Fut: std::future::Future<Output = Option<HeaderLink>>,
+    // Owned (not `&dyn Fn`): the resolver is held across awaits inside
+    // `tokio::spawn`ed sync tasks, so the future must stay `Send` — a bare
+    // `&dyn Fn` is not `Sync` and would poison every spawner.
+    R: Fn(u64) -> Option<crate::consensus::ValidatorSet>,
 {
     let (anchor_height, mut parent_hash) = match our_finalized {
         Some((h, hash)) => (h, hash),
@@ -397,14 +408,18 @@ where
                 hex::encode(parent_hash)
             ));
         }
-        verify_finality_for_header(
-            validators,
-            height,
-            &link.block_hash,
-            &link.proposer,
-            &link.qc,
-        )
-        .map_err(|e| format!("snapshot anchor: {e}"))?;
+        // F5 set-at-height: each height's QC is verified against the set in
+        // force AT THAT height. An unresolvable height is a refusal, never a
+        // fallback to a neighbouring set (which would accept quorums the
+        // height never had, or refuse ones it genuinely reached).
+        let vs = resolve_set(height).ok_or_else(|| {
+            format!(
+                "snapshot anchor: no validator set resolvable at height {height}; \
+                 refusing without a set-at-height (F5 fail-closed)"
+            )
+        })?;
+        verify_finality_for_header(&vs, height, &link.block_hash, &link.proposer, &link.qc)
+            .map_err(|e| format!("snapshot anchor: {e}"))?;
         // The block at `next_height - 1` is the boundary: it is the height
         // the snapshot restores to, and its hash is the finalized head the
         // node resumes from.
@@ -431,6 +446,35 @@ where
         state_root,
         boundary_hash,
     })
+}
+
+/// Backward-compatible single-set entry for [`verify_snapshot_anchor_with_sets`]:
+/// every height resolves to the same set. Live callers MUST use
+/// `verify_snapshot_anchor_with_sets` so each certificate is checked against
+/// the set in force at ITS height; a height it cannot resolve is fail-closed
+/// (refused), never guessed.
+pub async fn verify_snapshot_anchor<F, Fut>(
+    our_finalized: Option<(u64, [u8; 32])>,
+    genesis_root: [u8; 32],
+    next_height: u64,
+    validators: &crate::consensus::ValidatorSet,
+    max_span: u64,
+    fetch_header: F,
+) -> Result<SnapshotAnchor, String>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Option<HeaderLink>>,
+{
+    let single = validators.clone();
+    verify_snapshot_anchor_with_sets(
+        our_finalized,
+        genesis_root,
+        next_height,
+        move |_| Some(single.clone()),
+        max_span,
+        fetch_header,
+    )
+    .await
 }
 
 /// How many trailing heights [`verify_snapshot_anchor_tail`] checks.
@@ -508,14 +552,23 @@ pub const SNAPSHOT_ANCHOR_TAIL_WINDOW: u64 = 3;
 ///
 /// Fail-closed like the full walk: any missing header, broken link, or failed
 /// QC is a refusal, never a skip.
-pub async fn verify_snapshot_anchor_tail<F, Fut>(
+///
+/// F5 SET-AT-HEIGHT: the single-set entry [`verify_snapshot_anchor_tail`]
+/// below is kept for backward compatibility, but live callers MUST use this
+/// per-height variant so each window height's QC is checked against the set
+/// in force AT THAT height. A height with no resolvable set is fail-closed
+/// (refused), never guessed.
+pub async fn verify_snapshot_anchor_tail_with_sets<F, Fut, R>(
     next_height: u64,
-    validators: &crate::consensus::ValidatorSet,
+    resolve_set: R,
     mut fetch_header: F,
 ) -> Result<SnapshotAnchor, String>
 where
     F: FnMut(u64) -> Fut,
     Fut: std::future::Future<Output = Option<HeaderLink>>,
+    // Owned (not `&dyn Fn`): same `Send`-future reason as
+    // [`verify_snapshot_anchor_with_sets`].
+    R: Fn(u64) -> Option<crate::consensus::ValidatorSet>,
 {
     if next_height == 0 {
         return Err("snapshot anchor (tail): no header at height 0 to anchor on".to_string());
@@ -555,14 +608,17 @@ where
                 ));
             }
         }
-        verify_finality_for_header(
-            validators,
-            height,
-            &link.block_hash,
-            &link.proposer,
-            &link.qc,
-        )
-        .map_err(|e| format!("snapshot anchor (tail): {e}"))?;
+        // F5 set-at-height: this window height's QC is verified against the
+        // set in force AT THIS height. An unresolvable height refuses the
+        // whole window (fail-closed), never falls back to a neighbouring set.
+        let vs = resolve_set(height).ok_or_else(|| {
+            format!(
+                "snapshot anchor (tail): no validator set resolvable at height {height}; \
+                 refusing without a set-at-height (F5 fail-closed)"
+            )
+        })?;
+        verify_finality_for_header(&vs, height, &link.block_hash, &link.proposer, &link.qc)
+            .map_err(|e| format!("snapshot anchor (tail): {e}"))?;
         // The boundary block (the height the snapshot restores to): its hash
         // is QC-verified above, so it is a value the quorum vouched for.
         if height + 1 == next_height {
@@ -584,6 +640,24 @@ where
         state_root,
         boundary_hash,
     })
+}
+
+/// Backward-compatible single-set entry for
+/// [`verify_snapshot_anchor_tail_with_sets`]: every window height resolves to
+/// the same set. Live callers MUST use the `_with_sets` variant so each
+/// certificate is checked against the set in force at ITS height.
+pub async fn verify_snapshot_anchor_tail<F, Fut>(
+    next_height: u64,
+    validators: &crate::consensus::ValidatorSet,
+    fetch_header: F,
+) -> Result<SnapshotAnchor, String>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Option<HeaderLink>>,
+{
+    let single = validators.clone();
+    verify_snapshot_anchor_tail_with_sets(next_height, move |_| Some(single.clone()), fetch_header)
+        .await
 }
 
 /// F3(b): after a body walk, the walked tail must BE the advertised head.
@@ -633,18 +707,26 @@ pub fn walked_head_anchor(
 /// `required_quorum` is the node's own 2/3 quorum size; a zero quorum is refused
 /// outright rather than degenerating into "accept anything".
 ///
-/// F5 LIMITATION (validator-set rotation): there are NO height-indexed
-/// validator-set snapshots -- `StakingLedger::to_validator_set` only ever
-/// reflects current bonded stake (`src/staking.rs`) -- so a historical block's
-/// precommit QC is verified against the set the caller passes, which is the
-/// node's CURRENT set. This is the conservative direction: signers who have
-/// rotated out carry no power and a quorum must still be met by the current
-/// set, so a peer cannot manufacture a quorum from stale keys. The residual is
-/// that a quorum of current validators could (pointlessly) vouch for old
-/// heights; closing it needs per-height set snapshots threaded through sync.
-/// TODO(F5): derive the set-at-height from the staking ledger as the chain is
-/// replayed (the replay path in `runtime::replay_historical_block` already does
-/// exactly this, because the engine sits at the block's pre-state there).
+/// F5 SET-AT-HEIGHT (validator-set rotation), CLOSED by threading:
+/// `StakingLedger::to_validator_set` still only ever reflects current bonded
+/// stake (`src/staking.rs`), so a historical block's precommit QC verified
+/// against the node's CURRENT set is the conservative direction (signers who
+/// have rotated out carry no power; a peer cannot manufacture a quorum from
+/// stale keys). The threading that closes the residual — a quorum of current
+/// validators pointlessly vouching for old heights — is:
+/// * body walks: [`validate_sync_chain_with_sets`], which resolves the set in
+///   force at EACH height (`ValidatorRuntime::validator_set_for_height`) and
+///   fail-closes on an unresolvable height (the single-set
+///   [`validate_sync_chain`] below is the backward-compatible entry);
+/// * snapshot anchors: [`verify_snapshot_anchor_with_sets`] and
+///   [`verify_snapshot_anchor_tail_with_sets`], same per-height rule;
+/// * snapshot trust: [`check_snapshot_set_binding`], which requires the
+///   snapshot at the boundary height to strict-decode and commit to the SAME
+///   non-empty validator set that verified its anchor — a snapshot without a
+///   set commitment cannot serve as a trust anchor (fail-closed).
+///
+/// The replay path in `runtime::replay_historical_block` derives the
+/// set-at-height from the engine at the block's pre-state.
 pub fn validate_sync_chain(
     blocks: &[Block],
     expected_first_height: u64,
@@ -887,9 +969,143 @@ pub const SYNC_DOMAIN_KINDS: &[&str] = &[
 pub async fn fast_sync_state<F, Fut, G, GFut>(
     target_engine: &crate::state_engine::InMemoryStateEngine,
     expected_root: crate::cell::CellHash,
+    fetch_snapshot: F,
+    fetch_domain: G,
+) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<u8>>>,
+    G: FnMut(&'static str) -> GFut,
+    GFut: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    fast_sync_fetch_verify_commit(
+        target_engine,
+        expected_root,
+        fetch_snapshot,
+        fetch_domain,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// F5 SET-AT-HEIGHT trust gate for snapshots: like [`fast_sync_state`], but
+/// the snapshot is additionally required to COMMIT TO the validator set at
+/// `snapshot_height`, and to commit to exactly the set that verified its
+/// anchor (`anchor_set` — the set the caller proved the boundary QCs under,
+/// resolved at the boundary height via
+/// `ValidatorRuntime::validator_set_for_height` or the `_with_sets` anchor).
+///
+/// Fail-closed BEFORE the target is mutated: a snapshot at `snapshot_height`
+/// that carries no `domains` blob, whose domains blob is legacy/unknown
+/// (strict parse, see
+/// [`crate::storage::decode_domain_snapshot_strict`]), that commits to an
+/// EMPTY set, or that commits to a DIFFERENT set than `anchor_set`, is
+/// refused as a trust anchor — the node must re-fetch (fresh set-only pull +
+/// retry, see the N3 note on [`verify_snapshot_anchor_tail_with_sets`]) or
+/// fall back to the body walk, never vote on an unbound snapshot.
+///
+/// Returns the bound validator set (the set the node resumes with at
+/// `snapshot_height + 1`, to install via the checked refresh) on success.
+/// Wire format unchanged: the commitment already flows inside the `domains`
+/// blob; this only enforces that the trust path checks it.
+pub async fn fast_sync_state_with_set_binding<F, Fut, G, GFut>(
+    target_engine: &crate::state_engine::InMemoryStateEngine,
+    expected_root: crate::cell::CellHash,
+    fetch_snapshot: F,
+    fetch_domain: G,
+    snapshot_height: u64,
+    anchor_set: &crate::consensus::ValidatorSet,
+) -> Result<crate::consensus::ValidatorSet, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<u8>>>,
+    G: FnMut(&'static str) -> GFut,
+    GFut: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    let bound = fast_sync_fetch_verify_commit(
+        target_engine,
+        expected_root,
+        fetch_snapshot,
+        fetch_domain,
+        Some((snapshot_height, anchor_set)),
+    )
+    .await?;
+    bound.ok_or_else(|| {
+        "fast sync: set binding requested but no bound set returned (internal error)".to_string()
+    })
+}
+
+/// F5 set-at-height binding check over an already-fetched domain bundle.
+///
+/// The snapshot at `snapshot_height` MUST commit to the validator set in force
+/// at that height — i.e. its `domains` blob strict-decodes and derives a
+/// NON-EMPTY set — and that set MUST equal `anchor_set`, the set the caller
+/// verified the snapshot's anchor QCs under. Any other shape refuses the
+/// snapshot AS A TRUST ANCHOR (fail-closed):
+/// * no `domains` blob: the snapshot carries no set commitment at all;
+/// * legacy/unknown `domains` bytes: strict parse refuses (no downgrade —
+///   re-publish from a current binary);
+/// * empty derived set: nothing could vouch for `snapshot_height + 1`;
+/// * different set: stale or rotated snapshot (or a forked feed) — pull a
+///   fresh set and retry, or walk bodies with per-height sets.
+///
+/// An empty `anchor_set` is itself a refusal: an anchor verified under no
+/// quorum proves nothing, so there is no binding to check against. (Unbonded
+/// chains, where no quorum exists yet, use the non-binding [`fast_sync_state`]
+/// with a config set — this gate is for quorum-secured heights.)
+pub fn check_snapshot_set_binding(
+    snapshot_height: u64,
+    bundle: &[(&'static str, Vec<u8>)],
+    anchor_set: &crate::consensus::ValidatorSet,
+) -> Result<crate::consensus::ValidatorSet, String> {
+    let dbytes = bundle
+        .iter()
+        .find(|(kind, _)| *kind == "domains")
+        .map(|(_, bytes)| bytes)
+        .ok_or_else(|| {
+            format!(
+                "fast sync: snapshot at height {snapshot_height} carries no `domains` blob: \
+                 it does not commit to the validator set at that height — \
+                 refusing as a trust anchor (fetch the domains snapshot or \
+                 re-publish from a current binary)"
+            )
+        })?;
+    let snap = crate::storage::decode_domain_snapshot_strict(dbytes)
+        .map_err(|e| format!("fast sync: snapshot at height {snapshot_height}: {e}"))?;
+    let set = snap.staking.to_validator_set();
+    if set.validators.is_empty() {
+        return Err(format!(
+            "fast sync: snapshot at height {snapshot_height} commits to an EMPTY validator set — \
+             refusing as a trust anchor (an empty set cannot vouch for height {}; \
+             unbonded chains must use the non-binding fast-sync path with a config set)",
+            snapshot_height + 1
+        ));
+    }
+    if anchor_set.validators.is_empty() {
+        return Err(format!(
+            "fast sync: anchor set is EMPTY but the snapshot at height {snapshot_height} commits \
+             to a non-empty set — refusing as a trust anchor (the anchor was never quorum-verified)"
+        ));
+    }
+    if set.validators != anchor_set.validators {
+        return Err(format!(
+            "fast sync: snapshot at height {snapshot_height} commits to a validator set that does \
+             not match the set that verified its anchor (stale, rotated, or forked snapshot) — \
+             refusing as a trust anchor (pull a fresh set via the set-only refresh and retry, \
+             or fall back to the body walk with per-height sets)"
+        ));
+    }
+    Ok(set)
+}
+
+async fn fast_sync_fetch_verify_commit<F, Fut, G, GFut>(
+    target_engine: &crate::state_engine::InMemoryStateEngine,
+    expected_root: crate::cell::CellHash,
     mut fetch_snapshot: F,
     mut fetch_domain: G,
-) -> Result<(), String>
+    set_binding: Option<(u64, &crate::consensus::ValidatorSet)>,
+) -> Result<Option<crate::consensus::ValidatorSet>, String>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Option<Vec<u8>>>,
@@ -948,6 +1164,19 @@ where
         ));
     }
 
+    // F5 SET-AT-HEIGHT binding gate: when requested, the snapshot must commit
+    // to the validator set at its height (strict parse, non-empty, equal to
+    // the anchor set) BEFORE the target is mutated, so a refusal leaves live
+    // state untouched exactly like the root and replay gates.
+    let bound_set = match set_binding {
+        Some((snapshot_height, anchor_set)) => Some(check_snapshot_set_binding(
+            snapshot_height,
+            &bundle,
+            anchor_set,
+        )?),
+        None => None,
+    };
+
     // FAIL-CLOSED replay gate (audit F1): the root check above pins the
     // snapshot's replay sets, but installing into the TARGET must additionally
     // prove the incoming sets cover what the target already holds. Cases:
@@ -1001,7 +1230,7 @@ where
         .await
         .map_err(|e| format!("fast sync: commit snapshot error: {e}"))?;
     install_bundle(target_engine, &bundle).await?;
-    Ok(())
+    Ok(bound_set)
 }
 
 /// Extract the cross-shard replay snapshot from a fetched domain bundle, if
@@ -1030,8 +1259,14 @@ async fn install_bundle(
     for (kind, dbytes) in bundle {
         match *kind {
             "domains" => {
-                let snap: crate::storage::DomainSnapshot = bincode::deserialize(dbytes)
-                    .map_err(|e| format!("fast sync: restore domains error: {e:?}"))?;
+                // Trust-anchor path: strict parse (current shape only, no
+                // warn-and-upgrade downgrade, trailing bytes rejected). A
+                // legacy or unknown-version blob is a hard refusal here; the
+                // LENIENT `decode_domain_snapshot` stays available only to the
+                // local-restore path that must still boot pre-upgrade data
+                // directories. See `decode_domain_snapshot_strict`.
+                let snap = crate::storage::decode_domain_snapshot_strict(dbytes)
+                    .map_err(|e| format!("fast sync: restore domains error: {e}"))?;
                 snap.apply(engine).await;
             }
             "session" => {

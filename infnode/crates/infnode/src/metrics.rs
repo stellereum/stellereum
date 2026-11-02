@@ -47,6 +47,11 @@ pub struct Metrics {
     pub auth_bans_hit: AtomicU64,
     /// F8 hardening: strike bans currently/ever imposed.
     pub auth_bans_total: AtomicU64,
+    /// F8-rep: per-identity temp bans imposed (escalating, expiring).
+    pub rep_bans: AtomicU64,
+    /// F8-rep: handshakes/requests refused on identity reputation (ban hit
+    /// or soft-throttle hit). Fail-closed counting, like `auth_bans_hit`.
+    pub rep_refusals: AtomicU64,
     pub start_unix: std::sync::atomic::AtomicI64,
 }
 
@@ -217,6 +222,18 @@ pub fn render(
         "infnode_auth_bans_total",
         "strike bans imposed",
         m.auth_bans_total.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_rep_bans_total",
+        "per-identity temp bans imposed",
+        m.rep_bans.load(Ordering::Relaxed),
+    );
+    fmt_metric(
+        &mut out,
+        "infnode_rep_refusals_total",
+        "handshakes/requests refused on identity reputation",
+        m.rep_refusals.load(Ordering::Relaxed),
     );
     fmt_metric(
         &mut out,

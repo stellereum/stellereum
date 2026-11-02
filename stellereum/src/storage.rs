@@ -2438,6 +2438,64 @@ pub fn decode_domain_snapshot(bytes: &[u8]) -> Result<DomainSnapshot> {
     Ok(v1.upgrade())
 }
 
+/// Maximum bytes [`decode_domain_snapshot_strict`] accepts for one domain
+/// blob (fail-closed anti-DoS on peer-supplied input: a snapshot is tens of
+/// MB; 512 MiB is two orders of magnitude above any honest blob and bounds
+/// the allocator before the first field decodes).
+pub const DOMAIN_SNAPSHOT_STRICT_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Strict trust-anchor parser for a persisted/fetched domain snapshot.
+///
+/// Accepts ONLY the current [`DomainSnapshot`] shape, with trailing bytes
+/// rejected (same wire contract as `ConsensusMsg::decode`: fixint bincode,
+/// exact-length). Any legacy shape (`DomainSnapshotV1`..`V6`, pre-ABI
+/// governance, pre-lazy ledgers) or unknown/future version is a hard `Err`
+/// naming the refusal — NO warn-and-upgrade fallback, NO silent skip.
+///
+/// Split from [`decode_domain_snapshot`] on purpose: the LOCAL restore path
+/// keeps the lenient decoder so pre-upgrade data directories still boot
+/// (pinned by `staking_ledger_migration_tests` and the `pre_e2`/`pre_lazy`
+/// unit tests), while every path that treats a snapshot as a TRUST ANCHOR
+/// (sync `install_bundle`, [`crate::sync::check_snapshot_set_binding`])
+/// uses this strict parser, so a legacy blob can never become quorum state.
+/// A legacy snapshot is re-published from a current binary, never upgraded
+/// in place on the trust path.
+pub fn decode_domain_snapshot_strict(bytes: &[u8]) -> Result<DomainSnapshot, String> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(DOMAIN_SNAPSHOT_STRICT_MAX_BYTES)
+        .reject_trailing_bytes()
+        .deserialize(bytes)
+        .map_err(|e| {
+            format!(
+                "refusing domain snapshot: not a current-shape DomainSnapshot \
+                 (legacy or unknown version — no downgrade applied, refusing \
+                 fail-closed; re-publish the snapshot from a current binary): {e}"
+            )
+        })
+}
+
+/// Validator set committed by the domain snapshot at `snapshot_height`.
+///
+/// Strict-decodes `domain_bytes` (see [`decode_domain_snapshot_strict`]) and
+/// derives the consensus set from the enclosed staking ledger. This is the
+/// F5 set-at-height commitment: a snapshot used as a trust anchor MUST carry
+/// the set in force at its height, so the anchor proof (QCs verified under a
+/// resolved set) and the adopted set (installed from this ledger) agree.
+/// Returns the derived set (possibly empty — the caller decides whether an
+/// empty commitment is usable; [`crate::sync::check_snapshot_set_binding`]
+/// refuses it as a trust anchor).
+pub fn snapshot_validator_set_strict(
+    snapshot_height: u64,
+    domain_bytes: &[u8],
+) -> Result<crate::consensus::ValidatorSet, String> {
+    let snap = decode_domain_snapshot_strict(domain_bytes).map_err(|e| {
+        format!("snapshot at height {snapshot_height} commits to no usable validator set: {e}")
+    })?;
+    Ok(snap.staking.to_validator_set())
+}
+
 /// Default ceiling for how far the ledger (domains) snapshot may lag the
 /// state snapshot before the derived validator set is refused as STALE.
 ///

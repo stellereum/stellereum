@@ -72,6 +72,7 @@ use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
+use ml_kem::kem::{Decapsulate, FromSeed, KeyExport};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -1141,28 +1142,32 @@ fn decrypt_share_package(
 // around the X25519 share-package leg.
 // ===========================================================================
 //
-// STATUS: the full RANK-1 swap (PQ-KEM encaps replacing the X25519 DH in
-// `encrypt/decrypt_share_package`) is BLOCKED: `ml-kem` is a direct
-// dependency of the sibling `infnode` crate only — it is NOT addressable
-// from this crate without adding a new dependency, which is forbidden. What
-// lands here is the fallback step the plan calls for in that case: every
-// `DkgContribution` is wrapped in a Falcon-512 signature over its canonical
-// bytes (the D2 binding preimage: epoch, index, commitments, packages), and
-// the authenticated ingest path refuses anything that does not verify.
+// STATUS: the Falcon-authenticated fallback step above is wired and pinned by
+// `tests/mev_pq_transport_tests.rs`. The full RANK-1 swap below it is WIRED
+// TOO (additive, `ml-kem 0.3` — the same audited lineage infnode pins in
+// `kem_kat_tests.rs`): share packages are ML-KEM-768 encapsulations to
+// explicitly supplied recipient keys, still wrapped in the SAME Falcon
+// envelope (`pq_transport_seal`/`verify` cover the packages via
+// `canonical_bytes`, so no new envelope shape). With
+// `PREFER_PQ_MEV_TRANSPORT = false` (default) the new
+// `ingest_pq_kem_transport` entry point below behaves exactly like the
+// classical `ingest` (byte-identical default).
 //
 // SHAPE PRESERVED: Feldman VSS, the Ristretto threshold arithmetic, the
 // X25519 package encryption, `DkgContribution`/`EncryptedShare` (wire
-// format untouched), `ingest`, `finalize`, and the sealing path are all
-// UNCHANGED. The new code is purely additive: with
-// `PREFER_PQ_MEV_TRANSPORT = false` the ingest entry point below behaves
-// exactly like the classical `ingest` (byte-identical default).
+// format untouched — the legs are distinguished by ciphertext LENGTH only),
+// `ingest`, `finalize`, and the sealing path are all UNCHANGED. The new code
+// is purely additive: classical 48-byte packages keep working everywhere,
+// PQ-KEM 1136-byte packages are refused by the classical ingest
+// fail-closed (and vice versa).
 //
 // ACTIVATION: flip `PREFER_PQ_MEV_TRANSPORT` to `true` (a future,
-// audited wiring diff) and route gossip through `ingest_pq_transport` with
-// the contributor's Falcon-512 key from the validator registry. Never
-// silent: a contribution without a valid Falcon envelope is refused when
-// the flag is on, exactly as a contribution without our share package is
-// refused today.
+// audited wiring diff) and route gossip through `ingest_pq_kem_transport`
+// with the contributor's Falcon-512 key from the validator registry and the
+// recipient KEM keys from the PQ registry. Never silent: a contribution
+// without a valid Falcon envelope or without a KEM package for us is
+// refused when the flag is on, exactly as a contribution without our share
+// package is refused today.
 
 /// PQ transport selector: `false` keeps the classical X25519 package leg
 /// (default, byte-identical); `true` requires Falcon-authenticated
@@ -1244,7 +1249,8 @@ impl EpochDkg {
     /// Ingest a Falcon-authenticated contribution: verify first, then run
     /// the UNCHANGED classical ingest (Feldman VSS + X25519 package
     /// decrypt). Always verifies, regardless of the transport flag — this
-    /// is the PQ leg.
+    /// is the Falcon-authenticated fallback leg (X25519 packages; the
+    /// RANK-1 KEM leg is `ingest_authenticated_pq`).
     pub fn ingest_authenticated(
         &mut self,
         envelope: &PqTransportEnvelope,
@@ -1268,6 +1274,406 @@ impl EpochDkg {
     ) -> Result<(), String> {
         if PREFER_PQ_MEV_TRANSPORT {
             self.ingest_authenticated(envelope, enc_secret, expected_falcon_pk)
+        } else {
+            self.ingest(envelope.contribution.clone(), enc_secret)
+        }
+    }
+}
+
+// ===========================================================================
+// PQ-KEM transport leg — RANK-1: ML-KEM-768 package encryption + Falcon auth
+// ===========================================================================
+//
+// MECHANICS: per share package, encapsulate to the recipient's ML-KEM-768
+// key (`pq_kem_encapsulate_deterministic`) -> 32-byte shared secret ->
+// `derive_seal_key` (the SAME KDF as the classical leg, with the same
+// all-zero salt/epoch binding) -> XChaCha20-Poly1305 of the 32-byte share
+// evaluation. The carrier is the UNCHANGED `EncryptedShare`:
+// `ephemeral_pk` is zeroed (a KEM needs no DH ephemeral), `nonce` is a fresh
+// XChaCha nonce, and `ciphertext = kem_ct (1088) || aead_ct (48)` = 1136
+// bytes. Length alone distinguishes the legs (classical: 48), and each
+// ingest refuses the other's shape fail-closed before touching any secret.
+//
+// KEY SOURCING: recipient KEM keys travel as explicit arguments
+// (`recipient_index -> 1184-byte ek` map for building, 64-byte seed for
+// opening). NO new committee wire field: `CommitteeMember` keeps only the
+// X25519 `enc_pk`, so the classical path and its hashes are byte-identical.
+// Registry wiring (which on-chain key feeds these arguments) is a lead
+// decision and deliberately NOT done here.
+//
+// IMPLICIT REJECTION (FIPS 203 s7.2, same pin as infnode's KATs):
+// `decapsulate` is INFALLIBLE — a tampered but well-formed `kem_ct` yields
+// a pseudorandom fallback key, never an error. The refusal surfaces at the
+// AEAD open (wrong key -> tag failure -> `Err`), so a tampered package dies
+// at transport and never reaches the VSS checks, let alone `finalize`.
+//
+
+/// ML-KEM-768 encapsulation key length (FIPS 203).
+pub const PQ_KEM_EK_LEN: usize = 1184;
+/// ML-KEM-768 ciphertext length (FIPS 203).
+pub const PQ_KEM_CT_LEN: usize = 1088;
+/// ML-KEM seed (`d || z`) length.
+pub const PQ_KEM_SEED_LEN: usize = 64;
+/// PQ-KEM package ciphertext length: `kem_ct || aead_ct` (1088 + 48).
+pub const PQ_KEM_PACKAGE_CT_LEN: usize = PQ_KEM_CT_LEN + 48;
+
+/// Derive a member's ML-KEM-768 encapsulation key from its 64-byte KEM seed.
+///
+/// Deterministic (`from_seed` — the same idiom infnode pins in
+/// `kem_kat_tests.rs`): the same seed always yields the same keypair, so
+/// tests pin vectors and production seeds from `OsRng` bytes (what
+/// `ml-kem`'s `getrandom`-gated `generate` would do internally).
+pub fn pq_kem_ek_from_seed(kem_seed: &[u8; 64]) -> Vec<u8> {
+    let seed: ml_kem::Seed = (*kem_seed).into();
+    let (_, ek) = ml_kem::MlKem768::from_seed(&seed);
+    ek.to_bytes().as_slice().to_vec()
+}
+
+/// Encapsulate to a recipient's ML-KEM-768 key with EXPLICIT randomness.
+///
+/// `randomness` is the KEM `m` (the `encapsulate_deterministic` idiom from
+/// infnode's KATs: "useful for testing against known vectors"): production
+/// passes fresh `OsRng` bytes (see `encrypt_share_package_pq`), tests pass
+/// fixed vectors for determinism. Returns `(kem_ct_bytes, shared_secret)`.
+pub fn pq_kem_encapsulate_deterministic(
+    recipient_ek: &[u8],
+    randomness: &[u8; 32],
+) -> Result<(Vec<u8>, [u8; 32]), String> {
+    if recipient_ek.len() != PQ_KEM_EK_LEN {
+        return Err("pq kem encapsulation key has the wrong length".to_string());
+    }
+    let key = ml_kem::kem::Key::<ml_kem::EncapsulationKey768>::try_from(recipient_ek)
+        .map_err(|_| "pq kem encapsulation key is malformed".to_string())?;
+    let ek = ml_kem::EncapsulationKey768::new(&key)
+        .map_err(|_| "pq kem encapsulation key is malformed".to_string())?;
+    let m: ml_kem::B32 = (*randomness).into();
+    let (ct, ss) = ek.encapsulate_deterministic(&m);
+    let mut shared = [0u8; 32];
+    shared.copy_from_slice(ss.as_slice());
+    Ok((ct.as_slice().to_vec(), shared))
+}
+
+/// Decapsulate a KEM ciphertext with the recipient's 64-byte KEM seed.
+///
+/// Infallible for a well-formed `ct` (FIPS 203 implicit rejection): a
+/// tampered `ct` yields the fallback key, never an error — the caller MUST
+/// use the key (here: the AEAD open fails with it). A malformed length is
+/// refused outright.
+pub fn pq_kem_decapsulate(kem_seed: &[u8; 64], ct: &[u8]) -> Result<[u8; 32], String> {
+    if ct.len() != PQ_KEM_CT_LEN {
+        return Err("pq kem ciphertext has the wrong length".to_string());
+    }
+    let seed: ml_kem::Seed = (*kem_seed).into();
+    let (dk, _) = ml_kem::MlKem768::from_seed(&seed);
+    let kem_ct: ml_kem::kem::Ciphertext<ml_kem::MlKem768> = ct
+        .try_into()
+        .map_err(|_| "pq kem ciphertext is malformed".to_string())?;
+    let ss = dk.decapsulate(&kem_ct);
+    let mut shared = [0u8; 32];
+    shared.copy_from_slice(ss.as_slice());
+    Ok(shared)
+}
+
+/// Encrypt one DKG share evaluation to a recipient's ML-KEM-768 key (PQ leg).
+///
+/// Production randomness: fresh KEM `m` AND a fresh XChaCha nonce from
+/// `OsRng` (the same `encapsulate_deterministic`-with-`OsRng`-bytes idiom as
+/// infnode's `pq_encapsulate`, because `ml-kem` is built without its
+/// `getrandom` feature). Fixed-vector tests pin the primitive layer
+/// (`pq_kem_encapsulate_deterministic`/`pq_kem_decapsulate`); this package
+/// layer is pinned by round-trip, not by bytes.
+pub fn encrypt_share_package_pq(
+    recipient_index: u32,
+    recipient_kem_ek: &[u8],
+    plaintext: &[u8; 32],
+) -> Result<EncryptedShare, String> {
+    let mut randomness = [0u8; 32];
+    OsRng.fill_bytes(&mut randomness);
+    let (kem_ct, shared) = pq_kem_encapsulate_deterministic(recipient_kem_ek, &randomness)?;
+    let key = derive_seal_key(&shared, &[0u8; 32], 0);
+    let mut nonce = [0u8; 24];
+    OsRng.fill_bytes(&mut nonce);
+    let cipher = XChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|e| format!("pq kem seal cipher init failed: {e}"))?;
+    let aead_ct = cipher
+        .encrypt(XNonce::from_slice(&nonce), plaintext.as_ref())
+        .map_err(|e| format!("pq kem share package encryption failed: {e}"))?;
+    let mut ciphertext = Vec::with_capacity(PQ_KEM_PACKAGE_CT_LEN);
+    ciphertext.extend_from_slice(&kem_ct);
+    ciphertext.extend_from_slice(&aead_ct);
+    Ok(EncryptedShare {
+        recipient_index,
+        ephemeral_pk: [0u8; 32],
+        nonce,
+        ciphertext,
+    })
+}
+
+/// Decrypt one PQ-KEM share package with the recipient's 64-byte KEM seed.
+///
+/// Fail-closed: a wrong length, an implicit-rejection key mismatch (AEAD
+/// tag failure — the tampered-`ct` and wrong-recipient cases), and a
+/// non-32-byte plaintext are all refused. Never a silent wrong share: a
+/// wrong share would poison `finalize` into a divergent epoch key.
+pub fn decrypt_share_package_pq(
+    kem_seed: &[u8; 64],
+    package: &EncryptedShare,
+) -> Result<[u8; 32], String> {
+    if package.ciphertext.len() != PQ_KEM_PACKAGE_CT_LEN {
+        return Err("pq kem share package has the wrong ciphertext length".to_string());
+    }
+    let (kem_ct, aead_ct) = package.ciphertext.split_at(PQ_KEM_CT_LEN);
+    let shared = pq_kem_decapsulate(kem_seed, kem_ct)?;
+    let key = derive_seal_key(&shared, &[0u8; 32], 0);
+    let cipher = XChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|e| format!("pq kem seal cipher init failed: {e}"))?;
+    let plaintext = cipher
+        .decrypt(XNonce::from_slice(&package.nonce), aead_ct)
+        .map_err(|_| "pq kem share package decryption failed".to_string())?;
+    if plaintext.len() != 32 {
+        return Err("pq kem share package plaintext has the wrong length".to_string());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&plaintext);
+    Ok(out)
+}
+
+impl EpochDkg {
+    /// Build our DKG contribution with PQ-KEM-encrypted packages (RANK-1).
+    ///
+    /// Identical to [`Self::contribution`] except the per-recipient packages
+    /// are ML-KEM-768 encapsulations (via [`encrypt_share_package_pq`]) to
+    /// the caller-supplied recipient keys (`recipient_index -> 1184-byte
+    /// ek`). The deterministic polynomial, the Feldman commitments, the
+    /// `enc_pk` committee binding, and the own-evaluation bookkeeping are
+    /// UNCHANGED — so the epoch key and every share match the classical run
+    /// over the same secrets (only the transcript root differs: it binds
+    /// the package bytes, which are encryption-randomized anyway).
+    pub fn contribution_pq(
+        &mut self,
+        validator_id: [u8; 32],
+        long_term_secret: &[u8; 32],
+        recipient_kem_pks: &std::collections::BTreeMap<u32, Vec<u8>>,
+    ) -> Result<DkgContribution, String> {
+        let index = self
+            .committee
+            .index_of(&validator_id)
+            .ok_or_else(|| "validator is not a member of this epoch committee".to_string())?;
+        if self.committee.threshold == 0 {
+            return Err("committee has no threshold (empty committee)".to_string());
+        }
+        if !self.committee.is_contributor(index) {
+            // Same gate as `contribution`: only the DERIVED contributor set
+            // defines the epoch key.
+            return Err(
+                "this member is not a contributor of this epoch (it holds a share, not a contribution)"
+                    .to_string(),
+            );
+        }
+        let coeffs = self.polynomial(long_term_secret);
+        let mut commitments = Vec::with_capacity(coeffs.len());
+        for c in &coeffs {
+            commitments.push((RISTRETTO_BASEPOINT_POINT * c).compress().to_bytes());
+        }
+        // The evaluation of our polynomial at every OTHER member's index,
+        // KEM-encapsulated to that member's PQ transport key.
+        let mut packages = Vec::new();
+        for recipient_index in 1..=self.committee.members.len() as u32 {
+            if recipient_index == index {
+                continue;
+            }
+            let ek = recipient_kem_pks.get(&recipient_index).ok_or_else(|| {
+                format!(
+                    "pq kem transport is missing the recipient key for committee index {recipient_index}"
+                )
+            })?;
+            let eval = eval_polynomial(&coeffs, recipient_index as u64);
+            packages.push(encrypt_share_package_pq(
+                recipient_index,
+                ek,
+                &eval.to_bytes(),
+            )?);
+        }
+        let contribution = DkgContribution {
+            epoch: self.committee.epoch,
+            validator_id,
+            index,
+            enc_pk: self
+                .committee
+                .member_at(index)
+                .map(|m| m.enc_pk)
+                .unwrap_or([0u8; 32]),
+            commitments,
+            packages,
+        };
+        // Remember our own evaluation: the aggregate share must include our
+        // own contribution (same as `contribution`).
+        self.own_eval = Some(eval_polynomial(&coeffs, index as u64));
+        self.own = Some(contribution.clone());
+        Ok(contribution)
+    }
+
+    /// Ingest and VERIFY a PQ-KEM contribution (companion to [`Self::ingest`]).
+    ///
+    /// The SAME fail-closed gates (epoch, contributor set, identity,
+    /// commitments, package coverage, Feldman VSS at our index) — only the
+    /// package open differs: ML-KEM decapsulation with `own_kem_seed`
+    /// instead of the X25519 DH. Classical (48-byte) packages are refused
+    /// here by length, exactly as PQ-KEM (1136-byte) packages are refused
+    /// by `ingest`.
+    pub fn ingest_pq(
+        &mut self,
+        contribution: DkgContribution,
+        own_kem_seed: &[u8; 64],
+    ) -> Result<(), String> {
+        if contribution.epoch != self.committee.epoch {
+            return Err(format!(
+                "dkg contribution for epoch {} does not match epoch {}",
+                contribution.epoch, self.committee.epoch
+            ));
+        }
+        if self.contributions.contains_key(&contribution.index) {
+            return Err(format!(
+                "duplicate dkg contribution for committee index {}",
+                contribution.index
+            ));
+        }
+        let contribution_index = contribution.index;
+        let member = self
+            .committee
+            .member_at(contribution.index)
+            .ok_or_else(|| "dkg contribution claims an index outside the committee".to_string())?;
+        if !self.committee.is_contributor(contribution.index) {
+            return Err(
+                "dkg contribution comes from a member that is not a contributor of this epoch"
+                    .to_string(),
+            );
+        }
+        if member.validator_id != contribution.validator_id {
+            return Err("dkg contribution identity does not match the committee".to_string());
+        }
+        let is_own = contribution.index == self.our_index.unwrap_or(0);
+        if is_own && contribution.validator_id != self.our_validator_id {
+            return Err("dkg contribution claims our committee index".to_string());
+        }
+        if member.enc_pk != contribution.enc_pk {
+            return Err("dkg contribution encryption key does not match the committee".to_string());
+        }
+        if contribution.commitments.len() != self.committee.threshold {
+            return Err(format!(
+                "dkg contribution has {} commitments, expected {}",
+                contribution.commitments.len(),
+                self.committee.threshold
+            ));
+        }
+        // Every commitment must be a valid group element.
+        let mut commitment_points = Vec::with_capacity(contribution.commitments.len());
+        for c in &contribution.commitments {
+            let point = decompress_point(c)
+                .ok_or_else(|| "dkg commitment is not a valid curve point".to_string())?;
+            commitment_points.push(point);
+        }
+        // Exactly one package per other member, and one for us.
+        let mut seen = std::collections::HashSet::new();
+        let mut our_package: Option<&EncryptedShare> = None;
+        for p in &contribution.packages {
+            if !seen.insert(p.recipient_index) {
+                return Err("duplicate dkg share package".to_string());
+            }
+            let target = self
+                .committee
+                .member_at(p.recipient_index)
+                .ok_or_else(|| "dkg share package targets a non-member".to_string())?;
+            if target.validator_id == contribution.validator_id {
+                return Err("dkg share package targets the contributor itself".to_string());
+            }
+            if p.recipient_index == contribution.index {
+                return Err("dkg share package targets the contributor itself".to_string());
+            }
+            if p.ciphertext.len() != PQ_KEM_PACKAGE_CT_LEN {
+                return Err("pq kem share package has the wrong ciphertext length".to_string());
+            }
+            if self.our_index() == Some(p.recipient_index) {
+                our_package = Some(p);
+            }
+        }
+        // Every other member must have received a package.
+        for i in 1..=self.committee.members.len() as u32 {
+            if i == contribution.index {
+                continue;
+            }
+            if !seen.contains(&i) {
+                return Err(format!(
+                    "dkg contribution is missing the share package for committee index {i}"
+                ));
+            }
+        }
+        if is_own {
+            // Same own-evaluation VSS check as `ingest`.
+            let eval = self
+                .own_eval
+                .ok_or_else(|| "dkg contribution for our index arrived before ours".to_string())?;
+            let expected = eval_point(&commitment_points, contribution.index as u64);
+            if expected != RISTRETTO_BASEPOINT_POINT * eval {
+                return Err(
+                    "our own dkg contribution does not match the commitments we published"
+                        .to_string(),
+                );
+            }
+            self.contributions.insert(contribution.index, contribution);
+            self.evaluations.insert(contribution_index, eval);
+            return Ok(());
+        }
+        let Some(package) = our_package else {
+            return Err("dkg contribution does not carry our share package".to_string());
+        };
+        let our_index = self
+            .our_index
+            .ok_or_else(|| "this node is not a member of the epoch committee".to_string())?;
+        let eval_bytes = decrypt_share_package_pq(own_kem_seed, package)?;
+        let eval = Option::<Scalar>::from(Scalar::from_canonical_bytes(eval_bytes))
+            .ok_or_else(|| "dkg share evaluation is not a canonical scalar".to_string())?;
+        // VERIFIABLE SECRET SHARING CHECK: the decrypted evaluation must
+        // match the published commitments at our index.
+        let expected = eval_point(&commitment_points, our_index as u64);
+        if expected != RISTRETTO_BASEPOINT_POINT * eval {
+            return Err(
+                "dkg share evaluation does not match the published commitments".to_string(),
+            );
+        }
+        self.contributions.insert(contribution.index, contribution);
+        self.evaluations.insert(contribution_index, eval);
+        Ok(())
+    }
+
+    /// Ingest a Falcon-authenticated PQ-KEM contribution: verify first, then
+    /// run the PQ-KEM ingest (Feldman VSS + KEM package decrypt). Always
+    /// verifies, regardless of the transport flag — this is the RANK-1 leg.
+    pub fn ingest_authenticated_pq(
+        &mut self,
+        envelope: &PqTransportEnvelope,
+        own_kem_seed: &[u8; 64],
+        expected_falcon_pk: &[u8],
+    ) -> Result<(), String> {
+        pq_transport_verify(envelope, expected_falcon_pk)?;
+        self.ingest_pq(envelope.contribution.clone(), own_kem_seed)
+    }
+
+    /// The KEM-transport-swapped ingest entry point.
+    ///
+    /// Const-gated: with `PREFER_PQ_MEV_TRANSPORT = false` (default) this
+    /// is exactly the classical `ingest` — byte-identical behavior. With
+    /// the flag on, contributions must carry a valid Falcon envelope AND
+    /// KEM-encrypted packages for our KEM seed.
+    pub fn ingest_pq_kem_transport(
+        &mut self,
+        envelope: &PqTransportEnvelope,
+        enc_secret: &[u8; 32],
+        own_kem_seed: &[u8; 64],
+        expected_falcon_pk: &[u8],
+    ) -> Result<(), String> {
+        if PREFER_PQ_MEV_TRANSPORT {
+            self.ingest_authenticated_pq(envelope, own_kem_seed, expected_falcon_pk)
         } else {
             self.ingest(envelope.contribution.clone(), enc_secret)
         }

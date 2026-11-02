@@ -34,3 +34,9 @@ x509-parser = { workspace = true }
 zeroize = { workspace = true }
 reed-solomon-erasure = { version = "6.0.0", default-features = false }
 ml-kem = "0.3"
+# PQ handshake Falcon-512 tag backend (lead-ordered, same versions as the
+# stellereum crate: no new crypto lineage). INTERIM: unwired — no code
+# references these yet; the Falcon tag is blocked on lead-gated PQ identity
+# keys (see keyring.rs NodeKeys::id + docs/PQ_TRANSPORT_PLAN.md §7).
+falcon-rust = "0.3.1"
+pqcrypto-falcon = "0.4.1"

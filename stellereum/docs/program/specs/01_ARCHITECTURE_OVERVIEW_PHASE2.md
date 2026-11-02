@@ -11,7 +11,7 @@ Supersedes narrative claims in `handoff/*`; replaces `01_ARCHITECTURE_OVERVIEW.m
 | `stellereum` (`stellereum/Cargo.toml:2-3`, package `stellereum 0.1.0`) | Canonical node: consensus, execution, storage, RPC, P2P |
 | `infnode` (`infnode/crates/infnode/src/main.rs:14,335`) | Overlay: QUIC + Ed25519 transport, DHT, mailbox; `lib.rs` + `dht.rs` + `mailbox.rs` present |
 | `infmail` (`infnode/crates/infmail/src/`: `blockchain.rs`, `inbound.rs`, `web.rs`, `main.rs`) | Webmail backend on the overlay |
-| `stellereum-contracts/`, `stellereum-indexer/`, `stellereum-sdk/`, `stell-wallet/`, `scripts/tools/stelops/` | Contracts+SDK, SQLite indexer, client SDK, wallet/light client, operator CLI (role per `00_PROJECT_MAP.md`; build layout UNVERIFIED beyond node+overlay — not re-read this pass) |
+| `stellereum-contracts/`, `stellereum-indexer/`, `stellereum-sdk/`, `stell-wallet/`, `scripts/tools/stelops/` | Contracts+SDK, SQLite indexer, client SDK, wallet/light client, operator CLI (dirs exist; roles per `stellereum-contracts/README.md:5`, `stellereum-indexer/README.md:5`, `stellereum-sdk/SDK-README.md:1-5`, `stell-wallet/README.md:6`, `scripts/tools/stelops/Cargo.toml:4` + `src/main.rs:1-5`) |
 
 Pinned deps (consensus-relevant): `ed25519-dalek v2` (`stellereum/Cargo.toml:13`),
 `x25519-dalek v2` (`:14`), `bls12_381 v0.9` (`:41`), `argon2 0.5` (`:46`),
@@ -39,7 +39,7 @@ Pinned deps (consensus-relevant): `ed25519-dalek v2` (`stellereum/Cargo.toml:13`
 | `main.rs`, `runtime.rs` | Node entry, block-apply paths (`runtime.rs:6884,6894,8184`) |
 | `mempool.rs` | Fee-priority admission (`mempool.rs:20-55`) |
 | `mev*.rs`, `mev_epoch.rs`, `mev_v4.rs` | MEV pipelines |
-| `native_api.rs`, `rpc.rs` | 22 native APIs surface (`native_api.rs` module doc; count UNVERIFIED — header claims range, exact 22 pinned in prior spec, not recounted) |
+| `native_api.rs`, `rpc.rs` | 35-method catalog `METHODS` (`native_api.rs:124-402`; first `stell_tokenTransfer` `:127`, last `stell_nativeApi` `:402`; prior spec's 22 superseded by recount) |
 | `network.rs`, `sync.rs`, `storage.rs` | Overlay use, catch-up (`sync.rs:134,351`), persistence |
 | `node_keys.rs`, `remote_signer.rs` | Key custody, remote signer |
 | `oracle.rs`, `orderbook.rs`, `pmm.rs` | Price feeds (`oracle.rs:10-34`), CLOB (`orderbook.rs:9-11`), PMM (`pmm.rs:30-35`) |
@@ -83,8 +83,10 @@ Pinned deps (consensus-relevant): `ed25519-dalek v2` (`stellereum/Cargo.toml:13`
   (`consensus.rs:48-68`); EVM serves it (`evm_adapter.rs:57-58`).
 - PQ verify lives in `stellereum` (`post_quantum.rs:520,2319`); `infnode`
   transport is classical Ed25519/QUIC (`infnode/crates/infnode/src/main.rs:14`)
-  with NO pure-PQ mode (per `docs/CLASSICAL_INVENTORY.md:30-34`; runtime
-  re-check UNVERIFIED this pass beyond inventory pointer).
+   with NO pure-PQ mode (per `docs/CLASSICAL_INVENTORY.md:30-34`; confirmed:
+   `infnode` QUIC+Ed25519 entry `infnode/crates/infnode/src/main.rs:14`, KEX
+   verdict classical-until-ML-KEM-vendored `pq_transport.rs:60-70`, TLS X25519
+   flagged classical in inventory).
 - `cn_vrf.rs:1-4` is sandbox-only: pure functions + KATs, no consensus call
-  site (call-site absence UNVERIFIED by grep this pass — grep for
-  `cn_vrf::` callers not run).
+   site (zero `cn_vrf::` callers outside `cn_vrf.rs` by grep; header
+   `cn_vrf.rs:1-4`).

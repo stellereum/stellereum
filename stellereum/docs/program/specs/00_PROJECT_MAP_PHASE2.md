@@ -16,7 +16,9 @@ untouched: this worker is NEW-FILES-ONLY. Lead merges. Phase-2 files:
   `COMPREHENSIVE_AUDIT_REPORT.md` (PART I byte-frozen per Phase-1 `01`).
 - Classical registry: `docs/CLASSICAL_INVENTORY.md:1`.
 - CN-VRF: `docs/PQ_CN_VRF_SPEC.md:1` (spec) + `stellereum/src/cn_vrf.rs:1-4` (sandbox).
-- VRF activation plan: `docs/VRF_ACTIVATION_PLAN.md` (pointer only, UNVERIFIED content).
+- VRF activation plan: `docs/VRF_ACTIVATION_PLAN.md:1-8` (DRAFT plan, default-off;
+  env `STELL_VRF_ACTIVATION_HEIGHT` per `stellereum/src/vrf.rs:87,132-150`;
+  live call sites pin `Disabled`+`None`).
 - Roadmaps/status: `docs/ROADMAP.md`, `STATUS.md` (machine-generated via
   `scripts/harness_status.sh`), `docs/TESTNET_READINESS_OPS.md`,
   `docs/LIVE_DEMOS_RUNBOOK.md`, `docs/PENTEST_NET_API.md`.
@@ -29,12 +31,20 @@ untouched: this worker is NEW-FILES-ONLY. Lead merges. Phase-2 files:
 
 ## Claim accounting (Phase-2 set)
 
-- ~140 cited claims across the 4 specs; ~11 marked UNVERIFIED inline:
-  01: native-API count 22, infnode pure-PQ absence beyond inventory, `cn_vrf::`
-  caller absence; 02: PQ-KEM absence beyond inventory, PoP-absence line,
-  Schnorr-construction term, CN-VRF activation/sortition use; 03: host-fn name
-  list, EIP-1559 mirror detail, apply interleave order, faucet/paymaster
-  mechanics; 04: gap-0 const, stream-shed const, reputation mechanics.
+- ~140 cited claims across the 4 specs; 0 open verification items (all resolved
+  with file:line citations in this pass):
+  01: native-API catalog 35 (`native_api.rs:124-402`), infnode pure-PQ absence
+  (`CLASSICAL_INVENTORY.md:30-34` + `pq_transport.rs:60-70`), `cn_vrf::`
+  caller absence (zero callers by grep); 02: PQ-KEM op absence
+  (`pq_transport.rs:60-70` + parked `mev_v4.rs:84-112`), PoP-absence line
+  (`bls.rs:527-531`), Schnorr-construction term (`vrf.rs:106,113,145`),
+  CN-VRF activation/sortition (`cn_vrf.rs:58`, `consensus.rs:1080-1086`);
+  03: host-fn name list (`contract.rs:1193-1413`), EIP-1559 static-default
+  detail (`evm_adapter.rs:115-123,328-368`), apply interleave order
+  (`state_engine.rs:6437`), faucet/paymaster mechanics (`rpc.rs:274-275,599-607`,
+  `sharding.rs:3892-3916`); 04: gap consts (`sync.rs:1640,1731`),
+  stream-shed const (`consensus_net.rs:158`), reputation split
+  (`network.rs:2112` + infnode `reputation.rs:1-27`).
 - No commits/stashes/pushes performed (lead-only). No existing file modified.
   New files: the 5 in this report (this map + 4 specs), all under
   `docs/specs/` with `_PHASE2` suffix to avoid colliding with Phase-1 names.

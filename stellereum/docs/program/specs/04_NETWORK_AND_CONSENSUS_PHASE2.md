@@ -56,8 +56,10 @@ Sources: `stellereum/src/consensus.rs`, `consensus_net.rs`, `network.rs`,
   (`:1057`).
 - Retry backoff: base 100 ms (`:1416`), max 1000 ms (`:1418`), jitter 100 ms
   (`:1428`); `fetch_retry_backoff_ms` (`:1644-1651`), jittered variant (`:1665`).
-- Gap-0 / checkpoint-invariants: exact const names UNVERIFIED this pass (no
-  `GAP_0` const located; resync depends on snapshot-anchor verification above).
+- Gap-0 / checkpoint-invariants: no `GAP_0` const exists in tree (grep zero
+  hits); gap-adjacent consts are `RETRO_SKIP_BEHIND_GAP 100` (`sync.rs:1640`,
+  used `:1721`) and `LIVE_ADOPT_GAP_THRESHOLD 16` (`:1731`); resync depends on
+  snapshot-anchor verification above.
 
 ## 6. Transport: dial/backoff, accept hardening, caps
 
@@ -68,9 +70,14 @@ Sources: `stellereum/src/consensus.rs`, `consensus_net.rs`, `network.rs`,
   (`:526-532`).
 - Accept path: `accept_inbound` (`network.rs:2911`, called `:2895`); message cap
   `MAX_CROSS_SHARD_MSG 4 MiB` (`:2344`); endpoint table 512 records (`:3352`),
-  backoff threshold 5 (`:3358`); stream-shed/receiver-drop behavior per prior
-  spec — per-line shed const UNVERIFIED this pass.
+  backoff threshold 5 (`:3358`); stream-shed/receiver-drop = superseded-vote
+  drop `SUPERSEDED_ROUND_LAG 2` (`consensus_net.rs:158`), drop predicate
+  `:185-191`, batch coalesce `:196-226`; proposals/commits/batches never
+  droppable (`:155-157,168-171`).
 - Replication store: 5 s timeout (`network.rs:4222`), 3 attempts (`:4226`),
   250 ms jitter max (`:4234`), backoff fn (`:4349-4357`).
-- Reputation: no `reputation|ban_peer|peer_score` const located in `network.rs`
-  this pass (only comment at `:2112`) — reputation mechanics UNVERIFIED.
+- Reputation: no peer down-score table in `stellereum` `network.rs` (comment
+  `:2112`: mismatch discarded + logged, hook named for a future system);
+  per-peer reputation lives in infnode
+  (`infnode/crates/infnode/src/reputation.rs:1-27`: score clamp, soft-throttle
+  + temp-ban at the accept gate).

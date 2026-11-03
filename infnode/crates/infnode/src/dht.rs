@@ -23,6 +23,13 @@ pub const ALPHA: usize = 3; // параллельность lookup
 /// дедуп защищает только от мгновенных дублей при репликации/починке.
 pub const DEDUP_TTL_MS: i64 = 5 * 60 * 1000;
 
+/// Horizon after which a routing-table entry counts as stale (no refresh seen).
+/// 24 h matches the persistent-subscription horizon (`Node::prune_subs`): an
+/// entry unseen for a full day is dead weight, not discovery memory. Applied
+/// by `RoutingTable::prune_stale` from the 60 s `dht_refresh` loop; lookups
+/// only ever ADD fresh entries, so this strictly shrinks the table.
+pub const ROUTING_STALE_AFTER_MS: i64 = 24 * 3600 * 1000;
+
 /// Узел в таблице маршрутизации.
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct NodeInfo {
@@ -151,6 +158,20 @@ impl RoutingTable {
     pub fn remove(&mut self, id: &[u8; NODEID_LEN]) {
         let idx = self.bucket_of(id);
         self.buckets[idx].retain(|n| n.id != *id);
+    }
+
+    /// Выселить протухшие записи (`last_seen` старше `max_age_ms`).
+    /// Возвращает число выселенных. `closest`/`insert` не меняются, поэтому
+    /// результаты lookup на свежих фикстурах бит-в-бит те же (см.
+    /// `tests/dht_scale_tests.rs::routing_prune_stale_before_after`).
+    pub fn prune_stale(&mut self, now_ms: i64, max_age_ms: i64) -> usize {
+        let mut evicted = 0usize;
+        for bucket in &mut self.buckets {
+            let before = bucket.len();
+            bucket.retain(|n| now_ms.saturating_sub(n.last_seen) <= max_age_ms);
+            evicted += before - bucket.len();
+        }
+        evicted
     }
 
     /// Ближайшие n узлов к target (по XOR).

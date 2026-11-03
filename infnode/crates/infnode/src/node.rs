@@ -94,6 +94,54 @@ impl Default for RateBucket {
 /// and cheap enough that one identity cannot wedge a worker.
 pub const DYNAMIC_PEER_RATE_LIMIT_PER_SEC: u32 = 20;
 
+/// Backpressure caps (audit 2026-11-03). Every connection-adjacent
+/// queue/table in this file is bounded by one of these. Shed policy is
+/// uniform: fail-closed (drop/refuse the NEW item, keep serving the old),
+/// mirroring the `MAX_OUTBOX_PER_PEER` + `outbox_dropped` idiom. Sheds bump
+/// an existing `metrics` counter where one fits (`outbox_dropped`,
+/// `msgs_dropped_dead_rx`); tables with no fitting counter shed silently and
+/// are listed as follow-ups (no new metrics infra per task scope).
+///
+/// Fairness: per-peer caps isolate peers at enqueue time (one abusive peer
+/// cannot evict honest peers' queues), and `MAX_OUTBOX_FLUSH_PER_PEER` makes
+/// `flush_outbox_once` round-robin (one abusive peer cannot starve honest
+/// peers at drain time).
+/// Live QUIC connections tracked per peer (inner Vec of `conns`).
+pub const MAX_CONNS_PER_PEER: usize = 8;
+/// Distinct peers with tracked connections (outer `conns` map).
+pub const MAX_CONN_PEERS_TOTAL: usize = 4096;
+/// Total stored session keys (`sessions`, keyed by conn stable_id).
+pub const MAX_SESSIONS_TOTAL: usize = 4096;
+/// Distinct pubsub topics (`subs` outer map).
+pub const MAX_SUBS_TOPICS: usize = 1024;
+/// Distinct subscribers of one topic (`subs` inner map).
+pub const MAX_SUBS_PEERS_PER_TOPIC: usize = 1024;
+/// Live connections recorded per (topic, peer) (`SubState.conns`).
+pub const MAX_SUB_CONNS_PER_PEER: usize = 8;
+/// Distinct peers with a pending outbox queue (`outbox` outer map).
+/// Per-queue depth stays `proto::MAX_OUTBOX_PER_PEER`.
+pub const MAX_OUTBOX_PEERS_TOTAL: usize = 1024;
+/// Fair-drain budget: messages processed for ONE peer per flush cycle.
+/// Guarantees every queued peer is serviced each cycle.
+pub const MAX_OUTBOX_FLUSH_PER_PEER: usize = 32;
+/// Distinct (origin, topic) reorder buffers (`reorder` outer map).
+pub const MAX_REORDER_KEYS: usize = 1024;
+/// Buffered out-of-order messages per (origin, topic) (`reorder` inner map).
+pub const MAX_REORDER_BUF_PER_KEY: usize = 128;
+/// Decrypted mail bodies held in RAM (`mail_cache`).
+pub const MAX_MAIL_CACHE_ENTRIES: usize = 256;
+/// Distinct topics with local app subscribers (`app_subs` outer map).
+pub const MAX_APP_SUB_TOPICS: usize = 1024;
+/// Local subscribers of one topic (`app_subs` inner vec).
+pub const MAX_APP_SUBS_PER_TOPIC: usize = 128;
+/// Distinct topics with an allocated publish sequence (`topic_seq`).
+pub const MAX_TOPIC_SEQ_TOPICS: usize = 1024;
+/// Distinct node ids in the route table (`routes` total; per-update and
+/// per-node caps stay in `proto`).
+pub const MAX_ROUTES_TOTAL: usize = 4096;
+/// Distinct peers with a tie-break fallback guard entry (`sessionless_guard`).
+pub const MAX_SESSIONLESS_GUARD_PEERS: usize = 1024;
+
 /// Reorder buffer: (origin, topic) -> (next_seq, {seq -> (data, src)}).
 ///
 /// `src` (node id ОТПРАВИТЕЛЯ) едет вместе с `data`: буфер может отдать
@@ -572,6 +620,11 @@ impl Node {
                         if b.len() == NODEID_LEN {
                             let mut pid = [0u8; NODEID_LEN];
                             pid.copy_from_slice(&b);
+                            // Backpressure on load: persisted state is
+                            // untrusted input — same total cap as live paths.
+                            if !routes.contains_key(&pid) && routes.len() >= MAX_ROUTES_TOTAL {
+                                continue;
+                            }
                             routes.entry(pid).or_insert(v.clone());
                             // NAT hole punch: вспоминаем публичный client-адрес пира
                             if let Some(peer) = peers.get_mut(&pid) {
@@ -958,6 +1011,180 @@ impl Node {
         self.metrics.rep_refusals.load(Ordering::Relaxed)
     }
 
+    /// Outbox shed counter (per-peer overflow, outer peer-queue overflow,
+    /// expiry/TTL drops, overloaded persist-load trims). Mirrors the other
+    /// `*_total()` fail-closed accessors.
+    pub fn outbox_dropped_total(&self) -> u64 {
+        self.metrics.outbox_dropped.load(Ordering::Relaxed)
+    }
+
+    // ============ Backpressure introspection / test hooks ============
+    //
+    // Thin wrappers over the REAL enqueue/drain/table paths above (no logic
+    // duplication): integration tests drive these to assert cap enforcement,
+    // per-peer isolation, and fair draining without a live network. Read-only
+    // observers return table sizes; `bp_*` injectors call the same private
+    // methods the production paths call.
+
+    /// Enqueue one outbox message via the real `enqueue` path (caps, shed
+    /// counter, dirty flag, persist).
+    pub async fn bp_enqueue_outbox(
+        &self,
+        pid: [u8; NODEID_LEN],
+        topic: String,
+        data: String,
+        msg_id: u64,
+        seq: u64,
+        origin: String,
+    ) {
+        self.enqueue(
+            pid,
+            QueuedMsg {
+                topic,
+                data,
+                msg_id,
+                seq,
+                origin,
+                attempts: 0,
+                ts: now_ms(),
+            },
+        )
+        .await;
+    }
+
+    /// Pending messages queued for one peer.
+    pub async fn bp_outbox_len(&self, pid: [u8; NODEID_LEN]) -> usize {
+        self.outbox.read().await.get(&pid).map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// Distinct peers with a pending outbox queue.
+    pub async fn bp_outbox_peer_count(&self) -> usize {
+        self.outbox.read().await.len()
+    }
+
+    /// Per-message attempt counters for one peer's queue (drain progress).
+    pub async fn bp_outbox_attempts(&self, pid: [u8; NODEID_LEN]) -> Vec<u32> {
+        self.outbox
+            .read()
+            .await
+            .get(&pid)
+            .map(|q| q.iter().map(|m| m.attempts).collect())
+            .unwrap_or_default()
+    }
+
+    /// Run one real `flush_outbox_once` drain cycle.
+    pub async fn bp_flush_outbox_once(self: &Arc<Self>) {
+        self.flush_outbox_once().await;
+    }
+
+    /// Insert into the real `subs_book` path (topic/peer caps). Returns false
+    /// on shed. Does NOT attach a live conn (no network in tests).
+    pub async fn bp_sub_book(&self, topic: &str, pid: [u8; NODEID_LEN]) -> bool {
+        self.subs_book(topic, pid).await
+    }
+
+    /// (topics with subscribers, max subscribers of one topic).
+    pub async fn bp_subs_sizes(&self) -> (usize, usize) {
+        let s = self.subs.read().await;
+        let max_peers = s.values().map(|m| m.len()).max().unwrap_or(0);
+        (s.len(), max_peers)
+    }
+
+    /// Offer to the real `reorder_offer` path. Returns messages to deliver
+    /// now as `(data, src, seq)`.
+    pub async fn bp_reorder_offer(
+        &self,
+        origin: String,
+        topic: String,
+        seq: u64,
+        data: String,
+        src: String,
+    ) -> Vec<(String, String, u64)> {
+        self.reorder_offer(&origin, &topic, seq, data, src).await
+    }
+
+    /// (distinct reorder keys, largest single buffer).
+    pub async fn bp_reorder_sizes(&self) -> (usize, usize) {
+        let r = self.reorder.read().await;
+        let max_buf = r.values().map(|(_, b)| b.len()).max().unwrap_or(0);
+        (r.len(), max_buf)
+    }
+
+    /// Insert via the real `mail_cache_insert` path (cap + eviction).
+    pub async fn bp_mail_cache_insert(&self, name: String, blob: Vec<u8>) {
+        self.mail_cache_insert(name, blob).await;
+    }
+
+    /// Decrypted bodies currently cached.
+    pub async fn bp_mail_cache_len(&self) -> usize {
+        self.mail_cache.read().await.len()
+    }
+
+    /// Allocate via the real `next_topic_seq` path (saturates to 0 at cap).
+    pub async fn bp_next_topic_seq(&self, topic: &str) -> u64 {
+        self.next_topic_seq(topic).await
+    }
+
+    /// Distinct topics with an allocated sequence.
+    pub async fn bp_topic_seq_len(&self) -> usize {
+        self.topic_seq.read().await.len()
+    }
+
+    /// Live local subscribers of one topic (after dead-prune on register).
+    pub async fn bp_app_subs_len(&self, topic: &str) -> usize {
+        self.app_subs.read().await.get(topic).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Insert via the real `session_insert` path. Returns false on shed.
+    pub async fn bp_session_insert(&self, sid: usize, key: [u8; 32]) -> bool {
+        self.session_insert(sid, key).await
+    }
+
+    /// Stored session keys.
+    pub async fn bp_sessions_len(&self) -> usize {
+        self.sessions.read().await.len()
+    }
+
+    /// Insert via the real `add_conn` path (per-peer + total caps, eviction).
+    pub async fn bp_conn_insert(&self, pid: [u8; NODEID_LEN], conn: Connection) {
+        self.add_conn(pid, conn).await;
+    }
+
+    /// Tracked connections for one peer.
+    pub async fn bp_conns_len(&self, pid: [u8; NODEID_LEN]) -> usize {
+        self.conns.read().await.get(&pid).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Distinct peers with tracked connections.
+    pub async fn bp_conns_peers(&self) -> usize {
+        self.conns.read().await.len()
+    }
+
+    /// Admit via the real sessionless-guard path (fail-closed at cap).
+    /// On admit, ensures a guard entry exists like the production path.
+    pub async fn bp_guard_admit(&self, pid: [u8; NODEID_LEN]) -> bool {
+        let mut g = self
+            .sessionless_guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !g.contains_key(&pid) && g.len() >= MAX_SESSIONLESS_GUARD_PEERS {
+            return false;
+        }
+        g.entry(pid).or_default();
+        true
+    }
+
+    /// Stored routes.
+    pub async fn bp_routes_len(&self) -> usize {
+        self.routes.read().await.len()
+    }
+
+    /// Feed a `dht.update`-style payload through the REAL gossip-merge path
+    /// (per-update + total caps). Returns the response bytes.
+    pub async fn bp_handle_dht_update(self: &Arc<Self>, v: serde_json::Value) -> Option<Vec<u8>> {
+        self.handle_dht_update(&v).await
+    }
+
     pub fn resolve(&self, sel: &str) -> Result<[u8; NODEID_LEN]> {
         if let Some(pid) = self.by_name.get(sel) {
             return Ok(*pid);
@@ -972,13 +1199,52 @@ impl Node {
         Ok(pid)
     }
 
+    /// Backpressure admission for the session table. Returns false (fail-closed:
+    /// caller must abort the connection) when the table is full and this is a
+    /// new entry. No fitting metrics counter exists (follow-up).
+    async fn session_insert(&self, sid: usize, key: [u8; 32]) -> bool {
+        let mut s = self.sessions.write().await;
+        if !s.contains_key(&sid) && s.len() >= MAX_SESSIONS_TOTAL {
+            return false;
+        }
+        s.insert(sid, key);
+        true
+    }
+
     async fn add_conn(&self, pid: [u8; NODEID_LEN], conn: Connection) {
         let sid = conn.stable_id();
+        // Backpressure admission (fail-closed): dedup first, then caps. The
+        // checks run under a read guard; the insert re-checks under the
+        // write guard so a race can only refuse, never exceed the cap.
+        // No fitting metrics counter exists for conn-table sheds (follow-up).
+        let need_evict: Option<usize> = {
+            let conns = self.conns.read().await;
+            match conns.get(&pid) {
+                Some(v) if v.iter().any(|c| c.stable_id() == sid) => return,
+                Some(v) if v.len() >= MAX_CONNS_PER_PEER => v.first().map(|c| c.stable_id()),
+                None if conns.len() >= MAX_CONN_PEERS_TOTAL => {
+                    conn.close(quinn::VarInt::from(0u32), b"conn table full");
+                    return;
+                }
+                _ => None,
+            }
+        };
+        if let Some(old) = need_evict {
+            // Evict the oldest conn of this peer (close + repoint + sub
+            // cleanup via remove_conn), then store the new one below.
+            self.remove_conn(pid, old).await;
+        }
         let mut conns = self.conns.write().await;
         let v = conns.entry(pid).or_default();
-        if !v.iter().any(|c| c.stable_id() == sid) {
-            v.push(conn);
+        if v.iter().any(|c| c.stable_id() == sid) {
+            return;
         }
+        if v.len() >= MAX_CONNS_PER_PEER {
+            drop(conns);
+            conn.close(quinn::VarInt::from(0u32), b"conn table full");
+            return;
+        }
+        v.push(conn);
     }
 
     async fn remove_conn(&self, pid: [u8; NODEID_LEN], sid: usize) {
@@ -1228,7 +1494,12 @@ impl Node {
             Some(a) => proto::pq_hybrid_session_key(&classical, &a.shared, &a.digest),
             None => classical,
         };
-        self.sessions.write().await.insert(conn.stable_id(), key);
+        // Backpressure: fail-closed when the session table is full (the dial
+        // fails here instead of growing memory without bound).
+        if !self.session_insert(conn.stable_id(), key).await {
+            self.drop_conn(pid, Some(conn.stable_id())).await;
+            bail!("sessions full");
+        }
         self.add_route(pid, addr.to_string(), &peer.cfg.ed_pub)
             .await;
         self.routing_insert(pid, &peer.cfg.endpoints, &peer.cfg.ed_pub, &peer.cfg.x_pub)
@@ -1421,6 +1692,12 @@ impl Node {
                 .sessionless_guard
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            // Backpressure: fail-closed when the guard table is full (no new
+            // entry for an unknown peer; the fallback dial is skipped).
+            // No fitting metrics counter exists (follow-up).
+            if !g.contains_key(&pid) && g.len() >= MAX_SESSIONLESS_GUARD_PEERS {
+                return Err(anyhow!("no session key for conn"));
+            }
             let e = g.entry(pid).or_default();
             if dropped_sessionless {
                 e.last_drop = Some(now);
@@ -1873,12 +2150,24 @@ impl Node {
     /// Локальная подписка приложения (CLI/MCP) на топик.
     pub async fn register_app_sub(&self, topic: &str) -> mpsc::UnboundedReceiver<String> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.app_subs
-            .write()
-            .await
-            .entry(topic.to_string())
-            .or_default()
-            .push(tx);
+        {
+            let mut subs = self.app_subs.write().await;
+            // Backpressure: fail-closed caps on the local subscriber table.
+            // Dead receivers are pruned first (a dropped rx otherwise stays
+            // in the vec forever and every publish pays for it); only when
+            // all slots hold LIVE receivers is the new subscription shed
+            // (the rx is still returned, but nothing is delivered to it).
+            // No fitting metrics counter exists (follow-up).
+            if !subs.contains_key(topic) && subs.len() >= MAX_APP_SUB_TOPICS {
+                return rx;
+            }
+            let v = subs.entry(topic.to_string()).or_default();
+            v.retain(|s| !s.is_closed());
+            if v.len() >= MAX_APP_SUBS_PER_TOPIC {
+                return rx;
+            }
+            v.push(tx);
+        }
         rx
     }
 
@@ -1904,6 +2193,12 @@ impl Node {
         let mut write_now = false;
         {
             let mut routes = self.routes.write().await;
+            // Backpressure: fail-closed total cap on the route table (per
+            // update and per-node caps stay in `proto`). Unknown nodes beyond
+            // the cap are ignored. No fitting metrics counter (follow-up).
+            if !routes.contains_key(&pid) && routes.len() >= MAX_ROUTES_TOTAL {
+                return;
+            }
             let route = routes.entry(pid).or_insert(Route {
                 endpoints: Vec::new(),
                 ed_hex: ed_hex.to_string(),
@@ -1954,6 +2249,28 @@ impl Node {
         };
         self.peers.write().await.insert(pid, link);
         Ok(())
+    }
+
+    /// Backpressure booking for the subscription table. Returns false
+    /// (fail-closed: caller must refuse the subscription) when a new topic
+    /// or a new subscriber would exceed the caps. Refreshes `ts` on the
+    /// existing entry. Connection slots are capped separately at insert time.
+    /// No fitting metrics counter exists (follow-up).
+    async fn subs_book(&self, topic: &str, pid: [u8; NODEID_LEN]) -> bool {
+        let mut subs = self.subs.write().await;
+        if !subs.contains_key(topic) && subs.len() >= MAX_SUBS_TOPICS {
+            return false;
+        }
+        let by_node = subs.entry(topic.to_string()).or_default();
+        if !by_node.contains_key(&pid) && by_node.len() >= MAX_SUBS_PEERS_PER_TOPIC {
+            return false;
+        }
+        let st = by_node.entry(pid).or_insert(SubState {
+            ts: now_ms(),
+            conns: HashMap::new(),
+        });
+        st.ts = now_ms();
+        true
     }
 
     /// Обработка pubsub/dht-сервисов. Возвращает plaintext-ответ, если сервис распознан.
@@ -2040,15 +2357,25 @@ impl Node {
                         .into_bytes(),
                 );
             }
+            if !self.subs_book(&topic, from).await {
+                return Some(
+                    json!({ "ok": false, "err": "too many subscriptions" })
+                        .to_string()
+                        .into_bytes(),
+                );
+            }
             {
+                // Fail-closed per-(topic, peer) connection slots: beyond the
+                // cap the subscription stays (outbox covers delivery) but no
+                // further live conn is tracked.
                 let mut subs = self.subs.write().await;
-                let by_node = subs.entry(topic.clone()).or_default();
-                let st = by_node.entry(from).or_insert(SubState {
-                    ts: now_ms(),
-                    conns: HashMap::new(),
-                });
-                st.ts = now_ms();
-                st.conns.insert(conn.stable_id(), conn.clone());
+                if let Some(st) = subs.get_mut(&topic).and_then(|m| m.get_mut(&from)) {
+                    if st.conns.contains_key(&conn.stable_id())
+                        || st.conns.len() < MAX_SUB_CONNS_PER_PEER
+                    {
+                        st.conns.insert(conn.stable_id(), conn.clone());
+                    }
+                }
             }
             self.persist_subs().await;
             Some(
@@ -2201,27 +2528,17 @@ impl Node {
                 );
             } else {
                 // reorder: выдаём в порядке seq по (origin, topic)
-                let mut reorder = self.reorder.write().await;
-                let entry = reorder
-                    .entry((origin.clone(), topic.clone()))
-                    .or_insert((1, BTreeMap::new()));
-                let (next, buf) = entry;
-                if seq == *next {
+                // (per-origin ordering; `src` travels with `data` so the
+                // per-sender token bucket is charged to the real sender).
+                // Backpressure sheds deliver immediately instead of buffering
+                // (no loss, no stall; ordering best-effort under overflow).
+                for (d, d_src, d_seq) in self.reorder_offer(&origin, &topic, seq, data, src).await
+                {
                     ordered.push(
-                        json!({ "topic": topic, "data": data, "seq": seq, "origin": origin, "src": src }).to_string(),
+                        json!({ "topic": topic, "data": d, "seq": d_seq, "origin": origin, "src": d_src })
+                            .to_string(),
                     );
-                    *next += 1;
-                    while let Some((d, d_src)) = buf.remove(next) {
-                        ordered.push(
-                            json!({ "topic": topic, "data": d, "seq": *next, "origin": origin.clone(), "src": d_src })
-                                .to_string(),
-                        );
-                        *next += 1;
-                    }
-                } else if seq > *next {
-                    buf.entry(seq).or_insert((data, src));
                 }
-                // seq < next => дубликат/позднее — игнорируем
             }
             let senders = {
                 let s = self.app_subs.read().await;
@@ -2254,6 +2571,49 @@ impl Node {
         } else {
             None
         }
+    }
+
+    /// Per-origin reorder buffer insert. Returns the messages to deliver NOW,
+    /// in order, as `(data, src, seq)`. Contiguous arrivals drain the buffer;
+    /// duplicates (`seq < next`) return empty. Backpressure sheds (unknown
+    /// key beyond `MAX_REORDER_KEYS`, or a full buffer beyond
+    /// `MAX_REORDER_BUF_PER_KEY`) return the message for IMMEDIATE delivery
+    /// instead of buffering: memory stays bounded, nothing is lost, no gap
+    /// can stall the stream; ordering is best-effort under overflow.
+    /// No fitting metrics counter exists (follow-up).
+    async fn reorder_offer(
+        &self,
+        origin: &str,
+        topic: &str,
+        seq: u64,
+        data: String,
+        src: String,
+    ) -> Vec<(String, String, u64)> {
+        let mut out = Vec::new();
+        let mut reorder = self.reorder.write().await;
+        let key = (origin.to_string(), topic.to_string());
+        if !reorder.contains_key(&key) && reorder.len() >= MAX_REORDER_KEYS {
+            out.push((data, src, seq));
+            return out;
+        }
+        let entry = reorder.entry(key).or_insert((1, BTreeMap::new()));
+        let (next, buf) = entry;
+        if seq == *next {
+            out.push((data, src, seq));
+            *next += 1;
+            while let Some((d, d_src)) = buf.remove(next) {
+                out.push((d, d_src, *next));
+                *next += 1;
+            }
+        } else if seq > *next {
+            if buf.len() >= MAX_REORDER_BUF_PER_KEY {
+                out.push((data, src, seq));
+            } else {
+                buf.entry(seq).or_insert((data, src));
+            }
+        }
+        // seq < next => дубликат/позднее — игнорируем
+        out
     }
 
     /// Доставка подписчикам. Живые соединения — напрямую; оффлайн/ошибки — в persistent outbox.
@@ -2361,6 +2721,14 @@ impl Node {
     /// Положить сообщение в outbox узла (dedup по msg_id) + персистентность.
     async fn enqueue(&self, pid: [u8; NODEID_LEN], msg: QueuedMsg) {
         let mut outbox = self.outbox.write().await;
+        // Fairness (enqueue side): per-peer queues are independent AND the
+        // number of peer queues is capped, so one abusive peer flooding its
+        // own queue (or conjuring many peer ids) cannot evict honest peers'
+        // queues. Shed drops the NEW message and reuses `outbox_dropped`.
+        if !outbox.contains_key(&pid) && outbox.len() >= MAX_OUTBOX_PEERS_TOTAL {
+            self.metrics.outbox_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let q = outbox.entry(pid).or_default();
         if q.iter().any(|m| m.msg_id == msg.msg_id) {
             return;
@@ -2384,7 +2752,16 @@ impl Node {
     async fn flush_outbox_once(self: &Arc<Self>) {
         let nodes: Vec<[u8; NODEID_LEN]> = self.outbox.read().await.keys().copied().collect();
         for pid in nodes {
+            // Fairness (drain side): round-robin budget per peer per cycle.
+            // Without it one abusive peer with a full failing queue consumes
+            // the whole flush cycle (1024 dial attempts) before honest peers
+            // are serviced; with it every queued peer is touched each cycle.
+            let mut budget = MAX_OUTBOX_FLUSH_PER_PEER;
             loop {
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
                 let front = {
                     let o = self.outbox.read().await;
                     match o.get(&pid) {
@@ -2587,7 +2964,7 @@ impl Node {
             }
         }
         let outbox_file = self.data_dir.join("outbox.json");
-        if let Ok(raw) = std::fs::read_to_string(&outbox_file) {
+                if let Ok(raw) = std::fs::read_to_string(&outbox_file) {
             if let Ok(map) = serde_json::from_str::<HashMap<String, Vec<QueuedMsg>>>(&raw) {
                 let mut outbox = self.outbox.write().await;
                 for (k, v) in map {
@@ -2595,7 +2972,22 @@ impl Node {
                         if b.len() == NODEID_LEN {
                             let mut pid = [0u8; NODEID_LEN];
                             pid.copy_from_slice(&b);
-                            outbox.insert(pid, v.into());
+                            // Backpressure on load: persisted state is
+                            // untrusted input — enforce the same caps as the
+                            // live path (per-queue trim keeps newest, outer
+                            // cap sheds whole peer queues).
+                            if !outbox.contains_key(&pid)
+                                && outbox.len() >= MAX_OUTBOX_PEERS_TOTAL
+                            {
+                                self.metrics.outbox_dropped.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            let mut dq: VecDeque<QueuedMsg> = v.into();
+                            while dq.len() > crate::proto::MAX_OUTBOX_PER_PEER {
+                                dq.pop_front();
+                                self.metrics.outbox_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            outbox.insert(pid, dq);
                         }
                     }
                 }
@@ -2637,11 +3029,22 @@ impl Node {
     }
 
     /// Монотонный seq на топик (порядок сообщений одного origin).
+    /// Backpressure: the table is capped at `MAX_TOPIC_SEQ_TOPICS`. Beyond
+    /// the cap an unknown topic gets seq 0 (legacy unordered path: the
+    /// receiver delivers it immediately instead of reorder-buffering), so
+    /// memory stays bounded while delivery keeps working. No fitting metrics
+    /// counter exists (follow-up).
     async fn next_topic_seq(&self, topic: &str) -> u64 {
         let mut m = self.topic_seq.write().await;
-        let s = m.entry(topic.to_string()).or_default();
-        *s += 1;
-        *s
+        if let Some(s) = m.get_mut(topic) {
+            *s += 1;
+            return *s;
+        }
+        if m.len() >= MAX_TOPIC_SEQ_TOPICS {
+            return 0;
+        }
+        m.insert(topic.to_string(), 1);
+        1
     }
 
     /// Dedup: возвращает true, если сообщение уже видели.
@@ -2791,6 +3194,11 @@ impl Node {
                     }
                     let mut pid = [0u8; NODEID_LEN];
                     pid.copy_from_slice(&b);
+                    // Backpressure: fail-closed total cap (unknown nodes
+                    // beyond it are ignored; existing entries still merge).
+                    if !mine.contains_key(&pid) && mine.len() >= MAX_ROUTES_TOTAL {
+                        continue;
+                    }
                     let ed_hex = rv["ed_pub"].as_str().unwrap_or("").to_string();
                     // Отравление таблицы: запись с чужим/битым ключом
                     // пропускается (иначе честный node_id привязывался к ключу
@@ -2943,6 +3351,18 @@ impl Node {
         }
         // чистим просроченные KV
         self.kv.write().await.prune();
+        // Stale-eviction routing health (`dht::ROUTING_STALE_AFTER_MS`, 24 h —
+        // тот же горизонт, что у `prune_subs`): сутки без refresh = мёртвый
+        // вес, а не discovery-память. Пишем dht.json только если реально
+        // что-то выселили.
+        let stale = self
+            .routing
+            .write()
+            .await
+            .prune_stale(crate::dht::now_ms(), crate::dht::ROUTING_STALE_AFTER_MS);
+        if stale > 0 {
+            self.persist_routing().await;
+        }
         // republish: переиздаём стареющие значения на k-ближайших к ключу
         let to_republish = self.kv.read().await.keys_to_republish(crate::dht::now_ms());
         for (key, value, ttl_ms, origin, stored_at) in to_republish {
@@ -4980,6 +5400,25 @@ impl Node {
         self.fetch_mail_inner(name, Some(owner_priv_hex)).await
     }
 
+    /// Backpressure insert for the decrypted-mail cache. The cache is
+    /// advisory (a miss just re-reads from network/disk), so the shed is a
+    /// silent eviction: expired entries first, else the oldest timestamp.
+    /// Memory stays bounded; no counter needed for a cache eviction.
+    async fn mail_cache_insert(&self, name: String, blob: Vec<u8>) {
+        let now = now_ms();
+        let mut c = self.mail_cache.write().await;
+        if !c.contains_key(&name) && c.len() >= MAX_MAIL_CACHE_ENTRIES {
+            c.retain(|_, (_, ts)| now - *ts < 60_000);
+            if c.len() >= MAX_MAIL_CACHE_ENTRIES {
+                if let Some(oldest) = c.iter().min_by_key(|(_, (_, ts))| *ts).map(|(k, _)| k.clone())
+                {
+                    c.remove(&oldest);
+                }
+            }
+        }
+        c.insert(name, (blob, now));
+    }
+
     async fn fetch_mail_inner(
         self: &Arc<Self>,
         name: &str,
@@ -5069,10 +5508,7 @@ impl Node {
             let ct = Self::ec_decode(&mut slots, k, n, ct_len)?;
             let plain = e2e_decrypt(&dk, &nonce, &ct).ok();
             if let Some(p) = &plain {
-                self.mail_cache
-                    .write()
-                    .await
-                    .insert(name.to_string(), (p.clone(), now_ms()));
+                self.mail_cache_insert(name.to_string(), p.clone()).await;
             }
             return plain;
         }
@@ -5159,10 +5595,7 @@ impl Node {
         let plain = e2e_decrypt(&dk, &nonce, &buf).ok();
         // кэш расшифрованных тел писем (60с) — повторное чтение Inbox не ходит в сеть
         if let Some(p) = &plain {
-            self.mail_cache
-                .write()
-                .await
-                .insert(name.to_string(), (p.clone(), now_ms()));
+            self.mail_cache_insert(name.to_string(), p.clone()).await;
         }
         plain
     }
@@ -6397,7 +6830,10 @@ async fn handle_stream(
             Some((_, a)) => proto::pq_hybrid_session_key(&classical, &a.shared, &a.digest),
             None => classical,
         };
-        node.sessions.write().await.insert(conn.stable_id(), key);
+        // Backpressure bound on the session table (fail-closed: when full the
+        // session is NOT stored, so this conn can serve no requests; the auth
+        // decision above is untouched). No fitting metrics counter (follow-up).
+        let _ = node.session_insert(conn.stable_id(), key).await;
         // Per-connection window: nothing to reset. See connect_with_auth.
         node.add_conn(claimed, conn.clone()).await;
         node.routing_insert(

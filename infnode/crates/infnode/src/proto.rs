@@ -167,8 +167,15 @@ pub struct Frame {
 const HDR: usize = 68;
 
 impl Frame {
-    pub fn sign_data(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(HDR + self.payload.len() + self.nonce.len());
+    /// Exact wire length of `encode()` output.
+    pub fn encoded_len(&self) -> usize {
+        HDR + self.payload.len() + self.nonce.len() + 64
+    }
+
+    /// Append the signed prefix (everything except the trailing 64-byte sig).
+    /// Single pass, no return-alloc: `encode`, `encode_into` and `sign_data`
+    /// all funnel here so the byte layout has exactly one definition.
+    pub fn sign_data_into(&self, v: &mut Vec<u8>) {
         v.push(1); // version
         v.push(self.kind);
         v.extend_from_slice(&self.seq.to_le_bytes());
@@ -180,11 +187,51 @@ impl Frame {
         v.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
         v.extend_from_slice(&self.payload);
         v.extend_from_slice(&self.nonce);
+    }
+
+    pub fn sign_data(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(HDR + self.payload.len() + self.nonce.len());
+        self.sign_data_into(&mut v);
         v
     }
 
+    /// Streaming digest of the signed prefix: byte-identical input to
+    /// `blake3::hash(&self.sign_data())` with no intermediate Vec.
+    fn sign_digest(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(&[1]); // version
+        h.update(&[self.kind]);
+        h.update(&self.seq.to_le_bytes());
+        h.update(&self.ts.to_le_bytes());
+        h.update(&self.src);
+        h.update(&self.dst);
+        h.update(&self.svc.to_le_bytes());
+        h.update(&(self.nonce.len() as u16).to_le_bytes());
+        h.update(&(self.payload.len() as u32).to_le_bytes());
+        h.update(&self.payload);
+        h.update(&self.nonce);
+        *h.finalize().as_bytes()
+    }
+
+    /// Append one full frame (prefix + sig) with a single reserve.
+    pub fn encode_into(&self, b: &mut Vec<u8>) {
+        b.reserve(self.encoded_len());
+        self.sign_data_into(b);
+        b.extend_from_slice(&self.sig);
+    }
+
+    /// Batch encode: one reserve for the whole run, zero per-frame allocs.
+    pub fn encode_many(frames: &[Frame], out: &mut Vec<u8>) {
+        out.reserve(frames.iter().map(Frame::encoded_len).sum::<usize>());
+        for f in frames {
+            f.encode_into(out);
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
-        let mut b = self.sign_data();
+        // Exact capacity: the trailing sig fits without a second alloc.
+        let mut b = Vec::with_capacity(self.encoded_len());
+        self.sign_data_into(&mut b);
         b.extend_from_slice(&self.sig);
         b
     }
@@ -193,10 +240,11 @@ impl Frame {
         if b.len() < HDR + 64 {
             bail!("frame too short");
         }
-        let plen =
-            u32::from_le_bytes(b[64..68].try_into().map_err(|_| anyhow::anyhow!("plen"))?) as usize;
-        let nlen =
-            u16::from_le_bytes(b[62..64].try_into().map_err(|_| anyhow::anyhow!("nlen"))?) as usize;
+        // Manual LE loads: slices are in-bounds (checked above), so no
+        // fallible try_into on the hot path. Validation order and error
+        // strings are unchanged from the original decoder.
+        let nlen = u16::from_le_bytes([b[62], b[63]]) as usize;
+        let plen = u32::from_le_bytes([b[64], b[65], b[66], b[67]]) as usize;
         // защита от переполнения usize и out-of-bounds при нечётких/злонамеренных пакетах
         if plen > MAX_FRAME {
             bail!("payload too large");
@@ -218,16 +266,21 @@ impl Frame {
         if total != b.len() {
             bail!("frame length mismatch");
         }
-        let sig: [u8; 64] = b[b.len() - 64..]
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("sig"))?;
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&b[b.len() - 64..]);
+        let mut src = [0u8; NODEID_LEN];
+        let mut dst = [0u8; NODEID_LEN];
+        src.copy_from_slice(&b[14..34]);
+        dst.copy_from_slice(&b[34..54]);
         let f = Frame {
             kind: b[1],
-            seq: u32::from_le_bytes(b[2..6].try_into().map_err(|_| anyhow::anyhow!("seq"))?),
-            ts: i64::from_le_bytes(b[6..14].try_into().map_err(|_| anyhow::anyhow!("ts"))?),
-            src: b[14..34].try_into().map_err(|_| anyhow::anyhow!("src"))?,
-            dst: b[34..54].try_into().map_err(|_| anyhow::anyhow!("dst"))?,
-            svc: u64::from_le_bytes(b[54..62].try_into().map_err(|_| anyhow::anyhow!("svc"))?),
+            seq: u32::from_le_bytes([b[2], b[3], b[4], b[5]]),
+            ts: i64::from_le_bytes([b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13]]),
+            src,
+            dst,
+            svc: u64::from_le_bytes([
+                b[54], b[55], b[56], b[57], b[58], b[59], b[60], b[61],
+            ]),
             payload: b[68..68 + plen].to_vec(),
             nonce: b[68 + plen..68 + plen + nlen].to_vec(),
             sig,
@@ -245,8 +298,8 @@ impl Frame {
 
     pub fn verify(&self, pk: &VerifyingKey) -> bool {
         // sign-then-hash: подпись над blake3-дайджестом всего фрейма (быстро для больших payload)
-        let d = blake3::hash(&self.sign_data());
-        pk.verify_strict(d.as_bytes(), &Signature::from_bytes(&self.sig))
+        let d = self.sign_digest();
+        pk.verify_strict(&d, &Signature::from_bytes(&self.sig))
             .is_ok()
     }
 }

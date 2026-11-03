@@ -44,6 +44,7 @@ pub mod rpc;
 pub mod runtime;
 pub mod sharding;
 pub mod simulator;
+pub mod snapshot_cadence;
 pub mod staking;
 pub mod state_engine;
 pub mod storage;

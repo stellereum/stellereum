@@ -3733,6 +3733,13 @@ async fn run_consensus_node(
     let mut peer_round_seen: Option<(u64, u32, std::time::Instant)> = None;
     // Align snapshots to round hundreds so probes ((peer_height/100)*100) hit them.
     let mut last_snapshot_height: u64 = (rt.hc.height / 100) * 100;
+    // Previous finalized height's worker-certified post-apply root, for the
+    // adaptive snapshot cadence gate (`stellereum::snapshot_cadence`): a
+    // candidate height whose certified root equals this one provably brought
+    // no state change and may be skipped while the interval floor is not due.
+    // `None` until the first finalize lands, so the gate starts conservative
+    // (assumes changed) rather than assuming idleness.
+    let mut prev_finalized_root: Option<[u8; 32]> = None;
     // Cross-shard replay bytes bound to the SUBMITTED snapshot height (see the
     // snapshot block below): captured at submit quiescence (post-`height`,
     // worker idle, before the next apply is submitted) and consumed verbatim
@@ -5725,11 +5732,28 @@ async fn run_consensus_node(
                 // that `try_snapshot_sync`'s `(peer_height / 100) * 100` probes
                 // find them reliably on any peer without needing to guess offsets.
                 let snap_int = snapshot_interval();
-                if (height % snap_int == 0
-                    || (height > last_snapshot_height.saturating_add(snap_int)
-                        && height % 100 == 0))
-                    && height > last_snapshot_height
-                {
+                // Adaptive cadence (`stellereum::snapshot_cadence`): the
+                // candidate rule below is byte-identical to the old trigger;
+                // the gate additionally skips a candidate that provably
+                // brought no state change (certified post-`height` root equals
+                // the previous height's root — asserted on real roots, never
+                // assumed from tx count) unless the interval floor is due
+                // (gap beyond one full `snap_int`, so the worst-case restore
+                // distance never exceeds today's). On an active chain
+                // `state_changed` is always true and this submits exactly as
+                // before.
+                let state_changed = prev_finalized_root != Some(root);
+                let candidate = stellereum::snapshot_cadence::snapshot_candidate(
+                    height,
+                    last_snapshot_height,
+                    snap_int,
+                );
+                if stellereum::snapshot_cadence::should_submit_snapshot(
+                    height,
+                    last_snapshot_height,
+                    snap_int,
+                    state_changed,
+                ) {
                     // Submit-time cross-shard binding: the worker bundle holds
                     // accounts/domains/aux at post-`height` (root-gated), but
                     // the replay set is captured HERE, on the tick, at the
@@ -5762,7 +5786,22 @@ async fn run_consensus_node(
                              last_snapshot_height={last_snapshot_height})"
                         );
                     }
+                } else if candidate {
+                    // Adaptive cadence skip: a candidate that provably brought
+                    // no state change (certified root equals the previous
+                    // height's) while the interval floor is not due. Stays
+                    // LOUD (never silent): every skip names the height, the
+                    // last snapshot, and the unchanged root.
+                    info!(
+                        "[snapshot] SKIPPED idle capture for height {height} \
+                         (last_snapshot_height={last_snapshot_height} \
+                         root={} snap_int={snap_int})",
+                        hex::encode(&root[..6])
+                    );
                 }
+                // Advance the idleness clock: the NEXT height compares against
+                // this height's certified root.
+                prev_finalized_root = Some(root);
                 // Collect a ready capture (non-blocking): serialize + enqueue
                 // + publish exactly like before, sourced from the bundle.
                 // Cross-shard runtime mirrors + tip header are captured here

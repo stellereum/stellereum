@@ -3324,6 +3324,48 @@ impl QuorumCertificate {
     /// committee, a missing/ignorable seal the legacy draw, and a forged seal
     /// (armed height, known key, bad proof) refuses the whole certificate
     /// (`None`). Pass `Disabled` + `None` for the legacy draw exactly.
+    /// Batch-verify staged PQ member signatures (the lattice analogue of the
+    /// Ed25519 `verify_batch` fast path: Falcon has no batch primitive, so the
+    /// SAME per-signature predicate runs per item, chunked across cores with
+    /// rayon — the `Transaction::verify_signatures_batch_parallel` precedent,
+    /// same primitive, zero new logic).
+    ///
+    /// Fail-closed all-must-pass: `true` iff EVERY staged signature verifies.
+    /// Serial and parallel paths combine the same per-item predicate with
+    /// boolean AND, so the verdict is order-independent and bit-identical on
+    /// both paths. `msg` is shared read-only and key resolution already
+    /// happened during staging, so no locks are taken in the parallel region.
+    fn verify_staged_pq_signatures(
+        staged: &[(ValidatorId, crate::post_quantum::PqScheme, Vec<u8>, &[u8])],
+        msg: &[u8],
+    ) -> bool {
+        fn one(
+            scheme: crate::post_quantum::PqScheme,
+            pubkey: &[u8],
+            msg: &[u8],
+            sig: &[u8],
+        ) -> bool {
+            if scheme == crate::post_quantum::PqScheme::Falcon512 {
+                verify_falcon_signature(pubkey, msg, sig)
+            } else {
+                crate::post_quantum::verify_pq_signature(scheme, pubkey, msg, sig)
+            }
+        }
+        // Serial at or below one chunk (rayon task overhead would dominate —
+        // the never-slower gate); chunked-parallel above, mirroring
+        // `verify_signatures_batch_parallel`.
+        const CHUNK: usize = 8;
+        if staged.len() <= CHUNK {
+            return staged
+                .iter()
+                .all(|(_, scheme, pubkey, sig)| one(*scheme, pubkey, msg, sig));
+        }
+        use rayon::prelude::*;
+        staged
+            .par_chunks(CHUNK)
+            .all(|chunk| chunk.iter().all(|(_, scheme, pubkey, sig)| one(*scheme, pubkey, msg, sig)))
+    }
+
     fn micro_cert_valid_signers(
         &self,
         cert: &PqMicroCertificate,
@@ -3390,8 +3432,15 @@ impl QuorumCertificate {
             return None;
         }
 
+        // Stage (member, scheme, pubkey, signature) per marked member, in
+        // committee order. Key resolution is serial and cheap; the expensive
+        // per-signature crypto runs batched below with the SAME per-item
+        // predicate and the SAME fail-closed verdict: every staged signature
+        // must verify, else the whole certificate is refused (`None`) —
+        // exactly the verdict the serial loop this replaces reaches.
         let mut sig_idx = 0;
-        let mut valid = Vec::new();
+        let mut staged: Vec<(ValidatorId, crate::post_quantum::PqScheme, Vec<u8>, &[u8])> =
+            Vec::new();
 
         for (i, val_id) in committee.iter().enumerate() {
             if cert.is_signer(i) {
@@ -3420,21 +3469,14 @@ impl QuorumCertificate {
                     return None;
                 }
 
-                let valid_sig = if cert.scheme == crate::post_quantum::PqScheme::Falcon512 {
-                    verify_falcon_signature(&pubkey, msg, sig)
-                } else {
-                    crate::post_quantum::verify_pq_signature(cert.scheme, &pubkey, msg, sig)
-                };
-
-                if !valid_sig {
-                    return None;
-                }
-
-                valid.push(*val_id);
+                staged.push((*val_id, scheme, pubkey, sig.as_slice()));
             }
         }
 
-        Some(valid)
+        if !Self::verify_staged_pq_signatures(&staged, msg) {
+            return None;
+        }
+        Some(staged.into_iter().map(|(id, _, _, _)| id).collect())
     }
 
     /// Power-weighted µQC verification: the members `micro_cert_valid_signers`
@@ -3566,8 +3608,13 @@ impl QuorumCertificate {
             return None;
         }
 
+        // Staged exactly like `micro_cert_valid_signers`: serial cheap key
+        // resolution in member order, batched crypto below with the same
+        // per-item predicate and the same fail-closed verdict (any bad or
+        // missing signature refuses the whole certificate — `None`).
         let mut sig_idx = 0;
-        let mut valid = Vec::new();
+        let mut staged: Vec<(ValidatorId, crate::post_quantum::PqScheme, Vec<u8>, &[u8])> =
+            Vec::new();
 
         for (i, val_id) in ids.iter().enumerate() {
             if cert.is_signer(i) {
@@ -3596,21 +3643,14 @@ impl QuorumCertificate {
                     return None;
                 }
 
-                let sig_ok = if cert.scheme == crate::post_quantum::PqScheme::Falcon512 {
-                    verify_falcon_signature(&pubkey, msg, sig)
-                } else {
-                    crate::post_quantum::verify_pq_signature(cert.scheme, &pubkey, msg, sig)
-                };
-
-                if !sig_ok {
-                    return None;
-                }
-
-                valid.push(*val_id);
+                staged.push((*val_id, scheme, pubkey, sig.as_slice()));
             }
         }
 
-        Some(valid)
+        if !Self::verify_staged_pq_signatures(&staged, msg) {
+            return None;
+        }
+        Some(staged.into_iter().map(|(id, _, _, _)| id).collect())
     }
 
     fn verify_epoch_cert(
@@ -3804,6 +3844,9 @@ impl QuorumCertificate {
     pub fn signers_set(&self, validators: &ValidatorSet) -> HashSet<ValidatorId> {
         let mut signers = HashSet::new();
         let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
+        // Classical candidates staged for one shared-message batch below
+        // (same batch-then-per-sig pattern as `verify_unified`'s fast path).
+        let mut classical: Vec<(ValidatorId, VerifyingKey, Signature)> = Vec::new();
         for (voter, payload) in &self.signatures {
             if *voter == PQ_UQC_MARKER_ID {
                 // Verify-grade: exactly what `verify_micro_cert` accepts (sans
@@ -3860,7 +3903,8 @@ impl QuorumCertificate {
                 // Classical: mirror `verify_unified`'s candidate checks — only
                 // a member whose bare Ed25519 signature verifies over THIS
                 // certificate's message is attributed. Garbage and forged
-                // entries contribute nothing.
+                // entries contribute nothing. Staged here, verified once
+                // below; the set dedups repeat signers exactly as before.
                 if validators.power_of(voter) == 0 {
                     continue;
                 }
@@ -3872,8 +3916,26 @@ impl QuorumCertificate {
                 let Ok(sig) = Signature::from_slice(ed25519_sig_bytes(payload)) else {
                     continue;
                 };
-                if vk.verify_strict(&msg, &sig).is_ok() {
-                    signers.insert(*voter);
+                classical.push((*voter, vk, sig));
+            }
+        }
+        // One batch verification over the shared message. A passing batch
+        // implies every staged Ed25519 half verifies (batch soundness), so
+        // all are attributed with no second pass; a rejection falls back to
+        // per-signature checks so one forgery never unattests honest
+        // signers. Either path attributes bit-identically to the serial
+        // loop this replaces.
+        if !classical.is_empty() {
+            let msgs: Vec<&[u8]> = classical.iter().map(|_| msg.as_slice()).collect();
+            let sigs: Vec<Signature> = classical.iter().map(|(_, _, s)| *s).collect();
+            let keys: Vec<VerifyingKey> = classical.iter().map(|(_, k, _)| *k).collect();
+            if ed25519_dalek::verify_batch(&msgs, &sigs, &keys).is_ok() {
+                signers.extend(classical.iter().map(|(v, _, _)| *v));
+            } else {
+                for (voter, vk, sig) in &classical {
+                    if vk.verify_strict(&msg, sig).is_ok() {
+                        signers.insert(*voter);
+                    }
                 }
             }
         }
@@ -7689,5 +7751,255 @@ mod post_quantum_uqc_tests {
             bls_qc.signers_set(&vs).is_empty(),
             "BLS-off: an unverifiable marker must attribute nobody"
         );
+    }
+
+    /// QC-VERIFY BATCH PARITY (classical Ed25519, fixed fixtures k=4/7/16/100):
+    /// the batched `verify` / `signers_set` must equal a serial per-signature
+    /// oracle on all-valid fixtures AND on 1-forged variants (the forged member
+    /// is unattributed on both paths; the verdict follows the surviving quorum
+    /// on both). An exact-quorum forged fixture pins whole-QC-invalid on both
+    /// paths. Extends the QC suites; weakens nothing.
+    #[test]
+    fn qc_verify_batch_parity_classical_ed25519_k4716_and_forged() {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        use rand::rngs::OsRng;
+        let local_keys = |k: usize| -> Vec<SigningKey> {
+            (0..k).map(|_| SigningKey::generate(&mut OsRng)).collect()
+        };
+        let local_vset = |ks: &[SigningKey]| -> ValidatorSet {
+            ValidatorSet::from_list(
+                ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect(),
+            )
+        };
+        for &k in &[4usize, 7, 16, 100] {
+            let ks = local_keys(k);
+            let vs = local_vset(&ks);
+            let height = 5;
+            let round = 0;
+            let kind = VoteKind::Precommit;
+            let target = Some([0x12; 32]);
+            let msg = vote_sign_bytes(height, round, kind, &target);
+            let sigs: Vec<(ValidatorId, Vec<u8>)> = ks
+                .iter()
+                .map(|sk| {
+                    (
+                        sk.verifying_key().to_bytes(),
+                        sk.sign(&msg).to_bytes().to_vec(),
+                    )
+                })
+                .collect();
+            let qc = QuorumCertificate {
+                height,
+                round,
+                kind,
+                block_hash: target,
+                signatures: sigs,
+            };
+            // Serial oracle: dedup + membership + strict per-sig verify, then
+            // the power quorum — the pre-batch loop, no batch primitive.
+            let serial = |q: &QuorumCertificate| -> (bool, HashSet<ValidatorId>) {
+                let mut seen = HashSet::new();
+                let mut power = 0u64;
+                let mut set = HashSet::new();
+                for (voter, sig_bytes) in &q.signatures {
+                    if !seen.insert(*voter) {
+                        continue;
+                    }
+                    if vs.power_of(voter) == 0 {
+                        continue;
+                    }
+                    let Ok(vk) = VerifyingKey::from_bytes(voter) else {
+                        continue;
+                    };
+                    let Ok(sig) = Signature::from_slice(ed25519_sig_bytes(sig_bytes)) else {
+                        continue;
+                    };
+                    if vk.verify_strict(&msg, &sig).is_ok() {
+                        power += vs.power_of(voter);
+                        set.insert(*voter);
+                    }
+                }
+                (power >= vs.quorum_power(), set)
+            };
+            let (exp_v, exp_s) = serial(&qc);
+            assert!(exp_v, "k={k} all-valid fixture must reach quorum serially");
+            assert_eq!(exp_s.len(), k, "k={k} all members attributed serially");
+            assert_eq!(qc.verify(&vs), exp_v, "k={k} batched == serial verdict");
+            assert_eq!(
+                qc.signers_set(&vs),
+                exp_s,
+                "k={k} identical signer accounting"
+            );
+            // Deterministic across repeats.
+            assert_eq!(qc.verify(&vs), exp_v, "k={k} verdict stable");
+            assert_eq!(qc.signers_set(&vs), exp_s, "k={k} attribution stable");
+            // 1-forged: offender unattributed on both paths; surviving quorum
+            // still decides on both.
+            let mut forged = qc.clone();
+            forged.signatures[0].1[10] ^= 0xFF;
+            let (f_v, f_s) = serial(&forged);
+            assert_eq!(forged.verify(&vs), f_v, "k={k} forged batched == serial");
+            assert_eq!(
+                forged.signers_set(&vs),
+                f_s,
+                "k={k} forged signer accounting"
+            );
+            assert_eq!(f_s.len(), k - 1, "k={k} only the forger drops out");
+            // Exact-quorum forged: survivors below quorum, so the whole QC is
+            // invalid on both paths.
+            let q = vs.quorum_power() as usize; // power 1 each ⇒ q members
+            let mut exact = qc.clone();
+            exact.signatures.truncate(q);
+            assert!(exact.verify(&vs), "k={k} exact-quorum fixture must verify");
+            exact.signatures[0].1[10] ^= 0xFF;
+            let (e_v, e_s) = serial(&exact);
+            assert!(!e_v, "k={k} forged exact-quorum fails serially");
+            assert!(
+                !exact.verify(&vs),
+                "k={k} forged exact-quorum QC invalid on batched path"
+            );
+            assert_eq!(
+                exact.signers_set(&vs),
+                e_s,
+                "k={k} exact-quorum forged signer accounting"
+            );
+            assert_eq!(e_s.len(), q - 1);
+        }
+    }
+
+    /// QC-VERIFY BATCH PARITY (Falcon µQC, fixed fixtures k=4/7/16/100): the
+    /// batched (rayon-chunked) per-signature verification must equal the serial
+    /// scalar verdict. A 1-forged member invalidates the WHOLE QC on both paths
+    /// (fail-closed all-must-pass) with identical (empty) signer accounting.
+    /// Extends the QC suites; weakens nothing.
+    #[test]
+    fn qc_verify_batch_parity_falcon_uqc_k4716_and_forged() {
+        for &k in &[4usize, 7, 16, 100] {
+            let mut vs = ValidatorSet::new();
+            let mut fks = Vec::new();
+            for i in 0..k {
+                let fk = make_sample_falcon512(0x51u8.wrapping_add(i as u8));
+                let pk = fk.public_key().to_vec();
+                let id = crate::post_quantum::derive_pq_address(
+                    crate::post_quantum::PqScheme::Falcon512,
+                    &pk,
+                    &crate::post_quantum::DEFAULT_SALT,
+                );
+                vs.add(id, 10);
+                register_validator_pq_key(id, crate::post_quantum::PqScheme::Falcon512, pk);
+                fks.push((id, fk));
+            }
+            let height = 42u64;
+            let round = 1u32;
+            let kind = VoteKind::Precommit;
+            let target = Some([0xAA; 32]);
+            let committee_size = micro_committee_size(vs.len());
+            let parent = [0x77; 32];
+            let committee = derive_sortition_committee(&vs, height, round, committee_size, &parent);
+            let msg = vote_sign_bytes(height, round, kind, &target);
+            let mut signatures = Vec::new();
+            let mut bitmask = vec![0u8; (committee_size as usize).div_ceil(8)];
+            for (i, val_id) in committee.iter().enumerate() {
+                let (_, fk) = fks.iter().find(|(id, _)| id == val_id).unwrap();
+                signatures.push(make_sample_falcon512_sig(fk, &msg));
+                bitmask[i / 8] |= 1 << (i % 8);
+            }
+            let uqc = PqMicroCertificate::new(
+                crate::post_quantum::PqScheme::Falcon512,
+                height,
+                round,
+                committee_size,
+                bitmask,
+                signatures,
+                parent,
+            );
+            let qc = QuorumCertificate {
+                height,
+                round,
+                kind,
+                block_hash: target,
+                signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc))],
+            };
+            // Serial oracle: the pre-batch scalar loop — every marked member
+            // must verify (fail-closed), then the power quorum. A failure
+            // attributes nobody (the `None` arm of `micro_cert_valid_signers`).
+            // (Fixtures use Falcon512 with registered keys, so the Ed25519
+            // address fallback never fires — same as production here.)
+            let serial = |cert: &PqMicroCertificate| -> (bool, HashSet<ValidatorId>) {
+                let mut ok = true;
+                let mut set = HashSet::new();
+                let mut sig_idx = 0;
+                for (i, val_id) in committee.iter().enumerate() {
+                    if !cert.is_signer(i) {
+                        continue;
+                    }
+                    let sig = &cert.signatures[sig_idx];
+                    sig_idx += 1;
+                    let pass = match get_validator_pq_key(val_id) {
+                        Some((scheme, pk)) if scheme == cert.scheme => {
+                            verify_falcon_signature(&pk, &msg, sig)
+                        }
+                        _ => false,
+                    };
+                    if pass {
+                        set.insert(*val_id);
+                    } else {
+                        ok = false;
+                    }
+                }
+                let committee_total: u64 =
+                    committee.iter().map(|id| vs.power_of(id)).sum();
+                let required = pq_micro_required_power(committee_total, vs.total_power());
+                let power: u64 = set.iter().map(|id| vs.power_of(id)).sum();
+                if ok && power >= required {
+                    (true, set)
+                } else {
+                    (false, HashSet::new())
+                }
+            };
+            let (exp_v, exp_s) = serial(&uqc);
+            assert!(exp_v, "k={k} all-valid µQC must verify serially");
+            assert_eq!(exp_s.len(), committee.len());
+            assert_eq!(qc.verify(&vs), exp_v, "k={k} batched == serial verdict");
+            assert_eq!(
+                qc.signers_set(&vs),
+                exp_s,
+                "k={k} identical signer accounting"
+            );
+            // Deterministic across repeats.
+            assert_eq!(qc.verify(&vs), exp_v, "k={k} verdict stable");
+            assert_eq!(qc.signers_set(&vs), exp_s, "k={k} attribution stable");
+            // 1-forged member: the WHOLE QC is invalid on both paths, and the
+            // forged envelope attributes nobody on either path.
+            let mut bad_sigs = uqc.signatures.clone();
+            bad_sigs[0][50] ^= 0xFF;
+            let bad_uqc = PqMicroCertificate::new(
+                crate::post_quantum::PqScheme::Falcon512,
+                height,
+                round,
+                committee_size,
+                uqc.signers_bitmask.clone(),
+                bad_sigs,
+                parent,
+            );
+            let bad_qc = QuorumCertificate {
+                height,
+                round,
+                kind,
+                block_hash: target,
+                signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&bad_uqc))],
+            };
+            let (b_v, b_s) = serial(&bad_uqc);
+            assert!(!b_v, "k={k} 1-forged µQC fails serially");
+            assert!(b_s.is_empty(), "k={k} forged envelope attributes nobody");
+            assert!(
+                !bad_qc.verify(&vs),
+                "k={k} 1-forged µQC invalid on batched path"
+            );
+            assert!(
+                bad_qc.signers_set(&vs).is_empty(),
+                "k={k} 1-forged µQC attributes nobody on batched path"
+            );
+        }
     }
 }

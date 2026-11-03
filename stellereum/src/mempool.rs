@@ -2550,6 +2550,31 @@ impl Mempool {
         let fee_order: Vec<(u64, u64, TxHash)> = order.keys().copied().collect();
         let aligned: Vec<Option<&Transaction>> =
             fee_order.iter().map(|(_, _, h)| txs.get(h)).collect();
+        // Hoisted per-tx packing costs (pure functions of the transaction, so
+        // the values are identical to recomputing them inline): `gas_limit`
+        // is a field copy, the wire estimate walks the payload op shapes and
+        // the proof-unit count walks the same payload. The hot loop below
+        // re-walks every untaken element on EVERY pass (up to 64 passes x
+        // 10k elements with scattered fees/deep nonce chains), so recomputing
+        // these per element per pass is pure waste — one batch pass here
+        // replaces up to `passes` recomputations per element. The accept
+        // predicate still runs inline in the original order (it is stateful:
+        // nonce advance, budget debit, census), and the cap checks below read
+        // the same values in the same order, so the selected set and order
+        // are unchanged. `None` slots are never selected (the loop skips them
+        // before reading the costs), so their filler values are irrelevant.
+        let gas_of: Vec<u64> = aligned
+            .iter()
+            .map(|t| t.map(|t| t.gas_limit).unwrap_or(0))
+            .collect();
+        let wire_of: Vec<usize> = aligned
+            .iter()
+            .map(|t| t.map(Self::estimate_tx_wire_bytes).unwrap_or(0))
+            .collect();
+        let proof_of: Vec<usize> = aligned
+            .iter()
+            .map(|t| t.map(Self::count_tx_proof_units).unwrap_or(0))
+            .collect();
         // Transactions a previous pass already took, aligned with `fee_order`:
         // each fee-order position appears at most once (BTreeMap keys are
         // unique), so a positional bit is exactly the old hash-keyed set —
@@ -2575,7 +2600,7 @@ impl Mempool {
                 if !accept(tx) {
                     continue;
                 }
-                let g = tx.gas_limit;
+                let g = gas_of[i];
                 if gas.saturating_add(g) > max_gas {
                     // This one does not fit. A cheaper one behind it might, so keep
                     // walking rather than truncating the block here.
@@ -2584,11 +2609,11 @@ impl Mempool {
                 // Wire + proof-unit caps (audit: blocks troubles): gas-valid
                 // does not mean gossipable or verifiable-in-time. Skip (do
                 // not truncate: a smaller tx behind may still fit).
-                let w = Self::estimate_tx_wire_bytes(tx);
+                let w = wire_of[i];
                 if wire.saturating_add(w) > Self::MAX_BLOCK_WIRE_BYTES {
                     continue;
                 }
-                let p = Self::count_tx_proof_units(tx);
+                let p = proof_of[i];
                 if proofs.saturating_add(p) > Self::MAX_BLOCK_PROOF_UNITS {
                     continue;
                 }

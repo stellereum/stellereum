@@ -209,6 +209,69 @@ struct SessionlessGuard {
 /// Minimum gap between two tie-break-exception dials to one peer.
 const FALLBACK_DIAL_COOLDOWN_MS: u64 = 250;
 
+/// Per-peer outbound-dial circuit breaker (redial-storm incident: a dead
+/// peer was redialled on every endpoint every 20s forever, abuse-flagging a
+/// host for "hammering ports").
+///
+/// Consecutive failed dial attempts are counted per peer in a LOCAL map
+/// (deliberately NOT the reputation table: unreachable is not abusive, and
+/// breaker state must never feed handshake-auth decisions). After
+/// [`CIRCUIT_FAIL_THRESHOLD`] consecutive failures the peer is PARKED:
+/// `reconnect_loop` skips it except for a single probe of the first
+/// configured endpoint per backoff interval (no sweep, no NAT punch, no
+/// `catch_up` spawn). Any successful connection (outbound dial or inbound
+/// accept — both register via `add_conn`) resets the breaker to closed.
+///
+/// No env knobs (lead decision): the schedule is compiled in below.
+/// In-zone counters live on `Node` (not `metrics.rs`).
+pub const CIRCUIT_FAIL_THRESHOLD: u32 = 5;
+/// First park backoff: matches the reconnect tick (one skipped sweep).
+pub const CIRCUIT_BACKOFF_FIRST_SECS: u64 = 20;
+/// Second consecutive park (first failed probe): 5 minutes.
+pub const CIRCUIT_BACKOFF_SECOND_SECS: u64 = 300;
+/// Steady-state park (second failed probe onward): 30 minutes (cap).
+pub const CIRCUIT_BACKOFF_MAX_SECS: u64 = 1800;
+/// Bound on tracked breaker entries (fail-closed eviction on the record path).
+pub const MAX_CIRCUIT_PEERS: usize = 1024;
+/// `reconnect_loop` tick (documents the existing 20s cadence; value unchanged).
+pub const CIRCUIT_RECONNECT_INTERVAL_SECS: u64 = 20;
+
+/// Breaker state for one peer.
+#[derive(Clone, Copy, Debug)]
+struct CircuitEntry {
+    /// Consecutive failed dial attempts (entry is removed on any success).
+    consecutive_failures: u32,
+    /// Next time a single probe dial is allowed (`None` = closed, never open).
+    next_probe_at: Option<std::time::Instant>,
+    /// Backoff currently in force (test/monitor hook).
+    backoff_secs: u64,
+}
+
+/// Backoff for the Nth consecutive failure (N >= threshold). Pure so the
+/// storm-rate bound is provable without sleeping: 20s on first park, 5min
+/// on the next failed probe, 30min steady-state (cap).
+pub fn circuit_backoff_secs(consecutive_failures: u32) -> u64 {
+    if consecutive_failures <= CIRCUIT_FAIL_THRESHOLD {
+        CIRCUIT_BACKOFF_FIRST_SECS
+    } else if consecutive_failures == CIRCUIT_FAIL_THRESHOLD + 1 {
+        CIRCUIT_BACKOFF_SECOND_SECS
+    } else {
+        CIRCUIT_BACKOFF_MAX_SECS
+    }
+}
+
+/// Whether N consecutive failures parks the peer. Pure (threshold test hook).
+pub fn circuit_should_park(consecutive_failures: u32) -> bool {
+    consecutive_failures >= CIRCUIT_FAIL_THRESHOLD
+}
+
+/// First configured endpoint for a parked probe (pure shape hook: a parked
+/// peer dials this endpoint ONLY — no sweep, no gossip, no NAT punch).
+/// `dial_parked_probe` (the sole parked dial path) uses exactly this.
+pub fn circuit_probe_endpoint(endpoints: &[String]) -> Option<String> {
+    endpoints.first().cloned()
+}
+
 /// Granularity of the simultaneous-open wait (the wait is a whole number of
 /// these steps, so the peer is polled for an inbound connection every 50ms).
 const SIMOPEN_WAIT_STEP_MS: u64 = 50;
@@ -372,6 +435,15 @@ pub struct Node {
     /// dial. Bounds direct dials so a dead peer cannot turn the exception
     /// into the dial storm the strict tie-break fixed.
     sessionless_guard: std::sync::Mutex<HashMap<[u8; NODEID_LEN], SessionlessGuard>>,
+    /// Circuit breaker for outbound redials (redial-storm incident): per-peer
+    /// consecutive dial failures with exponential park (20s → 5min → 30min).
+    /// Local map on purpose (NOT reputation: unreachable ≠ abusive, and this
+    /// state never feeds handshake-auth). Sync mutex: entries are tiny and
+    /// the guard is never held across await.
+    circuit: std::sync::Mutex<HashMap<[u8; NODEID_LEN], CircuitEntry>>,
+    /// Breaker transitions (parks/unparks), in-zone counters (not metrics.rs).
+    circuit_parks: AtomicU64,
+    circuit_unparks: AtomicU64,
     /// маршруты для discovery (node_id -> Route)
     routes: RwLock<HashMap<[u8; NODEID_LEN], Route>>,
     /// каталог для персистентности (routes.json и пр.)
@@ -665,6 +737,9 @@ impl Node {
             app_subs: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             sessionless_guard: std::sync::Mutex::new(HashMap::new()),
+            circuit: std::sync::Mutex::new(HashMap::new()),
+            circuit_parks: AtomicU64::new(0),
+            circuit_unparks: AtomicU64::new(0),
             routes: RwLock::new(routes),
             data_dir: data_dir.clone(),
             started_at: Instant::now(),
@@ -1212,6 +1287,11 @@ impl Node {
     }
 
     async fn add_conn(&self, pid: [u8; NODEID_LEN], conn: Connection) {
+        // Circuit breaker: any registered connection — outbound dial success
+        // or inbound accept — proves reachability and closes the breaker.
+        // Silent for healthy peers (no entry: no log, no counter). Auth,
+        // reputation, and session logic below are untouched.
+        self.circuit_record_success(pid);
         let sid = conn.stable_id();
         // Backpressure admission (fail-closed): dedup first, then caps. The
         // checks run under a read guard; the insert re-checks under the
@@ -1589,26 +1669,311 @@ impl Node {
         }
         self.dial_peer(peer, pid).await
     }
+}
 
+/// Endpoint hygiene: hard cap on dial attempts per peer per reconnect
+/// cycle. Bounds the sweep so a peer with many configured/gossip endpoints
+/// (or a fast-growing route table) can never look like a port scan.
+pub const MAX_DIAL_ENDPOINTS_PER_CYCLE: usize = 3;
+
+/// Endpoint hygiene: gossip-learned route endpoints per reconnect cycle.
+/// A separate small budget inside [`MAX_DIAL_ENDPOINTS_PER_CYCLE`] — gossip
+/// is tried only after every configured endpoint failed.
+pub const MAX_GOSSIP_DIAL_PER_CYCLE: usize = 1;
+
+/// Where one entry of a dial plan came from (test/monitoring accessor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialKind {
+    /// Listed in the operator config, in listed order.
+    Configured,
+    /// Learned via route gossip, tried only after configured failed.
+    Gossip,
+    /// Public observed address (NAT hole punch), unparked peers only.
+    Punch,
+}
+
+/// One endpoint to attempt in a reconnect cycle, in attempt order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialPlanEntry {
+    pub endpoint: String,
+    pub kind: DialKind,
+}
+
+/// Build the ordered dial plan for one reconnect cycle (pure, no I/O).
+///
+/// Order: configured first (listed order, exact dupes collapsed), then
+/// gossip-learned route endpoints (skipping any already covered, at most
+/// [`MAX_GOSSIP_DIAL_PER_CYCLE`]), then the NAT-punch fallback (only when
+/// it adds an address not already covered). Total length never exceeds
+/// [`MAX_DIAL_ENDPOINTS_PER_CYCLE`]; every entry counts toward the same
+/// budget (no extra tries). A parked peer (sibling breaker signal) gets a
+/// single probe of its first configured endpoint: no gossip, no punch.
+///
+/// Unparseable strings are kept (the dial loop logs them exactly as before
+/// without spending budget); only actual `connect_with_auth` calls count
+/// as attempts, so attempts `<= plan.len() <= MAX_DIAL_ENDPOINTS_PER_CYCLE`.
+pub fn build_dial_plan(
+    configured: &[String],
+    gossip: &[String],
+    punch: Option<SocketAddr>,
+    parked: bool,
+) -> Vec<DialPlanEntry> {
+    if parked {
+        // Single probe: first listed endpoint only, whatever it parses to.
+        return configured
+            .first()
+            .map(|ep| DialPlanEntry {
+                endpoint: ep.clone(),
+                kind: DialKind::Configured,
+            })
+            .into_iter()
+            .collect();
+    }
+    let mut out: Vec<DialPlanEntry> = Vec::new();
+    for ep in configured {
+        if out.len() >= MAX_DIAL_ENDPOINTS_PER_CYCLE {
+            break;
+        }
+        if out.iter().any(|e| e.endpoint == *ep) {
+            continue;
+        }
+        out.push(DialPlanEntry {
+            endpoint: ep.clone(),
+            kind: DialKind::Configured,
+        });
+    }
+    let mut gossip_used = 0usize;
+    for ep in gossip {
+        if out.len() >= MAX_DIAL_ENDPOINTS_PER_CYCLE || gossip_used >= MAX_GOSSIP_DIAL_PER_CYCLE {
+            break;
+        }
+        if out.iter().any(|e| e.endpoint == *ep) {
+            continue;
+        }
+        out.push(DialPlanEntry {
+            endpoint: ep.clone(),
+            kind: DialKind::Gossip,
+        });
+        gossip_used += 1;
+    }
+    if out.len() < MAX_DIAL_ENDPOINTS_PER_CYCLE {
+        if let Some(addr) = punch {
+            let ep_str = addr.to_string();
+            if !out.iter().any(|e| e.endpoint == ep_str) {
+                out.push(DialPlanEntry {
+                    endpoint: ep_str,
+                    kind: DialKind::Punch,
+                });
+            }
+        }
+    }
+    out
+}
+
+impl Node {
+    /// Record one failed outbound dial attempt for a peer.
+    ///
+    /// Granularity is per ATTEMPT, not per endpoint: a full sweep that fails
+    /// everywhere (or a single parked probe that fails) counts once, so the
+    /// sibling width cap and this time-domain park compose instead of
+    /// double-counting. At [`CIRCUIT_FAIL_THRESHOLD`] the peer parks with
+    /// [`CIRCUIT_BACKOFF_FIRST_SECS`]; each failed probe while parked extends
+    /// the park to the next backoff step (5min, then 30min cap). Success
+    /// resets via [`Node::circuit_record_success`] (called from `add_conn`).
+    pub fn circuit_record_failure(&self, pid: [u8; NODEID_LEN]) {
+        let now = std::time::Instant::now();
+        let mut map = self.circuit.lock().unwrap_or_else(|e| e.into_inner());
+        if !map.contains_key(&pid) && map.len() >= MAX_CIRCUIT_PEERS {
+            // Fail-closed bound: evict one CLOSED entry first so a flood of
+            // fresh dead peers cannot grow memory without bound; never evict
+            // a parked peer (that would silently unpark it). If every entry
+            // is parked, skip tracking (the peer stays unparked this cycle).
+            if let Some(victim) = map
+                .iter()
+                .find_map(|(k, e)| (!circuit_should_park(e.consecutive_failures)).then_some(*k))
+            {
+                map.remove(&victim);
+            } else {
+                return;
+            }
+        }
+        let e = map.entry(pid).or_insert(CircuitEntry {
+            consecutive_failures: 0,
+            next_probe_at: None,
+            backoff_secs: 0,
+        });
+        e.consecutive_failures = e.consecutive_failures.saturating_add(1);
+        if circuit_should_park(e.consecutive_failures) {
+            let backoff = circuit_backoff_secs(e.consecutive_failures);
+            e.backoff_secs = backoff;
+            e.next_probe_at = now.checked_add(Duration::from_secs(backoff));
+            if e.consecutive_failures == CIRCUIT_FAIL_THRESHOLD {
+                let total = self.circuit_parks.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "[{}] CIRCUIT PARK peer={} fails={} backoff_s={} total_parks={}",
+                    self.cfg.name,
+                    hex::encode(pid),
+                    e.consecutive_failures,
+                    backoff,
+                    total
+                );
+            } else {
+                // Failed probe while parked: loud, but the park counter counts
+                // closed→parked transitions only (escalations stay countable
+                // via consecutive_failures/backoff_secs).
+                eprintln!(
+                    "[{}] CIRCUIT PARK-EXTEND peer={} fails={} backoff_s={}",
+                    self.cfg.name,
+                    hex::encode(pid),
+                    e.consecutive_failures,
+                    backoff
+                );
+            }
+        }
+    }
+
+    /// Reset the breaker to closed. Called on every registered connection
+    /// (`add_conn`: outbound dial success AND inbound accept prove
+    /// reachability) and when `reconnect_loop` observes a live connection.
+    /// Silent for healthy peers (unknown/closed entry: no log, no counter).
+    pub fn circuit_record_success(&self, pid: [u8; NODEID_LEN]) {
+        let was_parked = {
+            let mut map = self.circuit.lock().unwrap_or_else(|e| e.into_inner());
+            match map.remove(&pid) {
+                Some(e) => circuit_should_park(e.consecutive_failures),
+                None => return,
+            }
+        };
+        if was_parked {
+            let total = self.circuit_unparks.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!(
+                "[{}] CIRCUIT UNPARK peer={} total_unparks={}",
+                self.cfg.name,
+                hex::encode(pid),
+                total
+            );
+        }
+    }
+
+    /// Breaker open (parked): threshold consecutive failures reached.
+    /// Closed peers dial the normal path; only open peers are gated.
+    pub fn circuit_is_parked(&self, pid: &[u8; NODEID_LEN]) -> bool {
+        self.circuit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(pid)
+            .is_some_and(|e| circuit_should_park(e.consecutive_failures))
+    }
+
+    /// A parked peer may be probed once its backoff interval has elapsed.
+    /// Closed peers are never "due" (the normal dial path owns them).
+    pub fn circuit_probe_due(&self, pid: &[u8; NODEID_LEN]) -> bool {
+        let map = self.circuit.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(pid) {
+            Some(e) => {
+                circuit_should_park(e.consecutive_failures)
+                    && e.next_probe_at
+                        .is_some_and(|u| std::time::Instant::now() >= u)
+            }
+            None => false,
+        }
+    }
+
+    /// Consecutive failures currently counted for a peer (0 = closed/unknown).
+    pub fn circuit_consecutive_failures(&self, pid: &[u8; NODEID_LEN]) -> u32 {
+        self.circuit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(pid)
+            .map(|e| e.consecutive_failures)
+            .unwrap_or(0)
+    }
+
+    /// Backoff in force for a parked peer (0 when closed). Test/monitor hook.
+    pub fn circuit_current_backoff_secs(&self, pid: &[u8; NODEID_LEN]) -> u64 {
+        self.circuit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(pid)
+            .map(|e| e.backoff_secs)
+            .unwrap_or(0)
+    }
+
+    /// Breaker transitions so far (in-zone counters, not metrics.rs).
+    pub fn circuit_parks_total(&self) -> u64 {
+        self.circuit_parks.load(Ordering::Relaxed)
+    }
+
+    /// Breaker closes so far (in-zone counters, not metrics.rs).
+    pub fn circuit_unparks_total(&self) -> u64 {
+        self.circuit_unparks.load(Ordering::Relaxed)
+    }
+
+    /// Tracked breaker entries (cap test hook).
+    pub fn circuit_len(&self) -> usize {
+        self.circuit.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+impl Node {
     /// Dial a peer directly, bypassing the simultaneous-open tie-break.
     ///
     /// This is the dial half of `connect_or_get`, split out so the guarded
     /// fallback in `conn_with_session` can use it. A successful dial always
     /// registers a session (`connect_with_auth`), so the returned conn is
     /// immediately usable for requests.
+    ///
+    /// Endpoint hygiene (port-scan incident): one reconnect cycle sweeps at
+    /// most [`MAX_DIAL_ENDPOINTS_PER_CYCLE`] endpoints per peer — configured
+    /// endpoints first (in listed order), gossip-learned route endpoints
+    /// last within [`MAX_GOSSIP_DIAL_PER_CYCLE`], and the NAT-punch fallback
+    /// only when unparked and inside the same budget (no extra tries). The
+    /// gossip input is a bounded snapshot cloned once per cycle, never the
+    /// live-growing route vec. A reputation-parked peer (banned or
+    /// soft-throttled — sibling breaker signal, read-only here) gets a
+    /// single probe of its first configured endpoint.
     async fn dial_peer(
         self: &Arc<Self>,
         peer: &PeerLink,
         pid: [u8; NODEID_LEN],
     ) -> Result<Connection> {
+        // Bounded snapshots: cloned once so a concurrently growing route
+        // table cannot widen this cycle's sweep.
+        let configured: Vec<String> = peer.cfg.endpoints.clone();
+        let gossip_snapshot: Vec<String> = self
+            .routes
+            .read()
+            .await
+            .get(&pid)
+            .map(|r| r.endpoints.clone())
+            .unwrap_or_default();
+        let punch: Option<SocketAddr> = *peer.learned.read().await;
+        // Sibling breaker signals (read-only observation, no state touched):
+        // a reputation-parked OR circuit-parked peer gets a single probe of
+        // its first configured endpoint, never a sweep.
+        let parked = self.rep_is_banned(&pid).await
+            || self.rep_is_throttled(&pid).await
+            || self.circuit_is_parked(&pid);
+        let plan = build_dial_plan(&configured, &gossip_snapshot, punch, parked);
         let mut last_err = anyhow!("no endpoints");
-        for ep in &peer.cfg.endpoints {
-            let addr: SocketAddr = match ep.parse() {
+        let mut attempts = 0usize;
+        for entry in &plan {
+            // Defense in depth: the plan is already bounded; never exceed it.
+            if attempts >= MAX_DIAL_ENDPOINTS_PER_CYCLE {
+                break;
+            }
+            let addr: SocketAddr = match entry.endpoint.parse() {
                 Ok(a) => a,
                 Err(_) => {
-                    eprintln!("[{}] bad endpoint '{ep}'", self.cfg.name);
+                    eprintln!("[{}] bad endpoint '{}'", self.cfg.name, entry.endpoint);
                     continue;
                 }
+            };
+            attempts += 1;
+            let tag = match entry.kind {
+                DialKind::Configured => String::new(),
+                DialKind::Gossip => " (gossip)".to_string(),
+                DialKind::Punch => " (NAT punch)".to_string(),
             };
             match self.connect_with_auth(peer, addr).await {
                 Ok(c) => {
@@ -1619,35 +1984,63 @@ impl Node {
                     return Ok(c);
                 }
                 Err(e) => {
-                    last_err = anyhow!("{} @ {ep}: {e}", peer.cfg.name);
-                    eprintln!("[{}] connect {} @ {ep}: {e}", self.cfg.name, peer.cfg.name);
+                    last_err = anyhow!("{} @ {}{tag}: {e}", peer.cfg.name, entry.endpoint);
+                    eprintln!(
+                        "[{}] connect {} @ {}{tag}: {e}",
+                        self.cfg.name, peer.cfg.name, entry.endpoint
+                    );
                 }
             }
         }
-        // NAT hole punch: если настроенные endpoints недоступны, пробуем публичный
-        // client-адрес пира (каким мы его видим) — его NAT уже открыл привязку исходящим.
-        if let Some(addr) = peer.learned.read().await.as_ref() {
-            let ep_str = addr.to_string();
-            if !peer.cfg.endpoints.iter().any(|e| e == &ep_str) {
-                match self.connect_with_auth(peer, *addr).await {
-                    Ok(c) => {
-                        *peer.conn.write().await = Some(c.clone());
-                        *peer.learned.write().await = Some(c.remote_address());
-                        self.add_conn(pid, c.clone()).await;
-                        self.ensure_frame_loop(c.clone(), Some(pid));
-                        return Ok(c);
-                    }
-                    Err(e) => {
-                        last_err = anyhow!("{} @ {ep_str} (NAT punch): {e}", peer.cfg.name);
-                        eprintln!(
-                            "[{}] connect {} @ {ep_str} (NAT punch): {e}",
-                            self.cfg.name, peer.cfg.name
-                        );
-                    }
-                }
-            }
-        }
+        // Circuit breaker: a fully failed sweep counts ONE consecutive failure
+        // (per-attempt, not per-endpoint — `build_dial_plan` above already
+        // bounds the width). Success resets via `add_conn`.
+        self.circuit_record_failure(pid);
         Err(last_err)
+    }
+
+    /// Single probe dial for a circuit-parked peer whose backoff has elapsed.
+    ///
+    /// Parked discipline: FIRST configured endpoint only (no endpoint sweep,
+    /// no gossip, no NAT punch), and the caller (`reconnect_loop`) spawns no
+    /// `catch_up` for it. Success closes the breaker (via `add_conn`); a
+    /// failed probe extends the park to the next backoff step.
+    async fn dial_parked_probe(
+        self: &Arc<Self>,
+        peer: &PeerLink,
+        pid: [u8; NODEID_LEN],
+    ) -> Result<Connection> {
+        // The sole parked dial path: `circuit_probe_endpoint` returns the
+        // FIRST configured endpoint only (no sweep, no gossip, no punch).
+        let Some(ep) = circuit_probe_endpoint(&peer.cfg.endpoints) else {
+            self.circuit_record_failure(pid);
+            bail!("parked probe: no configured endpoints");
+        };
+        let addr: SocketAddr = match ep.parse() {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("[{}] bad probe endpoint '{ep}'", self.cfg.name);
+                self.circuit_record_failure(pid);
+                bail!("parked probe: bad endpoint '{ep}'");
+            }
+        };
+        match self.connect_with_auth(peer, addr).await {
+            Ok(c) => {
+                *peer.conn.write().await = Some(c.clone());
+                *peer.learned.write().await = Some(c.remote_address());
+                self.add_conn(pid, c.clone()).await;
+                self.ensure_frame_loop(c.clone(), Some(pid));
+                Ok(c)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[{}] connect {} @ {ep} (parked probe): {e}",
+                    self.cfg.name, peer.cfg.name
+                );
+                self.circuit_record_failure(pid);
+                Err(anyhow!("{} @ {ep} (parked probe): {e}", peer.cfg.name))
+            }
+        }
     }
 
     /// A connection that is guaranteed to carry a session key, self-healing.
@@ -6326,6 +6719,32 @@ async fn reconnect_loop(node: Arc<Node>) {
                 None => false,
             };
             if !has_conn {
+                // Circuit breaker: a parked peer gets at most ONE single-probe
+                // dial per backoff interval (first configured endpoint only —
+                // enforced inside `dial_peer` via the parked signal and in
+                // `dial_parked_probe` below: no sweep, no NAT punch, no
+                // `catch_up` spawn); otherwise it is skipped silently until
+                // its probe is due.
+                if node.circuit_is_parked(&pid) {
+                    if node.circuit_probe_due(&pid) {
+                        if let Some(peer) = peer {
+                            node.metrics.reconnects.fetch_add(1, Ordering::Relaxed);
+                            match node.dial_parked_probe(&peer, pid).await {
+                                Ok(conn) => {
+                                    node.ensure_frame_loop(conn, Some(pid));
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[{}] parked probe {} failed: {e}",
+                                        node.cfg.name,
+                                        hex::encode(pid)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 node.metrics.reconnects.fetch_add(1, Ordering::Relaxed);
                 if let Some(peer) = peer {
                     if let Ok(conn) = node.connect_or_get(&peer, pid).await {
@@ -6342,9 +6761,14 @@ async fn reconnect_loop(node: Arc<Node>) {
                         });
                     }
                 }
+            } else if node.circuit_is_parked(&pid) {
+                // A live connection proves reachability (inbound resets land
+                // via `add_conn`; this covers the race where it registered
+                // after the park check above).
+                node.circuit_record_success(pid);
             }
         }
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        tokio::time::sleep(Duration::from_secs(CIRCUIT_RECONNECT_INTERVAL_SECS)).await;
     }
 }
 

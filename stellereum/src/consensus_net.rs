@@ -495,6 +495,14 @@ pub struct ConsensusNetwork {
     /// Votes/proposals/commits bypass it; only bulk gossip is deferred.
     /// Mutex-only, never held across await.
     inbound_bulk: Mutex<InboundBulkLimiter>,
+    /// Global inbound-bandwidth shed meter (see [`InboundShed`]): a per-second
+    /// inbound byte counter. Over [`INBOUND_SHED_BYTES_PER_SEC`] new
+    /// connection attempts are refused ([`Self::shed_refuse_new`]) while
+    /// existing connections keep serving. Mutex-only, never held across await.
+    inbound_shed: Mutex<InboundShed>,
+    /// Peer evictions imposed by the target policy (see
+    /// [`PEER_EVICT_TARGET_MAX`]). Monotonic test/monitoring counter.
+    peer_evicted_total: AtomicU64,
 }
 
 /// Consecutive-failure counter for one peer (see `peer_health`).
@@ -933,6 +941,8 @@ impl ConsensusNetwork {
             bcast_last_ms: Mutex::new(HashMap::new()),
             probe_last_ms: Mutex::new(HashMap::new()),
             inbound_bulk: Mutex::new(InboundBulkLimiter::with_defaults()),
+            inbound_shed: Mutex::new(InboundShed::new(INBOUND_SHED_BYTES_PER_SEC)),
+            peer_evicted_total: AtomicU64::new(0),
         }
     }
 
@@ -961,6 +971,8 @@ impl ConsensusNetwork {
             bcast_last_ms: Mutex::new(HashMap::new()),
             probe_last_ms: Mutex::new(HashMap::new()),
             inbound_bulk: Mutex::new(InboundBulkLimiter::with_defaults()),
+            inbound_shed: Mutex::new(InboundShed::new(INBOUND_SHED_BYTES_PER_SEC)),
+            peer_evicted_total: AtomicU64::new(0),
         }
     }
 
@@ -1141,6 +1153,18 @@ impl ConsensusNetwork {
                 );
                 continue;
             }
+            // Inbound shed (flood control): while the global per-second
+            // inbound counter is over budget, refuse NEW dials (counted in
+            // the shed meter) and keep serving existing connections —
+            // cheapest-first. No-op when not shedding, so honest joins are
+            // byte-identical.
+            if self.shed_refuse_new() {
+                tracing::debug!(
+                    "[net] join {} refused (inbound shed active, keeping existing)",
+                    hex::encode(pid),
+                );
+                continue;
+            }
             let node = Arc::clone(&self.adapter.node);
             let health = Arc::clone(&self.peer_health);
             let payload = payload.clone();
@@ -1279,6 +1303,9 @@ impl ConsensusNetwork {
                 }
             }
         }
+        // Peer-target policy (flood control): no-op at/below target, so the
+        // probe cadence is unchanged on honest stands.
+        self.enforce_peer_target().await;
     }
 
     /// Broadcast a consensus message to all configured peers (best-effort).
@@ -1829,6 +1856,10 @@ pub struct TxGossip {
     /// [`CONS_BCAST_MIN_INTERVAL_MS_DEFAULT`]). Mutex-only, never held across
     /// await.
     bcast_last_ms: Mutex<HashMap<[u8; 20], u64>>,
+    /// Per-peer SEND rate limiter for gossip publish (see
+    /// [`SendRateLimiter`]): over-budget peers are dropped per-peer, the
+    /// publisher is never blocked. Mutex-only, never held across await.
+    send_limit: Mutex<SendRateLimiter>,
 }
 
 impl TxGossip {
@@ -1839,6 +1870,7 @@ impl TxGossip {
             topic,
             peer_health: Arc::new(Mutex::new(HashMap::new())),
             bcast_last_ms: Mutex::new(HashMap::new()),
+            send_limit: Mutex::new(SendRateLimiter::with_defaults()),
         }
     }
 
@@ -2114,6 +2146,22 @@ impl TxGossip {
         for pid in self.peer_ids() {
             if self.peer_skipped(&pid) {
                 skipped += 1;
+                continue;
+            }
+            // SEND-side rate limit (flood control): over-budget peers are
+            // DROPPED for this publish only (counted in the limiter) while
+            // every other peer still sends — the publisher is never blocked
+            // and no await rides on the limiter.
+            let allowed = match self.send_limit.lock() {
+                Ok(mut l) => l.try_send(&pid, payload.len() as u64, epoch_ms()),
+                Err(_) => true,
+            };
+            if !allowed {
+                skipped += 1;
+                tracing::debug!(
+                    "[txgossip] publish to {} dropped (per-peer send budget exceeded)",
+                    hex::encode(pid),
+                );
                 continue;
             }
             let wait_ms = self.bcast_wait_and_stamp(&pid);
@@ -4110,9 +4158,304 @@ impl ConsensusNetwork {
         bytes: usize,
     ) -> InboundDecision {
         let now = epoch_ms();
+        // Global shed meter observes EVERY inbound byte (allowed or
+        // deferred): it is a per-second counter, not a per-message gate, so
+        // the per-peer decision below is untouched by it.
+        if let Ok(mut shed) = self.inbound_shed.lock() {
+            shed.observe(bytes as u64, now);
+        }
         match self.inbound_bulk.lock() {
             Ok(mut l) => l.admit(peer_hex, bytes as u64, inbound_is_critical(msg), now),
             Err(_) => InboundDecision::Allow,
         }
+    }
+
+    /// True while the node is shedding new connection attempts: the global
+    /// per-second inbound byte counter is over [`INBOUND_SHED_BYTES_PER_SEC`].
+    /// Callers refuse NEW dials/handshakes (counted) and keep serving
+    /// existing connections. Fail-open (`false`) when the meter is poisoned.
+    pub fn shed_refuse_new(&self) -> bool {
+        match self.inbound_shed.lock() {
+            Ok(mut shed) => {
+                if shed.shed_active(epoch_ms()) {
+                    shed.note_refused();
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Shed refusals imposed so far (over-const inbound windows observed +
+    /// new dials refused while shedding). Fail-open 0 when poisoned.
+    pub fn shed_refused_total(&self) -> u64 {
+        match self.inbound_shed.lock() {
+            Ok(shed) => shed.refused_total(),
+            Err(_) => 0,
+        }
+    }
+
+    /// Peer evictions imposed by the target policy so far.
+    pub fn peer_evicted_total(&self) -> u64 {
+        self.peer_evicted_total.load(Ordering::Relaxed)
+    }
+
+    /// Enforce the peer-target policy (see [`PEER_EVICT_TARGET_MAX`]): when
+    /// the live peer table (static + dynamic) grows past the target, evict
+    /// the worst NON-STATIC peer (see [`evict_candidate`]) and count it.
+    /// Static config peers are never evicted (they include every validator:
+    /// the validator set is not plumbed to the net layer — [`ValidatorSet`]
+    /// is only borrowed at isolated call sites like
+    /// [`proposal_hint_admissible`] — so static-membership is the
+    /// validator-exemption rule). No-op at/below target: honest stands never
+    /// reach it, so their behavior is byte-identical.
+    pub async fn enforce_peer_target(&self) {
+        let live: Vec<[u8; 20]> = {
+            let peers = self.adapter.node.peers.read().await;
+            peers.keys().copied().collect()
+        };
+        if live.len() <= PEER_EVICT_TARGET_MAX {
+            return;
+        }
+        let mut statik = std::collections::HashSet::new();
+        for p in &self.adapter.node.cfg.peers {
+            if let Ok(pid) = p.node_id_raw() {
+                statik.insert(pid);
+            }
+        }
+        let fails: HashMap<[u8; 20], u32> = match self.peer_health.lock() {
+            Ok(h) => h.iter().map(|(k, v)| (*k, v.fails)).collect(),
+            Err(_) => HashMap::new(),
+        };
+        let scores: Vec<PeerScore> = live
+            .iter()
+            .map(|pid| PeerScore {
+                id: *pid,
+                fails: fails.get(pid).copied().unwrap_or(0),
+                is_static: statik.contains(pid),
+            })
+            .collect();
+        if let Some(pid) = evict_candidate(&scores, PEER_EVICT_TARGET_MAX) {
+            self.adapter.node.invalidate_peer_conn(pid).await;
+            self.peer_evicted_total.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                "[net] peer target {} exceeded ({} live): evicted worst non-static peer {}",
+                PEER_EVICT_TARGET_MAX,
+                live.len(),
+                hex::encode(pid),
+            );
+        }
+    }
+}
+
+// ==================== SEND-side flood controls (CometBFT-style) ====================
+
+/// Sustained per-peer SEND budget on gossip publish in bytes/sec. A spammer
+/// publisher burning hotter than this is dropped per-peer (see
+/// [`SendRateLimiter`]); honest gossip (a few small frames/sec) never reaches
+/// it, so honest behavior is unchanged.
+pub const SEND_RATE_PER_PEER_BYTES_PER_SEC: u64 = 1024 * 1024;
+/// Burst headroom per peer on gossip publish in bytes. One
+/// [`MAX_TX_MSG`] frame always fits, so no honest single publish is dropped.
+pub const SEND_BURST_PER_PEER_BYTES: u64 = 4 * 1024 * 1024;
+/// Cap on tracked send-limiter peers (memory bound, mirrors
+/// [`INBOUND_MAX_TRACKED_PEERS`]). Overflow evicts an arbitrary entry.
+pub const SEND_MAX_TRACKED_PEERS: usize = 1024;
+
+/// Peer-target ceiling for the live peer table (static + dynamic). Below the
+/// infnode hard cap (`MAX_CONN_PEERS_TOTAL = 4096`, read-only): when the live
+/// table grows past this, the worst non-static peer is evicted (see
+/// [`evict_candidate`]). Honest stands run far below it.
+pub const PEER_EVICT_TARGET_MAX: usize = 512;
+
+/// Global inbound-bandwidth shed threshold in bytes/sec. Over this within one
+/// wall-clock second the node sheds cheapest-first: NEW connection attempts
+/// are refused (counted) while EXISTING connections keep serving (see
+/// [`InboundShed`]). Set above the per-peer bulk budget times a healthy peer
+/// count, so honest stands never trip it.
+pub const INBOUND_SHED_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct SendBucket {
+    tokens: f64,
+    last_ms: u64,
+}
+
+/// Per-peer SEND rate limiter for gossip publish (TxGossip fanout).
+///
+/// Mirrors the receive-side bucket idiom ([`InboundBulkLimiter`]): sustained
+/// `rate_bps` bytes/sec with `burst` headroom, per-peer token buckets keyed
+/// by node id, time-injected (`now_ms`) for deterministic tests. Difference:
+/// over-budget SENDS are DROPPED for that peer only (with [`Self::dropped_total`]
+/// counting) and the publisher is NEVER blocked — the flush moves on to the
+/// next peer. A single message larger than the burst never passes.
+pub struct SendRateLimiter {
+    rate_bps: f64,
+    burst: f64,
+    buckets: HashMap<[u8; 20], SendBucket>,
+    max_peers: usize,
+    dropped_total: u64,
+}
+
+impl SendRateLimiter {
+    /// General constructor: sustained `rate_bps` bytes/sec, `burst` headroom.
+    pub fn new(rate_bps: u64, burst_bytes: u64) -> Self {
+        Self {
+            rate_bps: (rate_bps.max(1)) as f64,
+            burst: (burst_bytes.max(1)) as f64,
+            buckets: HashMap::new(),
+            max_peers: SEND_MAX_TRACKED_PEERS,
+            dropped_total: 0,
+        }
+    }
+
+    /// Production shape from the in-code consts (no env knobs).
+    pub fn with_defaults() -> Self {
+        Self::new(
+            SEND_RATE_PER_PEER_BYTES_PER_SEC,
+            SEND_BURST_PER_PEER_BYTES,
+        )
+    }
+
+    /// Over-budget send drops for one peer so far (monotonic).
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped_total
+    }
+
+    /// Peers currently tracked (for the memory-bound pin).
+    pub fn peer_count(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// True when `bytes` for `peer` at `now_ms` may be sent (budget spent).
+    /// False when over budget: the caller must DROP that peer's send (counted
+    /// here) and move on — never block the publisher, never retry inline.
+    pub fn try_send(&mut self, peer: &[u8; 20], bytes: u64, now_ms: u64) -> bool {
+        if (bytes as f64) > self.burst {
+            self.dropped_total = self.dropped_total.saturating_add(1);
+            return false;
+        }
+        if !self.buckets.contains_key(peer) && self.buckets.len() >= self.max_peers {
+            if let Some(k) = self.buckets.keys().next().cloned() {
+                self.buckets.remove(&k);
+            }
+        }
+        let bucket = self.buckets.entry(*peer).or_insert(SendBucket {
+            tokens: self.burst,
+            last_ms: now_ms,
+        });
+        let elapsed = now_ms.saturating_sub(bucket.last_ms);
+        if elapsed > 0 {
+            bucket.tokens =
+                (bucket.tokens + elapsed as f64 / 1000.0 * self.rate_bps).min(self.burst);
+            bucket.last_ms = now_ms;
+        }
+        if bucket.tokens >= bytes as f64 {
+            bucket.tokens -= bytes as f64;
+            true
+        } else {
+            self.dropped_total = self.dropped_total.saturating_add(1);
+            false
+        }
+    }
+}
+
+/// One peer's standing for the eviction choice.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerScore {
+    /// Node id ([u8; 20] infnode identity).
+    pub id: [u8; 20],
+    /// Consecutive send/probe failures (higher = lower reputation = evict first).
+    pub fails: u32,
+    /// Static config peers are NEVER evicted (validator-exemption rule: the
+    /// validator set is not plumbed to the net layer, and every validator is
+    /// a static config peer in every deployment).
+    pub is_static: bool,
+}
+
+/// Pure eviction choice: `None` at/below `target` or when every peer is
+/// static; otherwise the non-static peer with the worst (highest) failure
+/// streak. Ties break to the first worst in slice order (deterministic for a
+/// fixed input order). Never evicts validators: without a validator↔node-id
+/// map at the net layer, static-membership is the exemption rule.
+pub fn evict_candidate(peers: &[PeerScore], target: usize) -> Option<[u8; 20]> {
+    if peers.len() <= target {
+        return None;
+    }
+    let mut best: Option<[u8; 20]> = None;
+    let mut best_fails: u32 = 0;
+    let mut found = false;
+    for p in peers {
+        if p.is_static {
+            continue;
+        }
+        if !found || p.fails > best_fails {
+            found = true;
+            best_fails = p.fails;
+            best = Some(p.id);
+        }
+    }
+    best
+}
+
+/// Global inbound-bandwidth shed meter: a per-second inbound byte counter.
+/// Over `cap_bytes_per_sec` within one wall-clock second the node is shedding:
+/// NEW connection attempts are refused (see [`ConsensusNetwork::shed_refuse_new`],
+/// counted in [`Self::refused_total`]) while EXISTING connections keep
+/// serving. Cheapest-first: unproven newcomers are refused before any proven
+/// (existing) route is touched. Time-injected (`now_ms`) for deterministic
+/// tests; wall-clock seconds anchor the window.
+pub struct InboundShed {
+    cap_bytes_per_sec: u64,
+    window_sec: u64,
+    used: u64,
+    refused_total: u64,
+}
+
+impl InboundShed {
+    /// General constructor: shed while over `cap_bytes_per_sec` per second.
+    pub fn new(cap_bytes_per_sec: u64) -> Self {
+        Self {
+            cap_bytes_per_sec: cap_bytes_per_sec.max(1),
+            window_sec: u64::MAX,
+            used: 0,
+            refused_total: 0,
+        }
+    }
+
+    /// Observe `bytes` of inbound traffic at `now_ms`. Returns false while
+    /// shedding (the caller refuses NEW connection attempts, keeps existing);
+    /// every shed observation is counted.
+    pub fn observe(&mut self, bytes: u64, now_ms: u64) -> bool {
+        let sec = now_ms / 1000;
+        if sec != self.window_sec {
+            self.window_sec = sec;
+            self.used = 0;
+        }
+        self.used = self.used.saturating_add(bytes);
+        if self.used > self.cap_bytes_per_sec {
+            self.refused_total = self.refused_total.saturating_add(1);
+            false
+        } else {
+            true
+        }
+    }
+
+    /// True while the current wall-clock second is over budget (new attempts
+    /// must be refused). Pure read: does not count.
+    pub fn shed_active(&self, now_ms: u64) -> bool {
+        self.window_sec == now_ms / 1000 && self.used > self.cap_bytes_per_sec
+    }
+
+    /// Count one refused NEW connection attempt while shedding.
+    pub fn note_refused(&mut self) {
+        self.refused_total = self.refused_total.saturating_add(1);
+    }
+
+    /// Shed refusals so far (over-const observations + refused new attempts).
+    pub fn refused_total(&self) -> u64 {
+        self.refused_total
     }
 }

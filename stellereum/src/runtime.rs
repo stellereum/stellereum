@@ -6167,6 +6167,38 @@ impl ValidatorRuntime {
             .map(|t| t.compute_tx_hash())
             .collect();
         self.mempool.write().await.prune_confirmed(&included);
+        // CometBFT-style RECHECK after each commit: the commit advanced
+        // on-chain nonces, drained balances and may have moved the fee floor,
+        // so queued txs valid at admission can now be permanently
+        // unexecutable. `recheck` drops exactly those (spent nonce / drained
+        // balance / fee below floor) against post-commit state; honest pools
+        // come back with 0. Snapshot-then-recheck under SEPARATE short locks
+        // (never nested): the accounts read drops before the mempool write is
+        // taken, so no lock order is introduced.
+        {
+            let payers: Vec<[u8; 32]> =
+                self.mempool.read().await.fee_payers().into_iter().collect();
+            let guard = self.state.accounts.read().await;
+            let mut snap: HashMap<[u8; 32], (u64, u64)> =
+                HashMap::with_capacity(payers.len());
+            for a in &payers {
+                if let Some(acct) = guard.get(a) {
+                    snap.insert(*a, (acct.nonce, acct.balance));
+                }
+            }
+            drop(guard);
+            let dropped = self
+                .mempool
+                .write()
+                .await
+                .recheck(crate::zkml::now_secs(), |a| snap.get(a).copied());
+            if dropped > 0 {
+                tracing::info!(
+                    "[mempool] recheck after commit at height {}: dropped {dropped} stale tx(s)",
+                    block.height,
+                );
+            }
+        }
         // D2 free-failure gate: an included transaction that FAILED at apply
         // paid nothing (the native commit is atomic) while its bytes occupied
         // block wire/gas and burned verifier CPU. Feed the verdicts back so a
@@ -8259,6 +8291,30 @@ impl ChainState {
                 .map(|t| t.compute_tx_hash())
                 .collect();
             mp.write().await.prune_confirmed(&included);
+            // CometBFT-style RECHECK after each commit (mirror of
+            // `ValidatorRuntime::record_apply_outcome`): drop queued txs the
+            // commit made permanently unexecutable. Snapshot-then-recheck
+            // under separate short locks (never nested).
+            let payers: Vec<[u8; 32]> = mp.read().await.fee_payers().into_iter().collect();
+            let guard = self.state.accounts.read().await;
+            let mut snap: HashMap<[u8; 32], (u64, u64)> =
+                HashMap::with_capacity(payers.len());
+            for a in &payers {
+                if let Some(acct) = guard.get(a) {
+                    snap.insert(*a, (acct.nonce, acct.balance));
+                }
+            }
+            drop(guard);
+            let dropped = mp
+                .write()
+                .await
+                .recheck(crate::zkml::now_secs(), |a| snap.get(a).copied());
+            if dropped > 0 {
+                tracing::info!(
+                    "[mempool] recheck after commit at height {}: dropped {dropped} stale tx(s)",
+                    block.height,
+                );
+            }
         }
     }
 

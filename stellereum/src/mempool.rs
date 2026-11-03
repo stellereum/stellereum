@@ -2775,6 +2775,45 @@ impl Mempool {
             self.release_sender_slot(&sender);
         }
     }
+
+    /// Re-validate every queued transaction against POST-COMMIT state
+    /// (CometBFT-style mempool recheck). Call after each commit, AFTER
+    /// [`Mempool::prune_confirmed`]: the commit advanced on-chain nonces,
+    /// drained balances and may have moved the fee floor, so queued txs that
+    /// were valid at admission can now be permanently unexecutable (spent
+    /// nonce, drained balance, fee below the new floor). Without this they
+    /// accumulate: never included (execution refuses them) yet never pruned,
+    /// permanently occupying pool slots and the sender's nonce head.
+    ///
+    /// `account` yields the post-commit `(nonce, balance)` per sender. A
+    /// sender the view does not know (`None`) is SKIPPED, never treated as
+    /// broke (same fail-open as [`Mempool::evict_unexecutable`]). Returns how
+    /// many were dropped. No-attack behavior: every still-valid tx is kept,
+    /// so honest pools come back with 0.
+    pub fn recheck<F>(&mut self, now_secs: u64, mut account: F) -> usize
+    where
+        F: FnMut(&[u8; 32]) -> Option<(u64, u64)>,
+    {
+        // Pass 1: spent nonce / drained balance / aged future-nonce (same
+        // predicate the proposer sweep uses, now against post-commit state).
+        let mut dropped = self.evict_unexecutable_at(now_secs, &mut account);
+        // Pass 2: the fee floor moved under the tx (base fee rose or a D2
+        // failure penalty accrued at/after commit): `gas_limit` no longer
+        // covers `required_fee_for_tx`, so admission would refuse it today.
+        // `evict` keeps the fee index, per-sender quota and F-03 reservations
+        // in step (never remove straight from `txs`).
+        let stale_floor: Vec<TxHash> = self
+            .txs
+            .values()
+            .filter(|tx| tx.gas_limit < self.required_fee_for_tx(tx))
+            .map(|tx| tx.compute_tx_hash())
+            .collect();
+        for h in &stale_floor {
+            self.evict(h);
+        }
+        dropped += stale_floor.len();
+        dropped
+    }
 }
 
 #[cfg(test)]

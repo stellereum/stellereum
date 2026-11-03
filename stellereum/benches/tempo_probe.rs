@@ -25,8 +25,9 @@ use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
 use stellereum::commitment::{
-    AbiJsonCache, Domain, DomainCache, assemble_cached_digest, contracts_preimage,
-    contracts_preimage_cached, staking_preimage, tokens_preimage, CommitmentSnapshot,
+    AbiJsonCache, Domain, DomainCache, assemble_cached_digest, assemble_from_cache,
+    contracts_preimage, contracts_preimage_cached, staking_preimage, tokens_preimage,
+    CommitmentSnapshot,
 };
 use stellereum::contract::ContractRegistry;
 use stellereum::contract_abi::{AbiEvent, AbiMethod, AbiParam, AbiType, ContractAbi};
@@ -453,4 +454,150 @@ fn tempo_batch_verify_blockscale_428() {
 #[test]
 fn tempo_batch_verify_blockscale_1000() {
     intake_verify_serial_vs_parallel_row(1_000, 600_000);
+}
+
+/// Zero-copy steady-state assembly vs the cloning hot path (fixed fixture).
+///
+/// Same snapshot as `tempo_assemble_hot_vs_streaming` (200 tokens x 8
+/// balances, 50 contracts, 50 validators): reports streaming ms (full
+/// re-walk/re-sort/re-hash), hot-clone ms (14 `Vec` clones + one hash — the
+/// pre-change steady-state cost) and zero-copy ms (`assemble_from_cache`:
+/// the same slot bytes hashed in place, no clones). REPORTS, not gates:
+/// correctness asserts only (all three digests equal, all-hit counters) — a
+/// slow machine must still be green. The never-slower gate is the manual
+/// before/after comparison in the task report.
+#[test]
+fn tempo_assemble_zero_copy_vs_hot() {
+    let s = empty_snapshot_with(make_tokens(200, 8), make_contracts(50), make_staking(50));
+    let confidential = stellereum::crypto_privacy::ConfidentialState::new();
+    let zkml = stellereum::zkml::ZkMlModelRegistry::default();
+    let reference = stellereum::commitment::commitment_digest_with_confidential_and_zkml(
+        &s,
+        &confidential,
+        &zkml,
+    );
+    let ms_stream = median_ms(10, 2, || {
+        let _ = stellereum::commitment::commitment_digest_with_confidential_and_zkml(
+            &s,
+            &confidential,
+            &zkml,
+        );
+    });
+    // Fill every slot once (cold), then time the all-hit steady state.
+    let mut cache = DomainCache::default();
+    let gens = [7u64; 14];
+    macro_rules! fill {
+        ($domain:expr, $build:expr) => {{
+            let b: Vec<u8> = $build;
+            cache.put($domain, gens[$domain.index()], b.clone());
+            b
+        }};
+    }
+    let domains = [
+        fill!(Domain::Tokens, tokens_preimage(&s.tokens)),
+        fill!(Domain::Staking, staking_preimage(&s.staking)),
+        fill!(
+            Domain::Pmm,
+            stellereum::commitment::pmm_preimage(&s.pmm, &s.pmm_usdt_token, &s.pmm_treasury)
+        ),
+        fill!(
+            Domain::Contracts,
+            contracts_preimage_cached(&s.contracts, &mut cache.abi)
+        ),
+        fill!(
+            Domain::Escrow,
+            stellereum::commitment::escrow_preimage(&s.order_escrow)
+        ),
+        fill!(
+            Domain::Governance,
+            stellereum::commitment::governance_preimage(&s.governance)
+        ),
+        fill!(
+            Domain::Oracle,
+            stellereum::commitment::oracle_preimage(&s.oracle)
+        ),
+        fill!(
+            Domain::SessionKeys,
+            stellereum::commitment::session_keys_preimage(&s.session_keys)
+        ),
+        fill!(
+            Domain::Books,
+            stellereum::commitment::books_preimage(&s.orderbooks)
+        ),
+        fill!(
+            Domain::Bridge,
+            stellereum::commitment::bridge_preimage(&s.bridge)
+        ),
+        fill!(
+            Domain::CrossShard,
+            stellereum::commitment::cross_shard_preimage(
+                &s.cross_shard_consumed,
+                &s.cross_shard_produced,
+                &s.cross_shard_completed
+            )
+        ),
+        fill!(
+            Domain::Xpc,
+            stellereum::commitment::xpc_preimage(&s.cross_shard_xpc)
+        ),
+        fill!(
+            Domain::Confidential,
+            stellereum::commitment::confidential_preimage(&confidential)
+        ),
+        fill!(
+            Domain::Zkml,
+            stellereum::commitment::zkml_preimage(&zkml)
+        ),
+    ];
+    let total: usize = domains.iter().map(|b| b.len()).sum();
+    let refs: [&[u8]; 14] = [
+        &domains[0],
+        &domains[1],
+        &domains[2],
+        &domains[3],
+        &domains[4],
+        &domains[5],
+        &domains[6],
+        &domains[7],
+        &domains[8],
+        &domains[9],
+        &domains[10],
+        &domains[11],
+        &domains[12],
+        &domains[13],
+    ];
+    assert_eq!(assemble_cached_digest(refs), reference, "cached == streaming");
+    assert_eq!(
+        assemble_from_cache(&mut cache, &gens).expect("all-hit"),
+        reference,
+        "zero-copy == streaming"
+    );
+    cache.reset_counters();
+    let ms_hot_clone = median_ms(10, 2, || {
+        let mut parts: [Vec<u8>; 14] = std::array::from_fn(|_| Vec::new());
+        for d in Domain::ALL {
+            parts[d.index()] = cache.get(d, gens[d.index()]).expect("all-hit");
+        }
+        let r: [&[u8]; 14] = [
+            &parts[0], &parts[1], &parts[2], &parts[3], &parts[4], &parts[5],
+            &parts[6], &parts[7], &parts[8], &parts[9], &parts[10], &parts[11],
+            &parts[12], &parts[13],
+        ];
+        let _ = assemble_cached_digest(r);
+    });
+    cache.reset_counters();
+    let ms_zero_copy = median_ms(10, 2, || {
+        let _ = assemble_from_cache(&mut cache, &gens).expect("all-hit");
+    });
+    println!(
+        "[tempo][assemble][zero_copy] preimage_total={total} bytes streaming={} hot_clone={} zero_copy={} clone_speedup={:.2}x zero_copy_speedup={:.2}x hits={} misses={}",
+        medal_ms(ms_stream),
+        medal_ms(ms_hot_clone),
+        medal_ms(ms_zero_copy),
+        if ms_hot_clone > 0.0 { ms_stream / ms_hot_clone } else { f64::INFINITY },
+        if ms_zero_copy > 0.0 { ms_stream / ms_zero_copy } else { f64::INFINITY },
+        cache.hits,
+        cache.misses,
+    );
+    assert_eq!(cache.misses, 0, "steady-state recommit must not miss");
 }

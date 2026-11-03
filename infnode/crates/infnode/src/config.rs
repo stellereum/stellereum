@@ -27,6 +27,11 @@ pub struct PeerConfig {
     pub node_id: String,
     pub ed_pub: String,
     pub x_pub: String,
+    /// Falcon-512 long-term PQ public key (897 bytes, hex). `None` (absent)
+    /// = classical-only peer, explicit — never inferred. PQ 9.0, default-off:
+    /// old configs without this key parse unchanged (`serde(default)`).
+    #[serde(default)]
+    pub pq_pub: Option<String>,
     pub endpoints: Vec<String>,
     #[serde(default = "default_allow")]
     pub allow: Vec<String>,
@@ -77,6 +82,20 @@ impl PeerConfig {
         let b = hex::decode(&self.x_pub)?;
         b.try_into()
             .map_err(|_| anyhow!("x_pub должен быть 32 байта"))
+    }
+
+    /// Raw Falcon-512 public key, or `None` for a classical-only peer
+    /// (explicit absence — not an error, per plan §5 window tolerance).
+    /// A present-but-malformed value is a hard error (fail closed: a pinned
+    /// PQ key that does not parse must never silently become "classical").
+    pub fn pq_bytes(&self) -> Result<Option<[u8; crate::proto::PQ_FALCON_PK_LEN]>> {
+        let Some(s) = self.pq_pub.as_deref() else {
+            return Ok(None);
+        };
+        let b = hex::decode(s)?;
+        b.try_into()
+            .map_err(|_| anyhow!("pq_pub должен быть 897 байт"))
+            .map(Some)
     }
 }
 

@@ -6,7 +6,8 @@
 use crate::cell::{CellHash, MerkleProof, PatriciaTrie};
 pub use crate::contract::{ContractEventJson, GetMethodResponse, GET_METHOD_SAFETY_FUEL_LIMIT};
 use crate::token::{TokenError, TokenEvent, TokenMetadata, TokenOp, TokenRegistry};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::ParallelIterator;
+use rayon::slice::ParallelSlice;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1104,6 +1105,33 @@ pub struct ExecPostActions {
 /// from the same values and write the same final state, so the wave's
 /// result never depends on which path ran.
 const PARALLEL_WAVE_MIN_TX: usize = 32;
+
+/// Granularity of the concurrent plan phase: the wave is split into
+/// `par_chunks` of this many transactions, one rayon task per chunk.
+///
+/// Planning ONE plain transaction costs about a hundred nanoseconds, so
+/// handing the pool one task per transaction would spend more time waking
+/// workers and stealing work than planning. Chunking amortises the dispatch
+/// over `PARALLEL_PLAN_CHUNK` plans per task. Overridable per process via
+/// `STELL_PARALLEL_PLAN_CHUNK` (positive integer; unset/invalid falls back
+/// to the default) so the speedup bench can sweep it in one binary.
+///
+/// This is a PURE performance switch like `PARALLEL_WAVE_MIN_TX`: chunking
+/// only changes how the same pure `plan_plain_tx` calls are grouped into
+/// tasks. The collect is order-preserving, so the plans - and the merged
+/// final state - are byte-identical for every chunk size.
+const PARALLEL_PLAN_CHUNK: usize = 128;
+
+/// Effective plan chunk for one wave: the configured chunk, capped so a
+/// wave always splits into at least four chunks (a wave smaller than the
+/// chunk must still spread over workers instead of collapsing to one task).
+fn parallel_plan_chunk() -> usize {
+    std::env::var("STELL_PARALLEL_PLAN_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(PARALLEL_PLAN_CHUNK)
+}
 
 /// The plan of ONE plain (payload-free) transaction, computed from a
 /// CONSISTENT snapshot of the accounts map.
@@ -4516,29 +4544,36 @@ impl InMemoryStateEngine {
                 snap
             };
 
-            // (b) PLAN - in parallel, on the rayon pool.
+            // (b) PLAN - in parallel, on the rayon pool, in chunks of
+            // `parallel_plan_chunk()` transactions per task. The collect is
+            // order-preserving, so the chunking never changes the plans.
+            let chunk = parallel_plan_chunk().min(wave.len().div_ceil(4).max(1));
             let plans: Vec<(usize, PlainTxPlan)> = wave
-                .par_iter()
-                .map(|&i| {
-                    let tx = &txs[i];
-                    let (floor_base, surcharge) = fee_floors[i];
-                    let session_ok = session_valid
-                        .map(|sv| sv.get(&i).copied().unwrap_or(false))
-                        .unwrap_or(true);
-                    let plan = plan_plain_tx(
-                        tx,
-                        admitted[i],
-                        session_ok,
-                        snapshot.get(&tx.from).copied().flatten(),
-                        snapshot.get(&tx.to).copied().flatten(),
-                        floor_base,
-                        surcharge,
-                        vesting_floors.get(&tx.from).copied(),
-                        burn_for_cross_shard && tx.source_shard != tx.target_shard,
-                        tx.effective_sponsor()
-                            .and_then(|s| snapshot.get(&s).copied().flatten()),
-                    );
-                    (i, plan)
+                .par_chunks(chunk)
+                .flat_map(|c| {
+                    c.iter()
+                        .map(|&i| {
+                            let tx = &txs[i];
+                            let (floor_base, surcharge) = fee_floors[i];
+                            let session_ok = session_valid
+                                .map(|sv| sv.get(&i).copied().unwrap_or(false))
+                                .unwrap_or(true);
+                            let plan = plan_plain_tx(
+                                tx,
+                                admitted[i],
+                                session_ok,
+                                snapshot.get(&tx.from).copied().flatten(),
+                                snapshot.get(&tx.to).copied().flatten(),
+                                floor_base,
+                                surcharge,
+                                vesting_floors.get(&tx.from).copied(),
+                                burn_for_cross_shard && tx.source_shard != tx.target_shard,
+                                tx.effective_sponsor()
+                                    .and_then(|s| snapshot.get(&s).copied().flatten()),
+                            );
+                            (i, plan)
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .collect();
 

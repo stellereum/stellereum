@@ -784,6 +784,7 @@ mod tests {
             node_id: id_of(&ed),
             ed_pub: hex::encode(ed),
             x_pub: hex::encode(ed_of(seed.wrapping_add(1))),
+            pq_pub: None, // GATE: classical-only fixture (no PQ identity announced)
             endpoints: vec!["127.0.0.1:9411".into()],
             allow: vec!["*".into()],
             rate_limit_per_sec: 0,
@@ -980,6 +981,7 @@ mod tests {
                 node_id: p.node_id.clone(),
                 ed_pub: hex::encode(p.ed_pub),
                 x_pub: p.x_pub.map(hex::encode).unwrap_or_default(),
+                pq_pub: None, // GATE: discovered peers carry no PQ identity yet
                 endpoints: vec![format!("{}:{}", p.host, p.port)],
                 allow: vec!["*".into()],
                 rate_limit_per_sec: 0,

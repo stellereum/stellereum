@@ -23,7 +23,7 @@ use x25519_dalek::{PublicKey as XPub, StaticSecret as XSecret};
 use x509_parser::parse_x509_certificate;
 
 use crate::config::{NodeConfig, PeerConfig};
-use crate::keyring::NodeKeys;
+use crate::keyring::{NodeKeys, PqKeys};
 use crate::proto::{self, now_ms, ts_ok, Frame, NODEID_LEN};
 use crate::reputation::{RepConfig, RepEntry, REP_MAP_CAP, REP_MAP_HARD_CAP};
 
@@ -3204,6 +3204,9 @@ impl Node {
             node_id: format!("inf1:{}", hex::encode(info.id)),
             ed_pub: info.ed_hex.clone(),
             x_pub: info.x_hex.clone(),
+            // DHT-discovered peers are classical by construction (explicit):
+            // PQ binding happens only via pinned pq_pub + verified tag.
+            pq_pub: None,
             endpoints: endpoints.clone(),
             // DHT-обнаруженные ноды: только discovery (lookup/update/find_node).
             // БЕЗ dht.store (запись фейковых манифестов/реестра), dht.sync (слепок KV),
@@ -6298,6 +6301,8 @@ async fn handle_stream(
                 node_id: format!("inf1:{}", hex::encode(claimed)),
                 ed_pub: ed_hex.clone(),
                 x_pub: x_hex,
+                // TOFU peers are classical by construction (explicit).
+                pq_pub: None,
                 endpoints: vec![conn.remote_address().to_string()],
                 allow: node.unknown_allow_cfg.read().await.clone(),
                 // PENTEST F5: a TOFU identity is the least-trusted peer on the
@@ -7343,6 +7348,90 @@ pub fn pq_initiator_answer(
     }
 }
 
+/// PQ FALCON TAG + identity binding (opt-in, default OFF — PQ 9.0).
+/// Pure helpers; no live handshake path calls them yet, so flag OFF (or
+/// absent PQ identity) leaves production behavior byte-identical. Follow-up
+/// (explicit, out of this change's zone): load `pq-identity.key` at startup
+/// (`main.rs` key-load sites), hold `Option<PqKeys>` on `Node`, and emit/
+/// check `pq_pub`/`pq_id`/`pq_sig` in CHALLENGE/AUTH when
+/// `STELL_INF_PQ_HANDSHAKE=1` — via `pq_announce_fields` +
+/// `proto::pq_falcon_policy` below (fail-closed, same refuse arms as the
+/// KEM path, mixed-mode window per plan §5).
+///
+/// Outcome of announcing a PQ long-term key for a classical id.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum PqBindOutcome {
+    /// First valid claim: bound sticky (first-PQ-wins, plan §3.4).
+    NewBound,
+    /// Same key re-announced with a valid tag: steady state.
+    AlreadyBound,
+    /// Different key (or malformed claim) without rollback ceremony:
+    /// quarantined, fail closed — mirrors the classical MITM rule.
+    Quarantined,
+}
+
+/// Sticky first-PQ-wins registry: classical id -> bound Falcon-512 pub.
+/// Pure binding rule (executable form of `pq_transport.rs::pqplan_resolve`);
+/// the live session-table hookup is a follow-up (see module note).
+#[derive(Default)]
+pub struct PqIdentityRegistry {
+    bound: HashMap<[u8; NODEID_LEN], Vec<u8>>,
+}
+
+impl PqIdentityRegistry {
+    pub fn new() -> Self {
+        Self {
+            bound: HashMap::new(),
+        }
+    }
+
+    /// Announce `pq_pub` (raw 897-byte Falcon-512 key) for `classical`,
+    /// with `tag_ok` = result of `proto::pq_falcon_verify` over the
+    /// finalized transcript digest. Malformed keys and bad tags never bind.
+    pub fn announce(
+        &mut self,
+        classical: &[u8; NODEID_LEN],
+        pq_pub: &[u8],
+        tag_ok: bool,
+    ) -> PqBindOutcome {
+        if pq_pub.len() != proto::PQ_FALCON_PK_LEN || !tag_ok {
+            // Bad tag on a KNOWN peer is a key-change attack pattern;
+            // on an unknown peer it is garbage either way: quarantine.
+            return PqBindOutcome::Quarantined;
+        }
+        match self.bound.get(classical) {
+            None => {
+                self.bound.insert(*classical, pq_pub.to_vec());
+                PqBindOutcome::NewBound
+            }
+            Some(bound) if bound.as_slice() == pq_pub => PqBindOutcome::AlreadyBound,
+            Some(_) => PqBindOutcome::Quarantined,
+        }
+    }
+
+    /// Bound PQ key for a classical id, if any (sticky until ceremony).
+    pub fn bound_pq(&self, classical: &[u8; NODEID_LEN]) -> Option<&[u8]> {
+        self.bound.get(classical).map(|v| v.as_slice())
+    }
+}
+
+/// Additive announce fields for CHALLENGE/AUTH JSON: `(pq_pub_hex,
+/// pq_id_hex, pq_sig_hex)` where `pq_sig` is the Falcon-512 tag over the
+/// finalized transcript digest by the long-term PQ key. The caller merges
+/// these into the existing payload ONLY when the PQ handshake is enabled
+/// AND local PQ identity is present; absent identity emits nothing
+/// (classical-explicit, plan §5).
+pub fn pq_announce_fields(pq: &PqKeys, digest: &[u8; 32]) -> (String, String, String) {
+    let sig = pq.sign_digest(digest);
+    (pq.pq_pub_hex(), pq.pq_id_hex(), hex::encode(sig))
+}
+
+/// Finalized transcript digest bytes the Falcon tag covers (same canonical
+/// encoding as the KEM path, Falcon suite id — see `proto::pq_falcon_digest`).
+pub fn pq_falcon_transcript_digest(t: &proto::PqTranscript) -> [u8; 32] {
+    proto::pq_falcon_digest(t)
+}
+
 fn parse_dht_node(v: &serde_json::Value) -> Option<crate::dht::NodeInfo> {
     let id_hex = v["node_id"].as_str()?;
     let b = hex::decode(id_hex.strip_prefix("inf1:").unwrap_or(id_hex)).ok()?;
@@ -8312,6 +8401,7 @@ mod session_heal_tests {
             node_id: keys.id_hex(),
             ed_pub: hex::encode(keys.verifying.to_bytes()),
             x_pub: hex::encode(keys.e2e_pub.as_bytes()),
+            pq_pub: None,
             endpoints: vec![listen.to_string()],
             allow: vec!["*".to_string()],
             rate_limit_per_sec: 0,

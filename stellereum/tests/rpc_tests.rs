@@ -301,13 +301,17 @@ async fn test_rpc_hardening_body_limit_and_batches() {
     let res: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(res["result"], "0x167d");
 
-    // 2. Batch requests are rejected loudly (-32600)
+    // 2. Batch requests are SERVED per-item (JSON-RPC batch support with
+    // caps: MAX_RPC_BATCH_ITEMS=64, bytes<=MAX_RPC_BODY). One-item batch of
+    // a valid call returns an array with that call's result.
     let batch_req = json!([
         { "jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": [] }
     ]);
     let (_, body_batch) = http_post(addr, "/", &batch_req.to_string()).await;
     let res_batch: Value = serde_json::from_str(&body_batch).unwrap();
-    assert_eq!(res_batch["error"]["code"], -32600);
+    assert!(res_batch.is_array(), "batch must return an array");
+    assert_eq!(res_batch[0]["result"], "0x167d");
+    assert_eq!(res_batch[0]["id"], 1);
 
     // 3. Body exceeding 1 MiB is rejected
     // 1 MiB + 100 bytes payload

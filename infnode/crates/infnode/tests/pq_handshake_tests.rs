@@ -1,10 +1,13 @@
 //! PQ handshake tests (opt-in `STELL_INF_PQ_HANDSHAKE=1`, default OFF).
 //!
 //! Scope: `infnode` crate only. Covers the PQ handshake paths added in
-//! `proto.rs` (transcript/tag/policy) and `node.rs` (ML-KEM-768 offer/answer):
+//! `proto.rs` (transcript/tag/policy, KEM-hybrid + Falcon-512 tag) and
+//! `node.rs` (ML-KEM-768 offer/answer, PQ identity registry + announce):
 //! KAT pins where possible (Wycheproof ML-KEM-768 vectors, transcript digest),
 //! happy-path agreement, tampered-transcript refusal, wrong-key refusal,
-//! mixed-mode window both directions, hybrid-key properties, and classical
+//! mixed-mode window both directions, hybrid-key properties, PQ identity
+//! keygen/load/perms, `pq_pub` announce/bind, Falcon-tag happy/tamper/
+//! wrong-key, absent-identity classical fallback, and classical
 //! invariants (flag OFF = byte-identical classical).
 //!
 //! Env-safety: only `pq_flag_defaults_off_and_parses_only_exact_1` touches
@@ -18,6 +21,15 @@ use infnode::node::{
 use infnode::proto::{
     self, PqOfferCheck, PqTranscript, Frame, PQ_CHAN_BIND_PLACEHOLDER, PQ_DOMAIN,
     PQ_SUITE_MLKEM768_HYBRID, PQ_TRANSCRIPT_VERSION, NODEID_LEN,
+};
+use infnode::config::PeerConfig;
+use infnode::keyring::PqKeys;
+use infnode::node::{
+    pq_announce_fields, pq_falcon_transcript_digest, PqBindOutcome, PqIdentityRegistry,
+};
+use infnode::proto::{
+    pq_falcon_digest, pq_falcon_policy, pq_falcon_sign, pq_falcon_verify, pq_id_from_pub,
+    PQ_FALCON_PK_LEN, PQ_FALCON_SIG_LEN, PQ_SUITE_FALCON512,
 };
 use ml_kem::kem::{Decapsulate, FromSeed, KeyExport};
 
@@ -635,4 +647,358 @@ fn pq_classical_kdfs_and_frame_auth_unchanged() {
     .expect("json");
     assert_eq!(v["nonce"].as_str().unwrap(), "abcdef0123456789");
     assert_eq!(v["pq_suite"].as_u64().unwrap(), 77);
+}
+
+// ---------------------------------------------------------------------------
+// 10. PQ identity: Falcon-512 keygen from seed + pq-identity.key convention.
+// ---------------------------------------------------------------------------
+
+fn pq_test_dir(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("infnode-pq-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).expect("tmpdir");
+    d
+}
+
+fn pq_cleanup(d: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn pq_identity_keygen_from_seed_deterministic() {
+    // Same seed => identical keypair (the property save/load round-trips).
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let a2 = PqKeys::from_seed([0x5Au8; 32]);
+    assert_eq!(a.pq_pub(), a2.pq_pub());
+    // Different seed => different key.
+    let b = PqKeys::from_seed([0x3Bu8; 32]);
+    assert_ne!(a.pq_pub(), b.pq_pub());
+    // Shape: 897-byte pub (header 0x09, the chain-accepted pubkey layout),
+    // 1281-byte secret encoding, 20-byte pq id rendered inf1:.
+    assert_eq!(a.pq_pub().len(), PQ_FALCON_PK_LEN);
+    assert_eq!(a.pq_pub()[0], 0x09);
+    assert_eq!(a.secret_bytes().len(), 1281);
+    assert_eq!(a.pq_id(), pq_id_from_pub(&a.pq_pub()));
+    assert!(a.pq_id_hex().starts_with("inf1:"));
+    assert_eq!(a.pq_id_hex().len(), 5 + 40);
+    // pq id binds the key: different key => different pq id.
+    assert_ne!(a.pq_id(), b.pq_id());
+    // NodeId derivation is untouched: classical id still blake3(ed)[..20].
+    let ed = [0x77u8; 32];
+    let classical: [u8; 20] = blake3::hash(&ed).as_bytes()[..20].try_into().unwrap();
+    assert_ne!(classical, a.pq_id());
+}
+
+#[test]
+fn pq_identity_save_load_roundtrip_and_perms() {
+    let d = pq_test_dir("roundtrip");
+    let keys = PqKeys::from_seed([0x5Au8; 32]);
+    keys.save(&d).expect("save");
+    assert!(d.join("pq-identity.key").exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let fmode = std::fs::metadata(d.join("pq-identity.key"))
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(fmode, 0o600, "pq-identity.key must be 0600");
+        let dmode = std::fs::metadata(&d)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dmode, 0o700, "keys dir must be 0700");
+    }
+    let back = PqKeys::load_opt(&d).expect("load").expect("present");
+    assert_eq!(back.pq_pub(), keys.pq_pub());
+    assert_eq!(back.pq_id(), keys.pq_id());
+    pq_cleanup(&d);
+}
+
+#[test]
+fn pq_identity_absent_is_none_classical_explicit() {
+    // Absent file in an existing dir: classical-only, explicit.
+    let d = pq_test_dir("absent");
+    assert!(PqKeys::load_opt(&d).expect("load").is_none());
+    pq_cleanup(&d);
+    // Missing dir entirely: also absent, not an error.
+    let missing = std::env::temp_dir().join(format!(
+        "infnode-pq-never-created-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&missing);
+    assert!(PqKeys::load_opt(&missing).expect("load").is_none());
+}
+
+#[test]
+fn pq_identity_corrupt_fail_closed() {
+    let d = pq_test_dir("corrupt");
+    PqKeys::from_seed([0x5Au8; 32]).save(&d).expect("save");
+    // Valid hex, wrong length: our length gate fires with a clear error.
+    std::fs::write(d.join("pq-identity.key"), "00").expect("clobber");
+    let err = match PqKeys::load_opt(&d) {
+        Ok(_) => panic!("corrupt pq-identity.key must fail"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(err.contains("32 байта"), "clear error, got: {err}");
+    // Non-hex garbage: also a hard error, never a silent fallback.
+    std::fs::write(d.join("pq-identity.key"), "zz").expect("clobber");
+    assert!(PqKeys::load_opt(&d).is_err());
+    pq_cleanup(&d);
+}
+
+#[cfg(unix)]
+#[test]
+fn pq_identity_wrong_perms_fail_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = pq_test_dir("perms");
+    PqKeys::from_seed([0x5Au8; 32]).save(&d).expect("save");
+    std::fs::set_permissions(
+        d.join("pq-identity.key"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("chmod");
+    let err = match PqKeys::load_opt(&d) {
+        Ok(_) => panic!("insecure pq-identity.key must fail"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(err.contains("insecure permissions"), "got: {err}");
+    pq_cleanup(&d);
+}
+
+// ---------------------------------------------------------------------------
+// 11. PeerConfig.pq_pub: absent = classical-only, present = pinned + parsed.
+// ---------------------------------------------------------------------------
+
+fn pq_peer_cfg(pq_pub: Option<String>) -> PeerConfig {
+    PeerConfig {
+        name: "p".to_string(),
+        node_id: format!("inf1:{}", hex::encode([1u8; 20])),
+        ed_pub: hex::encode([2u8; 32]),
+        x_pub: hex::encode([3u8; 32]),
+        pq_pub,
+        endpoints: vec![],
+        allow: vec!["*".to_string()],
+        rate_limit_per_sec: 0,
+        role: None,
+        storage_roles: vec![],
+    }
+}
+
+#[test]
+fn pq_peer_config_pq_pub_optional_and_pinned() {
+    // Absent: classical-only peer, explicit — not an error.
+    assert!(pq_peer_cfg(None).pq_bytes().expect("none").is_none());
+    // Present and well-formed: parses to 897 bytes.
+    let keys = PqKeys::from_seed([0x5Au8; 32]);
+    let got = pq_peer_cfg(Some(keys.pq_pub_hex()))
+        .pq_bytes()
+        .expect("parse")
+        .expect("present");
+    assert_eq!(got.as_slice(), keys.pq_pub().as_slice());
+    // Present but malformed: hard error (never silent classical).
+    assert!(pq_peer_cfg(Some("00".to_string())).pq_bytes().is_err());
+    assert!(pq_peer_cfg(Some(hex::encode([9u8; 32]))).pq_bytes().is_err());
+}
+
+#[test]
+fn pq_peer_config_yaml_backward_compatible() {
+    // Old configs without pq-pub parse unchanged (serde default).
+    let old: PeerConfig = serde_yaml::from_str(
+        "name: a\nnode-id: inf1:0102030405060708090a0b0c0d0e0f1011121314\ned-pub: '0202020202020202020202020202020202020202020202020202020202020202'\nx-pub: '0303030303030303030303030303030303030303030303030303030303030303'\nendpoints: []\n",
+    )
+    .expect("old yaml");
+    assert!(old.pq_pub.is_none());
+    assert!(old.pq_bytes().expect("none").is_none());
+    // New configs carry pq-pub (kebab-case) and round-trip.
+    let keys = PqKeys::from_seed([0x5Au8; 32]);
+    let mut cfg = pq_peer_cfg(None);
+    cfg.pq_pub = Some(keys.pq_pub_hex());
+    let yaml = serde_yaml::to_string(&cfg).expect("ser");
+    assert!(yaml.contains("pq-pub:"), "kebab-case key, got:\n{yaml}");
+    let back: PeerConfig = serde_yaml::from_str(&yaml).expect("de");
+    assert_eq!(back.pq_bytes().expect("parse").expect("present").as_slice(), keys.pq_pub().as_slice());
+}
+
+// ---------------------------------------------------------------------------
+// 12. Falcon tag: happy / tamper / wrong-key over the finalized digest.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pq_falcon_suite_distinct_and_covered() {
+    assert_ne!(PQ_SUITE_FALCON512, PQ_SUITE_MLKEM768_HYBRID);
+    // 0xF1 is the reserved Falcon production suite (see pq_transport.rs):
+    // the ML-KEM path already refuses it as unknown (existing test pins that).
+    let t = fixed_transcript();
+    let kem = t.digest(PQ_TRANSCRIPT_VERSION, PQ_SUITE_MLKEM768_HYBRID);
+    let falcon = pq_falcon_digest(&t);
+    assert_eq!(falcon, t.digest(PQ_TRANSCRIPT_VERSION, PQ_SUITE_FALCON512));
+    assert_ne!(kem, falcon, "suite byte is covered by the digest");
+}
+
+#[test]
+fn pq_falcon_tag_happy_verify_passes() {
+    let keys = PqKeys::from_seed([0x5Au8; 32]);
+    let digest = pq_falcon_digest(&fixed_transcript());
+    // Both sign entry points agree (method + proto byte-level).
+    let sig = keys.sign_digest(&digest);
+    assert_eq!(sig.len(), PQ_FALCON_SIG_LEN);
+    let sig2 = pq_falcon_sign(&keys.secret_bytes(), &digest).expect("sign");
+    assert_eq!(sig2.len(), PQ_FALCON_SIG_LEN);
+    assert!(pq_falcon_verify(&keys.pq_pub(), &digest, &sig));
+    assert!(pq_falcon_verify(&keys.pq_pub(), &digest, &sig2));
+    // Announce builder (node side) round-trips through hex into verify.
+    let (pub_hex, id_hex, sig_hex) = pq_announce_fields(&keys, &digest);
+    assert_eq!(pub_hex, keys.pq_pub_hex());
+    assert_eq!(id_hex, keys.pq_id_hex());
+    assert_eq!(pq_falcon_transcript_digest(&fixed_transcript()), digest);
+    let sig_raw = hex::decode(&sig_hex).expect("hex");
+    assert!(pq_falcon_verify(
+        &hex::decode(&pub_hex).expect("hex"),
+        &digest,
+        &sig_raw
+    ));
+    // Policy: offered + verified => Pq.
+    assert_eq!(
+        pq_falcon_policy(true, Some(&keys.pq_pub()), &digest, Some(&sig)).unwrap(),
+        proto::PqMode::Pq
+    );
+}
+
+#[test]
+fn pq_falcon_tag_tamper_fails_closed() {
+    let keys = PqKeys::from_seed([0x5Au8; 32]);
+    let digest = pq_falcon_digest(&fixed_transcript());
+    let sig = keys.sign_digest(&digest);
+    // Tampered digest: tag fails.
+    let mut bad_digest = digest;
+    bad_digest[0] ^= 0x01;
+    assert!(!pq_falcon_verify(&keys.pq_pub(), &bad_digest, &sig));
+    // Tampered signature byte: fails.
+    let mut bad_sig = sig.clone();
+    bad_sig[10] ^= 0x01;
+    assert!(!pq_falcon_verify(&keys.pq_pub(), &digest, &bad_sig));
+    // Truncated / empty / over-long signatures: fail, never panic.
+    assert!(!pq_falcon_verify(&keys.pq_pub(), &digest, &sig[..100]));
+    assert!(!pq_falcon_verify(&keys.pq_pub(), &digest, &[]));
+    let mut long = sig.clone();
+    long.extend_from_slice(&[0u8; 16]);
+    assert!(!pq_falcon_verify(&keys.pq_pub(), &digest, &long));
+    // Malformed peer key: fail.
+    assert!(!pq_falcon_verify(&[9u8; 32], &digest, &sig));
+    assert!(!pq_falcon_verify(&[], &digest, &sig));
+    // Policy refuses every mistag with a clear error (no silent downgrade).
+    for bad in [&bad_sig, &sig[..100].to_vec(), &long] {
+        assert_eq!(
+            pq_falcon_policy(true, Some(&keys.pq_pub()), &digest, Some(bad)).unwrap_err(),
+            "pq falcon tag failed"
+        );
+    }
+    assert_eq!(
+        pq_falcon_policy(true, Some(&keys.pq_pub()), &bad_digest, Some(&sig)).unwrap_err(),
+        "pq falcon tag failed"
+    );
+    assert_eq!(
+        pq_falcon_policy(true, Some(&keys.pq_pub()), &digest, None).unwrap_err(),
+        "pq falcon tag failed"
+    );
+    assert_eq!(
+        pq_falcon_policy(true, Some(&[9u8; 32]), &digest, Some(&sig)).unwrap_err(),
+        "pq identity malformed"
+    );
+}
+
+#[test]
+fn pq_falcon_tag_wrong_key_fails() {
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let b = PqKeys::from_seed([0x3Bu8; 32]);
+    let digest = pq_falcon_digest(&fixed_transcript());
+    let sig_a = a.sign_digest(&digest);
+    // Cross-key: fails (Falcon non-determinism is irrelevant — the math binds).
+    assert!(!pq_falcon_verify(&b.pq_pub(), &digest, &sig_a));
+    assert_eq!(
+        pq_falcon_policy(true, Some(&b.pq_pub()), &digest, Some(&sig_a)).unwrap_err(),
+        "pq falcon tag failed"
+    );
+    // ...while the right key still passes (control).
+    assert!(pq_falcon_verify(&a.pq_pub(), &digest, &sig_a));
+}
+
+// ---------------------------------------------------------------------------
+// 13. Registry binding: first-PQ-wins, sticky, quarantine on change.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pq_registry_first_wins_sticky_and_quarantined() {
+    let mut reg = PqIdentityRegistry::new();
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let b = PqKeys::from_seed([0x3Bu8; 32]);
+    let id_a = [7u8; NODEID_LEN];
+    let id_b = [9u8; NODEID_LEN];
+    assert!(reg.bound_pq(&id_a).is_none());
+    // First valid claim binds.
+    assert_eq!(reg.announce(&id_a, &a.pq_pub(), true), PqBindOutcome::NewBound);
+    assert_eq!(reg.bound_pq(&id_a), Some(a.pq_pub().as_slice()));
+    // Same key re-announced: steady state.
+    assert_eq!(
+        reg.announce(&id_a, &a.pq_pub(), true),
+        PqBindOutcome::AlreadyBound
+    );
+    // Different key without ceremony: quarantined, binding UNCHANGED.
+    assert_eq!(
+        reg.announce(&id_a, &b.pq_pub(), true),
+        PqBindOutcome::Quarantined
+    );
+    assert_eq!(reg.bound_pq(&id_a), Some(a.pq_pub().as_slice()));
+    // Bad tag or malformed claim: quarantined, never bound.
+    assert_eq!(
+        reg.announce(&id_b, &a.pq_pub(), false),
+        PqBindOutcome::Quarantined
+    );
+    assert!(reg.bound_pq(&id_b).is_none());
+    assert_eq!(
+        reg.announce(&id_b, &[0u8; 32], true),
+        PqBindOutcome::Quarantined
+    );
+    assert!(reg.bound_pq(&id_b).is_none());
+    // Independent ids bind independently.
+    assert_eq!(reg.announce(&id_b, &b.pq_pub(), true), PqBindOutcome::NewBound);
+}
+
+// ---------------------------------------------------------------------------
+// 14. Flag-off / identity-absent path: classical-explicit, never an error.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pq_identity_absent_means_classical_both_flag_states() {
+    let digest = pq_falcon_digest(&fixed_transcript());
+    let keys = PqKeys::from_seed([0x5Au8; 32]);
+    let sig = keys.sign_digest(&digest);
+    // No PQ offered: classical in both local states (window tolerance).
+    assert_eq!(
+        pq_falcon_policy(false, None, &digest, None).unwrap(),
+        proto::PqMode::Classical
+    );
+    assert_eq!(
+        pq_falcon_policy(true, None, &digest, None).unwrap(),
+        proto::PqMode::Classical
+    );
+    // Classical-only local node ignores even a VALID offered tag: never an
+    // error (plan §5 — additive fields are not errors for a node that does
+    // not speak PQ). This is the exact branch the flag-OFF callers take.
+    assert_eq!(
+        pq_falcon_policy(false, Some(&keys.pq_pub()), &digest, Some(&sig)).unwrap(),
+        proto::PqMode::Classical
+    );
+    assert_eq!(
+        pq_mixed_policy_off_path(),
+        proto::PqMode::Classical
+    );
+}
+
+fn pq_mixed_policy_off_path() -> proto::PqMode {
+    // Flag OFF callers pass `local_pq = false` with no offer material.
+    proto::pq_mixed_policy(false, None).unwrap()
 }

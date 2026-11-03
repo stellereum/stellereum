@@ -457,6 +457,7 @@ fn dns_merge_never_overflows_and_dedups_validator_ids() {
         node_id: id_of(&ed_of(0x77)),
         ed_pub: hex::encode(ed_of(0x77)),
         x_pub: hex::encode(ed_of(0x78)),
+        pq_pub: None, // GATE: classical-only fixture (no PQ identity announced)
         endpoints: vec!["127.0.0.1:9411".into()],
         allow: vec!["*".into()],
         rate_limit_per_sec: 0,

@@ -58,7 +58,11 @@ def hexint(v):
 rpc_url, explorer_url = sys.argv[1], sys.argv[2]
 height = hexint(os.environ.get("HEIGHT_HEX") or "")
 validators = rpc_result(os.environ.get("VALIDATORS") or "")
-n_validators = len(validators) if isinstance(validators, list) else None
+if isinstance(validators, dict):
+    _vl = validators.get("validators")
+    n_validators = len(_vl) if isinstance(_vl, list) else None
+else:
+    n_validators = len(validators) if isinstance(validators, list) else None
 try:
     version = json.loads(os.environ.get("VERSION_JSON") or "")
     if not isinstance(version, dict):

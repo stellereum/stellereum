@@ -73,6 +73,22 @@ use tokio::sync::{broadcast, RwLock};
 /// Max JSON body accepted by the RPC server (1 MiB is plenty for a signed tx).
 const MAX_RPC_BODY: usize = 1024 * 1024;
 
+/// Max calls in one JSON-RPC batch array (overall cap, fail-closed).
+///
+/// Each batch item is a FULL `dispatch` (own auth check, own rate-budget
+/// draws, own error shape), so the fan-out is bounded here: without a cap a
+/// single HTTP request could buy unbounded expensive-read simulations.
+pub const MAX_RPC_BATCH_ITEMS: usize = 64;
+
+/// Max bytes of one batch request body, as a multiple of [`MAX_RPC_BODY`].
+///
+/// Kept at 1x on purpose: the axum extractor (`DefaultBodyLimit`) and the
+/// in-handler check already refuse every body above [`MAX_RPC_BODY`], so a
+/// batch can never be bigger than a single call's bound — no new DoS surface.
+/// The named const makes the overall byte cap explicit next to the item cap
+/// (and is the defense-in-depth check for callers that bypass the layer).
+pub const MAX_RPC_BATCH_BYTES: usize = MAX_RPC_BODY;
+
 /// Constant-time byte comparison, so comparing a caller-supplied secret against
 /// the configured token does not leak its length/prefix through timing.
 /// Both inputs are hashed with SHA-256 to a fixed 32-byte digest to prevent secret
@@ -2269,6 +2285,101 @@ pub async fn handle_rpc_call(st: &RpcState, req: &RpcRequest) -> RpcResponse {
     let id = req.id.clone().unwrap_or(Value::Null);
     let res = dispatch(st, id, &req.method, &req.params, None, None).await;
     res.0
+}
+
+/// Whole-batch refusal: the single error object the batch path answers when
+/// the batch ITSELF is invalid (empty, too many items, too many bytes).
+/// Per-item failures never come here — they are per-item `-32601`/`-32602`/
+/// `-32000` entries inside the array (see [`handle_rpc_batch_call`]).
+fn batch_refused(message: impl Into<String>) -> RpcResponse {
+    RpcResponse {
+        jsonrpc: "2.0",
+        id: Value::Null,
+        result: None,
+        error: Some(RpcError {
+            code: -32600,
+            message: message.into(),
+            data: None,
+        }),
+    }
+}
+
+/// Dispatch one parsed JSON-RPC batch array.
+///
+/// * Overall caps (fail-closed, whole-batch refusal as a single `-32600`
+///   error object): more than [`MAX_RPC_BATCH_ITEMS`] items, or a body over
+///   [`MAX_RPC_BATCH_BYTES`], refuses the WHOLE batch.
+/// * Per-item isolation: every item is parsed and dispatched independently
+///   through the SAME `dispatch` as a single call (same `header_token`,
+///   same `peer_ip`, same auth checks, same per-IP budgets, same error
+///   shapes) — one bad/unknown/over-budget call never fails its siblings.
+/// * Ordering: responses come back in request order, whatever the ids are.
+/// * Notifications (no `id`, or `id: null`) get NO response entry, per the
+///   JSON-RPC 2.0 spec (an all-notification batch yields an empty vec — the
+///   HTTP handler answers that with `204 No Content`).
+pub async fn handle_rpc_batch_call(
+    st: &RpcState,
+    items: &[Value],
+    raw_len: usize,
+    header_token: Option<&str>,
+    peer_ip: Option<std::net::IpAddr>,
+) -> Result<Vec<RpcResponse>, RpcResponse> {
+    if items.is_empty() {
+        return Err(batch_refused("empty batch"));
+    }
+    if items.len() > MAX_RPC_BATCH_ITEMS {
+        return Err(batch_refused(format!(
+            "batch too large: {} items (max {MAX_RPC_BATCH_ITEMS})",
+            items.len()
+        )));
+    }
+    if raw_len > MAX_RPC_BATCH_BYTES {
+        return Err(batch_refused(format!(
+            "batch too large: {raw_len} bytes (max {MAX_RPC_BATCH_BYTES})"
+        )));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let req: RpcRequest = match serde_json::from_value(item.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                out.push(batch_refused(format!("invalid request: {e}")));
+                continue;
+            }
+        };
+        // Notification: no response entry, per spec (siblings unaffected).
+        let id = req.id.clone().unwrap_or(Value::Null);
+        if id.is_null() {
+            continue;
+        }
+        // Per-item transport budget: the HTTP middleware charged the batch
+        // request once; every item draws the per-IP standalone budget again,
+        // exactly as N single calls would. Over budget fails THIS item with
+        // the per-item `-32000` rate shape (the socket stays answerable, the
+        // siblings are unaffected) — never the whole batch.
+        let ip = peer_ip.unwrap_or(LOCAL_BUCKET_IP);
+        let limiter = STANDALONE_LIMITER
+            .get_or_init(|| crate::explorer::RateLimiter::new(standalone_limit_per_sec()));
+        if !limiter.check(ip) {
+            out.push(RpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(RpcError {
+                    code: -32000,
+                    message: "rate limit exceeded (per-IP budget on standalone RPC)".to_string(),
+                    data: None,
+                }),
+            });
+            continue;
+        }
+        out.push(
+            dispatch(st, id, &req.method, &req.params, header_token, peer_ip)
+                .await
+                .0,
+        );
+    }
+    Ok(out)
 }
 
 #[derive(Serialize)]
@@ -8852,14 +8963,22 @@ async fn ws_handle_text(
         .is_ok()
 }
 /// axum handler for the JSON-RPC endpoint.
+///
+/// Single calls answer with the single response object, byte-identical to
+/// before. Batch arrays answer with the response ARRAY (one entry per
+/// non-notification call, request order); a batch that is invalid AS A WHOLE
+/// (empty, too many items, too many bytes) is refused with the single
+/// `-32600` error object, and an all-notification batch gets `204 No
+/// Content` (there is nothing to answer, per spec).
 async fn rpc_handler(
     axum::extract::State(st): axum::extract::State<Arc<RpcState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
     body: String,
-) -> Json<RpcResponse> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     if body.len() > MAX_RPC_BODY {
-        return err(Value::Null, -32600, "request too large");
+        return err(Value::Null, -32600, "request too large").into_response();
     }
     // A credential in a header rather than in the body, so a client can keep it out
     // of its request logs. `Authorization: Bearer <t>` / `Token <t>`, or the
@@ -8868,34 +8987,34 @@ async fn rpc_handler(
     // Support both single and batch requests.
     let first: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(e) => return err(Value::Null, -32700, format!("parse error: {e}")),
+        Err(e) => return err(Value::Null, -32700, format!("parse error: {e}")).into_response(),
     };
-    if let Some(arr) = first.as_array() {
-        // Batches are refused loudly (audit 2026-10-06): the old code silently
-        // processed ONLY the first element and dropped the rest — clients
-        // lost requests without any error. -32600 (invalid request) until
-        // array responses are implemented.
-        if arr.is_empty() {
-            return err(Value::Null, -32600, "empty batch");
-        }
-        return err(
-            Value::Null,
-            -32600,
-            "batch requests are not supported: send requests individually",
-        );
-    }
-
-    let req: RpcRequest = match serde_json::from_value(first) {
-        Ok(r) => r,
-        Err(e) => return err(Value::Null, -32600, format!("invalid request: {e}")),
-    };
-    let id = req.id.unwrap_or(Value::Null);
     // Real client IP for per-IP faucet throttling: proxy headers only when
     // the TCP peer is a trusted proxy (STELL_TRUSTED_PROXY_CIDRS,
     // loopback-only by default — see crate::client_ip); otherwise the peer.
     // Without this every client behind nginx/Cloudflare shared one bucket.
     let peer_ip = Some(crate::client_ip::resolve_client_ip(&headers, addr.ip()));
-    dispatch(&st, id, &req.method, &req.params, header_token, peer_ip).await
+    if let Some(arr) = first.as_array() {
+        let raw_len = body.len();
+        match handle_rpc_batch_call(&st, arr, raw_len, header_token, peer_ip).await {
+            Ok(responses) => {
+                if responses.is_empty() {
+                    // All-notification batch: nothing to answer (JSON-RPC 2.0:
+                    // "the Server MUST NOT return an empty array").
+                    return axum::http::StatusCode::NO_CONTENT.into_response();
+                }
+                return axum::Json(responses).into_response();
+            }
+            Err(refused) => return axum::Json(refused).into_response(),
+        }
+    }
+
+    let req: RpcRequest = match serde_json::from_value(first) {
+        Ok(r) => r,
+        Err(e) => return err(Value::Null, -32600, format!("invalid request: {e}")).into_response(),
+    };
+    let id = req.id.unwrap_or(Value::Null);
+    dispatch(&st, id, &req.method, &req.params, header_token, peer_ip).await.into_response()
 }
 
 /// Pull a token out of the conventional auth headers, if one is present.
@@ -15671,6 +15790,176 @@ mod tests {
             WS_GENERAL_RATE_LIMIT_DEFAULT, STANDALONE_RATE_LIMIT_DEFAULT,
             "WS general budget must stay symmetric to the standalone HTTP budget"
         );
+    }
+
+    /// Batch caps stay consistent with the single-call bounds they mirror.
+    #[test]
+    fn rpc_batch_consts_are_sane() {
+        // GATE: black_box defeats const-folding; pins must fail loudly if changed.
+        assert!(std::hint::black_box(MAX_RPC_BATCH_ITEMS) > 0);
+        // The total batch byte bound is a multiple of the single-call body
+        // bound (currently 1x: a batch can never exceed a single call's
+        // bound, so batches add no new DoS surface).
+        assert_eq!(MAX_RPC_BATCH_BYTES, MAX_RPC_BODY);
+        assert!(std::hint::black_box(MAX_RPC_BATCH_BYTES) <= MAX_RPC_BODY);
+    }
+
+    /// Same as `test_state`, but with an API token configured so the gated
+    /// arms can prove per-item auth inside a batch.
+    async fn test_state_authed() -> Arc<RpcState> {
+        let engine = Arc::new(InMemoryStateEngine::new());
+        let mempool = Arc::new(RwLock::new(Mempool::default()));
+        Arc::new(RpcState {
+            engine,
+            mempool,
+            height: Arc::new(std::sync::atomic::AtomicU64::new(42)),
+            node_id: "inf1:test".to_string(),
+            chain_id: 777,
+            staking: Arc::new(RwLock::new(crate::staking::StakingLedger::new())),
+            governance: Arc::new(RwLock::new(crate::governance::Governance::new())),
+            recent_blocks: Arc::new(RwLock::new(std::collections::VecDeque::new())),
+            receipts: Arc::new(tokio::sync::RwLock::new(ReceiptIndex::default())),
+            auth_token: Some("test-token".to_string()),
+            tx_broadcast: None,
+            faucet: None,
+            faucet_token: None,
+            msg_signing_seed: None,
+            archive_store: None,
+            shard_registry: ShardRegistry::single(),
+        })
+    }
+
+    /// Happy batch: mixed methods (incl. 1 bad-params + 1 unknown + 1
+    /// malformed item + 1 notification) — every item answers independently,
+    /// one bad call never fails its siblings, order is preserved.
+    #[tokio::test]
+    async fn rpc_batch_happy_mixed_per_item_isolation() {
+        let st = test_state().await;
+        let items = vec![
+            json!({"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "stell_chainId", "params": []}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "stell_nopeNotReal", "params": []}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "stell_sendRawTransaction", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 5}),
+            json!({"jsonrpc": "2.0", "method": "eth_chainId", "params": []}),
+        ];
+        let raw = serde_json::to_string(&items).unwrap();
+        let out = match handle_rpc_batch_call(&st, &items, raw.len(), None, None).await {
+            Ok(v) => v,
+            Err(_) => panic!("valid batch must dispatch"),
+        };
+        // 6 items minus 1 notification = 5 responses, in request order.
+        assert_eq!(out.len(), 5);
+        let body = serde_json::to_value(&out).unwrap();
+        assert_eq!(body[0]["id"], 1);
+        assert_eq!(body[0]["result"], "0x167d");
+        assert_eq!(body[1]["id"], 2);
+        assert_eq!(body[1]["result"], 777);
+        assert_eq!(body[2]["id"], 3);
+        assert_eq!(body[2]["error"]["code"], -32601);
+        assert_eq!(body[3]["id"], 4);
+        assert_eq!(body[3]["error"]["code"], -32602);
+        // Malformed item: per-item `-32600` with a null id (spec: the id
+        // could not be detected), siblings unaffected.
+        assert_eq!(body[4]["id"], Value::Null);
+        assert_eq!(body[4]["error"]["code"], -32600);
+    }
+
+    /// Batch ordering follows REQUEST order, not id order.
+    #[tokio::test]
+    async fn rpc_batch_preserves_request_order() {
+        let st = test_state().await;
+        let items = vec![
+            json!({"jsonrpc": "2.0", "id": 30, "method": "stell_chainId", "params": []}),
+            json!({"jsonrpc": "2.0", "id": 10, "method": "eth_chainId", "params": []}),
+            json!({"jsonrpc": "2.0", "id": 20, "method": "stell_chainId", "params": []}),
+        ];
+        let raw = serde_json::to_string(&items).unwrap();
+        let out = match handle_rpc_batch_call(&st, &items, raw.len(), None, None).await {
+            Ok(v) => v,
+            Err(_) => panic!("valid batch must dispatch"),
+        };
+        let ids: Vec<i64> = out
+            .iter()
+            .map(|r| serde_json::to_value(r).unwrap()["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![30, 10, 20]);
+    }
+
+    /// Overall caps fail closed on the WHOLE batch (single `-32600` object,
+    /// no partial answers): empty, too many items, too many bytes.
+    #[tokio::test]
+    async fn rpc_batch_caps_refuse_whole_batch() {
+        let st = test_state().await;
+        // Empty batch.
+        let empty: Vec<Value> = vec![];
+        let refused = match handle_rpc_batch_call(&st, &empty, 2, None, None).await {
+            Err(e) => e,
+            Ok(_) => panic!("empty batch must be refused"),
+        };
+        assert_eq!(serde_json::to_value(&refused).unwrap()["error"]["code"], -32600);
+        // One item over the item cap.
+        let big: Vec<Value> = (0..MAX_RPC_BATCH_ITEMS + 1)
+            .map(|i| json!({"jsonrpc": "2.0", "id": i, "method": "eth_chainId", "params": []}))
+            .collect();
+        let raw = serde_json::to_string(&big).unwrap();
+        let refused =
+            match handle_rpc_batch_call(&st, &big, raw.len(), None, None).await {
+                Err(e) => e,
+                Ok(_) => panic!("over-cap batch must be refused whole"),
+            };
+        assert_eq!(serde_json::to_value(&refused).unwrap()["error"]["code"], -32600);
+        // At exactly the cap it dispatches (responses may be rate-shaped but
+        // the batch itself is accepted).
+        let at_cap: Vec<Value> = (0..MAX_RPC_BATCH_ITEMS)
+            .map(|i| json!({"jsonrpc": "2.0", "id": i, "method": "eth_chainId", "params": []}))
+            .collect();
+        let raw = serde_json::to_string(&at_cap).unwrap();
+        assert!(raw.len() <= MAX_RPC_BATCH_BYTES);
+        let out = match handle_rpc_batch_call(&st, &at_cap, raw.len(), None, None).await {
+            Ok(v) => v,
+            Err(_) => panic!("at-cap batch must dispatch"),
+        };
+        assert_eq!(out.len(), MAX_RPC_BATCH_ITEMS);
+        // Byte cap: same items, lied-about body length over the bound.
+        let refused = match handle_rpc_batch_call(
+            &st,
+            &at_cap,
+            MAX_RPC_BATCH_BYTES + 1,
+            None,
+            None,
+        )
+        .await {
+            Err(e) => e,
+            Ok(_) => panic!("over-bytes batch must be refused whole"),
+        };
+        assert_eq!(serde_json::to_value(&refused).unwrap()["error"]["code"], -32600);
+    }
+
+    /// Auth is per-item and mirrors the single-call shape exactly: a gated
+    /// arm without its token fails with `-32001` while its siblings succeed,
+    /// and a per-item params token opens just that item.
+    #[tokio::test]
+    async fn rpc_batch_auth_is_per_item() {
+        let st = test_state_authed().await;
+        let items = vec![
+            json!({"jsonrpc": "2.0", "id": 1, "method": "stell_mempoolDump", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "stell_chainId", "params": []}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "stell_mempoolDump", "params": {"token": "test-token"}}),
+        ];
+        let raw = serde_json::to_string(&items).unwrap();
+        let out = match handle_rpc_batch_call(&st, &items, raw.len(), None, None).await {
+            Ok(v) => v,
+            Err(_) => panic!("valid batch must dispatch"),
+        };
+        assert_eq!(out.len(), 3);
+        let body = serde_json::to_value(&out).unwrap();
+        // No token -> same `-32001` as the single call, sibling unaffected.
+        assert_eq!(body[0]["error"]["code"], -32001);
+        assert_eq!(body[1]["result"], 777);
+        // Per-item params token opens just that item.
+        assert!(body[2]["error"].is_null());
+        assert!(body[2]["result"].is_array());
     }
 
     /// Rate-limit audit: EVERY public method maps to at least one bucket —

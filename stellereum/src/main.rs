@@ -11028,6 +11028,7 @@ mod dns_seed_guard_tests {
             node_id: id,
             ed_pub: hex::encode(ed),
             x_pub: hex::encode([ed[0] ^ 0xFF; 32]),
+            pq_pub: None, // GATE: classical-only test fixture
             endpoints: vec!["127.0.0.1:9411".to_string()],
             allow: vec!["*".to_string()],
             rate_limit_per_sec: 0,

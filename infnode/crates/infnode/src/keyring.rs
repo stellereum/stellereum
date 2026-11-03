@@ -1,6 +1,7 @@
 use crate::proto::NODEID_LEN;
 use anyhow::{anyhow, bail, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use falcon_rust::falcon512;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::path::Path;
@@ -176,15 +177,16 @@ impl NodeKeys {
     }
 
     pub fn id(&self) -> [u8; NODEID_LEN] {
-        // PQ FOLLOW-UP (not done here, per PQ_TRANSPORT_PLAN.md §3.4/§4):
-        // `NodeId` stays `blake3(ed_pub)[..20]` — canonical and byte-identical
-        // even with `STELL_INF_PQ_HANDSHAKE=1`. The PQ handshake carries the
-        // ML-KEM ephemeral key alongside the classical identity and routes by
-        // the classical id (window semantics). Promoting a PQ long-term id
-        // (`pq_id = blake3("infnode-pqid-v1" || falcon_pk)[..20]`, dual-announce
-        // window, first-PQ-wins sticky binding, re-ceremony) needs a vendored
-        // Falcon-512 crate + `pq-identity.key` management and is lead-gated;
-        // changing `id()` before that would fork DHT/pins/TLS/federation.
+        // PQ NOTE (PQ 9.0: `PqKeys` landed below, `pq-identity.key` convention
+        // live): `NodeId` stays `blake3(ed_pub)[..20]` — canonical and
+        // byte-identical even with PQ identity present. The PQ handshake
+        // carries the Falcon-512 long-term id alongside the classical id
+        // (`pq_id = blake3("infnode-pqid-v1" || falcon_pk)[..20]`, see
+        // `proto::pq_id_from_pub`) with first-PQ-wins sticky binding
+        // (`node::PqIdentityRegistry`), and routes by the classical id.
+        // Promoting a PQ long-term id to canonical `NodeId` is a flag-day
+        // follow-up (would fork DHT/pins/TLS/federation); changing `id()`
+        // before that is FORBIDDEN.
         let h = blake3::hash(self.verifying.as_bytes());
         let mut id = [0u8; NODEID_LEN];
         id.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
@@ -273,5 +275,140 @@ impl NodeKeys {
             e2e_sec,
             e2e_pub,
         })
+    }
+}
+
+/// PQ long-term identity (Falcon-512), landed PQ 9.0, default-off.
+///
+/// File convention — mirrors the `identity.key` precedent exactly:
+/// - file: `<keys-dir>/pq-identity.key` (constant [`PQ_IDENTITY_FILE`]);
+/// - contents: `protect()` envelope over the hex-encoded 32-byte Falcon
+///   seed (same Argon2id+XChaCha20-Poly1305 envelope + 0600 file / 0700 dir
+///   discipline as the classical keys; see `NodeKeys::save`);
+/// - absent file = classical-only node, explicit (see
+///   [`PqKeys::load_opt`]); corrupt content or insecure permissions =
+///   hard error, never a silent classical fallback (fail closed).
+///
+/// The seed is the sole secret input: `falcon_rust::falcon512::keygen` is
+/// deterministic, so the keypair regenerates byte-identically from it
+/// (pinned by test). Storing the seed (not the 1281-byte secret encoding)
+/// keeps the file small; secrecy is equivalent — guard it like a key.
+///
+/// `NodeId` derivation is UNCHANGED: use [`PqKeys::pq_id`] (display/binding
+/// helper, `inf1:`-rendered) alongside the classical id; never as `NodeId`.
+pub const PQ_IDENTITY_FILE: &str = "pq-identity.key";
+
+#[derive(Clone)]
+pub struct PqKeys {
+    seed: [u8; 32],
+    secret: falcon512::SecretKey,
+    pub public: falcon512::PublicKey,
+}
+
+impl PqKeys {
+    /// Deterministic keygen from a 32-byte seed (tests, offline ceremony).
+    /// The seed is retained (guarded like the key) so `save` persists it.
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        let (secret, public) = falcon512::keygen(seed);
+        Self { seed, secret, public }
+    }
+
+    /// Fresh keygen from OS randomness (production path).
+    pub fn generate() -> Self {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let keys = Self::from_seed(seed);
+        seed.zeroize();
+        keys
+    }
+
+    /// Raw 897-byte Falcon-512 public key (chain pubkey layout: header 0x09).
+    pub fn pq_pub(&self) -> Vec<u8> {
+        self.public.to_bytes()
+    }
+
+    /// Hex of the raw public key (wire/`PeerConfig.pq_pub` form).
+    pub fn pq_pub_hex(&self) -> String {
+        hex::encode(self.pq_pub())
+    }
+
+    /// Raw 1281-byte secret-key encoding (for `proto::pq_falcon_sign`).
+    pub fn secret_bytes(&self) -> Vec<u8> {
+        self.secret.to_bytes()
+    }
+
+    /// PQ display/binding id: `blake3("infnode-pqid-v1" || falcon_pk)[..20]`.
+    /// Announced alongside the classical id; NOT the `NodeId` (see above).
+    pub fn pq_id(&self) -> [u8; NODEID_LEN] {
+        crate::proto::pq_id_from_pub(&self.pq_pub())
+    }
+
+    /// `inf1:`-rendered PQ id (same alphabet as the classical id).
+    pub fn pq_id_hex(&self) -> String {
+        format!("inf1:{}", hex::encode(self.pq_id()))
+    }
+
+    /// Falcon-512 tag over a finalized transcript digest with the long-term
+    /// PQ key (666-byte framing, randomized nonce — see `proto` PQ docs).
+    pub fn sign_digest(&self, digest: &[u8; 32]) -> Vec<u8> {
+        falcon512::sign(digest, &self.secret).to_bytes()
+    }
+
+    pub fn save(&self, dir: &Path) -> Result<()> {
+        secure_dir(dir)?;
+        let mut seed_hex = hex::encode(self.seed);
+        write_private(&dir.join(PQ_IDENTITY_FILE), &protect(seed_hex.as_bytes()))?;
+        seed_hex.zeroize();
+        Ok(())
+    }
+
+    /// Load if present, `Ok(None)` if the file is absent (classical-only,
+    /// explicit). Corrupt content or insecure permissions are hard errors —
+    /// a broken PQ key must never silently become "classical".
+    pub fn load_opt(dir: &Path) -> Result<Option<Self>> {
+        let path = dir.join(PQ_IDENTITY_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        // Recover the seed deterministically: falcon-rust keygen is a pure
+        // function of it, so round-trip regenerates the identical keypair.
+        let stored = Self::load_seed(dir)?;
+        Ok(Some(Self::from_seed(stored)))
+    }
+
+    /// The seed cannot be recovered from the keypair encodings, so `save`
+    /// persists it — and `load_opt` must read the same file. Kept private:
+    /// callers use `save`/`load_opt`, never raw seeds.
+    fn load_seed(dir: &Path) -> Result<[u8; 32]> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_meta = std::fs::metadata(dir)
+                .map_err(|e| anyhow!("keystore dir {}: {e}", dir.display()))?;
+            let dir_mode = dir_meta.permissions().mode() & 0o777;
+            if dir_mode != 0o700 {
+                bail!(
+                    "keystore dir {} has insecure permissions 0o{:03o}, expected 0o700",
+                    dir.display(),
+                    dir_mode
+                );
+            }
+            let path = dir.join(PQ_IDENTITY_FILE);
+            let meta = std::fs::metadata(&path).map_err(|e| anyhow!("{PQ_IDENTITY_FILE}: {e}"))?;
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                bail!(
+                    "{PQ_IDENTITY_FILE} has insecure permissions 0o{mode:03o}, expected 0o600"
+                );
+            }
+        }
+        let raw = std::fs::read_to_string(dir.join(PQ_IDENTITY_FILE))
+            .map_err(|e| anyhow!("{PQ_IDENTITY_FILE}: {e}"))?;
+        let mut plain = unprotect(raw.trim())?;
+        let seed: [u8; 32] = hex::decode(plain.trim())?
+            .try_into()
+            .map_err(|_| anyhow!("pq seed должен быть 32 байта"))?;
+        plain.zeroize();
+        Ok(seed)
     }
 }

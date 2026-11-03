@@ -48,7 +48,6 @@
 
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 /// Byte sink for the commitment preimage.
@@ -416,6 +415,29 @@ impl DomainCache {
         self.slots[domain.index()] = Some(DomainSlot { generation, bytes });
     }
 
+    /// Borrow a cached preimage when its generation still matches.
+    ///
+    /// Zero-copy twin of [`get`](Self::get): the hit/miss accounting is
+    /// identical, but no bytes are cloned — the caller hashes the borrowed
+    /// slice in place. A cache hit therefore costs a refcount-free borrow
+    /// plus one hasher update instead of a ~28KB-average `memcpy` (387KB
+    /// total at the tempo-probe fixture). Miss semantics match `get` exactly.
+    pub fn get_ref(&mut self, domain: Domain, generation: u64) -> Option<&[u8]> {
+        let hit = matches!(
+            &self.slots[domain.index()],
+            Some(slot) if slot.generation == generation
+        );
+        if hit {
+            self.hits += 1;
+            // Re-borrow after the counter bump: the slot is still present
+            // (only `&mut self` aliasing was in play, no mutation happened).
+            self.slots[domain.index()].as_ref().map(|s| s.bytes.as_slice())
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
     /// Invalidate one domain (tests; the live path invalidates implicitly
     /// because the generation counters move on mutation).
     pub fn invalidate(&mut self, domain: Domain) {
@@ -469,6 +491,14 @@ fn put_bool<S: PreimageSink>(h: &mut S, tag: &[u8], v: bool) {
 fn put_addr<S: PreimageSink>(h: &mut S, tag: &[u8], v: &[u8; 32]) {
     put_bytes(h, tag, v);
 }
+
+/// Sort-buffer element types: the `Vec` + `sort_unstable` replacements for
+/// the old `BTreeMap` sort buffers (same key `Ord`, so byte-identical
+/// iteration order). Named once so the annotations stay readable and
+/// `clippy::type_complexity` stays quiet.
+type KeyPairAmount<'a> = (&'a ([u8; 32], [u8; 32]), &'a u64);
+type KeyPairAmount128<'a> = (&'a ([u8; 32], [u8; 32]), &'a u128);
+type PqKeyEntry<'a> = (&'a [u8; 32], &'a (crate::post_quantum::PqScheme, Vec<u8>));
 
 /// A snapshot of the non-trie consensus state, cloned under the subsystem locks
 /// and hashed without them. Hashing while holding every subsystem lock would
@@ -577,8 +607,9 @@ fn governance_digest<S: PreimageSink>(h: &mut S, g: &crate::governance::Governan
     put_u64(h, b"gov_next_id", g.next_id);
     put_u64(h, b"gov_quorum_bps", g.quorum_bps);
 
-    let proposals: std::collections::BTreeMap<u64, &crate::governance::Proposal> =
+    let mut proposals: Vec<(u64, &crate::governance::Proposal)> =
         g.proposals.iter().map(|(k, v)| (*k, v)).collect();
+    proposals.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     put_u64(h, b"gov_proposals_len", proposals.len() as u64);
     for (id, p) in proposals {
         put_u64(h, b"gov_prop_id", id);
@@ -623,8 +654,9 @@ fn governance_digest<S: PreimageSink>(h: &mut S, g: &crate::governance::Governan
                 ProposalStatus::Executed => 3,
             },
         );
-        let voters: std::collections::BTreeMap<[u8; 32], VoteChoice> =
+        let mut voters: Vec<([u8; 32], VoteChoice)> =
             p.voters.iter().map(|(k, v)| (*k, *v)).collect();
+        voters.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         put_u64(h, b"gov_prop_voters_len", voters.len() as u64);
         for (voter, choice) in voters {
             put_bytes(h, b"gov_voter", &voter);
@@ -645,8 +677,9 @@ fn governance_digest<S: PreimageSink>(h: &mut S, g: &crate::governance::Governan
         // digest is byte-identical to before and COMMITMENT_VERSION stays 4.
         put_u64(h, b"gov_prop_electorate_lo", p.electorate as u64);
         put_u64(h, b"gov_prop_electorate_hi", (p.electorate >> 64) as u64);
-        let weights: std::collections::BTreeMap<[u8; 32], u128> =
+        let mut weights: Vec<([u8; 32], u128)> =
             p.weights.iter().map(|(k, v)| (*k, *v)).collect();
+        weights.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         put_u64(h, b"gov_prop_weights_len", weights.len() as u64);
         for (voter, w) in weights {
             put_bytes(h, b"gov_weight_voter", &voter);
@@ -814,10 +847,13 @@ fn book_digest<S: PreimageSink>(h: &mut S, book: &crate::orderbook::OrderbookAct
 /// class of divergence this module exists to prevent.
 fn tokens_digest<S: PreimageSink>(h: &mut S, reg: &crate::token::TokenRegistry) {
     put_u64(h, b"tokens_next_nonce", reg.next_nonce);
-    let mut sorted: BTreeMap<&[u8; 32], &crate::token::TokenActor> = BTreeMap::new();
-    for (k, v) in &reg.tokens {
-        sorted.insert(k, v);
-    }
+    // Sorted by token id: `HashMap` order is not reproducible across nodes.
+    // A `Vec` + `sort_unstable` replaces the old `BTreeMap` sort buffer: one
+    // allocation and O(n log n) comparisons instead of one heap node per
+    // entry, with byte-identical iteration order (same key `Ord`).
+    let mut sorted: Vec<(&[u8; 32], &crate::token::TokenActor)> =
+        reg.tokens.iter().collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
     put_u64(h, b"tokens_len", sorted.len() as u64);
     for (id, t) in sorted {
         put_addr(h, b"token_id", id);
@@ -837,20 +873,17 @@ fn tokens_digest<S: PreimageSink>(h: &mut S, reg: &crate::token::TokenRegistry) 
         put_addr(h, b"token_minter", &m.minter);
         put_bool(h, b"token_paused", m.paused);
 
-        let mut bals: BTreeMap<&[u8; 32], &u64> = BTreeMap::new();
-        for (k, v) in &t.balances {
-            bals.insert(k, v);
-        }
+        let mut bals: Vec<(&[u8; 32], &u64)> =
+            t.balances.iter().collect();
+        bals.sort_unstable_by(|a, b| a.0.cmp(b.0));
         put_u64(h, b"token_balances_len", bals.len() as u64);
         for (acct, bal) in bals {
             put_addr(h, b"token_balance_owner", acct);
             put_u64(h, b"token_balance", *bal);
         }
 
-        let mut alls: BTreeMap<&([u8; 32], [u8; 32]), &u64> = BTreeMap::new();
-        for (k, v) in &t.allowances {
-            alls.insert(k, v);
-        }
+        let mut alls: Vec<KeyPairAmount<'_>> = t.allowances.iter().collect();
+        alls.sort_unstable_by(|a, b| a.0.cmp(b.0));
         put_u64(h, b"token_allowances_len", alls.len() as u64);
         for ((owner, spender), amt) in alls {
             put_addr(h, b"token_allowance_owner", owner);
@@ -862,10 +895,10 @@ fn tokens_digest<S: PreimageSink>(h: &mut S, reg: &crate::token::TokenRegistry) 
 
 fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
     // Sorted by validator id: HashMap order is not reproducible across nodes.
-    let mut vals: BTreeMap<&[u8; 32], &crate::staking::ValidatorStake> = BTreeMap::new();
-    for (k, v) in &l.validators {
-        vals.insert(k, v);
-    }
+    // `Vec` + `sort_unstable` sort buffer (one allocation, same key `Ord`).
+    let mut vals: Vec<(&[u8; 32], &crate::staking::ValidatorStake)> =
+        l.validators.iter().collect();
+    vals.sort_unstable_by(|a, b| a.0.cmp(b.0));
     put_u64(h, b"validators_len", vals.len() as u64);
     for (id, s) in vals {
         put_addr(h, b"validator", id);
@@ -878,10 +911,8 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
         put_u64(h, b"last_downtime_penalty", s.last_downtime_penalty);
     }
 
-    let mut dels: BTreeMap<&([u8; 32], [u8; 32]), &u64> = BTreeMap::new();
-    for (k, v) in &l.delegations {
-        dels.insert(k, v);
-    }
+    let mut dels: Vec<KeyPairAmount<'_>> = l.delegations.iter().collect();
+    dels.sort_unstable_by(|a, b| a.0.cmp(b.0));
     put_u64(h, b"delegations_len", dels.len() as u64);
     for ((val, del), amt) in dels {
         put_addr(h, b"del_val", val);
@@ -889,10 +920,8 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
         put_u64(h, b"del_amount", *amt);
     }
 
-    let mut rews: BTreeMap<&([u8; 32], [u8; 32]), &u64> = BTreeMap::new();
-    for (k, v) in &l.delegator_rewards {
-        rews.insert(k, v);
-    }
+    let mut rews: Vec<KeyPairAmount<'_>> = l.delegator_rewards.iter().collect();
+    rews.sort_unstable_by(|a, b| a.0.cmp(b.0));
     put_u64(h, b"delegator_rewards_len", rews.len() as u64);
     for ((val, del), amt) in rews {
         put_addr(h, b"rew_val", val);
@@ -906,10 +935,8 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
         unbonding_digest(h, e);
     }
 
-    let mut wths: BTreeMap<&([u8; 32], [u8; 32]), &u64> = BTreeMap::new();
-    for (k, v) in &l.withdrawable {
-        wths.insert(k, v);
-    }
+    let mut wths: Vec<KeyPairAmount<'_>> = l.withdrawable.iter().collect();
+    wths.sort_unstable_by(|a, b| a.0.cmp(b.0));
     put_u64(h, b"withdrawable_len", wths.len() as u64);
     for ((val, owner), amt) in wths {
         put_addr(h, b"wth_val", val);
@@ -940,10 +967,9 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
     // the next unbond/undelegate applies, so it must move the root.
     if !l.locked_governance.is_empty() {
         put_bytes(h, b"staking_gov_locks_domain", b"STAKING_GOV_LOCKS_V1");
-        let mut locks: BTreeMap<&[u8; 32], &u64> = BTreeMap::new();
-        for (k, v) in &l.locked_governance {
-            locks.insert(k, v);
-        }
+        let mut locks: Vec<(&[u8; 32], &u64)> =
+            l.locked_governance.iter().collect();
+        locks.sort_unstable_by(|a, b| a.0.cmp(b.0));
         put_u64(h, b"gov_locks_len", locks.len() as u64);
         for (owner, amt) in locks {
             put_addr(h, b"gov_lock_owner", owner);
@@ -1013,11 +1039,8 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
 
     if !l.validator_pq_keys.is_empty() {
         put_bytes(h, b"staking_pq_keys_domain", b"STAKING_PQ_KEYS_V1");
-        let mut keys: BTreeMap<&[u8; 32], &(crate::post_quantum::PqScheme, Vec<u8>)> =
-            BTreeMap::new();
-        for (k, v) in &l.validator_pq_keys {
-            keys.insert(k, v);
-        }
+        let mut keys: Vec<PqKeyEntry<'_>> = l.validator_pq_keys.iter().collect();
+        keys.sort_unstable_by(|a, b| a.0.cmp(b.0));
         put_u64(h, b"pq_keys_len", keys.len() as u64);
         for (validator, (scheme, pubkey)) in keys {
             put_addr(h, b"pq_key_validator", validator);
@@ -1070,10 +1093,9 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
             b"staking_reward_accumulator_domain",
             b"STAKING_REWARD_ACC_V1",
         );
-        let mut accs: BTreeMap<&[u8; 32], &crate::staking::ValidatorRewardState> = BTreeMap::new();
-        for (k, v) in &l.reward_accumulators {
-            accs.insert(k, v);
-        }
+        let mut accs: Vec<(&[u8; 32], &crate::staking::ValidatorRewardState)> =
+            l.reward_accumulators.iter().collect();
+        accs.sort_unstable_by(|a, b| a.0.cmp(b.0));
         put_u64(h, b"reward_acc_len", accs.len() as u64);
         for (id, a) in accs {
             put_addr(h, b"reward_acc_validator", id);
@@ -1083,10 +1105,9 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
             put_u128(h, b"reward_acc_remainder", a.remainder);
             put_u64(h, b"reward_acc_remainder_den", a.remainder_den);
         }
-        let mut cps: BTreeMap<&([u8; 32], [u8; 32]), &u128> = BTreeMap::new();
-        for (k, v) in &l.delegator_reward_checkpoints {
-            cps.insert(k, v);
-        }
+        let mut cps: Vec<KeyPairAmount128<'_>> =
+            l.delegator_reward_checkpoints.iter().collect();
+        cps.sort_unstable_by(|a, b| a.0.cmp(b.0));
         put_u64(h, b"reward_checkpoint_len", cps.len() as u64);
         for ((val, del), cp) in cps {
             put_addr(h, b"reward_cp_validator", val);
@@ -1123,10 +1144,9 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
     //    the other refuses, under the same root.
     if !l.jail.is_empty() {
         put_bytes(h, b"staking_jail_domain", b"STAKING_JAIL_V1");
-        let mut jailed: BTreeMap<&[u8; 32], &crate::staking::JailRecord> = BTreeMap::new();
-        for (k, v) in &l.jail {
-            jailed.insert(k, v);
-        }
+        let mut jailed: Vec<(&[u8; 32], &crate::staking::JailRecord)> =
+            l.jail.iter().collect();
+        jailed.sort_unstable_by(|a, b| a.0.cmp(b.0));
         put_u64(h, b"jail_len", jailed.len() as u64);
         for (id, r) in jailed {
             put_addr(h, b"jail_validator", id);
@@ -1137,10 +1157,9 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
 
     if !l.commission_schedule.is_empty() {
         put_bytes(h, b"staking_commission_domain", b"STAKING_COMMISSION_V1");
-        let mut scheds: BTreeMap<&[u8; 32], &crate::staking::CommissionSchedule> = BTreeMap::new();
-        for (k, v) in &l.commission_schedule {
-            scheds.insert(k, v);
-        }
+        let mut scheds: Vec<(&[u8; 32], &crate::staking::CommissionSchedule)> =
+            l.commission_schedule.iter().collect();
+        scheds.sort_unstable_by(|a, b| a.0.cmp(b.0));
         put_u64(h, b"commission_len", scheds.len() as u64);
         for (id, s) in scheds {
             put_addr(h, b"commission_validator", id);
@@ -1169,10 +1188,8 @@ fn staking_digest<S: PreimageSink>(h: &mut S, l: &StakingLedger) {
             b"staking_redelegation_lock_domain",
             b"STAKING_REDELEGATION_LOCK_V1",
         );
-        let mut locks: BTreeMap<&([u8; 32], [u8; 32]), &u64> = BTreeMap::new();
-        for (k, v) in &l.redelegation_lock {
-            locks.insert(k, v);
-        }
+        let mut locks: Vec<KeyPairAmount<'_>> = l.redelegation_lock.iter().collect();
+        locks.sort_unstable_by(|a, b| a.0.cmp(b.0));
         put_u64(h, b"redelegation_lock_len", locks.len() as u64);
         for ((val, owner), until) in locks {
             put_addr(h, b"relock_validator", val);
@@ -1232,10 +1249,9 @@ fn contracts_digest_inner<S: PreimageSink>(
     mut cache: Option<&mut AbiJsonCache>,
 ) {
     put_u64(h, b"contracts_next_nonce", reg.next_nonce);
-    let mut sorted: BTreeMap<&[u8; 32], &crate::contract::Contract> = BTreeMap::new();
-    for (k, v) in &reg.contracts {
-        sorted.insert(k, v);
-    }
+    let mut sorted: Vec<(&[u8; 32], &crate::contract::Contract)> =
+        reg.contracts.iter().collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
     put_u64(h, b"contracts_len", sorted.len() as u64);
     for (addr, c) in sorted {
         put_addr(h, b"contract_addr", addr);
@@ -1283,10 +1299,10 @@ fn contracts_digest_inner<S: PreimageSink>(
         // Storage is where a contract's balances and counters actually live.
         // Committing only the code hash would let a node prove a contract
         // exists while proving nothing about what it holds.
-        let mut slots: BTreeMap<&i64, &i64> = BTreeMap::new();
-        for (k, v) in &c.storage {
-            slots.insert(k, v);
-        }
+        // Signed-key order matches the old `BTreeMap<&i64, _>` buffer exactly.
+        let mut slots: Vec<(&i64, &i64)> =
+            c.storage.iter().collect();
+        slots.sort_unstable_by(|a, b| a.0.cmp(b.0));
         put_u64(h, b"contract_storage_len", slots.len() as u64);
         for (k, v) in slots {
             put_u64(h, b"contract_slot", *k as u64);
@@ -1296,10 +1312,9 @@ fn contracts_digest_inner<S: PreimageSink>(
 }
 
 fn escrow_digest<S: PreimageSink>(h: &mut S, escrow: &HashMap<(u32, u64), EscrowRecord>) {
-    let mut sorted: BTreeMap<&(u32, u64), &EscrowRecord> = BTreeMap::new();
-    for (k, v) in escrow {
-        sorted.insert(k, v);
-    }
+    let mut sorted: Vec<(&(u32, u64), &EscrowRecord)> =
+        escrow.iter().collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
     put_u64(h, b"escrow_len", sorted.len() as u64);
     for ((pair, order), rec) in sorted {
         put_u64(h, b"escrow_pair", *pair as u64);
@@ -1634,10 +1649,9 @@ fn commitment_digest_into<S: PreimageSink>(h: &mut S, s: &CommitmentSnapshot) {
         session_keys_digest(h, &s.session_keys);
     }
 
-    let mut books: BTreeMap<&u32, &crate::orderbook::OrderbookActor> = BTreeMap::new();
-    for (k, v) in &s.orderbooks.books {
-        books.insert(k, v);
-    }
+    let mut books: Vec<(&u32, &crate::orderbook::OrderbookActor)> =
+        s.orderbooks.books.iter().collect();
+    books.sort_unstable_by(|a, b| a.0.cmp(b.0));
     put_u64(h, b"books_len", books.len() as u64);
     for (pair, book) in books {
         put_u64(h, b"book_pair", *pair as u64);
@@ -1779,10 +1793,9 @@ pub fn session_keys_preimage(reg: &crate::zkml::SessionKeyRegistry) -> Vec<u8> {
 /// Orderbooks domain preimage (pair -> book, walked in id order).
 pub fn books_preimage(manager: &crate::orderbook::OrderbookManager) -> Vec<u8> {
     capture(|h| {
-        let mut books: BTreeMap<&u32, &crate::orderbook::OrderbookActor> = BTreeMap::new();
-        for (k, v) in &manager.books {
-            books.insert(k, v);
-        }
+        let mut books: Vec<(&u32, &crate::orderbook::OrderbookActor)> =
+            manager.books.iter().collect();
+        books.sort_unstable_by(|a, b| a.0.cmp(b.0));
         put_u64(h, b"books_len", books.len() as u64);
         for (pair, book) in books {
             put_u64(h, b"book_pair", *pair as u64);
@@ -1841,6 +1854,31 @@ pub fn assemble_cached_digest(domains: [&[u8]; 14]) -> [u8; 32] {
         h.update(bytes);
     }
     h.finalize().into()
+}
+
+/// Zero-copy steady-state assembly: hash every cached domain preimage in
+/// digest order without cloning a single byte.
+///
+/// Batch-hashing twin of [`assemble_cached_digest`]: the same version prefix
+/// is written and the same slot bytes are fed to SHA-256 in the same order —
+/// the only difference is the bytes are borrowed from the cache instead of
+/// from caller-owned clones. Returns `None` (after recording the miss) when
+/// any domain's generation is stale, so the caller rebuilds exactly that
+/// domain through the usual `*_preimage` builders and `put`s it back.
+///
+/// Bit-for-bit equality with the streaming digest follows from the same
+/// argument as `assemble_cached_digest` (same concatenation ⇒ same hash).
+pub fn assemble_from_cache(
+    cache: &mut DomainCache,
+    generations: &[u64; 14],
+) -> Option<[u8; 32]> {
+    let mut h = Sha256::new();
+    put_u64(&mut h, b"COMMITMENT_VERSION", COMMITMENT_VERSION as u64);
+    for d in Domain::ALL {
+        let bytes = cache.get_ref(d, generations[d.index()])?;
+        h.update(bytes);
+    }
+    Some(h.finalize().into())
 }
 
 /// Digest of every consensus subsystem that lives outside the trie.
@@ -2799,6 +2837,204 @@ mod tests {
         // and hits served the untouched ones.
         assert!(cache.hits > 0, "untouched domains must be cache hits");
         assert!(cache.misses > 0, "mutated domains must rebuild");
+    }
+
+    /// Differential: the zero-copy batch assembly (`assemble_from_cache`,
+    /// no clones) and the `Vec`-sort buffers equal the streaming digest over
+    /// randomized state sequences at fixed seeds — any 1-bit digest
+    /// difference fails.
+    ///
+    /// Unlike `randomized_mutations_cached_equals_streaming` (which touches
+    /// one representative map per domain), this populates EVERY map whose
+    /// sort buffer changed (`BTreeMap` → `Vec` + `sort_unstable`) and mutates
+    /// across all of them, so an ordering slip in any converted buffer is a
+    /// hard failure here.
+    #[test]
+    fn zero_copy_and_sorted_buffers_match_streaming_over_randomized_sequences() {
+        for seed in [0x1234_5678_9ABC_DEF1u64, 0x9E37_79B9_7F4A_7C15u64] {
+            let mut s = populated_snapshot(32, 4, 16, 8);
+            // Fill every converted sort buffer with several entries (insertion
+            // order varies with `i`, so a missed sort would already diverge).
+            let val0 = *s.staking.validators.keys().next().unwrap();
+            for i in 0..6u8 {
+                let a = [i.wrapping_add(0x10); 32];
+                let b = [i.wrapping_add(0x20); 32];
+                s.staking.delegations.insert((val0, a), i as u64);
+                s.staking.delegator_rewards.insert((val0, a), i as u64);
+                s.staking.withdrawable.insert((val0, a), i as u64);
+                s.staking.locked_governance.insert(a, i as u64);
+                s.staking.equivocation_dedup.insert(a);
+                s.staking.pq_equivocation_dedup.insert(b);
+                s.staking.validator_pq_keys.insert(
+                    a,
+                    (crate::post_quantum::PqScheme::Falcon512, vec![i; 32]),
+                );
+                s.staking.vesting_schedules.insert(
+                    b,
+                    crate::tokenomics::TeamVestingSchedule::new(i as u64),
+                );
+                s.staking.reward_accumulators.insert(
+                    a,
+                    crate::staking::ValidatorRewardState {
+                        reward_per_token: i as u128,
+                        ..Default::default()
+                    },
+                );
+                s.staking
+                    .delegator_reward_checkpoints
+                    .insert((val0, a), i as u128);
+                s.staking.jail.insert(
+                    a,
+                    crate::staking::JailRecord {
+                        jailed_at_height: i as u64,
+                        release_height: i as u64 + 100,
+                    },
+                );
+                s.staking.commission_schedule.insert(
+                    a,
+                    crate::staking::CommissionSchedule {
+                        last_effective_height: Some(i as u64),
+                        pending: None,
+                    },
+                );
+                s.staking.redelegation_lock.insert((val0, a), i as u64);
+                let tok = *s.tokens.tokens.keys().next().unwrap();
+                if let Some(actor) = s.tokens.tokens.get_mut(&tok) {
+                    actor.allowances.insert((a, b), i as u64);
+                }
+            }
+            let confidential = crate::crypto_privacy::ConfidentialState::new();
+            let zkml = crate::zkml::ZkMlModelRegistry::default();
+            // Cold-fill the cache, then check the zero-copy all-hit path.
+            let mut cache = DomainCache::default();
+            let mut gens = [3u64; 14];
+            let reference = streaming_of(&s, &confidential, &zkml);
+            let cloned = assemble_test(&s, &confidential, &zkml, &gens, &mut cache);
+            assert_eq!(cloned, reference, "seed {seed:#x}: cold clone-path diverged");
+            let zero = assemble_from_cache(&mut cache, &gens)
+                .expect("seed: all-hit zero-copy assembly must succeed");
+            assert_eq!(zero, reference, "seed {seed:#x}: zero-copy diverged");
+            // Stale generation on any domain must be a `None` (rebuild signal),
+            // never a wrong digest.
+            let mut stale = gens;
+            stale[Domain::Tokens.index()] += 1;
+            assert_eq!(
+                assemble_from_cache(&mut cache, &stale),
+                None,
+                "seed {seed:#x}: stale generation must miss, not mis-digest"
+            );
+            // Randomized mutation walk: every step rebuilds the touched
+            // domain through the `Vec`-sort builders and checks BOTH assembly
+            // paths against streaming.
+            let mut rng = Lcg(seed);
+            for step in 0..200 {
+                match rng.next() % 10 {
+                    0 => {
+                        let id = *s.tokens.tokens.keys().next().unwrap();
+                        let actor = s.tokens.tokens.get_mut(&id).unwrap();
+                        let acct = [((step as u8).wrapping_add(1)); 32];
+                        *actor.balances.entry(acct).or_insert(0) += 1;
+                        gens[Domain::Tokens.index()] += 1;
+                    }
+                    1 => {
+                        s.staking.total_burned += 1;
+                        gens[Domain::Staking.index()] += 1;
+                    }
+                    2 => {
+                        let a = [(step as u8).wrapping_add(0x40); 32];
+                        s.staking.delegations.insert((val0, a), step);
+                        s.staking.delegator_rewards.insert((val0, a), step);
+                        s.staking.withdrawable.insert((val0, a), step);
+                        gens[Domain::Staking.index()] += 1;
+                    }
+                    3 => {
+                        let a = [(step as u8).wrapping_add(0x50); 32];
+                        s.staking.locked_governance.insert(a, step);
+                        s.staking.equivocation_dedup.insert(a);
+                        s.staking.jail.insert(
+                            a,
+                            crate::staking::JailRecord {
+                                jailed_at_height: step,
+                                release_height: step + 100,
+                            },
+                        );
+                        s.staking.redelegation_lock.insert((val0, a), step);
+                        gens[Domain::Staking.index()] += 1;
+                    }
+                    4 => {
+                        let a = [(step as u8).wrapping_add(0x60); 32];
+                        s.staking.reward_accumulators.insert(
+                            a,
+                            crate::staking::ValidatorRewardState {
+                                reward_per_token: step as u128,
+                                ..Default::default()
+                            },
+                        );
+                        s.staking
+                            .delegator_reward_checkpoints
+                            .insert((val0, a), step as u128);
+                        gens[Domain::Staking.index()] += 1;
+                    }
+                    5 => {
+                        let addr = *s.contracts.contracts.keys().next().unwrap();
+                        let c = s.contracts.contracts.get_mut(&addr).unwrap();
+                        *c.storage.entry(step as i64).or_insert(0) += 1;
+                        gens[Domain::Contracts.index()] += 1;
+                    }
+                    6 => {
+                        let mut ledger = s.staking.clone();
+                        let voter = [(step as u8).wrapping_add(0xF0); 32];
+                        let val = s.staking.validators.keys().next().copied().unwrap();
+                        ledger
+                            .delegations
+                            .insert((val, voter), 20_000u64 * 1_000_000_000);
+                        let _ = s.governance.vote(
+                            &mut ledger,
+                            voter,
+                            0,
+                            crate::governance::VoteChoice::Yes,
+                            step + 2,
+                        );
+                        gens[Domain::Governance.index()] += 1;
+                    }
+                    7 => {
+                        s.oracle.breaker_tripped = step % 2 == 0;
+                        gens[Domain::Oracle.index()] += 1;
+                    }
+                    8 => {
+                        s.order_escrow.insert(
+                            (7, step),
+                            EscrowRecord {
+                                trader: [step as u8; 32],
+                                locked_base_stell: step,
+                                locked_quote_wusdt: 0,
+                                locked_quote_native: 0,
+                            },
+                        );
+                        gens[Domain::Escrow.index()] += 1;
+                    }
+                    _ => {
+                        if let Some(book) = s.orderbooks.books.get_mut(&7) {
+                            book.next_order_id += 1;
+                        }
+                        gens[Domain::Books.index()] += 1;
+                    }
+                }
+                let cloned = assemble_test(&s, &confidential, &zkml, &gens, &mut cache);
+                let reference = streaming_of(&s, &confidential, &zkml);
+                assert_eq!(
+                    cloned, reference,
+                    "seed {seed:#x} step {step}: clone-path diverged from streaming"
+                );
+                let zero = assemble_from_cache(&mut cache, &gens).expect(
+                    "seed: cache was just filled by the clone path, zero-copy must hit",
+                );
+                assert_eq!(
+                    zero, reference,
+                    "seed {seed:#x} step {step}: zero-copy diverged from streaming"
+                );
+            }
+        }
     }
 
     /// Perf + regression: on a populated state the steady-state recommit is

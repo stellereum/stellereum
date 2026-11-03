@@ -51,6 +51,7 @@ fn peer_config(
         node_id: format!("inf1:{}", hex::encode([node_id_byte; 20])),
         ed_pub: ed_pub.to_string(),
         x_pub: ed('d'),
+        pq_pub: None, // GATE: classical-only test fixture
         endpoints: endpoints.iter().map(|s| s.to_string()).collect(),
         allow: vec!["*".to_string()],
         rate_limit_per_sec: 0,

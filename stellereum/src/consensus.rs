@@ -18,6 +18,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type Height = u64;
 pub type Round = u32;
@@ -1297,6 +1298,11 @@ pub fn register_validator_pq_key(
     let mut lock = PQ_VALIDATOR_KEYS.write().unwrap_or_else(|e| e.into_inner());
     let map = lock.get_or_insert_with(HashMap::new);
     map.insert(id, (scheme, pubkey));
+    drop(lock);
+    // KEY-ROTATION INVALIDATION (in-zone trigger): a (re-)registration
+    // changes what `Vote::verify` computes for this voter, so every cached
+    // verdict — keyed on the old key bytes — is dropped. Miss = full verify.
+    clear_verified_vote_cache();
 }
 
 /// Retrieve a registered validator's post-quantum scheme and public key.
@@ -1312,6 +1318,9 @@ pub fn clear_validator_pq_keys_for_tests() {
     if let Some(map) = lock.as_mut() {
         map.clear();
     }
+    // The vote verdicts below are keyed on the registered PQ key bytes: a
+    // key-registry wipe without a cache wipe would serve stale verdicts.
+    clear_verified_vote_cache();
 }
 
 /// Process-global VRF key registry, loaded once at startup from
@@ -1640,6 +1649,31 @@ impl Vote {
     }
 
     pub fn verify(&self) -> bool {
+        // VERIFY-ONCE (vote-ingest hot path): a vote carries the same bytes
+        // every time it is re-gossiped, re-driven through `on_prevote` /
+        // `on_precommit` (which verify once in `VoteSet::add` AND once in
+        // `observe_peer_vote`), or re-scanned, so the second and later
+        // verifications of identical bytes under an identical key context
+        // are pure CPU with no new information. Consult the cache first
+        // (hit skips crypto); miss runs full verification and records it.
+        // Fail-closed: any key-context drift (below) misses and re-verifies.
+        if let Some(hit) = verified_vote_cached(self) {
+            VERIFIED_VOTE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return hit;
+        }
+        VERIFIED_VOTE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+        let verdict = self.verify_uncached();
+        record_verified_vote(self, verdict);
+        verdict
+    }
+
+    /// Full cryptographic verification, bypassing the verified-vote cache.
+    ///
+    /// Single definition of vote validity: [`Vote::verify`] (cached),
+    /// [`Vote::partition_valid`] (batch screen + scalar fallback) and
+    /// [`verify_equivocation_evidence`] all bottom out here, so a cache hit
+    /// can never admit what full verification would refuse.
+    fn verify_uncached(&self) -> bool {
         let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
 
         // Under Pure Post-Quantum Mode, a valid Falcon signature is strictly required
@@ -1752,13 +1786,33 @@ impl Vote {
         if crate::post_quantum::is_pure_pq_enforced() {
             return votes.iter().map(|v| v.verify()).collect();
         }
+        // VERIFY-ONCE: votes already verified under the current key context
+        // (valid OR invalid) reuse their cached verdict and skip the batch
+        // screen entirely. Only uncached votes pay crypto below, and every
+        // verdict produced below is recorded, so the next identical ingest
+        // hits. Stats are counted exactly once per vote here (hits for
+        // cached, misses for screened); the scalar fallback uses
+        // `verify_uncached` + explicit record to avoid double-counting the
+        // miss that `verify()` would add.
+        let cached: Vec<Option<bool>> = votes.iter().map(verified_vote_cached).collect();
+        let n_cached = cached.iter().filter(|c| c.is_some()).count();
+        if n_cached == votes.len() {
+            VERIFIED_VOTE_CACHE_HITS.fetch_add(votes.len() as u64, Ordering::Relaxed);
+            return cached.into_iter().map(|c| c.unwrap_or(false)).collect();
+        }
+        VERIFIED_VOTE_CACHE_HITS.fetch_add(n_cached as u64, Ordering::Relaxed);
         // Items that cannot even be staged (bad key / bad sig bytes) are
         // already known-bad without failing the good ones' batch verdict.
+        // Cached votes never reach staging: their verdict is already known.
         let mut bad = vec![false; votes.len()];
+        let mut staged: Vec<usize> = Vec::with_capacity(votes.len());
         let mut msgs: Vec<Vec<u8>> = Vec::with_capacity(votes.len());
         let mut sigs: Vec<Signature> = Vec::with_capacity(votes.len());
         let mut keys: Vec<VerifyingKey> = Vec::with_capacity(votes.len());
         for (i, v) in votes.iter().enumerate() {
+            if cached[i].is_some() {
+                continue;
+            }
             let (Ok(vk), Ok(sig)) = (
                 VerifyingKey::from_bytes(&v.voter),
                 Signature::from_slice(v.ed25519_signature()),
@@ -1766,22 +1820,69 @@ impl Vote {
                 bad[i] = true;
                 continue;
             };
+            staged.push(i);
             msgs.push(vote_sign_bytes(v.height, v.round, v.kind, &v.block_hash));
             sigs.push(sig);
             keys.push(vk);
         }
-        if sigs.is_empty() {
-            return vec![false; votes.len()];
-        }
-        {
+        // Screen verdict per STAGED vote; cached votes keep theirs.
+        let mut screen_ok = vec![false; votes.len()];
+        if !sigs.is_empty() {
+            VERIFIED_VOTE_CACHE_MISSES.fetch_add(staged.len() as u64, Ordering::Relaxed);
             let msg_refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
             if ed25519_dalek::verify_batch(&msg_refs, &sigs, &keys).is_ok() {
-                return bad.iter().map(|b| !b).collect();
+                for &i in &staged {
+                    screen_ok[i] = true;
+                }
+            } else {
+                // Slow path: batch rejected — scalar verdict per staged vote,
+                // input order. Unparseable (`bad`) votes stay false.
+                for &i in staged.iter() {
+                    let verdict = votes[i].verify_uncached();
+                    record_verified_vote(&votes[i], verdict);
+                    screen_ok[i] = verdict;
+                }
+            }
+            // The batch screen covers the Ed25519 halves only. A vote
+            // carrying a Falcon half (or a registered PQ key) needs the FULL
+            // predicate — confirm exactly those with one scalar pass, so the
+            // documented invariant (`partition_valid[i] == votes[i].verify()`)
+            // holds for Falcon votes too. Falcon-less votes are settled by
+            // batch soundness (a passing batch implies each Ed25519 half
+            // verifies) with no second crypto pass.
+            for &i in &staged {
+                if screen_ok[i] {
+                    if votes[i].falcon_signature().is_some() {
+                        let verdict = votes[i].verify_uncached();
+                        record_verified_vote(&votes[i], verdict);
+                        screen_ok[i] = verdict;
+                    } else {
+                        record_verified_vote(&votes[i], true);
+                    }
+                }
             }
         }
-        // Slow path: batch rejected — scalar verdict per vote, input order.
-        let out: Vec<bool> = votes.iter().map(|v| v.verify()).collect();
-        debug_assert!(out.iter().enumerate().all(|(i, v)| !bad[i] || !v));
+        let out: Vec<bool> = (0..votes.len())
+            .map(|i| {
+                if let Some(v) = cached[i] {
+                    return v;
+                }
+                if bad[i] {
+                    // Unstageable AND uncached: full predicate decides
+                    // (fail-closed for unparseable keys/signatures), then
+                    // record so the verdict itself is cached.
+                    let verdict = votes[i].verify_uncached();
+                    record_verified_vote(&votes[i], verdict);
+                    return verdict;
+                }
+                screen_ok[i]
+            })
+            .collect();
+        // INVARIANT (no assert on `bad[i] ==> !out[i]`): an unstageable vote
+        // takes the FULL predicate, which admits a non-Ed25519 (Falcon-address)
+        // voter carrying a valid Falcon half under a registered PQ key — the
+        // same verdict `VoteSet::add` reaches via `verify()`. `bad` only means
+        // "skipped the Ed25519 batch screen", never "invalid".
         out
     }
 
@@ -1850,6 +1951,225 @@ fn attach_vote_bls(msg: &[u8], signature: &mut Vec<u8>) {
     out.extend_from_slice(&*signature);
     out.extend_from_slice(&bls);
     *signature = out;
+}
+
+// ============================================================================
+// Verified-vote cache (verify-once for the vote-INGEST path)
+// ============================================================================
+//
+// PATTERN: the ingest path verifies the same vote bytes repeatedly — once in
+// `VoteSet::add`, once more in `ValidatorRuntime::observe_peer_vote`, again on
+// every re-gossip / re-drive / re-scan. The verdict is a pure function of the
+// cached key below, so re-verifying identical bytes under an identical key
+// context is pure CPU. The cache consults on the ingest path (hit skips
+// crypto); miss runs FULL verification and records the verdict (valid AND
+// invalid verdicts are cached — a forgery is never "served as valid", and a
+// cached `false` refuses exactly like a fresh `false`).
+//
+// QUORUM / LOCK / FINALITY UNTOUCHED: the cache stores signature validity
+// only. Membership/power (`ValidatorSet::power_of`), first-vote-wins dedup,
+// equivocation recording and every quorum/lock/decide rule run on EVERY
+// ingest exactly as before, cache hit or not.
+//
+// EXACT INVALIDATION — every trigger enumerated (found by grep over the
+// tree; see call sites):
+//  1. VALIDATOR-SET CHANGE. `VoteSet::add` / `add_batch` receive the set in
+//     force and call `note_validator_set_for_vote_cache` first: a digest of
+//     the sorted `(voter, power)` table is compared against the last-seen
+//     digest, and ANY change clears the cache (miss = full verify). Set
+//     producers (all outside this file, read-only from here):
+//     `runtime.rs` `refresh_validator_set_from_ledger`,
+//     `refresh_validator_set_from_master_ledger`,
+//     `refresh_validator_set_from_domain_bytes`,
+//     `refresh_validator_set_from_staking_checked`, the `hc.validators =
+//     ...` re-anchors in `prepare_decided_block` / `try_finalize_submit` /
+//     `apply_and_advance`, and `main.rs` `refresh_validator_set_from_fresh_snapshot`.
+//     Defense in depth: membership is re-checked per-admit OUTSIDE the cache
+//     (`add_verified`), so even a hypothetical missed clear could only skip
+//     crypto, never admit a non-member.
+//  2. PQ KEY REGISTRATION / ROTATION. `register_validator_pq_key` (this file)
+//     clears the cache on every insert; `clear_validator_pq_keys_for_tests`
+//     does the same. Ledger-side rotation ops (`staking.rs`
+//     `register_pq_key`, `pq_announce_rotation`, `pq_apply_rotation`,
+//     `pq_apply_due_rotations`) take effect on the verify path only through
+//     this registry, and every cached verdict additionally carries the key
+//     bytes in force at verify time — a rotated key misses by construction.
+//  3. CONSENSUS-KEY ROTATION. `staking.rs` `StakingLedger::rotate_key`
+//     retires one voter id and activates another. The voter id IS the Ed25519
+//     public key, so a rotated key is a different cache key (miss), and the
+//     retired id loses membership — refused by the per-admit membership
+//     check even if its old signature still verifies.
+//  4. EPOCH ADVANCE. MEV/CN-VRF epochs (`mev_epoch.rs`, `cn_vrf.rs`
+//     `epoch_of_height`) do not enter the vote preimage; every cache key
+//     carries `(height, round)`, so a vote from another epoch is a different
+//     key (cross-epoch confusion misses). Epoch-boundary set refreshes are
+//     covered by trigger 1.
+//  5. CHAIN-ID CHANGE. The id is frozen process-global (`FROZEN_CHAIN_ID`)
+//     and enters every key; the test-only thread-local override
+//     (`set_consensus_chain_id_for_tests`) therefore misses across chains
+//     instead of serving a foreign-chain verdict.
+//  6. PURE-PQ MODE FLAG. `post_quantum::is_pure_pq_enforced()` (env
+//     `STELL_PURE_PQ` / test override `set_pure_pq_override`) changes the
+//     verify predicate, so its value enters every key: toggling the flag
+//     misses rather than serving a verdict computed under the other mode.
+//
+// OUT-OF-ZONE HOOK: code outside `consensus.rs` that rotates vote-verifying
+// key material without passing through `register_validator_pq_key` MUST call
+// `invalidate_verified_vote_cache()` at the rotation point (fail-closed:
+// an uncalled hook only costs CPU, never safety — verdicts stay exact
+// because triggers 1–6 above still hold).
+//
+// BOUND: the map holds at most `VERIFIED_VOTE_CACHE_CAP` entries; beyond
+// that it is cleared wholesale (fail-safe: verdicts are recomputed, never
+// approximated). Clearing is behavior-preserving, so long-lived nodes stay
+// bounded without any eviction-order determinism question.
+
+/// Maximum cached vote verdicts. Heights ratchet forward forever, so the
+/// bound — not the workload — caps memory.
+const VERIFIED_VOTE_CACHE_CAP: usize = 65_536;
+
+/// Cache key: everything `verify_uncached` reads. Same key ⇒ same verdict.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct VerifiedVoteCacheKey {
+    voter: ValidatorId,
+    height: Height,
+    round: Round,
+    kind: u8,
+    block_hash: Option<BlockHash>,
+    signature: Vec<u8>,
+    /// PQ registry entry for `voter` at verify time (trigger 2).
+    pq_key: Option<(u8, Vec<u8>)>,
+    /// Pure-PQ flag at verify time (trigger 6).
+    pure_pq: bool,
+    /// Effective chain id at verify time (trigger 5).
+    chain_id: u64,
+}
+
+static VERIFIED_VOTE_CACHE: std::sync::LazyLock<
+    std::sync::RwLock<HashMap<VerifiedVoteCacheKey, bool>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+static VERIFIED_VOTE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static VERIFIED_VOTE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+/// Digest of the validator set the cache was last validated against
+/// (trigger 1). `None` forces a re-record on the next ingest.
+static VERIFIED_VOTE_CACHE_SET_DIGEST: std::sync::LazyLock<std::sync::RwLock<Option<[u8; 32]>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
+/// Deterministic digest of the in-force validator set (sorted iteration —
+/// `ValidatorSet.validators` is a `BTreeMap`, so equal sets digest equal on
+/// every node and every call).
+fn validator_set_digest(validators: &ValidatorSet) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("STELL_VERIFIED_VOTE_SET_V1");
+    h.update(&(validators.validators.len() as u64).to_le_bytes());
+    for (id, power) in validators.validators.iter() {
+        h.update(id);
+        h.update(&power.to_le_bytes());
+    }
+    *h.finalize().as_bytes()
+}
+
+/// Trigger-1 enforcement: call at the top of every vote-ingest entry point
+/// that observes the in-force set. A changed set clears the cache before any
+/// verdict is consulted (miss = full verify).
+fn note_validator_set_for_vote_cache(validators: &ValidatorSet) {
+    let digest = validator_set_digest(validators);
+    let changed = {
+        let lock = VERIFIED_VOTE_CACHE_SET_DIGEST
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        *lock != Some(digest)
+    };
+    if changed {
+        clear_verified_vote_cache();
+        let mut lock = VERIFIED_VOTE_CACHE_SET_DIGEST
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *lock = Some(digest);
+    }
+}
+
+fn vote_cache_key(vote: &Vote) -> VerifiedVoteCacheKey {
+    VerifiedVoteCacheKey {
+        voter: vote.voter,
+        height: vote.height,
+        round: vote.round,
+        kind: match vote.kind {
+            VoteKind::Prevote => 0,
+            VoteKind::Precommit => 1,
+        },
+        block_hash: vote.block_hash,
+        signature: vote.signature.clone(),
+        pq_key: get_validator_pq_key(&vote.voter).map(|(scheme, pk)| (scheme as u8, pk)),
+        pure_pq: crate::post_quantum::is_pure_pq_enforced(),
+        chain_id: consensus_chain_id(),
+    }
+}
+
+fn verified_vote_cached(vote: &Vote) -> Option<bool> {
+    let key = vote_cache_key(vote);
+    let lock = VERIFIED_VOTE_CACHE
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    lock.get(&key).copied()
+}
+
+fn record_verified_vote(vote: &Vote, verdict: bool) {
+    let key = vote_cache_key(vote);
+    let mut lock = VERIFIED_VOTE_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    if lock.len() >= VERIFIED_VOTE_CACHE_CAP {
+        // Fail-safe bound: drop everything and re-record (miss = full
+        // verify). Verdicts are recomputed, never approximated.
+        lock.clear();
+    }
+    lock.insert(key, verdict);
+}
+
+/// Drop every cached vote verdict. Fail-closed: the next ingest of any vote
+/// fully re-verifies. See the trigger list above for when this runs
+/// automatically vs. when out-of-zone callers must invoke it.
+pub fn clear_verified_vote_cache() {
+    let mut lock = VERIFIED_VOTE_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    lock.clear();
+}
+
+/// Out-of-zone invalidation hook: call at any vote-key rotation point that
+/// does not pass through `register_validator_pq_key` (triggers 2–3), and at
+/// any epoch/set installation not visible to `note_validator_set_for_vote_cache`
+/// (triggers 1, 4). Also resets the set-digest so the next ingest re-records
+/// it. Safe to call redundantly: clearing only costs CPU.
+pub fn invalidate_verified_vote_cache() {
+    clear_verified_vote_cache();
+    let mut lock = VERIFIED_VOTE_CACHE_SET_DIGEST
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    *lock = None;
+}
+
+/// (hits, misses) since the last reset. A hit skipped crypto with a verdict
+/// identical to full verification; a miss ran full verification.
+pub fn verified_vote_cache_stats() -> (u64, u64) {
+    (
+        VERIFIED_VOTE_CACHE_HITS.load(Ordering::Relaxed),
+        VERIFIED_VOTE_CACHE_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+/// Zero the hit/miss counters (the verdict map is left intact).
+pub fn verified_vote_cache_reset_stats() {
+    VERIFIED_VOTE_CACHE_HITS.store(0, Ordering::Relaxed);
+    VERIFIED_VOTE_CACHE_MISSES.store(0, Ordering::Relaxed);
+}
+
+/// Number of cached verdicts (observability for tests / metrics).
+pub fn verified_vote_cache_len() -> usize {
+    VERIFIED_VOTE_CACHE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
 }
 
 // ============================================================================
@@ -2335,6 +2655,11 @@ impl VoteSet {
         round: Round,
         kind: VoteKind,
     ) -> Result<(), String> {
+        // Trigger-1 invalidation BEFORE any cached verdict is consulted: a
+        // validator-set change clears stale verdicts (miss = full verify).
+        // Membership itself is re-checked per-admit in `add_verified`,
+        // outside the cache, so the set change can never admit a non-member.
+        note_validator_set_for_vote_cache(validators);
         if vote.height != height || vote.round != round || vote.kind != kind {
             return Err("vote out of scope".to_string());
         }
@@ -2421,6 +2746,8 @@ impl VoteSet {
         round: Round,
         kind: VoteKind,
     ) -> Vec<Result<(), String>> {
+        // Trigger-1 invalidation once per batch (same guarantee as `add`).
+        note_validator_set_for_vote_cache(validators);
         // Canonical admission order: sorted by (voter, block_hash). `sort_by`
         // is stable and the keys are fully ordered, so every permutation of
         // the same input admits in the same order.

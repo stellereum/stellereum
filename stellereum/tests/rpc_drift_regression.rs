@@ -243,9 +243,12 @@ async fn evm_compat_surface_shapes() {
         .dispatch("eth_maxPriorityFeePerGas", &json!(null))
         .unwrap()
         .is_string());
+    // GATE: floor-aware estimate (evm_adapter.rs:16,130) — "0x445c0" = 280k
+    // admission floor for transfers. Pure-EVM 0x5208 would under-quote and
+    // get the tx refused at admission; the honest estimate covers the floor.
     assert_eq!(
         a.dispatch("eth_estimateGas", &json!([])).unwrap(),
-        json!("0x5208")
+        json!("0x445c0")
     );
     assert!(a
         .dispatch("eth_blockNumber", &json!(null))

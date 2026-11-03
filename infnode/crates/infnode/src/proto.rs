@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -436,6 +436,124 @@ pub fn pq_mixed_policy(
     }
     if !o.tag_ok {
         return Err("pq transcript auth failed");
+    }
+    Ok(PqMode::Pq)
+}
+
+// PQ FALCON TAG (opt-in, default OFF — PQ 9.0). Additive only: nothing above
+// is modified; flag OFF (or PQ-identity absent) leaves the handshake
+// byte-identical to the ML-KEM-hybrid/classical paths.
+//
+// Backend: `falcon-rust 0.3.1` (already vendored in `Cargo.toml` — no new
+// crypto lineage). What the tag is: Falcon-512 over the FINALIZED transcript
+// digest by the LONG-TERM PQ key (`keyring::PqKeys`), verified against the
+// peer's pinned `pq_pub` BEFORE any session key is derived (fail closed,
+// same ordering discipline as the classical sig-before-session gate).
+//
+// Blocker resolutions (see task report):
+// (a) fixed vectors: Falcon signing is randomized (fresh 40-byte nonce per
+//     signature), so byte pins are IMPOSSIBLE by construction. Tests pin
+//     verification BEHAVIOR instead (real `falcon512::sign`: verify-passes,
+//     tampered-digest-fails, cross-key-fails, truncated/malformed-fails).
+//     Wycheproof-style byte pins stay where the primitive is deterministic
+//     (KEM parts, transcript digest — see existing KATs, untouched).
+// (b) framing: NEITHER vendored crate emits the chain-canonical 0x29/666
+//     layout (`stellereum/src/post_quantum.rs:2260-2308` — verified
+//     empirically: `falcon-rust` emits header 0x59, `pqcrypto-falcon`
+//     padded emits 0x39; cross-crate verification FAILS both directions).
+//     So both ends use `falcon-rust` verify (self-consistent, fail-closed),
+//     and chain interop stays an OPEN follow-up (framing adapter, a
+//     coordinated-change item per the chain comment — never a silent
+//     verifier relaxation here). The public-key encoding IS shared (897
+//     bytes, header 0x09, accepted by both crates), so pins and `pq_id`
+//     derivation are framing-independent.
+
+/// Wire suite id for the Falcon-512 tag. Equals the reserved production
+/// suite (`pq_transport.rs` `PQPLAN_SUITE_FALCON512_RESERVED`); distinct from
+/// the ML-KEM-hybrid suite (`0x4D`) and the test-only suite (`0xFF`).
+pub const PQ_SUITE_FALCON512: u8 = 0xF1;
+/// Falcon-512 raw public-key length (shared encoding, header 0x09).
+pub const PQ_FALCON_PK_LEN: usize = 897;
+/// Falcon-512 secret-key encoding length (`falcon-rust`).
+pub const PQ_FALCON_SK_LEN: usize = 1281;
+/// Falcon-512 signature length (`falcon-rust` fixed framing).
+pub const PQ_FALCON_SIG_LEN: usize = 666;
+/// Domain for the PQ long-term id (binding helper only — NOT `NodeId`).
+pub const PQ_ID_DOMAIN: &[u8] = b"infnode-pqid-v1";
+
+/// PQ binding id: `blake3("infnode-pqid-v1" || falcon_pk)[..20]`, announced
+/// alongside the classical id with first-PQ-wins stickiness
+/// (`node::PqIdentityRegistry`). Display/binding helper ONLY — promoting it
+/// to canonical `NodeId` is a flag-day follow-up (would fork
+/// DHT/pins/TLS/federation); see `keyring::NodeKeys::id`.
+pub fn pq_id_from_pub(pk: &[u8]) -> [u8; NODEID_LEN] {
+    let mut h = blake3::Hasher::new();
+    h.update(PQ_ID_DOMAIN);
+    h.update(pk);
+    let out = h.finalize();
+    let mut id = [0u8; NODEID_LEN];
+    id.copy_from_slice(&out.as_bytes()[..NODEID_LEN]);
+    id
+}
+
+/// Finalized transcript digest bytes the Falcon tag covers (same canonical
+/// `PqTranscript` encoding, Falcon suite id — so the suite byte is covered
+/// and KEM-suite digests never validate as Falcon tags).
+pub fn pq_falcon_digest(t: &PqTranscript) -> [u8; 32] {
+    t.digest(PQ_TRANSCRIPT_VERSION, PQ_SUITE_FALCON512)
+}
+
+/// Falcon-512 tag over `digest` with a raw 1281-byte secret encoding.
+/// Malformed secret = hard error (fail closed, never an empty tag).
+pub fn pq_falcon_sign(sk_bytes: &[u8], digest: &[u8; 32]) -> Result<Vec<u8>> {
+    use falcon_rust::falcon512;
+    let sk =
+        falcon512::SecretKey::from_bytes(sk_bytes).map_err(|_| anyhow!("pq sk malformed"))?;
+    Ok(falcon512::sign(digest, &sk).to_bytes())
+}
+
+/// Fail-closed Falcon-512 verification: any malformed key/signature
+/// (length, parse, variant) returns false — never an error, never a panic.
+pub fn pq_falcon_verify(pk_bytes: &[u8], digest: &[u8; 32], sig_bytes: &[u8]) -> bool {
+    use falcon_rust::falcon512;
+    let (Ok(pk), Ok(sig)) = (
+        falcon512::PublicKey::from_bytes(pk_bytes),
+        falcon512::Signature::from_bytes(sig_bytes),
+    ) else {
+        return false;
+    };
+    falcon512::verify(digest, &sig, &pk)
+}
+
+/// Falcon-tag window policy, mirroring `pq_mixed_policy` (plan §5):
+/// identity-absent peers are classical-EXPLICIT (`Ok(Classical)` — the
+/// `PeerConfig.pq_pub = None` case); a classical-only local node ignores
+/// offered PQ identity (never an error); explicitly offered PQ identity that
+/// is malformed or mistagged is REFUSED with a clear error (no silent
+/// downgrade, same fail-closed arm as the KEM path).
+pub fn pq_falcon_policy(
+    local_has_pq: bool,
+    peer_pq: Option<&[u8]>,
+    digest: &[u8; 32],
+    sig: Option<&[u8]>,
+) -> Result<PqMode, &'static str> {
+    let Some(pk) = peer_pq else {
+        return Ok(PqMode::Classical);
+    };
+    if !local_has_pq {
+        return Ok(PqMode::Classical);
+    }
+    if pk.len() != PQ_FALCON_PK_LEN {
+        return Err("pq identity malformed");
+    }
+    let Some(s) = sig else {
+        return Err("pq falcon tag failed");
+    };
+    if s.len() != PQ_FALCON_SIG_LEN {
+        return Err("pq falcon tag failed");
+    }
+    if !pq_falcon_verify(pk, digest, s) {
+        return Err("pq falcon tag failed");
     }
     Ok(PqMode::Pq)
 }

@@ -55,6 +55,7 @@ fn peer_of(
         node_id: keys.id_hex(),
         ed_pub: hex::encode(keys.verifying.to_bytes()),
         x_pub: hex::encode(keys.e2e_pub.as_bytes()),
+        pq_pub: None,
         endpoints: vec![listen.to_string()],
         allow: vec!["*".to_string()],
         rate_limit_per_sec: rate,

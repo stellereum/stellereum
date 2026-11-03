@@ -1,7 +1,7 @@
 //! Kademlia DHT: routing table (k-buckets) + KV-хранилище.
 
 use crate::proto::NODEID_LEN;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -361,14 +361,28 @@ impl KvStore {
                 let mut ids: Vec<String> = serde_json::from_str(&local.value).unwrap_or_default();
                 // чистим от tombstones при слиянии, чтобы удалённое не воскресало
                 // от старых реплик (удаление реплицируется и списком, и tombstone)
+                //
+                // Perf: исходный тройной вложенный скан (`retain` × tombs +
+                // цикл × (tombs + ids)) — O(n·m) строковых сравнений; на
+                // индексе из тысяч id это миллисекунды под write-lock'ом на
+                // КАЖДОЕ слияние. Множества дают ТЕ ЖЕ порядок/флаги/байты за
+                // O(n+m): `ids` растёт только push'ами в исходном порядке
+                // (сначала локальные, затем входящие по порядку), `changed` —
+                // только при push'е, проверки tombstone — раньше dedup'а.
                 let tombs = self.tombs_for(key);
-                ids.retain(|x| !tombs.iter().any(|t| t == x));
+                let tomb_set: HashSet<&str> = tombs.iter().map(String::as_str).collect();
+                if !tomb_set.is_empty() {
+                    ids.retain(|x| !tomb_set.contains(x.as_str()));
+                }
+                let mut known: HashSet<String> = ids.iter().cloned().collect();
+                ids.reserve(incoming.len());
                 let mut changed = false;
                 for id in incoming {
-                    if tombs.iter().any(|t| t == &id) {
+                    if tomb_set.contains(id.as_str()) {
                         continue;
                     }
-                    if !ids.iter().any(|x| x == &id) {
+                    if !known.contains(id.as_str()) {
+                        known.insert(id.clone());
                         ids.push(id);
                         changed = true;
                     }

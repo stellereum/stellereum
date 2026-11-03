@@ -1392,10 +1392,11 @@ impl Node {
         // forward secrecy: свежий эфемерный X25519 на каждое соединение
         let eph_sec = XSecret::random_from_rng(rand::rngs::OsRng);
         let eph_pub = XPub::from(&eph_sec);
-        // PQ handshake offer (opt-in STELL_INF_PQ_HANDSHAKE=1): ephemeral
-        // ML-KEM-768 ek alongside the classical fields. Flag OFF => None and
+        // PQ handshake offer (default-ON since PQ 9.1; explicit opt-out
+        // `STELL_INF_PQ_HANDSHAKE=0`, honored pre-H only): ephemeral
+        // ML-KEM-768 ek alongside the classical fields. Opted-out => None and
         // the classical payload below is byte-identical to before.
-        let pq_offer = if proto::pq_handshake_enabled() {
+        let pq_offer = if proto::pq_handshake_active() {
             Some(pq_initiator_offer()?)
         } else {
             None
@@ -1479,14 +1480,20 @@ impl Node {
                 bail!("auth without eph");
             }
         }
-        // PQ handshake answer (opt-in): verify the transcript tag BEFORE
+        // PQ handshake answer (default-ON): verify the transcript tag BEFORE
         // session derivation; absent PQ fields => classical fallback (window,
-        // plan §5). Refusals carry clear errors, never silent downgrade.
-        let pq_agreed = if proto::pq_handshake_enabled() {
+        // plan §5) with a loud WARN + counter while pre-H. Refusals carry
+        // clear errors, never silent downgrade.
+        let pq_agreed = if proto::pq_handshake_active() {
             pq_initiator_answer(&pq_offer, &f.sign_data(), eph_pub.as_bytes(), &auth)?
         } else {
             None
         };
+        if proto::pq_handshake_active() && pq_agreed.is_none() {
+            // PQ was attempted first (default-ON) but the responder answered
+            // classical: pre-H window fallback — loud, counted, explicit.
+            proto::pq_warn_classical_fallback("dial");
+        }
         // forward secrecy: сессионный ключ из static+эфемерных ECDH
         let classical = derive_session_key(&self.keys, &peer.cfg, &eph_sec, &auth.payload)?;
         // PQ-hybrid: breaks only if BOTH classical X3DH and ML-KEM break.
@@ -6797,13 +6804,15 @@ async fn handle_stream(
         let srv_eph = XSecret::random_from_rng(rand::rngs::OsRng);
         let srv_eph_pub = XPub::from(&srv_eph);
         let auth_at = now_ms();
-        // PQ handshake offer (opt-in): absent PQ fields => classical path
-        // (window tolerance, plan §5). Present => encapsulate now and answer
-        // below with a hybrid session key. Malformed/mis-versioned offers are
-        // refused with a clear error, debiting reputation like every other
-        // auth failure on this path.
+        // PQ handshake offer (default-ON; explicit opt-out
+        // `STELL_INF_PQ_HANDSHAKE=0` honored pre-H only): absent PQ fields =>
+        // classical path (window tolerance, plan §5), LOUD + counted while
+        // pre-H (see `proto::pq_warn_classical_fallback` below). Present =>
+        // encapsulate now and answer below with a hybrid session key.
+        // Malformed/mis-versioned offers are refused with a clear error,
+        // debiting reputation like every other auth failure on this path.
         let mut pq_state: Option<(Vec<u8>, PqAgreed)> = None;
-        if proto::pq_handshake_enabled() {
+        if proto::pq_handshake_active() {
             match pq_responder_accept(
                 &ch_eph,
                 &ch,
@@ -6818,6 +6827,11 @@ async fn handle_stream(
                     return Err(e);
                 }
             }
+        }
+        if proto::pq_handshake_active() && pq_state.is_none() {
+            // PQ active (default-ON) but the initiator offered no PQ fields:
+            // pre-H window fallback — loud, counted, explicit.
+            proto::pq_warn_classical_fallback("accept");
         }
         let classical = match derive_session_key_server(&node.keys, &peer.cfg, &srv_eph, &f.payload) {
             Ok(k) => k,
@@ -7539,7 +7553,9 @@ fn derive_session_key_server(
     ))
 }
 
-/// PQ HANDSHAKE helpers (opt-in `STELL_INF_PQ_HANDSHAKE=1`, default OFF).
+/// PQ HANDSHAKE helpers (default-ON since PQ 9.1 — same
+/// `proto::pq_handshake_active` gate; explicit `STELL_INF_PQ_HANDSHAKE=0`
+/// opts out pre-H only).
 /// KEX: ephemeral ML-KEM-768 per handshake (vendored crate, no new deps).
 /// Auth (INTERIM, honest): transcript MAC keyed by the ML-KEM shared secret
 /// over the `proto::PqTranscript` digest — the same digest bytes a future
@@ -7547,9 +7563,10 @@ fn derive_session_key_server(
 /// lead-gated per `docs/PQ_TRANSPORT_PLAN.md` §7). Verified BEFORE any
 /// session key is derived; refusals carry clear errors and never silently
 /// downgrade. Mixed-mode window policy is `proto::pq_mixed_policy` (plan §5:
-/// verify dual-or-classical, route by classical id). `NodeId` unchanged
-/// (see `keyring.rs`). Flag OFF => none of this runs: payloads and KDF stay
-/// byte-identical to classical.
+/// verify dual-or-classical, route by classical id), height-gated by
+/// `proto::pq_mixed_policy_at` / `proto::PQ_CLASSICAL_REFUSE_AFTER_HEIGHT`.
+/// `NodeId` unchanged (see `keyring.rs`). Opted-out => none of this runs:
+/// payloads and KDF stay byte-identical to classical.
 pub struct PqInitOffer {
     /// Initiator ephemeral decapsulation key, kept until the AUTH answer.
     pub dk: ml_kem::DecapsulationKey768,
@@ -7784,13 +7801,16 @@ pub fn pq_initiator_answer(
     }
 }
 
-/// PQ FALCON TAG + identity binding (opt-in, default OFF — PQ 9.0).
-/// Pure helpers; no live handshake path calls them yet, so flag OFF (or
+/// PQ FALCON TAG + identity binding (default-ON since PQ 9.1 — same
+/// `proto::pq_handshake_active` gate; explicit `STELL_INF_PQ_HANDSHAKE=0`
+/// opts out pre-H only).
+/// Pure helpers; no live handshake path calls them yet, so opted-out (or
 /// absent PQ identity) leaves production behavior byte-identical. Follow-up
 /// (explicit, out of this change's zone): load `pq-identity.key` at startup
-/// (`main.rs` key-load sites), hold `Option<PqKeys>` on `Node`, and emit/
+/// (`main.rs` key-load sites — `PqKeys::load_or_generate` is the one-line
+/// hook), hold `Option<PqKeys>` on `Node`, and emit/
 /// check `pq_pub`/`pq_id`/`pq_sig` in CHALLENGE/AUTH when
-/// `STELL_INF_PQ_HANDSHAKE=1` — via `pq_announce_fields` +
+/// `proto::pq_handshake_active()` — via `pq_announce_fields` +
 /// `proto::pq_falcon_policy` below (fail-closed, same refuse arms as the
 /// KEM path, mixed-mode window per plan §5).
 ///

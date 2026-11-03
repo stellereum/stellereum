@@ -929,6 +929,8 @@ const fn mod_pow(mut base: u32, mut exp: u32) -> u32 {
     res
 }
 
+/// Test-only: modular inverse for the `compute_h` test helper below.
+#[cfg(test)]
 fn mod_inv(a: u32) -> u32 {
     mod_pow(a, FALCON_MODULUS_Q - 2)
 }
@@ -1045,33 +1047,9 @@ fn negacyclic_mul_i64(a: &[i64; 512], b: &[i16; 512]) -> [i64; 512] {
     res
 }
 
-fn apply_automorphism(src: &[i16; 512], k: usize) -> [i16; 512] {
-    let mut res = [0i16; 512];
-    for (i, &s) in src.iter().enumerate() {
-        let raw_idx = (i * k) % 1024;
-        if raw_idx < 512 {
-            res[raw_idx] = s;
-        } else {
-            res[raw_idx - 512] = -s;
-        }
-    }
-    res
-}
-
-fn monomial_mul(src: &[i16; 512], shift: usize) -> [i16; 512] {
-    let mut res = [0i16; 512];
-    let s = shift % 1024;
-    for (i, &v) in src.iter().enumerate() {
-        let idx = (i + s) % 1024;
-        if idx < 512 {
-            res[idx] = v;
-        } else {
-            res[idx - 512] = -v;
-        }
-    }
-    res
-}
-
+/// Test-only: rebuilds `h` for the pre-FIPS-206 on-disk migration test
+/// (`test_legacy_pre_fips206_on_disk_key_loads_signs_and_verifies`).
+#[cfg(test)]
 fn compute_h(f: &[i16; 512], g: &[i16; 512]) -> Option<[u16; 512]> {
     let mut f_modq = [0u16; 512];
     let mut g_modq = [0u16; 512];
@@ -1092,99 +1070,6 @@ fn compute_h(f: &[i16; 512], g: &[i16; 512]) -> Option<[u16; 512]> {
     intt(&mut h_ntt);
     Some(h_ntt)
 }
-
-static BASE_F: [i16; 512] = [
-    -4, -2, -5, -1, 4, -2, 0, -3, -1, 1, -2, -2, -6, -3, 3, -5, -1, 4, -3, -8, 4, -1, 2, -1, -8, 5,
-    -6, -3, 6, 0, -2, 4, 5, -6, 2, 3, 6, 4, 2, 3, 3, 7, 0, 1, 5, -3, -1, -9, -1, 6, -2, -5, 4, 0,
-    4, -2, 10, -4, -3, 4, -7, -1, -7, -2, -1, -6, 5, -1, -9, 3, 2, -5, 4, -2, 2, -4, 4, -3, -1, 0,
-    5, 2, 2, -1, -9, -7, -2, -1, 0, 3, 1, 0, -1, -2, -5, 4, -1, -1, 3, -1, 1, 4, -3, 2, -5, -2, 2,
-    -4, 3, 6, 3, 9, 1, -2, 4, -1, -1, -6, -2, -2, 4, 5, -1, 0, 10, -2, 1, -2, -3, 0, -4, -4, -1, 0,
-    1, -5, -3, -7, -2, -1, 2, -6, 3, 0, 0, 4, -4, 0, 0, -5, -2, 5, -8, 8, 5, 4, 10, -4, 3, 8, 5, 1,
-    -7, 0, -5, 0, -4, 3, -4, -2, 2, -2, 6, 8, 2, -1, 4, -4, -2, 1, 0, 3, 7, 0, 9, -3, 1, 4, -3, 2,
-    -1, 5, -8, 4, -1, 1, -8, 2, 4, -9, -3, 1, 3, -1, -7, 5, 5, 4, -3, 0, -7, -3, -1, -6, -7, 0, -3,
-    0, 3, -3, 0, -3, 1, 3, 4, -6, -6, -3, 6, 0, 2, -5, 1, -3, -6, -6, -1, -7, -2, -4, 3, 0, -4, -1,
-    2, 7, -7, -2, 4, 2, 0, 1, -1, -3, 2, 1, 8, -1, 1, -2, 1, -1, 1, 4, 0, -4, 4, 3, -2, 6, -3, -2,
-    1, 2, 3, 6, 5, -4, -7, -6, 4, 3, -4, 3, -3, 3, -3, 2, -1, 1, 5, -2, 2, 1, 0, -7, 0, 0, -1, 4,
-    -3, 2, 1, -3, 5, 4, -6, -1, -3, 2, -1, -8, 4, 2, 4, 0, 1, -5, 8, 5, 4, -3, -1, -2, 4, 0, 2, -2,
-    0, -2, -1, -7, 5, 0, 1, 2, 1, -2, 2, -1, 1, -4, 1, 0, 4, -4, 0, 5, 1, 4, -5, -2, -3, -2, 1, 3,
-    1, 2, 5, 12, 0, -1, 4, -6, 1, -4, 3, -5, -4, 4, 2, -2, -6, 1, 1, 3, -1, 0, -4, -4, -4, 6, -2,
-    4, -3, 0, -2, -1, 0, -6, -3, -2, 0, 6, 5, -5, -5, 3, 0, 3, -3, -2, 5, 7, -3, 1, -1, 0, 3, 0, 3,
-    -7, 2, -4, -4, 1, 1, 1, 0, -3, -8, 3, 6, 1, -2, -7, 3, 3, 4, -1, -2, -5, 9, 7, 1, 2, -4, 4, 0,
-    -11, 3, 0, -3, -5, 5, -1, -1, 7, 6, -1, 6, 3, 9, 5, -2, -3, -3, 1, -2, 0, -1, 1, -2, 2, 0, -5,
-    -1, -4, -2, 2, -1, -3, 0, -3, 0, 1, 3, -3, 2, 5, 8, -2, 3, -4, -7, 0, 4, -8, 1, 8, -2, 1, -1,
-    2, 0, -2, 1, 3, 3, 4, -2, -4, 3, -4, 2, 3, -2, -4, 1, -4, 10, 2,
-];
-static BASE_G: [i16; 512] = [
-    -1, 5, -7, -1, -4, 6, 4, -1, -4, -13, -1, -5, -2, -8, 2, 1, 4, 2, 0, 0, 2, 0, -1, 2, 5, -5, -8,
-    8, 1, 11, 0, -8, -4, 1, 1, -6, -4, 1, -3, 0, -10, -4, -6, -3, -2, 1, 6, 2, 8, -2, 2, -2, 1, 3,
-    -4, 2, -1, -1, -2, -2, -3, 0, -3, 2, -3, 2, -3, -4, 2, 3, 4, -5, 6, -3, -2, -1, -1, -6, -2, 1,
-    -4, -7, 8, 0, 2, -2, 2, 0, 1, 0, 4, 9, 7, 0, -1, -1, 4, -3, -2, 6, 6, 0, 1, 7, -6, -5, 5, 1, 4,
-    -1, 0, -2, 3, -4, 1, -1, -3, -2, 0, -1, -7, -8, -1, 2, 0, -5, 0, 1, -4, 6, -5, 6, 4, 1, -4, -5,
-    8, -1, 1, -2, 1, 1, 1, 3, 0, -1, 1, 1, -4, -5, -4, 2, -3, 2, -2, 3, 7, -4, 4, -1, -2, 4, -4,
-    -5, 2, 6, -7, 5, -1, 1, 3, 0, -5, -5, 3, -2, -3, -1, -6, 0, 2, 3, 2, 7, -3, -2, -2, 1, -5, 3,
-    3, -7, 0, 4, 4, -1, 2, -3, 1, 3, -1, -1, 0, -7, -6, -3, 7, -3, 5, -5, 1, -2, 0, 9, -2, 3, -1,
-    -5, -3, -5, 3, 1, -4, -3, 2, -2, 2, 8, -1, 0, 5, -3, -2, -6, 4, 0, 3, -3, -3, 4, -1, 0, 0, -2,
-    -1, 3, 7, 4, 5, -1, 8, 0, -1, -6, -3, 4, 3, -3, 5, 2, -1, -2, 1, -1, 3, -2, -6, 4, 0, 0, -4, 1,
-    6, 2, 0, 10, 9, 2, -2, 0, 2, 1, -3, -1, -1, 3, 2, 1, 1, -3, -2, 7, 2, -1, 5, -3, -2, 1, -2, 2,
-    -2, -4, 3, 2, 1, -4, 1, 4, 3, -7, -4, 2, -5, -2, 5, -3, 1, -4, -5, 1, 0, 0, 0, 7, -5, -1, 2, 2,
-    -3, 6, -6, 4, -3, -5, -6, -7, -4, 3, -2, -2, -10, -3, 2, -1, -6, -4, 1, 2, 2, 1, 4, 1, -5, -10,
-    -2, 2, -4, 4, 4, -2, 1, 4, -3, 0, -6, -3, 1, 5, -7, -6, -4, 8, -1, 0, -1, 6, -3, -2, -2, 6, 2,
-    3, -3, -3, 5, -2, 1, 1, -4, -4, 8, 0, 3, 2, 3, 7, 4, 3, 2, -6, -9, 0, -8, 11, -2, 2, -2, -2, 3,
-    0, -6, 2, -1, 4, 2, -2, 0, -3, -7, -1, -1, 0, -1, -4, -2, -5, 3, -4, 2, 2, -1, -1, 7, -1, 3, 6,
-    -7, 1, -5, 0, -7, 4, 3, -5, -1, 0, 3, -4, 1, 2, -7, 1, -2, -8, -2, -5, -5, 1, -4, -4, 4, -3,
-    -2, 2, -4, -8, -1, 0, -9, 5, -1, -2, 3, 2, 6, -1, 1, -1, -5, 5, 9, 3, -6, -5, 1, -6, 0, 2, -4,
-    6, 2, 7, 2, 15, 0, -2, 9, 0, 1, 6, 4, -1, -1, -6, -3, 3, 1, -6, -3, 2, 2, -2,
-];
-static BASE_CAPITAL_F: [i16; 512] = [
-    0, -25, -39, 21, 7, -5, -10, 4, -1, -38, -9, -1, 4, -23, 15, -1, 8, 1, -38, 41, 29, 22, 9, 12,
-    -46, 0, 9, -17, -19, 32, 38, -3, 14, 6, 2, -6, -18, -1, 23, 80, -12, -20, 24, 22, -31, -38,
-    -11, 8, 17, 18, 19, -10, 0, -1, 28, -5, -28, -33, 4, -31, -33, -8, -9, -44, 46, -11, -5, -21,
-    -22, -7, 1, -11, 33, -8, 12, -7, -6, 63, 17, 12, -49, -11, -31, -8, 7, -28, 33, -28, -19, 8,
-    46, -73, 9, 32, 18, 7, -43, 0, -6, -4, 8, -39, -17, 11, 15, -25, -9, -28, -2, 24, -23, 10, -15,
-    4, 41, 46, 18, 2, -3, -29, 11, -3, 20, 35, 21, 23, 5, -8, -3, -27, -69, 0, 26, -29, -24, 8, 19,
-    6, -14, -18, 47, 5, 21, -50, 17, -44, -36, 24, 9, 16, -38, -5, -54, 34, 13, 31, -2, 9, 8, -12,
-    -14, -17, 28, -59, -20, 19, 31, 14, 14, 7, -32, 37, 5, -3, -7, -6, 21, -29, -33, 23, -25, -23,
-    14, 38, -29, -33, -9, 23, -43, 18, -12, 2, 30, 32, -28, -21, 42, 1, 6, -6, 58, 34, -22, 1, 5,
-    -2, -8, 14, -19, -4, -6, 10, -3, -3, 32, 18, -19, -12, 49, 13, 4, -18, 57, 37, -19, 25, 14, 18,
-    -51, 13, 4, 4, 17, -37, -2, 1, 41, -36, -8, -13, 49, -6, 9, 46, -36, -6, -20, -18, -6, -29,
-    -42, -21, -25, -29, 5, -41, 51, 49, -20, -22, -9, 3, -6, -52, 10, 41, 12, -27, -20, 31, -17,
-    -23, -16, 3, 44, -3, -5, -2, 0, -22, 14, -30, -41, 3, -27, 3, 18, 38, 10, 49, 45, -13, -27, -4,
-    -10, -67, -1, -17, -2, 72, 46, 20, 24, 22, 16, 25, 6, -6, -31, 2, 0, -13, -14, 9, 4, 31, 18,
-    22, 12, 59, -1, -3, -24, -47, -10, 48, 37, -34, -32, -4, 18, -2, 52, -8, -7, 34, -44, -14, -21,
-    -49, -35, 41, -4, 31, 3, 23, 9, 8, 0, -24, 38, -9, -9, 4, -10, -55, -19, 21, 27, 22, 41, 6,
-    -23, 41, -2, 28, -46, 20, 52, 16, 20, 32, 18, 2, -3, 9, 16, 33, -18, 12, 6, -9, -19, 1, -5,
-    -15, -17, 6, -3, 4, -22, 30, -34, 43, -4, 9, -3, -33, -43, -5, -13, -56, 38, 16, 11, -36, 11,
-    -4, -56, 2, 0, -19, -45, -8, -34, 16, 31, -3, 16, 27, -16, -9, 8, 45, -51, -20, 62, -17, -4, 4,
-    17, -45, 4, -15, -19, 39, 39, 15, 17, -19, 2, 45, 36, -22, 16, -23, 28, 34, 12, 5, 10, -7, 28,
-    -35, 17, -37, -50, -28, 19, -25, 9, 45, -6, -7, -16, 57, 27, 50, -30, 2, -10, -1, -57, -49,
-    -23, 0, -9, -36, -4, -3, 32, -6, -25, 67, -27, -19, 25, -6, 1, -17, -14, 0, 29, 26, -12, -20,
-    44, 14, 10, 8, -11, -18, -53, 22, 25, 27, 35, 6, -16, 12, 71, -8,
-];
-static BASE_CAPITAL_G: [i16; 512] = [
-    27, 6, 12, -3, -31, -42, 27, 17, 11, 8, 34, 6, -3, 2, 11, -11, 18, 48, 1, 21, -7, -6, 9, 33,
-    -18, -40, -55, -9, -71, -50, 32, -36, 11, 4, 29, 33, 10, -19, -43, -10, 22, -36, -23, -21, -14,
-    -47, 25, -4, -14, 30, 16, -18, -11, 6, -37, -27, -12, 6, 7, 33, -36, 33, -2, 12, -21, 1, 16,
-    49, -11, -16, -41, 15, 11, 8, 20, -15, 26, -8, 11, -43, -36, 28, 2, -47, -30, -47, -1, 1, 48,
-    -6, -22, 24, -20, -3, -1, -15, -12, 62, 12, 7, -9, 15, -71, 49, 22, 27, 20, -8, -28, -13, -31,
-    18, 28, 54, 29, 5, 0, 33, -5, -22, -21, -12, -14, -2, 11, -24, 32, -26, -71, 21, -15, -20, -12,
-    36, -5, 35, 46, 13, -34, -8, 10, -10, 10, 40, -52, 8, 0, 18, -33, -10, 8, 43, -8, -6, -31, -17,
-    19, 30, 12, -9, 8, -19, -32, -18, -1, -37, 4, 43, 27, 14, -6, -14, -44, -34, -8, 16, -39, 13,
-    6, -32, 8, 17, -12, 23, -44, -25, -66, -12, -31, 30, 14, -9, -5, -10, 44, -12, -2, -43, -22,
-    -18, -7, -9, -15, -7, -21, -27, -5, 1, -13, -10, 8, -8, 29, 21, 64, 47, -28, -9, -28, 25, -47,
-    -34, -3, -14, -26, -12, -5, -10, -27, -9, -14, -23, -2, -31, 28, 17, -4, -30, 31, 3, -15, 25,
-    9, -32, 0, -6, -22, 20, -37, 3, 12, -19, -17, 13, 30, 11, -15, 15, 50, 66, -31, -31, 16, 2, 3,
-    -8, 40, -21, -31, -2, 41, -29, -12, 9, 14, -4, 9, 8, -20, 28, 12, 20, -10, 5, -6, -33, 6, 21,
-    51, 30, 9, 3, 8, 7, 19, -53, 19, 15, 4, -38, 19, 29, 18, 6, 19, 3, -17, -32, 16, 3, 46, -6, -3,
-    47, 3, -66, 3, 25, -6, -6, 21, -24, -9, 28, -39, -42, 42, -6, -19, -14, 6, -8, 9, 28, -4, 23,
-    12, -17, -13, 3, 3, 6, 44, 6, -5, 38, -4, -16, 12, -15, 8, -11, 45, 1, -16, 37, -35, 20, 26, 9,
-    13, 34, 25, -3, -10, -2, -42, -23, -22, -56, -56, 6, 17, -9, 0, 36, 20, 6, -58, 12, 0, -3, -29,
-    -49, -24, -12, -13, 5, -39, -8, 36, -9, 44, 35, -64, -22, -12, 26, -15, 41, 36, -19, -37, -20,
-    46, 35, 9, 32, -5, 27, 21, -36, -51, 19, 10, -23, 28, 46, 28, 8, 22, -31, 18, 2, -16, -9, 1,
-    -22, -22, 31, 14, 5, 44, -3, 38, 0, -12, 50, -23, -19, 1, 42, 15, 1, 13, 32, 45, 37, 15, 11,
-    -9, -23, -6, -23, 36, 4, -34, -14, -14, -37, -28, 19, 20, 14, 24, -48, -34, -27, -34, -12, 9,
-    -20, -30, 25, 28, -51, -13, 11, -20, -1, -3, 6, -38, -46, -15, 28, 10, -4, 3, -1, 4, -40, 16,
-    61, 31, 28, 8, -2, 21, -3, -25, -12, -32, -15, -38, 20, -7, -35, 28, 29, 9, -27,
-];
 
 // ===========================================================================
 // FIPS 206 (FN-DSA) COMPLIANT FALCON-512 KEYGEN + SIGNER
@@ -1634,46 +1519,6 @@ fn warn_legacy_ntru_key_once(repaired: bool, address: [u8; 32]) {
     }
 }
 
-/// AUDIT W6.5: emitted ONCE per process when a key is derived through the
-/// LEGACY (pre-FIPS-206) path.
-///
-/// The legacy derivation is an automorphic image of the Falcon REFERENCE
-/// BASE KEY: the 32-byte seed only selects
-///
-/// ```text
-/// k        in {1, 3, 5, ..., 1023}   (512 values)
-/// shift_f  in [0, 1024)              (1024 values)
-/// shift_g  in [0, 1024)              (1024 values)
-/// flags    in {neg_f, neg_g, swap}   (8 combinations)
-/// ```
-///
-/// i.e. the seed's 256 bits are collapsed onto a parameter space of at most
-/// `512 * 1024 * 1024 * 8 = 2^32` DISTINCT keys. The effective entropy of
-/// such a key is therefore ~32 bits, NOT 256: an attacker who observes the
-/// PUBLIC key can enumerate the parameter space, recover the private key
-/// and forge consensus signatures for that validator.
-///
-/// The path exists only to reproduce the historical testnet genesis root, so
-/// it is not removed here — but it is announced loudly, and the operator is
-/// told to rotate the key.
-fn warn_legacy_weak_entropy_key_once() {
-    static LEGACY_WEAK_WARNED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    if !LEGACY_WEAK_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        tracing::error!(
-            "Falcon-512 key derived through the LEGACY path (STELL_LEGACY_GENESIS_ROOT=1): \
-             the effective key space is at most 2^32 keys (the seed only picks an automorphic \
-             image of the Falcon reference base key), so the private key is RECOVERABLE by \
-             brute force from the public key. Rotate this validator key now \
-             (`stellereum keys rotate-falcon`)"
-        );
-        eprintln!(
-            "[ERROR] Falcon-512 LEGACY key derived (STELL_LEGACY_GENESIS_ROOT=1): effective \
-             entropy ~32 bits — the private key can be brute-forced from the public key. \
-             ROTATE this validator key now (`stellereum keys rotate-falcon`)."
-        );
-    }
-}
 
 /// Authentic NIST FIPS 206 Falcon-512 keypair.
 #[derive(Clone)]
@@ -1749,11 +1594,10 @@ impl FalconKeypair {
     /// Generates a COMPLETE FN-DSA (FIPS 206) keypair with OS entropy,
     /// ALWAYS through the authentic reference-implementation key generation.
     ///
-    /// Unlike [`FalconKeypair::generate`] this ignores the
-    /// `STELL_LEGACY_GENESIS_ROOT` escape hatch (which exists only to
-    /// reproduce the historical testnet genesis keys), so the returned key
-    /// always carries the true NTRU partner `G`. This is what the key
-    /// rotation command uses.
+    /// Unlike [`FalconKeypair::generate`] this always derives through the
+    /// authentic reference-implementation key generation (strict-only: no
+    /// legacy branch exists), so the returned key always carries the true
+    /// NTRU partner `G`. This is what the key rotation command uses.
     pub fn generate_complete() -> Self {
         use rand::RngCore;
         let mut seed = Zeroizing::new([0u8; 32]);
@@ -1957,9 +1801,6 @@ impl FalconKeypair {
     /// (`f*G - g*F = q`), not the zero-filled placeholder the old code left
     /// behind.
     pub fn generate_from_seed_bytes(seed: &[u8; 32]) -> Self {
-        if std::env::var("STELL_LEGACY_GENESIS_ROOT").as_deref() == Ok("1") {
-            return Self::generate_from_seed_bytes_legacy(seed);
-        }
 
         // The reference implementation draws 48 bytes of randomness to seed
         // its NTRU key generation; derive them deterministically from the
@@ -1996,85 +1837,6 @@ impl FalconKeypair {
             h,
             // A freshly generated key always carries the complete NTRU
             // partner (`capital_g`), so it is never a legacy incomplete key.
-            legacy_incomplete_ntru: false,
-        }
-    }
-
-    fn generate_from_seed_bytes_legacy(seed: &[u8; 32]) -> Self {
-        // AUDIT W6.5: the legacy derivation has a ~2^32 effective key space
-        // (the seed only selects an automorphic image of the Falcon reference
-        // base key), so the resulting key is brute-forceable from its public
-        // key. Announce it loudly — the operator must rotate the key.
-        warn_legacy_weak_entropy_key_once();
-        let mut hasher = blake3::Hasher::new_derive_key("FALCON512_KEYGEN_V4");
-        hasher.update(seed);
-        let derived_seed = hasher.finalize();
-        let mut reader = Shake256Reader::new(derived_seed.as_bytes());
-
-        let k = 1 + 2 * (reader.next_u16_be() as usize % 512);
-        let shift_f = reader.next_u16_be() as usize % 1024;
-        let shift_g = reader.next_u16_be() as usize % 1024;
-        let flags = reader.next_u16_be();
-        let neg_f = (flags & 1) != 0;
-        let neg_g = (flags & 2) != 0;
-        let swap = (flags & 4) != 0;
-
-        let f_auto = apply_automorphism(&BASE_F, k);
-        let g_auto = apply_automorphism(&BASE_G, k);
-        let cap_f_auto = apply_automorphism(&BASE_CAPITAL_F, k);
-        let cap_g_auto = apply_automorphism(&BASE_CAPITAL_G, k);
-
-        let f_shift = monomial_mul(&f_auto, shift_f);
-        let cap_g_shift = monomial_mul(&cap_g_auto, (1024 - (shift_f % 1024)) % 1024);
-
-        let g_shift = monomial_mul(&g_auto, shift_g);
-        let cap_f_shift = monomial_mul(&cap_f_auto, (1024 - (shift_g % 1024)) % 1024);
-
-        let mut f = f_shift;
-        let mut cap_g = cap_g_shift;
-        if neg_f {
-            for i in 0..512 {
-                f[i] = -f[i];
-                cap_g[i] = -cap_g[i];
-            }
-        }
-
-        let mut g = g_shift;
-        let mut cap_f = cap_f_shift;
-        if neg_g {
-            for i in 0..512 {
-                g[i] = -g[i];
-                cap_f[i] = -cap_f[i];
-            }
-        }
-
-        let (f, g, capital_f, capital_g) = if swap {
-            let mut neg_cap_f = [0i16; 512];
-            let mut neg_cap_g = [0i16; 512];
-            for i in 0..512 {
-                neg_cap_f[i] = -cap_f[i];
-                neg_cap_g[i] = -cap_g[i];
-            }
-            (g, f, neg_cap_g, neg_cap_f)
-        } else {
-            (f, g, cap_f, cap_g)
-        };
-
-        let h = compute_h(&f, &g).expect("f must be invertible in Z_q[x]/(x^512+1)");
-        let mut pk_bytes = vec![0u8; FALCON512_PUBKEY_LEN];
-        pk_bytes[0] = 0x09;
-        let mut enc_buf = [0u8; 896];
-        modq_encode(&mut enc_buf, &h);
-        pk_bytes[1..].copy_from_slice(&enc_buf);
-
-        Self {
-            private_key: f.to_vec(),
-            public_key: pk_bytes,
-            f,
-            g,
-            capital_f,
-            capital_g,
-            h,
             legacy_incomplete_ntru: false,
         }
     }

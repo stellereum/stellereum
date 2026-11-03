@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const NODEID_LEN: usize = 20;
@@ -304,10 +305,12 @@ impl Frame {
     }
 }
 
-// PQ HANDSHAKE (opt-in `STELL_INF_PQ_HANDSHAKE=1`, default OFF).
-// Additive only: every item below is new; no existing function, layout, or
-// domain string above is modified, so flag OFF (or absent) leaves the
-// classical handshake byte-identical.
+// PQ HANDSHAKE (default-ON since PQ 9.1; explicit opt-out
+// `STELL_INF_PQ_HANDSHAKE=0`, honored pre-H only — see `pq_handshake_active`
+// and the height gate below). Additive only: every item below is new; no
+// existing function, layout, or domain string above is modified, so an
+// opted-out node (or a classical peer's absence of `pq_*`) still takes the
+// classical path byte-identical to before.
 //
 // Design (mirrors `pq_transport.rs` shapes + `docs/PQ_TRANSPORT_PLAN.md` §3/§5):
 // - KEX: ephemeral ML-KEM-768 per handshake (vendored `ml-kem` crate; keygen
@@ -333,15 +336,92 @@ impl Frame {
 //   label is pinned (same caveat as `pq_transport.rs`); the domain string
 //   pins the label slot meanwhile. Follow-up, not silent.
 
-/// Env gate for the PQ handshake. Exact match `"1"`; anything else (unset,
-/// empty, `"0"`, …) is OFF.
+/// Env gate for the PQ handshake (shared name for both reads below; no new
+/// env knobs — the opt-out reuses this same variable, inverted).
 pub const PQ_HANDSHAKE_ENV: &str = "STELL_INF_PQ_HANDSHAKE";
 
-/// True exactly when `STELL_INF_PQ_HANDSHAKE=1`.
+/// Legacy opt-in read: true exactly when `STELL_INF_PQ_HANDSHAKE=1`.
+/// Kept byte-for-byte for compatibility (pinned by
+/// `pq_flag_defaults_off_and_parses_only_exact_1`); live handshake paths
+/// use `pq_handshake_active` (default-ON) instead.
 pub fn pq_handshake_enabled() -> bool {
     std::env::var(PQ_HANDSHAKE_ENV)
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+/// Default-ON read (PQ 9.1): PQ is attempted first unless the operator
+/// explicitly opts out with `STELL_INF_PQ_HANDSHAKE=0` (exact `"0"`).
+/// Unset, empty, or any other value (including the legacy `"1"`) = PQ
+/// active. There was no pre-existing classical opt-out flag — the same
+/// variable is now read inverted, so old `=1` configs keep working and only
+/// an explicit `=0` opts out. The opt-out is honored ONLY while
+/// `!pq_classical_refused_at(height)`; at/after
+/// [`PQ_CLASSICAL_REFUSE_AFTER_HEIGHT`] classical is refused fail-closed
+/// regardless of this flag.
+pub fn pq_handshake_active() -> bool {
+    pq_handshake_active_for(std::env::var(PQ_HANDSHAKE_ENV).ok().as_deref())
+}
+
+/// Pure core of [`pq_handshake_active`] (env-free so tests stay race-free:
+/// only the legacy `pq_flag_defaults_off_...` test touches the process env).
+/// `Some("0")` = explicit classical opt-out; anything else = PQ active.
+pub fn pq_handshake_active_for(value: Option<&str>) -> bool {
+    !matches!(value, Some("0"))
+}
+
+// HEIGHT-GATED CLASSICAL DEATH (PQ 9.1, default-ON).
+//
+// Shape mirrors the `STELL_VRF_ACTIVATION_HEIGHT` precedent
+// (`stellereum/src/vrf.rs`: `VrfActivation::Disabled` default,
+// `FromHeight(h)` arms refusal for heights `>= h` via `is_active_at`, same
+// boundary carried + logged at startup): pre-H the mixed window tolerates
+// classical (WARN + counter, fail-open with noise); at/after H classical is
+// refused fail-closed (`pq_mixed_policy_at` / `pq_falcon_policy_at`).
+// Unlike VRF there is NO env override here on purpose: a single binary-wide
+// const keeps every node on the identical boundary with no per-node drift.
+// To adjust, the lead changes the const below (one line) and redeploys
+// uniformly — same rollout discipline as a VRF H change.
+//
+// H choice: infnode-observed heights are tens of thousands (kv fixtures pin
+// `"stell:height:*" = "42000:..."`; `node.rs` cites live height 71587),
+// VRF activation tests stage at `ACTIVATION_H = 1_000_000`. `300_000` is
+// current-chain-scale (≈42k–72k) + ~200k headroom, rounded up — far future,
+// comfortably pre-activation for every live/test height, far below any
+// planned flag-day. Revisit well before the chain approaches H.
+pub const PQ_CLASSICAL_REFUSE_AFTER_HEIGHT: u64 = 300_000;
+
+/// True when a handshake at `height` must refuse classical (height `>= H`).
+/// Pre-H (`false`) = legacy window behavior, byte-identical.
+pub fn pq_classical_refused_at(height: u64) -> bool {
+    height >= PQ_CLASSICAL_REFUSE_AFTER_HEIGHT
+}
+
+/// Monotonic count of classical fallbacks taken while PQ was active (pre-H
+/// window only; post-H there are no fallbacks — only refusals). Lives here
+/// (not `metrics.rs`) to keep the change inside the handshake zone; the
+/// lead may mirror it into the Prometheus render as a follow-up.
+static PQ_CLASSICAL_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record one classical fallback; returns the new total.
+pub fn pq_record_classical_fallback() -> u64 {
+    PQ_CLASSICAL_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Classical fallbacks so far (fail-closed counting, like `auth_bans_hit`).
+pub fn pq_classical_fallback_total() -> u64 {
+    PQ_CLASSICAL_FALLBACK_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Loud WARN for a classical fallback (call on every pre-H fallback, dial
+/// and accept sides). Never silent: prints the running fallback count and
+/// the refusal height so operators see the window closing.
+pub fn pq_warn_classical_fallback(side: &str) {
+    let n = pq_record_classical_fallback();
+    eprintln!(
+        "[WARN] PQ handshake fell back to classical ({side}, fallback #{n}): peer is classical-only or offered no pq_* (pre-H window). Classical will be REFUSED at/after height {} — provision pq-identity.key on both ends.",
+        PQ_CLASSICAL_REFUSE_AFTER_HEIGHT
+    );
 }
 
 /// Wire version of the PQ handshake transcript.
@@ -493,9 +573,11 @@ pub fn pq_mixed_policy(
     Ok(PqMode::Pq)
 }
 
-// PQ FALCON TAG (opt-in, default OFF — PQ 9.0). Additive only: nothing above
-// is modified; flag OFF (or PQ-identity absent) leaves the handshake
-// byte-identical to the ML-KEM-hybrid/classical paths.
+// PQ FALCON TAG (default-ON since PQ 9.1 — same `pq_handshake_active` gate
+// as the KEM path; explicit `STELL_INF_PQ_HANDSHAKE=0` opts out pre-H only).
+// Additive only: nothing above is modified; opted-out (or PQ-identity
+// absent) leaves the handshake byte-identical to the ML-KEM-hybrid/classical
+// paths.
 //
 // Backend: `falcon-rust 0.3.1` (already vendored in `Cargo.toml` — no new
 // crypto lineage). What the tag is: Falcon-512 over the FINALIZED transcript
@@ -595,6 +677,73 @@ pub fn pq_falcon_policy(
     };
     if !local_has_pq {
         return Ok(PqMode::Classical);
+    }
+    if pk.len() != PQ_FALCON_PK_LEN {
+        return Err("pq identity malformed");
+    }
+    let Some(s) = sig else {
+        return Err("pq falcon tag failed");
+    };
+    if s.len() != PQ_FALCON_SIG_LEN {
+        return Err("pq falcon tag failed");
+    }
+    if !pq_falcon_verify(pk, digest, s) {
+        return Err("pq falcon tag failed");
+    }
+    Ok(PqMode::Pq)
+}
+
+/// Height-gated KEM policy (PQ 9.1): pre-H delegates to [`pq_mixed_policy`]
+/// unchanged (window tolerance, classical-explicit); at/after
+/// [`PQ_CLASSICAL_REFUSE_AFTER_HEIGHT`] classical is refused fail-closed —
+/// even peer-absent (`None`) and even for a classical-only local node. Only
+/// a fully verified PQ offer negotiates `Pq` at/after H.
+pub fn pq_mixed_policy_at(
+    height: u64,
+    local_pq: bool,
+    offer: Option<PqOfferCheck>,
+) -> Result<PqMode, &'static str> {
+    if !pq_classical_refused_at(height) {
+        return pq_mixed_policy(local_pq, offer);
+    }
+    let Some(o) = offer else {
+        return Err("classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT");
+    };
+    if !local_pq {
+        return Err("classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT");
+    }
+    if !o.wellformed {
+        return Err("pq fields malformed");
+    }
+    if !o.suite_ok {
+        return Err("unsupported pq suite/version");
+    }
+    if !o.tag_ok {
+        return Err("pq transcript auth failed");
+    }
+    Ok(PqMode::Pq)
+}
+
+/// Height-gated Falcon-tag policy (PQ 9.1): pre-H delegates to
+/// [`pq_falcon_policy`] unchanged (absent identity = classical-explicit);
+/// at/after [`PQ_CLASSICAL_REFUSE_AFTER_HEIGHT`] classical is refused
+/// fail-closed — absent identity, classical-only local, malformed key, and
+/// mistag ALL refuse. Only offered + verified PQ negotiates `Pq`.
+pub fn pq_falcon_policy_at(
+    height: u64,
+    local_has_pq: bool,
+    peer_pq: Option<&[u8]>,
+    digest: &[u8; 32],
+    sig: Option<&[u8]>,
+) -> Result<PqMode, &'static str> {
+    if !pq_classical_refused_at(height) {
+        return pq_falcon_policy(local_has_pq, peer_pq, digest, sig);
+    }
+    let Some(pk) = peer_pq else {
+        return Err("classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT");
+    };
+    if !local_has_pq {
+        return Err("classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT");
     }
     if pk.len() != PQ_FALCON_PK_LEN {
         return Err("pq identity malformed");

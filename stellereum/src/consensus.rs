@@ -75,6 +75,8 @@ pub fn consensus_chain_id() -> u64 {
 /// `0` restores the frozen deployment value (the default). The override is
 /// thread-scoped, so a leaked override cannot re-point another test's
 /// signatures at another network.
+/// Absent from production builds (`any(test, debug_assertions)` only).
+#[cfg(any(test, debug_assertions))]
 pub fn set_consensus_chain_id_for_tests(chain_id: u64) {
     CHAIN_ID_OVERRIDE.with(|c| c.set(chain_id));
 }

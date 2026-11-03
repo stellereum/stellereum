@@ -262,10 +262,11 @@ async fn hunt_finding_8_fund_genesis_silently_leaves_an_empty_validator_set() {
         .await
         .unwrap()
         .balance;
-    // Under SEC-ECON-01 (P0-5 fix), the genesis bond is debited to STAKING_POOL.
-    if std::env::var("STELL_LEGACY_GENESIS_ROOT").as_deref() == Ok("1") {
-        assert_eq!(bal, poor);
-    } else {
+    // Under SEC-ECON-01 (P0-5 fix), the genesis bond is debited to STELL_POOL.
+    // GATE (LEAD a: legacy branch removed — strict-only, no env toggle): the
+    // bond is ALWAYS debited, so the funded account holds 0 and the pool
+    // holds the full bonded sum.
+    {
         assert_eq!(bal, 0);
         let pool = engine
             .get_account(&stellereum::staking::STAKING_POOL)

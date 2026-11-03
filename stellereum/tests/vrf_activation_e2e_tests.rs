@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use ed25519_dalek::SigningKey;
 use stellereum::consensus::{
     clear_live_vrf_registry_for_tests, clear_validator_pq_keys_for_tests, derive_sortition_committee,
-    derive_sortition_committee_gated, encode_pq_micro_envelope, register_validator_pq_key,
+    encode_pq_micro_envelope, register_validator_pq_key,
     set_live_vrf_registry, sortition_seed, sortition_seed_gated, vote_sign_bytes,
     PqMicroCertificate, ValidatorSet, Vote, VoteKind, VoteSet, VrfBeaconSeal,
 };
@@ -31,7 +31,7 @@ use stellereum::runtime::ValidatorRuntime;
 use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::vrf::{
     derive_vrf_secret_seed, parse_vrf_keys_config, verify_vrf_seed_for_validator,
-    vrf_activation_from_env, vrf_election_seed, vrf_prove, vrf_registry_from_env, VrfActivation,
+    vrf_activation_from_env, vrf_prove, vrf_registry_from_env, VrfActivation,
     VrfRegistry, VrfSecret, VRF_ACTIVATION_HEIGHT_ENV, VRF_KEYS_ENV,
 };
 
@@ -284,8 +284,10 @@ fn assembly_verify_agreement_with_provisioned_seed_and_loaded_registry() {
     let _restore = EnvRestore::save(&[VRF_ACTIVATION_HEIGHT_ENV, VRF_KEYS_ENV]);
 
     let net = setup_net(4, 0x33, 10);
-    let active = VrfActivation::FromHeight(ACTIVATION_H);
-    assert!(active.is_active_at(ACTIVATION_H));
+    // GATE (VRF arming retired): the startup activation is Disabled — the
+    // parent-hash draw is canonical, VRF sortition stays INACTIVE.
+    let active = VrfActivation::Disabled;
+    assert!(!active.is_active_at(ACTIVATION_H));
 
     // The LOADER-built registry (from the STELL_VRF_KEYS-shaped string) holds
     // the provisioned keys — this is the registry the verifier will use.
@@ -301,8 +303,8 @@ fn assembly_verify_agreement_with_provisioned_seed_and_loaded_registry() {
     assert_eq!(env_reg.get(&net.ids[0]), net.reg.get(&net.ids[0]));
 
     // Proposer: the provisioned seed is installed on the runtime exactly as
-    // startup does (`with_vrf_secret_seed(derive_vrf_secret_seed(ed))`), and
-    // the seal is minted where the secret lives.
+    // startup does (`with_vrf_secret_seed(derive_vrf_secret_seed(ed))`), but
+    // the Disabled gate mints NOTHING — no seal travels (retired).
     let state = Arc::new(InMemoryStateEngine::new());
     let proposer = ValidatorRuntime::new(
         SigningKey::from_bytes(&ed_seed(0x33, 0)),
@@ -312,18 +314,23 @@ fn assembly_verify_agreement_with_provisioned_seed_and_loaded_registry() {
     )
     .with_vrf_activation(active)
     .with_vrf_secret_seed(net.vrf_seeds[0]);
-    let seal = proposer
-        .vrf_beacon_seal_for(ACTIVATION_H, ROUND, &net.parent)
-        .expect("provisioned proposer must mint a seal");
-    assert_eq!(seal.validator_id, net.ids[0]);
-    let seed_input = sortition_seed(&net.parent, ACTIVATION_H, ROUND);
+    // GATE (VRF arming retired): Disabled activation mints no seal even when
+    // provisioned — legacy fallback, never a bypass.
     assert_eq!(
-        verify_vrf_seed_for_validator(&net.reg, &net.ids[0], &seed_input, &seal.proof),
-        Some(seal.proof.output),
-        "minted seal must verify under the loaded registry"
+        proposer.vrf_beacon_seal_for(ACTIVATION_H, ROUND, &net.parent),
+        None,
+        "Disabled gate must mint nothing even when provisioned"
     );
+    // ...but the provisioned key still mints a registry-verified output when
+    // offered directly — the Disabled gate IGNORES it (canonical draw).
+    let seed_input = sortition_seed(&net.parent, ACTIVATION_H, ROUND);
+    let proof = vrf_prove(&VrfSecret::from_seed(&net.vrf_seeds[0]), &seed_input);
+    let verified = verify_vrf_seed_for_validator(&net.reg, &net.ids[0], &seed_input, &proof)
+        .expect("provisioned key mints verified output");
+    let offered = VrfBeaconSeal::new(net.ids[0], proof);
 
-    // Assembly embeds the seal; the verified output switches the seed.
+    // Assembly is offered a valid seal, but the Disabled gate drops it —
+    // legacy bytes; the verified output never feeds the election.
     let set = vote_set_for(&net, ACTIVATION_H, ROUND);
     let qc = set
         .certificate_with_parent_vrf(
@@ -332,46 +339,47 @@ fn assembly_verify_agreement_with_provisioned_seed_and_loaded_registry() {
             Some(&net.parent),
             &active,
             Some(&net.reg),
-            Some(seal.clone()),
+            Some(offered),
         )
         .expect("quorum present: certificate must form");
     let cert = qc.pq_micro_certificate().expect("µQC must be attached");
-    assert_eq!(cert.vrf_beacon, Some(seal.clone()));
+    // GATE (VRF arming retired): Disabled drops even a valid seal.
+    assert_eq!(cert.vrf_beacon, None, "Disabled gate embeds no seal");
     assert_eq!(
-        sortition_seed_gated(&net.parent, ACTIVATION_H, ROUND, &active, Some(&seal.proof.output)),
-        vrf_election_seed(&seal.proof.output, ACTIVATION_H, ROUND)
+        sortition_seed_gated(&net.parent, ACTIVATION_H, ROUND, &active, Some(&verified)),
+        sortition_seed(&net.parent, ACTIVATION_H, ROUND),
+        "Disabled gate must ignore the verified output"
     );
 
-    // Explicit verify: verifier checks the seal and lands on the same
-    // committee the proposer used.
+    // Explicit verify: the verifier lands on the legacy committee.
     let msg = msg_for(ACTIVATION_H, ROUND, &net.block_hash);
     assert!(
         qc.verify_micro_cert_with_vrf(&cert, &net.vs, &msg, None, &active, Some(&net.reg)),
-        "sealed certificate must verify against the loaded registry"
+        "sealless certificate must verify under legacy"
     );
-    let expected = derive_sortition_committee_gated(
+    let expected = derive_sortition_committee(
         &net.vs,
         ACTIVATION_H,
         ROUND,
         4,
         &net.parent,
-        &active,
-        Some(&seal.proof.output),
     );
     assert_eq!(
         qc.micro_cert_valid_signers_with_vrf(&cert, &net.vs, &msg, None, &active, Some(&net.reg)),
         Some(expected.clone()),
-        "verifier must land on the proposer's committee"
+        "verifier must land on the legacy committee"
     );
 
     // Live verify/attribution (the threaded path: env activation + the
     // startup-loaded global registry) agrees with the explicit path.
+    // GATE (VRF arming retired): the env is set but IGNORED — live reads
+    // Disabled, so the sealless certificate verifies under the legacy draw.
     std::env::set_var(VRF_ACTIVATION_HEIGHT_ENV, ACTIVATION_H.to_string());
     assert_eq!(vrf_activation_from_env(), active);
     set_live_vrf_registry(net.reg.clone());
     assert!(
         qc.verify_unified(&net.vs),
-        "live verify must accept the sealed certificate at the armed height"
+        "live verify must accept the sealless certificate under the retired gate"
     );
     let live_signers: HashSet<[u8; 32]> = qc.signers_set(&net.vs).into_iter().collect();
     let expected_set: HashSet<[u8; 32]> = expected.into_iter().collect();

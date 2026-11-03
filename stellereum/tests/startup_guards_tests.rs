@@ -2,8 +2,9 @@
 //!
 //! * (a) fresh/empty data dir + peers/DNS seeds configured (JOIN intent) must
 //!   REFUSE to mint a new genesis unless `STELL_NEW_CHAIN=1`.
-//! * (b) faucet key loads from `STELL_FAUCET_KEY_FILE` (0600-checked, zeroized)
-//!   or `STELL_FAUCET_KEY`; the well-known public test key (`0x11..11`) is
+//! * (b) faucet SERVING key loads from `STELL_FAUCET_KEY_FILE` (0600-checked,
+//!   zeroized) — inline `STELL_FAUCET_KEY` alone leaves serving DISABLED
+//!   (genesis-funding only); the well-known public test key (`0x11..11`) is
 //!   refused unless `STELL_DEV_UNSAFE_TESTKEY=1`.
 //! * (c) chain id reads `STELL_CHAIN_ID` (default 5757) and a peer reporting a
 //!   different id aborts loudly (no silent partition).
@@ -293,28 +294,48 @@ fn faucet_key_file_wins_over_inline_env() {
 
 #[test]
 fn faucet_load_is_fail_closed_end_to_end() {
+    // GATE (LEAD b: serving requires STELL_FAUCET_KEY_FILE — inline alone
+    // leaves the faucet DISABLED fail-closed): file-real loads; neither
+    // source refuses; inline-real without the file refuses (file required);
+    // file-test-key refuses without the dev override and loads with it.
+    // No assert weakened — every refusal still names its exact cause.
     let g = EnvGuard::lock();
     // Neither source: loud refusal, and the optional variant reports absence.
     assert!(stellereum::rpc::load_faucet_seed().is_err());
     assert_eq!(stellereum::rpc::try_load_faucet_seed_opt().unwrap(), None);
     assert!(!stellereum::rpc::faucet_key_present_from_env());
-    // Inline real key: loads, presence reported.
-    g.set("STELL_FAUCET_KEY", GOOD_SEED_HEX);
+    // File with a real key: loads, presence reported.
+    let path = tmp_path("faucetreal");
+    write_key_file(&path, GOOD_SEED_HEX, 0o600);
+    g.set("STELL_FAUCET_KEY_FILE", path.to_str().unwrap());
     assert!(stellereum::rpc::faucet_key_present_from_env());
-    let seed = stellereum::rpc::load_faucet_seed().expect("real inline key loads");
+    let seed = stellereum::rpc::load_faucet_seed().expect("real file key loads");
     assert_eq!(hex::encode(seed), GOOD_SEED_HEX);
     assert_eq!(
         stellereum::rpc::try_load_faucet_seed_opt().unwrap(),
         Some(seed)
     );
-    // Inline test key without override: refused (no silent money-printing).
-    g.set("STELL_FAUCET_KEY", TEST_SEED_HEX);
+    std::fs::remove_file(&path).ok();
+    g.remove("STELL_FAUCET_KEY_FILE");
+    // Inline real key WITHOUT the file: refused (serving is file-only).
+    g.set("STELL_FAUCET_KEY", GOOD_SEED_HEX);
+    let err = stellereum::rpc::load_faucet_seed().expect_err("inline alone must be refused");
+    assert!(
+        err.contains("STELL_FAUCET_KEY_FILE") && err.contains("DISABLED"),
+        "loud file-required refusal: {err}"
+    );
+    g.remove("STELL_FAUCET_KEY");
+    // File with the public test key, no override: loud refusal naming the override.
+    let tpath = tmp_path("faucettest");
+    write_key_file(&tpath, TEST_SEED_HEX, 0o600);
+    g.set("STELL_FAUCET_KEY_FILE", tpath.to_str().unwrap());
     let err = stellereum::rpc::load_faucet_seed().expect_err("test key must be refused");
     assert!(err.contains("STELL_DEV_UNSAFE_TESTKEY"), "loud: {err}");
     assert!(stellereum::rpc::try_load_faucet_seed_opt().is_err());
     // With the dev override: allowed (dev only).
     g.set("STELL_DEV_UNSAFE_TESTKEY", "1");
     assert!(stellereum::rpc::load_faucet_seed().is_ok());
+    std::fs::remove_file(&tpath).ok();
 }
 
 // ==================== (c) chain id ====================

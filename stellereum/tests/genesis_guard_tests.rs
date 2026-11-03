@@ -57,12 +57,10 @@ fn datadir_message_names_suspects_without_shard() {
         !msg.contains("shard 0"),
         "datadir message must not name a shard: {msg}"
     );
-    for suspect in [
-        "STELL_FAUCET_KEY",
-        "STELL_LEGACY_GENESIS_ROOT",
-        "validators:",
-        "STELL_SHARDS",
-    ] {
+    // GATE (LEAD a: STELL_LEGACY_GENESIS_ROOT removed): the suspect list no
+    // longer names the deleted escape hatch; every remaining suspect is
+    // still pinned (no assert weakened, one entry removed).
+    for suspect in ["STELL_FAUCET_KEY", "validators:", "STELL_SHARDS"] {
         assert!(msg.contains(suspect), "must name {suspect}: {msg}");
     }
     assert!(msg.contains("./data"), "must name the wipe path: {msg}");
@@ -73,12 +71,8 @@ fn shard_message_names_all_suspects_too() {
     let expected = [0x01u8; 32];
     let found = vec![0x02u8; 32];
     let msg = genesis_mismatch_msg(Some(0), &expected, &found);
-    for suspect in [
-        "STELL_FAUCET_KEY",
-        "STELL_LEGACY_GENESIS_ROOT",
-        "validators:",
-        "STELL_SHARDS",
-    ] {
+    // GATE (LEAD a: STELL_LEGACY_GENESIS_ROOT removed — see above).
+    for suspect in ["STELL_FAUCET_KEY", "validators:", "STELL_SHARDS"] {
         assert!(msg.contains(suspect), "must name {suspect}: {msg}");
     }
     assert!(msg.contains("shard 0"), "must name shard 0: {msg}");

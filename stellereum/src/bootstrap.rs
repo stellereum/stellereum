@@ -324,7 +324,7 @@ fn short_root_hex(raw: &[u8]) -> String {
 ///
 /// The text names both roots (16-hex-char prefixes), the shard when given,
 /// and the usual suspects (`STELL_FAUCET_KEY(/_FILE)`,
-/// `STELL_LEGACY_GENESIS_ROOT`, the `validators:` list, `STELL_SHARDS`)
+/// the `validators:` list, `STELL_SHARDS`)
 /// plus the wipe-or-restore recovery. Callers must still refuse to start
 /// (comparison semantics unchanged — this only formats the refusal).
 pub fn genesis_mismatch_msg(shard: Option<u32>, expected: &[u8; 32], found: &[u8]) -> String {
@@ -336,7 +336,7 @@ pub fn genesis_mismatch_msg(shard: Option<u32>, expected: &[u8; 32], found: &[u8
     };
     format!(
         "genesis state root mismatch {scope}:\n  expected (config): {expected_hex}\n  found (stored): {found_hex}\n\
-         Suspects: STELL_FAUCET_KEY(/_FILE), STELL_LEGACY_GENESIS_ROOT, validators: list, STELL_SHARDS. \
+          Suspects: STELL_FAUCET_KEY(/_FILE), validators: list, STELL_SHARDS. \
          Wipe ./data to start a new chain, or restore the original config."
     )
 }

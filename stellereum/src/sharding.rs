@@ -378,6 +378,67 @@ pub const BASE_WORKCHAIN_SHARD_INITIAL: ShardId = 1;
 /// one shard it was started with, which is the pre-sharding behaviour.
 pub const SHARD_REGISTRY_ENV: &str = "STELL_SHARDS";
 
+/// Escape hatch that re-allows a non-canonical shard registry for local
+/// soak/tests only. One env var, no new config formats. Public launch is
+/// single-shard canonical; the hatch is loudly logged at boot (see `main.rs`)
+/// and never documented for operators.
+pub const EXPERIMENTAL_SHARDS_ENV: &str = "STELL_EXPERIMENTAL_SHARDS";
+
+/// Freeze doc pinned by the boot-guard refusal text below.
+pub const WORKCHAIN_FREEZE_DOC: &str = "docs/PUBLIC_TESTNET_CODE_GAPS.md §1";
+
+/// True only when `STELL_EXPERIMENTAL_SHARDS=1` (exact match). Anything else
+/// (unset, empty, `0`, `true`, ...) is disabled — fail-closed.
+pub fn experimental_shards_hatch_enabled() -> bool {
+    matches!(
+        std::env::var(EXPERIMENTAL_SHARDS_ENV).as_deref(),
+        Ok("1")
+    )
+}
+
+/// Boot guard: single-shard `{0}` canonical for public launch (protocol
+/// freeze, see [`WORKCHAIN_FREEZE_DOC`]).
+///
+/// * `Ok(())` — registry is exactly `{MASTERCHAIN_SHARD}` (default path,
+///   byte-identical), or the experimental hatch is enabled.
+/// * `Err(msg)` — any other registry (`STELL_SHARDS != {0}`, i.e. any
+///   multishard request or any non-canonical single shard) without the hatch.
+///   The message names the freeze doc, both env vars, and the recovery.
+///
+/// Pure except for the hatch env read; use
+/// [`check_workchain_boot_guard_with_hatch`] for deterministic tests.
+pub fn check_workchain_boot_guard(registry: &ShardRegistry) -> Result<(), String> {
+    check_workchain_boot_guard_with_hatch(registry, experimental_shards_hatch_enabled())
+}
+
+/// Deterministic core of [`check_workchain_boot_guard`]: `hatch` is the
+/// already-resolved `STELL_EXPERIMENTAL_SHARDS=1` flag.
+pub fn check_workchain_boot_guard_with_hatch(
+    registry: &ShardRegistry,
+    hatch: bool,
+) -> Result<(), String> {
+    if *registry == ShardRegistry::single() {
+        return Ok(());
+    }
+    if hatch {
+        return Ok(());
+    }
+    Err(format!(
+        "REFUSING startup: STELL_SHARDS {{{}}} is not single-shard canonical {{0}} \
+         (protocol freeze {doc}). Multishard boot is parked until live-soak + flag-day. \
+         For local soak/tests only, set {hatch_env}=1 (loudly logged). \
+         Requested shards: {{{}}}",
+        MASTERCHAIN_SHARD,
+        registry
+            .ids()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        doc = WORKCHAIN_FREEZE_DOC,
+        hatch_env = EXPERIMENTAL_SHARDS_ENV,
+    ))
+}
+
 /// The set of shards a single process is responsible for.
 ///
 /// Before sharding, one process ran exactly one chain and every block was a
@@ -5387,6 +5448,9 @@ impl Block {
     /// either defaulted or derived, adding a field to [`Block`] no longer
     /// breaks the call sites: they call this constructor instead of spelling
     /// a struct literal.
+    /// Test-only constructor: absent from production builds
+    /// (`any(test, debug_assertions)` only).
+    #[cfg(any(test, debug_assertions))]
     pub fn new_for_test(
         shard_id: ShardId,
         height: u64,

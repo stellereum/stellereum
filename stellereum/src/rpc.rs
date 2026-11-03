@@ -346,6 +346,8 @@ pub fn faucet_ip_max_per_hour() -> u32 {
 
 /// Env var carrying the faucet ed25519 seed inline (64-char hex, cleartext in
 /// the process environment — prefer [`FAUCET_KEY_FILE_ENV`]).
+/// Genesis-funding ONLY: serving the faucet ([`load_faucet_seed`]) requires
+/// the key file and ignores this var fail-closed.
 pub const FAUCET_KEY_ENV: &str = "STELL_FAUCET_KEY";
 /// Env var naming a FILE that carries the faucet ed25519 seed (hex, first
 /// line). The file MUST be owner-only (`0600`) or loading fails closed.
@@ -497,13 +499,20 @@ pub fn faucet_key_present_from_env() -> bool {
     inline || file
 }
 
-/// Load the faucet seed for startup: `STELL_FAUCET_KEY_FILE` wins when set
-/// (0600-checked, zeroized after load), else `STELL_FAUCET_KEY`.
+/// Load the faucet seed for SERVING drips: `STELL_FAUCET_KEY_FILE` is
+/// REQUIRED (0600-checked, zeroized after load).
 ///
-/// * `Ok(seed)` — exactly one source configured and parsed, test-key gate passed.
-/// * `Err(msg)` — fail-closed loud error: misconfigured file (missing /
-///   bad perms / bad hex), bad inline hex, or the public test key without the
-///   dev override. Callers must refuse to start the faucet on `Err`.
+/// LEAD (no test keys, no defaults in public paths): serving NEVER falls
+/// back to inline `STELL_FAUCET_KEY` — an inline seed alone leaves the
+/// faucet disabled fail-closed with a loud error pointing at the file.
+/// Inline seeds remain valid ONLY for genesis-funding reproducibility via
+/// [`load_faucet_seed_for_genesis`] (root determinism for existing chains).
+///
+/// * `Ok(seed)` — file configured and parsed, test-key gate passed.
+/// * `Err(msg)` — fail-closed loud error: missing file (faucet stays
+///   DISABLED), bad file (missing / bad perms / bad hex), or the public
+///   test key without the dev override. Callers must refuse to serve the
+///   faucet on `Err`.
 pub fn load_faucet_seed() -> Result<[u8; 32], String> {
     if let Some(path) = std::env::var(FAUCET_KEY_FILE_ENV)
         .ok()
@@ -514,19 +523,18 @@ pub fn load_faucet_seed() -> Result<[u8; 32], String> {
         check_faucet_seed_allows_startup(&seed)?;
         return Ok(seed);
     }
-    if let Some(mut hex_str) = std::env::var(FAUCET_KEY_ENV)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    {
-        let seed = parse_faucet_seed_hex(&hex_str)?;
-        use zeroize::Zeroize;
-        hex_str.zeroize();
-        check_faucet_seed_allows_startup(&seed)?;
-        return Ok(seed);
+    if faucet_key_present_from_env() {
+        return Err(format!(
+            "[faucet] REFUSING: serving the faucet from inline {} is disabled — \
+             set {} to a 0600 file carrying the seed (inline seeds are genesis-only, \
+             see load_faucet_seed_for_genesis); faucet stays DISABLED",
+            FAUCET_KEY_ENV, FAUCET_KEY_FILE_ENV
+        ));
     }
     Err(format!(
-        "[faucet] no faucet key configured (set {} or {}); refusing to start the faucet",
-        FAUCET_KEY_ENV, FAUCET_KEY_FILE_ENV
+        "[faucet] no faucet key file configured (set {} to a 0600 file); \
+         refusing to start the faucet — faucet stays DISABLED",
+        FAUCET_KEY_FILE_ENV
     ))
 }
 
@@ -8445,6 +8453,8 @@ static WS_IDLE_TIMEOUT_OVERRIDE_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Set the WS idle timeout for tests (0 restores the const default).
+/// Absent from production builds (`any(test, debug_assertions)` only).
+#[cfg(any(test, debug_assertions))]
 pub fn set_ws_idle_timeout_for_tests(secs: u64) {
     WS_IDLE_TIMEOUT_OVERRIDE_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
 }

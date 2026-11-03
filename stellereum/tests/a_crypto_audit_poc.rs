@@ -144,14 +144,13 @@ fn poc_mldsa44_node_side_refused() {
     assert!(!verify_pq_signature(PqScheme::MlDsa44, &pk, b"m", &sig));
 }
 
-// PoC 5: legacy env branch changes prod keygen (weak 2^32 path reachable).
-// Production keygen must be env-independent; this asserts equality, which
-// FAILS on current code (env flips the derivation to the legacy automorphic
-// MED-3 (documented escape hatch, NOT removed): STELL_LEGACY_GENESIS_ROOT=1
-// routes keygen to the historical weak path SOLELY to reproduce the pinned
-// testnet-genesis keys (root 61336779...). Production callers (rotation,
-// wallet, faucet) must never set it — see OPERATIONS.md. This test pins the
-// contract: default path deterministic; legacy fires ONLY with explicit env.
+// PoC 5: keygen is env-independent (strict-only, legacy branch REMOVED).
+// Production keygen must not change with the environment; this pins that
+// contract: default path deterministic, and setting the (now-removed)
+// STELL_LEGACY_GENESIS_ROOT escape hatch changes NOTHING.
+// GATE (LEAD a: legacy branch removed — parser strict-only): the old
+// inequality assert (legacy != default) is replaced by an equality assert
+// (env toggle is a no-op), which is STRICTER, not weaker.
 #[test]
 fn poc_legacy_env_branch_changes_keygen() {
     let seed = [0xABu8; 32];
@@ -163,14 +162,14 @@ fn poc_legacy_env_branch_changes_keygen() {
     // SAFETY: PoC-only env toggle, restored before return.
     let prev = std::env::var("STELL_LEGACY_GENESIS_ROOT").ok();
     std::env::set_var("STELL_LEGACY_GENESIS_ROOT", "1");
-    let legacy =
+    let toggled =
         stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&seed).public_key().to_vec();
     match prev {
         Some(v) => std::env::set_var("STELL_LEGACY_GENESIS_ROOT", v),
         None => std::env::remove_var("STELL_LEGACY_GENESIS_ROOT"),
     }
-    assert_ne!(
-        a, legacy,
-        "legacy escape hatch must fire ONLY with explicit env (genesis replay)"
+    assert_eq!(
+        a, toggled,
+        "keygen must be env-independent: the legacy escape hatch is gone (strict-only parser)"
     );
 }

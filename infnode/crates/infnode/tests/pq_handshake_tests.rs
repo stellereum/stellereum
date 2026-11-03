@@ -1002,3 +1002,243 @@ fn pq_mixed_policy_off_path() -> proto::PqMode {
     // Flag OFF callers pass `local_pq = false` with no offer material.
     proto::pq_mixed_policy(false, None).unwrap()
 }
+
+// ---------------------------------------------------------------------------
+// 15. Default-ON gate (PQ 9.1): inverted flag, H const, WARN + counter.
+// Env-safety: NO env mutation here — `pq_handshake_active_for` is the pure
+// core, so parallel execution still cannot race with the legacy flag test.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pq_default_on_active_for_exact_zero_only() {
+    // Unset/empty/legacy-"1"/anything-else = PQ active (default-ON).
+    assert!(proto::pq_handshake_active_for(None));
+    assert!(proto::pq_handshake_active_for(Some("")));
+    assert!(proto::pq_handshake_active_for(Some("1")));
+    assert!(proto::pq_handshake_active_for(Some("true")));
+    assert!(proto::pq_handshake_active_for(Some(" 0")));
+    assert!(proto::pq_handshake_active_for(Some("00")));
+    // ONLY exact "0" opts out (explicit classical, honored pre-H only).
+    assert!(!proto::pq_handshake_active_for(Some("0")));
+}
+
+#[test]
+fn pq_classical_refuse_height_boundary() {
+    let h = proto::PQ_CLASSICAL_REFUSE_AFTER_HEIGHT;
+    // H is far future vs every height pinned in-repo (kv fixtures "42000",
+    // live comment 71587, VRF staging 1_000_000): documents the choice.
+    assert_eq!(h, 300_000);
+    assert!(!proto::pq_classical_refused_at(0));
+    assert!(!proto::pq_classical_refused_at(42_000));
+    assert!(!proto::pq_classical_refused_at(71_587));
+    assert!(!proto::pq_classical_refused_at(h - 1));
+    assert!(proto::pq_classical_refused_at(h));
+    assert!(proto::pq_classical_refused_at(h + 1));
+    assert!(proto::pq_classical_refused_at(u64::MAX));
+}
+
+#[test]
+fn pq_mixed_policy_at_pre_h_delegates_unchanged() {
+    let h = proto::PQ_CLASSICAL_REFUSE_AFTER_HEIGHT;
+    let pre = h - 1;
+    // Pre-H is byte-behavior-identical to the legacy policy on every arm.
+    assert_eq!(
+        proto::pq_mixed_policy_at(pre, false, None).unwrap(),
+        proto::pq_mixed_policy(false, None).unwrap()
+    );
+    assert_eq!(
+        proto::pq_mixed_policy_at(pre, true, None).unwrap(),
+        proto::PqMode::Classical
+    );
+    let verified = PqOfferCheck { wellformed: true, suite_ok: true, tag_ok: true };
+    assert_eq!(
+        proto::pq_mixed_policy_at(pre, true, Some(verified)).unwrap(),
+        proto::PqMode::Pq
+    );
+    let garbage = PqOfferCheck { wellformed: false, suite_ok: false, tag_ok: false };
+    assert_eq!(
+        proto::pq_mixed_policy_at(pre, false, Some(garbage)).unwrap(),
+        proto::PqMode::Classical
+    );
+    for (wellformed, suite_ok, tag_ok) in
+        [(true, true, false), (true, false, false), (false, false, false)]
+    {
+        let mk = || PqOfferCheck { wellformed, suite_ok, tag_ok };
+        let legacy = proto::pq_mixed_policy(true, Some(mk()));
+        let gated = proto::pq_mixed_policy_at(pre, true, Some(mk()));
+        assert_eq!(legacy.unwrap_err(), gated.unwrap_err());
+    }
+    // Current-chain-scale heights are pre-H: classical warns-but-works.
+    assert_eq!(
+        proto::pq_mixed_policy_at(71_587, true, None).unwrap(),
+        proto::PqMode::Classical
+    );
+}
+
+#[test]
+fn pq_classical_fallback_warns_loud_and_counts() {
+    let before = proto::pq_classical_fallback_total();
+    proto::pq_warn_classical_fallback("test");
+    assert_eq!(proto::pq_classical_fallback_total(), before + 1);
+    proto::pq_warn_classical_fallback("test");
+    assert_eq!(proto::pq_classical_fallback_total(), before + 2);
+}
+
+#[test]
+fn pq_mixed_policy_at_post_h_classical_refused() {
+    let h = proto::PQ_CLASSICAL_REFUSE_AFTER_HEIGHT;
+    // Absent offer (classical-explicit) refused — no silent window past H.
+    assert_eq!(
+        proto::pq_mixed_policy_at(h, true, None).unwrap_err(),
+        "classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT"
+    );
+    assert_eq!(
+        proto::pq_mixed_policy_at(h, false, None).unwrap_err(),
+        "classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT"
+    );
+    // Classical-only local node refused even with a verified offer.
+    assert_eq!(
+        proto::pq_mixed_policy_at(
+            h, false,
+            Some(PqOfferCheck { wellformed: true, suite_ok: true, tag_ok: true })
+        ).unwrap_err(),
+        "classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT"
+    );
+    // Malformed/suite/tag arms keep their specific fail-closed errors.
+    assert_eq!(
+        proto::pq_mixed_policy_at(
+            h, true,
+            Some(PqOfferCheck { wellformed: false, suite_ok: false, tag_ok: false })
+        ).unwrap_err(),
+        "pq fields malformed"
+    );
+    assert_eq!(
+        proto::pq_mixed_policy_at(
+            h, true,
+            Some(PqOfferCheck { wellformed: true, suite_ok: false, tag_ok: false })
+        ).unwrap_err(),
+        "unsupported pq suite/version"
+    );
+    assert_eq!(
+        proto::pq_mixed_policy_at(
+            h, true,
+            Some(PqOfferCheck { wellformed: true, suite_ok: true, tag_ok: false })
+        ).unwrap_err(),
+        "pq transcript auth failed"
+    );
+    // Verified PQ offer still negotiates Pq at/after H (PQ<->PQ verified).
+    assert_eq!(
+        proto::pq_mixed_policy_at(
+            h, true,
+            Some(PqOfferCheck { wellformed: true, suite_ok: true, tag_ok: true })
+        ).unwrap(),
+        proto::PqMode::Pq
+    );
+}
+
+#[test]
+fn pq_falcon_policy_at_pre_h_delegates_post_h_refuses() {
+    let h = proto::PQ_CLASSICAL_REFUSE_AFTER_HEIGHT;
+    let pre = h - 1;
+    let digest = pq_falcon_digest(&fixed_transcript());
+    let keys = PqKeys::from_seed([0x5Au8; 32]);
+    let sig = keys.sign_digest(&digest);
+    // Pre-H: absent identity = classical-explicit (both local states).
+    assert_eq!(
+        proto::pq_falcon_policy_at(pre, false, None, &digest, None).unwrap(),
+        proto::PqMode::Classical
+    );
+    assert_eq!(
+        proto::pq_falcon_policy_at(pre, true, None, &digest, None).unwrap(),
+        proto::PqMode::Classical
+    );
+    // Pre-H: verified offer negotiates Pq.
+    assert_eq!(
+        proto::pq_falcon_policy_at(pre, true, Some(&keys.pq_pub()), &digest, Some(&sig)).unwrap(),
+        proto::PqMode::Pq
+    );
+    // Post-H: absent identity refused (no classical-explicit past H).
+    assert_eq!(
+        proto::pq_falcon_policy_at(h, true, None, &digest, None).unwrap_err(),
+        "classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT"
+    );
+    // Post-H: classical-only local refused even with a valid offered tag.
+    assert_eq!(
+        proto::pq_falcon_policy_at(h, false, Some(&keys.pq_pub()), &digest, Some(&sig)).unwrap_err(),
+        "classical refused at/after PQ_CLASSICAL_REFUSE_AFTER_HEIGHT"
+    );
+    // Post-H: malformed key and mistag keep their specific fail-closed errors.
+    assert_eq!(
+        proto::pq_falcon_policy_at(h, true, Some(&[9u8; 32]), &digest, Some(&sig)).unwrap_err(),
+        "pq identity malformed"
+    );
+    let other = PqKeys::from_seed([0x3Bu8; 32]);
+    let cross = other.sign_digest(&digest);
+    assert_eq!(
+        proto::pq_falcon_policy_at(h, true, Some(&keys.pq_pub()), &digest, Some(&cross)).unwrap_err(),
+        "pq falcon tag failed"
+    );
+    // Post-H: PQ<->PQ verified still works.
+    assert_eq!(
+        proto::pq_falcon_policy_at(h, true, Some(&keys.pq_pub()), &digest, Some(&sig)).unwrap(),
+        proto::PqMode::Pq
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 16. First-boot auto-generation: absent -> generate (0600) + reload;
+// corrupt -> hard error, never silent classical downgrade.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pq_identity_load_or_generate_creates_0600_and_reloads() {
+    let d = pq_test_dir("autogen");
+    assert!(!d.join("pq-identity.key").exists());
+    let keys = PqKeys::load_or_generate(&d).expect("first boot generates");
+    assert!(d.join("pq-identity.key").exists());
+    assert_eq!(keys.pq_pub().len(), PQ_FALCON_PK_LEN);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let fmode = std::fs::metadata(d.join("pq-identity.key"))
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(fmode, 0o600, "auto-generated pq-identity.key must be 0600");
+        let dmode = std::fs::metadata(&d)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dmode, 0o700, "keys dir must be 0700");
+    }
+    // Second boot loads the SAME identity (no regeneration).
+    let again = PqKeys::load_or_generate(&d).expect("second boot loads");
+    assert_eq!(again.pq_pub(), keys.pq_pub());
+    assert_eq!(again.pq_id(), keys.pq_id());
+    // And the plain load_opt path agrees (one file, one identity).
+    let via_opt = PqKeys::load_opt(&d).expect("load").expect("present");
+    assert_eq!(via_opt.pq_pub(), keys.pq_pub());
+    // NodeId derivation still untouched: classical id != pq id.
+    let ed = [0x77u8; 32];
+    let classical: [u8; 20] = blake3::hash(&ed).as_bytes()[..20].try_into().unwrap();
+    assert_ne!(classical, keys.pq_id());
+    pq_cleanup(&d);
+}
+
+#[test]
+fn pq_identity_load_or_generate_corrupt_hard_errors() {
+    let d = pq_test_dir("autogen-corrupt");
+    PqKeys::from_seed([0x5Au8; 32]).save(&d).expect("save");
+    std::fs::write(d.join("pq-identity.key"), "00").expect("clobber");
+    // Corrupt content: hard error, never Ok and never a silent fallback.
+    let err = match PqKeys::load_or_generate(&d) {
+        Ok(_) => panic!("corrupt pq-identity.key must fail"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(err.contains("32 байта"), "clear error, got: {err}");
+    // Unreadable (missing after dir exists... absent regenerates; a
+    // directory that cannot be written fails instead of downgrading).
+    pq_cleanup(&d);
+}

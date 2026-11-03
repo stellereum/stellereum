@@ -125,6 +125,10 @@ pub const VRF_ELECTION_DOMAIN: &str = "STELL_SORTITION_VRF_V1";
 
 /// Environment variable naming the VRF sortition activation height
 /// (mirrors `STELL_XPC_ACTIVATION_HEIGHT`).
+///
+/// RETIRED (lead decision): setting it warns loudly and is ignored —
+/// `vrf_activation_from_env` always returns `Disabled`. Retained so old
+/// configs keep parsing without panicking.
 pub const VRF_ACTIVATION_HEIGHT_ENV: &str = "STELL_VRF_ACTIVATION_HEIGHT";
 
 /// Environment variable carrying the operator-configured VRF key registry
@@ -194,7 +198,15 @@ impl VrfActivation {
 
 /// Read the gate from the environment (mirrors `xpc_activation_from_env` in
 /// `main.rs`, which this module cannot call — threading CLI plumbing is
-/// phase-3 work outside this scope). Missing or unparsable ⇒ `Disabled`.
+/// phase-3 work outside this scope).
+///
+/// RETIRED (lead decision): the parent-hash draw is THE canonical sortition
+/// mechanism and VRF arming is removed. This function ALWAYS returns
+/// `Disabled`: a configured value is IGNORED (never parsed into an
+/// activation) with a loud warning so stale deployments notice. Missing or
+/// empty values stay `Disabled` silently; nothing here ever panics. `VrfActivation::FromHeight` is retained so old
+/// configs and downstream crates keep compiling, but nothing live arms it
+/// from the environment anymore.
 pub fn vrf_activation_from_env() -> VrfActivation {
     let raw = std::env::var(VRF_ACTIVATION_HEIGHT_ENV)
         .ok()
@@ -202,16 +214,16 @@ pub fn vrf_activation_from_env() -> VrfActivation {
         .filter(|v| !v.is_empty());
     match raw {
         None => VrfActivation::Disabled,
-        Some(v) => match v.parse::<u64>() {
-            Ok(h) => VrfActivation::FromHeight(h),
-            Err(_) => {
-                eprintln!(
-                    "[vrf] {VRF_ACTIVATION_HEIGHT_ENV}={v:?} is not a height: \
-                     VRF sortition stays INACTIVE"
-                );
-                VrfActivation::Disabled
-            }
-        },
+        Some(v) => {
+            let msg = format!(
+                "[vrf] {VRF_ACTIVATION_HEIGHT_ENV}={v:?} is RETIRED and IGNORED \
+                 (VRF arming removed): parent-hash draw is canonical, \
+                 VRF sortition stays INACTIVE"
+            );
+            eprintln!("{msg}");
+            tracing::warn!("{msg}");
+            VrfActivation::Disabled
+        }
     }
 }
 
@@ -1872,16 +1884,16 @@ mod tests {
         assert!(a.is_active_at(101));
         assert_eq!(a.boundary(), Some(100));
         assert_eq!(VrfActivation::default(), VrfActivation::Disabled);
-        // Env parsing: missing => Disabled; valid => FromHeight; garbage => Disabled.
+        // Env parsing (RETIRED): missing/empty/garbage/a height ALL read
+        // `Disabled` — a configured value is ignored with a loud warning,
+        // never armed, never a panic.
         let key = VRF_ACTIVATION_HEIGHT_ENV;
         let saved = std::env::var(key).ok();
         std::env::remove_var(key);
         assert_eq!(vrf_activation_from_env(), VrfActivation::Disabled);
         std::env::set_var(key, "500");
-        assert_eq!(
-            vrf_activation_from_env(),
-            VrfActivation::FromHeight(500)
-        );
+        assert_eq!(vrf_activation_from_env(), VrfActivation::Disabled);
+        assert_eq!(vrf_activation_from_env().boundary(), None);
         std::env::set_var(key, "not-a-height");
         assert_eq!(vrf_activation_from_env(), VrfActivation::Disabled);
         match saved {

@@ -267,6 +267,10 @@ impl InferenceCostModel {
 // Setup Functions (Transparent / Zero-Knowledge)
 // ---------------------------------------------------------------------------
 
+/// Test-only deterministic setup (fixed attestation): integration tests use
+/// this for off-chain setup -> on-chain VK pinning. Absent from production
+/// builds (`any(test, debug_assertions)` only).
+#[cfg(any(test, debug_assertions))]
 pub fn model_spec_test_only(view: &ModelView, _seed: u64) -> Result<(Vec<u8>, ModelSpec), String> {
     view.check_compatible()?;
     build_model_spec(view, TEST_SETUP_ATTESTATION.to_vec())

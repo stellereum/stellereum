@@ -38,7 +38,7 @@ use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::vrf::{
-    verify_vrf_seed_for_validator, vrf_binding_preimage, vrf_election_seed, vrf_prove,
+    verify_vrf_seed_for_validator, vrf_binding_preimage, vrf_prove,
     vrf_verify, VrfActivation, VrfBinding, VrfRegistry, VrfSecret, VRF_PROOF_LEN,
 };
 
@@ -149,9 +149,12 @@ fn msg_for(height: u64, round: u32, block_hash: &Option<[u8; 32]>) -> Vec<u8> {
 
 #[test]
 fn assembly_verify_agreement_post_activation() {
+    let _guard = SERIAL_LIVE.lock().unwrap_or_else(|e| e.into_inner());
     let net = setup_net(4, 0x11, 10);
-    let active = VrfActivation::FromHeight(ACTIVATION_H);
-    assert!(active.is_active_at(ACTIVATION_H));
+    // GATE (VRF arming retired): the gate is Disabled — the parent-hash draw
+    // is canonical, VRF sortition stays INACTIVE.
+    let active = VrfActivation::Disabled;
+    assert!(!active.is_active_at(ACTIVATION_H));
 
     let seal = seal_for(&net, 0, ACTIVATION_H, ROUND);
     let output = seal.proof.output;
@@ -167,44 +170,39 @@ fn assembly_verify_agreement_post_activation() {
         )
         .expect("quorum present: certificate must form");
 
-    // The seal travels with the certificate (bincode envelope) and survives
-    // the decode round-trip byte-identically.
+    // The seal is OFFERED but the Disabled gate drops it: the certificate
+    // carries legacy bytes and the decode round-trip keeps them.
     let cert = qc.pq_micro_certificate().expect("µQC must be attached");
-    assert_eq!(cert.vrf_beacon, Some(seal.clone()));
+    // GATE (VRF arming retired): Disabled drops even a valid seal.
+    assert_eq!(cert.vrf_beacon, None, "Disabled gate embeds no seal");
     assert_eq!(cert.sortition_parent, net.parent);
 
-    // The verifier re-derives the SAME committee the proposer used.
+    // The verifier re-derives the SAME (legacy) committee the proposer used.
     let expected =
-        derive_sortition_committee_gated(&net.vs, ACTIVATION_H, ROUND, 4, &net.parent, &active, Some(&output));
+        derive_sortition_committee(&net.vs, ACTIVATION_H, ROUND, 4, &net.parent);
     let msg = msg_for(ACTIVATION_H, ROUND, &net.block_hash);
     assert!(
         qc.verify_micro_cert_with_vrf(&cert, &net.vs, &msg, None, &active, Some(&net.reg)),
-        "sealed certificate must verify against the registry"
+        "sealless certificate must verify under legacy"
     );
     assert_eq!(
         qc.micro_cert_valid_signers_with_vrf(&cert, &net.vs, &msg, None, &active, Some(&net.reg)),
         Some(expected.clone()),
-        "verifier must land on the proposer's committee"
+        "verifier must land on the legacy committee"
     );
 
-    // The VRF path is genuinely engaged: the election seed left the
-    // parent-hash seed (N=4 elects the full set either way, so the committee
-    // coincides here — the seed proves the entropy switched).
+    // The retired path never leaves the parent-hash seed: the gated draw is
+    // byte-identical to the legacy draw even with a valid output offered.
     assert_eq!(
         sortition_seed_gated(&net.parent, ACTIVATION_H, ROUND, &active, Some(&output)),
-        vrf_election_seed(&output, ACTIVATION_H, ROUND)
-    );
-    assert_ne!(
-        sortition_seed_gated(&net.parent, ACTIVATION_H, ROUND, &active, Some(&output)),
         sortition_seed(&net.parent, ACTIVATION_H, ROUND),
-        "post-activation must leave the parent-hash seed"
+        "retired gate must ignore even a valid VRF output"
     );
 
-    // Mixed-version compat at small N: the sealed cert ALSO verifies under
-    // the legacy draw (same full-set committee), so old nodes accept it.
+    // Legacy-draw check on the sealless cert (old nodes accept it trivially).
     assert!(
         qc.verify_micro_cert_with_vrf(&cert, &net.vs, &msg, None, &VrfActivation::Disabled, None),
-        "sealed cert on a full-set committee must verify as legacy too"
+        "sealless cert must verify as legacy too"
     );
 }
 
@@ -212,6 +210,7 @@ fn assembly_verify_agreement_post_activation() {
 
 #[test]
 fn pre_activation_cert_byte_identical_to_legacy() {
+    let _guard = SERIAL_LIVE.lock().unwrap_or_else(|e| e.into_inner());
     let net = setup_net(4, 0x22, 10);
     let active = VrfActivation::FromHeight(ACTIVATION_H);
     let h = 9u64;
@@ -296,8 +295,11 @@ fn legacy_qc_at(net: &Net, height: u64, round: u32) -> QuorumCertificate {
 
 #[test]
 fn fallback_matrix_none_missing_forged() {
+    let _guard = SERIAL_LIVE.lock().unwrap_or_else(|e| e.into_inner());
     let net = setup_net(4, 0x33, 10);
-    let active = VrfActivation::FromHeight(ACTIVATION_H);
+    // GATE (VRF arming retired): the gate is Disabled — the parent-hash draw
+    // is canonical; every cell below must land on the legacy draw.
+    let active = VrfActivation::Disabled;
     let h = ACTIVATION_H;
     let msg = msg_for(h, ROUND, &net.block_hash);
     let legacy_committee = derive_sortition_committee(&net.vs, h, ROUND, 4, &net.parent);
@@ -409,8 +411,9 @@ fn fallback_matrix_none_missing_forged() {
         "unknown-key seal falls back to legacy"
     );
 
-    // (e) FORGED proof bytes + armed + known key ⇒ assembly falls back to
-    // legacy, but verification REFUSES the forged cert fail-closed.
+    // (e) FORGED proof bytes + known key + Disabled ⇒ the seal is IGNORED
+    // (retired gate), so assembly falls back to legacy AND verification lands
+    // on legacy too (fail-closed refusal only applies at an armed height).
     let mut bad_proof = seal.proof.clone();
     bad_proof.proof[7] ^= 0x01;
     let forged_seal = VrfBeaconSeal::new(net.ids[0], bad_proof);
@@ -440,8 +443,11 @@ fn fallback_matrix_none_missing_forged() {
         legacy_cert.sortition_parent,
     )
     .with_vrf_beacon(forged_seal);
+    // GATE (VRF arming retired): Disabled ignores the forged seal — legacy
+    // verifies (armed-height refusal is pinned by the explicit-FromHeight
+    // forged-seal suites).
     assert!(
-        !legacy.verify_micro_cert_with_vrf(
+        legacy.verify_micro_cert_with_vrf(
             &forged_cert,
             &net.vs,
             &msg,
@@ -449,7 +455,7 @@ fn fallback_matrix_none_missing_forged() {
             &active,
             Some(&net.reg)
         ),
-        "forged proof bytes must refuse the whole certificate"
+        "Disabled gate ignores the forged seal: legacy verifies"
     );
     assert_eq!(
         legacy.micro_cert_valid_signers_with_vrf(
@@ -460,8 +466,8 @@ fn fallback_matrix_none_missing_forged() {
             &active,
             Some(&net.reg)
         ),
-        None,
-        "forged proof attributes nobody"
+        Some(legacy_committee.clone()),
+        "Disabled gate attributes the legacy committee"
     );
 
     // (f) Proof verifies but `output` field substituted ⇒ refuse (the output
@@ -479,8 +485,11 @@ fn fallback_matrix_none_missing_forged() {
         legacy_cert.sortition_parent,
     )
     .with_vrf_beacon(swapped_seal);
+    // GATE (VRF arming retired): Disabled ignores the substituted output —
+    // legacy verifies (armed-height refusal is pinned by the
+    // explicit-FromHeight forged-seal suites).
     assert!(
-        !legacy.verify_micro_cert_with_vrf(
+        legacy.verify_micro_cert_with_vrf(
             &swapped_cert,
             &net.vs,
             &msg,
@@ -488,7 +497,7 @@ fn fallback_matrix_none_missing_forged() {
             &active,
             Some(&net.reg)
         ),
-        "substituted output must refuse the whole certificate"
+        "Disabled gate ignores the substituted output: legacy verifies"
     );
 
     // (g) Old-version cert (serde field absent) verifies under legacy.
@@ -512,8 +521,11 @@ fn fallback_matrix_none_missing_forged() {
 
 #[test]
 fn determinism_same_key_and_height_same_outcome() {
+    let _guard = SERIAL_LIVE.lock().unwrap_or_else(|e| e.into_inner());
     let net = setup_net(4, 0x44, 10);
-    let active = VrfActivation::FromHeight(ACTIVATION_H);
+    // GATE (VRF arming retired): the gate is Disabled — the election is the
+    // canonical parent-hash draw.
+    let active = VrfActivation::Disabled;
     let msg = msg_for(ACTIVATION_H, ROUND, &net.block_hash);
 
     let first_seal = seal_for(&net, 1, ACTIVATION_H, ROUND);
@@ -559,7 +571,8 @@ fn determinism_same_key_and_height_same_outcome() {
             )
             .expect("forms");
         let cert = qc.pq_micro_certificate().expect("attached");
-        assert_eq!(cert.vrf_beacon, Some(seal));
+        // GATE (VRF arming retired): Disabled drops even a valid seal.
+        assert_eq!(cert.vrf_beacon, None, "Disabled gate embeds no seal");
         assert!(
             qc.verify_micro_cert_with_vrf(&cert, &net.vs, &msg, None, &active, Some(&net.reg))
         );
@@ -577,10 +590,13 @@ fn determinism_same_key_and_height_same_outcome() {
 /// smuggled through a valid-looking seal.
 #[test]
 fn verifier_accepts_unique_proof_second_envelope_refuses() {
+    let _guard = SERIAL_LIVE.lock().unwrap_or_else(|e| e.into_inner());
     use stellereum::vrf::VrfProof;
 
     let net = setup_net(4, 0x55, 10);
-    let active = VrfActivation::FromHeight(ACTIVATION_H);
+    // GATE (VRF arming retired): the gate is Disabled — the election is the
+    // canonical parent-hash draw; seals are ignored at the cert layer.
+    let active = VrfActivation::Disabled;
     let seed_input = sortition_seed(&net.parent, ACTIVATION_H, ROUND);
     let first = vrf_prove(&net.vrf[0], &seed_input);
     let pk = net.vrf[0].public_key().to_bytes();
@@ -619,9 +635,9 @@ fn verifier_accepts_unique_proof_second_envelope_refuses() {
         None
     );
 
-    // And the election is a pure function of the unique verified output:
-    // the seal-carrying cert verifies for the honest proof and refuses for
-    // the alternate.
+    // And the election ignores the seal under the retired gate: the
+    // seal-carrying cert verifies under the legacy draw (seal ignored), and
+    // the attributed committee is the legacy committee.
     let msg = msg_for(ACTIVATION_H, ROUND, &net.block_hash);
     let legacy = legacy_qc_at(&net, ACTIVATION_H, ROUND);
     let legacy_cert = legacy.pq_micro_certificate().expect("attached");
@@ -635,18 +651,18 @@ fn verifier_accepts_unique_proof_second_envelope_refuses() {
         legacy_cert.sortition_parent,
     )
     .with_vrf_beacon(VrfBeaconSeal::new(net.ids[0], first.clone()));
+    // GATE (VRF arming retired): Disabled ignores the honest seal — legacy
+    // verifies (the unique output still mints at the registry layer above).
     assert!(
         legacy.verify_micro_cert_with_vrf(&cert, &net.vs, &msg, None, &active, Some(&net.reg)),
-        "the unique verifying proof elects its committee"
+        "Disabled gate ignores the seal: legacy verifies"
     );
-    let committee = derive_sortition_committee_gated(
+    let committee = derive_sortition_committee(
         &net.vs,
         ACTIVATION_H,
         ROUND,
         4,
         &net.parent,
-        &active,
-        Some(&first.output),
     );
     assert_eq!(
         legacy.micro_cert_valid_signers_with_vrf(
@@ -659,7 +675,9 @@ fn verifier_accepts_unique_proof_second_envelope_refuses() {
         ),
         Some(committee)
     );
-    // The alternate seal refuses the whole certificate.
+    // The alternate seal is ignored too under the retired gate — legacy
+    // verifies (uniqueness refusal is pinned at the raw/registry layers
+    // above; armed-height cert refusal by the explicit-FromHeight suites).
     let bad_cert = PqMicroCertificate::new(
         legacy_cert.scheme,
         legacy_cert.height,
@@ -671,8 +689,8 @@ fn verifier_accepts_unique_proof_second_envelope_refuses() {
     )
     .with_vrf_beacon(VrfBeaconSeal::new(net.ids[0], alt));
     assert!(
-        !legacy.verify_micro_cert_with_vrf(&bad_cert, &net.vs, &msg, None, &active, Some(&net.reg)),
-        "an alternate-unique envelope must refuse the whole certificate"
+        legacy.verify_micro_cert_with_vrf(&bad_cert, &net.vs, &msg, None, &active, Some(&net.reg)),
+        "Disabled gate ignores the alternate seal: legacy verifies"
     );
 }
 
@@ -685,9 +703,12 @@ fn verifier_accepts_unique_proof_second_envelope_refuses() {
 /// on the legacy draw when the draw actually differs.
 #[test]
 fn large_committee_diverges_post_activation() {
+    let _guard = SERIAL_LIVE.lock().unwrap_or_else(|e| e.into_inner());
     let net = setup_net(65, 0x66, 10);
     assert_eq!(micro_committee_size(65), 64);
-    let active = VrfActivation::FromHeight(ACTIVATION_H);
+    // GATE (VRF arming retired): the gate is Disabled — no draw divergence;
+    // the gated draw is byte-identical to the legacy parent-hash draw.
+    let active = VrfActivation::Disabled;
     let seal = seal_for(&net, 0, ACTIVATION_H, ROUND);
     let output = seal.proof.output;
 
@@ -702,13 +723,13 @@ fn large_committee_diverges_post_activation() {
     );
     let legacy_committee = derive_sortition_committee(&net.vs, ACTIVATION_H, ROUND, 64, &net.parent);
     assert_eq!(vrf_committee.len(), 64);
-    assert_ne!(
+    assert_eq!(
         vrf_committee, legacy_committee,
-        "this fixture must exercise a real draw divergence"
+        "retired gate must not diverge from the legacy draw"
     );
 
-    // Full assembly↔verify at scale: all 65 vote, the 64-member VRF committee
-    // is covered, quorum power is met.
+    // Full assembly↔verify at scale: all 65 vote, the 64-member legacy
+    // committee is covered, quorum power is met.
     let set = vote_set_for(&net, ACTIVATION_H, ROUND);
     let qc = set
         .certificate_with_parent_vrf(
@@ -721,21 +742,21 @@ fn large_committee_diverges_post_activation() {
         )
         .expect("scaled certificate must form");
     let cert = qc.pq_micro_certificate().expect("attached");
-    assert_eq!(cert.vrf_beacon, Some(seal));
+    // GATE (VRF arming retired): Disabled drops even a valid seal.
+    assert_eq!(cert.vrf_beacon, None, "Disabled gate embeds no seal");
     let msg = msg_for(ACTIVATION_H, ROUND, &net.block_hash);
     assert!(
         qc.verify_micro_cert_with_vrf(&cert, &net.vs, &msg, None, &active, Some(&net.reg)),
-        "scaled sealed certificate must verify"
+        "scaled sealless certificate must verify under legacy"
     );
     assert_eq!(
         qc.micro_cert_valid_signers_with_vrf(&cert, &net.vs, &msg, None, &active, Some(&net.reg)),
         Some(vrf_committee)
     );
-    // …while the legacy draw refuses it (the committees genuinely differ):
-    // this is the post-activation flag-day shape for non-trivial draws.
+    // …and the legacy draw verifies it too (no divergence under retirement).
     assert!(
-        !qc.verify_micro_cert_with_vrf(&cert, &net.vs, &msg, None, &VrfActivation::Disabled, None),
-        "legacy draw must refuse a diverged VRF committee"
+        qc.verify_micro_cert_with_vrf(&cert, &net.vs, &msg, None, &VrfActivation::Disabled, None),
+        "legacy draw must verify the canonical-draw certificate"
     );
 }
 
@@ -815,6 +836,7 @@ async fn runtime_proof_seam_mints_and_falls_back() {
 // mixed-version new-node + old-cert cell over bytes, not JSON.
 #[test]
 fn activation_boundary_exact_h_minus_one_vs_h() {
+    let _guard = SERIAL_LIVE.lock().unwrap_or_else(|e| e.into_inner());
     let net = setup_net(4, 0x99, 10);
     let active = VrfActivation::FromHeight(ACTIVATION_H);
     let h_before = ACTIVATION_H - 1;
@@ -905,6 +927,7 @@ fn activation_boundary_exact_h_minus_one_vs_h() {
 
 #[test]
 fn old_wire_bytes_verify_legacy_at_armed_height() {
+    let _guard = SERIAL_LIVE.lock().unwrap_or_else(|e| e.into_inner());
     let net = setup_net(4, 0x9A, 10);
     let active = VrfActivation::FromHeight(ACTIVATION_H);
     let msg = msg_for(ACTIVATION_H, ROUND, &net.block_hash);
@@ -1040,7 +1063,12 @@ fn live_sites_agree_post_activation_small_and_scaled() {
     assert_eq!(cert.vrf_beacon, Some(seal.clone()));
 
     std::env::set_var(live_env_key(), ACTIVATION_H.to_string());
-    assert_eq!(stellereum::vrf::vrf_activation_from_env(), active);
+    // GATE (VRF arming retired): the env is set but IGNORED — live reads
+    // Disabled, so the live sites land on the legacy draw.
+    assert_eq!(
+        stellereum::vrf::vrf_activation_from_env(),
+        VrfActivation::Disabled
+    );
     stellereum::consensus::set_live_vrf_registry(net.reg.clone());
 
     let msg = msg_for(ACTIVATION_H, ROUND, &net.block_hash);
@@ -1121,16 +1149,16 @@ fn live_sites_agree_post_activation_small_and_scaled() {
         "scaled sealed certificate must verify on the explicit path"
     );
     let marker = marker_only_qc_live(&cert, net.block_hash);
+    // GATE (VRF arming retired): the live sites read Disabled, so the sealed
+    // cert's VRF committee is NOT the live committee — the live path refuses
+    // the diverged envelope fail-closed and attributes nobody.
     assert!(
-        marker.verify_unified(&net.vs),
-        "live pq path must accept the diverged VRF committee"
+        !marker.verify_unified(&net.vs),
+        "live pq path must refuse the diverged VRF committee under the retired gate"
     );
-    let vrf_set: std::collections::HashSet<[u8; 32]> =
-        vrf_committee.iter().copied().collect();
-    assert_eq!(
-        marker.signers_set(&net.vs),
-        vrf_set,
-        "live attribution must match the diverged VRF committee"
+    assert!(
+        marker.signers_set(&net.vs).is_empty(),
+        "live attribution must name nobody for the diverged committee"
     );
     // …while the legacy draw refuses it (flag-day shape for non-trivial draws).
     assert!(
@@ -1216,6 +1244,8 @@ fn live_sites_fallback_matrix_and_forged_refuse() {
     let active = VrfActivation::FromHeight(ACTIVATION_H);
     let h = ACTIVATION_H;
     assert!(active.is_active_at(h), "fixture height must be armed");
+    // GATE (VRF arming retired): the env is set but IGNORED — live reads
+    // Disabled, so seals are ignored on the live path (legacy fallback).
     std::env::set_var(live_env_key(), ACTIVATION_H.to_string());
     stellereum::consensus::set_live_vrf_registry(net.reg.clone());
 
@@ -1250,35 +1280,41 @@ fn live_sites_fallback_matrix_and_forged_refuse() {
     );
     assert_eq!(marker.signers_set(&net.vs), legacy_set);
 
-    // FORGED proof bytes under a KNOWN key ⇒ the whole micro-cert refuses.
+    // FORGED proof bytes under a KNOWN key ⇒ ignored under the retired live
+    // gate: legacy fallback verifies (armed-height refusal is pinned by the
+    // explicit-FromHeight forged-seal suites).
     let seal = seal_for(&net, 0, h, ROUND);
     let mut bad_proof = seal.proof.clone();
     bad_proof.proof[7] ^= 0x01;
     let forged_seal = VrfBeaconSeal::new(net.ids[0], bad_proof);
     let forged_cert = base().with_vrf_beacon(forged_seal);
     let marker = marker_only_qc_live(&forged_cert, net.block_hash);
+    // GATE (VRF arming retired): Disabled ignores the forged seal.
     assert!(
-        !marker.verify_unified(&net.vs),
-        "forged proof bytes must refuse on the live path"
+        marker.verify_unified(&net.vs),
+        "Disabled live gate ignores the forged seal: legacy verifies"
     );
-    assert!(
-        marker.signers_set(&net.vs).is_empty(),
-        "forged proof must attribute nobody on the live path"
+    assert_eq!(
+        marker.signers_set(&net.vs),
+        legacy_set,
+        "Disabled live gate attributes the legacy committee"
     );
 
-    // Substituted `output` (proof verifies, field mismatches) ⇒ refuse too.
+    // Substituted `output` (proof verifies, field mismatches) ⇒ ignored too.
     let mut bad_out = seal.proof.clone();
     bad_out.output[3] ^= 0x40;
     let swapped_seal = VrfBeaconSeal::new(net.ids[0], bad_out);
     let swapped_cert = base().with_vrf_beacon(swapped_seal);
     let marker = marker_only_qc_live(&swapped_cert, net.block_hash);
+    // GATE (VRF arming retired): Disabled ignores the substituted output.
     assert!(
-        !marker.verify_unified(&net.vs),
-        "substituted output must refuse on the live path"
+        marker.verify_unified(&net.vs),
+        "Disabled live gate ignores the substituted output: legacy verifies"
     );
-    assert!(
-        marker.signers_set(&net.vs).is_empty(),
-        "substituted output must attribute nobody on the live path"
+    assert_eq!(
+        marker.signers_set(&net.vs),
+        legacy_set,
+        "Disabled live gate attributes the legacy committee"
     );
 
     // Missing registry (nothing to check against) + armed env + valid seal ⇒

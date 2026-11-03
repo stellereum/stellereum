@@ -28,7 +28,9 @@ pub struct PeerConfig {
     pub ed_pub: String,
     pub x_pub: String,
     /// Falcon-512 long-term PQ public key (897 bytes, hex). `None` (absent)
-    /// = classical-only peer, explicit — never inferred. PQ 9.0, default-off:
+    /// = classical-only peer, explicit — never inferred. PQ 9.0 field,
+    /// handshake default-ON since PQ 9.1 (absent stays classical-explicit
+    /// pre-H, refused at/after `proto::PQ_CLASSICAL_REFUSE_AFTER_HEIGHT`):
     /// old configs without this key parse unchanged (`serde(default)`).
     #[serde(default)]
     pub pq_pub: Option<String>,

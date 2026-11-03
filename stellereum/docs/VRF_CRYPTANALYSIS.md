@@ -138,3 +138,9 @@ sufficient for NO-GO and fully removed by the planned audited-ECVRF swap.
 ## 5. Classical status + LaV endgame (FULL-PQ verdict)
 
 ECVRF-EDWARDS25519 is CLASSICAL: Shor breaks the Edwards25519 discrete log and forges arbitrary proofs/outputs, so in the FULL-PQ architecture VRF stays default-off (`VrfActivation::Disabled`, parent-hash draw live) and sortition MUST NOT consume ECVRF output on the PQ path while `VRF_IS_POST_QUANTUM` reads `false` (pinned by `vrf_is_marked_classical_not_post_quantum`); any non-PQ use is LEGACY-ONLY behind a lead-defined opt-in, never a default. The PQ-native endgame is the LaV lattice VRF (`docs/PQ_VRF_LAV_FEASIBILITY.md`): long-term stateless with uniqueness YES under Module-LWR, but ~10.27 KB proofs, unpublished timings, unaudited research code, and 4–6 person-months plus external audit before any consensus wiring — so LaV stays research-only and nothing about the classical verdict changes until an audited, standardized PQ VRF lands.
+
+## 6. Canonical-draw decision (LEAD, 2026-11-03): VRF arming retired
+LEAD DECISION: the parent-hash draw is THE canonical sortition mechanism; `STELL_VRF_ACTIVATION_HEIGHT` is retired.
+If set it warns loudly and is ignored (`vrf_activation_from_env` always returns `Disabled`): stale configs arm nothing, never panic.
+Pinned by `tests/vrf_canonical_draw_tests.rs`: a PQ-enforced run with the VRF module present-but-off elects byte-identically to the parent-hash draw (no VRF output consulted).
+The ECVRF module stays, marked classical and off — deletion was rejected (blast radius); a PQ-native VRF stays future work per §5.

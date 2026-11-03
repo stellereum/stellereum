@@ -28,7 +28,7 @@ use stellereum::consensus::{
 };
 use stellereum::post_quantum::FalconKeypair;
 use stellereum::vrf::{
-    verify_vrf_seed_for_validator, vrf_activation_from_env, vrf_binding_preimage, vrf_election_seed,
+    verify_vrf_seed_for_validator, vrf_activation_from_env, vrf_binding_preimage,
     vrf_prove, VrfActivation, VrfBinding, VrfRegistry, VrfSecret, VRF_ACTIVATION_HEIGHT_ENV,
 };
 
@@ -154,16 +154,11 @@ fn default_off_identity_same_schedule_with_and_without_env() {
         );
     }
 
-    // A scheduled height parses to the boundary (the value main.rs logs).
+    // GATE (VRF arming retired): a configured height is IGNORED — the env
+    // always reads `Disabled` with a loud WARN (parent-hash draw canonical).
     std::env::set_var(VRF_ACTIVATION_HEIGHT_ENV, ACTIVATION_H.to_string());
-    assert_eq!(
-        vrf_activation_from_env(),
-        VrfActivation::FromHeight(ACTIVATION_H)
-    );
-    assert_eq!(
-        vrf_activation_from_env().boundary(),
-        Some(ACTIVATION_H)
-    );
+    assert_eq!(vrf_activation_from_env(), VrfActivation::Disabled);
+    assert_eq!(vrf_activation_from_env().boundary(), None);
 }
 
 // --- 2. activation-height boundary -------------------------------------------
@@ -172,9 +167,12 @@ fn default_off_identity_same_schedule_with_and_without_env() {
 fn activation_boundary_below_legacy_at_and_above_vrf_gated() {
     let _gate = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let _restore = EnvRestore::save(&[VRF_ACTIVATION_HEIGHT_ENV]);
+    // GATE (VRF arming retired): env arming is IGNORED — always Disabled,
+    // no height is ever active via the env (parent-hash draw canonical).
     std::env::set_var(VRF_ACTIVATION_HEIGHT_ENV, ACTIVATION_H.to_string());
     let activation = vrf_activation_from_env();
-    assert!(activation.is_active_at(ACTIVATION_H));
+    assert_eq!(activation, VrfActivation::Disabled);
+    assert!(!activation.is_active_at(ACTIVATION_H));
     assert!(!activation.is_active_at(ACTIVATION_H - 1));
 
     let (vs, ids) = fixture_set();
@@ -202,21 +200,21 @@ fn activation_boundary_below_legacy_at_and_above_vrf_gated() {
         );
     }
 
-    // At and above the boundary WITH a verified output: the seed IS the VRF
-    // election seed (not the parent seed), and the committee follows it.
+    // GATE (VRF arming retired): at/above the RETIRED boundary the gate is
+    // Disabled, so even a verified output is IGNORED — canonical parent-hash
+    // draw, byte-identical to the legacy path.
     for h in [ACTIVATION_H, ACTIVATION_H + 1, ACTIVATION_H + 1_000] {
         let verified = minted_output_for(&reg, &ids[0], &secrets[0], h, 2, &parent);
         let gated = sortition_seed_gated(&parent, h, 2, &activation, Some(&verified));
-        assert_eq!(gated, vrf_election_seed(&verified, h, 2));
-        assert_ne!(
+        assert_eq!(
             gated,
             sortition_seed(&parent, h, 2),
-            "post-activation must leave the parent-hash seed (h={h})"
+            "retired gate must ignore even a valid VRF output (h={h})"
         );
         assert_eq!(
             derive_sortition_committee_gated(&vs, h, 2, 2, &parent, &activation, Some(&verified)),
-            derive_sortition_committee_gated(&vs, h, 2, 2, &parent, &activation, Some(&verified)),
-            "post-activation committee must be a pure function of the VRF seed"
+            derive_sortition_committee(&vs, h, 2, 2, &parent),
+            "retired gate elects the legacy committee (h={h})"
         );
     }
 

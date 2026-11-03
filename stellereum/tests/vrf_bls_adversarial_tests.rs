@@ -471,17 +471,15 @@ fn boundary_activation_heights_fail_closed() {
     assert!(is_bls_active(u64::MAX, u64::MAX));
     assert!(!is_bls_active(0, u64::MAX));
 
-    // Env parsing never panics on boundary spellings.
+    // Env parsing never panics on boundary spellings — and (GATE: VRF arming
+    // retired) every configured value reads `Disabled`, never a boundary.
     let saved = std::env::var(VRF_ACTIVATION_HEIGHT_ENV).ok();
     std::env::set_var(VRF_ACTIVATION_HEIGHT_ENV, u64::MAX.to_string());
-    assert_eq!(
-        vrf_activation_from_env(),
-        VrfActivation::FromHeight(u64::MAX)
-    );
+    assert_eq!(vrf_activation_from_env(), VrfActivation::Disabled);
     std::env::set_var(VRF_ACTIVATION_HEIGHT_ENV, "0");
-    assert_eq!(vrf_activation_from_env(), VrfActivation::FromHeight(0));
+    assert_eq!(vrf_activation_from_env(), VrfActivation::Disabled);
     std::env::set_var(VRF_ACTIVATION_HEIGHT_ENV, "1");
-    assert_eq!(vrf_activation_from_env(), VrfActivation::FromHeight(1));
+    assert_eq!(vrf_activation_from_env(), VrfActivation::Disabled);
     std::env::set_var(VRF_ACTIVATION_HEIGHT_ENV, "not-a-height");
     assert_eq!(vrf_activation_from_env(), VrfActivation::Disabled);
     match saved {

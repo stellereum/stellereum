@@ -767,19 +767,6 @@ pub fn stell_to_evm_hash(stell_hash: &[u8; 32]) -> Option<String> {
     STELL_TO_EVM.lock().ok()?.get(stell_hash).cloned()
 }
 
-/// Test helper: drop every settlement link (isolates pending->mined tests).
-pub fn clear_evm_settlement_maps_for_test() {
-    if let Ok(mut fwd) = EVM_TO_STELL.lock() {
-        fwd.clear();
-    }
-    if let Ok(mut rev) = STELL_TO_EVM.lock() {
-        rev.clear();
-    }
-    if let Ok(mut pending) = EVM_PENDING_TXS.lock() {
-        pending.clear();
-    }
-}
-
 /// True when `tx.signature` carries a secp settlement envelope (`SC1` magic).
 pub fn is_secp_settlement_tx(tx: &crate::sharding::Transaction) -> bool {
     tx.signature.len() == SECP_ENVELOPE_LEN && tx.signature.starts_with(SECP_ENVELOPE_MAGIC)
@@ -1557,6 +1544,8 @@ impl FilterManager {
     /// Test/debug helper: backdates a filter's `last_poll` beyond the TTL so
     /// that the next `get_filter_changes` / `get_filter_logs` treats it as
     /// expired. Returns `false` if the filter does not exist.
+    /// Absent from production builds (`any(test, debug_assertions)` only).
+    #[cfg(any(test, debug_assertions))]
     pub fn expire_filter_for_test(&self, id: &str) -> bool {
         let norm_id = normalize_filter_id(id);
         let mut filters = self.filters.write().unwrap();

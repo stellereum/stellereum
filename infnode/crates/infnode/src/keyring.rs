@@ -278,7 +278,8 @@ impl NodeKeys {
     }
 }
 
-/// PQ long-term identity (Falcon-512), landed PQ 9.0, default-off.
+/// PQ long-term identity (Falcon-512), landed PQ 9.0, default-ON since 9.1
+/// (first boot auto-generates via [`PqKeys::load_or_generate`]).
 ///
 /// File convention — mirrors the `identity.key` precedent exactly:
 /// - file: `<keys-dir>/pq-identity.key` (constant [`PQ_IDENTITY_FILE`]);
@@ -374,6 +375,29 @@ impl PqKeys {
         // function of it, so round-trip regenerates the identical keypair.
         let stored = Self::load_seed(dir)?;
         Ok(Some(Self::from_seed(stored)))
+    }
+
+    /// First-boot ensure (PQ 9.1, default-ON): load if present, else generate
+    /// fresh (OS randomness) and save with 0600/0700 discipline, returning
+    /// the new identity. Mirrors the `identity.key` precedent exactly: the
+    /// `main.rs` key-load sites do `if exists { load } else { generate +
+    /// save }` for the classical keys — this is the same shape for
+    /// `pq-identity.key`, so every booting node picks up PQ with no
+    /// ceremony. Corrupt/unreadable content propagates as a hard error via
+    /// `load_opt` (fail closed — never a silent classical downgrade), as do
+    /// insecure permissions and save failures.
+    pub fn load_or_generate(dir: &Path) -> Result<Self> {
+        if let Some(keys) = Self::load_opt(dir)? {
+            return Ok(keys);
+        }
+        let keys = Self::generate();
+        keys.save(dir)?;
+        eprintln!(
+            "[PQ] generated new {} in {} (0600, Falcon-512) — first boot, no ceremony needed",
+            PQ_IDENTITY_FILE,
+            dir.display()
+        );
+        Ok(keys)
     }
 
     /// The seed cannot be recovered from the keypair encodings, so `save`

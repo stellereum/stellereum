@@ -486,15 +486,29 @@ const TESTKEY_HEX: &str = "11111111111111111111111111111111111111111111111111111
 
 #[test]
 fn f7_serving_refuses_test_key_that_genesis_allows() {
+    // GATE (LEAD b: serving requires STELL_FAUCET_KEY_FILE): the serving
+    // loader now reads the test key from a FILE. Serving still hard-refuses
+    // it without the dev override; genesis still warns-but-returns; the
+    // override re-opens serving only. Same verdicts, file-sourced.
     use stellereum::rpc;
     let _env = EnvGuard::take(&[
         rpc::FAUCET_KEY_ENV,
         rpc::FAUCET_KEY_FILE_ENV,
         rpc::DEV_UNSAFE_TESTKEY_ENV,
     ]);
+    std::env::remove_var(rpc::FAUCET_KEY_ENV);
     std::env::remove_var(rpc::FAUCET_KEY_FILE_ENV);
     std::env::remove_var(rpc::DEV_UNSAFE_TESTKEY_ENV);
-    std::env::set_var(rpc::FAUCET_KEY_ENV, TESTKEY_HEX);
+    let dir = std::env::temp_dir().join(format!("stell_f7_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("faucet.key");
+    std::fs::write(&path, format!("{TESTKEY_HEX}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    std::env::set_var(rpc::FAUCET_KEY_FILE_ENV, &path);
 
     // SERVING loader: hard refusal of the well-known public test key.
     let serving = rpc::load_faucet_seed();
@@ -505,13 +519,15 @@ fn f7_serving_refuses_test_key_that_genesis_allows() {
     assert!(serving.unwrap_err().contains("PUBLIC test key"));
 
     // GENESIS loader: warns but returns (root determinism for chains founded
-    // with the test key). Same env, same bytes — different verdict.
+    // with the test key). Same key file, same bytes — different verdict.
     let genesis = rpc::load_faucet_seed_for_genesis();
     assert_eq!(genesis, Ok(rpc::TEST_FAUCET_SEED));
 
     // Explicit dev opt-in re-opens SERVING only (never the default).
     std::env::set_var(rpc::DEV_UNSAFE_TESTKEY_ENV, "1");
     assert_eq!(rpc::load_faucet_seed(), Ok(rpc::TEST_FAUCET_SEED));
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_dir(&dir).ok();
 }
 
 #[test]

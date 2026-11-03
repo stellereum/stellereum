@@ -6927,9 +6927,10 @@ enum WalletCommands {
     /// base fee + activation surcharge) — it fits the existing verifier, no
     /// consensus change. Fail-closed: a bad seed is refused here, never
     /// silently downgraded to an ed25519 (or unsigned) transaction.
-    /// Key-derivation caveat: run with the SAME `STELL_LEGACY_GENESIS_ROOT`
-    /// as the nodes (local-cluster: `1`), or the derived address misses the
-    /// funded account and the node refuses for insufficient balance.
+    /// Key-derivation caveat: the derivation is strict-only (LEAD: no
+    /// legacy branch) — the funded account is always the address this
+    /// derivation produces; a mismatched seed means the node refuses for
+    /// insufficient balance.
     SendPq {
         /// Falcon-512 seed in hex (32 bytes). For the genesis-funded faucet
         /// account this is the shared `STELL_FAUCET_KEY` seed (dev only).
@@ -7538,6 +7539,30 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             // process). Unset/empty => just the CLI shard, i.e. the pre-sharding
             // behaviour with `is_sharded() == false`.
             let registry = ShardRegistry::from_env_or(shard);
+            // Protocol-freeze boot guard (docs/PUBLIC_TESTNET_CODE_GAPS.md §1):
+            // single-shard {0} canonical for public launch. Any other registry
+            // (STELL_SHARDS != {0}) refuses startup unless the local
+            // soak/test hatch STELL_EXPERIMENTAL_SHARDS=1 is set (loudly
+            // logged below). Fail-closed; the default {0} path is untouched.
+            if let Err(e) = stellereum::sharding::check_workchain_boot_guard(&registry) {
+                eprintln!("{e}");
+                tracing::error!("{e}");
+                anyhow::bail!("{e}");
+            }
+            if registry != ShardRegistry::single() {
+                // Hatch path only (guard above refused the non-hatch case).
+                tracing::warn!(
+                    "[workchain-guard] EXPERIMENTAL multishard boot: shards {{{}}} \
+                     allowed only by {}=1 (local soak/tests, NOT public protocol; \
+                     see docs/PUBLIC_TESTNET_CODE_GAPS.md §1)",
+                    registry
+                        .ids()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    stellereum::sharding::EXPERIMENTAL_SHARDS_ENV
+                );
+            }
             // Copy out once: the shutdown handler below moves it into an
             // `async move` block, and the extras loop still needs the registry.
             let sharded = registry.is_sharded();
@@ -8081,12 +8106,14 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         .ok()
                         .filter(|s| s == "1" || s.eq_ignore_ascii_case("true"))
                         .and_then(|_| {
-                            // Faucet key: STELL_FAUCET_KEY_FILE (0600-checked,
-                            // zeroized) wins when set, else STELL_FAUCET_KEY.
-                            // Fail-closed: a bad file, bad hex, or the PUBLIC
-                            // test key without STELL_DEV_UNSAFE_TESTKEY=1
-                            // refuses to start the faucet LOUDLY (no silent
-                            // money-printing on a guessable key).
+                            // Faucet key: STELL_FAUCET_KEY_FILE is REQUIRED
+                            // (0600-checked, zeroized). Inline STELL_FAUCET_KEY
+                            // alone leaves the faucet DISABLED fail-closed
+                            // (genesis-funding only). Fail-closed: a bad file,
+                            // or the PUBLIC test key without
+                            // STELL_DEV_UNSAFE_TESTKEY=1, refuses to start the
+                            // faucet LOUDLY (no silent money-printing on a
+                            // guessable key).
                             let seed = match stellereum::rpc::load_faucet_seed() {
                                 Ok(seed) => zeroize::Zeroizing::new(seed),
                                 Err(e) => {

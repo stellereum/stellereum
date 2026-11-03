@@ -158,12 +158,12 @@ pub async fn fund_genesis(engine: &InMemoryStateEngine, validators: &ValidatorSe
         } else {
             // SEC-ECON-01: Transfer bond from validator account to STAKING_POOL
             // so genesis stake is fully backed and STAKING_POOL is solvent.
-            if std::env::var("STELL_LEGACY_GENESIS_ROOT").as_deref() != Ok("1") {
-                let _ = engine.debit_native(v, bond).await;
-                let _ = engine
-                    .credit_native(&crate::staking::STAKING_POOL, bond)
-                    .await;
-            }
+            // Strict-only (LEAD: no legacy branch): every genesis takes this
+            // path unconditionally.
+            let _ = engine.debit_native(v, bond).await;
+            let _ = engine
+                .credit_native(&crate::staking::STAKING_POOL, bond)
+                .await;
         }
     }
 }

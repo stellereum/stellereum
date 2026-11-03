@@ -722,8 +722,22 @@ fn extract_turnstile_token(headers: &HeaderMap, body: &[u8]) -> Option<String> {
 /// Defenses, all enforced before any mint:
 /// - per-address 45-minute cooldown (persisted, survives restarts);
 /// - per-IP hourly budget (shared throttle with the token faucet path);
-/// - Cloudflare Turnstile captcha, when `STELL_TURNSTILE_SITE_KEY` +
-///   `STELL_TURNSTILE_SECRET_KEY` are set (see [`crate::turnstile`]).
+/// - Cloudflare Turnstile captcha, REQUIRED on non-loopback claims.
+///
+/// OPERATOR CONTRACT (fail-closed):
+/// - Set BOTH `STELL_TURNSTILE_SITE_KEY` (public, embedded in the explorer
+///   HTML) and `STELL_TURNSTILE_SECRET_KEY` (server-only, verified via
+///   Cloudflare `siteverify`) to enable the captcha; the gate then verifies
+///   every public claim BEFORE any budget is consumed or funds move.
+/// - When NEITHER key is set (`CaptchaConfig::Disabled`) public claims from
+///   non-loopback client IPs are refused with `503 captcha not configured`
+///   and nothing dispenses (no throttle consumed, no mint queued).
+/// - Loopback clients (`client_ip.is_loopback()`, i.e. local dev/tests over
+///   `127.0.0.0/8` or `::1`) keep the legacy IP-throttle-only path so the
+///   existing faucet tests stay green without weakening asserts.
+/// - Exactly ONE key set (`CaptchaConfig::Misconfigured`) is always `503`,
+///   loopback included: refusing beats dispensing while the operator believes
+///   the captcha is on.
 ///
 /// Check order (deliberate):
 /// 1. address validation — free; a malformed address must never reach
@@ -731,6 +745,7 @@ fn extract_turnstile_token(headers: &HeaderMap, body: &[u8]) -> Option<String> {
 /// 2. Turnstile captcha (when configured) — fail-closed: verified BEFORE
 ///    consuming IP throttle quota to prevent quota exhaustion on shared NAT IPs
 ///    (missing token → 400, Cloudflare rejection → 403, siteverify unreachable → 503);
+///    unconfigured + non-loopback → 503 "captcha not configured";
 /// 3. per-IP hourly throttle;
 /// 4. mint/dispense.
 async fn api_faucet_public(
@@ -816,7 +831,21 @@ async fn api_faucet_public(
                 }
             }
         }
-        crate::turnstile::CaptchaConfig::Disabled => {}
+        crate::turnstile::CaptchaConfig::Disabled => {
+            // Fail-closed default: an unconfigured captcha must not dispense to
+            // the public internet. Loopback (local dev/tests) keeps the legacy
+            // IP-throttle-only path; everything else is 503 with no funds
+            // moved, no throttle consumed. NOTE: behind a reverse proxy the
+            // operator must forward the client IP (STELL_TRUSTED_PROXY_CIDRS /
+            // X-Forwarded-For) so public traffic is not misread as loopback.
+            if !client_ip.is_loopback() {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "public faucet captcha is not configured on this node (set STELL_TURNSTILE_SITE_KEY and STELL_TURNSTILE_SECRET_KEY); refusing to dispense",
+                )
+                    .into_response();
+            }
+        }
     }
     // (3) Per-IP drip throttle after captcha verification.
     if !faucet.check_ip_throttle(Some(client_ip), now_secs).await {

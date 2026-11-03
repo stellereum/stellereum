@@ -400,9 +400,13 @@ pub fn experimental_shards_hatch_enabled() -> bool {
 /// freeze, see [`WORKCHAIN_FREEZE_DOC`]).
 ///
 /// * `Ok(())` — registry is exactly `{MASTERCHAIN_SHARD}` (default path,
-///   byte-identical), or the experimental hatch is enabled.
+///   byte-identical), or the experimental hatch is enabled AND the registry
+///   is a VALID configured set (see [`ShardRegistry::validate`]: every
+///   multi-shard set names the masterchain and stays within the shard cap).
 /// * `Err(msg)` — any other registry (`STELL_SHARDS != {0}`, i.e. any
-///   multishard request or any non-canonical single shard) without the hatch.
+///   multishard request or any non-canonical single shard) without the hatch,
+///   or an INVALID registry (missing masterchain, over the cap) even WITH the
+///   hatch: the hatch allows the CONFIGURED set, not just any set.
 ///   The message names the freeze doc, both env vars, and the recovery.
 ///
 /// Pure except for the hatch env read; use
@@ -413,6 +417,10 @@ pub fn check_workchain_boot_guard(registry: &ShardRegistry) -> Result<(), String
 
 /// Deterministic core of [`check_workchain_boot_guard`]: `hatch` is the
 /// already-resolved `STELL_EXPERIMENTAL_SHARDS=1` flag.
+///
+/// The hatch allows the CONFIGURED set, not just any set: a registry that
+/// fails [`ShardRegistry::validate`] (multi-shard without the masterchain,
+/// or over the shard cap) is refused even with the hatch set, fail-closed.
 pub fn check_workchain_boot_guard_with_hatch(
     registry: &ShardRegistry,
     hatch: bool,
@@ -420,6 +428,7 @@ pub fn check_workchain_boot_guard_with_hatch(
     if *registry == ShardRegistry::single() {
         return Ok(());
     }
+    registry.validate()?;
     if hatch {
         return Ok(());
     }
@@ -482,6 +491,12 @@ impl ShardRegistry {
     /// Parse the registry from the environment, falling back to `cli_shard`
     /// when `STELL_SHARDS` is unset or empty. With the CLI default of 0 this is
     /// exactly `{MASTERCHAIN_SHARD}`, preserving single-shard behaviour.
+    ///
+    /// LENIENT (legacy): unparsable entries are skipped and duplicates
+    /// collapse, so garbage can silently shrink to the default. New boot code
+    /// must use [`ShardRegistry::parse_list`] (fail-closed) for an explicitly
+    /// set `STELL_SHARDS`; this stays for the unset/empty default path and for
+    /// existing callers.
     pub fn from_env_or(cli_shard: ShardId) -> Self {
         match std::env::var(SHARD_REGISTRY_ENV) {
             Ok(v) if !v.trim().is_empty() => {
@@ -493,6 +508,94 @@ impl ShardRegistry {
             }
             _ => Self::from_ids([cli_shard]),
         }
+    }
+
+    /// Parse an explicitly set `STELL_SHARDS` value, fail-closed.
+    ///
+    /// * empty value / empty entry (`"0,,1"`, whitespace-only) → `Err`;
+    /// * an entry that is not a shard id (`"0,abc"`) → `Err` naming it;
+    /// * a duplicate id (`"0,1,1"`) → `Err` naming it (the `BTreeSet`
+    ///   backing would otherwise collapse it silently);
+    /// * more than [`MAX_SHARDS`] ids → `Err` naming the cap;
+    /// * a MULTI-shard set without [`MASTERCHAIN_SHARD`] → `Err` (every
+    ///   configured process runs the masterchain; a lone non-masterchain
+    ///   single shard stays the boot guard's business, not a parse error).
+    ///
+    /// On success the ids are unique and iterate in ascending order (the
+    /// `BTreeSet` backing), so the registry IS the sorted N-shard set.
+    pub fn parse_list(raw: &str) -> Result<Self, String> {
+        if raw.trim().is_empty() {
+            return Err(format!(
+                "REFUSING startup: {env} is empty (set {env}=<id>[,<id>...], e.g. {env}=0,1,2, or unset it for the canonical single-shard {{0}})",
+                env = SHARD_REGISTRY_ENV,
+            ));
+        }
+        let mut ids: Vec<ShardId> = Vec::new();
+        for (i, tok) in raw.split(',').enumerate() {
+            let t = tok.trim();
+            if t.is_empty() {
+                return Err(format!(
+                    "REFUSING startup: {env}={raw:?} has an empty entry at position {i} (every entry must be a shard id)",
+                    env = SHARD_REGISTRY_ENV,
+                ));
+            }
+            let id: ShardId = t.parse().map_err(|_| {
+                format!(
+                    "REFUSING startup: {env}={raw:?} has an invalid shard id `{t}` at position {i} (every entry must be a non-negative integer)",
+                    env = SHARD_REGISTRY_ENV,
+                )
+            })?;
+            if ids.contains(&id) {
+                return Err(format!(
+                    "REFUSING startup: {env}={raw:?} lists shard id {id} twice (ids must be unique)",
+                    env = SHARD_REGISTRY_ENV,
+                ));
+            }
+            ids.push(id);
+        }
+        let registry = Self::from_ids(ids);
+        registry.validate()?;
+        Ok(registry)
+    }
+
+    /// Fail-closed config check for a registry, independent of the hatch.
+    ///
+    /// * more than [`MAX_SHARDS`] shards → `Err` (the topology hard cap:
+    ///   the process must never configure more shards than the network can
+    ///   hold);
+    /// * a MULTI-shard set without [`MASTERCHAIN_SHARD`] → `Err` (every
+    ///   configured process runs the masterchain; cross-shard proofs anchor
+    ///   to it).
+    ///
+    /// A single non-masterchain shard (`{1}`) PASSES: it is non-canonical but
+    /// not malformed — refusing it is the boot guard's freeze business (which
+    /// still refuses it without the hatch), and the pinned guard tests cover
+    /// exactly that.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.shards.len() > MAX_SHARDS {
+            return Err(format!(
+                "REFUSING startup: {env} configures {} shards {{{}}} — over the shard cap {cap} (reduce to at most {cap} comma-separated ids)",
+                self.shards.len(),
+                self.ids()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                env = SHARD_REGISTRY_ENV,
+                cap = MAX_SHARDS,
+            ));
+        }
+        if self.is_sharded() && !self.shards.contains(&MASTERCHAIN_SHARD) {
+            return Err(format!(
+                "REFUSING startup: {env} configures {{{}}} without the masterchain shard {master} (every multi-shard process must include {master})",
+                self.ids()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                env = SHARD_REGISTRY_ENV,
+                master = MASTERCHAIN_SHARD,
+            ));
+        }
+        Ok(())
     }
 
     /// True when this process runs MORE THAN ONE shard. This is the single gate

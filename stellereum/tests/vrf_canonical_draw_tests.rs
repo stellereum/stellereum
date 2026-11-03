@@ -2,18 +2,19 @@
 //!
 //! Lead decision: `STELL_VRF_ACTIVATION_HEIGHT` arming is retired (setting it
 //! warns loudly and is ignored — `vrf_activation_from_env` always returns
-//! `Disabled`), the ECVRF module stays compiled in but classical and off
-//! (`VRF_IS_POST_QUANTUM == false`), and election math is untouched.
+//! `Disabled`), the ECVRF prove/verify bodies are removed (classical, off),
+//! and election math is untouched.
 //!
 //! What this pins (read-only against the draw — no caller rewiring):
 //! * Retired flag: any configured `STELL_VRF_ACTIVATION_HEIGHT` value (a valid
 //!   height, garbage, whitespace) reads `Disabled` with no panic; the
 //!   boundary is `None` and no height is active.
 //! * Canonical draw: on the PQ-enforced path (`set_pure_pq_override(Some(true))`)
-//!   with the VRF module present-but-off (populated registry, freshly minted
-//!   and verified ECVRF outputs offered to the gate), the gated draw is
-//!   byte-identical to the legacy parent-hash draw — the VRF output is never
-//!   consulted. Fixed vectors pin the canonical bytes.
+//!   with the VRF registry present-but-off (populated, Falcon-bound) and
+//!   dummy output bytes offered to the gate, the gated draw is
+//!   byte-identical to the legacy parent-hash draw — no output is ever
+//!   consulted (nothing can mint one: prove/verify are removed). Fixed
+//!   vectors pin the canonical bytes.
 //!
 //! No quorum, lock, timeout, vote, or certificate changes: seeds/committees only.
 
@@ -23,8 +24,8 @@ use stellereum::consensus::{
 };
 use stellereum::post_quantum::{set_pure_pq_override, FalconKeypair};
 use stellereum::vrf::{
-    verify_vrf_seed_for_validator, vrf_activation_from_env, vrf_binding_preimage, vrf_prove,
-    VrfActivation, VrfBinding, VrfRegistry, VrfSecret, VRF_ACTIVATION_HEIGHT_ENV, VRF_IS_POST_QUANTUM,
+    vrf_activation_from_env, vrf_binding_preimage, VrfActivation, VrfBinding, VrfRegistry, VrfSecret,
+    VRF_ACTIVATION_HEIGHT_ENV, VRF_IS_POST_QUANTUM,
 };
 
 // Canonical fixed vectors (same bytes as the pre-gate path pins):
@@ -76,16 +77,17 @@ fn fixture_set() -> (ValidatorSet, Vec<[u8; 32]>) {
     (vs, ids)
 }
 
-/// VRF module present: every validator holds a Falcon-bound registered key and
-/// mints real, registry-verified ECVRF outputs — yet stays OFF (no activation).
-fn present_but_off_registry(ids: &[[u8; 32]]) -> (VrfRegistry, Vec<VrfSecret>) {
+/// VRF registry present: every validator holds a Falcon-bound registered key —
+///
+/// yet the gate stays OFF (no activation), and nothing can mint outputs
+/// (prove/verify removed), so only inert dummy bytes are ever offered.
+fn present_but_off_registry(ids: &[[u8; 32]]) -> VrfRegistry {
     let mut reg = VrfRegistry::new();
-    let mut secrets = Vec::new();
     for (i, id) in ids.iter().enumerate() {
         let falcon_seed = [(i as u8).wrapping_add(0x70); 32];
         let falcon = FalconKeypair::generate_from_seed_bytes(&falcon_seed);
-        let sk = VrfSecret::from_seed(&[(i as u8).wrapping_add(0x42); 32]);
-        let vrf_pk = sk.public_key().to_bytes();
+        let vrf_sk = VrfSecret::from_seed(&[(i as u8).wrapping_add(0x42); 32]);
+        let vrf_pk = vrf_sk.public_key().to_bytes();
         let sig = falcon.sign(&vrf_binding_preimage(id, &vrf_pk));
         reg.register(
             &VrfBinding {
@@ -96,9 +98,8 @@ fn present_but_off_registry(ids: &[[u8; 32]]) -> (VrfRegistry, Vec<VrfSecret>) {
             falcon.public_key(),
         )
         .expect("honest binding registers");
-        secrets.push(sk);
     }
-    (reg, secrets)
+    reg
 }
 
 #[test]
@@ -158,7 +159,7 @@ fn canonical_draw_consumed_on_pq_path_vrf_output_never_read() {
     assert_eq!(startup, VrfActivation::Disabled);
 
     let (vs, ids) = fixture_set();
-    let (reg, secrets) = present_but_off_registry(&ids);
+    let reg = present_but_off_registry(&ids);
     assert_eq!(reg.len(), 4);
 
     // Canonical bytes pinned: the parent-hash seed and committee for the
@@ -170,22 +171,19 @@ fn canonical_draw_consumed_on_pq_path_vrf_output_never_read() {
         vec![h32(PIN_COMM_PRE_0), h32(PIN_COMM_PRE_1)]
     );
 
-    // Sweep: every gated draw with a FRESHLY MINTED, registry-VERIFIED ECVRF
-    // output offered equals the parent-hash draw — the output is never read
-    // while the gate is Disabled (the existing off-switch; callers unwired).
+    // Sweep: every gated draw with inert dummy output bytes offered equals
+    // the parent-hash draw — no output is ever read while the gate is
+    // Disabled (nothing live can mint a verified output: prove/verify are
+    // removed, so the bytes below stand in for "whatever a caller offers").
     let parents = [[0x5Au8; 32], [0x6Bu8; 32], [0x00u8; 32], [0xFFu8; 32]];
     for p in &parents {
         for h in [0u64, 1, 9, 999_999, 1_000_000, 1_000_001] {
             for r in [0u32, 1, 2] {
-                let seed_input = sortition_seed(p, h, r);
-                let proof = vrf_prove(&secrets[0], &seed_input);
-                let verified =
-                    verify_vrf_seed_for_validator(&reg, &ids[0], &seed_input, &proof)
-                        .expect("present module mints verified output");
+                let verified = [0xABu8; 32];
                 assert_eq!(
                     sortition_seed_gated(p, h, r, &startup, Some(&verified)),
                     sortition_seed(p, h, r),
-                    "Disabled gate must not read the VRF output (h={h} r={r})"
+                    "Disabled gate must not read the offered output (h={h} r={r})"
                 );
                 for k in [0u32, 1, 2, 3, 4, 100] {
                     assert_eq!(

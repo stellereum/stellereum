@@ -1,5 +1,8 @@
 use anyhow::{anyhow, bail, Result};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, VerifyingKey};
+use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -758,6 +761,115 @@ pub fn pq_falcon_policy_at(
         return Err("pq falcon tag failed");
     }
     Ok(PqMode::Pq)
+}
+
+// TRANSPORT-KEX FULL: AEAD frame bodies under the established hybrid
+// session key when PQ is negotiated. Additive only: no existing function,
+// layout, or domain above is modified, so classical sessions stay
+// byte-identical (they never call these helpers; the classical wire path is
+// `Frame::{encode,decode,verify}` + `session_key`/`e2e_key_from_shared`,
+// pinned by existing KATs).
+//
+// Key: `pq_hybrid_session_key(classical, pq_shared, digest)` — same
+// derivation and transcript shapes as the handshake (`PqTranscript::digest`
+// with `PQ_SUITE_MLKEM768_HYBRID`). Cipher: XChaCha20-Poly1305, same idiom
+// as `mailbox::seal`/`node::e2e_encrypt_det` (no new deps). Classical e2e
+// uses empty AAD; PQ frames bind a canonical AAD
+// (`KEX_FRAME_DOMAIN || header || session digest`) so a body sealed in one
+// session never opens in another (key differs AND aad differs — both layers
+// fail closed).
+//
+// Key rotation / epoch: the session key is fixed for the lifetime of one
+// connection (`sessions: stable_id -> [u8;32]` in `node.rs`, read-only here).
+// There is no mid-connection re-key in scope; re-key = reconnect (fresh
+// ephemeral X25519 + fresh ML-KEM encap => fresh hybrid key). Wiring these
+// helpers into `node.rs frame_loop` is the sibling's zone; this module only
+// provides the fail-closed seal/open primitives + tests.
+//
+/// Domain separating PQ frame AAD from classical e2e (which uses empty AAD).
+pub const KEX_FRAME_DOMAIN: &[u8] = b"infnode-frame-v1";
+/// XChaCha nonce length for frame bodies (same 24 B as `Frame.nonce` legit use).
+pub const KEX_FRAME_NONCE_LEN: usize = 24;
+
+/// Canonical AAD binding a sealed body to its frame header + PQ session:
+/// `KEX_FRAME_DOMAIN || kind u8 || seq le32 || ts le64 || src20 || dst20 ||
+/// svc le64 || session_digest32`. Any header or session swap changes the AAD
+/// and `kex_frame_open` refuses (no silent cross-frame/cross-session accept).
+pub fn kex_frame_aad(
+    kind: u8,
+    seq: u32,
+    ts: i64,
+    src: &[u8; NODEID_LEN],
+    dst: &[u8; NODEID_LEN],
+    svc: u64,
+    session_digest: &[u8; 32],
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(
+        KEX_FRAME_DOMAIN.len() + 1 + 4 + 8 + NODEID_LEN + NODEID_LEN + 8 + 32,
+    );
+    v.extend_from_slice(KEX_FRAME_DOMAIN);
+    v.push(kind);
+    v.extend_from_slice(&seq.to_le_bytes());
+    v.extend_from_slice(&ts.to_le_bytes());
+    v.extend_from_slice(src);
+    v.extend_from_slice(dst);
+    v.extend_from_slice(&svc.to_le_bytes());
+    v.extend_from_slice(session_digest);
+    v
+}
+
+/// Seal a frame body under `session_key` (== `pq_hybrid_session_key(...)`
+/// when PQ negotiated) with the given 24-byte nonce and AAD from
+/// [`kex_frame_aad`]. Deterministic for fixed inputs (fixtures/KATs); use
+/// [`kex_frame_seal_rand`] for live traffic.
+pub fn kex_frame_seal(
+    session_key: &[u8; 32],
+    nonce: &[u8; 24],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Vec<u8> {
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(session_key));
+    cipher
+        .encrypt(
+            XNonce::from_slice(nonce),
+            Payload { msg: plaintext, aad },
+        )
+        .expect("kex frame seal")
+}
+
+/// Live-traffic seal: fresh OS-random 24-byte nonce, returns `(ct, nonce)`.
+/// Same shape as `node::e2e_encrypt` so the call site swaps one line.
+pub fn kex_frame_seal_rand(
+    session_key: &[u8; 32],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
+    let mut nonce = [0u8; KEX_FRAME_NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let ct = kex_frame_seal(session_key, &nonce, aad, plaintext);
+    (ct, nonce.to_vec())
+}
+
+/// Open a PQ frame body: AEAD-verifies the Poly1305 tag over
+/// (`aad`, `ct`) and returns the plaintext. Fail-closed: wrong key, tampered
+/// body, swapped header/session (AAD mismatch), or bad nonce length all
+/// error — never an empty/plaintext fallback.
+pub fn kex_frame_open(
+    session_key: &[u8; 32],
+    nonce: &[u8],
+    aad: &[u8],
+    ct: &[u8],
+) -> Result<Vec<u8>> {
+    if nonce.len() != KEX_FRAME_NONCE_LEN {
+        bail!("invalid frame nonce length");
+    }
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(session_key));
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload { msg: ct, aad },
+        )
+        .map_err(|_| anyhow!("kex frame open failed (tamper/wrong key/session?)"))
 }
 
 /// Decoder fuzz regressions (Agent 1, stellereum): Frame::decode is the

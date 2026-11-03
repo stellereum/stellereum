@@ -51,9 +51,12 @@ pub const MAX_BLOCK_REWARD_NANO: u64 = 10_000_000 * 1_000_000_000;
 /// Upper bound for `SetMinGasLimit`: 10x the base transfer fee (audit
 /// follow-up). Lets governance price out spam hard without ever bricking the
 /// faucet/test flows that declare exactly the base fee... which is why the
-/// ADMISSION floor stays max(env, governed): raising governed above what the
-/// owner set in env only affects admission if the operator also raises env.
-/// (Full migration to a purely governed floor is a separate step.)
+/// ADMISSION floor stays max(frozen, governed): raising governed above the
+/// frozen floor only affects admission at the governed value.
+/// (Protocol freeze 2026-11-03: the frozen half is identical on all nodes.)
+///
+/// FREEZE (protocol freeze 2026-11-03): 10x the cheapest real transfer.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const MAX_MIN_GAS_LIMIT: u64 = 10 * crate::svm::GAS_BASIC_TRANSFER;
 /// Maximum proposal title size in bytes (E4).
 ///
@@ -144,7 +147,7 @@ pub enum GovAction {
     // APPENDED, never inserted above (same discriminant rule as the oracle
     // actions above).
     /// Raise/lower the admission base-fee floor (nano-STELL). Bounded by
-    /// `MAX_MIN_GAS_LIMIT`; the effective floor is max(env, governed).
+    /// `MAX_MIN_GAS_LIMIT`; the effective floor is max(frozen, governed).
     SetMinGasLimit(u64),
     /// Schedule a coordinated software upgrade at a specific block height.
     SoftwareUpgrade {

@@ -28,10 +28,10 @@
 //!
 //! # Soft-fork activation
 //! `ValidatorId = [u8; 32]` lives inside the staking ledger, which is inside the
-//! commitment, which is inside the state root. So an aggregate-only release cannot
-//! start on existing data directories. [`HybridCertificate`] and
-//! [`is_bls_active`] model the transition: Ed25519 below the activation height,
-//! BLS aggregate at or above it.
+//! commitment, which is inside the state root. (The `HybridCertificate`
+//! soft-fork vehicle and its `is_bls_active` gate were removed with the
+//! aggregate-counting path: BLS envelopes that remain on the wire are inert
+//! metadata, never counted, so no format transition is modeled.)
 //!
 //! # BLS12-381 is CLASSICAL (quantum-breakable) — LEGACY-ONLY in this architecture
 //!
@@ -44,13 +44,14 @@
 //! PQ POLICY (stated in code so it can be enforced programmatically via
 //! [`BLS_IS_POST_QUANTUM`]):
 //!
-//! * Consensus MUST NOT count BLS aggregate QCs on the PQ path. The live
-//!   `QuorumCertificate` BLS envelope is inert metadata by default: counting
-//!   BLS power (`STELL_BLS_QC=1`) is hard-refused at startup by
-//!   [`refuse_bls_qc_if_enabled`], and [`bls_envelope_verified_signers`] (in
-//!   `consensus.rs`, outside this module) returns `None` unless the flag is
-//!   explicitly enabled, so the default verify path falls through to the
-//!   Ed25519 baseline.
+//! * Consensus MUST NOT count BLS aggregate QCs on the PQ path. The
+//!   aggregate-counting path was REMOVED (see below): the live
+//!   `QuorumCertificate` BLS envelope is inert metadata by construction —
+//!   there is no flag that enables counting, and the default verify path is
+//!   always the Ed25519 baseline. `STELL_BLS_QC=1` remains hard-refused at
+//!   startup by [`refuse_bls_qc_if_enabled`] (defense in depth: a stale
+//!   operator config that requests the removed path fails loudly instead of
+//!   silently running without it).
 //! * Any future activation of BLS counting is a NON-PQ, LEGACY-ONLY mode. It
 //!   requires an explicit non-PQ opt-in whose mechanism is a LEAD DECISION —
 //!   this module deliberately does NOT invent the opt-in mechanism (no new env
@@ -78,14 +79,6 @@ pub const SIGNATURE_LEN: usize = 96;
 /// mechanism (a lead decision, not defined here) must branch on this marker
 /// so the classical nature of the path is enforced programmatically.
 pub const BLS_IS_POST_QUANTUM: bool = false;
-
-/// Default height at which BLS aggregation is activated in consensus.
-pub const DEFAULT_BLS_ACTIVATION_HEIGHT: u64 = 10_000;
-
-/// Returns true if BLS aggregate verification is active for the given block height.
-pub fn is_bls_active(height: u64, activation_height: u64) -> bool {
-    height >= activation_height
-}
 
 /// BLS secret scalar. Not `Clone` by accident: every clone is another copy of the key.
 ///
@@ -323,175 +316,43 @@ impl BlsAggregateSignature {
     }
 }
 
-/// Aggregate signatures from multiple validators over the same message.
-///
-/// Returns an error on an out-of-range or duplicate index, or a signature that is
-/// not a curve point, rather than silently producing an aggregate that will not
-/// verify -- a malformed aggregate that verifies would be far worse than a rejection.
-pub fn aggregate_signatures(
-    signatures: &[(usize, BlsSignature)],
-    total_validators: usize,
-) -> Result<BlsAggregateSignature, String> {
-    if signatures.is_empty() {
-        return Err("cannot aggregate zero signatures".into());
-    }
+// REMOVED (aggregate-QC counting path): `aggregate_signatures` and
+// `verify_aggregate_signature` lived here. The consensus counting path that
+// consumed them is deleted, and no live path references remain (proven by
+// grep: the only references were the deleted consensus call sites and
+// tests). Envelopes still parse as inert metadata via
+// [`BlsSignature::from_bytes`] + [`SignerBitVector::from_bitmask`] (wire
+// compat), and the PoP / registry / refusal-gate policy below is untouched.
+// REMOVED (soft-fork transition vehicle): `HybridCertificate`,
+// `is_bls_active`, and `DEFAULT_BLS_ACTIVATION_HEIGHT` lived here. No live
+// path referenced them (proven by grep: only tests and doc comments). BLS
+// envelopes on the wire are inert metadata, never counted, so no format
+// transition is modeled.
 
-    let mut participants = SignerBitVector::new(total_validators);
-    let mut sum = G2Projective::identity();
-
-    for (idx, sig) in signatures {
-        if *idx >= total_validators {
-            return Err(format!("validator index {idx} out of range"));
-        }
-        if participants.is_set(*idx) {
-            return Err(format!("validator {idx} appears twice in one aggregate"));
-        }
-        let Some(pt) = sig_point(sig) else {
-            return Err("aggregate member is not a valid G2 point".into());
-        };
-        participants.set(*idx, true);
-        sum += pt;
-    }
-
-    // FAIL-CLOSED: an aggregate that sums to the identity (e.g. crafted
-    // cancelling members) must never reach the wire — like the identity key
-    // and identity signature, it is refused at construction.
-    if bool::from(G2Affine::from(sum).is_identity()) {
-        return Err("aggregate sums to the identity; refused".into());
-    }
-
-    Ok(BlsAggregateSignature {
-        signature: BlsSignature(G2Affine::from(sum).to_compressed()),
-        participants,
-    })
-}
-
-/// Verify an aggregate signature over a message against the FULL validator key list.
-///
-/// `validator_keys` is the whole set in canonical order and `participants` selects
-/// from it, so an attacker cannot choose the key set the signature is measured
-/// against -- the same reason the consensus side stopped taking a caller-supplied
-/// validator set.
-pub fn verify_aggregate_signature(
-    validator_keys: &[BlsPublicKey],
-    msg: &[u8],
-    agg: &BlsAggregateSignature,
-) -> bool {
-    if agg.participants.total_validators() != validator_keys.len() {
-        return false;
-    }
-    if agg.participants.signed_count() == 0 {
-        return false;
-    }
-    let Some(sig_pt) = sig_point(&agg.signature) else {
-        return false;
-    };
-    // AUDIT W6.5 (defence in depth): refuse the IDENTITY aggregate
-    // explicitly. `BlsSignature::from_bytes` and `aggregate_signatures`
-    // already refuse it, but `BlsAggregateSignature` has PUBLIC fields, so a
-    // hand-built certificate can carry one. The pairing would then read
-    // `e(G1, O) == 1`, and the check would only fail because the honest key
-    // sum is non-trivial — an identity aggregate must never get that far.
-    if bool::from(sig_pt.is_identity()) {
-        return false;
-    }
-
-    // Sum the participating public keys. Any unparseable key fails closed.
-    let mut sum_pk = G1Projective::identity();
-    for (i, pk) in validator_keys.iter().enumerate() {
-        if !agg.participants.is_set(i) {
-            continue;
-        }
-        let Some(pt) = pk.point() else {
-            return false;
-        };
-        sum_pk += pt;
-    }
-
-    let h = G2Affine::from(hash_to_g2(msg));
-    pairing(&G1Affine::generator(), &sig_pt) == pairing(&G1Affine::from(sum_pk), &h)
-}
-
-/// Hybrid consensus certificate supporting the soft-fork transition.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HybridCertificate {
-    /// Pre-activation: the existing Ed25519 signature list.
-    Ed25519 {
-        height: u64,
-        round: u32,
-        block_hash: [u8; 32],
-        signatures: Vec<([u8; 32], [u8; 64])>,
-    },
-    /// Post-activation: one BLS aggregate plus the signer bitvector.
-    BlsAggregate {
-        height: u64,
-        round: u32,
-        block_hash: [u8; 32],
-        aggregate: BlsAggregateSignature,
-    },
-}
-
-impl HybridCertificate {
-    pub fn height(&self) -> u64 {
-        match self {
-            Self::Ed25519 { height, .. } | Self::BlsAggregate { height, .. } => *height,
-        }
-    }
-
-    pub fn round(&self) -> u32 {
-        match self {
-            Self::Ed25519 { round, .. } | Self::BlsAggregate { round, .. } => *round,
-        }
-    }
-
-    pub fn block_hash(&self) -> [u8; 32] {
-        match self {
-            Self::Ed25519 { block_hash, .. } | Self::BlsAggregate { block_hash, .. } => *block_hash,
-        }
-    }
-
-    /// Whether this certificate's FORMAT is legal at the soft-fork height.
-    ///
-    /// This is deliberately a separate question from "does the quorum verify": a
-    /// pre-activation block must be Ed25519 and a post-activation block must be BLS,
-    /// and mixing them would let a node accept a format the rest of the network has
-    /// stopped producing (or has not started producing yet).
-    pub fn is_format_valid(&self, activation_height: u64) -> bool {
-        let active = is_bls_active(self.height(), activation_height);
-        match self {
-            Self::Ed25519 { .. } => !active,
-            Self::BlsAggregate { .. } => active,
-        }
-    }
-}
-
-// ============================================================================
-// QC-BLS activation: env/config flag + validator key registry
+// QC-BLS activation: env flag + validator key registry (RETIRED counting).
 // ============================================================================
 //
 // Quorum certificates carry the BLS aggregate as an envelope INSIDE the
 // existing `signatures` list (see `consensus::BLS_QC_MARKER_ID`), so the
 // bincode layout of `QuorumCertificate` — and therefore every persisted block —
-// is unchanged. What decides whether the aggregate may COUNT signature power
-// is this configuration:
+// is unchanged. The aggregate-COUNTING path that consumed this configuration
+// was removed: no flag, registry state, or key material enables counting.
+// What stays live here: the envelope byte parser (`BlsSignature::from_bytes`,
+// `SignerBitVector::from_bitmask`), the PoP/registry readers below (policy),
+// and the startup refusal gate (`refuse_bls_qc_if_enabled`, which keeps
+// refusing `STELL_BLS_QC=1` as defense in depth).
 //
-// * `STELL_BLS_QC=1`              — enable the BLS path (default: OFF).
-// * `STELL_BLS_KEYS_FILE=<path>`   — registry of `<ed25519_hex> <bls_pk_hex>`
-//   lines (or `STELL_BLS_KEYS` inline, comma-separated `<ed>:<bls>` pairs).
-//   The registry is what makes the aggregate meaningful: verification maps
-//   bitvector indices to the FULL validator set in canonical order and looks
-//   each member's BLS key up here. A missing member disables the BLS path for
-//   that certificate (fall back to the Ed25519 list) rather than failing it.
-// * `STELL_BLS_SK_SEED=<64 hex>`   — this node's BLS secret seed, so its votes
-//   can carry a BLS half (`BlsSecretKey::from_seed`).
+// Env knobs (retained so old configs parse, never counted):
 //
-// BOTH SIDES MUST ENABLE TOGETHER for the aggregate to ever be *counted*:
-// with the flag off (the default, and the state of the live stand) a
-// certificate's aggregate is ignored and verification is exactly the Ed25519
-// baseline. Because production NEVER strips the Ed25519 list, a flag-off node
-// still accepts flag-on nodes' certificates through the fallback — mixed
-// configurations do not fork. The stripping that would realize the wire-space
-// saving is deferred until the network is uniformly enabled.
+// * `STELL_BLS_QC=1`              — requests the removed BLS path: LOUDLY
+//   refused at startup, never silently accepted (see the gate).
+// * `STELL_BLS_KEYS_FILE=<path>` / `STELL_BLS_KEYS` — registry of
+//   `<ed25519_hex> <bls_pk_hex>` lines (or comma-separated `<ed>:<bls>`
+//   pairs), read by the parsers below for policy/metering only.
+// * `STELL_BLS_SK_SEED=<64 hex>`   — this node's BLS secret seed (key
+//   material; no live consumer since vote-BLS production was removed).
+// * `STELL_BLS_POP_REQUIRED`      — selects the PoP-strict registry parse
+//   (default OFF: the v1 parse runs byte-identically to before).
 
 /// Registry: validator Ed25519 identity -> that validator's BLS public key.
 pub type BlsKeyRegistry = std::collections::BTreeMap<[u8; 32], BlsPublicKey>;
@@ -541,8 +402,9 @@ pub fn bls_pop_required() -> bool {
 /// keep verifying through the Ed25519 baseline. When a PoP-carrying registry
 /// lands, this gate is the line to delete — not to weaken.
 ///
-/// Parses the flag EXACTLY like [`QcBlsConfig::from_env`] (`1` or
-/// case-insensitive `true`/`on`): anything else is OFF.
+/// Parses the flag as ON for `1` or case-insensitive `true`/`on` (after
+/// trimming): anything else is OFF. This literal set is shared with
+/// [`bls_flag_on`] so the gate and the helper can never disagree.
 pub fn refuse_bls_qc_if_enabled() -> Result<(), String> {
     let enabled = std::env::var(BLS_QC_ENV)
         .map(|v| bls_flag_on(&v))
@@ -566,9 +428,8 @@ pub fn refuse_bls_qc_if_enabled() -> Result<(), String> {
 
 /// Single source of truth for "is the BLS flag ON" (audit F-HIGH-1).
 ///
-/// Shared by [`refuse_bls_qc_if_enabled`] and [`QcBlsConfig::from_env`] so the
-/// startup refusal gate and the runtime config can never disagree about what
-/// "enabled" means. Literals are exact (`1`, case-sensitive `true`/`TRUE`,
+/// Consumed by [`refuse_bls_qc_if_enabled`] (the sole remaining consumer).
+/// Literals are exact (`1`, case-sensitive `true`/`TRUE`,
 /// `on`/`ON` after trimming): anything else — including `True`, `On`,
 /// `yes`, or `1\n`-with-garbage — is OFF. Case-insensitivity is deliberately
 /// NOT extended: widening the match would silently enable an experimental
@@ -577,8 +438,10 @@ fn bls_flag_on(raw: &str) -> bool {
     matches!(raw.trim(), "1" | "true" | "TRUE" | "on" | "ON")
 }
 
-/// Process configuration for the QC-BLS path. Built once from the environment
-/// (or directly in tests, via [`set_qc_bls_for_tests`]).
+/// BLS key-registry configuration (policy surface).
+///
+/// The aggregate-counting path that consumed `enabled` was removed; the live
+/// readers are the registry parsers below and the refusal gate above.
 ///
 /// SECRET HYGIENE: `local_vote_seed` is key material. The manual `Debug` impl
 /// below prints only its presence — never the bytes. (The previous derived
@@ -630,83 +493,18 @@ impl Drop for QcBlsConfig {
 }
 
 impl QcBlsConfig {
-    /// Build from the environment. Malformed entries are skipped with a
-    /// warning — a partial registry disables the BLS path per certificate
-    /// (missing member => fallback), which is the safe direction.
-    pub fn from_env() -> Self {
-        let enabled = std::env::var(BLS_QC_ENV)
-            .map(|v| bls_flag_on(&v))
-            .unwrap_or(false);
-        // Gated PoP-strict parse (phase 1, default OFF): when
-        // `STELL_BLS_POP_REQUIRED` is on, entries without a valid PoP are
-        // refused at parse and never enter the registry. When the gate is
-        // off (the default) both calls below are exactly the pre-PoP v1
-        // parse — byte-identical behavior, Ed25519 baseline untouched.
-        let strict = bls_pop_required();
-        let mut registry = BlsKeyRegistry::new();
-        if let Ok(path) = std::env::var(BLS_KEYS_FILE_ENV) {
-            match std::fs::read_to_string(&path) {
-                Ok(text) => {
-                    if strict {
-                        let mut stats = BlsRegistryStats::default();
-                        parse_registry_entries_strict_pop(&text, &mut registry, &mut stats);
-                    } else {
-                        parse_registry_entries(&text, &mut registry);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(%e, path, "bls: cannot read BLS key registry file; BLS path disabled");
-                }
-            }
-        }
-        if let Ok(inline) = std::env::var(BLS_KEYS_INLINE_ENV) {
-            if strict {
-                let mut stats = BlsRegistryStats::default();
-                parse_registry_entries_strict_pop(&inline, &mut registry, &mut stats);
-            } else {
-                parse_registry_entries(&inline, &mut registry);
-            }
-        }
-        let local_vote_seed = std::env::var(BLS_SK_SEED_ENV)
-            .ok()
-            .and_then(|s| hex::decode(s.trim()).ok())
-            .and_then(|b| <[u8; 32]>::try_from(b).ok());
-        Self {
-            enabled,
-            registry,
-            local_vote_seed,
-        }
-    }
-
-    /// Canonical BLS public keys for `validators`, in the set's canonical
-    /// (sorted) order — the order `SignerBitVector` indices refer to.
-    ///
-    /// Returns `None` if ANY member of the set is missing from the registry:
-    /// a partial key list cannot be summed for the pairing check, so the
-    /// caller falls back to the Ed25519 list instead of guessing.
-    pub fn canonical_keys(
-        &self,
-        validators: &crate::consensus::ValidatorSet,
-    ) -> Option<Vec<BlsPublicKey>> {
-        // Explicit sort: HashMap iteration order differs between processes, and
-        // the bitvector-index <-> key binding must be identical on every node
-        // (matches the sort_unstable() hardening in consensus F8).
-        let mut ids: Vec<_> = validators.validators.keys().collect();
-        ids.sort_unstable();
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            out.push(*self.registry.get(id)?);
-        }
-        Some(out)
-    }
-
-    /// This node's local BLS signing key, when configured.
-    pub fn local_vote_key(&self) -> Option<BlsSecretKey> {
-        self.local_vote_seed.as_ref().map(BlsSecretKey::from_seed)
-    }
+    // REMOVED (counting-path config surface): `QcBlsConfig::from_env`,
+    // `canonical_keys`, and `local_vote_key` lived here. The only consumer
+    // was the deleted aggregate-counting path (proven by grep: no other
+    // live references). Registry policy is read directly via
+    // `parse_registry_entries` / `parse_registry_entries_v2` /
+    // `parse_registry_entries_strict_pop` (pinned by tests); refusal via
+    // `refuse_bls_qc_if_enabled`.
 }
 
-fn parse_registry_entries(text: &str, out: &mut BlsKeyRegistry) {
+/// Parse the live registry format: bare `<ed> <bls>` lines (no PoP).
+/// (Public: policy/tests read the registry without the removed config surface.)
+pub fn parse_registry_entries(text: &str, out: &mut BlsKeyRegistry) {
     // Entries may be newline-separated (file) or comma/semicolon-separated
     // (inline env var); inside an entry, `ed bls`, `ed:bls` and `ed=bls` all
     // separate the two keys.
@@ -763,73 +561,13 @@ fn parse_registry_entries(text: &str, out: &mut BlsKeyRegistry) {
     }
 }
 
-static QC_BLS: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<QcBlsConfig>>> =
-    std::sync::OnceLock::new();
+// REMOVED (counting-path runtime config): the process-global `QC_BLS` cell,
+// `qc_bls`, `qc_bls_enabled`, `local_vote_bls_sign`, and the test-only
+// `set_qc_bls_for_tests` guard lived here. The only consumers were the
+// deleted vote-attachment and envelope-verify-for-counting call sites
+// (proven by grep). The refusal gate and marker stay; envelopes that remain
+// on the wire are inert metadata.
 
-fn qc_bls_cell() -> &'static std::sync::RwLock<std::sync::Arc<QcBlsConfig>> {
-    QC_BLS.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(QcBlsConfig::from_env())))
-}
-
-/// Current QC-BLS configuration (env-derived on first use).
-pub fn qc_bls() -> std::sync::Arc<QcBlsConfig> {
-    qc_bls_cell()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
-/// Is the BLS path enabled? Gates vote-BLS attachment, certificate aggregate
-/// production, and counting BLS power at verification. Default: OFF.
-pub fn qc_bls_enabled() -> bool {
-    qc_bls().enabled
-}
-
-/// Sign `msg` with this node's local BLS key when the QC-BLS path is enabled.
-/// Returns the 96-byte signature, or `None` (no envelope) when disabled or
-/// unconfigured — vote bytes are then byte-identical to the pre-BLS format.
-pub fn local_vote_bls_sign(msg: &[u8]) -> Option<[u8; SIGNATURE_LEN]> {
-    let cfg = qc_bls();
-    if !cfg.enabled {
-        return None;
-    }
-    Some(cfg.local_vote_key()?.sign(msg).to_bytes())
-}
-
-/// Test-only override for the process-global QC-BLS configuration.
-///
-/// The returned guard HOLDS a process-wide gate for its lifetime, so every
-/// test that observes BLS configuration (enabled or disabled) must take it;
-/// dropping the guard restores the previous configuration. Tests that never
-/// touch BLS configuration are unaffected either way: the default config has
-/// no registry and the flag off, and a certificate without a BLS envelope
-/// never consults any of it.
-#[cfg(any(test, debug_assertions))]
-pub fn set_qc_bls_for_tests(cfg: QcBlsConfig) -> QcBlsGuard {
-    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let gate = GATE.lock().unwrap_or_else(|e| e.into_inner());
-    let mut cell = qc_bls_cell().write().unwrap_or_else(|e| e.into_inner());
-    let prev = std::mem::replace(&mut *cell, std::sync::Arc::new(cfg));
-    drop(cell);
-    QcBlsGuard { prev, _gate: gate }
-}
-
-/// Guard returned by [`set_qc_bls_for_tests`]; restores the previous config
-/// (and releases the test gate) on drop.
-#[cfg(any(test, debug_assertions))]
-pub struct QcBlsGuard {
-    prev: std::sync::Arc<QcBlsConfig>,
-    _gate: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(any(test, debug_assertions))]
-impl Drop for QcBlsGuard {
-    fn drop(&mut self) {
-        let mut cell = qc_bls_cell().write().unwrap_or_else(|e| e.into_inner());
-        *cell = self.prev.clone();
-    }
-}
-
-// ============================================================================
 // Proof-of-possession registry (A7/C2 structural fix), PHASE 1.
 //
 // The live registry (`STELL_BLS_KEYS_FILE` / `STELL_BLS_KEYS`) carries bare
@@ -999,11 +737,10 @@ pub fn parse_registry_entries_v2(
 /// there is NO v1 fallback for a malformed third token: under this gate a
 /// garbage PoP is a refusal, never a legacy acceptance.
 ///
-/// Refused keys never enter the registry, so [`QcBlsConfig::canonical_keys`]
-/// (and therefore the BLS power count) can never count them — the rogue-key
-/// fail-closed posture, enforced at parse rather than at verify time. Live
-/// QC counting is untouched: this function is only reached from
-/// [`QcBlsConfig::from_env`] when [`bls_pop_required`] is on.
+/// Refused keys never enter the registry, so no (removed) power-count path
+/// can ever count them — the rogue-key fail-closed posture, enforced at
+/// parse rather than at verify time. This function runs only when
+/// [`bls_pop_required`] is on.
 pub fn parse_registry_entries_strict_pop(
     text: &str,
     out: &mut BlsKeyRegistry,
@@ -1107,363 +844,16 @@ pub fn bls_registry_migration_counts() -> (u64, u64, u64) {
     )
 }
 
-// ============================================================================
-// PoP-bound registration + aggregate-verify for the FUTURE QC path (phase 2).
-//
-// What this section is: the clean, documented API the QC-activation step will
-// need — a registration type that always carries a live PoP
-// ([`BlsRegistration`]), a PoP-only admission registry ([`BlsRegistry`]), a
-// raw same-message aggregate check ([`aggregate_verify`]), and the
-// registry-gated QC primitive ([`BlsRegistry::verify_aggregate_qc`]).
-//
-// What this section is NOT: it is not wired into any consensus counting path.
-// Vote signing (`local_vote_bls_sign`), certificate verification, and the
-// `STELL_BLS_QC=1` startup refusal (`refuse_bls_qc_if_enabled`) are untouched,
-// so default behavior (all BLS flags off) is byte-identical to before: this
-// code only runs when a caller — today, only tests — calls it. It never reads
-// process environment itself; activation wiring (which flag arms it, which
-// height arms it) is a future step owned by the consensus agent.
-//
-// Rogue-key posture: the pairing check alone CANNOT tell an honest key from a
-// cancellation-crafted one, so rogue-key resistance lives at REGISTRATION —
-// every key admitted here proved secret knowledge via [`bls_verify_pop`] —
-// never at verify time. `aggregate_verify` therefore documents a caller
-// contract (inputs must be PoP-verified) and only fail-closes on malformed
-// inputs; [`BlsRegistry::verify_aggregate_qc`] enforces the contract by
-// resolving keys exclusively from the PoP-only registry.
-// ============================================================================
-
-/// Maximum number of keys one [`aggregate_verify`] call will sum.
-///
-/// Fail-closed bound, not a protocol limit: validator sets are far smaller,
-/// and an unbounded sum is a cheap remote-CPU lever (each key is a G1 add
-/// before the pairing). Over-cap inputs refuse BEFORE any pairing work.
-/// Frozen like [`BLS_POP_DST`]: raising it changes no signature bytes, but
-/// every verifier must enforce the same bound or QC acceptance diverges.
-pub const MAX_BLS_AGGREGATE_KEYS: usize = 4096;
-
-/// A BLS key registration: the validator's BLS public key PLUS the
-/// proof-of-possession binding it to the validator's Ed25519 identity.
-///
-/// INVARIANT: the carried `pop` verifies under [`bls_verify_pop`] for the
-/// carried `(pk, ed_id)` pair. Fields are private so the invariant cannot be
-/// bypassed by struct-literal construction: both constructors verify, and
-/// [`BlsRegistration::from_parts`] returns `None` (refuses) on missing or
-/// invalid material. There is no "register now, prove later" state — a
-/// `BlsRegistration` value always carries a live PoP.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct BlsRegistration {
-    ed_id: [u8; 32],
-    pk: BlsPublicKey,
-    pop: BlsSignature,
-}
-
-impl BlsRegistration {
-    /// Mint a registration for `ed_id` from the BLS secret. Infallible: a
-    /// freshly minted PoP over its own preimage always verifies (debug-
-    /// asserted so a future hash-to-curve change fails loudly in tests
-    /// rather than minting dead registrations in production).
-    pub fn register(sk: &BlsSecretKey, ed_id: &[u8; 32]) -> Self {
-        let pk = sk.public_key();
-        let pop = bls_sign_pop(sk, ed_id);
-        debug_assert!(bls_verify_pop(&pk, ed_id, &pop));
-        Self {
-            ed_id: *ed_id,
-            pk,
-            pop,
-        }
-    }
-
-    /// Build from registry/wire parts, refusing anything without a live PoP.
-    ///
-    /// `None` key or PoP bytes (a missing token at parse) refuses exactly
-    /// like an invalid one; non-curve bytes refuse at parse; a PoP over
-    /// another preimage, another key, or a truncated preimage refuses at
-    /// verify. Whatever the cause, the result is `None` and nothing registers.
-    pub fn from_parts(
-        ed_id: &[u8; 32],
-        pk_bytes: Option<[u8; PUBLIC_KEY_LEN]>,
-        pop_bytes: Option<[u8; SIGNATURE_LEN]>,
-    ) -> Option<Self> {
-        let pk = BlsPublicKey::from_bytes(&pk_bytes?)?;
-        let pop = BlsSignature::from_bytes(&pop_bytes?)?;
-        let reg = Self {
-            ed_id: *ed_id,
-            pk,
-            pop,
-        };
-        if !reg.verify_pop() {
-            return None;
-        }
-        Some(reg)
-    }
-
-    /// Re-verify the carried PoP against the carried key and identity.
-    /// Fail-closed: `false` on any mismatch, never a partial accept.
-    pub fn verify_pop(&self) -> bool {
-        bls_verify_pop(&self.pk, &self.ed_id, &self.pop)
-    }
-
-    /// The validator identity this key is bound to.
-    pub fn ed_id(&self) -> &[u8; 32] {
-        &self.ed_id
-    }
-
-    /// The registered BLS public key (PoP-verified for [`ed_id`](Self::ed_id)).
-    pub fn public_key(&self) -> BlsPublicKey {
-        self.pk
-    }
-
-    /// The carried proof-of-possession.
-    pub fn pop(&self) -> BlsSignature {
-        self.pop
-    }
-}
-
-/// Verify a same-message aggregate against an explicit key list — the
-/// primitive QC counting will need.
-///
-/// CALLER CONTRACT (rogue-key safety): every key in `pks` MUST have a valid
-/// PoP verified at registration time (via [`BlsRegistration`] /
-/// [`BlsRegistry` / `parse_registry_entries_strict_pop`]). The pairing
-/// identity `e(G1, agg) == e(sum(pk_i), H(m))` holds for ANY key list whose
-/// sum matches — including a cancellation-crafted rogue key — so this
-/// function cannot, on its own, tell the attacker out. What it DOES is
-/// fail closed on every malformed input: empty list (no vacuous truth, no
-/// identity-aggregate bypass), over-cap list (before any pairing work),
-/// non-curve or identity aggregate, unparseable member key, or an
-/// identity-sum key list.
-///
-/// Prefer [`BlsRegistry::verify_aggregate_qc`], which enforces the contract
-/// by resolving keys only from the PoP-only registry.
-pub fn aggregate_verify(pks: &[BlsPublicKey], msg: &[u8], agg_sig: &BlsSignature) -> bool {
-    if pks.is_empty() {
-        return false;
-    }
-    if pks.len() > MAX_BLS_AGGREGATE_KEYS {
-        return false;
-    }
-    let Some(sig_pt) = sig_point(agg_sig) else {
-        return false;
-    };
-    if bool::from(sig_pt.is_identity()) {
-        return false;
-    }
-    let mut sum_pk = G1Projective::identity();
-    for pk in pks {
-        let Some(pt) = pk.point() else {
-            return false;
-        };
-        sum_pk += pt;
-    }
-    // Defence in depth: a cancellation-crafted key list sums to the identity,
-    // and `e(G1, sig) == 1` only for the (already refused) identity sig — but
-    // name the refusal explicitly rather than relying on the pairing to miss.
-    if bool::from(G1Affine::from(sum_pk).is_identity()) {
-        return false;
-    }
-    let h = G2Affine::from(hash_to_g2(msg));
-    pairing(&G1Affine::generator(), &sig_pt) == pairing(&G1Affine::from(sum_pk), &h)
-}
-
-/// PoP-only BLS key registry: the admission desk for the future QC path.
-///
-/// Every key in here proved secret knowledge AND identity binding at
-/// admission ([`BlsRegistry::insert`] re-verifies the carried PoP even
-/// though [`BlsRegistration`] already checked it at construction, so a
-/// hand-spliced `(pk, pop)` pair refuses here too). Keys that fail the PoP
-/// never enter, so [`BlsRegistry::keys_for`] — and therefore
-/// [`BlsRegistry::verify_aggregate_qc`] — can never count BLS power for them:
-/// the rogue-key fail-closed posture, enforced at registration rather than
-/// at verify time.
-///
-/// NOT consulted by any consensus counting path today (see the section
-/// header): admitting keys here changes no vote, certificate, or startup
-/// behavior. `QcBlsConfig::canonical_keys` remains the live lookup.
-#[derive(Clone, Debug, Default)]
-pub struct BlsRegistry {
-    keys: BlsKeyRegistry,
-}
-
-impl BlsRegistry {
-    /// Empty registry: resolves nothing, verifies nothing (fail-closed).
-    pub fn new() -> Self {
-        Self {
-            keys: BlsKeyRegistry::new(),
-        }
-    }
-
-    /// Admit a registration. Re-verifies the carried PoP and inserts ONLY on
-    /// success; returns `false` (registry unchanged) otherwise.
-    pub fn insert(&mut self, reg: &BlsRegistration) -> bool {
-        if !reg.verify_pop() {
-            return false;
-        }
-        self.keys.insert(reg.ed_id, reg.pk);
-        true
-    }
-
-    /// Admit raw parts: parse + PoP-verify + insert in one fail-closed step.
-    /// Anything [`BlsRegistration::from_parts`] refuses is refused here.
-    pub fn insert_verified(
-        &mut self,
-        ed_id: &[u8; 32],
-        pk: &BlsPublicKey,
-        pop: &BlsSignature,
-    ) -> bool {
-        if !bls_verify_pop(pk, ed_id, pop) {
-            return false;
-        }
-        self.keys.insert(*ed_id, *pk);
-        true
-    }
-
-    /// Look up one admitted key. `None` means never-registered-or-refused:
-    /// callers must fall back (fail closed), never guess.
-    pub fn get(&self, ed_id: &[u8; 32]) -> Option<BlsPublicKey> {
-        self.keys.get(ed_id).copied()
-    }
-
-    /// Whether `ed_id` holds an admitted (PoP-verified) key.
-    pub fn contains(&self, ed_id: &[u8; 32]) -> bool {
-        self.keys.contains_key(ed_id)
-    }
-
-    /// Number of admitted keys.
-    pub fn len(&self) -> usize {
-        self.keys.len()
-    }
-
-    /// Whether no key has been admitted yet.
-    pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
-    }
-
-    /// Keys for `ids` in the CALLER's order (the QC caller passes canonical
-    /// bitvector order). `None` if the list is empty, over-cap, or ANY member
-    /// is missing: a partial key list must never reach the pairing check.
-    pub fn keys_for(&self, ids: &[[u8; 32]]) -> Option<Vec<BlsPublicKey>> {
-        if ids.is_empty() || ids.len() > MAX_BLS_AGGREGATE_KEYS {
-            return None;
-        }
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            out.push(*self.keys.get(id)?);
-        }
-        Some(out)
-    }
-
-    /// The primitive QC counting will need: resolve `ids` from the PoP-only
-    /// registry and [`aggregate_verify`] the aggregate over `msg`.
-    ///
-    /// Refuses (returns `false`) on: empty or over-cap id list, a DUPLICATE
-    /// id (one validator's power must never count twice), any id missing
-    /// from the registry (refused-at-registration keys are unresolvable by
-    /// construction), or a pairing mismatch. On `true`, every counted key
-    /// carried a valid PoP at admission.
-    pub fn verify_aggregate_qc(
-        &self,
-        ids: &[[u8; 32]],
-        msg: &[u8],
-        agg_sig: &BlsSignature,
-    ) -> bool {
-        if ids.is_empty() || ids.len() > MAX_BLS_AGGREGATE_KEYS {
-            return false;
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        for id in ids {
-            if !seen.insert(id) {
-                return false;
-            }
-        }
-        let Some(pks) = self.keys_for(ids) else {
-            return false;
-        };
-        aggregate_verify(&pks, msg, agg_sig)
-    }
-}
+// REMOVED (future counting primitive): `BlsRegistration`, `aggregate_verify`,
+// `MAX_BLS_AGGREGATE_KEYS`, and the PoP-only `BlsRegistry` (with `keys_for` and
+// `verify_aggregate_qc`) lived here. They were never wired into any consensus
+// counting path (proven by grep: only tests referenced them). Rogue-key
+// resistance for the registry format stays enforced at parse time by
+// `parse_registry_entries_strict_pop` + `bls_verify_pop` (pinned by tests).
 
 #[cfg(test)]
 mod internal_tests {
     use super::*;
-
-    fn keys(n: usize) -> Vec<BlsSecretKey> {
-        (0..n).map(|_| BlsSecretKey::generate()).collect()
-    }
-
-    #[test]
-    fn identity_public_key_is_rejected() {
-        // The identity would make an aggregate verify for free, so it must not parse.
-        let id = G1Affine::identity().to_compressed();
-        assert!(BlsPublicKey::from_bytes(&id).is_none());
-    }
-
-    #[test]
-    fn a_signature_is_not_a_public_key_and_vice_versa() {
-        let sk = BlsSecretKey::generate();
-        let sig = sk.sign(b"m");
-        // 96 bytes truncated/padded into a key slot must not parse as a point.
-        let mut fake_key = [0u8; PUBLIC_KEY_LEN];
-        fake_key.copy_from_slice(&sig.to_bytes()[..PUBLIC_KEY_LEN]);
-        assert!(BlsPublicKey::from_bytes(&fake_key).is_none());
-    }
-
-    #[test]
-    fn aggregate_over_distinct_keys_is_not_the_identity() {
-        let ks = keys(4);
-        let mut sigs = Vec::new();
-        for (i, k) in ks.iter().enumerate() {
-            sigs.push((i, k.sign(b"same")));
-        }
-        let agg = aggregate_signatures(&sigs, 4).unwrap();
-        assert!(!bool::from(
-            sig_point(&agg.signature).unwrap().is_identity()
-        ));
-        let pks: Vec<BlsPublicKey> = ks.iter().map(|k| k.public_key()).collect();
-        assert!(verify_aggregate_signature(&pks, b"same", &agg));
-    }
-
-    /// AUDIT W6.5: the aggregate verifier must refuse every degenerate
-    /// certificate, not only the ones the constructor rejects.
-    ///
-    /// `BlsAggregateSignature` has PUBLIC fields, so an attacker-supplied
-    /// certificate is not necessarily one that `aggregate_signatures`
-    /// produced — the verifier is the last line of defence.
-    #[test]
-    fn aggregate_verification_refuses_degenerate_certificates() {
-        let ks = keys(4);
-        let pks: Vec<BlsPublicKey> = ks.iter().map(|k| k.public_key()).collect();
-        let sigs: Vec<(usize, BlsSignature)> = ks
-            .iter()
-            .enumerate()
-            .map(|(i, k)| (i, k.sign(b"same")))
-            .collect();
-        let agg = aggregate_signatures(&sigs, 4).unwrap();
-        assert!(verify_aggregate_signature(&pks, b"same", &agg));
-
-        // The identity aggregate is refused.
-        let mut identity = agg.clone();
-        identity.signature = BlsSignature(G2Affine::identity().to_compressed());
-        assert!(!verify_aggregate_signature(&pks, b"same", &identity));
-
-        // A bitvector that does not describe THIS key list is refused (the
-        // attacker must not choose the key set the aggregate is measured
-        // against).
-        assert!(!verify_aggregate_signature(&pks[..3], b"same", &agg));
-
-        // A different message is refused.
-        assert!(!verify_aggregate_signature(&pks, b"other", &agg));
-
-        // An empty participant set is refused.
-        let mut none = agg.clone();
-        none.participants = SignerBitVector::new(4);
-        assert!(!verify_aggregate_signature(&pks, b"same", &none));
-
-        // A bitmask whose length does not match the validator count cannot
-        // even be parsed.
-        assert!(SignerBitVector::from_bitmask(vec![0u8; 2], 4).is_none());
-        assert!(SignerBitVector::from_bitmask(vec![0u8; 1], 4).is_some());
-    }
 
     // ---- A7/C2 phase-1: PoP format + v2 registry parsing -------------------
 

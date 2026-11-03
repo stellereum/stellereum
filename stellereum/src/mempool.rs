@@ -548,8 +548,8 @@ pub struct Mempool {
     /// Minimum fee (`gas_limit`) accepted on the checked/network path (A11).
     ///
     /// FEE-MARKET HONESTY (audit F-11, verified as-stated): there is NO
-    /// dynamic fee market — this is a STATIC, node-local, gas-unit floor
-    /// (`max(STELL_MIN_GAS_LIMIT env, governed min_gas_limit)`, synced every
+    /// dynamic fee market — this is a STATIC gas-unit floor
+    /// (`max(FROZEN_MIN_GAS_FLOOR, governed min_gas_limit)`, synced every
     /// finalize; a mismatch across validators diverges admission liveness
     /// only, never consensus). Pool-full behavior is a fee AUCTION (evict
     /// lowest iff the newcomer bids ≥2× it), not FIFO. Congestion never
@@ -1352,18 +1352,24 @@ impl Mempool {
 
     /// Read the per-node admission floor from the environment.
     ///
+    /// FREEZE (protocol freeze 2026-11-03): canonical admission fee floor,
+    /// 280_000 gas (= [`crate::svm::GAS_BASIC_TRANSFER`], the cheapest real
+    /// transfer). Value = pre-freeze `STELL_MIN_GAS_LIMIT` code default; the
+    /// env knob is removed — the floor MUST be identical on all validators
+    /// (main.rs `[config]` log) and a per-node env knob for a must-match
+    /// value is a divergence risk. Change requires spec update + audit note
+    /// (AGENTS.md §7).
+    pub const FROZEN_MIN_GAS_FLOOR: u64 = crate::svm::GAS_BASIC_TRANSFER;
+
+    /// The frozen canonical admission floor (see [`Self::FROZEN_MIN_GAS_FLOOR`]).
+    ///
     /// CONSENSUS WARNING (audit 2026-10-06): this is enforced ONLY at
-    /// admission, never in the proposer filter or apply path, and it is read
-    /// per process — two validators with different `STELL_MIN_GAS_LIMIT`
-    /// silently admit different tx sets (liveness divergence, not a split:
-    /// consensus never disagrees, one node just skips). ALL validators MUST
-    /// run the identical value; node startup logs the effective floor at
-    /// info so a mismatch is visible in the first lines of every journal.
-    pub fn read_base_fee_from_env() -> u64 {
-        std::env::var("STELL_MIN_GAS_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(crate::svm::GAS_BASIC_TRANSFER)
+    /// admission, never in the proposer filter or apply path. ALL validators
+    /// run the identical value by construction now (frozen const, no env);
+    /// node startup still logs the effective floor at info so a divergent
+    /// binary is visible in the first lines of every journal.
+    pub fn frozen_base_fee_floor() -> u64 {
+        Self::FROZEN_MIN_GAS_FLOOR
     }
 
     /// Attach the engine's session-key registry lock (see

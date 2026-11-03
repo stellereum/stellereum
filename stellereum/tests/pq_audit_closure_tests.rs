@@ -309,63 +309,29 @@ fn pq_envelope_strict_single_layout() {
 
 #[test]
 fn bls_signature_identity_rejected_at_parse() {
-    use stellereum::bls::{
-        aggregate_signatures, verify_aggregate_signature, BlsSecretKey, BlsSignature, SIGNATURE_LEN,
-    };
+    use stellereum::bls::{BlsSecretKey, BlsSignature, SIGNATURE_LEN};
     // The identity G2 point must not parse (mirrors the G1 key check).
+    // (The genuine-aggregate tail of this probe was deleted with
+    // `aggregate_signatures` / `verify_aggregate_signature`.)
     let id_bytes: [u8; SIGNATURE_LEN] = G2Affine::identity().to_compressed();
     assert!(
         BlsSignature::from_bytes(&id_bytes).is_none(),
         "F-HIGH-1: identity signature must not parse"
     );
-    // Genuine aggregates still work end to end.
-    let keys: Vec<BlsSecretKey> = (0..4).map(|_| BlsSecretKey::generate()).collect();
-    let pks: Vec<_> = keys.iter().map(|k| k.public_key()).collect();
-    let msg = b"qc quorum";
-    let sigs: Vec<_> = keys
-        .iter()
-        .enumerate()
-        .map(|(i, k)| (i, k.sign(msg)))
-        .collect();
-    let agg = aggregate_signatures(&sigs, 4).expect("genuine aggregate builds");
-    assert!(verify_aggregate_signature(&pks, msg, &agg));
-    assert!(!verify_aggregate_signature(&pks, b"other", &agg));
+    // Single-signature parse round-trip still works (parser layer kept).
+    let sk = BlsSecretKey::generate();
+    let sig = sk.sign(b"qc quorum");
+    assert_eq!(BlsSignature::from_bytes(&sig.to_bytes()), Some(sig));
+    assert!(sk.public_key().verify(b"qc quorum", &sig));
 }
 
-#[test]
-fn bls_flag_parsing_parity_refuse_vs_config() {
-    use stellereum::bls::{refuse_bls_qc_if_enabled, QcBlsConfig, BLS_QC_ENV};
-    let _g = SERIAL.lock().unwrap();
-    let prior = std::env::var(BLS_QC_ENV).ok();
-    // (value, expected_enabled): refusal errors exactly when config enables.
-    let cases = [
-        ("1", true),
-        ("true", true),
-        ("TRUE", true),
-        ("on", true),
-        ("ON", true),
-        (" 1 ", true),
-        ("0", false),
-        ("false", false),
-        ("True", false),
-        ("yes", false),
-        ("", false),
-    ];
-    for (val, enabled) in cases {
-        std::env::set_var(BLS_QC_ENV, val);
-        let cfg = QcBlsConfig::from_env();
-        assert_eq!(cfg.enabled, enabled, "flag {val:?}");
-        assert_eq!(
-            refuse_bls_qc_if_enabled().is_err(),
-            enabled,
-            "gate and config must agree on {val:?}"
-        );
-    }
-    match prior {
-        Some(v) => std::env::set_var(BLS_QC_ENV, v),
-        None => std::env::remove_var(BLS_QC_ENV),
-    }
-}
+
+// REMOVED (`bls_flag_parsing_parity_refuse_vs_config`): pinned refusal-vs-`QcBlsConfig::from_env`
+// parity — `from_env` was deleted with the counting-path config, so the parity
+// target is gone (reported). Refusal spelling matrix stays pinned by
+// `bls_qc_startup_refusal_is_unchanged` (bls_pop_tests) and
+// `default_startup_still_refuses_bls_qc_counting` (bls_classical_tests).
+
 
 #[test]
 fn bls_config_debug_redacts_seed() {

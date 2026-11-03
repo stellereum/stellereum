@@ -424,6 +424,62 @@ else
   echo "[matrix] econ-abuse -> SKIP (file absent)"
 fi
 
+# ---- anti-flood + public-freeze + concurrent-landing sweep (SKIP-if-absent idiom) ----
+if [ -f "$ROOT/infnode/crates/infnode/tests/circuit_breaker_tests.rs" ]; then
+  row circuit-breaker infnode 600 -- -p infnode --test circuit_breaker_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "circuit-breaker" "infnode" "SKIP" "0" "circuit_breaker_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] circuit-breaker -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/infnode/crates/infnode/tests/endpoint_hygiene_tests.rs" ]; then
+  row endpoint-hygiene infnode 300 -- -p infnode --test endpoint_hygiene_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "endpoint-hygiene" "infnode" "SKIP" "0" "endpoint_hygiene_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] endpoint-hygiene -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/flood_bigchain_tests.rs" ]; then
+  row flood-bigchain stellereum 600 -- --test flood_bigchain_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "flood-bigchain" "stellereum" "SKIP" "0" "flood_bigchain_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] flood-bigchain -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/infnode/crates/infnode/tests/kex_session_tests.rs" ]; then
+  row kex-session infnode 300 -- -p infnode --test kex_session_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "kex-session" "infnode" "SKIP" "0" "kex_session_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] kex-session -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/infnode/crates/infnode/tests/nodeid_ceremony_tests.rs" ]; then
+  row nodeid-ceremony infnode 300 -- -p infnode --test nodeid_ceremony_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "nodeid-ceremony" "infnode" "SKIP" "0" "nodeid_ceremony_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] nodeid-ceremony -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/nshard_soak_tests.rs" ]; then
+  row nshard-soak stellereum 600 -- --test nshard_soak_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "nshard-soak" "stellereum" "SKIP" "0" "nshard_soak_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] nshard-soak -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/freeze_pins_tests.rs" ]; then
+  row freeze-pins stellereum 300 -- --test freeze_pins_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "freeze-pins" "stellereum" "SKIP" "0" "freeze_pins_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] freeze-pins -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/workchain_guard_tests.rs" ]; then
+  row workchain-guard stellereum 300 -- --test workchain_guard_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "workchain-guard" "stellereum" "SKIP" "0" "workchain_guard_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] workchain-guard -> SKIP (file absent)"
+fi
+if [ -f "$ROOT/stellereum/tests/vrf_canonical_draw_tests.rs" ]; then
+  row vrf-canonical-draw stellereum 300 -- --test vrf_canonical_draw_tests
+else
+  printf '%s\t%s\t%s\t%s\t%s\n' "vrf-canonical-draw" "stellereum" "SKIP" "0" "vrf_canonical_draw_tests.rs absent at runtime" >> "$TSV"
+  echo "[matrix] vrf-canonical-draw -> SKIP (file absent)"
+fi
+
 python3 - "$TSV" "$ROOT" <<'EOF'
 import json, sys
 tsv, root = sys.argv[1], sys.argv[2]

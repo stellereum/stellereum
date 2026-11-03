@@ -56,6 +56,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 ///    [`reentry_warn_message_for`]) and keep a liveness watch on it (see
 ///    [`reentry_liveness_risk`]) — visibility only, the derived set is never
 ///    altered.
+///
+/// FREEZE (protocol freeze 2026-11-03): 1,000 STELL entry floor, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const MIN_VALIDATOR_BOND: u64 = 1_000 * 1_000_000_000;
 
 /// Hard entry buffer in nano-STELL (100 STELL): a NEW bond must carry at
@@ -69,6 +72,9 @@ pub const MIN_VALIDATOR_BOND: u64 = 1_000 * 1_000_000_000;
 /// log policy and may differ. Default equals
 /// [`DEFAULT_MIN_BOND_BUFFER_NANO`] so the enforced floor and the
 /// recommended cushion agree out of the box.
+///
+/// FREEZE (protocol freeze 2026-11-03): 100 STELL admission buffer, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const STELL_MIN_BOND_BUFFER: u64 = 100 * 1_000_000_000;
 
 /// Required self-bond for a NEW bond: MIN + buffer (fail-closed floor).
@@ -189,6 +195,10 @@ pub fn buffer_warn_message_for(total_self_bond: u64, buffer: u64) -> Option<Stri
 }
 
 /// Maximum active validators (consensus set cap): 250.///
+///
+/// FREEZE (protocol freeze 2026-11-03): set-size cap input to quorum math.
+/// Change requires spec update + audit note (AGENTS.md §7).
+///
 /// Rationale (multi-chain research 2026): TON caps at 400 (380 live),
 /// Cosmos Hub at 180, Polygon PoS at 105, BNB at 45, Sui ~102-127,
 /// Aptos ~129, NEAR top-100 block producers / ~213 total.
@@ -226,17 +236,35 @@ pub const REWARDS_EMISSION_CAP: u64 = 350_000_000 * 1_000_000_000;
 /// Minimum delegation amount (1 STELL).
 pub const MIN_DELEGATION: u64 = 1_000_000_000;
 /// Unbonding cooldown before funds can be withdrawn (~2 days at 3s blocks).
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const UNBONDING_PERIOD_SECS: u64 = 2 * 24 * 3600;
 /// Slash fraction for equivocation (double-sign), in basis points (5%).
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const EQUIVOCATION_SLASH_BPS: u64 = 500;
 /// Slash fraction for micro-committee equivocation (100% of bond).
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const MICRO_COMMITTEE_SLASH_BPS: u64 = 10_000;
 /// Slash fraction for prolonged downtime, in basis points (0.1%).
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const DOWNTIME_SLASH_BPS: u64 = 10;
 /// Consecutive missed heights before a downtime slash fires.
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const DOWNTIME_MISS_THRESHOLD: u32 = 10;
 /// Minimum heights between two downtime slashes for the same validator, so a
 /// long outage costs a bounded amount rather than draining the whole bond.
+///
+/// FREEZE (protocol freeze 2026-11-03): deterministic const, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const DOWNTIME_PENALTY_COOLDOWN: u64 = 100;
 /// Default validator commission on delegated rewards (10%).
 ///
@@ -262,8 +290,14 @@ pub const DOWNTIME_PENALTY_COOLDOWN: u64 = 100;
 /// owned by another scope); the path is ledger-complete and RPC-observable
 /// (`stell_getValidatorStatus`) so operators and wallets can use it the
 /// moment an opcode lands.
+///
+/// FREEZE (protocol freeze 2026-11-03): 10% default commission, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const DEFAULT_COMMISSION_BPS: u64 = 1_000;
 /// Basis-point denominator for every `*_bps` field (commission, slashes).
+///
+/// FREEZE (protocol freeze 2026-11-03): 10_000 divisor, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const BPS_DENOMINATOR: u64 = 10_000;
 
 /// Jail release delay in heights: a downtime-jailed validator becomes
@@ -275,6 +309,9 @@ pub const BPS_DENOMINATOR: u64 = 10_000;
 /// the delay deliberately exceeds [`DOWNTIME_PENALTY_COOLDOWN`] (100) so a
 /// validator cannot unjail inside the same outage window that would
 /// immediately re-slash it.
+///
+/// FREEZE (protocol freeze 2026-11-03): 1,000 heights ≈ 50 min at 3 s blocks.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const JAIL_RELEASE_DELAY_HEIGHTS: u64 = 1_000;
 
 /// Maximum commission change per [`StakingLedger::announce_commission`], in
@@ -282,6 +319,9 @@ pub const JAIL_RELEASE_DELAY_HEIGHTS: u64 = 1_000;
 /// at least 18 announced steps — a rug cannot land in one transaction.
 /// Fail-closed: a larger delta is refused with
 /// [`StakingError::CommissionDeltaExceeded`].
+///
+/// FREEZE (protocol freeze 2026-11-03): 500 BPS max step, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const COMMISSION_MAX_DELTA_BPS: u64 = 500;
 
 /// Delegator-exit window in heights: an announced commission change takes
@@ -291,12 +331,18 @@ pub const COMMISSION_MAX_DELTA_BPS: u64 = 500;
 /// and `undelegate`/`redelegate` stay fully available, so no delegator is
 /// ever surprised by a raise — the exit window the immutability decision
 /// demanded as the EXACT PRECONDITION for any `SetCommission` path.
+///
+/// FREEZE (protocol freeze 2026-11-03): 7,200 heights ≈ 6 h, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const COMMISSION_EFFECT_DELAY_HEIGHTS: u64 = 7_200;
 
 /// Minimum heights between two EFFECTIVE commission changes for one
 /// validator (7,200 ≈ 6 h). Announcing while the cooldown from the last
 /// effective change has not elapsed is refused fail-closed with
 /// [`StakingError::CommissionNotDue`].
+///
+/// FREEZE (protocol freeze 2026-11-03): 7,200 heights ≈ 6 h, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const COMMISSION_CHANGE_COOLDOWN_HEIGHTS: u64 = 7_200;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

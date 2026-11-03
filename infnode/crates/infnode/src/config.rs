@@ -99,6 +99,29 @@ impl PeerConfig {
             .map_err(|_| anyhow!("pq_pub должен быть 897 байт"))
             .map(Some)
     }
+
+    /// Primary identity for this peer under the NodeId re-ceremony
+    /// (`keyring::resolve_node_id` peer-side mirror): the PQ id when a PQ key
+    /// is pinned (via `proto::pq_id_from_pub` — no duplicate logic), else the
+    /// pinned classical `node_id`. Pure addition — serde shape unchanged, so
+    /// old single-ed configs parse exactly as before.
+    pub fn primary_id(&self) -> Result<[u8; crate::proto::NODEID_LEN]> {
+        if let Some(pq) = self.pq_bytes()? {
+            return Ok(crate::proto::pq_id_from_pub(&pq));
+        }
+        self.node_id_raw()
+    }
+
+    /// Dual-announce view of this peer during the migration window: both ids,
+    /// PQ FIRST when a PQ key is pinned, else the single classical alias.
+    /// Same ordering rule as `keyring::dual_announce_ids` (recomputed from
+    /// the pinned keys, never stored — pins stay the source of truth).
+    pub fn dual_announce_ids(&self) -> Result<Vec<[u8; crate::proto::NODEID_LEN]>> {
+        match self.pq_bytes()? {
+            Some(pq) => Ok(vec![crate::proto::pq_id_from_pub(&pq), self.node_id_raw()?]),
+            None => Ok(vec![self.node_id_raw()?]),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

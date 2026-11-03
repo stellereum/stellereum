@@ -5829,7 +5829,7 @@ async fn dispatch(
         // Admission floor for wallets and harnesses: the minimum declared
         // `gas_limit` this node currently accepts into its mempool (and the
         // floor its proposer filter skips below). Read-only; refreshed from
-        // max(env, governed) every finalized height, so a wallet asserts this
+        // max(frozen, governed) every finalized height, so a wallet asserts this
         // BEFORE blasting, not after its transactions bounce.
         "stell_baseFee" => {
             let floor = st.mempool.read().await.base_fee;

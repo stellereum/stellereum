@@ -1,10 +1,15 @@
 //! Cloudflare Turnstile captcha gate for the public faucet.
 //!
-//! The public faucet (`POST /api/faucet-public/:address`) used to be protected
-//! by the per-IP hourly budget alone. Turnstile adds a proof-of-humanity check
-//! in front of that budget. The captcha is OPTIONAL at the deployment level:
-//! when neither key is configured the faucet behaves exactly as before (IP
-//! throttle only), so existing deployments do not break on upgrade.
+//! The public faucet (`POST /api/faucet-public/:address`) requires a
+//! proof-of-humanity check in front of the per-IP hourly budget.
+//! OPERATOR CONTRACT (fail-closed):
+//! - Set BOTH `STELL_TURNSTILE_SITE_KEY` and `STELL_TURNSTILE_SECRET_KEY` to
+//!   enable the captcha (`CaptchaConfig::Enabled`): every public claim is
+//!   verified via Cloudflare `siteverify` before any budget is consumed.
+//! - When NEITHER key is set (`CaptchaConfig::Disabled`) the gateway refuses
+//!   non-loopback public claims with `503 captcha not configured` and moves
+//!   no funds; loopback clients (`127.0.0.0/8`, `::1` — local dev/tests) keep
+//!   the IP-throttle-only path (see `api_faucet_public`).
 //!
 //! Configuration (both keys or neither):
 //!
@@ -15,7 +20,8 @@
 //!
 //! A deployment that sets only one of the two keys is treated as a
 //! misconfiguration: the faucet answers `503` instead of silently dispensing
-//! without captcha (fail-closed — the operator clearly *meant* to enable it).
+//! without captcha (fail-closed — the operator clearly *meant* to enable it),
+//! on loopback and non-loopback alike.
 //!
 //! Verification happens server-side against Cloudflare's `siteverify` endpoint
 //! through the already-vendored blocking HTTP client (`ureq`), executed on the
@@ -29,17 +35,20 @@ use std::time::Duration;
 
 /// Cloudflare Turnstile **site** key for the public faucet. This value is
 /// public by design: it is embedded in the explorer HTML so the browser can
-/// render the widget. Default: unset, which disables the captcha on the public
-/// faucet (the per-IP hourly budget still applies). Must be paired with
-/// [`TURNSTILE_SECRET_KEY_ENV`]; setting only this key is a misconfiguration
-/// and the public faucet answers `503` until both are set.
+/// render the widget. Default: unset. When BOTH keys are unset the public
+/// faucet is `Disabled`: non-loopback claims are refused with `503 captcha
+/// not configured` (fail-closed; loopback keeps the IP-throttle-only path).
+/// Must be paired with [`TURNSTILE_SECRET_KEY_ENV`]; setting only this key
+/// is a misconfiguration and the public faucet answers `503` until both are set.
 pub const TURNSTILE_SITE_KEY_ENV: &str = "STELL_TURNSTILE_SITE_KEY";
 
 /// Cloudflare Turnstile **secret** key for the public faucet. Server-side
 /// only: it authorizes `siteverify` calls and must never reach a browser, a
-/// log line, or an error message. Default: unset, which disables the captcha
-/// on the public faucet (the per-IP hourly budget still applies). Must be
-/// paired with [`TURNSTILE_SITE_KEY_ENV`]; setting only this key is a
+/// log line, or an error message. Default: unset. When BOTH keys are unset
+/// the public faucet is `Disabled`: non-loopback claims are refused with
+/// `503 captcha not configured` (fail-closed; loopback keeps the
+/// IP-throttle-only path). Must be paired with
+/// [`TURNSTILE_SITE_KEY_ENV`]; setting only this key is a
 /// misconfiguration and the public faucet answers `503` until both are set —
 /// refusing beats dispensing without captcha while the operator believes the
 /// captcha is on.
@@ -78,8 +87,10 @@ pub enum CaptchaVerdict {
 /// printed by `Debug` (see the manual impl below).
 #[derive(Clone, PartialEq, Eq)]
 pub enum CaptchaConfig {
-    /// Neither key set: the public faucet relies on the per-IP hourly budget
-    /// alone (pre-captcha behaviour; existing deployments keep working).
+    /// Neither key set: non-loopback public claims are refused with `503
+    /// captcha not configured` (fail-closed, no funds move); loopback clients
+    /// (local dev/tests) keep the per-IP hourly budget path. Configure BOTH
+    /// keys to enable the captcha on public claims.
     Disabled,
     /// Both keys set: the captcha is mandatory on the public faucet.
     Enabled {
@@ -262,7 +273,7 @@ pub fn log_captcha_startup(config: &CaptchaConfig) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| match config {
         CaptchaConfig::Disabled => tracing::warn!(
-            "public faucet has no captcha configured (set STELL_TURNSTILE_SITE_KEY / _SECRET_KEY); relying on IP throttle alone"
+            "public faucet has no captcha configured (set STELL_TURNSTILE_SITE_KEY and STELL_TURNSTILE_SECRET_KEY); non-loopback public claims will fail with 503 until both are set"
         ),
         CaptchaConfig::Misconfigured => tracing::warn!(
             "public faucet captcha is misconfigured: exactly one of STELL_TURNSTILE_SITE_KEY / STELL_TURNSTILE_SECRET_KEY is set; public faucet requests will fail with 503 until both are set"

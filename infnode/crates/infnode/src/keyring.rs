@@ -177,16 +177,16 @@ impl NodeKeys {
     }
 
     pub fn id(&self) -> [u8; NODEID_LEN] {
-        // PQ NOTE (PQ 9.0: `PqKeys` landed below, `pq-identity.key` convention
-        // live): `NodeId` stays `blake3(ed_pub)[..20]` — canonical and
-        // byte-identical even with PQ identity present. The PQ handshake
-        // carries the Falcon-512 long-term id alongside the classical id
-        // (`pq_id = blake3("infnode-pqid-v1" || falcon_pk)[..20]`, see
-        // `proto::pq_id_from_pub`) with first-PQ-wins sticky binding
-        // (`node::PqIdentityRegistry`), and routes by the classical id.
-        // Promoting a PQ long-term id to canonical `NodeId` is a flag-day
-        // follow-up (would fork DHT/pins/TLS/federation); changing `id()`
-        // before that is FORBIDDEN.
+        // LEGACY alias (classical `blake3(ed_pub)[..20]`). Byte-identical and
+        // stable: pre-ceremony configs, pins, DHT entries and tests keep
+        // working through the migration window (see `LEGACY_ALIAS_END_UNIX_MS`
+        // + `legacy_alias_accepted_at`). The canonical post-ceremony
+        // derivation is `resolve_node_id` below (PQ-primary when a PQ identity
+        // exists); `id()` is the explicit LEGACY arm of that rule, marked by
+        // `NodeIdKind::Legacy` in type and in startup logs (`node.rs`).
+        // The PQ long-term id rides alongside (`PqKeys::pq_id`, display/
+        // binding helper, `inf1:`-rendered) with first-PQ-wins sticky binding
+        // (`node::PqIdentityRegistry`); routes still key on the resolved id.
         let h = blake3::hash(self.verifying.as_bytes());
         let mut id = [0u8; NODEID_LEN];
         id.copy_from_slice(&h.as_bytes()[..NODEID_LEN]);
@@ -435,4 +435,130 @@ impl PqKeys {
         plain.zeroize();
         Ok(seed)
     }
+}
+
+// ---------------------------------------------------------------------------
+// NodeId re-ceremony: PQ identity becomes primary, with a migration window.
+//
+// Derivation rule (one line): `NodeId = blake3("infnode-pqid-v1"||falcon_pk)[..20]`
+// when a PQ identity exists, else legacy `blake3(ed_pub)[..20]` marked LEGACY.
+// * PQ arm reuses `PqKeys::pq_id` (which reuses `proto::pq_id_from_pub`) —
+//   no duplicate hashing logic lives here.
+// * Legacy arm (`NodeKeys::id`) is byte-identical to the pre-ceremony id, so
+//   old single-ed configs keep working until the window end below.
+// * `pq-identity.key` auto-gen already exists (`PqKeys::load_or_generate`);
+//   nothing new is invented here — call it at startup to enrol PQ.
+// * Window end: `LEGACY_ALIAS_END_UNIX_MS` (far-future default, documented).
+//   Enforcement is a pure predicate on an injected clock
+//   (`legacy_alias_accepted_at`); no timers or wall-clock reads in this code.
+// ---------------------------------------------------------------------------
+
+/// End of the migration window: Unix millis after which the legacy classical
+/// alias is dropped and legacy-only peers are refused.
+///
+/// Default: 2035-01-01T00:00:00Z (far future — operators get years to enrol
+/// `pq-identity.key`; tightening it is a one-line const change + spec note,
+/// never a behavior patch). No timer fires in code: callers pass an injected
+/// clock to `legacy_alias_accepted_at` (tests never touch wall-clock).
+pub const LEGACY_ALIAS_END_UNIX_MS: i64 = 2_051_222_400_000;
+
+/// Pure window gate: true while the legacy classical alias is still honored.
+/// `now_unix_ms` is caller-supplied (injected clock — no wall-clock read).
+pub fn legacy_alias_accepted_at(now_unix_ms: i64) -> bool {
+    now_unix_ms < LEGACY_ALIAS_END_UNIX_MS
+}
+
+/// Which arm of the re-ceremony derivation produced a `NodeId`. The legacy
+/// arm is explicit in the type (`Legacy`) and in startup logs (`node.rs`
+/// emits `node_id_kind` with this label) — a classical-only node is always
+/// visibly LEGACY, never silently classical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeIdKind {
+    Pq,
+    Legacy,
+}
+
+impl NodeIdKind {
+    /// Short label for logs and `node_id_kind` telemetry (`"PQ"`/`"LEGACY"`).
+    pub fn label(self) -> &'static str {
+        match self {
+            NodeIdKind::Pq => "PQ",
+            NodeIdKind::Legacy => "LEGACY",
+        }
+    }
+}
+
+/// A derived `NodeId` with its ceremony arm attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedNodeId {
+    pub id: [u8; NODEID_LEN],
+    pub kind: NodeIdKind,
+}
+
+impl ResolvedNodeId {
+    /// True for the legacy classical arm (pre-window-end compat only).
+    pub fn is_legacy(self) -> bool {
+        self.kind == NodeIdKind::Legacy
+    }
+
+    /// `"PQ"` or `"LEGACY"` (log/telemetry mark).
+    pub fn kind_label(self) -> &'static str {
+        self.kind.label()
+    }
+
+    /// `inf1:`-rendered id (same alphabet as the classical id).
+    pub fn id_hex(self) -> String {
+        format!("inf1:{}", hex::encode(self.id))
+    }
+}
+
+/// Canonical NodeId derivation: PQ-primary when a PQ identity exists (via
+/// `PqKeys::pq_id` — same construction as `proto::pq_id_from_pub`, no
+/// duplicate logic), else the byte-identical legacy `blake3(ed_pub)[..20]`
+/// explicitly marked `LEGACY`.
+pub fn resolve_node_id(ed: &NodeKeys, pq: Option<&PqKeys>) -> ResolvedNodeId {
+    match pq {
+        Some(pq) => ResolvedNodeId {
+            id: pq.pq_id(),
+            kind: NodeIdKind::Pq,
+        },
+        None => ResolvedNodeId {
+            id: ed.id(),
+            kind: NodeIdKind::Legacy,
+        },
+    }
+}
+
+/// Dual-announce during the window: both ids, PQ FIRST. Legacy-only nodes
+/// announce the single classical alias. Pure ordering rule for the announce
+/// path (wire encoding stays out of scope — see `parse_dual_announce`).
+pub fn dual_announce_ids(ed: &NodeKeys, pq: Option<&PqKeys>) -> Vec<[u8; NODEID_LEN]> {
+    match pq {
+        Some(pq) => vec![pq.pq_id(), ed.id()],
+        None => vec![ed.id()],
+    }
+}
+
+/// `inf1:`-rendered dual-announce (same order as `dual_announce_ids`).
+pub fn dual_announce_hex(ed: &NodeKeys, pq: Option<&PqKeys>) -> Vec<String> {
+    dual_announce_ids(ed, pq)
+        .iter()
+        .map(|id| format!("inf1:{}", hex::encode(id)))
+        .collect()
+}
+
+/// Parse an advertised dual-announce: 1–2 `inf1:` ids, fail-closed.
+/// Malformed entries, wrong lengths and lists longer than 2 are refused
+/// (never silently truncated). Order is preserved (PQ first by convention).
+pub fn parse_dual_announce(ids: &[String]) -> Result<Vec<[u8; NODEID_LEN]>> {
+    if ids.is_empty() || ids.len() > 2 {
+        bail!("dual announce must carry 1-2 ids");
+    }
+    ids.iter()
+        .map(|s| {
+            let b = hex::decode(s.strip_prefix(crate::config::NODEID_PREFIX).unwrap_or(s))?;
+            b.try_into()
+                .map_err(|_| anyhow!("announced id must be 20 bytes"))
+        })
+        .collect()
 }

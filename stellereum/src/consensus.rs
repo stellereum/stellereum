@@ -510,30 +510,18 @@ pub const QC_PQ_MAGIC: &[u8; 16] = b"STELL_QC_PQ_V5__";
 ///     finalize a block (audit W6.5 — committee capture).
 /// - Carried inside `QuorumCertificate::signatures` under sentinel marker `PQ_UQC_MARKER_ID`.
 ///
-/// Phase-3 VRF beacon seal carried by a micro-certificate.
+/// Phase-3 VRF beacon seal carried by a micro-certificate (RETIRED, inert).
 ///
-/// The proposer's registry-bound VRF proof for the election input
-/// `(sortition_parent, height, round)` — i.e. `vrf_prove(secret,
-/// sortition_seed(parent, height, round))` minted by the validator named in
-/// `validator_id`, verifiable via
-/// `vrf::verify_vrf_seed_for_validator(registry, validator_id, seed_input,
-/// proof)`.
-///
-/// The verifier looks the VRF public key up in its OWN registry (Falcon-bound
-/// keys only), re-derives the seed input from the certificate's OWN
-/// `(sortition_parent, height, round)`, and re-verifies the proof bytes: the
-/// seal carries exactly what that check needs (id + proof envelope) and
-/// nothing else. No uniqueness is assumed (the Schnorr construction admits
-/// several valid proofs per input — see the documented ECVRF gap in
-/// `vrf.rs`): verification accepts ANY proof that verifies under the bound
-/// key, and the election is a pure function of the verified output.
+/// The ECVRF prove/verify bodies were removed (classical crypto, FULL-PQ
+/// architecture): seals are never minted and never consulted. The field and
+/// this envelope type stay for WIRE COMPAT — certificates that carry a seal
+/// (trailing serde-defaulted field) still decode byte-identically, and the
+/// election always resolves to the canonical parent-hash draw.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VrfBeaconSeal {
     /// The validator whose VRF secret minted `proof` (registry lookup key).
     pub validator_id: ValidatorId,
-    /// The VRF proof envelope: `output` bound to the 64 proof bytes.
-    /// `vrf::vrf_verify` re-derives `output` from those bytes, so a seal whose
-    /// `output` field does not match its proof bytes refuses.
+    /// The VRF proof envelope: `output` bound to the proof bytes.
     pub proof: crate::vrf::VrfProof,
 }
 
@@ -543,23 +531,6 @@ impl VrfBeaconSeal {
             validator_id,
             proof,
         }
-    }
-
-    /// The verified VRF output, or `None` when the seal does not verify
-    /// against `registry` for `seed_input` (unknown key, bad proof bytes, or
-    /// an `output` field that does not match the proof bytes — fail-closed).
-    pub fn verified_output(
-        &self,
-        registry: &crate::vrf::VrfRegistry,
-        seed_input: &[u8; 32],
-    ) -> Option<[u8; 32]> {
-        crate::vrf::verify_vrf_seed_for_validator(
-            registry,
-            &self.validator_id,
-            seed_input,
-            &self.proof,
-        )
-        .filter(|out| *out == self.proof.output)
     }
 }
 
@@ -587,15 +558,12 @@ pub struct PqMicroCertificate {
     /// "elected with the zero parent" — which the header pin then rejects.
     #[serde(default)]
     pub sortition_parent: [u8; 32],
-    /// Phase-3 VRF beacon seal (trailing, optional).
+    /// Phase-3 VRF beacon seal (trailing, optional; RETIRED, inert).
     ///
-    /// `None` (the default) means "elected by the legacy parent-hash draw":
-    /// every pre-activation certificate, and every certificate built or
-    /// decoded without VRF material, carries `None` and verifies exactly as
-    /// today. `Some(seal)` means "elected by the verified VRF output": at an
-    /// armed height the verifier re-checks the seal against its registry and
-    /// re-derives the committee from the verified output instead of the
-    /// parent hash (see [`derive_sortition_committee_gated`]).
+    /// Always resolves to the legacy parent-hash draw: `None` (the default)
+    /// is what every certificate built by this code carries, and a `Some`
+    /// seal that remains on the wire (from old binaries) is never consulted
+    /// (see [`VrfBeaconSeal`]). Verification is exactly as without it.
     ///
     /// The field is LAST on purpose, like `sortition_parent`: a certificate
     /// persisted/serialized before this field existed ends its byte stream one
@@ -634,13 +602,11 @@ impl PqMicroCertificate {
         }
     }
 
-    /// Attach a VRF beacon seal (phase-3 assembly path only).
+    /// Attach a VRF beacon seal (RETIRED, inert).
     ///
-    /// The caller MUST have minted `seal` for THIS certificate's
-    /// `(sortition_parent, height, round)` and self-verified it; verifiers
-    /// re-check the seal against their own registry regardless, so a bad seal
-    /// attached here only makes the certificate refuse — it can never mint a
-    /// forged committee.
+    /// Kept for wire-compat construction in tests: assembly never calls this
+    /// (no seal is minted or embedded), and verifiers never consult the seal.
+    /// A `Some` seal on the wire resolves to the legacy parent-hash draw.
     pub fn with_vrf_beacon(mut self, seal: VrfBeaconSeal) -> Self {
         self.vrf_beacon = Some(seal);
         self
@@ -758,6 +724,9 @@ impl PqMicroCertificate {
 /// Consensus-domain quorum floor: `floor(2n/3) + 1` votes (or voting power)
 /// out of `n`.
 ///
+/// FREEZE (protocol freeze 2026-11-03): value = BFT safety curve, no env knob
+/// ever existed. Change requires spec update + audit note (AGENTS.md §7).
+///
 /// Domain: PBFT/PQ-BFT finality. It is deliberately NOT the bridge threshold
 /// [`crate::bridge::quorum_threshold`] (`floor((2n+2)/3)`, floored at 1): that
 /// counts DISTINCT signers of an external cross-chain signer set and is LOWER
@@ -774,6 +743,9 @@ pub fn consensus_quorum_min(n: u64) -> u64 {
 }
 
 /// Strict quorum threshold for micro-committee of size k: floor(2*k/3) + 1.
+///
+/// FREEZE (protocol freeze 2026-11-03): same consensus-domain curve as
+/// [`consensus_quorum_min`]. Change requires spec update + audit note.
 ///
 /// Same consensus-domain curve as [`consensus_quorum_min`]; a zero-size
 /// committee is unrepresentable as a real threshold, so it fails closed with
@@ -792,6 +764,9 @@ pub fn pq_micro_quorum_threshold(committee_size: u32) -> usize {
 
 /// Power-weighted quorum threshold for a micro-committee: `floor(2*W/3) + 1`
 /// over the committee's total voting power `W`.
+///
+/// FREEZE (protocol freeze 2026-11-03): the LIVE µQC rule. Change requires
+/// spec update + audit note (AGENTS.md §7).
 ///
 /// This is the LIVE µQC rule (classical BFT accounting applied to the
 /// sortition committee): the verifier sums the powers of the committee
@@ -968,9 +943,8 @@ pub fn derive_sortition_committee(
 /// `(validators, height, round, seed)` ⇒ same committee on every node; no
 /// wall clock, no local randomness anywhere in this path.
 ///
-/// Live callers pass `Disabled` + `None` today (v5 bytes pinned); phase 3
-/// threads the configured activation and the winning ticket's verified
-/// output here.
+/// Live callers pass `Disabled` + `None` (v5 bytes pinned); the VRF
+/// resolution always yields no output (retired), so the legacy draw applies.
 pub fn derive_sortition_committee_gated(
     validators: &ValidatorSet,
     height: Height,
@@ -1075,11 +1049,10 @@ pub fn sortition_seed(prev_block_hash: &[u8; 32], height: Height, round: Round) 
 /// * Gate active at `height` WITH a registry-verified output ⇒
 ///   `vrf::vrf_election_seed(output, height, round)`.
 ///
-/// The `verified_vrf_output` MUST be minted by
-/// `vrf::verify_vrf_seed_for_validator` (proof verified under the
-/// Falcon-bound registry key); unverified bytes are never passed here —
-/// without a `Some`, an active height falls back to the parent-hash seed
-/// rather than attacker-chosen entropy. Pure and deterministic.
+/// The `verified_vrf_output`, when supplied, is caller-attested output bytes
+/// (minting removed with ECVRF; the only live callers pass `None`); without
+/// a `Some`, the parent-hash seed applies rather than attacker-chosen
+/// entropy. Pure and deterministic.
 pub fn sortition_seed_gated(
     prev_block_hash: &[u8; 32],
     height: Height,
@@ -1095,59 +1068,22 @@ pub fn sortition_seed_gated(
     sortition_seed(prev_block_hash, height, round)
 }
 
-/// Phase-3 VRF election resolution for a µQC (shared by assembly and verify).
+/// VRF election resolution for a µQC (RETIRED, canonical parent-hash draw).
 ///
-/// Returns the registry-verified VRF output to elect with, or `None` for the
-/// legacy parent-hash draw. `Err` (fail-closed, the whole certificate
-/// refuses) ONLY when the certificate claims a VRF seal at an armed height
-/// under a KNOWN registry key but the proof does not verify — a forged seal.
-/// Every other seal problem falls back to the legacy draw:
-///
-/// | seal | height | registry/key | result |
-/// |---|---|---|---|
-/// | none | any | — | legacy (old-version certificate) |
-/// | some | pre-activation / `Disabled` | — | legacy (seal ignored) |
-/// | some | armed | registry missing | legacy (nothing to check against) |
-/// | some | armed | key unknown | legacy (rollout gap; a legacy committee
-/// still needs a real Falcon quorum, so liveness is preserved, not gifted) |
-/// | some | armed | key known, proof + output verify | VRF committee |
-/// | some | armed | key known, proof/output mismatch | REFUSE (forged) |
-///
-/// The asymmetry (refuse forged, fall back on missing) is deliberate: at an
-/// armed height a KNOWN-key seal that fails verification is evidence of
-/// tampering, and silently downgrading it to the grindable parent-hash
-/// committee is exactly the downgrade an attacker wants. An absent seal (or
-/// an incomplete rollout) carries no such evidence, so the legacy draw —
-/// still guarded by the network-anchored quorum — applies.
-///
-/// No uniqueness is assumed: any proof that verifies under the bound key
-/// mints its output (the Schnorr construction admits several valid proofs
-/// per input; the election is a pure function of whichever output verifies).
+/// The ECVRF prove/verify bodies were removed (classical crypto, FULL-PQ
+/// architecture): no seal can ever verify, so this always resolves to `Ok(None)`
+/// — the legacy parent-hash draw, byte-identical to today. The signature is
+/// unchanged so the election-math call sites (`micro_cert_valid_signers`,
+/// `verify_micro_cert`, assembly) are untouched; they already treat `None`
+/// as the legacy draw via the pre-existing fallback matrix.
 fn vrf_output_for_cert(
-    cert: &PqMicroCertificate,
-    activation: &crate::vrf::VrfActivation,
-    registry: Option<&crate::vrf::VrfRegistry>,
+    _cert: &PqMicroCertificate,
+    _activation: &crate::vrf::VrfActivation,
+    _registry: Option<&crate::vrf::VrfRegistry>,
 ) -> Result<Option<[u8; 32]>, ()> {
-    let Some(seal) = &cert.vrf_beacon else {
-        return Ok(None);
-    };
-    if !activation.is_active_at(cert.height) {
-        // Pre-activation the seal is not even read: the height gate, not
-        // proof presence, decides (byte-identical legacy draw).
-        return Ok(None);
-    }
-    let Some(reg) = registry else {
-        return Ok(None);
-    };
-    let Some(vrf_pk) = reg.get(&seal.validator_id) else {
-        return Ok(None);
-    };
-    let seed_input = sortition_seed(&cert.sortition_parent, cert.height, cert.round);
-    match crate::vrf::vrf_verify(&vrf_pk, &seed_input, &seal.proof) {
-        Some(out) if out == seal.proof.output => Ok(Some(out)),
-        _ => Err(()),
-    }
+    Ok(None)
 }
+
 
 /// Encode a post-quantum micro-certificate (µQC) into its canonical wire envelope.
 ///
@@ -1397,6 +1333,9 @@ impl ValidatorSet {
 
     /// Quorum is strictly more than 2/3 of total power: floor(2*total/3) + 1,
     /// the consensus-domain curve [`consensus_quorum_min`].
+    ///
+    /// FREEZE (protocol freeze 2026-11-03): quorum accounting is frozen core.
+    /// Change requires spec update + audit note (AGENTS.md §7).
     pub fn quorum_power(&self) -> u64 {
         let total = self.total_power();
         if total == 0 {
@@ -1607,8 +1546,7 @@ impl Vote {
         let voter = key.verifying_key().to_bytes();
         let msg = vote_sign_bytes(height, round, kind, &block_hash);
         let sig = key.sign(&msg);
-        let mut signature = sig.to_vec();
-        attach_vote_bls(&msg, &mut signature);
+        let signature = sig.to_vec();
         Self {
             height,
             round,
@@ -1624,11 +1562,6 @@ impl Vote {
     /// The caller must have signed `vote_sign_bytes(height, round, kind, block_hash)`
     /// with the key behind `voter`. `Vote::verify` checks it, so an incorrect signature
     /// is rejected at the same place a locally produced one would be.
-    ///
-    /// When the QC-BLS path is enabled, the local BLS half is appended as an
-    /// envelope (`VOTE_BLS_MAGIC || ed || bls`) even though the Ed25519 half
-    /// came from elsewhere: the BLS key stays in this process, and the
-    /// envelope is what lets certificates aggregate this vote.
     pub fn signed_with(
         voter: ValidatorId,
         height: Height,
@@ -1637,17 +1570,14 @@ impl Vote {
         block_hash: Option<BlockHash>,
         signature: Vec<u8>,
     ) -> Self {
-        let mut vote = Self {
+        Self {
             height,
             round,
             kind,
             block_hash,
             voter,
             signature,
-        };
-        let msg = vote_sign_bytes(height, round, kind, &block_hash);
-        attach_vote_bls(&msg, &mut vote.signature);
-        vote
+        }
     }
 
     pub fn verify(&self) -> bool {
@@ -1888,15 +1818,6 @@ impl Vote {
         out
     }
 
-    /// The BLS half of this vote's signature, when it carries one.
-    pub fn bls_signature(&self) -> Option<[u8; 96]> {
-        if self.signature.len() == VOTE_BLS_PART_LEN && self.signature.starts_with(VOTE_BLS_MAGIC) {
-            self.signature[80..176].try_into().ok()
-        } else {
-            None
-        }
-    }
-
     /// The Falcon-512 half of this vote's signature, when it carries one.
     pub fn falcon_signature(&self) -> Option<&[u8]> {
         if self.signature.len() == VOTE_FALCON_PART_LEN
@@ -1936,23 +1857,6 @@ impl Vote {
             signature,
         }
     }
-}
-
-/// Append the local BLS half to a plain 64-byte Ed25519 signature when the
-/// QC-BLS path is enabled. No-op otherwise: flag-off vote bytes stay
-/// byte-identical to the pre-BLS format (default on the stand).
-fn attach_vote_bls(msg: &[u8], signature: &mut Vec<u8>) {
-    if signature.len() != 64 || signature.starts_with(VOTE_BLS_MAGIC) {
-        return;
-    }
-    let Some(bls) = crate::bls::local_vote_bls_sign(msg) else {
-        return;
-    };
-    let mut out = Vec::with_capacity(VOTE_BLS_PART_LEN);
-    out.extend_from_slice(VOTE_BLS_MAGIC);
-    out.extend_from_slice(&*signature);
-    out.extend_from_slice(&bls);
-    *signature = out;
 }
 
 // ============================================================================
@@ -2884,8 +2788,8 @@ impl VoteSet {
     /// elected (audit W6.4b).
     ///
     /// LEGACY alias: `Disabled` activation, no registry, no seal — the v5
-    /// parent-hash draw byte-for-byte. Phase-3 callers (a proposer holding a
-    /// self-verified VRF seal) use [`Self::certificate_with_parent_vrf`].
+    /// parent-hash draw byte-for-byte (VRF threading retired, so the threaded
+    /// entry point resolves identically).
     #[allow(clippy::unnecessary_unwrap)]
     // GATE: is_some guard plus expect keeps parent-hash handling explicit on the consensus path; restructuring risks quorum logic.
     pub fn certificate_with_parent(
@@ -2904,24 +2808,13 @@ impl VoteSet {
         )
     }
 
-    /// Build a quorum certificate with phase-3 VRF threading.
+    /// Build a quorum certificate (VRF threading RETIRED).
     ///
-    /// `activation` is the deployment's VRF height gate, `registry` the local
-    /// Falcon-bound VRF key registry, and `seal` the proposer's OWN
-    /// self-verified [`VrfBeaconSeal`] for `(parent_hash, height, round)`
-    /// (minted where the VRF secret lives — see
-    /// `runtime::ValidatorRuntime::vrf_beacon_seal_for` — and passed down as
-    /// verified output; secrets are never plumbed into this pure function).
-    ///
-    /// The VRF committee is used IFF the height is armed AND `seal` verifies
-    /// against `registry` for this certificate's seed input (with its
-    /// `output` field matching the proof bytes); the seal is then embedded in
-    /// the certificate. ANY other case — gate off, pre-activation height,
-    /// missing registry, unknown key, bad proof — compiles the legacy
-    /// parent-hash committee with `vrf_beacon: None`, byte-identical to
-    /// [`Self::certificate_with_parent`]. (Assembly never refuses on a bad
-    /// seal: it falls back to legacy; VERIFIERS refuse forged seals
-    /// fail-closed — see [`vrf_output_for_cert`].)
+    /// `activation`, `registry`, and `seal` are accepted for API compatibility
+    /// and ignored: the ECVRF prove/verify bodies were removed (classical
+    /// crypto, FULL-PQ architecture), so no seal is minted, embedded, or
+    /// consulted. The committee is always the canonical parent-hash draw,
+    /// byte-identical to [`Self::certificate_with_parent`].
     #[allow(clippy::unnecessary_unwrap)]
     // GATE: is_some guard plus expect keeps parent-hash handling explicit on the consensus path; restructuring risks quorum logic.
     pub fn certificate_with_parent_vrf(
@@ -2929,40 +2822,22 @@ impl VoteSet {
         target: Option<BlockHash>,
         validators: &ValidatorSet,
         parent_hash: Option<&[u8; 32]>,
-        activation: &crate::vrf::VrfActivation,
-        registry: Option<&crate::vrf::VrfRegistry>,
-        seal: Option<VrfBeaconSeal>,
+        _activation: &crate::vrf::VrfActivation,
+        _registry: Option<&crate::vrf::VrfRegistry>,
+        _seal: Option<VrfBeaconSeal>,
     ) -> Option<QuorumCertificate> {
         if !self.quorum_reached(target, validators) {
             return None;
         }
-        // Canonical validator-set indices (audit-consensus F8 hardening):
-        // sorted EXPLICITLY, not via whatever order the map iterator happens
-        // to yield today. `validators` is a `BTreeMap` (sorted iteration),
-        // so this matches the verifier's registry order bit-for-bit — and
-        // keeps matching if the container ever changes. The BLS bitvector
-        // means exactly what the verifier reads back only when both sides
-        // number validators identically.
-        let mut sorted_ids: Vec<ValidatorId> = validators.validators.keys().copied().collect();
-        sorted_ids.sort_unstable();
-        let index: HashMap<ValidatorId, usize> = sorted_ids
-            .into_iter()
-            .enumerate()
-            .map(|(i, id)| (id, i))
-            .collect();
+        // REMOVED (BLS aggregate-QC production): the per-vote BLS-half
+        // collection and the `BLS_QC_MARKER_ID` aggregate attach lived here.
+        // Certificates now always carry the Ed25519 list only; BLS envelopes
+        // that remain on the wire (from old binaries) decode as inert
+        // metadata via `decode_qc_bls_envelope` and are never counted.
         let mut signatures = Vec::new();
-        let mut bls_sigs: Vec<(usize, crate::bls::BlsSignature)> = Vec::new();
         for v in self.votes.values() {
             if v.block_hash == target {
                 signatures.push((v.voter, v.ed25519_signature().to_vec()));
-                if let Some(bytes) = v.bls_signature() {
-                    if let (Some(&idx), Some(sig)) = (
-                        index.get(&v.voter),
-                        crate::bls::BlsSignature::from_bytes(&bytes),
-                    ) {
-                        bls_sigs.push((idx, sig));
-                    }
-                }
             }
         }
         let mut qc = QuorumCertificate {
@@ -2972,16 +2847,6 @@ impl VoteSet {
             block_hash: target,
             signatures,
         };
-        if crate::bls::qc_bls_enabled()
-            && !bls_sigs.is_empty()
-            && qc.signatures.len() < MAX_COMMIT_CERT_SIGNERS
-        {
-            if let Ok(aggregate) = crate::bls::aggregate_signatures(&bls_sigs, validators.len()) {
-                let payload =
-                    encode_qc_bls_envelope(&aggregate, qc.height, qc.round, qc.kind, qc.block_hash);
-                qc.signatures.push((BLS_QC_MARKER_ID, payload));
-            }
-        }
 
         // Post-Quantum Micro-Certificate (µQC) compilation:
         // When collected votes carry Falcon-512 signatures, compile PqMicroCertificate
@@ -3007,40 +2872,25 @@ impl VoteSet {
             let parent_hash = parent_hash.expect("checked above");
             let committee_size = micro_committee_size(validators.len());
             if committee_size > 0 {
-                // Phase-3 VRF election: the VRF committee is used IFF the
-                // height is armed AND the proposer's seal verifies against
-                // the registry for this height's seed input (with its output
-                // field matching the proof bytes). Anything else elects the
-                // v5 parent-hash draw byte-for-byte (gate off, pre-activation,
-                // missing registry/key, or bad proof all fall back here).
-                let seed_input = sortition_seed(parent_hash, qc.height, qc.round);
-                let verified_output: Option<[u8; 32]> = match &seal {
-                    Some(s) if activation.is_active_at(qc.height) => match registry {
-                        Some(reg) => s
-                            .verified_output(reg, &seed_input)
-                            .filter(|out| *out == s.proof.output),
-                        None => None,
-                    },
-                    _ => None,
-                };
+                // VRF election (RETIRED — ECVRF classical, bodies removed):
+                // the seal is never consulted; the v5 parent-hash draw
+                // applies byte-for-byte (canonical draw). `seal`,
+                // `activation`, and `registry` are accepted for API
+                // compatibility and ignored.
+                let verified_output: Option<[u8; 32]> = None;
                 let committee = derive_sortition_committee_gated(
                     validators,
                     qc.height,
                     qc.round,
                     committee_size,
                     parent_hash,
-                    activation,
+                    &crate::vrf::VrfActivation::Disabled,
                     verified_output.as_ref(),
                 );
-                // Only a seal that actually elected this committee travels
-                // with the certificate: verifiers re-derive the committee
-                // from the embedded seal, so embedding an unverified seal
-                // would elect different committees on the two sides.
-                let embedded_seal = if verified_output.is_some() {
-                    seal.clone()
-                } else {
-                    None
-                };
+                // No seal ever travels with the certificate: verifiers resolve
+                // the same legacy committee, so embedding anything would only
+                // risk divergence.
+                let embedded_seal = None;
                 let get_sig_for_committee_member = |val_id: &ValidatorId| -> Option<Vec<u8>> {
                     if let Some(sig) = falcon_sigs.get(val_id) {
                         return Some(sig.clone());
@@ -3142,15 +2992,20 @@ pub struct QuorumCertificate {
 
 impl QuorumCertificate {
     /// Verify the QC carries a real quorum of valid, distinct validator signatures.
-    /// Supports post-quantum µQC / CEC envelopes, BLS aggregates, and classical Ed25519 threshold.
+    /// Supports post-quantum µQC / CEC envelopes and classical Ed25519 threshold.
+    /// BLS aggregate envelopes that remain on the wire decode as inert metadata
+    /// (never counted).
     pub fn verify(&self, validators: &ValidatorSet) -> bool {
         self.verify_unified(validators)
     }
 
     /// Unified certificate verification supporting:
-    /// 1. Post-quantum µQC (`PQ_UQC_MARKER_ID`) and Epoch CEC (`PQ_QC_MARKER_ID`) envelopes.
-    /// 2. BLS aggregate envelopes (`BLS_QC_MARKER_ID`).
-    /// 3. Classical Ed25519 threshold signatures.
+    /// 1. Post-quantum µQC (`PQ_UQC_MARKER_ID`) and CEC Epoch (`PQ_QC_MARKER_ID`) envelopes.
+    /// 2. Classical Ed25519 threshold signatures.
+    ///
+    /// BLS aggregate envelopes (`BLS_QC_MARKER_ID`) are inert metadata: they
+    /// decode (wire compat) but are never counted (aggregate-QC counting path
+    /// removed).
     pub fn verify_unified(&self, validators: &ValidatorSet) -> bool {
         self.verify_unified_with_pq_keys(validators, None)
     }
@@ -3177,20 +3032,13 @@ impl QuorumCertificate {
             return true;
         }
 
-        // Under Pure Post-Quantum Mode, classical signatures (BLS aggregate, Ed25519 threshold) are rejected.
+        // Under Pure Post-Quantum Mode, classical Ed25519 threshold signatures
+        // are rejected. (The BLS aggregate-QC counting path was removed: a
+        // `BLS_QC_MARKER_ID` envelope that remains on the wire carries no
+        // power and the marker entry falls through to the Ed25519 list below,
+        // where it is skipped as a non-member.)
         if crate::post_quantum::is_pure_pq_enforced() {
             return false;
-        }
-
-        // 2. BLS aggregate path: one pairing identity against the FULL canonical
-        // validator key list from the registry (membership is by construction —
-        // the verifier sums exactly the keys the validator set names), then
-        // power is summed from the validator set itself over the signer
-        // bitvector. Only a completed, quorum-reaching check returns here.
-        if let Some(power) = self.bls_path_power(validators, &msg) {
-            if power >= validators.quorum_power() {
-                return true;
-            }
         }
         // First pass: dedup, membership and parsing are cheap per item. Collect the
         // candidates; the expensive crypto happens once below, not N times.
@@ -3259,10 +3107,8 @@ impl QuorumCertificate {
                         continue;
                     }
                     // Live path: the deployment's activation (env) + the
-                    // startup-loaded registry (global). Disabled/empty ⇒ the
-                    // legacy draw, byte-identical to today; armed + known key
-                    // + verifying seal ⇒ the VRF committee (phase-3
-                    // threading, fallback matrix in `vrf_output_for_cert`).
+                    // startup-loaded registry (global). Resolution is always
+                    // the legacy draw (VRF retired; see `vrf_output_for_cert`).
                     // Callers with explicit values use
                     // `verify_micro_cert_with_vrf`.
                     let live_activation = crate::vrf::vrf_activation_from_env();
@@ -3321,11 +3167,10 @@ impl QuorumCertificate {
     /// (V-P34 R2: nobody is forgiven on the strength of an unverifiable
     /// marker).
     ///
-    /// Phase-3 VRF threading: `activation` + `registry` resolve the election
-    /// via [`vrf_output_for_cert`] — a verified seal elects the VRF
-    /// committee, a missing/ignorable seal the legacy draw, and a forged seal
-    /// (armed height, known key, bad proof) refuses the whole certificate
-    /// (`None`). Pass `Disabled` + `None` for the legacy draw exactly.
+    /// Election resolution (VRF RETIRED): `activation` + `registry` are threaded
+    /// through to [`vrf_output_for_cert`], which always resolves to the legacy
+    /// parent-hash draw (ECVRF bodies removed). Pass `Disabled` + `None` for
+    /// the legacy draw exactly.
     /// Batch-verify staged PQ member signatures (the lattice analogue of the
     /// Ed25519 `verify_batch` fast path: Falcon has no batch primitive, so the
     /// SAME per-signature predicate runs per item, chunked across cores with
@@ -3404,8 +3249,7 @@ impl QuorumCertificate {
         // block-apply path additionally pins that parent to the hash committed
         // in the block header (`QuorumCertificate::binds_to_parent`), so a
         // certificate cannot pick a favourable committee of its own.
-        // Phase-3 VRF threading: a verified seal elects the VRF committee,
-        // anything else the legacy draw; a forged seal refuses (`None`).
+        // Election resolution (VRF RETIRED): always the legacy parent-hash draw.
         let verified_output = vrf_output_for_cert(cert, activation, registry).ok()?;
         let committee = derive_sortition_committee_gated(
             validators,
@@ -3491,11 +3335,10 @@ impl QuorumCertificate {
     /// 11/16, …) certificates verify unchanged — they carry the full
     /// committee power.
     ///
-    /// Phase-3 VRF threading: `activation` + `registry` resolve the election
-    /// via [`vrf_output_for_cert`] (same rule as `micro_cert_valid_signers`
-    /// above): verified seal → VRF committee; missing/ignorable seal →
-    /// legacy draw; forged seal (armed height, known key, bad proof) →
-    /// `false`. Pass `Disabled` + `None` for the legacy draw exactly.
+    /// Election resolution (VRF RETIRED): `activation` + `registry` resolve via
+    /// [`vrf_output_for_cert`] (same rule as `micro_cert_valid_signers`
+    /// above) — always the legacy parent-hash draw. Pass `Disabled` + `None`
+    /// for the legacy draw exactly.
     fn verify_micro_cert(
         &self,
         cert: &PqMicroCertificate,
@@ -3516,9 +3359,8 @@ impl QuorumCertificate {
         // 2-of-3 bitmask that the old `floor(2*3/3)+1 = 3` rule threw out may
         // still carry quorum POWER, which is exactly the fragile-unanimous
         // case this fixes.
-        // Phase-3 VRF threading: the quorum is summed over the SAME
-        // committee the attribution above resolved (VRF or legacy); a forged
-        // seal refuses here too (`Err` → `false`).
+        // Election resolution (VRF RETIRED): the quorum is summed over the SAME
+        // legacy committee the attribution above resolved.
         let Ok(verified_output) = vrf_output_for_cert(cert, activation, registry) else {
             return false;
         };
@@ -3540,14 +3382,12 @@ impl QuorumCertificate {
         valid_power >= quorum_power
     }
 
-    /// Attribution-grade µQC signer check with phase-3 VRF threading.
+    /// Attribution-grade µQC signer check (VRF threading RETIRED).
     ///
-    /// Same as the private `micro_cert_valid_signers`, but with the live
-    /// `activation` and the local `registry` threaded through: a verified seal
-    /// elects the VRF committee, a missing/ignorable seal the legacy draw,
-    /// and a forged seal (armed height, known registry key, bad proof)
-    /// refuses (`None`). This is the entry point phase-3 verifiers call;
-    /// `signers_set` keeps the legacy `(Disabled, None)` draw.
+    /// Same as the private `micro_cert_valid_signers`, with `activation` and
+    /// `registry` threaded through to the always-legacy resolution. Verifiers
+    /// that pinned the live path keep calling this; `signers_set` keeps the
+    /// legacy `(Disabled, None)` draw.
     pub fn micro_cert_valid_signers_with_vrf(
         &self,
         cert: &PqMicroCertificate,
@@ -3560,12 +3400,11 @@ impl QuorumCertificate {
         self.micro_cert_valid_signers(cert, validators, msg, pq_keys, activation, registry)
     }
 
-    /// Power-weighted µQC verification with phase-3 VRF threading.
+    /// Power-weighted µQC verification (VRF threading RETIRED).
     ///
-    /// Same as the private `verify_micro_cert`, but with the live
-    /// `activation` and the local `registry` threaded through (see
-    /// [`Self::micro_cert_valid_signers_with_vrf`] for the election rule).
-    /// This is the entry point phase-3 verifiers call; `verify_unified` keeps
+    /// Same as the private `verify_micro_cert`, with `activation` and
+    /// `registry` threaded through to the always-legacy resolution (see
+    /// [`Self::micro_cert_valid_signers_with_vrf`]). `verify_unified` keeps
     /// the legacy `(Disabled, None)` draw.
     pub fn verify_micro_cert_with_vrf(
         &self,
@@ -3673,7 +3512,7 @@ impl QuorumCertificate {
     ///
     /// Unsealed certificates encode to the canonical envelope
     /// ([`encode_pq_micro_envelope`]) — today's bytes bit-for-bit. A sealed
-    /// (phase-3 VRF) certificate travels as `QC_UQC_MAGIC || bincode(cert)`,
+    /// (retired VRF seal, old bytes only) certificate travels as `QC_UQC_MAGIC || bincode(cert)`,
     /// read back by the existing bincode fallback in
     /// [`decode_pq_micro_envelope`]: the canonical envelope has no room for
     /// the trailing serde-defaulted seal field, and extending it would change
@@ -3750,79 +3589,13 @@ impl QuorumCertificate {
         }
     }
 
-    /// The canonical-set members a BLS envelope PROVES (attribution-grade).
-    ///
-    /// Exactly the gates `bls_path_power` enforces — envelope binding to THIS
-    /// certificate, registry-backed canonical keys, aggregate verification —
-    /// MINUS the quorum gate: `None` when the envelope cannot be verified,
-    /// else the bitmask members (the aggregate signature proves every one of
-    /// them signed, even in a sub-quorum envelope). A bitmask on top of a
-    /// forged aggregate is attacker-chosen bytes and attributes nobody
-    /// (V-P34 R2).
-    fn bls_envelope_verified_signers(
-        &self,
-        validators: &ValidatorSet,
-        msg: &[u8],
-        payload: &[u8],
-    ) -> Option<Vec<ValidatorId>> {
-        let cfg = crate::bls::qc_bls();
-        if !cfg.enabled {
-            return None;
-        }
-        // Membership: the FULL canonical validator set in sorted order, every
-        // member's BLS key resolved from the registry. One missing member and
-        // the path is unavailable (fallback) — it never verifies against a
-        // partial or caller-chosen key list.
-        let keys = cfg.canonical_keys(validators)?;
-        // Audit-consensus F8: index power against the SAME canonical (sorted)
-        // order the registry hands out above — explicitly sorted here rather
-        // than trusting the map iterator, so a future container swap cannot
-        // silently renumber the bitvector between assembler and verifier.
-        let mut ids: Vec<ValidatorId> = validators.validators.keys().copied().collect();
-        ids.sort_unstable();
-        let (h, r, kind, bh, aggregate) = decode_qc_bls_envelope(payload)?;
-        // The envelope must describe THIS certificate: a spliced aggregate
-        // from another height/round/kind/target fails binding here, and a
-        // mismatched message would fail the pairing anyway.
-        if h != self.height
-            || r != self.round
-            || kind != self.kind
-            || bh != self.block_hash.unwrap_or([0u8; 32])
-        {
-            return None;
-        }
-        if aggregate.participants.total_validators() != validators.len() {
-            return None;
-        }
-        if !crate::bls::verify_aggregate_signature(&keys, msg, &aggregate) {
-            return None;
-        }
-        let mut out = Vec::new();
-        for (i, id) in ids.iter().enumerate() {
-            if aggregate.participants.is_set(i) {
-                out.push(*id);
-            }
-        }
-        Some(out)
-    }
-
-    /// Voting power proven by the certificate's BLS aggregate, if the BLS path
-    /// is enabled and a well-formed aggregate strictly verifies. `None` means
-    /// "do not count BLS power at all" — the caller falls back to Ed25519.
-    fn bls_path_power(&self, validators: &ValidatorSet, msg: &[u8]) -> Option<u64> {
-        let mut best: Option<u64> = None;
-        for (voter, payload) in &self.signatures {
-            if *voter != BLS_QC_MARKER_ID {
-                continue;
-            }
-            let Some(members) = self.bls_envelope_verified_signers(validators, msg, payload) else {
-                continue;
-            };
-            let power: u64 = members.iter().map(|id| validators.power_of(id)).sum();
-            best = Some(best.map_or(power, |b: u64| b.max(power)));
-        }
-        best
-    }
+    // REMOVED (BLS envelope verify-for-counting): `bls_envelope_verified_signers`
+    // and `bls_path_power` lived here. No live path references remain (proven by
+    // grep: the only consumers were `verify_unified` and `signers_set`, both
+    // rewired above). The marker entry now falls through to the classical
+    // Ed25519 list, where it is skipped as a non-member — the same observable
+    // behavior as the default-off path. The byte parser
+    // (`decode_qc_bls_envelope`) is untouched (wire compat).
 
     /// Extracts the set of validator IDs that signed this QuorumCertificate.
     ///
@@ -3831,8 +3604,10 @@ impl QuorumCertificate {
     ///    envelope or bitmask and identifies signing committee members via sortition.
     /// 2. Post-quantum Epoch CEC (`PQ_QC_MARKER_ID` = `[0xFE; 32]`): decodes the epoch certificate
     ///    envelope and identifies signing validators via canonical sorted validator bitmask.
-    /// 3. BLS aggregate envelopes (`BLS_QC_MARKER_ID` = `[0xFF; 32]`): decodes the aggregate envelope
-    ///    or bitmask and identifies signing validators via canonical sorted validator indices.
+    /// 3. BLS aggregate envelopes (`BLS_QC_MARKER_ID` = `[0xFF; 32]`): inert —
+    ///    skipped (the marker id carries no voting power, so the entry falls
+    ///    into the classical path below and contributes nothing; the counting
+    ///    path was removed).
     /// 4. Classical / individual Ed25519 signatures where voter ID is the validator ID.
     ///
     /// Attribution MUST mirror verification: only signers `verify` accepts
@@ -3863,8 +3638,8 @@ impl QuorumCertificate {
                         continue;
                     }
                     // Live path: same live activation + registry as
-                    // `pq_path_verify` above (Disabled/empty ⇒ legacy draw).
-                    // Phase-3 callers use `micro_cert_valid_signers_with_vrf`.
+                    // `pq_path_verify` above (resolution always legacy).
+                    // Explicit-value callers use `micro_cert_valid_signers_with_vrf`.
                     let live_activation = crate::vrf::vrf_activation_from_env();
                     let live_registry = live_vrf_registry_snapshot();
                     if let Some(ids) = self.micro_cert_valid_signers(
@@ -3892,14 +3667,6 @@ impl QuorumCertificate {
                     {
                         signers.extend(ids);
                     }
-                }
-            } else if *voter == BLS_QC_MARKER_ID {
-                // Verify-grade: exactly what `bls_path_power` accepts (sans
-                // the quorum gate — the aggregate proves every bitmask member
-                // signed). Truncated envelopes, wrong validator count, spliced
-                // bindings and forged aggregates attribute nobody.
-                if let Some(ids) = self.bls_envelope_verified_signers(validators, &msg, payload) {
-                    signers.extend(ids);
                 }
             } else {
                 // Classical: mirror `verify_unified`'s candidate checks — only
@@ -4270,8 +4037,9 @@ pub const PROPOSER_MISS_THRESHOLD_M: u32 = 3;
 ///   headroom), not throughput.
 ///
 /// INPUTS (exhaustive — anything else is a bug):
-///  1. `base_ms` — operator env `STELL_ROUND_TIMEOUT_MS`. MUST match on all
-///     validators (documented rollout invariant, same as today).
+///  1. `base_ms` — the frozen canonical base [`FROZEN_ROUND_TIMEOUT_BASE_MS`].
+///     MUST match on all validators (documented rollout invariant); there is
+///     no per-node env override anymore (protocol freeze 2026-11-03).
 ///  2. `round` — the round the timeout is FOR (not a local failure count).
 ///  3. `proposer_missed_streak` — ledger `missed` of the scheduled proposer
 ///     for (height, round). Deterministic block content, not observation.
@@ -4279,6 +4047,17 @@ pub const PROPOSER_MISS_THRESHOLD_M: u32 = 3;
 /// NO wall-clock input: no `Instant::now`, no `SystemTime`, no elapsed, no
 /// peer-seen timestamps, no local vote-observation flags. A reader can verify
 /// with `grep -n "Instant\|SystemTime" ` on this function: zero hits.
+///
+/// FREEZE (protocol freeze 2026-11-03): canonical round-timeout base, 3_000 ms.
+/// Value = pre-freeze `STELL_ROUND_TIMEOUT_MS` code default (was read in
+/// `main.rs` with clamp 200..=3_600_000; the frozen value is inside that
+/// range, so default-env behavior is byte-identical). Rationale: this base
+/// feeds the same-on-all-nodes ladder (spec
+/// `docs/specs/04_NETWORK_AND_CONSENSUS_PHASE2.md` §2) and MUST match on all
+/// validators — a per-node env knob for a must-match value is a fork risk.
+/// Change requires spec update + audit note (AGENTS.md §7).
+pub const FROZEN_ROUND_TIMEOUT_BASE_MS: u64 = 3_000;
+
 pub fn deterministic_round_timeout_ms(
     base_ms: u64,
     round: Round,

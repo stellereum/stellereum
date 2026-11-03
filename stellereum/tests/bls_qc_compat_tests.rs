@@ -1,22 +1,27 @@
-//! BLS quorum certificates on the real path (passport §6B).
+//! BLS quorum certificates on the real path (passport §6B) — RETIRED counting.
 //!
-//! Proves, with golden bytes captured from the PRE-change baseline:
+//! The aggregate-QC counting path is removed: BLS envelopes that remain on
+//! the wire decode as inert metadata and are never counted. What this suite
+//! still proves, with golden bytes captured from the PRE-change baseline:
 //! * old certificate bytes decode AND verify under the new code (compat);
 //! * new certificate bytes decode under the old field layout, and old
-//!   verification FAILS CLOSED on a certificate whose only power is the BLS
-//!   aggregate (while still accepting an augmented certificate that carries
-//!   the Ed25519 quorum — so mixed old/new nodes do not fork);
-//! * strict verification: pairing against the full canonical validator
-//!   registry, membership by construction, power from the validator set —
-//!   tampered/insufficient/mis-bound aggregates reject, and ANY BLS failure
-//!   falls back to the Ed25519 list;
-//! * activation is flag-gated (default OFF) and two ValidatorRuntimes on
-//!   opposite sides of the flag agree on the same chain.
+//!   verification FAILS CLOSED on a marker-only certificate (while still
+//!   accepting an augmented certificate that carries the Ed25519 quorum —
+//!   so mixed old/new nodes do not fork);
+//! * the envelope survives a bincode roundtrip bit-for-bit and the marker id
+//!   counts for nothing under both verifiers;
+//! * two ValidatorRuntimes fed the same (marker-carrying and plain)
+//!   certificate bytes converge on the same chain (no fork in either
+//!   direction).
+//!
+//! Envelopes below are hand-built (single real BLS signature + bitvector):
+//! no aggregation exists to mint them, and these tests pin only the wire
+//! layer — never counting.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use stellereum::bls::*;
 use stellereum::consensus::*;
 
@@ -100,13 +105,14 @@ fn old_layout(bytes: &[u8]) -> OldQuorumCertificate {
     bincode::deserialize(bytes).expect("old layout must decode the same bytes")
 }
 
-/// Two-validator fixture: Ed25519 keys (fixed seeds) plus matching BLS keys
-/// registered in a `QcBlsConfig`.
+/// Two-validator fixture: Ed25519 keys (fixed seeds) plus BLS keys for
+/// hand-built envelopes (single real signature + bitvector — no aggregation
+/// exists to mint real ones, and counting is removed, so these envelopes pin
+/// only the wire layer).
 struct Fixture {
     ed: Vec<SigningKey>,
     bls: Vec<BlsSecretKey>,
     vs: ValidatorSet,
-    registry: BlsKeyRegistry,
 }
 
 impl Fixture {
@@ -122,32 +128,15 @@ impl Fixture {
                 .map(|k| (k.verifying_key().to_bytes(), 1))
                 .collect(),
         );
-        let registry: BlsKeyRegistry = ed
-            .iter()
-            .zip(&bls)
-            .map(|(k, b)| (k.verifying_key().to_bytes(), b.public_key()))
-            .collect();
-        Self {
-            ed,
-            bls,
-            vs,
-            registry,
-        }
-    }
-
-    fn enabled_config(&self) -> QcBlsConfig {
-        QcBlsConfig {
-            enabled: true,
-            registry: self.registry.clone(),
-            local_vote_seed: None,
-        }
+        Self { ed, bls, vs }
     }
 
     /// Build a certificate for `(height, round, kind, target)`. `ed_signers`
     /// chooses who contributes bare Ed25519 signatures; `agg_signers` (when
-    /// present) chooses who contributes to the BLS aggregate — they are
-    /// deliberately independent so tests can build certificates whose power
-    /// lives in only one of the two halves.
+    /// present) chooses the bitvector of a hand-built envelope carrying one
+    /// real BLS signature (the first member signs): decode accepts it, and
+    /// the new code verifies the certificate through its Ed25519 quorum —
+    /// the envelope itself is inert metadata, never counted.
     fn cert(
         &self,
         height: u64,
@@ -167,8 +156,14 @@ impl Fixture {
             ));
         }
         if let Some(range) = agg_signers {
-            let sigs: Vec<_> = range.map(|i| (i, self.bls[i].sign(&msg))).collect();
-            let aggregate = aggregate_signatures(&sigs, self.ed.len()).expect("aggregate");
+            let mut participants = SignerBitVector::new(self.ed.len());
+            for i in range.clone() {
+                participants.set(i, true);
+            }
+            let aggregate = BlsAggregateSignature {
+                signature: self.bls[range.start].sign(&msg),
+                participants,
+            };
             let payload = encode_qc_bls_envelope(&aggregate, height, round, kind, target);
             signatures.push((BLS_QC_MARKER_ID, payload));
         }
@@ -182,9 +177,10 @@ impl Fixture {
     }
 }
 
-fn disabled() -> QcBlsGuard {
-    set_qc_bls_for_tests(QcBlsConfig::default())
-}
+// REMOVED (counting-path config): `Fixture::enabled_config` and the `disabled()`
+// test guard wrapped `set_qc_bls_for_tests` — deleted with the counting path.
+// There is no flag anymore: every certificate verifies through the Ed25519 list.
+
 
 // ---------------------------------------------------------------------------
 // Golden compatibility
@@ -192,7 +188,6 @@ fn disabled() -> QcBlsGuard {
 
 #[test]
 fn golden_old_certificate_decodes_and_verifies_under_new_code() {
-    let _gate = disabled();
     let bytes = golden_bytes();
     let qc: QuorumCertificate =
         bincode::deserialize(&bytes).expect("pre-change certificate bytes must decode");
@@ -234,7 +229,6 @@ fn golden_old_certificate_decodes_and_verifies_under_new_code() {
 #[test]
 fn new_augmented_certificate_decodes_under_old_layout_and_passes_legacy_verify() {
     let f = Fixture::new(2);
-    let _on = set_qc_bls_for_tests(f.enabled_config());
     let bh = [0x22u8; 32];
     // A certificate with BOTH halves: bare Ed25519 quorum + aggregate envelope.
     let qc = f.cert(3, 0, VoteKind::Precommit, Some(bh), 0..2, Some(0..2));
@@ -258,192 +252,41 @@ fn new_augmented_certificate_decodes_under_old_layout_and_passes_legacy_verify()
 }
 
 #[test]
-fn bls_only_certificate_fails_closed_under_old_code_and_flag_off_new_code() {
+fn bls_only_certificate_fails_closed_under_old_code_and_new_code() {
+    // REMOVED: the flag-ON strict-accept block lived here — counting is gone,
+    // so a marker-only certificate (short Ed25519 list) rejects everywhere.
     let f = Fixture::new(2);
     // Only ONE Ed25519 signature: below the quorum of 2, so the Ed25519 list
-    // alone can never carry this certificate. Power comes only from BLS.
+    // alone can never carry this certificate. The envelope is inert metadata.
     let bh = [0x33u8; 32];
-    let qc = {
-        let _on = set_qc_bls_for_tests(f.enabled_config());
-        f.cert(4, 0, VoteKind::Precommit, Some(bh), 0..1, Some(0..2))
-    };
+    let qc = f.cert(4, 0, VoteKind::Precommit, Some(bh), 0..1, Some(0..2));
 
     // Old code: decodes (same layout), then FAILS CLOSED — it cannot see the
-    // aggregate and the Ed25519 list is short.
+    // envelope and the Ed25519 list is short.
     let old = old_layout(&bincode::serialize(&qc).unwrap());
     assert!(
         !legacy_verify(&old, &f.vs),
         "old code must reject a certificate whose only power is the BLS aggregate"
     );
 
-    // New code with the flag OFF (the default on the stand): same verdict —
-    // the aggregate is not counted, the Ed25519 list is short.
-    {
-        let _off = disabled();
-        assert!(
-            !qc.verify(&f.vs),
-            "flag-off verification must fail closed on a BLS-only certificate"
-        );
-    }
-
-    // New code with the flag ON and the registry present: strict BLS
-    // verification counts the quorum.
-    {
-        let _on = set_qc_bls_for_tests(f.enabled_config());
-        assert!(
-            qc.verify(&f.vs),
-            "flag-on verification must accept the aggregate quorum"
-        );
-    }
+    // New code: same verdict — the envelope is never counted and the Ed25519
+    // list is short.
+    assert!(
+        !qc.verify(&f.vs),
+        "new code must fail closed on a marker-only certificate"
+    );
 }
 
 // ---------------------------------------------------------------------------
-// Strict verification + fallback
+// Envelope roundtrip + marker inertness
 // ---------------------------------------------------------------------------
 
-#[test]
-fn strict_bls_path_rejects_tampered_insufficient_and_mis_bound_aggregates() {
-    let f = Fixture::new(3); // quorum power = 3
-    let _on = set_qc_bls_for_tests(f.enabled_config());
-    let bh = [0x44u8; 32];
-    let msg = vote_sign_bytes(9, 2, VoteKind::Precommit, &Some(bh));
 
-    // Control: full aggregate, NO Ed25519 list at all — must pass strictly.
-    let good = {
-        let sigs: Vec<_> = (0..3).map(|i| (i, f.bls[i].sign(&msg))).collect();
-        aggregate_signatures(&sigs, 3).unwrap()
-    };
-    let mut qc = QuorumCertificate {
-        height: 9,
-        round: 2,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: vec![(
-            BLS_QC_MARKER_ID,
-            encode_qc_bls_envelope(&good, 9, 2, VoteKind::Precommit, Some(bh)),
-        )],
-    };
-    assert!(qc.verify(&f.vs), "a full strict aggregate must verify");
 
-    // Tampered aggregate: one member signed a DIFFERENT message, so the
-    // aggregated point no longer satisfies the pairing identity. (This is the
-    // tamper a relay can actually achieve — flipping raw point bytes usually
-    // lands off-curve and never parses.)
-    let bad_sigs: Vec<_> = std::iter::once((0, f.bls[0].sign(b"attacker-message")))
-        .chain((1..3).map(|i| (i, f.bls[i].sign(&msg))))
-        .collect();
-    let tampered = aggregate_signatures(&bad_sigs, 3).unwrap();
-    qc.signatures[0].1 = encode_qc_bls_envelope(&tampered, 9, 2, VoteKind::Precommit, Some(bh));
-    assert!(!qc.verify(&f.vs), "a tampered aggregate must reject");
-
-    // Insufficient: only 2 of 3 validators signed (power 2 < quorum 3).
-    let sigs: Vec<_> = (0..2).map(|i| (i, f.bls[i].sign(&msg))).collect();
-    let weak = aggregate_signatures(&sigs, 3).unwrap();
-    qc.signatures[0].1 = encode_qc_bls_envelope(&weak, 9, 2, VoteKind::Precommit, Some(bh));
-    assert!(!qc.verify(&f.vs), "an under-quorum aggregate must reject");
-
-    // Mis-bound: the envelope was created for a DIFFERENT height. The
-    // binding check rejects it before any pairing.
-    qc.signatures[0].1 = encode_qc_bls_envelope(&good, 10, 2, VoteKind::Precommit, Some(bh));
-    assert!(
-        !qc.verify(&f.vs),
-        "an envelope bound to another height must reject"
-    );
-
-    // Wrong target block.
-    qc.signatures[0].1 = encode_qc_bls_envelope(&good, 9, 2, VoteKind::Precommit, Some([0xEE; 32]));
-    assert!(
-        !qc.verify(&f.vs),
-        "an envelope bound to another block must reject"
-    );
-
-    // Garbage payload under the marker id: decode fails, falls through, and
-    // with no Ed25519 list the certificate rejects.
-    qc.signatures[0].1 = vec![0u8; 64];
-    assert!(!qc.verify(&f.vs), "a garbage envelope must not verify");
-}
-
-#[test]
-fn bls_path_ignores_a_garbage_ed25519_list() {
-    // Proves the BLS path is what accepted the certificate, not the fallback:
-    // the Ed25519 entries are present but garbage, so a fallback would reject.
-    let f = Fixture::new(3);
-    let _on = set_qc_bls_for_tests(f.enabled_config());
-    let bh = [0x55u8; 32];
-    let msg = vote_sign_bytes(11, 0, VoteKind::Precommit, &Some(bh));
-    let sigs: Vec<_> = (0..3).map(|i| (i, f.bls[i].sign(&msg))).collect();
-    let aggregate = aggregate_signatures(&sigs, 3).unwrap();
-    let qc = QuorumCertificate {
-        height: 11,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: vec![
-            (f.ed[0].verifying_key().to_bytes(), vec![0xAB; 64]),
-            (
-                BLS_QC_MARKER_ID,
-                encode_qc_bls_envelope(&aggregate, 11, 0, VoteKind::Precommit, Some(bh)),
-            ),
-        ],
-    };
-    assert!(
-        qc.verify(&f.vs),
-        "strict pairing counts; the garbage list never matters"
-    );
-}
-
-#[test]
-fn any_bls_failure_falls_back_to_the_ed25519_list() {
-    let f = Fixture::new(3);
-    let bh = [0x66u8; 32];
-
-    // Full aggregate + full Ed25519 quorum, flag ON, but the registry is
-    // missing one member: the BLS path is unavailable and verification must
-    // succeed through the Ed25519 list (liveness never depends on BLS).
-    let qc = {
-        let _on = set_qc_bls_for_tests(f.enabled_config());
-        f.cert(12, 0, VoteKind::Precommit, Some(bh), 0..3, Some(0..3))
-    };
-    {
-        let mut partial = f.enabled_config();
-        partial.registry.remove(&f.ed[2].verifying_key().to_bytes());
-        let _on = set_qc_bls_for_tests(partial);
-        assert!(
-            qc.verify(&f.vs),
-            "an incomplete registry must fall back to the Ed25519 quorum, not reject"
-        );
-    }
-
-    // Same certificate, flag OFF entirely: fallback again.
-    {
-        let _off = disabled();
-        assert!(
-            qc.verify(&f.vs),
-            "flag-off verification accepts via the Ed25519 list"
-        );
-    }
-
-    // A certificate with ONLY an Ed25519 quorum (no aggregate at all — what a
-    // non-BLS peer produces) is accepted with the flag ON: mixed producers
-    // never fork.
-    {
-        let _on = set_qc_bls_for_tests(f.enabled_config());
-        let plain = f.cert(12, 0, VoteKind::Precommit, Some(bh), 0..3, None);
-        assert!(!plain
-            .signatures
-            .iter()
-            .any(|(id, _)| *id == BLS_QC_MARKER_ID));
-        assert!(
-            plain.verify(&f.vs),
-            "flag-on verification accepts a plain Ed25519 certificate"
-        );
-    }
-}
 
 #[test]
 fn certificate_roundtrip_keeps_the_envelope_intact() {
     let f = Fixture::new(3);
-    let _on = set_qc_bls_for_tests(f.enabled_config());
     let qc = f.cert(
         21,
         1,
@@ -488,7 +331,6 @@ fn marker_id_counts_for_nothing_and_legacy_skips_it() {
     );
 
     // New code: a non-envelope marker payload also counts for nothing.
-    let _on = set_qc_bls_for_tests(f.enabled_config());
     assert!(
         !qc.verify(&f.vs),
         "a non-envelope marker entry counts for nothing"
@@ -496,141 +338,14 @@ fn marker_id_counts_for_nothing_and_legacy_skips_it() {
 }
 
 // ---------------------------------------------------------------------------
-// Vote envelope (the transport that lets certificates aggregate at all)
-// ---------------------------------------------------------------------------
+// REMOVED (vote envelope production): `vote_envelope_roundtrip_and_flag_off_bytes_unchanged`
+// and `vote_set_certificate_attaches_and_verifies_end_to_end` tested removed
+// vote-BLS production (`attach_vote_bls`) and counting — deleted with that code.
 
-#[test]
-fn vote_envelope_roundtrip_and_flag_off_bytes_unchanged() {
-    let sk = SigningKey::from_bytes(&[9u8; 32]);
-    let msg = vote_sign_bytes(5, 1, VoteKind::Prevote, &Some([1u8; 32]));
 
-    // Flag OFF (default): byte-identical plain signature.
-    {
-        let _off = disabled();
-        let v = Vote::sign(&sk, 5, 1, VoteKind::Prevote, Some([1u8; 32]));
-        assert_eq!(v.signature.len(), 64, "flag-off votes stay plain");
-        assert!(v.verify());
-        assert!(v.bls_signature().is_none());
-    }
-
-    // Flag ON with a local seed: envelope with both halves.
-    let seed = [0x42u8; 32];
-    {
-        let _on = set_qc_bls_for_tests(QcBlsConfig {
-            enabled: true,
-            registry: BTreeMap::new(),
-            local_vote_seed: Some(seed),
-        });
-        let v = Vote::sign(&sk, 5, 1, VoteKind::Prevote, Some([1u8; 32]));
-        assert_eq!(
-            v.signature.len(),
-            VOTE_BLS_PART_LEN,
-            "flag-on votes carry the envelope"
-        );
-        assert!(v.signature.starts_with(VOTE_BLS_MAGIC));
-        assert_eq!(v.ed25519_signature().len(), 64, "the Ed25519 half is bare");
-        let bls_half = v.bls_signature().expect("envelope carries a BLS half");
-        assert!(v.verify(), "envelope votes must verify under the new code");
-        // The BLS half really is a signature over the vote message by the
-        // configured local seed's key.
-        let cfg_key = BlsSecretKey::from_seed(&seed);
-        assert!(cfg_key
-            .public_key()
-            .verify(&msg, &BlsSignature::from_bytes(&bls_half).unwrap()));
-
-        // OLD code: `Signature::from_slice` over the whole 176-byte field.
-        // Fail closed — this is why the flag must be enabled network-wide.
-        assert!(
-            Signature::from_slice(&v.signature).is_err(),
-            "pre-BLS vote verification must reject envelope bytes"
-        );
-        // Tamper the Ed25519 half: envelope votes must still fail closed.
-        let mut forged = v.clone();
-        forged.signature[20] ^= 0xFF;
-        assert!(!forged.verify());
-    }
-}
-
-#[test]
-fn vote_set_certificate_attaches_and_verifies_end_to_end() {
-    let f = Fixture::new(3);
-    let bh = [0x88u8; 32];
-    let h = 30u64;
-    let msg = vote_sign_bytes(h, 0, VoteKind::Precommit, &Some(bh));
-
-    let make_vote = |i: usize| -> Vote {
-        let ed_sig = f.ed[i].sign(&msg).to_vec();
-        let bls_sig = f.bls[i].sign(&msg).to_bytes();
-        let mut signature = Vec::with_capacity(VOTE_BLS_PART_LEN);
-        signature.extend_from_slice(VOTE_BLS_MAGIC);
-        signature.extend_from_slice(&ed_sig);
-        signature.extend_from_slice(&bls_sig);
-        Vote {
-            height: h,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(bh),
-            voter: f.ed[i].verifying_key().to_bytes(),
-            signature,
-        }
-    };
-
-    // Flag ON: the certificate produced from envelope votes carries the
-    // aggregate, and strict verification passes.
-    {
-        let _on = set_qc_bls_for_tests(f.enabled_config());
-        let mut set = VoteSet::new();
-        for i in 0..3 {
-            set.add(make_vote(i), &f.vs, h, 0, VoteKind::Precommit)
-                .expect("vote accepted");
-        }
-        let qc = set
-            .certificate(Some(bh), &f.vs, &[0u8; 32])
-            .expect("quorum reached");
-        assert!(
-            qc.signatures.iter().any(|(id, _)| *id == BLS_QC_MARKER_ID),
-            "aggregation must attach the marker envelope"
-        );
-        assert!(
-            qc.signatures
-                .iter()
-                .filter(|(id, payload)| *id != BLS_QC_MARKER_ID && payload.len() == 64)
-                .count()
-                == 3,
-            "the Ed25519 list stays bare and complete"
-        );
-        assert!(qc.verify(&f.vs));
-        // A BLS-only view of the same certificate (Ed25519 entries removed)
-        // still verifies — the aggregate alone carries the quorum.
-        let mut bls_only = qc.clone();
-        bls_only
-            .signatures
-            .retain(|(id, _)| *id == BLS_QC_MARKER_ID);
-        assert!(bls_only.verify(&f.vs));
-    }
-
-    // Flag OFF: the SAME votes produce a certificate with NO envelope —
-    // production is gated, not merely verification.
-    {
-        let _off = disabled();
-        let mut set = VoteSet::new();
-        for i in 0..3 {
-            set.add(make_vote(i), &f.vs, h, 0, VoteKind::Precommit)
-                .expect("vote accepted");
-        }
-        let qc = set
-            .certificate(Some(bh), &f.vs, &[0u8; 32])
-            .expect("quorum reached");
-        assert!(
-            !qc.signatures.iter().any(|(id, _)| *id == BLS_QC_MARKER_ID),
-            "flag-off certificates must not carry the envelope"
-        );
-        assert!(qc.verify(&f.vs));
-    }
-}
 
 // ---------------------------------------------------------------------------
-// Mixed mode: two ValidatorRuntimes, opposite sides of the flag, one chain
+// Mixed envelopes: two ValidatorRuntimes fed marker-carrying and plain bytes
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -652,10 +367,10 @@ async fn mixed_bls_and_ed25519_sides_do_not_fork() {
         .await;
     assert_eq!(s_bls.get_state_root().await, s_ed.get_state_root().await);
 
-    // Two ValidatorRuntimes: one we will treat as the BLS-enabled side, one
-    // as the Ed25519-only side. Config is process-global, so the sides take
-    // turns holding the flag — what must hold is that BOTH accept the SAME
-    // certificate bytes and converge on the same state.
+    // Two ValidatorRuntimes fed the SAME bytes. (No flag exists anymore:
+    // the "BLS side" / "Ed25519 side" split below is now two identical
+    // verifiers — the pin is that marker-carrying bytes and plain bytes both
+    // adopt and converge, i.e. envelopes on the wire fork nothing.)
     let mut v_bls = ValidatorRuntime::new(f.ed[0].clone(), f.vs.clone(), s_bls, 1);
     let mut v_ed = ValidatorRuntime::new(f.ed[1].clone(), f.vs.clone(), s_ed, 1);
 
@@ -694,29 +409,26 @@ async fn mixed_bls_and_ed25519_sides_do_not_fork() {
         .iter()
         .any(|(id, _)| *id == BLS_QC_MARKER_ID));
 
-    // BLS side (flag ON): adopts the augmented certificate.
+    // Both sides adopt the marker-carrying certificate through the Ed25519
+    // quorum it carries (the envelope is inert metadata).
     {
-        let _on = set_qc_bls_for_tests(f.enabled_config());
         v_bls
             .adopt_committed(1, b1.clone(), cert_bls.clone())
             .await
-            .expect("BLS side must accept a BLS-carrying certificate");
+            .expect("first runtime must accept a marker-carrying certificate");
     }
-    // Ed25519 side (flag OFF): adopts the byte-identical certificate through
-    // the Ed25519 fallback.
     {
-        let _off = disabled();
         v_ed.adopt_committed(1, b1.clone(), cert_bls.clone())
             .await
-            .expect("Ed25519 side must accept the same certificate bytes");
+            .expect("second runtime must accept the same certificate bytes");
     }
-    assert_eq!(v_bls.height(), 2, "BLS side advanced");
-    assert_eq!(v_ed.height(), 2, "Ed25519 side advanced to the same height");
+    assert_eq!(v_bls.height(), 2, "first runtime advanced");
+    assert_eq!(v_ed.height(), 2, "second runtime advanced to the same height");
     let root1_bls = v_bls.state_root().await;
     let root1_ed = v_ed.state_root().await;
     assert_eq!(root1_bls, root1_ed, "no fork after height 1");
 
-    // ---- height 2: certificate WITHOUT the aggregate (plain Ed25519) ----
+    // ---- height 2: certificate WITHOUT the envelope (plain Ed25519) ----
     let proposer2 = f.vs.proposer_for(2, 0).expect("proposer");
     let key2 =
         f.ed.iter()
@@ -752,27 +464,23 @@ async fn mixed_bls_and_ed25519_sides_do_not_fork() {
         .iter()
         .any(|(id, _)| *id == BLS_QC_MARKER_ID));
 
-    // BLS side (flag ON) accepts a plain Ed25519 certificate — it never
-    // REQUIRES the aggregate.
+    // Both sides accept the plain Ed25519 certificate the way they always did.
     {
-        let _on = set_qc_bls_for_tests(f.enabled_config());
         v_bls
             .adopt_committed(2, b2.clone(), cert_ed.clone())
             .await
-            .expect("BLS side must accept a plain Ed25519 certificate");
+            .expect("first runtime must accept a plain Ed25519 certificate");
     }
-    // Ed25519 side (flag OFF) accepts it the way it always did.
     {
-        let _off = disabled();
         v_ed.adopt_committed(2, b2.clone(), cert_ed.clone())
             .await
-            .expect("Ed25519 side must accept a plain Ed25519 certificate");
+            .expect("second runtime must accept a plain Ed25519 certificate");
     }
     assert_eq!(v_bls.height(), 3);
     assert_eq!(v_ed.height(), 3);
     assert_eq!(
         v_bls.state_root().await,
         v_ed.state_root().await,
-        "opposite sides of the flag converge — no fork in either direction"
+        "both runtimes converge — no fork in either direction"
     );
 }

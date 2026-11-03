@@ -22,9 +22,10 @@ fn kinds(plan: &[infnode::node::DialPlanEntry]) -> Vec<DialKind> {
 
 #[test]
 fn consts_sane() {
-    assert_eq!(MAX_DIAL_ENDPOINTS_PER_CYCLE, 3);
-    assert_eq!(MAX_GOSSIP_DIAL_PER_CYCLE, 1);
-    assert!(MAX_GOSSIP_DIAL_PER_CYCLE <= MAX_DIAL_ENDPOINTS_PER_CYCLE);
+    // GATE: black_box defeats const-folding; pins must fail loudly if changed.
+    assert_eq!(std::hint::black_box(MAX_DIAL_ENDPOINTS_PER_CYCLE), 3);
+    assert_eq!(std::hint::black_box(MAX_GOSSIP_DIAL_PER_CYCLE), 1);
+    assert!(std::hint::black_box(MAX_GOSSIP_DIAL_PER_CYCLE) <= MAX_DIAL_ENDPOINTS_PER_CYCLE);
 }
 
 #[test]

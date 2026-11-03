@@ -430,6 +430,12 @@ pub struct Node {
     app_subs: RwLock<HashMap<String, Vec<mpsc::UnboundedSender<String>>>>,
     /// forward secrecy: session-ключи соединений (stable_id -> [u8;32])
     sessions: RwLock<HashMap<usize, [u8; 32]>>,
+    /// KEX wiring: PQ transcript digest per connection (stable_id -> digest).
+    /// Present IFF the session negotiated PQ (hybrid key); absent = classical.
+    /// `frame_loop` seals/opens bodies with `kex_frame_*` (AAD-bound) when
+    /// present, else the legacy `e2e_*` path byte-identical. Same cap as
+    /// `sessions`; inserted/removed alongside it, never alone.
+    pq_digests: RwLock<HashMap<usize, [u8; 32]>>,
     /// Guard for the tie-break-exception dial (see `conn_with_session`): per
     /// peer, when we last dropped a session-less cached conn + last fallback
     /// dial. Bounds direct dials so a dead peer cannot turn the exception
@@ -623,6 +629,19 @@ impl Node {
     ) -> Result<Arc<Self>> {
         let id = keys.id();
         let id_hex = keys.id_hex();
+        // Re-ceremony mark: `Node::new` is classical-only today (no `PqKeys`
+        // param — signature frozen; startup PQ enrolment via
+        // `keyring::PqKeys::load_or_generate` is a follow-up outside this
+        // change's zone). The local id is therefore the LEGACY alias —
+        // say so in the log, never silently classical.
+        crate::log::emit(
+            2,
+            "info",
+            &cfg.name,
+            0,
+            "node_id_kind",
+            json!({ "kind": crate::keyring::NodeIdKind::Legacy.label(), "id": id_hex }),
+        );
         let client_bind = cfg
             .client_listen
             .clone()
@@ -736,6 +755,7 @@ impl Node {
             outbox: RwLock::new(HashMap::new()),
             app_subs: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
+            pq_digests: RwLock::new(HashMap::new()),
             sessionless_guard: std::sync::Mutex::new(HashMap::new()),
             circuit: std::sync::Mutex::new(HashMap::new()),
             circuit_parks: AtomicU64::new(0),
@@ -1286,6 +1306,18 @@ impl Node {
         true
     }
 
+    /// KEX wiring: remember the PQ transcript digest for a PQ-negotiated
+    /// connection. Same fail-closed cap as `session_insert`; caller drops the
+    /// session + conn when full so the two maps never disagree on PQ-ness.
+    async fn pq_digest_insert(&self, sid: usize, digest: [u8; 32]) -> bool {
+        let mut m = self.pq_digests.write().await;
+        if !m.contains_key(&sid) && m.len() >= MAX_SESSIONS_TOTAL {
+            return false;
+        }
+        m.insert(sid, digest);
+        true
+    }
+
     async fn add_conn(&self, pid: [u8; NODEID_LEN], conn: Connection) {
         // Circuit breaker: any registered connection — outbound dial success
         // or inbound accept — proves reachability and closes the breaker.
@@ -1577,7 +1609,7 @@ impl Node {
         // forward secrecy: сессионный ключ из static+эфемерных ECDH
         let classical = derive_session_key(&self.keys, &peer.cfg, &eph_sec, &auth.payload)?;
         // PQ-hybrid: breaks only if BOTH classical X3DH and ML-KEM break.
-        let key = match pq_agreed {
+        let key = match &pq_agreed {
             Some(a) => proto::pq_hybrid_session_key(&classical, &a.shared, &a.digest),
             None => classical,
         };
@@ -1586,6 +1618,17 @@ impl Node {
         if !self.session_insert(conn.stable_id(), key).await {
             self.drop_conn(pid, Some(conn.stable_id())).await;
             bail!("sessions full");
+        }
+        // KEX wiring: PQ-negotiated sessions carry their transcript digest so
+        // frame seal/open binds the AAD; classical sessions store nothing and
+        // stay on the legacy path. Digest-table-full drops the just-stored
+        // session + conn (fail-closed, never a half-PQ session).
+        if let Some(a) = &pq_agreed {
+            if !self.pq_digest_insert(conn.stable_id(), a.digest).await {
+                self.sessions.write().await.remove(&conn.stable_id());
+                self.drop_conn(pid, Some(conn.stable_id())).await;
+                bail!("pq digests full");
+            }
         }
         self.add_route(pid, addr.to_string(), &peer.cfg.ed_pub)
             .await;
@@ -2278,14 +2321,29 @@ impl Node {
         } else {
             let _ = send.set_priority(0);
         }
-        let (ct, nonce) = e2e_encrypt(key, payload);
+        let seq = self.next_seq();
+        let ts = now_ms();
+        let svc_id = proto::svc_id(svc);
+        // KEX seal site: PQ sessions bind header+digest AAD, classical None.
+        let pq_digest = self.pq_digests.read().await.get(&conn.stable_id()).copied();
+        let (ct, nonce) = frame_seal_body(
+            key,
+            pq_digest,
+            proto::kind::REQ,
+            seq,
+            ts,
+            &self.id,
+            pid,
+            svc_id,
+            payload,
+        );
         let mut f = Frame {
             kind: proto::kind::REQ,
-            seq: self.next_seq(),
-            ts: now_ms(),
+            seq,
+            ts,
             src: self.id,
             dst: *pid,
-            svc: proto::svc_id(svc),
+            svc: svc_id,
             payload: ct,
             nonce,
             sig: [0; 64],
@@ -2342,14 +2400,29 @@ impl Node {
         } else {
             let _ = send.set_priority(0);
         }
-        let (ct, nonce) = e2e_encrypt(key, payload);
+        let seq = self.next_seq();
+        let ts = now_ms();
+        let svc_id = proto::svc_id(svc);
+        // KEX seal site: PQ sessions bind header+digest AAD, classical None.
+        let pq_digest = self.pq_digests.read().await.get(&conn.stable_id()).copied();
+        let (ct, nonce) = frame_seal_body(
+            key,
+            pq_digest,
+            proto::kind::REQ,
+            seq,
+            ts,
+            &self.id,
+            pid,
+            svc_id,
+            payload,
+        );
         let mut f = Frame {
             kind: proto::kind::REQ,
-            seq: self.next_seq(),
-            ts: now_ms(),
+            seq,
+            ts,
             src: self.id,
             dst: *pid,
-            svc: proto::svc_id(svc),
+            svc: svc_id,
             payload: ct,
             nonce,
             sig: [0; 64],
@@ -2409,7 +2482,9 @@ impl Node {
         if resp.kind != proto::kind::RESP || !resp.verify(&vk) {
             bail!("bad response");
         }
-        e2e_decrypt(key, &resp.nonce, &resp.payload)
+        // KEX open site: PQ sessions verify the AAD-bound tag, classical None.
+        let pq_digest = self.pq_digests.read().await.get(&conn.stable_id()).copied();
+        frame_open_body(key, pq_digest, &resp)
     }
 
     pub async fn ping(self: &Arc<Self>, sel: &str, count: u32) -> Result<String> {
@@ -6942,6 +7017,7 @@ async fn frame_loop(conn: Connection, node: Arc<Node>, known_pid: Option<[u8; NO
         .unwrap_or_else(|e| e.into_inner())
         .remove(&sid);
     node.sessions.write().await.remove(&sid);
+    node.pq_digests.write().await.remove(&sid);
     node.metrics.conns_closed.fetch_add(1, Ordering::Relaxed);
     node.metrics.conns_active.fetch_sub(1, Ordering::Relaxed);
     crate::log::emit(2, "info", &node.cfg.name, 0, "conn_closed", json!({}));
@@ -7272,6 +7348,12 @@ async fn handle_stream(
         // session is NOT stored, so this conn can serve no requests; the auth
         // decision above is untouched). No fitting metrics counter (follow-up).
         let _ = node.session_insert(conn.stable_id(), key).await;
+        // KEX wiring: PQ-negotiated sessions carry their transcript digest so
+        // frame seal/open binds the AAD; classical sessions store nothing and
+        // stay on the legacy path (same best-effort discipline as above).
+        if let Some((_, a)) = &pq_state {
+            let _ = node.pq_digest_insert(conn.stable_id(), a.digest).await;
+        }
         // Per-connection window: nothing to reset. See connect_with_auth.
         node.add_conn(claimed, conn.clone()).await;
         node.routing_insert(
@@ -7455,11 +7537,24 @@ async fn handle_stream(
                 let resp = json!({ "ok": false, "err": "rate limit exceeded" })
                     .to_string()
                     .into_bytes();
-                let (ct, nonce) = e2e_encrypt(&key, &resp);
+                // KEX seal site: PQ sessions bind header+digest AAD, classical None.
+                let r_ts = now_ms();
+                let pq_digest = node.pq_digests.read().await.get(&conn.stable_id()).copied();
+                let (ct, nonce) = frame_seal_body(
+                    &key,
+                    pq_digest,
+                    proto::kind::RESP,
+                    f.seq,
+                    r_ts,
+                    &node.id,
+                    &f.src,
+                    f.svc,
+                    &resp,
+                );
                 let mut r = Frame {
                     kind: proto::kind::RESP,
                     seq: f.seq,
-                    ts: now_ms(),
+                    ts: r_ts,
                     src: node.id,
                     dst: f.src,
                     svc: f.svc,
@@ -7473,9 +7568,17 @@ async fn handle_stream(
                 report_stages(&f, t_proc.elapsed());
                 return Ok(None);
             }
-            let plain = match e2e_decrypt(&key, &f.nonce, &f.payload) {
+            // KEX open site: PQ sessions verify the AAD-bound tag and drop the
+            // frame fail-closed on failure; classical sessions use legacy open.
+            let pq_digest = node.pq_digests.read().await.get(&conn.stable_id()).copied();
+            let plain = match frame_open_body(&key, pq_digest, &f) {
                 Ok(p) => p,
                 Err(e) => {
+                    // KEX: PQ open failure is fail-closed + counted (existing
+                    // `reqs_errors`); the classical arm is untouched.
+                    if pq_digest.is_some() {
+                        node.metrics.reqs_errors.fetch_add(1, Ordering::Relaxed);
+                    }
                     // F8-rep: undecryptable frame from the proven identity.
                     node.rep_record_protocol_violation(&pid).await;
                     return Err(e);
@@ -7564,11 +7667,24 @@ async fn handle_stream(
                 "req",
                 json!({ "svc": svc_name, "from": hex::encode(pid), "ok": !resp.starts_with(b"{\"ok\":false") }),
             );
-            let (ct, nonce) = e2e_encrypt(&key, &resp);
+            // KEX seal site: PQ sessions bind header+digest AAD, classical None.
+            let r_ts = now_ms();
+            let pq_digest = node.pq_digests.read().await.get(&conn.stable_id()).copied();
+            let (ct, nonce) = frame_seal_body(
+                &key,
+                pq_digest,
+                proto::kind::RESP,
+                f.seq,
+                r_ts,
+                &node.id,
+                &f.src,
+                f.svc,
+                &resp,
+            );
             let mut r = Frame {
                 kind: proto::kind::RESP,
                 seq: f.seq,
-                ts: now_ms(),
+                ts: r_ts,
                 src: node.id,
                 dst: f.src,
                 svc: f.svc,
@@ -7614,6 +7730,48 @@ pub fn e2e_decrypt(key: &[u8; 32], nonce: &[u8], ct: &[u8]) -> Result<Vec<u8>> {
     cipher
         .decrypt(XNonce::from_slice(nonce), ct)
         .map_err(|_| anyhow!("e2e decrypt failed (tamper?)"))
+}
+
+/// KEX frame seal site (ONE swap): PQ-negotiated sessions seal bodies with
+/// `kex_frame_seal_rand` under a canonical AAD (header + session digest);
+/// classical sessions (`None`) call legacy `e2e_encrypt` byte-identical.
+#[allow(clippy::too_many_arguments)] // GATE: header fields mirror Frame 1:1 for byte-identical AAD rebuild
+fn frame_seal_body(
+    key: &[u8; 32],
+    pq_digest: Option<[u8; 32]>,
+    kind: u8,
+    seq: u32,
+    ts: i64,
+    src: &[u8; NODEID_LEN],
+    dst: &[u8; NODEID_LEN],
+    svc: u64,
+    plain: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
+    match pq_digest {
+        Some(d) => {
+            let aad = proto::kex_frame_aad(kind, seq, ts, src, dst, svc, &d);
+            proto::kex_frame_seal_rand(key, &aad, plain)
+        }
+        None => e2e_encrypt(key, plain),
+    }
+}
+
+/// KEX frame open site (ONE swap): PQ-negotiated sessions rebuild the same
+/// canonical AAD from the received header and open with `kex_frame_open`
+/// (fail-closed: any error drops the frame, never a plaintext fallback);
+/// classical sessions (`None`) call legacy `e2e_decrypt` byte-identical.
+fn frame_open_body(
+    key: &[u8; 32],
+    pq_digest: Option<[u8; 32]>,
+    f: &Frame,
+) -> Result<Vec<u8>> {
+    match pq_digest {
+        Some(d) => {
+            let aad = proto::kex_frame_aad(f.kind, f.seq, f.ts, &f.src, &f.dst, f.svc, &d);
+            proto::kex_frame_open(key, &f.nonce, &aad, &f.payload)
+        }
+        None => e2e_decrypt(key, &f.nonce, &f.payload),
+    }
 }
 
 /// Content id блоба: blake3(плейнтекст целиком). Из него выводятся и chunk_id
@@ -8304,6 +8462,15 @@ impl PqIdentityRegistry {
 pub fn pq_announce_fields(pq: &PqKeys, digest: &[u8; 32]) -> (String, String, String) {
     let sig = pq.sign_digest(digest);
     (pq.pq_pub_hex(), pq.pq_id_hex(), hex::encode(sig))
+}
+
+/// Canonical re-ceremony call site: PQ-primary `NodeId` derivation
+/// (`keyring::resolve_node_id` — same construction, no duplicate logic).
+/// This is the one function new code calls to derive a local id; the
+/// pre-ceremony `keys.id()` call sites below stay byte-identical legacy
+/// until startup PQ enrolment lands (follow-up, out of this change's zone).
+pub fn ceremony_local_id(keys: &NodeKeys, pq: Option<&PqKeys>) -> [u8; NODEID_LEN] {
+    crate::keyring::resolve_node_id(keys, pq).id
 }
 
 /// Finalized transcript digest bytes the Falcon tag covers (same canonical

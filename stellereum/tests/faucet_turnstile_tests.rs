@@ -510,3 +510,130 @@ async fn index_embeds_widget_only_when_configured() {
         "submit must send the token"
     );
 }
+
+// 11. Unconfigured captcha + NON-loopback claim → fail-closed 503 with a
+//     clear message, no funds moved, siteverify never consulted. The
+//     non-loopback client is simulated over the loopback test socket via
+//     X-Forwarded-For (the loopback test peer is trusted by default, so the
+//     resolved client IP is the forwarded public IP).
+#[tokio::test]
+async fn unconfigured_non_loopback_is_503_without_dispense() {
+    let mock = MockVerifier::new(CaptchaVerdict::Success);
+    let gate = Arc::new(CaptchaGate::new(CaptchaConfig::Disabled, mock.clone()));
+    let addr = spawn_gateway_with(gate).await;
+    let public_ip = "203.0.113.7";
+    // Tokenless claim from the public internet.
+    let who = hex::encode([21u8; 32]);
+    let (status, body) = http_post_with(
+        addr,
+        &format!("/api/faucet-public/{who}"),
+        "",
+        &[("X-Forwarded-For", public_ip)],
+    )
+    .await;
+    assert!(
+        status.contains("503"),
+        "unconfigured captcha + public claim must be 503: {status} {body}"
+    );
+    assert!(
+        body.contains("not configured"),
+        "body must say captcha is not configured: {body}"
+    );
+    assert!(
+        !body.contains("pending"),
+        "must not mint on refusal: {body}"
+    );
+    // Even WITH a (bogus) token the unconfigured gate refuses before verify.
+    let who2 = hex::encode([22u8; 32]);
+    let (status, body) = http_post_with(
+        addr,
+        &format!("/api/faucet-public/{who2}"),
+        &ok_body("tok-any"),
+        &[("X-Forwarded-For", public_ip)],
+    )
+    .await;
+    assert!(
+        status.contains("503"),
+        "token does not bypass missing captcha config: {status} {body}"
+    );
+    assert!(
+        body.contains("not configured"),
+        "body must say captcha is not configured: {body}"
+    );
+    assert_eq!(
+        mock.calls.load(Ordering::SeqCst),
+        0,
+        "no verifier call when captcha is unconfigured"
+    );
+    // No funds moved: both refused recipients still hold exactly zero.
+    for w in [who, who2] {
+        let (_, bal) = http_get(addr, &format!("/api/balance/{w}")).await;
+        assert!(
+            bal.contains("\"balance\":\"0\""),
+            "refused claim must dispense nothing, got: {bal}"
+        );
+    }
+}
+
+// 12. Unconfigured captcha + loopback claim → legacy local/dev path still
+//     works (this is the allowed path the pre-existing test 1 exercises;
+//     pinned here explicitly with an XFF loopback client too).
+#[tokio::test]
+async fn unconfigured_loopback_still_dispenses() {
+    let mock = MockVerifier::new(CaptchaVerdict::Success);
+    let gate = Arc::new(CaptchaGate::new(CaptchaConfig::Disabled, mock.clone()));
+    let addr = spawn_gateway_with(gate).await;
+    // Plain loopback (no forwarding headers).
+    let who = hex::encode([23u8; 32]);
+    let (status, body) = http_post(addr, &format!("/api/faucet-public/{who}"), "").await;
+    assert!(
+        status.contains("200"),
+        "loopback claim without captcha must still work: {status} {body}"
+    );
+    assert!(body.contains("pending"), "must mint on loopback: {body}");
+    // Explicit loopback via X-Forwarded-For from the trusted test peer.
+    let who2 = hex::encode([24u8; 32]);
+    let (status, body) = http_post_with(
+        addr,
+        &format!("/api/faucet-public/{who2}"),
+        "",
+        &[("X-Forwarded-For", "127.0.0.1")],
+    )
+    .await;
+    assert!(
+        status.contains("200"),
+        "XFF-loopback claim without captcha must still work: {status} {body}"
+    );
+    assert!(body.contains("pending"), "must mint on loopback: {body}");
+    assert_eq!(
+        mock.calls.load(Ordering::SeqCst),
+        0,
+        "no verifier call on the unconfigured loopback path"
+    );
+}
+
+// 13. Configured captcha + NON-loopback claim with a valid token → 200 mint
+//     (the public operator path: captcha verified, then dispense).
+#[tokio::test]
+async fn configured_non_loopback_success_dispenses() {
+    let mock = MockVerifier::new(CaptchaVerdict::Success);
+    let addr = spawn_gateway_with(enabled_gate(mock.clone())).await;
+    let who = hex::encode([25u8; 32]);
+    let (status, body) = http_post_with(
+        addr,
+        &format!("/api/faucet-public/{who}"),
+        &ok_body("tok-public"),
+        &[("X-Forwarded-For", "198.51.100.9")],
+    )
+    .await;
+    assert!(
+        status.contains("200"),
+        "valid public claim must mint: {status} {body}"
+    );
+    assert!(body.contains("\"status\":\"pending\""), "must mint: {body}");
+    assert_eq!(
+        mock.calls.load(Ordering::SeqCst),
+        1,
+        "siteverify must be called exactly once for a public claim"
+    );
+}

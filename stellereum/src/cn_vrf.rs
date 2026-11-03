@@ -55,6 +55,10 @@ use crate::post_quantum::{
 // ---------------------------------------------------------------------------
 
 /// Epoch length in heights (O1): one PQ rotation window = one epoch.
+///
+/// FREEZE (protocol freeze 2026-11-03): 7,200 heights ≈ 6 h at 3 s blocks
+/// (spec docs/specs/02_CRYPTO_AND_PQ_PHASE2.md §6, == PQ_ROTATION_DELAY_HEIGHTS).
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const EPOCH_LEN: u64 = 7200;
 
 /// Domain separation: commitment preimage (spec §1.2).

@@ -80,6 +80,9 @@ use sha2::{Digest, Sha256, Sha512};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
 
 /// Blocks per MEV epoch. The epoch key rotates every this many blocks.
+///
+/// FREEZE (protocol freeze 2026-11-03): 128 blocks per epoch, == MMR
+/// MMR_EPOCH_BLOCKS. Change requires spec update + audit note (AGENTS.md §7).
 pub const EPOCH_BLOCKS: u64 = 128;
 
 /// Domain separator of the epoch committee hash.

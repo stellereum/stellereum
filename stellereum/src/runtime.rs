@@ -635,25 +635,20 @@ pub struct ValidatorRuntime {
     /// legacy flow to completion, so one transfer is never half 2PC and half
     /// legacy.
     pub xpc_activation: crate::xshard2pc::XpcActivation,
-    /// The VRF sortition activation switch (phase-3 threading).
+    /// The VRF sortition activation switch (RETIRED, inert).
     ///
     /// `Disabled` (the default) keeps every certificate on the legacy
-    /// parent-hash draw — byte-identical to today. `FromHeight(h)` arms the
-    /// VRF election seed for heights `>= h`, provided this validator holds a
-    /// provisioned VRF secret (see `vrf_secret_seed`) and verifiers hold the
-    /// matching Falcon-bound registry keys. The HEIGHT it names is
-    /// consensus-visible: every node of a deployment must configure the same
-    /// value (same pattern as [`Self::xpc_activation`]).
+    /// parent-hash draw — byte-identical to today. `FromHeight(h)` no longer
+    /// arms anything (ECVRF bodies removed): the seal seam always resolves
+    /// to the legacy draw. The HEIGHT it names stays consensus-visible in
+    /// shape (same pattern as [`Self::xpc_activation`]).
     pub vrf_activation: crate::vrf::VrfActivation,
-    /// This validator's VRF secret seed (phase-3 sortition proofs).
+    /// This validator's VRF secret seed (RETIRED, inert).
     ///
     /// `None` (the default) means "no VRF proofs": assembly falls back to the
-    /// legacy committee. When `Some`, [`Self::vrf_beacon_seal_for`] mints the
-    /// validator's own VRF proof for `(height, round, parent)` right here —
-    /// the one place the secret legitimately lives (alongside `key` and
-    /// `falcon_key`) — and passes only the verified public output down to the
-    /// pure consensus assembly path. There is deliberately NO getter: the
-    /// secret is never extracted into new places.
+    /// legacy committee — and with ECVRF removed, `Some` resolves identically
+    /// (`vrf_beacon_seal_for` always returns `None`). There is deliberately
+    /// NO getter: the secret is never extracted into new places.
     vrf_secret_seed: Option<[u8; 32]>,
     /// §9: the runtime's mirror of the committed 2PC records (tx hash ->
     /// record), keyed the same way the engine's map is.
@@ -952,7 +947,7 @@ impl ValidatorRuntime {
         // The DEFAULT pool has NO admission floor of its own: it is the
         // library default (`Mempool::default()`, floor 0) and the NODE always
         // injects its own floored pool through `with_mempool` (main.rs), so
-        // the production pool carries the operator's `STELL_MIN_GAS_LIMIT`
+        // the production pool carries the frozen `FROZEN_MIN_GAS_FLOOR`
         // floor. A runtime built WITHOUT an injected pool would accept
         // zero-fee transactions - that is a deployment hazard, not a code
         // path, and it is called out in the operations notes.
@@ -1669,12 +1664,10 @@ impl ValidatorRuntime {
         self.xpc_activation
     }
 
-    /// Set the VRF sortition activation switch (phase-3 threading).
+    /// Set the VRF sortition activation switch (RETIRED, inert).
     ///
-    /// Mirrors [`Self::with_xpc_activation`]: the switch is node
-    /// configuration, but the HEIGHT it names is consensus-visible, so every
-    /// node of a deployment must agree on it (see
-    /// `STELL_VRF_ACTIVATION_HEIGHT`). Default is `Disabled`.
+    /// Accepted for API compatibility and stored, but nothing arms: the seal
+    /// seam always resolves to the legacy draw. Default is `Disabled`.
     pub fn with_vrf_activation(mut self, activation: crate::vrf::VrfActivation) -> Self {
         self.vrf_activation = activation;
         self
@@ -1685,11 +1678,11 @@ impl ValidatorRuntime {
         self.vrf_activation
     }
 
-    /// Provision this validator's VRF secret seed (phase-3 sortition proofs).
+    /// Provision this validator's VRF secret seed (RETIRED, inert).
     ///
     /// The seed lives here — alongside `key` and `falcon_key` — and nowhere
-    /// else: there is no getter, and proofs are minted only by
-    /// [`Self::vrf_beacon_seal_for`].
+    /// else: there is no getter, and (with ECVRF removed) no proofs are
+    /// minted anywhere.
     pub fn with_vrf_secret_seed(mut self, seed: [u8; 32]) -> Self {
         self.vrf_secret_seed = Some(seed);
         self
@@ -1697,46 +1690,17 @@ impl ValidatorRuntime {
 
     /// Mint this validator's VRF beacon seal for `(height, round, parent)`.
     ///
-    /// This is the ONLY place a VRF proof is generated: the secret lives on
-    /// this runtime, so the proof is minted here and the verified public
-    /// output is passed down to the pure consensus assembly path (see
-    /// `consensus::VoteSet::certificate_with_parent_vrf`). Returns `None`
-    /// (→ the caller falls back to the legacy parent-hash committee,
-    /// byte-identical to today) when:
-    /// * the activation is `Disabled` or the height is pre-activation;
-    /// * no VRF secret seed is provisioned on this node;
-    /// * the minted proof does not self-verify under our own key (never
-    ///   release an unverifiable seal).
-    ///
-    /// REMOTE-SIGNER GAP: the remote signer handle
-    /// ([`crate::remote_signer::Signer`]) is Ed25519-only — it can sign vote
-    /// bytes but it CANNOT produce VRF proofs (see the HSM-gap note on
-    /// `ValidatorSigner`), so it is never consulted here and no VRF material
-    /// is derived from Ed25519 key material. A deployment that signs via a
-    /// remote handle and has provisioned no local VRF seed gets `None` from
-    /// this helper — legacy fallback, never a bypass — until a
-    /// VRF-capable signer lands.
+    /// RETIRED (ECVRF classical, bodies removed): always returns `None` — the
+    /// caller falls back to the legacy parent-hash committee, byte-identical
+    /// to today. Kept as a seam (signature unchanged) for a future PQ VRF
+    /// (a lead decision, not defined here).
     pub fn vrf_beacon_seal_for(
         &self,
-        height: u64,
-        round: u32,
-        parent: &[u8; 32],
+        _height: u64,
+        _round: u32,
+        _parent: &[u8; 32],
     ) -> Option<crate::consensus::VrfBeaconSeal> {
-        if !self.vrf_activation.is_active_at(height) {
-            return None;
-        }
-        let seed = self.vrf_secret_seed?;
-        let secret = crate::vrf::VrfSecret::from_seed(&seed);
-        let seed_input = crate::consensus::sortition_seed(parent, height, round);
-        let proof = crate::vrf::vrf_prove(&secret, &seed_input);
-        // Self-verified before release: a seal that does not verify under
-        // our own key is never emitted (defense in depth — the assembly and
-        // verify paths re-check it against the registry regardless).
-        let own_pk = secret.public_key().to_bytes();
-        if crate::vrf::vrf_verify(&own_pk, &seed_input, &proof) != Some(proof.output) {
-            return None;
-        }
-        Some(crate::consensus::VrfBeaconSeal::new(self.id, proof))
+        None
     }
 
     /// True when this shard holds a §9 2PC record for the transfer.
@@ -5178,10 +5142,11 @@ impl ValidatorRuntime {
         // refused, not skipped) rather than executing underpriced work. An
         // empty block passes vacuously.
         //
-        // CONSENSUS NOTE: the base here is the admission base (`max(env,
-        // governed)`, synced every finalize); the apply path charges the
-        // governed base (see `consensus_floor_parts`) — the env half is
-        // node-local config and cannot move consensus. Validate is therefore
+        // CONSENSUS NOTE: the base here is the admission base
+        // (`max(frozen, governed)`, synced every finalize); the apply path
+        // charges the governed base (see `consensus_floor_parts`) — the
+        // frozen half is the same const on every node and cannot move
+        // consensus. Validate is therefore
         // never looser than apply: anything apply would up-charge is either
         // refused here or arrives declaring at least the floor. The penalty
         // half converges across honest nodes that finalized the same chain
@@ -5201,7 +5166,7 @@ impl ValidatorRuntime {
             let penalty_snapshot = pool.penalty_snapshot();
             // The CONSENSUS floor the apply path will charge with (the D2
             // penalty - the governed base is already covered by `base_fee`,
-            // which is synced to `max(env, governed)`), snapshotted once. The
+            // which is synced to `max(frozen, governed)`), snapshotted once. The
             // validation floor is `max(admission floor, consensus floor)`: it
             // must NEVER be looser than the floor execution charges with,
             // otherwise a transaction whose fee depends on the penalty could

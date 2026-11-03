@@ -45,6 +45,10 @@ use sha2::{Digest, Sha256};
 /// Blocks per MMR epoch. Identical to the MEV epoch length: one MMR root
 /// per MEV epoch, committed by the first masterchain block of the NEXT
 /// epoch (see [`commits_epoch_root`]).
+///
+/// FREEZE (protocol freeze 2026-11-03): 128 blocks per epoch, == MEV
+/// EPOCH_BLOCKS (compile-asserted below). Change requires spec update +
+/// audit note (AGENTS.md §7).
 pub const MMR_EPOCH_BLOCKS: u64 = 128;
 
 // The MMR epoch and the MEV epoch must stay the same epoch: the RPC answer,

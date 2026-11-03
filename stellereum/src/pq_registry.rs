@@ -94,6 +94,10 @@ use crate::post_quantum::{PqScheme, HYBRID_PUBKEY_LEN};
 /// attacker key instantly. Deterministic const, never env: rotation admission
 /// is consensus (every node applying the same blocks must agree on when a
 /// key activates).
+///
+/// FREEZE (protocol freeze 2026-11-03): 7,200 heights ≈ 6 h at 3 s blocks
+/// (spec docs/specs/02_CRYPTO_AND_PQ_PHASE2.md §6, == CN-VRF EPOCH_LEN).
+/// Change requires spec update + audit note (AGENTS.md §7).
 pub const PQ_ROTATION_DELAY_HEIGHTS: u64 = 7_200;
 
 /// How many superseded keys are retained per validator (bounded history).

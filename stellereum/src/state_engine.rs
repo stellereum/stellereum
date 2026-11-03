@@ -3560,11 +3560,12 @@ impl InMemoryStateEngine {
     ///
     /// * BASE: the GOVERNED `min_gas_limit` (committed state, identical on
     ///   every node that applied the same chain). Admission uses
-    ///   `max(env, governed)` (`Mempool::read_base_fee_from_env` + the
-    ///   per-finalize sync in main.rs), but the env half is node-local
-    ///   process config and must not move consensus: when every operator
-    ///   runs the default env the two bases coincide, and a higher env only
-    ///   ever makes local admission STRICTER, never consensus looser.
+    ///   `max(frozen, governed)` (`Mempool::frozen_base_fee_floor` + the
+    ///   per-finalize sync in main.rs); the frozen half is the same const on
+    ///   every node by construction. When governance never raised the floor,
+    ///   the two bases coincide at `FROZEN_MIN_GAS_FLOOR`, and a higher
+    ///   governed value only ever makes admission STRICTER, never consensus
+    ///   looser.
     /// * PENALTY: this engine's deterministic D2 mirror (`consensus_penalty`,
     ///   same step/cap/clear rule as `note_apply_feedback`), derived purely
     ///   from applied blocks, so all nodes that applied the same chain agree.

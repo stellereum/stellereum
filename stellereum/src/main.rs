@@ -509,8 +509,8 @@ async fn start_workchain_shard(
             gossip_bcast_task.broadcast(&tx).await;
         }
     });
-    let base_fee = stellereum::mempool::Mempool::read_base_fee_from_env();
-    info!("[config] admission base_fee floor={base_fee} (STELL_MIN_GAS_LIMIT; MUST match on all validators)");
+    let base_fee = stellereum::mempool::Mempool::frozen_base_fee_floor();
+    info!("[config] admission base_fee floor={base_fee} (FROZEN_MIN_GAS_FLOOR; same on all validators by construction)");
     let init_height = persistence
         .storage()
         .finalized()
@@ -2739,17 +2739,14 @@ fn xpc_activation_from_env() -> stellereum::xshard2pc::XpcActivation {
     }
 }
 
-/// VRF sortition activation, read from the environment (phase-1 wiring).
+/// VRF sortition activation, read from the environment (RETIRED).
 ///
 /// Same shape as [`xpc_activation_from_env`] (an env height boundary,
-/// default-off): `STELL_VRF_ACTIVATION_HEIGHT=<h>` arms the VRF election seed
-/// for heights `>= h`; unset/empty/unparsable keeps `Disabled`, which is
-/// byte-identical to today's parent-hash election. Single source of truth is
-/// `stellereum::vrf::vrf_activation_from_env`; this wrapper is the main.rs-owned
-/// startup seam phase 3 will thread into `HeightConsensus` construction
-/// (blocked today: `HeightConsensus::new` lives in `src/consensus.rs` and its
-/// four live sortition call sites pin `Disabled`+`None` — see the startup log
-/// below).
+/// default-off), except arming is retired: any configured
+/// `STELL_VRF_ACTIVATION_HEIGHT=<h>` value warns loudly and is ignored —
+/// `stellereum::vrf::vrf_activation_from_env` always returns `Disabled`.
+/// Single source of truth is `stellereum::vrf::vrf_activation_from_env`;
+/// this wrapper is the main.rs-owned startup seam.
 fn vrf_activation_from_env() -> stellereum::vrf::VrfActivation {
     stellereum::vrf::vrf_activation_from_env()
 }
@@ -3079,25 +3076,19 @@ async fn run_consensus_node(
         ),
     }
 
-    // VRF sortition activation (phase-3 threading, XPC-activation-height
-    // pattern). `STELL_VRF_ACTIVATION_HEIGHT=<h>` arms the VRF election seed
-    // for heights `>= h`; unset/unparsable keeps `Disabled` (byte-identical
-    // parent-hash election). The height is CONSENSUS-VISIBLE — every node of
-    // a deployment must be configured with the SAME value. The live verify /
-    // attribution sites (`verify_unified`, `signers_set`) now consult this
-    // activation plus the startup-loaded registry below (threaded entry
-    // points `verify_micro_cert_with_vrf` /
-    // `micro_cert_valid_signers_with_vrf` take explicit values); the
-    // `HeightConsensus` assembly sites still build the legacy parent-hash
-    // committee until seals are carried into them (proposers mint seals via
-    // `ValidatorRuntime::vrf_beacon_seal_for` + `certificate_with_parent_vrf`).
-    // Carry is default-off-preserving: `Disabled` (unset env) with an empty
-    // registry behaves byte-identically to before on every path.
+    // VRF sortition activation (RETIRED — ECVRF classical, bodies removed).
+    // `vrf_activation_from_env` always returns `Disabled`, so the boundary
+    // arm below never fires in practice; it is kept so a stale configured
+    // value logs loudly instead of silently arming. The live verify /
+    // attribution sites (`verify_unified`, `signers_set`) still consult the
+    // activation plus the startup-loaded registry below, but resolution is
+    // always the legacy parent-hash draw (see `vrf_output_for_cert`).
+    // `ValidatorRuntime::vrf_beacon_seal_for` always returns `None`.
     let vrf_activation = vrf_activation_from_env();
     rt = rt.with_vrf_activation(vrf_activation);
     match vrf_activation.boundary() {
         Some(h) => tracing::warn!(
-            "[vrf] VRF sortition ARMED from height {h} (STELL_VRF_ACTIVATION_HEIGHT={h}): election switches to the verified VRF seed at/above the boundary for registry-known sealed certificates; pre-activation heights stay on the parent-hash draw"
+            "[vrf] VRF sortition ARMED from height {h} (STELL_VRF_ACTIVATION_HEIGHT={h}): RETIRED — ECVRF bodies removed, election stays on the parent-hash draw at every height; unset the variable to silence this"
         ),
         None => info!(
             "[vrf] VRF sortition inactive (STELL_VRF_ACTIVATION_HEIGHT unset): parent-hash election on every height"
@@ -3682,24 +3673,14 @@ async fn run_consensus_node(
     // best-effort and a single lost prevote/precommit costs the whole round.
     let mut last_rexmit = std::time::Instant::now();
     let mut round_started = std::time::Instant::now();
-    // Round timeout is operator policy, not a consensus constant: it only
-    // bounds how long a node waits before moving on, and every peer applies
-    // its own. The 3s default is comfortable for a WAN; on a LAN (single
-    // millisecond RTTs, which is what a validator set on one host has) it
-    // dominates every measurement -- a height that needs ~10 missed rounds
-    // costs 30s. Scaled down, the SAME consensus logic finalises far more
-    // often because each miss is cheap. Bounded to a sane range.
+    // Round timeout base is a FROZEN protocol constant, not operator policy:
+    // the base feeds the same-on-all-nodes deterministic ladder
+    // (`stellereum::consensus::deterministic_round_timeout_ms`, spec
+    // 04_NETWORK_AND_CONSENSUS_PHASE2 §2), so heterogeneous bases would fork
+    // the timeout schedule. Former `STELL_ROUND_TIMEOUT_MS` env knob removed
+    // by the protocol freeze 2026-11-03 (value = pre-freeze code default).
     let round_timeout = Duration::from_millis(
-        std::env::var("STELL_ROUND_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            // Wide clamp (was 30s): WAN members need hour-long rounds to
-            // overlap with fast locals (observed live: a 2-11s-latency third
-            // validator could never coincide, halting a 3-member chain).
-            // Default deployments never set the env (800ms-3s effective),
-            // so the wide ceiling changes nothing unless asked for.
-            .map(|v| v.clamp(200, 3_600_000))
-            .unwrap_or(3_000),
+        stellereum::consensus::FROZEN_ROUND_TIMEOUT_BASE_MS,
     );
     // Per-round backoff (audit 2026-10-06): a FIXED timeout on a persistently
     // slow network spins at constant cadence forever instead of converging
@@ -5430,9 +5411,9 @@ async fn run_consensus_node(
             let bh = completed.hash;
             let root = completed.root;
             // Governed fee floor (audit follow-up): admission floor =
-            // max(env, governed), refreshed every finalized height so a passed
+            // max(frozen, governed), refreshed every finalized height so a passed
             // SetMinGasLimit takes effect network-wide without restarts.
-            // Env stays the boot default; governance can only raise.
+            // Frozen floor stays the boot default; governance can only raise.
             {
                 let gov_floor = rt
                     .state
@@ -5441,11 +5422,11 @@ async fn run_consensus_node(
                     .applied
                     .min_gas_limit
                     .unwrap_or(0);
-                let env_floor = stellereum::mempool::Mempool::read_base_fee_from_env();
+                let env_floor = stellereum::mempool::Mempool::frozen_base_fee_floor();
                 let want = env_floor.max(gov_floor);
                 let mut mp = rpc.mempool.write().await;
                 if mp.base_fee != want {
-                    info!("[config] admission base_fee floor {0} -> {want} (env={env_floor} governed={gov_floor})", mp.base_fee);
+                    info!("[config] admission base_fee floor {0} -> {want} (frozen={env_floor} governed={gov_floor})", mp.base_fee);
                     mp.base_fee = want;
                 }
             }
@@ -7533,12 +7514,23 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 parallel_exec,
                 false,
             );
-            // Which shards this ONE process runs. `STELL_SHARDS=0,1` runs the
-            // masterchain and workchain 1 over a single infnode node (the
-            // cross-shard KV helpers are node-local, so they must share a
-            // process). Unset/empty => just the CLI shard, i.e. the pre-sharding
-            // behaviour with `is_sharded() == false`.
-            let registry = ShardRegistry::from_env_or(shard);
+            // Which shards this ONE process runs. `STELL_SHARDS=0,1[,2...]`
+            // runs the masterchain plus every configured workchain over a
+            // single infnode node (the cross-shard KV helpers are node-local,
+            // so they must share a process). Unset/empty => just the CLI
+            // shard, i.e. the pre-sharding behaviour with `is_sharded() == false`.
+            //
+            // An EXPLICITLY set list parses fail-closed (`parse_list`: every
+            // entry must be a shard id, ids unique, masterchain 0 present in
+            // every multi-shard set, at most MAX_SHARDS entries) — garbage
+            // refuses startup instead of silently shrinking to the default.
+            let registry = match std::env::var(stellereum::sharding::SHARD_REGISTRY_ENV) {
+                Ok(v) if !v.trim().is_empty() => {
+                    stellereum::sharding::ShardRegistry::parse_list(&v)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                }
+                _ => ShardRegistry::from_env_or(shard),
+            };
             // Protocol-freeze boot guard (docs/PUBLIC_TESTNET_CODE_GAPS.md §1):
             // single-shard {0} canonical for public launch. Any other registry
             // (STELL_SHARDS != {0}) refuses startup unless the local
@@ -8048,12 +8040,12 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     // transaction with `gas_limit: 0` is charged nothing, still
                     // occupies a slot, and the proposer is paid exactly as much as
                     // for real work. A node therefore needs a real floor.
-                    // `STELL_MIN_GAS_LIMIT` sets it; the default matches
+                    // `FROZEN_MIN_GAS_FLOOR` sets it; the value matches
                     // `GAS_BASIC_TRANSFER`, the cheapest real transfer.
                     mempool: Arc::new(tokio::sync::RwLock::new(
                         stellereum::mempool::Mempool::default()
                             .with_mev_engine(mev_engine)
-                            .with_base_fee(stellereum::mempool::Mempool::read_base_fee_from_env())
+                            .with_base_fee(stellereum::mempool::Mempool::frozen_base_fee_floor())
                             // Session-key phase 2: this ONE pool is shared with
                             // the consensus loop (`with_mempool`), so handing it
                             // the engine's registry is what lets admission see a
@@ -8208,12 +8200,13 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         ));
                     });
                 }
-                // Additional shards in this process (`STELL_SHARDS=0,1`): each
-                // runs its own run_consensus_node instance over the SAME infnode
-                // node, so their per-shard state/mempool/store never share, but
-                // the node-local cross-shard KV helpers they will use in M2+ do.
-                // The main flow above is ALWAYS the masterchain; extras are the
-                // remaining registry shards, spawned ONLY in sharded mode (a
+                // Additional shards in this process (`STELL_SHARDS=0,1[,2...]`):
+                // EACH configured workchain runs its own run_consensus_node
+                // instance over the SAME infnode node, so their
+                // per-shard state/mempool/store never share, but the node-local
+                // cross-shard KV helpers they use in M2+ do. The main flow
+                // above is ALWAYS the masterchain; extras are the remaining
+                // registry shards, spawned ONLY in sharded mode (a
                 // single-shard `--shard 1` process has registry {1} and must
                 // spawn nothing - filtering by namespace here once started a
                 // masterchain "extra" that fought the main flow over the store
@@ -8221,7 +8214,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 for extra in registry
                     .ids()
                     .filter(|s| {
-                        registry.is_sharded() && *s != stellereum::sharding::MASTERCHAIN_SHARD
+                        registry.is_sharded()
+                            && stellereum::sharding::is_workchain_shard(*s)
                     })
                     .collect::<Vec<_>>()
                 {

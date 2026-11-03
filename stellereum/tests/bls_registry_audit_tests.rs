@@ -13,33 +13,28 @@
 //!   cannot silently move an entry from one class to the other.
 //! * FORGED-PoP REFUSAL (rogue-key negative test): spliced, wrong-key,
 //!   truncated-preimage and identity-point PoPs never enter the strict
-//!   registry, so `canonical_keys` — and therefore any BLS power count — is
-//!   unavailable for any set containing the refused identity, while the
-//!   honest quorum still verifies.
+//!   registry (the counting path that would have consumed them is removed),
+//!   while honest PoPs register and re-verify.
 //! * SKIP-METERING: every skipped entry is observable in
 //!   `bls_registry_migration_counts`. This covers the fix that the live
-//!   default-off v1 parse (`QcBlsConfig::from_env` without
-//!   `STELL_BLS_POP_REQUIRED`) now feeds the legacy/rejected counters —
-//!   before the fix its warn-and-skip path incremented nothing, leaving the
-//!   documented phase-2 readiness signal (`legacy == 0 && rejected == 0`)
-//!   blind on the only path production parses take.
-//! * CERT-CONFUSION REFUSAL: `HybridCertificate` (soft-fork format vehicle)
-//!   and the live `QuorumCertificate` BLS-envelope path cannot be mistaken
-//!   for each other — the envelope is cryptographically bound to its
-//!   certificate's (height, round, kind, target) while the hybrid height is
-//!   an unbound format field, and a spliced binding is refused.
+//!   default-off v1 parse (`parse_registry_entries`) feeds the
+//!   legacy/rejected counters — before the fix its warn-and-skip path
+//!   incremented nothing, leaving the documented phase-2 readiness signal
+//!   (`legacy == 0 && rejected == 0`) blind on the only path production
+//!   parses take. (Previously routed through `QcBlsConfig::from_env`,
+//!   removed with the counting-path config; the parse itself is unchanged.)
+//! * REMOVED CERT-CONFUSION section: the `HybridCertificate` vs live-QC
+//!   confusion probes and the aggregate-composition probes lived here —
+//!   deleted with `HybridCertificate` / `aggregate_signatures` /
+//!   `verify_aggregate_signature` / `canonical_keys` (reported). The live
+//!   `QuorumCertificate` BLS envelope still decodes as inert metadata and
+//!   attributes/ counts nothing (pinned by the compat + pentest suites).
 
 use stellereum::bls::*;
-use stellereum::consensus::{
-    BLS_QC_MARKER_ID, QuorumCertificate, ValidatorSet, VoteKind, decode_qc_bls_envelope,
-    encode_qc_bls_envelope, vote_sign_bytes,
-};
 
 // Serializes every test in this file that observes process-wide state: the
-// migration counters (bumped by all three registry parsers), the process
-// environment (read by `QcBlsConfig::from_env`), and the process-global QC
-// config. Without this, parallel test threads would pollute each other's
-// counter deltas and env windows.
+// migration counters (bumped by all three registry parsers). Without this,
+// parallel test threads would pollute each other's counter deltas.
 static AUDIT_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn ed(id: u8) -> [u8; 32] {
@@ -67,28 +62,6 @@ fn legacy_line(ed_id: &[u8; 32], sk: &BlsSecretKey) -> String {
     )
 }
 
-struct EnvRestore {
-    saved: Vec<(&'static str, Option<String>)>,
-}
-
-impl EnvRestore {
-    fn save(keys: &[&'static str]) -> Self {
-        Self {
-            saved: keys.iter().map(|k| (*k, std::env::var(k).ok())).collect(),
-        }
-    }
-}
-
-impl Drop for EnvRestore {
-    fn drop(&mut self) {
-        for (k, v) in &self.saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // 1. Strict-vs-lenient differential
@@ -268,46 +241,18 @@ fn forged_pop_shapes_refuse_and_yield_no_bls_power() {
     assert!(!reg.contains_key(&rogue_id), "rogue key must never register");
     assert_eq!((v1 - v0, r1 - r0), (2, 4));
 
-    // Any validator set containing the refused identity resolves NO BLS keys
-    // at all: one missing member disables counting for the whole certificate
-    // (fallback), so the forgery buys zero BLS power.
-    let vs_with_rogue = ValidatorSet::from_list(vec![
-        (honest_ids[0], 1),
-        (honest_ids[1], 1),
-        (rogue_id, 1),
-    ]);
-    let cfg = QcBlsConfig {
-        enabled: true,
-        registry: reg.clone(),
-        local_vote_seed: None,
-    };
-    assert!(
-        cfg.canonical_keys(&vs_with_rogue).is_none(),
-        "a set containing the refused rogue resolves no keys"
-    );
-
-    // The honest-only set still resolves, and its aggregate verifies — the
-    // gate removes the attacker without breaking honest quorum math.
-    let vs_honest =
-        ValidatorSet::from_list(vec![(honest_ids[0], 1), (honest_ids[1], 1)]);
-    let keys = cfg
-        .canonical_keys(&vs_honest)
-        .expect("honest set must resolve");
-    let msg = b"audit-forged-pop-negative";
-    let sigs: Vec<(usize, BlsSignature)> = honest
-        .iter()
-        .enumerate()
-        .map(|(i, k)| (i, k.sign(msg)))
-        .collect();
-    let agg = aggregate_signatures(&sigs, 2).expect("honest aggregate builds");
-    assert!(verify_aggregate_signature(&keys, msg, &agg));
-    // And the same bytes do NOT verify with the rogue key substituted in.
-    let mut tampered = keys.clone();
-    tampered[0] = rogue_sk.public_key();
-    assert!(
-        !verify_aggregate_signature(&tampered, msg, &agg),
-        "aggregate must not verify under a substituted rogue key"
-    );
+    // Any validator set containing the refused identity gains no BLS power
+    // through this registry: the rogue never registers, and with the counting
+    // path removed there is no other way to count it. (The `canonical_keys`
+    // + aggregate-composition tail of this probe was deleted with those
+    // bodies.) The honest PoPs stay registered and re-verify.
+    assert!(reg.contains_key(&honest_ids[0]));
+    assert!(reg.contains_key(&honest_ids[1]));
+    assert!(bls_verify_pop(
+        reg.get(&honest_ids[0]).unwrap(),
+        &honest_ids[0],
+        &bls_sign_pop(&honest[0], &honest_ids[0])
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -317,9 +262,10 @@ fn forged_pop_shapes_refuse_and_yield_no_bls_power() {
 #[test]
 fn default_path_skips_are_metered_in_migration_counts() {
     let _gate = AUDIT_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-    let _restore =
-        EnvRestore::save(&[BLS_KEYS_FILE_ENV, BLS_KEYS_INLINE_ENV, BLS_POP_REQUIRED_ENV, BLS_QC_ENV]);
-
+    // (Previously routed through `QcBlsConfig::from_env` + env vars, removed
+    // with the counting-path config. The parse calls below are the same code
+    // the removed reader ran: v1 for the default-off shape, strict for the
+    // gated shape — metering pins unchanged.)
     let sk_a = BlsSecretKey::from_seed(&seed(0x71));
     let sk_b = BlsSecretKey::from_seed(&seed(0x72));
     let (id_a, id_b) = (ed(0xE1), ed(0xE2));
@@ -336,31 +282,19 @@ fn default_path_skips_are_metered_in_migration_counts() {
         hex::encode(id_b),
         "ab",
     );
-    let path = std::env::temp_dir().join(format!(
-        "stell-bls-audit-meter-{}-{}.reg",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    ));
-    std::fs::write(&path, &body).expect("write temp registry");
-    std::env::set_var(BLS_KEYS_FILE_ENV, &path);
-    std::env::remove_var(BLS_KEYS_INLINE_ENV);
-    std::env::remove_var(BLS_QC_ENV);
 
     // Default OFF: the pre-PoP v1 parse runs. Both good lines register; all
-    // three bad lines skip — AND the skips are now metered (the fix: before,
+    // three bad lines skip — AND the skips are metered (the fix: before,
     // this parse touched no counter, so silent BLS-power loss was invisible
     // to `bls_registry_migration_counts`).
-    std::env::remove_var(BLS_POP_REQUIRED_ENV);
     assert!(!bls_pop_required());
     let (v0, l0, r0) = bls_registry_migration_counts();
-    let off = QcBlsConfig::from_env();
+    let mut off = BlsKeyRegistry::new();
+    parse_registry_entries(&body, &mut off);
     let (v1, l1, r1) = bls_registry_migration_counts();
-    assert_eq!(off.registry.len(), 2, "good legacy entries must register");
-    assert!(off.registry.contains_key(&id_a));
-    assert!(off.registry.contains_key(&id_b));
+    assert_eq!(off.len(), 2, "good legacy entries must register");
+    assert!(off.contains_key(&id_a));
+    assert!(off.contains_key(&id_b));
     assert_eq!(
         (v1 - v0, l1 - l0, r1 - r0),
         (0, 2, 3),
@@ -369,12 +303,13 @@ fn default_path_skips_are_metered_in_migration_counts() {
 
     // Gate ON: the same bytes refuse every line (no valid PoP anywhere), so
     // nothing registers and all five lines count rejected.
-    std::env::set_var(BLS_POP_REQUIRED_ENV, "1");
     let (v2a, l2a, r2a) = bls_registry_migration_counts();
-    let on = QcBlsConfig::from_env();
+    let mut on = BlsKeyRegistry::new();
+    let mut on_stats = BlsRegistryStats::default();
+    parse_registry_entries_strict_pop(&body, &mut on, &mut on_stats);
     let (v2b, l2b, r2b) = bls_registry_migration_counts();
     assert!(
-        on.registry.is_empty(),
+        on.is_empty(),
         "strict gate must refuse keys without a valid PoP"
     );
     assert_eq!(
@@ -386,212 +321,14 @@ fn default_path_skips_are_metered_in_migration_counts() {
     // Counters never move backwards.
     let (v3, l3, r3) = bls_registry_migration_counts();
     assert!(v3 >= v2b && l3 >= l2b && r3 >= r2b);
-
-    let _ = std::fs::remove_file(&path);
 }
-
-// ---------------------------------------------------------------------------
-// 4. Aggregate soundness over registry-resolved keys (composition)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn registry_resolved_keys_verify_and_tampering_fails_closed() {
-    // Registry built by direct insert (no parse, no counters): this test pins
-    // the verify composition, not the metering.
-    let sks: Vec<BlsSecretKey> = (0..3).map(|i| BlsSecretKey::from_seed(&seed(0x20 + i))).collect();
-    let ids = [ed(0xB1), ed(0xB2), ed(0xB3)];
-    let mut reg = BlsKeyRegistry::new();
-    for (id, sk) in ids.iter().zip(&sks) {
-        reg.insert(*id, sk.public_key());
-    }
-    let vs = ValidatorSet::from_list(ids.iter().map(|id| (*id, 1)).collect());
-    let cfg = QcBlsConfig {
-        enabled: true,
-        registry: reg,
-        local_vote_seed: None,
-    };
-    let keys = cfg.canonical_keys(&vs).expect("full registry resolves");
-    let msg = b"audit-registry-verify-composition";
-    let sigs: Vec<(usize, BlsSignature)> = sks
-        .iter()
-        .enumerate()
-        .map(|(i, k)| (i, k.sign(msg)))
-        .collect();
-    let agg = aggregate_signatures(&sigs, 3).expect("aggregate builds");
-    assert!(verify_aggregate_signature(&keys, msg, &agg));
-
-    // Soundness on the resolved path: every tamper fails closed.
-    assert!(!verify_aggregate_signature(&keys, b"other message", &agg));
-    let mut wrong_key = keys.clone();
-    wrong_key[1] = BlsSecretKey::from_seed(&seed(0xFF)).public_key();
-    assert!(!verify_aggregate_signature(&wrong_key, msg, &agg));
-    let mut silent = agg.clone();
-    silent.participants.set(0, false);
-    assert!(
-        !verify_aggregate_signature(&keys, msg, &silent),
-        "muted bitvector member must fail: the signature covers 3, the set claims 2"
-    );
-    assert!(
-        !verify_aggregate_signature(&keys[..2], msg, &agg),
-        "key list measured against the wrong set must refuse"
-    );
-    // A set with one member rotated out of the registry resolves nothing:
-    // partial key lists are never summed.
-    let vs_rotated = ValidatorSet::from_list(vec![(ids[0], 1), (ids[1], 1), (ed(0x00), 1)]);
-    assert!(cfg.canonical_keys(&vs_rotated).is_none());
-}
-
-// ---------------------------------------------------------------------------
-// 5. HybridCertificate vs live-QC confusion refusal
-// ---------------------------------------------------------------------------
-
-#[test]
-fn hybrid_format_gate_pins_activation_boundary() {
-    let activation = 10_000u64;
-    assert!(!is_bls_active(activation - 1, activation));
-    assert!(is_bls_active(activation, activation));
-    assert!(is_bls_active(activation + 1, activation));
-
-    let ed_cert = |height| HybridCertificate::Ed25519 {
-        height,
-        round: 0,
-        block_hash: [1u8; 32],
-        signatures: vec![([0u8; 32], [0u8; 64])],
-    };
-    let dummy_agg = || {
-        let sig = BlsSecretKey::from_seed(&seed(0x99)).sign(b"format-check");
-        BlsAggregateSignature {
-            signature: sig,
-            participants: SignerBitVector::new(2),
-        }
-    };
-    let bls_cert = |height| HybridCertificate::BlsAggregate {
-        height,
-        round: 0,
-        block_hash: [2u8; 32],
-        aggregate: dummy_agg(),
-    };
-
-    // Exact boundary: pre-activation is Ed25519-only, activation is BLS-only.
-    assert!(ed_cert(activation - 1).is_format_valid(activation));
-    assert!(!ed_cert(activation).is_format_valid(activation));
-    assert!(!bls_cert(activation - 1).is_format_valid(activation));
-    assert!(bls_cert(activation).is_format_valid(activation));
-    assert!(bls_cert(activation + 1).is_format_valid(activation));
-
-    // Accessors report the certificate's OWN fields, independent of variant.
-    assert_eq!(bls_cert(7).height(), 7);
-    assert_eq!(bls_cert(7).round(), 0);
-    assert_eq!(bls_cert(7).block_hash(), [2u8; 32]);
-    assert_eq!(ed_cert(9).height(), 9);
-}
-
-#[test]
-fn hybrid_height_is_unbound_while_qc_envelope_binding_refuses_splice() {
-    // The two "heights" live in different domains: the hybrid height is a
-    // plain field that only drives the FORMAT verdict, while the QC envelope
-    // height is cryptographically bound to the aggregate and refused on
-    // mismatch. Neither can be mistaken for the other.
-    //
-    // Takes AUDIT_GUARD: installing the test config lazy-initializes the
-    // process-global `qc_bls()` cell via `QcBlsConfig::from_env`, which reads
-    // the registry env vars — so this must never overlap the env windows of
-    // the metering tests.
-    let _audit_gate = AUDIT_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-    let _qc_guard = set_qc_bls_for_tests(QcBlsConfig {
-        enabled: true,
-        registry: {
-            let sks: Vec<BlsSecretKey> =
-                (0..2).map(|i| BlsSecretKey::from_seed(&seed(0x30 + i))).collect();
-            sks.iter()
-                .enumerate()
-                .map(|(i, sk)| (ed(0xF0 + i as u8), sk.public_key()))
-                .collect()
-        },
-        local_vote_seed: None,
-    });
-    // Rebuild the same keys/ids the guard registry was built from.
-    let sks: Vec<BlsSecretKey> = (0..2).map(|i| BlsSecretKey::from_seed(&seed(0x30 + i))).collect();
-    let ids = [ed(0xF0), ed(0xF1)];
-    let vs = ValidatorSet::from_list(ids.iter().map(|id| (*id, 1)).collect());
-
-    let height = 41u64;
-    let bh = [0xABu8; 32];
-    let msg = vote_sign_bytes(height, 0, VoteKind::Precommit, &Some(bh));
-    let sigs: Vec<(usize, BlsSignature)> = sks
-        .iter()
-        .enumerate()
-        .map(|(i, k)| (i, k.sign(&msg)))
-        .collect();
-    let agg = aggregate_signatures(&sigs, 2).expect("aggregate builds");
-
-    // QC side: a BLS-only certificate verifies, and ONLY with its bound height.
-    let good_qc = QuorumCertificate {
-        height,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: vec![(
-            BLS_QC_MARKER_ID,
-            encode_qc_bls_envelope(&agg, height, 0, VoteKind::Precommit, Some(bh)),
-        )],
-    };
-    assert!(good_qc.verify(&vs), "bound envelope must verify");
-    let (dh, dr, dkind, dbh, _) =
-        decode_qc_bls_envelope(&good_qc.signatures[0].1).expect("envelope decodes");
-    assert_eq!((dh, dr, dkind, dbh), (height, 0, VoteKind::Precommit, bh));
-
-    // Spliced binding, same aggregate bytes, envelope re-bound to height+1
-    // while the certificate still claims height: refused.
-    let spliced_qc = QuorumCertificate {
-        height,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: vec![(
-            BLS_QC_MARKER_ID,
-            encode_qc_bls_envelope(&agg, height + 1, 0, VoteKind::Precommit, Some(bh)),
-        )],
-    };
-    assert!(
-        !spliced_qc.verify(&vs),
-        "envelope bound to another height must refuse"
-    );
-
-    // Hybrid side: the SAME aggregate in a HybridCertificate verifies
-    // independently of the height field — the field only drives the format
-    // verdict, never the pairing. Flipping height flips format validity and
-    // leaves crypto untouched, the exact opposite coupling from the QC path.
-    let activation = 10_000u64;
-    let keys: Vec<BlsPublicKey> = sks.iter().map(|k| k.public_key()).collect();
-    let hybrid_at = |h| HybridCertificate::BlsAggregate {
-        height: h,
-        round: 0,
-        block_hash: bh,
-        aggregate: agg.clone(),
-    };
-    assert!(verify_aggregate_signature(&keys, &msg, &hybrid_at(height).as_aggregate()));
-    assert!(!hybrid_at(height).is_format_valid(activation));
-    assert!(hybrid_at(activation).is_format_valid(activation));
-    assert!(verify_aggregate_signature(&keys, &msg, &hybrid_at(activation).as_aggregate()));
-}
-
-/// Test-only accessor: unwrap the aggregate out of a hybrid certificate.
-///
-/// (There is deliberately no such helper in production code — nothing on the
-/// live path converts a `HybridCertificate` into signature bytes, which is
-/// part of why the two certificate shapes cannot be confused.)
-trait HybridAggregate {
-    fn as_aggregate(&self) -> BlsAggregateSignature;
-}
-
-impl HybridAggregate for HybridCertificate {
-    fn as_aggregate(&self) -> BlsAggregateSignature {
-        match self {
-            HybridCertificate::BlsAggregate { aggregate, .. } => aggregate.clone(),
-            HybridCertificate::Ed25519 { .. } => {
-                panic!("no aggregate in the Ed25519 variant")
-            }
-        }
-    }
-}
+// REMOVED (aggregate-composition + hybrid-confusion probes): section 4
+// (`registry_resolved_keys_verify_and_tampering_fails_closed`), section 5
+// (`hybrid_format_gate_pins_activation_boundary`), section 6
+// (`hybrid_height_is_unbound_while_qc_envelope_binding_refuses_splice`),
+// and the `HybridAggregate` test helper tested the removed
+// `aggregate_signatures` / `verify_aggregate_signature` /
+// `HybridCertificate` / `is_bls_active` / `canonical_keys` /
+// `set_qc_bls_for_tests` surface — deleted with the code they pinned
+// (reported). Envelope binding (bound to height/round/kind/target) stays
+// pinned by the compat suite; marker inertness by the pentest suites.

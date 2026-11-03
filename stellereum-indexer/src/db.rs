@@ -456,6 +456,14 @@ impl Database {
     /// Every filter is optional; the ones that are set are ANDed. Addresses
     /// and hashes are matched case-insensitively and with or without the
     /// `0x` prefix, so a client can paste either form.
+    ///
+    /// Block bounds are clamped to the i64 range SQLite binds: a bound above
+    /// `i64::MAX` (e.g. `u64::MAX`) would otherwise fail conversion and
+    /// surface as HTTP 500. Clamping preserves semantics (heights above the
+    /// clamp match everything below it).
+    fn clamp_block_bound(v: Option<u64>) -> Option<i64> {
+        v.map(|x| x.min(i64::MAX as u64) as i64)
+    }
     pub fn get_events(
         &self,
         filter: &EventFilter,
@@ -489,8 +497,8 @@ impl Database {
         };
         let rows = stmt.query_map(
             params![
-                filter.from_block,
-                filter.to_block,
+                Self::clamp_block_bound(filter.from_block),
+                Self::clamp_block_bound(filter.to_block),
                 contract_flag,
                 contract_a,
                 contract_b,
@@ -547,8 +555,8 @@ impl Database {
         };
         let count: u64 = stmt.query_row(
             params![
-                filter.from_block,
-                filter.to_block,
+                Self::clamp_block_bound(filter.from_block),
+                Self::clamp_block_bound(filter.to_block),
                 contract_flag,
                 contract_a,
                 contract_b,

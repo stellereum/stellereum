@@ -1,0 +1,25 @@
+{
+  "name": "Stellereum Testnet",
+  "chain": "STELL",
+  "chainId": 5757,
+  "networkId": 5757,
+  "shortName": "stell-t",
+  "rpc": [
+    "https://evm.stellereum.org",
+    "https://rpc.stellereum.org"
+  ],
+  "faucets": [],
+  "nativeCurrency": {
+    "name": "STELL",
+    "symbol": "STELL",
+    "decimals": 9
+  },
+  "infoURL": "https://stellereum.org",
+  "explorers": [
+    {
+      "name": "Stellereum Explorer",
+      "url": "https://explorer.stellereum.org",
+      "standard": "EIP3091"
+    }
+  ]
+}

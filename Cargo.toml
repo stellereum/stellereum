@@ -1,0 +1,81 @@
+[package]
+name = "stellereum"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+infnode = { git = "https://github.com/stellereum/infnode", branch = "main" }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core", "batch"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+aead = "0.5"
+hex = "0.4"
+sha2 = "0.10"
+rand = "0.8"
+bincode = "1.3"
+sled = "0.34"
+rayon = "1"
+axum = { version = "0.7", features = ["ws"] }
+# Timeouts + concurrency caps on both HTTP servers (audit 2026-10-06).
+# Pinned to the version already in Cargo.lock (axum's own dep), features add
+# no new crates beyond what is cached.
+tower = { version = "0.5", features = ["timeout", "limit"] }
+# catch_unwind for the apply-worker panic guard (audit follow-up). Pinned to a
+# cached version; only FutureExt is used.
+futures = "0.3"
+curve25519-dalek = { version = "4", features = ["rand_core"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+ureq = "2"
+lazy_static = "1.5"
+# Real pairing-based BLS12-381 for aggregate validator certificates (P1-c). Pure
+# Rust, no C toolchain: `blst` was avoided deliberately so the build stays portable.
+# minimal-signature-size would need 96-byte public keys; minimal-pubkey-size gives
+# 48-byte keys and 96-byte signatures, which is what the certificate carries.
+bls12_381 = { version = "0.9", features = ["experimental"] }
+# NOTE: `group` 0.13 and `ff` 0.13 were dropped as direct dependencies (audit
+# 2026-10-20): nothing in src/, tests/, benches/ or examples/ referenced them.
+# They stay in the lockfile as transitive deps of `k256` -> `elliptic-curve`
+# 0.13, and `bls12_381` 0.9 uses the 0.14 generation instead.
+argon2 = "0.5"
+wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "deterministic", "portable-dispatch"] }
+# Post-Quantum STARK / BLAKE3 zkML Engine (100% Quantum-Resistant, zero trusted setup, zero elliptic curves)
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+zeroize = { version = "1", features = ["derive"] }
+falcon-rust = "0.3.1"
+# `pqcrypto-falcon` is USED: src/post_quantum.rs links its FIPS 206 C archive
+# (`use pqcrypto_falcon as _;`). It pulls `pqcrypto-traits` / `pqcrypto-internals`
+# transitively, so those are NOT direct dependencies either.
+pqcrypto-falcon = "0.4.1"
+# Canonical contract source form is `.wat` text (contracts/*.wat); the node
+# recompiles it with this crate for `stell_verifyContractSource` (P2-15).
+wat = "1"
+ml-kem = "0.3"
+
+[dev-dependencies]
+# WebSocket client for the streaming-subscription tests. Already in the
+# dependency graph through axum's `ws` feature, so this adds no new crate.
+tokio-tungstenite = "0.24"
+
+# Test speed: the suite is crypto-heavy (Ed25519, hashing, Merkle, WASM), and an
+# unoptimized dependency graph made it unusably slow. Dependencies are compiled
+# with full optimizations while our own crate stays at opt-level 0, so rebuilds
+# remain quick. Debuginfo is dropped because it dominated link time and disk
+# (20 GB of target/debug) without helping the tests at all.
+[profile.dev]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.test]
+debug = 0
+
+[profile.test.package."*"]
+opt-level = 3

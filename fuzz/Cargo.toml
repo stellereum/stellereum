@@ -1,0 +1,83 @@
+[package]
+name = "stellereum-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+stellereum = { path = ".." }
+# Relative path: `fuzz/` -> repo root -> sibling workspace checkout.
+# Resolved relative to THIS manifest's directory, so it needs one `..`
+# more than the root Cargo.toml's `../infnode/crates/infnode`.
+infnode = { git = "https://github.com/stellereum/infnode", branch = "main" }
+bincode = "1.3"
+
+[dependencies.libfuzzer-sys]
+version = "0.4"
+optional = true
+
+# `libfuzzer` is ON by default so `cargo +nightly fuzz run <target>` links the
+# fuzz_target! harness. Each target is `#![no_main]`, so building it WITHOUT
+# the feature (feature off => no `fuzz_target!` => only `fn main() {}`, which
+# `no_main` discards) produces "undefined symbol: main" at link time — that is
+# exactly what `cargo fuzz run` used to hit. `--no-default-features` still
+# builds a no-op `fn main` stub for tooling that wants a plain binary.
+# tests/fuzz_decoder_tests.rs runs the same corpus deterministically under
+# stable `cargo test`. See fuzz_targets/ and tests/fuzz_decoder_tests.rs.
+[features]
+default = ["libfuzzer"]
+libfuzzer = ["libfuzzer-sys"]
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "consensus_msg_decode"
+path = "fuzz_targets/consensus_msg_decode.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "transaction_decode"
+path = "fuzz_targets/transaction_decode.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "block_decode"
+path = "fuzz_targets/block_decode.rs"
+test = false
+bench = false
+
+# Added by the external-audit preparation (2026-10). The certificate envelope
+# decoders and the hand-rolled EVM RLP decoder were NOT covered by any
+# target: they are raw-byte parsers fed by remote peers, and they are where a
+# length-prefix or bitmask off-by-one would turn into an accepted
+# under-powered certificate or a remote DoS. See docs/audits/EXTERNAL_AUDIT_BRIEF.md.
+[[bin]]
+name = "cert_envelope_decode"
+path = "fuzz_targets/cert_envelope_decode.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "evm_raw_tx_decode"
+path = "fuzz_targets/evm_raw_tx_decode.rs"
+test = false
+bench = false
+
+# Also added by the external-audit preparation (2026-10): the cross-shard
+# message decoder and the epoch-seal gossip frames were uncovered, and the
+# cross-shard message carries a `trusted` flag that bypasses the inclusion
+# proof, so a decode that kept it would be a consensus-critical bug.
+[[bin]]
+name = "peer_msg_decode"
+path = "fuzz_targets/peer_msg_decode.rs"
+test = false
+bench = false

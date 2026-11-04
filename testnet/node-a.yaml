@@ -1,0 +1,144 @@
+# =============================================================================
+# Stellereum testnet — node A (validator 1 of 2)
+# =============================================================================
+#
+# This is the infnode P2P transport configuration that `stellereum run --config`
+# loads. The schema is infnode's NodeConfig, which is `#[serde(rename_all =
+# "kebab-case")]`, so every key below is kebab-case (that is why docker/node.yaml
+# says `storage-roles:` and `allow-unknown:`). Required keys are `name`,
+# `listen` and `peers`; everything else has a default.
+#
+# WHAT YOU MUST REPLACE
+#   1. the four PLACEHOLDER hex values in `peers:` (node-id, ed-pub, x-pub)
+#   2. the four PLACEHOLDER hex values in `validators:`
+#   3. the `endpoints:` address if node B is not on the same host
+#
+# Where those values come from: start node B once with an empty `peers:` list and
+# the log line
+#     NODE IDENTITY: id=inf1:<40 hex> ed=<64 hex> x=<64 hex> listen=0.0.0.0:9411
+# gives you exactly the three keys the `peers:` entry needs, and the `id=` part
+# is what goes in `validators:`.
+#
+# ------------------------------------------------------------------
+# THE VALIDATOR SET IS DERIVED FROM THIS FILE — READ THIS
+# ------------------------------------------------------------------
+# build_validator_set() in src/main.rs builds the consensus set as:
+#
+#     { this node's own Ed25519 key }  UNION
+#     { the ed-pub of every `peers:` entry whose node-id appears in `validators:` }
+#
+# The genesis state root is computed over the accounts of that set (plus the
+# faucet account). So the set must come out identical on every node or the roots
+# differ and you are running two chains. Concretely, for a 2-validator testnet:
+#
+#   * node A must list BOTH ids in `validators:` (its own and B's) AND carry a
+#     `peers:` entry for B
+#   * node B must do the same for A
+#
+# Forgetting a peer in your own file does not produce a warning. It produces a
+# solo validator set, a different genesis root, and a chain that splits
+# silently. See ../../PROTOCOL.md section 3 (I7) on why the set has exactly one
+# source of truth.
+#
+# `validators:` holds NODE IDS (the 20-byte inf1: id, 40 hex chars). The account
+# that actually gets funded at genesis is the peer's ed-pub (32 bytes, 64 hex
+# chars). They are different values; the `inf1:` prefix on the node-id is
+# optional and is stripped before comparison.
+# ------------------------------------------------------------------
+
+name: stellereum-testnet-a
+
+# QUIC listener. 9410 for node A, 9411 for node B — they cannot share a port if
+# both run on the same host.
+listen: "0.0.0.0:9410"
+
+# Outbound QUIC socket, used for NAT hole punching. Pinning it to the same port
+# as `listen` keeps the node's public address stable across restarts; leaving it
+# unset makes the outbound socket ephemeral. Only set this if you are behind
+# NAT — otherwise remove the line.
+client-listen: "0.0.0.0:9410"
+
+# Reported by the node's status output. It is NOT used to dial anyone: a node
+# connects to the `endpoints:` of its configured peers, never to `advertise`.
+# Set it to the address other nodes should actually reach you on, purely so the
+# status output is not misleading.
+advertise: "127.0.0.1:9410"
+
+# Storage role. Both roles is what docker/node.yaml uses and what the stell_*
+# buckets (blocks, state) need.
+storage-roles:
+  - mail
+  - files
+
+# 0 = error, 1 = warn, 2 = info, 3 = debug.
+# Keep this at 2 or higher on a testnet: the progress line to watch is
+#     [consensus] FINALIZED block #<n> <hash> (state root <root>)
+# and it is emitted at info level. It is also how you distinguish "chain is
+# advancing" from "this node is stuck in a view-change loop" (the
+# "[consensus] view change -> height N round R" line at info level).
+log-level: 2
+
+# infnode's own Prometheus endpoint (frames, bytes, connections, pubsub
+# counters). This is a DIFFERENT port from the stellereum gateway /metrics,
+# which lives on STELL_EXPLORER_LISTEN. Unset = off. Keep it on loopback and
+# scrape it over SSH or a tunnel; do not publish it.
+metrics-listen: "127.0.0.1:9401"
+
+# Accept connections from nodes that are not pinned below (TOFU). Defaults to
+# false. The unknown-allow list is spelled out rather than left implicit so a
+# reader does not have to look up what the default is: unknown peers get the
+# four read-only DHT discovery capabilities and nothing else — no store, no
+# pubsub, no services. Without this, a public testnet refuses unknown nodes
+# outright and you cannot discover anyone you did not hardcode.
+#
+# DEV/TOFU MODE: `allow-unknown: true` is a development-environment setting. On
+# a PUBLIC testnet turn it off (`allow-unknown: false` or remove the line) and
+# pin every node you intend to talk to under `peers:`. The value is network
+# config — changing it must be done consistently across the network, so treat
+# that as a coordinated upgrade, not a per-node tweak.
+allow-unknown: true
+unknown-allow:
+  - "dht.lookup"
+  - "dht.update"
+  - "dht.find_node"
+  - "dht.find_value"
+
+# Optional. When set, a DNS TXT record under this domain must contain this
+# node's node id, which is how a federation recognises its own validators.
+# Leave it out unless you actually control the domain — with no `domain:` set
+# the check does not run at all.
+# domain: "testnet.stellereum.example"
+
+# --- peers -------------------------------------------------------------------
+# Replace the placeholders with node B's values. `endpoints` is the real dial
+# target: node A will try each address in turn. On one host, 127.0.0.1:9411.
+# `allow` is omitted deliberately — its default is ["*"], full access, which is
+# correct for a peer you have explicitly pinned.
+peers:
+  - name: stellereum-testnet-b
+    # PLACEHOLDER — node B's id, from its "NODE IDENTITY: id=inf1:..." line.
+    # 20 bytes, 40 hex chars. The `inf1:` prefix is optional.
+    node-id: "inf1:PLACEHOLDER_B_NODE_ID_00000000000000000000"
+    # PLACEHOLDER — node B's ed_pub, 32 bytes, 64 hex chars.
+    # THIS is the value that decides B's consensus identity: it is what
+    # build_validator_set puts in the validator set, and it is the account that
+    # gets GENESIS_VALIDATOR_BALANCE credited at genesis.
+    ed-pub: "PLACEHOLDER_B_ED_PUB_0000000000000000000000000000000000000000000000000000"
+    # PLACEHOLDER — node B's x-pub, 32 bytes, 64 hex chars. Used for the
+    # encrypted transport, not for consensus.
+    x-pub: "PLACEHOLDER_B_X_PUB_0000000000000000000000000000000000000000000000000000000"
+    endpoints:
+      - "127.0.0.1:9411"
+
+# --- validators --------------------------------------------------------------
+# Node ids that this config should treat as consensus validators. List EVERY
+# validator in the network, including this node, or the genesis state root will
+# not match its peers'. Both entries below are PLACEHOLDER.
+#
+# With this file, node A's set = {A's own key, B's ed-pub}. If node B's file
+# lists the same two ids, B's set is the same pair. The set is a BTreeMap
+# (sorted by key), so fund_genesis credits the accounts in a deterministic order
+# and every node derives the same root.
+validators:
+  - "inf1:PLACEHOLDER_A_NODE_ID_00000000000000000000"
+  - "inf1:PLACEHOLDER_B_NODE_ID_00000000000000000000"

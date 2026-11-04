@@ -3658,11 +3658,9 @@ impl Transaction {
                             return true;
                         }
                     }
-                    crate::crypto_privacy::verify_stealth_signature(
-                        &self.from,
-                        &self.signing_message(),
-                        sig_slice,
-                    )
+                    // Ristretto excision: stealth fallback removed with crypto_privacy;
+                    // fail closed on failed classical verify.
+                    false
                 }
                 Some(d) => {
                     if d.master_address != self.from {

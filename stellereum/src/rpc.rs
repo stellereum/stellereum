@@ -4314,6 +4314,15 @@ async fn gov_write(
     }
 }
 
+/// Loopback-dev escape for UNSIGNED gov writes: ONLY when the existing
+/// dev-test flag is armed (`STELL_DEV_UNSAFE_TESTKEY=1`, the same flag the
+/// wallet SIGN arms and the faucet test key use) AND the bind is loopback.
+/// No new env knob is introduced: without the flag, an unsigned proposal or
+/// vote is refused fail-closed on every bind (including loopback).
+fn gov_unsigned_dev_escape() -> bool {
+    is_dev_unsafe_testkey_env() && rpc_bind_is_loopback()
+}
+
 /// Effective chain id for a wallet-signing call: explicit `chain_id` wins,
 /// otherwise the node's own chain id. The preimage is ALWAYS rebuilt with this
 /// value on both sign and verify, so a signature minted for one chain never
@@ -6119,13 +6128,66 @@ async fn dispatch(
                 .unwrap_or(0);
             let mut g = gov_write(st).await;
             let mut ledger = st.engine.staking_write().await;
-            let proposer = params["proposer"]
-                .as_str()
-                .and_then(|s| parse_addr(s).ok())
-                .unwrap_or([1u8; 32]);
-            match g.propose(&mut ledger, proposer, title, action, now) {
+            // Operator-signed identity: the proposer MUST be explicit (no
+            // default identity — a default would let any caller propose as
+            // an address whose key they do not hold).
+            let proposer = match params["proposer"].as_str().and_then(|s| parse_addr(s).ok()) {
+                Some(p) => p,
+                None => return err(id, -32602, "missing or invalid proposer address"),
+            };
+            // Unsigned legacy path: refused fail-closed unless the loopback
+            // dev-test escape is armed (existing STELL_DEV_UNSAFE_TESTKEY=1
+            // flag AND a loopback bind — no new knob).
+            let sig_hex = params["signature"].as_str();
+            if sig_hex.is_none() && gov_unsigned_dev_escape() {
+                match g.propose(&mut ledger, proposer, title, action, now) {
+                    Ok(pid) => return ok(id, json!({ "proposal_id": pid, "status": "Open" })),
+                    Err(e) => return err(id, -32000, format!("propose failed: {e}")),
+                }
+            }
+            let Some(sig_hex) = sig_hex else {
+                return err(
+                    id,
+                    -32001,
+                    "missing gov signature: stell_submitProposal requires an operator signature over (chain_id || proposer || title || action || nonce) verifiable against the proposer's staking key; pass 'signature' (wallet envelope hex) and 'nonce' (u64)",
+                );
+            };
+            let nonce = match params.get("nonce") {
+                Some(v) => match crate::wallet_signing::parse_u64_param(v) {
+                    Ok(n) => n,
+                    Err(e) => return err(id, -32602, format!("bad gov nonce: {e}")),
+                },
+                None => {
+                    return err(
+                        id,
+                        -32602,
+                        "missing gov nonce: pass 'nonce' (u64, fresh per proposer; consumed on success)",
+                    )
+                }
+            };
+            let sig = match crate::wallet_signing::WalletSignature::from_hex(sig_hex) {
+                Ok(s) => s,
+                Err(e) => return err(id, -32602, format!("bad gov signature envelope: {e}")),
+            };
+            if sig.claimed_address() != proposer {
+                return err(
+                    id,
+                    -32000,
+                    "gov signature wrong key: the envelope's claimed address is not the proposer",
+                );
+            }
+            match g.propose_signed(
+                &mut ledger,
+                proposer,
+                title,
+                action,
+                now,
+                st.chain_id,
+                nonce,
+                &sig,
+            ) {
                 Ok(pid) => ok(id, json!({ "proposal_id": pid, "status": "Open" })),
-                Err(e) => err(id, -32000, format!("propose failed: {:?}", e)),
+                Err(e) => err(id, -32000, format!("propose failed: {e}")),
             }
         }
         "stell_vote" => {
@@ -6158,12 +6220,49 @@ async fn dispatch(
                 .unwrap_or(0);
             let mut g = gov_write(st).await;
             let mut ledger = st.engine.staking_write().await;
-            match g.vote(&mut ledger, voter, pid, choice, now) {
+            // Operator-signed identity: the envelope must verify against the
+            // claimed voter STAKING key (the same key whose stake is
+            // locked/voted — checked by `vote_signed` against the ledger
+            // snapshot, so a stakeless signature lands on NotStaker).
+            // Unsigned legacy path: refused fail-closed unless the loopback
+            // dev-test escape is armed (existing STELL_DEV_UNSAFE_TESTKEY=1
+            // flag AND a loopback bind — no new knob).
+            let sig_hex = params["signature"].as_str();
+            if sig_hex.is_none() && gov_unsigned_dev_escape() {
+                match g.vote(&mut ledger, voter, pid, choice, now) {
+                    Ok(weight) => {
+                        return ok(
+                            id,
+                            json!({ "voted": true, "proposal_id": pid, "weight": weight.to_string() }),
+                        )
+                    }
+                    Err(e) => return err(id, -32000, format!("vote failed: {e}")),
+                }
+            }
+            let Some(sig_hex) = sig_hex else {
+                return err(
+                    id,
+                    -32001,
+                    "missing gov signature: stell_vote requires an operator signature over (chain_id || proposal_id || choice) verifiable against the voter's staking key; pass 'signature' (wallet envelope hex)",
+                );
+            };
+            let sig = match crate::wallet_signing::WalletSignature::from_hex(sig_hex) {
+                Ok(s) => s,
+                Err(e) => return err(id, -32602, format!("bad gov signature envelope: {e}")),
+            };
+            if sig.claimed_address() != voter {
+                return err(
+                    id,
+                    -32000,
+                    "gov signature wrong key: the envelope's claimed address is not the voter",
+                );
+            }
+            match g.vote_signed(&mut ledger, voter, pid, choice, now, st.chain_id, &sig) {
                 Ok(weight) => ok(
                     id,
                     json!({ "voted": true, "proposal_id": pid, "weight": weight.to_string() }),
                 ),
-                Err(e) => err(id, -32000, format!("vote failed: {:?}", e)),
+                Err(e) => err(id, -32000, format!("vote failed: {e}")),
             }
         }
         "stell_executeProposal" => {
@@ -9670,6 +9769,40 @@ mod tests {
         ))
     }
 
+    // GATE: operator-signed governance — deterministic test keys stand in
+    // for operator staking keys (never validator/consensus keys). The
+    // helpers sign EXACTLY what the production handlers verify.
+    use crate::wallet_signing::WalletSigningKey as TestGovKey;
+
+    /// Sign a gov proposal envelope for tests (chain-bound, minted by `key`
+    /// for `proposer` over the exact action the handler will apply).
+    fn sign_test_proposal(
+        chain_id: u64,
+        key: &TestGovKey,
+        proposer: &[u8; 32],
+        title: &str,
+        action: &crate::governance::GovAction,
+        nonce: u64,
+    ) -> String {
+        let msg = crate::governance::Governance::gov_propose_message(
+            chain_id, proposer, title, action, nonce,
+        );
+        key.sign_message(chain_id, &msg).unwrap().to_hex()
+    }
+
+    /// Sign a gov vote envelope for tests.
+    fn sign_test_vote(
+        chain_id: u64,
+        key: &TestGovKey,
+        voter: &[u8; 32],
+        proposal_id: u64,
+        choice: crate::governance::VoteChoice,
+    ) -> String {
+        let msg =
+            crate::governance::Governance::gov_vote_message(chain_id, proposal_id, choice, voter);
+        key.sign_message(chain_id, &msg).unwrap().to_hex()
+    }
+
     // GATE: H-02 — fixed test seed 0x42 stands in for the ephemeral dev-only
     // key (`dev_msg_signing_seed_from_env`); it is NOT the validator key and
     // no test may wire a validator/consensus key here. Justification: the
@@ -10428,10 +10561,23 @@ mod tests {
     /// The dispatcher used to answer an unrecognised `type` with a `Signal`
     /// action — a silent no-op that made a typo look like an accepted
     /// proposal. It now fails closed.
+    ///
+    /// GATE (operator-signed governance): every accepted proposal below is
+    /// submitted with a wallet signature over
+    /// (chain_id || proposer || title || action || nonce), bound to a staked
+    /// proposer key. Justification for touching this test: the handler now
+    /// refuses unsigned proposals fail-closed, so the reachability pins must
+    /// sign; the unknown-type and missing-param refusals still fire BEFORE
+    /// any signature check (unchanged fail-closed vocabulary gate).
     #[tokio::test]
     async fn submit_proposal_reaches_every_action_and_refuses_an_unknown_type() {
         let st = test_state().await;
-        let proposer = hex::encode([0xA1u8; 32]);
+        // The proposer is a real signing key: the handler binds the envelope
+        // to the claimed staking address, so an arbitrary 0xA1 address can no
+        // longer propose.
+        let proposer_key = TestGovKey::ed25519([0xA1u8; 32]);
+        let proposer_addr = proposer_key.address();
+        let proposer = hex::encode(proposer_addr);
 
         // 1. An unknown action type is REFUSED, and nothing is recorded.
         let res = call(
@@ -10471,11 +10617,11 @@ mod tests {
 
         // 3. Every canonical action type is accepted (the proposer is staked,
         //    otherwise the proposal is refused for the stake and not for the
-        //    action).
+        //    action). Each envelope carries a fresh nonce (replay protection).
         {
             let mut ledger = st.engine.staking_write().await;
             ledger
-                .bond([0xA1u8; 32], crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
+                .bond(proposer_addr, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
                 .unwrap();
         }
         let cases: Vec<(&str, serde_json::Value)> = vec![
@@ -10510,13 +10656,27 @@ mod tests {
             crate::governance::GovAction::ACTION_TYPES.len(),
             "every documented action type must be covered by this test"
         );
-        for (action_type, extra) in &cases {
-            let mut params = json!({ "title": format!("proposal {action_type}"), "type": action_type, "proposer": proposer });
+        for (i, (action_type, extra)) in cases.iter().enumerate() {
+            let title = format!("proposal {action_type}");
+            let mut params = json!({ "title": title.clone(), "type": action_type, "proposer": proposer });
             if let serde_json::Value::Object(map) = extra {
                 for (k, v) in map {
                     params[k] = v.clone();
                 }
             }
+            // Sign EXACTLY what the handler will apply (same params shape).
+            let action = crate::governance::gov_action_from_params(action_type, &params)
+                .expect("test action must parse");
+            let nonce = 1000u64 + i as u64;
+            params["nonce"] = json!(nonce);
+            params["signature"] = json!(sign_test_proposal(
+                st.chain_id,
+                &proposer_key,
+                &proposer_addr,
+                &title,
+                &action,
+                nonce
+            ));
             let res = call(&st, "stell_submitProposal", params).await;
             assert!(
                 res.get("error").is_none(),
@@ -12798,7 +12958,7 @@ mod tests {
             .put_bridge(height, &engine.bridge_snapshot().await)
             .unwrap();
         store
-            .put_confidential(height, &engine.confidential_snapshot().await)
+            .put_confidential(height, &Vec::<u8>::new())
             .unwrap();
         store
             .put_zkml_models(height, &engine.zkml_models_snapshot().await)
@@ -16184,11 +16344,18 @@ mod tests {
             "refused writes must not record anything"
         );
 
-        // 2. Loopback bind, no token: dev flows work end to end.
+        // 2. Loopback bind, no token: signed dev flows work end to end.
+        // GATE (operator-signed governance): the dev flow now signs both
+        // writes with the stakers' own keys (the unsigned legacy path stays
+        // refused without STELL_DEV_UNSAFE_TESTKEY=1, which this test does
+        // not set). Justification: the handler requires an operator
+        // signature fail-closed, so the loopback pin must sign.
         set_test_bind_loopback(Some(true));
         let st = test_state().await;
-        let proposer = [0xA1u8; 32];
-        let voter = [0xB2u8; 32];
+        let proposer_key = TestGovKey::ed25519([0xA1u8; 32]);
+        let proposer = proposer_key.address();
+        let voter_key = TestGovKey::ed25519([0xB2u8; 32]);
+        let voter = voter_key.address();
         {
             let mut ledger = st.engine.staking_write().await;
             ledger
@@ -16198,14 +16365,18 @@ mod tests {
                 .bond(voter, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
                 .unwrap();
         }
+        let title = "dev".to_string();
+        let action = crate::governance::GovAction::Signal("hi".to_string());
         let r = call(
             &st,
             "stell_submitProposal",
             json!({
-                "title": "dev",
+                "title": title,
                 "type": "signal",
                 "text": "hi",
                 "proposer": hex::encode(proposer),
+                "nonce": 1u64,
+                "signature": sign_test_proposal(st.chain_id, &proposer_key, &proposer, &title, &action, 1),
             }),
         )
         .await;
@@ -16219,10 +16390,273 @@ mod tests {
         let r = call(
             &st,
             "stell_vote",
-            json!({"id": pid, "voter": hex::encode(voter), "choice": "yes"}),
+            json!({
+                "id": pid,
+                "voter": hex::encode(voter),
+                "choice": "yes",
+                "signature": sign_test_vote(st.chain_id, &voter_key, &voter, pid, crate::governance::VoteChoice::Yes),
+            }),
         )
         .await;
         assert_eq!(r["voted"], json!(true), "loopback vote must work: {r}");
+    }
+
+    /// Operator-signed governance ingest: valid envelopes are accepted;
+    /// unsigned, wrong-key, tampered, cross-chain, and replayed envelopes
+    /// are refused fail-closed. Same-choice vote replay is idempotent;
+    /// different-choice replay is refused (first choice wins).
+    ///
+    /// // GATE: new-path pins for operator-signed gov identity; extends, never weakens.
+    #[tokio::test]
+    async fn gov_writes_require_operator_signatures() {
+        use crate::governance::{GovAction, VoteChoice};
+        let st = test_state().await;
+        let chain = st.chain_id;
+        let proposer_key = TestGovKey::ed25519([0xA1u8; 32]);
+        let proposer = proposer_key.address();
+        let voter_key = TestGovKey::ed25519([0xB2u8; 32]);
+        let voter = voter_key.address();
+        let lone_key = TestGovKey::ed25519([0xC3u8; 32]);
+        let lone = lone_key.address();
+        {
+            let mut ledger = st.engine.staking_write().await;
+            ledger
+                .bond(proposer, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
+                .unwrap();
+            ledger
+                .bond(voter, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
+                .unwrap();
+        }
+        let title = "sig test".to_string();
+        let action = GovAction::Signal("hi".to_string());
+        let submit = |title: &str, _action: &GovAction, nonce: u64, sig_hex: &str| {
+            call(
+                &st,
+                "stell_submitProposal",
+                json!({
+                    "title": title,
+                    "type": "signal",
+                    "text": "hi",
+                    "proposer": hex::encode(proposer),
+                    "nonce": nonce,
+                    "signature": sig_hex,
+                }),
+            )
+        };
+
+        // 1. Unsigned proposal: refused fail-closed (no new knob involved;
+        //    this test process does not arm STELL_DEV_UNSAFE_TESTKEY).
+        let r = call(
+            &st,
+            "stell_submitProposal",
+            json!({
+                "title": title,
+                "type": "signal",
+                "text": "hi",
+                "proposer": hex::encode(proposer),
+                "nonce": 1u64,
+            }),
+        )
+        .await;
+        assert!(
+            r["error"].as_str().unwrap_or("").contains("missing gov signature"),
+            "unsigned proposal must be refused: {r}"
+        );
+
+        // 2. Valid signed proposal: accepted.
+        let sig = sign_test_proposal(chain, &proposer_key, &proposer, &title, &action, 1);
+        let r = submit(&title, &action, 1, &sig).await;
+        assert!(r.get("error").is_none(), "valid signed proposal: {r}");
+        let pid = r["proposal_id"].as_u64().expect("proposal id");
+
+        // 3. Exact replay of the envelope: refused (nonce consumed).
+        let r = submit(&title, &action, 1, &sig).await;
+        assert!(
+            r["error"].as_str().unwrap_or("").contains("already consumed"),
+            "replayed proposal nonce must be refused: {r}"
+        );
+
+        // 4. Wrong key: the voter's envelope presented as the proposer.
+        let wrong_msg = crate::governance::Governance::gov_propose_message(
+            chain,
+            &proposer,
+            &title,
+            &action,
+            2,
+        );
+        let wrong = voter_key.sign_message(chain, &wrong_msg).unwrap().to_hex();
+        let r = submit(&title, &action, 2, &wrong).await;
+        assert!(
+            r["error"].as_str().unwrap_or("").contains("wrong key"),
+            "wrong-key proposal must be refused: {r}"
+        );
+
+        // 5. Tampered title: signed "sig test", submitted as something else.
+        let r = submit("tampered title", &action, 3, &sig).await;
+        assert!(
+            r["error"].as_str().unwrap_or_default().contains("propose failed"),
+            "tampered proposal must be refused: {r}"
+        );
+
+        // 6. Cross-chain envelope: minted for another chain.
+        let cross_msg = crate::governance::Governance::gov_propose_message(
+            chain + 1,
+            &proposer,
+            &title,
+            &action,
+            4,
+        );
+        let cross = proposer_key.sign_message(chain + 1, &cross_msg).unwrap().to_hex();
+        let r = submit(&title, &action, 4, &cross).await;
+        assert!(
+            r["error"].as_str().unwrap_or_default().contains("propose failed"),
+            "cross-chain proposal must be refused: {r}"
+        );
+
+        // 7. Stakeless key, perfectly valid signature: refused (NotStaker).
+        let lone_msg = crate::governance::Governance::gov_propose_message(
+            chain,
+            &lone,
+            &title,
+            &action,
+            5,
+        );
+        let lone_sig = lone_key.sign_message(chain, &lone_msg).unwrap().to_hex();
+        let r = call(
+            &st,
+            "stell_submitProposal",
+            json!({
+                "title": title,
+                "type": "signal",
+                "text": "hi",
+                "proposer": hex::encode(lone),
+                "nonce": 5u64,
+                "signature": lone_sig,
+            }),
+        )
+        .await;
+        assert!(
+            r["error"].as_str().unwrap_or_default().contains("no staked balance"),
+            "stakeless proposer must be refused: {r}"
+        );
+
+        // 8. Unsigned vote: refused fail-closed.
+        let r = call(
+            &st,
+            "stell_vote",
+            json!({"id": pid, "voter": hex::encode(voter), "choice": "yes"}),
+        )
+        .await;
+        assert!(
+            r["error"].as_str().unwrap_or("").contains("missing gov signature"),
+            "unsigned vote must be refused: {r}"
+        );
+
+        // 9. Valid signed vote: accepted.
+        let vsig = sign_test_vote(chain, &voter_key, &voter, pid, VoteChoice::Yes);
+        let r = call(
+            &st,
+            "stell_vote",
+            json!({
+                "id": pid,
+                "voter": hex::encode(voter),
+                "choice": "yes",
+                "signature": vsig,
+            }),
+        )
+        .await;
+        assert_eq!(r["voted"], json!(true), "valid signed vote: {r}");
+        let weight = r["weight"].as_str().unwrap_or("").to_string();
+
+        // 10. Same-choice replay: idempotent, same weight.
+        let r = call(
+            &st,
+            "stell_vote",
+            json!({
+                "id": pid,
+                "voter": hex::encode(voter),
+                "choice": "yes",
+                "signature": vsig,
+            }),
+        )
+        .await;
+        assert_eq!(r["voted"], json!(true), "same-choice replay: {r}");
+        assert_eq!(r["weight"].as_str().unwrap_or(""), weight);
+
+        // 11. Different choice with a fresh valid signature: refused.
+        let flip = sign_test_vote(chain, &voter_key, &voter, pid, VoteChoice::No);
+        let r = call(
+            &st,
+            "stell_vote",
+            json!({
+                "id": pid,
+                "voter": hex::encode(voter),
+                "choice": "no",
+                "signature": flip,
+            }),
+        )
+        .await;
+        assert!(
+            r["error"].as_str().unwrap_or_default().contains("already voted"),
+            "different-choice replay must be refused: {r}"
+        );
+
+        // 12. Tampered choice: Yes-envelope presented as No.
+        let r = call(
+            &st,
+            "stell_vote",
+            json!({
+                "id": pid,
+                "voter": hex::encode(voter),
+                "choice": "no",
+                "signature": vsig,
+            }),
+        )
+        .await;
+        assert!(
+            r["error"].as_str().unwrap_or_default().contains("vote failed"),
+            "tampered vote must be refused: {r}"
+        );
+
+        // 13. Cross-chain vote.
+        let cross_vmsg =
+            crate::governance::Governance::gov_vote_message(chain + 1, pid, VoteChoice::Yes, &voter);
+        let cross_vsig = voter_key.sign_message(chain + 1, &cross_vmsg).unwrap().to_hex();
+        let r = call(
+            &st,
+            "stell_vote",
+            json!({
+                "id": pid,
+                "voter": hex::encode(voter),
+                "choice": "yes",
+                "signature": cross_vsig,
+            }),
+        )
+        .await;
+        assert!(
+            r["error"].as_str().unwrap_or_default().contains("vote failed"),
+            "cross-chain vote must be refused: {r}"
+        );
+
+        // 14. Stakeless key, valid vote signature: refused (NotStaker).
+        let lone_vmsg =
+            crate::governance::Governance::gov_vote_message(chain, pid, VoteChoice::Yes, &lone);
+        let lone_vsig = lone_key.sign_message(chain, &lone_vmsg).unwrap().to_hex();
+        let r = call(
+            &st,
+            "stell_vote",
+            json!({
+                "id": pid,
+                "voter": hex::encode(lone),
+                "choice": "yes",
+                "signature": lone_vsig,
+            }),
+        )
+        .await;
+        assert!(
+            r["error"].as_str().unwrap_or_default().contains("no staked balance"),
+            "stakeless voter must be refused: {r}"
+        );
     }
 
     /// `stell_getEvents` must answer a BOUNDED list: the receipt index holds
@@ -16939,9 +17373,6 @@ mod tests {
             "stell_sessionKeys",
             "stell_oraclePrice",
             "stell_oracleFeeds",
-            "stell_shieldedTransfer",
-            "stell_shieldedBalance",
-            "stell_unshield",
             "stell_nativeApi",
         ];
         // Every native method the dispatcher knows must be transport-bucketed.

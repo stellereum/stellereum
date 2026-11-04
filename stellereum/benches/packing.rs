@@ -13,21 +13,13 @@
 //!   declares `GAS_BASIC_TRANSFER` (280k), so the gas cap binds at 1785 and
 //!   the count cap does not bind before it — the point is selection TIME vs
 //!   pool size plus the pinned packed count, not a bigger block.
-//! * `transfer2_verify_32_vs_64` — the exact live-path predicate
-//!   (`ConfidentialTransfer::verify_balanced_with_ranges`, called by the
-//!   `SysCallConfidentialTransfer2` handler BEFORE anything mutates) for a
-//!   1-in/1-out transfer at 32-bit vs 64-bit proof widths. Same committed
-//!   values, only the width differs, so the delta isolates proof-size cost.
-//!   Proving is setup-only (outside the timer).
 //! * `apply_mixed_*` — `InMemoryStateEngine::apply_block_parallel_fees`
 //!   (THE live consensus apply path) over blocks of N mixed txs (3/4 plain
 //!   value transfers + 1/4 single-`Transfer`-syscall payloads), N = 100 /
 //!   428 / 1_000. Reports wall ms and tx/s; asserts every tx applies.
 
-use curve25519_dalek::scalar::Scalar;
 use ed25519_dalek::SigningKey;
 use std::time::Instant;
-use stellereum::crypto_privacy::{ConfidentialTransfer, PedersenCommitment, RangeProof};
 use stellereum::mempool::Mempool;
 use stellereum::runtime::{MAX_BLOCK_GAS, MAX_BLOCK_TXS};
 use stellereum::sharding::Transaction;
@@ -122,41 +114,6 @@ fn packing_plain_1000() {
 #[test]
 fn packing_plain_10000() {
     bench_packing_row(10_000);
-}
-
-/// One balanced 1-in/1-out transfer with explicit proof width: input commits
-/// value+fee, output commits value, same blinding (mirrors the live
-/// confidential-tx test helper).
-fn transfer2_pair(
-    value: u64,
-    fee: u64,
-    bits: u8,
-) -> (ConfidentialTransfer, Vec<RangeProof>, Vec<RangeProof>) {
-    let r = Scalar::from(0x5EED_u64);
-    let c_in = PedersenCommitment::commit(value + fee, &r);
-    let c_out = PedersenCommitment::commit(value, &r);
-    let t = ConfidentialTransfer::new(vec![c_in], vec![c_out], fee);
-    let in_ranges = vec![RangeProof::prove(&c_in, value + fee, &r, bits)];
-    let out_ranges = vec![RangeProof::prove(&c_out, value, &r, bits)];
-    assert!(t.verify_balanced_with_ranges(&in_ranges, &out_ranges));
-    (t, in_ranges, out_ranges)
-}
-
-#[test]
-fn transfer2_verify_32_vs_64() {
-    // Same values (fit 32 bits); only the proof width differs, so the delta
-    // is pure width cost on the exact live-path predicate.
-    for bits in [32u8, 64u8] {
-        let (t, in_ranges, out_ranges) = transfer2_pair(1_480, 20, bits);
-        let repeats = if bits == 64 { 5 } else { 10 };
-        let ns = time_ns_per_op(1, repeats, 1, || {
-            assert!(t.verify_balanced_with_ranges(&in_ranges, &out_ranges));
-        });
-        println!(
-            "[bench][packing][transfer2_verify_1in1out_{bits}bit] time={} per verify",
-            medal(ns),
-        );
-    }
 }
 
 /// N mixed txs from N distinct funded senders: 3/4 plain value transfers,

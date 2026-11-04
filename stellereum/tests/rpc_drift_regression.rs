@@ -2,11 +2,10 @@
 //! live-but-previously-undocumented methods.
 //!
 //! Coverage:
-//! * native manifest advertises exactly 35 methods including the 3 shielded
-//!   arms (`src/native_api.rs` `METHODS`);
-//! * `stell_shieldedTransfer` / `stell_shieldedBalance` / `stell_unshield`
-//!   fail-closed shapes (`-32602` on missing params) and success envelopes;
-//! * the same three are reachable over JSON-RPC (not `-32601`);
+//! * native manifest advertises exactly 32 methods (the 3 shielded arms
+//!   were removed with the shielded protocol: `stell_shieldedTransfer`,
+//!   `stell_shieldedBalance`, `stell_unshield` are now unknown, `-32601`);
+//! * the removed shielded methods fail closed as unknown over dispatch;
 //! * the EVM / `net_*` / `web3_*` compatibility surface answers its
 //!   documented shapes (`src/evm_adapter.rs`).
 
@@ -46,111 +45,57 @@ fn rpc_state() -> Arc<RpcState> {
 }
 
 #[tokio::test]
-async fn native_manifest_pins_35_methods_including_shielded() {
+async fn native_manifest_pins_32_transparent_methods() {
     let m = native_api::native_api_manifest();
     assert_eq!(m["version"], json!(NATIVE_API_VERSION));
     let methods = m["methods"].as_array().expect("methods array").clone();
-    assert_eq!(methods.len(), 35, "native manifest method count drift");
-    assert_eq!(m["method_count"], json!(35));
+    assert_eq!(methods.len(), 32, "native manifest method count drift");
+    assert_eq!(m["method_count"], json!(32));
     for name in [
         "stell_shieldedTransfer",
         "stell_shieldedBalance",
         "stell_unshield",
     ] {
         assert!(
-            methods.iter().any(|x| x["name"] == name),
-            "manifest must advertise {name}"
+            !methods.iter().any(|x| x["name"] == name),
+            "removed shielded method must not be advertised: {name}"
         );
-    }
-    assert_eq!(native_api::METHODS.len(), 35);
-    for name in [
-        "stell_shieldedTransfer",
-        "stell_shieldedBalance",
-        "stell_unshield",
-    ] {
         assert!(
-            native_api::is_native_method(name),
-            "{name} must route via native dispatch"
+            !native_api::is_native_method(name),
+            "{name} must not route via native dispatch"
         );
+    }
+    assert_eq!(native_api::METHODS.len(), 32);
+}
+
+#[tokio::test]
+async fn removed_shielded_methods_are_unknown_not_refused() {
+    // Fail-closed removal: the methods are gone, so dispatch answers
+    // UnknownMethod (-32601) however they are called — never a stale
+    // parameter error and never a success envelope.
+    let e = engine();
+    for (method, params) in [
+        ("stell_shieldedTransfer", json!({})),
+        (
+            "stell_shieldedTransfer",
+            json!({"to": hex::encode([0xabu8; 32]), "amount": 1_000u64}),
+        ),
+        ("stell_shieldedBalance", json!({})),
+        (
+            "stell_shieldedBalance",
+            json!({"viewing_key": hex::encode([0x09u8; 32]), "payloads": []}),
+        ),
+        ("stell_unshield", json!({})),
+    ] {
+        let err = native_api::dispatch(&e, method, &params)
+            .await
+            .expect_err("removed shielded method must not dispatch");
+        assert_eq!(err.code(), -32601, "{method} must be unknown");
     }
 }
 
 #[tokio::test]
-async fn shielded_transfer_missing_params_is_invalid_params() {
-    let e = engine();
-    let err = native_api::dispatch(&e, "stell_shieldedTransfer", &json!({}))
-        .await
-        .expect_err("empty shielded transfer must refuse");
-    assert_eq!(err.code(), -32602);
-}
-
-#[tokio::test]
-async fn shielded_transfer_prepare_envelope_shape() {
-    let e = engine();
-    let to = hex::encode([0xabu8; 32]);
-    let out = native_api::dispatch(
-        &e,
-        "stell_shieldedTransfer",
-        &json!({"to": to, "amount": 1_000u64}),
-    )
-    .await
-    .expect("plain-recipient shielded prepare must succeed");
-    assert_eq!(out["action"], json!("shielded_transfer"));
-    assert_eq!(out["submit_with"], json!("stell_sendRawTransaction"));
-    assert!(out["gas_limit"].as_u64().unwrap_or(0) > 0);
-    assert_eq!(
-        out["transaction"]["op"],
-        json!("SysCallConfidentialShield+SysCallConfidentialTransfer2")
-    );
-    assert_eq!(out["amount"], json!("1000"));
-    assert_eq!(out["to"], json!(to));
-    assert!(out["openings"].as_array().is_some());
-    assert!(out["gas_breakdown"].is_object());
-}
-
-#[tokio::test]
-async fn shielded_balance_shapes() {
-    let e = engine();
-    // Missing viewing key refuses fail-closed.
-    let err = native_api::dispatch(&e, "stell_shieldedBalance", &json!({"payloads": []}))
-        .await
-        .expect_err("missing viewing_key must refuse");
-    assert_eq!(err.code(), -32602);
-
-    // Empty inventory scans to zero without echoing the secret.
-    let vk = hex::encode([0x09u8; 32]);
-    let out = native_api::dispatch(
-        &e,
-        "stell_shieldedBalance",
-        &json!({"viewing_key": vk, "payloads": []}),
-    )
-    .await
-    .expect("empty shielded scan must succeed");
-    assert_eq!(out["spendable_sum"], json!("0"));
-    assert_eq!(out["coin_count"], json!(0));
-    assert_eq!(out["undecryptable"], json!(0));
-    assert!(out["view_pub"].as_str().is_some());
-    assert!(out.get("viewing_key").is_none(), "secret must not echo");
-    assert!(out["chain"]["owned_outputs"].is_number());
-}
-
-#[tokio::test]
-async fn unshield_missing_params_is_invalid_params() {
-    let e = engine();
-    let err = native_api::dispatch(&e, "stell_unshield", &json!({}))
-        .await
-        .expect_err("empty unshield must refuse");
-    assert_eq!(err.code(), -32602);
-
-    let to = hex::encode([0xccu8; 32]);
-    let err2 = native_api::dispatch(&e, "stell_unshield", &json!({"to": to, "amount": 10u64}))
-        .await
-        .expect_err("unshield without inputs must refuse");
-    assert_eq!(err2.code(), -32602);
-}
-
-#[tokio::test]
-async fn rpc_router_routes_shielded_and_native_manifest() {
+async fn rpc_router_serves_native_manifest_with_32_methods() {
     let st = rpc_state();
     let app = stellereum::rpc::router(st);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -183,16 +128,19 @@ async fn rpc_router_routes_shielded_and_native_manifest() {
         serde_json::from_str(b).unwrap()
     }
 
-    // Unknown params on a live method -> -32602 (reachable, not -32601).
-    let r = post(addr, "stell_shieldedTransfer", json!({})).await;
-    assert_eq!(r["error"]["code"], -32602);
-
-    let r = post(addr, "stell_shieldedBalance", json!({})).await;
-    assert_eq!(r["error"]["code"], -32602);
+    // Removed shielded methods are unknown over JSON-RPC too (-32601).
+    for method in [
+        "stell_shieldedTransfer",
+        "stell_shieldedBalance",
+        "stell_unshield",
+    ] {
+        let r = post(addr, method, json!({})).await;
+        assert_eq!(r["error"]["code"], -32601, "{method} must be unknown");
+    }
 
     // Manifest over HTTP pins the same count.
     let r = post(addr, "stell_nativeApi", json!({})).await;
-    assert_eq!(r["result"]["method_count"], json!(35));
+    assert_eq!(r["result"]["method_count"], json!(32));
     let names: Vec<String> = r["result"]["methods"]
         .as_array()
         .unwrap()
@@ -204,7 +152,7 @@ async fn rpc_router_routes_shielded_and_native_manifest() {
         "stell_shieldedBalance",
         "stell_unshield",
     ] {
-        assert!(names.contains(&n.to_string()), "manifest needs {n}");
+        assert!(!names.contains(&n.to_string()), "manifest must drop {n}");
     }
 }
 

@@ -135,23 +135,9 @@ pub const GAS_CONFIDENTIAL_TRANSFER2: u64 = 3_500;
 pub const GAS_CONFIDENTIAL_T2_PER_COMMITMENT: u64 = 1_750;
 pub const GAS_CONFIDENTIAL_T2_PER_BIT: u64 = 44;
 
-/// Full dispatch charge for a V2 transfer. Single definition shared by the
-/// `opcode_gas` table and the execution arm (they must agree bit-identically —
-/// pinned by `syscall_charges_match_the_priced_table`).
-pub fn confidential_transfer2_gas(
-    input_ranges: &[crate::crypto_privacy::RangeProof],
-    output_ranges: &[crate::crypto_privacy::RangeProof],
-) -> u64 {
-    let n = (input_ranges.len() + output_ranges.len()) as u64;
-    let bits: u64 = input_ranges
-        .iter()
-        .chain(output_ranges.iter())
-        .map(|p| p.bits as u64)
-        .sum();
-    GAS_CONFIDENTIAL_TRANSFER2
-        .saturating_add(n.saturating_mul(GAS_CONFIDENTIAL_T2_PER_COMMITMENT))
-        .saturating_add(bits.saturating_mul(GAS_CONFIDENTIAL_T2_PER_BIT))
-}
+// PQ excision: `confidential_transfer2_gas` removed with
+// `SysCallConfidentialTransfer2`; the GAS_CONFIDENTIAL_* / MAX_* constants
+// below stay for sibling-owned callers under excision and are otherwise unused.
 /// Gas for a shield entry: one Pedersen recomputation (opening check) plus
 /// the ownership-map insert. 1.75x scaled.
 pub const GAS_CONFIDENTIAL_SHIELD: u64 = 3_500;
@@ -378,15 +364,7 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         OpCode::SysCallTokenBurn { .. } => GAS_TOKEN_BURN,
         OpCode::SysCallTokenApprove { .. } => GAS_TOKEN_APPROVE,
         OpCode::SysCallTokenCreate { .. } => GAS_TOKEN_CREATE,
-        OpCode::SysCallConfidentialTransfer2 {
-            input_ranges,
-            output_ranges,
-            ..
-        } => confidential_transfer2_gas(input_ranges, output_ranges),
-        OpCode::SysCallConfidentialShield { .. } => GAS_CONFIDENTIAL_SHIELD,
-        OpCode::SysCallConfidentialUnshield { inputs } => GAS_CONFIDENTIAL_UNSHIELD.saturating_add(
-            (inputs.len() as u64).saturating_mul(GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT),
-        ),
+        // PQ excision: confidential ops (SysCallConfidentialTransfer/Transfer2/Shield/Unshield) removed with Ristretto; discriminants reserved, never reuse.
         OpCode::SysCallTokenBalanceOf { .. } => GAS_TOKEN_BALANCE,
         OpCode::SysCallDeployContract { code } => contract_deploy_gas(code.len()),
         OpCode::SysCallCallContract { method, .. } => {
@@ -411,7 +389,6 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         OpCode::SysCallPmmSell { .. } => GAS_PMM_SELL,
         OpCode::SysCallPublishSessionGrant(_) => GAS_PUBLISH_SESSION_GRANT,
         OpCode::SysCallBridge(_) => GAS_BRIDGE_INTENT,
-        OpCode::SysCallConfidentialTransfer { .. } => GAS_CONFIDENTIAL_TRANSFER,
         OpCode::SysCallActorSend { .. } => GAS_ACTOR_SEND,
         // §2: the proof is part of the payload, so its BYTES are charged here
         // (the model half is charged in the handler - `opcode_gas` cannot see
@@ -632,35 +609,7 @@ pub enum OpCode {
     /// time-lock and the hourly rate limit - is enforced there too, against
     /// the committed domain and the BLOCK timestamp; see `bridge.rs`.
     SysCallBridge(Box<crate::bridge::BridgeIntent>),
-    // APPEND, never insert above: same bincode-discriminant rule as every
-    // variant above (see the comment on `SysCallSubmitPriceFeed`). Appending
-    // is what keeps every already-signed payload and every pinned tx hash
-    // byte-identical while an old node's decoder fails closed on these bytes.
-    /// Apply a §9 confidential (shielded) value transfer.
-    ///
-    /// The handler is the live front door to the committed engine: it calls
-    /// `ConfidentialTransfer::verify_balance_conservation`, then
-    /// `ConfidentialState::apply_transfer`, which rejects a repeated input and
-    /// an input already in the spent set (double-spend) and only then rewrites
-    /// the two shielded balances, the spent set and the fee total. Every
-    /// rejection reverts the whole transaction.
-    ///
-    /// The SENDER is `ctx.sender` - the transaction's authenticated signer -
-    /// and never a field of the opcode: input ownership is not proven here
-    /// (that is an A5 range/balance-proof concern, and this opcode does not
-    /// carry proofs yet), so the signature is the only thing tying a spend to
-    /// an account. `recipient` is the shielded account being credited.
-    ///
-    /// The ledger itself is NOT in the VM: `execute_payload` clones the engine's
-    /// `ConfidentialState`, hands that working copy in through
-    /// [`Svm::execute_with_confidential_and_sends`] and commits it back only if
-    /// the whole transaction applies (clone-commit, exactly like the staking
-    /// ledger). A direct [`Svm::execute`] caller has no ledger to offer, so the
-    /// syscall reverts the way a token syscall does without a registry.
-    SysCallConfidentialTransfer {
-        recipient: [u8; 32],
-        transfer: Box<crate::crypto_privacy::ConfidentialTransfer>,
-    },
+    // RESERVED (PQ excision): SysCallConfidentialTransfer discriminant — never reuse.
     // APPEND, never insert above: same bincode-discriminant rule as every
     // variant above (see the comment on `SysCallSubmitPriceFeed`). This is
     // §1 of the actor mailbox: it enqueues an asynchronous message into the
@@ -852,45 +801,7 @@ pub enum OpCode {
         initial_supply: u64,
         max_supply: Option<u64>,
     },
-    // APPEND, never insert above: same bincode-discriminant rule as every
-    // variant above (see the comment on `SysCallSubmitPriceFeed`).
-    // ENFORCED confidential transfer (audit 2026-10-06, F-A fix): the V1
-    // opcode above checked only the group equation, so wrapped/negative
-    // values and anyone's commitments inflated the pool. V2 carries a range
-    // proof per commitment (verified BEFORE anything mutates) and the state
-    // machine requires every input to be recorded as owned by the sender
-    // (see `ConfidentialState.owned`). The V1 variant is DISABLED (its
-    // handler reverts) — payloads using it must migrate to V2.
-    SysCallConfidentialTransfer2 {
-        recipient: [u8; 32],
-        transfer: Box<crate::crypto_privacy::ConfidentialTransfer>,
-        input_ranges: Vec<crate::crypto_privacy::RangeProof>,
-        output_ranges: Vec<crate::crypto_privacy::RangeProof>,
-    },
-    // APPEND, never insert above: same bincode-discriminant rule.
-    /// Shield entry: move native STELL into the shielded pool. The commitment
-    /// must open EXACTLY to `amount` (recomputed in the handler — a range
-    /// proof cannot bind a value, only an opening can), and the output is
-    /// recorded as owned by the sender. The native debit (sender ->
-    /// [`SHIELD_ESCROW`][crate::crypto_privacy::SHIELD_ESCROW]) settles in
-    /// the engine on the SUCCESS arm via the transfers channel, so a failed
-    /// debit reverts the recording with everything else.
-    SysCallConfidentialShield {
-        commitment: [u8; 32],
-        amount: u64,
-        blinding: [u8; 32],
-    },
-    // APPEND, never insert above: same bincode-discriminant rule.
-    /// Unshield exit: retire owned inputs by revealing their openings and
-    /// release the matching native value from
-    /// [`SHIELD_ESCROW`][crate::crypto_privacy::SHIELD_ESCROW]. Privacy ends
-    /// at exit by design (amounts are public here, like transparent deposits
-    /// into shielded pools elsewhere). The native credit settles in the
-    /// engine via the payouts channel on the SUCCESS arm; escrow
-    /// insufficiency reverts the retirement with everything else.
-    SysCallConfidentialUnshield {
-        inputs: Vec<crate::crypto_privacy::UnshieldInput>,
-    },
+    // RESERVED (PQ excision): SysCallConfidentialTransfer2/Shield/Unshield discriminants — never reuse.
     // APPEND, never insert above: same bincode-discriminant rule.
     /// Rotate a validator's consensus key (foreign-validator operations):
     /// move the entire staking record from `old_validator` to
@@ -1163,8 +1074,8 @@ pub struct VmContext<'a> {
     /// from any opcode. The reachable, sound §2 path is
     /// `OpCode::SysCallVerifyZkMlReexec`, which CARRIES its proof in the payload
     /// and fetches its model from the committed registry - the registry rides
-    /// into the VM as an `execute_inner` parameter (like the shielded ledger
-    /// and the actor-send sink), not as a context field, so every existing
+    /// into the VM as an `execute_inner` parameter (like the actor-send
+    /// sink), not as a context field, so every existing
     /// `VmContext` literal stays source-compatible.
     pub zkml_proof: Option<&'a ZkMlProof>,
     pub timestamp: u64,
@@ -1288,40 +1199,17 @@ pub struct Svm;
 impl Svm {
     /// Execute `instructions` against every domain wired into `ctx`.
     ///
-    /// The shielded ledger is deliberately NOT one of them: this entry point
-    /// passes `None`, so a payload carrying `SysCallConfidentialTransfer`
-    /// reverts with "confidential state not available" - the same fail-closed
-    /// shape as a token syscall with no registry. Block application uses
-    /// [`Svm::execute_with_confidential_and_sends`], which hands the engine's
-    /// working copy of the `ConfidentialState` (and the actor-send sink) in.
+    /// Block application uses [`Svm::execute_with_confidential_and_sends`],
+    /// which hands the engine's actor-send sink in.
     pub fn execute(
         instructions: &[OpCode],
         gas_limit: u64,
         ctx: &mut VmContext,
     ) -> VmExecutionResult {
-        Self::execute_inner(instructions, gas_limit, ctx, None, None, None, None)
+        Self::execute_inner(instructions, gas_limit, ctx, None, None)
     }
 
-    /// The same VM, plus the shielded ledger `SysCallConfidentialTransfer`
-    /// applies against.
-    ///
-    /// `confidential` is a working COPY owned by the caller
-    /// (`InMemoryStateEngine::execute_payload` clones the committed state in,
-    /// exactly like the session registry): the handler mutates that copy in
-    /// place, and the caller writes it back only if the whole transaction -
-    /// including every settlement step after the VM returns - applied. A
-    /// revert, an out-of-gas or a failed settlement therefore discards the
-    /// transfer along with everything else the payload did.
-    pub fn execute_with_confidential(
-        instructions: &[OpCode],
-        gas_limit: u64,
-        ctx: &mut VmContext,
-        confidential: Option<&mut crate::crypto_privacy::ConfidentialState>,
-    ) -> VmExecutionResult {
-        Self::execute_inner(instructions, gas_limit, ctx, confidential, None, None, None)
-    }
-
-    /// The block-path VM: the shielded ledger, the actor-send sink AND the §2
+    /// The block-path VM: the actor-send sink AND the §2
     /// zkML model registry.
     ///
     /// `sends` collects every `SysCallActorSend` this run EXECUTED, in
@@ -1344,62 +1232,18 @@ impl Svm {
         instructions: &[OpCode],
         gas_limit: u64,
         ctx: &mut VmContext,
-        confidential: Option<&mut crate::crypto_privacy::ConfidentialState>,
         sends: &mut Vec<ActorSendRequest>,
         zkml_models: Option<&mut crate::zkml::ZkMlModelRegistry>,
     ) -> VmExecutionResult {
-        Self::execute_inner(
-            instructions,
-            gas_limit,
-            ctx,
-            confidential,
-            Some(sends),
-            zkml_models,
-            None,
-        )
-    }
-
-    /// The block-path VM with a range-proof pre-verification cache: the same
-    /// execution as [`Svm::execute_with_confidential_and_sends`], except the
-    /// `SysCallConfidentialTransfer2` handler may skip re-verifying range
-    /// proofs for bundles the engine's parallel pre-pass already verified.
-    ///
-    /// `range_preverify` maps
-    /// [`crate::crypto_privacy::confidential_transfer2_preverify_digest`] to
-    /// the pre-pass verdict for that exact bundle. The cache covers ONLY the
-    /// stateless proof check — ownership, spent-set, conservation and fee
-    /// handling below run unconditionally, and a cache miss runs the full
-    /// check exactly as the surgery-free path does. `None` (and every other
-    /// entry point above, which passes `None`) is the single-transaction
-    /// path: it never consults a cache.
-    pub fn execute_with_confidential_and_sends_with_preverify(
-        instructions: &[OpCode],
-        gas_limit: u64,
-        ctx: &mut VmContext,
-        confidential: Option<&mut crate::crypto_privacy::ConfidentialState>,
-        sends: &mut Vec<ActorSendRequest>,
-        zkml_models: Option<&mut crate::zkml::ZkMlModelRegistry>,
-        range_preverify: Option<&HashMap<[u8; 32], bool>>,
-    ) -> VmExecutionResult {
-        Self::execute_inner(
-            instructions,
-            gas_limit,
-            ctx,
-            confidential,
-            Some(sends),
-            zkml_models,
-            range_preverify,
-        )
+        Self::execute_inner(instructions, gas_limit, ctx, Some(sends), zkml_models)
     }
 
     fn execute_inner(
         instructions: &[OpCode],
         gas_limit: u64,
         ctx: &mut VmContext,
-        mut confidential: Option<&mut crate::crypto_privacy::ConfidentialState>,
         mut sends: Option<&mut Vec<ActorSendRequest>>,
         mut zkml_models: Option<&mut crate::zkml::ZkMlModelRegistry>,
-        range_preverify: Option<&HashMap<[u8; 32], bool>>,
     ) -> VmExecutionResult {
         // The operand stack starts WITHOUT an allocation: the hot benchmark
         // path (and most real payloads) may never push, and `Vec::new` only
@@ -1941,7 +1785,7 @@ impl Svm {
                     // Wire caps BEFORE any clone/commit: an unbounded method
                     // name would otherwise force every node through a UTF-8
                     // scan + export lookup for fixed gas. Same fail-closed
-                    // shape as the confidential IO caps above.
+                    // shape as other capped syscalls.
                     if method.len() > MAX_CONTRACT_METHOD_LEN {
                         return VmExecutionResult::Reverted(format!(
                             "contract call rejected: method name exceeds {MAX_CONTRACT_METHOD_LEN} bytes"
@@ -2651,198 +2495,7 @@ impl Svm {
                     }
                     state.stack.push(1);
                 }
-                OpCode::SysCallConfidentialTransfer { .. } => {
-                    // DISABLED (audit 2026-10-06, F-A): the V1 equation-only
-                    // check admits wrapped/negative values and anyone's
-                    // commitments. Use SysCallConfidentialTransfer2.
-                    return VmExecutionResult::Reverted(
-                        "confidential transfer V1 is disabled: resubmit as SysCallConfidentialTransfer2 with range proofs"
-                            .to_string(),
-                    );
-                }
-                OpCode::SysCallConfidentialTransfer2 {
-                    recipient,
-                    transfer,
-                    input_ranges,
-                    output_ranges,
-                } => {
-                    // Recipient sanity (audit follow-up): protocol-owned
-                    // accounts (escrow, pools) can sign for nothing, so outputs
-                    // to them freeze forever. Burn-by-design stays possible
-                    // via an explicit dead address, not via the vault.
-                    if *recipient == crate::crypto_privacy::SHIELD_ESCROW
-                        || *recipient == crate::staking::STAKING_POOL
-                        || *recipient == crate::bridge::BRIDGE_ESCROW
-                    {
-                        return VmExecutionResult::Reverted(
-                            "confidential transfer rejected: recipient is a protocol account"
-                                .to_string(),
-                        );
-                    }
-                    // IO-count cap (audit: blocks troubles): uncapped proofs
-                    // let one hostile tx eat ~5% of proposal wire for <1% of
-                    // block gas. Fail closed before charging/paying anything.
-                    if input_ranges.len() + output_ranges.len() > MAX_CONFIDENTIAL_IO_PER_TX {
-                        return VmExecutionResult::Reverted(format!(
-                            "confidential transfer rejected: too many proofs (max {MAX_CONFIDENTIAL_IO_PER_TX})"
-                        ));
-                    }
-                    // Same dynamic charge as the table (see
-                    // `confidential_transfer2_gas`): flat would underprice
-                    // big proofs and break table/dispatch agreement.
-                    charge!(confidential_transfer2_gas(input_ranges, output_ranges));
-                    // Range proofs FIRST (before any state read): every
-                    // committed value is proven in [0, 2^bits), closing the
-                    // wrapped/negative-value inflation hole.
-                    //
-                    // Block-path fast path: the engine's parallel pre-pass
-                    // (`InMemoryStateEngine::apply_block_parallel_fees`) already
-                    // verified this EXACT bundle's stateless proof check across
-                    // cores. A hit reuses that verdict instead of re-verifying;
-                    // it covers ONLY the range proofs — the ownership,
-                    // spent-set, conservation and fee checks in
-                    // `apply_transfer` below run unconditionally either way.
-                    // A miss (always, on the single-transaction path, which
-                    // never carries a cache) runs the full check as before. A
-                    // hit is bit-identical to recomputing: verification is a
-                    // pure function of the bundled bytes, so the same digest
-                    // always verifies the same way on every node.
-                    let ranges_ok = match range_preverify.and_then(|m| {
-                        m.get(
-                            &crate::crypto_privacy::confidential_transfer2_preverify_digest(
-                                transfer,
-                                input_ranges,
-                                output_ranges,
-                            ),
-                        )
-                        .copied()
-                    }) {
-                        Some(preverified) => preverified,
-                        None => transfer.verify_balanced_with_ranges(input_ranges, output_ranges),
-                    };
-                    if !ranges_ok {
-                        return VmExecutionResult::Reverted(
-                            "confidential transfer rejected: range proofs failed \
-                             (bad count, bad proof, or unbalanced)"
-                                .to_string(),
-                        );
-                    }
-                    let Some(shielded) = confidential.as_mut() else {
-                        return VmExecutionResult::Reverted(
-                            "confidential state not available".to_string(),
-                        );
-                    };
-                    // `apply_transfer_with_ranges` enforces everything atomically:
-                    // range proofs + valid points, no intra-tx repeats, sender
-                    // OWNS every input, no double-spend, conservation, fee
-                    // overflow — then rewrites balances, spent set, ownership
-                    // map and fee total. Single entry point (C1): the preverify
-                    // above is a fast-path only; this call re-verifies, so no
-                    // caller can ever reach equation-only `apply_transfer`.
-                    let sender = ctx.sender;
-                    if let Err(e) = shielded.apply_transfer_with_ranges(
-                        &sender,
-                        recipient,
-                        transfer,
-                        input_ranges,
-                        output_ranges,
-                    ) {
-                        return VmExecutionResult::Reverted(format!(
-                            "confidential transfer rejected: {e}"
-                        ));
-                    }
-                    state.stack.push(1);
-                }
-                OpCode::SysCallConfidentialShield {
-                    commitment,
-                    amount,
-                    blinding,
-                } => {
-                    charge!(GAS_CONFIDENTIAL_SHIELD);
-                    if *amount == 0 {
-                        return VmExecutionResult::Reverted(
-                            "shield amount must be greater than zero".to_string(),
-                        );
-                    }
-                    // The opening MUST recompute exactly: a range proof cannot
-                    // bind a value, only an opening can. Wrong blinding (or a
-                    // commitment to a different value) reverts here, before
-                    // any native coin moves.
-                    if !crate::crypto_privacy::ConfidentialState::verify_opening(
-                        commitment, *amount, blinding,
-                    ) {
-                        return VmExecutionResult::Reverted(
-                            "shield rejected: opening does not match commitment".to_string(),
-                        );
-                    }
-                    let Some(shielded) = confidential.as_mut() else {
-                        return VmExecutionResult::Reverted(
-                            "confidential state not available".to_string(),
-                        );
-                    };
-                    if shielded.is_spent(commitment) {
-                        return VmExecutionResult::Reverted(
-                            "shield rejected: commitment already spent".to_string(),
-                        );
-                    }
-                    // No double-funding (audit follow-up): re-shielding a LIVE
-                    // commitment double-debits native for one spendable entry
-                    // and skews escrow-vs-outstanding forever. Same opening
-                    // twice is a user error, not a second coin.
-                    if shielded.is_owned(commitment) {
-                        return VmExecutionResult::Reverted(
-                            "shield rejected: commitment already shielded".to_string(),
-                        );
-                    }
-                    shielded.note_shielded_output(&ctx.sender, *commitment);
-                    // Native leg via the transfers channel (sender debited,
-                    // SHIELD_ESCROW credited, atomically with everything else
-                    // in commit_native). A sender that cannot cover `amount`
-                    // fails there and the recording above dies with the tx.
-                    ctx.transfers
-                        .push((crate::crypto_privacy::SHIELD_ESCROW, *amount));
-                    state.stack.push(1);
-                }
-                OpCode::SysCallConfidentialUnshield { inputs } => {
-                    charge!(GAS_CONFIDENTIAL_UNSHIELD.saturating_add(
-                        (inputs.len() as u64).saturating_mul(GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT)
-                    ));
-                    if inputs.is_empty() {
-                        return VmExecutionResult::Reverted(
-                            "unshield needs at least one input".to_string(),
-                        );
-                    }
-                    // IO-count cap (audit: blocks troubles): see Transfer2.
-                    if inputs.len() > MAX_UNSHIELD_INPUTS_PER_TX {
-                        return VmExecutionResult::Reverted(format!(
-                            "unshield rejected: too many inputs (max {MAX_UNSHIELD_INPUTS_PER_TX})"
-                        ));
-                    }
-                    let Some(shielded) = confidential.as_mut() else {
-                        return VmExecutionResult::Reverted(
-                            "confidential state not available".to_string(),
-                        );
-                    };
-                    // Verifies openings + ownership + unspent, retires the
-                    // inputs, returns the releasable total. Privacy ends at
-                    // exit by design (amounts are public from here on).
-                    let total = match shielded.retire_for_unshield(&ctx.sender, inputs) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            return VmExecutionResult::Reverted(format!("unshield rejected: {e}"))
-                        }
-                    };
-                    if total == 0 {
-                        return VmExecutionResult::Reverted(
-                            "unshield total must be greater than zero".to_string(),
-                        );
-                    }
-                    // Native leg via payouts (SHIELD_ESCROW pays the sender;
-                    // escrow insufficiency fails the whole tx in commit_native).
-                    ctx.payouts
-                        .push((crate::crypto_privacy::SHIELD_ESCROW, ctx.sender, total));
-                    state.stack.push(total);
-                }
+                // PQ excision: SysCallConfidentialTransfer/Transfer2/Shield/Unshield arms removed with Ristretto (no PQ replacement); see OpCode (discriminants reserved).
                 OpCode::SysCallActorSend {
                     recipient,
                     value,

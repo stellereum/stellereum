@@ -1,14 +1,15 @@
-//! Bot/session-key visibility: `stell_sessionBudget` RPC + human-readable
-//! confidential display (backend JSON the frontend consumes).
+//! Bot/session-key visibility: `stell_sessionBudget` RPC.
 //!
-//! Zones: RPC read path + explorer rendering only. No consensus change.
+//! Zones: RPC read path only. No consensus change.
+//!
+//! (The human-readable confidential-display section was deleted with the
+//! shielded protocol removal: the transfer type, explorer renderers and
+//! `/api/confidential/` endpoint it covered no longer exist.)
 
 use std::sync::Arc;
 
-use curve25519_dalek::Scalar;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use stellereum::crypto_privacy::{ConfidentialState, ConfidentialTransfer, PedersenCommitment};
 use stellereum::explorer::{self, GatewayState};
 use stellereum::rpc::{ReceiptIndex, RpcState};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
@@ -17,13 +18,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const CHAIN_ID: u64 = 5757;
-
-fn balanced_transfer(value: u64, fee: u64) -> ConfidentialTransfer {
-    let r = Scalar::from(0x5EED_u64);
-    let c_in = PedersenCommitment::commit(value + fee, &r);
-    let c_out = PedersenCommitment::commit(value, &r);
-    ConfidentialTransfer::new(vec![c_in], vec![c_out], fee)
-}
 
 async fn rpc_state() -> Arc<RpcState> {
     rpc_state_with_token(None).await
@@ -297,159 +291,4 @@ async fn budget_read_needs_no_auth_token() {
         resp.get("result").is_some(),
         "reads must not require the write API token: {resp}"
     );
-}
-
-// ---- human-readable confidential display ----
-
-#[test]
-fn confidential_display_labels_shape_not_raw_hex() {
-    let sender = [1u8; 32];
-    let recipient = [2u8; 32];
-    let transfer = balanced_transfer(1_000, 20);
-    let state = ConfidentialState::new();
-    let v = explorer::describe_confidential_transfer(&sender, &recipient, &transfer, &state);
-    assert_eq!(v["kind"], serde_json::json!("confidential"));
-    assert_eq!(v["sender"], serde_json::json!(hex::encode(sender)));
-    assert_eq!(v["recipient"], serde_json::json!(hex::encode(recipient)));
-    assert_eq!(v["fee"], serde_json::json!(20));
-    assert_eq!(v["inputs"], serde_json::json!(1));
-    assert_eq!(v["outputs"], serde_json::json!(1));
-    assert_eq!(v["spent"], serde_json::json!([false]));
-    assert_eq!(v["all_spent"], serde_json::json!(false));
-    // Commitments are listed explicitly (labeled), not an opaque payload blob.
-    assert_eq!(v["input_commitments"].as_array().unwrap().len(), 1);
-    assert_eq!(v["output_commitments"].as_array().unwrap().len(), 1);
-}
-
-#[test]
-fn confidential_display_marks_spent_inputs() {
-    let sender = [1u8; 32];
-    let recipient = [2u8; 32];
-    let transfer = balanced_transfer(1_000, 20);
-    let mut state = ConfidentialState::new();
-    for c in &transfer.input_commitments {
-        state.note_shielded_output(&sender, c.commitment);
-    }
-    state
-        .apply_transfer(&sender, &recipient, &transfer)
-        .expect("balanced transfer applies");
-    let v = explorer::describe_confidential_transfer(&sender, &recipient, &transfer, &state);
-    assert_eq!(v["spent"], serde_json::json!([true]));
-    assert_eq!(v["all_spent"], serde_json::json!(true));
-}
-
-#[test]
-fn transaction_display_routes_confidential_vs_transparent() {
-    use stellereum::sharding::Transaction;
-    let sk = SigningKey::generate(&mut OsRng);
-    let state = ConfidentialState::new();
-    // Confidential payload -> labeled shape.
-    let ctx = Transaction::sign_with_payload(
-        &sk,
-        [2u8; 32],
-        0,
-        100_000,
-        0,
-        1,
-        1,
-        vec![stellereum::svm::OpCode::SysCallConfidentialTransfer {
-            recipient: [2u8; 32],
-            transfer: Box::new(balanced_transfer(500, 10)),
-        }],
-    );
-    let v = explorer::describe_transaction(&ctx, &state);
-    assert_eq!(v["kind"], serde_json::json!("confidential"));
-    assert_eq!(v["fee"], serde_json::json!(10));
-    assert_eq!(v["inputs"], serde_json::json!(1));
-    // Plain transfer -> transparent summary, never "confidential".
-    let plain = Transaction::sign(&sk, [3u8; 32], 5, 5, 1, 1, 1);
-    let w = explorer::describe_transaction(&plain, &state);
-    assert_eq!(w["kind"], serde_json::json!("transparent"));
-    assert!(w.get("input_commitments").is_none());
-}
-
-#[tokio::test]
-async fn gateway_tx_endpoint_renders_confidential_not_raw_hex() {
-    let st = rpc_state().await;
-    let addr = spawn(st.clone()).await;
-    let sk = SigningKey::generate(&mut OsRng);
-    let from = sk.verifying_key().to_bytes();
-    st.engine
-        .update_account(AccountState::new(from, 1_000_000_000_000))
-        .await;
-    let transfer = balanced_transfer(500, 10);
-    let tx = stellereum::sharding::Transaction::sign_with_payload(
-        &sk,
-        from,
-        0,
-        100_000,
-        0,
-        1,
-        1,
-        vec![stellereum::svm::OpCode::SysCallConfidentialTransfer {
-            recipient: [8u8; 32],
-            transfer: Box::new(transfer.clone()),
-        }],
-    );
-    let hash_hex = hex::encode(tx.compute_tx_hash());
-    st.mempool.write().await.add(tx.clone()).unwrap();
-
-    // (1) UNAUTHENTICATED: a PENDING body is REDACTED. Only the hash, the
-    // nonce and the status are public - the pre-finalization payload is not
-    // (front-running aid), so no confidential detail may leak here.
-    let (status, body) = http_get(addr, &format!("/api/tx/{hash_hex}")).await;
-    assert!(status.contains("200"), "{status} {body}");
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["tx_hash"], serde_json::json!(hash_hex), "{v}");
-    assert_eq!(v["nonce"], serde_json::json!(0));
-    assert_eq!(v["status"], serde_json::json!("pending"));
-    for leaked in ["kind", "sender", "recipient", "fee", "input_commitments"] {
-        assert!(
-            v.get(leaked).is_none(),
-            "the pending body must not be rendered to an unauthenticated caller \
-             (leaked {leaked}): {v}"
-        );
-    }
-
-    // (2) AUTHENTICATED: the view renders the CONFIDENTIAL shape - labelled,
-    // with the recipient and the inner fee - never a raw hex dump of the
-    // payload.
-    let token = "gateway-token";
-    let st_auth = rpc_state_with_token(Some(token)).await;
-    let addr_auth = spawn(st_auth.clone()).await;
-    st_auth
-        .engine
-        .update_account(AccountState::new(from, 1_000_000_000_000))
-        .await;
-    st_auth.mempool.write().await.add(tx).unwrap();
-    let (status, body) = http_get(addr_auth, &format!("/api/tx/{hash_hex}?token={token}")).await;
-    assert!(status.contains("200"), "{status} {body}");
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["kind"], serde_json::json!("confidential"), "{v}");
-    assert_eq!(v["sender"], serde_json::json!(hex::encode(from)));
-    assert_eq!(v["recipient"], serde_json::json!(hex::encode([8u8; 32])));
-    assert_eq!(v["fee"], serde_json::json!(10));
-    assert_eq!(v["inputs"], serde_json::json!(1));
-    assert_eq!(v["outputs"], serde_json::json!(1));
-    assert_eq!(v["status"], serde_json::json!("pending"));
-
-    // A WRONG token is treated exactly like no token: the body stays redacted.
-    let (status, body) = http_get(addr_auth, &format!("/api/tx/{hash_hex}?token=wrong")).await;
-    assert!(status.contains("200"), "{status} {body}");
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(
-        v.get("kind").is_none(),
-        "a wrong token must not unlock the pending body: {v}"
-    );
-
-    // Spent-status endpoint: unspent before finalization.
-    let commit_hex = hex::encode(transfer.input_commitments[0].commitment);
-    let (status2, body2) = http_get(addr, &format!("/api/confidential/{commit_hex}")).await;
-    assert!(status2.contains("200"), "{status2} {body2}");
-    let s: serde_json::Value = serde_json::from_str(&body2).unwrap();
-    assert_eq!(s["spent"], serde_json::json!(false), "{s}");
-
-    // Unknown tx hash: honest unknown, never fabricated.
-    let (status3, _) = http_get(addr, &format!("/api/tx/{}", hex::encode([9u8; 32]))).await;
-    assert!(status3.contains("404"), "{status3}");
 }

@@ -539,24 +539,6 @@ pub struct InMemoryStateEngine {
     /// `DomainSnapshot` (a new field there would stop every pre-phase-2 domain
     /// snapshot from decoding, and its restore path hard-errors).
     session_keys: Arc<RwLock<crate::zkml::SessionKeyRegistry>>,
-    /// §9 shielded (confidential) balance ledger: `balances`, the spent-input
-    /// nullifier set and the burned fee total.
-    ///
-    /// PRIVATE on purpose, like every other committed subsystem: reads go
-    /// through `confidential_read`, mutations through `confidential_write`
-    /// (which bumps `commitment_generation`). The only writer on the live path
-    /// is the SVM's `SysCallConfidentialTransfer`, applied to a CLONE that
-    /// `execute_payload` commits back only when the whole transaction applied
-    /// - so a reverted, out-of-gas or later-refused transaction leaves the
-    ///   shielded ledger byte-for-byte where it was.
-    ///
-    /// CONDITIONAL in the commitment: `commit_consensus_domains*` routes the
-    /// digest through `commitment::commitment_digest_with_confidential`, whose
-    /// confidential domain writes ZERO bytes while the state is empty. A chain
-    /// that has never made a confidential transfer therefore keeps a
-    /// byte-identical root, which is what lets this domain join the digest
-    /// WITHOUT bumping `COMMITMENT_VERSION` or re-pinning the genesis KAT.
-    confidential: Arc<RwLock<crate::crypto_privacy::ConfidentialState>>,
     /// §2 zkML model registry: `model_id -> (code/weights hash, weights)`.
     ///
     /// PRIVATE on purpose, like every other committed subsystem: reads go
@@ -570,16 +552,15 @@ pub struct InMemoryStateEngine {
     /// leaves the registry byte-for-byte where it was.
     ///
     /// CONDITIONAL in the commitment: `commit_consensus_domains*` routes the
-    /// digest through
-    /// `commitment::commitment_digest_with_confidential_and_zkml`, whose zkML
+    /// digest through `commitment::commitment_digest_with_zkml`, whose zkML
     /// domain writes ZERO bytes while the registry is empty. A chain that has
     /// never registered a model therefore keeps a byte-identical root, which
     /// is what lets this domain join the digest WITHOUT bumping
     /// `COMMITMENT_VERSION` or re-pinning the genesis KAT. No separate
-    /// persistence tree this wave (same as the shielded ledger): the registry
-    /// is consensus state in memory and under the root, and a restart drops
-    /// it - both nodes drop the same state, so agreement is preserved but
-    /// models must be re-registered. A disk tree is the follow-up.
+    /// persistence tree this wave: the registry is consensus state in memory
+    /// and under the root, and a restart drops it - both nodes drop the same
+    /// state, so agreement is preserved but models must be re-registered.
+    /// A disk tree is the follow-up.
     zkml_models: Arc<RwLock<crate::zkml::ZkMlModelRegistry>>,
     /// Bumped by every mutation of a committed subsystem.
     ///
@@ -1065,8 +1046,8 @@ impl Default for InMemoryStateEngine {
 /// validator bond, no free mint, no half-settled bridge/actor/PMM legs.
 /// Domains with their own snapshot/rollback (bridge, actor, PMM-native,
 /// oracle, books) keep it; this covers the ones that had none (tokens,
-/// contracts, orderbooks, escrow, PMM curve, staking). Session,
-/// confidential and zkML ride as working copies committed on success and
+/// contracts, orderbooks, escrow, PMM curve, staking). Session keys
+/// and zkML ride as working copies committed on success and
 /// are restored from their `*_before` clones the same way.
 struct PayloadDomainSnapshot {
     tokens: Option<crate::token::TokenRegistry>,
@@ -1077,7 +1058,6 @@ struct PayloadDomainSnapshot {
     staking: Option<crate::staking::StakingLedger>,
     oracle: Option<crate::oracle::OracleState>,
     session_keys: Option<crate::zkml::SessionKeyRegistry>,
-    confidential: Option<crate::crypto_privacy::ConfidentialState>,
     zkml_models: Option<crate::zkml::ZkMlModelRegistry>,
 }
 
@@ -1495,7 +1475,6 @@ impl InMemoryStateEngine {
             governance: Arc::new(RwLock::new(crate::governance::Governance::new())),
             oracle: Arc::new(RwLock::new(crate::oracle::OracleState::default())),
             session_keys: Arc::new(RwLock::new(crate::zkml::SessionKeyRegistry::default())),
-            confidential: Arc::new(RwLock::new(crate::crypto_privacy::ConfidentialState::new())),
             zkml_models: Arc::new(RwLock::new(crate::zkml::ZkMlModelRegistry::default())),
             commitment_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             committed_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1544,7 +1523,6 @@ impl InMemoryStateEngine {
         let governance = self.governance.read().await.clone();
         let oracle = self.oracle.read().await.clone();
         let session_keys = self.session_keys.read().await.clone();
-        let confidential = self.confidential.read().await.clone();
         let zkml_models = self.zkml_models.read().await.clone();
         let cross_shard_consumed = self.cross_shard_consumed.read().await.clone();
         let cross_shard_produced = self.cross_shard_produced.read().await.clone();
@@ -1572,7 +1550,6 @@ impl InMemoryStateEngine {
             governance: Arc::new(RwLock::new(governance)),
             oracle: Arc::new(RwLock::new(oracle)),
             session_keys: Arc::new(RwLock::new(session_keys)),
-            confidential: Arc::new(RwLock::new(confidential)),
             zkml_models: Arc::new(RwLock::new(zkml_models)),
             commitment_generation: Arc::new(std::sync::atomic::AtomicU64::new(
                 self.commitment_generation
@@ -1827,7 +1804,6 @@ impl InMemoryStateEngine {
         tx: &crate::sharding::Transaction,
         idx: usize,
         timestamp: u64,
-        range_preverify: &HashMap<[u8; 32], bool>,
     ) -> WaveItemExec {
         if tx.payload.is_empty() {
             return WaveItemExec {
@@ -1907,10 +1883,7 @@ impl InMemoryStateEngine {
         }
 
         let domain_snap = Some(self.snapshot_payload_domains(&tx.payload).await);
-        match self
-            .execute_payload_with_preverify(tx, timestamp, Some(range_preverify))
-            .await
-        {
+        match self.execute_payload_with_preverify(tx, timestamp).await {
             Ok((
                 crate::svm::VmExecutionResult::Success {
                     transfers,
@@ -2173,8 +2146,7 @@ impl InMemoryStateEngine {
         tx: &crate::sharding::Transaction,
         timestamp: u64,
     ) -> Result<(crate::svm::VmExecutionResult, ExecPostActions), String> {
-        self.execute_payload_with_preverify(tx, timestamp, None)
-            .await
+        self.execute_payload_with_preverify(tx, timestamp).await
     }
 
     /// Capture pre-execution state for exactly the domains this payload's
@@ -2193,7 +2165,6 @@ impl InMemoryStateEngine {
         let mut touches_staking = false;
         let mut touches_oracle = false;
         let mut touches_session = false;
-        let mut touches_conf = false;
         let mut touches_zkml = false;
         for op in payload {
             match op {
@@ -2238,10 +2209,6 @@ impl InMemoryStateEngine {
                 SysCallPublishSessionGrant { .. } | SysCallRevokeSession { .. } => {
                     touches_session = true
                 }
-                SysCallConfidentialTransfer { .. }
-                | SysCallConfidentialTransfer2 { .. }
-                | SysCallConfidentialShield { .. }
-                | SysCallConfidentialUnshield { .. } => touches_conf = true,
                 SysCallVerifyZkMl
                 | SysCallVerifyZkMlReexec { .. }
                 | SysCallRegisterZkMlModel { .. }
@@ -2263,7 +2230,6 @@ impl InMemoryStateEngine {
             staking: None,
             oracle: None,
             session_keys: None,
-            confidential: None,
             zkml_models: None,
         };
         if touches_tokens {
@@ -2287,9 +2253,6 @@ impl InMemoryStateEngine {
         }
         if touches_session {
             snap.session_keys = Some((*self.session_keys_read().await).clone());
-        }
-        if touches_conf {
-            snap.confidential = Some((*self.confidential_read().await).clone());
         }
         if touches_zkml {
             snap.zkml_models = Some((*self.zkml_models_read().await).clone());
@@ -2340,9 +2303,6 @@ impl InMemoryStateEngine {
         }
         if let Some(v) = snap.session_keys {
             *self.session_keys_write().await = v;
-        }
-        if let Some(v) = snap.confidential {
-            *self.confidential_write().await = v;
         }
         if let Some(v) = snap.zkml_models {
             *self.zkml_models_write().await = v;
@@ -2427,24 +2387,19 @@ impl InMemoryStateEngine {
         self.sync_aux_trie().await;
     }
 
-    /// Payload execution with an optional range-proof pre-verification cache
-    /// (see [`Svm::execute_with_confidential_and_sends_with_preverify`]).
+    /// Payload execution through the block-path VM entry point
+    /// ([`Svm::execute_with_confidential_and_sends`]).
     ///
-    /// `None` is the single-transaction path (`apply_transaction`, which calls
-    /// through [`Self::execute_payload`]): it NEVER consults a cache and runs
-    /// every check from scratch. `Some` is the block path
-    /// (`apply_block_parallel_fees`), which hands over the verdict map its
-    /// parallel pre-pass built — the handler still runs every state check
-    /// (ownership, spent set, conservation, fees) and only skips re-verifying
-    /// range proofs on a hit. Gas, settlement and commit behavior are identical
-    /// either way: the cache only avoids recomputing a pure function.
+    /// The name keeps the pre-excision `..._with_preverify` shape: the
+    /// range-proof pre-verification cache for shielded transfers was removed
+    /// with the shielded protocol, so every path now runs every check from
+    /// scratch. Gas, settlement and commit behavior are unchanged.
     #[allow(clippy::type_complexity)]
     // GATE: execution snapshot uses account tuple layout shared with commit path.
     pub async fn execute_payload_with_preverify(
         &self,
         tx: &crate::sharding::Transaction,
         timestamp: u64,
-        range_preverify: Option<&HashMap<[u8; 32], bool>>,
     ) -> Result<(crate::svm::VmExecutionResult, ExecPostActions), String> {
         // Session-key gate at the BLOCK timestamp, checked BEFORE the
         // empty-payload early return below. A plain session transfer has no
@@ -2604,33 +2559,10 @@ impl InMemoryStateEngine {
         };
         let session_keys_before = session_keys_work.clone();
 
-        // §9 SHIELDED LEDGER, cloned in only for payloads that can touch it
-        // (`SysCallConfidentialTransfer`) - the same clone-on-demand shape as
-        // the session registry above, for the same two reasons: a revert /
-        // out-of-gas / later settlement failure discards the transfer with
-        // everything else (the working copy is written back ONLY on the SUCCESS
-        // arm), and the 99.99% of payloads with no shielded opcode never take
-        // the lock or pay for the clone. The VM mutates this copy in place
-        // through `Svm::execute_with_confidential_and_sends`.
-        let mut confidential_work = if tx.payload.iter().any(|op| {
-            matches!(
-                op,
-                crate::svm::OpCode::SysCallConfidentialTransfer { .. }
-                    | crate::svm::OpCode::SysCallConfidentialTransfer2 { .. }
-                    | crate::svm::OpCode::SysCallConfidentialShield { .. }
-                    | crate::svm::OpCode::SysCallConfidentialUnshield { .. }
-            )
-        }) {
-            Some(self.confidential.read().await.clone())
-        } else {
-            None
-        };
-        let confidential_before = confidential_work.clone();
-
         // §2 MODEL REGISTRY, cloned in only for payloads that can touch it
         // (`SysCallVerifyZkMlReexec` / `SysCallVerifyZkMlAttestation` read it,
         // `SysCallRegisterZkMlModel` / `SysCallRegisterZkMlSpec` write it) -
-        // the same clone-on-demand shape as the shielded ledger above, for
+        // the same clone-on-demand shape as the session registry above, for
         // the same two reasons: a revert / out-of-gas / later settlement
         // failure discards a registration with everything else (the working
         // copy is written back ONLY on the SUCCESS arm), and the 99.99% of
@@ -2754,13 +2686,7 @@ impl InMemoryStateEngine {
         // clock. Every node applying this block supplies the same number, so
         // freshness and monotonicity checks in `commit_feed` agree everywhere.
         //
-        // The shielded ledger rides in as `confidential_work` (a working COPY,
-        // cloned above for payloads that carry the opcode): the handler applies
-        // the transfer to the copy, and only the SUCCESS arm below writes it
-        // back to the engine - so a revert, an out-of-gas or a failed escrow /
-        // PMM / bridge settlement discards the transfer with everything else.
-        //
-        // `actor_send_sink` is the mirror image for §1: the VM has no account
+        // `actor_send_sink` is the channel for §1: the VM has no account
         // map, so a `SysCallActorSend` can only be validated there (bounce
         // rule, prepaid delivery gas, affordability against the balance
         // mirror) and RECORDED here. `settle_actor_sends` below then moves the
@@ -2769,14 +2695,12 @@ impl InMemoryStateEngine {
         // the raw payload bytes. A payload with no actor send never allocates
         // anything measurable (the sink stays empty).
         let mut actor_send_sink: Vec<crate::svm::ActorSendRequest> = Vec::new();
-        let res = crate::svm::Svm::execute_with_confidential_and_sends_with_preverify(
+        let res = crate::svm::Svm::execute_with_confidential_and_sends(
             &tx.payload,
             tx.gas_limit,
             &mut ctx,
-            confidential_work.as_mut(),
             &mut actor_send_sink,
             zkml_models_work.as_mut(),
-            range_preverify,
         );
         // The PMM's native leg: the VM moved wUSDT and advanced the curve in
         // its clone-committed registries, but it cannot mint or burn native
@@ -3168,22 +3092,8 @@ impl InMemoryStateEngine {
                         *self.session_keys_write().await = work;
                     }
                 }
-                // §9 SHIELDED LEDGER, same all-or-nothing rule as the revoke
-                // above and for the same reason: the working copy the VM
-                // mutated is written back ONLY here, at the very end of a
-                // transaction that settled completely. Every `Err` above
-                // dropped the copy instead, so a transfer can never be half
-                // remembered - and the write accessor bumps
-                // `commitment_generation`, so the next root read folds the new
-                // balances, spent inputs and fee total into the state root.
-                if let (Some(before), Some(work)) = (&confidential_before, confidential_work.take())
-                {
-                    if *before != work {
-                        *self.confidential_write().await = work;
-                    }
-                }
-                // §2 MODEL REGISTRY, same all-or-nothing rule as the shielded
-                // ledger above: the working copy the VM mutated is written
+                // §2 MODEL REGISTRY, same all-or-nothing rule as the revoke
+                // above: the working copy the VM mutated is written
                 // back ONLY here, at the very end of a transaction that
                 // settled completely. Every `Err` above dropped the copy
                 // instead, so a registration can never survive a payload that
@@ -4674,93 +4584,6 @@ impl InMemoryStateEngine {
         }
     }
 
-    /// Block-path range-proof pre-verification (the CPU win for shielded TPS).
-    ///
-    /// Collects `(tx_idx, transfer, input_ranges, output_ranges)` for every
-    /// ADMITTED transaction carrying `SysCallConfidentialTransfer2` and
-    /// verifies the bundles' stateless proof check in parallel via
-    /// [`crate::crypto_privacy::ConfidentialTransfer::batch_verify_balanced_with_ranges`]
-    /// (rayon, order-preserving collect; sequential fast path below 4 bundles,
-    /// the same shape as `PARALLEL_UNSEAL_MIN_TXS` / `PAR_VERIFY_MIN_PAIRS`).
-    ///
-    /// Returns digest -> verdict, keyed by
-    /// [`crate::crypto_privacy::confidential_transfer2_preverify_digest`]. The
-    /// SVM handler consults it to skip RE-VERIFICATION of range proofs only:
-    /// ownership, spent-set, conservation and fee checks all still run per
-    /// transaction, in block order, against live state — and a cache miss runs
-    /// the full check as today. Determinism is load-bearing here: verification
-    /// is a pure function of the bundle bytes, so 1-thread and N-thread
-    /// verdicts are bit-identical, and only admitted transactions contribute
-    /// (a rejected transaction's payload never executes, pre-pass or not).
-    fn preverify_confidential_ranges(
-        txs: &[crate::sharding::Transaction],
-        admitted: &[bool],
-    ) -> HashMap<[u8; 32], bool> {
-        struct Item<'a> {
-            tx_idx: usize,
-            digest: [u8; 32],
-            transfer: &'a crate::crypto_privacy::ConfidentialTransfer,
-            input_ranges: &'a [crate::crypto_privacy::RangeProof],
-            output_ranges: &'a [crate::crypto_privacy::RangeProof],
-        }
-        let mut items: Vec<Item<'_>> = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for (tx_idx, tx) in txs.iter().enumerate() {
-            if !admitted.get(tx_idx).copied().unwrap_or(false) {
-                continue;
-            }
-            for op in &tx.payload {
-                if let crate::svm::OpCode::SysCallConfidentialTransfer2 {
-                    transfer,
-                    input_ranges,
-                    output_ranges,
-                    ..
-                } = op
-                {
-                    let digest = crate::crypto_privacy::confidential_transfer2_preverify_digest(
-                        transfer,
-                        input_ranges,
-                        output_ranges,
-                    );
-                    // First occurrence wins: identical bundles verify
-                    // identically, so verifying each digest once is exact and
-                    // keeps the batch order deterministic (block order).
-                    if seen.insert(digest) {
-                        items.push(Item {
-                            tx_idx,
-                            digest,
-                            transfer,
-                            input_ranges,
-                            output_ranges,
-                        });
-                    }
-                }
-            }
-        }
-        if items.is_empty() {
-            return HashMap::new();
-        }
-        let refs: Vec<(
-            &crate::crypto_privacy::ConfidentialTransfer,
-            &[crate::crypto_privacy::RangeProof],
-            &[crate::crypto_privacy::RangeProof],
-        )> = items
-            .iter()
-            .map(|it| (it.transfer, it.input_ranges, it.output_ranges))
-            .collect();
-        let verdicts =
-            crate::crypto_privacy::ConfidentialTransfer::batch_verify_balanced_with_ranges(&refs);
-        debug_assert_eq!(items.len(), verdicts.len());
-        for (it, v) in items.iter().zip(verdicts.iter()) {
-            tracing::trace!(tx = it.tx_idx, verdict = v, "confidential pre-pass verdict");
-        }
-        items
-            .into_iter()
-            .zip(verdicts)
-            .map(|(it, v)| (it.digest, v))
-            .collect()
-    }
-
     /// Apply a block's transactions, returning per-transaction success flags for
     /// receipts alongside the aggregate counters.
     ///
@@ -5113,17 +4936,6 @@ impl InMemoryStateEngine {
             }
         }
 
-        // 3b) Parallel range-proof PRE-PASS (block path only): verify the
-        //     stateless shielded-proof bundles of the admitted transactions
-        //     across cores, BEFORE the sequential execute loop. The loop below
-        //     still executes payloads one at a time in block order against
-        //     live state, and the SVM handler still runs every state check —
-        //     the cached verdict only lets it skip re-verifying range proofs.
-        //     Pure function of admitted bundle bytes, order-preserving, so the
-        //     sequential loop observes bit-identical verdicts with or without
-        //     the pre-pass (and on 1 thread vs N threads).
-        let range_preverify = Self::preverify_confidential_ranges(txs, &admitted);
-
         // 4) Execute the payload and commit the native movement, ONE transaction
         //    at a time, in BLOCK ORDER. Payload execution and value movement are
         //    interleaved on purpose: `apply_transaction` runs the VM against the
@@ -5362,14 +5174,7 @@ impl InMemoryStateEngine {
                             } else {
                                 domain_snap =
                                     Some(self.snapshot_payload_domains(&tx.payload).await);
-                                match self
-                                    .execute_payload_with_preverify(
-                                        tx,
-                                        timestamp,
-                                        Some(&range_preverify),
-                                    )
-                                    .await
-                                {
+                                match self.execute_payload_with_preverify(tx, timestamp).await {
                                     Ok((
                                         crate::svm::VmExecutionResult::Success {
                                             transfers,
@@ -5575,19 +5380,12 @@ impl InMemoryStateEngine {
                 let (transfers, payouts, burns, gas_used, tx_events) = if tx.payload.is_empty() {
                     (Vec::new(), Vec::new(), Vec::new(), tx.gas_limit, Vec::new())
                 } else {
-                    // Block path: hand the pre-pass verdicts over. The single-tx
-                    // path (`apply_transaction` -> `execute_payload`) passes `None`
-                    // and never consults the cache.
-                    //
                     // B1 atomicity: snapshot domains BEFORE the VM runs; any
                     // failure after (including the native commit below) restores
                     // everything (see rollback_payload). NOTE: must stay in sync
                     // with the `apply_transaction` copy.
                     domain_snap = Some(self.snapshot_payload_domains(&tx.payload).await);
-                    match self
-                        .execute_payload_with_preverify(tx, timestamp, Some(&range_preverify))
-                        .await
-                    {
+                    match self.execute_payload_with_preverify(tx, timestamp).await {
                         Ok((
                             crate::svm::VmExecutionResult::Success {
                                 transfers,
@@ -7057,7 +6855,6 @@ impl InMemoryStateEngine {
             &body.program,
             body.gas_budget,
             &mut ctx,
-            None,
             &mut sends,
             None,
         );
@@ -7728,29 +7525,6 @@ impl InMemoryStateEngine {
                 b
             }
         };
-        // Confidential (shielded ledger).
-        let gen = self.domain_gens.load(Domain::Confidential);
-        let confidential_hit = self
-            .domain_cache
-            .lock()
-            .unwrap()
-            .get(Domain::Confidential, gen);
-        let confidential = match confidential_hit {
-            Some(b) => b,
-            None => {
-                // TEMPORARY, like the old fold point: cloned and released at
-                // once, never held across another subsystem lock.
-                let state = self.confidential.read().await.clone();
-                let b = crate::commitment::confidential_preimage(&state);
-                if self.domain_gens.load(Domain::Confidential) == gen {
-                    self.domain_cache
-                        .lock()
-                        .unwrap()
-                        .put(Domain::Confidential, gen, b.clone());
-                }
-                b
-            }
-        };
         // zkML (models, then verifying keys: one domain, one generation).
         let gen = self.domain_gens.load(Domain::Zkml);
         let zkml_hit = self.domain_cache.lock().unwrap().get(Domain::Zkml, gen);
@@ -7782,7 +7556,6 @@ impl InMemoryStateEngine {
             &bridge,
             &cross_shard,
             &xpc,
-            &confidential,
             &zkml,
         ])
     }
@@ -8049,26 +7822,6 @@ impl InMemoryStateEngine {
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, crate::zkml::SessionKeyRegistry> {
         self.dom_guard(crate::commitment::Domain::SessionKeys, &self.session_keys)
-            .await
-    }
-
-    /// Read the shielded ledger (the VM's clone source, the commitment fold,
-    /// receipts). Reads cannot make the commitment stale, so this does NOT
-    /// bump the generation - and the guard must be dropped before any other
-    /// subsystem lock is taken, exactly like `commitment_snapshot`'s fields.
-    pub async fn confidential_read(
-        &self,
-    ) -> tokio::sync::RwLockReadGuard<'_, crate::crypto_privacy::ConfidentialState> {
-        self.confidential.read().await
-    }
-
-    /// Write access to the shielded ledger: applying a confidential transfer
-    /// bumps `commitment_generation`, so the very next root read folds the new
-    /// balances, spent inputs and fee total into the state root.
-    pub async fn confidential_write(
-        &self,
-    ) -> tokio::sync::RwLockWriteGuard<'_, crate::crypto_privacy::ConfidentialState> {
-        self.dom_guard(crate::commitment::Domain::Confidential, &self.confidential)
             .await
     }
 
@@ -8456,17 +8209,13 @@ impl InMemoryStateEngine {
             .commitment_generation
             .load(std::sync::atomic::Ordering::Acquire);
         let snapshot = self.commitment_snapshot().await;
-        // §9 + §2 FOLD POINT (the unconditional twin of the one in
+        // §2 FOLD POINT (the unconditional twin of the one in
         // `commit_consensus_domains_if_stale`): same conditional domains, same
         // transient read guards, so both entry points commit byte-identical
         // digests for the same state.
-        let confidential = self.confidential.read().await.clone();
         let zkml_models = self.zkml_models.read().await.clone();
-        let digest = crate::commitment::commitment_digest_with_confidential_and_zkml(
-            &snapshot,
-            &confidential,
-            &zkml_models,
-        );
+        let digest =
+            crate::commitment::commitment_digest_with_zkml(&snapshot, &zkml_models);
         self.state_trie
             .write()
             .await
@@ -10895,42 +10644,6 @@ impl InMemoryStateEngine {
         // out-of-band baseline audit. Operators must see this line.
         tracing::warn!(
             "[bridge] restored pre-F-H V1 state: mint counters start at ZERO — verify real minted supply out-of-band before trusting cap headroom (exact on fresh/test chains)"
-        );
-        Ok(())
-    }
-
-    /// Serialize the committed shielded ledger for persistence (audit F-B).
-    ///
-    /// Own storage tree, exactly like session keys and the bridge domain: the
-    /// spent set and shielded balances are consensus state (they move the
-    /// root when non-empty), and a restart that dropped them would both
-    /// re-open spent commitments for double-spend AND compute a different
-    /// root than the network. Absent entry means "empty" (zero digest bytes).
-    pub async fn confidential_snapshot(&self) -> Vec<u8> {
-        bincode::serialize(&*self.confidential.read().await).unwrap_or_default()
-    }
-
-    /// Install a persisted shielded ledger (startup restore). Bumps the
-    /// commitment generation like every other domain install, so the restored
-    /// spent set is folded into the very next root read.
-    pub async fn restore_confidential(&self, bytes: &[u8]) -> Result<(), String> {
-        match bincode::deserialize::<crate::crypto_privacy::ConfidentialState>(bytes) {
-            Ok(state) => {
-                *self.confidential_write().await = state;
-                return Ok(());
-            }
-            Err(_) => {
-                // Pre-ownership snapshot (no `owned` map): upgrade instead of
-                // refusing to start. Pre-fix outputs are unattributed and
-                // therefore unspendable (frozen, not stealable) — see
-                // `ConfidentialStateV1`. LOUD, like the bridge upgrade.
-            }
-        }
-        let v1: crate::crypto_privacy::ConfidentialStateV1 = bincode::deserialize(bytes)
-            .map_err(|e| format!("restore confidential state failed: {e:?}"))?;
-        *self.confidential_write().await = v1.upgrade();
-        tracing::warn!(
-            "[confidential] restored pre-ownership V1 state: old shielded outputs are FROZEN (unspendable until migration); new outputs are fully owned"
         );
         Ok(())
     }
@@ -14555,9 +14268,8 @@ mod tests {
     /// pre-TAIL-1 code path, kept as the differential oracle).
     async fn reference_digest(engine: &InMemoryStateEngine) -> [u8; 32] {
         let snap = engine.commitment_snapshot().await;
-        let confidential = engine.confidential.read().await.clone();
         let zkml = engine.zkml_models.read().await.clone();
-        crate::commitment::commitment_digest_with_confidential_and_zkml(&snap, &confidential, &zkml)
+        crate::commitment::commitment_digest_with_zkml(&snap, &zkml)
     }
 
     /// The digest the engine actually folded into the trie (the live path).
@@ -14805,7 +14517,7 @@ mod tests {
             committed_trie_digest(&engine).await,
             reference_digest(&engine).await
         );
-        // Cross-shard + xpc + zkml + confidential touch.
+        // Cross-shard + xpc + zkml touch.
         engine
             .cross_shard_completed
             .write()
@@ -14852,7 +14564,7 @@ mod tests {
             misses, 1,
             "exactly the staking domain rebuilds, got {misses}"
         );
-        assert_eq!(hits, 13, "every other domain must be a hit, got {hits}");
+        assert_eq!(hits, 12, "every other domain must be a hit, got {hits}");
         // Steady state: the global generation skip serves the read; the
         // per-domain cache is not even consulted.
         reset_cache_stats(&engine);

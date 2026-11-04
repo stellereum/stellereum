@@ -1,0 +1,36 @@
+# INFNODE repo junk audit (non-transport inventory)
+
+Scope: `github.com/stellereum/infnode` (mirror `/home/imm/stellereum-project/infnode/`).
+Transport = `crates/infnode` only. Everything below is NOT the transport.
+Rule: every verdict cites `grep`/`file:line` or is marked UNVERIFIED. No files modified.
+
+## Verdict table
+
+| # | Item | What (≤3 lines) | Who uses it | Verdict |
+|---|------|-----------------|-------------|---------|
+| 1 | `contracts/` (8× `.tolk`: `registry`, `storage`, `NftCollection`, `NftItem`, `messages`, `types`, `errors`, `fees-management`) | TON-only contracts (Tolk 1.4.1, TEP-62/64 NFT, Getgems-compatible). Registry = paid email→wallet map; Storage = node-reward accounting; Collection/Item = optional Web3→NFT upgrade (`NftCollection.tolk:13`). | Only `crates/infmail` off-chain via `REGISTRY_CONTRACT_ADDRESS` env + TON Center API (`crates/infmail/src/blockchain.rs:40`, `web.rs:4572`). Zero refs from `crates/infnode` (`rg -ni "contract\|toncenter\|tolk" crates/infnode/src/` → NONE). Zero refs from stellereum crate. No EVM/Solana (`rg -rli "evm\|solana\|erc20" infnode/` → NONE). | **MOVE** → infmail product repo |
+| 2 | `crates/infmail/` (~9.8k lines: `web.rs` 7097, `blockchain.rs` 800, `inbound.rs` 937, `nft/` 4 mods, `main.rs` 111) | Webmail product on top of the transport (accounts, mail/files API, 2FA, subs, NFT). Own bin `infmail-backend serve` (`main.rs:1-11`). Self-describes as "Отдельный проект, не часть ядра infnode" (`crates/infmail/Cargo.toml:5`). | Depends ON transport: `crates/infmail/Cargo.toml:9` (`infnode = { path = "../infnode" }`). Reverse = zero code deps (transport mentions `infmail` only as domain-example strings + proto tags `infmail-box-v1`/`infmail-cryptobox-v1`: `node.rs:7898,7914,7925,7937,8646`, `mailbox.rs:137`, `lib.rs:2`). Stellereum deps only `infnode` (`stellereum/Cargo.toml:7`, `main.rs:8-9`), zero `infmail` refs in its `src/`+`Cargo.toml`. | **MOVE** → own `infmail` repo (keep path-dep until split) |
+| 3 | `nft/` (Node.js `server.js` + `package.json` + `dist/designs.js`) | NFT-card render microservice (node-canvas, port 9200, `POST /render`, `POST /render-lsb`, `GET /healthz`; `server.js:1-20,104-106`). `dist/designs.js` is vendored compiled output of external `nft-card-studio` (per `server.js` header) — source studio NOT in repo. | Live caller: `crates/infmail/src/nft/nft.rs:19-20,74` (`NFT_CARD_SERVICE_URL`, default `127.0.0.1:9200`, `POST {url}/render-lsb`). Zero refs from `crates/infnode`, zero from stellereum. | **MOVE** → infmail repo (with #2) |
+| 4a | `tools-src/go/` (`obs`, `payouts`, `watcher`; `go 1.22`, stdlib-only) | Validator-ops daemons: `obs` = :9100 stats/metrics from local JSON files; `payouts` = TON Distribute-draft generator (never holds payout key); `watcher` = :9101 anomaly alerts. Headers: `obs/main.go:1-16`, `payouts/main.go:1-26`, `watcher/main.go:1-17`. | Coupled via files produced by transport `rewards.rs:239,455-468` (`rewards.json`, `payout_ledger.json`) and read by tools (`obs/main.go:3,61`, `watcher/main.go:128,151`). No Rust-crate imports (separate Go modules). Shipped via `systemd/` + `Makefile:tools`. Zero refs from stellereum. | **MOVE** → validator-ops repo (with #6); keep file-schema contract with transport |
+| 4b | `tools-src/zig/cli/infmail-chunkcheck.zig` | Chunk auditor: verifies `kv.json` `m:`/`f:` manifests vs chunk files (`chunkcheck.zig:1-2,13-30`). Built by `Makefile:32-45`, installed to `/opt/infnode/bin` by `install-tools`. | No automated caller: no systemd unit, no Rust/Go/Shell caller in repo (UNVERIFIED outside repo: manual validator use possible). | **ASK-LEAD** (ship-with-ops vs dead; see list) |
+| 5 | `Makefile` | Validator runbook: `build/init/run/start/tools/tools-run/install-tools/status/clean/test` (`.PHONY:15`, targets `:17-:75`). Header still says `infmail-valid-backend` (pre-rename name). | Used by validator ops; transport itself builds via `cargo -p infnode` (contradicts: repo `README` says `cargo build -p infnode`). | **ASK-LEAD** — repair, don't delete (stale targets, see list) |
+| 6 | `systemd/` (4 units: `infmail-obs`, `infmail-payouts{,.timer}`, `infmail-watcher`) | Systemd shipping for #4a (`ExecStart=/opt/infnode/bin/...`, hourly payouts timer). | Installed only by `Makefile:install-tools` (root). All three services declare `After/Wants=infnode.service`, but **no `infnode.service` file exists in repo** (`ls systemd/` = 4 files only). | **MOVE** → with #4a; fix dangling `infnode.service` dep (ASK-LEAD item) |
+| 7 | `tools/bin/` (4 ELF binaries, ~40 MB total) | Local build outputs of #4a/#4b (`chunkcheck` 17 MB, `obs` 9.9 MB, `payouts` 3.4 MB, `watcher` 9.8 MB). | Nothing in-repo executes `./tools/bin/*` (systemd points at `/opt/infnode/bin`, not `tools/bin`). Git-untracked: `git ls-files tools/` → empty; ignored by `.gitignore:tools/bin/`. Regenerable via `make tools`. | **DELETE** (untracked, regenerable artifacts) |
+| 8 | `docs/`, `examples/` | Do not exist in infnode repo (`ls` → no such directory). Transport docs live in-code + stellereum `docs/program/`. | n/a | **n/a** — nothing to move/delete |
+
+## DELETE list (exact paths; all untracked + regenerable)
+
+- `infnode/tools/bin/infmail-chunkcheck`
+- `infnode/tools/bin/infmail-obs`
+- `infnode/tools/bin/infmail-payouts`
+- `infnode/tools/bin/infmail-watcher`
+
+Evidence: `git -C infnode ls-files tools/` → empty AND `.gitignore` contains `tools/bin/` AND `Makefile:32-45` rebuilds all four from `tools-src/`. (Lead executes deletion; this audit changed nothing.)
+
+## ASK-LEAD list
+
+1. **Makefile stale targets** (`Makefile:17-25,69-76`): `build` = `cargo build --release -p infmail`, but `init`/`status` exec `./target/release/infnode` — a *different package binary* (`crates/infnode/src/main.rs` exists, but `-p infmail` never builds it) → fresh `make start` runs a stale/missing `infnode` binary. `test` covers only `-p infmail`, never the transport. `install-tools:56` missing from `.PHONY:15`. Header comment names `infmail-valid-backend` (pre-rename). Fix: build/test both `-p infnode -p infmail`, or split Makefiles per repo after #2 moves.
+2. **`tools-src/zig` chunkcheck fate** (#4b): built + installed but zero in-repo callers and no systemd unit. Keep as manual validator tool (move with ops) or declare dead and drop `Makefile:tools` Zig leg + `tools/bin/infmail-chunkcheck`? UNVERIFIED: external manual use.
+3. **Dangling `infnode.service`** (#6): three units `After/Wants=infnode.service`, file absent from repo. Where does the production `infnode.service` live — stellereum repo, private ops, or missing? Add it or drop the dep.
+4. **Cosmetic transport coupling**: `infmail-*` default path (`node.rs:704` `./infmail`), proto tags `infmail-box-v1` (`node.rs:7898+`), `infmail-cryptobox-v1` (`mailbox.rs:137`). Harmless strings, no code dep — rename on own schedule or keep as protocol constants (renaming = wire-visible; do NOT touch without lead).
+5. **`SECURITY.md` placeholder** (side note, existing file, not modified): contact `security@example.invalid`, self-marked "PLACEHOLDER — REPLACE BEFORE PUBLISHING" — founder must complete before mainnet (out of junk-audit scope, flagged so it isn't lost in a repo split).

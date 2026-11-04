@@ -59,8 +59,8 @@ use std::collections::HashMap;
 /// path would have fed — the split is behaviour-preserving by construction.
 ///
 /// The trait is also implemented by downstream domains
-/// (`crate::crypto_privacy::write_confidential_domain`) so every committed
-/// domain can be captured, not just the ones defined in this module.
+/// so every committed domain can be captured, not just the ones defined
+/// in this module.
 pub trait PreimageSink {
     /// Append raw bytes to the preimage.
     fn push_preimage(&mut self, bytes: &[u8]);
@@ -133,13 +133,12 @@ pub enum Domain {
     Bridge,
     CrossShard,
     Xpc,
-    Confidential,
     Zkml,
 }
 
 impl Domain {
     /// Every domain, in digest order.
-    pub const ALL: [Domain; 14] = [
+    pub const ALL: [Domain; 13] = [
         Domain::Tokens,
         Domain::Staking,
         Domain::Pmm,
@@ -152,7 +151,6 @@ impl Domain {
         Domain::Bridge,
         Domain::CrossShard,
         Domain::Xpc,
-        Domain::Confidential,
         Domain::Zkml,
     ];
 
@@ -187,7 +185,6 @@ pub struct DomainGenerations {
     pub bridge: std::sync::atomic::AtomicU64,
     pub cross_shard: std::sync::atomic::AtomicU64,
     pub xpc: std::sync::atomic::AtomicU64,
-    pub confidential: std::sync::atomic::AtomicU64,
     pub zkml: std::sync::atomic::AtomicU64,
 }
 
@@ -199,8 +196,8 @@ impl DomainGenerations {
     }
 
     /// Snapshot every counter (for tests and diagnostics).
-    pub fn snapshot(&self) -> [u64; 14] {
-        let mut out = [0u64; 14];
+    pub fn snapshot(&self) -> [u64; 13] {
+        let mut out = [0u64; 13];
         for d in Domain::ALL {
             out[d.index()] = self.load(d);
         }
@@ -232,7 +229,6 @@ impl DomainGenerations {
             Domain::Bridge => &self.bridge,
             Domain::CrossShard => &self.cross_shard,
             Domain::Xpc => &self.xpc,
-            Domain::Confidential => &self.confidential,
             Domain::Zkml => &self.zkml,
         }
     }
@@ -365,7 +361,7 @@ struct DomainSlot {
 /// mutation, so equality implies byte-identical content.
 #[derive(Debug, Default)]
 pub struct DomainCache {
-    slots: [Option<DomainSlot>; 14],
+    slots: [Option<DomainSlot>; 13],
     /// Per-contract ABI JSON cache (feeds the contracts domain).
     pub abi: AbiJsonCache,
     /// Domain-level hits (reused preimage) since creation / last reset.
@@ -1452,7 +1448,7 @@ fn bridge_digest<S: PreimageSink>(h: &mut S, b: &crate::bridge::BridgeState) {
 
 /// §2 zkML model-registry domain digest.
 ///
-/// CONDITIONAL DOMAIN, exactly like the session-key / bridge / confidential
+/// CONDITIONAL DOMAIN, exactly like the session-key / bridge
 /// domains: the caller only invokes this when the registry is NON-EMPTY (see
 /// [`write_zkml_models_domain`)), so a chain that has never registered a model
 /// - every genesis KAT - digests byte-for-byte identically to before and
@@ -1559,8 +1555,8 @@ pub fn zkml_vks_digest(reg: &crate::zkml::ZkMlModelRegistry) -> [u8; 32] {
 
 /// Write the commitment preimage into an existing hasher.
 ///
-/// Split out of [`commitment_digest`] so the confidential-aware entry point
-/// below can share the EXACT same byte sequence. The split is behaviour
+/// Split out of [`commitment_digest`] so digest variants below can share
+/// the EXACT same byte sequence. The split is behaviour
 /// preserving by construction: `commitment_digest` still calls this and
 /// finalizes, so its output is byte-for-byte unchanged.
 /// Cross-shard replay domain digest (audit F1).
@@ -1568,7 +1564,7 @@ pub fn zkml_vks_digest(reg: &crate::zkml::ZkMlModelRegistry) -> [u8; 32] {
 /// CONDITIONAL DOMAIN: all three sets empty writes zero bytes, so appending
 /// this unconditionally keeps the genesis root (and every pre-cross-shard
 /// snapshot root) byte-identical with no `COMMITMENT_VERSION` bump - the same
-/// contract as the session-key / bridge / confidential / zkML domains. Inside
+/// contract as the session-key / bridge / zkML domains. Inside
 /// the domain nothing is conditional: every set's length is written and
 /// entries are hashed in sorted order, so two different replay states cannot
 /// encode to the same preimage (PROTOCOL.md I2).
@@ -1806,11 +1802,6 @@ pub fn xpc_preimage(records: &[crate::xshard2pc::XpcRecord]) -> Vec<u8> {
     capture(|h| write_xshard_2pc_domain(h, records))
 }
 
-/// Confidential domain preimage.
-pub fn confidential_preimage(state: &crate::crypto_privacy::ConfidentialState) -> Vec<u8> {
-    capture(|h| crate::crypto_privacy::write_confidential_domain(h, state))
-}
-
 /// zkML domain preimage (models, then verifying keys).
 pub fn zkml_preimage(reg: &crate::zkml::ZkMlModelRegistry) -> Vec<u8> {
     capture(|h| {
@@ -1826,7 +1817,7 @@ pub fn zkml_preimage(reg: &crate::zkml::ZkMlModelRegistry) -> Vec<u8> {
 /// is written directly and every domain's captured bytes are fed in order.
 /// Feeding cached bytes into SHA-256 hashes the same concatenation the
 /// streaming path hashes, so equal inputs ⇒ equal digests by construction.
-pub fn assemble_cached_digest(domains: [&[u8]; 14]) -> [u8; 32] {
+pub fn assemble_cached_digest(domains: [&[u8]; 13]) -> [u8; 32] {
     let mut h = Sha256::new();
     put_u64(&mut h, b"COMMITMENT_VERSION", COMMITMENT_VERSION as u64);
     for bytes in domains {
@@ -1849,7 +1840,7 @@ pub fn assemble_cached_digest(domains: [&[u8]; 14]) -> [u8; 32] {
 /// argument as `assemble_cached_digest` (same concatenation ⇒ same hash).
 pub fn assemble_from_cache(
     cache: &mut DomainCache,
-    generations: &[u64; 14],
+    generations: &[u64; 13],
 ) -> Option<[u8; 32]> {
     let mut h = Sha256::new();
     put_u64(&mut h, b"COMMITMENT_VERSION", COMMITMENT_VERSION as u64);
@@ -1867,36 +1858,12 @@ pub fn commitment_digest(s: &CommitmentSnapshot) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Confidential-aware commitment digest.
+/// §2-aware commitment digest: the snapshot preimage, then the zkML
+/// model-registry domain, then the zkML VK domain.
 ///
-/// Appends the shielded-balance domain [`crate::crypto_privacy::ConfidentialState`]
-/// after every existing field. The domain is CONDITIONAL and self-gating: an
-/// empty state writes zero bytes, so this is byte-identical to
-/// [`commitment_digest`] on any chain that has never used a confidential
-/// transfer. That is what allows the domain to be folded in WITHOUT bumping
-/// [`COMMITMENT_VERSION`] or re-pinning `tests/genesis_root_known_answer_tests.rs`.
-///
-/// Not yet called by the live path: the coordinator adds the
-/// `CommitmentSnapshot` field and the engine lock, then routes
-/// `commitment_digest` through this function (or calls
-/// `crate::crypto_privacy::write_confidential_domain` directly inside
-/// `commitment_digest_into`). Nothing else in this module changes.
-pub fn commitment_digest_with_confidential(
-    s: &CommitmentSnapshot,
-    confidential: &crate::crypto_privacy::ConfidentialState,
-) -> [u8; 32] {
-    let mut h = Sha256::new();
-    commitment_digest_into(&mut h, s);
-    crate::crypto_privacy::write_confidential_domain(&mut h, confidential);
-    h.finalize().into()
-}
-
-/// §2-aware commitment digest: the snapshot preimage, then the shielded
-/// domain, then the zkML model-registry domain, then the zkML VK domain.
-///
-/// All three appended domains are CONDITIONAL and self-gating (empty writes
+/// Both appended domains are CONDITIONAL and self-gating (empty writes
 /// zero bytes), so this is byte-identical to [`commitment_digest`] on a chain
-/// that has never used any of them - which is what lets the registry AND the
+/// that has never used them - which is what lets the registry AND the
 /// key set join the digest WITHOUT bumping [`COMMITMENT_VERSION`] or
 /// re-pinning `tests/genesis_root_known_answer_tests.rs`. The zkML domains
 /// are APPENDED last (models, then specs) so every pre-attestation preimage keeps
@@ -1904,21 +1871,6 @@ pub fn commitment_digest_with_confidential(
 ///
 /// This is the live-path digest: `InMemoryStateEngine` routes both
 /// `commit_consensus_domains*` entry points through it.
-pub fn commitment_digest_with_confidential_and_zkml(
-    s: &CommitmentSnapshot,
-    confidential: &crate::crypto_privacy::ConfidentialState,
-    zkml_models: &crate::zkml::ZkMlModelRegistry,
-) -> [u8; 32] {
-    let mut h = Sha256::new();
-    commitment_digest_into(&mut h, s);
-    crate::crypto_privacy::write_confidential_domain(&mut h, confidential);
-    zkml_models_digest_inner(&mut h, zkml_models);
-    write_zkml_vks_domain(&mut h, zkml_models);
-    h.finalize().into()
-}
-
-/// zkML-only commitment digest (for tests and callers with no shielded
-/// state in scope): the snapshot preimage plus the conditional §2 domains.
 pub fn commitment_digest_with_zkml(
     s: &CommitmentSnapshot,
     zkml_models: &crate::zkml::ZkMlModelRegistry,
@@ -2555,9 +2507,8 @@ mod tests {
     /// (test mirror of the engine's cached commit path).
     fn assemble_test(
         s: &CommitmentSnapshot,
-        confidential: &crate::crypto_privacy::ConfidentialState,
         zkml: &crate::zkml::ZkMlModelRegistry,
-        gens: &[u64; 14],
+        gens: &[u64; 13],
         cache: &mut DomainCache,
     ) -> [u8; 32] {
         macro_rules! fill {
@@ -2599,10 +2550,9 @@ mod tests {
                 )
             ),
             fill!(Domain::Xpc, xpc_preimage(&s.cross_shard_xpc)),
-            fill!(Domain::Confidential, confidential_preimage(confidential)),
             fill!(Domain::Zkml, zkml_preimage(zkml)),
         ];
-        let refs: [&[u8]; 14] = [
+        let refs: [&[u8]; 13] = [
             &domains[0],
             &domains[1],
             &domains[2],
@@ -2616,42 +2566,36 @@ mod tests {
             &domains[10],
             &domains[11],
             &domains[12],
-            &domains[13],
         ];
         assemble_cached_digest(refs)
     }
 
     /// Reference streaming digest for the §2-aware live path.
-    fn streaming_of(
-        s: &CommitmentSnapshot,
-        confidential: &crate::crypto_privacy::ConfidentialState,
-        zkml: &crate::zkml::ZkMlModelRegistry,
-    ) -> [u8; 32] {
-        commitment_digest_with_confidential_and_zkml(s, confidential, zkml)
+    fn streaming_of(s: &CommitmentSnapshot, zkml: &crate::zkml::ZkMlModelRegistry) -> [u8; 32] {
+        commitment_digest_with_zkml(s, zkml)
     }
 
     /// The cached assembly is byte-identical to the streaming digest on a
     /// populated state (every domain non-empty except the conditional
-    /// confidential/zkML ones, which stay empty here).
+    /// zkML ones, which stay empty here).
     #[test]
     fn cached_assembly_matches_streaming_on_populated_snapshot() {
         let s = populated_snapshot(64, 4, 32, 16);
-        let confidential = crate::crypto_privacy::ConfidentialState::new();
         let zkml = crate::zkml::ZkMlModelRegistry::default();
-        let reference = streaming_of(&s, &confidential, &zkml);
+        let reference = streaming_of(&s, &zkml);
         let mut cache = DomainCache::default();
-        let gens = [1u64; 14];
-        let cached = assemble_test(&s, &confidential, &zkml, &gens, &mut cache);
+        let gens = [1u64; 13];
+        let cached = assemble_test(&s, &zkml, &gens, &mut cache);
         assert_eq!(
             cached, reference,
             "cached per-domain assembly must equal the streaming digest"
         );
         // Second assembly with the same generations is served fully from cache.
         cache.reset_counters();
-        let cached2 = assemble_test(&s, &confidential, &zkml, &gens, &mut cache);
+        let cached2 = assemble_test(&s, &zkml, &gens, &mut cache);
         assert_eq!(cached2, reference);
         assert_eq!(
-            cache.hits, 14,
+            cache.hits, 13,
             "steady-state recommit must hit every domain"
         );
         assert_eq!(cache.misses, 0);
@@ -2732,10 +2676,9 @@ mod tests {
     #[test]
     fn randomized_mutations_cached_equals_streaming() {
         let mut s = populated_snapshot(32, 4, 16, 8);
-        let confidential = crate::crypto_privacy::ConfidentialState::new();
         let zkml = crate::zkml::ZkMlModelRegistry::default();
         let mut cache = DomainCache::default();
-        let mut gens = [1u64; 14];
+        let mut gens = [1u64; 13];
         let mut rng = Lcg(0x1234_5678_9ABC_DEF1);
         for step in 0..200 {
             match rng.next() % 7 {
@@ -2805,8 +2748,8 @@ mod tests {
                     gens[Domain::Books.index()] += 1;
                 }
             }
-            let cached = assemble_test(&s, &confidential, &zkml, &gens, &mut cache);
-            let reference = streaming_of(&s, &confidential, &zkml);
+            let cached = assemble_test(&s, &zkml, &gens, &mut cache);
+            let reference = streaming_of(&s, &zkml);
             assert_eq!(
                 cached, reference,
                 "step {step}: cached assembly diverged from streaming"
@@ -2882,13 +2825,12 @@ mod tests {
                     actor.allowances.insert((a, b), i as u64);
                 }
             }
-            let confidential = crate::crypto_privacy::ConfidentialState::new();
             let zkml = crate::zkml::ZkMlModelRegistry::default();
             // Cold-fill the cache, then check the zero-copy all-hit path.
             let mut cache = DomainCache::default();
-            let mut gens = [3u64; 14];
-            let reference = streaming_of(&s, &confidential, &zkml);
-            let cloned = assemble_test(&s, &confidential, &zkml, &gens, &mut cache);
+            let mut gens = [3u64; 13];
+            let reference = streaming_of(&s, &zkml);
+            let cloned = assemble_test(&s, &zkml, &gens, &mut cache);
             assert_eq!(cloned, reference, "seed {seed:#x}: cold clone-path diverged");
             let zero = assemble_from_cache(&mut cache, &gens)
                 .expect("seed: all-hit zero-copy assembly must succeed");
@@ -2999,8 +2941,8 @@ mod tests {
                         gens[Domain::Books.index()] += 1;
                     }
                 }
-                let cloned = assemble_test(&s, &confidential, &zkml, &gens, &mut cache);
-                let reference = streaming_of(&s, &confidential, &zkml);
+                let cloned = assemble_test(&s, &zkml, &gens, &mut cache);
+                let reference = streaming_of(&s, &zkml);
                 assert_eq!(
                     cloned, reference,
                     "seed {seed:#x} step {step}: clone-path diverged from streaming"
@@ -3019,28 +2961,27 @@ mod tests {
     /// Perf + regression: on a populated state the steady-state recommit is
     /// served entirely from cache. Prints measured ms for the report; the
     /// hard assertions are correctness (byte equality) and the hit-rate
-    /// contract (14/14 hits, 0 misses, ABI hits for every manifest).
+    /// contract (13/13 hits, 0 misses, ABI hits for every manifest).
     #[test]
     fn perf_digest_cached_vs_streaming() {
         let s = populated_snapshot(1500, 8, 300, 200);
-        let confidential = crate::crypto_privacy::ConfidentialState::new();
         let zkml = crate::zkml::ZkMlModelRegistry::default();
         // Warm up, then measure the reference streaming path.
-        let reference = streaming_of(&s, &confidential, &zkml);
+        let reference = streaming_of(&s, &zkml);
         let t0 = std::time::Instant::now();
-        let reference2 = streaming_of(&s, &confidential, &zkml);
+        let reference2 = streaming_of(&s, &zkml);
         let streaming_ms = t0.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(reference2, reference);
         // Cold cached build, then the steady-state (all-hit) recommit.
         let mut cache = DomainCache::default();
-        let gens = [7u64; 14];
+        let gens = [7u64; 13];
         let t0 = std::time::Instant::now();
-        let cold = assemble_test(&s, &confidential, &zkml, &gens, &mut cache);
+        let cold = assemble_test(&s, &zkml, &gens, &mut cache);
         let cold_ms = t0.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(cold, reference, "cold cached build must equal streaming");
         cache.reset_counters();
         let t0 = std::time::Instant::now();
-        let hot = assemble_test(&s, &confidential, &zkml, &gens, &mut cache);
+        let hot = assemble_test(&s, &zkml, &gens, &mut cache);
         let hot_ms = t0.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(hot, reference, "hot cached build must equal streaming");
         eprintln!(
@@ -3048,7 +2989,7 @@ mod tests {
             if hot_ms > 0.0 { streaming_ms / hot_ms } else { f64::INFINITY },
         );
         assert_eq!(
-            cache.hits, 14,
+            cache.hits, 13,
             "steady-state recommit must hit every domain"
         );
         assert_eq!(cache.misses, 0);
@@ -3066,14 +3007,14 @@ mod tests {
         let mut gens2 = gens;
         gens2[Domain::Contracts.index()] += 1;
         cache.reset_counters();
-        let rebuilt = assemble_test(&s2, &confidential, &zkml, &gens2, &mut cache);
+        let rebuilt = assemble_test(&s2, &zkml, &gens2, &mut cache);
         assert_eq!(
             rebuilt,
-            streaming_of(&s2, &confidential, &zkml),
+            streaming_of(&s2, &zkml),
             "contracts-domain rebuild must equal streaming"
         );
         assert_ne!(rebuilt, reference);
-        assert_eq!(cache.hits, 13, "only the contracts domain rebuilds");
+        assert_eq!(cache.hits, 12, "only the contracts domain rebuilds");
         assert_eq!(cache.misses, 1);
         assert_eq!(
             cache.abi.hits as usize,

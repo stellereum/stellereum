@@ -745,9 +745,9 @@ impl Mempool {
     /// proposer stops packing at ~24MB estimated wire and leaves headroom.
     /// Estimate, not exact bincode (see `estimate_tx_wire_bytes`).
     pub const MAX_BLOCK_WIRE_BYTES: usize = 24 * 1024 * 1024;
-    /// Verified-proof cap per block (audit: blocks troubles): range proofs
-    /// and attestation verifies serialize on the single apply worker while
-    /// `apply_in_flight` blocks the next propose. Bounds worst-case lane
+    /// Verified-proof cap per block (audit: blocks troubles): attestation
+    /// verifies and zkML re-executions serialize on the single apply worker
+    /// while `apply_in_flight` blocks the next propose. Bounds worst-case lane
     /// stall per height; gas alone does not (cheap gas, costly verify).
     pub const MAX_BLOCK_PROOF_UNITS: usize = 2048;
     /// Denominator of the sealed-transaction share of the pool (audit:
@@ -2651,17 +2651,6 @@ impl Mempool {
         n += tx.signature.len();
         for op in &tx.payload {
             n += match op {
-                OpCode::SysCallConfidentialTransfer2 {
-                    input_ranges,
-                    output_ranges,
-                    ..
-                } => 200 + (input_ranges.len() + output_ranges.len()) * 10_250,
-                OpCode::SysCallConfidentialTransfer { transfer, .. } => {
-                    200 + (transfer.input_commitments.len() + transfer.output_commitments.len())
-                        * 32
-                }
-                OpCode::SysCallConfidentialShield { .. } => 150,
-                OpCode::SysCallConfidentialUnshield { inputs } => 100 + inputs.len() * 96,
                 OpCode::SysCallVerifyZkMlReexec { proof, .. } => 500 + proof.wire_len(),
                 OpCode::SysCallVerifyZkMlAttestation { proof, .. } => {
                     500 + proof.public_inputs.len() * 2 + proof.wire_len()
@@ -2684,18 +2673,13 @@ impl Mempool {
     }
 
     /// Verified-proof units in a transaction for packing (audit: blocks
-    /// troubles): counts range proofs + attestation verifies + zkML re-executions,
-    /// the work that serializes on the single apply worker.
+    /// troubles): counts attestation verifies + zkML re-executions, the work
+    /// that serializes on the single apply worker.
     pub fn count_tx_proof_units(tx: &Transaction) -> usize {
         use crate::svm::OpCode;
         tx.payload
             .iter()
             .map(|op| match op {
-                OpCode::SysCallConfidentialTransfer2 {
-                    input_ranges,
-                    output_ranges,
-                    ..
-                } => input_ranges.len() + output_ranges.len(),
                 OpCode::SysCallVerifyZkMlAttestation { .. } => 64, // ~one 64-bit proof of work
                 OpCode::SysCallVerifyZkMlReexec { .. } => 16,      // re-execution, model-bounded
                 _ => 0,
@@ -3685,148 +3669,6 @@ mod tests {
         assert_eq!(mp.len(), 0);
         // The per-sender quota must not leak.
         assert_eq!(mp.per_sender.get(&me).copied().unwrap_or(0), 0);
-    }
-
-    #[test]
-    fn select_respects_wire_and_proof_caps() {
-        use crate::crypto_privacy::{PedersenCommitment, RangeProof};
-        use curve25519_dalek::scalar::Scalar;
-        // A max-proof Transfer2 (~330KB est, 16 proofs): wire cap 24MB means
-        // at most ~70 fit even with infinite gas/count budget.
-        let one = {
-            let sk = key();
-            let r = Scalar::from(1u64);
-            let c = PedersenCommitment::commit(100, &r);
-            let p = RangeProof::prove(&c, 100, &r, 64);
-            let ops = vec![crate::svm::OpCode::SysCallConfidentialTransfer2 {
-                recipient: [9u8; 32],
-                transfer: Box::new(crate::crypto_privacy::ConfidentialTransfer::new(
-                    vec![c; 8],
-                    vec![c; 8],
-                    0,
-                )),
-                input_ranges: vec![p.clone(); 8],
-                output_ranges: vec![p; 8],
-            }];
-            Transaction::sign_with_payload(&sk, [1u8; 32], 0, 100_000_000, 0, 1, 1, ops)
-        };
-        assert!(
-            Mempool::estimate_tx_wire_bytes(&one) > 100_000,
-            "fat tx estimates big"
-        );
-        assert_eq!(Mempool::count_tx_proof_units(&one), 16);
-        let mut mp2 = Mempool::new(1000, 1000);
-        for i in 0..150u64 {
-            let mut seed = [0xBu8; 32];
-            seed[0] = i as u8;
-            seed[1] = (i >> 8) as u8;
-            let k = SigningKey::from_bytes(&seed);
-            let r = Scalar::from(i + 1);
-            let c = PedersenCommitment::commit(100, &r);
-            let p = RangeProof::prove(&c, 100, &r, 64);
-            let ops = vec![crate::svm::OpCode::SysCallConfidentialTransfer2 {
-                recipient: [9u8; 32],
-                transfer: Box::new(crate::crypto_privacy::ConfidentialTransfer::new(
-                    vec![c; 8],
-                    vec![c; 8],
-                    0,
-                )),
-                input_ranges: vec![p.clone(); 8],
-                output_ranges: vec![p; 8],
-            }];
-            let t = Transaction::sign_with_payload(&k, [1u8; 32], 0, 100_000_000, i, 1, 1, ops);
-            mp2.add(t).unwrap();
-        }
-        let sel = mp2.select_for_block_multi(10_000, u64::MAX, |_| true);
-        // 150 fat txs x ~164KB = ~24.6MB > 24MB cap: not all selected.
-        // (Proof cap 150x16=2400 > 2048 would also bind first — wire wins here
-        // only if proofs stay under it; either cap stopping is correct.)
-        assert!(
-            sel.len() < 150,
-            "a packing cap must stop packing: got {}",
-            sel.len()
-        );
-        assert!(!sel.is_empty(), "but small packing still works");
-    }
-
-    #[test]
-    fn blast_200_reused_small_proofs_bind_packing_caps() {
-        // Blast check (packing perf): 200 fat txs built from ONE reused 8-bit
-        // range proof (fast: a single `prove`, then cheap clones — NOT 200
-        // 64-bit proves). Each tx carries 48+48 = 96 proofs, so the unbounded
-        // totals blow BOTH caps (wire: 200 x `one_wire` > MAX_BLOCK_WIRE_BYTES;
-        // proofs: 200 x 96 = 19_200 > MAX_BLOCK_PROOF_UNITS — both asserted
-        // below, so the fixture is meaningful under any width-aware estimate
-        // revision). `select_multi` must stop early on at least one of them,
-        // and the selected set must respect BOTH.
-        use crate::crypto_privacy::{PedersenCommitment, RangeProof};
-        use curve25519_dalek::scalar::Scalar;
-        let r = Scalar::from(7u64);
-        let c = PedersenCommitment::commit(42, &r);
-        let p = RangeProof::prove(&c, 42, &r, 8);
-        assert_eq!(p.bits, 8, "small-proof fixture must stay 8-bit");
-        let fat_ops = || {
-            vec![crate::svm::OpCode::SysCallConfidentialTransfer2 {
-                recipient: [9u8; 32],
-                transfer: Box::new(crate::crypto_privacy::ConfidentialTransfer::new(
-                    vec![c; 8],
-                    vec![c; 8],
-                    0,
-                )),
-                input_ranges: vec![p.clone(); 48],
-                output_ranges: vec![p.clone(); 48],
-            }]
-        };
-        // Unbounded totals exceed both caps (so the test is meaningful).
-        let one_wire = {
-            let sk = key();
-            let t =
-                Transaction::sign_with_payload(&sk, [1u8; 32], 0, 100_000_000, 0, 1, 1, fat_ops());
-            Mempool::estimate_tx_wire_bytes(&t)
-        };
-        let one_proofs = {
-            let sk = key();
-            let t =
-                Transaction::sign_with_payload(&sk, [1u8; 32], 0, 100_000_000, 0, 1, 1, fat_ops());
-            Mempool::count_tx_proof_units(&t)
-        };
-        assert_eq!(one_proofs, 96, "fixture must carry 96 proof units/tx");
-        assert!(
-            one_wire.saturating_mul(200) > Mempool::MAX_BLOCK_WIRE_BYTES,
-            "200 fat txs must overflow the wire cap unbounded ({} x 200)",
-            one_wire,
-        );
-        assert!(
-            one_proofs.saturating_mul(200) > Mempool::MAX_BLOCK_PROOF_UNITS,
-            "200 fat txs must overflow the proof cap unbounded"
-        );
-        let mut mp = Mempool::new(1024, 1024);
-        for i in 0..200u64 {
-            let mut seed = [0xCBu8; 32];
-            seed[..8].copy_from_slice(&i.to_le_bytes());
-            let k = SigningKey::from_bytes(&seed);
-            let t =
-                Transaction::sign_with_payload(&k, [1u8; 32], 0, 100_000_000, 0, 1, 1, fat_ops());
-            mp.add(t).expect("unchecked admission must succeed");
-        }
-        assert_eq!(mp.len(), 200);
-        let sel = mp.select_for_block_multi(10_000, u64::MAX, |_| true);
-        assert!(
-            sel.len() < 200,
-            "a packing cap must bind under blast: got {}",
-            sel.len()
-        );
-        assert!(!sel.is_empty(), "but small packing still works");
-        let wire: usize = sel.iter().map(Mempool::estimate_tx_wire_bytes).sum();
-        let proofs: usize = sel.iter().map(Mempool::count_tx_proof_units).sum();
-        assert!(
-            wire <= Mempool::MAX_BLOCK_WIRE_BYTES,
-            "selected wire {wire} must respect the cap"
-        );
-        assert!(
-            proofs <= Mempool::MAX_BLOCK_PROOF_UNITS,
-            "selected proofs {proofs} must respect the cap"
-        );
     }
 
     #[test]

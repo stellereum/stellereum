@@ -1281,12 +1281,9 @@ async fn install_bundle(
                     .await
                     .map_err(|e| format!("fast sync: restore bridge error: {e}"))?;
             }
-            "confidential" => {
-                engine
-                    .restore_confidential(dbytes)
-                    .await
-                    .map_err(|e| format!("fast sync: restore confidential error: {e}"))?;
-            }
+            // Ristretto deletion wave: confidential/shielded ledger removed with
+            // crypto_privacy; fetched blob (if any) falls through to the
+            // forward-compat unhandled arm below (logged, not installed).
             "zkml" => {
                 engine
                     .restore_zkml_models(dbytes)

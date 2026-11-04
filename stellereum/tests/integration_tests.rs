@@ -3,8 +3,11 @@
 //! - SVM & Micro-Gas Model
 //! - CLOB Orderbook Actor
 //! - zkML Proofs & Session Keys
-//! - Selective Confidentiality (Pedersen Commitments & Stealth Addresses)
 //! - 3-Tier Price Safety Network & Oracle
+//!
+//! (The Selective Confidentiality section was deleted with the shielded
+//! protocol removal: the commitments and addresses it covered no longer
+//! exist.)
 //! - Genesis Vault & Tokenomics
 //! - MEV Preemption (Blind Rounds)
 //! - Teleport Bridges (Locks & Quorum)
@@ -12,14 +15,10 @@
 
 #[cfg(test)]
 mod tests {
-    use curve25519_dalek::scalar::Scalar;
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
     use stellereum::bridge::{SupportedChain, TeleportBridgeEngine, TeleportDepositEvent};
     use stellereum::cell::{BagOfCells, Cell, PatriciaTrie};
-    use stellereum::crypto_privacy::{
-        ConfidentialTransfer, PedersenCommitment, StealthAddress, ViewingKey,
-    };
     use stellereum::mev::MevPreemptionEngine;
     use stellereum::oracle::{OracleSafetyEngine, PriceFeedUpdate};
     use stellereum::orderbook::{OrderSide, OrderbookActor};
@@ -315,54 +314,6 @@ mod tests {
         let (outputs, proof) = ZkMlProof::prove_reexec(&model, &inputs);
         assert_eq!(outputs, vec![11, 7]);
         assert!(proof.verify_inference());
-    }
-
-    #[test]
-    fn test_pedersen_commitments_and_stealth_addresses() {
-        let r1 = PedersenCommitment::random_blinding();
-        let r2 = PedersenCommitment::random_blinding();
-
-        let c1 = PedersenCommitment::commit(500, &r1);
-        let c2 = PedersenCommitment::commit(300, &r2);
-        assert!(c1.verify(500, &r1));
-
-        let c_sum = c1.add(&c2).expect("Homomorphic addition failed");
-        let r_sum = r1 + r2;
-        assert!(c_sum.verify(800, &r_sum));
-
-        // Confidential Transfer balance conservation test:
-        // Input: 500 + 300 = 800.
-        // Output: 750 with blinding r_out. Fee: 50.
-        // Blinding conservation: r_out = r1 + r2.
-        let r_out = r1 + r2;
-        let c_out = PedersenCommitment::commit(750, &r_out);
-        let transfer = ConfidentialTransfer::new(vec![c1, c2], vec![c_out], 50);
-        assert!(transfer.verify_balance_conservation());
-
-        // Stealth Address
-        let view_priv = Scalar::random(&mut OsRng);
-        let view_pub = (curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT * view_priv)
-            .compress()
-            .to_bytes();
-
-        let spend_priv = Scalar::random(&mut OsRng);
-        let spend_pub = (curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT * spend_priv)
-            .compress()
-            .to_bytes();
-
-        let stealth = StealthAddress::generate(&view_pub, &spend_pub).unwrap();
-        let is_mine = stealth.is_for_recipient(&view_priv, &spend_pub).unwrap();
-        assert!(is_mine);
-
-        // Viewing Key Audit test
-        let auditor_vk = ViewingKey::generate();
-        let blind_audit = PedersenCommitment::random_blinding();
-        let enc_payload =
-            ViewingKey::encrypt_amount_for_auditor(&auditor_vk.view_pub, 12_500, &blind_audit)
-                .unwrap();
-        let (dec_val, dec_blind) = auditor_vk.decrypt_amount(&enc_payload).unwrap();
-        assert_eq!(dec_val, 12_500);
-        assert_eq!(dec_blind, blind_audit);
     }
 
     #[test]

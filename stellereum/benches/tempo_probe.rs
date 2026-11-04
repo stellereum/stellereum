@@ -239,23 +239,14 @@ fn tempo_staking_domain() {
 #[test]
 fn tempo_assemble_hot_vs_streaming() {
     let s = empty_snapshot_with(make_tokens(200, 8), make_contracts(50), make_staking(50));
-    let confidential = stellereum::crypto_privacy::ConfidentialState::new();
     let zkml = stellereum::zkml::ZkMlModelRegistry::default();
-    let reference = stellereum::commitment::commitment_digest_with_confidential_and_zkml(
-        &s,
-        &confidential,
-        &zkml,
-    );
+    let reference = stellereum::commitment::commitment_digest_with_zkml(&s, &zkml);
     let ms_stream = median_ms(10, 2, || {
-        let _ = stellereum::commitment::commitment_digest_with_confidential_and_zkml(
-            &s,
-            &confidential,
-            &zkml,
-        );
+        let _ = stellereum::commitment::commitment_digest_with_zkml(&s, &zkml);
     });
     // Fill every slot once (cold), then time the all-hit steady state.
     let mut cache = DomainCache::default();
-    let gens = [7u64; 14];
+    let gens = [7u64; 13];
     macro_rules! fill {
         ($domain:expr, $build:expr) => {{
             let b: Vec<u8> = $build;
@@ -311,16 +302,12 @@ fn tempo_assemble_hot_vs_streaming() {
             stellereum::commitment::xpc_preimage(&s.cross_shard_xpc)
         ),
         fill!(
-            Domain::Confidential,
-            stellereum::commitment::confidential_preimage(&confidential)
-        ),
-        fill!(
             Domain::Zkml,
             stellereum::commitment::zkml_preimage(&zkml)
         ),
     ];
     let total: usize = domains.iter().map(|b| b.len()).sum();
-    let refs: [&[u8]; 14] = [
+    let refs: [&[u8]; 13] = [
         &domains[0],
         &domains[1],
         &domains[2],
@@ -334,31 +321,30 @@ fn tempo_assemble_hot_vs_streaming() {
         &domains[10],
         &domains[11],
         &domains[12],
-        &domains[13],
     ];
     assert_eq!(assemble_cached_digest(refs), reference, "cached == streaming");
     cache.reset_counters();
     let ms_hot = median_ms(10, 2, || {
-        let mut parts: [Vec<u8>; 14] = std::array::from_fn(|_| Vec::new());
+        let mut parts: [Vec<u8>; 13] = std::array::from_fn(|_| Vec::new());
         for d in Domain::ALL {
             parts[d.index()] = cache.get(d, gens[d.index()]).expect("all-hit");
         }
-        let r: [&[u8]; 14] = [
+        let r: [&[u8]; 13] = [
             &parts[0], &parts[1], &parts[2], &parts[3], &parts[4], &parts[5],
             &parts[6], &parts[7], &parts[8], &parts[9], &parts[10], &parts[11],
-            &parts[12], &parts[13],
+            &parts[12],
         ];
         let _ = assemble_cached_digest(r);
     });
     println!(
-        "[tempo][assemble] preimage_total={total} bytes streaming={} hot(all-hit,14 clones)={} speedup={:.2}x hits={} misses={}",
+        "[tempo][assemble] preimage_total={total} bytes streaming={} hot(all-hit,13 clones)={} speedup={:.2}x hits={} misses={}",
         medal_ms(ms_stream),
         medal_ms(ms_hot),
         if ms_hot > 0.0 { ms_stream / ms_hot } else { f64::INFINITY },
         cache.hits,
         cache.misses,
     );
-    assert_eq!(cache.hits, 14 * 12, "12 timed runs x 14 domains all-hit");
+    assert_eq!(cache.hits, 13 * 12, "12 timed runs x 13 domains all-hit");
     assert_eq!(cache.misses, 0);
 }
 
@@ -460,7 +446,7 @@ fn tempo_batch_verify_blockscale_1000() {
 ///
 /// Same snapshot as `tempo_assemble_hot_vs_streaming` (200 tokens x 8
 /// balances, 50 contracts, 50 validators): reports streaming ms (full
-/// re-walk/re-sort/re-hash), hot-clone ms (14 `Vec` clones + one hash — the
+/// re-walk/re-sort/re-hash), hot-clone ms (13 `Vec` clones + one hash — the
 /// pre-change steady-state cost) and zero-copy ms (`assemble_from_cache`:
 /// the same slot bytes hashed in place, no clones). REPORTS, not gates:
 /// correctness asserts only (all three digests equal, all-hit counters) — a
@@ -469,23 +455,14 @@ fn tempo_batch_verify_blockscale_1000() {
 #[test]
 fn tempo_assemble_zero_copy_vs_hot() {
     let s = empty_snapshot_with(make_tokens(200, 8), make_contracts(50), make_staking(50));
-    let confidential = stellereum::crypto_privacy::ConfidentialState::new();
     let zkml = stellereum::zkml::ZkMlModelRegistry::default();
-    let reference = stellereum::commitment::commitment_digest_with_confidential_and_zkml(
-        &s,
-        &confidential,
-        &zkml,
-    );
+    let reference = stellereum::commitment::commitment_digest_with_zkml(&s, &zkml);
     let ms_stream = median_ms(10, 2, || {
-        let _ = stellereum::commitment::commitment_digest_with_confidential_and_zkml(
-            &s,
-            &confidential,
-            &zkml,
-        );
+        let _ = stellereum::commitment::commitment_digest_with_zkml(&s, &zkml);
     });
     // Fill every slot once (cold), then time the all-hit steady state.
     let mut cache = DomainCache::default();
-    let gens = [7u64; 14];
+    let gens = [7u64; 13];
     macro_rules! fill {
         ($domain:expr, $build:expr) => {{
             let b: Vec<u8> = $build;
@@ -541,16 +518,12 @@ fn tempo_assemble_zero_copy_vs_hot() {
             stellereum::commitment::xpc_preimage(&s.cross_shard_xpc)
         ),
         fill!(
-            Domain::Confidential,
-            stellereum::commitment::confidential_preimage(&confidential)
-        ),
-        fill!(
             Domain::Zkml,
             stellereum::commitment::zkml_preimage(&zkml)
         ),
     ];
     let total: usize = domains.iter().map(|b| b.len()).sum();
-    let refs: [&[u8]; 14] = [
+    let refs: [&[u8]; 13] = [
         &domains[0],
         &domains[1],
         &domains[2],
@@ -564,7 +537,6 @@ fn tempo_assemble_zero_copy_vs_hot() {
         &domains[10],
         &domains[11],
         &domains[12],
-        &domains[13],
     ];
     assert_eq!(assemble_cached_digest(refs), reference, "cached == streaming");
     assert_eq!(
@@ -574,14 +546,14 @@ fn tempo_assemble_zero_copy_vs_hot() {
     );
     cache.reset_counters();
     let ms_hot_clone = median_ms(10, 2, || {
-        let mut parts: [Vec<u8>; 14] = std::array::from_fn(|_| Vec::new());
+        let mut parts: [Vec<u8>; 13] = std::array::from_fn(|_| Vec::new());
         for d in Domain::ALL {
             parts[d.index()] = cache.get(d, gens[d.index()]).expect("all-hit");
         }
-        let r: [&[u8]; 14] = [
+        let r: [&[u8]; 13] = [
             &parts[0], &parts[1], &parts[2], &parts[3], &parts[4], &parts[5],
             &parts[6], &parts[7], &parts[8], &parts[9], &parts[10], &parts[11],
-            &parts[12], &parts[13],
+            &parts[12],
         ];
         let _ = assemble_cached_digest(r);
     });

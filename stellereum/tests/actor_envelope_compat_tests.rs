@@ -20,7 +20,6 @@
 
 use ed25519_dalek::SigningKey;
 use stellereum::bridge::BridgeIntent;
-use stellereum::crypto_privacy::ConfidentialTransfer;
 use stellereum::oracle::PriceFeedUpdate;
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::svm::OpCode;
@@ -296,13 +295,9 @@ fn every_opcode_and_its_discriminant() -> Vec<(OpCode, u32)> {
             OpCode::SysCallBridge(Box::new(BridgeIntent::Release { req_id: 1 })),
             32,
         ),
-        (
-            OpCode::SysCallConfidentialTransfer {
-                recipient: [0; 32],
-                transfer: Box::new(ConfidentialTransfer::new(vec![], vec![], 0)),
-            },
-            33,
-        ),
+        // PQ excision: the shielded transfer opcode (discriminant 33)
+        // removed with Ristretto; 33 stays RESERVED so every pin below
+        // is unchanged.
         (
             OpCode::SysCallActorSend {
                 recipient: [0; 32],
@@ -371,24 +366,9 @@ fn every_opcode_and_its_discriminant() -> Vec<(OpCode, u32)> {
             },
             39,
         ),
-        (
-            OpCode::SysCallConfidentialTransfer2 {
-                recipient: [0; 32],
-                transfer: Box::new(ConfidentialTransfer::new(vec![], vec![], 0)),
-                input_ranges: vec![],
-                output_ranges: vec![],
-            },
-            40,
-        ),
-        (
-            OpCode::SysCallConfidentialShield {
-                commitment: [0; 32],
-                amount: 0,
-                blinding: [0; 32],
-            },
-            41,
-        ),
-        (OpCode::SysCallConfidentialUnshield { inputs: vec![] }, 42),
+        // PQ excision: the three remaining shielded opcodes
+        // (discriminants 40/41/42) removed with Ristretto; all RESERVED
+        // so every pin below is unchanged.
         (
             OpCode::SysCallRotateValidatorKey {
                 old_validator: [0; 32],
@@ -422,7 +402,7 @@ fn every_opcode_and_its_discriminant() -> Vec<(OpCode, u32)> {
 #[test]
 fn appended_discriminant_preserves_every_existing_encoding() {
     let cases = every_opcode_and_its_discriminant();
-    assert_eq!(cases.len(), 47, "OpCode must have exactly 47 variants");
+    assert_eq!(cases.len(), 43, "OpCode list must have exactly 43 entries");
 
     for (op, want) in &cases {
         let bytes = bincode::serialize(op).expect("opcode serializes");
@@ -524,8 +504,9 @@ fn actor_tx_hash_commits_the_body() {
 // 4. A pre-actor decoder fails closed
 // ===========================================================================
 
-/// A modelled PRE-actor node: its `OpCode` enum ends at
-/// `SysCallConfidentialTransfer` - 34 variants, discriminants 0..=33 - and
+/// A modelled PRE-actor node: its `OpCode` enum ends at discriminant 33
+/// (the shielded transfer opcode that lived there, removed since) -
+/// 34 variants, discriminants 0..=33 - and
 /// bincode matches the decoded `u32` index against them. An index it does not
 /// know is a DECODE ERROR, so a payload starting with `SysCallActorSend`
 /// cannot be decoded at all (fail closed), rather than being misread as some

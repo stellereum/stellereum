@@ -1629,11 +1629,8 @@ impl Storage {
                 .await
                 .map_err(|e| anyhow!("restore bridge domain at height {height}: {e}"))?;
         }
-        if let Some(bytes) = self.confidential_at(height)? {
-            tmp.restore_confidential(&bytes)
-                .await
-                .map_err(|e| anyhow!("restore confidential ledger at height {height}: {e}"))?;
-        }
+        // Ristretto deletion wave: confidential/shielded ledger removed with
+        // crypto_privacy; no restore (transparent paths unchanged).
         if let Some(bytes) = self.zkml_models_at(height)? {
             tmp.restore_zkml_models(&bytes)
                 .await
@@ -2440,6 +2437,10 @@ impl GovernanceLegacy {
             // KI-23: legacy storage predates the timelock map — no maturities
             // (pre-timelock Passed executes immediately, one-time migration).
             timelocks: Default::default(),
+            // Operator-signed governance: legacy storage predates signed
+            // nonces — the set starts empty (exact: no signed nonce existed
+            // when those bytes were written, so nothing can be replayed).
+            gov_propose_nonces: Default::default(),
         }
     }
 }
@@ -2784,11 +2785,7 @@ pub async fn load_full_state_into(
                 .await
                 .map_err(|e| anyhow!("restore bridge domain: {e}"))?;
         }
-        if let Some(bytes) = storage.confidential_at(height)? {
-            tmp.restore_confidential(&bytes)
-                .await
-                .map_err(|e| anyhow!("restore confidential ledger: {e}"))?;
-        }
+        // Ristretto deletion wave: confidential ledger removed; no restore.
         if let Some(bytes) = storage.zkml_models_at(height)? {
             tmp.restore_zkml_models(&bytes)
                 .await
@@ -2829,12 +2826,7 @@ pub async fn load_full_state_into(
             .await
             .map_err(|e| anyhow!("restore bridge domain: {e}"))?;
     }
-    if let Some(bytes) = storage.confidential_at(height)? {
-        engine
-            .restore_confidential(&bytes)
-            .await
-            .map_err(|e| anyhow!("restore confidential ledger: {e}"))?;
-    }
+    // Ristretto deletion wave: confidential ledger removed; no restore.
     if let Some(bytes) = storage.zkml_models_at(height)? {
         engine
             .restore_zkml_models(&bytes)
@@ -3253,7 +3245,9 @@ impl AsyncPersistence {
         let snap = DomainSnapshot::capture(engine, staking, governance).await;
         let session_keys = engine.session_keys_snapshot().await;
         let bridge = engine.bridge_snapshot().await;
-        let confidential = engine.confidential_snapshot().await;
+        // Ristretto deletion wave: confidential/shielded ledger removed with
+        // crypto_privacy; persist empty bytes to keep Domains job shape stable.
+        let confidential: Vec<u8> = Vec::new();
         let zkml_models = engine.zkml_models_snapshot().await;
         // Cross-shard replay, engine half (audit F-I): the runtime mirrors are
         // empty wherever this runs (startup healing with a fresh runtime, or
@@ -3954,7 +3948,7 @@ mod tests {
             .expect("encode domains");
         let session_keys = engine.session_keys_snapshot().await;
         let bridge = engine.bridge_snapshot().await;
-        let confidential = engine.confidential_snapshot().await;
+        let confidential: Vec<u8> = Vec::new();
         let zkml_models = engine.zkml_models_snapshot().await;
         let cross_shard = {
             let mut engine_consumed = engine.cross_shard_consumed_snapshot().await;
@@ -4064,7 +4058,7 @@ mod tests {
             .expect("encode domains");
         let session_keys = engine.session_keys_snapshot().await;
         let bridge = engine.bridge_snapshot().await;
-        let confidential = engine.confidential_snapshot().await;
+        let confidential: Vec<u8> = Vec::new();
         let zkml_models = engine.zkml_models_snapshot().await;
         let cross_shard_s = {
             let mut engine_consumed = engine.cross_shard_consumed_snapshot().await;
@@ -4754,7 +4748,7 @@ mod archive_proof_tests {
             .put_bridge(height, &engine.bridge_snapshot().await)
             .unwrap();
         store
-            .put_confidential(height, &engine.confidential_snapshot().await)
+            .put_confidential(height, &Vec::<u8>::new())
             .unwrap();
         store
             .put_zkml_models(height, &engine.zkml_models_snapshot().await)

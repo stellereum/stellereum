@@ -14,7 +14,6 @@ pub mod contract;
 pub mod contract_abi;
 pub mod contract_source;
 pub mod cpat2;
-pub mod crypto_privacy;
 pub mod dns_seeds;
 pub mod evm_adapter;
 pub mod explorer;

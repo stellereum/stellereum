@@ -109,6 +109,16 @@ pub enum GovError {
     /// KI-23 timelock: the proposal passed but its executable height has not
     /// been reached. Fail-closed; the proposal stays `Passed`.
     Timelocked,
+    /// Operator-signed governance identity: the ingest path requires a wallet
+    /// signature and none was supplied. Fail-closed; the legacy unsigned path
+    /// is refused except behind the dev-test escape.
+    MissingSignature,
+    /// The supplied governance signature does not verify against the claimed
+    /// proposer/voter staking key (wrong key, tampered bytes, or wrong chain).
+    BadSignature,
+    /// The proposal nonce was already consumed by this proposer. Fail-closed;
+    /// the caller must mint a fresh nonce and re-sign.
+    ReplayedNonce,
 }
 
 impl std::fmt::Display for GovError {
@@ -124,6 +134,12 @@ impl std::fmt::Display for GovError {
             GovError::AlreadyExecuted => "proposal already executed",
             GovError::Timelocked =>
                 "proposal timelock has not matured (execution refused fail-closed)",
+            GovError::MissingSignature =>
+                "missing governance signature (operator-signed identity required: pass 'signature' over (chain_id || action || nonce))",
+            GovError::BadSignature =>
+                "invalid governance signature (not verifiable against the claimed staking key)",
+            GovError::ReplayedNonce =>
+                "replayed governance nonce (this proposer already consumed this nonce; mint a fresh one)",
             // Names every propose/execute bound (E5 quorum floor 3333 bps,
             // E4 title/signal caps, E6 non-zero publisher) so a rejected
             // action explains the rule at both propose-time and execute-time.
@@ -546,6 +562,20 @@ pub struct Governance {
     /// without this map loads with no maturities (legacy immediate).
     #[serde(default)]
     pub timelocks: HashMap<u64, u64>,
+    /// Consumed operator-signature proposal nonces: (proposer, nonce).
+    ///
+    /// Replay protection for the signed propose path (`propose_signed`):
+    /// a signature binds (chain_id || proposer || title || action || nonce),
+    /// and the nonce is consumed here on success, so a captured envelope can
+    /// never open a second proposal. Votes need no nonce: they are
+    /// proposal-scoped (one vote per voter per proposal, see `vote`), so a
+    /// replayed vote envelope is idempotent-or-refused, never double-counted.
+    /// `#[serde(default)]` so pre-signature storage loads with an empty set
+    /// (exact: no signed nonce existed before this path, nothing to replay).
+    /// Deliberately NOT in the commitment digest: admission replay state, not
+    /// tally state (same precedent as `timelocks`).
+    #[serde(default)]
+    pub gov_propose_nonces: std::collections::HashSet<([u8; 32], u64)>,
 }
 
 /// Coordinated software upgrade plan.
@@ -865,6 +895,7 @@ impl Governance {
             quorum_bps: GOVERNANCE_QUORUM_BPS,
             applied: AppliedParams::default(),
             timelocks: HashMap::new(),
+            gov_propose_nonces: std::collections::HashSet::new(),
         }
     }
 
@@ -981,7 +1012,15 @@ impl Governance {
         if now >= p.voting_end {
             return Err(GovError::VotingClosed);
         }
-        if p.voters.contains_key(&voter) {
+        // Vote-equivocation philosophy (never slash, deterministic outcome):
+        // a replayed vote with the SAME choice is idempotent (returns the
+        // recorded weight, touches neither the tally nor the staking lock —
+        // a replay can never double-count). A DIFFERENT choice is refused
+        // (first choice wins); flipping is not supported.
+        if let Some(prev) = p.voters.get(&voter) {
+            if *prev == choice {
+                return Ok(p.weights.get(&voter).copied().unwrap_or(0));
+            }
             return Err(GovError::AlreadyVoted);
         }
         // Voting weight = the stake THIS voter actually owns:
@@ -1027,6 +1066,157 @@ impl Governance {
         // the lock below cannot disagree.
         ledger.lock_governance(voter, u64::try_from(weight).unwrap_or(u64::MAX));
         Ok(weight)
+    }
+
+    // =======================================================================
+    // OPERATOR-SIGNED GOVERNANCE IDENTITY (ingest-path entry validation).
+    //
+    // A proposal/vote envelope carries a wallet signature over a
+    // chain-bound, length-framed message. Verification binds the envelope to
+    // the SAME staking key whose stake is locked/voted:
+    //   * the envelope's claimed address must EQUAL the proposer/voter, and
+    //   * that address must hold stake in the ledger snapshot the tally
+    //     reads (propose gate / vote snapshot, enforced by `propose`/`vote`
+    //     themselves — a signature from a stakeless key verifies but still
+    //     lands on `NotStaker`, so the check is never theater);
+    //   * the wallet preimage itself binds `chain_id`, so a testnet envelope
+    //     never verifies on another chain.
+    // No new crypto: envelopes are `crate::wallet_signing::WalletSignature`
+    // (Ed25519/Falcon-512/Hybrid), verified by `verify_message`.
+    // =======================================================================
+
+    /// Domain tag for signed proposal envelopes (framing prefix only; the
+    /// chain binding comes from the wallet preimage).
+    pub const GOV_PROPOSE_TAG: &[u8] = b"STELL-GOV-PROPOSE-V1";
+    /// Domain tag for signed vote envelopes.
+    pub const GOV_VOTE_TAG: &[u8] = b"STELL-GOV-VOTE-V1";
+
+    /// Canonical bytes the proposer signs:
+    /// `TAG || 0x00 || chain_id BE || proposer || nonce BE || title || action`.
+    /// Length-framed (no `a||b` vs `ab` ambiguity); the action is the
+    /// canonical JSON of the EXACT `GovAction` the node will apply, so any
+    /// tampered parameter invalidates the envelope.
+    pub fn gov_propose_message(
+        chain_id: u64,
+        proposer: &[u8; 32],
+        title: &str,
+        action: &GovAction,
+        nonce: u64,
+    ) -> Vec<u8> {
+        let action_json = crate::wallet_signing::canonical_json(
+            &serde_json::to_value(action).unwrap_or(serde_json::Value::Null),
+        );
+        let mut out = Vec::with_capacity(
+            Self::GOV_PROPOSE_TAG.len()
+                + 1
+                + 8
+                + 32
+                + 8
+                + 8
+                + title.len()
+                + 8
+                + action_json.len(),
+        );
+        out.extend_from_slice(Self::GOV_PROPOSE_TAG);
+        out.push(0x00);
+        out.extend_from_slice(&chain_id.to_be_bytes());
+        out.extend_from_slice(proposer);
+        out.extend_from_slice(&nonce.to_be_bytes());
+        out.extend_from_slice(&(title.len() as u64).to_be_bytes());
+        out.extend_from_slice(title.as_bytes());
+        out.extend_from_slice(&(action_json.len() as u64).to_be_bytes());
+        out.extend_from_slice(action_json.as_bytes());
+        out
+    }
+
+    /// Canonical bytes the voter signs:
+    /// `TAG || 0x00 || chain_id BE || proposal_id BE || choice || voter`.
+    /// Proposal-scoped by construction: the envelope names its proposal, so
+    /// cross-proposal replay is impossible and same-proposal replay is
+    /// idempotent-or-refused via the voters map (no nonce store needed).
+    pub fn gov_vote_message(
+        chain_id: u64,
+        proposal_id: u64,
+        choice: VoteChoice,
+        voter: &[u8; 32],
+    ) -> Vec<u8> {
+        let choice_byte = match choice {
+            VoteChoice::Yes => 0u8,
+            VoteChoice::No => 1u8,
+            VoteChoice::Abstain => 2u8,
+        };
+        let mut out = Vec::with_capacity(Self::GOV_VOTE_TAG.len() + 1 + 8 + 8 + 1 + 32);
+        out.extend_from_slice(Self::GOV_VOTE_TAG);
+        out.push(0x00);
+        out.extend_from_slice(&chain_id.to_be_bytes());
+        out.extend_from_slice(&proposal_id.to_be_bytes());
+        out.push(choice_byte);
+        out.extend_from_slice(voter);
+        out
+    }
+
+    /// Whether `(proposer, nonce)` was already consumed by a signed proposal.
+    pub fn propose_nonce_used(&self, proposer: &[u8; 32], nonce: u64) -> bool {
+        self.gov_propose_nonces.contains(&(*proposer, nonce))
+    }
+
+    /// Submit a proposal with operator-signed identity. Verifies the envelope
+    /// against the claimed proposer staking key, consumes the nonce, then
+    /// delegates to [`Governance::propose`] (stake gates and tally paths
+    /// unchanged). The nonce is consumed ONLY on success, so a refused
+    /// proposal (bad stake, bad action) does not burn the caller's nonce.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: signed propose needs identity + envelope + ledger context; callers pass them explicitly.
+    pub fn propose_signed(
+        &mut self,
+        ledger: &mut StakingLedger,
+        proposer: ValidatorId,
+        title: String,
+        action: GovAction,
+        now: u64,
+        chain_id: u64,
+        nonce: u64,
+        sig: &crate::wallet_signing::WalletSignature,
+    ) -> Result<u64, GovError> {
+        if sig.claimed_address() != proposer {
+            return Err(GovError::BadSignature);
+        }
+        let message = Self::gov_propose_message(chain_id, &proposer, &title, &action, nonce);
+        if !crate::wallet_signing::verify_message(&proposer, chain_id, &message, sig) {
+            return Err(GovError::BadSignature);
+        }
+        if self.propose_nonce_used(&proposer, nonce) {
+            return Err(GovError::ReplayedNonce);
+        }
+        let id = self.propose(ledger, proposer, title, action, now)?;
+        self.gov_propose_nonces.insert((proposer, nonce));
+        Ok(id)
+    }
+
+    /// Cast a vote with operator-signed identity. Verifies the envelope
+    /// against the claimed voter staking key, then delegates to
+    /// [`Governance::vote`] (weight snapshot, tally, and lock paths
+    /// unchanged — including same-choice idempotency).
+    #[allow(clippy::too_many_arguments)]
+    // GATE: signed vote needs identity + envelope + ledger context; callers pass them explicitly.
+    pub fn vote_signed(
+        &mut self,
+        ledger: &mut StakingLedger,
+        voter: [u8; 32],
+        proposal_id: u64,
+        choice: VoteChoice,
+        now: u64,
+        chain_id: u64,
+        sig: &crate::wallet_signing::WalletSignature,
+    ) -> Result<u128, GovError> {
+        if sig.claimed_address() != voter {
+            return Err(GovError::BadSignature);
+        }
+        let message = Self::gov_vote_message(chain_id, proposal_id, choice, &voter);
+        if !crate::wallet_signing::verify_message(&voter, chain_id, &message, sig) {
+            return Err(GovError::BadSignature);
+        }
+        self.vote(ledger, voter, proposal_id, choice, now)
     }
 
     /// Finalize a proposal after voting ends. Turnout must meet the quorum
@@ -1706,6 +1896,200 @@ mod tests {
                 GOVERNANCE_VOTING_PERIOD_SECS + 1
             ),
             Err(GovError::VotingClosed)
+        );
+    }
+
+    /// Same-choice vote replay is idempotent: the recorded weight is
+    /// returned, the tally does not move, and the staking lock is not
+    /// topped up (a replay can never double-count). A different choice is
+    /// refused (first choice wins) — the vote-equivocation philosophy: never
+    /// slash, deterministic outcome.
+    #[test]
+    fn vote_same_choice_replay_is_idempotent() {
+        let (mut l, ids) = ledger_with(2, 10_000);
+        let mut g = Governance::new();
+        let id = g
+            .propose(&mut l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
+        let w1 = g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
+        let yes_before = g.proposals.get(&id).unwrap().yes;
+        let lock_before = l.locked_governance_of(&ids[0]);
+        // Replay the identical vote: idempotent success, same weight.
+        let w2 = g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
+        assert_eq!(w1, w2, "replay must return the recorded weight");
+        let p = g.proposals.get(&id).unwrap();
+        assert_eq!(p.yes, yes_before, "replay must not move the tally");
+        assert_eq!(p.no, 0);
+        assert_eq!(
+            l.locked_governance_of(&ids[0]),
+            lock_before,
+            "replay must not top up the staking lock"
+        );
+        // A different choice on the same proposal is refused (no flipping).
+        assert_eq!(
+            g.vote(&mut l, ids[0], id, VoteChoice::No, 1),
+            Err(GovError::AlreadyVoted)
+        );
+        assert_eq!(
+            g.proposals.get(&id).unwrap().yes,
+            yes_before,
+            "a refused flip must not move the tally either"
+        );
+    }
+
+    /// Signed proposals: a valid envelope opens the proposal; wrong key,
+    /// tampered bytes, wrong chain, and replayed nonces all fail closed.
+    /// A valid signature from a STAKELESS key still lands on `NotStaker` —
+    /// the binding is to the key whose stake is locked, never theater.
+    #[test]
+    fn propose_signed_binds_key_chain_action_and_nonce() {
+        use crate::wallet_signing::WalletSigningKey;
+        const CHAIN: u64 = 777;
+        let key = WalletSigningKey::ed25519([0xA1u8; 32]);
+        let addr = key.address();
+        let other = WalletSigningKey::ed25519([0xB2u8; 32]);
+        let mut l = StakingLedger::new();
+        l.bond(addr, stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+        let mut g = Governance::new();
+        let title = "raise reward".to_string();
+        let action = GovAction::SetBlockReward(stell(9));
+        let nonce = 7u64;
+        // Valid envelope: opens the proposal and consumes the nonce.
+        let msg = Governance::gov_propose_message(CHAIN, &addr, &title, &action, nonce);
+        let sig = key.sign_message(CHAIN, &msg).unwrap();
+        assert!(!g.propose_nonce_used(&addr, nonce));
+        let id = g
+            .propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, nonce, &sig)
+            .unwrap();
+        assert_eq!(id, 1);
+        assert!(g.propose_nonce_used(&addr, nonce));
+        // Exact replay: same envelope, nonce already consumed.
+        assert_eq!(
+            g.propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, nonce, &sig),
+            Err(GovError::ReplayedNonce)
+        );
+        // Owner double-signs a different title under the same nonce: the
+        // signature verifies (they own the key) but the nonce is spent.
+        let msg2 = Governance::gov_propose_message(CHAIN, &addr, "other title", &action, nonce);
+        let sig2 = key.sign_message(CHAIN, &msg2).unwrap();
+        assert_eq!(
+            g.propose_signed(
+                &mut l,
+                addr,
+                "other title".into(),
+                action.clone(),
+                0,
+                CHAIN,
+                nonce,
+                &sig2
+            ),
+            Err(GovError::ReplayedNonce)
+        );
+        // Wrong key: another key's envelope presented as this proposer.
+        let wrong_msg = Governance::gov_propose_message(CHAIN, &addr, &title, &action, 8);
+        let wrong = other.sign_message(CHAIN, &wrong_msg).unwrap();
+        assert_eq!(
+            g.propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, 8, &wrong),
+            Err(GovError::BadSignature)
+        );
+        // Tampered title: sign one title, present for another.
+        let tampered_msg = Governance::gov_propose_message(CHAIN, &addr, "tampered", &action, 9);
+        let tampered_sig = key.sign_message(CHAIN, &tampered_msg).unwrap();
+        assert_eq!(
+            g.propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, 9, &tampered_sig),
+            Err(GovError::BadSignature)
+        );
+        // Wrong chain: minted elsewhere, refused here.
+        let cross_msg = Governance::gov_propose_message(CHAIN + 1, &addr, &title, &action, 10);
+        let cross = key.sign_message(CHAIN + 1, &cross_msg).unwrap();
+        assert_eq!(
+            g.propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, 10, &cross),
+            Err(GovError::BadSignature)
+        );
+        // Stakeless key with a PERFECTLY valid signature: NotStaker, not Open.
+        let lone = WalletSigningKey::ed25519([0xC3u8; 32]);
+        let lone_addr = lone.address();
+        let lone_msg = Governance::gov_propose_message(CHAIN, &lone_addr, &title, &action, 1);
+        let lone_sig = lone.sign_message(CHAIN, &lone_msg).unwrap();
+        assert_eq!(
+            g.propose_signed(&mut l, lone_addr, title, action, 0, CHAIN, 1, &lone_sig),
+            Err(GovError::NotStaker)
+        );
+    }
+
+    /// Signed votes: a valid envelope records the weight; tampered choice,
+    /// wrong voter, and wrong chain fail closed; same-choice replay is
+    /// idempotent; a stakeless signature lands on `NotStaker`.
+    #[test]
+    fn vote_signed_binds_key_chain_proposal_and_choice() {
+        use crate::wallet_signing::WalletSigningKey;
+        const CHAIN: u64 = 777;
+        let voter_key = WalletSigningKey::ed25519([0xB2u8; 32]);
+        let voter = voter_key.address();
+        let proposer_key = WalletSigningKey::ed25519([0xA1u8; 32]);
+        let proposer = proposer_key.address();
+        let mut l = StakingLedger::new();
+        l.bond(proposer, stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
+        l.bond(voter, stell(20_000), DEFAULT_COMMISSION_BPS).unwrap();
+        let mut g = Governance::new();
+        let id = g
+            .propose(&mut l, proposer, "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
+        // Valid envelope records the weight.
+        let msg = Governance::gov_vote_message(CHAIN, id, VoteChoice::Yes, &voter);
+        let sig = voter_key.sign_message(CHAIN, &msg).unwrap();
+        let w = g
+            .vote_signed(&mut l, voter, id, VoteChoice::Yes, 1, CHAIN, &sig)
+            .unwrap();
+        assert_eq!(w, stell(20_000) as u128);
+        // Same-choice replay: idempotent, tally unmoved.
+        let w2 = g
+            .vote_signed(&mut l, voter, id, VoteChoice::Yes, 1, CHAIN, &sig)
+            .unwrap();
+        assert_eq!(w, w2);
+        assert_eq!(g.proposals.get(&id).unwrap().yes, w);
+        // Different choice with a FRESH valid signature: refused, first wins.
+        let flip_msg = Governance::gov_vote_message(CHAIN, id, VoteChoice::No, &voter);
+        let flip = voter_key.sign_message(CHAIN, &flip_msg).unwrap();
+        assert_eq!(
+            g.vote_signed(&mut l, voter, id, VoteChoice::No, 1, CHAIN, &flip),
+            Err(GovError::AlreadyVoted)
+        );
+        // Tampered choice: Yes-envelope presented as No.
+        assert_eq!(
+            g.vote_signed(&mut l, voter, id, VoteChoice::No, 1, CHAIN, &sig),
+            Err(GovError::BadSignature)
+        );
+        // Wrong voter: proposer's envelope presented as the voter.
+        let impostor_msg = Governance::gov_vote_message(CHAIN, id, VoteChoice::Yes, &voter);
+        let impostor = proposer_key.sign_message(CHAIN, &impostor_msg).unwrap();
+        assert_eq!(
+            g.vote_signed(&mut l, voter, id, VoteChoice::Yes, 1, CHAIN, &impostor),
+            Err(GovError::BadSignature)
+        );
+        // Wrong proposal id: envelope for another proposal.
+        let elsewhere_msg = Governance::gov_vote_message(CHAIN, id + 100, VoteChoice::Yes, &voter);
+        let elsewhere = voter_key.sign_message(CHAIN, &elsewhere_msg).unwrap();
+        assert_eq!(
+            g.vote_signed(&mut l, voter, id, VoteChoice::Yes, 1, CHAIN, &elsewhere),
+            Err(GovError::BadSignature)
+        );
+        // Wrong chain.
+        let cross_msg = Governance::gov_vote_message(CHAIN + 1, id, VoteChoice::Yes, &voter);
+        let cross = voter_key.sign_message(CHAIN + 1, &cross_msg).unwrap();
+        assert_eq!(
+            g.vote_signed(&mut l, voter, id, VoteChoice::Yes, 1, CHAIN, &cross),
+            Err(GovError::BadSignature)
+        );
+        // Stakeless key, valid signature: NotStaker (binding is not theater).
+        let lone = WalletSigningKey::ed25519([0xC3u8; 32]);
+        let lone_addr = lone.address();
+        let lone_msg = Governance::gov_vote_message(CHAIN, id, VoteChoice::Yes, &lone_addr);
+        let lone_sig = lone.sign_message(CHAIN, &lone_msg).unwrap();
+        assert_eq!(
+            g.vote_signed(&mut l, lone_addr, id, VoteChoice::Yes, 1, CHAIN, &lone_sig),
+            Err(GovError::NotStaker)
         );
     }
 

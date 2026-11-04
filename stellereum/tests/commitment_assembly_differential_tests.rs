@@ -12,9 +12,9 @@ use std::collections::HashMap;
 
 use stellereum::commitment::{
     Domain, DomainCache, assemble_cached_digest, assemble_from_cache, books_preimage,
-    bridge_preimage, confidential_preimage, contracts_preimage_cached, cross_shard_preimage,
-    escrow_preimage, governance_preimage, oracle_preimage, pmm_preimage, session_keys_preimage,
-    staking_preimage, tokens_preimage, xpc_preimage, zkml_preimage, CommitmentSnapshot,
+    bridge_preimage, contracts_preimage_cached, cross_shard_preimage, escrow_preimage,
+    governance_preimage, oracle_preimage, pmm_preimage, session_keys_preimage, staking_preimage,
+    tokens_preimage, xpc_preimage, zkml_preimage, CommitmentSnapshot,
 };
 
 fn populated_snapshot(
@@ -218,20 +218,15 @@ fn populated_snapshot(
     s
 }
 
-fn streaming_of(
-    s: &CommitmentSnapshot,
-    confidential: &stellereum::crypto_privacy::ConfidentialState,
-    zkml: &stellereum::zkml::ZkMlModelRegistry,
-) -> [u8; 32] {
-    stellereum::commitment::commitment_digest_with_confidential_and_zkml(s, confidential, zkml)
+fn streaming_of(s: &CommitmentSnapshot, zkml: &stellereum::zkml::ZkMlModelRegistry) -> [u8; 32] {
+    stellereum::commitment::commitment_digest_with_zkml(s, zkml)
 }
 
 /// Clone-path assembly (test mirror of the engine's cached commit path).
 fn assemble_clone(
     s: &CommitmentSnapshot,
-    confidential: &stellereum::crypto_privacy::ConfidentialState,
     zkml: &stellereum::zkml::ZkMlModelRegistry,
-    gens: &[u64; 14],
+    gens: &[u64; 13],
     cache: &mut DomainCache,
 ) -> [u8; 32] {
     macro_rules! fill {
@@ -276,10 +271,9 @@ fn assemble_clone(
             )
         ),
         fill!(Domain::Xpc, xpc_preimage(&s.cross_shard_xpc)),
-        fill!(Domain::Confidential, confidential_preimage(confidential)),
         fill!(Domain::Zkml, zkml_preimage(zkml)),
     ];
-    let refs: [&[u8]; 14] = [
+    let refs: [&[u8]; 13] = [
         &domains[0],
         &domains[1],
         &domains[2],
@@ -293,7 +287,6 @@ fn assemble_clone(
         &domains[10],
         &domains[11],
         &domains[12],
-        &domains[13],
     ];
     assemble_cached_digest(refs)
 }
@@ -365,12 +358,11 @@ fn zero_copy_and_clone_paths_match_streaming_over_randomized_sequences() {
                 actor.allowances.insert((a, b), i as u64);
             }
         }
-        let confidential = stellereum::crypto_privacy::ConfidentialState::new();
         let zkml = stellereum::zkml::ZkMlModelRegistry::default();
         let mut cache = DomainCache::default();
-        let mut gens = [3u64; 14];
-        let reference = streaming_of(&s, &confidential, &zkml);
-        let cloned = assemble_clone(&s, &confidential, &zkml, &gens, &mut cache);
+        let mut gens = [3u64; 13];
+        let reference = streaming_of(&s, &zkml);
+        let cloned = assemble_clone(&s, &zkml, &gens, &mut cache);
         assert_eq!(cloned, reference, "seed {seed:#x}: cold clone-path diverged");
         let zero = assemble_from_cache(&mut cache, &gens)
             .expect("seed: all-hit zero-copy assembly must succeed");
@@ -476,8 +468,8 @@ fn zero_copy_and_clone_paths_match_streaming_over_randomized_sequences() {
                     gens[Domain::Books.index()] += 1;
                 }
             }
-            let cloned = assemble_clone(&s, &confidential, &zkml, &gens, &mut cache);
-            let reference = streaming_of(&s, &confidential, &zkml);
+            let cloned = assemble_clone(&s, &zkml, &gens, &mut cache);
+            let reference = streaming_of(&s, &zkml);
             assert_eq!(
                 cloned, reference,
                 "seed {seed:#x} step {step}: clone-path diverged from streaming"

@@ -18,9 +18,6 @@ use stellereum::consensus::{ValidatorSet, VoteKind};
 use stellereum::consensus_net::{
     parse_incoming, ConsensusMsg, ConsensusNetwork, ConsensusSender, TxGossip, MAX_BATCH_ITEMS,
 };
-use stellereum::crypto_privacy::{
-    ConfidentialTransfer, PedersenCommitment, StealthAddress, ViewingKey,
-};
 use stellereum::mev::MevPreemptionEngine;
 use stellereum::network::CrossShardTransport;
 use stellereum::network::P2pNetworkAdapter;
@@ -8472,16 +8469,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         c0.shard_id, c0.prefix, c1.shard_id, c1.prefix);
                 }
 
-                // 6. Confidential Transfer Verification
-                let r1 = PedersenCommitment::random_blinding();
-                let r2 = PedersenCommitment::random_blinding();
-                let c1 = PedersenCommitment::commit(1000, &r1);
-                let c2 = PedersenCommitment::commit(500, &r2);
-                let r_out = r1 + r2;
-                let c_out = PedersenCommitment::commit(1480, &r_out);
-                let conf_tx = ConfidentialTransfer::new(vec![c1, c2], vec![c_out], 20);
-                assert!(conf_tx.verify_balance_conservation());
-                println!("  [Privacy] Pedersen Confidential Transfer Verified (Homomorphic conservation fee=20)");
+                // 6. Confidential transfers removed with Ristretto deletion wave
+                // (crypto_privacy excised); transparent path continues.
 
                 // 7. Oracle 3-Tier Price Check
                 let price = oracle.resolve_price(None, "TON", now_secs()).unwrap();
@@ -8665,32 +8654,13 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 let pub_bytes = signing_key.verifying_key().to_bytes();
                 let priv_bytes = signing_key.to_bytes();
 
-                let viewing_key = ViewingKey::generate();
-                let spend_priv = curve25519_dalek::scalar::Scalar::from_bytes_mod_order(priv_bytes);
-                let spend_pub = (curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT
-                    * spend_priv)
-                    .compress()
-                    .to_bytes();
-                let stealth = StealthAddress::generate(&viewing_key.view_pub, &spend_pub)
-                    .ok_or_else(|| anyhow::anyhow!("Stealth address generation failed"))?;
-
+                // Shielded keys removed with Ristretto deletion wave
+                // (crypto_privacy excised); transparent ed25519 wallet only.
                 println!("╔═══════════════════════════════════════════════════════════════╗");
                 println!("║                   🔑 NEW STELLEREUM WALLET                   ║");
                 println!("╚═══════════════════════════════════════════════════════════════╝");
                 println!("• Address (Public Key):   {}", hex::encode(pub_bytes));
                 println!("• Private Key:            {}", hex::encode(priv_bytes));
-                println!(
-                    "• Viewing Public Key:     {}",
-                    hex::encode(viewing_key.view_pub)
-                );
-                println!(
-                    "• Viewing Private Key:    {}",
-                    hex::encode(viewing_key.view_priv)
-                );
-                println!(
-                    "• Stealth One-Time Pub:   {}",
-                    hex::encode(stealth.one_time_pub)
-                );
                 println!("\n⚠️  Keep your private keys safe! Do not share them.");
             }
 

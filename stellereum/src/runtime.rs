@@ -467,7 +467,9 @@ impl ApplyLane {
                             crate::storage::DomainSnapshot::capture(&state, &ledger, &gov).await;
                         let session_keys = state.session_keys_snapshot().await;
                         let bridge = state.bridge_snapshot().await;
-                        let confidential = state.confidential_snapshot().await;
+                        // Ristretto excision: shielded ledger removed with crypto_privacy;
+                        // snapshot carries empty bytes (transparent paths unchanged).
+                        let confidential: Vec<u8> = Vec::new();
                         let zkml_models = state.zkml_models_snapshot().await;
                         let _ = job.done.send(Some(SnapBundle {
                             height: job.height,

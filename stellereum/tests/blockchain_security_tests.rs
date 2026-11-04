@@ -8,13 +8,15 @@
 //! 6. Flash-loan price manipulation & Circuit Breaker trip
 //! 7. Stablecoin depeg detection & trading freeze (USDT < $0.95)
 //! 8. Bridge rate-limit & time-lock bypass prevention
-//! 9. Zero-Knowledge confidential balance inflation attack rejection
-//! 10. AI bot session key budget exhaustion & expired key rejection
+//! 9. AI bot session key budget exhaustion & expired key rejection
+//!
+//! (The confidential-balance inflation probe was deleted with the shielded
+//! protocol removal: the commitments and transfer type it attacked no longer
+//! exist.)
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use stellereum::bridge::{SupportedChain, TeleportBridgeEngine};
-use stellereum::crypto_privacy::{ConfidentialTransfer, PedersenCommitment};
 use stellereum::mev::{MevPreemptionEngine, ShamirSecretSharing};
 use stellereum::oracle::{OracleSafetyEngine, PriceFeedUpdate};
 use stellereum::sharding::{
@@ -298,27 +300,6 @@ fn attack_test_bridge_timelock_and_ratelimit_enforcement() {
     assert!(
         rate_limit_res.is_err(),
         "Withdrawal exceeding hourly rate limit MUST be rejected!"
-    );
-}
-
-#[test]
-fn attack_test_confidential_inflation_exploit_rejected() {
-    // Attacker tries to create free tokens out of thin air:
-    // Input commitment: 100 STELL
-    // Output commitment: 1,000 STELL
-    // Fee: 0
-    let r1 = PedersenCommitment::random_blinding();
-    let r2 = PedersenCommitment::random_blinding();
-
-    let c_in = PedersenCommitment::commit(100, &r1);
-    let c_out_inflated = PedersenCommitment::commit(1000, &r2);
-
-    let exploit_transfer = ConfidentialTransfer::new(vec![c_in], vec![c_out_inflated], 0);
-
-    // Homomorphic balance conservation check: sum(in) - sum(out) == fee * G
-    assert!(
-        !exploit_transfer.verify_balance_conservation(),
-        "Confidential token inflation attempt MUST be rejected by homomorphic commitment math!"
     );
 }
 

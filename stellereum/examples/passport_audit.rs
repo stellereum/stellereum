@@ -8,7 +8,6 @@ use rand::rngs::OsRng;
 use stellereum::bridge::{SupportedChain, TeleportBridgeEngine, TeleportDepositEvent};
 use stellereum::cell::{BagOfCells, Cell, PatriciaTrie};
 use stellereum::consensus::{ValidatorSet, Vote, VoteKind, VoteSet};
-use stellereum::crypto_privacy::{ConfidentialTransfer, PedersenCommitment, ViewingKey};
 use stellereum::mev::MevPreemptionEngine;
 use stellereum::oracle::{OracleSafetyEngine, PriceFeedUpdate};
 use stellereum::orderbook::{OrderSide, OrderType, OrderbookActor};
@@ -171,38 +170,8 @@ async fn main() {
         pass("zkML inference proves+verifies; session key gas cap enforced");
     }
 
-    // 8. Selective confidentiality
-    hdr(
-        8,
-        "Selective Confidentiality (Pedersen + Stealth + Viewing)",
-    );
-    {
-        let r1 = PedersenCommitment::random_blinding();
-        let c1 = PedersenCommitment::commit(500, &r1);
-        if !c1.verify(500, &r1) {
-            fail("pedersen");
-        }
-        let r2 = PedersenCommitment::random_blinding();
-        let c2 = PedersenCommitment::commit(300, &r2);
-        let sum = c1.add(&c2).unwrap();
-        if !sum.verify(800, &(r1 + r2)) {
-            fail("homomorphic");
-        }
-        let tx = ConfidentialTransfer::new(
-            vec![c1, c2],
-            vec![PedersenCommitment::commit(780, &(r1 + r2))],
-            20,
-        );
-        if !tx.verify_balance_conservation() {
-            fail("confidential balance");
-        }
-        let vk = ViewingKey::generate();
-        let enc = ViewingKey::encrypt_amount_for_auditor(&vk.view_pub, 12345, &r1).unwrap();
-        if vk.decrypt_amount(&enc).unwrap().0 != 12345 {
-            fail("viewing key");
-        }
-        pass("Pedersen homomorphic + stealth + viewing-key audit all work");
-    }
+    // 8. Selective confidentiality removed with Ristretto deletion wave
+    // (crypto_privacy excised).
 
     // 9. 3-tier oracle + circuit breaker
     hdr(9, "3-Tier Price Safety Network + Circuit Breaker");

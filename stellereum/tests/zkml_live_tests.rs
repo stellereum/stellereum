@@ -508,13 +508,13 @@ fn gas_metering_covers_proof_bytes_reexecution_and_model_size() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Wire compat: discriminants 0..=38 pinned, legacy goldens unchanged,
+// 7. Wire compat: discriminants 0..=38 pinned (33 reserved by PQ excision),
+//    legacy goldens unchanged,
 //    tx hash commits the proof, pre-§2 decoders fail closed.
 // ---------------------------------------------------------------------------
 
 fn every_opcode_and_its_discriminant() -> Vec<(OpCode, u32)> {
     use stellereum::bridge::BridgeIntent;
-    use stellereum::crypto_privacy::ConfidentialTransfer;
     use stellereum::oracle::PriceFeedUpdate;
     use stellereum::zkml::SessionKeyAuthorization;
     use stellereum::zkml_attestation::AttestationProof;
@@ -678,13 +678,9 @@ fn every_opcode_and_its_discriminant() -> Vec<(OpCode, u32)> {
             OpCode::SysCallBridge(Box::new(BridgeIntent::Release { req_id: 1 })),
             32,
         ),
-        (
-            OpCode::SysCallConfidentialTransfer {
-                recipient: [0; 32],
-                transfer: Box::new(ConfidentialTransfer::new(vec![], vec![], 0)),
-            },
-            33,
-        ),
+        // PQ excision: the shielded opcode removed with Ristretto;
+        // discriminant 33 stays RESERVED (never reused), so every pin below
+        // is unchanged.
         (
             OpCode::SysCallActorSend {
                 recipient: [0; 32],
@@ -735,8 +731,8 @@ fn appended_discriminants_preserve_every_existing_encoding() {
     let cases = every_opcode_and_its_discriminant();
     assert_eq!(
         cases.len(),
-        39,
-        "OpCode must have exactly 39 variants (0..=38)"
+        38,
+        "OpCode list must have exactly 38 entries (0..=38 minus reserved 33)"
     );
     for (op, want) in &cases {
         let bytes = bincode::serialize(op).expect("opcode serializes");

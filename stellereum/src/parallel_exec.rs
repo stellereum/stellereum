@@ -206,13 +206,6 @@ pub fn extract_access_keys(tx: &Transaction) -> Vec<ResourceKey> {
                 keys.push(ResourceKey::Global);
             }
 
-            OpCode::SysCallConfidentialTransfer { .. }
-            | OpCode::SysCallConfidentialTransfer2 { .. }
-            | OpCode::SysCallConfidentialShield { .. }
-            | OpCode::SysCallConfidentialUnshield { .. } => {
-                keys.push(ResourceKey::Global);
-            }
-
             OpCode::SysCallActorSend { recipient, .. } => {
                 keys.push(ResourceKey::Actor);
                 keys.push(ResourceKey::Account(*recipient));

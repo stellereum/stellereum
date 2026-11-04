@@ -109,7 +109,7 @@ async fn store_paired_snapshot(
         .put_bridge(height, &engine.bridge_snapshot().await)
         .unwrap();
     store
-        .put_confidential(height, &engine.confidential_snapshot().await)
+        .put_confidential(height, &Vec::<u8>::new())
         .unwrap();
     store
         .put_zkml_models(height, &engine.zkml_models_snapshot().await)

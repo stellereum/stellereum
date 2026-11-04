@@ -26,6 +26,13 @@
 - Native CLOB order book, bridge and oracle on-chain — no external DeFi needed
 - Runs a validator on 1 vCPU: no datacenter hardware required
 
+## The STELL token
+
+- **Gas**: every transaction pays fees in STELL (floor-aware estimates)
+- **Staking**: bond STELL to validate or delegate; rewards accrue per epoch
+- **Security budget**: 5% equivocation slash and 0.1% downtime slash are denominated in STELL
+- Testnet STELL has no value — faucet coins are for testing only
+
 ## Quickstart
 
 ```bash

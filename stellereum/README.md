@@ -3,7 +3,7 @@
   <img src="docs/brand/logo-black.svg#gh-light-mode-only" width="160" alt="Stellereum logo"/>
 </p>
 
-<h1 align="center">Stellereum Network (STELL)</h1>
+<h1 align="center">Stellereum Network</h1>
 
 <p align="center">
   <strong>Post-quantum Layer-1 blockchain, rebuilt in pure Rust.</strong><br/>

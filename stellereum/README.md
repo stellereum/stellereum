@@ -1,5 +1,10 @@
 # Stellereum Network (STELL)
 
+<p align="center">
+  <img src="docs/brand/logo-white.svg#gh-dark-mode-only" width="140" alt="Stellereum logo"/>
+  <img src="docs/brand/logo-black.svg#gh-light-mode-only" width="140" alt="Stellereum logo"/>
+</p>
+
 **Post-quantum Layer-1 blockchain, rebuilt in pure Rust.**
 Tendermint-style BFT, Falcon-512 signatures, actor accounts, on-chain order book —
 a full node on lightweight hardware. Open source, quantum-safe, and yours.

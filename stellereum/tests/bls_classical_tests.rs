@@ -52,12 +52,11 @@ fn default_startup_still_refuses_bls_qc_counting() {
     let _restore = EnvRestore::save(&[BLS_QC_ENV]);
 
     // Default (unset): no refusal — the Ed25519 baseline starts as before.
+    // GATE (HDAE wire-EMIT cut): the `QcBlsConfig::default().enabled` pin lived
+    // here; the shell is deleted (zero live users), and the gate-OK assert
+    // above already pins default-OFF.
     std::env::remove_var(BLS_QC_ENV);
     assert!(refuse_bls_qc_if_enabled().is_ok());
-    assert!(
-        !QcBlsConfig::default().enabled,
-        "default config must never count BLS power"
-    );
 
     // Enabled still hard-refuses: consensus MUST NOT count BLS aggregate QCs
     // on the default/PQ path.

@@ -11,15 +11,17 @@
 //! happen to share an address.
 //!
 //! It EXTENDS the existing hardening, it does not replace it: the IP bucket,
-//! strike and deadline checks all stay exactly as they are. Identity checks
-//! run at the CHALLENGE gate (claimed id) and on the authed path (proven id).
+//! strike and deadline checks all stay exactly as they are. The identity
+//! gate reads (never debits) the claimed id pre-auth; debits apply only
+//! to the proven id on the authed path.
 //!
 //! ## Score model
 //!
 //! * `+reward` on a valid handshake / accepted message (good citizen).
 //! * `-pen_*` on auth failure, oversize frame, rate-limit violation and
 //!   protocol violation (bad signature, stale frame, src mismatch, decrypt
-//!   failure). Scores clamp to `[REP_SCORE_MIN, REP_SCORE_MAX]`.
+//!   failure) by the PROVEN identity only — pre-auth failures debit nobody.
+//!   Scores clamp to `[REP_SCORE_MIN, REP_SCORE_MAX]`.
 //! * Soft threshold: while `score <= soft` (and not banned) the identity is
 //!   **throttled** — its handshakes are refused fail-closed, but no ban is
 //!   imposed; decay alone can lift it out.
@@ -43,12 +45,15 @@
 //! * Refusals that are *caused by* reputation carry NO extra penalty —
 //!   penalising a refused handshake would make soft throttle permanent and
 //!   defeat decay.
-//! * Framing caveat (accepted, same direction as the existing IP strikes):
-//!   pre-auth attribution uses the *claimed* node id, which an attacker can
-//!   spoof. Impact is bounded (temporary, decaying, escalating only on
-//!   repeats) and the IP layer still binds the sender's address. Uniform
-//!   attribution keeps every refusal path auditable instead of sprinkling
-//!   per-site exceptions.
+//! * Attribution rule (framing-impossible): failures are debited ONLY to
+//!   the proven post-handshake identity (`authed` pid in `frame_loop` /
+//!   `handle_stream`, set after a valid CHALLENGE). Pre-auth failures and
+//!   frames whose claimed id does not match the proven id are NEVER
+//!   debited to any identity — the connection is dropped fail-closed
+//!   instead (the per-IP strike still binds the sender's address). A
+//!   claimed id is unproven bytes any sender can stamp, so debiting it
+//!   would let an attacker frame honest ids into temp-bans. The CHALLENGE
+//!   gate below reads (never writes) reputation: refusals carry no penalty.
 //! * App-layer policy refusals (oversized DHT value, bad TTL, ACL deny,
 //!   unknown service) are well-formed requests answered with an error —
 //!   they are NOT peer-abuse signals and carry no penalty. Only

@@ -194,22 +194,19 @@ pub const ROUND_LOOKBACK: Round = 8;
 pub const MAX_COMMIT_CERT_SIGNERS: usize = 4_096;
 
 // ============================================================================
-// BLS aggregate envelopes (additive to the Ed25519 list — see bls.rs)
+// BLS aggregate envelopes (RETIRED emit; inert history metadata — see bls.rs)
 // ============================================================================
 
-/// Magic prefix of a vote `signature` that carries a BLS half beside the
-/// Ed25519 one: `VOTE_BLS_MAGIC || ed25519_sig(64) || bls_sig(96)`.
-///
-/// Rides INSIDE the existing `signature: Vec<u8>` so `Vote`'s bincode layout
-/// is untouched: a flag-off node (the default, and the live stand) produces
-/// and sees plain 64-byte signatures exactly as before, and only votes from a
-/// node with `STELL_BLS_QC=1` grow the envelope.
-pub const VOTE_BLS_MAGIC: &[u8; 16] = b"STELL_VOTEBLS_V1";
-/// Size of the BLS half of an envelope vote signature.
-pub const VOTE_BLS_PART_LEN: usize = 16 + 64 + 96;
+// REMOVED (BLS vote-envelope emit): `VOTE_BLS_MAGIC` (`b"STELL_VOTEBLS_V1"`) and
+// `VOTE_BLS_PART_LEN` lived here. No live writer remains (proven by grep: the
+// only producer `attach_vote_bls` was deleted with the counting path; assembly
+// copies only `ed25519_signature()` into certificates, so stored history never
+// carries vote-level BLS envelopes). The strip branches in
+// `ed25519_sig_bytes` / `attach_vote_falcon` are straight-lined to the live
+// Falcon (v2) envelope below. CLOSED TESTNET: no wire compat needed.
 
 /// Marker "validator id" for the BLS aggregate envelope entry carried inside
-/// `QuorumCertificate::signatures`.
+/// `QuorumCertificate::signatures` (RETIRED emit; inert history-parse key).
 ///
 /// `[0xFF; 32]` as an unmintable sentinel: a verifier that predates this
 /// format skips the entry through the SAME membership check every other entry
@@ -222,39 +219,28 @@ pub const VOTE_BLS_PART_LEN: usize = 16 + 64 + 96;
 /// aggregate (its Ed25519 list is then short, and the marker counts for
 /// nothing).
 pub const BLS_QC_MARKER_ID: ValidatorId = [0xFF; 32];
-/// Magic prefix of a certificate's BLS envelope payload.
+/// Magic prefix of a certificate's BLS envelope payload (v1 HISTORY reader).
+///
+/// Kept for [`decode_qc_bls_envelope`] only: the EMIT side
+/// ([`encode_qc_bls_envelope`]) is retired and returns empty. Storage v1
+/// readers stay (history compat, no wipe needed).
 pub const QC_BLS_MAGIC: &[u8; 16] = b"STELL_QC_BLS_V1_";
 
-/// Encode a BLS aggregate as the payload of the marker entry in
-/// `QuorumCertificate::signatures`. Self-describing and bound to this
-/// certificate's fields:
-/// `QC_BLS_MAGIC(16) || height u64le || round u32le || kind u8 || block_hash(32)
-///  || total_validators u32le || sig(96) || bitvector(ceil(total/8))`.
+/// Encode a BLS aggregate as the payload of the marker entry (RETIRED emit).
+///
+/// Always returns empty: no live path attaches BLS envelopes (proven by grep:
+/// the only assembly call site was deleted with the counting path; the only
+/// remaining callers are test READ fixtures, which hand-build history bytes).
+/// CLOSED TESTNET: no wire compat needed on EMIT. The PARSE side
+/// ([`decode_qc_bls_envelope`]) is untouched (storage v1 readers stay).
 pub fn encode_qc_bls_envelope(
-    aggregate: &crate::bls::BlsAggregateSignature,
-    height: Height,
-    round: Round,
-    kind: VoteKind,
-    block_hash: Option<BlockHash>,
+    _aggregate: &crate::bls::BlsAggregateSignature,
+    _height: Height,
+    _round: Round,
+    _kind: VoteKind,
+    _block_hash: Option<BlockHash>,
 ) -> Vec<u8> {
-    let (sig, bits) = aggregate.to_bytes();
-    let total = aggregate.participants.total_validators();
-    let mut out = Vec::with_capacity(16 + 8 + 4 + 1 + 32 + 4 + 96 + bits.len());
-    out.extend_from_slice(QC_BLS_MAGIC);
-    out.extend_from_slice(&height.to_le_bytes());
-    out.extend_from_slice(&round.to_le_bytes());
-    out.push(match kind {
-        VoteKind::Prevote => 0,
-        VoteKind::Precommit => 1,
-    });
-    match block_hash {
-        Some(h) => out.extend_from_slice(&h),
-        None => out.extend_from_slice(&[0u8; 32]),
-    }
-    out.extend_from_slice(&(total as u32).to_le_bytes());
-    out.extend_from_slice(&sig);
-    out.extend_from_slice(bits);
-    out
+    Vec::new()
 }
 
 /// Decode a marker-entry payload. Returns `None` on ANY malformed input —
@@ -308,16 +294,11 @@ pub fn decode_qc_bls_envelope(
     ))
 }
 
-/// The Ed25519 half of a vote/certificate signature entry: strips the BLS
-/// or Falcon envelope when present. Plain 64-byte signatures pass through untouched, so
-/// this is a no-op for every certificate and vote produced with the BLS/Falcon flags
-/// off.
-#[allow(clippy::if_same_then_else)]
-// GATE: BLS and Falcon envelopes share the same Ed25519 slice; keeping branches explicit preserves auditability.
+/// The Ed25519 half of a vote/certificate signature entry: strips the live
+/// Falcon envelope when present. Plain 64-byte signatures pass through untouched.
+// GATE: single live envelope (Falcon v2) keeps the straight-line strip auditable.
 pub fn ed25519_sig_bytes(signature: &[u8]) -> &[u8] {
-    if signature.len() == VOTE_BLS_PART_LEN && signature.starts_with(VOTE_BLS_MAGIC) {
-        &signature[16..80]
-    } else if signature.len() == VOTE_FALCON_PART_LEN && signature.starts_with(VOTE_FALCON_MAGIC) {
+    if signature.len() == VOTE_FALCON_PART_LEN && signature.starts_with(VOTE_FALCON_MAGIC) {
         &signature[16..80]
     } else {
         signature
@@ -446,15 +427,12 @@ impl BlockProposerExt for crate::sharding::Block {
 }
 
 /// Attach a Falcon-512 signature to an existing vote signature (creating or updating the envelope).
-#[allow(clippy::if_same_then_else)]
-// GATE: BLS and Falcon envelopes share the same Ed25519 extraction; explicit branches keep wire-format handling auditable.
+// GATE: single live envelope (Falcon v2); the retired BLS branch was stripped (no wire compat on emit).
 pub fn attach_vote_falcon(key: &FalconKeypair, msg: &[u8], signature: &mut Vec<u8>) {
     let falcon_sig = key.sign(msg);
     let mut ed = vec![0u8; 64];
     if signature.len() == 64 {
         ed.copy_from_slice(signature);
-    } else if signature.len() == VOTE_BLS_PART_LEN && signature.starts_with(VOTE_BLS_MAGIC) {
-        ed.copy_from_slice(&signature[16..80]);
     } else if signature.len() == VOTE_FALCON_PART_LEN && signature.starts_with(VOTE_FALCON_MAGIC) {
         ed.copy_from_slice(&signature[16..80]);
     }
@@ -526,12 +504,10 @@ pub struct VrfBeaconSeal {
 }
 
 impl VrfBeaconSeal {
-    pub fn new(validator_id: ValidatorId, proof: crate::vrf::VrfProof) -> Self {
-        Self {
-            validator_id,
-            proof,
-        }
-    }
+    // REMOVED (seal minting): `VrfBeaconSeal::new` lived here. No live caller
+    // remains (proven by grep: assembly mints no seals — `vrf_beacon_seal_for`
+    // always returns `None` — and verifiers never consult the field). The TYPE
+    // stays for wire/history parse (trailing serde-defaulted field).
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -602,15 +578,10 @@ impl PqMicroCertificate {
         }
     }
 
-    /// Attach a VRF beacon seal (RETIRED, inert).
-    ///
-    /// Kept for wire-compat construction in tests: assembly never calls this
-    /// (no seal is minted or embedded), and verifiers never consult the seal.
-    /// A `Some` seal on the wire resolves to the legacy parent-hash draw.
-    pub fn with_vrf_beacon(mut self, seal: VrfBeaconSeal) -> Self {
-        self.vrf_beacon = Some(seal);
-        self
-    }
+    // REMOVED (seal install): `with_vrf_beacon` lived here. No caller remains
+    // (proven by grep: zero users in src/, tests/, benches/, examples/; assembly
+    // mints no seals and verifiers never consult the field). The TYPE + field
+    // stay for wire/history parse.
 
     /// Legacy head-count quorum threshold for this micro-committee:
     /// floor(2*k/3) + 1.
@@ -2873,8 +2844,8 @@ impl VoteSet {
             let committee_size = micro_committee_size(validators.len());
             if committee_size > 0 {
                 // VRF election (RETIRED — ECVRF classical, bodies removed):
-                // the seal is never consulted; the v5 parent-hash draw
-                // applies byte-for-byte (canonical draw). `seal`,
+                // the seal is never minted and never travels: the v5 parent-hash
+                // draw applies byte-for-byte (canonical draw). `seal`,
                 // `activation`, and `registry` are accepted for API
                 // compatibility and ignored.
                 let verified_output: Option<[u8; 32]> = None;
@@ -2889,8 +2860,8 @@ impl VoteSet {
                 );
                 // No seal ever travels with the certificate: verifiers resolve
                 // the same legacy committee, so embedding anything would only
-                // risk divergence.
-                let embedded_seal = None;
+                // risk divergence. (EMBED retired: `vrf_beacon` is always `None`
+                // on EMIT; the field stays for history parse only.)
                 let get_sig_for_committee_member = |val_id: &ValidatorId| -> Option<Vec<u8>> {
                     if let Some(sig) = falcon_sigs.get(val_id) {
                         return Some(sig.clone());
@@ -2960,13 +2931,12 @@ impl VoteSet {
                         committee_size,
                         signers_bitmask: bitmask,
                         signatures: uqc_signatures,
-                        // The parent hash the committee was elected with: a
-                        // verifier re-derives the committee from it, and the
-                        // block-apply path pins it to the block's own parent.
-                        sortition_parent: *parent_hash,
-                        // Some only when the VRF committee above was elected
-                        // from this seal (legacy path: None, today's bytes).
-                        vrf_beacon: embedded_seal,
+                    // The parent hash the committee was elected with: a
+                    // verifier re-derives the committee from it, and the
+                    // block-apply path pins it to the block's own parent.
+                    sortition_parent: *parent_hash,
+                    // EMBED retired: never `Some` on EMIT (history parse only).
+                    vrf_beacon: None,
                     };
                     qc.attach_pq_micro_certificate(&uqc);
                 }
@@ -3510,41 +3480,11 @@ impl QuorumCertificate {
 
     /// Attach a post-quantum micro-certificate (µQC) to this QuorumCertificate.
     ///
-    /// Unsealed certificates encode to the canonical envelope
-    /// ([`encode_pq_micro_envelope`]) — today's bytes bit-for-bit. A sealed
-    /// (retired VRF seal, old bytes only) certificate travels as `QC_UQC_MAGIC || bincode(cert)`,
-    /// read back by the existing bincode fallback in
-    /// [`decode_pq_micro_envelope`]: the canonical envelope has no room for
-    /// the trailing serde-defaulted seal field, and extending it would change
-    /// the wire beyond that field. Old binaries decode the bincode form with
-    /// their own fallback and ignore the trailing seal (`#[serde(default)]`
-    /// → `None` → legacy draw), so mixed versions agree on the serde layer.
+    /// Always the canonical envelope ([`encode_pq_micro_envelope`]) — today's
+    /// bytes bit-for-bit. EMBED retired: a sealed (retired VRF seal, old bytes
+    /// only) certificate is never produced; such history bytes still read back
+    /// through the existing bincode fallback in [`decode_pq_micro_envelope`].
     pub fn attach_pq_micro_certificate(&mut self, uqc: &PqMicroCertificate) {
-        let payload = match &uqc.vrf_beacon {
-            None => encode_pq_micro_envelope(uqc),
-            Some(_) => {
-                let mut out = QC_UQC_MAGIC.to_vec();
-                match bincode::serialize(uqc) {
-                    Ok(body) => out.extend_from_slice(&body),
-                    // Unreachable for an in-memory struct (no IO, no size
-                    // cap); fall back to the canonical envelope rather than
-                    // panic on the consensus path. The seal is dropped in
-                    // that case, so the certificate verifies as legacy.
-                    Err(_) => return self.attach_legacy_micro_certificate(uqc),
-                }
-                out
-            }
-        };
-        self.signatures
-            .retain(|(voter, _)| *voter != PQ_UQC_MARKER_ID);
-        self.signatures.push((PQ_UQC_MARKER_ID, payload));
-    }
-
-    /// Attach the canonical envelope unconditionally (legacy bytes).
-    ///
-    /// Used as the serialization fallback above; every other caller passes
-    /// through [`Self::attach_pq_micro_certificate`].
-    fn attach_legacy_micro_certificate(&mut self, uqc: &PqMicroCertificate) {
         let payload = encode_pq_micro_envelope(uqc);
         self.signatures
             .retain(|(voter, _)| *voter != PQ_UQC_MARKER_ID);
@@ -7505,6 +7445,8 @@ mod post_quantum_uqc_tests {
         // the marker, and attribution mirrors verify — the decodable-but-
         // unverifiable envelope attributes NOBODY. (Genuine-BLS attribution
         // with the path enabled is pinned by the v34_r2e integration test.)
+        // GATE (HDAE wire-EMIT cut): the envelope is hand-built HISTORY bytes
+        // (the retired `encode_qc_bls_envelope` returns empty and is NOT used).
         let mut ids_sorted = ids.clone();
         ids_sorted.sort_unstable();
         let mut bitvec = crate::bls::SignerBitVector::new(ids_sorted.len());
@@ -7515,8 +7457,16 @@ mod post_quantum_uqc_tests {
             signature: dummy_sig,
             participants: bitvec,
         };
-        let bls_payload =
-            encode_qc_bls_envelope(&dummy_agg, 1, 0, VoteKind::Precommit, Some([0xAA; 32]));
+        let (sig_bytes, bits) = dummy_agg.to_bytes();
+        let mut bls_payload = Vec::with_capacity(16 + 8 + 4 + 1 + 32 + 4 + 96 + bits.len());
+        bls_payload.extend_from_slice(QC_BLS_MAGIC);
+        bls_payload.extend_from_slice(&1u64.to_le_bytes());
+        bls_payload.extend_from_slice(&0u32.to_le_bytes());
+        bls_payload.push(1);
+        bls_payload.extend_from_slice(&[0xAA; 32]);
+        bls_payload.extend_from_slice(&(ids_sorted.len() as u32).to_le_bytes());
+        bls_payload.extend_from_slice(&sig_bytes);
+        bls_payload.extend_from_slice(bits);
         let bls_qc = QuorumCertificate {
             height: 1,
             round: 0,

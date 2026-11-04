@@ -308,36 +308,10 @@ impl Frame {
     }
 }
 
-// PQ HANDSHAKE (default-ON since PQ 9.1; explicit opt-out
-// `STELL_INF_PQ_HANDSHAKE=0`, honored pre-H only — see `pq_handshake_active`
-// and the height gate below). Additive only: every item below is new; no
-// existing function, layout, or domain string above is modified, so an
-// opted-out node (or a classical peer's absence of `pq_*`) still takes the
-// classical path byte-identical to before.
-//
-// Design (mirrors `pq_transport.rs` shapes + `docs/PQ_TRANSPORT_PLAN.md` §3/§5):
-// - KEX: ephemeral ML-KEM-768 per handshake (vendored `ml-kem` crate; keygen
-//   via `from_seed` over fresh OS randomness, encap via deterministic entry
-//   point over a fresh random `m` — byte-equivalent to `encapsulate_with_rng`,
-//   which is unavailable: `ml-kem` is built without its `getrandom` feature
-//   and `rand 0.8`'s `OsRng` does not implement `rand_core 0.10`'s `CryptoRng`).
-// - Auth (INTERIM, honest): the transcript digest is MACed with
-//   `blake3::keyed_hash` keyed by the ML-KEM shared secret. This proves the
-//   peer processed THIS `{ek, ct, eph, frames}` binding and is verified BEFORE
-//   any session key is derived (fail closed, mirrors the classical
-//   sig-before-session ordering). It is NOT a Falcon-512 signature: no
-//   Falcon crate is vendored (lead-gated per plan §7), so long-term PQ
-//   identity stays classical (`NodeId` unchanged, see `keyring.rs`). The
-//   transcript layout is final-shaped so a future Falcon backend signs the
-//   SAME digest bytes without wire churn.
-// - Mixed-mode (plan §5, window semantics): a peer that offers no PQ fields
-//   handshakes classically in both directions; a classical-only node NEVER
-//   treats unknown `pq_*` JSON fields as errors (payload parsing reads known
-//   keys only). Explicitly offered PQ that is malformed, versioned wrong, or
-//   mistagged is REFUSED with a clear error (no silent downgrade).
-// - Channel binding is a zeroed 32-byte field until the QUIC/TLS exporter
-//   label is pinned (same caveat as `pq_transport.rs`); the domain string
-//   pins the label slot meanwhile. Follow-up, not silent.
+// PQ HANDSHAKE (default-ON since PQ 9.1; opt-out `STELL_INF_PQ_HANDSHAKE=0` pre-H only;
+// additive only — mirrors pq_transport.rs + docs/PQ_TRANSPORT_PLAN.md §3/§5).
+// KEX ephemeral ML-KEM-768; auth INTERIM keyed-hash MAC (NOT Falcon, plan §7), verified BEFORE
+// session derivation (fail closed); malformed PQ REFUSED (no silent downgrade); binding zeroed till exporter pinned.
 
 /// Env gate for the PQ handshake (shared name for both reads below; no new
 /// env knobs — the opt-out reuses this same variable, inverted).

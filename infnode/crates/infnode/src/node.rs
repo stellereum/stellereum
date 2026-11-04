@@ -1068,8 +1068,9 @@ impl Node {
         self.rep_apply(*pid, d).await;
     }
 
-    /// F8-rep: debit a failed authentication attempt (bad sig, stale,
-    /// replay, key mismatch, unknown identity).
+    /// F8-rep: debit a failed authentication by the PROVEN (post-handshake)
+    /// identity. Pre-auth failures never reach this: the claimed id is
+    /// unproven, so the connection is dropped with no identity debit.
     pub async fn rep_record_auth_failure(&self, pid: &[u8; NODEID_LEN]) {
         let d = RepConfig::load().pen_auth;
         self.rep_apply(*pid, -d).await;
@@ -1089,8 +1090,10 @@ impl Node {
         self.rep_apply(*pid, -d).await;
     }
 
-    /// F8-rep: debit a protocol violation (bad signature, stale frame, src
-    /// mismatch, decrypt failure, unauthenticated non-CHALLENGE frame).
+    /// F8-rep: debit a protocol violation by the PROVEN (post-handshake)
+    /// identity (bad signature, stale frame, src mismatch, decrypt
+    /// failure). Pre-auth sources are unproven: unauthenticated frames drop
+    /// the connection with no identity debit.
     pub async fn rep_record_protocol_violation(&self, pid: &[u8; NODEID_LEN]) {
         let d = RepConfig::load().pen_proto;
         self.rep_apply(*pid, -d).await;
@@ -7145,13 +7148,16 @@ async fn handle_stream(
             node.metrics.rep_refusals.fetch_add(1, Ordering::Relaxed);
             bail!("reputation throttled");
         }
-        // F8-rep: every failure below attributes an auth-failure debit to the
-        // claimed identity (uniform, fail-closed; see `crate::reputation` for
-        // the framing tradeoff shared with the IP strikes).
+        // F8-rep: failures below NEVER debit an identity. `claimed` is
+        // unproven pre-auth (any sender can put any src on the wire), so a
+        // debit here would let an attacker frame honest ids into temp-bans.
+        // The connection is dropped fail-closed instead (Err closes it in
+        // the pre-auth caller; the per-IP strike still binds the sender's
+        // address). Only the proven post-handshake id (`authed` pid, set
+        // after a valid CHALLENGE) is ever debited — see the authed path.
         let ch: serde_json::Value = match serde_json::from_slice(&f.payload) {
             Ok(v) => v,
             Err(e) => {
-                node.rep_record_auth_failure(&claimed).await;
                 return Err(e.into());
             }
         };
@@ -7161,14 +7167,12 @@ async fn handle_stream(
         let (ch_nonce, ch_eph, ch_ed, ch_x) = match challenge_fields(&ch) {
             Ok(v) => v,
             Err(e) => {
-                node.rep_record_auth_failure(&claimed).await;
                 return Err(e);
             }
         };
         // Рамочный ts — ДО любых side-эффектов (регистрация TOFU-пира,
         // сессии, маршруты): протухший кадр не оставляет следов.
         if !ts_ok(f.ts) {
-            node.rep_record_auth_failure(&claimed).await;
             bail!("stale challenge");
         }
         // read-guard в {} освобождается ДО взятия write-lock в add_dynamic_peer (иначе deadlock)
@@ -7177,7 +7181,6 @@ async fn handle_stream(
             let peer = match node.peers.read().await.get(&claimed).cloned() {
                 Some(p) => p,
                 None => {
-                    node.rep_record_auth_failure(&claimed).await;
                     bail!("peer disappeared");
                 }
             };
@@ -7186,19 +7189,16 @@ async fn handle_stream(
             let pinned_ed = match peer.cfg.ed_bytes() {
                 Ok(b) => b,
                 Err(e) => {
-                    node.rep_record_auth_failure(&claimed).await;
                     return Err(e);
                 }
             };
             let pinned_x = match peer.cfg.x_bytes() {
                 Ok(b) => b,
                 Err(e) => {
-                    node.rep_record_auth_failure(&claimed).await;
                     return Err(e);
                 }
             };
             if ch_ed != pinned_ed || ch_x != pinned_x {
-                node.rep_record_auth_failure(&claimed).await;
                 bail!("challenge key mismatch");
             }
             peer
@@ -7210,16 +7210,13 @@ async fn handle_stream(
             let vk = match VerifyingKey::from_bytes(&ed) {
                 Ok(v) => v,
                 Err(e) => {
-                    node.rep_record_auth_failure(&claimed).await;
                     return Err(e.into());
                 }
             };
             if claimed != blake3::hash(vk.as_bytes()).as_bytes()[..NODEID_LEN] {
-                node.rep_record_auth_failure(&claimed).await;
                 bail!("claimed node id does not match public key");
             }
             if !f.verify(&vk) {
-                node.rep_record_auth_failure(&claimed).await;
                 bail!("unknown node could not sign the challenge");
             }
             // детект MITM: если этот node_id уже видели с ДРУГИМ ключом — отказ + громкое предупреждение
@@ -7232,7 +7229,6 @@ async fn handle_stream(
                         known.ed_hex,
                         ed_hex
                     );
-                    node.rep_record_auth_failure(&claimed).await;
                     bail!("node key changed (possible MITM)");
                 }
             }
@@ -7252,7 +7248,6 @@ async fn handle_stream(
                 storage_roles: vec![],
             };
             if let Err(e) = node.add_dynamic_peer(claimed, pcfg).await {
-                node.rep_record_auth_failure(&claimed).await;
                 return Err(e);
             }
             // TOFU: показываем оператору отпечаток для ручной проверки (как SSH fingerprint)
@@ -7266,29 +7261,24 @@ async fn handle_stream(
             match node.peers.read().await.get(&claimed).cloned() {
                 Some(p) => p,
                 None => {
-                    node.rep_record_auth_failure(&claimed).await;
                     bail!("dynamic peer did not appear");
                 }
             }
         } else {
-            node.rep_record_auth_failure(&claimed).await;
             bail!("unknown node claiming {}", hex::encode(claimed));
         };
         let vk = match peer.cfg.ed_bytes() {
             Ok(b) => match VerifyingKey::from_bytes(&b) {
                 Ok(v) => v,
                 Err(e) => {
-                    node.rep_record_auth_failure(&claimed).await;
                     return Err(e.into());
                 }
             },
             Err(e) => {
-                node.rep_record_auth_failure(&claimed).await;
                 return Err(e);
             }
         };
         if !f.verify(&vk) || !ts_ok(f.ts) {
-            node.rep_record_auth_failure(&claimed).await;
             bail!("challenge bad sig/ts");
         }
         // Anti-replay: nonce одноразовый. Проверяется ПОСЛЕ подписи, чтобы
@@ -7296,7 +7286,6 @@ async fn handle_stream(
         {
             let mut seen = node.challenge_nonces.lock().await;
             if !crate::proto::claim_nonce(&mut seen, &ch_nonce, now_ms()) {
-                node.rep_record_auth_failure(&claimed).await;
                 bail!("challenge replay");
             }
         }
@@ -7309,8 +7298,9 @@ async fn handle_stream(
         // classical path (window tolerance, plan §5), LOUD + counted while
         // pre-H (see `proto::pq_warn_classical_fallback` below). Present =>
         // encapsulate now and answer below with a hybrid session key.
-        // Malformed/mis-versioned offers are refused with a clear error,
-        // debiting reputation like every other auth failure on this path.
+        // Malformed/mis-versioned offers are refused with a clear error and
+        // the connection is dropped fail-closed (no identity debit pre-auth,
+        // same as every other failure on this path).
         let mut pq_state: Option<(Vec<u8>, PqAgreed)> = None;
         if proto::pq_handshake_active() {
             match pq_responder_accept(
@@ -7323,7 +7313,6 @@ async fn handle_stream(
             ) {
                 Ok(s) => pq_state = s,
                 Err(e) => {
-                    node.rep_record_auth_failure(&claimed).await;
                     return Err(e);
                 }
             }
@@ -7336,7 +7325,6 @@ async fn handle_stream(
         let classical = match derive_session_key_server(&node.keys, &peer.cfg, &srv_eph, &f.payload) {
             Ok(k) => k,
             Err(e) => {
-                node.rep_record_auth_failure(&claimed).await;
                 return Err(e);
             }
         };
@@ -7411,9 +7399,8 @@ async fn handle_stream(
     let pid = match authed {
         Some(p) => p,
         None => {
-            // F8-rep: an unauthenticated non-CHALLENGE frame is attributable
-            // only to its claimed source (CHALLENGE frames returned above).
-            node.rep_record_protocol_violation(&f.src).await;
+            // F8-rep: pre-auth source is unproven — drop the connection
+            // with NO identity debit (unframeable by construction).
             bail!("unauthenticated frame");
         }
     };

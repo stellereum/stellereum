@@ -12,8 +12,8 @@ use stellereum::bls::{
     BlsSecretKey, BlsSignature, SignerBitVector,
 };
 use stellereum::consensus::{
-    decode_qc_bls_envelope, derive_sortition_committee_gated, encode_qc_bls_envelope,
-    sortition_seed, sortition_seed_gated, ValidatorSet, VoteKind, BLS_QC_MARKER_ID,
+    decode_qc_bls_envelope, derive_sortition_committee_gated,
+    sortition_seed, sortition_seed_gated, ValidatorSet, VoteKind, BLS_QC_MARKER_ID, QC_BLS_MAGIC,
 };
 use stellereum::vrf::{
     vrf_activation_from_env, vrf_election_seed, VrfActivation, VRF_ACTIVATION_HEIGHT_ENV,
@@ -46,6 +46,8 @@ fn legacy_line(ed_id: &[u8; 32], sk: &BlsSecretKey) -> String {
 /// a single real BLS signature plus the caller-chosen bitvector. Decode must
 /// accept it (`Some`); counting never runs (removed), so acceptance here pins
 /// only the wire parser.
+/// GATE (HDAE wire-EMIT cut): hand-built READ bytes inline — the retired
+/// `encode_qc_bls_envelope` (empty) is NOT used.
 #[allow(clippy::too_many_arguments)] // GATE: envelope fixture mirrors the wire layout field-for-field; a struct would hide the field order under test.
 fn handbuilt_envelope(
     height: u64,
@@ -65,7 +67,20 @@ fn handbuilt_envelope(
         signature: keys[signers.start].sign(msg),
         participants,
     };
-    encode_qc_bls_envelope(&agg, height, round, kind, Some(bh))
+    let (sig, bits) = agg.to_bytes();
+    let mut out = Vec::with_capacity(16 + 8 + 4 + 1 + 32 + 4 + 96 + bits.len());
+    out.extend_from_slice(QC_BLS_MAGIC);
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&round.to_le_bytes());
+    out.push(match kind {
+        VoteKind::Prevote => 0,
+        VoteKind::Precommit => 1,
+    });
+    out.extend_from_slice(&bh);
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(&sig);
+    out.extend_from_slice(bits);
+    out
 }
 
 // --- REMOVED (ECVRF-body tests): `forged_vrf_proof_random_bytes_refused`,

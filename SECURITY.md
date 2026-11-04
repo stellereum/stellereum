@@ -3,12 +3,15 @@
 > **Status: DRAFT for the owning org to complete before mainnet.**
 > The contact address, PGP key and bounty terms below are **placeholders**
 > the organisation MUST replace. A policy that still contains
-> `REPLACE-ME` / `security@example.invalid` is not shippable.
+> `REPLACE-ME` / `[LEAD-SETS-EMAIL]` is not shippable.
+>
+> **Testnet only — no real funds.** Testnet coins have no value. Do not attack
+> live systems without explicit written permission (see below).
 
 ## Scope
 
-This policy covers the code in this repository that decides consensus,
-holds funds, or faces the network:
+This policy covers the node, contracts, and indexer that decide consensus,
+hold funds, or face the network:
 
 - the L1 node and consensus engine (`stellereum/src/`, in particular
   `consensus.rs`, `runtime.rs`, `state_engine.rs`, `staking.rs`,
@@ -34,8 +37,8 @@ multisig/threshold accounts, §J D-11) rather than a vulnerability.
 
 ## How to report
 
-- **Email:** `security@example.invalid` — **PLACEHOLDER, REPLACE BEFORE
-  MAINNET.** The real address must be a monitored, access-controlled
+- **Email:** `[LEAD-SETS-EMAIL]` — **PLACEHOLDER, LEAD SETS THE REAL ADDRESS
+  BEFORE MAINNET.** The real address must be a monitored, access-controlled
   mailbox owned by the core team (e.g. `security@stellereum.org`).
 - Encrypt with the PGP key below. If you cannot use PGP, say so in the
   subject line (`[no-pgp]`) and we will open a secure channel.

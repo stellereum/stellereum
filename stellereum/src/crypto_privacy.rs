@@ -64,37 +64,10 @@ fn ensure_classical_allowed() -> Result<(), ConfidentialError> {
     Ok(())
 }
 
-// §9 batched Ristretto verification (IMPLEMENTED — MSM throughput layer).
-//
-// Every Pedersen check in this module (`verify_balance_conservation`,
-// `RangeProof::verify`, `BitProof::verify`, the `sum_points` fold) is scalar
-// variable-base multiplication over Ristretto. The hot path is a
-// multi-scalar multiplication (MSM): sum_i v_i * G + sum_j r_j * H plus the
-// per-bit `2^i * C_i` fold in `RangeProof::verify_reconstruction`.
-//
-// Backend finding (measured, do not "optimize" blindly): curve25519-dalek 4.x
-// has NO `simd_backend` cargo feature — that name is from the 3.x era. On
-// x86_64 the 4.x build script compiles BOTH a serial and an AVX2 Pippenger
-// backend and `RistrettoPoint::vartime_multiscalar_mul` picks between them at
-// RUNTIME via CPUID, with zero RUSTFLAGS required (see
-// `curve25519-dalek-4.1.3/src/backend/mod.rs`: `get_selected_backend`). So the
-// library already owns the vectorized field-arithmetic layer, and hand-rolled
-// `core::arch::{x86_64,aarch64}` intrinsics in this crate would duplicate it.
-// What is NOT automatic is *calling* the MSM entry point instead of N
-// sequential `point * scalar` folds — that algorithmic batching is what this
-// section adds, on top of `vartime_multiscalar_mul`.
-//
-// Rules that keep this consensus-safe:
-// * scalar path is the reference — every batched entry point returns
-//   per-item bools that are BIT-IDENTICAL to the scalar result, always
-//   (differential tests in `tests/privacy_onchain_tests.rs` pin this with
-//   randomized inputs, including invalid ones);
-// * SIMD/MSM is throughput only — it never touches the committed byte
-//   framing (`encode`/`digest`/`write_confidential_domain` are untouched);
-// * small weighted inputs stay on the scalar fold below `MSM_FOLD_CUTOFF`
-//   terms (and unit-coefficient sums stay additions at every size — see the
-//   §9 section); the `cfg(target_feature)` gates only label the build, the
-//   size/weight dispatch is what buys throughput.
+// §9 MSM batching: N sequential scalar folds → one `vartime_multiscalar_mul` call.
+// Backend fact (measured): dalek 4.x has no `simd_backend` feature; AVX2 picked at RUNTIME
+// via CPUID, zero RUSTFLAGS. Consensus-safe: per-item bools bit-identical to scalar (pinned
+// by tests/privacy_onchain_tests.rs); framing untouched; scalar below MSM_FOLD_CUTOFF.
 
 lazy_static::lazy_static! {
     /// Independent generator H for Pedersen commitments: H = hash_to_point(G)

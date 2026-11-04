@@ -279,33 +279,41 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
         .expect("transport ok");
     assert!(resp_text(&r).contains("\"pong\":true"), "warmup ping");
 
-    // Phase 1: single attacker identity, bad handshakes -> throttled.
-    // Bounded drive (established idiom): scheduling stalls only add decay,
-    // debits always win, so 2 dials suffice live and retries cover stalls.
+    // Phase 1: single attacker identity, bad handshakes -> refused per
+    // connection AND dropped, with no identity trace (framing-impossible:
+    // pre-auth failures are never attributed to the claimed id).
     let atk_keys = NodeKeys::generate();
     let atk_id = atk_keys.id();
     let mut attacker_refused = 0usize;
     let mut seed = 100u64;
     for _ in 0..8 {
-        if victim.rep_is_throttled(&atk_id).await {
-            break;
-        }
         let c = raw_connect(listen).await.expect("admission passes");
         assert!(
             raw_handshake(&c, &det_bad_wire(&atk_keys, seed)).await.is_none(),
             "bad signature refused"
         );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), c.closed())
+                .await
+                .is_ok(),
+            "attacker connection dropped"
+        );
         attacker_refused += 1;
         seed += 1;
         tokio::time::sleep(Duration::from_millis(120)).await;
     }
-    assert!(
-        victim.rep_is_throttled(&atk_id).await,
-        "single flood identity throttled after 2 bad dials"
+    assert_eq!(
+        victim.rep_score(&atk_id).await,
+        0,
+        "pre-auth abuse leaves no score trace"
     );
-    assert!(!victim.rep_is_banned(&atk_id).await, "throttle imposes no ban");
+    assert!(
+        !victim.rep_is_throttled(&atk_id).await,
+        "bad dials alone never throttle"
+    );
+    assert!(!victim.rep_is_banned(&atk_id).await, "bad dials alone never ban");
 
-    // Honest unaffected while attacker throttled (raw + full-node paths).
+    // Honest unaffected while the attacker is refused (raw + full-node paths).
     let h1 = NodeKeys::generate();
     let c = raw_connect(listen).await.expect("admission passes");
     assert!(
@@ -318,9 +326,10 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
         .expect("transport ok");
     assert!(resp_text(&r).contains("\"pong\":true"), "honest ping during throttle");
 
-    // Phase 2: 8-identity sybil burst -> every one throttled, gate-refused.
-    // Per-identity immediate asserts: score decay (2/s, policy default) would
-    // otherwise forgive early sybils before a batch check at the end.
+    // Phase 2: 8-identity sybil burst -> every dial refused + dropped, every
+    // sybil untouched (framing-impossible). Throttle-gate coverage is then
+    // primed via the authed-path-equivalent records and refused with a valid
+    // wire, proving the gate still bites once attribution is genuine.
     let mut sybils = Vec::new();
     for s in 0..8u64 {
         let k = NodeKeys::generate();
@@ -329,10 +338,7 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     let refused_before = victim.rep_refusals_total();
     for (i, (k, base)) in sybils.iter().enumerate() {
         let mut s = *base;
-        for _ in 0..8 {
-            if victim.rep_is_throttled(&k.id()).await {
-                break;
-            }
+        for _ in 0..2 {
             let c = raw_connect(listen).await.expect("admission passes");
             assert!(
                 raw_handshake(&c, &det_bad_wire(k, s)).await.is_none(),
@@ -342,9 +348,18 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
             s += 1;
             tokio::time::sleep(Duration::from_millis(120)).await;
         }
+        assert_eq!(
+            victim.rep_score(&k.id()).await,
+            0,
+            "sybil {i} untouched by its own bad dials"
+        );
+        assert!(!victim.rep_is_banned(&k.id()).await, "sybil dials never ban");
+        // Genuine (attributed) abuse throttles the sybil at its own gate time.
+        victim.rep_record_auth_failure(&k.id()).await;
+        victim.rep_record_auth_failure(&k.id()).await;
         assert!(
             victim.rep_is_throttled(&k.id()).await,
-            "sybil {i} throttled at its own gate time"
+            "sybil {i} throttled once abuse is attributed"
         );
         assert!(!victim.rep_is_banned(&k.id()).await, "sybil throttle, not ban");
         // Gate refusal with a VALID wire, immediately (no decay gap).
@@ -362,8 +377,8 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
     );
 
     // Phase 3: attributed post-auth abuse escalates the prime offender to ban.
-    // Bounded drive: phase-2 time decayed the prime score, sustained abuse
-    // must re-cross the ban threshold (this IS the escalation property).
+    // Bounded drive: the prime score is neutral (bad dials leave no trace),
+    // so sustained attributed abuse must cross the full ban threshold.
     for _ in 0..10 {
         if victim.rep_is_banned(&atk_id).await {
             break;
@@ -392,8 +407,8 @@ async fn eclipse_flood_dials_honest_unaffected_attacker_throttled() {
         }
     }
     assert_eq!(honest_ok, 5, "honest delivery 5/5 while attacker fully throttled/banned");
-    // Attacker refuse rate: every attacker dial refused (2+ bad dials per
-    // identity minimum, 8 gate refusals, 1 ban refusal => >= 27 total).
+    // Attacker refuse rate: every attacker dial refused (8 bad dials phase 1,
+    // 16 bad + 8 gate refusals phase 2, 1 ban refusal phase 3 => 33 total).
     assert!(
         attacker_refused > 2 + 16 + 8,
         "attacker dial floor, got {attacker_refused}"

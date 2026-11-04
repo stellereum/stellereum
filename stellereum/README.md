@@ -1,19 +1,50 @@
-> **⚠️ Unaudited testnet — do not use real funds.** Internal audits and penetration tests are done (see [`docs/audits/`](docs/audits/)), but no independent external audit has completed yet. Published for testnet use and review only.
+> **⚠️ Testnet only — do not use real funds. No mainnet. No external audit yet.**
+> Internal audits and pentest batteries are in-tree (`docs/audits/`), but no
+> independent external audit has completed. Published for testnet use and review only.
+> There is no live production network and no promised performance figure.
 
 # Stellereum Network (STELL)
 
+Stellereum is an in-development Rust L1 for high-frequency trading and AI agents:
+TON-style actor accounts, a masterchain plus one canonical shard, Tendermint-style
+BFT with Falcon-512 post-quantum validator keys, a native on-chain order book, and
+private transfers — runnable on lightweight hardware. `chainId 5757`. Testnet only.
+
 <p align="center">
   <a href="https://github.com/immtes/stellereum/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/immtes/stellereum/ci.yml?label=CI" alt="CI"/></a>
-  <img src="https://img.shields.io/badge/tests-1067%20passing%20%28cargo%20test%20--lib%29-brightgreen" alt="lib tests, measured 2026-11-02"/>
-  <img src="https://img.shields.io/badge/fuzz-7%20decode%20harnesses-blue" alt="fuzz targets"/>
-  <img src="https://img.shields.io/badge/testnet-local--only%20%28public%20RPC%20502%20on%202026--10--25%29-yellow" alt="testnet status"/>
+  <img src="https://img.shields.io/badge/tests-1088%20passing%20%28cargo%20test%20--lib%29-brightgreen" alt="lib tests, measured 2026-11-04"/>
+  <img src="https://img.shields.io/badge/matrix-113%20rows%20%28112%20green%201%20skip%29-brightgreen" alt="feature matrix, measured 2026-11-04"/>
+  <img src="https://img.shields.io/badge/fuzz-7%20decode%20harnesses-blue" alt="fuzz targets, verified 2026-11-04"/>
+  <img src="https://img.shields.io/badge/testnet-closed%20local--only-yellow" alt="testnet status"/>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-orange" alt="License"/></a>
   <a href="docs/RPC.md"><img src="https://img.shields.io/badge/docs-RPC%20%7C%20ops%20%7C%20sharding-lightgrey" alt="Docs"/></a>
 </p>
 
-> **Badge freshness (no stale numbers):** `1067` = `cargo test --lib` → `1067 passed; 0 failed` on 2026-11-02 in `stellereum/` (re-run to refresh; the tree moves fast — it read 970/936 on 2026-10-25). `7` = `ls fuzz/fuzz_targets/*.rs` (re-verified 2026-11-02). `39` = `grep -c "^row " scripts/feature_matrix.sh`. `276` = `ls stellereum/tests/*.rs | wc -l` (2026-11-02). Public RPC `https://rpc.stellereum.org` returned HTTP 502 on 2026-10-25 (last check; not re-probed 2026-11-02), so there is no live tip to link — run the local stack below instead.
+> **Badge freshness (no stale numbers):** `1088` = `cargo test --lib` →
+> `1088 passed; 0 failed` on 2026-11-04 in `stellereum/`. `113` = feature rows in `FEATURES.md`
+> (112 GREEN + 1 SKIP, footer count verified 2026-11-04). `7` =
+> `ls fuzz/fuzz_targets/*.rs` (re-verified 2026-11-04). `312` =
+> `ls stellereum/tests/*.rs | wc -l` (measured 2026-11-04; replaces the stale
+> `276` from 2026-11-02). `51` = `grep -c "^row " scripts/feature_matrix.sh`
+> (measured 2026-11-04; replaces the stale `39`). Public RPC
+> `https://rpc.stellereum.org` returned HTTP 502 on 2026-10-25 (last check,
+> not re-probed) — so there is no live tip to link; run the local stack below instead.
 
-**Pitch.** Stellereum is an in-development Rust L1 for high-frequency trading and AI agents: TON-style actor accounts and BoC state, a masterchain plus a single active shard (workchain shard-1 PARKED — empty, no user txs; `docs/BFT_COMPARISON.md`, `docs/specs/04_NETWORK_AND_CONSENSUS.md`), Tendermint-style prevote/precommit BFT at `floor(2W/3)+1` voting power with Falcon-512 PQ validator keys enforced via `STELL_PURE_PQ=1` (`is_pure_pq_enforced()`), a native on-chain order book, and private transfers — all runnable on lightweight hardware. CN-VRF is sandbox-only KATs (`src/cn_vrf.rs`, `tests/cn_vrf_tests.rs`) per `docs/PQ_CN_VRF_SPEC.md` (SPEC ONLY, consensus wiring FORBIDDEN before external audit); classical-removal Phase 2+3 is design-only per `docs/CLASSICAL_REMOVAL_PHASE23.md` against the 25-hole list in `docs/CLASSICAL_INVENTORY.md`. Stage: fully working local simulator and deterministic devnet, multi-node testnet configs shipped, no production network and no external audit yet. `chainId 5757`; testnet only.
+## Testnet status (honest)
+
+- **Closed / local-only testnet.** Fully working local simulator and deterministic
+  devnet; multi-node testnet configs ship in `testnet/`. No production network.
+- **Protocol freeze is the gate to any public testnet.** The canonical freeze doc is
+  [`docs/PUBLIC_TESTNET_CODE_GAPS.md`](../../docs/PUBLIC_TESTNET_CODE_GAPS.md)
+  (lead working doc, in Russian, updated 2026-11-04): ~95% ready — five decisions,
+  two removals, one neural-audit pass; nothing there requires new cryptography.
+- **Single-shard canonical.** Unset `STELL_SHARDS` = one shard, 2PC disabled; any
+  other registry refuses boot unless `STELL_EXPERIMENTAL_SHARDS=1` (boot-guard,
+  guard tests 5/5). Shards 2…16 are parked design-only — not live.
+- **External audit: pending.** Internal program (protocol, consensus, mempool/P2P,
+  PQ crypto, staking/economics, storage/sync, bridge/privacy, RPC/EVM pentests) is
+  complete in [`docs/audits/`](docs/audits/); the external brief is ready, the
+  external audit is not.
 
 ```text
                     ┌─────────────────────────────────────────┐
@@ -37,6 +68,18 @@
    └────────────────────────────────────────────────────────────┘
 ```
 
+**Consensus & crypto (frozen core).** Tendermint-style prevote/precommit BFT at
+`floor(2W/3)+1` voting power (`consensus_quorum_min`). Validator keys are
+Falcon-512 PQ, enforced via `STELL_PURE_PQ=1` (`is_pure_pq_enforced()`).
+Chain-id binding (`STELLEREUM_BLOCK_V3`, default id `5757` — verified in
+`src/wallet_signing.rs`); order-root and shard-header commitments are
+consensus-enforced; large bridge withdrawals park behind a 1 h timelock with a
+2/3-distinct-validator quorum. CN-VRF is sandbox-only KATs (`src/cn_vrf.rs`,
+`tests/cn_vrf_tests.rs`) per `docs/PQ_CN_VRF_SPEC.md` — consensus wiring is
+FORBIDDEN before external audit. Classical-removal Phase 2+3 is design-only per
+`docs/CLASSICAL_REMOVAL_PHASE23.md` against the 25-hole list in
+`docs/CLASSICAL_INVENTORY.md`.
+
 ## Quickstart — first signed transaction in 5 commands
 
 ```bash
@@ -49,36 +92,56 @@ cargo build                                   # 1. build the node
 ./target/debug/stellereum sim --blocks 3      # 5. full stack: BFT + shards + CLOB + zkML + bridge
 ```
 
-(All five verified against this tree on 2026-10-25; `send` without `--dry-run` submits to `--rpc http://127.0.0.1:8545`.) Next: [`testnet/README.md`](testnet/README.md) for a real multi-node stand, [`docs/VALIDATOR_ONBOARDING.md`](docs/VALIDATOR_ONBOARDING.md) to validate.
+(All five verified against this tree on 2026-10-25; `send` without `--dry-run`
+submits to `--rpc http://127.0.0.1:8545`.) Next: [`testnet/README.md`](testnet/README.md)
+for a real multi-node stand, [`docs/VALIDATOR_ONBOARDING.md`](docs/VALIDATOR_ONBOARDING.md)
+to validate.
 
 ## Repo map
 
 | Path | What lives there |
 | :--- | :--- |
 | `src/` | node: consensus, mempool, shards, PQ crypto, RPC, wallet, bridge, SVM/CLOB |
-| `tests/` / `benches/` | integration suites / release-profile benches (`packing`, `svm_hot_path`, …) |
-| `fuzz/fuzz_targets/` | 7 `*_decode` harnesses; generated corpus under `fuzz/corpus/` is git-ignored |
+| `tests/` / `benches/` | 312 integration test files (measured 2026-11-04) / release-profile benches (`packing`, `svm_hot_path`, …) |
+| `fuzz/fuzz_targets/` | 7 `*_decode` harnesses (verified 2026-11-04); generated corpus under `fuzz/corpus/` is git-ignored |
 | `docs/` | `PROTOCOL.md` (consensus rules), `RPC.md`, `OPERATIONS.md`, `SHARDING.md`, `PERF_1K.md`, `audits/` |
 | `testnet/` | 2-node configs, `genesis.env`, stand guide |
 | `contracts/` `examples/` `scripts/` `site/` | STS-20/token contracts, demos, ops scripts, static site |
-| `../explorer-site/` `../stellereum-indexer/` `../stell-wallet/` | explorer+ faucet, indexer, wallet (sibling dirs, own READMEs) |
-| `../stellereum-sdk/` | canonical tx-builder SDK (B2 closer): 5 builders, bound-by-default envelopes, [`SDK-README.md`](../stellereum-sdk/SDK-README.md) |
+| `../explorer-site/` `../stellereum-indexer/` `../stell-wallet/` | explorer + faucet, indexer, wallet (sibling dirs, own READMEs) |
+| `../stellereum-sdk/` | canonical tx-builder SDK: 5 builders, bound-by-default envelopes, [`SDK-README.md`](../stellereum-sdk/SDK-README.md) |
 
 ## Performance — measured only, bench vs live labeled
 
 | Figure | Value | How obtained (re-run it) |
 | :--- | :--- | :--- |
-| Lib tests | **1067 passed, 0 failed** | `cargo test --lib`, 2026-11-02, debug, in `stellereum/` |
+| Lib tests | **1088 passed, 0 failed** | `cargo test --lib`, 2026-11-04, debug, in `stellereum/` |
+| Feature matrix | **113 rows: 112 GREEN, 0 RED, 1 SKIP** | `FEATURES.md` footer, verified 2026-11-04 |
 | Block apply, mixed 428 tx | **8.45 ms wall (~50k tx/s in-process)** | BENCH, release, Ryzen 5 3600 (`benches/packing.rs`, via [`docs/PERF_1K.md`](docs/PERF_1K.md)) |
 | Mempool select, pool 428/1k/10k | **35.0 / 60.2 / 550.5 µs** | BENCH, same host/profile |
 | Simulator block finality | **~1.7 ms** | in-process `sim`, NOT network (sample in old docs) |
 | Live stand block time | **seconds per block** (transport-bound) | live observation, NOT a bench — `<120 ms` remains a target |
 | Throughput math | 1785 tx/block ÷ 0.4 s floor ≈ 4462 TPS | DERIVED from the 500M gas cap, not measured end-to-end |
 
+Nothing above is a mainnet or live-network promise. Bench numbers are host-specific;
+see [`docs/PERF_1K.md`](docs/PERF_1K.md) for method and re-run commands.
+
 ## Security
 
-Internal program completed: protocol, consensus, mempool/P2P, PQ crypto, staking/economics, storage/sync, bridge/privacy, RPC/EVM pentests — full package in [`docs/audits/`](docs/audits/) (`INVARIANTS.md`, `THREAT_MODEL.md`, `KNOWN_ISSUES.md`, `EXTERNAL_AUDIT_BRIEF.md`). Chain-id binding (`STELLEREUM_BLOCK_V3`, default id 5757), order-root and shard-header commitments are consensus-enforced; large bridge withdrawals park behind a 1 h timelock with a 2/3-distinct-validator quorum. **External audit: pending — the brief is ready, the audit is not.** Report issues via [`SECURITY.md`](../SECURITY.md); never open a public issue for a suspected vulnerability.
+Internal program completed: protocol, consensus, mempool/P2P, PQ crypto,
+staking/economics, storage/sync, bridge/privacy, RPC/EVM pentests — full package in
+[`docs/audits/`](docs/audits/) (`INVARIANTS.md`, `THREAT_MODEL.md`, `KNOWN_ISSUES.md`,
+`EXTERNAL_AUDIT_BRIEF.md`). **External audit: pending — the brief is ready, the audit
+is not.** Testnet coins have no value; never use real funds. Report issues via
+[`SECURITY.md`](../SECURITY.md) (contact: `[LEAD-SETS-EMAIL]`); never open a public
+issue for a suspected vulnerability.
 
 ## Contributing · License · Links
 
-No formal contributing process yet — open an issue with a reproducer (`sim`/`devnet` seed included) before large PRs; keep `cargo test --lib` green and refresh the badge numbers above when they move. License: MIT **or** Apache-2.0 ([`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE)). Entry docs: [`PROTOCOL.md`](PROTOCOL.md) · [`docs/OPERATIONS.md`](docs/OPERATIONS.md) · [`docs/RPC.md`](docs/RPC.md) · [`docs/SHARDING.md`](docs/SHARDING.md) · [`docs/PERF_1K.md`](docs/PERF_1K.md) · [`testnet/README.md`](testnet/README.md) · [`../explorer-site/README.md`](../explorer-site/README.md).
+No formal contributing process yet — open an issue with a reproducer (`sim`/`devnet`
+seed included) before large PRs; keep `cargo test --lib` green and refresh the badge
+numbers above when they move. License: MIT **or** Apache-2.0 ([`LICENSE-MIT`](LICENSE-MIT),
+[`LICENSE-APACHE`](LICENSE-APACHE)). Entry docs: [`PROTOCOL.md`](PROTOCOL.md) ·
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) · [`docs/RPC.md`](docs/RPC.md) ·
+[`docs/SHARDING.md`](docs/SHARDING.md) · [`docs/PERF_1K.md`](docs/PERF_1K.md) ·
+[`testnet/README.md`](testnet/README.md) · [`../explorer-site/README.md`](../explorer-site/README.md) ·
+freeze doc [`docs/PUBLIC_TESTNET_CODE_GAPS.md`](../../docs/PUBLIC_TESTNET_CODE_GAPS.md).

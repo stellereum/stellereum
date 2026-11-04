@@ -113,31 +113,10 @@ pub fn commitment_key() -> [u8; 32] {
     h.finalize().into()
 }
 
-// ---------------------------------------------------------------------------
-// Per-domain generation caching.
-//
-// `commit_consensus_domains_if_stale` used to skip the O(state) digest only
-// when NOTHING changed since the last commit. A block that touches one
-// domain (the common case: a staking payout, an oracle feed, a single trade)
-// still re-walked, re-sorted and re-hashed every other domain.
-//
-// Each committed domain now has its own content-generation counter (see
-// `DomainGenerations`, owned by the engine and bumped on every mutation of
-// that domain — never by wall clock). The digest of a domain is captured as
-// preimage bytes on first build and reused verbatim while its generation is
-// unchanged, so a commit after a single-domain mutation re-walks exactly one
-// domain. The assembled digest is bit-for-bit the streaming digest: the
-// cache only replays bytes, it never reinterprets them.
-//
-// FORK SAFETY: the cache is per-engine-instance state (`DomainCache`,
-// constructed fresh with the engine and with every deep copy). There is
-// deliberately NO process-wide / `static` cache: two engines that diverged
-// (a fork, a snapshot restore, a simulation clone) hold different states
-// under the same domain generations, and a shared cache would serve one
-// fork's bytes to the other — a silent consensus split. Keying by
-// (domain, content-generation) inside one instance cannot leak across
-// instances because the bytes never leave the instance.
-// ---------------------------------------------------------------------------
+// Per-domain generation caching: each domain's digest bytes are captured once and
+// reused while its `DomainGenerations` counter is unchanged (bit-for-bit the streaming
+// digest; single-domain mutation re-walks one domain). FORK SAFETY: `DomainCache` lives in
+// the engine instance only — never `static` — so diverged forks/snapshots can't share bytes.
 
 /// One committed domain of the digest. Order matches `commitment_digest_into`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -438,69 +438,14 @@ fn bls_flag_on(raw: &str) -> bool {
     matches!(raw.trim(), "1" | "true" | "TRUE" | "on" | "ON")
 }
 
-/// BLS key-registry configuration (policy surface).
-///
-/// The aggregate-counting path that consumed `enabled` was removed; the live
-/// readers are the registry parsers below and the refusal gate above.
-///
-/// SECRET HYGIENE: `local_vote_seed` is key material. The manual `Debug` impl
-/// below prints only its presence — never the bytes. (The previous derived
-/// `Debug` printed the seed into any log line holding the config.)
-#[derive(Clone, Default)]
-pub struct QcBlsConfig {
-    /// Flag (`STELL_BLS_QC`). Default OFF: the stand keeps verifying exactly
-    /// as before.
-    pub enabled: bool,
-    /// Validator id -> BLS public key. Consensus-critical once enabled: every
-    /// verifier must hold the same registry, or the aggregate simply fails to
-    /// pair and falls back to Ed25519 (no fork either way).
-    pub registry: BlsKeyRegistry,
-    /// Seed for THIS node's BLS key; present only on a node that signs votes
-    /// with a BLS half.
-    ///
-    /// SECRET: wiped on drop (see `Zeroize` below); never logged (see the
-    /// manual `Debug` impl). Cloning this config copies the seed — keep clones
-    /// short-lived and never place them in logs, errors, or RPC responses.
-    pub local_vote_seed: Option<[u8; 32]>,
-}
-
-impl std::fmt::Debug for QcBlsConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QcBlsConfig")
-            .field("enabled", &self.enabled)
-            .field("registry_len", &self.registry.len())
-            .field(
-                "local_vote_seed",
-                &self.local_vote_seed.map(|_| "[redacted]"),
-            )
-            .finish_non_exhaustive()
-    }
-}
-
-impl zeroize::Zeroize for QcBlsConfig {
-    fn zeroize(&mut self) {
-        if let Some(seed) = self.local_vote_seed.as_mut() {
-            zeroize::Zeroize::zeroize(seed.as_mut_slice());
-        }
-        self.local_vote_seed = None;
-    }
-}
-
-impl Drop for QcBlsConfig {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(self);
-    }
-}
-
-impl QcBlsConfig {
-    // REMOVED (counting-path config surface): `QcBlsConfig::from_env`,
-    // `canonical_keys`, and `local_vote_key` lived here. The only consumer
-    // was the deleted aggregate-counting path (proven by grep: no other
-    // live references). Registry policy is read directly via
-    // `parse_registry_entries` / `parse_registry_entries_v2` /
-    // `parse_registry_entries_strict_pop` (pinned by tests); refusal via
-    // `refuse_bls_qc_if_enabled`.
-}
+// REMOVED (BLS config shell): `QcBlsConfig` (with its redacting `Debug`,
+// wiping `Zeroize`/`Drop`, and the earlier-removed `from_env` surface) lived
+// here. Zero live users (proven by grep: no src/ references outside this
+// block; the only consumers were the deleted counting path and two test pins,
+// updated with GATE comments). Registry policy is read directly via
+// `parse_registry_entries` / `parse_registry_entries_v2` /
+// `parse_registry_entries_strict_pop` (pinned by tests); refusal via
+// `refuse_bls_qc_if_enabled`.
 
 /// Parse the live registry format: bare `<ed> <bls>` lines (no PoP).
 /// (Public: policy/tests read the registry without the removed config surface.)

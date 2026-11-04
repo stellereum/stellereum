@@ -105,10 +105,40 @@ fn old_layout(bytes: &[u8]) -> OldQuorumCertificate {
     bincode::deserialize(bytes).expect("old layout must decode the same bytes")
 }
 
-/// Two-validator fixture: Ed25519 keys (fixed seeds) plus BLS keys for
-/// hand-built envelopes (single real signature + bitvector — no aggregation
-/// exists to mint real ones, and counting is removed, so these envelopes pin
-/// only the wire layer).
+/// Hand-build a v1 BLS marker-envelope payload inline (history READ bytes).
+///
+/// GATE (HDAE wire-EMIT cut): `encode_qc_bls_envelope` is retired (returns
+/// empty — no live writer), so READ fixtures no longer call it. The layout
+/// below is the frozen v1 history format
+/// (`QC_BLS_MAGIC || height || round || kind || block_hash || total || sig || bits`);
+/// `decode_qc_bls_envelope` (the kept v1 reader) must keep parsing it.
+fn hand_built_bls_envelope(
+    height: u64,
+    round: u32,
+    kind: VoteKind,
+    target: Option<BlockHash>,
+    total_validators: usize,
+    sig: &[u8; 96],
+    bits: &[u8],
+) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(16 + 8 + 4 + 1 + 32 + 4 + 96 + bits.len());
+    out.extend_from_slice(QC_BLS_MAGIC);
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&round.to_le_bytes());
+    out.push(match kind {
+        VoteKind::Prevote => 0,
+        VoteKind::Precommit => 1,
+    });
+    match target {
+        Some(h) => out.extend_from_slice(&h),
+        None => out.extend_from_slice(&[0u8; 32]),
+    }
+    out.extend_from_slice(&(total_validators as u32).to_le_bytes());
+    out.extend_from_slice(sig);
+    out.extend_from_slice(bits);
+    out
+}
 struct Fixture {
     ed: Vec<SigningKey>,
     bls: Vec<BlsSecretKey>,
@@ -133,10 +163,13 @@ impl Fixture {
 
     /// Build a certificate for `(height, round, kind, target)`. `ed_signers`
     /// chooses who contributes bare Ed25519 signatures; `agg_signers` (when
-    /// present) chooses the bitvector of a hand-built envelope carrying one
-    /// real BLS signature (the first member signs): decode accepts it, and
+    /// present) chooses the bitvector of a hand-built HISTORY envelope carrying
+    /// one real BLS signature (the first member signs): decode accepts it, and
     /// the new code verifies the certificate through its Ed25519 quorum —
-    /// the envelope itself is inert metadata, never counted.
+    /// the envelope itself is inert metadata, never counted, never emitted.
+    /// GATE (HDAE wire-EMIT cut): the envelope is hand-built READ bytes (see
+    /// `hand_built_bls_envelope`); the retired `encode_qc_bls_envelope` (empty)
+    /// is NOT used.
     fn cert(
         &self,
         height: u64,
@@ -164,7 +197,16 @@ impl Fixture {
                 signature: self.bls[range.start].sign(&msg),
                 participants,
             };
-            let payload = encode_qc_bls_envelope(&aggregate, height, round, kind, target);
+            let (sig, bits) = aggregate.to_bytes();
+            let payload = hand_built_bls_envelope(
+                height,
+                round,
+                kind,
+                target,
+                self.ed.len(),
+                &sig,
+                bits,
+            );
             signatures.push((BLS_QC_MARKER_ID, payload));
         }
         QuorumCertificate {
@@ -231,10 +273,14 @@ fn new_augmented_certificate_decodes_under_old_layout_and_passes_legacy_verify()
     let f = Fixture::new(2);
     let bh = [0x22u8; 32];
     // A certificate with BOTH halves: bare Ed25519 quorum + aggregate envelope.
+    // GATE (HDAE wire-EMIT cut): the envelope here is hand-built HISTORY bytes
+    // (no live path emits it anymore); the pin is that history bytes still
+    // decode under the old layout and both verifiers accept via the Ed25519
+    // quorum, so mixed old/new nodes never fork on them.
     let qc = f.cert(3, 0, VoteKind::Precommit, Some(bh), 0..2, Some(0..2));
     assert!(
         qc.signatures.iter().any(|(id, _)| *id == BLS_QC_MARKER_ID),
-        "production certificate must carry the aggregate envelope"
+        "history certificate must carry the aggregate envelope"
     );
 
     let bytes = bincode::serialize(&qc).unwrap();
@@ -275,6 +321,50 @@ fn bls_only_certificate_fails_closed_under_old_code_and_new_code() {
         !qc.verify(&f.vs),
         "new code must fail closed on a marker-only certificate"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Wire-EMIT retirement pins (HDAE cut): EMIT is gone, READERS stay
+// ---------------------------------------------------------------------------
+
+#[test]
+fn retired_bls_envelope_encode_emits_empty() {
+    // GATE: `encode_qc_bls_envelope` must emit absent/empty — no live writer
+    // may produce BLS marker payloads (CLOSED TESTNET: no wire compat needed).
+    // The PARSE side (`decode_qc_bls_envelope`) is untouched (history compat).
+    let sk = BlsSecretKey::from_seed(&[0x11u8; 32]);
+    let mut participants = SignerBitVector::new(2);
+    participants.set(0, true);
+    let msg = vote_sign_bytes(9, 0, VoteKind::Precommit, &Some([0xAA; 32]));
+    let agg = BlsAggregateSignature {
+        signature: sk.sign(&msg),
+        participants,
+    };
+    assert!(
+        encode_qc_bls_envelope(&agg, 9, 0, VoteKind::Precommit, Some([0xAA; 32])).is_empty(),
+        "retired BLS envelope EMIT must be empty"
+    );
+}
+
+#[test]
+fn fixed_v1_history_envelope_bytes_still_parse() {
+    // GATE: fixed fixture of v1 envelope bytes (captured from the pre-cut
+    // encoder: height 9, round 0, precommit for 0xAA*32, 2 validators both
+    // signed, single real BLS signature). Asserts the kept v1 READER parses
+    // old-history bytes OK — the storage-compat pin that survives the EMIT cut.
+    const V1_ENVELOPE_HEX: &str = "5354454c4c5f51435f424c535f56315f09000000000000000000000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa02000000b71b1068608a6250189b14e329b9fd76327e3ecfd43135418707de370afc781bcece9329dc84076c5cd30dbd8bad3afe03c8ff36efc80dc0208faba0aa9f7ad3dfe50d8253b67961de129d506537ffb1768e0e5293d9174848dd846583ffca6c03";
+    let payload = hex::decode(V1_ENVELOPE_HEX).expect("fixed v1 fixture hex");
+    let (height, round, kind, block_hash, agg) =
+        decode_qc_bls_envelope(&payload).expect("v1 history envelope must parse");
+    assert_eq!(height, 9);
+    assert_eq!(round, 0);
+    assert_eq!(kind, VoteKind::Precommit);
+    assert_eq!(block_hash, [0xAA; 32]);
+    assert_eq!(agg.participants.total_validators(), 2);
+    assert_eq!(agg.participants.signed_count(), 2);
+    // And the marker id still counts for nothing under a live verifier set.
+    let f = Fixture::new(2);
+    assert_eq!(f.vs.power_of(&BLS_QC_MARKER_ID), 0);
 }
 
 // ---------------------------------------------------------------------------

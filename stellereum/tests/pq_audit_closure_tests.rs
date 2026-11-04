@@ -333,25 +333,10 @@ fn bls_signature_identity_rejected_at_parse() {
 // `default_startup_still_refuses_bls_qc_counting` (bls_classical_tests).
 
 
-#[test]
-fn bls_config_debug_redacts_seed() {
-    use stellereum::bls::QcBlsConfig;
-    let cfg = QcBlsConfig {
-        enabled: false,
-        registry: Default::default(),
-        local_vote_seed: Some([0xABu8; 32]),
-    };
-    let dbg = format!("{cfg:?}");
-    assert!(!dbg.contains("abab"), "Debug must not print the seed bytes");
-    assert!(
-        dbg.contains("redacted"),
-        "Debug must show presence only: {dbg}"
-    );
-    // Zeroize wipes the seed.
-    let mut cfg2 = cfg.clone();
-    zeroize::Zeroize::zeroize(&mut cfg2);
-    assert!(cfg2.local_vote_seed.is_none());
-}
+// REMOVED (BLS config shell): `bls_config_debug_redacts_seed` pinned the
+// deleted `QcBlsConfig` shell's redacting `Debug` + wiping `Zeroize` — the shell
+// has zero live users (proven by grep) and is deleted with its hygiene surface
+// (reported). No live writer removed; registry policy + refusal gate pins stay.
 
 // F-HIGH-1 (BLS no-PoP): the startup gate is a LOUD refusal, not a silent
 // fallback. Pins the message so a future edit cannot weaken it into a

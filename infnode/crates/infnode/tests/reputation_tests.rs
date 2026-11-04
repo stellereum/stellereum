@@ -356,19 +356,19 @@ async fn rep_penalty_kinds_debit_and_scores_clamp() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. End to end over real QUIC: the throttle/ban follows the abusive IDENTITY,
-//    not the IP. Same loopback address throughout: the offender's bad
-//    handshakes stall at throttle (fail-closed, no escalation without bound);
-//    attributed post-auth abuse escalates it to a temp ban; an honest peer
-//    from the same IP passes the whole time; the IP itself is never
-//    strike-banned; the offender recovers after the temp ban expires.
+// 8. End to end over real QUIC: the ban follows the abusive IDENTITY, not
+//    the IP. Same loopback address throughout: bad pre-auth handshakes are
+//    refused per-connection AND dropped, leaving no identity trace
+//    (framing-impossible — pre-auth failures are never attributed); throttle
+//    and temp-ban still come from attributed (proven-identity, authed-path)
+//    abuse, which this test models with the `rep_record_*` calls the authed
+//    message path makes for a misbehaving peer. An honest peer from the same
+//    IP passes the whole time; the IP itself is never strike-banned; the
+//    offender recovers after the temp ban expires.
 //
-//    (Throttle-gate refusals deliberately carry no penalty — decay alone must
-//    be able to lift a throttle — so sustained CHALLENGE abuse cannot deepen
-//    the score past the soft threshold. Escalation to a ban comes from
-//    attributed violations, which the unit tests above drive directly and
-//    which this test models with `rep_record_protocol_violation`: the same
-//    calls the authed message path makes for a misbehaving peer.)
+//    (Gate refusals deliberately carry no penalty — decay alone must be able
+//    to lift a throttle — so a refused CHALLENGE never deepens any score.
+//    Escalation to a ban comes only from attributed violations.)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -516,21 +516,37 @@ async fn rep_quic_ban_follows_identity_not_ip() {
 
     let bad_keys = NodeKeys::generate();
     let bad_id = bad_keys.id();
-    // Two bad handshakes (-20): refused, and the identity is now throttled.
+    // Two bad handshakes: refused AND dropped, with no identity trace —
+    // pre-auth failures are never attributed to the claimed id.
     for _ in 0..2 {
         let c = raw_connect(listen).await.expect("admission passes");
         assert!(
             raw_handshake(&c, &bad_wire(&bad_keys)).await.is_none(),
             "bad signature refused"
         );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), c.closed())
+                .await
+                .is_ok(),
+            "attacker connection dropped"
+        );
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    assert!(
-        b.rep_is_throttled(&bad_id).await,
-        "offender throttled after 2 bad handshakes"
+    assert_eq!(
+        b.rep_score(&bad_id).await,
+        0,
+        "pre-auth abuse leaves no score trace"
     );
-    // Same loopback IP, honest identity: passes WHILE the offender is
-    // throttled — no shared-IP blast radius at this layer.
+    assert!(
+        !b.rep_is_throttled(&bad_id).await,
+        "handshake abuse alone never throttles"
+    );
+    assert!(
+        !b.rep_is_banned(&bad_id).await,
+        "handshake abuse alone never bans"
+    );
+    // Same loopback IP, honest identity: passes while the offender's bad
+    // handshakes are refused — no shared-IP blast radius at this layer.
     let good_keys = NodeKeys::generate();
     let c = raw_connect(listen).await.expect("admission passes");
     assert!(
@@ -539,9 +555,8 @@ async fn rep_quic_ban_follows_identity_not_ip() {
     );
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // Three more bad handshakes: still refused, still only throttled — the
-    // gate carries no extra penalty, so CHALLENGE abuse alone stalls at the
-    // soft threshold instead of escalating without bound.
+    // Three more bad handshakes: still refused per-connection, still no
+    // identity trace — sustained handshake abuse alone escalates nothing.
     for _ in 0..3 {
         let c = raw_connect(listen).await.expect("admission passes");
         assert!(
@@ -550,13 +565,39 @@ async fn rep_quic_ban_follows_identity_not_ip() {
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+    assert_eq!(
+        b.rep_score(&bad_id).await,
+        0,
+        "sustained handshake abuse leaves no score trace"
+    );
     assert!(
-        b.rep_is_throttled(&bad_id).await,
-        "sustained handshake abuse stalls at throttle"
+        !b.rep_is_throttled(&bad_id).await,
+        "sustained handshake abuse stalls at nothing"
     );
     assert!(
         !b.rep_is_banned(&bad_id).await,
         "handshake abuse alone does not ban"
+    );
+    // Attributed abuse (the authed message path's records for a misbehaving
+    // proven peer) still throttles, then escalates the identity to a ban.
+    for _ in 0..2 {
+        b.rep_record_auth_failure(&bad_id).await;
+    }
+    assert!(
+        b.rep_is_throttled(&bad_id).await,
+        "proven-identity abuse throttles"
+    );
+    // A now-VALID handshake from the throttled identity is refused at the gate
+    // (fail-closed), and counted — without any extra score penalty.
+    let c = raw_connect(listen).await.expect("admission passes");
+    assert!(
+        raw_handshake(&c, &good_wire(&bad_keys)).await.is_none(),
+        "throttled identity refused even with a valid handshake"
+    );
+    assert!(
+        b.rep_refusals_total() >= 1,
+        "reputation refusals counted, got {}",
+        b.rep_refusals_total()
     );
     // Attributed post-auth abuse (what the authed message path records for a
     // misbehaving peer) escalates the throttled identity to a temp ban.

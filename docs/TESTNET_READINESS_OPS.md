@@ -1,5 +1,7 @@
 # Testnet readiness — operator checklist (3-node testnet)
 
+> 2026-11-04 changelog: legacy-genesis env knob marked removed/inert and VRF arming marked retired/inert in §3 env inventory (citations in text).
+
 > Scope: READ-ONLY audit of the repo. Nothing here was verified against a live
 > host (no ssh, no systemctl, no restarts). Anything that requires a live host
 > to confirm is marked **UNVERIFIED**.
@@ -166,8 +168,8 @@ live values are whatever the per-node env files hold — **UNVERIFIED** live):
   `STELL_FAUCET_IP_MAX_PER_HOUR`, `STELL_PEER_PQ_KEYS`, `STELL_FALCON_KEY_FILE`,
   `STELL_BLS_QC` / `STELL_BLS_KEYS_FILE` / `STELL_BLS_KEYS_INLINE` /
   `STELL_BLS_SK_SEED` / `STELL_BLS_POP_REQUIRED`,
-  `STELL_VRF_ACTIVATION_HEIGHT` / `STELL_VRF_KEYS`,
-  `STELL_PURE_PQ`, `STELL_LEGACY_GENESIS_ROOT` (genesis-replay only),
+  `STELL_VRF_ACTIVATION_HEIGHT` (RETIRED/inert — always Disabled + WARN: `stellereum/src/vrf.rs:201-224`, `stellereum/src/main.rs:2742-2752`) / `STELL_VRF_KEYS`,
+  `STELL_PURE_PQ`, ~~legacy-genesis env knob~~ (REMOVED/inert no-op — strict-only keygen: `stellereum/src/post_quantum.rs:1598-1600`; toggle changes nothing: `stellereum/tests/a_crypto_audit_poc.rs:147-174`; guards no longer list it: `stellereum/tests/genesis_guard_tests.rs:60-64`),
   `STELL_DEV_UNSAFE_TESTKEY`, `STELL_TRUSTED_PROXY_CIDRS`, `STELL_XFF_MODE`,
   `STELL_TURNSTILE_SITE_KEY` / `STELL_TURNSTILE_SECRET_KEY`,
   `STELL_REMOTE_SIGNER_URL` / `STELL_REMOTE_SIGNER_TOKEN` (Ed25519-only gap,

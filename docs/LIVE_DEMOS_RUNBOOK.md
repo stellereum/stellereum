@@ -1,5 +1,7 @@
 # LIVE_DEMOS_RUNBOOK — chain split, xshard 2PC, DKG (EpochDkg)
 
+> 2026-11-04 changelog: dropped removed legacy-genesis env knob from genesis-identity (§0) and send-pq (§2); keygen is strict-only/env-independent (citations in text).
+
 Push-button runbook for the three unclosed-structural live demos.
 Live chain is DOWN, so nothing here touches live nodes/configs.
 Local proof is against `scripts/local-cluster.sh` (3 local validators
@@ -21,10 +23,13 @@ derived from them, not guessed.
   ssh tunnel on this dev box; the script `ss`-checks every port and
   fails loudly.)
 - Genesis identity: every node gets `STELL_FAUCET_KEY=1111…1` (32 bytes
-  `0x11`) + `STELL_DEV_UNSAFE_TESTKEY=1` + `STELL_LEGACY_GENESIS_ROOT=1`
+  `0x11`) + `STELL_DEV_UNSAFE_TESTKEY=1`
   + `STELL_PURE_PQ=1` (`local-cluster.sh` `write_configs`). Same seed +
   same flags on all nodes = identical genesis state root; `up` asserts
   identical epoch + non-empty intersection of FINALIZED heights.
+  (Removed legacy-genesis env knob omitted: it is removed/inert — Falcon
+  keygen is strict-only `stellereum/src/post_quantum.rs:1598-1600`, the toggle
+  changes nothing `stellereum/tests/a_crypto_audit_poc.rs:147-174`.)
 - Chain id default 5757 (`STELL_CHAIN_ID` unset everywhere).
 - Timeouts: `STELL_ROUND_TIMEOUT_MS=10000`,
   `STELL_BROADCAST_JOIN_MS=2000`, `STELL_CATCHUP_BUDGET_MS=8000`.
@@ -340,8 +345,9 @@ byte-identical to a faucet drip):
 
 ```bash
 BIN=stellereum/target/debug/stellereum
-export STELL_LEGACY_GENESIS_ROOT=1   # must match the nodes (env.i sets 1),
-                                     # else the derived address misses genesis funds
+# NOTE: removed legacy-genesis env knob is inert (no-op) — do NOT export it.
+# Keygen is strict-only (stellereum/src/post_quantum.rs:1598-1600) and the
+# toggle changes nothing (stellereum/tests/a_crypto_audit_poc.rs:147-174).
 $BIN wallet send-pq --falcon-seed <hex-seed> --to <hex-addr> --amount <nano> \
   [--target-shard 0|1, default 0] --rpc http://127.0.0.1:<port> \
   [--nonce N] [--dry-run] [--verbose]

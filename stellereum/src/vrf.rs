@@ -580,13 +580,9 @@ impl VrfSecret {
         Self(*seed)
     }
 
-    /// Fresh random secret from the OS.
-    pub fn generate() -> Self {
-        use rand::RngCore;
-        let mut seed = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut seed);
-        Self(seed)
-    }
+    // REMOVED (VRF key minting): `VrfSecret::generate` (fresh OS-random secret)
+    // lived here. Zero users (proven by grep: no src/ or test callers; secrets
+    // arrive via `from_seed` over provisioned seeds). No live writer removed.
 
     fn scalar(&self) -> Scalar {
         ecvrf_secret_scalar(&self.0)

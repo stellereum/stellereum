@@ -83,17 +83,6 @@ async fn http_post(addr: std::net::SocketAddr, path: &str, body: &str) -> (Strin
     (head.to_string(), body.to_string())
 }
 
-async fn http_get(addr: std::net::SocketAddr, path: &str) -> (String, String) {
-    let mut s = TcpStream::connect(addr).await.unwrap();
-    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-    s.write_all(req.as_bytes()).await.unwrap();
-    let mut buf = Vec::new();
-    s.read_to_end(&mut buf).await.unwrap();
-    let text = String::from_utf8_lossy(&buf).to_string();
-    let (head, body) = text.split_once("\r\n\r\n").unwrap_or(("", &text));
-    (head.to_string(), body.to_string())
-}
-
 fn rpc_body(method: &str, params: serde_json::Value) -> String {
     serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string()
 }

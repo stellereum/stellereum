@@ -17402,9 +17402,11 @@ mod tests {
         for m in &all {
             assert!(seen.insert(*m), "method `{m}` listed in two audit rows");
         }
-        // The table covers 143 public methods; a dispatch arm added without
-        // updating the table keeps this count stale on purpose — bump it.
-        assert_eq!(all.len(), 143, "audit list size drifted: recount dispatch");
+        // The table covers 140 public methods (143 minus the 3 removed
+        // shielded methods); a dispatch arm added without updating the table
+        // keeps this count stale on purpose — bump it.
+        // GATE (Ristretto excision): shieldedTransfer/shieldedBalance/unshield gone.
+        assert_eq!(all.len(), 140, "audit list size drifted: recount dispatch");
         for m in &all {
             let buckets = rpc_rate_buckets(m);
             assert!(

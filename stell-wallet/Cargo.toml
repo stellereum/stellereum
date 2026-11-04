@@ -3,6 +3,7 @@ name = "stell-wallet"
 version = "0.1.0"
 edition = "2021"
 description = "Official Lightweight CLI Wallet & SPV Client for Stellereum L1 Blockchain"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "stell"

@@ -3,6 +3,7 @@ name = "infmail"
 version.workspace = true
 edition.workspace = true
 description = "Инфмейл: webmail-сервис поверх сети infnode (аккаунты, письма, файлы, подписки, 2FA, NFT). Отдельный проект, не часть ядра infnode."
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 infnode = { path = "../infnode" }

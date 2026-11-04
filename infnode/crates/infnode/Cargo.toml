@@ -3,6 +3,7 @@ name = "infnode"
 version.workspace = true
 edition.workspace = true
 description = "Инфнод: лёгковесный оверлейный P2P-протокол (QUIC + DHT + storage RF≤3 + rewards + proof-of-storage). Только сетевой слой, без почты."
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = { workspace = true }

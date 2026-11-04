@@ -1,7 +1,29 @@
-> **⚠️ Unaudited testnet — do not use real funds.** This code has passed internal audits and penetration tests, but no independent external audit has been completed yet. It is published for testnet use and review only; do not trust it with real funds or mainnet keys until an external audit is done.
-
 # stellereum-indexer
 
-High-performance Rust indexer for the Stellereum L1 (Gram.org-compatible API
-schema, dual-shard, SQLite WAL). See `src/` for the implementation and
+> Testnet software — no real funds, no mainnet yet, no external audit yet.
+
+High-performance Rust indexer for the Stellereum L1: chain data into a
+queryable REST API over SQLite WAL. See `src/` for the implementation and
 `tests/` for the API test-suite.
+
+<p align="center">
+  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-orange" alt="License"/></a>
+</p>
+
+## Build & test
+
+```bash
+cargo build
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+## Security
+
+No external audit yet. Testnet only. **Never open a public issue for a
+suspected vulnerability** — report via [`SECURITY.md`](SECURITY.md).
+
+## Contributing · License
+
+Keep tests green. MIT **or** Apache-2.0
+([`LICENSE-MIT`](LICENSE-MIT), [`LICENSE-APACHE`](LICENSE-APACHE)).

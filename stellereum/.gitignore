@@ -43,3 +43,12 @@ env.*
 *helper*keys*
 node_modules/
 .opencode/
+
+# --- publish: local runtime/state dirs (never commit) ---
+.archive/
+artifacts/
+run/
+tmp/
+node-data/
+data-store/
+chunks/

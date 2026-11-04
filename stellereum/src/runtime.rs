@@ -929,6 +929,66 @@ impl PackFilterCtx {
     }
 }
 
+/// Height-driven governance finalization on the live path (neural audit
+/// 2026-11-04 C-02, P0: `gov_finalize` was never called on the live path, so
+/// voter/proposer staking locks were held forever).
+///
+/// After each decided block, finalizes every still-Open proposal whose voting
+/// window closed (block time is `now`) via `finalize_at_height` at the decided
+/// height: Passed proposals get their `GOV_TIMELOCK_HEIGHTS` (7200) maturity
+/// scheduled, and every terminal transition releases its staking locks.
+/// Inputs are pure block content (`height`, `timestamp`) plus the committed
+/// pre-state, swept in proposal-id order, so every node finalizing the same
+/// block derives the same transition and the same root — the mutation is a
+/// deterministic function of the block, not an off-block RPC write (C-01
+/// direction). Returns the finalized ids (logging/tests).
+///
+/// Lock order is governance-then-staking, matching the RPC handlers, so no
+/// lock cycle is introduced. // GATE: C-02 live-path wiring.
+async fn sweep_gov_finalize(
+    state: &crate::state_engine::InMemoryStateEngine,
+    cur_height: u64,
+    now: u64,
+) -> Vec<u64> {
+    let due: Vec<u64> = {
+        let g = state.governance_read().await;
+        let mut ids: Vec<u64> = g
+            .proposals
+            .iter()
+            .filter(|(_, p)| {
+                p.status == crate::governance::ProposalStatus::Open && now >= p.voting_end
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    if due.is_empty() {
+        return Vec::new();
+    }
+    let mut g = state.governance_write().await;
+    let mut ledger = state.staking_write().await;
+    let mut done = Vec::with_capacity(due.len());
+    for pid in due {
+        match g.finalize_at_height(&mut ledger, pid, now, cur_height) {
+            Ok(_) => done.push(pid),
+            Err(_) => {
+                // Unreachable with the filter above (same `now`, and no other
+                // finalizer exists on this path); skip fail-safe so one id can
+                // never wedge the height — the next height retries with the
+                // same deterministic inputs.
+            }
+        }
+    }
+    if !done.is_empty() {
+        tracing::info!(
+            "[gov] finalized {} proposal(s) at height {cur_height}: {done:?}",
+            done.len()
+        );
+    }
+    done
+}
+
 impl ValidatorRuntime {
     pub fn new(
         key: SigningKey,
@@ -6357,6 +6417,9 @@ impl ValidatorRuntime {
         outcome: &crate::state_engine::BlockTransitionOutcome,
     ) {
         self.record_apply_outcome(block, outcome).await;
+        // C-02: height-driven gov finalization (locks release, 7200-height
+        // timelocks schedule). Deterministic in (height, block.timestamp).
+        sweep_gov_finalize(&self.state, height, block.timestamp).await;
         self.finalized.push((height, bh));
         // The block is final: it anchors the fork-choice tree, and every
         // candidate branch it superseded is pruned (and signalled).
@@ -6563,6 +6626,9 @@ impl ValidatorRuntime {
         // `apply_equivocation_slashes` for the full rationale; the WIRED
         // path is block-carried evidence via `apply_block_transition`.
         self.apply_block_fees_rewards(&block).await;
+        // C-02: height-driven gov finalization (locks release, 7200-height
+        // timelocks schedule). Deterministic in (height, block.timestamp).
+        sweep_gov_finalize(&self.state, height, block.timestamp).await;
         self.finalized.push((height, bh));
         // The block is final: it anchors the fork-choice tree, and every
         // candidate branch it superseded is pruned (and signalled).
@@ -6864,6 +6930,9 @@ impl ValidatorRuntime {
         self.hc.precommit_qc = Some(qc.clone());
         self.blocks.insert(bh, block.clone());
         self.apply_block_fees_rewards(block).await;
+        // C-02: same deterministic gov-finalization sweep as the live path,
+        // so a replayed catch-up converges with live-finalized nodes.
+        sweep_gov_finalize(&self.state, block.height, block.timestamp).await;
         // The replayed block is canonical, finalized history: the
         // fork-choice tree follows it, so the candidates seen afterwards
         // are compared against the right chain.
@@ -6915,6 +6984,9 @@ impl ValidatorRuntime {
         // on this path exactly as on finalize and replay.
         self.apply_block_fees_rewards(block).await;
         let height = self.hc.height;
+        // C-02: height-driven gov finalization (locks release, 7200-height
+        // timelocks schedule). Deterministic in (height, block.timestamp).
+        sweep_gov_finalize(&self.state, height, block.timestamp).await;
         self.finalized.push((height, bh));
         // The block is final: it anchors the fork-choice tree, and every
         // candidate branch it superseded is pruned (and signalled).
@@ -8281,6 +8353,9 @@ impl ChainState {
                 );
             }
         }
+        // C-02: same deterministic gov-finalization sweep as the live path,
+        // so a reorg re-apply converges with live-finalized nodes.
+        sweep_gov_finalize(&self.state, block.height, block.timestamp).await;
     }
 
     /// The validator set this state implies: the same read-only derivation
@@ -11255,5 +11330,76 @@ mod shard_header_commitment_tests {
         let mut empty: Vec<Transaction> = Vec::new();
         ValidatorRuntime::truncate_to_block_caps(&mut empty);
         assert!(empty.is_empty());
+    }
+
+    /// C-02/P0: the live-path sweep finalizes due proposals at the decided
+    /// height — locks release and the 7200-height timelock schedules.
+    /// // GATE: proves the `sweep_gov_finalize` wiring; extends, never weakens.
+    #[tokio::test]
+    async fn sweep_gov_finalize_releases_locks_and_schedules_timelock() {
+        use crate::governance::{
+            GovAction, ProposalStatus, VoteChoice, GOVERNANCE_VOTING_PERIOD_SECS,
+            GOV_TIMELOCK_HEIGHTS, PROPOSAL_MIN_STAKE_NANO,
+        };
+        let state = Arc::new(InMemoryStateEngine::new());
+        let proposer = [0xA1u8; 32];
+        let voter = [0xB2u8; 32];
+        {
+            let mut ledger = state.staking_write().await;
+            ledger.bond(proposer, PROPOSAL_MIN_STAKE_NANO, 0).unwrap();
+            ledger.bond(voter, PROPOSAL_MIN_STAKE_NANO, 0).unwrap();
+        }
+        let pid = {
+            let mut gov = state.governance_write().await;
+            let mut ledger = state.staking_write().await;
+            let id = gov
+                .propose(
+                    &mut ledger,
+                    proposer,
+                    "t".into(),
+                    GovAction::Signal("s".into()),
+                    0,
+                )
+                .expect("propose");
+            gov.vote(&mut ledger, proposer, id, VoteChoice::Yes, 1)
+                .expect("proposer vote");
+            gov.vote(&mut ledger, voter, id, VoteChoice::Yes, 1)
+                .expect("voter vote");
+            id
+        };
+        // Locks are held before finalization (the C-02 grief: never released).
+        {
+            let ledger = state.staking_read().await;
+            assert!(ledger.locked_governance_of(&proposer) > 0);
+            assert!(ledger.locked_governance_of(&voter) > 0);
+        }
+        // Not due yet (voting window still open): the sweep leaves it Open.
+        let now_due = GOVERNANCE_VOTING_PERIOD_SECS + 1;
+        let early =
+            sweep_gov_finalize(&state, 999, GOVERNANCE_VOTING_PERIOD_SECS - 1).await;
+        assert!(early.is_empty());
+        assert_eq!(
+            state.governance_read().await.get(pid).unwrap().status,
+            ProposalStatus::Open
+        );
+        // Due at the decided height: finalized, locks released, timelock set.
+        let pass_height = 41_000u64;
+        let done = sweep_gov_finalize(&state, pass_height, now_due).await;
+        assert_eq!(done, vec![pid]);
+        assert_eq!(
+            state.governance_read().await.get(pid).unwrap().status,
+            ProposalStatus::Passed
+        );
+        assert!(
+            state.staking_read().await.locked_governance.is_empty(),
+            "finalize must release every gov lock"
+        );
+        assert_eq!(
+            state.governance_read().await.executable_height_of(pid),
+            Some(pass_height + GOV_TIMELOCK_HEIGHTS)
+        );
+        // Idempotent: a second sweep at a later height is a no-op.
+        let again = sweep_gov_finalize(&state, pass_height + 1, now_due).await;
+        assert!(again.is_empty());
     }
 }

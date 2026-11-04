@@ -547,9 +547,11 @@ async fn start_workchain_shard(
             .filter(|s| !s.is_empty()),
         tx_broadcast: Some(tx_bcast_tx),
         faucet: None,
-        // `stell_signMessage` / `stell_signTypedData` sign with the NODE's key
-        // (testing/devnet only — production wallets sign locally).
-        msg_signing_seed: Some(validator_key.to_bytes()),
+        // GATE: H-02 — `stell_signMessage` / `stell_signTypedData` NEVER use
+        // the validator key. Separate ephemeral dev-only key (present only
+        // with STELL_DEV_UNSAFE_TESTKEY=1), else disabled; production wallets
+        // sign locally.
+        msg_signing_seed: stellereum::rpc::dev_msg_signing_seed_from_env(),
         // Archive proofs + historical roots are served from the persisted
         // snapshot history, never from the live trie.
         archive_store: Some(persistence.storage()),
@@ -8079,10 +8081,12 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         .ok()
                         .filter(|s| !s.is_empty()),
                     tx_broadcast: Some(tx_bcast_tx),
-                    // `stell_signMessage` / `stell_signTypedData` sign with the
-                    // NODE's key (testing/devnet only — production wallets sign
-                    // locally and never ask a node to sign).
-                    msg_signing_seed: Some(validator_key.to_bytes()),
+                    // GATE: H-02 — `stell_signMessage` / `stell_signTypedData`
+                    // NEVER use the validator key. Separate ephemeral dev-only
+                    // key (present only with STELL_DEV_UNSAFE_TESTKEY=1), else
+                    // disabled; production wallets sign locally and never ask
+                    // a node to sign.
+                    msg_signing_seed: stellereum::rpc::dev_msg_signing_seed_from_env(),
                     // Archive proofs + historical roots are served from the
                     // persisted snapshot history, never from the live trie.
                     archive_store: Some(persistence.storage()),

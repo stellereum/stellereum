@@ -2649,4 +2649,51 @@ mod tests {
         assert!(oracle.publishers.contains(&[0x31u8; 32]));
         assert_eq!(g.get(id).unwrap().status, ProposalStatus::Executed);
     }
+
+    /// C-02/P0: height-aware finalization releases EVERY staking lock
+    /// (proposer + all voters) exactly once, schedules the exact 7200-height
+    /// maturity, and refuses early execution fail-closed.
+    /// // GATE: proves the live-path `finalize_at_height` contract — locks
+    /// cannot outlive the vote; extends, never weakens.
+    #[test]
+    fn finalize_at_height_releases_all_locks_with_exact_maturity() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let now_due = GOVERNANCE_VOTING_PERIOD_SECS + 1;
+        let id = g
+            .propose(&mut l, ids[0], "t".into(), GovAction::Signal("t".into()), 0)
+            .expect("propose");
+        for v in &ids {
+            g.vote(&mut l, *v, id, VoteChoice::Yes, 1).expect("vote");
+        }
+        // Locks are held for the whole voting window (the C-02 grief when
+        // finalization never runs: unbond stays impossible).
+        for v in &ids {
+            assert!(
+                l.locked_governance_of(v) > 0,
+                "voter lock must be held before finalize"
+            );
+        }
+        let pass_height = 7_000u64;
+        let status = g
+            .finalize_at_height(&mut l, id, now_due, pass_height)
+            .expect("finalize");
+        assert_eq!(status, ProposalStatus::Passed);
+        assert!(
+            l.locked_governance.is_empty(),
+            "finalize must release every gov lock exactly once"
+        );
+        // Exact maturity: pass_height + 7200, boundary-checked both sides.
+        let maturity = pass_height + GOV_TIMELOCK_HEIGHTS;
+        assert_eq!(maturity, 14_200);
+        assert_eq!(g.executable_height_of(id), Some(maturity));
+        assert_eq!(
+            g.execute_at_height(ids[0], id, maturity - 1),
+            Err(GovError::Timelocked)
+        );
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Passed);
+        g.execute_at_height(ids[0], id, maturity)
+            .expect("maturity executes");
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Executed);
+    }
 }

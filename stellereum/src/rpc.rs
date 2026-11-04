@@ -42,9 +42,20 @@
 //!   bounded by the per-IP limiters plus pool caps — see `router`/`serve`.
 //! * GATED by `auth_token` (when `Some`): `stell_mempoolDump` (pending pool contents
 //!   aid front-running), the `admit_signed_payload_tx` arms `stell_submitPriceFeed`,
-//!   `stell_pmmBuy`, `stell_pmmSell`, and the wallet SIGN arms `stell_signMessage`,
-//!   `stell_signTypedData` (they sign with the node's key — testing/devnet only).
-//!   Without a token configured these stay open (local/dev mode).
+//!   `stell_pmmBuy`, `stell_pmmSell`.
+//!   Without a token configured these stay open (local/dev mode) — EXCEPT the
+//!   governance writes below, which fail closed on a non-loopback bind.
+//! * The governance writes `stell_submitProposal`, `stell_vote`,
+//!   `stell_executeProposal` are FAIL-CLOSED without a token on a non-loopback
+//!   bind (GATE: H-01/C-02): no token + loopback bind keeps dev flows; no token +
+//!   non-loopback bind refuses. The bind is the existing `STELL_RPC_LISTEN`
+//!   (no new knob); `stell_sendRawTransaction` stays OPEN by design.
+//! * The wallet SIGN arms `stell_signMessage`, `stell_signTypedData` are
+//!   SEPARATELY fail-closed (GATE: H-02): they sign with an ephemeral dev-only
+//!   key that exists only when explicit dev mode is on
+//!   (`STELL_DEV_UNSAFE_TESTKEY=1`), and additionally require a configured
+//!   `auth_token` presented by the caller plus a loopback peer. Otherwise they
+//!   refuse. Production wallets sign locally and never ask a node to sign.
 //! * GATED by the SEPARATE `faucet_token` (fail-closed — an enabled faucet with no
 //!   token refuses to dispense): `stell_faucet` and the explorer `POST /api/faucet/:address`.
 //!
@@ -166,7 +177,10 @@ pub struct RpcState {
     /// `eth_sendRawTransaction`) are OPEN by design — a caller can only submit
     /// a validly signed, funded, nonce-sane tx — and the faucet has its own
     /// fail-closed `faucet_token`. When `None`, the gated arms stay open
-    /// (local/dev mode).
+    /// (local/dev mode) — except the governance writes (`stell_submitProposal`,
+    /// `stell_vote`, `stell_executeProposal`), which fail closed without a
+    /// token on a non-loopback bind (GATE: H-01/C-02; see
+    /// `require_gov_write_auth`).
     pub auth_token: Option<String>,
 
     /// Optional channel to forward validated raw transactions into P2P gossip
@@ -180,10 +194,11 @@ pub struct RpcState {
     /// reach the port may mint".
     pub faucet_token: Option<String>,
     /// Ed25519 seed the `stell_signMessage` / `stell_signTypedData` arms sign
-    /// with (the NODE's key — wired to the validator/identity key at startup).
-    /// `None` (tests, and any node that opts out) makes both arms refuse
-    /// fail-closed with `-32000`. Testing/devnet ONLY: a production wallet
-    /// signs locally and never ships its key to a node.
+    /// with: a SEPARATE ephemeral dev-only key (see
+    /// [`dev_msg_signing_seed_from_env`]), NEVER the validator/consensus key.
+    /// `None` (production default, and any node without explicit dev mode)
+    /// makes both arms refuse fail-closed with `-32000`. Testing/devnet ONLY:
+    /// a production wallet signs locally and never ships its key to a node.
     pub msg_signing_seed: Option<[u8; 32]>,
     /// Durable store handle serving per-key ARCHIVE proofs and historical
     /// roots (`stell_getArchiveProof`, `stell_getHistoricalRoot`).
@@ -369,6 +384,21 @@ pub fn is_dev_unsafe_testkey(v: Option<&str>) -> bool {
 /// [`is_dev_unsafe_testkey`] over the live process environment.
 pub fn is_dev_unsafe_testkey_env() -> bool {
     is_dev_unsafe_testkey(std::env::var(DEV_UNSAFE_TESTKEY_ENV).ok().as_deref())
+}
+
+// GATE: H-02 fix — the wallet SIGN arms NEVER use the validator key. This is
+// the ONLY production constructor for `RpcState::msg_signing_seed`: an
+// ephemeral random seed minted in-memory when explicit dev mode is on
+// (`STELL_DEV_UNSAFE_TESTKEY=1`, reusing the existing dev-mode flag — no new
+// env knob), else `None` (SIGN arms refuse fail-closed). Never persisted,
+// never derived from node/validator key material.
+pub fn dev_msg_signing_seed_from_env() -> Option<[u8; 32]> {
+    if !is_dev_unsafe_testkey_env() {
+        return None;
+    }
+    let mut seed = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+    Some(seed)
 }
 
 /// True when `seed` is the well-known public test key.
@@ -2711,6 +2741,200 @@ fn parse_rpc_address(s: &str) -> Result<[u8; 32], String> {
     Err(format!("invalid address: {}", snip_for_error(s)))
 }
 
+/// A call-like opcode extracted from a sealed tx for preview/admission.
+struct ExtractedCall {
+    contract: [u8; 32],
+    method: Vec<u8>,
+    args: Vec<i64>,
+    calldata: Vec<u8>,
+}
+
+/// The call shape a contract-call preview executes on the registry clone.
+enum PreviewCall<'a> {
+    /// Plain wasm arguments (`call_args` path).
+    Plain(&'a [i64]),
+    /// Raw multi-argument form with the canonical ABI calldata blob
+    /// (`call_with_context_args_calldata` path — the exact opcode a
+    /// `SysCallCallContractArgs` carries).
+    RawArgs(&'a [i64], &'a [u8]),
+    /// Typed ABI arguments (`call_abi` path).
+    Abi(&'a [AbiValue]),
+}
+
+/// H-03: read-only contract-call preview executed on a CLONE of the contract
+/// registry. Returns the same
+/// [`crate::state_engine::ContractCallOutcome`] the block-applied execution
+/// would report (same return value, gas and events), but touches NO live
+/// state: no debit/credit, no balance syncs, no outbound-message routing, no
+/// trie writes. State changes happen exclusively when the admitted tx is
+/// applied by a block.
+///
+/// The `value` leg is simulated on the clone with the same failure modes the
+/// old direct path had: a sender that cannot cover `value` fails with
+/// `insufficient funds to transfer value: …` and nothing moves. Execution
+/// uses the default call context, exactly like the engine's structured-call
+/// helpers did, so previews are result-identical to the pre-fix answers.
+async fn preview_contract_call(
+    st: &RpcState,
+    contract_addr: &[u8; 32],
+    method: &str,
+    call: PreviewCall<'_>,
+    value: u64,
+    sender: &[u8; 32],
+    gas_limit: u64,
+) -> crate::state_engine::ContractCallOutcome {
+    let failed = |msg: String, gas_used: u64| crate::state_engine::ContractCallOutcome {
+        status: "failed".to_string(),
+        return_value: None,
+        gas_used,
+        events: Vec::new(),
+        error: Some(msg),
+    };
+    // Same failure modes as the retired direct debit, evaluated read-only.
+    if value > 0 {
+        match st.engine.get_account(sender).await {
+            None => {
+                return failed(
+                    "insufficient funds to transfer value: account does not exist".to_string(),
+                    0,
+                );
+            }
+            Some(a) if a.balance < value => {
+                return failed(
+                    "insufficient funds to transfer value: Insufficient native STELL balance"
+                        .to_string(),
+                    0,
+                );
+            }
+            Some(_) => {}
+        }
+    }
+    let mut work = st.engine.contracts_read().await.clone();
+    // Read-only mirror of `sync_contract_balance` plus the value leg: the
+    // contract observes the live account balance plus the transferred value.
+    // Applied to the CLONE only; the live registry and accounts are untouched.
+    if work.contracts.contains_key(contract_addr) {
+        let acct_bal = st
+            .engine
+            .get_account(contract_addr)
+            .await
+            .map(|a| a.balance)
+            .unwrap_or(0);
+        if let Some(c) = work.contracts.get_mut(contract_addr) {
+            c.balance = c.balance.max(acct_bal).saturating_add(value);
+        }
+    }
+    let exec: Result<
+        (i64, u64, Vec<crate::contract::ContractEvent>),
+        crate::contract::ContractError,
+    > = match call {
+        PreviewCall::Plain(args) => work
+            .call_args(contract_addr, method, args, gas_limit)
+            .map(|(r, u, e, _)| (r, u, e)),
+        PreviewCall::RawArgs(args, calldata) => work
+            .call_with_context_args_calldata(
+                contract_addr,
+                method,
+                args,
+                calldata,
+                gas_limit,
+                &crate::contract::ContractCallContext::default(),
+            )
+            .map(|o| (o.result, o.fuel_used, o.events)),
+        PreviewCall::Abi(args) => work
+            .call_abi(contract_addr, method, args, gas_limit)
+            .map(|o| (o.result, o.fuel_used, o.events)),
+    };
+    // Same outcome mapping as the engine's structured-call helpers.
+    match exec {
+        Ok((ret, used, events)) => crate::state_engine::ContractCallOutcome {
+            status: "success".to_string(),
+            return_value: Some(ret),
+            gas_used: used,
+            events,
+            error: None,
+        },
+        Err(e) => {
+            let (gas_used, msg) = match &e {
+                crate::contract::ContractError::OutOfFuel => (gas_limit, e.to_string()),
+                _ => (0, e.to_string()),
+            };
+            failed(msg, gas_used)
+        }
+    }
+}
+
+/// H-03/H-04: the single choke point through which the contract arms admit a
+/// transaction. It files the node-local receipt for the CLONE preview
+/// `outcome`, submits the tx to the mempool (state changes only when a block
+/// applies it) and renders the canonical response shape. It never touches
+/// consensus state itself.
+async fn admit_contract_tx_and_respond(
+    st: &RpcState,
+    id: Value,
+    tx: Transaction,
+    contract_addr: [u8; 32],
+    raw_tx_hex: String,
+    outcome: crate::state_engine::ContractCallOutcome,
+) -> Json<RpcResponse> {
+    let gas_limit = tx.gas_limit;
+    let tx_hash = tx.compute_tx_hash();
+
+    // Submit to mempool & broadcast if available
+    let _ = st.mempool.write().await.add(tx.clone());
+    if let Some(ref bc) = st.tx_broadcast {
+        let _ = bc.send(tx.clone());
+    }
+
+    let is_success = outcome.status == "success";
+    let events_view: Vec<Value> = outcome
+        .events
+        .iter()
+        .map(|e| {
+            json!({
+                "contract": hex::encode(e.contract),
+                "contract_stl57": crate::address::encode_stl57_address(&e.contract),
+                "topic": e.topic,
+                "value": e.value,
+            })
+        })
+        .collect();
+
+    // Record receipt in receipt index
+    st.receipts.write().await.insert(TxReceipt {
+        tx_hash,
+        height: st.height.load(std::sync::atomic::Ordering::Relaxed),
+        block_hash: [0u8; 32],
+        index: 0,
+        success: is_success,
+        gas_limit,
+        fee_charged: outcome.gas_used,
+        raw_tx: Some(raw_tx_hex),
+        return_value: outcome.return_value,
+        gas_used: Some(outcome.gas_used),
+        events: outcome.events.clone(),
+        contract_address: Some(contract_addr),
+    });
+
+    ok(
+        id,
+        json!({
+            "tx_hash": hex::encode(tx_hash),
+            "status": outcome.status,
+            "return_value": outcome.return_value.map(|v| json!(v)).unwrap_or(Value::Null),
+            "gas_used": outcome.gas_used,
+            "events": events_view,
+            "outcome": {
+                "status": outcome.status,
+                "return_value": outcome.return_value.map(|v| json!(v)).unwrap_or(Value::Null),
+                "gas_used": outcome.gas_used,
+                "events": events_view,
+                "error": outcome.error
+            }
+        }),
+    )
+}
+
 /// Parse address for RPC methods, supporting TON-style workchain / shard prefixes (e.g. "-1:<addr>", "0:<addr>", "1:<addr>").
 /// (crate-visible: the explorer gateway enforces the same faucet shard rule.)
 ///
@@ -3882,11 +4106,14 @@ pub async fn collect_shard_heads(st: &RpcState) -> Vec<ShardHead> {
 // ============================================================================
 // Wallet signature standard (docs/WALLET_SIGNING.md, audit P2 item 15).
 //
-// `stell_signMessage` / `stell_signTypedData` sign with the NODE's Ed25519 key
-// and are gated by `auth_token` exactly like the other sensitive arms
-// (`stell_mempoolDump`, the signed-payload arms): required when configured,
-// open in local/dev mode when it is not. They exist for TESTING/DEVNET ONLY —
-// a production wallet MUST sign locally and never ship its key to a node.
+// `stell_signMessage` / `stell_signTypedData` sign with a SEPARATE ephemeral
+// dev-only key (NEVER the validator key — see `dev_msg_signing_seed_from_env`)
+// and are fail-closed: they require (a) the key to be configured (explicit
+// dev mode at startup), (b) a configured `auth_token` presented by the caller
+// (in `params.token` / `params.apiKey` / a header), and (c) a loopback peer
+// (in-process `None` callers are the test harness). Otherwise they refuse.
+// They exist for TESTING/DEVNET ONLY — a production wallet MUST sign locally
+// and never ship its key to a node.
 // `stell_verifyMessage` / `stell_verifyTypedData` are public (no secret, no
 // auth): verification is total and side-effect free.
 //
@@ -3895,10 +4122,143 @@ pub async fn collect_shard_heads(st: &RpcState) -> Vec<ShardHead> {
 // three live schemes.
 // ============================================================================
 
-/// Gate shared by the wallet SIGN arms: the caller must present `auth_token`
-/// (in `params.token` / `params.apiKey` / a header) when one is configured.
-/// Mirrors `admit_signed_payload_tx`'s gate.
+// GATE: H-02 — SIGN arms are fail-closed without a configured `auth_token`
+// (unlike the mempool/payload arms which stay open in local/dev mode). A
+// dev signing key must never be anonymously reachable.
 fn require_wallet_sign_auth(
+    st: &RpcState,
+    id: &Value,
+    params: &Value,
+    header_token: Option<&str>,
+) -> Option<Json<RpcResponse>> {
+    let Some(expected) = &st.auth_token else {
+        return Some(err(
+            id.clone(),
+            -32001,
+            "unauthorized: message signing is disabled without STELL_RPC_AUTH_TOKEN \
+             (devnet-only; production wallets must sign locally)",
+        ));
+    };
+    let provided = params["token"]
+        .as_str()
+        .or_else(|| params["apiKey"].as_str())
+        .or(header_token);
+    if !provided
+        .map(|p| constant_time_eq(p, expected.as_str()))
+        .unwrap_or(false)
+    {
+        return Some(err(
+            id.clone(),
+            -32001,
+            "unauthorized: missing or invalid API token",
+        ));
+    }
+    None
+}
+
+// GATE: H-02 — SIGN arms serve loopback peers only (audit: "only on
+// loopback"). `None` is the in-process test harness (production transports
+// always resolve an IP); any non-loopback `Some(ip)` is refused.
+fn require_wallet_sign_loopback(
+    id: &Value,
+    peer_ip: Option<std::net::IpAddr>,
+) -> Option<Json<RpcResponse>> {
+    match peer_ip {
+        None => None,
+        Some(ip) if ip.is_loopback() => None,
+        Some(_) => Some(err(
+            id.clone(),
+            -32001,
+            "unauthorized: message signing is loopback-only (devnet-only)",
+        )),
+    }
+}
+
+// ============================================================================
+// Governance-write auth gate (neural audit 2026-11-04 H-01/C-02, P0).
+//
+// `stell_submitProposal` / `stell_vote` / `stell_executeProposal` mutate the
+// committed staking/governance domains, so without a token they are
+// fail-CLOSED on a non-loopback bind: an operator that publishes the RPC port
+// without `STELL_RPC_AUTH_TOKEN` refuses gov writes instead of serving them
+// to the network. A loopback bind keeps dev flows (no token needed), and
+// `stell_sendRawTransaction` stays OPEN by design (self-authenticating signed
+// txs — see the module docs). No new env knob: the bind is read from the
+// existing `STELL_RPC_LISTEN` (the same string `serve` binds; default
+// `127.0.0.1:8545`, loopback).
+// ============================================================================
+
+/// Pure loopback check over a bind string (`STELL_RPC_LISTEN` form, e.g.
+/// `127.0.0.1:8545`, `localhost:8545`, `[::1]:8545`, bare `::1`). Anything
+/// that is not provably loopback — `0.0.0.0`, LAN/WAN IPs, other hostnames,
+/// unparseable input — answers `false` (fail closed).
+fn bind_addr_is_loopback(addr: &str) -> bool {
+    let addr = addr.trim();
+    if addr.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    // Otherwise expect `host:port` (or `[v6]:port`); what remains after
+    // stripping the port must itself be loopback. A `[` without `]` is
+    // malformed (could never bind) — fail closed.
+    let host = if addr.starts_with('[') {
+        if !addr.contains(']') {
+            return false;
+        }
+        addr.strip_prefix('[')
+            .and_then(|h| h.split(']').next())
+            .unwrap_or(addr)
+    } else {
+        match addr.rsplit_once(':') {
+            // A non-numeric tail is a bare hostname, not `host:port`.
+            Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h,
+            _ => addr,
+        }
+    };
+    let host = host.trim();
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    matches!(host.parse::<std::net::IpAddr>(), Ok(ip) if ip.is_loopback())
+}
+
+/// Effective bind loopback-ness for the gov-write gate: the existing
+/// `STELL_RPC_LISTEN`, defaulting to loopback when unset (local/dev).
+fn rpc_bind_is_loopback() -> bool {
+    #[cfg(test)]
+    if let Some(v) = test_bind_loopback_override() {
+        return v;
+    }
+    match std::env::var("STELL_RPC_LISTEN") {
+        Err(_) => true,
+        Ok(s) => bind_addr_is_loopback(&s),
+    }
+}
+
+#[cfg(test)]
+static TEST_BIND_LOOPBACK: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// Test-only mock for the bind check ("mock bind"): `Some(v)` forces the
+/// gate's view of the bind, `None` restores the env/default path. A mutex
+/// (not the env) so parallel tests cannot disturb each other.
+#[cfg(test)]
+pub(crate) fn set_test_bind_loopback(v: Option<bool>) {
+    *TEST_BIND_LOOPBACK.lock().unwrap() = v;
+}
+
+#[cfg(test)]
+fn test_bind_loopback_override() -> Option<bool> {
+    *TEST_BIND_LOOPBACK.lock().unwrap()
+}
+
+/// Fail-closed gate for the three governance WRITE arms. Returns `Some(err)`
+/// when the call must be refused:
+/// * token configured → the caller must present it (unchanged);
+/// * no token + loopback bind → dev flows stay open (unchanged);
+/// * no token + non-loopback bind → REFUSE (H-01 fix).
+fn require_gov_write_auth(
     st: &RpcState,
     id: &Value,
     params: &Value,
@@ -3919,8 +4279,34 @@ fn require_wallet_sign_auth(
                 "unauthorized: missing or invalid API token",
             ));
         }
+        return None;
     }
-    None
+    if rpc_bind_is_loopback() {
+        return None;
+    }
+    Some(err(
+        id.clone(),
+        -32001,
+        "unauthorized: governance writes on a non-loopback bind require STELL_RPC_AUTH_TOKEN (fail-closed without a token; bind loopback for dev)",
+    ))
+}
+
+/// Bumped write guard for the shared governance object (C-01 staleness half).
+///
+/// In production `st.governance` aliases the engine's committed governance
+/// (same `Arc`), so the write must go through `engine.governance_write()` —
+/// a bare `Arc` write skips the commitment-generation bump and the state root
+/// goes stale. Test fixtures keep a detached governance object, so fall back
+/// to the direct lock when the handles do not alias (zero behavior change
+/// there). // GATE: C-01 staleness fix; prod path bumped, test path untouched.
+async fn gov_write(
+    st: &RpcState,
+) -> tokio::sync::RwLockWriteGuard<'_, crate::governance::Governance> {
+    if Arc::ptr_eq(&st.governance, &st.engine.governance_handle()) {
+        st.engine.governance_write().await
+    } else {
+        st.governance.write().await
+    }
 }
 
 /// Effective chain id for a wallet-signing call: explicit `chain_id` wins,
@@ -3977,8 +4363,12 @@ fn handle_sign_message(
     id: Value,
     params: &Value,
     header_token: Option<&str>,
+    peer_ip: Option<std::net::IpAddr>,
 ) -> Json<RpcResponse> {
     if let Some(denied) = require_wallet_sign_auth(st, &id, params, header_token) {
+        return denied;
+    }
+    if let Some(denied) = require_wallet_sign_loopback(&id, peer_ip) {
         return denied;
     }
     let Some(seed) = st.msg_signing_seed else {
@@ -4067,8 +4457,12 @@ fn handle_sign_typed_data(
     id: Value,
     params: &Value,
     header_token: Option<&str>,
+    peer_ip: Option<std::net::IpAddr>,
 ) -> Json<RpcResponse> {
     if let Some(denied) = require_wallet_sign_auth(st, &id, params, header_token) {
+        return denied;
+    }
+    if let Some(denied) = require_wallet_sign_loopback(&id, peer_ip) {
         return denied;
     }
     let Some(seed) = st.msg_signing_seed else {
@@ -5684,17 +6078,10 @@ async fn dispatch(
             )
         }
         "stell_submitProposal" => {
-            if let Some(expected) = &st.auth_token {
-                let provided = params["token"]
-                    .as_str()
-                    .or_else(|| params["apiKey"].as_str())
-                    .or(header_token);
-                if !provided
-                    .map(|p| constant_time_eq(p, expected.as_str()))
-                    .unwrap_or(false)
-                {
-                    return err(id, -32001, "unauthorized: missing or invalid API token");
-                }
+            // GATE: H-01/C-02 — fail-closed without a token on a non-loopback
+            // bind (loopback keeps dev flows; sendRawTransaction stays open).
+            if let Some(denied) = require_gov_write_auth(st, &id, params, header_token) {
+                return denied;
             }
             let title = match params["title"].as_str() {
                 Some(t) => t.to_string(),
@@ -5725,7 +6112,7 @@ async fn dispatch(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let mut g = st.governance.write().await;
+            let mut g = gov_write(st).await;
             let mut ledger = st.engine.staking_write().await;
             let proposer = params["proposer"]
                 .as_str()
@@ -5737,17 +6124,10 @@ async fn dispatch(
             }
         }
         "stell_vote" => {
-            if let Some(expected) = &st.auth_token {
-                let provided = params["token"]
-                    .as_str()
-                    .or_else(|| params["apiKey"].as_str())
-                    .or(header_token);
-                if !provided
-                    .map(|p| constant_time_eq(p, expected.as_str()))
-                    .unwrap_or(false)
-                {
-                    return err(id, -32001, "unauthorized: missing or invalid API token");
-                }
+            // GATE: H-01/C-02 — fail-closed without a token on a non-loopback
+            // bind (loopback keeps dev flows; sendRawTransaction stays open).
+            if let Some(denied) = require_gov_write_auth(st, &id, params, header_token) {
+                return denied;
             }
             let pid = match params["id"].as_u64() {
                 Some(p) => p,
@@ -5771,7 +6151,7 @@ async fn dispatch(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let mut g = st.governance.write().await;
+            let mut g = gov_write(st).await;
             let mut ledger = st.engine.staking_write().await;
             match g.vote(&mut ledger, voter, pid, choice, now) {
                 Ok(weight) => ok(
@@ -5794,17 +6174,11 @@ async fn dispatch(
             // "anyone may execute" (no proposer-only rule) is preserved so a
             // lost proposer key cannot brick execution — the operator's
             // token is enough.
-            if let Some(expected) = &st.auth_token {
-                let provided = params["token"]
-                    .as_str()
-                    .or_else(|| params["apiKey"].as_str())
-                    .or(header_token);
-                if !provided
-                    .map(|p| constant_time_eq(p, expected.as_str()))
-                    .unwrap_or(false)
-                {
-                    return err(id, -32001, "unauthorized: missing or invalid API token");
-                }
+            // GATE: H-01/C-02 — same fail-closed rule as the sibling gov
+            // writes (no token + non-loopback bind refuses; loopback dev
+            // stays open).
+            if let Some(denied) = require_gov_write_auth(st, &id, params, header_token) {
+                return denied;
             }
             let pid = match params["id"].as_u64() {
                 Some(p) => p,
@@ -5814,8 +6188,13 @@ async fn dispatch(
                 .as_str()
                 .and_then(|s| parse_addr(s).ok())
                 .unwrap_or_default();
-            let mut g = st.governance.write().await;
-            match g.execute(executor, pid) {
+            let mut g = gov_write(st).await;
+            // Height-aware execution (KI-23): legacy unscheduled passes
+            // execute immediately (unchanged); proposals scheduled by the
+            // live-path `finalize_at_height` enforce pass_height + 7200
+            // maturity fail-closed. `st.height` is the finalized height.
+            let cur_height = st.height.load(std::sync::atomic::Ordering::Relaxed);
+            match g.execute_at_height(executor, pid, cur_height) {
                 Ok(applied) => ok(id, json!({ "executed": true, "applied": applied })),
                 Err(e) => err(id, -32000, format!("execute failed: {:?}", e)),
             }
@@ -5898,14 +6277,15 @@ async fn dispatch(
             ok(id, json!(list))
         }
         // ---- wallet signature standard (docs/WALLET_SIGNING.md) ----
-        // SIGN arms: gated by `auth_token` (when configured), TESTING/DEVNET
-        // ONLY — they sign with the NODE's key, so a production wallet must
-        // never use them. VERIFY arms: public, no auth (verification is total
-        // and side-effect free). The node signs Ed25519 only; VERIFY accepts
-        // all three live schemes (Ed25519, Falcon-512, Hybrid).
-        "stell_signMessage" => handle_sign_message(st, id, params, header_token),
+        // SIGN arms: fail-closed devnet-only (GATE: H-02) — separate ephemeral
+        // dev key, configured `auth_token` required, loopback-only. Production
+        // wallets must never use them. VERIFY arms: public, no auth
+        // (verification is total and side-effect free). The node signs
+        // Ed25519 only; VERIFY accepts all three live schemes (Ed25519,
+        // Falcon-512, Hybrid).
+        "stell_signMessage" => handle_sign_message(st, id, params, header_token, peer_ip),
         "stell_verifyMessage" => handle_verify_message(st, id, params),
-        "stell_signTypedData" => handle_sign_typed_data(st, id, params, header_token),
+        "stell_signTypedData" => handle_sign_typed_data(st, id, params, header_token, peer_ip),
         "stell_verifyTypedData" => handle_verify_typed_data(st, id, params),
         "stell_sendRawTransaction" => {
             // params: { "tx": <hex of bincode(Transaction)> }
@@ -6487,6 +6867,26 @@ async fn dispatch(
                 params
             };
 
+            // H-03/H-04: `private_key` over RPC leaks key material and
+            // `from` without a key cannot be honored (the node cannot sign
+            // as the caller). Both are refused fail-closed: fund and sign
+            // locally (SDK `TxBuilder::contract_deploy` + `sign`, or the
+            // wallet) and submit the sealed transaction via the `tx` form.
+            if p.get("private_key").is_some() {
+                return err(
+                    id,
+                    -32602,
+                    "private_key is no longer accepted: sign the deploy transaction locally and submit it via the `tx` form",
+                );
+            }
+            if p.get("from").is_some() {
+                return err(
+                    id,
+                    -32602,
+                    "`from` is no longer accepted: the transaction signer (tx.from) is the deploy creator; sign locally and submit via the `tx` form",
+                );
+            }
+
             // Check if wrapped in signed raw tx wrapper
             if let Some(raw_tx_str) = p.get("tx").and_then(|v| v.as_str()) {
                 let raw_bytes =
@@ -6521,29 +6921,28 @@ async fn dispatch(
                         )
                     }
                 };
-                let salt = p
-                    .get("init_data")
-                    .or_else(|| p.get("salt"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| {
-                        let s = s.strip_prefix("0x").unwrap_or(s);
-                        hex::decode(s).unwrap_or_else(|_| s.as_bytes().to_vec())
-                    })
-                    .unwrap_or_default();
-
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                let outcome = match st
-                    .engine
-                    .deploy_contract_deterministic(tx.from, code.clone(), &salt, now)
-                    .await
-                {
-                    Ok(o) => o,
-                    Err(e) => return err(id, -32000, format!("deploy contract failed: {e}")),
-                };
+                // H-04: validate read-only. The contract is NOT deployed here:
+                // this arm only admits the signed tx to the mempool — state
+                // changes exclusively when a block applies it (C-01/H-03).
+                if let Err(e) = crate::contract::ContractRegistry::validate_code(&code) {
+                    return err(id, -32000, format!("deploy contract failed: {e}"));
+                }
+                // H-04: the `init_data`/`salt` parameter is retired. It is not
+                // part of the replayable `SysCallDeployContract` payload, so
+                // no block-applied transaction could ever observe it; keeping
+                // it would promise an address determinism the chain cannot
+                // deliver (the old BLAKE3(code_hash || salt) address was a
+                // phantom the block path never recreated — the second half of
+                // the double-deploy). The predicted address below is the
+                // SDK-canonical `contract_address(tx.from, tx.nonce)`: exactly
+                // what block application derives when this tx applies first
+                // for its sender.
+                let predicted = crate::contract::contract_address(&tx.from, tx.nonce);
+                if st.engine.get_contract(&predicted).await.is_some() {
+                    return err(id, -32000, "deploy contract failed: contract already exists");
+                }
+                let code_hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&code).into();
+                let predicted_stl57 = crate::address::encode_stl57_address(&predicted);
                 let tx_hash = tx.compute_tx_hash();
 
                 // Submit to mempool & broadcast if available
@@ -6565,21 +6964,25 @@ async fn dispatch(
                     return_value: None,
                     gas_used: Some(gas_cost),
                     events: Vec::new(),
-                    contract_address: Some(outcome.contract_address),
+                    contract_address: Some(predicted),
                 });
 
                 return ok(
                     id,
                     json!({
-                        "contract_address": hex::encode(outcome.contract_address),
-                        "contract_address_stl57": outcome.contract_address_stl57,
-                        "code_hash": hex::encode(outcome.code_hash),
+                        "contract_address": hex::encode(predicted),
+                        "contract_address_stl57": predicted_stl57,
+                        "code_hash": hex::encode(code_hash),
                         "tx_hash": hex::encode(tx_hash),
                     }),
                 );
             }
 
-            // Direct parameters:
+            // Direct parameters: validated + admitted, never deployed here.
+            // The node signs the mempool vehicle with a fresh ephemeral key
+            // (it can never leak a user key — none is accepted) and predicts
+            // the SDK-canonical address. State changes exclusively when a
+            // block applies the admitted tx (H-04/C-01).
             let code_str = match p.get("code").and_then(|v| v.as_str()) {
                 Some(s) => s,
                 None => return err(id, -32602, "missing 'code' parameter"),
@@ -6589,16 +6992,9 @@ async fn dispatch(
                 Ok(c) => c,
                 Err(e) => return err(id, -32602, format!("invalid code hex: {e}")),
             };
-
-            let salt = p
-                .get("init_data")
-                .or_else(|| p.get("salt"))
-                .and_then(|v| v.as_str())
-                .map(|s| {
-                    let s_clean = s.strip_prefix("0x").unwrap_or(s);
-                    hex::decode(s_clean).unwrap_or_else(|_| s.as_bytes().to_vec())
-                })
-                .unwrap_or_default();
+            if let Err(e) = crate::contract::ContractRegistry::validate_code(&code) {
+                return err(id, -32000, format!("deploy contract failed: {e}"));
+            }
 
             let gas_limit = p
                 .get("gas_limit")
@@ -6608,88 +7004,36 @@ async fn dispatch(
                 })
                 .unwrap_or(crate::contract::MAX_CONTRACT_FUEL);
 
-            let signing_key = if let Some(pk_str) = p.get("private_key").and_then(|v| v.as_str()) {
-                let pk_clean = pk_str.strip_prefix("0x").unwrap_or(pk_str);
-                let pk_bytes = match hex::decode(pk_clean) {
-                    Ok(b) if b.len() == 32 => {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&b);
-                        arr
-                    }
-                    _ => return err(id, -32602, "private_key must be 32 bytes hex"),
-                };
-                ed25519_dalek::SigningKey::from_bytes(&pk_bytes)
-            } else {
-                ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
-            };
-
-            let from_addr = if let Some(from_str) = p.get("from").and_then(|v| v.as_str()) {
-                match parse_rpc_address(from_str) {
-                    Ok(a) => a,
-                    Err(e) => return err(id, -32602, format!("invalid from address: {e}")),
-                }
-            } else {
-                signing_key.verifying_key().to_bytes()
-            };
-            // P5 FIX: `from` selected the deployed-creator account while the
-            // tx was signed by a DIFFERENT key (or an ephemeral one). The
-            // creator must be the signer; otherwise a caller deploys as the
-            // victim. Enforced fail-closed here, at admission.
-            if from_addr != signing_key.verifying_key().to_bytes() {
-                return err(
-                    id,
-                    -32602,
-                    "from must be the transaction signer (must match private_key)",
-                );
+            // Optional typed ABI manifest: validated here (it travels inside
+            // the admitted tx's execution path at apply time, committed next
+            // to the code hash by block application — never by this arm).
+            if let Err(e) = parse_abi_manifest_param(p) {
+                return err(id, -32602, format!("invalid abi parameter: {e}"));
             }
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
+            // Ephemeral vehicle only: the node cannot sign as the caller (no
+            // key is accepted), so the admitted tx is signed by a fresh
+            // random key. Its only purpose is to carry the deploy through
+            // mempool/block admission; the predicted address is what block
+            // application derives for it.
+            let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            let from_addr = signing_key.verifying_key().to_bytes();
+            let nonce = st
+                .engine
+                .get_account(&from_addr)
+                .await
+                .map(|a| a.nonce)
                 .unwrap_or(0);
-
-            // Optional typed ABI manifest: the contract keeps it (committed
-            // next to its code hash) so clients can encode/decode calls.
-            let abi = match parse_abi_manifest_param(p) {
-                Ok(a) => a,
-                Err(e) => return err(id, -32602, format!("invalid abi parameter: {e}")),
-            };
-
-            let outcome = match abi.clone() {
-                Some(a) => {
-                    match st
-                        .engine
-                        .deploy_contract_deterministic_with_abi(
-                            from_addr,
-                            code.clone(),
-                            &salt,
-                            now,
-                            a,
-                        )
-                        .await
-                    {
-                        Ok(o) => o,
-                        Err(e) => return err(id, -32000, format!("deploy contract failed: {e}")),
-                    }
-                }
-                None => {
-                    match st
-                        .engine
-                        .deploy_contract_deterministic(from_addr, code.clone(), &salt, now)
-                        .await
-                    {
-                        Ok(o) => o,
-                        Err(e) => return err(id, -32000, format!("deploy contract failed: {e}")),
-                    }
-                }
-            };
-
-            let sender_acc = st.engine.get_account(&from_addr).await;
-            let nonce = sender_acc.map(|a| a.nonce).unwrap_or(0);
+            let predicted = crate::contract::contract_address(&from_addr, nonce);
+            if st.engine.get_contract(&predicted).await.is_some() {
+                return err(id, -32000, "deploy contract failed: contract already exists");
+            }
+            let predicted_stl57 = crate::address::encode_stl57_address(&predicted);
+            let code_hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&code).into();
 
             let tx = Transaction::sign_with_payload(
                 &signing_key,
-                outcome.contract_address,
+                predicted,
                 0,
                 gas_limit,
                 nonce,
@@ -6719,25 +7063,25 @@ async fn dispatch(
                 return_value: None,
                 gas_used: Some(gas_cost),
                 events: Vec::new(),
-                contract_address: Some(outcome.contract_address),
+                contract_address: Some(predicted),
             });
 
             ok(
                 id,
                 json!({
-                    "contract_address": hex::encode(outcome.contract_address),
-                    "contract_address_stl57": outcome.contract_address_stl57,
-                    "code_hash": hex::encode(outcome.code_hash),
+                    "contract_address": hex::encode(predicted),
+                    "contract_address_stl57": predicted_stl57,
+                    "code_hash": hex::encode(code_hash),
                     "tx_hash": hex::encode(tx_hash),
                 }),
             )
         }
-
-        // ---- contract execution (TON / Near receipt model) ----
         "stell_callContract" => {
-            // P5 FIX: this arm moves native value (debit_native/credit_native)
-            // AND executes the contract inline, i.e. it writes consensus state
-            // directly. Same auth_token gate as the other state-writing arms.
+            // H-03/H-04: this arm no longer writes consensus state. It runs
+            // the call on a CLONE of the registry for a result preview and
+            // only admits the (signed or ephemeral-vehicle) tx to the
+            // mempool — state changes exclusively when a block applies it.
+            // Same auth_token gate as the other state-writing arms.
             if let Some(expected) = &st.auth_token {
                 let provided = params["token"]
                     .as_str()
@@ -6755,6 +7099,119 @@ async fn dispatch(
             } else {
                 params
             };
+
+            // H-04: `private_key` over RPC leaks key material and `from`
+            // without a key cannot be honored. Both are refused fail-closed:
+            // sign locally (SDK `TxBuilder::contract_call` + `sign`) and
+            // submit the sealed transaction via the `tx` form, or use the
+            // direct parameters for a keyless preview (an ephemeral vehicle
+            // carries the call through mempool/block admission).
+            if p.get("private_key").is_some() {
+                return err(
+                    id,
+                    -32602,
+                    "private_key is no longer accepted: sign the call transaction locally and submit it via the `tx` form",
+                );
+            }
+            if p.get("from").is_some() {
+                return err(
+                    id,
+                    -32602,
+                    "`from` is no longer accepted: the transaction signer (tx.from) is the caller; sign locally and submit via the `tx` form",
+                );
+            }
+
+            // Signed-tx form: a sealed `SysCallCallContract` /
+            // `SysCallCallContractArgs` transaction. Verified exactly like
+            // `stell_sendRawTransaction`, previewed on a registry clone, and
+            // admitted to the mempool — never executed against live state.
+            if let Some(raw_tx_str) = p.get("tx").and_then(|v| v.as_str()) {
+                let raw_bytes =
+                    match hex::decode(raw_tx_str.strip_prefix("0x").unwrap_or(raw_tx_str)) {
+                        Ok(b) => b,
+                        Err(e) => return err(id, -32602, format!("invalid raw tx hex: {e}")),
+                    };
+                let tx: Transaction = match bincode::deserialize(&raw_bytes) {
+                    Ok(t) => t,
+                    Err(e) => return err(id, -32602, format!("failed to decode transaction: {e}")),
+                };
+                if !tx.verify_signature() {
+                    return err(id, -32000, "invalid transaction signature");
+                }
+                let mut found: Option<ExtractedCall> = None;
+                for op in &tx.payload {
+                    match op {
+                        crate::svm::OpCode::SysCallCallContract {
+                            contract,
+                            method,
+                            arg,
+                        } => {
+                            found = Some(ExtractedCall {
+                                contract: *contract,
+                                method: method.clone(),
+                                args: vec![*arg],
+                                calldata: Vec::new(),
+                            });
+                            break;
+                        }
+                        crate::svm::OpCode::SysCallCallContractArgs {
+                            contract,
+                            method,
+                            args,
+                            calldata,
+                        } => {
+                            found = Some(ExtractedCall {
+                                contract: *contract,
+                                method: method.clone(),
+                                args: args.clone(),
+                                calldata: calldata.clone(),
+                            });
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let extracted = match found {
+                    Some(f) => f,
+                    None => {
+                        return err(
+                            id,
+                            -32602,
+                            "transaction does not contain SysCallCallContract payload",
+                        )
+                    }
+                };
+                let (contract_addr, method_bytes, tx_args, tx_calldata) = (
+                    extracted.contract,
+                    extracted.method,
+                    extracted.args,
+                    extracted.calldata,
+                );
+                let method_str = match std::str::from_utf8(&method_bytes) {
+                    Ok(m) => m.to_string(),
+                    Err(_) => return err(id, -32602, "invalid contract method name"),
+                };
+                let outcome = preview_contract_call(
+                    st,
+                    &contract_addr,
+                    &method_str,
+                    PreviewCall::RawArgs(&tx_args, &tx_calldata),
+                    tx.amount,
+                    &tx.from,
+                    tx.gas_limit,
+                )
+                .await;
+                let raw_tx_hex = hex::encode(bincode::serialize(&tx).unwrap_or_default());
+                return admit_contract_tx_and_respond(
+                    st,
+                    id,
+                    tx,
+                    contract_addr,
+                    raw_tx_hex,
+                    outcome,
+                )
+                .await;
+            }
 
             let contract_str = match p
                 .get("contract")
@@ -6811,40 +7268,12 @@ async fn dispatch(
                 })
                 .unwrap_or(crate::contract::MAX_CONTRACT_FUEL);
 
-            let signing_key = if let Some(pk_str) = p.get("private_key").and_then(|v| v.as_str()) {
-                let pk_clean = pk_str.strip_prefix("0x").unwrap_or(pk_str);
-                let pk_bytes = match hex::decode(pk_clean) {
-                    Ok(b) if b.len() == 32 => {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&b);
-                        arr
-                    }
-                    _ => return err(id, -32602, "private_key must be 32 bytes hex"),
-                };
-                ed25519_dalek::SigningKey::from_bytes(&pk_bytes)
-            } else {
-                ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
-            };
-
-            let from_addr = if let Some(from_str) = p.get("from").and_then(|v| v.as_str()) {
-                match parse_rpc_address(from_str) {
-                    Ok(a) => a,
-                    Err(e) => return err(id, -32602, format!("invalid from address: {e}")),
-                }
-            } else {
-                signing_key.verifying_key().to_bytes()
-            };
-            // P5 FIX (THEFT): `from` selected whose native balance was debited
-            // for `value` while the tx was signed by a DIFFERENT key. Passing
-            // from=victim + attacker private_key drained the victim straight
-            // into the contract. The debited account must be the signer.
-            if from_addr != signing_key.verifying_key().to_bytes() {
-                return err(
-                    id,
-                    -32602,
-                    "from must be the transaction signer (must match private_key)",
-                );
-            }
+            // Ephemeral vehicle only (see above: no key is accepted). The
+            // admitted tx is signed by a fresh random key and carries the
+            // call through mempool/block admission; the preview below runs
+            // on a registry clone and changes nothing.
+            let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            let from_addr = signing_key.verifying_key().to_bytes();
 
             // Execute the contract call. When the contract carries an ABI
             // manifest the manifest is authoritative: the method and its
@@ -6875,32 +7304,35 @@ async fn dispatch(
                 _ => (call_args.clone(), Vec::new()),
             };
 
-            if value > 0 {
-                if let Err(e) = st.engine.debit_native(&from_addr, value).await {
-                    return err(
-                        id,
-                        -32000,
-                        format!("insufficient funds to transfer value: {e}"),
-                    );
-                }
-                let _ = st.engine.credit_native(&contract_addr, value).await;
-            }
-
+            // H-03: the preview runs on a registry CLONE (see
+            // `preview_contract_call`): the `value` leg is simulated with
+            // the same failure modes, but no account, contract, trie or
+            // mailbox state moves. The admitted tx below is the ONLY thing
+            // that can change state, when a block applies it.
             let outcome = match &typed_args {
                 Some(args) => {
-                    st.engine
-                        .call_contract_abi_structured(&contract_addr, method_str, args, gas_limit)
-                        .await
+                    preview_contract_call(
+                        st,
+                        &contract_addr,
+                        method_str,
+                        PreviewCall::Abi(args),
+                        value,
+                        &from_addr,
+                        gas_limit,
+                    )
+                    .await
                 }
                 None => {
-                    st.engine
-                        .call_contract_args_structured(
-                            &contract_addr,
-                            method_str,
-                            &call_args,
-                            gas_limit,
-                        )
-                        .await
+                    preview_contract_call(
+                        st,
+                        &contract_addr,
+                        method_str,
+                        PreviewCall::Plain(&call_args),
+                        value,
+                        &from_addr,
+                        gas_limit,
+                    )
+                    .await
                 }
             };
 
@@ -6935,62 +7367,9 @@ async fn dispatch(
                 0,
                 vec![call_opcode],
             );
-            let tx_hash = tx.compute_tx_hash();
             let raw_tx_hex = hex::encode(bincode::serialize(&tx).unwrap_or_default());
 
-            // Submit to mempool & broadcast if available
-            let _ = st.mempool.write().await.add(tx.clone());
-            if let Some(ref bc) = st.tx_broadcast {
-                let _ = bc.send(tx.clone());
-            }
-
-            let is_success = outcome.status == "success";
-            let events_view: Vec<Value> = outcome
-                .events
-                .iter()
-                .map(|e| {
-                    json!({
-                        "contract": hex::encode(e.contract),
-                        "contract_stl57": crate::address::encode_stl57_address(&e.contract),
-                        "topic": e.topic,
-                        "value": e.value,
-                    })
-                })
-                .collect();
-
-            // Record receipt in receipt index
-            st.receipts.write().await.insert(TxReceipt {
-                tx_hash,
-                height: st.height.load(std::sync::atomic::Ordering::Relaxed),
-                block_hash: [0u8; 32],
-                index: 0,
-                success: is_success,
-                gas_limit,
-                fee_charged: outcome.gas_used,
-                raw_tx: Some(raw_tx_hex),
-                return_value: outcome.return_value,
-                gas_used: Some(outcome.gas_used),
-                events: outcome.events.clone(),
-                contract_address: Some(contract_addr),
-            });
-
-            ok(
-                id,
-                json!({
-                    "tx_hash": hex::encode(tx_hash),
-                    "status": outcome.status,
-                    "return_value": outcome.return_value.map(|v| json!(v)).unwrap_or(Value::Null),
-                    "gas_used": outcome.gas_used,
-                    "events": events_view,
-                    "outcome": {
-                        "status": outcome.status,
-                        "return_value": outcome.return_value.map(|v| json!(v)).unwrap_or(Value::Null),
-                        "gas_used": outcome.gas_used,
-                        "events": events_view,
-                        "error": outcome.error
-                    }
-                }),
-            )
+            admit_contract_tx_and_respond(st, id, tx, contract_addr, raw_tx_hex, outcome).await
         }
 
         // ---- the ABI manifest of a contract (typed interface discovery) ----
@@ -9284,8 +9663,11 @@ mod tests {
         ))
     }
 
-    /// `test_state` with the node message-signing key configured (seed 0x42)
-    /// and an optional auth token: the harness for the wallet-signing arms.
+    // GATE: H-02 — fixed test seed 0x42 stands in for the ephemeral dev-only
+    // key (`dev_msg_signing_seed_from_env`); it is NOT the validator key and
+    // no test may wire a validator/consensus key here. Justification: the
+    // address pin below needs a deterministic seed, while production mints a
+    // fresh random seed per boot.
     async fn signing_state(token: Option<&str>) -> Arc<RpcState> {
         let base = test_state().await;
         Arc::new(RpcState {
@@ -9310,11 +9692,16 @@ mod tests {
 
     #[tokio::test]
     async fn sign_and_verify_message_round_trip() {
-        let st = signing_state(None).await;
+        // GATE: H-02 — dev-mode works only with a presented token (SIGN arms
+        // are fail-closed without STELL_RPC_AUTH_TOKEN). Justification: this
+        // test previously used an open tokenless node; updated to the gated
+        // dev-mode path. The seed is the fixed test stand-in, not a
+        // validator key.
+        let st = signing_state(Some("secret")).await;
         let signed = call(
             &st,
             "stell_signMessage",
-            json!({"message": "hello stellereum"}),
+            json!({"message": "hello stellereum", "token": "secret"}),
         )
         .await;
         assert!(signed.get("error").is_none(), "sign must succeed: {signed}");
@@ -9424,10 +9811,33 @@ mod tests {
 
     #[tokio::test]
     async fn sign_refuses_fail_closed_without_a_key() {
-        // `test_state` configures no `msg_signing_seed`: the SIGN arms must
-        // refuse, not sign with a zero key.
-        let st = test_state().await;
-        let r = call(&st, "stell_signMessage", json!({"message": "hi"})).await;
+        // GATE: H-02 — prod-mode refused: token configured but no dev key
+        // (production default) must refuse with "not configured", not sign.
+        let base = test_state().await;
+        let st = Arc::new(RpcState {
+            engine: base.engine.clone(),
+            mempool: base.mempool.clone(),
+            height: base.height.clone(),
+            node_id: base.node_id.clone(),
+            chain_id: base.chain_id,
+            staking: base.staking.clone(),
+            governance: base.governance.clone(),
+            recent_blocks: base.recent_blocks.clone(),
+            receipts: base.receipts.clone(),
+            auth_token: Some("secret".to_string()),
+            tx_broadcast: base.tx_broadcast.clone(),
+            faucet: base.faucet.clone(),
+            faucet_token: base.faucet_token.clone(),
+            msg_signing_seed: None,
+            archive_store: None,
+            shard_registry: ShardRegistry::single(),
+        });
+        let r = call(
+            &st,
+            "stell_signMessage",
+            json!({"message": "hi", "token": "secret"}),
+        )
+        .await;
         assert!(r.get("error").is_some(), "keyless sign must fail: {r}");
         assert!(
             r["error"].as_str().unwrap().contains("not configured"),
@@ -9436,16 +9846,68 @@ mod tests {
         let t = call(
             &st,
             "stell_signTypedData",
-            json!({"contract": hex::encode([0x01u8; 32]), "method": "ping"}),
+            json!({"contract": hex::encode([0x01u8; 32]), "method": "ping", "token": "secret"}),
         )
         .await;
         assert!(t.get("error").is_some());
     }
 
     #[tokio::test]
-    async fn rpc_signature_does_not_verify_on_another_chain() {
+    async fn sign_refuses_without_token_even_with_key() {
+        // GATE: H-02 — dev key present but no token configured/presented:
+        // SIGN arms stay fail-closed (anonymous signing oracle refused).
         let st = signing_state(None).await;
-        let signed = call(&st, "stell_signMessage", json!({"message": "move 1 STELL"})).await;
+        let r = call(&st, "stell_signMessage", json!({"message": "hi"})).await;
+        assert!(r.get("error").is_some(), "tokenless sign must fail: {r}");
+        assert!(
+            r["error"].as_str().unwrap().contains("STELL_RPC_AUTH_TOKEN"),
+            "{r}"
+        );
+        let t = call(
+            &st,
+            "stell_signTypedData",
+            json!({"contract": hex::encode([0x01u8; 32]), "method": "ping"}),
+        )
+        .await;
+        assert!(t.get("error").is_some(), "{t}");
+    }
+
+    #[tokio::test]
+    async fn sign_refuses_non_loopback_peer() {
+        // GATE: H-02 — loopback-only: a routable peer IP is refused even with
+        // a valid token; loopback succeeds on the same state.
+        let st = signing_state(Some("secret")).await;
+        let params = json!({"message": "hi", "token": "secret"});
+        let remote: std::net::IpAddr = "8.8.8.8".parse().unwrap();
+        let denied = call_as(&st, remote, "stell_signMessage", params.clone()).await;
+        assert!(
+            denied.get("error").is_some(),
+            "non-loopback sign must fail: {denied}"
+        );
+        assert!(
+            denied["error"].as_str().unwrap().contains("loopback"),
+            "{denied}"
+        );
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let allowed = call_as(&st, loopback, "stell_signMessage", params).await;
+        assert!(
+            allowed.get("error").is_none(),
+            "loopback sign must succeed: {allowed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_signature_does_not_verify_on_another_chain() {
+        // GATE: H-02 — updated to the gated dev-mode path (token required);
+        // domain assertions unchanged.
+        let st = signing_state(Some("secret")).await;
+        let signed = call(
+            &st,
+            "stell_signMessage",
+            json!({"message": "move 1 STELL", "token": "secret"}),
+        )
+        .await;
+        assert!(signed.get("error").is_none(), "sign must succeed: {signed}");
         let params = |chain: u64| {
             json!({
                 "address": signed["address"],
@@ -9466,8 +9928,16 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_tampered_message_and_bad_envelope_fail() {
-        let st = signing_state(None).await;
-        let signed = call(&st, "stell_signMessage", json!({"message": "pay alice 1"})).await;
+        // GATE: H-02 — updated to the gated dev-mode path (token required);
+        // tamper/envelope assertions unchanged.
+        let st = signing_state(Some("secret")).await;
+        let signed = call(
+            &st,
+            "stell_signMessage",
+            json!({"message": "pay alice 1", "token": "secret"}),
+        )
+        .await;
+        assert!(signed.get("error").is_none(), "sign must succeed: {signed}");
         let bad_msg = call(
             &st,
             "stell_verifyMessage",
@@ -9508,7 +9978,9 @@ mod tests {
 
     #[tokio::test]
     async fn typed_data_is_canonical_over_rpc() {
-        let st = signing_state(None).await;
+        // GATE: H-02 — updated to the gated dev-mode path (token required);
+        // canonicalization assertions unchanged.
+        let st = signing_state(Some("secret")).await;
         let contract = hex::encode([0xABu8; 32]);
         let args_a = json!({"to": "alice", "amount": 100});
         let args_b = json!({"amount": 100, "to": "alice"});
@@ -9525,6 +9997,7 @@ mod tests {
                         "args": args,
                         "value": "1000",
                         "nonce": "7",
+                        "token": "secret",
                     }),
                 )
                 .await
@@ -11162,15 +11635,16 @@ mod tests {
         );
     }
 
-    /// P5 EXPLOIT (Critical, rpc.rs `stell_callContract`): the `from` param
-    /// selected whose native balance was debited for `value`, while the tx was
-    /// signed by a DIFFERENT key (`private_key`, or a fresh ephemeral one).
-    /// `from=victim + private_key=attacker + value=N` drained N native units
-    /// from the victim into the contract on every call — even when the call
-    /// itself failed (the debit ran before execution with no rollback).
-    /// Fixed by requiring `from == signer` fail-closed at admission.
+    /// H-03/H-04 (rpc.rs `stell_callContract` / `stell_deployContract`):
+    /// the old `from` + `private_key` pair let a caller debit ANY account
+    /// (`from=victim + private_key=attacker + value=N` drained the victim
+    /// straight into the contract, even when the call itself failed). The
+    /// whole key-accepting shape is gone: `private_key` is refused
+    /// fail-closed on both arms, `from` is refused too (without a key the
+    /// node cannot sign as the caller, so honoring it is impossible), and
+    /// the arms never debit — previews simulate `value` on a clone.
     #[tokio::test]
-    async fn p5_call_contract_from_must_equal_signer() {
+    async fn p5_call_contract_rejects_key_material_and_spoofed_sender() {
         let st = test_state().await;
         let victim = SigningKey::from_bytes(&[0x51u8; 32]);
         let victim_addr = victim.verifying_key().to_bytes();
@@ -11186,6 +11660,8 @@ mod tests {
             .map(|a| a.balance)
             .unwrap_or(0);
         assert_eq!(before, 1_000_000);
+        // `private_key` is refused on the call arm (it used to select the
+        // debit victim's fate via `from` + attacker key).
         let r = call(
             &st,
             "stell_callContract",
@@ -11202,8 +11678,44 @@ mod tests {
             r["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("must be the transaction signer"),
-            "mismatched from/signer must be refused: {r}"
+                .contains("no longer accepted"),
+            "key material over RPC must be refused: {r}"
+        );
+        // `from` alone is refused too: without a key it cannot be honored.
+        let r_from = call(
+            &st,
+            "stell_callContract",
+            json!({
+                "contract": hex::encode(contract),
+                "method": "get",
+                "from": hex::encode(victim_addr),
+                "value": 500u64,
+            }),
+        )
+        .await;
+        assert!(
+            r_from["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no longer accepted"),
+            "spoofable sender must be refused: {r_from}"
+        );
+        // And on the deploy arm.
+        let r_deploy = call(
+            &st,
+            "stell_deployContract",
+            json!({
+                "code": hex::encode(counter_getter_wasm()),
+                "private_key": hex::encode(attacker.to_bytes()),
+            }),
+        )
+        .await;
+        assert!(
+            r_deploy["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no longer accepted"),
+            "deploy must refuse key material: {r_deploy}"
         );
         let after = st
             .engine
@@ -11213,28 +11725,32 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(
             after, before,
-            "victim balance must be untouched by the refused call"
+            "victim balance must be untouched by the refused calls"
         );
-        // Sanity: signer calling as itself is still admitted past the check
-        // (fails later on the unknown contract, never on signer binding).
+        // Sanity: the keyless preview is still admitted past the key checks
+        // (it fails later on the unknown contract — a clone-exec failure,
+        // never a signer error — and files nothing that moves value).
         let r_self = call(
             &st,
             "stell_callContract",
             json!({
                 "contract": hex::encode(contract),
                 "method": "get",
-                "from": hex::encode(attacker.verifying_key().to_bytes()),
-                "private_key": hex::encode(attacker.to_bytes()),
                 "value": 0u64,
             }),
         )
         .await;
         assert!(
-            !r_self["error"]
+            !r_self["error"].is_string(),
+            "keyless preview must pass the key checks: {r_self}"
+        );
+        assert_eq!(r_self["status"], json!("failed"));
+        assert!(
+            r_self["outcome"]["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("must be the transaction signer"),
-            "self-signed call must pass the signer check: {r_self}"
+                .contains("not found"),
+            "unknown contract must fail in preview: {r_self}"
         );
     }
 
@@ -13531,40 +14047,65 @@ mod tests {
 
     // ==================== stell_deployContract & stell_callContract Tests ====================
 
+    /// H-04/C-01: the deploy arms validate + admit but never deploy. The
+    /// returned address is the SDK-canonical prediction
+    /// (`contract_address(tx.from, tx.nonce)` — exactly what block
+    /// application derives when this tx applies first for its sender), and
+    /// nothing is visible in state until a block carries the admitted tx.
+    /// (The old BLAKE3(code_hash || salt) address was a phantom the block
+    /// path never recreated — `init_data`/`salt` is retired: not part of the
+    /// replayable payload, so it cannot influence the chain.)
     #[tokio::test]
-    async fn deploy_contract_deterministic_address_and_trie_deployment() {
+    async fn deploy_contract_predicts_address_and_admits_without_writing_state() {
         let st = test_state().await;
         let code = sample_getter_wasm();
-        let code_hex = hex::encode(&code);
-        let salt = vec![0x12, 0x34, 0x56, 0x78];
-        let salt_hex = hex::encode(&salt);
-
-        // Calculate expected deterministic address: BLAKE3("STELL_CONTRACT" || code_hash || salt)
-        let expected_code_hash = *blake3::hash(&code).as_bytes();
-        let expected_addr =
-            crate::state_engine::compute_contract_address(&expected_code_hash, &salt);
-        let expected_stl57 = crate::address::encode_stl57_address(&expected_addr);
+        let root_before = st.engine.get_state_root().await;
 
         let res = call(
             &st,
             "stell_deployContract",
             json!({
-                "code": code_hex,
-                "init_data": salt_hex,
+                "code": hex::encode(&code),
+                "init_data": hex::encode(vec![0x12, 0x34, 0x56, 0x78]),
                 "gas_limit": 10_000_000,
             }),
         )
         .await;
 
-        assert_eq!(res["contract_address"], json!(hex::encode(expected_addr)));
-        assert_eq!(res["contract_address_stl57"], json!(expected_stl57));
-        assert_eq!(res["code_hash"], json!(hex::encode(expected_code_hash)));
         let tx_hash = res["tx_hash"].as_str().expect("tx_hash present");
         assert_eq!(tx_hash.len(), 64);
+        // The admitted vehicle is a validly signed ephemeral tx; the
+        // prediction is derived from it, independent of the retired salt.
+        let pooled: Vec<Transaction> = st.mempool.read().await.all();
+        assert_eq!(pooled.len(), 1, "deploy belongs in the mempool");
+        assert!(pooled[0].verify_signature());
+        let expected_addr =
+            crate::contract::contract_address(&pooled[0].from, pooled[0].nonce);
+        assert_eq!(res["contract_address"], json!(hex::encode(expected_addr)));
+        assert_eq!(
+            res["contract_address_stl57"],
+            json!(crate::address::encode_stl57_address(&expected_addr))
+        );
+        assert_eq!(
+            res["code_hash"],
+            json!(hex::encode(
+                <sha2::Sha256 as sha2::Digest>::digest(&code).as_slice()
+            ))
+        );
 
-        // Verify WASM code is deployed in the Patricia state trie under contract address
-        let trie_code = st.engine.get_contract_code_from_trie(&expected_addr).await;
-        assert_eq!(trie_code, Some(code));
+        // Nothing is visible in consensus state before a block applies it.
+        assert_eq!(
+            st.engine.get_state_root().await,
+            root_before,
+            "admission must not move the state root"
+        );
+        assert!(st.engine.get_contract(&expected_addr).await.is_none());
+        assert!(
+            st.engine
+                .get_contract_code_hash(&expected_addr)
+                .await
+                .is_none()
+        );
 
         // Verify receipt is recorded in st.receipts
         let receipt = call(
@@ -13578,19 +14119,64 @@ mod tests {
             receipt["contract_address"],
             json!(hex::encode(expected_addr))
         );
-        assert_eq!(receipt["contract_address_stl57"], json!(expected_stl57));
+        assert_eq!(
+            receipt["contract_address_stl57"],
+            json!(crate::address::encode_stl57_address(&expected_addr))
+        );
+
+        // The state change happens exactly once, at block application: fund
+        // the vehicle, apply it, and the predicted address materializes.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        st.engine
+            .update_account(AccountState::new(pooled[0].from, 1_000_000_000))
+            .await;
+        st.engine.apply_transaction(&pooled[0], now).await.unwrap();
+        // Block application materializes the contract in the registry and
+        // commits its code hash (the code bytes live in the registry; the
+        // trie carries the code hash under the namespaced contract key —
+        // the raw-address code blob was deterministic-path-only).
+        let stored = st
+            .engine
+            .get_contract(&expected_addr)
+            .await
+            .expect("applied deploy must materialize the contract");
+        assert_eq!(stored.code, code);
+        assert_eq!(
+            st.engine.get_contract_code_hash(&expected_addr).await,
+            Some(
+                <sha2::Sha256 as sha2::Digest>::digest(&code).as_slice().try_into().unwrap()
+            )
+        );
+        // Re-applying the same tx is refused (nonce consumed): apply-once.
+        let again = st.engine.apply_transaction(&pooled[0], now).await;
+        assert!(
+            again.is_err(),
+            "double application must be refused: {again:?}"
+        );
+        assert_eq!(
+            st.engine
+                .get_contract(&expected_addr)
+                .await
+                .map(|c| c.code),
+            Some(code),
+            "the refused re-application must not disturb the deployed code"
+        );
     }
 
     #[tokio::test]
     async fn deploy_contract_with_signed_raw_tx_wrapper() {
         let st = test_state().await;
         let code = counter_getter_wasm();
-        let salt = vec![0xAB, 0xCD];
-        let expected_code_hash = *blake3::hash(&code).as_bytes();
-        let expected_addr =
-            crate::state_engine::compute_contract_address(&expected_code_hash, &salt);
 
         let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        let from = key.verifying_key().to_bytes();
+        // Funded, so the admitted tx can actually apply at block time.
+        st.engine
+            .update_account(AccountState::new(from, 1_000_000_000))
+            .await;
         let tx = Transaction::sign_with_payload(
             &key,
             [0u8; 32],
@@ -13603,6 +14189,9 @@ mod tests {
         );
         let tx_hash = tx.compute_tx_hash();
         let raw_hex = hex::encode(bincode::serialize(&tx).unwrap());
+        // `init_data` is retired (not part of the payload): passing it must
+        // not change the predicted address.
+        let salt = vec![0xAB, 0xCD];
 
         let res = call(
             &st,
@@ -13614,10 +14203,26 @@ mod tests {
         )
         .await;
 
+        // SDK-canonical prediction: what block application derives.
+        let expected_addr = crate::contract::contract_address(&from, 0);
+        let root_after_funding = st.engine.get_state_root().await;
         assert_eq!(res["contract_address"], json!(hex::encode(expected_addr)));
         assert_eq!(res["tx_hash"], json!(hex::encode(tx_hash)));
+        assert_eq!(st.mempool.read().await.len(), 1);
+        assert_eq!(
+            st.engine.get_state_root().await,
+            root_after_funding,
+            "admission must not move the state root"
+        );
+        assert!(st.engine.get_contract(&expected_addr).await.is_none());
 
-        // Verify contract can be called immediately
+        // Only block application materializes the contract — then the
+        // contract is callable, exactly once.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        st.engine.apply_transaction(&tx, now).await.unwrap();
         let call_res = call(
             &st,
             "stell_callContract",
@@ -13630,6 +14235,11 @@ mod tests {
         .await;
         assert_eq!(call_res["status"], json!("success"));
         assert_eq!(call_res["return_value"], json!(1));
+        let again = st.engine.apply_transaction(&tx, now).await;
+        assert!(
+            again.is_err(),
+            "double application must be refused: {again:?}"
+        );
     }
 
     #[tokio::test]
@@ -13650,19 +14260,20 @@ mod tests {
     #[tokio::test]
     async fn call_contract_execution_and_receipt_structured_outcomes() {
         let st = test_state().await;
-        let code = sample_getter_wasm();
-        let deploy_res = call(
-            &st,
-            "stell_deployContract",
-            json!({
-                "code": hex::encode(&code),
-                "gas_limit": 10_000_000,
-            }),
-        )
-        .await;
+        // H-03 fixture setup deploys through the engine directly: the RPC
+        // no longer deploys out-of-block, so tests materialize contracts the
+        // way block application does.
+        let creator = [0x11u8; 32];
+        let deployed = st
+            .engine
+            .deploy_contract(creator, sample_getter_wasm(), 0)
+            .await
+            .unwrap();
 
-        let contract_addr = deploy_res["contract_address"].as_str().unwrap();
-        let contract_stl57 = deploy_res["contract_address_stl57"].as_str().unwrap();
+        let contract_addr_hex = hex::encode(deployed);
+        let contract_addr = contract_addr_hex.as_str();
+        let contract_stl57_hex = crate::address::encode_stl57_address(&deployed);
+        let contract_stl57 = contract_stl57_hex.as_str();
 
         // 1. Call with integer argument
         let call1 = call(
@@ -13762,39 +14373,36 @@ mod tests {
         assert_eq!(call4["return_value"], json!(42));
     }
 
+    /// H-03: previews are result-identical but state-free, and the admitted
+    /// tx applies exactly once. The counter contract is the proof: two
+    /// identical previews return the SAME value (the old suite asserted
+    /// 1-then-2, i.e. live mutation per call), storage stays empty until a
+    /// block applies the tx, and re-application is refused by the nonce rule.
     #[tokio::test]
     async fn call_contract_state_mutations_and_events() {
         let st = test_state().await;
+        let creator = [0x33u8; 32];
 
-        // 1. Counter contract (persistent storage)
-        let deploy_counter = call(
-            &st,
-            "stell_deployContract",
-            json!({
-                "code": hex::encode(counter_getter_wasm()),
-            }),
-        )
-        .await;
-        let counter_addr = deploy_counter["contract_address"].as_str().unwrap();
+        // 1. Counter contract (persistent storage), deployed engine-side.
+        let counter = st
+            .engine
+            .deploy_contract(creator, counter_getter_wasm(), 0)
+            .await
+            .unwrap();
+        let counter_hex = hex::encode(counter);
+        let counter_addr = counter_hex.as_str();
 
-        let inc1 = call(
-            &st,
-            "stell_callContract",
-            json!({ "contract": counter_addr, "method": "inc", "args": 7 }),
-        )
-        .await;
-        assert_eq!(inc1["status"], json!("success"));
-        assert_eq!(inc1["return_value"], json!(1));
-
-        let inc2 = call(
-            &st,
-            "stell_callContract",
-            json!({ "contract": counter_addr, "method": "inc", "args": 7 }),
-        )
-        .await;
-        assert_eq!(inc2["status"], json!("success"));
-        assert_eq!(inc2["return_value"], json!(2));
-
+        // Preview twice: same answer both times, nothing persisted.
+        for _ in 0..2 {
+            let inc = call(
+                &st,
+                "stell_callContract",
+                json!({ "contract": counter_addr, "method": "inc", "args": 7 }),
+            )
+            .await;
+            assert_eq!(inc["status"], json!("success"));
+            assert_eq!(inc["return_value"], json!(1));
+        }
         let get = call(
             &st,
             "stell_callContract",
@@ -13802,18 +14410,94 @@ mod tests {
         )
         .await;
         assert_eq!(get["status"], json!("success"));
-        assert_eq!(get["return_value"], json!(2));
+        assert_eq!(
+            get["return_value"],
+            json!(0),
+            "previews must not persist storage"
+        );
+        assert!(
+            st.engine
+                .get_contract(&counter)
+                .await
+                .map(|c| c.storage.is_empty())
+                .unwrap_or(false),
+            "registry storage must be untouched by previews"
+        );
 
-        // 2. Event emission contract
-        let deploy_event = call(
+        // 2. The funded `tx` form previews the same answer, admits the tx,
+        // and still changes nothing — until block application.
+        let caller = ed25519_dalek::SigningKey::from_bytes(&[0xC4u8; 32]);
+        let caller_addr = caller.verifying_key().to_bytes();
+        st.engine
+            .update_account(AccountState::new(caller_addr, 1_000_000_000))
+            .await;
+        let root_after_funding = st.engine.get_state_root().await;
+        let call_tx = Transaction::sign_with_payload(
+            &caller,
+            counter,
+            0,
+            1_000_000,
+            0,
+            0,
+            0,
+            vec![crate::svm::OpCode::SysCallCallContract {
+                contract: counter,
+                method: b"inc".to_vec(),
+                arg: 7,
+            }],
+        );
+        let preview = call(
             &st,
-            "stell_deployContract",
-            json!({
-                "code": hex::encode(event_getter_wasm()),
-            }),
+            "stell_callContract",
+            json!({ "tx": hex::encode(bincode::serialize(&call_tx).unwrap()) }),
         )
         .await;
-        let event_addr = deploy_event["contract_address"].as_str().unwrap();
+        assert_eq!(preview["status"], json!("success"));
+        assert_eq!(preview["return_value"], json!(1));
+        assert_eq!(
+            st.engine.get_state_root().await,
+            root_after_funding,
+            "admission must not move the state root"
+        );
+
+        // 3. Apply-once: the first application persists exactly one
+        // increment; the replay is refused and changes nothing.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        st.engine.apply_transaction(&call_tx, now).await.unwrap();
+        let stored = st
+            .engine
+            .get_contract(&counter)
+            .await
+            .and_then(|c| c.storage.get(&7).copied());
+        assert_eq!(stored, Some(1), "exactly one increment must apply");
+        let replay = st.engine.apply_transaction(&call_tx, now).await;
+        assert!(replay.is_err(), "double application must be refused");
+        let stored_again = st
+            .engine
+            .get_contract(&counter)
+            .await
+            .and_then(|c| c.storage.get(&7).copied());
+        assert_eq!(stored_again, Some(1), "the refused replay must not execute");
+        // And the post-apply preview observes the applied state.
+        let get_after = call(
+            &st,
+            "stell_callContract",
+            json!({ "contract": counter_addr, "method": "get", "args": 7 }),
+        )
+        .await;
+        assert_eq!(get_after["return_value"], json!(1));
+
+        // 4. Event emission contract: the clone preview still reports events.
+        let event_contract = st
+            .engine
+            .deploy_contract(creator, event_getter_wasm(), 0)
+            .await
+            .unwrap();
+        let event_hex = hex::encode(event_contract);
+        let event_addr = event_hex.as_str();
 
         let emit_call = call(
             &st,
@@ -13847,18 +14531,21 @@ mod tests {
         assert_eq!(r_events[0]["value"], json!(888));
     }
 
+    /// H-03 result-equivalence: the clone preview reports byte-identical
+    /// failure shapes (trap, unknown method/contract, out-of-fuel) without
+    /// executing against live state. Fixtures deploy engine-side (the RPC no
+    /// longer deploys out-of-block).
     #[tokio::test]
     async fn call_contract_observable_failures() {
         let st = test_state().await;
-        let deploy = call(
-            &st,
-            "stell_deployContract",
-            json!({
-                "code": hex::encode(sample_getter_wasm()),
-            }),
-        )
-        .await;
-        let contract_addr = deploy["contract_address"].as_str().unwrap();
+        let creator = [0x77u8; 32];
+        let sample = st
+            .engine
+            .deploy_contract(creator, sample_getter_wasm(), 0)
+            .await
+            .unwrap();
+        let sample_hex = hex::encode(sample);
+        let contract_addr = sample_hex.as_str();
 
         // 1. Trap failure
         let trap_res = call(
@@ -13917,15 +14604,13 @@ mod tests {
             .contains("not found"));
 
         // 4. Out of fuel failure
-        let deploy_loop = call(
-            &st,
-            "stell_deployContract",
-            json!({
-                "code": hex::encode(loop_getter_wasm()),
-            }),
-        )
-        .await;
-        let loop_addr = deploy_loop["contract_address"].as_str().unwrap();
+        let loop_contract = st
+            .engine
+            .deploy_contract(creator, loop_getter_wasm(), 0)
+            .await
+            .unwrap();
+        let loop_hex = hex::encode(loop_contract);
+        let loop_addr = loop_hex.as_str();
         let oof_res = call(
             &st,
             "stell_callContract",
@@ -15411,6 +16096,126 @@ mod tests {
             st.governance.read().await.get(7).map(|p| p.status),
             Some(crate::governance::ProposalStatus::Executed)
         );
+    }
+
+    /// The bind parser: only provably-loopback binds read as loopback, so the
+    /// gov-write gate fails closed on anything else.
+    /// // GATE: fail-closed direction of H-01 (unparseable → refused).
+    #[test]
+    fn bind_addr_loopback_parser_is_fail_closed() {
+        for good in [
+            "127.0.0.1:8545",
+            "127.0.0.1",
+            "127.2.3.4:1",
+            "localhost:8545",
+            "localhost",
+            "[::1]:8545",
+            "::1",
+            "  127.0.0.1:8545  ",
+        ] {
+            assert!(bind_addr_is_loopback(good), "{good} must read as loopback");
+        }
+        for bad in [
+            "0.0.0.0:8545",
+            "0.0.0.0",
+            "192.168.1.10:8545",
+            "10.0.0.5:8545",
+            "example.com:8545",
+            "example.com",
+            "",
+            "garbage",
+            ":8545",
+            "[::1",
+            "127.0.0.1:abc",
+        ] {
+            assert!(
+                !bind_addr_is_loopback(bad),
+                "{bad} must NOT read as loopback"
+            );
+        }
+    }
+
+    /// H-01/C-02: gov writes are fail-CLOSED without a token on a non-loopback
+    /// bind (mock bind) and stay open on loopback (dev flows preserved).
+    /// // GATE: P0 fail-closed rule + loopback-dev pin; extends, never weakens.
+    #[tokio::test]
+    async fn gov_writes_fail_closed_off_loopback_and_open_on_it() {
+        // Panic-safe mock guard: the override is process-wide (a mutex, never
+        // the env), so it must reset even when an assert below fails.
+        struct BindGuard;
+        impl Drop for BindGuard {
+            fn drop(&mut self) {
+                set_test_bind_loopback(None);
+            }
+        }
+        let _guard = BindGuard;
+
+        // 1. Non-loopback bind, no token: all three gov writes refuse. The
+        //    gate runs before payload parsing, so garbage params are still
+        //    unauthorized (never a parse error).
+        set_test_bind_loopback(Some(false));
+        let st = test_state().await;
+        for (method, params) in [
+            (
+                "stell_submitProposal",
+                json!({"title": "t", "type": "signal", "proposer": hex::encode([9u8; 32])}),
+            ),
+            (
+                "stell_vote",
+                json!({"id": 1, "voter": hex::encode([9u8; 32])}),
+            ),
+            ("stell_executeProposal", json!({"id": 1})),
+        ] {
+            let r = call(&st, method, params).await;
+            assert!(
+                r["error"].as_str().unwrap_or("").contains("unauthorized"),
+                "{method} without a token on a non-loopback bind must refuse: {r}"
+            );
+        }
+        assert!(
+            st.governance.read().await.proposals.is_empty(),
+            "refused writes must not record anything"
+        );
+
+        // 2. Loopback bind, no token: dev flows work end to end.
+        set_test_bind_loopback(Some(true));
+        let st = test_state().await;
+        let proposer = [0xA1u8; 32];
+        let voter = [0xB2u8; 32];
+        {
+            let mut ledger = st.engine.staking_write().await;
+            ledger
+                .bond(proposer, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
+                .unwrap();
+            ledger
+                .bond(voter, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
+                .unwrap();
+        }
+        let r = call(
+            &st,
+            "stell_submitProposal",
+            json!({
+                "title": "dev",
+                "type": "signal",
+                "text": "hi",
+                "proposer": hex::encode(proposer),
+            }),
+        )
+        .await;
+        let pid = r["proposal_id"]
+            .as_u64()
+            .expect("loopback submit must work");
+        assert!(
+            r.get("error").is_none(),
+            "loopback submit must work: {r}"
+        );
+        let r = call(
+            &st,
+            "stell_vote",
+            json!({"id": pid, "voter": hex::encode(voter), "choice": "yes"}),
+        )
+        .await;
+        assert_eq!(r["voted"], json!(true), "loopback vote must work: {r}");
     }
 
     /// `stell_getEvents` must answer a BOUNDED list: the receipt index holds

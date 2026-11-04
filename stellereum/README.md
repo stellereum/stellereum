@@ -1,16 +1,13 @@
 # Stellereum Network (STELL)
 
-> Testnet software — no real funds, no mainnet yet, no external audit yet.
+**Post-quantum Layer-1 blockchain, rebuilt in pure Rust.**
+Tendermint-style BFT, Falcon-512 signatures, actor accounts, on-chain order book —
+a full node on lightweight hardware. Open source, quantum-safe, and yours.
 
-A post-quantum Layer-1 blockchain in Rust: Tendermint-style BFT finality,
-Falcon-512 validator signatures, actor accounts, a native on-chain order book —
-running on lightweight hardware. `chainId 5757`.
-
-<p align="center">
-  <a href="https://github.com/stellereum/stellereum/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/stellereum/stellereum/ci.yml?label=CI" alt="CI"/></a>
-  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-orange" alt="License"/></a>
-  <img src="https://img.shields.io/badge/testnet-closed-yellow" alt="Testnet status"/>
-</p>
+[![100% Rust](https://img.shields.io/badge/100%25-Rust-%2373410e?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![Linux x86_64](https://img.shields.io/badge/Linux-x86__64-2f7d62?style=flat-square)](https://github.com/stellereum/stellereum/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20%2F%20Apache--2.0-3a3a3a?style=flat-square)](LICENSE-MIT)
+[![Status: closed testnet](https://img.shields.io/badge/Status-closed%20testnet-d69e2d?style=flat-square)](#status)
 
 ## Highlights
 

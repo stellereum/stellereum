@@ -67,6 +67,7 @@
 
 use crate::contract_abi::{AbiType, AbiValue, ContractAbi};
 use crate::mempool::{AdmissionCtx, Mempool};
+use crate::network::decode_wire_limited;
 use crate::sharding::{ShardId, ShardRegistry, Transaction};
 use crate::state_engine::{token_balance_key, AccountState, InMemoryStateEngine};
 use axum::{
@@ -3104,10 +3105,14 @@ fn parse_estimate_payload(p: &Value, to_addr: [u8; 32]) -> Result<Vec<crate::svm
             }
             let clean = s.strip_prefix("0x").unwrap_or(s);
             if let Ok(bytes) = hex::decode(clean) {
-                if let Ok(ops) = bincode::deserialize::<Vec<crate::svm::OpCode>>(&bytes) {
+                if let Ok(ops) =
+                    decode_wire_limited::<Vec<crate::svm::OpCode>>(&bytes, MAX_RPC_BODY as u64)
+                {
                     return Ok(ops);
                 }
-                if let Ok(op) = bincode::deserialize::<crate::svm::OpCode>(&bytes) {
+                if let Ok(op) =
+                    decode_wire_limited::<crate::svm::OpCode>(&bytes, MAX_RPC_BODY as u64)
+                {
                     return Ok(vec![op]);
                 }
                 return Ok(vec![crate::svm::OpCode::SysCallCallContract {
@@ -3254,7 +3259,7 @@ async fn handle_estimate_fee(st: &RpcState, id: Value, params: &Value) -> Json<R
             Ok(b) => b,
             Err(e) => return err(id, -32602, format!("invalid hex: {e}")),
         };
-        match bincode::deserialize::<Transaction>(&bytes) {
+        match decode_wire_limited::<Transaction>(&bytes, MAX_RPC_BODY as u64) {
             Ok(t) => t,
             Err(_) => match crate::evm_adapter::evm_raw_to_stell_transaction(&bytes) {
                 Ok(t) => t,
@@ -3534,7 +3539,7 @@ async fn admit_signed_payload_tx(
     if bytes.len() > MAX_RPC_BODY {
         return err(id, -32602, "transaction too large");
     }
-    let tx: Transaction = match bincode::deserialize(&bytes) {
+    let tx: Transaction = match decode_wire_limited(&bytes, MAX_RPC_BODY as u64) {
         Ok(t) => t,
         Err(e) => return err(id, -32602, format!("decode: {e}")),
     };
@@ -6301,7 +6306,7 @@ async fn dispatch(
             if bytes.len() > MAX_RPC_BODY {
                 return err(id, -32602, "transaction too large");
             }
-            let tx: Transaction = match bincode::deserialize(&bytes) {
+            let tx: Transaction = match decode_wire_limited(&bytes, MAX_RPC_BODY as u64) {
                 Ok(t) => t,
                 Err(e) => return err(id, -32602, format!("decode: {e}")),
             };
@@ -6894,7 +6899,8 @@ async fn dispatch(
                         Ok(b) => b,
                         Err(e) => return err(id, -32602, format!("invalid raw tx hex: {e}")),
                     };
-                let tx: Transaction = match bincode::deserialize(&raw_bytes) {
+                let tx: Transaction =
+                    match decode_wire_limited(&raw_bytes, MAX_RPC_BODY as u64) {
                     Ok(t) => t,
                     Err(e) => return err(id, -32602, format!("failed to decode transaction: {e}")),
                 };
@@ -7131,7 +7137,8 @@ async fn dispatch(
                         Ok(b) => b,
                         Err(e) => return err(id, -32602, format!("invalid raw tx hex: {e}")),
                     };
-                let tx: Transaction = match bincode::deserialize(&raw_bytes) {
+                let tx: Transaction =
+                    match decode_wire_limited(&raw_bytes, MAX_RPC_BODY as u64) {
                     Ok(t) => t,
                     Err(e) => return err(id, -32602, format!("failed to decode transaction: {e}")),
                 };

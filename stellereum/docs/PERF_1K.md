@@ -17,6 +17,18 @@ apply share of budget, verify cost per proof) travel.
 > size it was actually measured at. Nothing was re-measured here: the bench
 > rows in §2 still carry the old 120M numbers, and any figure derived from
 > them is marked as an extrapolation.
+>
+> **PQ SCOPE NOTE (M-01 fallback + M-06, 2026-11-04).** Pure-PQ mode is
+> OPT-IN (`STELL_PURE_PQ=1`); every number in §2 was measured on the
+> classical (Ed25519) path. PQ figures below are DERIVED from wire
+> constants (`src/post_quantum.rs`: Falcon-512 pubkey 897 B / sig 666 B;
+> explicit envelope = 9 + 897 + 666 = **1572 B** per tx sig vs 64 B
+> Ed25519, ~24.6x; registry-implicit = **675 B**, ~10.5x; µQC at N=100 =
+> 64 seats × 666 B ≈ **42.6 KB**) — NOT measured end-to-end. A PQ-enforced
+> default was tried and reverted (155/1104 lib failures; suite, sim,
+> wallet and genesis assume the dual-stack default), so no PQ-path block
+> time or PQ TPS is claimed here. Do not quote this recipe as PQ
+> performance.
 
 ## 1. The recipe (headline)
 

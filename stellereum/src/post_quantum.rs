@@ -60,7 +60,13 @@ pub fn set_pure_pq_override(enabled: Option<bool>) {
 ///
 /// Checks the override first (thread-local under `cfg(test)`, process-wide
 /// otherwise). If unset (-1), inspects the `STELL_PURE_PQ` environment
-/// variable (enforced on `1`, `true`, or `always`).
+/// variable (enforced on `1`, `true`, or `always`; explicitly opted out
+/// with `0` / `false` / empty). If the variable is UNSET, enforcement
+/// defaults OFF (PQ OPT-IN default — M-01 fallback, 2026-11-04): a
+/// PQ-enforced default was verified and REVERTED (155/1104 lib failures;
+/// classical suite/sim/wallet/genesis assume dual-stack default — see
+/// M-01 fallback note in README/PERF_1K). Operators opt in with
+/// `STELL_PURE_PQ=1` (or `--pure-pq`); `STELL_PURE_PQ=0` pins dual-stack.
 ///
 /// BATCH-MIRROR CONTRACT (audit F-HIGH-2): every batched signature screen
 /// (vote `verify_batch` / `partition_valid` / `add_batch`, tx batch paths)

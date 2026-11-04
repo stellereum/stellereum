@@ -97,7 +97,10 @@ pub fn is_encrypted_blob(raw: &[u8]) -> bool {
 }
 
 /// Derive a 32-byte symmetric key from a passphrase and salt using Argon2id.
-pub fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
+///
+/// Returns the key wrapped in [`Zeroizing`] so the KDF output buffer is
+/// wiped on drop: callers never hold a bare `[u8; 32]` copy on the stack.
+pub fn derive_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     let params = argon2::Params::new(KDF_MEM_KIB, KDF_ITERS, KDF_LANES, Some(32))
         .map_err(|e| anyhow!("argon2 params: {e}"))?;
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
@@ -105,7 +108,7 @@ pub fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
     argon2
         .hash_password_into(passphrase.as_bytes(), salt, &mut *key)
         .map_err(|e| anyhow!("argon2 kdf: {e}"))?;
-    Ok(*key)
+    Ok(key)
 }
 
 /// Verify that directory exists, is not a symbolic link, and on Unix has strict 0700 permissions.
@@ -225,7 +228,7 @@ pub fn set_private_file_perms(path: &Path) -> Result<()> {
 pub fn encrypt_bytes(data: &[u8], passphrase: &str) -> Result<String> {
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
-    let mut key = Zeroizing::new(derive_key(passphrase, &salt)?);
+    let mut key = derive_key(passphrase, &salt)?;
     let mut nonce = [0u8; 24];
     OsRng.fill_bytes(&mut nonce);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key[..]));
@@ -265,7 +268,7 @@ pub fn decrypt_bytes(raw: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
             let salt = hex::decode(parts[0]).map_err(|e| anyhow!("invalid salt hex: {e}"))?;
             let nonce = hex::decode(parts[1]).map_err(|e| anyhow!("invalid nonce hex: {e}"))?;
             let ct = hex::decode(parts[2]).map_err(|e| anyhow!("invalid ciphertext hex: {e}"))?;
-            let mut key = Zeroizing::new(derive_key(pass, &salt)?);
+            let mut key = derive_key(pass, &salt)?;
             let cipher = XChaCha20Poly1305::new(Key::from_slice(&key[..]));
             let plain = cipher
                 .decrypt(XNonce::from_slice(&nonce), ct.as_ref())

@@ -12,6 +12,9 @@ storage-roles:
 # multi-node cluster; see LAUNCH_STRATEGY.txt.
 peers: []
 
+# PQ MODE (M-01 fallback, opt-in): PQ mode comes from the process env, not
+# this file. Unset STELL_PURE_PQ = dual-stack default; STELL_PURE_PQ=1
+# (every node, coordinated) = Falcon-512-only. See docker-compose.yml.
 # accept unknown nodes in read-only (TOFU) mode — convenient for testnets
 # DEV/TOFU MODE: this is a development-environment setting. On a public testnet
 # set `allow-unknown: false` (or remove the line) and pin validators under

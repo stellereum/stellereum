@@ -21,8 +21,13 @@
 
 ## Highlights
 
-- Post-quantum by default: Falcon-512 signatures enforced, classical crypto refused
+- Post-quantum opt-in (M-01): `STELL_PURE_PQ=1` (or `--pure-pq`) enforces
+  Falcon-512-only mode chain-wide; default (env unset) is dual-stack —
+  Ed25519 and PQ envelopes are both admitted. Classical paths are refused
+  only under the opt-in flag.
 - 0.6 s block target with ~11 ms of measured CPU per block height
+  (classical path; PQ-path figures are projected, not measured —
+  see `docs/PERF_1K.md`)
 - Native CLOB order book, bridge and oracle on-chain — no external DeFi needed
 - Runs a validator on 1 vCPU: no datacenter hardware required
 
@@ -71,11 +76,12 @@ under slow and flapping proposers — all pinned by simulation batteries
 
 ### Post-quantum signatures everywhere it counts
 
-Validator votes, blocks and handshakes verify under Falcon-512 (FIPS 206),
-enforced chain-wide with `STELL_PURE_PQ=1`. Classical Ed25519/BLS/ECVRF code
-paths are refused or removed — the chain never counts a classical signature on
-the PQ path. Validator PQ keys live in an on-chain registry with rotation
-delays, queryable over RPC (`stell_getPqKey`).
+Validator votes, blocks and handshakes verify under Falcon-512 (FIPS 206)
+when the operator opts in with `STELL_PURE_PQ=1` (or `--pure-pq`); only
+then are classical Ed25519/BLS/ECVRF code paths refused chain-wide — the
+chain never counts a classical signature on the PQ path. Default (env
+unset) is dual-stack. Validator PQ keys live in an on-chain registry with
+rotation delays, queryable over RPC (`stell_getPqKey`).
 
 ### Execution: SVM, order book, bridge, oracle
 

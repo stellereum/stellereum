@@ -848,23 +848,38 @@ fn chunk_streaming_bounds_pure() {
 
 #[tokio::test]
 async fn f7_pq_keys_blob_installs_on_sync() {
-    use stellereum::post_quantum::PqScheme;
-    let addr = [0x51u8; 32];
-    let pk = vec![0x42u8; 32];
+    use stellereum::post_quantum::{derive_pq_address, PqScheme};
+    // M-03: the blob entry must validate against its account leaf
+    // (blake3(pk) == leaf pubkey_hash AND derive == address), so the test
+    // pins a REAL key: the leaf carries the hash, the blob carries the key.
+    let scheme = PqScheme::Falcon512;
+    let pk = Transaction::sample_falcon512_pubkey(0xF7);
     let salt = [0x01u8; 16];
+    let addr = derive_pq_address(scheme, &pk, &salt);
     let akey = [b"a:".to_vec(), addr.to_vec()].concat();
-    let aval = bincode::serialize(&(PqScheme::Falcon512, pk.clone(), salt)).unwrap();
+    let aval = bincode::serialize(&(scheme, pk.clone(), salt)).unwrap();
     let blob = bincode::serialize(&vec![(akey, aval)]).unwrap();
+    // Leaf WITHOUT the key (proves the restore installs it): balance +
+    // scheme + pinned hash, synced to the trie via update_account.
+    let mut leaf = AccountState::new(addr, 1_000_000);
+    leaf.scheme = scheme;
+    leaf.pubkey_hash = Some(*blake3::hash(&pk).as_bytes());
 
     // Direct restore: corrupt bytes fail closed, good bytes pin the key.
     let e = InMemoryStateEngine::new();
     assert!(e.restore_pq_keys(&[0xDE, 0xAD]).await.is_err());
+    e.update_account(leaf.clone()).await;
     e.restore_pq_keys(&blob).await.expect("pq blob installs");
-    let (scheme, got) = e
+    let (got_scheme, got) = e
         .get_pinned_pubkey(&addr)
         .expect("key pinned after restore");
-    assert_eq!(scheme, PqScheme::Falcon512);
+    assert_eq!(got_scheme, scheme);
     assert_eq!(got, pk);
+    assert_eq!(
+        e.get_pinned_pubkey_with_salt(&addr),
+        Some((scheme, pk.clone(), salt)),
+        "restore preserves the pinned salt"
+    );
 
     // Sync path: the blob travels beside the snapshot and lands on the target
     // WITHOUT moving the root (keys are not in the digest; they ride the
@@ -872,6 +887,7 @@ async fn f7_pq_keys_blob_installs_on_sync() {
     let src = InMemoryStateEngine::new();
     let user = [0x52u8; 32];
     src.update_account(AccountState::new(user, 777_000)).await;
+    src.update_account(leaf).await;
     let root = src.get_state_root().await;
     let snap = src.create_snapshot().await;
     let target = InMemoryStateEngine::new();
@@ -893,9 +909,10 @@ async fn f7_pq_keys_blob_installs_on_sync() {
     .await
     .expect("sync with pq blob verifies");
     assert_eq!(target.get_state_root().await, root);
-    assert!(
-        target.get_pinned_pubkey(&addr).is_some(),
-        "pq keys installed, not skipped"
+    assert_eq!(
+        target.get_pinned_pubkey_with_salt(&addr),
+        Some((scheme, pk.clone(), salt)),
+        "pq keys installed with pinned salt, not skipped"
     );
 }
 

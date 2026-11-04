@@ -341,7 +341,7 @@ pub fn parse_header_index(bytes: &[u8]) -> Option<(u64, String)> {
 /// (a miss), never as market evidence.
 pub fn decode_verified_price_feed(val_hex: &str) -> Option<PriceFeedUpdate> {
     let bytes = hex::decode(val_hex.trim()).ok()?;
-    let feed: PriceFeedUpdate = bincode::deserialize(&bytes).ok()?;
+    let feed: PriceFeedUpdate = decode_wire_limited(&bytes, MAX_WIRE_SMALL_BYTES).ok()?;
     feed.verify().then_some(feed)
 }
 
@@ -586,7 +586,7 @@ impl P2pNetworkAdapter {
             )
             .await?;
 
-        bincode::deserialize(&bytes).ok()
+        decode_wire_limited(&bytes, MAX_WIRE_BLOCK_BYTES).ok()
     }
 
     // ==================== Retro-publish of already-finalized bodies ====================
@@ -1050,7 +1050,10 @@ impl P2pNetworkAdapter {
             .ok()
             .flatten();
             if let Some(bytes) = blob_res {
-                match bincode::deserialize::<crate::storage::BlockHeaderRecord>(&bytes) {
+                match decode_wire_limited::<crate::storage::BlockHeaderRecord>(
+                    &bytes,
+                    MAX_WIRE_SMALL_BYTES,
+                ) {
                     Ok(rec) => {
                         if rec.height == height && rec.block_hash == expected_hash {
                             return Some(rec);
@@ -1091,7 +1094,10 @@ impl P2pNetworkAdapter {
             .ok()
             .flatten();
             if let Some(bytes) = blob_res {
-                match bincode::deserialize::<crate::consensus::QuorumCertificate>(&bytes) {
+                match decode_wire_limited::<crate::consensus::QuorumCertificate>(
+                    &bytes,
+                    MAX_WIRE_SMALL_BYTES,
+                ) {
                     Ok(qc) => return Some(qc),
                     Err(_) => last_err = "bad bincode",
                 }
@@ -1685,7 +1691,9 @@ impl P2pNetworkAdapter {
                                 );
                             }
                         }
-                    } else if let Ok(tx) = bincode::deserialize::<Transaction>(&bytes) {
+                    } else if let Ok(tx) =
+                        decode_wire_limited::<Transaction>(&bytes, MAX_WIRE_SMALL_BYTES)
+                    {
                         entries.push(MempoolEntry::Plain(tx));
                     }
                 }
@@ -1779,7 +1787,8 @@ impl P2pNetworkAdapter {
     /// so an attacker cannot forge a "trusted" message and mint value on the
     /// target shard. Only locally-generated messages (`new_trusted`) are trusted.
     pub fn parse_cross_shard_incoming(bytes: &[u8]) -> Option<CrossShardMessage> {
-        let mut msg: CrossShardMessage = bincode::deserialize(bytes).ok()?;
+        let mut msg: CrossShardMessage =
+            decode_wire_limited(bytes, MAX_CROSS_SHARD_MSG as u64).ok()?;
         msg.trusted = false;
         Some(msg)
     }
@@ -1888,7 +1897,7 @@ impl P2pNetworkAdapter {
         let key = format!("{}{}", PREFIX_MEV_COMMIT, round);
         let val_hex = self.node.get_local_kv(&key).await?;
         let bytes = hex::decode(&val_hex).ok()?;
-        bincode::deserialize(&bytes).ok()
+        decode_wire_limited(&bytes, MAX_WIRE_SMALL_BYTES).ok()
     }
 
     /// Discover known peers and active endpoints in the infnode overlay
@@ -1972,8 +1981,8 @@ pub fn plan_block_body_publish_bytes(
     block_hash: [u8; 32],
     body: &[u8],
 ) -> Result<PublishWrite, String> {
-    let block: Block =
-        bincode::deserialize(body).map_err(|e| format!("block body deserialize failed: {e:?}"))?;
+    let block: Block = decode_wire_limited(body, MAX_WIRE_BLOCK_BYTES)
+        .map_err(|e| format!("block body deserialize failed: {e:?}"))?;
     let computed = block.compute_hash();
     if computed != block_hash {
         return Err(format!(
@@ -2135,7 +2144,7 @@ pub async fn fetch_verified_body(
     // fields existed) applies to the LOCAL STORE only — otherwise a
     // truncated peer body would be silently reinterpreted as a different
     // block (audit W6.4b).
-    let block: Block = match bincode::deserialize(&bytes) {
+    let block: Block = match decode_wire_limited(&bytes, MAX_WIRE_BLOCK_BYTES) {
         Ok(b) => b,
         Err(e) => {
             eprintln!(
@@ -2342,6 +2351,34 @@ impl LocalCrossShardKv {
 /// proof: kilobytes, not megabytes. The cap keeps a malformed or oversized
 /// payload from being pushed into the overlay.
 pub const MAX_CROSS_SHARD_MSG: usize = 4 * 1024 * 1024;
+
+/// Bound for single DHT blobs carrying full block bodies (L-01).
+/// Blocks hold up to 10k txs; 32 MiB mirrors `consensus_net::MAX_CONSENSUS_MSG`
+/// and is two orders above any honest body.
+pub const MAX_WIRE_BLOCK_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Bound for small wire values (price feeds, mempool txs, blind commits).
+/// 1 MiB matches `rpc::MAX_RPC_BODY`-class inputs; honest values are bytes.
+pub const MAX_WIRE_SMALL_BYTES: u64 = 1024 * 1024;
+
+/// Strict decoder for untrusted wire/DHT bytes (L-01).
+///
+/// Wire-compatible with `bincode::deserialize` (fixint, little-endian) but
+/// bounded (`with_limit`) and trailing-rejecting, so a pathological
+/// length-prefix cannot drive allocation and padded re-framings are refused.
+/// Pure so the pathological-prefix fuzz test pins it without a live DHT.
+pub fn decode_wire_limited<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    limit: u64,
+) -> Result<T, String> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(limit)
+        .reject_trailing_bytes()
+        .deserialize(bytes)
+        .map_err(|e| format!("wire decode: {e}"))
+}
 
 /// How many mesh hops a cross-shard gossip message may take.
 ///
@@ -3210,6 +3247,42 @@ mod tests {
         assert_eq!(receiver.prune_consumed(2, &[msg2.msg_id]).await, 1);
         assert_eq!(receiver.prune_consumed(2, &[msg2.msg_id]).await, 0);
         assert!(receiver.fetch_cross_shard_inbound(2).await.is_empty());
+    }
+
+    #[test]
+    fn l01_wire_decoder_rejects_pathological_prefix_and_trailing() {
+        use std::time::Instant;
+        // Pathological length-prefix: 0xFFFFFFFF count for a Vec<u8> must be
+        // refused by the limit before any large allocation.
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        evil.extend_from_slice(&[0x41u8; 16]);
+        let start = Instant::now();
+        let res: Result<Vec<u8>, String> = decode_wire_limited(&evil, MAX_WIRE_SMALL_BYTES);
+        assert!(res.is_err(), "pathological prefix must be refused");
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "refusal took too long: {:?}",
+            start.elapsed()
+        );
+        // Trailing bytes are rejected even when the prefix is valid.
+        let sk = SigningKey::generate(&mut OsRng);
+        let tx = Transaction::sign(&sk, [2u8; 32], 1, 10_000, 0, 0, 0);
+        let mut bytes = bincode::serialize(&tx).expect("tx serializes");
+        bytes.push(0xFF);
+        assert!(
+            decode_wire_limited::<Transaction>(&bytes, MAX_WIRE_SMALL_BYTES).is_err(),
+            "trailing byte must be rejected"
+        );
+        bytes.pop();
+        let back: Transaction =
+            decode_wire_limited(&bytes, MAX_WIRE_SMALL_BYTES).expect("valid tx must decode");
+        assert_eq!(back.compute_tx_hash(), tx.compute_tx_hash());
+        // parse_cross_shard_incoming inherits both guards.
+        assert!(
+            P2pNetworkAdapter::parse_cross_shard_incoming(&evil).is_none(),
+            "evil cross-shard bytes must not decode"
+        );
     }
 }
 

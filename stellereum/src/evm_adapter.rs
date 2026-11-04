@@ -33,21 +33,18 @@ use std::time::{Duration, Instant};
 
 /// Default chain ID for Stellereum network (5757).
 ///
-/// WHY THE VERIFICATION PINS STAY ON THIS CONSTANT (audit 2026-10-14 F3):
-/// `eth_chainId` / `net_version` SERVE [`effective_chain_id`] (dynamic, so a
-/// `STELL_CHAIN_ID` deployment never misidentifies itself to wallets), but
-/// every signature-verification site (`eth_send_raw_transaction_bytes`,
-/// `evm_raw_to_stell_transaction`, `DecodedTransaction::verify_signature`,
-/// `validate_transaction_signature*`, `ecrecover*`) deliberately keeps
-/// pinning `CHAIN_ID`. Verification is consensus-adjacent: every node that
-/// admits or settles the same raw bytes must reach the same verdict, and a
-/// per-process env read at each of those sites would let two validators with
-/// different environments admit different tx sets (liveness divergence) or —
-/// worse — disagree about what a settled envelope means. A deployment on a
-/// different chain id changes this constant (and `CHAIN_ID_HEX` /
-/// `NET_VERSION` defaults) at build/deploy time, identically on all nodes;
-/// it never varies per process at runtime. Live is 5757 either way, so there
-/// is zero behavior change while the env is unset.
+/// SINGLE SOURCE (M-02): served identity AND verification both resolve the
+/// deployment's chain through [`effective_chain_id`] (`STELL_CHAIN_ID`, else
+/// this default). Every signature-verification site
+/// (`eth_send_raw_transaction_bytes`, `evm_raw_to_stell_transaction`,
+/// `DecodedTransaction::verify_signature`,
+/// `validate_transaction_signature*`) compares against
+/// [`effective_chain_id`], so one binary serves any number of networks and
+/// every node of one deployment (same `STELL_CHAIN_ID`) reaches the same
+/// verdict on the same bytes. Live is 5757 either way (env unset), so there
+/// is zero behavior change on the stand. `CHAIN_ID` remains only as the
+/// compile-time default seed (and `CHAIN_ID_HEX` / `NET_VERSION` as its
+/// default rendering); never compare against it directly in new code.
 pub const CHAIN_ID: u64 = 5757;
 
 /// This node's effective EVM chain id: `STELL_CHAIN_ID` when set, else
@@ -66,13 +63,13 @@ pub fn check_peer_chain_id(local: u64, peer: u64) -> Result<(), String> {
 }
 
 /// `eth_chainId` for an explicit chain id (hex quantity, e.g. `0x167d`).
-/// The static [`eth_chain_id`] keeps serving the default for compatibility.
+/// [`eth_chain_id`] serves this for [`effective_chain_id`].
 pub fn eth_chain_id_for(chain_id: u64) -> String {
     format!("0x{chain_id:x}")
 }
 
 /// `net_version` for an explicit chain id (decimal string, e.g. `"5757"`).
-/// The static [`net_version`] keeps serving the default for compatibility.
+/// [`net_version`] serves this for [`effective_chain_id`].
 pub fn net_version_for(chain_id: u64) -> String {
     chain_id.to_string()
 }
@@ -214,13 +211,9 @@ pub const EMPTY_STORAGE_VALUE_HEX: &str =
 /// Returns this node's Ethereum chain ID formatted as a hex quantity.
 ///
 /// Serves [`effective_chain_id`] (STELL_CHAIN_ID-aware; default 5757), so the
-/// served identity always matches the node's configured chain: previously
-/// this hardcoded the default (`CHAIN_ID_HEX`) while node identity was
-/// `STELL_CHAIN_ID`-configurable, so a non-default deployment served a
-/// foreign chain id. Live stays 5757 (env unset), zero behavior change on
-/// the stand. The `CHAIN_ID_HEX` / `NET_VERSION` constants stay as the
-/// pinned DEFAULTS (consensus-adjacent verification and tx construction pin
-/// them deliberately — see below); only the SERVED identity is dynamic.
+/// served identity always matches the node's configured chain. Live stays
+/// 5757 (env unset), zero behavior change on the stand. The `CHAIN_ID_HEX`
+/// / `NET_VERSION` constants stay as the pinned DEFAULT renderings.
 pub fn eth_chain_id() -> String {
     eth_chain_id_for(effective_chain_id())
 }
@@ -468,7 +461,7 @@ pub const MAX_EVM_RAW_TX_BYTES: usize = 128 * 1024;
 /// Submit a signed EVM raw transaction (MetaMask `eth_sendRawTransaction`).
 ///
 /// Phase 1 (EVM intent pool): decodes RLP (legacy EIP-155 or EIP-1559 type-2),
-/// strictly verifies `chain_id == CHAIN_ID` (5757) + low-s + ecrecover,
+/// strictly verifies `chain_id == effective_chain_id()` + low-s + ecrecover,
 /// stores the pending `EvmTransaction` so `eth_getTransactionByHash` /
 /// filters see it, notifies pending-tx filters, and returns the keccak hash.
 /// Phase 2 (L1 settlement): the stateful RPC bridge maps the SAME bytes onto
@@ -519,8 +512,8 @@ pub fn extract_raw_evm_bytes(params: &Value) -> Result<Vec<u8>, JsonRpcError> {
 /// AFTER the L1 leg is admitted, so a mempool rejection never leaves a
 /// stale intent behind.
 ///
-/// The `chain_id == CHAIN_ID` pins below are DELIBERATE (see [`CHAIN_ID`]):
-/// served identity is dynamic, verification is pinned so all nodes agree.
+/// Verification compares against [`effective_chain_id`] (single source,
+/// M-02): served identity and admission agree on every deployment.
 pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError> {
     if raw.is_empty() || raw.len() > MAX_EVM_RAW_TX_BYTES {
         return Err(JsonRpcError::invalid_params(
@@ -536,12 +529,13 @@ pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError
         let from = decoded
             .verify_signature()
             .map_err(|e| JsonRpcError::server_error(INTERNAL_ERROR_CODE, e.to_string()))?;
-        if decoded.chain_id != CHAIN_ID {
+        let expected_chain = effective_chain_id();
+        if decoded.chain_id != expected_chain {
             return Err(JsonRpcError::server_error(
                 INTERNAL_ERROR_CODE,
                 format!(
-                    "EIP-155 replay protection mismatch: expected chain 5757, got {}",
-                    decoded.chain_id
+                    "EIP-155 replay protection mismatch: expected chain {}, got {}",
+                    expected_chain, decoded.chain_id
                 ),
             ));
         }
@@ -561,7 +555,7 @@ pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError
             r: format!("0x{}", hex::encode(decoded.r)),
             s: format!("0x{}", hex::encode(decoded.s)),
             tx_type: Some("0x2".to_string()),
-            chain_id: Some(CHAIN_ID_HEX.to_string()),
+            chain_id: Some(eth_chain_id_for(effective_chain_id())),
             max_fee_per_gas: Some(format!("0x{:x}", decoded.max_fee_per_gas)),
             max_priority_fee_per_gas: Some(format!("0x{:x}", decoded.max_priority_fee_per_gas)),
             access_list: None,
@@ -574,12 +568,13 @@ pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError
         let from = decoded
             .verify_signature()
             .map_err(|e| JsonRpcError::server_error(INTERNAL_ERROR_CODE, e.to_string()))?;
+        let expected_chain = effective_chain_id();
         match decoded.chain_id {
-            Some(cid) if cid == CHAIN_ID => {}
+            Some(cid) if cid == expected_chain => {}
             Some(cid) => {
                 return Err(JsonRpcError::server_error(
                     INTERNAL_ERROR_CODE,
-                    format!("EIP-155 replay protection mismatch: expected chain 5757, got {cid}"),
+                    format!("EIP-155 replay protection mismatch: expected chain {expected_chain}, got {cid}"),
                 ))
             }
             None => {
@@ -605,7 +600,7 @@ pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError
             r: format!("0x{}", hex::encode(decoded.r)),
             s: format!("0x{}", hex::encode(decoded.s)),
             tx_type: Some("0x0".to_string()),
-            chain_id: Some(CHAIN_ID_HEX.to_string()),
+            chain_id: Some(eth_chain_id_for(effective_chain_id())),
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             access_list: None,
@@ -630,7 +625,7 @@ pub fn eth_send_raw_transaction_bytes(raw: &[u8]) -> Result<String, JsonRpcError
 /// Map verified raw EVM bytes onto a Phase-2 L1 settlement transaction.
 ///
 /// Decodes RLP (legacy EIP-155 or EIP-1559 type-2), strictly verifies
-/// `chain_id == CHAIN_ID` (5757, DELIBERATE pin — see [`CHAIN_ID`]) + low-s +
+/// `chain_id == effective_chain_id()` (single source, M-02) + low-s +
 /// ecrecover via [`DecodedTransaction::verify_signature`], then maps through
 /// `evm_to_stell_address` (sender/recipient), `wei_to_nano` (value, sub-nano
 /// wei truncated deterministically) and verbatim nonce/gas_limit, sealing the
@@ -650,8 +645,8 @@ pub fn evm_raw_to_stell_transaction(raw: &[u8]) -> Result<crate::sharding::Trans
         return Err("empty or oversized raw transaction".to_string());
     }
     let decoded = parse_raw_transaction(raw)?;
-    // Strict chain_id == 5757 + low-s + ecrecover (both variants enforce it;
-    // unprotected legacy v=27/28 fails here).
+    // Strict chain_id == effective_chain_id() + low-s + ecrecover (both
+    // variants enforce it; unprotected legacy v=27/28 fails here).
     let evm_from = decoded.verify_signature().map_err(|e| e.to_string())?;
     let evm_to = decoded.to().ok_or_else(|| {
         "EVM contract creation is not settled in Phase 2 (value transfers only)".to_string()
@@ -2016,9 +2011,9 @@ impl EvmAdapter {
     /// every view (`eth_chainId`, `net_version`, tx/block `chain_id`) agrees
     /// with the node's configured chain out of the box. Explicit
     /// [`EvmAdapter::with_chain_id`] still overrides (tests, multi-chain
-    /// harnesses). Verification sites do NOT follow this field — they pin
-    /// [`CHAIN_ID`] deliberately (see [`CHAIN_ID`]). Zero behavior change
-    /// while the env is unset (`effective == CHAIN_ID == 5757`).
+    /// harnesses). Verification also follows [`effective_chain_id`]
+    /// (single source, M-02). Zero behavior change while the env is unset
+    /// (`effective == CHAIN_ID == 5757`).
     pub fn new() -> Self {
         Self::default().with_chain_id(effective_chain_id())
     }
@@ -5229,11 +5224,10 @@ pub fn stell_tx_to_evm_with_chain(
 /// Converts a Stellereum transaction to an EVM JSON-RPC transaction.
 ///
 /// Served-identity default: [`effective_chain_id`] (STELL_CHAIN_ID-aware), so
-/// block/tx views agree with `eth_chainId` on every deployment. This is
-/// DISPLAY only — admission/verification pins [`CHAIN_ID`] deliberately (all
-/// nodes must reach the same verdict on the same bytes; see [`CHAIN_ID`]).
-/// Callers that need the pinned protocol default explicitly use
-/// [`stell_tx_to_evm_with_chain`] with [`CHAIN_ID`].
+/// block/tx views agree with `eth_chainId` on every deployment. Admission
+/// and verification use the same [`effective_chain_id`] (single source,
+/// M-02). Callers that need an explicit id use
+/// [`stell_tx_to_evm_with_chain`] directly.
 pub fn stell_tx_to_evm(
     tx: &crate::sharding::Transaction,
     block_hash: Option<[u8; 32]>,
@@ -5314,8 +5308,10 @@ pub fn stell_receipt_with_tx_to_evm(
 }
 
 /// Reconstructs an EVM transaction from a Stellereum `TxReceipt` if it contains `raw_tx`.
+/// Defaults to [`effective_chain_id`] (single source, M-02) so the view
+/// agrees with `eth_chainId` on every deployment.
 pub fn stell_receipt_to_evm_tx(r: &crate::rpc::TxReceipt) -> Option<EvmTransaction> {
-    stell_receipt_to_evm_tx_with_chain(r, CHAIN_ID)
+    stell_receipt_to_evm_tx_with_chain(r, effective_chain_id())
 }
 
 /// Reconstructs an EVM transaction from a Stellereum `TxReceipt` with a custom chain ID.
@@ -6358,16 +6354,14 @@ impl LegacyTransaction {
     }
 
     /// Verifies that this transaction's signature is valid, strictly requiring
-    /// Stellereum replay protection (`chain_id == CHAIN_ID == 5757`) in addition
-    /// to low-s compliance under EIP-2.
+    /// Stellereum replay protection (`chain_id == effective_chain_id()`) in
+    /// addition to low-s compliance under EIP-2.
     pub fn verify_signature(&self) -> Result<[u8; 20], EvmError> {
+        let expected = effective_chain_id();
         match self.chain_id {
-            Some(CHAIN_ID) => {}
+            Some(got) if got == expected => {}
             Some(got) => {
-                return Err(EvmError::ChainIdMismatch {
-                    expected: CHAIN_ID,
-                    got,
-                })
+                return Err(EvmError::ChainIdMismatch { expected, got })
             }
             None => return Err(EvmError::ReplayProtectionRequired),
         }
@@ -6674,12 +6668,13 @@ impl Eip1559Transaction {
     }
 
     /// Verifies that this transaction's signature is valid, strictly requiring
-    /// Stellereum replay protection (`chain_id == CHAIN_ID == 5757`) in addition
-    /// to low-s compliance under EIP-2.
+    /// Stellereum replay protection (`chain_id == effective_chain_id()`) in
+    /// addition to low-s compliance under EIP-2.
     pub fn verify_signature(&self) -> Result<[u8; 20], EvmError> {
-        if self.chain_id != CHAIN_ID {
+        let expected = effective_chain_id();
+        if self.chain_id != expected {
             return Err(EvmError::ChainIdMismatch {
-                expected: CHAIN_ID,
+                expected,
                 got: self.chain_id,
             });
         }
@@ -7045,7 +7040,7 @@ pub fn ecrecover(hash: &[u8; 32], v: u64, r: &[u8; 32], s: &[u8; 32]) -> Result<
 }
 
 /// Validates an Ethereum transaction signature:
-/// - Replay protection: verifies `chain_id == 5757` (CHAIN_ID).
+/// - Replay protection: verifies `chain_id == effective_chain_id()`.
 /// - Canonical s: verifies `s <= secp256k1_order / 2` (EIP-2).
 ///   Recovers and returns the 20-byte sender address.
 pub fn validate_transaction_signature(
@@ -7054,7 +7049,7 @@ pub fn validate_transaction_signature(
     r: &[u8; 32],
     s: &[u8; 32],
 ) -> Result<[u8; 20], String> {
-    validate_transaction_signature_with_chain_id(hash, v, r, s, Some(CHAIN_ID))
+    validate_transaction_signature_with_chain_id(hash, v, r, s, Some(effective_chain_id()))
 }
 
 /// Validates an Ethereum transaction signature against an expected chain ID:
@@ -9209,5 +9204,239 @@ mod tests {
             !tampered.verify_sender().unwrap(),
             "tampered sender must not match"
         );
+    }
+
+    // M-02: single chain-id source — verification follows effective_chain_id().
+    // These tests never touch the process environment (parallel-safe): they
+    // sign for `effective_chain_id()` itself, so they hold on any deployment
+    // (default 5757 live, custom elsewhere). Custom-id-vs-mismatch is covered
+    // both here (explicit-id paths) and in the integration file that serializes
+    // STELL_CHAIN_ID via EnvGuard.
+    fn m02_low_s_normalize(
+        s: [u8; 32],
+        recid_byte: u8,
+    ) -> ([u8; 32], u8) {
+        if is_low_s(&s) {
+            return (s, recid_byte);
+        }
+        let mut out = [0u8; 32];
+        let mut borrow: i32 = 0;
+        for i in (0..32).rev() {
+            let v = SECP256K1_N[i] as i32 - s[i] as i32 - borrow;
+            if v < 0 {
+                out[i] = (v + 256) as u8;
+                borrow = 1;
+            } else {
+                out[i] = v as u8;
+                borrow = 0;
+            }
+        }
+        (out, recid_byte ^ 1)
+    }
+
+    fn m02_sign_legacy_for(chain_id: u64, nonce: u64) -> Vec<u8> {
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x42u8; 32]).unwrap();
+        let unsigned = LegacyTransaction {
+            nonce,
+            gas_price: 20_000_000_000,
+            gas_limit: 21_000,
+            to: Some([0x35u8; 20]),
+            value: 1_000,
+            data: Vec::new(),
+            v: 0,
+            r: [0u8; 32],
+            s: [0u8; 32],
+            chain_id: Some(chain_id),
+        };
+        let sighash = unsigned.signing_hash();
+        let (sig, recid) = key.sign_prehash_recoverable(&sighash).unwrap();
+        let mut r = [0u8; 32];
+        let mut s = [0u8; 32];
+        r.copy_from_slice(&sig.to_bytes()[0..32]);
+        s.copy_from_slice(&sig.to_bytes()[32..64]);
+        let (s, recid_b) = m02_low_s_normalize(s, recid.to_byte());
+        LegacyTransaction {
+            v: chain_id * 2 + 35 + recid_b as u64,
+            r,
+            s,
+            ..unsigned
+        }
+        .encode()
+    }
+
+    fn m02_sign_eip1559_for(chain_id: u64, nonce: u64) -> Vec<u8> {
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x55u8; 32]).unwrap();
+        let unsigned = Eip1559Transaction {
+            chain_id,
+            nonce,
+            max_priority_fee_per_gas: 2_000_000_000,
+            max_fee_per_gas: 30_000_000_000,
+            gas_limit: 21_000,
+            to: Some([0x36u8; 20]),
+            value: 2_000,
+            data: Vec::new(),
+            access_list: Vec::new(),
+            y_parity: 0,
+            v: 0,
+            r: [0u8; 32],
+            s: [0u8; 32],
+        };
+        let sighash = unsigned.signing_hash();
+        let (sig, recid) = key.sign_prehash_recoverable(&sighash).unwrap();
+        let mut r = [0u8; 32];
+        let mut s = [0u8; 32];
+        r.copy_from_slice(&sig.to_bytes()[0..32]);
+        s.copy_from_slice(&sig.to_bytes()[32..64]);
+        let (s, y_parity) = m02_low_s_normalize(s, recid.to_byte());
+        Eip1559Transaction {
+            y_parity,
+            v: y_parity as u64,
+            r,
+            s,
+            ..unsigned
+        }
+        .encode()
+    }
+
+    #[test]
+    fn m02_legacy_verification_follows_effective_id() {
+        let eff = effective_chain_id();
+        assert!(eff > 0, "effective chain id must be non-zero");
+        // Tx signed for the effective id verifies at every strict layer.
+        let raw = m02_sign_legacy_for(eff, 810_001);
+        let decoded = parse_legacy_transaction(&raw).expect("decodes");
+        assert_eq!(decoded.chain_id, Some(eff));
+        decoded.verify_signature().expect("effective id verifies");
+        let sighash = decoded.signing_hash();
+        validate_transaction_signature(&sighash, decoded.v, &decoded.r, &decoded.s)
+            .expect("validate follows effective");
+        eth_send_raw_transaction_bytes(&raw).expect("gate admits effective id");
+        evm_raw_to_stell_transaction(&raw).expect("settlement maps effective id");
+        // A foreign chain is refused at every strict layer.
+        let other = if eff == 5757 { 1337 } else { 5757 };
+        let raw_other = m02_sign_legacy_for(other, 810_002);
+        let decoded_other = parse_legacy_transaction(&raw_other).expect("decodes");
+        let err = decoded_other
+            .verify_signature()
+            .expect_err("foreign chain refused");
+        assert_eq!(
+            err,
+            EvmError::ChainIdMismatch {
+                expected: eff,
+                got: other
+            },
+            "mismatch must name effective id"
+        );
+        let gate_err = eth_send_raw_transaction_bytes(&raw_other).expect_err("gate refuses foreign");
+        assert!(
+            gate_err.message.contains(&eff.to_string()),
+            "gate must name effective chain, got: {}",
+            gate_err.message
+        );
+    }
+
+    #[test]
+    fn m02_eip1559_verification_follows_effective_id() {
+        let eff = effective_chain_id();
+        let raw = m02_sign_eip1559_for(eff, 820_001);
+        let decoded = parse_eip1559_envelope(&raw).expect("decodes");
+        assert_eq!(decoded.chain_id, eff);
+        decoded.verify_signature().expect("effective id verifies");
+        eth_send_raw_transaction_bytes(&raw).expect("gate admits effective id");
+        evm_raw_to_stell_transaction(&raw).expect("settlement maps effective id");
+        let other = if eff == 5757 { 1337 } else { 5757 };
+        let raw_other = m02_sign_eip1559_for(other, 820_002);
+        let decoded_other = parse_eip1559_envelope(&raw_other).expect("decodes");
+        let err = decoded_other
+            .verify_signature()
+            .expect_err("foreign chain refused");
+        assert_eq!(
+            err,
+            EvmError::ChainIdMismatch {
+                expected: eff,
+                got: other
+            }
+        );
+        let gate_err = eth_send_raw_transaction_bytes(&raw_other).expect_err("gate refuses foreign");
+        assert!(
+            gate_err.message.contains(&eff.to_string()),
+            "gate must name effective chain, got: {}",
+            gate_err.message
+        );
+    }
+
+    #[test]
+    fn m02_explicit_chain_paths_verify_custom_id() {
+        // Explicit-id helpers (no env read) verify a custom chain under its own
+        // id and refuse it under any other — the same rule effective paths apply.
+        let custom: u64 = 9_999;
+        let raw = m02_sign_legacy_for(custom, 830_001);
+        let decoded = parse_legacy_transaction(&raw).expect("decodes");
+        assert_eq!(decoded.chain_id, Some(custom));
+        let sighash = decoded.signing_hash();
+        validate_transaction_signature_with_chain_id(
+            &sighash,
+            decoded.v,
+            &decoded.r,
+            &decoded.s,
+            Some(custom),
+        )
+        .expect("custom verifies under its own id");
+        let err = validate_transaction_signature_with_chain_id(
+            &sighash,
+            decoded.v,
+            &decoded.r,
+            &decoded.s,
+            Some(5757),
+        )
+        .expect_err("custom refused under 5757");
+        assert!(
+            err.contains("5757") && err.contains(&custom.to_string()),
+            "unexpected: {err}"
+        );
+        let rec = ecrecover_with_chain_id(&sighash, decoded.v, &decoded.r, &decoded.s, Some(custom))
+            .expect("ecrecover under custom");
+        assert_eq!(rec, decoded.recover_sender().expect("recover under own chain"));
+        // EIP-1559 envelope round-trips its own chain id into the view.
+        let raw1559 = m02_sign_eip1559_for(custom, 830_002);
+        let d1559 = parse_eip1559_envelope(&raw1559).expect("decodes");
+        assert_eq!(d1559.chain_id, custom);
+        let view = d1559.to_evm_transaction(None, None);
+        assert_eq!(view.chain_id, Some(format!("0x{custom:x}")));
+    }
+
+    #[test]
+    fn m02_view_defaults_track_effective_id() {
+        let eff = effective_chain_id();
+        let tx = crate::sharding::Transaction {
+            from: [0x11u8; 32],
+            to: [0x22u8; 32],
+            amount: 7,
+            gas_limit: 21_000,
+            nonce: 830_011,
+            source_shard: 0,
+            target_shard: 0,
+            signature: vec![0u8; 64],
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        let view = stell_tx_to_evm(&tx, None, None, None);
+        assert_eq!(view.chain_id, Some(eth_chain_id_for(eff)));
+        let receipt = crate::rpc::TxReceipt {
+            tx_hash: [0xabu8; 32],
+            height: 5,
+            block_hash: [0xcdu8; 32],
+            index: 0,
+            success: true,
+            gas_limit: 21_000,
+            fee_charged: 1_000,
+            raw_tx: None,
+            return_value: None,
+            gas_used: None,
+            events: Vec::new(),
+            contract_address: None,
+        };
+        let rview = stell_receipt_to_evm_tx(&receipt).expect("receipt view");
+        assert_eq!(rview.chain_id, Some(eth_chain_id_for(eff)));
     }
 }

@@ -303,9 +303,9 @@ onto a chain that *does* extend the anchor but is not the canonical one?
 | | |
 | --- | --- |
 | **Severity** | MEDIUM (deployment-dependent) |
-| **File** | `src/rpc.rs` — `RpcState::auth_token` (≈ line 153), the gate at `src/rpc.rs:2715` (mempoolDump) / `:4236` / `:4284` / `:4333` (the write methods) — every one of them refuses with "unauthorized" when no token is configured; the source is `STELL_RPC_AUTH_TOKEN` (`src/main.rs` line 408) |
+| **File** | `src/rpc.rs` — `RpcState::auth_token` (≈ line 153); gates: `stell_mempoolDump` (fail-closed without a token), the signed-payload arms `stell_submitPriceFeed` / `stell_pmmBuy` / `stell_pmmSell` and `stell_deployContract` / `stell_callContract` (open when unset, require the token when set), the governance writes `stell_submitProposal` / `stell_vote` / `stell_executeProposal` (require the token when set; without a token: loopback bind stays open for dev, non-loopback bind refuses fail-closed), the SIGN arms `stell_signMessage` / `stell_signTypedData` (fail-closed without a token, loopback-only, dev key required); `stell_sendRawTransaction` / `eth_sendRawTransaction` stay OPEN by design. Token source `STELL_RPC_AUTH_TOKEN` (`src/main.rs`) |
 | **Exploitability** | `REMOTE` |
-| **Status** | Open by design: the token is **optional**. When it is not configured, the gated methods fail closed (they refuse with "unauthorized: … is disabled when auth_token is not configured") — but a deployment that sets no token exposes the write surface to anyone who can reach the port. The faucet has its own separate token (`STELL_FAUCET_TOKEN`) and refuses to dispense without it. |
+| **Status** | Open by design: the token is **optional**. Without it, only `stell_mempoolDump` and the SIGN arms fail closed; the payload/contract arms stay open, and the governance writes stay open on a loopback bind while refusing on a non-loopback bind. A deployment that publishes the RPC port without a token therefore still exposes the open arms to anyone who can reach the port. The faucet has its own separate token (`STELL_FAUCET_TOKEN`) and refuses to dispense without it. |
 
 **Audit action:** confirm the operator runbook requires `STELL_RPC_AUTH_TOKEN`
 on a public deployment and that the RPC port is not exposed.

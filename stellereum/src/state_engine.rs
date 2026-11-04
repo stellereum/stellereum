@@ -718,7 +718,10 @@ pub struct InMemoryStateEngine {
     /// never fail-closed); size it for tests / diskless nodes only.
     pq_keys_fallback: Arc<
         std::sync::RwLock<
-            memory_bounds::BoundedLruCache<[u8; 32], (crate::post_quantum::PqScheme, Vec<u8>)>,
+            memory_bounds::BoundedLruCache<
+                [u8; 32],
+                (crate::post_quantum::PqScheme, Vec<u8>, [u8; 16]),
+            >,
         >,
     >,
     /// F-01 consensus D2 penalty mirror: sender -> extra floor added to the
@@ -1737,7 +1740,7 @@ impl InMemoryStateEngine {
             self.pq_keys_fallback
                 .write()
                 .unwrap()
-                .insert(address, (scheme, pubkey.to_vec()));
+                .insert(address, (scheme, pubkey.to_vec(), *salt));
         }
 
         let _ = crate::sharding::Transaction::global_implicit_registry()
@@ -1803,8 +1806,8 @@ impl InMemoryStateEngine {
         // In-memory fallback when persistent sled tree is unconfigured.
         // `get` refreshes LRU recency (needs the write guard); a miss here is
         // fail-open `None`, never an error.
-        if let Some((scheme, pk)) = self.pq_keys_fallback.write().unwrap().get(address) {
-            return Some((scheme, pk, crate::post_quantum::DEFAULT_SALT));
+        if let Some((scheme, pk, salt)) = self.pq_keys_fallback.write().unwrap().get(address) {
+            return Some((scheme, pk, salt));
         }
 
         None
@@ -3255,12 +3258,12 @@ impl InMemoryStateEngine {
                 .lookup(&tx.from)
                 .is_none()
         {
-            if let Some((scheme, pk)) = self.get_pinned_pubkey(&tx.from) {
+            if let Some((scheme, pk, salt)) = self.get_pinned_pubkey_with_salt(&tx.from) {
                 let _ = crate::sharding::Transaction::global_implicit_registry().register(
                     tx.from,
                     scheme,
                     &pk,
-                    &crate::post_quantum::DEFAULT_SALT,
+                    &salt,
                 );
             }
         }
@@ -4866,14 +4869,14 @@ impl InMemoryStateEngine {
                     .lookup(&tx.from)
                     .is_none()
             {
-                if let Some((scheme, pk)) = self.get_pinned_pubkey(&tx.from) {
-                    let _ = crate::sharding::Transaction::global_implicit_registry().register(
-                        tx.from,
-                        scheme,
-                        &pk,
-                        &crate::post_quantum::DEFAULT_SALT,
-                    );
-                }
+            if let Some((scheme, pk, salt)) = self.get_pinned_pubkey_with_salt(&tx.from) {
+                let _ = crate::sharding::Transaction::global_implicit_registry().register(
+                    tx.from,
+                    scheme,
+                    &pk,
+                    &salt,
+                );
+            }
             }
         }
         // 1) Batched signature verification (parallel across cores for big blocks).
@@ -8119,17 +8122,26 @@ impl InMemoryStateEngine {
     /// Wire format is `Storage::export_pq_keys_blob`: bincode of the raw
     /// `(key, value)` pairs of the `pq_keys` sled tree (namespaced `a:` /
     /// `h:` keys, see `storage.rs`). Install rule, in order:
-    /// * attached persistent tree (`attach_pq_tree`): insert every pair
+    /// * every address record (`a:` + 32B, plus legacy bare-32B keys) is
+    ///   validated fail-closed per entry — `blake3(pk)` must equal the
+    ///   account leaf's pinned `pubkey_hash` AND
+    ///   `derive_pq_address(scheme, pk, salt)` must equal the address. A
+    ///   record that fails is skipped (counted + logged), never aborts the
+    ///   whole restore;
+    /// * attached persistent tree (`attach_pq_tree`): valid pairs install
     ///   verbatim — the synced node then serves the publisher's keys from
-    ///   disk exactly as the publisher did;
-    /// * diskless fallback: decode the `a:`-namespaced address records into
-    ///   the bounded in-memory LRU (`h:` hash-lookup records are skipped —
-    ///   they are derivable from the address records and the LRU is keyed by
-    ///   address only). Bounded like every Phase-1 cache: past the cap the
-    ///   coldest entry is evicted LOUDLY and re-served from... nothing (no
-    ///   disk) — which is why diskless nodes are tests-only: an evicted key
-    ///   refuses its PQ-gated admission until gossip re-pins it
-    ///   (availability, never a fork; a MISS here never attests anything).
+    ///   disk exactly as the publisher did. Hash-lookup (`h:`) records
+    ///   install verbatim only when their hash belongs to a valid address
+    ///   record, so a refused entry leaves no orphan behind;
+    /// * diskless fallback: the valid address records decode into the
+    ///   bounded in-memory LRU WITH their pinned salt (`h:` hash-lookup
+    ///   records are skipped — they are derivable from the address records
+    ///   and the LRU is keyed by address only). Bounded like every Phase-1
+    ///   cache: past the cap the coldest entry is evicted LOUDLY and
+    ///   re-served from... nothing (no disk) — which is why diskless nodes
+    ///   are tests-only: an evicted key refuses its PQ-gated admission until
+    ///   gossip re-pins it (availability, never a fork; a MISS here never
+    ///   attests anything).
     ///
     /// Corrupt bytes are a hard error (fail closed — installing a truncated
     /// key set as complete would refuse honest PQ transactions silently).
@@ -8139,36 +8151,202 @@ impl InMemoryStateEngine {
     pub async fn restore_pq_keys(&self, bytes: &[u8]) -> Result<(), String> {
         let pairs: Vec<(Vec<u8>, Vec<u8>)> =
             bincode::deserialize(bytes).map_err(|e| format!("restore pq_keys failed: {e:?}"))?;
+        // Leaf snapshot for fail-closed per-entry validation (M-03): cloned
+        // under one read guard so validation never holds the accounts lock
+        // across sled I/O.
+        let leaves: HashMap<[u8; 32], (crate::post_quantum::PqScheme, Option<[u8; 32]>)> = {
+            let map = self.accounts.read().await;
+            map.iter()
+                .map(|(addr, acc)| (*addr, (acc.scheme, acc.pubkey_hash)))
+                .collect()
+        };
+        // Decode one address-record value in every known shape (current
+        // triple, legacy double, raw scheme-id prefix); `None` = undecodable.
+        fn decode_record(
+            bytes: &[u8],
+        ) -> Option<(crate::post_quantum::PqScheme, Vec<u8>, [u8; 16])> {
+            if let Ok((scheme, pk, salt)) = bincode::deserialize::<(
+                crate::post_quantum::PqScheme,
+                Vec<u8>,
+                [u8; 16],
+            )>(bytes)
+            {
+                return Some((scheme, pk, salt));
+            }
+            if let Ok((scheme, pk)) =
+                bincode::deserialize::<(crate::post_quantum::PqScheme, Vec<u8>)>(bytes)
+            {
+                return Some((scheme, pk, crate::post_quantum::DEFAULT_SALT));
+            }
+            if bytes.len() > 1 {
+                if let Ok(scheme) = crate::post_quantum::PqScheme::from_id(bytes[0]) {
+                    return Some((
+                        scheme,
+                        bytes[1..].to_vec(),
+                        crate::post_quantum::DEFAULT_SALT,
+                    ));
+                }
+            }
+            None
+        }
+        // Fail-closed per-entry verdict: `Ok(())` installs, `Err(reason)`
+        // skips (counted + logged) without aborting the restore.
+        fn record_verdict(
+            leaves: &HashMap<[u8; 32], (crate::post_quantum::PqScheme, Option<[u8; 32]>)>,
+            addr: &[u8; 32],
+            scheme: crate::post_quantum::PqScheme,
+            pk: &[u8],
+            salt: &[u8; 16],
+        ) -> Result<(), String> {
+            if scheme.is_disabled() {
+                return Err(format!("disabled scheme {}", scheme.name()));
+            }
+            if pk.len() != scheme.pubkey_size() {
+                return Err(format!(
+                    "pubkey length {} != {} for {}",
+                    pk.len(),
+                    scheme.pubkey_size(),
+                    scheme.name()
+                ));
+            }
+            let Some((leaf_scheme, leaf_hash)) = leaves.get(addr) else {
+                return Err("no account leaf for address".to_string());
+            };
+            if *leaf_scheme != scheme {
+                return Err("leaf scheme mismatch".to_string());
+            }
+            let pk_hash = *blake3::hash(pk).as_bytes();
+            if *leaf_hash != Some(pk_hash) {
+                return Err("blake3(pk) != leaf pubkey_hash".to_string());
+            }
+            if crate::post_quantum::derive_pq_address(scheme, pk, salt) != *addr {
+                return Err("derive(scheme,pk,salt) != address".to_string());
+            }
+            Ok(())
+        }
+        // First pass: decide the valid address records (fail-closed). The
+        // valid set drives both install paths so disk and fallback agree.
+        // First valid record wins a duplicated address; a conflicting
+        // duplicate is itself a refused entry.
+        let mut valid: HashMap<[u8; 32], (crate::post_quantum::PqScheme, Vec<u8>, [u8; 16])> =
+            HashMap::new();
+        let mut valid_hashes: HashSet<[u8; 32]> = HashSet::new();
+        let mut skipped: u64 = 0;
+        for (k, v) in &pairs {
+            let addr_opt: Option<[u8; 32]> = if k.len() == 34 && k[0] == b'a' && k[1] == b':' {
+                let mut addr = [0u8; 32];
+                addr.copy_from_slice(&k[2..]);
+                Some(addr)
+            } else if k.len() == 32 {
+                let mut addr = [0u8; 32];
+                addr.copy_from_slice(k);
+                Some(addr)
+            } else {
+                None
+            };
+            let Some(addr) = addr_opt else {
+                continue;
+            };
+            let Some((scheme, pk, salt)) = decode_record(v) else {
+                skipped += 1;
+                tracing::debug!(
+                    address = %hex::encode(addr),
+                    "restore_pq_keys: refusing undecodable record"
+                );
+                continue;
+            };
+            if let Err(reason) = record_verdict(&leaves, &addr, scheme, &pk, &salt) {
+                skipped += 1;
+                tracing::debug!(
+                    address = %hex::encode(addr),
+                    "restore_pq_keys: refusing invalid record ({reason})"
+                );
+                continue;
+            }
+            if let Some((prev_scheme, prev_pk, prev_salt)) = valid.get(&addr) {
+                if *prev_scheme != scheme || *prev_pk != pk || *prev_salt != salt {
+                    skipped += 1;
+                    tracing::debug!(
+                        address = %hex::encode(addr),
+                        "restore_pq_keys: refusing conflicting duplicate record"
+                    );
+                }
+                continue;
+            }
+            valid_hashes.insert(*blake3::hash(&pk).as_bytes());
+            valid.insert(addr, (scheme, pk, salt));
+        }
         if let Some(tree) = self.pq_tree.read().unwrap().clone() {
+            // Second pass: valid address records install verbatim (the synced
+            // node serves the publisher's bytes); hash-lookup records install
+            // verbatim only for a valid address hash; unknown shapes pass
+            // through verbatim (forward-compat, as before).
+            let mut installed: u64 = 0;
             for (k, v) in &pairs {
-                tree.insert(k.as_slice(), v.as_slice())
-                    .map_err(|e| format!("restore pq_keys tree insert failed: {e}"))?;
+                if k.len() == 34 && k[0] == b'a' && k[1] == b':' {
+                    let mut addr = [0u8; 32];
+                    addr.copy_from_slice(&k[2..]);
+                    let keep = valid.get(&addr).is_some_and(|(s, pk, salt)| {
+                        decode_record(v).is_some_and(|(ds, dpk, dsalt)| {
+                            *s == ds && *pk == dpk && *salt == dsalt
+                        })
+                    });
+                    if !keep {
+                        continue;
+                    }
+                    tree.insert(k.as_slice(), v.as_slice())
+                        .map_err(|e| format!("restore pq_keys tree insert failed: {e}"))?;
+                    installed += 1;
+                } else if k.len() == 32 {
+                    let mut addr = [0u8; 32];
+                    addr.copy_from_slice(k);
+                    let keep = valid.get(&addr).is_some_and(|(s, pk, salt)| {
+                        decode_record(v).is_some_and(|(ds, dpk, dsalt)| {
+                            *s == ds && *pk == dpk && *salt == dsalt
+                        })
+                    });
+                    if !keep {
+                        continue;
+                    }
+                    tree.insert(k.as_slice(), v.as_slice())
+                        .map_err(|e| format!("restore pq_keys tree insert failed: {e}"))?;
+                    installed += 1;
+                } else if k.len() == 34 && k[0] == b'h' && k[1] == b':' {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&k[2..]);
+                    if !valid_hashes.contains(&hash) || *blake3::hash(v).as_bytes() != hash {
+                        skipped += 1;
+                        tracing::debug!(
+                            hash = %hex::encode(hash),
+                            "restore_pq_keys: refusing orphan hash-lookup record"
+                        );
+                        continue;
+                    }
+                    tree.insert(k.as_slice(), v.as_slice())
+                        .map_err(|e| format!("restore pq_keys tree insert failed: {e}"))?;
+                    installed += 1;
+                } else {
+                    tree.insert(k.as_slice(), v.as_slice())
+                        .map_err(|e| format!("restore pq_keys tree insert failed: {e}"))?;
+                    installed += 1;
+                }
+            }
+            if skipped > 0 {
+                tracing::warn!(
+                    "restore_pq_keys: refused {skipped} invalid entries (installed {installed} valid)"
+                );
             }
             return Ok(());
         }
         let mut fb = self.pq_keys_fallback.write().unwrap();
-        for (k, v) in &pairs {
-            // Address records only (`a:` + 32B); hash-lookup (`h:`) and
-            // legacy/unknown shapes carry no address to index by.
-            if k.len() != 34 || k[0] != b'a' || k[1] != b':' {
-                continue;
-            }
-            let mut addr = [0u8; 32];
-            addr.copy_from_slice(&k[2..]);
-            let rec: Option<(crate::post_quantum::PqScheme, Vec<u8>)> = if let Ok((s, pk, _salt)) =
-                bincode::deserialize::<(crate::post_quantum::PqScheme, Vec<u8>, [u8; 16])>(v)
-            {
-                Some((s, pk))
-            } else if let Ok((s, pk)) =
-                bincode::deserialize::<(crate::post_quantum::PqScheme, Vec<u8>)>(v)
-            {
-                Some((s, pk))
-            } else {
-                None
-            };
-            if let Some((scheme, pk)) = rec {
-                fb.insert(addr, (scheme, pk));
-            }
+        let installed = valid.len() as u64;
+        for (addr, (scheme, pk, salt)) in valid {
+            fb.insert(addr, (scheme, pk, salt));
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                "restore_pq_keys: refused {skipped} invalid entries (fallback installed {installed} valid)"
+            );
         }
         Ok(())
     }
@@ -12299,6 +12477,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn m03_restore_pq_keys_refuses_invalid_entries_fail_closed() {
+        // One valid address record plus two corrupt ones (wrong-address pin,
+        // hash-mismatched key): the corrupt entries are skipped (counted +
+        // logged) and the restore still installs the valid entry.
+        let scheme = PqScheme::Falcon512;
+        let seed = 0xE7;
+        let pk = Transaction::sample_falcon512_pubkey(seed);
+        let salt = [0x3Au8; 16];
+        let addr = derive_pq_address(scheme, &pk, &salt);
+        let engine = InMemoryStateEngine::new();
+        engine.credit_native(&addr, 10_000_000).await.unwrap();
+        engine
+            .pin_pubkey(addr, scheme, &pk, &salt)
+            .await
+            .unwrap();
+
+        let mut akey = Vec::with_capacity(34);
+        akey.extend_from_slice(b"a:");
+        akey.extend_from_slice(&addr);
+        let aval = bincode::serialize(&(scheme, pk.clone(), salt)).unwrap();
+        // Corrupt 1: the right key filed under the wrong address
+        // (derive(scheme,pk,salt) != address, and no leaf there either).
+        let wrong_addr = [0xBBu8; 32];
+        let mut bad_key = Vec::with_capacity(34);
+        bad_key.extend_from_slice(b"a:");
+        bad_key.extend_from_slice(&wrong_addr);
+        let bad_key_val = bincode::serialize(&(scheme, pk.clone(), salt)).unwrap();
+        // Corrupt 2: the right address bound to a different key
+        // (blake3(pk) != leaf pubkey_hash).
+        let other_pk = Transaction::sample_falcon512_pubkey(0xE8);
+        let bad_pk_val = bincode::serialize(&(scheme, other_pk, salt)).unwrap();
+        let blob = bincode::serialize(&vec![
+            (akey.clone(), aval),
+            (bad_key, bad_key_val),
+            (akey, bad_pk_val),
+        ])
+        .unwrap();
+        engine
+            .restore_pq_keys(&blob)
+            .await
+            .expect("invalid entries must not abort the restore");
+        assert_eq!(
+            engine.get_pinned_pubkey(&addr),
+            Some((scheme, pk)),
+            "valid entry installs"
+        );
+        assert_eq!(
+            engine.get_pinned_pubkey(&wrong_addr),
+            None,
+            "wrong-address entry refused"
+        );
+    }
+
+    #[tokio::test]
     async fn test_ml_dsa_44_and_hybrid_and_ed25519_pinning() {
         let engine = InMemoryStateEngine::new();
 
@@ -12733,6 +12965,81 @@ mod tests {
         assert_eq!(failed3, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn m03_custom_salt_restart_heal_implicit_verifies() {
+        // M-03 liveness regression: a non-default-salt account must recover
+        // across a restart. Origin pins with a custom salt; the restart
+        // heals from the accounts snapshot + the pq_keys blob, and the
+        // healed implicit registry (pinned salt, NOT DEFAULT_SALT) verifies
+        // an implicit-PQ transaction. Diskless (fallback) path throughout,
+        // so the salt survives only via the pinned record.
+        use crate::post_quantum::DEFAULT_SALT;
+        let scheme = PqScheme::Falcon512;
+        let seed = 0xE3;
+        let pk = Transaction::sample_falcon512_pubkey(seed);
+        let salt = [0x9Cu8; 16];
+        assert_ne!(salt, DEFAULT_SALT, "test needs a non-default salt");
+        let from = derive_pq_address(scheme, &pk, &salt);
+
+        let engine1 = InMemoryStateEngine::new();
+        engine1.credit_native(&from, 50_000_000).await.unwrap();
+        engine1
+            .pin_pubkey(from, scheme, &pk, &salt)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine1.get_pinned_pubkey_with_salt(&from),
+            Some((scheme, pk.clone(), salt)),
+            "fallback must persist the pinned salt"
+        );
+        let snap = engine1.create_snapshot().await;
+        let mut akey = Vec::with_capacity(34);
+        akey.extend_from_slice(b"a:");
+        akey.extend_from_slice(&from);
+        let aval = bincode::serialize(&(scheme, pk.clone(), salt)).unwrap();
+        let mut hkey = Vec::with_capacity(34);
+        hkey.extend_from_slice(b"h:");
+        hkey.extend_from_slice(blake3::hash(&pk).as_bytes());
+        let blob = bincode::serialize(&vec![(akey, aval), (hkey, pk.clone())]).unwrap();
+        drop(engine1);
+
+        // Restart: fresh diskless engine installs the snapshot + the blob.
+        let engine2 = InMemoryStateEngine::new();
+        engine2.restore_snapshot(&snap).await.unwrap();
+        engine2.restore_pq_keys(&blob).await.unwrap();
+        assert_eq!(
+            engine2.get_pinned_pubkey_with_salt(&from),
+            Some((scheme, pk.clone(), salt)),
+            "healing must recover the PINNED salt, not DEFAULT_SALT"
+        );
+
+        // An implicit-PQ transaction verifies against the healed state: the
+        // block path heals the global implicit registry from the pinned salt
+        // before verifying, so a custom-salt account stays live.
+        let mut tx = Transaction {
+            from,
+            to: [0x77u8; 32],
+            amount: 1_000,
+            gas_limit: 50_000,
+            nonce: 0,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        let msg = tx.signing_message();
+        let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+        tx.signature = PqSignatureEnvelope::new_implicit(scheme, sig).encode();
+        assert!(tx.is_pq_implicit());
+        let (applied, failed, _, _, _) = engine2.apply_block_parallel_fees(&[tx], 1000).await;
+        assert_eq!(
+            applied, 1,
+            "implicit-PQ tx on the healed custom-salt account must apply"
+        );
+        assert_eq!(failed, 0);
     }
 
     #[tokio::test]

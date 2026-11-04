@@ -6,6 +6,13 @@ A post-quantum Layer-1 blockchain in Rust: Tendermint-style BFT finality,
 Falcon-512 validator signatures, actor accounts, a native on-chain order book —
 running on lightweight hardware. `chainId 5757`.
 
+## Highlights
+
+- Post-quantum by default: Falcon-512 signatures enforced, classical crypto refused
+- 0.6 s block target with ~11 ms of measured CPU per block height
+- Native CLOB order book, bridge and oracle on-chain — no external DeFi needed
+- Runs a validator on 1 vCPU: no datacenter hardware required
+
 <p align="center">
   <a href="https://github.com/stellereum/stellereum/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/stellereum/stellereum/ci.yml?label=CI" alt="CI"/></a>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-orange" alt="License"/></a>
@@ -31,10 +38,15 @@ Want to run a node or validate? Start with [`NODE.md`](NODE.md) and
 
 ## How it fits together
 
-- **Masterchain (shard 0)** — validator set, Tendermint-style BFT finality, single-shard canonical
-- **Execution** — SVM, CLOB order book, bridge, oracle
-- **Crypto** — Falcon-512 validator keys, quorum `floor(2W/3)+1`
-- **API** — JSON-RPC/WS `:8545` (`stell_*`), explorer gateway `:8080`
+```mermaid
+flowchart LR
+    Wallet --> RPC[JSON-RPC :8545]
+    RPC --> Mempool
+    Mempool --> BFT[Tendermint BFT<br/>quorum 2W/3+1]
+    BFT --> Master[Masterchain shard 0]
+    Master --> Exec[SVM · CLOB · bridge]
+    Val[Validators<br/>Falcon-512 keys] --> BFT
+```
 
 Single shard is canonical today; workchain code paths are parked behind a
 boot guard. Details live in [`PROTOCOL.md`](PROTOCOL.md) and

@@ -2437,6 +2437,9 @@ impl GovernanceLegacy {
             next_id: self.next_id,
             quorum_bps: self.quorum_bps,
             applied: self.applied.upgrade(),
+            // KI-23: legacy storage predates the timelock map — no maturities
+            // (pre-timelock Passed executes immediately, one-time migration).
+            timelocks: Default::default(),
         }
     }
 }

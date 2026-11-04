@@ -36,6 +36,28 @@ pub const GOVERNANCE_QUORUM_FLOOR_BPS: u64 = 3_333;
 pub const GOVERNANCE_VOTING_PERIOD_SECS: u64 = 3 * 24 * 3600; // 3 days
 /// Minimum stake required to submit a proposal (10,000 STELL), in bps-free nano.
 pub const PROPOSAL_MIN_STAKE_NANO: u64 = 10_000 * 1_000_000_000;
+/// Timelock delay in heights between a proposal passing and its execution
+/// (KI-23 fix: voted proposals no longer execute immediately).
+///
+/// A passed proposal schedules execution at `pass_height +
+/// GOV_TIMELOCK_HEIGHTS`; execution before maturity REFUSES fail-closed
+/// (`GovError::Timelocked`, proposal stays `Passed`). Query via
+/// [`Governance::executable_height_of`] / [`Governance::is_mature`]
+/// (and `get` status `Passed` = pending).
+///
+/// Choice: 7,200 heights ≈ 6 h at 3 s blocks — the SAME exit-window
+/// philosophy as [`crate::staking::COMMISSION_EFFECT_DELAY_HEIGHTS`]
+/// (delegators get a window to exit before a commission raise lands; here
+/// the chain gets a window to react before a passed action lands).
+/// Deterministic const, never env (consensus: every node applying the same
+/// blocks must reach the same maturity; an env knob would fork the chain).
+///
+/// There is deliberately NO emergency bypass in this module (out of scope;
+/// reported as follow-up).
+///
+/// FREEZE (protocol freeze 2026-11-03 style): 7,200 heights, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
+pub const GOV_TIMELOCK_HEIGHTS: u64 = 7_200;
 
 const BPS: u128 = 10_000;
 /// Basis points as u64 for parameter bounds checks.
@@ -84,6 +106,9 @@ pub enum GovError {
     NotPassed,
     AlreadyExecuted,
     InvalidAction,
+    /// KI-23 timelock: the proposal passed but its executable height has not
+    /// been reached. Fail-closed; the proposal stays `Passed`.
+    Timelocked,
 }
 
 impl std::fmt::Display for GovError {
@@ -97,6 +122,8 @@ impl std::fmt::Display for GovError {
             GovError::AlreadyVoted => "already voted on this proposal",
             GovError::NotPassed => "proposal has not passed",
             GovError::AlreadyExecuted => "proposal already executed",
+            GovError::Timelocked =>
+                "proposal timelock has not matured (execution refused fail-closed)",
             // Names every propose/execute bound (E5 quorum floor 3333 bps,
             // E4 title/signal caps, E6 non-zero publisher) so a rejected
             // action explains the rule at both propose-time and execute-time.
@@ -507,6 +534,18 @@ pub struct Governance {
     pub quorum_bps: u64,
     /// Applied parameter values (last executed action wins).
     pub applied: AppliedParams,
+    /// KI-23 timelock schedule: proposal id -> executable height
+    /// (`pass_height + GOV_TIMELOCK_HEIGHTS`).
+    ///
+    /// Set on the Passed transition by `finalize_at_height` ONLY. No entry
+    /// means unscheduled: Open/Rejected, or a pre-timelock Passed migrated
+    /// from storage (executes immediately via either path — one-time
+    /// migration, not a bypass: all NEW passes schedule `Some`).
+    /// Kept (not drained) after execution as the audit trail of when the
+    /// proposal became executable. `#[serde(default)]` so persisted state
+    /// without this map loads with no maturities (legacy immediate).
+    #[serde(default)]
+    pub timelocks: HashMap<u64, u64>,
 }
 
 /// Coordinated software upgrade plan.
@@ -825,6 +864,7 @@ impl Governance {
             next_id: 1,
             quorum_bps: GOVERNANCE_QUORUM_BPS,
             applied: AppliedParams::default(),
+            timelocks: HashMap::new(),
         }
     }
 
@@ -901,7 +941,7 @@ impl Governance {
                 title,
                 action,
                 created_at: now,
-                voting_end: now + GOVERNANCE_VOTING_PERIOD_SECS,
+                voting_end: now.saturating_add(GOVERNANCE_VOTING_PERIOD_SECS),
                 yes: 0,
                 no: 0,
                 abstain: 0,
@@ -1012,6 +1052,41 @@ impl Governance {
         proposal_id: u64,
         now: u64,
     ) -> Result<ProposalStatus, GovError> {
+        // Legacy path (pre-timelock): no height supplied, so no maturity is
+        // scheduled (`timelocks` stays empty for this proposal and `execute`
+        // allows immediate execution). Kept so existing callers/tests pinning
+        // vote/tally behavior stay byte-identical; NEW passes must use
+        // `finalize_at_height` so execution is timelocked (KI-23).
+        // Vote/quorum/tally math below is UNCHANGED.
+        self.finalize_inner(ledger, proposal_id, now, None)
+    }
+
+    /// Finalize a proposal after voting ends AND schedule its timelock.
+    ///
+    /// Vote/quorum/tally math is byte-identical to [`Governance::finalize`]
+    /// (turnout >= frozen quorum, yes > no, non-zero decisive turnout; locks
+    /// released exactly once on the terminal transition). On the
+    /// Open -> Passed transition ONLY, records
+    /// `timelocks[id] = cur_height.saturating_add(GOV_TIMELOCK_HEIGHTS)`;
+    /// Rejected schedules nothing. Re-finalize of a non-Open proposal
+    /// early-returns WITHOUT touching an existing schedule (idempotent).
+    pub fn finalize_at_height(
+        &mut self,
+        ledger: &mut StakingLedger,
+        proposal_id: u64,
+        now: u64,
+        cur_height: u64,
+    ) -> Result<ProposalStatus, GovError> {
+        self.finalize_inner(ledger, proposal_id, now, Some(cur_height))
+    }
+
+    fn finalize_inner(
+        &mut self,
+        ledger: &mut StakingLedger,
+        proposal_id: u64,
+        now: u64,
+        cur_height: Option<u64>,
+    ) -> Result<ProposalStatus, GovError> {
         // Read the gating fields first so the terminal transition below is
         // the single writer (the borrow ends before any unlock call).
         let (voting_end, status) = {
@@ -1038,6 +1113,15 @@ impl Governance {
         } else {
             ProposalStatus::Rejected
         };
+        // KI-23: schedule the timelock on the Passed transition only, when a
+        // height was supplied. Saturating: near-u64::MAX maturity clamps,
+        // never wraps.
+        if p.status == ProposalStatus::Passed {
+            if let Some(h) = cur_height {
+                self.timelocks
+                    .insert(proposal_id, h.saturating_add(GOV_TIMELOCK_HEIGHTS));
+            }
+        }
         // E7: release every lock exactly once. This is the only transition
         // out of `Open` (re-finalize early-returns above), so no voter can
         // be unlocked twice and no lock can survive its proposal.
@@ -1058,8 +1142,17 @@ impl Governance {
     /// a passed proposal (no proposer-only gate, so a lost/rotated proposer key
     /// cannot brick execution).
     ///
-    /// NOTE (E5): no timelock by deferred design decision — execution is
-    /// allowed as soon as the proposal has passed (finalized).
+    /// KI-23 TIMELOCK (replaces the E5 "no timelock by deferred design
+    /// decision"): a proposal scheduled via `finalize_at_height` REFUSES
+    /// execution before `executable_height_of(id)` (fail-closed
+    /// `Timelocked`, stays `Passed`). This legacy `execute` supplies NO
+    /// height, so a scheduled proposal ALWAYS refuses here — callers MUST use
+    /// `execute_at_height` with the current chain height. An UNSCHEDULED
+    /// Passed (legacy `finalize`, or pre-timelock storage with no `timelocks`
+    /// entry) executes immediately (one-time migration, not a bypass).
+    ///
+    /// There is deliberately NO emergency bypass in this module (out of
+    /// scope; reported as follow-up).
     ///
     /// Oracle actions cannot be reached from here: the oracle is a separate
     /// committed domain. Passing one fails closed with `InvalidAction` and
@@ -1072,7 +1165,20 @@ impl Governance {
         executor: [u8; 32],
         proposal_id: u64,
     ) -> Result<&AppliedParams, GovError> {
-        self.execute_inner(executor, proposal_id, None)
+        self.execute_inner(executor, proposal_id, None, None)
+    }
+
+    /// Execute a passed proposal at the current chain height, enforcing the
+    /// KI-23 timelock: before `executable_height_of(id)` refuses fail-closed
+    /// (`Timelocked`, stays `Passed`); at/after maturity applies exactly once.
+    /// Anyone may execute (no proposer-only gate).
+    pub fn execute_at_height(
+        &mut self,
+        executor: [u8; 32],
+        proposal_id: u64,
+        cur_height: u64,
+    ) -> Result<&AppliedParams, GovError> {
+        self.execute_inner(executor, proposal_id, None, Some(cur_height))
     }
 
     /// Execute a passed proposal whose action ALSO moves committed oracle state
@@ -1084,13 +1190,55 @@ impl Governance {
     /// same passed proposal against the same starting oracle lands on the same
     /// subsequent state root, and no node can apply the governance half without
     /// the oracle half.
+    ///
+    /// Timelock: same rule as [`Governance::execute`] — a scheduled proposal
+    /// refuses without a height (use `execute_with_oracle_at_height`).
     pub fn execute_with_oracle(
         &mut self,
         executor: [u8; 32],
         proposal_id: u64,
         oracle: &mut crate::oracle::OracleState,
     ) -> Result<&AppliedParams, GovError> {
-        self.execute_inner(executor, proposal_id, Some(oracle))
+        self.execute_inner(executor, proposal_id, Some(oracle), None)
+    }
+
+    /// Oracle-aware execution at the current chain height (timelock-enforcing;
+    /// see [`Governance::execute_at_height`]).
+    pub fn execute_with_oracle_at_height(
+        &mut self,
+        executor: [u8; 32],
+        proposal_id: u64,
+        oracle: &mut crate::oracle::OracleState,
+        cur_height: u64,
+    ) -> Result<&AppliedParams, GovError> {
+        self.execute_inner(executor, proposal_id, Some(oracle), Some(cur_height))
+    }
+
+    /// Height at which a passed proposal becomes executable, if scheduled.
+    ///
+    /// `None` = unscheduled (Open/Rejected, or pre-timelock Passed with no
+    /// `timelocks` entry — executes immediately as the one-time migration).
+    /// Query surface for the timelock alongside `get(id).status == Passed`
+    /// (= pending execution).
+    pub fn executable_height_of(&self, proposal_id: u64) -> Option<u64> {
+        self.timelocks.get(&proposal_id).copied()
+    }
+
+    /// Whether `proposal_id` may execute at `cur_height`.
+    ///
+    /// Unscheduled Passed (no entry) counts as mature (legacy immediate);
+    /// non-Passed never counts as mature. Executed counts as mature only if
+    /// its recorded height is reached (history queries stay truthful).
+    pub fn is_mature(&self, proposal_id: u64, cur_height: u64) -> bool {
+        let status = self.proposals.get(&proposal_id).map(|p| p.status);
+        match status {
+            Some(ProposalStatus::Passed) | Some(ProposalStatus::Executed) => {}
+            _ => return false,
+        }
+        match self.timelocks.get(&proposal_id) {
+            Some(m) => cur_height >= *m,
+            None => true,
+        }
     }
 
     fn execute_inner(
@@ -1098,14 +1246,40 @@ impl Governance {
         _executor: [u8; 32],
         proposal_id: u64,
         mut oracle: Option<&mut crate::oracle::OracleState>,
+        cur_height: Option<u64>,
     ) -> Result<&AppliedParams, GovError> {
+        // KI-23 gate FIRST (before any domain write): a scheduled proposal
+        // refuses without/at-before maturity, fail-closed, staying `Passed`.
+        // `None` height (legacy `execute`) refuses whenever an entry exists;
+        // `None` entry (legacy `finalize` / pre-timelock storage) is the
+        // one-time migration and proceeds immediately.
+        if let Some(maturity) = self.timelocks.get(&proposal_id).copied() {
+            let mature = match cur_height {
+                Some(h) => h >= maturity,
+                None => false,
+            };
+            if !mature {
+                // Existence + status checked below for the exact error
+                // (`UnknownProposal` / `AlreadyExecuted` / `NotPassed` win
+                // over `Timelocked` when the proposal is not in `Passed`).
+                let status = self.proposals.get(&proposal_id).map(|p| p.status);
+                match status {
+                    Some(ProposalStatus::Passed) => return Err(GovError::Timelocked),
+                    Some(ProposalStatus::Executed) => {
+                        return Err(GovError::AlreadyExecuted)
+                    }
+                    Some(_) => return Err(GovError::NotPassed),
+                    None => return Err(GovError::UnknownProposal),
+                }
+            }
+        }
         let p = self
             .proposals
             .get_mut(&proposal_id)
             .ok_or(GovError::UnknownProposal)?;
         // E5: anyone-can-execute — no `p.proposer == executor` (`NotProposer`)
         // gate, so a lost/rotated proposer key cannot brick a passed proposal.
-        // NOTE: no timelock by deferred design decision.
+        // KI-23: maturity enforced above; reaching here means mature-or-legacy.
         match p.status {
             ProposalStatus::Passed => {}
             ProposalStatus::Executed => return Err(GovError::AlreadyExecuted),
@@ -1200,6 +1374,9 @@ impl Governance {
                     .register_publisher(pk);
             }
             GovAction::UnregisterOraclePublisher(pk) => {
+                if pk == [0u8; 32] {
+                    return Err(GovError::InvalidAction);
+                }
                 oracle
                     .as_deref_mut()
                     .ok_or(GovError::InvalidAction)?
@@ -2045,7 +2222,7 @@ mod tests {
                     sha256: [7u8; 32],
                 },
                 created_at: now,
-                voting_end: now + GOVERNANCE_VOTING_PERIOD_SECS,
+                voting_end: now.saturating_add(GOVERNANCE_VOTING_PERIOD_SECS),
                 yes: 0,
                 no: 0,
                 abstain: 0,
@@ -2275,5 +2452,201 @@ mod tests {
         assert_eq!(std::fs::read(&staged).unwrap(), payload);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&staged);
+    }
+
+    // -----------------------------------------------------------------------
+    // KI-23 TIMELOCK (voted proposals execute at pass_height + delay)
+    // -----------------------------------------------------------------------
+
+    /// Drive a proposal to Passed via the height-aware finalize (100% yes).
+    fn pass_at_height(
+        l: &mut StakingLedger,
+        g: &mut Governance,
+        proposer: [u8; 32],
+        voters: &[[u8; 32]],
+        action: GovAction,
+        pass_height: u64,
+    ) -> u64 {
+        let id = g
+            .propose(l, proposer, "t".into(), action, 0)
+            .expect("propose");
+        for v in voters {
+            g.vote(l, *v, id, VoteChoice::Yes, 1).expect("vote");
+        }
+        let status = g
+            .finalize_at_height(l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1, pass_height)
+            .expect("finalize");
+        assert_eq!(status, ProposalStatus::Passed);
+        id
+    }
+
+    #[test]
+    fn timelock_const_is_7200_heights_no_env() {
+        // Pinned: same exit-window philosophy as the commission delay.
+        assert_eq!(GOV_TIMELOCK_HEIGHTS, 7_200);
+        assert_eq!(
+            crate::staking::COMMISSION_EFFECT_DELAY_HEIGHTS,
+            7_200,
+            "timelock mirrors the commission exit window"
+        );
+    }
+
+    #[test]
+    fn timelock_schedule_sets_maturity() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let pass_height = 1_000_000u64;
+        let id = pass_at_height(
+            &mut l,
+            &mut g,
+            ids[0],
+            &ids,
+            GovAction::Signal("t".into()),
+            pass_height,
+        );
+        assert_eq!(
+            g.executable_height_of(id),
+            Some(pass_height.saturating_add(GOV_TIMELOCK_HEIGHTS))
+        );
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Passed);
+    }
+
+    #[test]
+    fn timelock_early_execution_refused_fail_closed() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let pass_height = 50_000u64;
+        let id = pass_at_height(
+            &mut l,
+            &mut g,
+            ids[0],
+            &ids,
+            GovAction::SetBlockReward(stell(9)),
+            pass_height,
+        );
+        let maturity = pass_height + GOV_TIMELOCK_HEIGHTS;
+        // Legacy path (no height) refuses a scheduled proposal fail-closed.
+        assert_eq!(g.execute(ids[0], id), Err(GovError::Timelocked));
+        // Height-aware path before maturity refuses too.
+        assert_eq!(
+            g.execute_at_height(ids[0], id, maturity - 1),
+            Err(GovError::Timelocked)
+        );
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Passed);
+        assert!(g.applied.block_reward.is_none());
+        // Retry is identically refused (no partial state).
+        assert_eq!(
+            g.execute_at_height(ids[0], id, maturity - 1),
+            Err(GovError::Timelocked)
+        );
+    }
+
+    #[test]
+    fn timelock_matured_executes_exactly_once() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let pass_height = 77_000u64;
+        let id = pass_at_height(
+            &mut l,
+            &mut g,
+            ids[0],
+            &ids,
+            GovAction::SetBlockReward(stell(9)),
+            pass_height,
+        );
+        let maturity = pass_height + GOV_TIMELOCK_HEIGHTS;
+        g.execute_at_height(ids[1], id, maturity)
+            .expect("matured must execute");
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Executed);
+        assert_eq!(g.applied.block_reward, Some(stell(9)));
+        assert_eq!(
+            g.execute_at_height(ids[1], id, maturity + 1),
+            Err(GovError::AlreadyExecuted)
+        );
+    }
+
+    #[test]
+    fn timelock_exact_boundary_maturity_minus_one_refuses_maturity_executes() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let pass_height = 123_456u64;
+        let id = pass_at_height(
+            &mut l,
+            &mut g,
+            ids[0],
+            &ids,
+            GovAction::Signal("b".into()),
+            pass_height,
+        );
+        let maturity = pass_height + GOV_TIMELOCK_HEIGHTS;
+        assert!(!g.is_mature(id, maturity - 1));
+        assert!(g.is_mature(id, maturity));
+        assert_eq!(
+            g.execute_at_height(ids[0], id, maturity - 1),
+            Err(GovError::Timelocked)
+        );
+        g.execute_at_height(ids[0], id, maturity)
+            .expect("maturity executes");
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn timelock_query_surfaces_pending_and_executable_height() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let pass_height = 9_000u64;
+        let id = pass_at_height(
+            &mut l,
+            &mut g,
+            ids[0],
+            &ids,
+            GovAction::Signal("q".into()),
+            pass_height,
+        );
+        // Pending: Passed (not Executed) + scheduled executable height.
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Passed);
+        assert_eq!(
+            g.executable_height_of(id),
+            Some(pass_height + GOV_TIMELOCK_HEIGHTS)
+        );
+        assert!(!g.is_mature(id, pass_height));
+        assert!(g.is_mature(id, pass_height + GOV_TIMELOCK_HEIGHTS));
+        // Unknown proposal: no schedule, never mature.
+        assert_eq!(g.executable_height_of(999_999), None);
+        assert!(!g.is_mature(999_999, u64::MAX));
+    }
+
+    #[test]
+    fn timelock_oracle_path_enforces_maturity() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let pass_height = 5_000u64;
+        let id = pass_at_height(
+            &mut l,
+            &mut g,
+            ids[0],
+            &ids,
+            GovAction::RegisterOraclePublisher([0x31u8; 32]),
+            pass_height,
+        );
+        let maturity = pass_height + GOV_TIMELOCK_HEIGHTS;
+        let mut oracle = crate::oracle::OracleState::default();
+        // Legacy oracle path (no height) refuses a scheduled proposal.
+        assert_eq!(
+            g.execute_with_oracle(ids[0], id, &mut oracle),
+            Err(GovError::Timelocked)
+        );
+        assert!(oracle.publishers.is_empty());
+        // Height-aware path before maturity refuses too.
+        assert_eq!(
+            g.execute_with_oracle_at_height(ids[1], id, &mut oracle, maturity - 1),
+            Err(GovError::Timelocked)
+        );
+        assert!(oracle.publishers.is_empty());
+        // At maturity applies exactly once (both domains).
+        g.execute_with_oracle_at_height(ids[1], id, &mut oracle, maturity)
+            .expect("matured oracle action must apply");
+        assert!(oracle.publishers.contains(&[0x31u8; 32]));
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Executed);
     }
 }

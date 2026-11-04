@@ -1,7 +1,7 @@
 # Публичный тестнет: кодовые пробелы и protocol freeze
 
 Статус: рабочий документ лида. Русский язык — для скармливания нейро-аудиторам вместе с кодом.
-Обновлено: 2026-11-03. Правило: публике — один зафиксированный протокол, не конструктор из env-флагов.
+Обновлено: 2026-11-04 (2026-11-04 changelog: закрыты stale-ссылки на удалённый legacy-genesis knob — strict-only подтверждён цитатами, активная задача снята). Правило: публике — один зафиксированный протокол, не конструктор из env-флагов.
 
 ## 0. Вердикт одной строкой
 
@@ -17,14 +17,14 @@
 | VRF (`STELL_VRF_ACTIVATION_HEIGHT`) | OFF; ECVRF помечен classical; CN-VRF — песочница без импорта в консенсус; живьём — parent-hash draw | **Parent-hash draw — THE механизм. ИСПОЛНЕНО:** arming удалён (флаг inert + WARN), 11 stale-пинов переведены на retired-ожидания, phase3-флейк (глобальный реестр) вылечен сериализацией всех 12 тестов (12/12 ×3). ECVRF — мёртвый код под маркером. CN-VRF — только после нейро-аудита |
 | Workchain (`STELL_SHARDS`, `STELL_XPC_ACTIVATION_HEIGHT`) | unset = один шард, 2PC Disabled; локальный soak 4/4 + N=3 доказан, live-soak не было | **Single-shard канон. ИСПОЛНЕНО:** boot-guard — `STELL_SHARDS != {0}` без `STELL_EXPERIMENTAL_SHARDS=1` отказывает старту с указанием на этот док. Тесты guard 5/5 |
 | `STELL_BLS_QC` | hard-refused на старте | **Оставить refused как финальное.** BLS — classical legacy, компактные QC не считаются никогда. Пин-тест уже есть |
-| `STELL_LEGACY_GENESIS_ROOT`, faucet test-key | Техдолг в коде | **ИСПОЛНЕНО:** legacy-ветки удалены (греп чист), faucet требует key-file (без файла — DISABLED), 7 debug-хуков загейчены/удалены (таблица в отчёте), доки OPERATIONS помечены stale (вне зоны) |
+| ~~legacy-genesis env knob~~, faucet test-key | Техдолг в коде | **ИСПОЛНЕНО:** legacy-ветки удалены — strict-only (`stellereum/src/post_quantum.rs:1598-1600`), тоггл no-op (`stellereum/tests/a_crypto_audit_poc.rs:147-174`), гарды его не перечисляют (`stellereum/tests/genesis_guard_tests.rs:60-64`); faucet требует key-file (`stellereum/src/rpc.rs:502-508`, без файла — DISABLED), 7 debug-хуков загейчены/удалены (таблица в отчёте), доки OPERATIONS помечены stale (вне зоны) |
 
 H (высота смерти классики/эксперимента) выбирается лидом перед пабликом с запасом в недели;
 константа в коде + env-override для тестов. До H поведение смешанное с громкими WARN и метрикой.
 
 ## 2. Удалить/закрыть до паблика (код)
 
-1. **`STELL_LEGACY_GENESIS_ROOT`** — legacy-путь парсинга/ключей. Удалить ветку, парсер — strict-only.
+1. **~~legacy-genesis env knob~~ — ЗАКРЫТО (было: legacy-путь парсинга/ключей).** Ветка удалена, парсер — strict-only (`stellereum/src/post_quantum.rs:1598-1600`; no-op пин `stellereum/tests/a_crypto_audit_poc.rs:147-174`). Иначе легаси навсегда часть «протокола» — устранено.
    Иначе легаси навсегда часть «протокола».
 2. **Faucet test-key по умолчанию** (`111...1`-класс). Публичный кран без ключа обязан быть
    ВЫКЛЮЧЕН (fail-closed), а не открыт миру. Исполнение: faucet требует key-file; тестовый ключ

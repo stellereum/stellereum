@@ -82,7 +82,7 @@ delays, queryable over RPC (`stell_getPqKey`).
 Accounts, tokens (STS-20), on-chain DNS, liquidity pools, a central-limit
 order book with price-time priority, a primary-market-maker exchange, price
 oracles with TWAP fallback, and a governed bridge with timelocked withdrawals —
-all running in the SVM (Stellereum Virtual Machine), our metered contract
+all running in the SVM — Stellereum Virtual Machine, our own metered contract
 runtime. An EVM adapter answers `eth_*` RPC for tooling compatibility.
 
 ### Staking operators actually get

@@ -10,8 +10,6 @@
 //!   * the consensus CERTIFICATE envelope decoders never panic on
 //!     peer-controlled bytes;
 //!   * a decoded µQC round-trips through its own canonical encoder;
-//!   * a decoded BLS aggregate's signer bitvector agrees with the validator
-//!     count it claims;
 //!   * the hand-rolled EVM RLP decoder never panics, and its "exact" and
 //!     "remainder" views always agree.
 //!
@@ -20,7 +18,7 @@
 //! `tests/fuzz_decoder_tests.rs` uses.
 
 use stellereum::consensus::{
-    decode_pq_epoch_envelope, decode_pq_micro_envelope, decode_qc_bls_envelope,
+    decode_pq_epoch_envelope, decode_pq_micro_envelope,
     encode_pq_epoch_envelope, encode_pq_micro_envelope,
 };
 use stellereum::evm_adapter::{decode_raw_transaction, DecodedTransaction, RlpItem};
@@ -167,7 +165,6 @@ fn certificate_envelopes_never_panic_on_peer_controlled_bytes() {
     assert_never_panics("cert-envelope/decode", inputs, |b| {
         let _ = decode_pq_micro_envelope(b);
         let _ = decode_pq_epoch_envelope(b);
-        let _ = decode_qc_bls_envelope(b);
         let _ = stellereum::sharding::PqSignatureEnvelope::decode(b);
         let _ = stellereum::post_quantum::PqSignatureEnvelope::decode(b);
     });
@@ -219,27 +216,6 @@ fn a_decoded_uqc_survives_a_mutation_sweep_without_breaking_the_round_trip() {
         decoded > 0,
         "no mutated input decoded as a µQC — the sweep is not reaching the decoder"
     );
-}
-
-#[test]
-fn a_decoded_bls_aggregate_names_a_consistent_signer_set() {
-    // The BLS QC envelope carries a signer bitvector whose length must agree
-    // with the validator count it claims; otherwise "who signed" is ambiguous
-    // and the downtime slashing would read the wrong set.
-    use stellereum::bls::{BlsAggregateSignature, BlsSignature, SignerBitVector};
-    let bitmask = vec![0b1010_1010u8, 0b0101_0101];
-    let participants = SignerBitVector::from_bitmask(bitmask.clone(), 16)
-        .expect("a bitmask of the right length must be accepted");
-    let aggregate = BlsAggregateSignature {
-        signature: BlsSignature([3u8; 96]),
-        participants,
-    };
-    assert_eq!(aggregate.participants.total_validators(), 16);
-    assert_eq!(aggregate.participants.bitmask().len(), 16usize.div_ceil(8));
-
-    // A bitmask of the WRONG length is refused outright.
-    assert!(SignerBitVector::from_bitmask(vec![0u8; 3], 16).is_none());
-    assert!(SignerBitVector::from_bitmask(vec![0u8; 1], 16).is_none());
 }
 
 // ---------------------------------------------------------------------------

@@ -31,9 +31,15 @@ const FAUCET_TOKEN: &str = "audit-faucet-token-xyz-456";
 const FAUCET_SEED: [u8; 32] = [0x33u8; 32];
 
 fn faucet_addr() -> [u8; 32] {
-    ed25519_dalek::SigningKey::from_bytes(&FAUCET_SEED)
-        .verifying_key()
-        .to_bytes()
+    // FULL-PQ: the faucet account is the Falcon-512 address derived from the
+    // seed (Faucet::account); fund that address, never a classical one.
+    let pq_key =
+        stellereum::post_quantum::FalconKeypair::generate_from_seed_bytes(&FAUCET_SEED);
+    stellereum::post_quantum::derive_pq_address(
+        stellereum::post_quantum::PqScheme::Falcon512,
+        &pq_key.public_key,
+        &stellereum::post_quantum::DEFAULT_SALT,
+    )
 }
 
 /// Base state: no tokens, no faucet (local/dev shape).
@@ -246,7 +252,9 @@ async fn faucet_refuses_without_token_and_fails_closed_without_config() {
 #[tokio::test]
 async fn faucet_lifetime_caps_hold_over_many_claims() {
     // Drip 10, lifetime cap 25: 10 + 10 + 5, then exhausted.
-    let st = faucet_state(10, 25, 1_000_000).await;
+    // FULL-PQ funding: each drip costs amount + GAS_BASIC_TRANSFER + the
+    // PQ activation surcharge legs, so the treasury needs headroom.
+    let st = faucet_state(10, 25, 10_000_000).await;
     let who = [0x42u8; 32];
     let who_hex = hex::encode(who);
     let r1 = st.call("stell_faucet", drip_req(&who_hex)).await;

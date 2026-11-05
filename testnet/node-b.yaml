@@ -78,6 +78,10 @@ unknown-allow:
   - "dht.find_node"
   - "dht.find_value"
 
+# PQ MODE (M-01 fallback, opt-in): this file is transport-only; PQ mode comes
+# from the process env (see genesis.env). Unset STELL_PURE_PQ = dual-stack
+# default (Ed25519 + PQ admitted); STELL_PURE_PQ=1 on EVERY node = PQ-only.
+# Mixed modes split the chain — change it as a coordinated upgrade.
 # --- peers -------------------------------------------------------------------
 # The roles of A and B are symmetric, so A's `peers:` entry points at this file's
 # `endpoints`, and this file's points at A's. A dial loop that has nowhere to

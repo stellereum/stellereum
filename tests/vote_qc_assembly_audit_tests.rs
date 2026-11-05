@@ -11,7 +11,7 @@
 //!   * QC binding: height/round/kind/target tampering fails verification AND
 //!     power accounting; a prevote QC for round r never authorizes a precommit
 //!     QC in round r' != r;
-//!   * envelope branches (µQC/CEC/BLS markers): garbage markers contribute
+//!   * envelope branches (µQC/CEC markers): garbage markers contribute
 //!     zero power and never rescue a sub-quorum QC.
 //!
 //! These tests are characterization + regression: they pass against the current
@@ -20,7 +20,7 @@
 use ed25519_dalek::SigningKey;
 use stellereum::consensus::{
     consensus_quorum_min, BlockHash, HeightConsensus, QuorumCertificate, ValidatorId,
-    ValidatorSet, Vote, VoteKind, VoteSet, BLS_QC_MARKER_ID, PQ_QC_MARKER_ID, PQ_UQC_MARKER_ID,
+    ValidatorSet, Vote, VoteKind, VoteSet, PQ_QC_MARKER_ID, PQ_UQC_MARKER_ID,
 };
 
 fn signing_key(seed: u8) -> SigningKey {
@@ -577,7 +577,6 @@ fn sub_quorum_qc_fails_both_gates_together() {
 fn classical_qc_carries_no_envelopes_by_default() {
     let (_, _, qc) = assembled_prevote_qc();
     for (voter, _) in &qc.signatures {
-        assert_ne!(*voter, BLS_QC_MARKER_ID, "no BLS envelope expected");
         assert_ne!(*voter, PQ_UQC_MARKER_ID, "no µQC envelope expected");
         assert_ne!(*voter, PQ_QC_MARKER_ID, "no CEC envelope expected");
     }
@@ -593,7 +592,6 @@ fn garbage_envelope_markers_contribute_zero_power() {
     // Splice garbage behind every marker id: attribution must stay exactly
     // the verified classical power, and verification must be unaffected.
     let mut forged = qc.clone();
-    forged.signatures.push((BLS_QC_MARKER_ID, b"not-an-envelope".to_vec()));
     forged.signatures.push((PQ_UQC_MARKER_ID, vec![0u8; 32]));
     forged.signatures.push((PQ_QC_MARKER_ID, vec![0u8; 64]));
     assert!(forged.verify(&vs), "garbage markers must not break the classical quorum");
@@ -610,7 +608,6 @@ fn garbage_envelope_markers_contribute_zero_power() {
         kind: VoteKind::Prevote,
         block_hash: Some(block_hash(1)),
         signatures: vec![
-            (BLS_QC_MARKER_ID, b"not-an-envelope".to_vec()),
             (PQ_UQC_MARKER_ID, vec![0u8; 32]),
             (PQ_QC_MARKER_ID, vec![0u8; 64]),
         ],

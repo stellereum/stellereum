@@ -606,6 +606,9 @@ pub struct Mempool {
     #[serde(skip)]
     pub implicit_registry: Option<StatefulImplicitKeyRegistry>,
     /// Optional node-local pure post-quantum mode override.
+    /// FULL-PQ: dead — always enforced; kept for call-site compat and
+    /// ignored (admission is PQ-only unconditionally; see below).
+    /// Use `with_pure_pq` still compiles but is a no-op (warns).
     #[serde(skip)]
     pub pure_pq_enforced: Option<bool>,
     /// SEALED transactions: the ciphertext the network carries for the
@@ -692,8 +695,11 @@ impl Mempool {
     }
 
     /// Explicitly configure Pure Post-Quantum mode for this mempool instance.
+    /// FULL-PQ: no-op (always enforced). Kept for call-site compat; warns.
     pub fn with_pure_pq(mut self, enabled: bool) -> Self {
-        self.pure_pq_enforced = Some(enabled);
+        let _ = enabled;
+        eprintln!("[WARN] Mempool::with_pure_pq is a no-op (FULL-PQ always-on): value ignored");
+        self.pure_pq_enforced = Some(true);
         self
     }
 
@@ -745,9 +751,9 @@ impl Mempool {
     /// proposer stops packing at ~24MB estimated wire and leaves headroom.
     /// Estimate, not exact bincode (see `estimate_tx_wire_bytes`).
     pub const MAX_BLOCK_WIRE_BYTES: usize = 24 * 1024 * 1024;
-    /// Verified-proof cap per block (audit: blocks troubles): range proofs
-    /// and attestation verifies serialize on the single apply worker while
-    /// `apply_in_flight` blocks the next propose. Bounds worst-case lane
+    /// Verified-proof cap per block (audit: blocks troubles): attestation
+    /// verifies and zkML re-executions serialize on the single apply worker
+    /// while `apply_in_flight` blocks the next propose. Bounds worst-case lane
     /// stall per height; gas alone does not (cheap gas, costly verify).
     pub const MAX_BLOCK_PROOF_UNITS: usize = 2048;
     /// Denominator of the sealed-transaction share of the pool (audit:
@@ -1847,10 +1853,12 @@ impl Mempool {
                 ));
             }
         }
-        let pure_pq = self
-            .pure_pq_enforced
-            .unwrap_or_else(crate::post_quantum::is_pure_pq_enforced);
-        if pure_pq {
+        // FULL-PQ (no compat, nodes wiped): a PQ envelope carrying a
+        // post-quantum scheme is mandatory on EVERY admission path. The old
+        // flag-gated allowance for classical (bare ed25519 / non-PQ
+        // envelopes) is deleted, not gated — there is no mode in which a
+        // classical transaction is admissible.
+        {
             let Some(env) = tx.pq_envelope() else {
                 return Err(MempoolError::Malformed(
                     "Pure PQ mode: classical non-PQ transactions rejected, submit with PQ1 envelope".to_string(),
@@ -2651,17 +2659,6 @@ impl Mempool {
         n += tx.signature.len();
         for op in &tx.payload {
             n += match op {
-                OpCode::SysCallConfidentialTransfer2 {
-                    input_ranges,
-                    output_ranges,
-                    ..
-                } => 200 + (input_ranges.len() + output_ranges.len()) * 10_250,
-                OpCode::SysCallConfidentialTransfer { transfer, .. } => {
-                    200 + (transfer.input_commitments.len() + transfer.output_commitments.len())
-                        * 32
-                }
-                OpCode::SysCallConfidentialShield { .. } => 150,
-                OpCode::SysCallConfidentialUnshield { inputs } => 100 + inputs.len() * 96,
                 OpCode::SysCallVerifyZkMlReexec { proof, .. } => 500 + proof.wire_len(),
                 OpCode::SysCallVerifyZkMlAttestation { proof, .. } => {
                     500 + proof.public_inputs.len() * 2 + proof.wire_len()
@@ -2684,18 +2681,13 @@ impl Mempool {
     }
 
     /// Verified-proof units in a transaction for packing (audit: blocks
-    /// troubles): counts range proofs + attestation verifies + zkML re-executions,
-    /// the work that serializes on the single apply worker.
+    /// troubles): counts attestation verifies + zkML re-executions, the work
+    /// that serializes on the single apply worker.
     pub fn count_tx_proof_units(tx: &Transaction) -> usize {
         use crate::svm::OpCode;
         tx.payload
             .iter()
             .map(|op| match op {
-                OpCode::SysCallConfidentialTransfer2 {
-                    input_ranges,
-                    output_ranges,
-                    ..
-                } => input_ranges.len() + output_ranges.len(),
                 OpCode::SysCallVerifyZkMlAttestation { .. } => 64, // ~one 64-bit proof of work
                 OpCode::SysCallVerifyZkMlReexec { .. } => 16,      // re-execution, model-bounded
                 _ => 0,
@@ -2826,11 +2818,75 @@ impl Mempool {
 mod tests {
     use super::*;
     use crate::sharding::Transaction;
-    use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
-    fn key() -> SigningKey {
-        SigningKey::generate(&mut OsRng)
+    /// FULL-PQ test keys: each call mints a fresh Falcon-512 seed, so every
+    /// test sender is distinct (mirrors the old fresh-`SigningKey` helper).
+    /// Signatures are real FIPS-206 via `create_falcon512_test_signature`.
+    static NEXT_PQ_SEED: AtomicU8 = AtomicU8::new(0x10);
+
+    fn key() -> u8 {
+        NEXT_PQ_SEED.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// PQ sender address for a seed (explicit-envelope derivation).
+    fn addr(seed: &u8) -> [u8; 32] {
+        crate::post_quantum::derive_pq_address(
+            crate::post_quantum::PqScheme::Falcon512,
+            &Transaction::sample_falcon512_pubkey(*seed),
+            &crate::post_quantum::DEFAULT_SALT,
+        )
+    }
+
+    /// Explicit Falcon-512 replacement for the old `Transaction::sign` test
+    /// helper: same `(to, amount 10, fee, nonce, shard 1)` shape, PQ envelope.
+    ///
+    /// IMPLICIT envelope with the key pre-registered globally: no activation
+    /// surcharge, so fee floors, costs and balances behave EXACTLY like the
+    /// old classical fixtures (the surcharge is covered by the dedicated
+    /// activation tests below, not by every fee test).
+    fn tx(seed: &u8, to: [u8; 32], fee: u64, nonce: u64) -> Transaction {
+        txa(seed, to, 10, fee, nonce)
+    }
+
+    /// Same as [`tx`] with an explicit amount (for the unaffordable-balance
+    /// fixtures, where the amount itself is the point).
+    fn txa(seed: &u8, to: [u8; 32], amount: u64, fee: u64, nonce: u64) -> Transaction {
+        txpa(seed, to, amount, fee, nonce, 0)
+    }
+
+    /// Implicit Falcon-512 replacement for `Transaction::sign_with_priority`
+    /// (same no-surcharge rule as [`tx`]).
+    fn txp(seed: &u8, to: [u8; 32], fee: u64, nonce: u64, bid: u64) -> Transaction {
+        txpa(seed, to, 10, fee, nonce, bid)
+    }
+
+    fn txpa(seed: &u8, to: [u8; 32], amount: u64, fee: u64, nonce: u64, bid: u64) -> Transaction {
+        use crate::post_quantum::{PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
+        let pk = Transaction::sample_falcon512_pubkey(*seed);
+        let from = addr(seed);
+        // Pre-register globally (idempotent): admission verifies implicit
+        // envelopes against this registry, routes around the activation
+        // buffer, and charges no activation surcharge.
+        Transaction::global_implicit_registry()
+            .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+            .expect("PQ test key must register");
+        let mut t = Transaction {
+            from,
+            to,
+            amount,
+            gas_limit: fee,
+            nonce,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: bid,
+        };
+        let msg = t.signing_message();
+        let sig = Transaction::create_falcon512_test_signature(&pk, &msg, *seed);
+        t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+        t
     }
 
     #[test]
@@ -2839,15 +2895,12 @@ mod tests {
         // nonce filter starves out-of-hash-order followers (observed: 10
         // contiguous txs draining 1,3,1,2 per height). Multi-pass must take
         // all executable ones regardless of hash order.
-        let sk = SigningKey::generate(&mut OsRng);
-        let me = sk.verifying_key().to_bytes();
+        let sk = key();
+        let me = addr(&sk);
         let mut mp = Mempool::new(100, 100);
         for i in 0..10u64 {
-            mp.add_checked(
-                Transaction::sign(&sk, [1u8; 32], 10, 1_000, i, 1, 1),
-                1_000_000,
-            )
-            .unwrap();
+            mp.add_checked(tx(&sk, [1u8; 32], 1_000, i), 1_000_000)
+                .unwrap();
         }
         let expected = std::cell::Cell::new(0u64);
         let out = mp.select_for_block_multi(100, u64::MAX, |t| {
@@ -2870,15 +2923,12 @@ mod tests {
         // chain selected only 37/200 under the old 16-pass cap, because an
         // adversarial fee-hash order completes ~one nonce per pass. The 64-pass
         // budget must drain chains up to 64 deep in one selection.
-        let sk = SigningKey::generate(&mut OsRng);
-        let me = sk.verifying_key().to_bytes();
+        let sk = key();
+        let me = addr(&sk);
         let mut mp = Mempool::new(300, 300);
         for i in 0..50u64 {
-            mp.add_checked(
-                Transaction::sign(&sk, [1u8; 32], 10, 1_000, i, 1, 1),
-                1_000_000,
-            )
-            .unwrap();
+            mp.add_checked(tx(&sk, [1u8; 32], 1_000, i), 1_000_000)
+                .unwrap();
         }
         let expected = std::cell::Cell::new(0u64);
         let out = mp.select_for_block_multi(300, u64::MAX, |t| {
@@ -2897,16 +2947,16 @@ mod tests {
 
     #[test]
     fn unexecutable_transactions_are_evicted() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let me = sk.verifying_key().to_bytes();
+        let sk = key();
+        let me = addr(&sk);
         let mut mp = Mempool::new(100, 10);
 
         // All three are admitted while the account is still solvent — that is
         // the real situation: a transaction becomes unexecutable AFTER it is
         // accepted (the nonce gets consumed, or the balance drops elsewhere).
-        let stale = Transaction::sign(&sk, [1u8; 32], 10, 1_000, 0, 1, 1);
-        let broke = Transaction::sign(&sk, [1u8; 32], 9_000, 1_000, 1, 1, 1);
-        let queued = Transaction::sign(&sk, [1u8; 32], 100, 1_000, 3, 1, 1);
+        let stale = tx(&sk, [1u8; 32], 1_000, 0);
+        let broke = txa(&sk, [1u8; 32], 9_000, 1_000, 1);
+        let queued = txa(&sk, [1u8; 32], 100, 1_000, 3);
         let queued_hash = queued.compute_tx_hash();
         for tx in [stale, broke, queued] {
             mp.add_checked(tx, 20_000).unwrap();
@@ -2931,9 +2981,9 @@ mod tests {
         // Regression (audit 2026-10-06): the old `(0, 0)` default treated a
         // sender missing from the snapshot as broke and irreversibly deleted
         // its funded transactions, while the proposer filter only skips them.
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = key();
         let mut mp = Mempool::new(100, 10);
-        let mine = Transaction::sign(&sk, [2u8; 32], 100, 1_000, 0, 1, 1);
+        let mine = txa(&sk, [2u8; 32], 100, 1_000, 0);
         let mine_hash = mine.compute_tx_hash();
         mp.add_checked(mine, 10_000).unwrap();
         // Snapshot knows NOBODY (partial/pre-height view): nothing may die.
@@ -2944,25 +2994,18 @@ mod tests {
 
     #[test]
     fn eviction_keeps_healthy_mempool_intact() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let me = sk.verifying_key().to_bytes();
+        let sk = key();
+        let me = addr(&sk);
         let mut mp = Mempool::new(100, 10);
         for n in 0..3u64 {
-            mp.add_checked(
-                Transaction::sign(&sk, [2u8; 32], 100, 1_000, n, 1, 1),
-                10_000,
-            )
-            .unwrap();
+            mp.add_checked(txa(&sk, [2u8; 32], 100, 1_000, n), 10_000)
+                .unwrap();
         }
         assert_eq!(
             mp.evict_unexecutable(|s| if *s == me { Some((0, 10_000)) } else { None }),
             0
         );
         assert_eq!(mp.len(), 3, "nothing valid may be dropped");
-    }
-
-    fn tx(sk: &SigningKey, to: [u8; 32], fee: u64, nonce: u64) -> Transaction {
-        Transaction::sign(sk, to, 10, fee, nonce, 1, 1)
     }
 
     #[test]
@@ -2991,9 +3034,9 @@ mod tests {
         let bal = 10_000_000;
 
         // The spammer: a massive resource cap, no priority bid.
-        let huge_cap = Transaction::sign(&sk, [1; 32], 10, 1_000_000, 0, 1, 1);
+        let huge_cap = tx(&sk, [1; 32], 1_000_000, 0);
         // The urgent one: a NORMAL gas limit, but an explicit priority bid.
-        let urgent = Transaction::sign_with_priority(&sk, [1; 32], 10, 100, 1, 1, 1, 100);
+        let urgent = txp(&sk, [1; 32], 100, 1, 100);
 
         mp.add_checked(huge_cap.clone(), bal).unwrap();
         mp.add_checked(urgent.clone(), bal).unwrap();
@@ -3015,14 +3058,14 @@ mod tests {
         // pool forever.
         let sk = key();
         let mut mp = Mempool::new(100, 100).with_base_fee(100);
-        let unfunded = Transaction::sign_with_priority(&sk, [1; 32], 10, 100, 0, 1, 1, 1_000);
+        let unfunded = txp(&sk, [1; 32], 100, 0, 1_000);
         assert_eq!(
             mp.add_checked(unfunded, 100_000),
             Err(MempoolError::FeeTooLow),
             "a bid the fee does not cover must be refused"
         );
         // Funding it (gas_limit covers floor + bid) works.
-        let funded = Transaction::sign_with_priority(&sk, [1; 32], 10, 100 + 1_000, 1, 1, 1, 1_000);
+        let funded = txp(&sk, [1; 32], 100 + 1_000, 1, 1_000);
         assert!(
             mp.add_checked(funded, 100_000).is_ok(),
             "a funded bid must be admitted"
@@ -3037,9 +3080,12 @@ mod tests {
         // two DIFFERENT transactions, so two nodes can never disagree about
         // what a transaction's priority is (a bid that was not hashed would be
         // a consensus split waiting to happen).
+        //
+        // WIRE-ONLY (no admission): FULL-PQ implicit envelopes exercise the
+        // same envelope/tag math; admission PQ-ness is covered elsewhere.
         let sk = key();
-        let tx = Transaction::sign_with_priority(&sk, [1; 32], 10, 100, 0, 1, 1, 777);
-        let bytes = bincode::serialize(&tx).expect("serialize");
+        let bid_tx = txp(&sk, [1; 32], 100, 0, 777);
+        let bytes = bincode::serialize(&bid_tx).expect("serialize");
         let back: Transaction = bincode::deserialize(&bytes).expect("deserialize");
         assert_eq!(
             back.priority_fee_per_gas, 777,
@@ -3047,7 +3093,7 @@ mod tests {
         );
         assert_eq!(
             back.compute_tx_hash(),
-            tx.compute_tx_hash(),
+            bid_tx.compute_tx_hash(),
             "the decoded transaction must keep its identity"
         );
         assert!(
@@ -3056,16 +3102,16 @@ mod tests {
         );
 
         // Only the bid differs -> a different hash.
-        let other = Transaction::sign_with_priority(&sk, [1; 32], 10, 100, 0, 1, 1, 778);
+        let other = txp(&sk, [1; 32], 100, 0, 778);
         assert_ne!(
-            tx.compute_tx_hash(),
+            bid_tx.compute_tx_hash(),
             other.compute_tx_hash(),
             "two bids are two different transactions"
         );
-        // The legacy (no bid) transaction keeps its legacy identity and is a
+        // The no-bid transaction keeps its identity and is a
         // different transaction from the bid-carrying one.
-        let legacy = Transaction::sign(&sk, [1; 32], 10, 100, 0, 1, 1);
-        assert_ne!(legacy.compute_tx_hash(), tx.compute_tx_hash());
+        let legacy = tx(&sk, [1; 32], 100, 0);
+        assert_ne!(legacy.compute_tx_hash(), bid_tx.compute_tx_hash());
         let legacy_bytes = bincode::serialize(&legacy).expect("serialize");
         let legacy_back: Transaction = bincode::deserialize(&legacy_bytes).expect("deserialize");
         assert_eq!(legacy_back.priority_fee_per_gas, 0);
@@ -3077,23 +3123,25 @@ mod tests {
         // The bid is signed with the rest of the transaction, so a third
         // party cannot inflate someone else's priority (and two bids are two
         // different transactions, with different hashes).
+        //
+        // WIRE-ONLY (no admission): see above.
         let sk = key();
-        let tx = Transaction::sign_with_priority(&sk, [1; 32], 10, 100, 0, 1, 1, 500);
-        assert!(tx.verify_signature(), "a priority tx must verify");
-        let mut tampered = tx.clone();
+        let bid_tx = txp(&sk, [1; 32], 100, 0, 500);
+        assert!(bid_tx.verify_signature(), "a priority tx must verify");
+        let mut tampered = bid_tx.clone();
         tampered.priority_fee_per_gas = 5_000;
         assert!(
             !tampered.verify_signature(),
             "inflating the bid must invalidate the signature"
         );
         assert_ne!(
-            tx.compute_tx_hash(),
+            bid_tx.compute_tx_hash(),
             tampered.compute_tx_hash(),
             "the bid is part of the transaction identity"
         );
-        // The legacy (no bid) signing message carries NO priority commitment,
-        // so legacy signatures/hashes stay byte-identical.
-        let legacy = Transaction::sign(&sk, [1; 32], 10, 100, 0, 1, 1);
+        // The no-bid signing message carries NO priority commitment,
+        // so no-bid signatures/hashes stay byte-identical.
+        let legacy = tx(&sk, [1; 32], 100, 0);
         assert!(
             !legacy
                 .signing_message()
@@ -3102,7 +3150,7 @@ mod tests {
             "a legacy transaction must not commit to a priority"
         );
         assert!(
-            tx.signing_message()
+            bid_tx.signing_message()
                 .windows(8)
                 .any(|w| w == crate::sharding::PRIORITY_FEE_COMMITMENT_TAG),
             "a priority transaction must commit to its bid"
@@ -3115,6 +3163,12 @@ mod tests {
         // priority bid existed ends its byte stream right after `payload`.
         // It must still decode (with the bid defaulting to 0) and keep its
         // hash, or every historical transaction would become unreadable.
+        //
+        // WIRE-ONLY (no admission): no-bid layout decode path, unchanged.
+        // FULL-PQ: the fixture is an implicit Falcon-512 envelope (the old
+        // classical constructor no longer verifies anywhere).
+        let sk = key();
+        let tx = tx(&sk, [1; 32], 100, 0);
         #[derive(serde::Serialize, serde::Deserialize)]
         struct LegacyTx {
             from: [u8; 32],
@@ -3127,8 +3181,6 @@ mod tests {
             signature: Vec<u8>,
             payload: Vec<crate::svm::OpCode>,
         }
-        let sk = key();
-        let tx = Transaction::sign(&sk, [1; 32], 10, 100, 0, 1, 1);
         let legacy = LegacyTx {
             from: tx.from,
             to: tx.to,
@@ -3580,7 +3632,7 @@ mod tests {
         // admission and nonce 5 is refused.
         assert_eq!(Mempool::NONCE_FUTURE_WINDOW, 4);
         let sk = key();
-        let me = sk.verifying_key().to_bytes();
+        let me = addr(&sk);
         let mp = Mempool::new(100, 100);
         assert!(mp.check_nonce_gap(&me, 0, 0).is_none());
         assert!(mp.check_nonce_gap(&me, 4, 0).is_none());
@@ -3647,11 +3699,11 @@ mod tests {
         assert_eq!(Mempool::STUCK_TX_TTL_SECS, 120);
 
         let sk = key();
-        let me = sk.verifying_key().to_bytes();
+        let me = addr(&sk);
         let now = 1_000_000u64;
         let mut mp = Mempool::new(100, 100);
         // Nonce 5 with an on-chain head of 0: a future nonce behind a gap.
-        let future = Transaction::sign(&sk, [1; 32], 10, 5, 1, 1, 1);
+        let future = tx(&sk, [1; 32], 5, 1);
         let future_hash = future.compute_tx_hash();
         mp.insert(future, 1_000_000, true, AdmissionCtx::new(now))
             .expect("a within-window future nonce is admitted");
@@ -3685,148 +3737,6 @@ mod tests {
         assert_eq!(mp.len(), 0);
         // The per-sender quota must not leak.
         assert_eq!(mp.per_sender.get(&me).copied().unwrap_or(0), 0);
-    }
-
-    #[test]
-    fn select_respects_wire_and_proof_caps() {
-        use crate::crypto_privacy::{PedersenCommitment, RangeProof};
-        use curve25519_dalek::scalar::Scalar;
-        // A max-proof Transfer2 (~330KB est, 16 proofs): wire cap 24MB means
-        // at most ~70 fit even with infinite gas/count budget.
-        let one = {
-            let sk = key();
-            let r = Scalar::from(1u64);
-            let c = PedersenCommitment::commit(100, &r);
-            let p = RangeProof::prove(&c, 100, &r, 64);
-            let ops = vec![crate::svm::OpCode::SysCallConfidentialTransfer2 {
-                recipient: [9u8; 32],
-                transfer: Box::new(crate::crypto_privacy::ConfidentialTransfer::new(
-                    vec![c; 8],
-                    vec![c; 8],
-                    0,
-                )),
-                input_ranges: vec![p.clone(); 8],
-                output_ranges: vec![p; 8],
-            }];
-            Transaction::sign_with_payload(&sk, [1u8; 32], 0, 100_000_000, 0, 1, 1, ops)
-        };
-        assert!(
-            Mempool::estimate_tx_wire_bytes(&one) > 100_000,
-            "fat tx estimates big"
-        );
-        assert_eq!(Mempool::count_tx_proof_units(&one), 16);
-        let mut mp2 = Mempool::new(1000, 1000);
-        for i in 0..150u64 {
-            let mut seed = [0xBu8; 32];
-            seed[0] = i as u8;
-            seed[1] = (i >> 8) as u8;
-            let k = SigningKey::from_bytes(&seed);
-            let r = Scalar::from(i + 1);
-            let c = PedersenCommitment::commit(100, &r);
-            let p = RangeProof::prove(&c, 100, &r, 64);
-            let ops = vec![crate::svm::OpCode::SysCallConfidentialTransfer2 {
-                recipient: [9u8; 32],
-                transfer: Box::new(crate::crypto_privacy::ConfidentialTransfer::new(
-                    vec![c; 8],
-                    vec![c; 8],
-                    0,
-                )),
-                input_ranges: vec![p.clone(); 8],
-                output_ranges: vec![p; 8],
-            }];
-            let t = Transaction::sign_with_payload(&k, [1u8; 32], 0, 100_000_000, i, 1, 1, ops);
-            mp2.add(t).unwrap();
-        }
-        let sel = mp2.select_for_block_multi(10_000, u64::MAX, |_| true);
-        // 150 fat txs x ~164KB = ~24.6MB > 24MB cap: not all selected.
-        // (Proof cap 150x16=2400 > 2048 would also bind first — wire wins here
-        // only if proofs stay under it; either cap stopping is correct.)
-        assert!(
-            sel.len() < 150,
-            "a packing cap must stop packing: got {}",
-            sel.len()
-        );
-        assert!(!sel.is_empty(), "but small packing still works");
-    }
-
-    #[test]
-    fn blast_200_reused_small_proofs_bind_packing_caps() {
-        // Blast check (packing perf): 200 fat txs built from ONE reused 8-bit
-        // range proof (fast: a single `prove`, then cheap clones — NOT 200
-        // 64-bit proves). Each tx carries 48+48 = 96 proofs, so the unbounded
-        // totals blow BOTH caps (wire: 200 x `one_wire` > MAX_BLOCK_WIRE_BYTES;
-        // proofs: 200 x 96 = 19_200 > MAX_BLOCK_PROOF_UNITS — both asserted
-        // below, so the fixture is meaningful under any width-aware estimate
-        // revision). `select_multi` must stop early on at least one of them,
-        // and the selected set must respect BOTH.
-        use crate::crypto_privacy::{PedersenCommitment, RangeProof};
-        use curve25519_dalek::scalar::Scalar;
-        let r = Scalar::from(7u64);
-        let c = PedersenCommitment::commit(42, &r);
-        let p = RangeProof::prove(&c, 42, &r, 8);
-        assert_eq!(p.bits, 8, "small-proof fixture must stay 8-bit");
-        let fat_ops = || {
-            vec![crate::svm::OpCode::SysCallConfidentialTransfer2 {
-                recipient: [9u8; 32],
-                transfer: Box::new(crate::crypto_privacy::ConfidentialTransfer::new(
-                    vec![c; 8],
-                    vec![c; 8],
-                    0,
-                )),
-                input_ranges: vec![p.clone(); 48],
-                output_ranges: vec![p.clone(); 48],
-            }]
-        };
-        // Unbounded totals exceed both caps (so the test is meaningful).
-        let one_wire = {
-            let sk = key();
-            let t =
-                Transaction::sign_with_payload(&sk, [1u8; 32], 0, 100_000_000, 0, 1, 1, fat_ops());
-            Mempool::estimate_tx_wire_bytes(&t)
-        };
-        let one_proofs = {
-            let sk = key();
-            let t =
-                Transaction::sign_with_payload(&sk, [1u8; 32], 0, 100_000_000, 0, 1, 1, fat_ops());
-            Mempool::count_tx_proof_units(&t)
-        };
-        assert_eq!(one_proofs, 96, "fixture must carry 96 proof units/tx");
-        assert!(
-            one_wire.saturating_mul(200) > Mempool::MAX_BLOCK_WIRE_BYTES,
-            "200 fat txs must overflow the wire cap unbounded ({} x 200)",
-            one_wire,
-        );
-        assert!(
-            one_proofs.saturating_mul(200) > Mempool::MAX_BLOCK_PROOF_UNITS,
-            "200 fat txs must overflow the proof cap unbounded"
-        );
-        let mut mp = Mempool::new(1024, 1024);
-        for i in 0..200u64 {
-            let mut seed = [0xCBu8; 32];
-            seed[..8].copy_from_slice(&i.to_le_bytes());
-            let k = SigningKey::from_bytes(&seed);
-            let t =
-                Transaction::sign_with_payload(&k, [1u8; 32], 0, 100_000_000, 0, 1, 1, fat_ops());
-            mp.add(t).expect("unchecked admission must succeed");
-        }
-        assert_eq!(mp.len(), 200);
-        let sel = mp.select_for_block_multi(10_000, u64::MAX, |_| true);
-        assert!(
-            sel.len() < 200,
-            "a packing cap must bind under blast: got {}",
-            sel.len()
-        );
-        assert!(!sel.is_empty(), "but small packing still works");
-        let wire: usize = sel.iter().map(Mempool::estimate_tx_wire_bytes).sum();
-        let proofs: usize = sel.iter().map(Mempool::count_tx_proof_units).sum();
-        assert!(
-            wire <= Mempool::MAX_BLOCK_WIRE_BYTES,
-            "selected wire {wire} must respect the cap"
-        );
-        assert!(
-            proofs <= Mempool::MAX_BLOCK_PROOF_UNITS,
-            "selected proofs {proofs} must respect the cap"
-        );
     }
 
     #[test]
@@ -4132,8 +4042,10 @@ mod tests {
         use crate::post_quantum::{PqScheme, PqSignatureEnvelope};
         use ed25519_dalek::Signer;
 
-        let sk = key();
-        let pk_bytes = sk.verifying_key().to_bytes().to_vec();
+        // Classical key on purpose: this test proves an Ed25519 scheme id in
+        // a PQ1 envelope is refused (not admitted, not verified).
+        let esk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let pk_bytes = esk.verifying_key().to_bytes().to_vec();
 
         let mut tx = Transaction {
             from: [0x33; 32],
@@ -4148,7 +4060,7 @@ mod tests {
             priority_fee_per_gas: 0,
         };
         let msg = tx.signing_message();
-        let sig = sk.sign(&msg).to_bytes().to_vec();
+        let sig = esk.sign(&msg).to_bytes().to_vec();
 
         // Classical Ed25519 wrapped in PQ1 envelope
         let env = PqSignatureEnvelope::new_explicit(PqScheme::Ed25519, pk_bytes, sig);

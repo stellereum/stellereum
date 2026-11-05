@@ -20,6 +20,7 @@ use crate::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
 use crate::network::P2pNetworkAdapter;
 use crate::sharding::{Block, ShardRegistry};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1094,7 +1095,7 @@ impl ConsensusNetwork {
 
     /// Resolve every configured peer to a node id.
     ///
-    /// The peer's `node-id` is preferred over its name: name resolution depends
+    /// The peer's PQ id (`primary_id`) is preferred over its name: name resolution depends
     /// on a name registry that fills in asymmetrically (a node can know the name
     /// of a peer that does not yet know its own), and a failed lookup used to
     /// make `broadcast` silently send nothing — stalling consensus with no error
@@ -1103,7 +1104,7 @@ impl ConsensusNetwork {
         let mut out = Vec::new();
         for p in &self.adapter.node.cfg.peers {
             let pid = p
-                .node_id_raw()
+                .primary_id()
                 .or_else(|_| self.adapter.node.resolve(&p.name));
             match pid {
                 Ok(pid) => out.push(pid),
@@ -1841,6 +1842,161 @@ pub fn parse_incoming(raw: &str) -> Option<ConsensusMsg> {
     ConsensusMsg::decode(&bytes).ok()
 }
 
+// ---------------------------------------------------------------------------
+// Dandelion tx-publish wiring (publish path only; default OFF, no env knob).
+//
+// The stem/fluff relay POLICY lives in `src/dandelion.rs` (pure, seeded,
+// bounded: `MAX_STEM_ENTRIES` / `MAX_SEEN_ENTRIES`, failover via
+// `MAX_FAILOVER_RETRIES`, loop budget `r -> r-1`, fluff-wins, fluff timeout).
+// It is reused here WITHOUT modification through the module below — the exact
+// state machine and the exact params (`DEFAULT_P_CONTINUE`, caps, retry
+// budget). This section only ADDS the publish-path glue: tx/peer identity
+// mapping, the stem frame codec, the OFF gate, and the decision/inspection
+// API the new wiring tests drive.
+//
+// Status: ORIGINATE-side wiring. `broadcast` (plain transactions only) either
+// fans out to all peers (OFF — byte-identical to the historical path) or
+// follows the relay decision (ON — tests/sim only): one-peer stem forward
+// carrying the remaining budget in a magic-prefixed stem frame, or a normal
+// all-peer fluff via the shared `broadcast_bytes` path. Sealed/epoch frames
+// (`broadcast_sealed`, `broadcast_mev_frame`) always fluff: consensus-critical
+// catch-up traffic never takes the stem.
+//
+// Explicitly DEFERRED (next audit-gated step, see `docs/DANDELION_PLAN.md`
+// section 5): inbound stem dispatch (mapping a received stem frame to
+// `on_stem_receive` + relaying), and arming one live fluff-timeout timer per
+// held stem entry. The timeout MECHANISM is wired (`dandelion_fluff_timeout`
+// force-fluffs a held entry; the publish path falls back to fluff whenever a
+// stem cannot be sent), so a swallowed stem can only delay, never suppress —
+// but no background timer task is spawned yet.
+// ---------------------------------------------------------------------------
+
+/// Dandelion stem/fluff relay policy, reused verbatim (see header above).
+///
+/// Nested here (rather than top-level `lib.rs`) so this wiring stays a
+/// publish-path-only change: one file plus the new wiring tests.
+#[path = "dandelion.rs"]
+pub mod dandelion;
+
+/// Dandelion stem/fluff in the tx publish path: default OFF, const-gated.
+///
+/// OFF (`false`) keeps the publish path byte-identical: `broadcast` serializes
+/// and fans out exactly as before. There is deliberately NO env knob — ON is
+/// for tests/sim only, driven through the decision API below (plus the
+/// `dandelion_reseed` determinism hook), never by operator configuration.
+pub const DANDELION_ENABLED: bool = false;
+
+/// Per-stem-entry fluff-timeout budget in ms (stem-blackhole mitigation).
+///
+/// A held stem entry must force-fluff within this budget; suggested start is
+/// single-digit seconds (a few sequential-hop RTTs at the
+/// [`BROADCAST_JOIN_TIMEOUT_MS_DEFAULT`] join budget). Live timer arming is
+/// deferred (see header); tests drive `dandelion_fluff_timeout` directly.
+pub const DANDELION_FLUFF_TIMEOUT_MS: u64 = 3_000;
+
+/// Magic prefix of a Dandelion stem frame on the tx topic.
+///
+/// Distinct from every epoch-seal magic (`STX1`/`STD1`/`STC1`/`STR1`/`STE1`),
+/// so a stem frame is never mis-read as a sealed/DKG/commit/release/announce
+/// frame. The historical plain path never emits or parses this prefix: OFF
+/// traffic is byte-identical, and an old node fail-closes on a stem frame
+/// (its `parse_tx_gossip_payload` bincode-decodes the body and refuses it).
+pub const DANDELION_STEM_MAGIC: &[u8; 4] = b"STDL";
+
+/// Dandelion transaction identity: `Sha256` over the gossip-serialised bytes.
+///
+/// The policy treats identities as opaque; this is the publish path's mapping
+/// from wire bytes to that opaque id. `sha2` is already a crate dependency —
+/// no new crypto, no new deps.
+pub fn dandelion_tx_hash(tx_bytes: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(tx_bytes);
+    h.finalize().into()
+}
+
+/// Dandelion peer identity: low 8 bytes (LE) of the 20-byte node id.
+///
+/// The policy works on abstract `u64`s; this is the publish path's mapping.
+/// The reverse lookup (first table entry with a matching low word) lives in
+/// the decision helpers; tests use node ids with distinct low words so the
+/// mapping is bijective there.
+pub fn dandelion_peer_id(pid: &[u8; 20]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&pid[..8]);
+    u64::from_le_bytes(b)
+}
+
+/// Encode a stem forward: magic + remaining budget (LE u32) + tx bytes.
+pub fn encode_dandelion_stem(hops_left: u32, tx_bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + tx_bytes.len());
+    out.extend_from_slice(DANDELION_STEM_MAGIC);
+    out.extend_from_slice(&hops_left.to_le_bytes());
+    out.extend_from_slice(tx_bytes);
+    out
+}
+
+/// Decode a stem forward: `Some((hops_left, tx_bytes))` or `None`.
+///
+/// Fail-closed: short frames, wrong magic, empty bodies and oversized bodies
+/// (past [`MAX_TX_MSG`] plus the 8-byte header) are refused. Never called on
+/// the plain fluff path.
+pub fn decode_dandelion_stem(bytes: &[u8]) -> Option<(u32, Vec<u8>)> {
+    if bytes.len() < 8 || bytes.len() > MAX_TX_MSG + 8 {
+        return None;
+    }
+    if &bytes[..4] != DANDELION_STEM_MAGIC {
+        return None;
+    }
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&bytes[4..8]);
+    let inner = bytes[8..].to_vec();
+    if inner.is_empty() || inner.len() > MAX_TX_MSG {
+        return None;
+    }
+    Some((u32::from_le_bytes(b), inner))
+}
+
+/// What the Dandelion publish path should do with one transaction right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DandelionPublishDecision {
+    /// Forward along the stem to exactly one peer, with this remaining budget
+    /// (carried in the stem frame header).
+    Stem {
+        /// The single selected next peer.
+        to: [u8; 20],
+        /// Stem budget handed to the next hop (`H - 1` at the originator).
+        hops_left: u32,
+    },
+    /// Diffuse with the normal all-peer broadcast (fluff).
+    Fluff,
+    /// Already seen: send nothing (loop protection / duplicate suppression).
+    Drop,
+}
+
+/// Map a policy action to a publish decision, resolving the `u64` stem target
+/// back to the first peer-table entry with a matching low word.
+///
+/// Fail-open to fluff: an unresolvable stem target (hash collision between two
+/// table entries, or a target that left the table between selection and send)
+/// must never blackhole — it fluffs instead.
+fn map_dandelion_action(
+    action: dandelion::RelayAction,
+    table: &[([u8; 20], u64)],
+) -> DandelionPublishDecision {
+    match action {
+        dandelion::RelayAction::StemForward { to } => table
+            .iter()
+            .find(|(_, id)| *id == to)
+            .map(|(pid, _)| DandelionPublishDecision::Stem {
+                to: *pid,
+                hops_left: 0, // filled in by the caller from the held entry
+            })
+            .unwrap_or(DandelionPublishDecision::Fluff),
+        dandelion::RelayAction::FluffBroadcast => DandelionPublishDecision::Fluff,
+        dandelion::RelayAction::IgnoreDuplicate => DandelionPublishDecision::Drop,
+    }
+}
+
 /// Transaction gossip over infnode pubsub. Anti-flood: only signatures are
 /// verified here; the mempool applies the authoritative signature check and
 /// per-sender quota, so a flood is bounded there.
@@ -1860,6 +2016,13 @@ pub struct TxGossip {
     /// [`SendRateLimiter`]): over-budget peers are dropped per-peer, the
     /// publisher is never blocked. Mutex-only, never held across await.
     send_limit: Mutex<SendRateLimiter>,
+    /// Dandelion stem/fluff relay state (publish-path wiring, default OFF).
+    /// Mutex-only, never held across await; the OFF path never touches it.
+    dandelion: Mutex<dandelion::DandelionRelay>,
+    /// Dandelion decision randomness (seeded from OS at construction; reseeded
+    /// deterministically via `dandelion_reseed` in tests/sim). Mutex-only,
+    /// never held across await; the OFF path never touches it.
+    dandelion_rng: Mutex<dandelion::NodeRng>,
 }
 
 impl TxGossip {
@@ -1871,10 +2034,12 @@ impl TxGossip {
             peer_health: Arc::new(Mutex::new(HashMap::new())),
             bcast_last_ms: Mutex::new(HashMap::new()),
             send_limit: Mutex::new(SendRateLimiter::with_defaults()),
+            dandelion: Mutex::new(dandelion::DandelionRelay::with_defaults()),
+            dandelion_rng: Mutex::new(dandelion::NodeRng::new(rand::random::<u64>())),
         }
     }
 
-    /// Peer ids, node-id first: the same asymmetric-registry trap fixed in
+    /// Peer ids, PQ-id first: the same asymmetric-registry trap fixed in
     /// `ConsensusNetwork::peer_ids` lived here too — a failed name lookup
     /// silently sent nothing, starving the peer's mempool (and its blocks)
     /// with no error anywhere (audit 2026-10-06).
@@ -1882,7 +2047,7 @@ impl TxGossip {
         let mut out = Vec::new();
         for p in &self.adapter.node.cfg.peers {
             let pid = p
-                .node_id_raw()
+                .primary_id()
                 .or_else(|_| self.adapter.node.resolve(&p.name));
             match pid {
                 Ok(pid) => out.push(pid),
@@ -2103,10 +2268,18 @@ impl TxGossip {
     /// longer head-of-line-block tx propagation to the rest: stragglers
     /// detach (still sending, still recording) while the flush moves on.
     /// Best-effort still: at most 1 MiB/tx, oversized txs never gossiped.
+    ///
+    /// Dandelion gate: OFF ([`DANDELION_ENABLED`] == false) serializes and fans
+    /// out exactly as before (byte-identical); ON (tests/sim only) follows the
+    /// stem/fluff decision in [`Self::broadcast_dandelion`].
     pub async fn broadcast(&self, tx: &crate::sharding::Transaction) {
         let Ok(bytes) = bincode::serialize(tx) else {
             return;
         };
+        if DANDELION_ENABLED {
+            self.broadcast_dandelion(bytes).await;
+            return;
+        }
         self.broadcast_bytes(bytes).await;
     }
 
@@ -2186,6 +2359,291 @@ impl TxGossip {
                 detached_late,
             );
         }
+    }
+
+    /// Dandelion publish path (ON only; tests/sim — see [`DANDELION_ENABLED`]).
+    ///
+    /// Originates the tx through the relay policy: fluff reuses the shared
+    /// all-peer [`Self::broadcast_bytes`] path (identical bytes/fanout), stem
+    /// sends one magic-prefixed frame to exactly one peer
+    /// ([`Self::unicast_dandelion_stem`]), duplicates are dropped. A stem
+    /// target that entered failure cooldown between selection and send runs
+    /// the policy failover once; anything un-sendable fluffs (fail-open —
+    /// never stall, never blackhole).
+    async fn broadcast_dandelion(&self, bytes: Vec<u8>) {
+        if bytes.len() > MAX_TX_MSG {
+            return; // oversized tx never gossiped
+        }
+        let txid = dandelion_tx_hash(&bytes);
+        match self.dandelion_publish_decision(&txid) {
+            DandelionPublishDecision::Drop => {}
+            DandelionPublishDecision::Fluff => self.broadcast_bytes(bytes).await,
+            DandelionPublishDecision::Stem { to, hops_left } => {
+                if self.peer_skipped(&to) {
+                    match self.dandelion_failover(&txid) {
+                        DandelionPublishDecision::Drop => {}
+                        DandelionPublishDecision::Fluff => {
+                            self.broadcast_bytes(bytes).await;
+                        }
+                        DandelionPublishDecision::Stem { to, hops_left } => {
+                            self.unicast_dandelion_stem(to, hops_left, bytes).await;
+                        }
+                    }
+                } else {
+                    self.unicast_dandelion_stem(to, hops_left, bytes).await;
+                }
+            }
+        }
+    }
+
+    /// Send one stem frame to exactly one peer (best-effort).
+    ///
+    /// Same preamble as [`Self::broadcast_bytes`] (size check, pacing floor,
+    /// per-peer send budget, bounded join) for that single peer. A peer lost
+    /// to the rate limiter fluffs instead (fail-open): dropping a lone stem
+    /// would stall the tx until the fluff timeout, while a fluff still
+    /// delivers everywhere reachable.
+    async fn unicast_dandelion_stem(&self, pid: [u8; 20], hops_left: u32, tx_bytes: Vec<u8>) {
+        let stem = encode_dandelion_stem(hops_left, &tx_bytes);
+        if stem.len() > MAX_TX_MSG + 8 {
+            self.broadcast_bytes(tx_bytes).await;
+            return;
+        }
+        let payload = serde_json::json!({ "topic": self.topic, "data": hex::encode(stem) })
+            .to_string()
+            .into_bytes();
+        let allowed = match self.send_limit.lock() {
+            Ok(mut l) => l.try_send(&pid, payload.len() as u64, epoch_ms()),
+            Err(_) => true,
+        };
+        if !allowed {
+            tracing::debug!(
+                "[txgossip] stem to {} dropped (per-peer send budget exceeded): fluffing",
+                hex::encode(pid),
+            );
+            self.broadcast_bytes(tx_bytes).await;
+            return;
+        }
+        let wait_ms = self.bcast_wait_and_stamp(&pid);
+        let handle = tokio::spawn(Self::send_one_peer(
+            Arc::clone(&self.adapter),
+            Arc::clone(&self.peer_health),
+            pid,
+            payload,
+            wait_ms,
+        ));
+        let (_joined, detached) = join_with_timeout(
+            vec![handle],
+            Duration::from_millis(broadcast_join_timeout_ms()),
+        )
+        .await;
+        if detached > 0 {
+            tracing::debug!(
+                "[txgossip] stem to {} detached past the join budget (still recording on completion)",
+                hex::encode(pid),
+            );
+        }
+    }
+
+    /// This node's Dandelion peer id (mapped from the local node id).
+    pub fn dandelion_self_id(&self) -> u64 {
+        dandelion_peer_id(&self.adapter.node.id)
+    }
+
+    /// Peer-table snapshot as `(node id, mapped peer id)` pairs, in table
+    /// order. The decision helpers below map through this table so the policy
+    /// (which only sees `u64`s) and the transport (which only dials `[u8; 20]`)
+    /// agree on identities.
+    fn dandelion_table(&self) -> Vec<([u8; 20], u64)> {
+        self.peer_ids()
+            .into_iter()
+            .map(|pid| (pid, dandelion_peer_id(&pid)))
+            .collect()
+    }
+
+    /// Decide what to do with one locally-originated transaction, using live
+    /// liveness (peers in failure cooldown count as down).
+    pub fn dandelion_publish_decision(&self, tx: &[u8; 32]) -> DandelionPublishDecision {
+        let table = self.dandelion_table();
+        let self_id = self.dandelion_self_id();
+        let alive: Vec<u64> = table
+            .iter()
+            .filter(|(pid, _)| !self.peer_skipped(pid))
+            .map(|(_, id)| *id)
+            .collect();
+        self.dandelion_publish_decision_with_liveness(tx, &table, self_id, &|p| alive.contains(&p))
+    }
+
+    /// Decide what to do with one locally-originated transaction, with
+    /// caller-supplied liveness (tests/sim: stale views, dead ends,
+    /// partitions). `candidates`/`self_id` are the peer table in transport
+    /// ids; `is_alive` sees the mapped policy ids.
+    pub fn dandelion_publish_decision_with_liveness(
+        &self,
+        tx: &[u8; 32],
+        candidates: &[([u8; 20], u64)],
+        self_id: u64,
+        is_alive: &impl Fn(u64) -> bool,
+    ) -> DandelionPublishDecision {
+        let peer_ids: Vec<u64> = candidates.iter().map(|(_, id)| *id).collect();
+        let (action, entry) = match (self.dandelion.lock(), self.dandelion_rng.lock()) {
+            (Ok(mut relay), Ok(mut rng)) => {
+                let action = relay.originate(&mut rng, *tx, &peer_ids, self_id, is_alive);
+                let entry = relay.stem_entry(tx).map(|e| e.hops_left);
+                (action, entry)
+            }
+            _ => return DandelionPublishDecision::Fluff,
+        };
+        match map_dandelion_action(action, candidates) {
+            DandelionPublishDecision::Stem { to, .. } => DandelionPublishDecision::Stem {
+                to,
+                hops_left: entry.unwrap_or(0),
+            },
+            other => other,
+        }
+    }
+
+    /// Handle a transaction arriving over the stem with `hops_left` budget,
+    /// using live liveness. Returns what to do next (forward once, fluff, or
+    /// drop). Inbound stem dispatch is deferred (see module header); this is
+    /// the decision hook the wiring tests and the sim drive.
+    pub fn dandelion_on_stem(&self, tx: &[u8; 32], hops_left: u32) -> DandelionPublishDecision {
+        let table = self.dandelion_table();
+        let self_id = self.dandelion_self_id();
+        let alive: Vec<u64> = table
+            .iter()
+            .filter(|(pid, _)| !self.peer_skipped(pid))
+            .map(|(_, id)| *id)
+            .collect();
+        self.dandelion_on_stem_with_liveness(tx, hops_left, &table, self_id, &|p| {
+            alive.contains(&p)
+        })
+    }
+
+    /// [`Self::dandelion_on_stem`] with caller-supplied liveness (tests/sim).
+    pub fn dandelion_on_stem_with_liveness(
+        &self,
+        tx: &[u8; 32],
+        hops_left: u32,
+        candidates: &[([u8; 20], u64)],
+        self_id: u64,
+        is_alive: &impl Fn(u64) -> bool,
+    ) -> DandelionPublishDecision {
+        let peer_ids: Vec<u64> = candidates.iter().map(|(_, id)| *id).collect();
+        let (action, entry) = match (self.dandelion.lock(), self.dandelion_rng.lock()) {
+            (Ok(mut relay), Ok(mut rng)) => {
+                let action =
+                    relay.on_stem_receive(&mut rng, *tx, hops_left, &peer_ids, self_id, is_alive);
+                let entry = relay.stem_entry(tx).map(|e| e.hops_left);
+                (action, entry)
+            }
+            _ => return DandelionPublishDecision::Fluff,
+        };
+        match map_dandelion_action(action, candidates) {
+            DandelionPublishDecision::Stem { to, .. } => DandelionPublishDecision::Stem {
+                to,
+                hops_left: entry.unwrap_or(0),
+            },
+            other => other,
+        }
+    }
+
+    /// Handle a transaction arriving via fluff broadcast. Returns true when
+    /// the caller should relay the fluff onward (exactly once per tx —
+    /// storm termination), false when it is a duplicate. Fluff wins: any held
+    /// stem state for the tx is dropped.
+    pub fn dandelion_on_fluff(&self, tx: &[u8; 32]) -> bool {
+        match self.dandelion.lock() {
+            Ok(mut relay) => relay.on_fluff_receive(*tx) == dandelion::RelayAction::FluffBroadcast,
+            Err(_) => true,
+        }
+    }
+
+    /// Failover: the stem peer holding `tx` is (now believed) down, using live
+    /// liveness. Re-emits, reroutes, or fluffs per policy (never blackholes).
+    pub fn dandelion_failover(&self, tx: &[u8; 32]) -> DandelionPublishDecision {
+        let table = self.dandelion_table();
+        let self_id = self.dandelion_self_id();
+        let alive: Vec<u64> = table
+            .iter()
+            .filter(|(pid, _)| !self.peer_skipped(pid))
+            .map(|(_, id)| *id)
+            .collect();
+        self.dandelion_failover_with_liveness(tx, &table, self_id, &|p| alive.contains(&p))
+    }
+
+    /// [`Self::dandelion_failover`] with caller-supplied liveness (tests/sim).
+    pub fn dandelion_failover_with_liveness(
+        &self,
+        tx: &[u8; 32],
+        candidates: &[([u8; 20], u64)],
+        self_id: u64,
+        is_alive: &impl Fn(u64) -> bool,
+    ) -> DandelionPublishDecision {
+        let peer_ids: Vec<u64> = candidates.iter().map(|(_, id)| *id).collect();
+        let (action, entry) = match (self.dandelion.lock(), self.dandelion_rng.lock()) {
+            (Ok(mut relay), Ok(mut rng)) => {
+                let action = relay.on_peer_down(&mut rng, tx, &peer_ids, self_id, is_alive);
+                let entry = relay.stem_entry(tx).map(|e| e.hops_left);
+                (action, entry)
+            }
+            _ => return DandelionPublishDecision::Fluff,
+        };
+        match map_dandelion_action(action, candidates) {
+            DandelionPublishDecision::Stem { to, .. } => DandelionPublishDecision::Stem {
+                to,
+                hops_left: entry.unwrap_or(0),
+            },
+            other => other,
+        }
+    }
+
+    /// Fluff timeout: force-fluff a held stem entry (stem-blackhole
+    /// mitigation). Returns `Some(Fluff)` when an entry was held (the caller
+    /// broadcasts), `None` otherwise. Live timer arming is deferred (see
+    /// module header); tests/sim drive this directly.
+    pub fn dandelion_fluff_timeout(&self, tx: &[u8; 32]) -> Option<DandelionPublishDecision> {
+        match self.dandelion.lock() {
+            Ok(mut relay) => relay
+                .fluff_timeout(tx)
+                .map(|_| DandelionPublishDecision::Fluff),
+            Err(_) => None,
+        }
+    }
+
+    /// Reseed the decision RNG (tests/sim only — makes ON-path decisions
+    /// reproducible; production seeds from OS randomness at construction).
+    /// Never consulted when OFF.
+    pub fn dandelion_reseed(&self, seed: u64) {
+        if let Ok(mut rng) = self.dandelion_rng.lock() {
+            *rng = dandelion::NodeRng::new(seed);
+        }
+    }
+
+    /// Number of currently held stem entries (always `<= MAX_STEM_ENTRIES`).
+    pub fn dandelion_stem_len(&self) -> usize {
+        self.dandelion.lock().map(|r| r.stem_len()).unwrap_or(0)
+    }
+
+    /// Number of seen-set entries (always `<= MAX_SEEN_ENTRIES`).
+    pub fn dandelion_seen_len(&self) -> usize {
+        self.dandelion.lock().map(|r| r.seen_len()).unwrap_or(0)
+    }
+
+    /// Whether a stem entry is currently held for `tx`.
+    pub fn dandelion_holds(&self, tx: &[u8; 32]) -> bool {
+        self.dandelion
+            .lock()
+            .map(|r| r.stem_entry(tx).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Whether `tx` was already fluffed through this node.
+    pub fn dandelion_is_fluffed(&self, tx: &[u8; 32]) -> bool {
+        self.dandelion
+            .lock()
+            .map(|r| r.is_fluffed(tx))
+            .unwrap_or(false)
     }
 }
 
@@ -2741,7 +3199,16 @@ mod tests {
     #[test]
     fn vote_roundtrip() {
         let sk = SigningKey::generate(&mut OsRng);
-        let v = Vote::sign(&sk, 3, 1, VoteKind::Prevote, Some([9u8; 32]));
+        // FULL-PQ: a classical `Vote::sign` no longer verifies, so the
+        // round-tripped vote carries a Falcon half (mirrors
+        // `consensus::tests::fvote`).
+        let fk = crate::consensus::FalconKeypair::generate_from_seed(0xA1);
+        crate::consensus::register_validator_pq_key(
+            sk.verifying_key().to_bytes(),
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+        let v = Vote::sign_with_falcon(&sk, &fk, 3, 1, VoteKind::Prevote, Some([9u8; 32]));
         let msg = ConsensusMsg::Vote {
             vote: v.clone(),
             locked: None,
@@ -3261,6 +3728,12 @@ mod tests {
     /// fetch re-verification) — hold. This test re-asserts both through the
     /// same pure gates the feature tests use, so a future audit can confirm
     /// the series is closed without re-diagnosing the middle IDs.
+    ///
+    /// FULL-PQ (mirrors `network::retention_tests::
+    /// verification_oracle_fetch_reverifies_signature`): classical Ed25519
+    /// feed verification is removed with no PQ feed path (wire frozen), so
+    /// EVERY classical feed — genuine, tampered, or self-consistent forgery
+    /// — reads as a miss. Same fail-closed property, stronger verdict.
     #[test]
     fn report_p1_g2_g4_filed_without_content_is_closed_as_accepted() {
         use crate::consensus::ValidatorSet;
@@ -3280,11 +3753,12 @@ mod tests {
         outsider.sign_block(&outsider_sk);
         assert!(!proposal_hint_admissible(&outsider, &validators));
         // Bookend G5: stored oracle bytes are re-verified on the way out —
-        // a re-priced feed with the old signature reads as a miss, never as
-        // market evidence.
+        // under FULL-PQ every classical feed reads as a miss (no PQ feed
+        // path), so a re-priced feed with the old signature reads as a miss,
+        // and so does the genuine one — never as market evidence.
         let feed = crate::oracle::PriceFeedUpdate::sign("STELL", 250_000, 1_700_000_000, &sk);
         let stored = hex::encode(bincode::serialize(&feed).unwrap());
-        assert!(crate::network::decode_verified_price_feed(&stored).is_some());
+        assert!(crate::network::decode_verified_price_feed(&stored).is_none());
         let mut tampered = feed.clone();
         tampered.price_micro_usd = 1;
         let bad = hex::encode(bincode::serialize(&tampered).unwrap());
@@ -3462,8 +3936,42 @@ mod tests {
 
     #[test]
     fn tx_gossip_roundtrip_and_fail_closed() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let tx = Transaction::sign(&sk, [1u8; 32], 10, 5, 0, 1, 1);
+        // FULL-PQ: implicit Falcon-512 envelope (mirrors the mempool `tx`
+        // idiom); a classical `Transaction::sign` no longer verifies.
+        let seed = 0x42u8;
+        let pk = Transaction::sample_falcon512_pubkey(seed);
+        let from = crate::post_quantum::derive_pq_address(
+            crate::post_quantum::PqScheme::Falcon512,
+            &pk,
+            &crate::post_quantum::DEFAULT_SALT,
+        );
+        Transaction::global_implicit_registry()
+            .register(
+                from,
+                crate::post_quantum::PqScheme::Falcon512,
+                &pk,
+                &crate::post_quantum::DEFAULT_SALT,
+            )
+            .expect("PQ test key must register");
+        let mut tx = Transaction {
+            from,
+            to: [1u8; 32],
+            amount: 10,
+            gas_limit: 5,
+            nonce: 0,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        let msg = tx.signing_message();
+        let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+        tx.signature = crate::sharding::PqSignatureEnvelope::new_implicit(
+            crate::post_quantum::PqScheme::Falcon512,
+            sig,
+        )
+        .encode();
         let bytes = bincode::serialize(&tx).unwrap();
         let raw = serde_json::json!({ "topic": tx_topic("test"), "data": hex::encode(bytes) })
             .to_string();
@@ -3932,7 +4440,7 @@ pub fn committed_admit_this_tick(already_admitted: u32) -> bool {
 /// by the closing searches, all empty:
 /// `git log --all -S "P1-G2" / -S "P1-G3" / -S "P1-G4"` (no commits),
 /// `rg "P1-G"` across the tree (no hits outside this note),
-/// `rg "\bG[234]\b"` (only BLS curve points in `src/bls.rs`),
+/// `rg "\bG[234]\b"` (no hits outside this note),
 /// `rg -i "filed.?gap"` (no markers), and the P1 wave report itself
 /// (`docs/audits/audit-pentest-p2p-mempool.md`, parent dir) contains no
 /// G-series content at all. There is nothing to reproduce, nothing to pin,
@@ -4221,7 +4729,7 @@ impl ConsensusNetwork {
         }
         let mut statik = std::collections::HashSet::new();
         for p in &self.adapter.node.cfg.peers {
-            if let Ok(pid) = p.node_id_raw() {
+            if let Ok(pid) = p.primary_id() {
                 statik.insert(pid);
             }
         }

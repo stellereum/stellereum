@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stellereum — Pure Post-Quantum Layer 1 Blockchain</title>
+<meta name="description" content="Stellereum is a pure post-quantum Layer 1: PQ-BFT v5 consensus, Falcon-512 validator signatures, Sealevel-lite parallel execution and SVM programs. Public testnet, chain ID 5757.">
+<meta name="theme-color" content="#04060c">
+<meta name="color-scheme" content="dark">
+<link rel="canonical" href="https://stellereum.org/">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Stellereum">
+<meta property="og:locale" content="en_US">
+<meta property="og:url" content="https://stellereum.org/">
+<meta property="og:title" content="Stellereum — Pure Post-Quantum Layer 1 Blockchain">
+<meta property="og:description" content="PQ-BFT v5 consensus, Falcon-512 validator signatures, Sealevel-lite parallel execution. Live testnet with chain ID 5757.">
+<meta name="twitter:card" content="summary_large_image">
+<meta property="og:image" content="https://stellereum.org/assets/img/og-image.png">
+<meta name="twitter:image" content="https://stellereum.org/assets/img/og-image.png">
+<meta name="twitter:title" content="Stellereum — Pure Post-Quantum Layer 1 Blockchain">
+<meta name="twitter:description" content="PQ-BFT v5 consensus, Falcon-512 validator signatures, Sealevel-lite parallel execution. Live testnet with chain ID 5757.">
+
+<link rel="icon" href="favicon.ico?v=6" sizes="48x48">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/img/favicon-32.png?v=6">
+<link rel="icon" type="image/png" sizes="16x16" href="assets/img/favicon-16.png?v=6">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/img/apple-touch-icon.png?v=6">
+<link rel="manifest" href="site.webmanifest">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+
+<link rel="stylesheet" href="assets/css/tokens.css?v=6">
+<link rel="stylesheet" href="assets/css/base.css?v=6">
+<link rel="stylesheet" href="assets/css/layout.css?v=6">
+<link rel="stylesheet" href="assets/css/components.css?v=6">
+<link rel="stylesheet" href="assets/css/sections.css?v=6">
+<link rel="stylesheet" href="assets/css/responsive.css?v=6">
+
+<script defer src="assets/js/app.js?v=6"></script>
+<script defer src="assets/js/starfield.js?v=6"></script>
+<script defer src="assets/js/motion.js?v=6"></script>
+<script defer src="assets/js/metrics.js?v=20261018c"></script>
+</head>
+<body>
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="#top">
+      <img class="brand-mark" src="assets/img/stell-mark.png?v=6" alt="" width="30" height="30">
+      <span class="brand-name">Stellereum</span>
+    </a>
+
+    <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="nav-panel" aria-label="Open menu">
+      <span class="bars" aria-hidden="true">
+        <span class="bar"></span><span class="bar"></span><span class="bar"></span>
+      </span>
+    </button>
+
+    <div class="nav-panel" id="nav-panel">
+      <div class="nav-panel-top">
+        <span class="nav-panel-title">Menu</span>
+        <button class="nav-close" type="button" aria-label="Close menu">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+
+      <nav aria-label="Primary">
+        <ul class="nav-list">
+          <li><a class="nav-link" href="#network">Network</a></li>
+          <li><a class="nav-link" href="#build">Build</a></li>
+          <li><a class="nav-link" href="#ecosystem">Ecosystem</a></li>
+          <li><a class="nav-link" href="#roadmap">Roadmap</a></li>
+        </ul>
+      </nav>
+
+      <a class="btn btn-primary btn-sm nav-cta" href="https://testnet.stellereum.org">Open Testnet</a>
+    </div>
+  </div>
+</header>
+
+<div class="nav-backdrop" data-nav-backdrop></div>
+
+<main id="main">
+
+  <!-- ============================================================ HERO -->
+  <section class="hero" id="top" aria-labelledby="hero-title">
+    <div class="container hero-grid">
+
+      <div class="hero-copy">
+        <p class="eyebrow" data-reveal>Pure Post-Quantum L1</p>
+
+        <h1 id="hero-title" data-reveal data-delay="1">Pure Post-Quantum Layer 1 Blockchain</h1>
+
+        <p class="hero-sub" data-reveal data-delay="2">
+          Stellereum finalises blocks with PQ-BFT v5, signs every validator vote with
+          Falcon-512 and executes transactions in parallel with Sealevel-lite.
+        </p>
+
+        <div class="hero-actions" data-reveal data-delay="3">
+          <a class="btn btn-primary" href="#build">Start building</a>
+          <a class="btn btn-ghost" href="https://explorer.stellereum.org">View explorer</a>
+        </div>
+      </div>
+
+      <div class="hero-visual" data-parallax data-reveal data-delay="2">
+        <canvas id="starfield" aria-hidden="true"></canvas>
+        <img class="hero-mark" src="assets/img/stell-mark.png?v=6" alt="" width="240" height="240" aria-hidden="true" decoding="async">
+        <span class="sr-only">Animated star field orbiting the Stellereum mark.</span>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ========================================================== METRICS -->
+  <section id="network" class="section section--alt metrics" aria-labelledby="network-title">
+    <div class="container">
+
+      <div class="section-head" data-reveal>
+        <p class="eyebrow">Network</p>
+        <h2 id="network-title">Live from the testnet</h2>
+        <p class="lead">
+          Every value is read straight from the public RPC gateway, then refreshed
+          every fifteen seconds. If the source stops answering, the number goes back to
+          a dash instead of a guess.
+        </p>
+      </div>
+
+      <div class="metrics-grid">
+        <div class="metric" data-metric="height" data-reveal>
+          <span class="metric-label">Block height</span>
+          <strong class="metric-value" data-value>&#8212;</strong>
+          <span class="metric-note">blocks finalised on testnet</span>
+        </div>
+
+        <div class="metric" data-metric="blockTime" data-reveal data-delay="1">
+          <span class="metric-label">Block time</span>
+          <strong class="metric-value" data-value>&#8212;</strong>
+          <span class="metric-note">seconds per block, sampled from height deltas</span>
+        </div>
+
+        <div class="metric" data-metric="baseFee" data-reveal data-delay="2">
+          <span class="metric-label">Base fee</span>
+          <strong class="metric-value" data-value>&#8212;</strong>
+          <span class="metric-note">equal to GAS_BASIC_TRANSFER (280000)</span>
+        </div>
+
+        <div class="metric" data-metric="chainId" data-reveal data-delay="1">
+          <span class="metric-label">Chain ID</span>
+          <strong class="metric-value" data-value>5757</strong>
+          <span class="metric-note">used by wallets and RPC clients</span>
+        </div>
+
+        <div class="metric" data-metric="validators" data-reveal data-delay="2">
+          <span class="metric-label">Validators</span>
+          <strong class="metric-value" data-value>&#8212;</strong>
+          <span class="metric-note">µQC committee, Falcon-512 votes</span>
+        </div>
+
+        <div class="metric" data-metric="stateRoot" data-reveal data-delay="3">
+          <div class="metric-head">
+            <span class="metric-label">State root</span>
+            <button class="icon-btn metric-action" type="button" data-copy-from="#state-root-value" aria-label="Copy full state root">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-copy-label>Copy</span>
+            </button>
+          </div>
+          <strong class="metric-value metric-value--mono" id="state-root-value" data-value>&#8212;</strong>
+          <span class="metric-note">32-byte Merkle root of world state</span>
+        </div>
+      </div>
+
+      <p class="metrics-status" data-status role="status">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span class="status-host" data-status-text>Connecting &#183; testnet.stellereum.org</span>
+        <span class="badge">polling every 15s</span>
+      </p>
+
+    </div>
+  </section>
+
+  <!-- ========================================================= FEATURES -->
+  <section id="features" class="section features" aria-labelledby="features-title">
+    <div class="container">
+
+      <div class="section-head" data-reveal>
+        <p class="eyebrow">Protocol</p>
+        <h2 id="features-title">The base layer, hardened end to end</h2>
+        <p class="lead">
+          Six decisions that define Stellereum: no legacy curves, a quantum-compact
+          committee, parallel execution and confidentiality that ships with the chain.
+        </p>
+      </div>
+
+      <div class="features-grid">
+
+        <article class="card" data-tilt data-reveal>
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.4-3 7.6-7 9-4-1.4-7-4.6-7-9V6l7-3z"/><path d="M9 12.5l2 2 4-4.5"/></svg>
+          </span>
+          <h3>Pure Post-Quantum</h3>
+          <p>Validator votes are signed with Falcon-512 and Ed25519 signatures are rejected at the protocol level, so no legacy curve can weaken consensus.</p>
+          <div class="card-meta"><span class="kv"><b>Falcon-512</b> signature scheme</span></div>
+        </article>
+
+        <article class="card" data-tilt data-reveal data-delay="1">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="2.4"/><circle cx="5" cy="17" r="2.4"/><circle cx="19" cy="17" r="2.4"/><path d="M10.6 7L6.4 14.9M13.4 7l4.2 7.9M7.4 17h9.2"/></svg>
+          </span>
+          <h3>PQ-BFT v5 + µQC</h3>
+          <p>The committee of 16 validators is chosen by BLAKE3 sortition and finalises every block through a quantum-compact quorum certificate.</p>
+          <div class="card-meta"><span class="kv">committee <b>16</b> &middot; quorum <b>66.7%</b></span></div>
+        </article>
+
+        <article class="card" data-tilt data-reveal data-delay="2">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4.5 13.5H10L9.5 22 19.5 10H13.5L13 2z"/><path d="M3 21h4M17 21h4"/></svg>
+          </span>
+          <h3>Sealevel-lite</h3>
+          <p>Transactions declare their read and write sets, so independent calls run in parallel. Benchmarked at 5.16&times; against sequential execution.</p>
+          <div class="card-meta"><span class="kv"><b>5.16&times;</b> parallel speed-up</span></div>
+        </article>
+
+        <article class="card" data-tilt data-reveal data-delay="1">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="7" width="10" height="10" rx="2"/><rect x="3.5" y="3.5" width="17" height="17" rx="4"/><path d="M12 3.5v3.5M12 17v3.5M3.5 12H7M17 12h3.5"/></svg>
+          </span>
+          <h3>SVM + zkML</h3>
+          <p>A Solana-compatible runtime for programs, extended with verifiable zero-knowledge machine-learning inference anchored on chain.</p>
+          <div class="card-meta"><span class="kv">SVM programs &middot; verifiable inference</span></div>
+        </article>
+
+        <article class="card" data-tilt data-reveal data-delay="2">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="3"/><path d="M8 10V7.5a4 4 0 0 1 8 0V10"/><path d="M12 14.5v2.5"/></svg>
+          </span>
+          <h3>Confidential transfers</h3>
+          <p>Shielded notes, internally called stealth, hide amounts and counterparties while the total supply stays auditable by anyone.</p>
+          <div class="card-meta"><span class="kv">shielded notes &middot; auditable supply</span></div>
+        </article>
+
+        <article class="card" data-tilt data-reveal data-delay="3">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18v-5a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4v5"/><path d="M3 18h18M7 9V6.5M17 9V6.5"/><path d="M8.5 18v2M15.5 18v2"/></svg>
+          </span>
+          <h3>Bridges &amp; L2</h3>
+          <p>Canonical bridge contracts plus three L2 tracks carry liquidity, privacy and rollup throughput above the base layer.</p>
+          <div class="card-meta"><span class="kv">3 L2 tracks &middot; canonical bridge</span></div>
+        </article>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ====================================================== PERFORMANCE -->
+  <section id="performance" class="section section--alt performance" aria-labelledby="perf-title">
+    <div class="container">
+
+      <div class="section-head" data-reveal>
+        <p class="eyebrow">Benchmarks</p>
+        <h2 id="perf-title">Throughput measured, not promised</h2>
+        <p class="lead">Results of the in-repo benchmark suite. These are lab numbers, not figures from the public testnet.</p>
+      </div>
+
+      <div class="perf-band" data-reveal>
+        <div class="perf-grid">
+          <div class="perf-item">
+            <span class="perf-value" data-count-to="257996">257,996</span>
+            <span class="perf-label">tx/s, in-engine</span>
+          </div>
+          <div class="perf-item">
+            <span class="perf-value" data-count-to="2645">2,645</span>
+            <span class="perf-label">end-to-end TPS</span>
+          </div>
+          <div class="perf-item">
+            <span class="perf-value" data-count-to="5.16" data-count-decimals="2" data-count-suffix="&#215;">5.16&#215;</span>
+            <span class="perf-label">parallel execution speed-up</span>
+          </div>
+          <div class="perf-item">
+            <span class="perf-value" data-count-to="-0.06" data-count-decimals="2" data-count-prefix="&#8722;" data-count-suffix="%">&#8722;0.06%</span>
+            <span class="perf-label">PQ vs Ed25519 delta</span>
+          </div>
+        </div>
+        <p class="perf-note">
+          Reference benchmark environment &#183; 150 ms block pacing &#183; full consensus path &#183; reproducible from the in-repo suite
+        </p>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================================================= QUICKSTART -->
+  <section id="build" class="section quickstart" aria-labelledby="build-title">
+    <div class="container quickstart-grid">
+
+      <div class="quickstart-main">
+        <div class="section-head section-head--left" data-reveal>
+          <p class="eyebrow">Build</p>
+          <h2 id="build-title">From zero to a transaction in three steps</h2>
+          <p class="lead">No allowlist, no private RPC. Everything you need is public and works today.</p>
+        </div>
+
+        <ol class="steps">
+          <li class="step" data-reveal>
+            <span class="step-num" aria-hidden="true"></span>
+            <div>
+              <h3>Connect a network</h3>
+              <p>Point your wallet or SDK at <span class="mono">https://rpc.stellereum.org</span> with chain ID <span class="mono">5757</span> and the symbol STELL.</p>
+            </div>
+          </li>
+          <li class="step" data-reveal data-delay="1">
+            <span class="step-num" aria-hidden="true"></span>
+            <div>
+              <h3>Get test STELL</h3>
+              <p>Request gas from the faucet: <span class="mono">POST /api/faucet-public/&lt;address&gt;</span> on the testnet host, 5 STELL per address every 45 minutes.</p>
+            </div>
+          </li>
+          <li class="step" data-reveal data-delay="2">
+            <span class="step-num" aria-hidden="true"></span>
+            <div>
+              <h3>Send a transaction</h3>
+              <p>Submit a signed transfer over JSON-RPC, then follow it block by block in the explorer until it is final.</p>
+            </div>
+          </li>
+        </ol>
+
+        <div class="quickstart-actions" data-reveal data-delay="3">
+          <a class="btn btn-primary" href="https://faucet.stellereum.org">Open faucet</a>
+          <a class="btn btn-ghost" href="https://explorer.stellereum.org">View explorer</a>
+        </div>
+      </div>
+
+      <div class="quickstart-side" data-reveal data-delay="1">
+        <dl class="net-strip">
+          <div>
+            <dt>RPC URL</dt>
+            <dd>https://rpc.stellereum.org</dd>
+          </div>
+          <div>
+            <dt>Chain ID</dt>
+            <dd>5757</dd>
+          </div>
+          <div>
+            <dt>Currency</dt>
+            <dd>STELL</dd>
+          </div>
+        </dl>
+
+        <div class="code-panel">
+          <div class="code-bar">
+            <div class="tablist" role="tablist" aria-label="Connection snippets">
+              <button class="tab" type="button" role="tab" id="tab-rpc" aria-controls="pane-rpc" aria-selected="true" tabindex="0">JSON-RPC</button>
+              <button class="tab" type="button" role="tab" id="tab-curl" aria-controls="pane-curl" aria-selected="false" tabindex="-1">cURL</button>
+              <button class="tab" type="button" role="tab" id="tab-faucet" aria-controls="pane-faucet" aria-selected="false" tabindex="-1">Faucet</button>
+            </div>
+            <button class="icon-btn" type="button" data-copy-active aria-label="Copy snippet">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <span data-copy-label>Copy</span>
+            </button>
+          </div>
+
+          <div class="code-body" role="tabpanel" id="pane-rpc" aria-labelledby="tab-rpc" tabindex="0">
+<pre><span class="tok-cmt">// POST https://rpc.stellereum.org</span>
+{
+  <span class="tok-key">"jsonrpc"</span>: <span class="tok-str">"2.0"</span>,
+  <span class="tok-key">"id"</span>: <span class="tok-num">1</span>,
+  <span class="tok-key">"method"</span>: <span class="tok-str">"stell_chainId"</span>,
+  <span class="tok-key">"params"</span>: []
+}
+
+<span class="tok-cmt">// response</span>
+{
+  <span class="tok-key">"jsonrpc"</span>: <span class="tok-str">"2.0"</span>,
+  <span class="tok-key">"id"</span>: <span class="tok-num">1</span>,
+  <span class="tok-key">"result"</span>: <span class="tok-num">5757</span>
+}</pre>
+          </div>
+
+          <div class="code-body" role="tabpanel" id="pane-curl" aria-labelledby="tab-curl" tabindex="0" hidden>
+<pre>curl -s -H <span class="tok-str">'Content-Type: application/json'</span> \
+  -d <span class="tok-str">'{"jsonrpc":"2.0","id":1,"method":"stell_chainId","params":[]}'</span> \
+  https://rpc.stellereum.org</pre>
+          </div>
+
+          <div class="code-body" role="tabpanel" id="pane-faucet" aria-labelledby="tab-faucet" tabindex="0" hidden>
+<pre><span class="tok-cmt"># 5 STELL per address, once every 45 minutes</span>
+curl -s -X POST \
+  <span class="tok-str">'https://testnet.stellereum.org/api/faucet-public/&lt;address&gt;'</span></pre>
+          </div>
+
+          <div class="code-foot">
+            <span class="mono">testnet.stellereum.org</span>
+            <span>JSON-RPC 2.0 &#183; chain ID 5757</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ======================================================= ECOSYSTEM -->
+  <section id="ecosystem" class="section section--alt ecosystem" aria-labelledby="ecosystem-title">
+    <div class="container">
+
+      <div class="section-head" data-reveal>
+        <p class="eyebrow">Ecosystem</p>
+        <h2 id="ecosystem-title">Scaling tracks above the base layer</h2>
+        <p class="lead">Three L2 directions extend L1 without moving trust off the post-quantum core.</p>
+      </div>
+
+      <div class="eco-grid">
+        <article class="card eco-card" data-tilt data-reveal>
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12s3.5-6 9-6c1.7 0 3.2.6 4.4 1.4M21 12s-3.5 6-9 6c-1.8 0-3.4-.7-4.7-1.6"/><path d="M4.2 15.5A9.6 9.6 0 0 0 12 18c1.8 0 3.4-.5 4.8-1.3"/><path d="M3 3l18 18"/><circle cx="12" cy="12" r="2.6"/></svg>
+          </span>
+          <h3>L2-Private <span class="badge badge--soon">Coming soon</span></h3>
+          <p>Shielded execution and confidential state for applications that must keep counterparties and amounts private by default.</p>
+          <div class="card-meta"><span class="kv">confidential state &#183; stealth notes</span></div>
+        </article>
+
+        <article class="card eco-card" data-tilt data-reveal data-delay="1">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="3"/><rect x="9" y="9" width="6" height="6" rx="1.5"/><path d="M9 2.5V5M15 2.5V5M9 19v2.5M15 19v2.5M2.5 9H5M2.5 15H5M19 9h2.5M19 15h2.5"/></svg>
+          </span>
+          <h3>Coming soon</h3>
+          <p>Still in development — no details to share yet.</p>
+        </article>
+
+        <article class="card eco-card" data-tilt data-reveal data-delay="2">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17a8 8 0 1 1 16 0"/><path d="M12 17l4.2-4.6"/><circle cx="12" cy="17" r="1.4"/><path d="M4 17h1.6M18.4 17H20"/></svg>
+          </span>
+          <h3>Coming soon</h3>
+          <p>Still in development — details will follow later.</p>
+        </article>
+      </div>
+
+
+    </div>
+  </section>
+
+  <!-- ========================================================= ROADMAP -->
+  <section id="roadmap" class="section roadmap" aria-labelledby="roadmap-title">
+    <div class="container">
+
+      <div class="section-head" data-reveal>
+        <p class="eyebrow">Roadmap</p>
+        <h2 id="roadmap-title">From testnet to mainnet</h2>
+        <p class="lead">Four steps, tracked in the open. Statuses reflect the current testnet release.</p>
+      </div>
+
+      <ol class="timeline">
+        <li class="timeline-item timeline-item--done" data-reveal>
+          <div class="timeline-body">
+            <div class="timeline-top">
+              <span class="timeline-step">Step 01</span>
+              <span class="badge badge--done"><span class="dot" aria-hidden="true"></span>Shipped</span>
+            </div>
+            <h3>Testnet launch</h3>
+            <p>Genesis v5 is live with Falcon-512 verification and the KAT beacon <span class="mono break-anywhere">61336779&#8230;fcd6e</span>.</p>
+          </div>
+        </li>
+
+        <li class="timeline-item timeline-item--active" data-reveal data-delay="1">
+          <div class="timeline-body">
+            <div class="timeline-top">
+              <span class="timeline-step">Step 02</span>
+              <span class="badge badge--active"><span class="dot" aria-hidden="true"></span>In progress</span>
+            </div>
+            <h3>Independent validator network</h3>
+            <p>Independent operators on separate hosts, so fault tolerance stays above the 66.7% quorum line. Admission is operator-managed today and moves to staking-driven onboarding for mainnet.</p>
+          </div>
+        </li>
+
+        <li class="timeline-item" data-reveal data-delay="2">
+          <div class="timeline-body">
+            <div class="timeline-top">
+              <span class="timeline-step">Step 03</span>
+              <span class="badge badge--todo"><span class="dot" aria-hidden="true"></span>Queued</span>
+            </div>
+            <h3>Innovations in the live network</h3>
+            <p>Confidential transfers and SVM tooling already ship in the client; further items land through coordinated network upgrades.</p>
+          </div>
+        </li>
+
+        <li class="timeline-item" data-reveal data-delay="3">
+          <div class="timeline-body">
+            <div class="timeline-top">
+              <span class="timeline-step">Step 04</span>
+              <span class="badge badge--todo"><span class="dot" aria-hidden="true"></span>Queued</span>
+            </div>
+            <h3>Mainnet</h3>
+            <p>Economic security with a 1,000 STELL validator bond, independent operators and production SLAs.</p>
+          </div>
+        </li>
+      </ol>
+
+    </div>
+  </section>
+
+  <!-- ============================================================= CTA -->
+  <section class="section cta" aria-labelledby="cta-title">
+    <div class="container">
+      <div class="cta-panel" data-reveal>
+        <div class="cta-inner">
+          <p class="eyebrow">Testnet is live</p>
+          <h2 id="cta-title">Deploy your first contract on Stellereum</h2>
+          <p>Chain ID 5757, public RPC, faucet around the clock and an explorer that shows every finalised block.</p>
+          <div class="cta-actions">
+            <a class="btn btn-primary" href="https://testnet.stellereum.org">Open Testnet</a>
+            <a class="btn btn-ghost" href="#build">Start building</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- =========================================================== FOOTER -->
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-grid">
+
+      <div class="footer-brand">
+        <a class="brand" href="#top">
+          <img class="brand-mark" src="assets/img/stell-mark.png?v=6" alt="" width="30" height="30">
+          <span class="brand-name">Stellereum</span>
+        </a>
+        <p class="footer-note">
+          A pure post-quantum Layer 1: PQ-BFT v5 consensus, Falcon-512 signatures and
+          Sealevel-lite parallel execution.
+        </p>
+      </div>
+
+
+
+
+
+      <div class="footer-col">
+        <h3>Community</h3>
+        <ul class="footer-links">
+          <li><a href="https://t.me/stellereum" target="_blank" rel="noopener noreferrer">Telegram</a></li>
+        </ul>
+      </div>
+
+    </div>
+
+    <div class="footer-bottom">
+      <div class="footer-meta">
+        <span class="footer-hash" title="c840d1dc2e6c70eb7c639a193715c0a57375fc78ae1f9749dc3cc73cb4c8ee77">Genesis c840d1dc2e6c70eb&#8230;</span>
+      </div>
+      <div class="footer-meta">
+        <span>&#169; <span data-year>2026</span> Stellereum</span>
+      </div>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

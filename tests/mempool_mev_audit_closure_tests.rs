@@ -35,8 +35,7 @@
 //! gapped nonce that `insert` now ALSO refuses whenever the head is carried
 //! — benign, self-healing via restart clamp-down; tracked, not re-tested.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use stellereum::consensus::ValidatorSet;
@@ -47,11 +46,45 @@ use stellereum::sharding::{PqSignatureEnvelope, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
 const STELL: u64 = 1_000_000_000;
-fn key() -> SigningKey {
-    SigningKey::generate(&mut OsRng)
+
+static NEXT_SEED: AtomicU8 = AtomicU8::new(0xD8);
+
+fn key() -> u8 {
+    NEXT_SEED.fetch_add(1, Ordering::Relaxed)
 }
-fn transfer(k: &SigningKey, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> Transaction {
-    Transaction::sign(k, to, amount, gas, nonce, 1, 1)
+
+fn pq_addr(seed: &u8) -> [u8; 32] {
+    derive_pq_address(
+        PqScheme::Falcon512,
+        &Transaction::sample_falcon512_pubkey(*seed),
+        &DEFAULT_SALT,
+    )
+}
+
+/// FULL-PQ: implicit Falcon-512 (registered globally; no surcharge), so
+/// reservation/floor assertions match the old classical fixtures exactly.
+fn transfer(seed: &u8, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> Transaction {
+    let pk = Transaction::sample_falcon512_pubkey(*seed);
+    let from = pq_addr(seed);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, *seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 // ============================================================================
@@ -63,22 +96,29 @@ fn transfer(k: &SigningKey, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> 
 /// not just at the RPC/gossip pre-checks. In-window nonces still admit.
 #[tokio::test]
 async fn f02_add_tx_refuses_gapped_nonce() {
-    let k = key();
+    // FULL-PQ: the runtime validator key stays classical (vote path,
+    // untouched); the admitted TRANSACTIONS are implicit Falcon-512.
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+    let k = SigningKey::generate(&mut OsRng);
     let me = k.verifying_key().to_bytes();
+    let tx_seed = key();
+    let tx_from = pq_addr(&tx_seed);
     let vs = ValidatorSet::from_list(vec![(me, 1)]);
     let st = Arc::new(InMemoryStateEngine::new());
     st.update_account(AccountState::new(me, 100 * STELL)).await;
+    st.update_account(AccountState::new(tx_from, 100 * STELL)).await;
     let mut rt = ValidatorRuntime::new(k.clone(), vs, st, 1);
 
-    rt.add_tx(transfer(&k, [9u8; 32], 1, 1_000, 32)).await;
+    rt.add_tx(transfer(&tx_seed, [9u8; 32], 1, 1_000, 32)).await;
     assert_eq!(
         rt.mempool.read().await.len(),
         0,
         "nonce 32 vs on-chain 0 (window 16) must not pool"
     );
-    rt.add_tx(transfer(&k, [9u8; 32], 1, 1_000, 0)).await;
+    rt.add_tx(transfer(&tx_seed, [9u8; 32], 1, 1_000, 0)).await;
     assert_eq!(rt.mempool.read().await.len(), 1, "head nonce admits");
-    rt.add_tx(transfer(&k, [9u8; 32], 1, 1_000, 32)).await;
+    rt.add_tx(transfer(&tx_seed, [9u8; 32], 1, 1_000, 32)).await;
     assert_eq!(
         rt.mempool.read().await.len(),
         1,
@@ -95,7 +135,7 @@ async fn f02_add_tx_refuses_gapped_nonce() {
 #[test]
 fn f03_eviction_releases_reservation() {
     let sk = key();
-    let me = sk.verifying_key().to_bytes();
+    let me = pq_addr(&sk);
     // Pool of exactly 1: the second admission must evict at >= 2x.
     let mut mp = Mempool::new(1, 64);
     let cost = |fee: u64| 100 + fee;
@@ -293,11 +333,11 @@ fn f11_floor_is_static_explicit_terms_only() {
 // MEV stance (F-08): seal enforced, order detected, vote-gate deferred
 // ============================================================================
 
-/// Seal-at-admission binds the exact bytes: match passes; mutating a
-/// NON-hashed field (the signature is outside `compute_tx_hash`, inside the
-/// sealed bincode) breaks the byte binding → `Mismatch`, which the build
-/// drops fail-closed; mutating a HASHED field changes tx identity → no
-/// envelope under the new hash → `NotSealed`, the documented
+/// Seal-at-admission binds the exact bytes: `Match` passes for the sealed
+/// bytes. PQ envelopes commit the signature bytes in the tx hash, so ANY
+/// byte mutation (sealed or hashed field) yields a new identity with no
+/// sealed envelope → `NotSealed` (never `Match`, never built). Unknown txs
+/// are `NotSealed`. Order commitment matches its own build,
 /// availability pass-through for restored pools (checked, never executed
 /// blind — and a re-keyed tx still faces admission/balance/nonce gates).
 /// Unknown txs are `NotSealed`. Order commitment matches its own build,
@@ -314,14 +354,23 @@ fn mev_seal_enforced_order_detected_vote_gate_deferred() {
 
     engine.seal_admitted(&hash, &bytes);
     assert_eq!(engine.verify_pool_tx(&tx), SealVerdict::Match);
-    // Signature-only mutation: same hash, different sealed bytes → Mismatch.
+    // Signature-only mutation: for PQ envelopes the signature bytes are
+    // committed in the tx hash (`PQ_ENV`), so the mutated bytes have a NEW
+    // identity with no sealed envelope: NotSealed (never Match, never built).
+    // The legacy Mismatch branch is vacuous for PQ — the mutation is caught
+    // earlier by hash identity plus verify failure — and refusal is what the
+    // seal guarantees here.
     let mut resig = tx.clone();
     resig.signature[0] ^= 0xFF;
-    assert_eq!(resig.compute_tx_hash(), hash, "sig is outside the tx hash");
+    assert_ne!(
+        resig.compute_tx_hash(),
+        hash,
+        "PQ envelope bytes are committed in the tx hash"
+    );
     assert_eq!(
         engine.verify_pool_tx(&resig),
-        SealVerdict::Mismatch,
-        "same-hash mutation must never reach a block (build drops it)"
+        SealVerdict::NotSealed,
+        "mutated bytes carry no seal and must never Match (build drops them)"
     );
     // Amount mutation: new identity, no envelope → NotSealed pass-through.
     let mut mutated = tx.clone();
@@ -332,6 +381,8 @@ fn mev_seal_enforced_order_detected_vote_gate_deferred() {
     assert_eq!(engine.verify_pool_tx(&stranger), SealVerdict::NotSealed);
 
     // Order commitment: build-time match, reorder mismatch, foreign NoCommit.
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
     let signer = SigningKey::generate(&mut OsRng);
     let txs = vec![tx.clone(), stranger.clone()];
     engine.commit_block_order(9, [0xBu8; 32], &txs, &[signer]);

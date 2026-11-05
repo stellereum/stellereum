@@ -1,12 +1,11 @@
 //! Audit-closure tests for `audit-pq-crypto.md` findings owned by
-//! `src/post_quantum.rs`, `src/bls.rs`, `src/node_keys.rs`, `src/remote_signer.rs`.
+//! `src/post_quantum.rs`, `src/node_keys.rs`, `src/remote_signer.rs`.
 //!
 //! NEW FILE (mission rule): no shared test was edited; every assertion below
 //! lives here. Each test maps to a finding ID in the report header.
 
 use std::sync::Mutex;
 
-use bls12_381::G2Affine;
 use ed25519_dalek::Signer as _;
 
 /// Serializes every test that mutates process-global state (env vars, the
@@ -304,74 +303,6 @@ fn pq_envelope_strict_single_layout() {
 }
 
 // ============================================================================
-// F-HIGH-1: BLS rogue-key gate (startup refusal) + identity hardening
-// ============================================================================
-
-#[test]
-fn bls_signature_identity_rejected_at_parse() {
-    use stellereum::bls::{BlsSecretKey, BlsSignature, SIGNATURE_LEN};
-    // The identity G2 point must not parse (mirrors the G1 key check).
-    // (The genuine-aggregate tail of this probe was deleted with
-    // `aggregate_signatures` / `verify_aggregate_signature`.)
-    let id_bytes: [u8; SIGNATURE_LEN] = G2Affine::identity().to_compressed();
-    assert!(
-        BlsSignature::from_bytes(&id_bytes).is_none(),
-        "F-HIGH-1: identity signature must not parse"
-    );
-    // Single-signature parse round-trip still works (parser layer kept).
-    let sk = BlsSecretKey::generate();
-    let sig = sk.sign(b"qc quorum");
-    assert_eq!(BlsSignature::from_bytes(&sig.to_bytes()), Some(sig));
-    assert!(sk.public_key().verify(b"qc quorum", &sig));
-}
-
-
-// REMOVED (`bls_flag_parsing_parity_refuse_vs_config`): pinned refusal-vs-`QcBlsConfig::from_env`
-// parity — `from_env` was deleted with the counting-path config, so the parity
-// target is gone (reported). Refusal spelling matrix stays pinned by
-// `bls_qc_startup_refusal_is_unchanged` (bls_pop_tests) and
-// `default_startup_still_refuses_bls_qc_counting` (bls_classical_tests).
-
-
-// REMOVED (BLS config shell): `bls_config_debug_redacts_seed` pinned the
-// deleted `QcBlsConfig` shell's redacting `Debug` + wiping `Zeroize` — the shell
-// has zero live users (proven by grep) and is deleted with its hygiene surface
-// (reported). No live writer removed; registry policy + refusal gate pins stay.
-
-// F-HIGH-1 (BLS no-PoP): the startup gate is a LOUD refusal, not a silent
-// fallback. Pins the message so a future edit cannot weaken it into a
-// warning, and pins default-OFF when the flag is unset.
-#[test]
-fn bls_qc_refusal_is_loud_and_default_is_off() {
-    use stellereum::bls::{refuse_bls_qc_if_enabled, BLS_QC_ENV};
-    let _g = SERIAL.lock().unwrap();
-    let prior = std::env::var(BLS_QC_ENV).ok();
-    // Enabled: loud refusal naming the structural gap and the recovery.
-    std::env::set_var(BLS_QC_ENV, "1");
-    let err = refuse_bls_qc_if_enabled().expect_err("STELL_BLS_QC=1 must be refused");
-    assert!(
-        err.contains("proof-of-possession"),
-        "must name the missing PoP: {err}"
-    );
-    assert!(err.contains("rogue-key"), "must name the attack: {err}");
-    assert!(err.contains("STELL_BLS_QC"), "must name the flag: {err}");
-    assert!(
-        err.contains("Ed25519"),
-        "must name the safe fallback: {err}"
-    );
-    // Unset: default OFF, gate passes (Ed25519 baseline, byte-identical).
-    std::env::remove_var(BLS_QC_ENV);
-    assert!(
-        refuse_bls_qc_if_enabled().is_ok(),
-        "unset flag must start normally"
-    );
-    match prior {
-        Some(v) => std::env::set_var(BLS_QC_ENV, v),
-        None => std::env::remove_var(BLS_QC_ENV),
-    }
-}
-
-// ============================================================================
 // F-HIGH-2: pure-PQ single/batch parity on the vote path
 // ============================================================================
 
@@ -516,7 +447,7 @@ fn node_key_files_enforce_perms_and_roundtrip() {
     let nk = load_or_generate_node_keys(&dir).expect("generate node keys");
     let nk2 = load_or_generate_node_keys(&dir).expect("reload node keys");
     assert_eq!(nk.signing.to_bytes(), nk2.signing.to_bytes());
-    assert_eq!(nk.e2e_sec.to_bytes(), nk2.e2e_sec.to_bytes());
+    assert_eq!(nk.kem_seed, nk2.kem_seed);
     let falcon_path = dir.join("falcon.key");
     let fk = load_or_generate_falcon_key(&falcon_path).expect("generate falcon key");
     let fk2 = load_or_generate_falcon_key(&falcon_path).expect("reload falcon key");

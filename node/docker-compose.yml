@@ -28,4 +28,6 @@ services:
       - STELL_EXPLORER_LISTEN=127.0.0.1:8080
       # - STELL_RPC_AUTH_TOKEN=change-me-before-exposing
       # - STELL_FAUCET_TOKEN=change-me-before-exposing
+      # PQ MODE: FULL-PQ is always-on (STELL_PURE_PQ is a no-op since the
+      # KEX cut: KEM-only sessions, PQ-only NodeId — see NODE.md).
     restart: unless-stopped

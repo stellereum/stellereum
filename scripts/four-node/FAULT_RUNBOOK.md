@@ -243,8 +243,8 @@ scripts/stell-sync.sh health
 scripts/stell-sync.sh doctor C
 
 # 3. the disk (INODES, not bytes) and the chunk garbage
-ssh -p 2222 root@203.0.113.12 'df -i /root/nodeC/data'
-ssh -p 2222 root@203.0.113.12 'scripts/node-prune-cron.sh --dir /root/nodeC --dry-run'
+ssh -p 2222 root@77.110.96.68 'df -i /root/nodeC/data'
+ssh -p 2222 root@77.110.96.68 'scripts/node-prune-cron.sh --dir /root/nodeC --dry-run'
 
 # 4. the node that does not finalise
 scripts/stell-sync.sh lockclear C            # the plan

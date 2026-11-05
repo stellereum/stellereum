@@ -12,6 +12,7 @@ storage-roles:
 # multi-node cluster; see LAUNCH_STRATEGY.txt.
 peers: []
 
+# PQ MODE: FULL-PQ is always-on (KEM-only sessions, PQ-only NodeId).
 # accept unknown nodes in read-only (TOFU) mode — convenient for testnets
 # DEV/TOFU MODE: this is a development-environment setting. On a public testnet
 # set `allow-unknown: false` (or remove the line) and pin validators under

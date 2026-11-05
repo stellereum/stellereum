@@ -2,7 +2,7 @@
 //!
 //! NEW file — shared test files are never edited per mission rules. Each test
 //! pins one finding's fix (or fail-closed behavior) in the consensus domain:
-//! lock paths (F7 newest-wins), BLS/schedule ordering (F8), quorum curve (F4),
+//! lock paths (F7 newest-wins), schedule ordering (F8), quorum curve (F4),
 //! hash-slot edge cases, QC assemble/verify power parity, round-sync caps,
 //! the deadlock-reset QC gate (F3), and µQC envelope decode (F9).
 
@@ -35,23 +35,57 @@ const H: u64 = 92079;
 
 // --- F7: polka unlock is newest-wins ------------------------------------------
 
-fn hc_locked_4(
+fn falcon_for_keys(tag: u8) -> Vec<FalconKeypair> {
+    (0..4)
+        .map(|i| FalconKeypair::generate_from_seed(tag.wrapping_add(i as u8)))
+        .collect()
+}
+
+fn fvote(
+    sk: &SigningKey,
+    fk: &FalconKeypair,
+    height: u64,
+    round: u32,
+    kind: VoteKind,
+    bh: Option<[u8; 32]>,
+) -> Vote {
+    Vote::sign_with_falcon(sk, fk, height, round, kind, bh)
+}
+
+/// PQ twin of `hc_locked_4`: same powers/topology, Falcon-registered set.
+/// Returns (hc, ks, fks).
+fn hc_locked_4_pq(
     a: [u8; 32],
     locked_round: u32,
     at_round: u32,
-) -> (HeightConsensus, Vec<SigningKey>) {
+    tag: u8,
+) -> (HeightConsensus, Vec<SigningKey>, Vec<FalconKeypair>) {
     let ks = keys(4);
     let vs = vset1(&ks);
+    let fks = falcon_for_keys(tag);
+    for (sk, fk) in ks.iter().zip(fks.iter()) {
+        register_validator_pq_key(
+            sk.verifying_key().to_bytes(),
+            PqScheme::Falcon512,
+            fk.public_key().to_vec(),
+        );
+    }
     let mut hc = HeightConsensus::new(H, vs);
     hc.locked = Some((a, locked_round));
     hc.round = at_round;
-    (hc, ks)
+    (hc, ks, fks)
 }
 
-/// Quorum (3/4) of prevotes for `target` at `round`.
-fn polka(hc: &mut HeightConsensus, ks: &[SigningKey], round: u32, target: Option<[u8; 32]>) {
-    for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, H, round, VoteKind::Prevote, target))
+/// Quorum (3/4) of prevotes for `target` at `round` (Falcon-signed).
+fn polka(
+    hc: &mut HeightConsensus,
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    round: u32,
+    target: Option<[u8; 32]>,
+) {
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        hc.add_prevote(fvote(k, fk, H, round, VoteKind::Prevote, target))
             .unwrap();
     }
 }
@@ -60,9 +94,9 @@ fn polka(hc: &mut HeightConsensus, ks: &[SigningKey], round: u32, target: Option
 fn f7_older_conflict_does_not_unlock_past_newer_confirmation() {
     // Lock A@5. Older polka B@6 (conflicting) + newer polka A@7 (confirming).
     // Old code unlocked on round 6 while scanning; newest-wins keeps the lock.
-    let (mut hc, ks) = hc_locked_4(A_BLK, 5, 7);
-    polka(&mut hc, &ks, 6, Some(B_BLK));
-    polka(&mut hc, &ks, 7, Some(A_BLK));
+    let (mut hc, ks, fks) = hc_locked_4_pq(A_BLK, 5, 7, 0x70);
+    polka(&mut hc, &ks, &fks, 6, Some(B_BLK));
+    polka(&mut hc, &ks, &fks, 7, Some(A_BLK));
     let found = hc.try_prevote_quorum_at();
     assert_eq!(found, Some((7, Some(A_BLK))), "newest polka wins");
     assert_eq!(
@@ -75,8 +109,8 @@ fn f7_older_conflict_does_not_unlock_past_newer_confirmation() {
 #[test]
 fn f7_newer_conflicting_polka_still_unlocks() {
     // Lock A@5, only polka is B@7 → unlock (liveness escape preserved).
-    let (mut hc, ks) = hc_locked_4(A_BLK, 5, 7);
-    polka(&mut hc, &ks, 7, Some(B_BLK));
+    let (mut hc, ks, fks) = hc_locked_4_pq(A_BLK, 5, 7, 0x71);
+    polka(&mut hc, &ks, &fks, 7, Some(B_BLK));
     let found = hc.try_prevote_quorum_at();
     assert_eq!(found, Some((7, Some(B_BLK))));
     assert_eq!(hc.locked, None, "newest conflicting polka must unlock");
@@ -86,8 +120,8 @@ fn f7_newer_conflicting_polka_still_unlocks() {
 fn f7_newer_nil_polka_never_unlocks() {
     // F-01 FIX: Nil polka forms on timeouts and must NEVER unlock a locked block
     // (otherwise honest nodes drop locks and finalize conflicting blocks).
-    let (mut hc, ks) = hc_locked_4(A_BLK, 5, 7);
-    polka(&mut hc, &ks, 7, None);
+    let (mut hc, ks, fks) = hc_locked_4_pq(A_BLK, 5, 7, 0x72);
+    polka(&mut hc, &ks, &fks, 7, None);
     hc.try_prevote_quorum_at();
     assert_eq!(
         hc.locked,
@@ -118,9 +152,6 @@ fn f02_forged_single_validator_committee_size_rejected() {
         signers_bitmask: vec![1],
         signatures: vec![vec![0x77; 666]],
         sortition_parent: [0u8; 32],
-        // Predates the phase-3 VRF seal (mechanical fallout of the new
-        // trailing field): legacy draw.
-        vrf_beacon: None,
     };
     qc.attach_pq_micro_certificate(&uqc);
     assert!(
@@ -133,8 +164,8 @@ fn f02_forged_single_validator_committee_size_rejected() {
 fn f7_same_round_polka_never_unlocks() {
     // Polka at exactly the locked round for another value: `round >
     // locked_round` is false → lock stays (unchanged semantics).
-    let (mut hc, ks) = hc_locked_4(A_BLK, 5, 5);
-    polka(&mut hc, &ks, 5, Some(B_BLK));
+    let (mut hc, ks, fks) = hc_locked_4_pq(A_BLK, 5, 5, 0x73);
+    polka(&mut hc, &ks, &fks, 5, Some(B_BLK));
     hc.try_prevote_quorum_at();
     assert_eq!(hc.locked, Some((A_BLK, 5)));
 }
@@ -363,9 +394,6 @@ fn qc_power_parity_single_heavy_neither_assembles_nor_verifies() {
         signers_bitmask: bitmask,
         signatures: vec![fks[0].sign(&msg)],
         sortition_parent: [0x6Bu8; 32],
-        // Predates the phase-3 VRF seal (mechanical fallout of the new
-        // trailing field): legacy draw.
-        vrf_beacon: None,
     };
     let mut qc = stellereum::consensus::QuorumCertificate {
         height: HH,
@@ -416,11 +444,19 @@ fn f3_nil_precommit_quorum_is_not_qc_observed() {
     // A nil quorum proves nothing certifiable: the gate passes and a bodyless
     // lock still drops (liveness preserved where no fork is possible).
     let ks = keys(4);
+    let fks = falcon_for_keys(0x74);
     let mut hc = HeightConsensus::new(H, vset1(&ks));
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        register_validator_pq_key(
+            k.verifying_key().to_bytes(),
+            PqScheme::Falcon512,
+            fk.public_key().to_vec(),
+        );
+    }
     hc.round = 412;
     hc.locked = Some((A_BLK, 400));
-    for k in ks.iter().take(3) {
-        hc.add_precommit(Vote::sign(k, H, 412, VoteKind::Precommit, None))
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        hc.add_precommit(fvote(k, fk, H, 412, VoteKind::Precommit, None))
             .unwrap();
     }
     assert!(
@@ -449,12 +485,20 @@ fn f3_banked_qc_survives_vote_set_pruning() {
     // The banked-QC half of the gate: after deciding (QC banked), even if the
     // vote sets are pruned away, the lock survives the reset.
     let ks = keys(4);
+    let fks = falcon_for_keys(0x75);
     let mut hc = HeightConsensus::new(H, vset1(&ks));
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        register_validator_pq_key(
+            k.verifying_key().to_bytes(),
+            PqScheme::Falcon512,
+            fk.public_key().to_vec(),
+        );
+    }
     hc.round = 5; // decide AT round 5 (the lookback scan only inspects ≤ round)
-    for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, H, 5, VoteKind::Prevote, Some(A_BLK)))
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        hc.add_prevote(fvote(k, fk, H, 5, VoteKind::Prevote, Some(A_BLK)))
             .unwrap();
-        hc.add_precommit(Vote::sign(k, H, 5, VoteKind::Precommit, Some(A_BLK)))
+        hc.add_precommit(fvote(k, fk, H, 5, VoteKind::Precommit, Some(A_BLK)))
             .unwrap();
     }
     assert_eq!(hc.try_precommit_quorum(), Some(A_BLK));
@@ -484,9 +528,6 @@ fn f9_decode_rejects_malformed_envelopes() {
         signers_bitmask: vec![0b101],
         signatures: vec![vec![1u8; 8], vec![2u8; 8]],
         sortition_parent: [0x6Bu8; 32],
-        // Predates the phase-3 VRF seal (mechanical fallout of the new
-        // trailing field): legacy draw.
-        vrf_beacon: None,
     };
     let good = encode_pq_micro_envelope(&cert);
     assert!(

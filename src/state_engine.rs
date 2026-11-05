@@ -162,6 +162,38 @@ pub fn verified_signature_covers(tx: &crate::sharding::Transaction, expected_cha
     covered
 }
 
+/// FULL-PQ (no compat, nodes wiped): a transaction is admissible only with
+/// a PQ envelope carrying a post-quantum scheme. Classical envelopes (bare
+/// ed25519, EVM, or non-PQ scheme ids) are refused at admission, before any
+/// floor / nonce / balance effect — no fee, no nonce consumption.
+///
+/// SESSION-AUTH CARVE-OUT (HDAE session zone): a well-formed session-key
+/// envelope (`SK1`/`SF1` framing parsed by `Transaction::delegation`) skips
+/// this TRANSPORT gate and falls through to session authorization instead —
+/// `verify_signature` (session branch) + `session_gate` — which refuse Ed
+/// grants fail-closed and admit Falcon grants. Without the carve-out no
+/// delegated transaction could apply at all (a session envelope is not a
+/// PQ1 envelope by construction: the session signature scheme differs from
+/// the transport framing). This changes no other verdict: non-session
+/// transactions take the exact same path as before.
+fn require_pq_tx_envelope(tx: &crate::sharding::Transaction) -> Result<(), String> {
+    if tx.delegation().is_some() {
+        return Ok(());
+    }    let Some(env) = tx.pq_envelope() else {
+        return Err(
+            "Pure PQ mode: classical non-PQ transactions rejected, submit with PQ1 envelope"
+                .to_string(),
+        );
+    };
+    if !env.scheme.is_post_quantum() {
+        return Err(
+            "Pure PQ mode: scheme must be post-quantum (Falcon-512, ML-DSA-44, or Hybrid)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Resolve per-transaction signature validity for a block: attested
 /// transactions skip crypto; every other transaction is verified exactly as
 /// before (parallel batch over the unattested subset, scalar fallback per
@@ -174,6 +206,12 @@ fn resolve_block_sig_validity(
     let mut out = vec![false; txs.len()];
     let mut need: Vec<usize> = Vec::new();
     for (i, tx) in txs.iter().enumerate() {
+        // FULL-PQ: classical envelopes never reach crypto — fail closed here
+        // (admission-stage: left false, so the block pre-check skips them
+        // with no fee, no nonce, exactly like a bad signature).
+        if require_pq_tx_envelope(tx).is_err() {
+            continue;
+        }
         if verified_signature_covers(tx, expected_chain) {
             out[i] = true;
         } else {
@@ -539,24 +577,6 @@ pub struct InMemoryStateEngine {
     /// `DomainSnapshot` (a new field there would stop every pre-phase-2 domain
     /// snapshot from decoding, and its restore path hard-errors).
     session_keys: Arc<RwLock<crate::zkml::SessionKeyRegistry>>,
-    /// §9 shielded (confidential) balance ledger: `balances`, the spent-input
-    /// nullifier set and the burned fee total.
-    ///
-    /// PRIVATE on purpose, like every other committed subsystem: reads go
-    /// through `confidential_read`, mutations through `confidential_write`
-    /// (which bumps `commitment_generation`). The only writer on the live path
-    /// is the SVM's `SysCallConfidentialTransfer`, applied to a CLONE that
-    /// `execute_payload` commits back only when the whole transaction applied
-    /// - so a reverted, out-of-gas or later-refused transaction leaves the
-    ///   shielded ledger byte-for-byte where it was.
-    ///
-    /// CONDITIONAL in the commitment: `commit_consensus_domains*` routes the
-    /// digest through `commitment::commitment_digest_with_confidential`, whose
-    /// confidential domain writes ZERO bytes while the state is empty. A chain
-    /// that has never made a confidential transfer therefore keeps a
-    /// byte-identical root, which is what lets this domain join the digest
-    /// WITHOUT bumping `COMMITMENT_VERSION` or re-pinning the genesis KAT.
-    confidential: Arc<RwLock<crate::crypto_privacy::ConfidentialState>>,
     /// §2 zkML model registry: `model_id -> (code/weights hash, weights)`.
     ///
     /// PRIVATE on purpose, like every other committed subsystem: reads go
@@ -570,16 +590,15 @@ pub struct InMemoryStateEngine {
     /// leaves the registry byte-for-byte where it was.
     ///
     /// CONDITIONAL in the commitment: `commit_consensus_domains*` routes the
-    /// digest through
-    /// `commitment::commitment_digest_with_confidential_and_zkml`, whose zkML
+    /// digest through `commitment::commitment_digest_with_zkml`, whose zkML
     /// domain writes ZERO bytes while the registry is empty. A chain that has
     /// never registered a model therefore keeps a byte-identical root, which
     /// is what lets this domain join the digest WITHOUT bumping
     /// `COMMITMENT_VERSION` or re-pinning the genesis KAT. No separate
-    /// persistence tree this wave (same as the shielded ledger): the registry
-    /// is consensus state in memory and under the root, and a restart drops
-    /// it - both nodes drop the same state, so agreement is preserved but
-    /// models must be re-registered. A disk tree is the follow-up.
+    /// persistence tree this wave: the registry is consensus state in memory
+    /// and under the root, and a restart drops it - both nodes drop the same
+    /// state, so agreement is preserved but models must be re-registered.
+    /// A disk tree is the follow-up.
     zkml_models: Arc<RwLock<crate::zkml::ZkMlModelRegistry>>,
     /// Bumped by every mutation of a committed subsystem.
     ///
@@ -718,7 +737,10 @@ pub struct InMemoryStateEngine {
     /// never fail-closed); size it for tests / diskless nodes only.
     pq_keys_fallback: Arc<
         std::sync::RwLock<
-            memory_bounds::BoundedLruCache<[u8; 32], (crate::post_quantum::PqScheme, Vec<u8>)>,
+            memory_bounds::BoundedLruCache<
+                [u8; 32],
+                (crate::post_quantum::PqScheme, Vec<u8>, [u8; 16]),
+            >,
         >,
     >,
     /// F-01 consensus D2 penalty mirror: sender -> extra floor added to the
@@ -750,6 +772,23 @@ pub struct InMemoryStateEngine {
     pub shard_topology: Arc<RwLock<crate::sharding::ShardTopology>>,
     /// Outbound cross-shard messages emitted during execution (e.g. cross-shard contract calls).
     pub cross_shard_out: Arc<RwLock<Vec<crate::sharding::CrossShardMessage>>>,
+    /// HashPool note/nullifier sub-state (default-OFF apply wiring).
+    ///
+    /// PRIVATE on purpose, like every other committed subsystem: reads go
+    /// through the `hashpool_*` accessors below, mutations go through the
+    /// gated `apply_hashpool_*` entry points (which refuse with
+    /// [`HashPoolOpError::Disabled`] while the gate is off and mirror every
+    /// mutation into the state trie under [`hashpool_commitment_key`] /
+    /// [`hashpool_nullifier_key`], so pool ops move the state root
+    /// deterministically). Bound to the engine's `chain_id` at
+    /// [`InMemoryStateEngine::enable_hashpool_for_tests`].
+    hashpool: Arc<RwLock<crate::hashpool::HashPool>>,
+    /// Test-only per-instance override of [`HASH_POOL_ENABLED`].
+    ///
+    /// Default `false` (the const value): flipped ONLY by
+    /// [`InMemoryStateEngine::enable_hashpool_for_tests`], which is never
+    /// called on the live path (grep-proof: only `tests/` call it).
+    hashpool_tests_on: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for InMemoryStateEngine {
@@ -920,6 +959,160 @@ pub fn contract_source_key(address: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+// ---------------------------------------------------------------------------
+// HashPool note/nullifier sub-state (default-OFF apply wiring).
+//
+// The pool reuses the exact constructions of `crate::hashpool` (domains,
+// tags, `note_commit` / `note_nullifier`, `coinjoin_*`); nothing is
+// re-derived here. The engine only owns the SUB-STATE (the `HashPool` map +
+// trie leaves so pool ops move the state root) and the gated ENTRY POINTS
+// below. Consensus counting, mempool admission and every pre-existing apply
+// step are untouched: while the gate is off no trie key below is ever
+// written, so the apply path is byte-identical (proven by
+// `tests/hashpool_wiring_tests.rs` and the unmodified apply/state suites).
+//
+// Residuals, stated plainly: the pool is memory-consensus state (same
+// posture as the `zkml_models` registry: no separate persistence tree, so a
+// restart drops it and a disk/snapshot round-trip is follow-up work). The
+// wire is frozen: blocks carry NO HashPool bytes, so ops travel via the
+// explicit `HashPoolBlockOps` sidecar of
+// `apply_block_transition_with_hashpool` (never inside `Transaction` /
+// `Block`, whose formats are frozen).
+// ---------------------------------------------------------------------------
+
+/// Default-OFF gate for the HashPool apply wiring.
+///
+/// Plain documented const, no env knob (mirrors the
+/// `PREFER_PQ_MEV_TRANSPORT = false` precedent): `false` in every build, so
+/// the standard apply path cannot observe the pool. Tests flip the
+/// per-instance override via
+/// [`InMemoryStateEngine::enable_hashpool_for_tests`] (never on the live
+/// path); production flips this const only with a spec update + audit.
+pub const HASH_POOL_ENABLED: bool = false;
+
+/// Namespaced trie key for a deposited HashPool commitment:
+/// `sha256("STELL_HP_TRIE_COMMIT_V1" || commitment)`.
+///
+/// A NEW trie namespace (deliberately NOT `HP_COMMIT_DST`: that domain is
+/// the note-commitment preimage inside `hashpool.rs`, while this one keys
+/// the state-trie leaf). The leaf value is the 32-byte stealth address the
+/// commitment was registered under.
+pub fn hashpool_commitment_key(commitment: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"STELL_HP_TRIE_COMMIT_V1");
+    hasher.update(commitment);
+    hasher.finalize().into()
+}
+
+/// Namespaced trie key for a spent HashPool nullifier:
+/// `sha256("STELL_HP_TRIE_NULL_V1" || nullifier)`.
+///
+/// A NEW trie namespace (deliberately NOT `HP_NULL_DST`, for the same reason
+/// as above). The leaf is present with value `[1]` iff the nullifier is
+/// spent; absent otherwise. Append-only: neither leaf is ever removed, so
+/// two nodes that applied the same ops derive the same root.
+pub fn hashpool_nullifier_key(nullifier: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"STELL_HP_TRIE_NULL_V1");
+    hasher.update(nullifier);
+    hasher.finalize().into()
+}
+
+/// Fail-closed refusal from a HashPool apply entry point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HashPoolOpError {
+    /// The gate is off on this instance: nothing was read, nothing was
+    /// written. Loud refusal (never a silent skip) so a misrouted op on
+    /// the live path fails closed instead of vanishing.
+    Disabled,
+    /// The gate is on and the pool itself refused the op (double-spend,
+    /// unknown commitment, unbalanced batch, bad owner signature, ...).
+    Pool(crate::hashpool::HpError),
+}
+
+impl std::fmt::Display for HashPoolOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HashPoolOpError::Disabled => write!(f, "hashpool gate is off (default)"),
+            HashPoolOpError::Pool(e) => write!(f, "hashpool refused: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for HashPoolOpError {}
+
+impl From<crate::hashpool::HpError> for HashPoolOpError {
+    fn from(e: crate::hashpool::HpError) -> Self {
+        HashPoolOpError::Pool(e)
+    }
+}
+
+/// One note deposit carried by [`HashPoolBlockOps`]: the caller computed
+/// `commitment = note_commit(chain, value, blinding, stealth)` and
+/// `nullifier = note_nullifier(serial)` off-chain (same contract as
+/// `HashPool::deposit`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HashPoolDepositOp {
+    /// Note commitment to register.
+    pub commitment: [u8; 32],
+    /// Stealth address the commitment is registered under (public).
+    pub stealth: [u8; 32],
+    /// Nullifier bound to the commitment at deposit.
+    pub nullifier: [u8; 32],
+}
+
+/// One note spend carried by [`HashPoolBlockOps`]: reveals exactly
+/// `(serial, value, blinding)` against the claimed `commitment` (same
+/// contract as `HashPool::spend`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HashPoolSpendOp {
+    /// Claimed commitment (must recompute from the stored stealth).
+    pub commitment: [u8; 32],
+    /// Note serial (preimage of the bound nullifier).
+    pub serial: [u8; 32],
+    /// Note value.
+    pub value: u64,
+    /// Note blinding.
+    pub blinding: [u8; 32],
+}
+
+/// Explicit HashPool sidecar for one block transition.
+///
+/// The wire is frozen so blocks carry no HashPool bytes; tests pass ops
+/// here to [`InMemoryStateEngine::apply_block_transition_with_hashpool`].
+/// Application order is deterministic: deposits (in order), then spends (in
+/// order), then batches (in order, each verified before it applies). A
+/// refused op is counted, never halting: the rest of the sidecar still
+/// applies in order.
+#[derive(Clone, Debug, Default)]
+pub struct HashPoolBlockOps {
+    /// Note deposits to register, in application order.
+    pub deposits: Vec<HashPoolDepositOp>,
+    /// Note spends to consume, in application order.
+    pub spends: Vec<HashPoolSpendOp>,
+    /// CoinJoin batches to verify (real Falcon-512) and apply, in order.
+    pub batches: Vec<crate::hashpool::CoinJoinBatch>,
+}
+
+/// What one [`HashPoolBlockOps`] sidecar application did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HashPoolApplyOutcome {
+    /// Deposits registered.
+    pub deposits_applied: usize,
+    /// Deposits refused (duplicate commitment, ...).
+    pub deposits_refused: usize,
+    /// Spends consumed.
+    pub spends_applied: usize,
+    /// Spends refused (double-spend, tampered opening, ...).
+    pub spends_refused: usize,
+    /// Batches verified and applied.
+    pub batches_applied: usize,
+    /// Batches refused (unbalanced, bad signature, ...).
+    pub batches_refused: usize,
+    /// True when the gate was off: every op skipped, state untouched.
+    pub skipped_gate_off: bool,
+}
+
 /// Compute deterministic contract address following TON StateInit / BLAKE3 model:
 /// BLAKE3("STELL_CONTRACT" || code_hash || salt)
 pub fn compute_contract_address(code_hash: &[u8; 32], salt: &[u8]) -> [u8; 32] {
@@ -1062,8 +1255,8 @@ impl Default for InMemoryStateEngine {
 /// validator bond, no free mint, no half-settled bridge/actor/PMM legs.
 /// Domains with their own snapshot/rollback (bridge, actor, PMM-native,
 /// oracle, books) keep it; this covers the ones that had none (tokens,
-/// contracts, orderbooks, escrow, PMM curve, staking). Session,
-/// confidential and zkML ride as working copies committed on success and
+/// contracts, orderbooks, escrow, PMM curve, staking). Session keys
+/// and zkML ride as working copies committed on success and
 /// are restored from their `*_before` clones the same way.
 struct PayloadDomainSnapshot {
     tokens: Option<crate::token::TokenRegistry>,
@@ -1074,7 +1267,6 @@ struct PayloadDomainSnapshot {
     staking: Option<crate::staking::StakingLedger>,
     oracle: Option<crate::oracle::OracleState>,
     session_keys: Option<crate::zkml::SessionKeyRegistry>,
-    confidential: Option<crate::crypto_privacy::ConfidentialState>,
     zkml_models: Option<crate::zkml::ZkMlModelRegistry>,
 }
 
@@ -1492,7 +1684,6 @@ impl InMemoryStateEngine {
             governance: Arc::new(RwLock::new(crate::governance::Governance::new())),
             oracle: Arc::new(RwLock::new(crate::oracle::OracleState::default())),
             session_keys: Arc::new(RwLock::new(crate::zkml::SessionKeyRegistry::default())),
-            confidential: Arc::new(RwLock::new(crate::crypto_privacy::ConfidentialState::new())),
             zkml_models: Arc::new(RwLock::new(crate::zkml::ZkMlModelRegistry::default())),
             commitment_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             committed_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1523,6 +1714,10 @@ impl InMemoryStateEngine {
             )),
             shard_topology: Arc::new(RwLock::new(crate::sharding::ShardTopology::new())),
             cross_shard_out: Arc::new(RwLock::new(Vec::new())),
+            hashpool: Arc::new(RwLock::new(crate::hashpool::HashPool::new(
+                crate::zkml::effective_chain_id(),
+            ))),
+            hashpool_tests_on: Arc::new(std::sync::atomic::AtomicBool::new(HASH_POOL_ENABLED)),
         }
     }
 
@@ -1541,7 +1736,6 @@ impl InMemoryStateEngine {
         let governance = self.governance.read().await.clone();
         let oracle = self.oracle.read().await.clone();
         let session_keys = self.session_keys.read().await.clone();
-        let confidential = self.confidential.read().await.clone();
         let zkml_models = self.zkml_models.read().await.clone();
         let cross_shard_consumed = self.cross_shard_consumed.read().await.clone();
         let cross_shard_produced = self.cross_shard_produced.read().await.clone();
@@ -1549,6 +1743,7 @@ impl InMemoryStateEngine {
         let cross_shard_xpc = self.cross_shard_xpc.read().await.clone();
         let bridge = self.bridge.read().await.clone();
         let consensus_penalty = self.consensus_penalty.read().await.clone();
+        let hashpool = self.hashpool.read().await.clone();
 
         let pq_tree = self.pq_tree.read().unwrap().clone();
         let pq_db = self.pq_db.read().unwrap().clone();
@@ -1569,7 +1764,6 @@ impl InMemoryStateEngine {
             governance: Arc::new(RwLock::new(governance)),
             oracle: Arc::new(RwLock::new(oracle)),
             session_keys: Arc::new(RwLock::new(session_keys)),
-            confidential: Arc::new(RwLock::new(confidential)),
             zkml_models: Arc::new(RwLock::new(zkml_models)),
             commitment_generation: Arc::new(std::sync::atomic::AtomicU64::new(
                 self.commitment_generation
@@ -1618,6 +1812,11 @@ impl InMemoryStateEngine {
             )),
             shard_topology: Arc::new(RwLock::new(self.shard_topology.read().await.clone())),
             cross_shard_out: Arc::new(RwLock::new(Vec::new())),
+            hashpool: Arc::new(RwLock::new(hashpool)),
+            hashpool_tests_on: Arc::new(std::sync::atomic::AtomicBool::new(
+                self.hashpool_tests_on
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
         }
     }
 
@@ -1737,7 +1936,7 @@ impl InMemoryStateEngine {
             self.pq_keys_fallback
                 .write()
                 .unwrap()
-                .insert(address, (scheme, pubkey.to_vec()));
+                .insert(address, (scheme, pubkey.to_vec(), *salt));
         }
 
         let _ = crate::sharding::Transaction::global_implicit_registry()
@@ -1803,8 +2002,8 @@ impl InMemoryStateEngine {
         // In-memory fallback when persistent sled tree is unconfigured.
         // `get` refreshes LRU recency (needs the write guard); a miss here is
         // fail-open `None`, never an error.
-        if let Some((scheme, pk)) = self.pq_keys_fallback.write().unwrap().get(address) {
-            return Some((scheme, pk, crate::post_quantum::DEFAULT_SALT));
+        if let Some((scheme, pk, salt)) = self.pq_keys_fallback.write().unwrap().get(address) {
+            return Some((scheme, pk, salt));
         }
 
         None
@@ -1824,7 +2023,6 @@ impl InMemoryStateEngine {
         tx: &crate::sharding::Transaction,
         idx: usize,
         timestamp: u64,
-        range_preverify: &HashMap<[u8; 32], bool>,
     ) -> WaveItemExec {
         if tx.payload.is_empty() {
             return WaveItemExec {
@@ -1904,10 +2102,7 @@ impl InMemoryStateEngine {
         }
 
         let domain_snap = Some(self.snapshot_payload_domains(&tx.payload).await);
-        match self
-            .execute_payload_with_preverify(tx, timestamp, Some(range_preverify))
-            .await
-        {
+        match self.execute_payload_with_preverify(tx, timestamp).await {
             Ok((
                 crate::svm::VmExecutionResult::Success {
                     transfers,
@@ -2170,8 +2365,7 @@ impl InMemoryStateEngine {
         tx: &crate::sharding::Transaction,
         timestamp: u64,
     ) -> Result<(crate::svm::VmExecutionResult, ExecPostActions), String> {
-        self.execute_payload_with_preverify(tx, timestamp, None)
-            .await
+        self.execute_payload_with_preverify(tx, timestamp).await
     }
 
     /// Capture pre-execution state for exactly the domains this payload's
@@ -2190,7 +2384,6 @@ impl InMemoryStateEngine {
         let mut touches_staking = false;
         let mut touches_oracle = false;
         let mut touches_session = false;
-        let mut touches_conf = false;
         let mut touches_zkml = false;
         for op in payload {
             match op {
@@ -2235,10 +2428,6 @@ impl InMemoryStateEngine {
                 SysCallPublishSessionGrant { .. } | SysCallRevokeSession { .. } => {
                     touches_session = true
                 }
-                SysCallConfidentialTransfer { .. }
-                | SysCallConfidentialTransfer2 { .. }
-                | SysCallConfidentialShield { .. }
-                | SysCallConfidentialUnshield { .. } => touches_conf = true,
                 SysCallVerifyZkMl
                 | SysCallVerifyZkMlReexec { .. }
                 | SysCallRegisterZkMlModel { .. }
@@ -2260,7 +2449,6 @@ impl InMemoryStateEngine {
             staking: None,
             oracle: None,
             session_keys: None,
-            confidential: None,
             zkml_models: None,
         };
         if touches_tokens {
@@ -2284,9 +2472,6 @@ impl InMemoryStateEngine {
         }
         if touches_session {
             snap.session_keys = Some((*self.session_keys_read().await).clone());
-        }
-        if touches_conf {
-            snap.confidential = Some((*self.confidential_read().await).clone());
         }
         if touches_zkml {
             snap.zkml_models = Some((*self.zkml_models_read().await).clone());
@@ -2337,9 +2522,6 @@ impl InMemoryStateEngine {
         }
         if let Some(v) = snap.session_keys {
             *self.session_keys_write().await = v;
-        }
-        if let Some(v) = snap.confidential {
-            *self.confidential_write().await = v;
         }
         if let Some(v) = snap.zkml_models {
             *self.zkml_models_write().await = v;
@@ -2424,24 +2606,19 @@ impl InMemoryStateEngine {
         self.sync_aux_trie().await;
     }
 
-    /// Payload execution with an optional range-proof pre-verification cache
-    /// (see [`Svm::execute_with_confidential_and_sends_with_preverify`]).
+    /// Payload execution through the block-path VM entry point
+    /// ([`Svm::execute_with_confidential_and_sends`]).
     ///
-    /// `None` is the single-transaction path (`apply_transaction`, which calls
-    /// through [`Self::execute_payload`]): it NEVER consults a cache and runs
-    /// every check from scratch. `Some` is the block path
-    /// (`apply_block_parallel_fees`), which hands over the verdict map its
-    /// parallel pre-pass built — the handler still runs every state check
-    /// (ownership, spent set, conservation, fees) and only skips re-verifying
-    /// range proofs on a hit. Gas, settlement and commit behavior are identical
-    /// either way: the cache only avoids recomputing a pure function.
+    /// The name keeps the pre-excision `..._with_preverify` shape: the
+    /// range-proof pre-verification cache for shielded transfers was removed
+    /// with the shielded protocol, so every path now runs every check from
+    /// scratch. Gas, settlement and commit behavior are unchanged.
     #[allow(clippy::type_complexity)]
     // GATE: execution snapshot uses account tuple layout shared with commit path.
     pub async fn execute_payload_with_preverify(
         &self,
         tx: &crate::sharding::Transaction,
         timestamp: u64,
-        range_preverify: Option<&HashMap<[u8; 32], bool>>,
     ) -> Result<(crate::svm::VmExecutionResult, ExecPostActions), String> {
         // Session-key gate at the BLOCK timestamp, checked BEFORE the
         // empty-payload early return below. A plain session transfer has no
@@ -2601,33 +2778,10 @@ impl InMemoryStateEngine {
         };
         let session_keys_before = session_keys_work.clone();
 
-        // §9 SHIELDED LEDGER, cloned in only for payloads that can touch it
-        // (`SysCallConfidentialTransfer`) - the same clone-on-demand shape as
-        // the session registry above, for the same two reasons: a revert /
-        // out-of-gas / later settlement failure discards the transfer with
-        // everything else (the working copy is written back ONLY on the SUCCESS
-        // arm), and the 99.99% of payloads with no shielded opcode never take
-        // the lock or pay for the clone. The VM mutates this copy in place
-        // through `Svm::execute_with_confidential_and_sends`.
-        let mut confidential_work = if tx.payload.iter().any(|op| {
-            matches!(
-                op,
-                crate::svm::OpCode::SysCallConfidentialTransfer { .. }
-                    | crate::svm::OpCode::SysCallConfidentialTransfer2 { .. }
-                    | crate::svm::OpCode::SysCallConfidentialShield { .. }
-                    | crate::svm::OpCode::SysCallConfidentialUnshield { .. }
-            )
-        }) {
-            Some(self.confidential.read().await.clone())
-        } else {
-            None
-        };
-        let confidential_before = confidential_work.clone();
-
         // §2 MODEL REGISTRY, cloned in only for payloads that can touch it
         // (`SysCallVerifyZkMlReexec` / `SysCallVerifyZkMlAttestation` read it,
         // `SysCallRegisterZkMlModel` / `SysCallRegisterZkMlSpec` write it) -
-        // the same clone-on-demand shape as the shielded ledger above, for
+        // the same clone-on-demand shape as the session registry above, for
         // the same two reasons: a revert / out-of-gas / later settlement
         // failure discards a registration with everything else (the working
         // copy is written back ONLY on the SUCCESS arm), and the 99.99% of
@@ -2751,13 +2905,7 @@ impl InMemoryStateEngine {
         // clock. Every node applying this block supplies the same number, so
         // freshness and monotonicity checks in `commit_feed` agree everywhere.
         //
-        // The shielded ledger rides in as `confidential_work` (a working COPY,
-        // cloned above for payloads that carry the opcode): the handler applies
-        // the transfer to the copy, and only the SUCCESS arm below writes it
-        // back to the engine - so a revert, an out-of-gas or a failed escrow /
-        // PMM / bridge settlement discards the transfer with everything else.
-        //
-        // `actor_send_sink` is the mirror image for §1: the VM has no account
+        // `actor_send_sink` is the channel for §1: the VM has no account
         // map, so a `SysCallActorSend` can only be validated there (bounce
         // rule, prepaid delivery gas, affordability against the balance
         // mirror) and RECORDED here. `settle_actor_sends` below then moves the
@@ -2766,14 +2914,12 @@ impl InMemoryStateEngine {
         // the raw payload bytes. A payload with no actor send never allocates
         // anything measurable (the sink stays empty).
         let mut actor_send_sink: Vec<crate::svm::ActorSendRequest> = Vec::new();
-        let res = crate::svm::Svm::execute_with_confidential_and_sends_with_preverify(
+        let res = crate::svm::Svm::execute_with_confidential_and_sends(
             &tx.payload,
             tx.gas_limit,
             &mut ctx,
-            confidential_work.as_mut(),
             &mut actor_send_sink,
             zkml_models_work.as_mut(),
-            range_preverify,
         );
         // The PMM's native leg: the VM moved wUSDT and advanced the curve in
         // its clone-committed registries, but it cannot mint or burn native
@@ -3165,22 +3311,8 @@ impl InMemoryStateEngine {
                         *self.session_keys_write().await = work;
                     }
                 }
-                // §9 SHIELDED LEDGER, same all-or-nothing rule as the revoke
-                // above and for the same reason: the working copy the VM
-                // mutated is written back ONLY here, at the very end of a
-                // transaction that settled completely. Every `Err` above
-                // dropped the copy instead, so a transfer can never be half
-                // remembered - and the write accessor bumps
-                // `commitment_generation`, so the next root read folds the new
-                // balances, spent inputs and fee total into the state root.
-                if let (Some(before), Some(work)) = (&confidential_before, confidential_work.take())
-                {
-                    if *before != work {
-                        *self.confidential_write().await = work;
-                    }
-                }
-                // §2 MODEL REGISTRY, same all-or-nothing rule as the shielded
-                // ledger above: the working copy the VM mutated is written
+                // §2 MODEL REGISTRY, same all-or-nothing rule as the revoke
+                // above: the working copy the VM mutated is written
                 // back ONLY here, at the very end of a transaction that
                 // settled completely. Every `Err` above dropped the copy
                 // instead, so a registration can never survive a payload that
@@ -3255,16 +3387,19 @@ impl InMemoryStateEngine {
                 .lookup(&tx.from)
                 .is_none()
         {
-            if let Some((scheme, pk)) = self.get_pinned_pubkey(&tx.from) {
+            if let Some((scheme, pk, salt)) = self.get_pinned_pubkey_with_salt(&tx.from) {
                 let _ = crate::sharding::Transaction::global_implicit_registry().register(
                     tx.from,
                     scheme,
                     &pk,
-                    &crate::post_quantum::DEFAULT_SALT,
+                    &salt,
                 );
             }
         }
-        // 1. Cryptographic signature check
+        // 1. Cryptographic signature check (FULL-PQ first: classical
+        // envelopes are refused before any crypto, fee, nonce or balance
+        // effect — admission-stage, like the chain-id mismatch below).
+        require_pq_tx_envelope(tx)?;
         if !tx.verify_signature() {
             return Err("Transaction signature verification failed (forged signature)".to_string());
         }
@@ -4671,93 +4806,6 @@ impl InMemoryStateEngine {
         }
     }
 
-    /// Block-path range-proof pre-verification (the CPU win for shielded TPS).
-    ///
-    /// Collects `(tx_idx, transfer, input_ranges, output_ranges)` for every
-    /// ADMITTED transaction carrying `SysCallConfidentialTransfer2` and
-    /// verifies the bundles' stateless proof check in parallel via
-    /// [`crate::crypto_privacy::ConfidentialTransfer::batch_verify_balanced_with_ranges`]
-    /// (rayon, order-preserving collect; sequential fast path below 4 bundles,
-    /// the same shape as `PARALLEL_UNSEAL_MIN_TXS` / `PAR_VERIFY_MIN_PAIRS`).
-    ///
-    /// Returns digest -> verdict, keyed by
-    /// [`crate::crypto_privacy::confidential_transfer2_preverify_digest`]. The
-    /// SVM handler consults it to skip RE-VERIFICATION of range proofs only:
-    /// ownership, spent-set, conservation and fee checks all still run per
-    /// transaction, in block order, against live state — and a cache miss runs
-    /// the full check as today. Determinism is load-bearing here: verification
-    /// is a pure function of the bundle bytes, so 1-thread and N-thread
-    /// verdicts are bit-identical, and only admitted transactions contribute
-    /// (a rejected transaction's payload never executes, pre-pass or not).
-    fn preverify_confidential_ranges(
-        txs: &[crate::sharding::Transaction],
-        admitted: &[bool],
-    ) -> HashMap<[u8; 32], bool> {
-        struct Item<'a> {
-            tx_idx: usize,
-            digest: [u8; 32],
-            transfer: &'a crate::crypto_privacy::ConfidentialTransfer,
-            input_ranges: &'a [crate::crypto_privacy::RangeProof],
-            output_ranges: &'a [crate::crypto_privacy::RangeProof],
-        }
-        let mut items: Vec<Item<'_>> = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for (tx_idx, tx) in txs.iter().enumerate() {
-            if !admitted.get(tx_idx).copied().unwrap_or(false) {
-                continue;
-            }
-            for op in &tx.payload {
-                if let crate::svm::OpCode::SysCallConfidentialTransfer2 {
-                    transfer,
-                    input_ranges,
-                    output_ranges,
-                    ..
-                } = op
-                {
-                    let digest = crate::crypto_privacy::confidential_transfer2_preverify_digest(
-                        transfer,
-                        input_ranges,
-                        output_ranges,
-                    );
-                    // First occurrence wins: identical bundles verify
-                    // identically, so verifying each digest once is exact and
-                    // keeps the batch order deterministic (block order).
-                    if seen.insert(digest) {
-                        items.push(Item {
-                            tx_idx,
-                            digest,
-                            transfer,
-                            input_ranges,
-                            output_ranges,
-                        });
-                    }
-                }
-            }
-        }
-        if items.is_empty() {
-            return HashMap::new();
-        }
-        let refs: Vec<(
-            &crate::crypto_privacy::ConfidentialTransfer,
-            &[crate::crypto_privacy::RangeProof],
-            &[crate::crypto_privacy::RangeProof],
-        )> = items
-            .iter()
-            .map(|it| (it.transfer, it.input_ranges, it.output_ranges))
-            .collect();
-        let verdicts =
-            crate::crypto_privacy::ConfidentialTransfer::batch_verify_balanced_with_ranges(&refs);
-        debug_assert_eq!(items.len(), verdicts.len());
-        for (it, v) in items.iter().zip(verdicts.iter()) {
-            tracing::trace!(tx = it.tx_idx, verdict = v, "confidential pre-pass verdict");
-        }
-        items
-            .into_iter()
-            .zip(verdicts)
-            .map(|(it, v)| (it.digest, v))
-            .collect()
-    }
-
     /// Apply a block's transactions, returning per-transaction success flags for
     /// receipts alongside the aggregate counters.
     ///
@@ -4866,14 +4914,14 @@ impl InMemoryStateEngine {
                     .lookup(&tx.from)
                     .is_none()
             {
-                if let Some((scheme, pk)) = self.get_pinned_pubkey(&tx.from) {
-                    let _ = crate::sharding::Transaction::global_implicit_registry().register(
-                        tx.from,
-                        scheme,
-                        &pk,
-                        &crate::post_quantum::DEFAULT_SALT,
-                    );
-                }
+            if let Some((scheme, pk, salt)) = self.get_pinned_pubkey_with_salt(&tx.from) {
+                let _ = crate::sharding::Transaction::global_implicit_registry().register(
+                    tx.from,
+                    scheme,
+                    &pk,
+                    &salt,
+                );
+            }
             }
         }
         // 1) Batched signature verification (parallel across cores for big blocks).
@@ -5109,17 +5157,6 @@ impl InMemoryStateEngine {
                 }
             }
         }
-
-        // 3b) Parallel range-proof PRE-PASS (block path only): verify the
-        //     stateless shielded-proof bundles of the admitted transactions
-        //     across cores, BEFORE the sequential execute loop. The loop below
-        //     still executes payloads one at a time in block order against
-        //     live state, and the SVM handler still runs every state check —
-        //     the cached verdict only lets it skip re-verifying range proofs.
-        //     Pure function of admitted bundle bytes, order-preserving, so the
-        //     sequential loop observes bit-identical verdicts with or without
-        //     the pre-pass (and on 1 thread vs N threads).
-        let range_preverify = Self::preverify_confidential_ranges(txs, &admitted);
 
         // 4) Execute the payload and commit the native movement, ONE transaction
         //    at a time, in BLOCK ORDER. Payload execution and value movement are
@@ -5359,14 +5396,7 @@ impl InMemoryStateEngine {
                             } else {
                                 domain_snap =
                                     Some(self.snapshot_payload_domains(&tx.payload).await);
-                                match self
-                                    .execute_payload_with_preverify(
-                                        tx,
-                                        timestamp,
-                                        Some(&range_preverify),
-                                    )
-                                    .await
-                                {
+                                match self.execute_payload_with_preverify(tx, timestamp).await {
                                     Ok((
                                         crate::svm::VmExecutionResult::Success {
                                             transfers,
@@ -5572,19 +5602,12 @@ impl InMemoryStateEngine {
                 let (transfers, payouts, burns, gas_used, tx_events) = if tx.payload.is_empty() {
                     (Vec::new(), Vec::new(), Vec::new(), tx.gas_limit, Vec::new())
                 } else {
-                    // Block path: hand the pre-pass verdicts over. The single-tx
-                    // path (`apply_transaction` -> `execute_payload`) passes `None`
-                    // and never consults the cache.
-                    //
                     // B1 atomicity: snapshot domains BEFORE the VM runs; any
                     // failure after (including the native commit below) restores
                     // everything (see rollback_payload). NOTE: must stay in sync
                     // with the `apply_transaction` copy.
                     domain_snap = Some(self.snapshot_payload_domains(&tx.payload).await);
-                    match self
-                        .execute_payload_with_preverify(tx, timestamp, Some(&range_preverify))
-                        .await
-                    {
+                    match self.execute_payload_with_preverify(tx, timestamp).await {
                         Ok((
                             crate::svm::VmExecutionResult::Success {
                                 transfers,
@@ -6773,6 +6796,191 @@ impl InMemoryStateEngine {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // HashPool note/nullifier apply wiring (default-OFF; see the section
+    // above `HASH_POOL_ENABLED`). No other apply logic is touched: the
+    // standard `apply_block_transition` body is unchanged, and the sidecar
+    // below reuses it verbatim before applying pool ops.
+    // -----------------------------------------------------------------------
+
+    /// Whether the HashPool apply path is live on this instance: the const
+    /// (always `false` in production builds) OR the test-only override.
+    pub fn hashpool_enabled(&self) -> bool {
+        HASH_POOL_ENABLED || self.hashpool_tests_on.load(Ordering::Relaxed)
+    }
+
+    /// Test-only switch: bind a FRESH empty pool to this engine's current
+    /// `chain_id` and flip the per-instance gate on.
+    ///
+    /// Never called on the live path (only `tests/` call it). Rebinding on
+    /// enable keeps the pool's chain binding exact even though `chain_id` is
+    /// a plain public field: whatever chain this engine claims at enable
+    /// time is what the pool commits to.
+    pub async fn enable_hashpool_for_tests(&self) {
+        *self.hashpool.write().await = crate::hashpool::HashPool::new(self.chain_id);
+        self.hashpool_tests_on.store(true, Ordering::Release);
+    }
+
+    /// Real Falcon-512 owner-signature verifier for CoinJoin batches (the
+    /// caller-supplied closure shape `coinjoin_verify` requires).
+    fn hashpool_verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+        crate::post_quantum::verify_pq_signature(
+            crate::post_quantum::PqScheme::Falcon512,
+            pk,
+            msg,
+            sig,
+        )
+    }
+
+    /// Number of deposited commitments (test accessor; no mutation).
+    pub async fn hashpool_len(&self) -> usize {
+        self.hashpool.read().await.len()
+    }
+
+    /// Number of spent nullifiers (test accessor; no mutation).
+    pub async fn hashpool_spent_len(&self) -> usize {
+        self.hashpool.read().await.spent_len()
+    }
+
+    /// True when `commitment` is registered (test accessor; no mutation).
+    pub async fn hashpool_contains(&self, commitment: &[u8; 32]) -> bool {
+        self.hashpool.read().await.contains(commitment)
+    }
+
+    /// True when `nullifier` is spent (test accessor; no mutation).
+    pub async fn hashpool_is_spent(&self, nullifier: &[u8; 32]) -> bool {
+        self.hashpool.read().await.is_spent(nullifier)
+    }
+
+    /// Register one note deposit. Refuses [`HashPoolOpError::Disabled`]
+    /// while the gate is off (nothing read, nothing written); otherwise
+    /// registers via `HashPool::deposit` and mirrors the commitment leaf
+    /// into the state trie so the state root moves deterministically.
+    pub async fn apply_hashpool_deposit(
+        &self,
+        commitment: [u8; 32],
+        stealth: [u8; 32],
+        nullifier: [u8; 32],
+    ) -> Result<(), HashPoolOpError> {
+        if !self.hashpool_enabled() {
+            return Err(HashPoolOpError::Disabled);
+        }
+        let mut pool = self.hashpool.write().await;
+        pool.deposit(commitment, stealth, nullifier)?;
+        let mut trie = self.state_trie.write().await;
+        trie.insert(&hashpool_commitment_key(&commitment), &stealth);
+        Ok(())
+    }
+
+    /// Consume one note by revealing its opening. Refuses
+    /// [`HashPoolOpError::Disabled`] while the gate is off; otherwise spends
+    /// via `HashPool::spend` (double-spend refused with
+    /// `HpError::AlreadySpent`, wrong serial with `HpError::SerialMismatch`)
+    /// and mirrors the spent nullifier leaf into the state trie.
+    /// Returns the spent nullifier.
+    pub async fn apply_hashpool_spend(
+        &self,
+        commitment: &[u8; 32],
+        serial: &[u8; 32],
+        value: u64,
+        blinding: &[u8; 32],
+    ) -> Result<[u8; 32], HashPoolOpError> {
+        if !self.hashpool_enabled() {
+            return Err(HashPoolOpError::Disabled);
+        }
+        let mut pool = self.hashpool.write().await;
+        let nf = pool.spend(commitment, serial, value, blinding)?;
+        let mut trie = self.state_trie.write().await;
+        trie.insert(&hashpool_nullifier_key(&nf), &[1u8]);
+        Ok(nf)
+    }
+
+    /// Verify a CoinJoin batch with the REAL Falcon-512 verifier and, only
+    /// on success, apply it: input nullifiers marked spent, output
+    /// commitments registered, both mirrored into the state trie.
+    /// Conservation (`sum_in == sum_out + fee`) is enforced by
+    /// `coinjoin_verify`/`coinjoin_apply`; a refused batch leaves the pool
+    /// and the trie untouched. Refuses [`HashPoolOpError::Disabled`] while
+    /// the gate is off.
+    pub async fn apply_hashpool_batch(
+        &self,
+        batch: &crate::hashpool::CoinJoinBatch,
+    ) -> Result<(), HashPoolOpError> {
+        if !self.hashpool_enabled() {
+            return Err(HashPoolOpError::Disabled);
+        }
+        let mut pool = self.hashpool.write().await;
+        crate::hashpool::coinjoin_verify(&pool, batch, &Self::hashpool_verify)?;
+        crate::hashpool::coinjoin_apply(&mut pool, batch)?;
+        let chain_id = pool.chain_id();
+        let mut trie = self.state_trie.write().await;
+        for inp in &batch.inputs {
+            let nf = crate::hashpool::note_nullifier(&inp.opening.serial);
+            trie.insert(&hashpool_nullifier_key(&nf), &[1u8]);
+        }
+        for out in &batch.outputs {
+            let c = crate::hashpool::note_commit(chain_id, out.value, &out.blinding, &out.stealth);
+            trie.insert(&hashpool_commitment_key(&c), &out.stealth);
+        }
+        Ok(())
+    }
+
+    /// Apply one explicit [`HashPoolBlockOps`] sidecar: deposits, then
+    /// spends, then batches, each in order; refused ops are counted, never
+    /// halting. While the gate is off the sidecar is skipped wholesale
+    /// (`skipped_gate_off`, all counts zero, state untouched).
+    pub async fn apply_hashpool_ops(&self, ops: &HashPoolBlockOps) -> HashPoolApplyOutcome {
+        if !self.hashpool_enabled() {
+            return HashPoolApplyOutcome {
+                skipped_gate_off: true,
+                ..Default::default()
+            };
+        }
+        let mut out = HashPoolApplyOutcome::default();
+        for d in &ops.deposits {
+            match self
+                .apply_hashpool_deposit(d.commitment, d.stealth, d.nullifier)
+                .await
+            {
+                Ok(()) => out.deposits_applied += 1,
+                Err(_) => out.deposits_refused += 1,
+            }
+        }
+        for s in &ops.spends {
+            match self
+                .apply_hashpool_spend(&s.commitment, &s.serial, s.value, &s.blinding)
+                .await
+            {
+                Ok(_) => out.spends_applied += 1,
+                Err(_) => out.spends_refused += 1,
+            }
+        }
+        for b in &ops.batches {
+            match self.apply_hashpool_batch(b).await {
+                Ok(()) => out.batches_applied += 1,
+                Err(_) => out.batches_refused += 1,
+            }
+        }
+        out
+    }
+
+    /// Block-apply entry point with an explicit HashPool sidecar: runs the
+    /// UNCHANGED standard [`InMemoryStateEngine::apply_block_transition`]
+    /// first (same outcome the live path records), then the gated
+    /// [`HashPoolBlockOps`] sidecar. While the gate is off the second step
+    /// is a proven no-op, so the returned base outcome and the resulting
+    /// state root equal the plain path exactly.
+    pub async fn apply_block_transition_with_hashpool(
+        &self,
+        block: &crate::sharding::Block,
+        block_reward: u64,
+        ops: &HashPoolBlockOps,
+    ) -> (BlockTransitionOutcome, HashPoolApplyOutcome) {
+        let base = self.apply_block_transition(block, block_reward).await;
+        let hp = self.apply_hashpool_ops(ops).await;
+        (base, hp)
+    }
+
     /// §1 ACTOR MAILBOX: deliver the messages queued in every inbox, once per
     /// block, and return how many were delivered.
     ///
@@ -7054,7 +7262,6 @@ impl InMemoryStateEngine {
             &body.program,
             body.gas_budget,
             &mut ctx,
-            None,
             &mut sends,
             None,
         );
@@ -7725,29 +7932,6 @@ impl InMemoryStateEngine {
                 b
             }
         };
-        // Confidential (shielded ledger).
-        let gen = self.domain_gens.load(Domain::Confidential);
-        let confidential_hit = self
-            .domain_cache
-            .lock()
-            .unwrap()
-            .get(Domain::Confidential, gen);
-        let confidential = match confidential_hit {
-            Some(b) => b,
-            None => {
-                // TEMPORARY, like the old fold point: cloned and released at
-                // once, never held across another subsystem lock.
-                let state = self.confidential.read().await.clone();
-                let b = crate::commitment::confidential_preimage(&state);
-                if self.domain_gens.load(Domain::Confidential) == gen {
-                    self.domain_cache
-                        .lock()
-                        .unwrap()
-                        .put(Domain::Confidential, gen, b.clone());
-                }
-                b
-            }
-        };
         // zkML (models, then verifying keys: one domain, one generation).
         let gen = self.domain_gens.load(Domain::Zkml);
         let zkml_hit = self.domain_cache.lock().unwrap().get(Domain::Zkml, gen);
@@ -7779,7 +7963,6 @@ impl InMemoryStateEngine {
             &bridge,
             &cross_shard,
             &xpc,
-            &confidential,
             &zkml,
         ])
     }
@@ -8049,26 +8232,6 @@ impl InMemoryStateEngine {
             .await
     }
 
-    /// Read the shielded ledger (the VM's clone source, the commitment fold,
-    /// receipts). Reads cannot make the commitment stale, so this does NOT
-    /// bump the generation - and the guard must be dropped before any other
-    /// subsystem lock is taken, exactly like `commitment_snapshot`'s fields.
-    pub async fn confidential_read(
-        &self,
-    ) -> tokio::sync::RwLockReadGuard<'_, crate::crypto_privacy::ConfidentialState> {
-        self.confidential.read().await
-    }
-
-    /// Write access to the shielded ledger: applying a confidential transfer
-    /// bumps `commitment_generation`, so the very next root read folds the new
-    /// balances, spent inputs and fee total into the state root.
-    pub async fn confidential_write(
-        &self,
-    ) -> tokio::sync::RwLockWriteGuard<'_, crate::crypto_privacy::ConfidentialState> {
-        self.dom_guard(crate::commitment::Domain::Confidential, &self.confidential)
-            .await
-    }
-
     /// Read the §2 model registry (the VM's clone source, the commitment
     /// fold, receipts). Reads cannot make the commitment stale, so this does
     /// NOT bump the generation - and the guard must be dropped before any
@@ -8119,17 +8282,26 @@ impl InMemoryStateEngine {
     /// Wire format is `Storage::export_pq_keys_blob`: bincode of the raw
     /// `(key, value)` pairs of the `pq_keys` sled tree (namespaced `a:` /
     /// `h:` keys, see `storage.rs`). Install rule, in order:
-    /// * attached persistent tree (`attach_pq_tree`): insert every pair
+    /// * every address record (`a:` + 32B, plus legacy bare-32B keys) is
+    ///   validated fail-closed per entry — `blake3(pk)` must equal the
+    ///   account leaf's pinned `pubkey_hash` AND
+    ///   `derive_pq_address(scheme, pk, salt)` must equal the address. A
+    ///   record that fails is skipped (counted + logged), never aborts the
+    ///   whole restore;
+    /// * attached persistent tree (`attach_pq_tree`): valid pairs install
     ///   verbatim — the synced node then serves the publisher's keys from
-    ///   disk exactly as the publisher did;
-    /// * diskless fallback: decode the `a:`-namespaced address records into
-    ///   the bounded in-memory LRU (`h:` hash-lookup records are skipped —
-    ///   they are derivable from the address records and the LRU is keyed by
-    ///   address only). Bounded like every Phase-1 cache: past the cap the
-    ///   coldest entry is evicted LOUDLY and re-served from... nothing (no
-    ///   disk) — which is why diskless nodes are tests-only: an evicted key
-    ///   refuses its PQ-gated admission until gossip re-pins it
-    ///   (availability, never a fork; a MISS here never attests anything).
+    ///   disk exactly as the publisher did. Hash-lookup (`h:`) records
+    ///   install verbatim only when their hash belongs to a valid address
+    ///   record, so a refused entry leaves no orphan behind;
+    /// * diskless fallback: the valid address records decode into the
+    ///   bounded in-memory LRU WITH their pinned salt (`h:` hash-lookup
+    ///   records are skipped — they are derivable from the address records
+    ///   and the LRU is keyed by address only). Bounded like every Phase-1
+    ///   cache: past the cap the coldest entry is evicted LOUDLY and
+    ///   re-served from... nothing (no disk) — which is why diskless nodes
+    ///   are tests-only: an evicted key refuses its PQ-gated admission until
+    ///   gossip re-pins it (availability, never a fork; a MISS here never
+    ///   attests anything).
     ///
     /// Corrupt bytes are a hard error (fail closed — installing a truncated
     /// key set as complete would refuse honest PQ transactions silently).
@@ -8139,36 +8311,202 @@ impl InMemoryStateEngine {
     pub async fn restore_pq_keys(&self, bytes: &[u8]) -> Result<(), String> {
         let pairs: Vec<(Vec<u8>, Vec<u8>)> =
             bincode::deserialize(bytes).map_err(|e| format!("restore pq_keys failed: {e:?}"))?;
+        // Leaf snapshot for fail-closed per-entry validation (M-03): cloned
+        // under one read guard so validation never holds the accounts lock
+        // across sled I/O.
+        let leaves: HashMap<[u8; 32], (crate::post_quantum::PqScheme, Option<[u8; 32]>)> = {
+            let map = self.accounts.read().await;
+            map.iter()
+                .map(|(addr, acc)| (*addr, (acc.scheme, acc.pubkey_hash)))
+                .collect()
+        };
+        // Decode one address-record value in every known shape (current
+        // triple, legacy double, raw scheme-id prefix); `None` = undecodable.
+        fn decode_record(
+            bytes: &[u8],
+        ) -> Option<(crate::post_quantum::PqScheme, Vec<u8>, [u8; 16])> {
+            if let Ok((scheme, pk, salt)) = bincode::deserialize::<(
+                crate::post_quantum::PqScheme,
+                Vec<u8>,
+                [u8; 16],
+            )>(bytes)
+            {
+                return Some((scheme, pk, salt));
+            }
+            if let Ok((scheme, pk)) =
+                bincode::deserialize::<(crate::post_quantum::PqScheme, Vec<u8>)>(bytes)
+            {
+                return Some((scheme, pk, crate::post_quantum::DEFAULT_SALT));
+            }
+            if bytes.len() > 1 {
+                if let Ok(scheme) = crate::post_quantum::PqScheme::from_id(bytes[0]) {
+                    return Some((
+                        scheme,
+                        bytes[1..].to_vec(),
+                        crate::post_quantum::DEFAULT_SALT,
+                    ));
+                }
+            }
+            None
+        }
+        // Fail-closed per-entry verdict: `Ok(())` installs, `Err(reason)`
+        // skips (counted + logged) without aborting the restore.
+        fn record_verdict(
+            leaves: &HashMap<[u8; 32], (crate::post_quantum::PqScheme, Option<[u8; 32]>)>,
+            addr: &[u8; 32],
+            scheme: crate::post_quantum::PqScheme,
+            pk: &[u8],
+            salt: &[u8; 16],
+        ) -> Result<(), String> {
+            if scheme.is_disabled() {
+                return Err(format!("disabled scheme {}", scheme.name()));
+            }
+            if pk.len() != scheme.pubkey_size() {
+                return Err(format!(
+                    "pubkey length {} != {} for {}",
+                    pk.len(),
+                    scheme.pubkey_size(),
+                    scheme.name()
+                ));
+            }
+            let Some((leaf_scheme, leaf_hash)) = leaves.get(addr) else {
+                return Err("no account leaf for address".to_string());
+            };
+            if *leaf_scheme != scheme {
+                return Err("leaf scheme mismatch".to_string());
+            }
+            let pk_hash = *blake3::hash(pk).as_bytes();
+            if *leaf_hash != Some(pk_hash) {
+                return Err("blake3(pk) != leaf pubkey_hash".to_string());
+            }
+            if crate::post_quantum::derive_pq_address(scheme, pk, salt) != *addr {
+                return Err("derive(scheme,pk,salt) != address".to_string());
+            }
+            Ok(())
+        }
+        // First pass: decide the valid address records (fail-closed). The
+        // valid set drives both install paths so disk and fallback agree.
+        // First valid record wins a duplicated address; a conflicting
+        // duplicate is itself a refused entry.
+        let mut valid: HashMap<[u8; 32], (crate::post_quantum::PqScheme, Vec<u8>, [u8; 16])> =
+            HashMap::new();
+        let mut valid_hashes: HashSet<[u8; 32]> = HashSet::new();
+        let mut skipped: u64 = 0;
+        for (k, v) in &pairs {
+            let addr_opt: Option<[u8; 32]> = if k.len() == 34 && k[0] == b'a' && k[1] == b':' {
+                let mut addr = [0u8; 32];
+                addr.copy_from_slice(&k[2..]);
+                Some(addr)
+            } else if k.len() == 32 {
+                let mut addr = [0u8; 32];
+                addr.copy_from_slice(k);
+                Some(addr)
+            } else {
+                None
+            };
+            let Some(addr) = addr_opt else {
+                continue;
+            };
+            let Some((scheme, pk, salt)) = decode_record(v) else {
+                skipped += 1;
+                tracing::debug!(
+                    address = %hex::encode(addr),
+                    "restore_pq_keys: refusing undecodable record"
+                );
+                continue;
+            };
+            if let Err(reason) = record_verdict(&leaves, &addr, scheme, &pk, &salt) {
+                skipped += 1;
+                tracing::debug!(
+                    address = %hex::encode(addr),
+                    "restore_pq_keys: refusing invalid record ({reason})"
+                );
+                continue;
+            }
+            if let Some((prev_scheme, prev_pk, prev_salt)) = valid.get(&addr) {
+                if *prev_scheme != scheme || *prev_pk != pk || *prev_salt != salt {
+                    skipped += 1;
+                    tracing::debug!(
+                        address = %hex::encode(addr),
+                        "restore_pq_keys: refusing conflicting duplicate record"
+                    );
+                }
+                continue;
+            }
+            valid_hashes.insert(*blake3::hash(&pk).as_bytes());
+            valid.insert(addr, (scheme, pk, salt));
+        }
         if let Some(tree) = self.pq_tree.read().unwrap().clone() {
+            // Second pass: valid address records install verbatim (the synced
+            // node serves the publisher's bytes); hash-lookup records install
+            // verbatim only for a valid address hash; unknown shapes pass
+            // through verbatim (forward-compat, as before).
+            let mut installed: u64 = 0;
             for (k, v) in &pairs {
-                tree.insert(k.as_slice(), v.as_slice())
-                    .map_err(|e| format!("restore pq_keys tree insert failed: {e}"))?;
+                if k.len() == 34 && k[0] == b'a' && k[1] == b':' {
+                    let mut addr = [0u8; 32];
+                    addr.copy_from_slice(&k[2..]);
+                    let keep = valid.get(&addr).is_some_and(|(s, pk, salt)| {
+                        decode_record(v).is_some_and(|(ds, dpk, dsalt)| {
+                            *s == ds && *pk == dpk && *salt == dsalt
+                        })
+                    });
+                    if !keep {
+                        continue;
+                    }
+                    tree.insert(k.as_slice(), v.as_slice())
+                        .map_err(|e| format!("restore pq_keys tree insert failed: {e}"))?;
+                    installed += 1;
+                } else if k.len() == 32 {
+                    let mut addr = [0u8; 32];
+                    addr.copy_from_slice(k);
+                    let keep = valid.get(&addr).is_some_and(|(s, pk, salt)| {
+                        decode_record(v).is_some_and(|(ds, dpk, dsalt)| {
+                            *s == ds && *pk == dpk && *salt == dsalt
+                        })
+                    });
+                    if !keep {
+                        continue;
+                    }
+                    tree.insert(k.as_slice(), v.as_slice())
+                        .map_err(|e| format!("restore pq_keys tree insert failed: {e}"))?;
+                    installed += 1;
+                } else if k.len() == 34 && k[0] == b'h' && k[1] == b':' {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&k[2..]);
+                    if !valid_hashes.contains(&hash) || *blake3::hash(v).as_bytes() != hash {
+                        skipped += 1;
+                        tracing::debug!(
+                            hash = %hex::encode(hash),
+                            "restore_pq_keys: refusing orphan hash-lookup record"
+                        );
+                        continue;
+                    }
+                    tree.insert(k.as_slice(), v.as_slice())
+                        .map_err(|e| format!("restore pq_keys tree insert failed: {e}"))?;
+                    installed += 1;
+                } else {
+                    tree.insert(k.as_slice(), v.as_slice())
+                        .map_err(|e| format!("restore pq_keys tree insert failed: {e}"))?;
+                    installed += 1;
+                }
+            }
+            if skipped > 0 {
+                tracing::warn!(
+                    "restore_pq_keys: refused {skipped} invalid entries (installed {installed} valid)"
+                );
             }
             return Ok(());
         }
         let mut fb = self.pq_keys_fallback.write().unwrap();
-        for (k, v) in &pairs {
-            // Address records only (`a:` + 32B); hash-lookup (`h:`) and
-            // legacy/unknown shapes carry no address to index by.
-            if k.len() != 34 || k[0] != b'a' || k[1] != b':' {
-                continue;
-            }
-            let mut addr = [0u8; 32];
-            addr.copy_from_slice(&k[2..]);
-            let rec: Option<(crate::post_quantum::PqScheme, Vec<u8>)> = if let Ok((s, pk, _salt)) =
-                bincode::deserialize::<(crate::post_quantum::PqScheme, Vec<u8>, [u8; 16])>(v)
-            {
-                Some((s, pk))
-            } else if let Ok((s, pk)) =
-                bincode::deserialize::<(crate::post_quantum::PqScheme, Vec<u8>)>(v)
-            {
-                Some((s, pk))
-            } else {
-                None
-            };
-            if let Some((scheme, pk)) = rec {
-                fb.insert(addr, (scheme, pk));
-            }
+        let installed = valid.len() as u64;
+        for (addr, (scheme, pk, salt)) in valid {
+            fb.insert(addr, (scheme, pk, salt));
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                "restore_pq_keys: refused {skipped} invalid entries (fallback installed {installed} valid)"
+            );
         }
         Ok(())
     }
@@ -8278,17 +8616,13 @@ impl InMemoryStateEngine {
             .commitment_generation
             .load(std::sync::atomic::Ordering::Acquire);
         let snapshot = self.commitment_snapshot().await;
-        // §9 + §2 FOLD POINT (the unconditional twin of the one in
+        // §2 FOLD POINT (the unconditional twin of the one in
         // `commit_consensus_domains_if_stale`): same conditional domains, same
         // transient read guards, so both entry points commit byte-identical
         // digests for the same state.
-        let confidential = self.confidential.read().await.clone();
         let zkml_models = self.zkml_models.read().await.clone();
-        let digest = crate::commitment::commitment_digest_with_confidential_and_zkml(
-            &snapshot,
-            &confidential,
-            &zkml_models,
-        );
+        let digest =
+            crate::commitment::commitment_digest_with_zkml(&snapshot, &zkml_models);
         self.state_trie
             .write()
             .await
@@ -10721,42 +11055,6 @@ impl InMemoryStateEngine {
         Ok(())
     }
 
-    /// Serialize the committed shielded ledger for persistence (audit F-B).
-    ///
-    /// Own storage tree, exactly like session keys and the bridge domain: the
-    /// spent set and shielded balances are consensus state (they move the
-    /// root when non-empty), and a restart that dropped them would both
-    /// re-open spent commitments for double-spend AND compute a different
-    /// root than the network. Absent entry means "empty" (zero digest bytes).
-    pub async fn confidential_snapshot(&self) -> Vec<u8> {
-        bincode::serialize(&*self.confidential.read().await).unwrap_or_default()
-    }
-
-    /// Install a persisted shielded ledger (startup restore). Bumps the
-    /// commitment generation like every other domain install, so the restored
-    /// spent set is folded into the very next root read.
-    pub async fn restore_confidential(&self, bytes: &[u8]) -> Result<(), String> {
-        match bincode::deserialize::<crate::crypto_privacy::ConfidentialState>(bytes) {
-            Ok(state) => {
-                *self.confidential_write().await = state;
-                return Ok(());
-            }
-            Err(_) => {
-                // Pre-ownership snapshot (no `owned` map): upgrade instead of
-                // refusing to start. Pre-fix outputs are unattributed and
-                // therefore unspendable (frozen, not stealable) — see
-                // `ConfidentialStateV1`. LOUD, like the bridge upgrade.
-            }
-        }
-        let v1: crate::crypto_privacy::ConfidentialStateV1 = bincode::deserialize(bytes)
-            .map_err(|e| format!("restore confidential state failed: {e:?}"))?;
-        *self.confidential_write().await = v1.upgrade();
-        tracing::warn!(
-            "[confidential] restored pre-ownership V1 state: old shielded outputs are FROZEN (unspendable until migration); new outputs are fully owned"
-        );
-        Ok(())
-    }
-
     /// Serialize the committed zkML model registry for persistence (audit F-B).
     ///
     /// Same reasoning as above: registered models (and their VKs) are
@@ -12168,6 +12466,61 @@ mod tests {
     use crate::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope};
     use crate::sharding::Transaction;
 
+    /// FULL-PQ test helper: implicit Falcon-512 keypair for a seed, with the
+    /// key pre-registered globally (idempotent) for apply-path verification.
+    /// Returns (sender address, raw pubkey).
+    fn pq_pair(seed: u8) -> ([u8; 32], Vec<u8>) {
+        let pk = Transaction::sample_falcon512_pubkey(seed);
+        let salt = crate::post_quantum::DEFAULT_SALT;
+        let from = derive_pq_address(PqScheme::Falcon512, &pk, &salt);
+        Transaction::global_implicit_registry()
+            .register(from, PqScheme::Falcon512, &pk, &salt)
+            .expect("PQ test key must register");
+        (from, pk)
+    }
+
+    /// FULL-PQ replacement for `Transaction::sign` in tests: implicit
+    /// Falcon-512 envelope (NO activation surcharge, so fee/balance/nonce
+    /// assertions match the old classical fixtures exactly). Returns
+    /// (tx, sender address, raw pubkey).
+    fn pq_tx(
+        seed: u8,
+        to: [u8; 32],
+        amount: u64,
+        gas: u64,
+        nonce: u64,
+    ) -> (Transaction, [u8; 32], Vec<u8>) {
+        pq_tx_payload(seed, to, amount, gas, nonce, Vec::new())
+    }
+
+    /// FULL-PQ replacement for `Transaction::sign_with_payload` in tests.
+    fn pq_tx_payload(
+        seed: u8,
+        to: [u8; 32],
+        amount: u64,
+        gas: u64,
+        nonce: u64,
+        payload: Vec<crate::svm::OpCode>,
+    ) -> (Transaction, [u8; 32], Vec<u8>) {
+        let (from, pk) = pq_pair(seed);
+        let mut tx = Transaction {
+            from,
+            to,
+            amount,
+            gas_limit: gas,
+            nonce,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload,
+            priority_fee_per_gas: 0,
+        };
+        let msg = tx.signing_message();
+        let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+        tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+        (tx, from, pk)
+    }
+
     #[tokio::test]
     async fn test_dormant_account_activation_and_spend_pinned_pubkey() {
         let engine = InMemoryStateEngine::new();
@@ -12296,6 +12649,60 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn m03_restore_pq_keys_refuses_invalid_entries_fail_closed() {
+        // One valid address record plus two corrupt ones (wrong-address pin,
+        // hash-mismatched key): the corrupt entries are skipped (counted +
+        // logged) and the restore still installs the valid entry.
+        let scheme = PqScheme::Falcon512;
+        let seed = 0xE7;
+        let pk = Transaction::sample_falcon512_pubkey(seed);
+        let salt = [0x3Au8; 16];
+        let addr = derive_pq_address(scheme, &pk, &salt);
+        let engine = InMemoryStateEngine::new();
+        engine.credit_native(&addr, 10_000_000).await.unwrap();
+        engine
+            .pin_pubkey(addr, scheme, &pk, &salt)
+            .await
+            .unwrap();
+
+        let mut akey = Vec::with_capacity(34);
+        akey.extend_from_slice(b"a:");
+        akey.extend_from_slice(&addr);
+        let aval = bincode::serialize(&(scheme, pk.clone(), salt)).unwrap();
+        // Corrupt 1: the right key filed under the wrong address
+        // (derive(scheme,pk,salt) != address, and no leaf there either).
+        let wrong_addr = [0xBBu8; 32];
+        let mut bad_key = Vec::with_capacity(34);
+        bad_key.extend_from_slice(b"a:");
+        bad_key.extend_from_slice(&wrong_addr);
+        let bad_key_val = bincode::serialize(&(scheme, pk.clone(), salt)).unwrap();
+        // Corrupt 2: the right address bound to a different key
+        // (blake3(pk) != leaf pubkey_hash).
+        let other_pk = Transaction::sample_falcon512_pubkey(0xE8);
+        let bad_pk_val = bincode::serialize(&(scheme, other_pk, salt)).unwrap();
+        let blob = bincode::serialize(&vec![
+            (akey.clone(), aval),
+            (bad_key, bad_key_val),
+            (akey, bad_pk_val),
+        ])
+        .unwrap();
+        engine
+            .restore_pq_keys(&blob)
+            .await
+            .expect("invalid entries must not abort the restore");
+        assert_eq!(
+            engine.get_pinned_pubkey(&addr),
+            Some((scheme, pk)),
+            "valid entry installs"
+        );
+        assert_eq!(
+            engine.get_pinned_pubkey(&wrong_addr),
+            None,
+            "wrong-address entry refused"
+        );
     }
 
     #[tokio::test]
@@ -12736,8 +13143,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sec03_downtime_slash_with_falcon_uqc_and_bls() {
-        use crate::consensus::{QuorumCertificate, Vote, VoteKind};
+    async fn m03_custom_salt_restart_heal_implicit_verifies() {
+        // M-03 liveness regression: a non-default-salt account must recover
+        // across a restart. Origin pins with a custom salt; the restart
+        // heals from the accounts snapshot + the pq_keys blob, and the
+        // healed implicit registry (pinned salt, NOT DEFAULT_SALT) verifies
+        // an implicit-PQ transaction. Diskless (fallback) path throughout,
+        // so the salt survives only via the pinned record.
+        use crate::post_quantum::DEFAULT_SALT;
+        let scheme = PqScheme::Falcon512;
+        let seed = 0xE3;
+        let pk = Transaction::sample_falcon512_pubkey(seed);
+        let salt = [0x9Cu8; 16];
+        assert_ne!(salt, DEFAULT_SALT, "test needs a non-default salt");
+        let from = derive_pq_address(scheme, &pk, &salt);
+
+        let engine1 = InMemoryStateEngine::new();
+        engine1.credit_native(&from, 50_000_000).await.unwrap();
+        engine1
+            .pin_pubkey(from, scheme, &pk, &salt)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine1.get_pinned_pubkey_with_salt(&from),
+            Some((scheme, pk.clone(), salt)),
+            "fallback must persist the pinned salt"
+        );
+        let snap = engine1.create_snapshot().await;
+        let mut akey = Vec::with_capacity(34);
+        akey.extend_from_slice(b"a:");
+        akey.extend_from_slice(&from);
+        let aval = bincode::serialize(&(scheme, pk.clone(), salt)).unwrap();
+        let mut hkey = Vec::with_capacity(34);
+        hkey.extend_from_slice(b"h:");
+        hkey.extend_from_slice(blake3::hash(&pk).as_bytes());
+        let blob = bincode::serialize(&vec![(akey, aval), (hkey, pk.clone())]).unwrap();
+        drop(engine1);
+
+        // Restart: fresh diskless engine installs the snapshot + the blob.
+        let engine2 = InMemoryStateEngine::new();
+        engine2.restore_snapshot(&snap).await.unwrap();
+        engine2.restore_pq_keys(&blob).await.unwrap();
+        assert_eq!(
+            engine2.get_pinned_pubkey_with_salt(&from),
+            Some((scheme, pk.clone(), salt)),
+            "healing must recover the PINNED salt, not DEFAULT_SALT"
+        );
+
+        // An implicit-PQ transaction verifies against the healed state: the
+        // block path heals the global implicit registry from the pinned salt
+        // before verifying, so a custom-salt account stays live.
+        let mut tx = Transaction {
+            from,
+            to: [0x77u8; 32],
+            amount: 1_000,
+            gas_limit: 50_000,
+            nonce: 0,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        let msg = tx.signing_message();
+        let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+        tx.signature = PqSignatureEnvelope::new_implicit(scheme, sig).encode();
+        assert!(tx.is_pq_implicit());
+        let (applied, failed, _, _, _) = engine2.apply_block_parallel_fees(&[tx], 1000).await;
+        assert_eq!(
+            applied, 1,
+            "implicit-PQ tx on the healed custom-salt account must apply"
+        );
+        assert_eq!(failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_sec03_downtime_slash_with_falcon_uqc() {
+        use crate::consensus::{QuorumCertificate, VoteKind};
         use crate::staking::{DOWNTIME_MISS_THRESHOLD, MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
         use ed25519_dalek::SigningKey;
         use rand::rngs::OsRng;
@@ -12769,22 +13251,42 @@ mod tests {
         let vs = engine.staking_read().await.to_validator_set();
         assert_eq!(vs.len(), 4);
 
-        // Genuine classical QC: honest + members 2,3 sign; offline misses.
+        // Genuine Falcon QC: honest + members 2,3 sign; offline misses.
+        // FULL-PQ (mirrors `sync::tests::pq_cert_for`): a classical
+        // `Vote::sign` QC no longer verifies, so the quorum is compiled from
+        // genuine Falcon votes into a µQC (Ed list for power + Falcon
+        // envelope for crypto) — the only form `QuorumCertificate::verify`
+        // accepts. The parent is the zero hash (no chain parent in this unit
+        // shape); the offline member (ids[1]) never signs, exactly as before.
+        let fks: Vec<crate::post_quantum::FalconKeypair> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xA0 + i as u8);
+                crate::consensus::register_validator_pq_key(
+                    k.verifying_key().to_bytes(),
+                    crate::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                );
+                fk
+            })
+            .collect();
         let qc_without_offline = || {
-            let sigs: Vec<([u8; 32], Vec<u8>)> = [0usize, 2, 3]
-                .iter()
-                .map(|&i| {
-                    let v = Vote::sign(&keys[i], 1, 0, VoteKind::Precommit, Some([0xAA; 32]));
-                    (v.voter, v.signature)
-                })
-                .collect();
-            QuorumCertificate {
-                height: 1,
-                round: 0,
-                kind: VoteKind::Precommit,
-                block_hash: Some([0xAA; 32]),
-                signatures: sigs,
+            let mut set = crate::consensus::VoteSet::new();
+            for &i in &[0usize, 2, 3] {
+                let v = crate::consensus::Vote::sign_with_falcon(
+                    &keys[i],
+                    &fks[i],
+                    1,
+                    0,
+                    VoteKind::Precommit,
+                    Some([0xAA; 32]),
+                );
+                set.add(v, &vs, 1, 0, VoteKind::Precommit)
+                    .expect("falcon vote must ingest");
             }
+            set.certificate_with_parent(Some([0xAA; 32]), &vs, Some(&[0u8; 32]))
+                .expect("quorum must compile a Falcon µQC")
         };
         assert!(
             qc_without_offline().verify(&vs),
@@ -12827,22 +13329,24 @@ mod tests {
         }
 
         // 2. Offline member comes back online and signs a genuine QC: the
-        // streak is forgiven (missed resets to 0).
+        // streak is forgiven (missed resets to 0). Same FULL-PQ µQC shape,
+        // now WITH the returning member (ids[1]) signing.
         let qc_with_offline = {
-            let sigs: Vec<([u8; 32], Vec<u8>)> = [1usize, 2, 3]
-                .iter()
-                .map(|&i| {
-                    let v = Vote::sign(&keys[i], 20, 0, VoteKind::Precommit, Some([0xBB; 32]));
-                    (v.voter, v.signature)
-                })
-                .collect();
-            QuorumCertificate {
-                height: 20,
-                round: 0,
-                kind: VoteKind::Precommit,
-                block_hash: Some([0xBB; 32]),
-                signatures: sigs,
+            let mut set = crate::consensus::VoteSet::new();
+            for &i in &[1usize, 2, 3] {
+                let v = crate::consensus::Vote::sign_with_falcon(
+                    &keys[i],
+                    &fks[i],
+                    20,
+                    0,
+                    VoteKind::Precommit,
+                    Some([0xBB; 32]),
+                );
+                set.add(v, &vs, 20, 0, VoteKind::Precommit)
+                    .expect("falcon vote must ingest");
             }
+            set.certificate_with_parent(Some([0xBB; 32]), &vs, Some(&[0u8; 32]))
+                .expect("quorum must compile a Falcon µQC")
         };
         assert!(
             qc_with_offline.verify(&vs),
@@ -12869,10 +13373,6 @@ mod tests {
             signatures: vec![
                 (
                     crate::consensus::PQ_UQC_MARKER_ID,
-                    b"garbage-not-an-envelope".to_vec(),
-                ),
-                (
-                    crate::consensus::BLS_QC_MARKER_ID,
                     b"garbage-not-an-envelope".to_vec(),
                 ),
                 (honest_id, vec![0x77u8; 64]),
@@ -12906,8 +13406,10 @@ mod tests {
         use rand::rngs::OsRng;
 
         let engine = InMemoryStateEngine::new();
-        let alice = SigningKey::generate(&mut OsRng);
-        let alice_addr = alice.verifying_key().to_bytes();
+        // FULL-PQ: transaction signers are Falcon-512 (implicit,
+        // pre-registered, no surcharge). The block proposer key stays
+        // classical: block-signature verification is outside tx admission.
+        let (alice_addr, _alice_pk) = pq_pair(0xA1);
         let recipient = [0x55u8; 32];
         let proposer = SigningKey::generate(&mut OsRng);
         let proposer_addr = proposer.verifying_key().to_bytes();
@@ -12922,14 +13424,12 @@ mod tests {
         // Admitted because sender covers amount (0) + gas_limit (50_000).
         // Fails at execution because 100 gas cannot run a 280k basic transfer opcode.
         let gas_limit = 50_000u64;
-        let fail_tx = Transaction::sign_with_payload(
-            &alice,
+        let (fail_tx, _, _) = pq_tx_payload(
+            0xA1,
             recipient,
             0,
             gas_limit,
             0,
-            1,
-            1,
             vec![OpCode::Transfer {
                 recipient: [0xCC; 32],
                 amount: 1,
@@ -12996,22 +13496,20 @@ mod tests {
         // 5. Test sender whose balance drops below fee during execution:
         // Tx1 spends balance, Tx2 was admitted but now cannot cover the full fee.
         // Balance saturates to 0, nonce increments, and actual fee_charged equals debited amount.
-        let alice_drain = SigningKey::generate(&mut OsRng);
-        let alice_drain_addr = alice_drain.verifying_key().to_bytes();
+        let alice_drain_seed = 0xA2u8;
+        let (alice_drain_addr, _alice_drain_pk) = pq_pair(alice_drain_seed);
         let bob_addr = [0xB0; 32];
         engine
             .credit_native(&alice_drain_addr, 1_200_000)
             .await
             .unwrap();
 
-        let tx_drain = Transaction::sign_with_payload(
-            &alice_drain,
+        let (tx_drain, _, _) = pq_tx_payload(
+            alice_drain_seed,
             recipient,
             0,
             500_000,
             0,
-            1,
-            1,
             vec![OpCode::Transfer {
                 recipient: bob_addr,
                 amount: 600_000,
@@ -13019,13 +13517,11 @@ mod tests {
         );
         // Tx2 is admitted against simulated remainder (1.2M - 500k = 700k >= 200k),
         // but at execution time Tx1 left only 100k balance.
-        let tx_broke = Transaction::sign_with_payload(
-            &alice_drain,
+        let (tx_broke, _, _) = pq_tx_payload(
+            alice_drain_seed,
             recipient,
             0,
             200_000,
-            1,
-            1,
             1,
             vec![OpCode::Transfer {
                 recipient: [0xCC; 32],
@@ -13099,8 +13595,8 @@ mod tests {
     #[tokio::test]
     async fn test_block_execution_collects_contract_events() {
         let engine = InMemoryStateEngine::new();
-        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let from = sk.verifying_key().to_bytes();
+        let sk_seed = 0xA3u8;
+        let (from, _pk) = pq_pair(sk_seed);
         engine
             .update_account(AccountState::new(from, 10_000_000))
             .await;
@@ -13116,14 +13612,12 @@ mod tests {
 
         let contract_addr = engine.deploy_contract(from, code, 100).await.unwrap();
 
-        let tx = Transaction::sign_with_payload(
-            &sk,
+        let (tx, _, _) = pq_tx_payload(
+            sk_seed,
             contract_addr,
             0,
             500_000,
             0,
-            1,
-            1,
             vec![crate::svm::OpCode::SysCallCallContract {
                 contract: contract_addr,
                 method: b"emit_val".to_vec(),
@@ -13172,30 +13666,28 @@ mod tests {
     /// path were order-dependent, one of these 20 runs would drift.
     #[tokio::test]
     async fn test_parallel_wave_execution_is_deterministic() {
-        use rand::rngs::StdRng;
-        use rand::SeedableRng;
-
         // At least `PARALLEL_WAVE_MIN_TX` senders, so the wave really takes
         // the CONCURRENT path.
         const SENDERS: usize = 48;
 
-        let mut rng = StdRng::seed_from_u64(0x5EED_5EED_5EED_5EED);
-        let keys: Vec<ed25519_dalek::SigningKey> = (0..SENDERS)
-            .map(|_| ed25519_dalek::SigningKey::generate(&mut rng))
-            .collect();
+        // FULL-PQ: senders are Falcon-512 seeds (distinct per sender);
+        // recipients are deterministic addresses (they never sign).
+        let seeds: Vec<u8> = (0..SENDERS).map(|i| (0x20 + i) as u8).collect();
         let recipients: Vec<[u8; 32]> = (0..SENDERS)
-            .map(|_| {
-                ed25519_dalek::SigningKey::generate(&mut rng)
-                    .verifying_key()
-                    .to_bytes()
+            .map(|i| {
+                let mut b = [0xEu8; 32];
+                b[0..8].copy_from_slice(
+                    &(0x9E00_0000_0000_0000u64.wrapping_add(i as u64)).to_be_bytes(),
+                );
+                b
             })
             .collect();
 
-        let txs: Vec<Transaction> = keys
+        let txs: Vec<Transaction> = seeds
             .iter()
             .zip(recipients.iter())
             .enumerate()
-            .map(|(i, (k, to))| Transaction::sign(k, *to, 100 + i as u64, 10, 0, 1, 1))
+            .map(|(i, (s, to))| pq_tx(*s, *to, 100 + i as u64, 10, 0).0)
             .collect();
 
         // The fixture must really be ONE wave, otherwise the concurrent path
@@ -13207,8 +13699,8 @@ mod tests {
         let mut roots: Vec<crate::cell::CellHash> = Vec::new();
         for run in 0..20u32 {
             let engine = InMemoryStateEngine::new().with_parallel_exec(true);
-            for k in &keys {
-                let addr = k.verifying_key().to_bytes();
+            for s in &seeds {
+                let (addr, _) = pq_pair(*s);
                 engine
                     .update_account(AccountState::new(addr, 1_000_000))
                     .await;
@@ -13236,30 +13728,27 @@ mod tests {
     /// order the plans were computed or applied in.
     #[tokio::test]
     async fn test_parallel_wave_order_independence() {
-        use rand::rngs::StdRng;
-        use rand::SeedableRng;
-
-        // At least `PARALLEL_WAVE_MIN_TX` senders, so the wave really takes
+        // At least `PARALLEL_WAVE_MIN_TX` senders, so the waves really take
         // the CONCURRENT path.
         const SENDERS: usize = 40;
 
-        let mut rng = StdRng::seed_from_u64(0xBEEF_BEEF_BEEF_BEEF);
-        let keys: Vec<ed25519_dalek::SigningKey> = (0..SENDERS)
-            .map(|_| ed25519_dalek::SigningKey::generate(&mut rng))
-            .collect();
+        // FULL-PQ: senders are Falcon-512 seeds (distinct per sender).
+        let seeds: Vec<u8> = (0..SENDERS).map(|i| (0x40 + i) as u8).collect();
         let recipients: Vec<[u8; 32]> = (0..SENDERS)
-            .map(|_| {
-                ed25519_dalek::SigningKey::generate(&mut rng)
-                    .verifying_key()
-                    .to_bytes()
+            .map(|i| {
+                let mut b = [0xEBu8; 32];
+                b[0..8].copy_from_slice(
+                    &(0xBE00_0000_0000_0000u64.wrapping_add(i as u64)).to_be_bytes(),
+                );
+                b
             })
             .collect();
 
-        let base: Vec<Transaction> = keys
+        let base: Vec<Transaction> = seeds
             .iter()
             .zip(recipients.iter())
             .enumerate()
-            .map(|(i, (k, to))| Transaction::sign(k, *to, 7 + i as u64, 10, 0, 1, 1))
+            .map(|(i, (s, to))| pq_tx(*s, *to, 7 + i as u64, 10, 0).0)
             .collect();
 
         let mut roots: Vec<crate::cell::CellHash> = Vec::new();
@@ -13272,8 +13761,8 @@ mod tests {
             }
 
             let engine = InMemoryStateEngine::new().with_parallel_exec(true);
-            for k in &keys {
-                let addr = k.verifying_key().to_bytes();
+            for s in &seeds {
+                let (addr, _) = pq_pair(*s);
                 engine
                     .update_account(AccountState::new(addr, 1_000_000))
                     .await;
@@ -13295,20 +13784,17 @@ mod tests {
     /// BIT for bit - same statuses, same fees, same state root.
     #[tokio::test]
     async fn test_concurrent_wave_matches_sequential_path() {
-        use rand::rngs::StdRng;
-        use rand::SeedableRng;
-
-        let mut rng = StdRng::seed_from_u64(0x0BAD_C0DE_0BAD_C0DE);
         // At least `PARALLEL_WAVE_MIN_TX` senders per wave, so the waves
         // really take the CONCURRENT path.
-        let keys: Vec<ed25519_dalek::SigningKey> = (0..40)
-            .map(|_| ed25519_dalek::SigningKey::generate(&mut rng))
-            .collect();
+        // FULL-PQ: senders are Falcon-512 seeds (distinct per sender).
+        let seeds: Vec<u8> = (0..40).map(|i| (0x60 + i) as u8).collect();
         let recipients: Vec<[u8; 32]> = (0..40)
-            .map(|_| {
-                ed25519_dalek::SigningKey::generate(&mut rng)
-                    .verifying_key()
-                    .to_bytes()
+            .map(|i| {
+                let mut b = [0xECu8; 32];
+                b[0..8].copy_from_slice(
+                    &(0xC000_0000_0000_0000u64.wrapping_add(i as u64)).to_be_bytes(),
+                );
+                b
             })
             .collect();
 
@@ -13316,28 +13802,21 @@ mod tests {
         // (same sender), so the block schedules into several waves.
         let mut txs: Vec<Transaction> = Vec::new();
         for nonce in 0..2u64 {
-            for (i, k) in keys.iter().enumerate() {
-                txs.push(Transaction::sign(
-                    k,
-                    recipients[i],
-                    50 + nonce * 10 + i as u64,
-                    10,
-                    nonce,
-                    1,
-                    1,
-                ));
+            for (i, s) in seeds.iter().enumerate() {
+                txs.push(
+                    pq_tx(*s, recipients[i], 50 + nonce * 10 + i as u64, 10, nonce).0,
+                );
             }
         }
         // A transaction that cannot pay: it must fail on BOTH paths, with
         // the same F-01 failure fee.
-        let broke = ed25519_dalek::SigningKey::generate(&mut rng);
-        txs.push(Transaction::sign(&broke, recipients[0], 1, 10, 0, 1, 1));
+        txs.push(pq_tx(0x7F, recipients[0], 1, 10, 0).0);
 
         let seq = InMemoryStateEngine::new().with_parallel_exec(false);
         let par = InMemoryStateEngine::new().with_parallel_exec(true);
         for engine in [&seq, &par] {
-            for k in &keys {
-                let addr = k.verifying_key().to_bytes();
+            for s in &seeds {
+                let (addr, _) = pq_pair(*s);
                 engine
                     .update_account(AccountState::new(addr, 1_000_000))
                     .await;
@@ -13364,8 +13843,6 @@ mod tests {
     #[tokio::test]
     async fn test_distinct_tokens_share_a_wave_and_match_sequential() {
         use crate::token::{TokenMetadata, TokenOp, ZERO_ADDRESS};
-        use rand::rngs::StdRng;
-        use rand::SeedableRng;
 
         fn meta(name: &str, symbol: &str) -> TokenMetadata {
             TokenMetadata {
@@ -13380,21 +13857,13 @@ mod tests {
             }
         }
 
-        let mut rng = StdRng::seed_from_u64(0xC0FF_EEC0_FFEE_0001);
-        let minter = ed25519_dalek::SigningKey::generate(&mut rng);
-        let user_a = ed25519_dalek::SigningKey::generate(&mut rng);
-        let user_b = ed25519_dalek::SigningKey::generate(&mut rng);
-        let (minter_addr, a_addr, b_addr) = (
-            minter.verifying_key().to_bytes(),
-            user_a.verifying_key().to_bytes(),
-            user_b.verifying_key().to_bytes(),
-        );
-        let recipient_a = ed25519_dalek::SigningKey::generate(&mut rng)
-            .verifying_key()
-            .to_bytes();
-        let recipient_b = ed25519_dalek::SigningKey::generate(&mut rng)
-            .verifying_key()
-            .to_bytes();
+        // FULL-PQ: token actors are Falcon-512 seeds (recipients are fixed
+        // addresses; they never sign).
+        let (minter_addr, _minter_pk) = pq_pair(0x80);
+        let (a_addr, _a_pk) = pq_pair(0x81);
+        let (b_addr, _b_pk) = pq_pair(0x82);
+        let recipient_a = [0xEAu8; 32];
+        let recipient_b = [0xEEu8; 32];
 
         let seq = InMemoryStateEngine::new().with_parallel_exec(false);
         let par = InMemoryStateEngine::new().with_parallel_exec(true);
@@ -13450,36 +13919,31 @@ mod tests {
 
         // One transfer per token: with the per-resource keys these two
         // transactions are DISJOINT and land in the SAME wave.
-        let txs = vec![
-            Transaction::sign_with_payload(
-                &user_a,
-                recipient_a,
-                0,
-                500_000,
-                0,
-                1,
-                1,
-                vec![crate::svm::OpCode::SysCallTokenTransfer {
-                    token_id: token_1,
-                    to: recipient_a,
-                    amount: 5_000,
-                }],
-            ),
-            Transaction::sign_with_payload(
-                &user_b,
-                recipient_b,
-                0,
-                500_000,
-                0,
-                1,
-                1,
-                vec![crate::svm::OpCode::SysCallTokenTransfer {
-                    token_id: token_2,
-                    to: recipient_b,
-                    amount: 4_000,
-                }],
-            ),
-        ];
+        let (tx_a, _, _) = pq_tx_payload(
+            0x81,
+            recipient_a,
+            0,
+            500_000,
+            0,
+            vec![crate::svm::OpCode::SysCallTokenTransfer {
+                token_id: token_1,
+                to: recipient_a,
+                amount: 5_000,
+            }],
+        );
+        let (tx_b, _, _) = pq_tx_payload(
+            0x82,
+            recipient_b,
+            0,
+            500_000,
+            0,
+            vec![crate::svm::OpCode::SysCallTokenTransfer {
+                token_id: token_2,
+                to: recipient_b,
+                amount: 4_000,
+            }],
+        );
+        let txs = vec![tx_a, tx_b];
 
         let waves = crate::parallel_exec::DisjointScheduler::schedule(&txs);
         assert_eq!(waves.len(), 1, "two different tokens must share one wave");
@@ -13519,11 +13983,11 @@ mod tests {
     /// * and the SINGLE-TX path and the BLOCK path agree on all of it.
     #[tokio::test]
     async fn failure_fee_contract_is_identical_on_both_paths() {
-        use ed25519_dalek::SigningKey;
-
+        // FULL-PQ: implicit Falcon-512 (no surcharge, so the fee assertions
+        // match the old classical fixtures exactly).
         const FLOOR: u64 = 100_000;
-        let sk = SigningKey::from_bytes(&[0x21; 32]);
-        let from = sk.verifying_key().to_bytes();
+        let fee_seed = 0x21u8;
+        let (from, _fee_pk) = pq_pair(fee_seed);
 
         // 1. An AFFORDABLE failure: the fee is charged, the nonce advances.
         {
@@ -13532,14 +13996,12 @@ mod tests {
                 .update_account(AccountState::new(from, 1_000_000))
                 .await;
             // A payload that reverts (the token does not exist).
-            let tx = Transaction::sign_with_payload(
-                &sk,
+            let (tx, _, _) = pq_tx_payload(
+                fee_seed,
                 [0x44; 32],
                 0,
                 200_000,
                 0,
-                1,
-                1,
                 vec![crate::svm::OpCode::SysCallTokenTransfer {
                     token_id: [0xAB; 32],
                     to: [0x44; 32],
@@ -13560,14 +14022,12 @@ mod tests {
             let engine = InMemoryStateEngine::new();
             // Only 1_000 left against a 200_000 declared fee.
             engine.update_account(AccountState::new(from, 1_000)).await;
-            let tx = Transaction::sign_with_payload(
-                &sk,
+            let (tx, _, _) = pq_tx_payload(
+                fee_seed,
                 [0x44; 32],
                 0,
                 200_000,
                 0,
-                1,
-                1,
                 vec![crate::svm::OpCode::SysCallTokenTransfer {
                     token_id: [0xAB; 32],
                     to: [0x44; 32],
@@ -13589,14 +14049,12 @@ mod tests {
             engine
                 .update_account(AccountState::new(from, 1_000_000))
                 .await;
-            let tx = Transaction::sign_with_payload(
-                &sk,
+            let (tx, _, _) = pq_tx_payload(
+                fee_seed,
                 [0x44; 32],
                 0,
                 200_000,
                 0,
-                1,
-                1,
                 vec![crate::svm::OpCode::SysCallTokenTransfer {
                     token_id: [0xAB; 32],
                     to: [0x44; 32],
@@ -13623,14 +14081,20 @@ mod tests {
 
         // 4. The SINGLE-TX path and the BLOCK path agree on a failing
         //    transaction (the equivalence the project pins in
-        //    tests/live_block_path_tests.rs).
+        //    `tests/live_block_path_tests.rs`).
         {
-            let payload = vec![crate::svm::OpCode::SysCallTokenTransfer {
-                token_id: [0xAB; 32],
-                to: [0x44; 32],
-                amount: 1,
-            }];
-            let tx = Transaction::sign_with_payload(&sk, [0x44; 32], 0, 200_000, 0, 1, 1, payload);
+            let (tx, _, _) = pq_tx_payload(
+                fee_seed,
+                [0x44; 32],
+                0,
+                200_000,
+                0,
+                vec![crate::svm::OpCode::SysCallTokenTransfer {
+                    token_id: [0xAB; 32],
+                    to: [0x44; 32],
+                    amount: 1,
+                }],
+            );
             let single = InMemoryStateEngine::new();
             let block = InMemoryStateEngine::new();
             single
@@ -13675,25 +14139,22 @@ mod tests {
     /// exotic than a restart or a snapshot sync).
     #[tokio::test]
     async fn snapshot_carries_the_d2_penalty_so_a_restored_node_agrees() {
-        use ed25519_dalek::SigningKey;
-
+        // FULL-PQ: implicit Falcon-512 (no surcharge).
         let engine = InMemoryStateEngine::new();
-        let alice = SigningKey::from_bytes(&[5u8; 32]);
-        let alice_addr = alice.verifying_key().to_bytes();
+        let penalty_seed = 0x91u8;
+        let (alice_addr, _alice_pk) = pq_pair(penalty_seed);
         engine
             .update_account(AccountState::new(alice_addr, 10_000_000))
             .await;
 
         // A transaction that fails at execution records the failure (the D2
         // mirror), which is what raises the sender's floor.
-        let fail = Transaction::sign_with_payload(
-            &alice,
+        let (fail, _, _) = pq_tx_payload(
+            penalty_seed,
             [0x77; 32],
             0,
             50_000,
             0,
-            1,
-            1,
             vec![crate::svm::OpCode::Transfer {
                 recipient: [0xCC; 32],
                 amount: 1,
@@ -13808,21 +14269,15 @@ mod tests {
     /// exercised the optimistic path at all.
     #[tokio::test]
     async fn parallel_wave_matches_sequential_for_randomized_blocks() {
-        use ed25519_dalek::SigningKey;
-
         for round in 0..8u64 {
             let mut rng = WaveRng(0x9E37_79B9_7F4A_7C15 ^ round.wrapping_mul(0x1234_5678));
             // 40 senders -> one wave of 40 disjoint plain transfers, above the
             // concurrent threshold.
+            // FULL-PQ: senders are Falcon-512 seeds (distinct per index within
+            // the round); recipients stay rng-derived addresses (never sign).
             let n_senders = 40usize + (rng.below(10) as usize);
-            let senders: Vec<SigningKey> = (0..n_senders)
-                .map(|_| {
-                    SigningKey::from_bytes(&{
-                        let mut b = [0u8; 32];
-                        b[..8].copy_from_slice(&rng.next().to_le_bytes());
-                        b
-                    })
-                })
+            let seeds: Vec<u8> = (0..n_senders)
+                .map(|i| ((round as usize * 64 + i) % 256) as u8)
                 .collect();
             let recipients: Vec<[u8; 32]> = (0..n_senders)
                 .map(|_| {
@@ -13838,8 +14293,8 @@ mod tests {
             par.set_parallel_exec(true);
 
             const BAL: u64 = 10_000_000;
-            for sk in &senders {
-                let addr = sk.verifying_key().to_bytes();
+            for s in &seeds {
+                let (addr, _) = pq_pair(*s);
                 seq.update_account(AccountState::new(addr, BAL)).await;
                 par.update_account(AccountState::new(addr, BAL)).await;
             }
@@ -13850,20 +14305,19 @@ mod tests {
             // deliberately unaffordable (they must fail identically on both
             // paths - and pay the same failure fee).
             let mut txs = Vec::with_capacity(n_senders);
-            for i in 0..n_senders {
-                let sk = &senders[i];
+            for (i, s) in seeds.iter().enumerate() {
+                let (self_addr, _) = pq_pair(*s);
                 let amount = 1 + rng.below(1_000);
                 let to = match rng.below(10) {
-                    0 => sk.verifying_key().to_bytes(),
+                    0 => self_addr,
                     _ => recipients[i],
                 };
                 let gas = 10 + rng.below(100);
-                txs.push(Transaction::sign(sk, to, amount, gas, 0, 1, 1));
+                txs.push(pq_tx(*s, to, amount, gas, 0).0);
             }
             // One transaction that cannot be afforded: it must fail on both
             // paths, pay the SAME failure fee and consume the SAME nonce.
-            let broke = Transaction::sign(&senders[0], recipients[0], u64::MAX / 2, 10, 1, 1, 1);
-            txs.push(broke);
+            txs.push(pq_tx(seeds[0], recipients[0], u64::MAX / 2, 10, 1).0);
 
             // The concurrent path is only taken for a wave of at least
             // `PARALLEL_WAVE_MIN_TX` plain transactions - assert the shape
@@ -13898,8 +14352,8 @@ mod tests {
             );
 
             // Every account must end in exactly the same state.
-            for sk in &senders {
-                let addr = sk.verifying_key().to_bytes();
+            for s in &seeds {
+                let (addr, _) = pq_pair(*s);
                 let a = seq.get_account(&addr).await;
                 let b = par.get_account(&addr).await;
                 assert_eq!(
@@ -14248,9 +14702,8 @@ mod tests {
     /// pre-TAIL-1 code path, kept as the differential oracle).
     async fn reference_digest(engine: &InMemoryStateEngine) -> [u8; 32] {
         let snap = engine.commitment_snapshot().await;
-        let confidential = engine.confidential.read().await.clone();
         let zkml = engine.zkml_models.read().await.clone();
-        crate::commitment::commitment_digest_with_confidential_and_zkml(&snap, &confidential, &zkml)
+        crate::commitment::commitment_digest_with_zkml(&snap, &zkml)
     }
 
     /// The digest the engine actually folded into the trie (the live path).
@@ -14498,7 +14951,7 @@ mod tests {
             committed_trie_digest(&engine).await,
             reference_digest(&engine).await
         );
-        // Cross-shard + xpc + zkml + confidential touch.
+        // Cross-shard + xpc + zkml touch.
         engine
             .cross_shard_completed
             .write()
@@ -14545,7 +14998,7 @@ mod tests {
             misses, 1,
             "exactly the staking domain rebuilds, got {misses}"
         );
-        assert_eq!(hits, 13, "every other domain must be a hit, got {hits}");
+        assert_eq!(hits, 12, "every other domain must be a hit, got {hits}");
         // Steady state: the global generation skip serves the read; the
         // per-domain cache is not even consulted.
         reset_cache_stats(&engine);

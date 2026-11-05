@@ -37,16 +37,14 @@ fn test_rpc_state() -> Arc<RpcState> {
     })
 }
 
-/// F1 (P0): `stell_shieldedBalance` accepts an UNBOUNDED `payloads` array.
-/// Every entry forces hex parsing + an X25519 DH + KDF + Pedersen commit +
-/// nullifier lookup on an UNAUTHENTICATED read. Contrast: `stell_getProof`
-/// caps `storage_keys` at 32 (`MAX_PROOF_STORAGE_KEYS`), `unshield` caps
-/// inputs at 64 (`MAX_UNSHIELD_INPUTS_PER_TX`). This arm has no cap.
+/// F1 (P0): `stell_shieldedBalance` was removed with the shielded protocol
+/// (Ristretto deletion wave: confidential sled tree + GAS_CONFIDENTIAL_*
+/// consts deleted, no migration — fresh genesis writes nothing confidential).
+/// Any call must fail closed as an unknown method, so no payload array —
+/// bounded or not — can reach decrypt work on an unauthenticated read.
 #[tokio::test]
 async fn poc_shielded_balance_cap_refuses_over_cap() {
     let engine = InMemoryStateEngine::new();
-    // Well-formed-shaped payloads with random bytes: parse succeeds, so each
-    // one burns the full decrypt attempt (DH + open) before failing.
     const N: usize = 2500;
     let mut payloads = Vec::with_capacity(N);
     for i in 0..N as u32 {
@@ -65,19 +63,26 @@ async fn poc_shielded_balance_cap_refuses_over_cap() {
         "payloads": payloads,
     });
     let out = native_api::dispatch(&engine, "stell_shieldedBalance", &params).await;
-    // FIXED (audit F1): over-cap scans are refused fail-closed (-32602).
-    assert!(out.is_err(), "2500 payloads must exceed the scan cap");
-    // Boundary: exactly the cap still scans.
-    let params_ok = json!({
+    // REMOVED: the method no longer exists (unknown-method, never a scan).
+    assert!(
+        matches!(
+            out,
+            Err(stellereum::native_api::NativeApiError::UnknownMethod(_))
+        ),
+        "shieldedBalance must be an unknown method, got: {out:?}"
+    );
+    // Boundary: even a single payload is refused the same way (no cap path).
+    let params_one = json!({
         "viewing_key": "07".repeat(32),
-        "payloads": payloads[..stellereum::svm::MAX_SHIELDED_SCAN_PAYLOADS].to_vec(),
+        "payloads": payloads[..1].to_vec(),
     });
-    let out_ok = native_api::dispatch(&engine, "stell_shieldedBalance", &params_ok)
-        .await
-        .expect("at-cap scan must succeed");
-    assert_eq!(
-        out_ok["coin_count"],
-        json!(stellereum::svm::MAX_SHIELDED_SCAN_PAYLOADS as u64)
+    let out_one = native_api::dispatch(&engine, "stell_shieldedBalance", &params_one).await;
+    assert!(
+        matches!(
+            out_one,
+            Err(stellereum::native_api::NativeApiError::UnknownMethod(_))
+        ),
+        "shieldedBalance must stay unknown for any payload count, got: {out_one:?}"
     );
 }
 

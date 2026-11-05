@@ -10,12 +10,12 @@
 //!
 //! Design notes (per passport):
 //!  - No global locks; the engine is a pure state machine, driven by votes.
-//!  - Votes are individually Ed25519-signed and verified on ingestion.
+//!  - Votes are individually Falcon-512-signed and verified on ingestion (FULL-PQ).
 //!  - Equivocation (two different votes by one validator at the same height/round/
 //!    kind) is recorded as evidence for slashing.
 //!  - The engine is height-scoped; `ConsensusDriver` pipelines heights.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -193,107 +193,6 @@ pub const ROUND_LOOKBACK: Round = 8;
 /// light clients -- inherits it without each remembering to check first.
 pub const MAX_COMMIT_CERT_SIGNERS: usize = 4_096;
 
-// ============================================================================
-// BLS aggregate envelopes (RETIRED emit; inert history metadata — see bls.rs)
-// ============================================================================
-
-// REMOVED (BLS vote-envelope emit): `VOTE_BLS_MAGIC` (`b"STELL_VOTEBLS_V1"`) and
-// `VOTE_BLS_PART_LEN` lived here. No live writer remains (proven by grep: the
-// only producer `attach_vote_bls` was deleted with the counting path; assembly
-// copies only `ed25519_signature()` into certificates, so stored history never
-// carries vote-level BLS envelopes). The strip branches in
-// `ed25519_sig_bytes` / `attach_vote_falcon` are straight-lined to the live
-// Falcon (v2) envelope below. CLOSED TESTNET: no wire compat needed.
-
-/// Marker "validator id" for the BLS aggregate envelope entry carried inside
-/// `QuorumCertificate::signatures` (RETIRED emit; inert history-parse key).
-///
-/// `[0xFF; 32]` as an unmintable sentinel: a verifier that predates this
-/// format skips the entry through the SAME membership check every other entry
-/// faces — `power_of(marker)` is 0 for any validator set that does not
-/// deliberately contain it, so control returns before any signature parse,
-/// exactly like any other non-member id. That is what keeps the certificate's
-/// bincode layout IDENTICAL to the pre-BLS format while carrying the
-/// aggregate: old bytes decode under new code, new bytes decode under old
-/// code, and old code fails closed on a certificate whose only power is the
-/// aggregate (its Ed25519 list is then short, and the marker counts for
-/// nothing).
-pub const BLS_QC_MARKER_ID: ValidatorId = [0xFF; 32];
-/// Magic prefix of a certificate's BLS envelope payload (v1 HISTORY reader).
-///
-/// Kept for [`decode_qc_bls_envelope`] only: the EMIT side
-/// ([`encode_qc_bls_envelope`]) is retired and returns empty. Storage v1
-/// readers stay (history compat, no wipe needed).
-pub const QC_BLS_MAGIC: &[u8; 16] = b"STELL_QC_BLS_V1_";
-
-/// Encode a BLS aggregate as the payload of the marker entry (RETIRED emit).
-///
-/// Always returns empty: no live path attaches BLS envelopes (proven by grep:
-/// the only assembly call site was deleted with the counting path; the only
-/// remaining callers are test READ fixtures, which hand-build history bytes).
-/// CLOSED TESTNET: no wire compat needed on EMIT. The PARSE side
-/// ([`decode_qc_bls_envelope`]) is untouched (storage v1 readers stay).
-pub fn encode_qc_bls_envelope(
-    _aggregate: &crate::bls::BlsAggregateSignature,
-    _height: Height,
-    _round: Round,
-    _kind: VoteKind,
-    _block_hash: Option<BlockHash>,
-) -> Vec<u8> {
-    Vec::new()
-}
-
-/// Decode a marker-entry payload. Returns `None` on ANY malformed input —
-/// wrong magic, truncated fields, impossible validator count, bitvector length
-/// mismatch — so a garbage envelope simply falls through to the Ed25519 list.
-/// A nil target is encoded as an all-zero hash; the caller compares the raw
-/// hash against its own `block_hash.unwrap_or([0; 32])`.
-pub fn decode_qc_bls_envelope(
-    payload: &[u8],
-) -> Option<(
-    Height,
-    Round,
-    VoteKind,
-    BlockHash,
-    crate::bls::BlsAggregateSignature,
-)> {
-    const HEADER: usize = 16 + 8 + 4 + 1 + 32 + 4 + 96;
-    if payload.len() < HEADER || &payload[..16] != QC_BLS_MAGIC {
-        return None;
-    }
-    let height = u64::from_le_bytes(payload[16..24].try_into().ok()?);
-    let round = u32::from_le_bytes(payload[24..28].try_into().ok()?);
-    let kind = match payload[28] {
-        0 => VoteKind::Prevote,
-        1 => VoteKind::Precommit,
-        _ => return None,
-    };
-    let block_hash: BlockHash = payload[29..61].try_into().ok()?;
-    let total = u32::from_le_bytes(payload[61..65].try_into().ok()?) as usize;
-    // A certificate cannot name more signers than the DoS cap allows, and a
-    // zero-validator set can never verify — reject both here.
-    if total == 0 || total > MAX_COMMIT_CERT_SIGNERS {
-        return None;
-    }
-    let sig_bytes: [u8; 96] = payload[65..161].try_into().ok()?;
-    let bitlen = total.div_ceil(8);
-    if payload.len() != HEADER + bitlen {
-        return None;
-    }
-    let signature = crate::bls::BlsSignature::from_bytes(&sig_bytes)?;
-    let participants = crate::bls::SignerBitVector::from_bitmask(payload[161..].to_vec(), total)?;
-    Some((
-        height,
-        round,
-        kind,
-        block_hash,
-        crate::bls::BlsAggregateSignature {
-            signature,
-            participants,
-        },
-    ))
-}
-
 /// The Ed25519 half of a vote/certificate signature entry: strips the live
 /// Falcon envelope when present. Plain 64-byte signatures pass through untouched.
 // GATE: single live envelope (Falcon v2) keeps the straight-line strip auditable.
@@ -427,7 +326,7 @@ impl BlockProposerExt for crate::sharding::Block {
 }
 
 /// Attach a Falcon-512 signature to an existing vote signature (creating or updating the envelope).
-// GATE: single live envelope (Falcon v2); the retired BLS branch was stripped (no wire compat on emit).
+// GATE: single live envelope (Falcon v2) keeps the straight-line strip auditable.
 pub fn attach_vote_falcon(key: &FalconKeypair, msg: &[u8], signature: &mut Vec<u8>) {
     let falcon_sig = key.sign(msg);
     let mut ed = vec![0u8; 64];
@@ -487,29 +386,6 @@ pub const QC_PQ_MAGIC: &[u8; 16] = b"STELL_QC_PQ_V5__";
 ///     of the WHOLE network's stake, so a captured committee cannot
 ///     finalize a block (audit W6.5 — committee capture).
 /// - Carried inside `QuorumCertificate::signatures` under sentinel marker `PQ_UQC_MARKER_ID`.
-///
-/// Phase-3 VRF beacon seal carried by a micro-certificate (RETIRED, inert).
-///
-/// The ECVRF prove/verify bodies were removed (classical crypto, FULL-PQ
-/// architecture): seals are never minted and never consulted. The field and
-/// this envelope type stay for WIRE COMPAT — certificates that carry a seal
-/// (trailing serde-defaulted field) still decode byte-identically, and the
-/// election always resolves to the canonical parent-hash draw.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VrfBeaconSeal {
-    /// The validator whose VRF secret minted `proof` (registry lookup key).
-    pub validator_id: ValidatorId,
-    /// The VRF proof envelope: `output` bound to the proof bytes.
-    pub proof: crate::vrf::VrfProof,
-}
-
-impl VrfBeaconSeal {
-    // REMOVED (seal minting): `VrfBeaconSeal::new` lived here. No live caller
-    // remains (proven by grep: assembly mints no seals — `vrf_beacon_seal_for`
-    // always returns `None` — and verifiers never consult the field). The TYPE
-    // stays for wire/history parse (trailing serde-defaulted field).
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PqMicroCertificate {
     pub scheme: crate::post_quantum::PqScheme,
@@ -534,25 +410,6 @@ pub struct PqMicroCertificate {
     /// "elected with the zero parent" — which the header pin then rejects.
     #[serde(default)]
     pub sortition_parent: [u8; 32],
-    /// Phase-3 VRF beacon seal (trailing, optional; RETIRED, inert).
-    ///
-    /// Always resolves to the legacy parent-hash draw: `None` (the default)
-    /// is what every certificate built by this code carries, and a `Some`
-    /// seal that remains on the wire (from old binaries) is never consulted
-    /// (see [`VrfBeaconSeal`]). Verification is exactly as without it.
-    ///
-    /// The field is LAST on purpose, like `sortition_parent`: a certificate
-    /// persisted/serialized before this field existed ends its byte stream one
-    /// field early and `#[serde(default)]` reads the missing trailing field as
-    /// `None` — the legacy fallback — so old certificates verify under the
-    /// legacy draw on mixed-version networks (no fork on the serde layer).
-    /// The canonical envelope ([`encode_pq_micro_envelope`]) is UNCHANGED and
-    /// never carries this field: unsealed certificates encode to today's bytes
-    /// bit-for-bit, and sealed ones travel as `MAGIC || bincode(cert)` (read
-    /// back by the existing bincode fallback in
-    /// [`decode_pq_micro_envelope`]).
-    #[serde(default)]
-    pub vrf_beacon: Option<VrfBeaconSeal>,
 }
 
 impl PqMicroCertificate {
@@ -573,8 +430,6 @@ impl PqMicroCertificate {
             signers_bitmask,
             signatures,
             sortition_parent,
-            // Legacy construction: no VRF seal (the parent-hash draw).
-            vrf_beacon: None,
         }
     }
 
@@ -876,54 +731,13 @@ pub fn pq_micro_required_power(committee_total_power: u64, network_total_power: 
 /// (ungrindable) selection would remove the grinding surface entirely; that
 /// is the structural fix and is out of scope here.
 ///
-/// PHASE-3 THREADING: this is the LEGACY ALIAS — `Disabled` activation, no
-/// verified output, i.e. the v5 parent-hash draw byte-for-byte, forever. Its
-/// signature is deliberately UNCHANGED: external callers exist across the
-/// codebase and its test suite (`sortition_integration_tests`, `vrf_*`,
-/// `pure_pq_enforcement_tests`, `v34_verification_pentest`,
-/// `p3_byzantine_pentest`, `bls_qc_compat_tests`, `examples/bench_pacing`),
-/// and every one of them pins the legacy draw. The threaded path is
-/// [`derive_sortition_committee_gated`], which the µQC assembly and verify
-/// sites call with the live activation and the registry-verified VRF output.
+/// Canonical parent-hash sortition committee selector (v5 draw, byte-pinned).
 pub fn derive_sortition_committee(
     validators: &ValidatorSet,
     height: Height,
     round: Round,
     committee_size: u32,
     prev_block_hash: &[u8; 32],
-) -> Vec<ValidatorId> {
-    derive_sortition_committee_gated(
-        validators,
-        height,
-        round,
-        committee_size,
-        prev_block_hash,
-        &crate::vrf::VrfActivation::Disabled,
-        None,
-    )
-}
-
-/// VRF-gated sortition committee selector (phase-1 wiring).
-///
-/// Byte-identical to [`derive_sortition_committee`] while the gate is
-/// `Disabled` (or the height is pre-activation, or no verified VRF output is
-/// supplied): the seed is the parent-hash [`sortition_seed`]. At
-/// `height >= activation` WITH a registry-verified VRF output, the seed is
-/// `vrf::vrf_election_seed(output, height, round)` instead — the same stake-
-/// weighted draw machinery, different entropy. Deterministic: same
-/// `(validators, height, round, seed)` ⇒ same committee on every node; no
-/// wall clock, no local randomness anywhere in this path.
-///
-/// Live callers pass `Disabled` + `None` (v5 bytes pinned); the VRF
-/// resolution always yields no output (retired), so the legacy draw applies.
-pub fn derive_sortition_committee_gated(
-    validators: &ValidatorSet,
-    height: Height,
-    round: Round,
-    committee_size: u32,
-    prev_block_hash: &[u8; 32],
-    activation: &crate::vrf::VrfActivation,
-    verified_vrf_output: Option<&[u8; 32]>,
 ) -> Vec<ValidatorId> {
     if committee_size == 0 || validators.is_empty() || validators.total_power() == 0 {
         return Vec::new();
@@ -951,15 +765,8 @@ pub fn derive_sortition_committee_gated(
     let mut total_power: u64 = pool.iter().map(|(_, p)| *p).sum();
 
     // Per-(height, round) seed: the parent block hash is the only entropy
-    // that is not known before the chain reaches this height — unless the
-    // VRF gate is active with a registry-verified output (see below).
-    let seed = sortition_seed_gated(
-        prev_block_hash,
-        height,
-        round,
-        activation,
-        verified_vrf_output,
-    );
+    // that is not known before the chain reaches this height.
+    let seed = sortition_seed(prev_block_hash, height, round);
 
     for step in 0..target_k {
         if total_power == 0 || pool.is_empty() {
@@ -1011,50 +818,6 @@ pub fn sortition_seed(prev_block_hash: &[u8; 32], height: Height, round: Round) 
     hasher.update(&round.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
-
-/// VRF-gated sortition seed (phase-1 wiring, XPC-activation-height pattern).
-///
-/// * Gate `Disabled`, or `height` below the activation boundary, or no
-///   verified VRF output supplied ⇒ the v5 parent-hash [`sortition_seed`]
-///   (live bytes, unchanged).
-/// * Gate active at `height` WITH a registry-verified output ⇒
-///   `vrf::vrf_election_seed(output, height, round)`.
-///
-/// The `verified_vrf_output`, when supplied, is caller-attested output bytes
-/// (minting removed with ECVRF; the only live callers pass `None`); without
-/// a `Some`, the parent-hash seed applies rather than attacker-chosen
-/// entropy. Pure and deterministic.
-pub fn sortition_seed_gated(
-    prev_block_hash: &[u8; 32],
-    height: Height,
-    round: Round,
-    activation: &crate::vrf::VrfActivation,
-    verified_vrf_output: Option<&[u8; 32]>,
-) -> [u8; 32] {
-    if let Some(output) = verified_vrf_output {
-        if activation.is_active_at(height) {
-            return crate::vrf::vrf_election_seed(output, height, round);
-        }
-    }
-    sortition_seed(prev_block_hash, height, round)
-}
-
-/// VRF election resolution for a µQC (RETIRED, canonical parent-hash draw).
-///
-/// The ECVRF prove/verify bodies were removed (classical crypto, FULL-PQ
-/// architecture): no seal can ever verify, so this always resolves to `Ok(None)`
-/// — the legacy parent-hash draw, byte-identical to today. The signature is
-/// unchanged so the election-math call sites (`micro_cert_valid_signers`,
-/// `verify_micro_cert`, assembly) are untouched; they already treat `None`
-/// as the legacy draw via the pre-existing fallback matrix.
-fn vrf_output_for_cert(
-    _cert: &PqMicroCertificate,
-    _activation: &crate::vrf::VrfActivation,
-    _registry: Option<&crate::vrf::VrfRegistry>,
-) -> Result<Option<[u8; 32]>, ()> {
-    Ok(None)
-}
-
 
 /// Encode a post-quantum micro-certificate (µQC) into its canonical wire envelope.
 ///
@@ -1147,9 +910,6 @@ pub fn decode_pq_micro_envelope(payload: &[u8]) -> Option<PqMicroCertificate> {
                             sortition_parent,
                             signers_bitmask,
                             signatures,
-                            // Canonical envelope predates the VRF seal: a
-                            // cert that decodes here carries no seal.
-                            vrf_beacon: None,
                         });
                     }
                 }
@@ -1232,41 +992,6 @@ pub fn clear_validator_pq_keys_for_tests() {
     clear_verified_vote_cache();
 }
 
-/// Process-global VRF key registry, loaded once at startup from
-/// `STELL_VRF_KEYS` (see `vrf::vrf_registry_from_env`) and consulted by the
-/// live verify/attribution paths (`pq_path_verify`, `signers_set`).
-///
-/// Default (never loaded, or loaded empty) ⇒ no registry ⇒ the
-/// `vrf_output_for_cert` fallback matrix resolves every seal to the legacy
-/// parent-hash draw — byte-identical to before. Same posture as
-/// `PQ_VALIDATOR_KEYS`: operator config is the trust root; entries were
-/// curve-validated at load, and only registry-known keys can elect the VRF
-/// committee (unknown keys fall back to legacy, known-key forgeries refuse).
-static VRF_LIVE_REGISTRY: std::sync::RwLock<Option<crate::vrf::VrfRegistry>> =
-    std::sync::RwLock::new(None);
-
-/// Install the startup-loaded VRF registry (called once from `main.rs`).
-pub fn set_live_vrf_registry(reg: crate::vrf::VrfRegistry) {
-    let mut lock = VRF_LIVE_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
-    *lock = Some(reg);
-}
-
-/// Snapshot the live VRF registry for one verify/attribution call.
-///
-/// `None` when no registry was loaded or it holds no keys — the call sites
-/// then take the "missing registry ⇒ legacy" fallback cell exactly.
-fn live_vrf_registry_snapshot() -> Option<crate::vrf::VrfRegistry> {
-    let lock = VRF_LIVE_REGISTRY.read().unwrap_or_else(|e| e.into_inner());
-    lock.clone().filter(|r| !r.is_empty())
-}
-
-/// Clear the live VRF registry (test hygiene).
-#[cfg(any(test, debug_assertions))]
-pub fn clear_live_vrf_registry_for_tests() {
-    let mut lock = VRF_LIVE_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
-    *lock = None;
-}
-
 // ============================================================================
 // Validator set
 // ============================================================================
@@ -1338,8 +1063,8 @@ impl ValidatorSet {
     /// the sum of this set's powers over the certificate's genuine signers.
     ///
     /// Attribution mirrors verification exactly: [`QuorumCertificate::signers_set`]
-    /// names only signers whose signatures verify (classical, µQC/epoch
-    /// envelopes and BLS aggregates alike), so forged or garbage entries
+    /// names only signers whose signatures verify (µQC/epoch envelopes),
+    /// so forged or garbage entries
     /// contribute nothing here — unlike a naive sum over the raw
     /// `signatures` list. Signers outside the set contribute nothing
     /// (rotated-away keys lend no weight).
@@ -1573,46 +1298,24 @@ impl Vote {
     /// Full cryptographic verification, bypassing the verified-vote cache.
     ///
     /// Single definition of vote validity: [`Vote::verify`] (cached),
-    /// [`Vote::partition_valid`] (batch screen + scalar fallback) and
+    /// [`Vote::partition_valid`] (scalar Falcon per vote) and
     /// [`verify_equivocation_evidence`] all bottom out here, so a cache hit
     /// can never admit what full verification would refuse.
+    ///
+    /// FULL-PQ (nodes wiped, no compat): Falcon-only. The Ed25519 legs are
+    /// deleted. A vote is valid iff it carries a Falcon half that verifies
+    /// under the voter's registered PQ key — exactly the old pure-PQ branch,
+    /// now unconditional.
     fn verify_uncached(&self) -> bool {
         let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
 
-        // Under Pure Post-Quantum Mode, a valid Falcon signature is strictly required
-        if crate::post_quantum::is_pure_pq_enforced() {
-            if let Some(falcon_sig) = self.falcon_signature() {
-                if let Some((_scheme, pk)) = get_validator_pq_key(&self.voter) {
-                    return verify_falcon_signature(&pk, &msg, falcon_sig);
-                }
-            }
-            return false;
-        }
-
-        // When a Falcon signature is present and the validator has registered a PQ key, verify Falcon
+        // FULL-PQ: Falcon-only. Ed25519 branches deleted (no compat).
         if let Some(falcon_sig) = self.falcon_signature() {
             if let Some((_scheme, pk)) = get_validator_pq_key(&self.voter) {
-                if !verify_falcon_signature(&pk, &msg, falcon_sig) {
-                    return false;
-                }
+                return verify_falcon_signature(&pk, &msg, falcon_sig);
             }
         }
-
-        // Verify Ed25519 signature
-        let Ok(vk) = VerifyingKey::from_bytes(&self.voter) else {
-            // Non-Ed25519 voter address (e.g. Falcon address)
-            if let Some(falcon_sig) = self.falcon_signature() {
-                if let Some((_scheme, pk)) = get_validator_pq_key(&self.voter) {
-                    return verify_falcon_signature(&pk, &msg, falcon_sig);
-                }
-            }
-            return false;
-        };
-        let ed_bytes = ed25519_sig_bytes(&self.signature);
-        let Ok(sig) = Signature::from_slice(ed_bytes) else {
-            return false;
-        };
-        vk.verify_strict(&msg, &sig).is_ok()
+        false
     }
 
     /// The bare Ed25519 signature bytes (envelope stripped when present).
@@ -1621,172 +1324,45 @@ impl Vote {
         ed25519_sig_bytes(&self.signature)
     }
 
-    /// Batch-verify many votes at once (Ed25519 batch verify). Returns true
-    /// iff EVERY vote carries a valid signature.
+    /// Batch-verify many votes at once (Falcon-only). Returns true
+    /// iff EVERY vote carries a valid Falcon signature.
     ///
-    /// Envelope-aware like [`Vote::verify`]: the Ed25519 half is taken out of
-    /// `MAGIC || ed || bls` when present, anything else must parse as a bare
-    /// 64-byte signature — fail closed. A vote whose key or signature does not
-    /// parse fails the batch (same as its scalar `verify` returning false).
-    ///
-    /// Pure-PQ mirror (audit fail-closed): under [`crate::post_quantum::is_pure_pq_enforced`]
-    /// the Ed25519 batch is SKIPPED and every vote goes through scalar
-    /// [`Vote::verify`], which strictly requires a valid Falcon-512 half —
-    /// exactly what [`VoteSet::add`] enforces per vote. Otherwise a batch of
-    /// Ed25519-only votes would verify while each single `add` refuses them.
+    /// FULL-PQ (nodes wiped, no compat): the Ed25519 batch is deleted.
+    /// Falcon has no batch primitive, so this is the scalar Falcon predicate
+    /// per vote — exactly what [`VoteSet::add`] enforces per vote.
     ///
     /// Determinism: the verdict is order-independent (all-or-nothing over the
-    /// set). Uses the same `ed25519_dalek::verify_batch` pattern as
-    /// `QuorumCertificate::verify`'s fast path.
+    /// set).
     pub fn verify_batch(votes: &[Vote]) -> bool {
         if votes.is_empty() {
             return true;
         }
-        if crate::post_quantum::is_pure_pq_enforced() {
-            return votes.iter().all(|v| v.verify());
-        }
-        let mut msgs: Vec<Vec<u8>> = Vec::with_capacity(votes.len());
-        let mut sigs: Vec<Signature> = Vec::with_capacity(votes.len());
-        let mut keys: Vec<VerifyingKey> = Vec::with_capacity(votes.len());
-        for v in votes {
-            let Ok(vk) = VerifyingKey::from_bytes(&v.voter) else {
-                return false;
-            };
-            let Ok(sig) = Signature::from_slice(v.ed25519_signature()) else {
-                return false;
-            };
-            msgs.push(vote_sign_bytes(v.height, v.round, v.kind, &v.block_hash));
-            sigs.push(sig);
-            keys.push(vk);
-        }
-        let msg_refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
-        ed25519_dalek::verify_batch(&msg_refs, &sigs, &keys).is_ok()
+        // FULL-PQ: Falcon-only (old pure-PQ branch, now unconditional).
+        votes.iter().all(|v| v.verify())
     }
 
-    /// Per-vote validity for a batch of votes (Ed25519 batch verify with
-    /// deterministic scalar fallback).
+    /// Per-vote validity for a batch of votes (Falcon-only scalar).
     ///
     /// Fallback semantics (VOTES — keep the good ones): dropping a whole batch
     /// on one bad neighbor would lose honest votes and could stall a quorum,
-    /// so a batch rejection falls back to the scalar [`Vote::verify`] per vote
-    /// in INPUT order and only the bad votes are marked `false`. Element `i`
+    /// so every vote gets its scalar [`Vote::verify`] verdict in INPUT order
+    /// and only the bad votes are marked `false`. Element `i`
     /// always equals `votes[i].verify()` — no behavior change, with offenders
     /// identified for slashing / peer down-scoring.
     ///
-    /// Determinism: per-item validity never depends on batch order; the
-    /// fallback iterates input order, so the result is stable for a given
-    /// input on whichever path is taken.
+    /// Determinism: per-item validity never depends on batch order.
     ///
-    /// Pure-PQ mirror (audit fail-closed): under [`crate::post_quantum::is_pure_pq_enforced`]
-    /// the Ed25519 batch screen is SKIPPED and every vote goes through scalar
-    /// [`Vote::verify`], which strictly requires a valid Falcon-512 half —
-    /// exactly what [`VoteSet::add`] enforces per vote. Otherwise `add_batch`
-    /// would admit Ed25519-only votes that a single `add` refuses.
+    /// FULL-PQ (nodes wiped, no compat): the Ed25519 batch screen is deleted.
+    /// Falcon has no batch primitive, so scalar Falcon is the only path —
+    /// exactly what [`VoteSet::add`] enforces per vote.
     pub fn partition_valid(votes: &[Vote]) -> Vec<bool> {
         if votes.is_empty() {
             return Vec::new();
         }
-        if crate::post_quantum::is_pure_pq_enforced() {
-            return votes.iter().map(|v| v.verify()).collect();
-        }
-        // VERIFY-ONCE: votes already verified under the current key context
-        // (valid OR invalid) reuse their cached verdict and skip the batch
-        // screen entirely. Only uncached votes pay crypto below, and every
-        // verdict produced below is recorded, so the next identical ingest
-        // hits. Stats are counted exactly once per vote here (hits for
-        // cached, misses for screened); the scalar fallback uses
-        // `verify_uncached` + explicit record to avoid double-counting the
-        // miss that `verify()` would add.
-        let cached: Vec<Option<bool>> = votes.iter().map(verified_vote_cached).collect();
-        let n_cached = cached.iter().filter(|c| c.is_some()).count();
-        if n_cached == votes.len() {
-            VERIFIED_VOTE_CACHE_HITS.fetch_add(votes.len() as u64, Ordering::Relaxed);
-            return cached.into_iter().map(|c| c.unwrap_or(false)).collect();
-        }
-        VERIFIED_VOTE_CACHE_HITS.fetch_add(n_cached as u64, Ordering::Relaxed);
-        // Items that cannot even be staged (bad key / bad sig bytes) are
-        // already known-bad without failing the good ones' batch verdict.
-        // Cached votes never reach staging: their verdict is already known.
-        let mut bad = vec![false; votes.len()];
-        let mut staged: Vec<usize> = Vec::with_capacity(votes.len());
-        let mut msgs: Vec<Vec<u8>> = Vec::with_capacity(votes.len());
-        let mut sigs: Vec<Signature> = Vec::with_capacity(votes.len());
-        let mut keys: Vec<VerifyingKey> = Vec::with_capacity(votes.len());
-        for (i, v) in votes.iter().enumerate() {
-            if cached[i].is_some() {
-                continue;
-            }
-            let (Ok(vk), Ok(sig)) = (
-                VerifyingKey::from_bytes(&v.voter),
-                Signature::from_slice(v.ed25519_signature()),
-            ) else {
-                bad[i] = true;
-                continue;
-            };
-            staged.push(i);
-            msgs.push(vote_sign_bytes(v.height, v.round, v.kind, &v.block_hash));
-            sigs.push(sig);
-            keys.push(vk);
-        }
-        // Screen verdict per STAGED vote; cached votes keep theirs.
-        let mut screen_ok = vec![false; votes.len()];
-        if !sigs.is_empty() {
-            VERIFIED_VOTE_CACHE_MISSES.fetch_add(staged.len() as u64, Ordering::Relaxed);
-            let msg_refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
-            if ed25519_dalek::verify_batch(&msg_refs, &sigs, &keys).is_ok() {
-                for &i in &staged {
-                    screen_ok[i] = true;
-                }
-            } else {
-                // Slow path: batch rejected — scalar verdict per staged vote,
-                // input order. Unparseable (`bad`) votes stay false.
-                for &i in staged.iter() {
-                    let verdict = votes[i].verify_uncached();
-                    record_verified_vote(&votes[i], verdict);
-                    screen_ok[i] = verdict;
-                }
-            }
-            // The batch screen covers the Ed25519 halves only. A vote
-            // carrying a Falcon half (or a registered PQ key) needs the FULL
-            // predicate — confirm exactly those with one scalar pass, so the
-            // documented invariant (`partition_valid[i] == votes[i].verify()`)
-            // holds for Falcon votes too. Falcon-less votes are settled by
-            // batch soundness (a passing batch implies each Ed25519 half
-            // verifies) with no second crypto pass.
-            for &i in &staged {
-                if screen_ok[i] {
-                    if votes[i].falcon_signature().is_some() {
-                        let verdict = votes[i].verify_uncached();
-                        record_verified_vote(&votes[i], verdict);
-                        screen_ok[i] = verdict;
-                    } else {
-                        record_verified_vote(&votes[i], true);
-                    }
-                }
-            }
-        }
-        let out: Vec<bool> = (0..votes.len())
-            .map(|i| {
-                if let Some(v) = cached[i] {
-                    return v;
-                }
-                if bad[i] {
-                    // Unstageable AND uncached: full predicate decides
-                    // (fail-closed for unparseable keys/signatures), then
-                    // record so the verdict itself is cached.
-                    let verdict = votes[i].verify_uncached();
-                    record_verified_vote(&votes[i], verdict);
-                    return verdict;
-                }
-                screen_ok[i]
-            })
-            .collect();
-        // INVARIANT (no assert on `bad[i] ==> !out[i]`): an unstageable vote
-        // takes the FULL predicate, which admits a non-Ed25519 (Falcon-address)
-        // voter carrying a valid Falcon half under a registered PQ key — the
-        // same verdict `VoteSet::add` reaches via `verify()`. `bad` only means
-        // "skipped the Ed25519 batch screen", never "invalid".
-        out
+        // FULL-PQ: Falcon-only (old pure-PQ branch, now unconditional).
+        // `verify()` consults/records the verified-vote cache, so batch
+        // ingest keeps verify-once behavior with no Ed25519 screen.
+        votes.iter().map(|v| v.verify()).collect()
     }
 
     /// The Falcon-512 half of this vote's signature, when it carries one.
@@ -2722,16 +2298,9 @@ impl VoteSet {
 
     /// Build a quorum certificate for `target` from the collected votes.
     ///
-    /// Two properties, both deliberate:
-    /// * The Ed25519 list carries BARE 64-byte signatures (any vote-envelope
-    ///   half is stripped). That is the format every verifier understands,
-    ///   including one that predates BLS, and it is what the certificate
-    ///   format keeps promising: the aggregate is ADDITIVE, never a
-    ///   replacement.
-    /// * When `STELL_BLS_QC` is enabled, the votes' BLS halves are aggregated
-    ///   into the marker envelope entry in the same list. Aggregation is over
-    ///   canonical validator-set indices, so the bitvector means exactly what
-    ///   the verifier's registry will read back.
+    /// The Ed25519 list carries BARE 64-byte signatures (any vote-envelope
+    /// half is stripped). That is the format every verifier understands,
+    /// and it is what the certificate format keeps promising.
     ///
     /// `parent_hash` is the hash of the block at `height - 1` — the parent
     /// committed in the header of the block this height decides. It is the
@@ -2758,9 +2327,7 @@ impl VoteSet {
     /// fail-closed: the node cannot finalize on a committee nobody else
     /// elected (audit W6.4b).
     ///
-    /// LEGACY alias: `Disabled` activation, no registry, no seal — the v5
-    /// parent-hash draw byte-for-byte (VRF threading retired, so the threaded
-    /// entry point resolves identically).
+    /// Canonical parent-hash draw byte-for-byte.
     #[allow(clippy::unnecessary_unwrap)]
     // GATE: is_some guard plus expect keeps parent-hash handling explicit on the consensus path; restructuring risks quorum logic.
     pub fn certificate_with_parent(
@@ -2769,42 +2336,12 @@ impl VoteSet {
         validators: &ValidatorSet,
         parent_hash: Option<&[u8; 32]>,
     ) -> Option<QuorumCertificate> {
-        self.certificate_with_parent_vrf(
-            target,
-            validators,
-            parent_hash,
-            &crate::vrf::VrfActivation::Disabled,
-            None,
-            None,
-        )
-    }
-
-    /// Build a quorum certificate (VRF threading RETIRED).
-    ///
-    /// `activation`, `registry`, and `seal` are accepted for API compatibility
-    /// and ignored: the ECVRF prove/verify bodies were removed (classical
-    /// crypto, FULL-PQ architecture), so no seal is minted, embedded, or
-    /// consulted. The committee is always the canonical parent-hash draw,
-    /// byte-identical to [`Self::certificate_with_parent`].
-    #[allow(clippy::unnecessary_unwrap)]
-    // GATE: is_some guard plus expect keeps parent-hash handling explicit on the consensus path; restructuring risks quorum logic.
-    pub fn certificate_with_parent_vrf(
-        &self,
-        target: Option<BlockHash>,
-        validators: &ValidatorSet,
-        parent_hash: Option<&[u8; 32]>,
-        _activation: &crate::vrf::VrfActivation,
-        _registry: Option<&crate::vrf::VrfRegistry>,
-        _seal: Option<VrfBeaconSeal>,
-    ) -> Option<QuorumCertificate> {
         if !self.quorum_reached(target, validators) {
             return None;
         }
-        // REMOVED (BLS aggregate-QC production): the per-vote BLS-half
-        // collection and the `BLS_QC_MARKER_ID` aggregate attach lived here.
-        // Certificates now always carry the Ed25519 list only; BLS envelopes
-        // that remain on the wire (from old binaries) decode as inert
-        // metadata via `decode_qc_bls_envelope` and are never counted.
+        // REMOVED (aggregate-QC production): the per-vote classical-half
+        // collection and the marker aggregate attach lived here.
+        // Certificates now always carry the Ed25519 list only.
         let mut signatures = Vec::new();
         for v in self.votes.values() {
             if v.block_hash == target {
@@ -2843,25 +2380,17 @@ impl VoteSet {
             let parent_hash = parent_hash.expect("checked above");
             let committee_size = micro_committee_size(validators.len());
             if committee_size > 0 {
-                // VRF election (RETIRED — ECVRF classical, bodies removed):
-                // the seal is never minted and never travels: the v5 parent-hash
-                // draw applies byte-for-byte (canonical draw). `seal`,
-                // `activation`, and `registry` are accepted for API
-                // compatibility and ignored.
-                let verified_output: Option<[u8; 32]> = None;
-                let committee = derive_sortition_committee_gated(
+                // Canonical draw applies byte-for-byte.
+                let committee = derive_sortition_committee(
                     validators,
                     qc.height,
                     qc.round,
                     committee_size,
                     parent_hash,
-                    &crate::vrf::VrfActivation::Disabled,
-                    verified_output.as_ref(),
                 );
                 // No seal ever travels with the certificate: verifiers resolve
                 // the same legacy committee, so embedding anything would only
-                // risk divergence. (EMBED retired: `vrf_beacon` is always `None`
-                // on EMIT; the field stays for history parse only.)
+                // risk divergence.
                 let get_sig_for_committee_member = |val_id: &ValidatorId| -> Option<Vec<u8>> {
                     if let Some(sig) = falcon_sigs.get(val_id) {
                         return Some(sig.clone());
@@ -2935,8 +2464,6 @@ impl VoteSet {
                     // verifier re-derives the committee from it, and the
                     // block-apply path pins it to the block's own parent.
                     sortition_parent: *parent_hash,
-                    // EMBED retired: never `Some` on EMIT (history parse only).
-                    vrf_beacon: None,
                     };
                     qc.attach_pq_micro_certificate(&uqc);
                 }
@@ -2962,25 +2489,25 @@ pub struct QuorumCertificate {
 
 impl QuorumCertificate {
     /// Verify the QC carries a real quorum of valid, distinct validator signatures.
-    /// Supports post-quantum µQC / CEC envelopes and classical Ed25519 threshold.
-    /// BLS aggregate envelopes that remain on the wire decode as inert metadata
-    /// (never counted).
+    /// FULL-PQ (nodes wiped, no compat): Falcon µQC / CEC envelopes only.
+    /// Classical Ed25519 threshold legs deleted.
     pub fn verify(&self, validators: &ValidatorSet) -> bool {
         self.verify_unified(validators)
     }
 
     /// Unified certificate verification supporting:
     /// 1. Post-quantum µQC (`PQ_UQC_MARKER_ID`) and CEC Epoch (`PQ_QC_MARKER_ID`) envelopes.
-    /// 2. Classical Ed25519 threshold signatures.
     ///
-    /// BLS aggregate envelopes (`BLS_QC_MARKER_ID`) are inert metadata: they
-    /// decode (wire compat) but are never counted (aggregate-QC counting path
-    /// removed).
+    /// FULL-PQ: classical Ed25519 threshold deleted (no compat). A QC without
+    /// a verifying PQ envelope is rejected.
     pub fn verify_unified(&self, validators: &ValidatorSet) -> bool {
         self.verify_unified_with_pq_keys(validators, None)
     }
 
     /// Unified verification with optional local post-quantum key overrides.
+    ///
+    /// FULL-PQ (nodes wiped): Falcon-only. The classical Ed25519 threshold
+    /// legs are deleted. After the PQ path, rejection is unconditional.
     pub fn verify_unified_with_pq_keys(
         &self,
         validators: &ValidatorSet,
@@ -2988,10 +2515,10 @@ impl QuorumCertificate {
     ) -> bool {
         // Anti-DoS (audit F7): reject an implausibly long signer list BEFORE
         // touching any signature. The list is attacker-supplied and uncapped on
-        // the wire, so one message could otherwise pin a verifier in an Ed25519
-        // loop proportional to its length. This is O(1) and applies to every
-        // caller of `verify`. The marker envelope entry counts toward this cap
-        // like any other entry.
+        // the wire, so one message could otherwise pin a verifier in a
+        // signature loop proportional to its length. This is O(1) and applies
+        // to every caller of `verify`. The marker envelope entry counts toward
+        // this cap like any other entry.
         if self.signatures.len() > MAX_COMMIT_CERT_SIGNERS {
             return false;
         }
@@ -3002,67 +2529,15 @@ impl QuorumCertificate {
             return true;
         }
 
-        // Under Pure Post-Quantum Mode, classical Ed25519 threshold signatures
-        // are rejected. (The BLS aggregate-QC counting path was removed: a
-        // `BLS_QC_MARKER_ID` envelope that remains on the wire carries no
-        // power and the marker entry falls through to the Ed25519 list below,
-        // where it is skipped as a non-member.)
-        if crate::post_quantum::is_pure_pq_enforced() {
-            return false;
-        }
-        // First pass: dedup, membership and parsing are cheap per item. Collect the
-        // candidates; the expensive crypto happens once below, not N times.
-        let mut seen = HashSet::new();
-        let mut candidates: Vec<(VerifyingKey, Signature, u64)> = Vec::new();
-        for (voter, sig_bytes) in &self.signatures {
-            if !seen.insert(*voter) {
-                continue; // duplicate signer
-            }
-            let vp = validators.power_of(voter);
-            if vp == 0 {
-                continue;
-            }
-            let Ok(vk) = VerifyingKey::from_bytes(voter) else {
-                continue;
-            };
-            // Envelope-tolerant: a certificate entry copied from an envelope
-            // vote keeps only its Ed25519 half. The marker entry never reaches
-            // here in practice (it is not a validator, so `vp == 0` above skips
-            // it), but stripping costs nothing and keeps every entry in this
-            // list a bare Ed25519 signature.
-            let Ok(sig) = Signature::from_slice(ed25519_sig_bytes(sig_bytes)) else {
-                continue;
-            };
-            candidates.push((vk, sig, vp));
-        }
-        if candidates.is_empty() {
-            return false;
-        }
-        // Fast path: one batch verification over the shared message. Same-message
-        // batching is roughly 2x a per-signature loop at 100 signers.
-        {
-            let msgs: Vec<&[u8]> = candidates.iter().map(|_| msg.as_slice()).collect();
-            let sigs: Vec<Signature> = candidates.iter().map(|(_, s, _)| *s).collect();
-            let keys: Vec<VerifyingKey> = candidates.iter().map(|(k, _, _)| *k).collect();
-            if ed25519_dalek::verify_batch(&msgs, &sigs, &keys).is_ok() {
-                let power: u64 = candidates.iter().map(|(_, _, p)| p).sum();
-                return power >= validators.quorum_power();
-            }
-        }
-        // Slow path: the batch failed, so at least one signature is bad. Fall back to
-        // per-signature checks to count exactly the valid ones -- an attacker who
-        // slips one bad signature into a quorum must not turn a good quorum bad, and
-        // a bad quorum must not pass on the strength of its good members.
-        let mut power = 0u64;
-        for (vk, sig, vp) in &candidates {
-            if vk.verify_strict(&msg, sig).is_ok() {
-                power += *vp;
-            }
-        }
-        power >= validators.quorum_power()
+        // FULL-PQ: classical Ed25519 threshold deleted (no compat, no fallback).
+        // Any non-PQ entry is rejected here.
+        false
     }
 
     /// Check if certificate contains a valid Post-Quantum µQC or Epoch CEC envelope.
+    ///
+    /// FULL-PQ (nodes wiped): non-post-quantum schemes are refused
+    /// unconditionally (old pure-PQ gate, now the only path).
     fn pq_path_verify(
         &self,
         validators: &ValidatorSet,
@@ -3072,25 +2547,11 @@ impl QuorumCertificate {
         for (voter, payload) in &self.signatures {
             if *voter == PQ_UQC_MARKER_ID {
                 if let Some(cert) = decode_pq_micro_envelope(payload) {
-                    if crate::post_quantum::is_pure_pq_enforced() && !cert.scheme.is_post_quantum()
-                    {
+                    if !cert.scheme.is_post_quantum() {
                         continue;
                     }
-                    // Live path: the deployment's activation (env) + the
-                    // startup-loaded registry (global). Resolution is always
-                    // the legacy draw (VRF retired; see `vrf_output_for_cert`).
-                    // Callers with explicit values use
-                    // `verify_micro_cert_with_vrf`.
-                    let live_activation = crate::vrf::vrf_activation_from_env();
-                    let live_registry = live_vrf_registry_snapshot();
-                    if self.verify_micro_cert(
-                        &cert,
-                        validators,
-                        msg,
-                        pq_keys,
-                        &live_activation,
-                        live_registry.as_ref(),
-                    ) {
+                    // Canonical parent-hash draw.
+                    if self.verify_micro_cert(&cert, validators, msg, pq_keys) {
                         return true;
                     }
                 }
@@ -3098,8 +2559,7 @@ impl QuorumCertificate {
                 if let Some(cert) =
                     decode_pq_epoch_envelope(payload).or_else(|| decode_pq_micro_envelope(payload))
                 {
-                    if crate::post_quantum::is_pure_pq_enforced() && !cert.scheme.is_post_quantum()
-                    {
+                    if !cert.scheme.is_post_quantum() {
                         continue;
                     }
                     if self.verify_epoch_cert(&cert, validators, msg, pq_keys) {
@@ -3137,15 +2597,12 @@ impl QuorumCertificate {
     /// (V-P34 R2: nobody is forgiven on the strength of an unverifiable
     /// marker).
     ///
-    /// Election resolution (VRF RETIRED): `activation` + `registry` are threaded
-    /// through to [`vrf_output_for_cert`], which always resolves to the legacy
-    /// parent-hash draw (ECVRF bodies removed). Pass `Disabled` + `None` for
-    /// the legacy draw exactly.
-    /// Batch-verify staged PQ member signatures (the lattice analogue of the
-    /// Ed25519 `verify_batch` fast path: Falcon has no batch primitive, so the
-    /// SAME per-signature predicate runs per item, chunked across cores with
-    /// rayon — the `Transaction::verify_signatures_batch_parallel` precedent,
-    /// same primitive, zero new logic).
+    /// Election: always the canonical parent-hash draw.
+    /// Batch-verify staged PQ member signatures (FULL-PQ: Falcon has no batch
+    /// primitive, so the SAME per-signature predicate runs per item, chunked
+    /// across cores with rayon — the
+    /// `Transaction::verify_signatures_batch_parallel` precedent, same
+    /// primitive, zero new logic).
     ///
     /// Fail-closed all-must-pass: `true` iff EVERY staged signature verifies.
     /// Serial and parallel paths combine the same per-item predicate with
@@ -3189,8 +2646,6 @@ impl QuorumCertificate {
         validators: &ValidatorSet,
         msg: &[u8],
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
-        activation: &crate::vrf::VrfActivation,
-        registry: Option<&crate::vrf::VrfRegistry>,
     ) -> Option<Vec<ValidatorId>> {
         if cert.height != self.height || cert.round != self.round {
             return None;
@@ -3219,16 +2674,13 @@ impl QuorumCertificate {
         // block-apply path additionally pins that parent to the hash committed
         // in the block header (`QuorumCertificate::binds_to_parent`), so a
         // certificate cannot pick a favourable committee of its own.
-        // Election resolution (VRF RETIRED): always the legacy parent-hash draw.
-        let verified_output = vrf_output_for_cert(cert, activation, registry).ok()?;
-        let committee = derive_sortition_committee_gated(
+        // Election: always the canonical parent-hash draw.
+        let committee = derive_sortition_committee(
             validators,
             cert.height,
             cert.round,
             cert.committee_size,
             &cert.sortition_parent,
-            activation,
-            verified_output.as_ref(),
         );
         let expected_len = (cert.committee_size as usize).min(validators.len());
         if committee.len() != expected_len || committee.is_empty() {
@@ -3270,14 +2722,9 @@ impl QuorumCertificate {
 
                 let key_opt = pq_keys
                     .and_then(|m| m.get(val_id).cloned())
-                    .or_else(|| get_validator_pq_key(val_id))
-                    .or_else(|| {
-                        if cert.scheme == crate::post_quantum::PqScheme::Ed25519 {
-                            Some((crate::post_quantum::PqScheme::Ed25519, val_id.to_vec()))
-                        } else {
-                            None
-                        }
-                    });
+                    .or_else(|| get_validator_pq_key(val_id));
+                // FULL-PQ: Ed25519 fallback deleted (no compat). A member
+                // without a registered PQ key fails closed (`None` below).
 
                 let (scheme, pubkey) = key_opt?;
 
@@ -3305,21 +2752,16 @@ impl QuorumCertificate {
     /// 11/16, …) certificates verify unchanged — they carry the full
     /// committee power.
     ///
-    /// Election resolution (VRF RETIRED): `activation` + `registry` resolve via
-    /// [`vrf_output_for_cert`] (same rule as `micro_cert_valid_signers`
-    /// above) — always the legacy parent-hash draw. Pass `Disabled` + `None`
-    /// for the legacy draw exactly.
+    /// Election: always the canonical parent-hash draw.
     fn verify_micro_cert(
         &self,
         cert: &PqMicroCertificate,
         validators: &ValidatorSet,
         msg: &[u8],
         pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
-        activation: &crate::vrf::VrfActivation,
-        registry: Option<&crate::vrf::VrfRegistry>,
     ) -> bool {
         let Some(valid) =
-            self.micro_cert_valid_signers(cert, validators, msg, pq_keys, activation, registry)
+            self.micro_cert_valid_signers(cert, validators, msg, pq_keys)
         else {
             return false;
         };
@@ -3329,19 +2771,14 @@ impl QuorumCertificate {
         // 2-of-3 bitmask that the old `floor(2*3/3)+1 = 3` rule threw out may
         // still carry quorum POWER, which is exactly the fragile-unanimous
         // case this fixes.
-        // Election resolution (VRF RETIRED): the quorum is summed over the SAME
-        // legacy committee the attribution above resolved.
-        let Ok(verified_output) = vrf_output_for_cert(cert, activation, registry) else {
-            return false;
-        };
-        let committee = derive_sortition_committee_gated(
+        // Election: the quorum is summed over the SAME
+        // canonical committee the attribution above resolved.
+        let committee = derive_sortition_committee(
             validators,
             cert.height,
             cert.round,
             cert.committee_size,
             &cert.sortition_parent,
-            activation,
-            verified_output.as_ref(),
         );
         let committee_total: u64 = committee.iter().map(|id| validators.power_of(id)).sum();
         if committee_total == 0 {
@@ -3350,42 +2787,6 @@ impl QuorumCertificate {
         let quorum_power = pq_micro_required_power(committee_total, validators.total_power());
         let valid_power: u64 = valid.iter().map(|id| validators.power_of(id)).sum();
         valid_power >= quorum_power
-    }
-
-    /// Attribution-grade µQC signer check (VRF threading RETIRED).
-    ///
-    /// Same as the private `micro_cert_valid_signers`, with `activation` and
-    /// `registry` threaded through to the always-legacy resolution. Verifiers
-    /// that pinned the live path keep calling this; `signers_set` keeps the
-    /// legacy `(Disabled, None)` draw.
-    pub fn micro_cert_valid_signers_with_vrf(
-        &self,
-        cert: &PqMicroCertificate,
-        validators: &ValidatorSet,
-        msg: &[u8],
-        pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
-        activation: &crate::vrf::VrfActivation,
-        registry: Option<&crate::vrf::VrfRegistry>,
-    ) -> Option<Vec<ValidatorId>> {
-        self.micro_cert_valid_signers(cert, validators, msg, pq_keys, activation, registry)
-    }
-
-    /// Power-weighted µQC verification (VRF threading RETIRED).
-    ///
-    /// Same as the private `verify_micro_cert`, with `activation` and
-    /// `registry` threaded through to the always-legacy resolution (see
-    /// [`Self::micro_cert_valid_signers_with_vrf`]). `verify_unified` keeps
-    /// the legacy `(Disabled, None)` draw.
-    pub fn verify_micro_cert_with_vrf(
-        &self,
-        cert: &PqMicroCertificate,
-        validators: &ValidatorSet,
-        msg: &[u8],
-        pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
-        activation: &crate::vrf::VrfActivation,
-        registry: Option<&crate::vrf::VrfRegistry>,
-    ) -> bool {
-        self.verify_micro_cert(cert, validators, msg, pq_keys, activation, registry)
     }
 
     /// The full-set members whose epoch-certificate signatures VERIFY
@@ -3439,14 +2840,9 @@ impl QuorumCertificate {
 
                 let key_opt = pq_keys
                     .and_then(|m| m.get(val_id).cloned())
-                    .or_else(|| get_validator_pq_key(val_id))
-                    .or_else(|| {
-                        if cert.scheme == crate::post_quantum::PqScheme::Ed25519 {
-                            Some((crate::post_quantum::PqScheme::Ed25519, val_id.to_vec()))
-                        } else {
-                            None
-                        }
-                    });
+                    .or_else(|| get_validator_pq_key(val_id));
+                // FULL-PQ: Ed25519 fallback deleted (no compat). A member
+                // without a registered PQ key fails closed (`None` below).
 
                 let (scheme, pubkey) = key_opt?;
 
@@ -3504,8 +2900,7 @@ impl QuorumCertificate {
     /// The parent block hash this certificate's sortition committee was
     /// elected with, if it carries a µQC.
     ///
-    /// `None` for a certificate without a µQC (the classical Ed25519 and BLS
-    /// paths do not use a committee, so there is nothing to bind).
+    /// `None` for a certificate without a µQC (no committee, so there is nothing to bind).
     pub fn sortition_parent(&self) -> Option<[u8; 32]> {
         self.pq_micro_certificate().map(|c| c.sortition_parent)
     }
@@ -3529,13 +2924,12 @@ impl QuorumCertificate {
         }
     }
 
-    // REMOVED (BLS envelope verify-for-counting): `bls_envelope_verified_signers`
-    // and `bls_path_power` lived here. No live path references remain (proven by
-    // grep: the only consumers were `verify_unified` and `signers_set`, both
-    // rewired above). The marker entry now falls through to the classical
-    // Ed25519 list, where it is skipped as a non-member — the same observable
-    // behavior as the default-off path. The byte parser
-    // (`decode_qc_bls_envelope`) is untouched (wire compat).
+    // REMOVED (aggregate envelope verify-for-counting): the envelope
+    // verified-signers and path-power helpers lived here. No live path
+    // references remain (proven by grep: the only consumers were
+    // `verify_unified` and `signers_set`, both rewired above). The marker
+    // entry is skipped as a non-member — the same observable behavior as
+    // the default-off path.
 
     /// Extracts the set of validator IDs that signed this QuorumCertificate.
     ///
@@ -3544,11 +2938,10 @@ impl QuorumCertificate {
     ///    envelope or bitmask and identifies signing committee members via sortition.
     /// 2. Post-quantum Epoch CEC (`PQ_QC_MARKER_ID` = `[0xFE; 32]`): decodes the epoch certificate
     ///    envelope and identifies signing validators via canonical sorted validator bitmask.
-    /// 3. BLS aggregate envelopes (`BLS_QC_MARKER_ID` = `[0xFF; 32]`): inert —
-    ///    skipped (the marker id carries no voting power, so the entry falls
-    ///    into the classical path below and contributes nothing; the counting
-    ///    path was removed).
-    /// 4. Classical / individual Ed25519 signatures where voter ID is the validator ID.
+    ///
+    /// FULL-PQ (nodes wiped): classical Ed25519 entries are inert — skipped,
+    /// never attributed. Attribution mirrors verification: only signers
+    /// `verify` accepts are named.
     ///
     /// Attribution MUST mirror verification: only signers `verify` accepts
     /// are named. Every envelope path requires the SAME cryptographic checks
@@ -3561,9 +2954,6 @@ impl QuorumCertificate {
     pub fn signers_set(&self, validators: &ValidatorSet) -> HashSet<ValidatorId> {
         let mut signers = HashSet::new();
         let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
-        // Classical candidates staged for one shared-message batch below
-        // (same batch-then-per-sig pattern as `verify_unified`'s fast path).
-        let mut classical: Vec<(ValidatorId, VerifyingKey, Signature)> = Vec::new();
         for (voter, payload) in &self.signatures {
             if *voter == PQ_UQC_MARKER_ID {
                 // Verify-grade: exactly what `verify_micro_cert` accepts (sans
@@ -3573,22 +2963,15 @@ impl QuorumCertificate {
                 // payload used to land on garbage bitmask bytes and attribute
                 // the wrong validators; a forged envelope now attributes none.
                 if let Some(cert) = decode_pq_micro_envelope(payload) {
-                    if crate::post_quantum::is_pure_pq_enforced() && !cert.scheme.is_post_quantum()
-                    {
+                    if !cert.scheme.is_post_quantum() {
                         continue;
                     }
-                    // Live path: same live activation + registry as
-                    // `pq_path_verify` above (resolution always legacy).
-                    // Explicit-value callers use `micro_cert_valid_signers_with_vrf`.
-                    let live_activation = crate::vrf::vrf_activation_from_env();
-                    let live_registry = live_vrf_registry_snapshot();
+                    // Canonical parent-hash draw (same as `pq_path_verify`).
                     if let Some(ids) = self.micro_cert_valid_signers(
                         &cert,
                         validators,
                         &msg,
                         None,
-                        &live_activation,
-                        live_registry.as_ref(),
                     ) {
                         signers.extend(ids);
                     }
@@ -3599,8 +2982,7 @@ impl QuorumCertificate {
                 if let Some(cert) =
                     decode_pq_epoch_envelope(payload).or_else(|| decode_pq_micro_envelope(payload))
                 {
-                    if crate::post_quantum::is_pure_pq_enforced() && !cert.scheme.is_post_quantum()
-                    {
+                    if !cert.scheme.is_post_quantum() {
                         continue;
                     }
                     if let Some(ids) = self.epoch_cert_valid_signers(&cert, validators, &msg, None)
@@ -3609,43 +2991,10 @@ impl QuorumCertificate {
                     }
                 }
             } else {
-                // Classical: mirror `verify_unified`'s candidate checks — only
-                // a member whose bare Ed25519 signature verifies over THIS
-                // certificate's message is attributed. Garbage and forged
-                // entries contribute nothing. Staged here, verified once
-                // below; the set dedups repeat signers exactly as before.
-                if validators.power_of(voter) == 0 {
-                    continue;
-                }
-                let Ok(vk) = VerifyingKey::from_bytes(voter) else {
-                    continue;
-                };
-                // Envelope-tolerant, like verify: a certificate entry copied
-                // from an envelope vote keeps only its Ed25519 half.
-                let Ok(sig) = Signature::from_slice(ed25519_sig_bytes(payload)) else {
-                    continue;
-                };
-                classical.push((*voter, vk, sig));
-            }
-        }
-        // One batch verification over the shared message. A passing batch
-        // implies every staged Ed25519 half verifies (batch soundness), so
-        // all are attributed with no second pass; a rejection falls back to
-        // per-signature checks so one forgery never unattests honest
-        // signers. Either path attributes bit-identically to the serial
-        // loop this replaces.
-        if !classical.is_empty() {
-            let msgs: Vec<&[u8]> = classical.iter().map(|_| msg.as_slice()).collect();
-            let sigs: Vec<Signature> = classical.iter().map(|(_, _, s)| *s).collect();
-            let keys: Vec<VerifyingKey> = classical.iter().map(|(_, k, _)| *k).collect();
-            if ed25519_dalek::verify_batch(&msgs, &sigs, &keys).is_ok() {
-                signers.extend(classical.iter().map(|(v, _, _)| *v));
-            } else {
-                for (voter, vk, sig) in &classical {
-                    if vk.verify_strict(&msg, sig).is_ok() {
-                        signers.insert(*voter);
-                    }
-                }
+                // FULL-PQ: classical Ed25519 entries deleted (no compat).
+                // Skipped: they carry no power and `verify` rejects them, so
+                // attribution names nobody — mirroring verification.
+                continue;
             }
         }
         signers
@@ -5267,6 +4616,40 @@ mod tests {
         HeightConsensus::new(1, vset(&ks))
     }
 
+    // FULL-PQ test helpers (nodes wiped, no compat): Ed ids + registered
+    // Falcon-512 keys, Falcon-signed votes. Quorum/power/targets/membership
+    // unchanged — only the signature scheme changes from Ed to Falcon.
+    fn falcon_for_keys(ks: &[SigningKey], base: u8) -> Vec<FalconKeypair> {
+        ks.iter()
+            .enumerate()
+            .map(|(i, _)| FalconKeypair::generate_from_seed(base.wrapping_add(i as u8)))
+            .collect()
+    }
+
+    fn vset_with_falcon(ks: &[SigningKey], fks: &[FalconKeypair]) -> ValidatorSet {
+        let vs = vset(ks);
+        for (sk, fk) in ks.iter().zip(fks.iter()) {
+            let id = sk.verifying_key().to_bytes();
+            register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+        }
+        vs
+    }
+
+    fn fvote(
+        sk: &SigningKey,
+        fk: &FalconKeypair,
+        height: Height,
+        round: Round,
+        kind: VoteKind,
+        bh: Option<BlockHash>,
+    ) -> Vote {
+        Vote::sign_with_falcon(sk, fk, height, round, kind, bh)
+    }
+
     #[test]
     fn sync_burst_is_rate_limited_not_unbounded() {
         // Regression (audit 2026-10-06): repeated verified votes ratcheted
@@ -5351,12 +4734,13 @@ mod tests {
     #[test]
     fn c2_nil_breaker_rebroadcasts_highest_qc_backed_proposal() {
         let ks = keys(4);
-        let vs = vset(&ks);
+        let fks = falcon_for_keys(&ks, 0x11);
+        let vs = vset_with_falcon(&ks, &fks);
         let mut hc = HeightConsensus::new(1, vs.clone());
         let bh = [0xABu8; 32];
         // Build a real block prevote QC at round 5 (3 of 4).
-        for k in ks.iter().take(3) {
-            let v = Vote::sign(k, 1, 5, VoteKind::Prevote, Some(bh));
+        for (i, k) in ks.iter().enumerate().take(3) {
+            let v = fvote(k, &fks[i], 1, 5, VoteKind::Prevote, Some(bh));
             hc.add_prevote(v).unwrap();
         }
         assert_eq!(hc.observed_polka, Some((5, bh)));
@@ -5443,8 +4827,11 @@ mod tests {
 
     #[test]
     fn vote_sign_and_verify() {
+        // FULL-PQ: Falcon-signed votes verify; Ed-only path deleted.
         let keys = keys(1);
-        let v = Vote::sign(&keys[0], 5, 0, VoteKind::Prevote, Some(block_hash(1)));
+        let fks = falcon_for_keys(&keys, 0x21);
+        let _vs = vset_with_falcon(&keys, &fks);
+        let v = fvote(&keys[0], &fks[0], 5, 0, VoteKind::Prevote, Some(block_hash(1)));
         assert!(v.verify());
 
         let mut tampered = v.clone();
@@ -5465,10 +4852,11 @@ mod tests {
     #[test]
     fn equivocation_is_recorded() {
         let keys = keys(4);
-        let vs = vset(&keys);
+        let fks = falcon_for_keys(&keys, 0x22);
+        let vs = vset_with_falcon(&keys, &fks);
         let mut set = VoteSet::new();
-        let v1 = Vote::sign(&keys[0], 1, 0, VoteKind::Prevote, Some(block_hash(1)));
-        let v2 = Vote::sign(&keys[0], 1, 0, VoteKind::Prevote, Some(block_hash(2)));
+        let v1 = fvote(&keys[0], &fks[0], 1, 0, VoteKind::Prevote, Some(block_hash(1)));
+        let v2 = fvote(&keys[0], &fks[0], 1, 0, VoteKind::Prevote, Some(block_hash(2)));
         set.add(v1, &vs, 1, 0, VoteKind::Prevote).unwrap();
         set.add(v2, &vs, 1, 0, VoteKind::Prevote).unwrap();
         assert_eq!(set.equivocations().len(), 1, "double-vote must be recorded");
@@ -5477,10 +4865,11 @@ mod tests {
     #[test]
     fn block_evidence_verifies_genuine_double_sign() {
         let ks = keys(3);
-        let vs = vset(&ks);
+        let fks = falcon_for_keys(&ks, 0x23);
+        let vs = vset_with_falcon(&ks, &fks);
         let member = |v: &ValidatorId| vs.validators.contains_key(v);
-        let a = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(block_hash(1)));
-        let b = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(block_hash(2)));
+        let a = fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(block_hash(1)));
+        let b = fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(block_hash(2)));
         let ev = EquivocationEvidence::new(ids(&ks)[0], a, b);
         assert!(verify_equivocation_evidence(&ev, &member));
     }
@@ -5488,9 +4877,11 @@ mod tests {
     #[test]
     fn block_evidence_offense_key_is_vote_order_stable() {
         let ks = keys(2);
+        let fks = falcon_for_keys(&ks, 0x24);
+        let _vs = vset_with_falcon(&ks, &fks);
         let voter = ids(&ks)[0];
-        let a = Vote::sign(&ks[0], 5, 2, VoteKind::Precommit, Some(block_hash(9)));
-        let b = Vote::sign(&ks[0], 5, 2, VoteKind::Precommit, Some(block_hash(3)));
+        let a = fvote(&ks[0], &fks[0], 5, 2, VoteKind::Precommit, Some(block_hash(9)));
+        let b = fvote(&ks[0], &fks[0], 5, 2, VoteKind::Precommit, Some(block_hash(3)));
         let fwd = EquivocationEvidence::new(voter, a.clone(), b.clone());
         let rev = EquivocationEvidence::new(voter, b, a);
         assert_eq!(fwd.offense_key(), rev.offense_key());
@@ -5500,13 +4891,14 @@ mod tests {
     #[test]
     fn block_evidence_refuses_forgeries_and_shapes_fail_closed() {
         let ks = keys(3);
-        let vs = vset(&ks);
+        let fks = falcon_for_keys(&ks, 0x25);
+        let vs = vset_with_falcon(&ks, &fks);
         let member = |v: &ValidatorId| vs.validators.contains_key(v);
         let voter = ids(&ks)[0];
-        let good_a = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(block_hash(1)));
-        let good_b = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(block_hash(2)));
+        let good_a = fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(block_hash(1)));
+        let good_b = fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(block_hash(2)));
         // Framing with another validator's vote.
-        let other = Vote::sign(&ks[1], 1, 0, VoteKind::Prevote, Some(block_hash(2)));
+        let other = fvote(&ks[1], &fks[1], 1, 0, VoteKind::Prevote, Some(block_hash(2)));
         assert!(!verify_equivocation_evidence(
             &EquivocationEvidence::new(voter, good_a.clone(), other),
             &member
@@ -5526,7 +4918,7 @@ mod tests {
             &member
         ));
         // Cross-kind pair is not pairwise equivocation (HUNT13/HUNT19).
-        let pc = Vote::sign(&ks[0], 1, 0, VoteKind::Precommit, Some(block_hash(2)));
+        let pc = fvote(&ks[0], &fks[0], 1, 0, VoteKind::Precommit, Some(block_hash(2)));
         assert!(!verify_equivocation_evidence(
             &EquivocationEvidence::new(voter, good_a.clone(), pc),
             &member
@@ -5540,7 +4932,7 @@ mod tests {
             &member
         ));
         // Nil-vs-value at the same round IS a double-sign (two statements).
-        let nil = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, None);
+        let nil = fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, None);
         assert!(verify_equivocation_evidence(
             &EquivocationEvidence::new(voter, good_a, nil),
             &member
@@ -5550,14 +4942,15 @@ mod tests {
     #[test]
     fn block_evidence_canonicalize_sorts_and_dedupes() {
         let ks = keys(2);
-        let vs = vset(&ks);
+        let fks = falcon_for_keys(&ks, 0x26);
+        let vs = vset_with_falcon(&ks, &fks);
         let member = |v: &ValidatorId| vs.validators.contains_key(v);
         let voter = ids(&ks)[0];
         let mk = |x: u8, y: u8| {
             EquivocationEvidence::new(
                 voter,
-                Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(block_hash(x))),
-                Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(block_hash(y))),
+                fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(block_hash(x))),
+                fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(block_hash(y))),
             )
         };
         let (e1, e2) = (mk(1, 2), mk(3, 4));
@@ -5565,14 +4958,14 @@ mod tests {
         let e1dup = mk(1, 2);
         let e1swapped = EquivocationEvidence::new(
             voter,
-            Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(block_hash(2))),
-            Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(block_hash(1))),
+            fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(block_hash(2))),
+            fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(block_hash(1))),
         );
         // Garbage: same-target pair never survives shaping.
         let garbage = EquivocationEvidence::new(
             voter,
-            Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(block_hash(7))),
-            Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(block_hash(7))),
+            fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(block_hash(7))),
+            fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(block_hash(7))),
         );
         let out = canonicalize_equivocation_evidence(
             vec![e2.clone(), garbage, e1dup, e1swapped, e1.clone()],
@@ -5717,7 +5110,8 @@ mod tests {
     #[test]
     fn full_happy_path_commits() {
         let keys = keys(4);
-        let vs = vset(&keys);
+        let fks = falcon_for_keys(&keys, 0x31);
+        let vs = vset_with_falcon(&keys, &fks);
         let bh = block_hash(7);
         let mut hc = HeightConsensus::new(1, vs.clone());
 
@@ -5727,15 +5121,15 @@ mod tests {
         assert_eq!(hc.decide_prevote(), Some(bh));
 
         // 3 of 4 prevote the block -> quorum
-        for k in keys.iter().take(3) {
-            let v = Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh));
+        for (i, k) in keys.iter().enumerate().take(3) {
+            let v = fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(bh));
             hc.add_prevote(v).unwrap();
         }
         assert_eq!(hc.try_prevote_quorum(), Some(Some(bh)));
 
         // 3 of 4 precommit -> finality
-        for k in keys.iter().take(3) {
-            let v = Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh));
+        for (i, k) in keys.iter().enumerate().take(3) {
+            let v = fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(bh));
             hc.add_precommit(v).unwrap();
         }
         assert_eq!(hc.try_precommit_quorum(), Some(bh));
@@ -5745,12 +5139,13 @@ mod tests {
     #[test]
     fn no_quorum_no_commit() {
         let keys = keys(4);
-        let vs = vset(&keys);
+        let fks = falcon_for_keys(&keys, 0x32);
+        let vs = vset_with_falcon(&keys, &fks);
         let bh = block_hash(7);
         let mut hc = HeightConsensus::new(1, vs);
         // only 2 of 4 precommit (below quorum 3)
-        for k in keys.iter().take(2) {
-            let v = Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh));
+        for (i, k) in keys.iter().enumerate().take(2) {
+            let v = fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(bh));
             hc.add_precommit(v).unwrap();
         }
         assert_eq!(hc.try_precommit_quorum(), None);
@@ -5792,44 +5187,58 @@ mod tests {
 
     #[test]
     fn qc_verification_rejects_insufficient_signatures() {
-        let keys = keys(4);
-        let vs = vset(&keys);
+        // FULL-PQ: Falcon µQC with 2 vs 3 signers (same 2-below / 3-meets
+        // quorum shape as the deleted Ed threshold). Quorum math unchanged.
+        let mut vs = ValidatorSet::new();
+        let mut fks: Vec<(ValidatorId, FalconKeypair)> = Vec::new();
+        for i in 0..4u8 {
+            let fk = FalconKeypair::generate_from_seed(0x40 + i);
+            let pk = fk.public_key.clone();
+            let id = crate::post_quantum::derive_pq_address(
+                crate::post_quantum::PqScheme::Falcon512,
+                &pk,
+                &crate::post_quantum::DEFAULT_SALT,
+            );
+            vs.add(id, 1);
+            register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                pk.clone(),
+            );
+            fks.push((id, fk));
+        }
         let bh = block_hash(9);
-        // QC with only 2 signatures (below quorum 3)
-        let sigs: Vec<(ValidatorId, Vec<u8>)> = keys
-            .iter()
-            .take(2)
-            .map(|k| {
-                let v = Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh));
-                (v.voter, v.signature)
-            })
-            .collect();
-        let qc = QuorumCertificate {
-            height: 1,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(bh),
-            signatures: sigs,
+        let parent = [0x99; 32];
+        let committee_size = micro_committee_size(vs.len());
+        let committee = derive_sortition_committee(&vs, 1, 0, committee_size, &parent);
+        let msg = vote_sign_bytes(1, 0, VoteKind::Precommit, &Some(bh));
+        let build = |n: usize| -> QuorumCertificate {
+            let mut bitmask = vec![0u8; (committee_size as usize).div_ceil(8)];
+            let mut msigs = Vec::new();
+            for (i, val_id) in committee.iter().enumerate().take(n) {
+                bitmask[i / 8] |= 1 << (i % 8);
+                let (_, fk) = fks.iter().find(|(id, _)| id == val_id).unwrap();
+                msigs.push(fk.sign(&msg));
+            }
+            let uqc = PqMicroCertificate::new(
+                crate::post_quantum::PqScheme::Falcon512,
+                1,
+                0,
+                committee_size,
+                bitmask,
+                msigs,
+                parent,
+            );
+            QuorumCertificate {
+                height: 1,
+                round: 0,
+                kind: VoteKind::Precommit,
+                block_hash: Some(bh),
+                signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc))],
+            }
         };
-        assert!(!qc.verify(&vs), "sub-quorum QC must not verify");
-
-        // With 3 signatures it verifies
-        let sigs3: Vec<(ValidatorId, Vec<u8>)> = keys
-            .iter()
-            .take(3)
-            .map(|k| {
-                let v = Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh));
-                (v.voter, v.signature)
-            })
-            .collect();
-        let qc3 = QuorumCertificate {
-            height: 1,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(bh),
-            signatures: sigs3,
-        };
-        assert!(qc3.verify(&vs));
+        assert!(!build(2).verify(&vs), "sub-quorum µQC must not verify");
+        assert!(build(3).verify(&vs), "quorum µQC must verify");
     }
 
     #[test]
@@ -5858,18 +5267,49 @@ mod tests {
     fn qc_verification_enforces_the_signer_cap() {
         // Audit F7: the cap is enforced INSIDE `verify`, so every caller
         // (sync/replay/adopt) inherits it without a separate length check.
-        let keys = keys(4);
-        let vs = vset(&keys);
+        // FULL-PQ: genuine quorum is a Falcon µQC (same cap logic, PQ scheme).
+        let mut vs = ValidatorSet::new();
+        let mut fks: Vec<(ValidatorId, FalconKeypair)> = Vec::new();
+        for i in 0..4u8 {
+            let fk = FalconKeypair::generate_from_seed(0x50 + i);
+            let pk = fk.public_key.clone();
+            let id = crate::post_quantum::derive_pq_address(
+                crate::post_quantum::PqScheme::Falcon512,
+                &pk,
+                &crate::post_quantum::DEFAULT_SALT,
+            );
+            vs.add(id, 1);
+            register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                pk.clone(),
+            );
+            fks.push((id, fk));
+        }
         let bh = block_hash(9);
+        let parent = [0x9A; 32];
+        let committee_size = micro_committee_size(vs.len());
+        let committee = derive_sortition_committee(&vs, 1, 0, committee_size, &parent);
+        let msg = vote_sign_bytes(1, 0, VoteKind::Precommit, &Some(bh));
+        let mut bitmask = vec![0u8; (committee_size as usize).div_ceil(8)];
+        let mut msigs = Vec::new();
+        for (i, val_id) in committee.iter().enumerate().take(3) {
+            bitmask[i / 8] |= 1 << (i % 8);
+            let (_, fk) = fks.iter().find(|(id, _)| id == val_id).unwrap();
+            msigs.push(fk.sign(&msg));
+        }
+        let uqc = PqMicroCertificate::new(
+            crate::post_quantum::PqScheme::Falcon512,
+            1,
+            0,
+            committee_size,
+            bitmask,
+            msigs,
+            parent,
+        );
+        let marker = (PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc));
         // A genuine 3-of-4 quorum under the cap.
-        let mut sigs: Vec<(ValidatorId, Vec<u8>)> = keys
-            .iter()
-            .take(3)
-            .map(|k| {
-                let v = Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh));
-                (v.voter, v.signature)
-            })
-            .collect();
+        let mut sigs: Vec<(ValidatorId, Vec<u8>)> = vec![marker.clone()];
         let base = QuorumCertificate {
             height: 1,
             round: 0,
@@ -5924,7 +5364,8 @@ mod tests {
     #[test]
     fn driver_finalizes_and_advances() {
         let keys = keys(4);
-        let vs = vset(&keys);
+        let fks = falcon_for_keys(&keys, 0x33);
+        let vs = vset_with_falcon(&keys, &fks);
         let mut driver = ConsensusDriver::new(vs, 1);
         let bh = block_hash(3);
 
@@ -5932,13 +5373,13 @@ mod tests {
             let hc = driver.current.as_mut().unwrap();
             let proposer = hc.proposer().unwrap();
             hc.receive_proposal(proposer, bh).unwrap();
-            for k in keys.iter().take(3) {
-                hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+            for (i, k) in keys.iter().enumerate().take(3) {
+                hc.add_prevote(fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(bh)))
                     .unwrap();
             }
             hc.try_prevote_quorum();
-            for k in keys.iter().take(3) {
-                hc.add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+            for (i, k) in keys.iter().enumerate().take(3) {
+                hc.add_precommit(fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(bh)))
                     .unwrap();
             }
             hc.try_precommit_quorum();
@@ -6017,10 +5458,11 @@ mod tests {
     #[test]
     fn vote_for_far_future_round_rejected() {
         let keys = keys(4);
-        let vs = vset(&keys);
+        let fks = falcon_for_keys(&keys, 0x37);
+        let vs = vset_with_falcon(&keys, &fks);
         let mut hc = HeightConsensus::new(1, vs);
         let far = MAX_ROUND_AHEAD + 5;
-        let v = Vote::sign(&keys[0], 1, far, VoteKind::Prevote, Some(block_hash(1)));
+        let v = fvote(&keys[0], &fks[0], 1, far, VoteKind::Prevote, Some(block_hash(1)));
         assert!(
             hc.add_prevote(v).is_err(),
             "vote for a far-future round must be rejected"
@@ -6061,13 +5503,14 @@ mod tests {
         // named. A peer could therefore hand a node precommits for a block that
         // nobody ever prevoted for, and it would be committed.
         let keys = keys(4);
-        let vs = vset(&keys);
+        let fks = falcon_for_keys(&keys, 0x34);
+        let vs = vset_with_falcon(&keys, &fks);
         let mut hc = HeightConsensus::new(1, vs);
 
         let a = block_hash(1);
         let b = block_hash(2);
-        for k in keys.iter() {
-            hc.add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(a)))
+        for (i, k) in keys.iter().enumerate() {
+            hc.add_precommit(fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(a)))
                 .unwrap();
         }
         assert_eq!(
@@ -6078,8 +5521,8 @@ mod tests {
         assert_eq!(hc.decided, None);
 
         // Prevote a DIFFERENT block: now the two quorums disagree.
-        for k in keys.iter() {
-            hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(b)))
+        for (i, k) in keys.iter().enumerate() {
+            hc.add_prevote(fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(b)))
                 .unwrap();
         }
         assert_eq!(
@@ -6090,11 +5533,11 @@ mod tests {
         assert_eq!(hc.decided, None);
 
         // Prevote the same block, and it decides.
-        let mut hc2 = HeightConsensus::new(1, vset(&keys));
-        for k in keys.iter() {
-            hc2.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(a)))
+        let mut hc2 = HeightConsensus::new(1, vset_with_falcon(&keys, &fks));
+        for (i, k) in keys.iter().enumerate() {
+            hc2.add_prevote(fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(a)))
                 .unwrap();
-            hc2.add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(a)))
+            hc2.add_precommit(fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(a)))
                 .unwrap();
         }
         assert_eq!(hc2.try_precommit_quorum(), Some(a));
@@ -6106,14 +5549,15 @@ mod tests {
         // on block A must not later decide block B at the same or a later round,
         // or a reorg past the lock becomes possible.
         let keys = keys(4);
-        let mut hc = HeightConsensus::new(1, vset(&keys));
+        let fks = falcon_for_keys(&keys, 0x35);
+        let mut hc = HeightConsensus::new(1, vset_with_falcon(&keys, &fks));
         let a = block_hash(1);
         let b = block_hash(2);
 
-        for k in keys.iter() {
-            hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(a)))
+        for (i, k) in keys.iter().enumerate() {
+            hc.add_prevote(fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(a)))
                 .unwrap();
-            hc.add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(a)))
+            hc.add_precommit(fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(a)))
                 .unwrap();
         }
         assert_eq!(
@@ -6123,10 +5567,10 @@ mod tests {
         );
 
         hc.next_round();
-        for k in keys.iter() {
-            hc.add_prevote(Vote::sign(k, 1, 1, VoteKind::Prevote, Some(b)))
+        for (i, k) in keys.iter().enumerate() {
+            hc.add_prevote(fvote(k, &fks[i], 1, 1, VoteKind::Prevote, Some(b)))
                 .unwrap();
-            hc.add_precommit(Vote::sign(k, 1, 1, VoteKind::Precommit, Some(b)))
+            hc.add_precommit(fvote(k, &fks[i], 1, 1, VoteKind::Precommit, Some(b)))
                 .unwrap();
         }
         assert_eq!(
@@ -6156,10 +5600,11 @@ mod tests {
     #[test]
     fn vote_wrong_scope_rejected() {
         let keys = keys(4);
-        let vs = vset(&keys);
+        let fks = falcon_for_keys(&keys, 0x36);
+        let vs = vset_with_falcon(&keys, &fks);
         let mut set = VoteSet::new();
         // vote at height 2 cannot be added to a height-1 set
-        let v = Vote::sign(&keys[0], 2, 0, VoteKind::Prevote, Some(block_hash(1)));
+        let v = fvote(&keys[0], &fks[0], 2, 0, VoteKind::Prevote, Some(block_hash(1)));
         assert!(set.add(v, &vs, 1, 0, VoteKind::Prevote).is_err());
     }
 }
@@ -6322,7 +5767,8 @@ mod phase_convergence_tests {
     /// A three-validator set with the live power split: the 1500-STELL
     /// validator is in EVERY quorum (1000+1000 = 2000 is below the 2334
     /// quorum), so one node that stays silent parks the whole chain.
-    fn live_three() -> (ValidatorSet, Vec<SigningKey>) {
+    /// FULL-PQ: also registers Falcon-512 keys for each Ed id.
+    fn live_three() -> (ValidatorSet, Vec<SigningKey>, Vec<FalconKeypair>) {
         let keys: Vec<SigningKey> = (0..3)
             .map(|i| {
                 let mut seed = [0u8; 32];
@@ -6331,13 +5777,38 @@ mod phase_convergence_tests {
                 SigningKey::from_bytes(&seed)
             })
             .collect();
+        let fks: Vec<FalconKeypair> = (0..3)
+            .map(|i| FalconKeypair::generate_from_seed(0x70 + i as u8))
+            .collect();
         let vs = ValidatorSet::from_list(
             keys.iter()
                 .zip([1500u64, 1000, 1000].iter())
                 .map(|(k, p)| (k.verifying_key().to_bytes(), *p))
                 .collect(),
         );
-        (vs, keys)
+        for (sk, fk) in keys.iter().zip(fks.iter()) {
+            let id = sk.verifying_key().to_bytes();
+            register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+        }
+        (vs, keys, fks)
+    }
+
+    // Local copy of the `mod tests` helper (sibling modules cannot see it):
+    // Falcon-only vote minting, identical semantics.
+    // GATE: keep in sync with `mod tests::fvote` — same one-line delegation.
+    fn fvote(
+        sk: &SigningKey,
+        fk: &FalconKeypair,
+        height: Height,
+        round: Round,
+        kind: VoteKind,
+        bh: Option<BlockHash>,
+    ) -> Vote {
+        Vote::sign_with_falcon(sk, fk, height, round, kind, bh)
     }
 
     #[test]
@@ -6348,12 +5819,12 @@ mod phase_convergence_tests {
         // the scan window cannot see it, and the node that misses it never
         // precommits, so the precommit quorum never forms and the height is
         // parked forever.
-        let (vs, keys) = live_three();
+        let (vs, keys, fks) = live_three();
         let mut hc = HeightConsensus::new(1, vs);
         let block = [0x42u8; 32];
 
         // Our own prevote for round 0 (we were there when the round opened).
-        hc.add_prevote(Vote::sign(&keys[0], 1, 0, VoteKind::Prevote, Some(block)))
+        hc.add_prevote(fvote(&keys[0], &fks[0], 1, 0, VoteKind::Prevote, Some(block)))
             .unwrap();
         assert!(hc.observed_polka().is_none(), "one prevote is not a polka");
 
@@ -6366,7 +5837,7 @@ mod phase_convergence_tests {
         // The other prevote arrives LATE. The 1500-STELL validator plus one
         // 1000-STELL validator is 2500 of the 2334 quorum, so the quorum
         // completes NOW - in a round this node left twelve rounds ago.
-        hc.add_prevote(Vote::sign(&keys[1], 1, 0, VoteKind::Prevote, Some(block)))
+        hc.add_prevote(fvote(&keys[1], &fks[1], 1, 0, VoteKind::Prevote, Some(block)))
             .unwrap();
 
         // The polka is recorded -- with the round it formed in, NOT the local
@@ -6388,21 +5859,21 @@ mod phase_convergence_tests {
 
     #[test]
     fn an_older_polka_never_supersedes_a_newer_one() {
-        let (vs, keys) = live_three();
+        let (vs, keys, fks) = live_three();
         let mut hc = HeightConsensus::new(1, vs);
         let block = [0x11u8; 32];
         let other = [0x22u8; 32];
 
         // A polka in round 5.
-        for k in &keys {
-            hc.add_prevote(Vote::sign(k, 1, 5, VoteKind::Prevote, Some(block)))
+        for (i, k) in keys.iter().enumerate() {
+            hc.add_prevote(fvote(k, &fks[i], 1, 5, VoteKind::Prevote, Some(block)))
                 .unwrap();
         }
         assert_eq!(hc.observed_polka(), Some((5, block)));
 
         // A LATE polka for the OLDER round 2 must not become the node's word.
-        for k in &keys {
-            hc.add_prevote(Vote::sign(k, 1, 2, VoteKind::Prevote, Some(other)))
+        for (i, k) in keys.iter().enumerate() {
+            hc.add_prevote(fvote(k, &fks[i], 1, 2, VoteKind::Prevote, Some(other)))
                 .unwrap();
         }
         assert_eq!(
@@ -6418,11 +5889,11 @@ mod phase_convergence_tests {
         // precommit quorum is formed in the same round). If the prune drops
         // that round, the height can never be decided: the precommit quorum is
         // there and the proof that it certified this block is gone.
-        let (vs, keys) = live_three();
+        let (vs, keys, fks) = live_three();
         let mut hc = HeightConsensus::new(1, vs);
         let block = [0x33u8; 32];
-        for k in &keys {
-            hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(block)))
+        for (i, k) in keys.iter().enumerate() {
+            hc.add_prevote(fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(block)))
                 .unwrap();
         }
         assert_eq!(hc.observed_polka(), Some((0, block)));
@@ -6445,19 +5916,19 @@ mod phase_convergence_tests {
     fn a_precommit_quorum_in_the_polka_round_decides_the_height() {
         // The finalization path must find the precommit quorum in the polka's
         // round even when that round is far outside the scan window.
-        let (vs, keys) = live_three();
+        let (vs, keys, fks) = live_three();
         let mut hc = HeightConsensus::new(1, vs);
         let block = [0x44u8; 32];
-        for k in &keys {
-            hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(block)))
+        for (i, k) in keys.iter().enumerate() {
+            hc.add_prevote(fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(block)))
                 .unwrap();
         }
         // Race ahead, then the precommits of round 0 arrive (late).
         for _ in 0..20 {
             hc.next_round();
         }
-        for k in &keys {
-            hc.add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(block)))
+        for (i, k) in keys.iter().enumerate() {
+            hc.add_precommit(fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(block)))
                 .unwrap();
         }
         assert_eq!(
@@ -6644,14 +6115,21 @@ mod post_quantum_uqc_tests {
         const MAINNET: u64 = 5757;
 
         let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let fk = FalconKeypair::generate_from_seed(0x77);
+        let id = key.verifying_key().to_bytes();
+        register_validator_pq_key(
+            id,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
         let height: Height = 42;
         let round: Round = 3;
         let kind = VoteKind::Prevote;
         let target = Some([0xAB; 32]);
 
-        // Sign on the TESTNET.
+        // Sign on the TESTNET (FULL-PQ: Falcon-signed vote).
         set_consensus_chain_id_for_tests(TESTNET);
-        let vote = Vote::sign(&key, height, round, kind, target);
+        let vote = Vote::sign_with_falcon(&key, &fk, height, round, kind, target);
         assert!(
             vote.verify(),
             "the vote must verify on the chain it was signed for"
@@ -6757,8 +6235,6 @@ mod post_quantum_uqc_tests {
             signers_bitmask: bitmask,
             signatures,
             sortition_parent: parent,
-            // Unit-test fixtures predate the VRF seal: legacy draw.
-            vrf_beacon: None,
         };
 
         // Test wire encoding & decoding roundtrip
@@ -6841,8 +6317,6 @@ mod post_quantum_uqc_tests {
             signers_bitmask: sub_bitmask,
             signatures: sub_sigs,
             sortition_parent: parent,
-            // Unit-test fixture predates the VRF seal: legacy draw.
-            vrf_beacon: None,
         };
         let sub_qc = QuorumCertificate {
             height,
@@ -6880,8 +6354,6 @@ mod post_quantum_uqc_tests {
             signers_bitmask: quorum_bitmask,
             signatures: quorum_sigs,
             sortition_parent: parent,
-            // Unit-test fixture predates the VRF seal: legacy draw.
-            vrf_beacon: None,
         };
         let tampered_qc = QuorumCertificate {
             height,
@@ -7019,8 +6491,6 @@ mod post_quantum_uqc_tests {
                 signers_bitmask: bitmask,
                 signatures,
                 sortition_parent: parent,
-                // Unit-test fixture predates the VRF seal: legacy draw.
-                vrf_beacon: None,
             }
         };
         let wrap = |uqc: &PqMicroCertificate| QuorumCertificate {
@@ -7052,49 +6522,130 @@ mod post_quantum_uqc_tests {
 
     #[test]
     fn test_backward_compatibility_classical_ed25519_qc() {
-        let mut vs = ValidatorSet::new();
-        let mut signers = Vec::new();
-
+        // FULL-PQ (nodes wiped, no compat): classical Ed25519 QC legs deleted.
+        // An Ed-only QC is REJECTED (fail-closed); a Falcon µQC with the same
+        // 3-of-4 quorum shape VERIFIES. Same strength as before (genuine pass,
+        // tampered fail), fixtures converted to Falcon/PQ.
+        //
+        // Part A: Ed-only QC (3 of 4) must now FAIL on both paths.
+        let mut vs_ed = ValidatorSet::new();
+        let mut ed_signers = Vec::new();
         for _ in 0..4 {
             let sk = SigningKey::generate(&mut rand::rngs::OsRng);
             let id = sk.verifying_key().to_bytes();
-            vs.add(id, 10);
-            signers.push(sk);
+            vs_ed.add(id, 10);
+            ed_signers.push(sk);
         }
-
         let height = 5;
         let round = 0;
         let kind = VoteKind::Precommit;
         let block_hash = Some([0x12; 32]);
         let msg = vote_sign_bytes(height, round, kind, &block_hash);
-
-        // 3 of 4 signers provide classical Ed25519 signatures (exceeds 2/3 threshold)
-        let mut signatures = Vec::new();
-        for sk in &signers[0..3] {
+        let mut ed_sigs = Vec::new();
+        for sk in &ed_signers[0..3] {
             let sig = sk.sign(&msg).to_bytes().to_vec();
-            signatures.push((sk.verifying_key().to_bytes(), sig));
+            ed_sigs.push((sk.verifying_key().to_bytes(), sig));
         }
-
-        let qc = QuorumCertificate {
+        let ed_qc = QuorumCertificate {
             height,
             round,
             kind,
             block_hash,
-            signatures,
+            signatures: ed_sigs,
         };
-
-        assert!(qc.verify(&vs), "Classical Ed25519 QC must verify unchanged");
         assert!(
-            qc.verify_unified(&vs),
-            "Classical Ed25519 QC must verify with verify_unified"
+            !ed_qc.verify(&vs_ed),
+            "FULL-PQ: Ed-only QC must be rejected (Ed legs deleted)"
+        );
+        assert!(
+            !ed_qc.verify_unified(&vs_ed),
+            "FULL-PQ: Ed-only QC must be rejected on verify_unified"
+        );
+        assert!(
+            ed_qc.signers_set(&vs_ed).is_empty(),
+            "FULL-PQ: rejected Ed-only QC attributes nobody"
         );
 
-        // Tamper with one signature: with only 2 valid signers (20 power < 28 quorum), verification fails
-        let mut tampered_qc = qc.clone();
-        tampered_qc.signatures[0].1[10] ^= 0xFF;
+        // Part B: Falcon µQC with the same 3-of-4 shape VERIFIES.
+        let mut vs = ValidatorSet::new();
+        let mut fks = Vec::new();
+        for i in 0..4u8 {
+            let fk = make_sample_falcon512(0xA0 + i);
+            let pk = fk.public_key().to_vec();
+            let id = crate::post_quantum::derive_pq_address(
+                crate::post_quantum::PqScheme::Falcon512,
+                &pk,
+                &crate::post_quantum::DEFAULT_SALT,
+            );
+            vs.add(id, 10);
+            register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                pk.clone(),
+            );
+            fks.push((id, fk));
+        }
+        let committee_size = micro_committee_size(vs.len());
+        assert_eq!(committee_size, 4);
+        let parent = [0x34; 32];
+        let committee = derive_sortition_committee(&vs, height, round, committee_size, &parent);
+        assert_eq!(committee.len(), 4);
+        let target = Some([0x12; 32]);
+        let qc_msg = vote_sign_bytes(height, round, kind, &target);
+        // 3 of 4 committee members sign (exceeds 2/3 power quorum, same shape
+        // as the deleted Ed fixture above).
+        let mut bitmask = vec![0u8; (committee_size as usize).div_ceil(8)];
+        let mut msigs = Vec::new();
+        for (i, val_id) in committee.iter().enumerate().take(3) {
+            bitmask[i / 8] |= 1 << (i % 8);
+            let (_, fk) = fks.iter().find(|(id, _)| id == val_id).unwrap();
+            msigs.push(make_sample_falcon512_sig(fk, &qc_msg));
+        }
+        let uqc = PqMicroCertificate::new(
+            crate::post_quantum::PqScheme::Falcon512,
+            height,
+            round,
+            committee_size,
+            bitmask,
+            msigs,
+            parent,
+        );
+        let qc = QuorumCertificate {
+            height,
+            round,
+            kind,
+            block_hash: target,
+            signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc))],
+        };
+        assert!(qc.verify(&vs), "Falcon µQC 3-of-4 must verify");
+        assert!(
+            qc.verify_unified(&vs),
+            "Falcon µQC 3-of-4 must verify with verify_unified"
+        );
+
+        // Tamper with one Falcon signature: surviving power below quorum,
+        // verification fails (same tamper shape as the deleted Ed fixture).
+        let mut bad_sigs = uqc.signatures.clone();
+        bad_sigs[0][10] ^= 0xFF;
+        let bad_uqc = PqMicroCertificate::new(
+            crate::post_quantum::PqScheme::Falcon512,
+            height,
+            round,
+            committee_size,
+            uqc.signers_bitmask.clone(),
+            bad_sigs,
+            parent,
+        );
+        let tampered_qc = QuorumCertificate {
+            height,
+            round,
+            kind,
+            block_hash: target,
+            signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&bad_uqc))],
+        };
         assert!(
             !tampered_qc.verify(&vs),
-            "Tampered classical QC must fail verification"
+            "Tampered Falcon µQC must fail verification"
         );
     }
 
@@ -7339,7 +6890,7 @@ mod post_quantum_uqc_tests {
     }
 
     #[test]
-    fn test_signers_set_extraction_falcon_uqc_bls_and_classical() {
+    fn test_signers_set_extraction_falcon_uqc_and_classical() {
         // Real keys throughout: attribution mirrors verification (V-P34 R2),
         // so every attributed signer must carry a verifying signature and
         // every unverifiable entry attributes nobody.
@@ -7362,8 +6913,9 @@ mod post_quantum_uqc_tests {
         let ids: Vec<ValidatorId> = sks.iter().map(|k| k.verifying_key().to_bytes()).collect();
         let target = [0xAA; 32];
 
-        // 1. Classical signatures: a genuine quorum attributes its signers,
-        // and a forged entry in a REJECTED certificate attributes nobody.
+        // 1. Classical signatures: FULL-PQ deletes the Ed threshold, so a
+        // genuine Ed quorum is REJECTED and attributes nobody (fail-closed);
+        // a forged entry in a REJECTED certificate attributes nobody.
         let genuine: Vec<(ValidatorId, Vec<u8>)> = sks
             .iter()
             .map(|k| {
@@ -7379,14 +6931,18 @@ mod post_quantum_uqc_tests {
             signatures: genuine,
         };
         assert!(
-            classical_qc.verify(&vs),
-            "genuine classical quorum must verify"
+            !classical_qc.verify(&vs),
+            "FULL-PQ: genuine Ed quorum must be rejected (Ed legs deleted)"
+        );
+        assert!(
+            !classical_qc.verify_unified(&vs),
+            "FULL-PQ: genuine Ed quorum must be rejected on verify_unified"
         );
         let signers_classical = classical_qc.signers_set(&vs);
-        assert_eq!(signers_classical.len(), 3);
-        for id in &ids {
-            assert!(signers_classical.contains(id));
-        }
+        assert!(
+            signers_classical.is_empty(),
+            "FULL-PQ: rejected Ed quorum attributes nobody"
+        );
         let forged_qc = QuorumCertificate {
             height: 1,
             round: 0,
@@ -7441,160 +6997,135 @@ mod post_quantum_uqc_tests {
             assert!(signers_uqc.contains(id));
         }
 
-        // 3. BLS aggregate with the BLS path OFF (the default): verify ignores
-        // the marker, and attribution mirrors verify — the decodable-but-
-        // unverifiable envelope attributes NOBODY. (Genuine-BLS attribution
-        // with the path enabled is pinned by the v34_r2e integration test.)
-        // GATE (HDAE wire-EMIT cut): the envelope is hand-built HISTORY bytes
-        // (the retired `encode_qc_bls_envelope` returns empty and is NOT used).
-        let mut ids_sorted = ids.clone();
-        ids_sorted.sort_unstable();
-        let mut bitvec = crate::bls::SignerBitVector::new(ids_sorted.len());
-        bitvec.set(1, true);
-        bitvec.set(2, true);
-        let dummy_sig = crate::bls::BlsSecretKey::generate().sign(b"msg");
-        let dummy_agg = crate::bls::BlsAggregateSignature {
-            signature: dummy_sig,
-            participants: bitvec,
-        };
-        let (sig_bytes, bits) = dummy_agg.to_bytes();
-        let mut bls_payload = Vec::with_capacity(16 + 8 + 4 + 1 + 32 + 4 + 96 + bits.len());
-        bls_payload.extend_from_slice(QC_BLS_MAGIC);
-        bls_payload.extend_from_slice(&1u64.to_le_bytes());
-        bls_payload.extend_from_slice(&0u32.to_le_bytes());
-        bls_payload.push(1);
-        bls_payload.extend_from_slice(&[0xAA; 32]);
-        bls_payload.extend_from_slice(&(ids_sorted.len() as u32).to_le_bytes());
-        bls_payload.extend_from_slice(&sig_bytes);
-        bls_payload.extend_from_slice(bits);
-        let bls_qc = QuorumCertificate {
+        // 3. Garbage marker (unknown id): verify ignores the entry, and
+        // attribution mirrors verify — the undecodable marker attributes
+        // NOBODY.
+        let marker_qc = QuorumCertificate {
             height: 1,
             round: 0,
             kind: VoteKind::Precommit,
             block_hash: Some([0xAA; 32]),
-            signatures: vec![(BLS_QC_MARKER_ID, bls_payload)],
+            signatures: vec![(PQ_UQC_MARKER_ID, b"garbage-not-an-envelope".to_vec())],
         };
         assert!(
-            !bls_qc.verify(&vs),
-            "BLS-off marker-only QC must be rejected"
+            !marker_qc.verify(&vs),
+            "marker-only QC must be rejected"
         );
         assert!(
-            bls_qc.signers_set(&vs).is_empty(),
-            "BLS-off: an unverifiable marker must attribute nobody"
+            marker_qc.signers_set(&vs).is_empty(),
+            "an unverifiable marker must attribute nobody"
         );
     }
 
-    /// QC-VERIFY BATCH PARITY (classical Ed25519, fixed fixtures k=4/7/16/100):
-    /// the batched `verify` / `signers_set` must equal a serial per-signature
-    /// oracle on all-valid fixtures AND on 1-forged variants (the forged member
-    /// is unattributed on both paths; the verdict follows the surviving quorum
-    /// on both). An exact-quorum forged fixture pins whole-QC-invalid on both
-    /// paths. Extends the QC suites; weakens nothing.
+    /// VOTE-VERIFY BATCH PARITY (Falcon-only, fixed fixtures k=4/7/16/100):
+    /// `Vote::verify_batch` / `partition_valid` must equal scalar `verify`
+    /// on all-valid fixtures AND on 1-forged variants. Converted from the
+    /// deleted classical Ed25519 QC parity (same k values, same strength):
+    /// Ed-only votes are rejected; tampering the Ed half of a dual envelope
+    /// still verifies (Ed ignored — proof of deletion); tampering the Falcon
+    /// half fails. Extends the vote suites; weakens nothing.
     #[test]
     fn qc_verify_batch_parity_classical_ed25519_k4716_and_forged() {
-        use ed25519_dalek::{Signature, VerifyingKey};
+        // NOTE: historic name kept for traceability; fixtures are Falcon-only
+        // (FULL-PQ conversion). The classical Ed25519 QC parity legs are
+        // deleted — see `verify_unified_with_pq_keys` (now unconditional
+        // `false` after the PQ path) and `signers_set` (classical skipped).
         use rand::rngs::OsRng;
-        let local_keys = |k: usize| -> Vec<SigningKey> {
-            (0..k).map(|_| SigningKey::generate(&mut OsRng)).collect()
-        };
-        let local_vset = |ks: &[SigningKey]| -> ValidatorSet {
-            ValidatorSet::from_list(
-                ks.iter().map(|k| (k.verifying_key().to_bytes(), 1)).collect(),
-            )
-        };
         for &k in &[4usize, 7, 16, 100] {
-            let ks = local_keys(k);
-            let vs = local_vset(&ks);
+            let mut vs = ValidatorSet::new();
+            let mut sks = Vec::new();
+            let mut fks = Vec::new();
+            for i in 0..k {
+                let sk = SigningKey::generate(&mut OsRng);
+                let id = sk.verifying_key().to_bytes();
+                let fk = make_sample_falcon512((k as u8).wrapping_mul(31).wrapping_add(i as u8));
+                vs.add(id, 1);
+                register_validator_pq_key(
+                    id,
+                    crate::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                );
+                sks.push(sk);
+                fks.push(fk);
+            }
             let height = 5;
             let round = 0;
             let kind = VoteKind::Precommit;
             let target = Some([0x12; 32]);
-            let msg = vote_sign_bytes(height, round, kind, &target);
-            let sigs: Vec<(ValidatorId, Vec<u8>)> = ks
-                .iter()
-                .map(|sk| {
-                    (
-                        sk.verifying_key().to_bytes(),
-                        sk.sign(&msg).to_bytes().to_vec(),
-                    )
-                })
+            let votes: Vec<Vote> = (0..k)
+                .map(|i| Vote::sign_with_falcon(&sks[i], &fks[i], height, round, kind, target))
                 .collect();
-            let qc = QuorumCertificate {
-                height,
-                round,
-                kind,
-                block_hash: target,
-                signatures: sigs,
-            };
-            // Serial oracle: dedup + membership + strict per-sig verify, then
-            // the power quorum — the pre-batch loop, no batch primitive.
-            let serial = |q: &QuorumCertificate| -> (bool, HashSet<ValidatorId>) {
-                let mut seen = HashSet::new();
-                let mut power = 0u64;
-                let mut set = HashSet::new();
-                for (voter, sig_bytes) in &q.signatures {
-                    if !seen.insert(*voter) {
-                        continue;
-                    }
-                    if vs.power_of(voter) == 0 {
-                        continue;
-                    }
-                    let Ok(vk) = VerifyingKey::from_bytes(voter) else {
-                        continue;
-                    };
-                    let Ok(sig) = Signature::from_slice(ed25519_sig_bytes(sig_bytes)) else {
-                        continue;
-                    };
-                    if vk.verify_strict(&msg, &sig).is_ok() {
-                        power += vs.power_of(voter);
-                        set.insert(*voter);
-                    }
-                }
-                (power >= vs.quorum_power(), set)
-            };
-            let (exp_v, exp_s) = serial(&qc);
-            assert!(exp_v, "k={k} all-valid fixture must reach quorum serially");
-            assert_eq!(exp_s.len(), k, "k={k} all members attributed serially");
-            assert_eq!(qc.verify(&vs), exp_v, "k={k} batched == serial verdict");
-            assert_eq!(
-                qc.signers_set(&vs),
-                exp_s,
-                "k={k} identical signer accounting"
-            );
-            // Deterministic across repeats.
-            assert_eq!(qc.verify(&vs), exp_v, "k={k} verdict stable");
-            assert_eq!(qc.signers_set(&vs), exp_s, "k={k} attribution stable");
-            // 1-forged: offender unattributed on both paths; surviving quorum
-            // still decides on both.
-            let mut forged = qc.clone();
-            forged.signatures[0].1[10] ^= 0xFF;
-            let (f_v, f_s) = serial(&forged);
-            assert_eq!(forged.verify(&vs), f_v, "k={k} forged batched == serial");
-            assert_eq!(
-                forged.signers_set(&vs),
-                f_s,
-                "k={k} forged signer accounting"
-            );
-            assert_eq!(f_s.len(), k - 1, "k={k} only the forger drops out");
-            // Exact-quorum forged: survivors below quorum, so the whole QC is
-            // invalid on both paths.
-            let q = vs.quorum_power() as usize; // power 1 each ⇒ q members
-            let mut exact = qc.clone();
-            exact.signatures.truncate(q);
-            assert!(exact.verify(&vs), "k={k} exact-quorum fixture must verify");
-            exact.signatures[0].1[10] ^= 0xFF;
-            let (e_v, e_s) = serial(&exact);
-            assert!(!e_v, "k={k} forged exact-quorum fails serially");
+            // Serial oracle: scalar Falcon predicate per vote.
+            let serial: Vec<bool> = votes.iter().map(|v| v.verify()).collect();
             assert!(
-                !exact.verify(&vs),
-                "k={k} forged exact-quorum QC invalid on batched path"
+                serial.iter().all(|&b| b),
+                "k={k} all-Falcon fixture must verify serially"
+            );
+            assert!(
+                Vote::verify_batch(&votes),
+                "k={k} all-Falcon batch must verify"
             );
             assert_eq!(
-                exact.signers_set(&vs),
-                e_s,
-                "k={k} exact-quorum forged signer accounting"
+                Vote::partition_valid(&votes),
+                serial,
+                "k={k} partition == serial"
             );
-            assert_eq!(e_s.len(), q - 1);
+            // Deterministic across repeats (cache hit path).
+            // GATE: black_box defeats const-folding; pin must fail loudly if changed.
+            assert!(
+                std::hint::black_box(Vote::verify_batch(&votes)),
+                "k={k} batch verdict stable"
+            );
+            assert_eq!(
+                Vote::partition_valid(&votes),
+                serial,
+                "k={k} partition stable"
+            );
+            // 1-forged Falcon half: offender fails on every path; survivors pass.
+            let mut forged_falcon = votes.clone();
+            forged_falcon[0].signature[90] ^= 0xFF;
+            assert!(
+                !forged_falcon[0].verify(),
+                "k={k} Falcon-tampered vote must fail scalar"
+            );
+            assert!(
+                !Vote::verify_batch(&forged_falcon),
+                "k={k} Falcon-forged batch must fail"
+            );
+            let part = Vote::partition_valid(&forged_falcon);
+            assert!(!part[0], "k={k} Falcon forger marked false");
+            assert!(
+                part[1..].iter().all(|&b| b),
+                "k={k} honest survivors still pass"
+            );
+            // Ed-half tamper still verifies (Ed ignored — proof of deletion).
+            let mut ed_tampered = votes.clone();
+            ed_tampered[0].signature[20] ^= 0xFF;
+            assert!(
+                ed_tampered[0].verify(),
+                "k={k} Ed-tampered dual vote must still verify (Ed ignored)"
+            );
+            assert!(
+                Vote::verify_batch(&ed_tampered),
+                "k={k} Ed-tampered batch must still verify"
+            );
+            // Ed-only votes (no Falcon half) are rejected on every path.
+            let ed_only: Vec<Vote> = sks
+                .iter()
+                .map(|sk| Vote::sign(sk, height, round, kind, target))
+                .collect();
+            assert!(
+                ed_only.iter().all(|v| !v.verify()),
+                "k={k} Ed-only votes must fail scalar"
+            );
+            assert!(
+                !Vote::verify_batch(&ed_only),
+                "k={k} Ed-only batch must fail"
+            );
+            assert!(
+                Vote::partition_valid(&ed_only).iter().all(|&b| !b),
+                "k={k} Ed-only partition all false"
+            );
         }
     }
 

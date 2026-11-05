@@ -32,35 +32,56 @@
 //!   `add_sealed` is now capped at `sealed_cap()` (`max_size / 4`).
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
+use std::sync::atomic::{AtomicU8, Ordering};
 use stellereum::mempool::{AdmissionCtx, Mempool, MempoolError};
 use stellereum::mev_epoch::{SealedEnvelope, TransparentMeta};
+use stellereum::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
 use stellereum::sharding::Transaction;
 
 const NOW: u64 = 5_000_000;
 
-fn key() -> SigningKey {
-    SigningKey::generate(&mut OsRng)
+static NEXT_SEED: AtomicU8 = AtomicU8::new(0xD0);
+
+fn key() -> u8 {
+    NEXT_SEED.fetch_add(1, Ordering::Relaxed)
 }
 
-fn addr(sk: &SigningKey) -> [u8; 32] {
-    sk.verifying_key().to_bytes()
+fn addr(seed: &u8) -> [u8; 32] {
+    derive_pq_address(
+        PqScheme::Falcon512,
+        &Transaction::sample_falcon512_pubkey(*seed),
+        &DEFAULT_SALT,
+    )
 }
 
-/// Plain transfer: `cost = amount + gas_limit` (no PQ surcharge on this path).
-fn tx(sk: &SigningKey, amount: u64, gas: u64, nonce: u64) -> Transaction {
-    Transaction::sign(sk, [9u8; 32], amount, gas, nonce, 1, 1)
+/// Plain transfer: `cost = amount + gas_limit` (no PQ surcharge on this path:
+/// implicit envelope, key pre-registered globally).
+fn tx(seed: &u8, amount: u64, gas: u64, nonce: u64) -> Transaction {
+    tx_prio(seed, amount, gas, nonce, 0)
 }
 
-fn tx_prio(
-    sk: &SigningKey,
-    amount: u64,
-    gas: u64,
-    nonce: u64,
-    prio: u64,
-) -> Transaction {
-    Transaction::sign_with_priority(sk, [9u8; 32], amount, gas, nonce, 1, 1, prio)
+fn tx_prio(seed: &u8, amount: u64, gas: u64, nonce: u64, prio: u64) -> Transaction {
+    let pk = Transaction::sample_falcon512_pubkey(*seed);
+    let from = addr(seed);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    let mut t = Transaction {
+        from,
+        to: [9u8; 32],
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: prio,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, *seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 fn ctx_onchain(now: u64, onchain: u64) -> AdmissionCtx {

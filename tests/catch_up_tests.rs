@@ -18,7 +18,10 @@ use rand::rngs::OsRng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use stellereum::cell::CellHash;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{
+    register_validator_pq_key, QuorumCertificate, ValidatorSet, Vote, VoteKind, VoteSet,
+};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::sharding::{Block, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::sync::{collect_missing_blocks, validate_sync_chain};
@@ -27,6 +30,16 @@ type Ns = Vec<SigningKey>;
 
 fn keys(n: usize) -> Ns {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
+}
+
+/// FULL-PQ: deterministic Falcon companions for `ks` (stable within a test:
+/// re-deriving per call would re-register and invalidate in-flight votes).
+/// Registered globally (keyed by ed id — distinct tests use distinct ed ids).
+fn fks_for(ks: &[SigningKey]) -> Vec<FalconKeypair> {
+    ks.iter()
+        .enumerate()
+        .map(|(i, _)| FalconKeypair::generate_from_seed(i as u8))
+        .collect()
 }
 
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
@@ -45,7 +58,12 @@ async fn state_with_funds(who: [u8; 32], bal: u64) -> Arc<InMemoryStateEngine> {
 
 /// Build `n` empty blocks on top of `base`, each signed by enough of `ks` to carry
 /// a real quorum, and each committing to the state root in force *before* it.
-async fn build_chain(ks: &[SigningKey], base: &Arc<InMemoryStateEngine>, n: u64) -> Vec<Block> {
+async fn build_chain(
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    base: &Arc<InMemoryStateEngine>,
+    n: u64,
+) -> Vec<Block> {
     let vs = vset(ks);
     let mut out = Vec::new();
     let mut prev = [0u8; 32];
@@ -82,7 +100,7 @@ async fn build_chain(ks: &[SigningKey], base: &Arc<InMemoryStateEngine>, n: u64)
         // the attached QC -- not extra block-hash signatures, which prove nothing
         // about agreement (votes are over vote_sign_bytes, a different message).
         let bh = b.compute_hash();
-        attach_quorum(&mut b, ks, h, bh);
+        attach_quorum(&mut b, ks, fks, &vs, h, bh, prev);
         let _ = &vs;
         prev = b.compute_hash();
         out.push(b);
@@ -90,22 +108,32 @@ async fn build_chain(ks: &[SigningKey], base: &Arc<InMemoryStateEngine>, n: u64)
     out
 }
 
-/// Attach a genuine precommit QC from `ks` for block `b` at `height`.
-fn attach_quorum(b: &mut Block, ks: &[SigningKey], height: u64, bh: [u8; 32]) {
-    let sigs = ks
-        .iter()
-        .map(|k| {
-            let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(bh));
-            (v.voter, v.signature)
-        })
-        .collect();
-    b.precommit_qc = Some(QuorumCertificate {
-        height,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: sigs,
-    });
+/// Attach a genuine Falcon µQC precommit certificate for block `b`.
+/// FULL-PQ: votes carry the Falcon half and the QC is compiled by the same
+/// committee path production uses (not a raw ed list, which carries no power).
+fn attach_quorum(
+    b: &mut Block,
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    vs: &ValidatorSet,
+    height: u64,
+    bh: [u8; 32],
+    parent: [u8; 32],
+) {
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        register_validator_pq_key(
+            k.verifying_key().to_bytes(),
+            PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+    }
+    let mut set = VoteSet::new();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        let v = Vote::sign_with_falcon(k, fk, height, 0, VoteKind::Precommit, Some(bh));
+        set.add(v, vs, height, 0, VoteKind::Precommit)
+            .expect("genuine vote admits");
+    }
+    b.precommit_qc = set.certificate_with_parent(Some(bh), vs, Some(&parent));
 }
 
 fn store(blocks: &[Block]) -> HashMap<[u8; 32], Block> {
@@ -160,10 +188,11 @@ async fn catch_up(
 #[tokio::test]
 async fn a_lagging_node_replays_the_gap_and_lands_on_the_peers_state_root() {
     let ks = keys(4);
+    let fks = fks_for(&ks);
     let vs = vset(&ks);
     let payer = ks[0].verifying_key().to_bytes();
     let base = state_with_funds(payer, 1_000_000_000_000).await;
-    let blocks = build_chain(&ks, &base, 12).await;
+    let blocks = build_chain(&ks, &fks, &base, 12).await;
 
     // We are stuck three blocks behind, which is the smallest skew that used to
     // deadlock the pair for good.
@@ -198,10 +227,11 @@ async fn a_lagging_node_replays_the_gap_and_lands_on_the_peers_state_root() {
 #[tokio::test]
 async fn a_gap_of_one_block_is_enough_to_recover() {
     let ks = keys(3);
+    let fks = fks_for(&ks);
     let vs = vset(&ks);
     let payer = ks[0].verifying_key().to_bytes();
     let base = state_with_funds(payer, 1_000_000_000_000).await;
-    let blocks = build_chain(&ks, &base, 5).await;
+    let blocks = build_chain(&ks, &fks, &base, 5).await;
 
     let our_last = blocks[3].compute_hash(); // we have 4 of 5
     let our_state = state_with_funds(payer, 1_000_000_000_000).await;
@@ -224,10 +254,11 @@ async fn a_gap_of_one_block_is_enough_to_recover() {
 #[tokio::test]
 async fn catch_up_refuses_a_chain_that_forks_before_our_finalized_block() {
     let ks = keys(4);
+    let fks = fks_for(&ks);
     let vs = vset(&ks);
     let payer = ks[0].verifying_key().to_bytes();
     let base = state_with_funds(payer, 1_000_000_000_000).await;
-    let honest = build_chain(&ks, &base, 10).await;
+    let honest = build_chain(&ks, &fks, &base, 10).await;
 
     // A peer hands us a history that replaces block 6, so it no longer links to
     // the last block we finalized. This is the fork the guard exists for.
@@ -253,7 +284,7 @@ async fn catch_up_refuses_a_chain_that_forks_before_our_finalized_block() {
     };
     b.sign_block(&proposer);
     let bh = b.compute_hash();
-    attach_quorum(&mut b, &ks, 6, bh);
+    attach_quorum(&mut b, &ks, &fks, &vs, 6, bh, [0xAB; 32]);
     forked.push(b);
     forked.extend(honest[6..].iter().cloned());
 
@@ -278,10 +309,11 @@ async fn catch_up_refuses_a_chain_that_forks_before_our_finalized_block() {
 #[tokio::test]
 async fn catch_up_refuses_a_chain_with_no_real_quorum() {
     let ks = keys(4);
+    let fks = fks_for(&ks);
     let vs = vset(&ks);
     let payer = ks[0].verifying_key().to_bytes();
     let base = state_with_funds(payer, 1_000_000_000_000).await;
-    let blocks = build_chain(&ks, &base, 6).await;
+    let blocks = build_chain(&ks, &fks, &base, 6).await;
 
     // One peer signs everything. The forgery replaces the whole decision proof
     // with a single-signer's QC: one member cannot reach a 4-member quorum, no
@@ -320,10 +352,11 @@ async fn catch_up_refuses_a_chain_with_no_real_quorum() {
 #[tokio::test]
 async fn catch_up_refuses_a_block_whose_header_disagrees_with_our_state() {
     let ks = keys(3);
+    let fks = fks_for(&ks);
     let vs = vset(&ks);
     let payer = ks[0].verifying_key().to_bytes();
     let base = state_with_funds(payer, 1_000_000_000_000).await;
-    let mut blocks = build_chain(&ks, &base, 5).await;
+    let mut blocks = build_chain(&ks, &fks, &base, 5).await;
 
     // Our node holds a different state than the header claims, so replaying
     // would corrupt consensus. The root check has to catch it.
@@ -352,10 +385,11 @@ async fn a_missing_body_in_the_middle_is_reported_not_silently_skipped() {
     // discoverable but a block body was never published to the DHT. The node has
     // to say so rather than advance a partial chain.
     let ks = keys(3);
+    let fks = fks_for(&ks);
     let vs = vset(&ks);
     let payer = ks[0].verifying_key().to_bytes();
     let base = state_with_funds(payer, 1_000_000_000_000).await;
-    let blocks = build_chain(&ks, &base, 6).await;
+    let blocks = build_chain(&ks, &fks, &base, 6).await;
 
     let head = blocks.last().unwrap().compute_hash();
     let our_last = blocks[1].compute_hash();

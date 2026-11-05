@@ -354,16 +354,18 @@ Also: the published shard space is `2^60`; the **shipped** cap is
 the `stell_getShards` response, because the advertised number is not a
 capacity.
 
-### 5.6 The legacy Falcon key path has ~32 bits of effective entropy
+### 5.6 The legacy Falcon key path had ~32 bits of effective entropy — REMOVED 2026-11-04
 
-The legacy derivation (behind `STELL_LEGACY_GENESIS_ROOT=1`) is an automorphic
-image of the Falcon reference base key: the 32-byte seed only picks
+The legacy derivation (behind `STELL_LEGACY_GENESIS_ROOT=1`) was an automorphic
+image of the Falcon reference base key: the 32-byte seed only picked
 `k ∈ {1,3,…,1023} × shift_f × shift_g × flags` — at most `2^32` distinct
-keys. An attacker who observes the **public** key can recover the private key
-and forge consensus signatures for that validator. The path exists only to
-reproduce the historical testnet genesis root; it announces itself loudly and
-tells the operator to rotate. **Audit action:** verify no live deployment
-still runs with that variable set.
+keys. Commit `03bba5120` (2026-11-03) **deleted** the path
+(`generate_from_seed_bytes_legacy`, `warn_legacy_weak_entropy_key_once`, the
+env gate; `grep src/` = 0 hits); the sole remaining derivation is
+`generate_from_seed_bytes` (`src/post_quantum.rs:1803`). Residual risk on this
+vector: NONE — the variable changes nothing
+(`tests/a_crypto_audit_poc.rs:150`, `tests/genesis_guard_tests.rs:60,74`).
+See KI-02 for the full record.
 
 ### 5.7 Two more you will meet immediately
 

@@ -6,8 +6,8 @@
 
 use crate::cell::{CellHash, MerkleProof, PatriciaTrie};
 use crate::post_quantum::{
-    derive_pq_address, verify_pq_signature, PqScheme, StatefulImplicitKeyRegistry, DEFAULT_SALT,
-    PQ_ENVELOPE_MAGIC,
+    derive_pq_address, verify_pq_signature, FalconKeypair, PqScheme, StatefulImplicitKeyRegistry,
+    DEFAULT_SALT, ED25519_SIG_LEN, FALCON512_SIG_LEN, PQ_ENVELOPE_MAGIC,
 };
 use crate::zkml::SessionKeyAuthorization;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -741,6 +741,8 @@ pub fn block_shard_for(namespace_shard: ShardId, registry: &ShardRegistry) -> Sh
 ///
 /// * legacy  : `64B ed25519 sig` (master key == `tx.from`)
 /// * envelope: `64B ed25519 sig` (SESSION key) ++ `b"SK1"` ++ `bincode(SessionKeyAuthorization)`
+/// * falcon  : `666B Falcon-512 sig` (SESSION key) ++ `b"SF1"` ++ `bincode(SessionKeyAuthorization)`
+///   (see [`SESSION_FALCON_SIG_TAG`]; the live framing — `SK1`/Ed grants stay refused)
 ///
 /// This is how delegation rides inside the pre-existing `signature: Vec<u8>`
 /// field: `Transaction`/`Block` gain NO new field, so bincode 1.3 keeps
@@ -748,6 +750,23 @@ pub fn block_shard_for(namespace_shard: ShardId, registry: &ShardRegistry) -> Sh
 /// envelope at `Signature::from_slice` (64-byte expected, envelope is longer)
 /// — fail-closed, exactly as required by the bincode verdict.
 pub const SESSION_SIG_TAG: &[u8; 3] = b"SK1";
+
+/// Tag that separates a Falcon-512 session signature from its delegation
+/// grant inside `Transaction::signature` (the PQ mirror of [`SESSION_SIG_TAG`]):
+///
+/// * Falcon envelope: `666B Falcon-512 sig` (SESSION key) ++ `b"SF1"` ++ `bincode(SessionKeyAuthorization)`
+///
+/// Same shape, same rules, only the signature scheme changes: the session key
+/// signs `base_signing_message + delegation commitment` with
+/// [`FalconKeypair::sign`], and the grant MUST be Falcon-delegated
+/// (`master_scheme`/`session_scheme` post-quantum — Ed grants stay refused by
+/// `verify_signature`/`check_session_policy` below). The distinct tag keeps the
+/// two framings unambiguous on the wire: a parser never has to guess whether
+/// the leading signature is 64 or 666 bytes, and the grant's own
+/// `session_scheme` disambiguates any future session-scheme class. Like `SK1`,
+/// this rides the pre-existing `signature: Vec<u8>` field, so
+/// `Transaction`/`Block` gain NO new field (bincode 1.3 compat).
+pub const SESSION_FALCON_SIG_TAG: &[u8; 3] = b"SF1";
 
 /// Tag that separates a legacy signature from a chain-id bound envelope inside
 /// `Transaction::signature` (Finding F1):
@@ -2908,6 +2927,84 @@ impl Transaction {
         }
     }
 
+    /// Sign a transaction with a Falcon-512 DELEGATED session key: the PQ
+    /// mirror of [`Self::sign_with_session`] with IDENTICAL semantics — only
+    /// the signature scheme changes.
+    ///
+    /// Envelope: `Falcon-512 session sig (666B)` ++ `b"SF1"` ++
+    /// `bincode(SessionKeyAuthorization)` (see [`SESSION_FALCON_SIG_TAG`]).
+    /// `tx.from` stays the master address, and both the grant and the payload
+    /// are committed into what the session key signs
+    /// (`base_signing_message` + `delegation commitment`), so neither can be
+    /// swapped after signing — exactly like the `SK1` envelope.
+    ///
+    /// The grant MUST already be Falcon-delegated
+    /// ([`SessionKeyAuthorization::sign_delegation_falcon512`], both schemes
+    /// post-quantum): an Ed grant, or a session key that does not match the
+    /// grant's registered Falcon session pubkey, can only ever produce a
+    /// transaction the verifier refuses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_with_session_falcon512(
+        session_key: &FalconKeypair,
+        delegation: SessionKeyAuthorization,
+        to: [u8; 32],
+        amount: u64,
+        gas_limit: u64,
+        nonce: u64,
+        source_shard: ShardId,
+        target_shard: ShardId,
+        payload: Vec<crate::svm::OpCode>,
+    ) -> Self {
+        // The grant must have been minted FOR this session key: verification
+        // selects the session public key from the grant's
+        // `session_pubkey_bytes`, so a mismatch could only ever produce a
+        // transaction nobody can verify.
+        debug_assert_eq!(
+            delegation.session_pubkey_bytes.as_deref(),
+            Some(session_key.public_key()),
+            "session key must match the delegation it is used with"
+        );
+        let from_pub = delegation.master_address;
+        let mut msg = Self::base_signing_message(
+            &from_pub,
+            to,
+            amount,
+            gas_limit,
+            nonce,
+            source_shard,
+            target_shard,
+            &payload,
+            0,
+        );
+        Self::append_delegation_commitment(&mut msg, &delegation);
+
+        let sig = session_key.sign(&msg);
+        debug_assert_eq!(
+            sig.len(),
+            FALCON512_SIG_LEN,
+            "Falcon-512 session signature must be {FALCON512_SIG_LEN} bytes"
+        );
+        let mut signature = sig;
+        signature.extend_from_slice(SESSION_FALCON_SIG_TAG);
+        // Serialization of this struct cannot realistically fail (fixed-size
+        // fields plus a few Vecs). If it somehow did, the envelope would not
+        // parse and the transaction fails closed at verification.
+        signature.extend_from_slice(&bincode::serialize(&delegation).unwrap_or_default());
+
+        Self {
+            from: from_pub,
+            to,
+            amount,
+            gas_limit,
+            nonce,
+            source_shard,
+            target_shard,
+            signature,
+            payload,
+            priority_fee_per_gas: 0,
+        }
+    }
+
     /// The signed message WITHOUT the delegation commitment: every legacy
     /// transaction's exact signing bytes, kept byte-identical so old
     /// signatures, old hashes and the python client's layout still hold.
@@ -2973,21 +3070,58 @@ impl Transaction {
     /// transaction carries one. `None` for a legacy signature — and for any
     /// blob that does not parse as an exact-fit envelope, which then fails
     /// `Signature::from_slice` (wrong length), so malformed input fails closed.
+    ///
+    /// Two framings, same rules (see [`SESSION_SIG_TAG`] /
+    /// [`SESSION_FALCON_SIG_TAG`]): the Falcon (`SF1`, 666-byte leading
+    /// signature) framing is tried first, then the legacy Ed (`SK1`, 64-byte)
+    /// framing. A blob can satisfy at most one exact-fit framing (the offsets
+    /// and lengths differ), so the order is only a tie-break for
+    /// non-parsing blobs, never a semantic choice.
     pub fn delegation(&self) -> Option<SessionKeyAuthorization> {
         let sig = self.sponsor_inner_sig();
-        let tag_len = SESSION_SIG_TAG.len();
-        if sig.len() <= 64 + tag_len || sig[64..64 + tag_len] != SESSION_SIG_TAG[..] {
-            return None;
+        for (sig_len, tag) in [
+            (FALCON512_SIG_LEN, SESSION_FALCON_SIG_TAG),
+            (ED25519_SIG_LEN, SESSION_SIG_TAG),
+        ] {
+            let tag_len = tag.len();
+            if sig.len() <= sig_len + tag_len || sig[sig_len..sig_len + tag_len] != tag[..] {
+                continue;
+            }
+            let grant: SessionKeyAuthorization =
+                bincode::deserialize(&sig[sig_len + tag_len..]).ok()?;
+            // Exact fit: the envelope is exactly `sig || tag || grant`, with
+            // no trailing junk — otherwise one transaction could carry two
+            // byte encodings under a single hash.
+            let expected = sig_len + tag_len + bincode::serialized_size(&grant).ok()? as usize;
+            if expected != sig.len() {
+                return None;
+            }
+            return Some(grant);
         }
-        let grant: SessionKeyAuthorization = bincode::deserialize(&sig[64 + tag_len..]).ok()?;
-        // Exact fit: the envelope is exactly `sig(64) || tag || grant`, with no
-        // trailing junk — otherwise one transaction could carry two byte
-        // encodings under a single hash.
-        let expected = 64 + tag_len + bincode::serialized_size(&grant).ok()? as usize;
-        if expected != sig.len() {
-            return None;
+        None
+    }
+
+    /// The session signature bytes of a session-keyed transaction (the leading
+    /// `64B` Ed / `666B` Falcon signature of the `SK1` / `SF1` envelope),
+    /// `None` for a legacy transaction or a malformed envelope. The length is
+    /// pinned by the framing [`Self::delegation`] parsed — never guessed —
+    /// so verification always checks exactly the bytes the builder signed.
+    fn session_sig_bytes(&self) -> Option<&[u8]> {
+        let sig = self.sponsor_inner_sig();
+        // Parsing here must agree with `delegation()`: only report signature
+        // bytes for an exact-fit envelope, so a grafted/truncated blob can
+        // never verify against a prefix of itself.
+        let _ = self.delegation()?;
+        for (sig_len, tag) in [
+            (FALCON512_SIG_LEN, SESSION_FALCON_SIG_TAG),
+            (ED25519_SIG_LEN, SESSION_SIG_TAG),
+        ] {
+            let tag_len = tag.len();
+            if sig.len() > sig_len + tag_len && sig[sig_len..sig_len + tag_len] == tag[..] {
+                return Some(&sig[..sig_len]);
+            }
         }
-        Some(grant)
+        None
     }
 
     /// True when this transaction carries a session-key envelope.
@@ -3505,7 +3639,9 @@ impl Transaction {
     /// * envelope: the delegation must be minted FOR this sender
     ///   (`master_address == tx.from` — the graft-attack guard), the master's
     ///   grant must verify, and the SESSION key must sign `signing_message()`
-    ///   (which commits to the grant).
+    ///   (which commits to the grant). Two framings: legacy-Ed `SK1` (always
+    ///   refused — Ed grants fail closed) and Falcon-512 `SF1` (verified
+    ///   through the post-quantum API).
     /// * post-quantum (PQ1 envelope):
     ///   - If explicit pubkey in envelope: verify signature using provided pubkey,
     ///     and verify `derive_pq_address(scheme, pubkey, salt) == self.from`.
@@ -3564,20 +3700,39 @@ impl Transaction {
         registry: &StatefulImplicitKeyRegistry,
         _salt: &[u8; 16],
     ) -> bool {
-        // Phase-2 EVM settlement: the envelope carries its own secp256k1
-        // authentication (re-derived from the canonical raw on every check),
-        // independent of ed25519 keys, PQ key registries and delegations.
-        if self.is_evm() {
-            if crate::post_quantum::is_pure_pq_enforced() {
+        // Session-keyed envelopes (`SK1` legacy-Ed / `SF1` Falcon-512) verify
+        // against the GRANT, not `tx.from`: the grant must be minted for this
+        // sender, the master's grant signature must verify, and the SESSION
+        // key must have signed `signing_message()` (which commits to the
+        // grant, so it cannot be swapped after signing). Ed (`SK1`) grants
+        // stay refused — `verify_signature`/`verify_session_signature` fail
+        // closed on non-post-quantum schemes — while Falcon (`SF1`) grants
+        // verify through the post-quantum API. This branch runs first so a
+        // session envelope always takes the session path deterministically;
+        // anything below it behaves byte-identically to before for
+        // non-session inputs (`delegation()` is `None` there).
+        if let Some(d) = self.delegation() {
+            if d.master_address != self.from {
                 return false;
             }
-            return self.verify_evm_signature();
+            if !d.verify_signature() {
+                return false;
+            }
+            let Some(session_sig) = self.session_sig_bytes() else {
+                return false;
+            };
+            return d.verify_session_signature(&self.signing_message(), session_sig);
+        }
+        // FULL-PQ: EVM settlement removed (no secp fallback).
+        if self.is_evm() {
+            return false;
         }
         if self.is_pq() {
             let Some(env) = self.pq_envelope() else {
                 return false;
             };
-            if crate::post_quantum::is_pure_pq_enforced() && !env.scheme.is_post_quantum() {
+            // FULL-PQ: non-PQ schemes always refused (no classical fallback).
+            if !env.scheme.is_post_quantum() {
                 return false;
             }
             if env.signature_bytes.len() != env.scheme.signature_size() {
@@ -3634,52 +3789,9 @@ impl Transaction {
                 }
             }
         } else {
-            if crate::post_quantum::is_pure_pq_enforced() {
-                return false;
-            }
-            match self.delegation() {
-                None => {
-                    // PAYMASTER: verify the sponsor-INNER blob (the full
-                    // signature for legacy transactions). Verifying the raw
-                    // `signature` field would feed the trailing `SP1` suffix
-                    // into `Signature::from_slice` and fail CLOSED on every
-                    // sponsored transaction — including valid ones.
-                    let inner_sig = self.sponsor_inner_sig();
-                    let sig_slice = if self.is_chain_id_bound() && inner_sig.len() >= 64 {
-                        &inner_sig[..64]
-                    } else {
-                        inner_sig
-                    };
-                    if let (Ok(vk), Ok(sig)) = (
-                        VerifyingKey::from_bytes(&self.from),
-                        Signature::from_slice(sig_slice),
-                    ) {
-                        if vk.verify(&self.signing_message(), &sig).is_ok() {
-                            return true;
-                        }
-                    }
-                    crate::crypto_privacy::verify_stealth_signature(
-                        &self.from,
-                        &self.signing_message(),
-                        sig_slice,
-                    )
-                }
-                Some(d) => {
-                    if d.master_address != self.from {
-                        return false;
-                    }
-                    if !d.verify_signature() {
-                        return false;
-                    }
-                    let Ok(vk) = VerifyingKey::from_bytes(&d.session_pubkey) else {
-                        return false;
-                    };
-                    let Ok(sig) = Signature::from_slice(&self.signature[..64]) else {
-                        return false;
-                    };
-                    vk.verify(&self.signing_message(), &sig).is_ok()
-                }
-            }
+            // FULL-PQ: legacy (non-PQ) transactions always refused.
+            // Classical ed/delegation fallback deleted.
+            false
         }
     }
 
@@ -3810,9 +3922,8 @@ impl Transaction {
             // not parse is rejected by `verify_signature` instead.
             return Ok(());
         };
-        if crate::post_quantum::is_pure_pq_enforced()
-            && (!d.master_scheme.is_post_quantum() || !d.session_scheme.is_post_quantum())
-        {
+        // FULL-PQ: non-PQ grants always refused (no classical fallback).
+        if !d.master_scheme.is_post_quantum() || !d.session_scheme.is_post_quantum() {
             return Err(SessionPolicyError::BadGrant);
         }
         if d.master_address != self.from {
@@ -4178,103 +4289,50 @@ impl Transaction {
         }
     }
 
-    /// Batched verification of many transactions at once (Ed25519 batch verify).
-    /// This is significantly faster than verifying signatures one-by-one and is
-    /// used when validating a whole block. Returns true iff ALL are valid.
+    /// Batched verification of many transactions at once (PQ-only).
+    /// FULL-PQ: classical ed batch removed. Returns true iff EVERY tx is a
+    /// valid PQ transaction (scalar `verify_signature` per item, which is
+    /// PQ-only). Any EVM, non-PQ-scheme, or legacy tx fails the batch.
     ///
     /// Envelope transactions contribute their SESSION key (not `tx.from`) to
     /// the batch, and their grant is checked (sender binding + master
     /// signature) before batching, so mixed plain + session batches work.
     pub fn verify_signatures_batch(txs: &[Transaction]) -> bool {
-        use ed25519_dalek::verify_batch;
         if txs.is_empty() {
             return true;
         }
-        // If any tx has a malformed key/signature, fall back to rejecting the batch
-        // (batch verify would error anyway).
-        let mut msgs: Vec<Vec<u8>> = Vec::with_capacity(txs.len());
-        let mut sigs: Vec<Signature> = Vec::with_capacity(txs.len());
-        let mut keys: Vec<VerifyingKey> = Vec::with_capacity(txs.len());
         for tx in txs {
-            // PAYMASTER v1: a malformed sponsor suffix fails the batch closed,
-            // and a well-formed one needs its sponsor signature checked
-            // per-transaction (the batch below only covers the USER's
-            // ed25519 signature). v1 composition is a plain legacy inner.
-            let (sponsor_inner_len, sponsor_auth, sponsor_malformed) =
+            // PAYMASTER v1: a malformed sponsor suffix fails the batch closed.
+            // FULL-PQ: sponsor composition is a plain legacy inner — refused.
+            let (_sponsor_inner_len, sponsor_auth, sponsor_malformed) =
                 Self::split_sponsor_envelope(&tx.signature);
             if sponsor_malformed {
                 return false;
             }
-            if let Some(ref auth) = sponsor_auth {
-                if sponsor_inner_len != 64 || !tx.verify_sponsor_sig(auth) {
-                    return false;
-                }
+            if sponsor_auth.is_some() {
+                return false;
             }
-            let inner_sig: &[u8] = &tx.signature[..sponsor_inner_len];
-            // Phase-2 EVM settlement authenticates via secp256k1 over its own
-            // envelope, not via the ed25519 batch below.
+            // FULL-PQ: EVM settlement removed.
             if tx.is_evm() {
-                if crate::post_quantum::is_pure_pq_enforced() {
-                    return false;
-                }
-                if !tx.verify_evm_signature() {
-                    return false;
-                }
-                continue;
+                return false;
             }
             if tx.is_pq() {
-                if crate::post_quantum::is_pure_pq_enforced() {
-                    if let Some(env) = tx.pq_envelope() {
-                        if !env.scheme.is_post_quantum() {
-                            return false;
-                        }
-                    } else {
+                if let Some(env) = tx.pq_envelope() {
+                    if !env.scheme.is_post_quantum() {
                         return false;
                     }
+                } else {
+                    return false;
                 }
                 if !tx.verify_signature() {
                     return false;
                 }
                 continue;
             }
-            if crate::post_quantum::is_pure_pq_enforced() {
-                return false;
-            }
-            let delegation = tx.delegation();
-            if let Some(d) = &delegation {
-                // The grant must belong to the sender and be authentically
-                // minted by that sender — the same rules as the single verify.
-                if d.master_address != tx.from || !d.verify_signature() {
-                    return false;
-                }
-            }
-            let key_bytes: [u8; 32] = delegation.as_ref().map_or(tx.from, |d| d.session_pubkey);
-            let Ok(vk) = VerifyingKey::from_bytes(&key_bytes) else {
-                return false;
-            };
-            let sig_bytes: &[u8] =
-                if delegation.is_some() || tx.is_chain_id_bound() || sponsor_auth.is_some() {
-                    // Envelope: only the leading 64 bytes are the user / session /
-                    // Ed25519 signature.
-                    match inner_sig.get(..64) {
-                        Some(s) => s,
-                        None => return false,
-                    }
-                } else {
-                    inner_sig
-                };
-            let Ok(sig) = Signature::from_slice(sig_bytes) else {
-                return false;
-            };
-            msgs.push(tx.signing_message());
-            sigs.push(sig);
-            keys.push(vk);
+            // Legacy (non-PQ) tx: always refused.
+            return false;
         }
-        if msgs.is_empty() {
-            return true;
-        }
-        let msg_refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
-        verify_batch(&msg_refs, &sigs, &keys).is_ok()
+        true
     }
 
     /// Parallel batched verification across CPU cores (rayon).
@@ -4312,106 +4370,32 @@ impl Transaction {
     /// stricter than the scalar one, never looser, and any batch rejection
     /// falls back to the scalar verdict per item).
     pub fn verify_signatures_partitioned(txs: &[Transaction]) -> Vec<bool> {
-        use ed25519_dalek::verify_batch;
+        // FULL-PQ: classical ed batch removed. Per-item scalar PQ verdict.
         if txs.is_empty() {
             return Vec::new();
         }
-        // Stage each item exactly as the scalar `verify_signature` would check
-        // it. Items that cannot even be parsed (bad key bytes, bad sig length,
-        // broken envelope, grant mismatch) are marked bad WITHOUT failing the
-        // whole batch — the good ones still get their batch verdict.
-        struct Staged {
-            idx: usize,
-            msg: Vec<u8>,
-            sig: Signature,
-            key: VerifyingKey,
-        }
         let mut out = vec![false; txs.len()];
-        let mut staged: Vec<Staged> = Vec::with_capacity(txs.len());
         for (i, tx) in txs.iter().enumerate() {
-            // Phase-2 EVM settlement: scalar secp256k1 verdict per item (the
-            // batch below only speaks ed25519).
+            // FULL-PQ: EVM settlement removed.
             if tx.is_evm() {
-                if crate::post_quantum::is_pure_pq_enforced() {
-                    out[i] = false;
-                    continue;
-                }
-                out[i] = tx.verify_evm_signature();
+                out[i] = false;
                 continue;
             }
             if tx.is_pq() {
-                if crate::post_quantum::is_pure_pq_enforced() {
-                    if let Some(env) = tx.pq_envelope() {
-                        if !env.scheme.is_post_quantum() {
-                            out[i] = false;
-                            continue;
-                        }
-                    } else {
+                if let Some(env) = tx.pq_envelope() {
+                    if !env.scheme.is_post_quantum() {
                         out[i] = false;
                         continue;
                     }
+                } else {
+                    out[i] = false;
+                    continue;
                 }
                 out[i] = tx.verify_signature();
                 continue;
             }
-            if crate::post_quantum::is_pure_pq_enforced() {
-                out[i] = false;
-                continue;
-            }
-            let delegation = tx.delegation();
-            if let Some(d) = &delegation {
-                if d.master_address != tx.from || !d.verify_signature() {
-                    out[i] = false;
-                    continue;
-                }
-            }
-            let key_bytes: [u8; 32] = delegation.as_ref().map_or(tx.from, |d| d.session_pubkey);
-            let Ok(vk) = VerifyingKey::from_bytes(&key_bytes) else {
-                out[i] = false;
-                continue;
-            };
-            let sig_bytes: &[u8] = if delegation.is_some() || tx.is_chain_id_bound() {
-                match tx.signature.get(..64) {
-                    Some(s) => s,
-                    None => {
-                        out[i] = false;
-                        continue;
-                    }
-                }
-            } else {
-                &tx.signature
-            };
-            let Ok(sig) = Signature::from_slice(sig_bytes) else {
-                out[i] = false;
-                continue;
-            };
-            staged.push(Staged {
-                idx: i,
-                msg: tx.signing_message(),
-                sig,
-                key: vk,
-            });
-        }
-        if staged.is_empty() {
-            return out;
-        }
-        // Fast path: one batch verification over the well-formed items.
-        {
-            let msg_refs: Vec<&[u8]> = staged.iter().map(|s| s.msg.as_slice()).collect();
-            let sigs: Vec<Signature> = staged.iter().map(|s| s.sig).collect();
-            let keys: Vec<VerifyingKey> = staged.iter().map(|s| s.key).collect();
-            if verify_batch(&msg_refs, &sigs, &keys).is_ok() {
-                for s in &staged {
-                    out[s.idx] = true;
-                }
-                return out;
-            }
-        }
-        // Slow path: batch rejected — at least one staged signature is bad.
-        // Fall back to the scalar verdict per item, in input order, so honest
-        // transactions survive a bad neighbor (fail closed per item).
-        for s in &staged {
-            out[s.idx] = txs[s.idx].verify_signature();
+            // Legacy (non-PQ) tx: always refused.
+            out[i] = false;
         }
         out
     }
@@ -6282,28 +6266,12 @@ mod tests {
 
         // Global registry verification also succeeds
         assert!(tx.verify_signature());
-
-        // Explicit Ed25519 PQ envelope
-        let ed_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let ed_pk = ed_sk.verifying_key().to_bytes().to_vec();
-        let ed_from = derive_pq_address(PqScheme::Ed25519, &ed_pk, &salt);
-        let mut ed_tx = Transaction {
-            from: ed_from,
-            to: [3u8; 32],
-            amount: 500,
-            gas_limit: 30_000,
-            nonce: 0,
-            source_shard: 1,
-            target_shard: 1,
-            signature: Vec::new(),
-            payload: Vec::new(),
-            priority_fee_per_gas: 0,
-        };
-        let ed_msg = ed_tx.signing_message();
-        let ed_sig = ed_sk.sign(&ed_msg).to_bytes().to_vec();
-        ed_tx.signature =
-            PqSignatureEnvelope::new_explicit(PqScheme::Ed25519, ed_pk, ed_sig).encode();
-        assert!(ed_tx.verify_signature());
+        // NOTE (PQ excision): the old "Explicit Ed25519 PQ envelope" leg is
+        // deleted, not converted. Non-post-quantum schemes are refused by
+        // design (`verify_inner_with_registry` returns false for any
+        // `!scheme.is_post_quantum()` envelope), so no PQ fixture can make it
+        // verify — and the Falcon-512 legs above already pin the property
+        // this test names (explicit PQ verification + auto-registration).
     }
 
     #[test]
@@ -7066,72 +7034,12 @@ mod tests {
         assert!(explicit_msg.verify_inclusion());
     }
 
-    #[tokio::test]
-    async fn test_finding_f1_chain_id_binding_ed25519() {
-        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
-        let from = sk.verifying_key().to_bytes();
-        let to = [0x42u8; 32];
-        let chain_id_main = 5757u64;
-        let chain_id_alt = 777u64;
-
-        let tx = Transaction::sign_with_chain_id(&sk, to, 1_000, 50_000, 0, 1, 1, chain_id_main);
-
-        assert!(
-            tx.is_chain_id_bound(),
-            "Transaction must carry CH1 envelope"
-        );
-        assert_eq!(tx.chain_id(), Some(chain_id_main));
-        assert!(tx.verify_signature(), "Self verification must pass");
-        assert!(
-            tx.verify_signature_for_chain(chain_id_main, true),
-            "Verification for target chain must pass"
-        );
-        assert!(
-            !tx.verify_signature_for_chain(chain_id_alt, true),
-            "Cross-chain replay on alt chain must be rejected"
-        );
-
-        // Tampering with chain_id in envelope invalidates cryptographic signature
-        let mut tampered_envelope = tx.clone();
-        let offset = 64 + CHAIN_SIG_TAG.len();
-        tampered_envelope.signature[offset..offset + 8]
-            .copy_from_slice(&chain_id_alt.to_be_bytes());
-        assert_eq!(tampered_envelope.chain_id(), Some(chain_id_alt));
-        assert!(
-            !tampered_envelope.verify_signature(),
-            "Tampered chain_id envelope must fail signature verification"
-        );
-
-        // Stripping envelope to simulate legacy tx fails because signing_message committed chain_id
-        let mut stripped = tx.clone();
-        stripped.signature.truncate(64);
-        assert_eq!(stripped.chain_id(), None);
-        assert!(
-            !stripped.verify_signature(),
-            "Stripping CH1 envelope must fail signature verification"
-        );
-
-        // State engine cross-chain replay rejection
-        let engine_main =
-            crate::state_engine::InMemoryStateEngine::new().with_chain_id(chain_id_main);
-        engine_main.credit_native(&from, 100_000).await.unwrap();
-        assert!(
-            engine_main.apply_transaction(&tx, 1_000).await.is_ok(),
-            "Transaction must apply on matching chain engine"
-        );
-
-        let engine_alt =
-            crate::state_engine::InMemoryStateEngine::new().with_chain_id(chain_id_alt);
-        engine_alt.credit_native(&from, 100_000).await.unwrap();
-        let err = engine_alt
-            .apply_transaction(&tx, 1_000)
-            .await
-            .expect_err("Must reject transaction on different chain");
-        assert!(
-            err.contains("chain_id mismatch"),
-            "Error must specify chain_id mismatch: {err}"
-        );
-    }
+    // NOTE (PQ excision): `test_finding_f1_chain_id_binding_ed25519` is
+    // deleted, not converted. It pinned the CLASSICAL chain-id envelope
+    // (`Transaction::sign_with_chain_id` + Ed25519 self-verification), whose
+    // verification is removed by design. The same chain-binding property for
+    // the live envelope is pinned by the green PQ twin
+    // `test_finding_f1_chain_id_binding_pq` directly below.
 
     #[test]
     fn test_finding_f1_chain_id_binding_pq() {
@@ -7183,27 +7091,71 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_finding_f1_legacy_compatibility_unaffected() {
-        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
-        let to = [0x33u8; 32];
-        let tx = Transaction::sign(&sk, to, 100, 21_000, 0, 1, 1);
-
-        assert_eq!(tx.chain_id(), None);
-        assert!(!tx.is_chain_id_bound());
-        assert_eq!(tx.signature.len(), 64);
-        assert_eq!(tx.signing_message().len(), 115);
-        assert!(tx.verify_signature());
-        assert!(tx.verify_signature_for_chain(5757, false));
-        assert!(!tx.verify_signature_for_chain(5757, true));
-    }
+    // NOTE (PQ excision): `test_finding_f1_legacy_compatibility_unaffected`
+    // is deleted, not converted. It asserted that a legacy classical
+    // transaction verifies (64-byte sig, 115-byte signing message,
+    // `verify_signature()` true, unbound chain-gate compat) — behavior the
+    // excision removes by design (legacy non-PQ transactions are always
+    // refused). No PQ equivalent exists: legacy compatibility itself is gone.
 
     #[test]
     fn test_finding_f1_batch_verification_with_chain_bound_tx() {
-        let sk1 = SigningKey::generate(&mut rand::rngs::OsRng);
-        let sk2 = SigningKey::generate(&mut rand::rngs::OsRng);
-        let tx1 = Transaction::sign(&sk1, [1u8; 32], 100, 21_000, 0, 1, 1);
-        let tx2 = Transaction::sign_with_chain_id(&sk2, [2u8; 32], 200, 21_000, 0, 1, 1, 5757);
+        // FULL-PQ: the batch/partitioned paths are Falcon-only now (legacy
+        // classical txs are refused), so both fixtures are PQ envelopes with
+        // the same shapes as before — one plain implicit, one chain-bound
+        // explicit.
+        let seed1 = 0x61;
+        let pk1 = Transaction::sample_falcon512_pubkey(seed1);
+        let from1 = derive_pq_address(PqScheme::Falcon512, &pk1, &DEFAULT_SALT);
+        Transaction::global_implicit_registry()
+            .register(from1, PqScheme::Falcon512, &pk1, &DEFAULT_SALT)
+            .expect("PQ test key must register");
+        let mut tx1 = Transaction {
+            from: from1,
+            to: [1u8; 32],
+            amount: 100,
+            gas_limit: 21_000,
+            nonce: 0,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        let msg1 = tx1.signing_message();
+        let sig1 = Transaction::create_falcon512_test_signature(&pk1, &msg1, seed1);
+        tx1.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig1).encode();
+
+        let seed2 = 0x62;
+        let pk2 = Transaction::sample_falcon512_pubkey(seed2);
+        let msg2_probe = Transaction {
+            from: derive_pq_address(PqScheme::Falcon512, &pk2, &DEFAULT_SALT),
+            to: [2u8; 32],
+            amount: 200,
+            gas_limit: 21_000,
+            nonce: 0,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        }
+        .signing_message_for_chain(5757);
+        let sig2 = Transaction::create_falcon512_test_signature(&pk2, &msg2_probe, seed2);
+        let tx2 = Transaction::new_pq_explicit_with_chain(
+            PqScheme::Falcon512,
+            pk2,
+            sig2,
+            [2u8; 32],
+            200,
+            21_000,
+            0,
+            1,
+            1,
+            Vec::new(),
+            &DEFAULT_SALT,
+            5757,
+        );
 
         let txs = vec![tx1, tx2];
         assert!(Transaction::verify_signatures_batch(&txs));

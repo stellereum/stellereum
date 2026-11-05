@@ -3,7 +3,7 @@
 # rounds, vote alignment, mempool, blockers, transport errors, disk, procs.
 # Usage: ./chain_diag.sh   (runs against the stand via ssh)
 set -u
-HOST="${STELL_HOST:-root@203.0.113.10}"
+HOST="${STELL_HOST:-root@212.113.103.105}"
 ssh -o ConnectTimeout=10 "$HOST" '
 echo "===== processes/disk ====="
 ps -eo args | grep -c "[s]tellereum run"

@@ -1232,142 +1232,10 @@ async fn api_account(
     .into_response()
 }
 
-/// Human-readable confidential display (backend part; read-only rendering,
-/// no consensus change).
-///
-/// A confidential transfer finalizes on chain but is opaque bytes without
-/// this: the commitments reveal no amount, so every other surface shows raw
-/// hex. These helpers turn it into a labeled shape the frontend can render
-/// instead.
-///
-/// JSON shape for the frontend (stable; additive-only evolution):
-/// ```json
-/// {
-///   "kind": "confidential",
-///   "sender": "<64-hex>",
-///   "recipient": "<64-hex>",
-///   "fee": 20,                       // u64 JSON number (confidential inner only)
-///   "inputs": 1,                     // input commitment count
-///   "outputs": 1,                   // output commitment count
-///   "input_commitments": ["<64-hex>", "..."],
-///   "output_commitments": ["<64-hex>", "..."],
-///   "spent": [true],                // per-input spent-status from the
-///                                    // committed ConfidentialState
-///   "all_spent": true
-/// }
-/// ```
-/// Non-confidential transactions use:
-/// ```json
-/// {
-///   "kind": "transparent",
-///   "sender": "<64-hex>", "recipient": "<64-hex>",
-///   "amount": 10, "fee_limit": 5, "nonce": 0,
-///   "tx_hash": "<64-hex>", "payload_ops": 0
-/// }
-/// ```
-/// (`fee_limit` is the DECLARED limit, not the charged fee — the old `fee`
-/// key overstated the charge and is gone.)
-/// `fee` here is the confidential-transfer inner fee (`transfer.fee`), NOT
-/// the transaction gas limit; gas is reported separately as `gas_limit` by
-/// `describe_transaction`.
-pub fn describe_confidential_transfer(
-    sender: &[u8; 32],
-    recipient: &[u8; 32],
-    transfer: &crate::crypto_privacy::ConfidentialTransfer,
-    state: &crate::crypto_privacy::ConfidentialState,
-) -> serde_json::Value {
-    let spent: Vec<bool> = transfer
-        .input_commitments
-        .iter()
-        .map(|c| state.is_spent(&c.commitment))
-        .collect();
-    let all_spent = !spent.is_empty() && spent.iter().all(|&b| b);
-    json!({
-        "kind": "confidential",
-        "sender": hex::encode(sender),
-        "recipient": hex::encode(recipient),
-        "fee": transfer.fee,
-        "inputs": transfer.input_commitments.len(),
-        "outputs": transfer.output_commitments.len(),
-        "input_commitments": transfer.input_commitments.iter().map(|c| hex::encode(c.commitment)).collect::<Vec<_>>(),
-        "output_commitments": transfer.output_commitments.iter().map(|c| hex::encode(c.commitment)).collect::<Vec<_>>(),
-        "spent": spent,
-        "all_spent": all_spent,
-    })
-}
-
-/// Human-readable rendering of one full transaction: a labeled confidential
-/// shape when the payload carries `SysCallConfidentialTransfer`, otherwise a
-/// transparent summary. Read-only; `confidential` is the committed shielded
-/// ledger used only for per-input spent-status.
-pub fn describe_transaction(
-    tx: &crate::sharding::Transaction,
-    confidential: &crate::crypto_privacy::ConfidentialState,
-) -> serde_json::Value {
+/// Human-readable rendering of one full transaction: a transparent summary.
+/// Read-only.
+pub fn describe_transaction(tx: &crate::sharding::Transaction) -> serde_json::Value {
     let tx_hash = hex::encode(tx.compute_tx_hash());
-    for op in &tx.payload {
-        if let crate::svm::OpCode::SysCallConfidentialTransfer {
-            recipient,
-            transfer,
-        } = op
-        {
-            let mut inner =
-                describe_confidential_transfer(&tx.from, recipient, transfer, confidential);
-            inner["tx_hash"] = json!(tx_hash);
-            inner["nonce"] = json!(tx.nonce);
-            inner["gas_limit"] = json!(tx.gas_limit);
-            inner["amount"] = json!(tx.amount);
-            return inner;
-        }
-        // V2 enforced transfer renders through the same viewer (proofs are
-        // verification material, not display data).
-        if let crate::svm::OpCode::SysCallConfidentialTransfer2 {
-            recipient,
-            transfer,
-            ..
-        } = op
-        {
-            let mut inner =
-                describe_confidential_transfer(&tx.from, recipient, transfer, confidential);
-            inner["tx_hash"] = json!(tx_hash);
-            inner["nonce"] = json!(tx.nonce);
-            inner["gas_limit"] = json!(tx.gas_limit);
-            inner["amount"] = json!(tx.amount);
-            inner["enforced"] = json!(true);
-            return inner;
-        }
-        if let crate::svm::OpCode::SysCallConfidentialShield {
-            commitment, amount, ..
-        } = op
-        {
-            return json!({
-                "kind": "confidential-shield",
-                "sender": hex::encode(tx.from),
-                "commitment": hex::encode(commitment),
-                "amount": amount,
-                "fee_limit": tx.gas_limit,
-                "nonce": tx.nonce,
-                "gas_limit": tx.gas_limit,
-                "tx_hash": tx_hash,
-            });
-        }
-        if let crate::svm::OpCode::SysCallConfidentialUnshield { inputs } = op {
-            let total: u64 = inputs
-                .iter()
-                .map(|i| i.amount)
-                .fold(0u64, |a, b| a.saturating_add(b));
-            return json!({
-                "kind": "confidential-unshield",
-                "sender": hex::encode(tx.from),
-                "inputs": inputs.len(),
-                "amount": total,
-                "fee_limit": tx.gas_limit,
-                "nonce": tx.nonce,
-                "gas_limit": tx.gas_limit,
-                "tx_hash": tx_hash,
-            });
-        }
-    }
     json!({
         "kind": "transparent",
         "sender": hex::encode(tx.from),
@@ -1409,9 +1277,7 @@ async fn api_tx(
     };
     let found = st.rpc.mempool.read().await.get(&hash).cloned();
     if let Some(tx) = found {
-        let shielded = st.rpc.engine.confidential_read().await;
-        let mut view = describe_transaction(&tx, &shielded);
-        drop(shielded);
+        let mut view = describe_transaction(&tx);
         let receipts = st.rpc.receipts.read().await;
         if let Some(r) = receipts.get(&hash) {
             view["status"] = json!(if r.success { "success" } else { "failed" });
@@ -1611,16 +1477,6 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
         Op::SysCallPmmSell { stell_nano } => format!("pmm-sell stell_nano={stell_nano}"),
         Op::SysCallPublishSessionGrant(_) => "publish-session-grant".to_string(),
         Op::SysCallBridge(_) => "bridge-intent".to_string(),
-        Op::SysCallConfidentialTransfer {
-            recipient,
-            transfer,
-        } => format!(
-            "confidential-transfer to={} inputs={} outputs={} fee={}",
-            hex::encode(recipient),
-            transfer.input_commitments.len(),
-            transfer.output_commitments.len(),
-            transfer.fee
-        ),
         Op::SysCallActorSend {
             recipient,
             value,
@@ -1656,29 +1512,6 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
             truncate_text(symbol, 64),
             max_supply.map(|m| m.to_string()).unwrap_or_else(|| "none".to_string())
         ),
-        Op::SysCallConfidentialTransfer2 {
-            recipient,
-            transfer,
-            input_ranges,
-            output_ranges,
-        } => format!(
-            "confidential-transfer2 to={} inputs={} outputs={} fee={} ranges={}/{}",
-            hex::encode(recipient),
-            transfer.input_commitments.len(),
-            transfer.output_commitments.len(),
-            transfer.fee,
-            input_ranges.len(),
-            output_ranges.len()
-        ),
-        Op::SysCallConfidentialShield {
-            commitment, amount, ..
-        } => format!(
-            "confidential-shield commitment={} amount={amount}",
-            hex::encode(commitment)
-        ),
-        Op::SysCallConfidentialUnshield { inputs } => {
-            format!("confidential-unshield inputs={}", inputs.len())
-        }
         Op::SysCallRotateValidatorKey {
             old_validator,
             new_validator,
@@ -1735,6 +1568,10 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
             "stake-with-commission validator={} amount={amount} commission_bps={commission_bps}",
             hex::encode(validator)
         ),
+        Op::Reserved33ConfidentialTransfer
+        | Op::Reserved40ConfidentialTransfer2
+        | Op::Reserved41ConfidentialShield
+        | Op::Reserved42ConfidentialUnshield => "reserved-removed-confidential".to_string(),
     }
 }
 
@@ -1775,7 +1612,7 @@ fn capped_tx_events(
 /// receipts, no new pipeline) with a stable human shape: status, parties,
 /// fees, decoded intent. `memo` is always `null`: the node indexes no memo
 /// bytes, and a view must say so instead of inventing one. `intent` reuses
-/// `describe_transaction` (confidential shapes included); `intent_ops` is the
+/// `describe_transaction`; `intent_ops` is the
 /// first [`MAX_TXDETAIL_INTENT_OPS`] per-op labels; receipt events are capped
 /// at [`MAX_TXDETAIL_EVENTS`].
 ///
@@ -1864,9 +1701,7 @@ async fn api_tx_detail(
         }))
         .into_response();
     }
-    let shielded = st.rpc.engine.confidential_read().await;
-    let intent = describe_transaction(&tx, &shielded);
-    drop(shielded);
+    let intent = describe_transaction(&tx);
     let (intent_ops, intent_ops_truncated) = capped_intent_ops(&tx.payload);
     let intent_summary = if tx.payload.is_empty() {
         "value-transfer".to_string()
@@ -2035,21 +1870,6 @@ async fn api_block_detail(
         "tx_refs_truncated": refs_truncated,
     }))
     .into_response()
-}
-
-/// `GET /api/confidential/:commitment` — spent-status of one shielded input
-/// commitment (`{"commitment": hex, "spent": bool}`), read from the committed
-/// `ConfidentialState`. Read-only.
-async fn api_confidential_spent(
-    State(st): State<Arc<GatewayState>>,
-    AxumPath(commit_hex): AxumPath<String>,
-) -> Response {
-    let Some(a) = parse_addr(&commit_hex) else {
-        return (StatusCode::BAD_REQUEST, "bad commitment").into_response();
-    };
-    let shielded = st.rpc.engine.confidential_read().await;
-    let spent = shielded.is_spent(&a);
-    Json(json!({ "commitment": hex::encode(a), "spent": spent })).into_response()
 }
 
 async fn health_check() -> (StatusCode, Json<serde_json::Value>) {
@@ -2352,7 +2172,6 @@ pub fn router(gateway: Arc<GatewayState>) -> Router {
         .route("/api/balance/:address", get(api_balance))
         .route("/api/tx/:hash", get(api_tx))
         .route("/api/tx-detail/:hash", get(api_tx_detail))
-        .route("/api/confidential/:commitment", get(api_confidential_spent))
         // State-changing on GET is a crawler/prefetch/CSRF footgun (audit
         // 2026-10-06): the faucet mints money, so it is POST-only. GET keeps
         // a 405 with a hint instead of silently minting.

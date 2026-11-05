@@ -106,9 +106,6 @@ fn build_uqc(f: &Fixture, signer_ids: &[[u8; 32]]) -> PqMicroCertificate {
         signers_bitmask: bitmask,
         signatures,
         sortition_parent: [0x5Au8; 32],
-        // Predates the phase-3 VRF seal (mechanical fallout of the new
-        // trailing field): legacy draw.
-        vrf_beacon: None,
     }
 }
 
@@ -201,9 +198,6 @@ fn empty_committee_and_zero_weight_fail_closed() {
         signers_bitmask: vec![],
         signatures: vec![],
         sortition_parent: [0x5Au8; 32],
-        // Predates the phase-3 VRF seal (mechanical fallout of the new
-        // trailing field): legacy draw.
-        vrf_beacon: None,
     };
     let qc = QuorumCertificate {
         height: f.height,
@@ -229,9 +223,6 @@ fn empty_committee_and_zero_weight_fail_closed() {
         signers_bitmask: vec![0b0000_0011],
         signatures: vec![vec![0u8; 8], vec![0u8; 8]],
         sortition_parent: [0x5Au8; 32],
-        // Predates the phase-3 VRF seal (mechanical fallout of the new
-        // trailing field): legacy draw.
-        vrf_beacon: None,
     };
     let qc2 = QuorumCertificate {
         height: f.height,
@@ -268,9 +259,6 @@ fn cec_power_path_still_verifies() {
         signers_bitmask: bitmask,
         signatures,
         sortition_parent: [0x5Au8; 32],
-        // Predates the phase-3 VRF seal (mechanical fallout of the new
-        // trailing field): legacy draw.
-        vrf_beacon: None,
     };
     let qc = QuorumCertificate {
         height: f.height,

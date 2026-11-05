@@ -14,7 +14,7 @@
 //! actually checks, and [`zkml_capabilities`] for the machine-readable
 //! statement of it (served over RPC as `stell_zkmlCapabilities`).
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 use serde::de::{SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -843,9 +843,8 @@ impl SessionKeyAuthorization {
     /// both caps — flipping ANY of those fields invalidates it.
     /// Supports Ed25519, Falcon-512, and Hybrid master keys.
     pub fn verify_signature(&self) -> bool {
-        if crate::post_quantum::is_pure_pq_enforced()
-            && (!self.master_scheme.is_post_quantum() || !self.session_scheme.is_post_quantum())
-        {
+        // FULL-PQ: non-PQ schemes are always refused (no classical fallback).
+        if !self.master_scheme.is_post_quantum() || !self.session_scheme.is_post_quantum() {
             return false;
         }
 
@@ -861,13 +860,8 @@ impl SessionKeyAuthorization {
 
         match self.master_scheme {
             PqScheme::Ed25519 => {
-                let Ok(verifying_key) = VerifyingKey::from_bytes(&self.master_address) else {
-                    return false;
-                };
-                let Ok(sig) = Signature::from_slice(&self.master_signature) else {
-                    return false;
-                };
-                verifying_key.verify(&msg, &sig).is_ok()
+                // FULL-PQ: classical master scheme removed.
+                false
             }
             PqScheme::Falcon512 | PqScheme::Hybrid | PqScheme::MlDsa44 => {
                 let Some(pk) = &self.master_pubkey else {
@@ -933,21 +927,15 @@ impl SessionKeyAuthorization {
     /// Verify a transaction payload signed by this session key.
     /// Supports Ed25519, Falcon-512, and Hybrid session keys.
     pub fn verify_session_signature(&self, message: &[u8], signature_bytes: &[u8]) -> bool {
-        if crate::post_quantum::is_pure_pq_enforced()
-            && (!self.master_scheme.is_post_quantum() || !self.session_scheme.is_post_quantum())
-        {
+        // FULL-PQ: non-PQ schemes are always refused (no classical fallback).
+        if !self.master_scheme.is_post_quantum() || !self.session_scheme.is_post_quantum() {
             return false;
         }
 
         match self.session_scheme {
             PqScheme::Ed25519 => {
-                let Ok(session_vk) = VerifyingKey::from_bytes(&self.session_pubkey) else {
-                    return false;
-                };
-                let Ok(sig) = Signature::from_slice(signature_bytes) else {
-                    return false;
-                };
-                session_vk.verify(message, &sig).is_ok()
+                // FULL-PQ: classical session scheme removed.
+                false
             }
             PqScheme::Falcon512 | PqScheme::Hybrid | PqScheme::MlDsa44 => {
                 let Some(pk) = &self.session_pubkey_bytes else {

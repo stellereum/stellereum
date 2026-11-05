@@ -18,9 +18,6 @@ use stellereum::consensus::{ValidatorSet, VoteKind};
 use stellereum::consensus_net::{
     parse_incoming, ConsensusMsg, ConsensusNetwork, ConsensusSender, TxGossip, MAX_BATCH_ITEMS,
 };
-use stellereum::crypto_privacy::{
-    ConfidentialTransfer, PedersenCommitment, StealthAddress, ViewingKey,
-};
 use stellereum::mev::MevPreemptionEngine;
 use stellereum::network::CrossShardTransport;
 use stellereum::network::P2pNetworkAdapter;
@@ -547,9 +544,11 @@ async fn start_workchain_shard(
             .filter(|s| !s.is_empty()),
         tx_broadcast: Some(tx_bcast_tx),
         faucet: None,
-        // `stell_signMessage` / `stell_signTypedData` sign with the NODE's key
-        // (testing/devnet only — production wallets sign locally).
-        msg_signing_seed: Some(validator_key.to_bytes()),
+        // GATE: H-02 — `stell_signMessage` / `stell_signTypedData` NEVER use
+        // the validator key. Separate ephemeral dev-only key (present only
+        // with STELL_DEV_UNSAFE_TESTKEY=1), else disabled; production wallets
+        // sign locally.
+        msg_signing_seed: stellereum::rpc::dev_msg_signing_seed_from_env(),
         // Archive proofs + historical roots are served from the persisted
         // snapshot history, never from the live trie.
         archive_store: Some(persistence.storage()),
@@ -1137,36 +1136,50 @@ fn build_validator_set(
     self_node_id_hex: &str,
     observer: bool,
 ) -> (ValidatorSet, bool) {
-    // Peers whose node id is listed in `validators:`, canonicalised the way infnode
-    // computes a node id (`blake3(ed_pub)[..20]`). A malformed peer is skipped.
+    // Peers whose ed-derived id is listed in `validators:`, with the id
+    // computed as infnode used to (`blake3(ed_pub)[..20]`). FULL-PQ: peer
+    // configs no longer carry a declared `node-id` (identity is PQ-only via
+    // `pq_pub`), so there is nothing to lie about — the id is DERIVED from
+    // the pinned key, never declared. The validator set itself still pins the
+    // frozen auth key (ed): a peer contributes its key iff its derived id is
+    // listed. A malformed peer is skipped.
     let mut from_peers: Vec<[u8; 32]> = Vec::new();
     for p in &cfg.peers {
-        let Ok(raw) = p.node_id_raw() else { continue };
-        let raw_hex = hex::encode(raw);
+        let Ok(ed) = p.ed_bytes() else { continue };
+        let computed = blake3::hash(&ed);
+        let raw_hex = hex::encode(&computed.as_bytes()[..20]);
         let listed = cfg
             .validators
             .iter()
             .any(|v| v.strip_prefix("inf1:").unwrap_or(v) == raw_hex);
         if listed {
-            if let Ok(ed) = p.ed_bytes() {
-                // F6 binding: the declared node_id MUST be blake3(ed_pub)[..20].
-                // A typo (or a doctored config) naming the wrong id would
-                // otherwise install a stranger's key into the validator set
-                // — or silently drop a real validator. Fail-closed: skip loudly.
-                let computed = blake3::hash(&ed);
-                if computed.as_bytes()[..20] != raw[..] {
-                    eprintln!(
-                        "[config] WARNING: peer '{}' declares node id {} but blake3(ed_pub)[..20] is {}; SKIPPING (not added to validator set)",
-                        p.name,
-                        raw_hex,
-                        hex::encode(&computed.as_bytes()[..20])
-                    );
-                    continue;
-                }
-                if ed == self_ed {
-                    continue; // a peer entry for ourselves; handled below
-                }
-                from_peers.push(ed);
+            // F6 binding (structural now): the listed id MUST be blake3(ed_pub)[..20].
+            // A typo (or a doctored config) naming the wrong id would
+            // otherwise install a stranger's key into the validator set
+            // — or silently drop a real validator. Fail-closed: skip loudly.
+            if ed == self_ed {
+                continue; // a peer entry for ourselves; handled below
+            }
+            from_peers.push(ed);
+        }
+    }
+    // Typo tripwire (F6 spirit): a listed id matching NO peer key is almost
+    // certainly a doctored config — loud, but non-fatal (the set stays a pure
+    // function of the file; an unknown id simply contributes nobody).
+    {
+        use std::collections::HashSet;
+        let known: HashSet<String> = cfg
+            .peers
+            .iter()
+            .filter_map(|p| p.ed_bytes().ok())
+            .map(|ed| hex::encode(&blake3::hash(&ed).as_bytes()[..20]))
+            .collect();
+        for v in &cfg.validators {
+            let listed = v.strip_prefix("inf1:").unwrap_or(v);
+            if !known.contains(listed) && listed != self_node_id_hex.strip_prefix("inf1:").unwrap_or(self_node_id_hex) {
+                eprintln!(
+                    "[config] WARNING: validators entry {v} matches no peer key (nor self); SKIPPING (contributes nobody)"
+                );
             }
         }
     }
@@ -2739,18 +2752,6 @@ fn xpc_activation_from_env() -> stellereum::xshard2pc::XpcActivation {
     }
 }
 
-/// VRF sortition activation, read from the environment (RETIRED).
-///
-/// Same shape as [`xpc_activation_from_env`] (an env height boundary,
-/// default-off), except arming is retired: any configured
-/// `STELL_VRF_ACTIVATION_HEIGHT=<h>` value warns loudly and is ignored —
-/// `stellereum::vrf::vrf_activation_from_env` always returns `Disabled`.
-/// Single source of truth is `stellereum::vrf::vrf_activation_from_env`;
-/// this wrapper is the main.rs-owned startup seam.
-fn vrf_activation_from_env() -> stellereum::vrf::VrfActivation {
-    stellereum::vrf::vrf_activation_from_env()
-}
-
 /// Startup-heal retry budget: missing bodies are transient (a peer that just
 /// restarted is still publishing its window), so the heal loop retries with
 /// backoff instead of exiting on the first miss.
@@ -2835,16 +2836,19 @@ async fn run_consensus_node(
     // Self id for the dynamic franchise check in the loop below (`key` moves
     // into the runtime on the next line).
     let self_vote_id = key.verifying_key().to_bytes();
+    // FULL-PQ: always enforced. `--pure-pq` / `STELL_PURE_PQ` are dead
+    // operator-compat knobs: parsed-and-ignored with a loud WARN (never gate).
     let has_pq_cli = std::env::args().any(|arg| arg == "--pure-pq");
-    let pure_pq = has_pq_cli || stellereum::post_quantum::is_pure_pq_enforced();
     if has_pq_cli {
+        eprintln!("[WARN] --pure-pq is a no-op (FULL-PQ always-on): flag ignored");
+    }
+    if std::env::var("STELL_PURE_PQ").is_ok() {
+        eprintln!("[WARN] STELL_PURE_PQ is a no-op (FULL-PQ always-on): env ignored");
+    }
+    {
         stellereum::post_quantum::set_pure_pq_override(Some(true));
     }
-    if pure_pq {
-        info!("[post-quantum] Pure PQ Mode: ENFORCED (Falcon-512 / ML-DSA)");
-    } else {
-        info!("[post-quantum] PQ Mode: Dual-Stack enabled");
-    }
+    info!("[post-quantum] Pure PQ Mode: ENFORCED (Falcon-512 / ML-DSA)");
     let env_var = std::env::var("STELL_PARALLEL_EXEC").ok();
     let has_cli_flag = std::env::args().any(|arg| arg == "--parallel-exec");
     let parallel_exec = is_parallel_exec_active(
@@ -2909,25 +2913,7 @@ async fn run_consensus_node(
             }
         }
     }
-    // VRF secret provisioning (phase-3 activation): precedence
-    // `STELL_VRF_SECRET_FILE` (0600-checked file) > `STELL_VRF_SECRET`
-    // (inline hex) > derived `BLAKE3("VRF_SUBSEED_V1" || ed_seed_32)` (see
-    // `stellereum::vrf::provision_vrf_secret_seed`) — installed via
-    // `with_vrf_secret_seed` below. Deterministic fallback: the same ed seed
-    // derives the same VRF key forever (across restarts, no new secret to
-    // distribute); a distinct keypair from ed (separate scalar derivation);
-    // the same secrecy level (seed-derived, stored alongside the ed key,
-    // zeroized after use). Remote-signer deployments hold no local VRF seed:
-    // nothing is installed, so `vrf_beacon_seal_for` returns `None` there
-    // (legacy fallback, loud). An explicit-but-broken source warns loudly
-    // and falls through — never fatal to startup.
-    let validator_ed_seed = zeroize::Zeroizing::new(key.to_bytes());
-    let provisioned_vrf_seed: Option<[u8; 32]> =
-        stellereum::vrf::provision_vrf_secret_seed(if remote_signer.is_some() {
-            None
-        } else {
-            Some(&*validator_ed_seed)
-        });
+    // Election is the canonical parent-hash draw (no key material provisioned).
     let mut rt = ValidatorRuntime::new(key, validators, state.clone(), 1)
         .with_mempool(rpc.mempool.clone())
         // The epoch-seal frames (the DKG contribution, the order commitment
@@ -3076,81 +3062,8 @@ async fn run_consensus_node(
         ),
     }
 
-    // VRF sortition activation (RETIRED — ECVRF classical, bodies removed).
-    // `vrf_activation_from_env` always returns `Disabled`, so the boundary
-    // arm below never fires in practice; it is kept so a stale configured
-    // value logs loudly instead of silently arming. The live verify /
-    // attribution sites (`verify_unified`, `signers_set`) still consult the
-    // activation plus the startup-loaded registry below, but resolution is
-    // always the legacy parent-hash draw (see `vrf_output_for_cert`).
-    // `ValidatorRuntime::vrf_beacon_seal_for` always returns `None`.
-    let vrf_activation = vrf_activation_from_env();
-    rt = rt.with_vrf_activation(vrf_activation);
-    match vrf_activation.boundary() {
-        Some(h) => tracing::warn!(
-            "[vrf] VRF sortition ARMED from height {h} (STELL_VRF_ACTIVATION_HEIGHT={h}): RETIRED — ECVRF bodies removed, election stays on the parent-hash draw at every height; unset the variable to silence this"
-        ),
-        None => info!(
-            "[vrf] VRF sortition inactive (STELL_VRF_ACTIVATION_HEIGHT unset): parent-hash election on every height"
-        ),
-    }
-    // Install the provisioned VRF seed (or log the seedless fallback) and
-    // load the operator VRF registry into the live verify/attribution path.
-    match provisioned_vrf_seed {
-        Some(seed) => {
-            // Own the seed in a wiping wrapper (faucet pattern): the copy
-            // installed into the runtime lives there (alongside the ed key);
-            // this binding is wiped on scope exit.
-            let seed = zeroize::Zeroizing::new(seed);
-            let vrf_pk = stellereum::vrf::VrfSecret::from_seed(&seed)
-                .public_key()
-                .to_bytes();
-            rt = rt.with_vrf_secret_seed(*seed);
-            info!(
-                "[vrf] VRF secret provisioned from validator seed (VRF pubkey {}): operators collect this line from every validator to build STELL_VRF_KEYS",
-                hex::encode(vrf_pk)
-            );
-        }
-        None => tracing::warn!(
-            "[vrf] no local VRF seed provisioned (remote-signer deployment): VRF proofs unavailable, legacy parent-hash election on every height"
-        ),
-    }
-    let vrf_registry = stellereum::vrf::vrf_registry_from_env();
-    if vrf_registry.is_empty() {
-        info!(
-            "[vrf] VRF registry empty (STELL_VRF_KEYS unset): verifies fall back to legacy"
-        );
-    } else {
-        info!(
-            "[vrf] VRF registry loaded: {} key(s) from STELL_VRF_KEYS",
-            vrf_registry.len()
-        );
-        // Readiness is ADVISORY only: voting power WITHOUT a registry key
-        // stays on the legacy parent-hash draw per certificate — no global
-        // height H is set here (see `vrf_registry_ready_for_power`). Warn
-        // loudly so operators collect the missing VRF pubkeys (every node
-        // logs its own at startup) into STELL_VRF_KEYS.
-        let power_entries: Vec<([u8; 32], u64)> = rt
-            .validators
-            .validators
-            .iter()
-            .map(|(id, power)| (*id, *power))
-            .collect();
-        let (registered_power, total_power) =
-            stellereum::vrf::vrf_registered_power(&vrf_registry, &power_entries);
-        if stellereum::vrf::vrf_registry_ready_for_power(&vrf_registry, &power_entries) {
-            info!(
-                "[vrf] VRF registry readiness: 100% of voting power registered ({total_power}/{total_power})"
-            );
-        } else {
-            tracing::warn!(
-                "[vrf] VRF registry INCOMPLETE: {registered_power}/{total_power} voting power registered — \
-                 unregistered power falls back to the legacy parent-hash draw; collect the missing \
-                 VRF pubkeys (nodes log theirs at startup) into STELL_VRF_KEYS"
-            );
-        }
-    }
-    stellereum::consensus::set_live_vrf_registry(vrf_registry);
+    // Election is the canonical parent-hash draw on every height.
+    info!("[sortition] canonical parent-hash draw: election on every height");
 
     // Restore the FULL persisted state (accounts + all domains) if available.
     // `restored_state_height` is the height whose post-state the engine holds (0 for
@@ -5834,7 +5747,6 @@ async fn run_consensus_node(
                             domains,
                             session_keys,
                             bridge,
-                            confidential,
                             zkml_models,
                         } = bundle;
                         // Serialize on the blocking pool. Bytes are identical to
@@ -5871,7 +5783,6 @@ async fn run_consensus_node(
                                 domain_bytes.clone(),
                                 session_keys.clone(),
                                 bridge.clone(),
-                                confidential.clone(),
                                 zkml_models.clone(),
                                 cross_shard.clone(),
                             );
@@ -5898,7 +5809,6 @@ async fn run_consensus_node(
                                 ("domains", domain_bytes.clone()),
                                 ("session", session_keys.clone()),
                                 ("bridge", bridge.clone()),
-                                ("confidential", confidential.clone()),
                                 ("zkml", zkml_models.clone()),
                                 ("cross_shard", cross_shard.clone()),
                             ];
@@ -6636,7 +6546,8 @@ enum Commands {
         /// Enable disjoint wave parallel block execution
         #[arg(long)]
         parallel_exec: bool,
-        /// Enforce Pure Post-Quantum Mode (reject classical Ed25519/BLS transactions and QCs)
+        /// Enforce Pure Post-Quantum Mode (FULL-PQ: no-op, always enforced;
+        /// kept for operator-config compat, ignored with WARN).
         #[arg(long)]
         pure_pq: bool,
     },
@@ -7466,8 +7377,9 @@ async fn main() -> anyhow::Result<()> {
             parallel_exec,
             pure_pq,
         } => {
+            // FULL-PQ: `--pure-pq` parsed-and-ignored with WARN (compat).
             if pure_pq {
-                stellereum::post_quantum::set_pure_pq_override(Some(true));
+                eprintln!("[WARN] --pure-pq is a no-op (FULL-PQ always-on): flag ignored");
             }
             info!("Initializing Stellereum Node on Shard {}...", shard);
             // LIVE MIGRATION ARMING — printed at STARTUP, before the node does
@@ -7578,6 +7490,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             let data_dir = PathBuf::from("./data");
             let keys_dir = PathBuf::from("./keys");
             let keys = stellereum::node_keys::load_or_generate_node_keys(&keys_dir)?;
+            // PQ identity (Falcon-512, first-boot generated): the transport
+            // NodeId is PQ-only (`ceremony_local_id`); the ed key above stays
+            // the consensus validator key (frozen staking world).
+            let pq_keys = infnode::keyring::PqKeys::load_or_generate(&keys_dir)?;
             let validator_key = keys.signing.clone();
             let validator_pub = keys.verifying.to_bytes();
             // NOTE: genesis accounts are funded AFTER the validator set is known
@@ -7602,14 +7518,21 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             if config.exists() {
                 info!("Bootstrapping infnode P2P transport from {:?}", config);
                 let node_cfg = node_config::load(&config)?;
-                let node = Node::new(node_cfg, keys, data_dir, config.clone()).await?;
+                let node = Node::new(node_cfg, keys, pq_keys, data_dir, config.clone()).await?;
                 let adapter = Arc::new(P2pNetworkAdapter::new(node));
 
+                // NODE IDENTITY: id is the PQ-only transport id
+                // (`ceremony_local_id`); ed is the consensus validator key;
+                // kem is the blake3 fingerprint of the ML-KEM-768 ek (the full
+                // 1184B key is never printed — it travels the protocol, not logs).
+                let kem_fp = hex::encode(
+                    &blake3::hash(&adapter.node.keys.kem_ek).as_bytes()[..8],
+                );
                 info!(
-                    "NODE IDENTITY: id={} ed={} x={} listen={}",
+                    "NODE IDENTITY: id={} ed={} kem_fp={} listen={}",
                     adapter.node.id_hex,
                     adapter.node.keys.ed_hex(),
-                    adapter.node.keys.x_hex(),
+                    kem_fp,
                     adapter.node.cfg.listen
                 );
 
@@ -7669,14 +7592,6 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         },
                     )?;
                 }
-
-                // Fail-closed BLS QC gate (audit-pq-crypto HIGH): the
-                // validator BLS registry carries no proof-of-possession, so
-                // counting BLS power (STELL_BLS_QC=1) admits rogue-key QC
-                // forgery. Refuse LOUDLY at startup; default-off nodes are
-                // unaffected (Ed25519 baseline, zero behavior change). See
-                // `bls::refuse_bls_qc_if_enabled` for the PoP rationale.
-                stellereum::bls::refuse_bls_qc_if_enabled().map_err(|e| anyhow::anyhow!("{e}"))?;
 
                 // Fail-closed fresh-join guard (task (a)): an EMPTY data dir
                 // with peers/DNS seeds configured means JOIN, not found —
@@ -8079,10 +7994,12 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         .ok()
                         .filter(|s| !s.is_empty()),
                     tx_broadcast: Some(tx_bcast_tx),
-                    // `stell_signMessage` / `stell_signTypedData` sign with the
-                    // NODE's key (testing/devnet only — production wallets sign
-                    // locally and never ask a node to sign).
-                    msg_signing_seed: Some(validator_key.to_bytes()),
+                    // GATE: H-02 — `stell_signMessage` / `stell_signTypedData`
+                    // NEVER use the validator key. Separate ephemeral dev-only
+                    // key (present only with STELL_DEV_UNSAFE_TESTKEY=1), else
+                    // disabled; production wallets sign locally and never ask
+                    // a node to sign.
+                    msg_signing_seed: stellereum::rpc::dev_msg_signing_seed_from_env(),
                     // Archive proofs + historical roots are served from the
                     // persisted snapshot history, never from the live trie.
                     archive_store: Some(persistence.storage()),
@@ -8468,16 +8385,8 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         c0.shard_id, c0.prefix, c1.shard_id, c1.prefix);
                 }
 
-                // 6. Confidential Transfer Verification
-                let r1 = PedersenCommitment::random_blinding();
-                let r2 = PedersenCommitment::random_blinding();
-                let c1 = PedersenCommitment::commit(1000, &r1);
-                let c2 = PedersenCommitment::commit(500, &r2);
-                let r_out = r1 + r2;
-                let c_out = PedersenCommitment::commit(1480, &r_out);
-                let conf_tx = ConfidentialTransfer::new(vec![c1, c2], vec![c_out], 20);
-                assert!(conf_tx.verify_balance_conservation());
-                println!("  [Privacy] Pedersen Confidential Transfer Verified (Homomorphic conservation fee=20)");
+                // 6. Confidential transfers removed with Ristretto deletion wave
+                // (crypto_privacy excised); transparent path continues.
 
                 // 7. Oracle 3-Tier Price Check
                 let price = oracle.resolve_price(None, "TON", now_secs()).unwrap();
@@ -8518,7 +8427,6 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             println!("• Zero-Overhead MEV Preemption (Shamir T-of-N): ACTIVE");
             println!("• zkML AI Verifiable Inference & Session Keys: ACTIVE");
             println!("• Dynamic Infinite Sharding & Cross-Shard Hub: ACTIVE");
-            println!("• Homomorphic Pedersen Commitments & Stealth: ACTIVE");
             println!("• 3-Tier Price Safety Network & Teleport:    ACTIVE");
             println!("═════════════════════════════════════════════════════════════════\n");
         }
@@ -8661,32 +8569,13 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 let pub_bytes = signing_key.verifying_key().to_bytes();
                 let priv_bytes = signing_key.to_bytes();
 
-                let viewing_key = ViewingKey::generate();
-                let spend_priv = curve25519_dalek::scalar::Scalar::from_bytes_mod_order(priv_bytes);
-                let spend_pub = (curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT
-                    * spend_priv)
-                    .compress()
-                    .to_bytes();
-                let stealth = StealthAddress::generate(&viewing_key.view_pub, &spend_pub)
-                    .ok_or_else(|| anyhow::anyhow!("Stealth address generation failed"))?;
-
+                // Shielded keys removed with Ristretto deletion wave
+                // (crypto_privacy excised); transparent ed25519 wallet only.
                 println!("╔═══════════════════════════════════════════════════════════════╗");
                 println!("║                   🔑 NEW STELLEREUM WALLET                   ║");
                 println!("╚═══════════════════════════════════════════════════════════════╝");
                 println!("• Address (Public Key):   {}", hex::encode(pub_bytes));
                 println!("• Private Key:            {}", hex::encode(priv_bytes));
-                println!(
-                    "• Viewing Public Key:     {}",
-                    hex::encode(viewing_key.view_pub)
-                );
-                println!(
-                    "• Viewing Private Key:    {}",
-                    hex::encode(viewing_key.view_priv)
-                );
-                println!(
-                    "• Stealth One-Time Pub:   {}",
-                    hex::encode(stealth.one_time_pub)
-                );
                 println!("\n⚠️  Keep your private keys safe! Do not share them.");
             }
 
@@ -9711,7 +9600,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     2,
                     "snapshot-sync: newest usable boundary (latest-snapshot pointer when sane), \
                      state + EVERY domain (accounts incl. the staking LEDGER, domains, session, \
-                     bridge, confidential, zkml, cross_shard), tail-anchored QC proof, \
+                     bridge, zkml, cross_shard), tail-anchored QC proof, \
                      root-checked BEFORE commit — stale domains are rejected with a retry, \
                      never committed"
                 )
@@ -9776,10 +9665,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 let keys = stellereum::node_keys::load_or_generate_node_keys(&keys_dir)?;
                 let falcon = stellereum::node_keys::load_or_generate_falcon_key(&falcon_path)?;
                 println!(
-                    "NODE IDENTITY: id={} ed={} x={} falcon={}",
+                    "NODE IDENTITY: id={} ed={} kem_ek={} falcon={}",
                     keys.id_hex(),
                     keys.ed_hex(),
-                    keys.x_hex(),
+                    keys.kem_ek_hex(),
                     hex::encode(&falcon.public_key),
                 );
                 println!("keys dir: {} (0700), files 0600", keys_dir.display());
@@ -9808,13 +9697,15 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 })?;
                 let id_hex = keys.id_hex();
                 let ed_hex = keys.ed_hex();
-                let x_hex = keys.x_hex();
                 let falcon_hex = hex::encode(&falcon.public_key);
                 println!("# === STELLEREUM PEER STANZA (send this block to the network admin) ===");
                 println!("  - name: {name}");
-                println!("    node-id: \"{id_hex}\"");
+                // FULL-PQ: no `node-id:`/`x-pub:` (removed fields) — identity
+                // is the Falcon key below; the `validators:` entry still pins
+                // the ed-derived id (frozen staking world, see
+                // `build_validator_set`).
                 println!("    ed-pub: \"{ed_hex}\"");
-                println!("    x-pub: \"{x_hex}\"");
+                println!("    pq-pub: \"{falcon_hex}\"");
                 println!("    endpoints: [\"{endpoint}\"]");
                 println!("    allow: [\"*\"]");
                 println!("# validators entry (admin adds the id to every node's `validators:`):");
@@ -11079,16 +10970,13 @@ mod dns_seed_guard_tests {
     use super::*;
 
     fn peer(name: &str, ed: [u8; 32]) -> node_config::PeerConfig {
-        let id = {
-            let h = blake3::hash(&ed);
-            format!("inf1:{}", hex::encode(&h.as_bytes()[..20]))
-        };
         node_config::PeerConfig {
             name: name.to_string(),
-            node_id: id,
             ed_pub: hex::encode(ed),
-            x_pub: hex::encode([ed[0] ^ 0xFF; 32]),
-            pq_pub: None, // GATE: classical-only test fixture
+            // In-code fixture: PQ pin optional in memory (parsed operator
+            // configs must carry it). The validator-set derivation below keys
+            // on the ed pin, so fixtures stay classical-shaped here.
+            pq_pub: None,
             endpoints: vec!["127.0.0.1:9411".to_string()],
             allow: vec!["*".to_string()],
             rate_limit_per_sec: 0,
@@ -11166,22 +11054,22 @@ mod dns_seed_guard_tests {
     }
 
     #[test]
-    fn peer_with_mismatched_node_id_is_skipped_not_installed() {
-        // F6: a peer entry whose declared node_id is not blake3(ed_pub)[..20]
-        // (typo or doctored config) must NOT contribute its key to the set.
-        // The peer claims OUR id and our id is listed, so the entry reaches
-        // the binding check — which must refuse it.
+    fn unlisted_peer_key_is_excluded_from_validator_set() {
+        // F6 (structural now): peer configs carry NO declared node-id — the
+        // id is derived from the pinned ed key, so a doctored config can no
+        // longer claim our id for a stranger's key (the old lie is
+        // inexpressible). What remains pinned: a peer whose derived id is NOT
+        // listed contributes nothing.
         let self_ed = [0x11u8; 32];
         let peer_ed = [0x22u8; 32];
-        let mut bad = peer("b", peer_ed);
-        bad.node_id = node_id_hex(&self_ed); // lie: claim our id
+        let stranger = peer("b", peer_ed); // derived id != listed self id
         let validators = vec![node_id_hex(&self_ed)];
-        let cfg = cfg_with(vec![bad], validators);
+        let cfg = cfg_with(vec![stranger], validators);
         let (vset, is_val) = build_validator_set(&cfg, self_ed, &node_id_hex(&self_ed), false);
         assert!(is_val, "we are listed, self stays a validator");
         assert!(
             !vset.contains(&peer_ed),
-            "mismatched peer key must not enter the validator set"
+            "unlisted peer key must not enter the validator set"
         );
         assert_eq!(vset.len(), 1, "only self remains");
     }
@@ -11254,7 +11142,7 @@ mod dns_seed_guard_tests {
         let clone_of_validator = stellereum::dns_seeds::DiscoveredPeer {
             node_id: node_id_hex(&validator_ed),
             ed_pub: validator_ed,
-            x_pub: None,
+            kem_ek_hash: None,
             host: "evil.example".to_string(),
             port: 9411,
         };

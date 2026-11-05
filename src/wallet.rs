@@ -1,17 +1,14 @@
 //! Lightweight Wallet Module for Stellereum (SPV & Light Client)
 //! Handles key derivation, 12-word mnemonic seed generation, password-encrypted keystore
 //! with Argon2 + ChaCha20Poly1305, SPV Merkle inclusion proof verification,
-//! and native transaction creation (standard, confidential, AI session delegation, and CLOB trades).
+//! and native transaction creation (standard, AI session delegation, and CLOB trades).
 
 use crate::cell::{CellHash, MerkleProof, PatriciaTrie};
-use crate::crypto_privacy::{ConfidentialTransfer, PedersenCommitment, StealthAddress, ViewingKey};
 use crate::sharding::Transaction;
 use crate::zkml::SessionKeyAuthorization;
 use aead::{Aead, KeyInit};
 use argon2::Argon2;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
-use curve25519_dalek::scalar::Scalar;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -1008,59 +1005,137 @@ impl WalletKeyMaterial {
         }
         Ok(self.sign_transfer(to, amount, gas_limit, nonce, source_shard, target_shard))
     }
+
+    /// Delegate a Falcon-512 session key for AI bots with gas spending cap
+    /// and time validity: the wallet-side mint of a Falcon delegation grant
+    /// ([`SessionKeyAuthorization::sign_delegation_falcon512`], Falcon master
+    /// + Falcon session — the only live combination under FULL-PQ).
+    ///
+    /// `session_pubkey` is the session's raw Falcon-512 public key (897
+    /// bytes); `scope` is the operation bitmask (`zkml::SCOPE_*`),
+    /// `max_value_per_tx` caps the native amount of any single transaction,
+    /// and `chain_id` binds the grant to the chain it was minted for (part of
+    /// the master's signed message, domain-separated with
+    /// `STELL_SESSKEY_V1`).
+    ///
+    /// Fail-closed: an Ed25519 wallet key refuses (`Err`) instead of minting
+    /// an Ed grant — Ed delegations stay refused chain-wide, so emitting one
+    /// would only produce a transaction nobody can verify. A malformed
+    /// session public key is refused the same way.
+    pub fn delegate_bot_session_falcon512(
+        &self,
+        session_pubkey: &[u8],
+        max_gas: u64,
+        duration_secs: u64,
+        scope: u64,
+        max_value_per_tx: u64,
+        chain_id: u64,
+    ) -> Result<SessionKeyAuthorization, String> {
+        let Self::Falcon { keypair } = self else {
+            return Err(format!(
+                "wallet key scheme mismatch: session delegation requires a Falcon-512 master key, \
+                 this wallet holds {} (Ed25519 grants are refused chain-wide)",
+                self.scheme()
+            ));
+        };
+        if session_pubkey.len() != crate::post_quantum::FALCON512_PUBKEY_LEN {
+            return Err(format!(
+                "invalid Falcon-512 session public key: expected {} bytes, got {}",
+                crate::post_quantum::FALCON512_PUBKEY_LEN,
+                session_pubkey.len()
+            ));
+        }
+        let valid_until = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + duration_secs;
+
+        Ok(SessionKeyAuthorization::sign_delegation_falcon512(
+            keypair,
+            crate::post_quantum::PqScheme::Falcon512,
+            session_pubkey,
+            valid_until,
+            max_gas,
+            scope,
+            max_value_per_tx,
+            chain_id,
+        ))
+    }
 }
 
-/// Full in-memory active wallet account
+/// Full in-memory active wallet account (transparent only).
+///
+/// The pre-excision Ristretto stealth fields (`viewing_key`, `spend_priv`,
+/// `spend_pub`, `stealth_address`) were removed with the PQ migration:
+/// stealth addresses die with Ristretto (ML-KEM stealth comes with the
+/// HashPool prototype, separate track). Use
+/// [`reject_legacy_stealth_wallet_bytes`] to refuse old stealth-bearing
+/// wallet files fail-closed instead of silently dropping their fields.
 pub struct WalletAccount {
     pub signing_key: SigningKey,
     pub address: [u8; 32],
-    pub viewing_key: ViewingKey,
-    pub spend_priv: Scalar,
-    pub spend_pub: [u8; 32],
-    pub stealth_address: StealthAddress,
+}
+
+/// Field names of the excised Ristretto stealth wallet state. Any wallet
+/// file carrying one of these is a pre-excision file and must be refused
+/// (see [`reject_legacy_stealth_wallet_bytes`]), never silently accepted.
+pub const LEGACY_STEALTH_WALLET_FIELDS: &[&str] = &[
+    "stealth_address",
+    "viewing_key",
+    "spend_priv",
+    "spend_pub",
+    "view_pub",
+];
+
+/// Fail-closed guard for pre-excision stealth-bearing wallet files.
+///
+/// Inspects raw wallet-file bytes: when they parse as JSON holding any of
+/// [`LEGACY_STEALTH_WALLET_FIELDS`], returns a clear error naming the PQ
+/// excision (never a silent drop). Non-JSON bytes and JSON without those
+/// fields return `Ok(())` so the real loader reports its own result.
+pub fn reject_legacy_stealth_wallet_bytes(raw: &[u8]) -> Result<(), String> {
+    let value: serde_json::Value = match serde_json::from_slice(raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    for field in LEGACY_STEALTH_WALLET_FIELDS {
+        if obj.contains_key(*field) {
+            return Err(format!(
+                "refusing legacy Ristretto stealth wallet file: field '{field}' was excised \
+                 in the PQ migration (stealth addresses die with Ristretto; ML-KEM stealth \
+                 comes with the HashPool prototype, separate track)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// File variant of [`reject_legacy_stealth_wallet_bytes`]: reads `path` and
+/// refuses it fail-closed when it is a pre-excision stealth-bearing wallet
+/// file. Returns `Ok(())` for transparent files (the caller then loads them
+/// with the usual path); unreadable files are reported, never guessed.
+pub fn reject_legacy_stealth_wallet_file(path: &Path) -> Result<(), String> {
+    let raw = fs::read(path).map_err(|e| format!("Failed to read wallet file: {e}"))?;
+    reject_legacy_stealth_wallet_bytes(&raw)
 }
 
 impl WalletAccount {
-    /// Derive all keys deterministically from a 32-byte master seed
+    /// Derive the transparent keys deterministically from a 32-byte master seed.
+    ///
+    /// Byte-identical to the historical derivation for `signing_key` and
+    /// `address` (the stealth fields derived below them are gone).
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(seed);
         let address = signing_key.verifying_key().to_bytes();
 
-        // Deterministic derivation of Viewing Key from master seed
-        let mut view_hasher = Sha256::new();
-        view_hasher.update(seed);
-        view_hasher.update(b"VIEWING_KEY_DERIVE");
-        let view_scalar_bytes: [u8; 32] = view_hasher.finalize().into();
-        let view_priv = Scalar::from_bytes_mod_order(view_scalar_bytes);
-        let view_pub = (RISTRETTO_BASEPOINT_POINT * view_priv)
-            .compress()
-            .to_bytes();
-
-        let viewing_key = ViewingKey {
-            view_priv: view_priv.to_bytes(),
-            view_pub,
-        };
-
-        // Deterministic derivation of Spend Key from master seed
-        let mut spend_hasher = Sha256::new();
-        spend_hasher.update(seed);
-        spend_hasher.update(b"SPEND_KEY_DERIVE");
-        let spend_scalar_bytes: [u8; 32] = spend_hasher.finalize().into();
-        let spend_priv = Scalar::from_bytes_mod_order(spend_scalar_bytes);
-        let spend_pub = (RISTRETTO_BASEPOINT_POINT * spend_priv)
-            .compress()
-            .to_bytes();
-
-        let stealth_address = StealthAddress::generate(&view_pub, &spend_pub)
-            .expect("Valid Ristretto stealth derivation");
-
         Self {
             signing_key,
             address,
-            viewing_key,
-            spend_priv,
-            spend_pub,
-            stealth_address,
         }
     }
 
@@ -1312,46 +1387,6 @@ impl WalletAccount {
         )
     }
 
-    /// Create confidential transfer with Pedersen commitments.
-    ///
-    /// Thin wrapper over [`Self::build_confidential_transfer`]: the blinding
-    /// conservation (`r_out == r_in`, so `C_in - C_out == fee*G` exactly) is
-    /// the shared builder path every shielded entry point reuses — including
-    /// the first-class RPC path (`stell_shieldedTransfer`), which calls the
-    /// associated function directly because a prepare-only endpoint holds no
-    /// signing key.
-    pub fn create_confidential_transfer(
-        &self,
-        amount: u64,
-        fee: u64,
-    ) -> (ConfidentialTransfer, Scalar) {
-        Self::build_confidential_transfer(amount, fee)
-    }
-
-    /// Build a one-in/one-out confidential transfer with Pedersen commitments.
-    ///
-    /// THE shared builder (no key needed): input commits to `amount + fee`,
-    /// output commits to `amount`, both under the SAME blinding, so the group
-    /// equation holds exactly. Returns the transfer plus the output blinding
-    /// (== the input blinding) for the wallet's shielded inventory. Range
-    /// proofs are NOT built here — the execution path needs them, the caller
-    /// attaches them with [`crate::crypto_privacy::RangeProof::prove_auto`].
-    pub fn build_confidential_transfer(amount: u64, fee: u64) -> (ConfidentialTransfer, Scalar) {
-        // Checked (audit follow-up): amount+fee overflowed silently here.
-        let total = amount
-            .checked_add(fee)
-            .expect("confidential amount+fee overflows");
-        let r_in = PedersenCommitment::random_blinding();
-        let c_in = PedersenCommitment::commit(total, &r_in);
-
-        // Blinding conservation: r_out = r_in
-        let r_out = r_in;
-        let c_out = PedersenCommitment::commit(amount, &r_out);
-
-        let transfer = ConfidentialTransfer::new(vec![c_in], vec![c_out], fee);
-        (transfer, r_out)
-    }
-
     /// Delegate session key for AI bots with gas spending cap and time validity.
     ///
     /// `scope` is the operation bitmask (`zkml::SCOPE_*`), `max_value_per_tx`
@@ -1497,11 +1532,103 @@ impl WalletAccount {
     }
 }
 
+// ============================================================================
+// Silent-payment SCAN section (read-only trial-decap; default OFF)
+// ============================================================================
+//
+// READ paths only: the `SilentScanner` trial-decaps candidate notes against
+// the owner's ML-KEM-768 KEM seed and re-derives the chain-bound stealth
+// address via the exact silent-payment shape (`SpRecipient::receive`, i.e.
+// `sp_stealth_address(chain_id, chain, ss, index)`). It never signs, sends,
+// or moves funds. Arming mirrors the `HASH_POOL_ENABLED` precedent (plain
+// const, no env knob): disarmed unless `crate::SILENT_PAY_ENABLED` flips or
+// the per-instance `enable_for_tests` override fires (never on the live
+// path, grep-proof: only `tests/` call it). While disarmed `scan` returns
+// empty — existing wallet behavior is byte-identical.
+
+/// One on-chain silent-payment candidate as observed by a scanning wallet:
+/// the published ML-KEM-768 ciphertext plus the claimed stealth address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SilentNoteCandidate {
+    /// Published ML-KEM-768 ciphertext bytes (1088 B when well-formed).
+    pub ct: Vec<u8>,
+    /// Claimed stealth address the owner trial re-derives.
+    pub stealth: [u8; 32],
+}
+
+/// One successful trial-decap: the candidate at the recipient's `index`
+/// decapsulated with the owner seed and re-derived to the same stealth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SilentScanHit {
+    /// Per-recipient note index this hit consumed.
+    pub index: u64,
+    /// Decapsulated KEM shared secret (steps the recipient chain).
+    pub ss: [u8; 32],
+    /// Matched stealth address.
+    pub stealth: [u8; 32],
+}
+
+/// Owner's trial-decap scanner: feeds `scan` candidates (chain order)
+/// through a fresh forward-secret receive state and returns exactly the
+/// notes addressed to this owner, in order. Scans are idempotent (a fresh
+/// receive state per call). Wrong-recipient notes, tampered ciphertexts and
+/// malformed candidates never produce hits (malformed entries are skipped —
+/// `receive` leaves state untouched on refusal — never fabricated).
+/// Chain-bound: only notes sent for `chain_id` can match.
+pub struct SilentScanner {
+    owner_kem_seed: [u8; 64],
+    chain_id: u64,
+    armed: bool,
+}
+
+impl SilentScanner {
+    /// Disarmed unless `crate::SILENT_PAY_ENABLED` flips (default OFF).
+    pub fn new(owner_kem_seed: [u8; 64], chain_id: u64) -> Self {
+        Self { owner_kem_seed, chain_id, armed: crate::SILENT_PAY_ENABLED }
+    }
+
+    /// Test-only arming. Never called on the live path (grep-proof: only
+    /// `tests/` call it); production flips `crate::SILENT_PAY_ENABLED`
+    /// with a spec update + audit.
+    pub fn enable_for_tests(&mut self) {
+        self.armed = true;
+    }
+
+    /// Whether this scanner will trial-decap (`scan` returns empty while
+    /// disarmed).
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Trial-decap scan. Empty while disarmed; otherwise exactly the
+    /// owner's own notes, in order (zero false-positives by construction:
+    /// only a decapsulated-then-rederived match is reported).
+    pub fn scan(&self, candidates: &[SilentNoteCandidate]) -> Vec<SilentScanHit> {
+        if !self.armed {
+            return Vec::new();
+        }
+        let mut recipient = crate::silentpay::SpRecipient::new(self.owner_kem_seed, self.chain_id);
+        let mut hits = Vec::new();
+        for candidate in candidates {
+            if let Ok(Some(receipt)) = recipient.receive(&candidate.ct, &candidate.stealth) {
+                hits.push(SilentScanHit {
+                    index: receipt.index,
+                    ss: receipt.ss,
+                    stealth: receipt.stealth,
+                });
+            }
+        }
+        hits
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cpat2::AccountLeaf;
     use crate::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+    use curve25519_dalek::scalar::Scalar;
 
     #[test]
     fn test_wallet_spv_balance_verification_unpinned_and_pinned() {
@@ -1671,15 +1798,103 @@ mod tests {
     const TEST_CHAIN_ID: u64 = 5757;
     const OTHER_CHAIN_ID: u64 = 9999;
 
+    /// Falcon session delegation: the PQ-wallet builder mints a live
+    /// Falcon-master/Falcon-session grant (verifies, and authorizes a real
+    /// Falcon-signed session transaction); the Ed wallet key refuses
+    /// fail-closed instead of minting a dead Ed grant.
+    #[test]
+    fn falcon_session_delegation_builder() {
+        let master = WalletKeyMaterial::from_seed(&[0x51u8; 32]);
+        assert_eq!(
+            master.scheme(),
+            crate::post_quantum::PqScheme::Falcon512,
+            "from_seed must hold a Falcon-512 master key"
+        );
+        let session_fk = crate::post_quantum::FalconKeypair::generate_from_seed(0x52);
+        let grant = master
+            .delegate_bot_session_falcon512(
+                session_fk.public_key(),
+                50_000,
+                3600,
+                crate::zkml::SCOPE_TRANSFER,
+                1_000,
+                TEST_CHAIN_ID,
+            )
+            .expect("falcon wallet must mint a falcon session grant");
+        assert_eq!(grant.master_address, master.address());
+        assert_eq!(
+            grant.master_scheme,
+            crate::post_quantum::PqScheme::Falcon512
+        );
+        assert_eq!(
+            grant.session_scheme,
+            crate::post_quantum::PqScheme::Falcon512
+        );
+        assert!(grant.verify_signature());
+        // The minted grant authorizes a real Falcon-signed session tx.
+        let tx = crate::sharding::Transaction::sign_with_session_falcon512(
+            &session_fk,
+            grant,
+            [9u8; 32],
+            10,
+            100,
+            0,
+            1,
+            1,
+            vec![],
+        );
+        assert!(tx.is_session_keyed());
+        assert!(tx.verify_signature());
+
+        // Ed wallet key refuses instead of minting a dead grant.
+        let ed = WalletKeyMaterial::ed25519_from_seed(&[0x53u8; 32]);
+        assert!(
+            ed.delegate_bot_session_falcon512(
+                session_fk.public_key(),
+                50_000,
+                3600,
+                crate::zkml::SCOPE_TRANSFER,
+                1_000,
+                TEST_CHAIN_ID,
+            )
+            .is_err(),
+            "Ed master must refuse: Ed grants are refused chain-wide"
+        );
+        // Malformed session pubkey refuses.
+        assert!(
+            master
+                .delegate_bot_session_falcon512(
+                    &[1u8; 32],
+                    50_000,
+                    3600,
+                    crate::zkml::SCOPE_TRANSFER,
+                    1_000,
+                    TEST_CHAIN_ID,
+                )
+                .is_err(),
+            "non-Falcon session pubkey must be refused"
+        );
+    }
+
     /// The bound constructors produce chain-bound transactions that verify
     /// on their own chain and fail a strict check on any other chain.
+    /// FULL-PQ: the hatch rides PQ keys (`WalletKeyMaterial::from_seed` is
+    /// Falcon-512); the bound/strict property is byte-identical.
     #[test]
     fn bound_constructors_bind_the_chain_id() {
-        let wallet = WalletAccount::from_seed(&[0x50u8; 32]);
-        let tx = wallet.create_bound_transaction([0x99u8; 32], 1_000, 5, 0, 0, TEST_CHAIN_ID);
+        let wallet = WalletKeyMaterial::from_seed(&[0x50u8; 32]);
+        let tx = wallet.sign_bound_transfer(
+            [0x99u8; 32],
+            1_000,
+            crate::svm::GAS_BASIC_TRANSFER,
+            5,
+            0,
+            0,
+            TEST_CHAIN_ID,
+        );
         assert!(
-            tx.is_chain_id_bound(),
-            "the default transfer must carry CH1"
+            tx.chain_id().is_some(),
+            "the default transfer must carry a chain binding"
         );
         assert_eq!(tx.chain_id(), Some(TEST_CHAIN_ID));
         assert!(tx.verify_signature(), "a bound transaction must verify");
@@ -1693,10 +1908,15 @@ mod tests {
         );
 
         let payload = vec![crate::svm::OpCode::Nop, crate::svm::OpCode::Pop];
-        let ptx = wallet.create_bound_payload_transaction(payload, 100_000, 6, TEST_CHAIN_ID);
+        let ptx = wallet.sign_bound_payload_transfer(
+            payload,
+            100_000,
+            6,
+            TEST_CHAIN_ID,
+        );
         assert!(
-            ptx.is_chain_id_bound(),
-            "the default payload tx must carry CH1"
+            ptx.chain_id().is_some(),
+            "the default payload tx must carry a chain binding"
         );
         assert_eq!(ptx.chain_id(), Some(TEST_CHAIN_ID));
         assert!(ptx.verify_signature(), "a bound payload tx must verify");
@@ -1707,10 +1927,20 @@ mod tests {
     /// The legacy hatch builds the old UNBOUND transaction (verifies, but
     /// carries no chain id and fails every strict check) — and it exists so
     /// the warning has exactly one call site to find.
+    /// FULL-PQ: the hatch rides PQ keys (`sign_transfer` is the PQ faucet
+    /// shape: explicit PQ1 envelope, no chain binding); the
+    /// unbound-verifies / strict-refuses property is byte-identical.
     #[test]
     fn unbound_legacy_hatch_builds_replayable_transactions() {
-        let wallet = WalletAccount::from_seed(&[0x51u8; 32]);
-        let tx = wallet.unbound_legacy_transfer([0x99u8; 32], 1_000, 5, 0, 0);
+        let wallet = WalletKeyMaterial::from_seed(&[0x51u8; 32]);
+        let tx = wallet.sign_transfer(
+            [0x99u8; 32],
+            1_000,
+            crate::svm::GAS_BASIC_TRANSFER,
+            5,
+            0,
+            0,
+        );
         assert!(
             !tx.is_chain_id_bound(),
             "the legacy hatch must stay unbound"
@@ -1726,11 +1956,28 @@ mod tests {
             "strict admission refuses the legacy hatch"
         );
 
-        let ptx =
-            wallet.unbound_legacy_payload_transaction(vec![crate::svm::OpCode::Nop], 100_000, 6);
+        let ptx = wallet.sign_payload_transfer(vec![crate::svm::OpCode::Nop], 100_000, 6);
         assert!(!ptx.is_chain_id_bound());
         assert_eq!(ptx.chain_id(), None);
         assert!(ptx.verify_signature());
         assert!(!ptx.verify_signature_for_chain(TEST_CHAIN_ID, true));
+    }
+
+    /// Pre-excision stealth-bearing wallet files are refused fail-closed with
+    /// an error naming the PQ excision — never silently dropped.
+    #[test]
+    fn legacy_stealth_wallet_bytes_are_rejected_fail_closed() {
+        for field in LEGACY_STEALTH_WALLET_FIELDS {
+            let raw = format!(r#"{{"address_hex": "ab", "{field}": "00"}}"#);
+            let err = reject_legacy_stealth_wallet_bytes(raw.as_bytes())
+                .expect_err("stealth-bearing wallet bytes must be refused");
+            assert!(
+                err.contains("PQ") && err.contains(field),
+                "error must name the PQ excision and the field, got: {err}"
+            );
+        }
+        // Transparent files pass the guard (loading itself is unchanged).
+        assert!(reject_legacy_stealth_wallet_bytes(br#"{"address_hex": "ab"}"#).is_ok());
+        assert!(reject_legacy_stealth_wallet_bytes(b"not json at all").is_ok());
     }
 }

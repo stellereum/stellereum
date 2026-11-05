@@ -1,11 +1,8 @@
 //! Second wave of adversarial tests: consensus, orderbook, actor model,
-//! privacy primitives, MEV threshold shares, tokenomics and sharding.
+//! MEV threshold shares, tokenomics and sharding.
 
-use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
-use curve25519_dalek::scalar::Scalar;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use stellereum::crypto_privacy::{PedersenCommitment, StealthAddress, ViewingKey};
 use stellereum::mev::MevPreemptionEngine;
 use stellereum::orderbook::{OrderSide, OrderbookActor};
 use stellereum::sharding::{Block, DynamicShardManager, Transaction, MASTERCHAIN_SHARD};
@@ -297,65 +294,6 @@ async fn actor_message_from_ghost_sender_rejected() {
         engine.get_account(&victim).await.unwrap().balance,
         0,
         "ghost sender must not mint value for the recipient"
-    );
-}
-
-// ============================================================================
-// PRIVACY: Pedersen commitment rejects wrong value / wrong blinding
-// ============================================================================
-#[test]
-fn pedersen_wrong_value_or_blinding_rejected() {
-    let r1 = PedersenCommitment::random_blinding();
-    let r2 = PedersenCommitment::random_blinding();
-    let c = PedersenCommitment::commit(500, &r1);
-
-    assert!(c.verify(500, &r1));
-    assert!(!c.verify(501, &r1), "wrong value must fail");
-    assert!(!c.verify(500, &r2), "wrong blinding must fail");
-}
-
-// ============================================================================
-// PRIVACY: stealth address is only recognized by the true recipient
-// ============================================================================
-#[test]
-fn stealth_address_wrong_recipient_rejected() {
-    let view_priv = Scalar::random(&mut OsRng);
-    let view_pub = (RISTRETTO_BASEPOINT_POINT * view_priv)
-        .compress()
-        .to_bytes();
-    let spend_priv = Scalar::random(&mut OsRng);
-    let spend_pub = (RISTRETTO_BASEPOINT_POINT * spend_priv)
-        .compress()
-        .to_bytes();
-
-    let stealth = StealthAddress::generate(&view_pub, &spend_pub).unwrap();
-    assert!(stealth.is_for_recipient(&view_priv, &spend_pub).unwrap());
-
-    // A different viewer must not recognize it
-    let other_view = Scalar::random(&mut OsRng);
-    assert!(
-        !stealth.is_for_recipient(&other_view, &spend_pub).unwrap(),
-        "wrong viewer must not match"
-    );
-}
-
-// ============================================================================
-// PRIVACY: only the intended auditor can decrypt a viewing payload
-// ============================================================================
-#[test]
-fn viewing_key_unauthorized_decrypt_rejected() {
-    let auditor = ViewingKey::generate();
-    let other = ViewingKey::generate();
-    let blinding = PedersenCommitment::random_blinding();
-
-    let payload =
-        ViewingKey::encrypt_amount_for_auditor(&auditor.view_pub, 12_345, &blinding).unwrap();
-    assert_eq!(auditor.decrypt_amount(&payload).unwrap().0, 12_345);
-
-    // A different viewing key cannot decrypt
-    assert!(
-        other.decrypt_amount(&payload).is_err(),
-        "unauthorized viewing key must fail"
     );
 }
 

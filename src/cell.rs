@@ -20,6 +20,24 @@ pub struct Cell {
 }
 
 impl Cell {
+    /// Fallible constructor: refuses oversize data/references instead of
+    /// panicking, for use on untrusted inputs.
+    pub fn try_new(data: Vec<u8>, references: Vec<CellHash>) -> Result<Self, String> {
+        if data.len() > MAX_CELL_DATA_BYTES {
+            return Err(format!(
+                "Cell data cannot exceed {MAX_CELL_DATA_BYTES} bytes (got {})",
+                data.len()
+            ));
+        }
+        if references.len() > MAX_CELL_REFS {
+            return Err(format!(
+                "Cell cannot have more than {MAX_CELL_REFS} references (got {})",
+                references.len()
+            ));
+        }
+        Ok(Self { data, references })
+    }
+
     pub fn new(data: Vec<u8>, references: Vec<CellHash>) -> Self {
         assert!(
             data.len() <= MAX_CELL_DATA_BYTES,
@@ -162,6 +180,13 @@ impl BagOfCells {
         let cells_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
 
         let mut offset = 12;
+        // M-04/KI-35: length-vs-remaining guard — never let an untrusted 32-bit
+        // prefix reach with_capacity unchecked (0xFFFFFFFF would request 128GiB+
+        // and abort where the allocation fails). Each root costs 32 bytes.
+        let remaining = bytes.len() - offset;
+        if roots_len > remaining / 32 {
+            return Err("BoC roots length exceeds remaining bytes".to_string());
+        }
         let mut roots = Vec::with_capacity(roots_len);
         for _ in 0..roots_len {
             if offset + 32 > bytes.len() {
@@ -173,6 +198,12 @@ impl BagOfCells {
             offset += 32;
         }
 
+        // M-04/KI-35: same guard for the cells table — each cell costs at least
+        // 35 bytes on the wire (32 hash + 1 refs_len + 2 data_len).
+        let remaining_cells = bytes.len() - offset;
+        if cells_len > remaining_cells / 35 {
+            return Err("BoC cells length exceeds remaining bytes".to_string());
+        }
         let mut cells = HashMap::with_capacity(cells_len);
         for _ in 0..cells_len {
             if offset + 35 > bytes.len() {
@@ -189,6 +220,18 @@ impl BagOfCells {
                 u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
 
+            // L-07: enforce Cell invariants at the parse boundary so a crafted
+            // BoC cannot smuggle a cell `Cell::new` would refuse.
+            if refs_len > MAX_CELL_REFS {
+                return Err(format!(
+                    "Cell references exceed {MAX_CELL_REFS} (got {refs_len})"
+                ));
+            }
+            if data_len > MAX_CELL_DATA_BYTES {
+                return Err(format!(
+                    "Cell data exceeds {MAX_CELL_DATA_BYTES} bytes (got {data_len})"
+                ));
+            }
             if offset + data_len + refs_len * 32 > bytes.len() {
                 return Err("Unexpected EOF reading cell payload".to_string());
             }
@@ -356,5 +399,107 @@ impl PatriciaTrie {
             leaf_hash: proof.leaf_hash,
         };
         crate::cpat2::CompressedTrie::verify(root, key, value, &cp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn m04_ki35_evil_prefix_refused_without_alloc_spike() {
+        // 12-byte blob: magic + roots_len=0xFFFFFFFF + cells_len=0xFFFFFFFF.
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&BOC_MAGIC_PREFIX);
+        evil.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes());
+        evil.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes());
+        assert_eq!(evil.len(), 12);
+        let start = Instant::now();
+        let res = BagOfCells::from_boc_bytes(&evil);
+        let elapsed = start.elapsed();
+        assert!(res.is_err(), "evil prefix must be cleanly refused");
+        // Generous time bound: the guard returns before any large allocation.
+        assert!(
+            elapsed.as_secs() < 5,
+            "refusal took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn m04_ki35_valid_bocs_still_parse() {
+        let (boc, root) = Cell::from_bytes(b"hello stellereum");
+        let bytes = boc.to_boc_bytes();
+        let back = BagOfCells::from_boc_bytes(&bytes).expect("valid BoC must parse");
+        assert_eq!(back.read_bytes(&root), Some(b"hello stellereum".to_vec()));
+        let empty = BagOfCells::new();
+        let empty_bytes = empty.to_boc_bytes();
+        BagOfCells::from_boc_bytes(&empty_bytes).expect("empty BoC must parse");
+    }
+
+    #[test]
+    fn m04_ki35_max_legit_size_blob_accepted() {
+        // Boundary-legal blob: roots_len * 32 + cells_len * 35 == remaining.
+        // 1 root (32B) + 1 minimal cell (35B, empty data, 0 refs).
+        let root = [0xABu8; 32];
+        let cell_hash = [0xCDu8; 32];
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&BOC_MAGIC_PREFIX);
+        blob.extend_from_slice(&1u32.to_be_bytes());
+        blob.extend_from_slice(&1u32.to_be_bytes());
+        blob.extend_from_slice(&root);
+        blob.extend_from_slice(&cell_hash);
+        blob.push(0u8);
+        blob.extend_from_slice(&0u16.to_be_bytes());
+        let back = BagOfCells::from_boc_bytes(&blob).expect("max-legit-size blob refused");
+        assert_eq!(back.roots.len(), 1);
+        assert_eq!(back.cells.len(), 1);
+    }
+
+    #[test]
+    fn l03_try_new_refuses_oversize_without_panic() {
+        assert!(Cell::try_new(vec![0u8; MAX_CELL_DATA_BYTES], vec![]).is_ok());
+        assert!(Cell::try_new(vec![0u8; MAX_CELL_DATA_BYTES + 1], vec![]).is_err());
+        assert!(Cell::try_new(vec![], vec![[0u8; 32]; MAX_CELL_REFS]).is_ok());
+        assert!(Cell::try_new(vec![], vec![[0u8; 32]; MAX_CELL_REFS + 1]).is_err());
+    }
+
+    #[test]
+    fn l07_boc_parse_enforces_cell_invariants() {
+        // refs_len = 5 (over MAX_CELL_REFS) with a size-consistent blob.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&BOC_MAGIC_PREFIX);
+        blob.extend_from_slice(&0u32.to_be_bytes());
+        blob.extend_from_slice(&1u32.to_be_bytes());
+        blob.extend_from_slice(&[0xCDu8; 32]);
+        blob.push(5u8);
+        blob.extend_from_slice(&0u16.to_be_bytes());
+        blob.extend_from_slice(&[0u8; 5 * 32]);
+        let err = BagOfCells::from_boc_bytes(&blob).expect_err("refs_len=5 must be refused");
+        assert!(err.contains("references"), "unexpected error: {err}");
+        // data_len = 129 (over MAX_CELL_DATA_BYTES) with a size-consistent blob.
+        let mut blob2 = Vec::new();
+        blob2.extend_from_slice(&BOC_MAGIC_PREFIX);
+        blob2.extend_from_slice(&0u32.to_be_bytes());
+        blob2.extend_from_slice(&1u32.to_be_bytes());
+        blob2.extend_from_slice(&[0xCDu8; 32]);
+        blob2.push(0u8);
+        blob2.extend_from_slice(&129u16.to_be_bytes());
+        blob2.extend_from_slice(&[0u8; 129]);
+        let err2 = BagOfCells::from_boc_bytes(&blob2).expect_err("data_len=129 must be refused");
+        assert!(err2.contains("data"), "unexpected error: {err2}");
+        // Boundary-legal max cell still parses: 128 data bytes + 4 refs.
+        let mut blob3 = Vec::new();
+        blob3.extend_from_slice(&BOC_MAGIC_PREFIX);
+        blob3.extend_from_slice(&0u32.to_be_bytes());
+        blob3.extend_from_slice(&1u32.to_be_bytes());
+        blob3.extend_from_slice(&[0xCDu8; 32]);
+        blob3.push(4u8);
+        blob3.extend_from_slice(&128u16.to_be_bytes());
+        blob3.extend_from_slice(&[0xEEu8; 128]);
+        for _ in 0..4 {
+            blob3.extend_from_slice(&[0xAAu8; 32]);
+        }
+        BagOfCells::from_boc_bytes(&blob3).expect("max-legal cell must parse");
     }
 }

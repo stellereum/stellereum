@@ -14,7 +14,10 @@ use std::collections::HashMap;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use stellereum::bootstrap;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{
+    register_validator_pq_key, QuorumCertificate, ValidatorSet, Vote, VoteKind, VoteSet,
+};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::governance::Governance;
 use stellereum::sharding::{
     Block, CrossShardKey, CrossShardReplaySnapshot, MASTERCHAIN_SHARD,
@@ -63,12 +66,56 @@ fn mkblock(height: u64, prev: [u8; 32], state_root: [u8; 32]) -> Block {
     b
 }
 
+/// FULL-PQ deterministic Falcon companions, stable within a test (keyed by
+/// validator index, registered globally by ed id).
+fn fks_for(n: usize) -> Vec<FalconKeypair> {
+    (0..n)
+        .map(|i| FalconKeypair::generate_from_seed(i as u8))
+        .collect()
+}
+
+/// FULL-PQ genuine QC: Falcon halves + compiled µQC envelope (a raw ed list
+/// carries no power). Sub-quorum sets fall back to the ed list, which
+/// verification refuses — same fail-closed verdict as before.
+fn qc_from(
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    vs: &ValidatorSet,
+    height: u64,
+    hash: [u8; 32],
+    parent: [u8; 32],
+) -> QuorumCertificate {
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        register_validator_pq_key(
+            k.verifying_key().to_bytes(),
+            PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+    }
+    let mut set = VoteSet::new();
+    let mut votes = Vec::new();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        let v = Vote::sign_with_falcon(k, fk, height, 0, VoteKind::Precommit, Some(hash));
+        let _ = set.add(v.clone(), vs, height, 0, VoteKind::Precommit);
+        votes.push(v);
+    }
+    set.certificate_with_parent(Some(hash), vs, Some(&parent))
+        .unwrap_or(QuorumCertificate {
+            height,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some(hash),
+            signatures: votes.into_iter().map(|v| (v.voter, v.signature)).collect(),
+        })
+}
+
 /// Quorum-certified chain, heights `1..=n`, every block carrying a full-set
 /// precommit QC from the returned validator set (proposer follows the schedule
 /// so the F8 proposer-slot gate passes).
 fn quorum_chain(n: u64, n_keys: usize) -> (Vec<Block>, ValidatorSet) {
     assert!(n >= 1 && n_keys >= 2, "need a real chain and a real quorum");
     let keys: Vec<SigningKey> = (0..n_keys).map(|_| SigningKey::generate(&mut OsRng)).collect();
+    let fks = fks_for(n_keys);
     let vs = ValidatorSet::from_list(
         keys.iter()
             .map(|k| (k.verifying_key().to_bytes(), 1))
@@ -102,18 +149,7 @@ fn quorum_chain(n: u64, n_keys: usize) -> (Vec<Block>, ValidatorSet) {
         };
         b.sign_block(&proposer);
         let hash = b.compute_hash();
-        let mut sigs = Vec::new();
-        for k in &keys {
-            let v = Vote::sign(k, h, 0, VoteKind::Precommit, Some(hash));
-            sigs.push((v.voter, v.signature));
-        }
-        b.precommit_qc = Some(QuorumCertificate {
-            height: h,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(hash),
-            signatures: sigs,
-        });
+        b.precommit_qc = Some(qc_from(&keys, &fks, &vs, h, hash, prev));
         prev = hash;
         out.push(b);
     }
@@ -908,7 +944,6 @@ fn aux_prune_preserves_snapshotted_heights_and_drops_junk() {
     for h in [5u64, 6, 7] {
         store.put_session_keys(h, b"sk").unwrap();
         store.put_bridge(h, b"br").unwrap();
-        store.put_confidential(h, b"cf").unwrap();
         store.put_zkml_models(h, b"zk").unwrap();
         store.put_cross_shard(h, b"xs").unwrap();
     }
@@ -923,7 +958,6 @@ fn aux_prune_preserves_snapshotted_heights_and_drops_junk() {
     assert!(store.domain_at(7).unwrap().is_some());
     assert!(store.session_keys_at(7).unwrap().is_some());
     assert!(store.bridge_at(7).unwrap().is_some());
-    assert!(store.confidential_at(7).unwrap().is_some());
     assert!(store.zkml_models_at(7).unwrap().is_some());
     assert!(store.cross_shard_at(7).unwrap().is_some());
     assert!(store.session_keys_at(5).unwrap().is_none());

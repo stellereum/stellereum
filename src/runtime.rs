@@ -360,7 +360,6 @@ pub struct SnapBundle {
     pub domains: crate::storage::DomainSnapshot,
     pub session_keys: Vec<u8>,
     pub bridge: Vec<u8>,
-    pub confidential: Vec<u8>,
     pub zkml_models: Vec<u8>,
 }
 
@@ -467,7 +466,6 @@ impl ApplyLane {
                             crate::storage::DomainSnapshot::capture(&state, &ledger, &gov).await;
                         let session_keys = state.session_keys_snapshot().await;
                         let bridge = state.bridge_snapshot().await;
-                        let confidential = state.confidential_snapshot().await;
                         let zkml_models = state.zkml_models_snapshot().await;
                         let _ = job.done.send(Some(SnapBundle {
                             height: job.height,
@@ -475,7 +473,6 @@ impl ApplyLane {
                             domains,
                             session_keys,
                             bridge,
-                            confidential,
                             zkml_models,
                         }));
                     }
@@ -635,21 +632,6 @@ pub struct ValidatorRuntime {
     /// legacy flow to completion, so one transfer is never half 2PC and half
     /// legacy.
     pub xpc_activation: crate::xshard2pc::XpcActivation,
-    /// The VRF sortition activation switch (RETIRED, inert).
-    ///
-    /// `Disabled` (the default) keeps every certificate on the legacy
-    /// parent-hash draw — byte-identical to today. `FromHeight(h)` no longer
-    /// arms anything (ECVRF bodies removed): the seal seam always resolves
-    /// to the legacy draw. The HEIGHT it names stays consensus-visible in
-    /// shape (same pattern as [`Self::xpc_activation`]).
-    pub vrf_activation: crate::vrf::VrfActivation,
-    /// This validator's VRF secret seed (RETIRED, inert).
-    ///
-    /// `None` (the default) means "no VRF proofs": assembly falls back to the
-    /// legacy committee — and with ECVRF removed, `Some` resolves identically
-    /// (`vrf_beacon_seal_for` always returns `None`). There is deliberately
-    /// NO getter: the secret is never extracted into new places.
-    vrf_secret_seed: Option<[u8; 32]>,
     /// §9: the runtime's mirror of the committed 2PC records (tx hash ->
     /// record), keyed the same way the engine's map is.
     ///
@@ -929,6 +911,66 @@ impl PackFilterCtx {
     }
 }
 
+/// Height-driven governance finalization on the live path (neural audit
+/// 2026-11-04 C-02, P0: `gov_finalize` was never called on the live path, so
+/// voter/proposer staking locks were held forever).
+///
+/// After each decided block, finalizes every still-Open proposal whose voting
+/// window closed (block time is `now`) via `finalize_at_height` at the decided
+/// height: Passed proposals get their `GOV_TIMELOCK_HEIGHTS` (7200) maturity
+/// scheduled, and every terminal transition releases its staking locks.
+/// Inputs are pure block content (`height`, `timestamp`) plus the committed
+/// pre-state, swept in proposal-id order, so every node finalizing the same
+/// block derives the same transition and the same root — the mutation is a
+/// deterministic function of the block, not an off-block RPC write (C-01
+/// direction). Returns the finalized ids (logging/tests).
+///
+/// Lock order is governance-then-staking, matching the RPC handlers, so no
+/// lock cycle is introduced. // GATE: C-02 live-path wiring.
+async fn sweep_gov_finalize(
+    state: &crate::state_engine::InMemoryStateEngine,
+    cur_height: u64,
+    now: u64,
+) -> Vec<u64> {
+    let due: Vec<u64> = {
+        let g = state.governance_read().await;
+        let mut ids: Vec<u64> = g
+            .proposals
+            .iter()
+            .filter(|(_, p)| {
+                p.status == crate::governance::ProposalStatus::Open && now >= p.voting_end
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    if due.is_empty() {
+        return Vec::new();
+    }
+    let mut g = state.governance_write().await;
+    let mut ledger = state.staking_write().await;
+    let mut done = Vec::with_capacity(due.len());
+    for pid in due {
+        match g.finalize_at_height(&mut ledger, pid, now, cur_height) {
+            Ok(_) => done.push(pid),
+            Err(_) => {
+                // Unreachable with the filter above (same `now`, and no other
+                // finalizer exists on this path); skip fail-safe so one id can
+                // never wedge the height — the next height retries with the
+                // same deterministic inputs.
+            }
+        }
+    }
+    if !done.is_empty() {
+        tracing::info!(
+            "[gov] finalized {} proposal(s) at height {cur_height}: {done:?}",
+            done.len()
+        );
+    }
+    done
+}
+
 impl ValidatorRuntime {
     pub fn new(
         key: SigningKey,
@@ -986,8 +1028,6 @@ impl ValidatorRuntime {
             produced_cross_shard: HashMap::new(),
             completed_cross_shard: HashSet::new(),
             xpc_activation: crate::xshard2pc::XpcActivation::Disabled,
-            vrf_activation: crate::vrf::VrfActivation::Disabled,
-            vrf_secret_seed: None,
             xpc_records: HashMap::new(),
             apply_lane: None,
             apply_in_flight: None,
@@ -1662,45 +1702,6 @@ impl ValidatorRuntime {
     /// The §9 2PC activation switch in force on this shard.
     pub fn xpc_activation(&self) -> crate::xshard2pc::XpcActivation {
         self.xpc_activation
-    }
-
-    /// Set the VRF sortition activation switch (RETIRED, inert).
-    ///
-    /// Accepted for API compatibility and stored, but nothing arms: the seal
-    /// seam always resolves to the legacy draw. Default is `Disabled`.
-    pub fn with_vrf_activation(mut self, activation: crate::vrf::VrfActivation) -> Self {
-        self.vrf_activation = activation;
-        self
-    }
-
-    /// The VRF sortition activation switch in force on this node.
-    pub fn vrf_activation(&self) -> crate::vrf::VrfActivation {
-        self.vrf_activation
-    }
-
-    /// Provision this validator's VRF secret seed (RETIRED, inert).
-    ///
-    /// The seed lives here — alongside `key` and `falcon_key` — and nowhere
-    /// else: there is no getter, and (with ECVRF removed) no proofs are
-    /// minted anywhere.
-    pub fn with_vrf_secret_seed(mut self, seed: [u8; 32]) -> Self {
-        self.vrf_secret_seed = Some(seed);
-        self
-    }
-
-    /// Mint this validator's VRF beacon seal for `(height, round, parent)`.
-    ///
-    /// RETIRED (ECVRF classical, bodies removed): always returns `None` — the
-    /// caller falls back to the legacy parent-hash committee, byte-identical
-    /// to today. Kept as a seam (signature unchanged) for a future PQ VRF
-    /// (a lead decision, not defined here).
-    pub fn vrf_beacon_seal_for(
-        &self,
-        _height: u64,
-        _round: u32,
-        _parent: &[u8; 32],
-    ) -> Option<crate::consensus::VrfBeaconSeal> {
-        None
     }
 
     /// True when this shard holds a §9 2PC record for the transfer.
@@ -6357,6 +6358,9 @@ impl ValidatorRuntime {
         outcome: &crate::state_engine::BlockTransitionOutcome,
     ) {
         self.record_apply_outcome(block, outcome).await;
+        // C-02: height-driven gov finalization (locks release, 7200-height
+        // timelocks schedule). Deterministic in (height, block.timestamp).
+        sweep_gov_finalize(&self.state, height, block.timestamp).await;
         self.finalized.push((height, bh));
         // The block is final: it anchors the fork-choice tree, and every
         // candidate branch it superseded is pruned (and signalled).
@@ -6563,6 +6567,9 @@ impl ValidatorRuntime {
         // `apply_equivocation_slashes` for the full rationale; the WIRED
         // path is block-carried evidence via `apply_block_transition`.
         self.apply_block_fees_rewards(&block).await;
+        // C-02: height-driven gov finalization (locks release, 7200-height
+        // timelocks schedule). Deterministic in (height, block.timestamp).
+        sweep_gov_finalize(&self.state, height, block.timestamp).await;
         self.finalized.push((height, bh));
         // The block is final: it anchors the fork-choice tree, and every
         // candidate branch it superseded is pruned (and signalled).
@@ -6864,6 +6871,9 @@ impl ValidatorRuntime {
         self.hc.precommit_qc = Some(qc.clone());
         self.blocks.insert(bh, block.clone());
         self.apply_block_fees_rewards(block).await;
+        // C-02: same deterministic gov-finalization sweep as the live path,
+        // so a replayed catch-up converges with live-finalized nodes.
+        sweep_gov_finalize(&self.state, block.height, block.timestamp).await;
         // The replayed block is canonical, finalized history: the
         // fork-choice tree follows it, so the candidates seen afterwards
         // are compared against the right chain.
@@ -6915,6 +6925,9 @@ impl ValidatorRuntime {
         // on this path exactly as on finalize and replay.
         self.apply_block_fees_rewards(block).await;
         let height = self.hc.height;
+        // C-02: height-driven gov finalization (locks release, 7200-height
+        // timelocks schedule). Deterministic in (height, block.timestamp).
+        sweep_gov_finalize(&self.state, height, block.timestamp).await;
         self.finalized.push((height, bh));
         // The block is final: it anchors the fork-choice tree, and every
         // candidate branch it superseded is pruned (and signalled).
@@ -8281,6 +8294,9 @@ impl ChainState {
                 );
             }
         }
+        // C-02: same deterministic gov-finalization sweep as the live path,
+        // so a reorg re-apply converges with live-finalized nodes.
+        sweep_gov_finalize(&self.state, block.height, block.timestamp).await;
     }
 
     /// The validator set this state implies: the same read-only derivation
@@ -8459,10 +8475,14 @@ mod tests {
         );
 
         let mut nodes: Vec<ValidatorRuntime> = Vec::new();
-        for k in &keys {
+        for (i, k) in keys.iter().enumerate() {
             let st = Arc::new(InMemoryStateEngine::new());
             crate::runtime::fund_genesis(&st, &validators, 1_000_000).await;
-            let mut rt = ValidatorRuntime::new(k.clone(), validators.clone(), st, 1);
+            // FULL-PQ: votes only verify with a Falcon half, so every node
+            // carries a persisted Falcon key (deterministic per test).
+            let fk = FalconKeypair::generate_from_seed(0xC0 + i as u8);
+            let mut rt =
+                ValidatorRuntime::new(k.clone(), validators.clone(), st, 1).with_falcon_key(fk);
             rt.hc.set_parent_hash([0u8; 32]);
             nodes.push(rt);
         }
@@ -8663,7 +8683,10 @@ mod tests {
     async fn rpc_mempool_is_the_mempool_the_proposer_uses() {
         let key = SigningKey::generate(&mut OsRng);
         let me = key.verifying_key().to_bytes();
-        let state = funded_state(me).await;
+        // FULL-PQ: the sender is a Falcon-512 identity; the classical
+        // `Transaction::sign` fixture is refused at admission.
+        const SENDER_SEED: u8 = 0xA1;
+        let state = pq_funded_state(SENDER_SEED, 10_000_000).await;
         let validators = ValidatorSet::from_list(vec![(me, 1)]);
 
         // This is the handle the RPC layer writes to.
@@ -8671,10 +8694,10 @@ mod tests {
         let rt =
             ValidatorRuntime::new(key.clone(), validators, state, 1).with_mempool(shared.clone());
 
-        let tx = crate::sharding::Transaction::sign(&key, [1u8; 32], 10, 1_000, 0, 1, 1);
+        let tx = pq_tx(SENDER_SEED, [1u8; 32], 10, 1_000, 0);
         let balance = rt
             .state
-            .get_account(&me)
+            .get_account(&tx.from)
             .await
             .map(|a| a.balance)
             .unwrap_or(0);
@@ -8882,19 +8905,20 @@ mod tests {
         assert!(rt.is_proposer());
 
         // 5 senders x 10 contiguous nonces = 50 executable txs.
+        // FULL-PQ: implicit Falcon-512 senders (domain-separated seeds);
+        // classical `Transaction::sign` fixtures are refused at admission.
         let mut senders = Vec::new();
-        for _ in 0..5 {
-            let sk = SigningKey::generate(&mut OsRng);
-            let from = sk.verifying_key().to_bytes();
+        for i in 0..5u8 {
+            let seed = 0x10 + i;
+            let (from, _pk) = pq_pair(seed);
             rt.state
                 .update_account(AccountState::new(from, 100_000_000))
                 .await;
-            senders.push(sk);
+            senders.push(seed);
         }
-        for sk in &senders {
+        for seed in &senders {
             for i in 0..10u64 {
-                rt.add_tx(Transaction::sign(sk, [1u8; 32], 10, 280_000, i, 1, 1))
-                    .await;
+                rt.add_tx(pq_tx(*seed, [1u8; 32], 10, 280_000, i)).await;
             }
         }
         assert_eq!(rt.mempool.read().await.len(), 50);
@@ -8924,24 +8948,169 @@ mod tests {
         (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
     }
 
+    /// FULL-PQ fixtures (PQ excision conversion).
+    ///
+    /// Mirrors the rpc.rs / state_engine.rs `pq_pair` / `pq_tx` idioms:
+    /// an implicit Falcon-512 envelope with the key pre-registered globally
+    /// (idempotent), so there is no activation surcharge and fee / balance /
+    /// nonce assertions match the old classical fixtures exactly. Classical
+    /// `Transaction::sign` outputs are refused by the Pure PQ mempool, so
+    /// every fixture that must be admitted uses these.
+    fn pq_pair(seed: u8) -> ([u8; 32], Vec<u8>) {
+        let pk = Transaction::sample_falcon512_pubkey(seed);
+        let from = crate::post_quantum::derive_pq_address(
+            crate::post_quantum::PqScheme::Falcon512,
+            &pk,
+            &crate::post_quantum::DEFAULT_SALT,
+        );
+        Transaction::global_implicit_registry()
+            .register(
+                from,
+                crate::post_quantum::PqScheme::Falcon512,
+                &pk,
+                &crate::post_quantum::DEFAULT_SALT,
+            )
+            .expect("PQ test key must register");
+        (from, pk)
+    }
+
+    /// FULL-PQ replacement for `Transaction::sign(sk, to, amount, gas, nonce,
+    /// 1, 1)` in tests: same shape, implicit Falcon-512 envelope.
+    fn pq_tx(seed: u8, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> Transaction {
+        let (from, pk) = pq_pair(seed);
+        let mut tx = Transaction {
+            from,
+            to,
+            amount,
+            gas_limit: gas,
+            nonce,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        let msg = tx.signing_message();
+        let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+        tx.signature = crate::sharding::PqSignatureEnvelope::new_implicit(
+            crate::post_quantum::PqScheme::Falcon512,
+            sig,
+        )
+        .encode();
+        tx
+    }
+
+    /// A funded state for one PQ sender (replaces `funded_state(classical)`).
+    async fn pq_funded_state(seed: u8, balance: u64) -> Arc<InMemoryStateEngine> {
+        let (from, _pk) = pq_pair(seed);
+        let st = Arc::new(InMemoryStateEngine::new());
+        st.update_account(AccountState::new(from, balance)).await;
+        st
+    }
+
+    /// Falcon vote minting (mirrors `consensus::tests::fvote`): a classical
+    /// `Vote::sign` no longer verifies under FULL-PQ, so every hand-driven
+    /// quorum in these tests uses this.
+    fn fvote(
+        sk: &SigningKey,
+        fk: &FalconKeypair,
+        height: Height,
+        round: Round,
+        kind: VoteKind,
+        bh: Option<BlockHash>,
+    ) -> Vote {
+        Vote::sign_with_falcon(sk, fk, height, round, kind, bh)
+    }
+
+    /// FULL-PQ cluster: runtimes with persisted Falcon keys (votes only
+    /// verify with a Falcon half now) over one shared validator set,
+    /// assembled as `Cluster { nodes }` so `broadcast_tx` / `run_height` are
+    /// reused unchanged. `falcon_base` domain-separates the per-test keys.
+    fn falcon_cluster(
+        val_keys: &[SigningKey],
+        states: Vec<Arc<InMemoryStateEngine>>,
+        falcon_base: u8,
+    ) -> Cluster {
+        let validators = ValidatorSet::from_list(
+            val_keys
+                .iter()
+                .map(|k| (k.verifying_key().to_bytes(), 1))
+                .collect(),
+        );
+        let nodes = val_keys
+            .iter()
+            .zip(states)
+            .enumerate()
+            .map(|(i, (k, st))| {
+                let fk = FalconKeypair::generate_from_seed(falcon_base.wrapping_add(i as u8));
+                ValidatorRuntime::new(k.clone(), validators.clone(), st, 1).with_falcon_key(fk)
+            })
+            .collect();
+        Cluster { nodes }
+    }
+
+    /// FULL-PQ QC (mirrors `sync::tests::pq_cert_for`): Ed list for
+    /// membership/power plus a Falcon µQC envelope for crypto — exactly what
+    /// `QuorumCertificate::verify` requires. `parent` must be the block's
+    /// `prev_hash` (chain binding). `signers` selects which keys sign (a
+    /// missing signer is the offline-member shape).
+    fn pq_cert_for(
+        vs: &ValidatorSet,
+        keys: &[SigningKey],
+        fks: &[FalconKeypair],
+        height: Height,
+        round: Round,
+        bh: BlockHash,
+        parent: BlockHash,
+    ) -> crate::consensus::QuorumCertificate {
+        let mut set = crate::consensus::VoteSet::new();
+        for (sk, fk) in keys.iter().zip(fks.iter()) {
+            let v = fvote(sk, fk, height, round, VoteKind::Precommit, Some(bh));
+            set.add(v, vs, height, round, VoteKind::Precommit)
+                .expect("falcon vote must ingest");
+        }
+        set.certificate_with_parent(Some(bh), vs, Some(&parent))
+            .expect("quorum must compile a Falcon µQC")
+    }
+
+    /// Falcon keypairs for `keys`, registered globally so hand-minted votes
+    /// verify (mirrors `consensus::tests::vset_with_falcon`).
+    fn falcon_for_keys(keys: &[SigningKey], base: u8) -> Vec<FalconKeypair> {
+        keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let fk = FalconKeypair::generate_from_seed(base.wrapping_add(i as u8));
+                crate::consensus::register_validator_pq_key(
+                    k.verifying_key().to_bytes(),
+                    crate::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                );
+                fk
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn cluster_finalizes_blocks_and_applies_state() {
         let val_keys = signer_keys(4);
-        let user = SigningKey::generate(&mut OsRng);
-        let from = user.verifying_key().to_bytes();
+        // FULL-PQ: the user is a Falcon-512 sender; the classical
+        // `Transaction::sign` fixture is refused at admission.
+        const USER_SEED: u8 = 0xB0;
+        let (from, _pk) = pq_pair(USER_SEED);
         let to = [9u8; 32];
 
         // Each validator gets its OWN identical state
-        let mut nodes = Vec::new();
-        for k in &val_keys {
-            nodes.push((k.clone(), funded_state(from).await));
+        let mut states = Vec::new();
+        for _ in &val_keys {
+            states.push(pq_funded_state(USER_SEED, 10_000_000).await);
         }
-        let mut cluster = Cluster::new(nodes);
+        let mut cluster = falcon_cluster(&val_keys, states, 0xF0);
 
         // 3 heights, one tx each. The gas limit clears the admission floor
         // (the runtime's default pool carries the operator's floor).
         for h in 0..3u64 {
-            let tx = Transaction::sign(&user, to, 1_000, 280_000, h, 1, 1);
+            let tx = pq_tx(USER_SEED, to, 1_000, 280_000, h);
             cluster.broadcast_tx(tx).await;
             let bh = cluster.run_height(1_000 + h).await;
 
@@ -8979,17 +9148,16 @@ mod tests {
     async fn cluster_survives_one_byzantine_validator() {
         // 4 validators, quorum = 3. Simulate one validator going silent.
         let val_keys = signer_keys(4);
-        let user = SigningKey::generate(&mut OsRng);
-        let from = user.verifying_key().to_bytes();
-        let to = [9u8; 32];
-
-        let mut nodes = Vec::new();
-        for k in &val_keys {
-            nodes.push((k.clone(), funded_state(from).await));
+        // FULL-PQ sender + Falcon-keyed runtimes (votes and admission both
+        // refuse classical fixtures now).
+        const USER_SEED: u8 = 0xB1;
+        let mut states = Vec::new();
+        for _ in &val_keys {
+            states.push(pq_funded_state(USER_SEED, 10_000_000).await);
         }
-        let mut cluster = Cluster::new(nodes);
+        let mut cluster = falcon_cluster(&val_keys, states, 0xE0);
 
-        let tx = Transaction::sign(&user, to, 500, 0, 0, 1, 1);
+        let tx = pq_tx(USER_SEED, [9u8; 32], 500, 0, 0);
         cluster.broadcast_tx(tx).await;
 
         // Silence the LAST validator: it never contributes prevotes/precommits.
@@ -9098,16 +9266,16 @@ mod tests {
     #[tokio::test]
     async fn proposal_validation_rejects_tampering() {
         let val_keys = signer_keys(4);
-        let user = SigningKey::generate(&mut OsRng);
-        let from = user.verifying_key().to_bytes();
-        let mut nodes = Vec::new();
-        for k in &val_keys {
-            nodes.push((k.clone(), funded_state(from).await));
+        // FULL-PQ sender + Falcon-keyed runtimes.
+        const USER_SEED: u8 = 0xB2;
+        let mut states = Vec::new();
+        for _ in &val_keys {
+            states.push(pq_funded_state(USER_SEED, 10_000_000).await);
         }
-        let mut cluster = Cluster::new(nodes);
+        let mut cluster = falcon_cluster(&val_keys, states, 0xD0);
         // The gas limit must clear the admission floor (the runtime's default
         // pool carries the operator's floor, exactly like the node's own).
-        let tx = Transaction::sign(&user, [9u8; 32], 100, 280_000, 0, 1, 1);
+        let tx = pq_tx(USER_SEED, [9u8; 32], 100, 280_000, 0);
         cluster.broadcast_tx(tx).await;
 
         let proposer_idx = cluster.nodes.iter().position(|n| n.is_proposer()).unwrap();
@@ -9197,17 +9365,17 @@ mod tests {
     #[tokio::test]
     async fn tampered_transaction_order_is_rejected() {
         let val_keys = signer_keys(4);
-        let user = SigningKey::generate(&mut OsRng);
-        let from = user.verifying_key().to_bytes();
-        let mut nodes = Vec::new();
-        for k in &val_keys {
-            nodes.push((k.clone(), funded_state(from).await));
+        // FULL-PQ sender + Falcon-keyed runtimes.
+        const USER_SEED: u8 = 0xB3;
+        let mut states = Vec::new();
+        for _ in &val_keys {
+            states.push(pq_funded_state(USER_SEED, 10_000_000).await);
         }
-        let mut cluster = Cluster::new(nodes);
+        let mut cluster = falcon_cluster(&val_keys, states, 0xC1);
         // Two transactions from the SAME sender (consecutive nonces) so both
         // are eligible and the ORDER is observable.
-        let tx1 = Transaction::sign(&user, [9u8; 32], 100, 280_000, 0, 1, 1);
-        let tx2 = Transaction::sign(&user, [8u8; 32], 200, 280_000, 1, 1, 1);
+        let tx1 = pq_tx(USER_SEED, [9u8; 32], 100, 280_000, 0);
+        let tx2 = pq_tx(USER_SEED, [8u8; 32], 200, 280_000, 1);
         cluster.broadcast_tx(tx1).await;
         cluster.broadcast_tx(tx2).await;
 
@@ -9271,14 +9439,14 @@ mod tests {
     #[tokio::test]
     async fn proposer_sets_the_order_root_over_the_packed_list() {
         let val_keys = signer_keys(4);
-        let user = SigningKey::generate(&mut OsRng);
-        let from = user.verifying_key().to_bytes();
-        let mut nodes = Vec::new();
-        for k in &val_keys {
-            nodes.push((k.clone(), funded_state(from).await));
+        // FULL-PQ sender + Falcon-keyed runtimes.
+        const USER_SEED: u8 = 0xB4;
+        let mut states = Vec::new();
+        for _ in &val_keys {
+            states.push(pq_funded_state(USER_SEED, 10_000_000).await);
         }
-        let mut cluster = Cluster::new(nodes);
-        let tx = Transaction::sign(&user, [9u8; 32], 100, 280_000, 0, 1, 1);
+        let mut cluster = falcon_cluster(&val_keys, states, 0xC2);
+        let tx = pq_tx(USER_SEED, [9u8; 32], 100, 280_000, 0);
         cluster.broadcast_tx(tx).await;
 
         let proposer_idx = cluster.nodes.iter().position(|n| n.is_proposer()).unwrap();
@@ -9325,7 +9493,10 @@ mod tests {
         use crate::sharding::MASTERCHAIN_SHARD;
 
         let user = SigningKey::generate(&mut OsRng);
-        let from = user.verifying_key().to_bytes();
+        // FULL-PQ: transfers are implicit Falcon-512 transactions; the
+        // block bodies are still signed classically (`mk` unchanged).
+        const USER_SEED: u8 = 0xB5;
+        let (from, _pk) = pq_pair(USER_SEED);
         let b_addr = [0xB0u8; 32];
         let c_addr = [0xC0u8; 32];
 
@@ -9367,19 +9538,9 @@ mod tests {
         cs.save_checkpoint().await;
 
         // Canonical chain A: two transfers of 100 to B.
-        let blk1 = mk(
-            1,
-            g,
-            vec![Transaction::sign(&user, b_addr, 100, 0, 0, 1, 1)],
-            &user,
-        );
+        let blk1 = mk(1, g, vec![pq_tx(USER_SEED, b_addr, 100, 0, 0)], &user);
         let b1 = cm.insert(blk1.clone());
-        let blk2 = mk(
-            2,
-            b1,
-            vec![Transaction::sign(&user, b_addr, 100, 0, 1, 1, 1)],
-            &user,
-        );
+        let blk2 = mk(2, b1, vec![pq_tx(USER_SEED, b_addr, 100, 0, 1)], &user);
         let b2 = cm.insert(blk2.clone());
         cm.recompute_canonical();
         assert_eq!(cm.best_head(), b2);
@@ -9389,26 +9550,11 @@ mod tests {
         assert_eq!(state.get_account(&b_addr).await.unwrap().balance, 200);
 
         // Longer fork B: three transfers of 50 to C.
-        let f1 = mk(
-            1,
-            g,
-            vec![Transaction::sign(&user, c_addr, 50, 0, 0, 1, 1)],
-            &user,
-        );
+        let f1 = mk(1, g, vec![pq_tx(USER_SEED, c_addr, 50, 0, 0)], &user);
         let fb1 = cm.insert(f1.clone());
-        let f2 = mk(
-            2,
-            fb1,
-            vec![Transaction::sign(&user, c_addr, 50, 0, 1, 1, 1)],
-            &user,
-        );
+        let f2 = mk(2, fb1, vec![pq_tx(USER_SEED, c_addr, 50, 0, 1)], &user);
         let fb2 = cm.insert(f2.clone());
-        let f3 = mk(
-            3,
-            fb2,
-            vec![Transaction::sign(&user, c_addr, 50, 0, 2, 1, 1)],
-            &user,
-        );
+        let f3 = mk(3, fb2, vec![pq_tx(USER_SEED, c_addr, 50, 0, 2)], &user);
         let fb3 = cm.insert(f3.clone());
 
         // Plan from canonical (b2) to the longer fork head (fb3).
@@ -9740,7 +9886,6 @@ mod tests {
     /// set -- this test proves replay consults it by making the two sets disjoint.
     #[tokio::test]
     async fn replay_verifies_qc_against_the_height_set_not_the_current_set() {
-        use crate::consensus::{QuorumCertificate, VoteKind};
         use crate::staking::{MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
 
         // The set in force at the replayed height: bonded in the engine ledger.
@@ -9796,20 +9941,20 @@ mod tests {
         };
         block.sign_block(&historical[0]);
         let bh = block.compute_hash();
-        let sigs = historical
-            .iter()
-            .map(|k| {
-                let v = Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh));
-                (v.voter, v.signature)
-            })
-            .collect();
-        block.precommit_qc = Some(QuorumCertificate {
-            height: 1,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(bh),
-            signatures: sigs,
-        });
+        // FULL-PQ: the historical certificate is a Falcon µQC compiled from
+        // genuine Falcon votes (mirrors `sync::tests::pq_cert_for`); a
+        // classical `Vote::sign` QC no longer verifies. The parent is the
+        // block's `prev_hash` (chain binding).
+        let fks = falcon_for_keys(&historical, 0xA0);
+        block.precommit_qc = Some(pq_cert_for(
+            &historical_vs,
+            &historical,
+            &fks,
+            1,
+            0,
+            bh,
+            [0u8; 32],
+        ));
 
         rt.replay_historical_block(&block)
             .await
@@ -9837,8 +9982,10 @@ mod tests {
         let target = [0x42u8; 32];
 
         // A full prevote quorum for `target` at round 0.
-        for k in &ks {
-            rt.on_prevote(Vote::sign(k, h, 0, VoteKind::Prevote, Some(target)))
+        // FULL-PQ: Falcon votes (classical `Vote::sign` is rejected).
+        let fks = falcon_for_keys(&ks, 0xA0);
+        for (k, fk) in ks.iter().zip(fks.iter()) {
+            rt.on_prevote(fvote(k, fk, h, 0, VoteKind::Prevote, Some(target)))
                 .unwrap();
         }
         // Move on to round 1 BEFORE precommitting: the round-0 QC is now
@@ -9871,8 +10018,8 @@ mod tests {
         assert_eq!(again.block_hash, Some(target));
 
         // A polka in a NEWER round supersedes: we now precommit at round 1.
-        for k in &ks {
-            rt.on_prevote(Vote::sign(k, h, 1, VoteKind::Prevote, Some(target)))
+        for (k, fk) in ks.iter().zip(fks.iter()) {
+            rt.on_prevote(fvote(k, fk, h, 1, VoteKind::Prevote, Some(target)))
                 .unwrap();
         }
         let pc = rt
@@ -10031,13 +10178,14 @@ mod tests {
     #[tokio::test]
     async fn validator_runtime_falcon_votes_form_uqc_and_verify_unified() {
         let val_keys = signer_keys(4);
-        let user = SigningKey::generate(&mut OsRng);
-        let from = user.verifying_key().to_bytes();
+        // FULL-PQ sender (the known Pure-PQ-unwrap site: a classical
+        // `Transaction::sign` fixture is refused at `add_checked`).
+        const USER_SEED: u8 = 0xB6;
         let to = [9u8; 32];
 
         let mut nodes = Vec::new();
         for k in &val_keys {
-            nodes.push((k.clone(), funded_state(from).await));
+            nodes.push((k.clone(), pq_funded_state(USER_SEED, 10_000_000).await));
         }
 
         let validators = ValidatorSet::from_list(
@@ -10056,7 +10204,7 @@ mod tests {
             })
             .collect();
 
-        let tx = Transaction::sign(&user, to, 1_000, 280_000, 0, 1, 1);
+        let tx = pq_tx(USER_SEED, to, 1_000, 280_000, 0);
         for rt in &runtimes {
             rt.mempool
                 .write()
@@ -10191,21 +10339,13 @@ mod tests {
             b
         };
 
+        let fks = falcon_for_keys(&ks, 0xA0);
         let make_qc = |round: Round, bh: BlockHash| -> crate::consensus::QuorumCertificate {
-            crate::consensus::QuorumCertificate {
-                height: 1,
-                round,
-                kind: VoteKind::Precommit,
-                block_hash: Some(bh),
-                signatures: ks
-                    .iter()
-                    .take(3)
-                    .map(|k| {
-                        let v = Vote::sign(k, 1, round, VoteKind::Precommit, Some(bh));
-                        (v.voter, v.signature)
-                    })
-                    .collect(),
-            }
+            // FULL-PQ: the certificate is a Falcon µQC compiled from genuine
+            // votes (a classical `Vote::sign` QC fails `verify` before the
+            // lock check is ever reached). The parent is the block's
+            // `prev_hash` (chain binding); all fixture blocks extend [0; 32].
+            pq_cert_for(&vs, &ks, &fks, 1, round, bh, [0u8; 32])
         };
 
         let root = rt.state.get_state_root().await;
@@ -10638,6 +10778,10 @@ mod shard_header_commitment_tests {
 
     const SHARD1: ShardId = 1;
 
+    /// Domain-separation seed for the VEL-1 pool sender (shared by the pool
+    /// helper and the pack-filter fixture so both address the same sender).
+    const VEL1_POOL_SEED: u8 = 0xE1;
+
     /// A funded state engine for the test validator (same shape as the
     /// helper of the main test module, which is private to it).
     async fn funded_state(owner: [u8; 32]) -> Arc<InMemoryStateEngine> {
@@ -10645,6 +10789,91 @@ mod shard_header_commitment_tests {
         st.update_account(crate::state_engine::AccountState::new(owner, 10_000_000))
             .await;
         st
+    }
+
+    /// FULL-PQ sender (mirrors the main test module's `pq_pair` idiom):
+    /// implicit Falcon-512 envelope, key pre-registered globally, so
+    /// admission and packing behave exactly like the old classical fixture.
+    fn pq_pair(seed: u8) -> ([u8; 32], Vec<u8>) {
+        let pk = crate::sharding::Transaction::sample_falcon512_pubkey(seed);
+        let from = crate::post_quantum::derive_pq_address(
+            crate::post_quantum::PqScheme::Falcon512,
+            &pk,
+            &crate::post_quantum::DEFAULT_SALT,
+        );
+        crate::sharding::Transaction::global_implicit_registry()
+            .register(
+                from,
+                crate::post_quantum::PqScheme::Falcon512,
+                &pk,
+                &crate::post_quantum::DEFAULT_SALT,
+            )
+            .expect("PQ test key must register");
+        (from, pk)
+    }
+
+    /// FULL-PQ replacement for `Transaction::sign` in this module.
+    fn pq_tx(seed: u8, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> crate::sharding::Transaction {
+        let (from, pk) = pq_pair(seed);
+        let mut tx = crate::sharding::Transaction {
+            from,
+            to,
+            amount,
+            gas_limit: gas,
+            nonce,
+            source_shard: crate::sharding::MASTERCHAIN_SHARD,
+            target_shard: crate::sharding::MASTERCHAIN_SHARD,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        let msg = tx.signing_message();
+        let sig = crate::sharding::Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+        tx.signature = crate::sharding::PqSignatureEnvelope::new_implicit(
+            crate::post_quantum::PqScheme::Falcon512,
+            sig,
+        )
+        .encode();
+        tx
+    }
+
+    /// Falcon vote minting (mirrors `consensus::tests::fvote`).
+    fn fvote(
+        sk: &SigningKey,
+        fk: &crate::post_quantum::FalconKeypair,
+        height: crate::consensus::Height,
+        round: crate::consensus::Round,
+        kind: crate::consensus::VoteKind,
+        bh: Option<[u8; 32]>,
+    ) -> crate::consensus::Vote {
+        crate::consensus::Vote::sign_with_falcon(sk, fk, height, round, kind, bh)
+    }
+
+    /// FULL-PQ QC (mirrors `sync::tests::pq_cert_for`): `parent` must be the
+    /// block's `prev_hash` (chain binding).
+    fn pq_cert_for(
+        vs: &crate::consensus::ValidatorSet,
+        keys: &[SigningKey],
+        fks: &[crate::post_quantum::FalconKeypair],
+        height: u64,
+        bh: [u8; 32],
+        parent: [u8; 32],
+    ) -> crate::consensus::QuorumCertificate {
+        let mut set = crate::consensus::VoteSet::new();
+        for (sk, fk) in keys.iter().zip(fks.iter()) {
+            let v = fvote(
+                sk,
+                fk,
+                height,
+                0,
+                crate::consensus::VoteKind::Precommit,
+                Some(bh),
+            );
+            set.add(v, vs, height, 0, crate::consensus::VoteKind::Precommit)
+                .expect("falcon vote must ingest");
+        }
+        set.certificate_with_parent(Some(bh), vs, Some(&parent))
+            .expect("quorum must compile a Falcon µQC")
     }
 
     fn workchain_block(height: u64, root: [u8; 32]) -> Block {
@@ -10866,22 +11095,17 @@ mod shard_header_commitment_tests {
     /// alone (fail closed — the walk still refuses).
     #[tokio::test]
     async fn snapshot_jump_reanchors_light_client_for_tail_walk() {
-        use crate::consensus::{QuorumCertificate, Vote, VoteKind};
+        use crate::consensus::QuorumCertificate;
 
-        fn qc_for(ks: &[SigningKey], height: u64, bh: [u8; 32]) -> QuorumCertificate {
-            QuorumCertificate {
-                height,
-                round: 0,
-                kind: VoteKind::Precommit,
-                block_hash: Some(bh),
-                signatures: ks
-                    .iter()
-                    .map(|k| {
-                        let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(bh));
-                        (v.voter, v.signature)
-                    })
-                    .collect(),
-            }
+        fn qc_for(
+            vs: &crate::consensus::ValidatorSet,
+            ks: &[SigningKey],
+            fks: &[crate::post_quantum::FalconKeypair],
+            height: u64,
+            bh: [u8; 32],
+            parent: [u8; 32],
+        ) -> QuorumCertificate {
+            pq_cert_for(vs, ks, fks, height, bh, parent)
         }
 
         fn empty_block(height: u64, prev: [u8; 32], root: [u8; 32], proposer: [u8; 32]) -> Block {
@@ -10909,6 +11133,21 @@ mod shard_header_commitment_tests {
         let vs = ValidatorSet::from_list(ids.iter().map(|id| (*id, 1_000_000)).collect());
         let me = ids[0];
         let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), funded_state(me).await, 1);
+        // FULL-PQ: register Falcon keys so the hand-minted µQC verifies (a
+        // classical `Vote::sign` QC no longer does).
+        let fks: Vec<crate::post_quantum::FalconKeypair> = ks
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xA0 + i as u8);
+                crate::consensus::register_validator_pq_key(
+                    k.verifying_key().to_bytes(),
+                    crate::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                );
+                fk
+            })
+            .collect();
         let genesis_root = rt.state.get_state_root().await;
         rt.set_light_client(vs.clone(), genesis_root)
             .expect("anchor at genesis");
@@ -10917,7 +11156,7 @@ mod shard_header_commitment_tests {
         let boundary = 50u64;
         let mut blk = empty_block(boundary, [0x11; 32], genesis_root, ids[0]);
         let bh = blk.compute_hash();
-        let qc = qc_for(&ks, boundary, bh);
+        let qc = qc_for(&vs, &ks, &fks, boundary, bh, [0x11; 32]);
         assert!(qc.verify(&vs), "test QC must verify");
         blk.precommit_qc = Some(qc);
 
@@ -10929,7 +11168,7 @@ mod shard_header_commitment_tests {
         let mut tail = empty_block(boundary + 1, bh, genesis_root, ids[1]);
         tail.sign_block(&ks[1]);
         let th = tail.compute_hash();
-        tail.precommit_qc = Some(qc_for(&ks, boundary + 1, th));
+        tail.precommit_qc = Some(qc_for(&vs, &ks, &fks, boundary + 1, th, bh));
 
         // Simulate the snapshot jump: finalized head + consensus move, but
         // the light client is still at genesis.
@@ -10985,27 +11224,38 @@ mod shard_header_commitment_tests {
     // ========================================================================
 
     async fn vel1_runtime_with_pool(key: &SigningKey, ntxs: u64) -> (ValidatorRuntime, [u8; 32]) {
+        let txs: Vec<crate::sharding::Transaction> =
+            (0..ntxs).map(|nonce| pq_tx(VEL1_POOL_SEED, [0x77u8; 32], 1_000, 21_000, nonce)).collect();
+        vel1_runtime_with_cloned_pool(key, &txs).await
+    }
+
+    /// A runtime pre-loaded with CLONES of one caller-built pool.
+    ///
+    /// PQ necessity: Falcon-512 signing is randomized (FIPS 206), so two
+    /// independently minted pools from the same seed carry different
+    /// signature bytes (hence different tx hashes). Sharing one pool makes
+    /// the reuse-vs-fresh inputs identical BY CONSTRUCTION — the property
+    /// under test (same inputs ⇒ same selection) — instead of relying on
+    /// the classical era's deterministic Ed25519 regeneration.
+    async fn vel1_runtime_with_cloned_pool(
+        key: &SigningKey,
+        txs: &[crate::sharding::Transaction],
+    ) -> (ValidatorRuntime, [u8; 32]) {
         let me = key.verifying_key().to_bytes();
         let validators = ValidatorSet::from_list(vec![(me, 1)]);
         let state = Arc::new(InMemoryStateEngine::new());
+        // FULL-PQ: the pool sender is a Falcon-512 identity; classical
+        // `Transaction::sign` outputs are refused at admission, so the pool
+        // would stay empty.
+        let (pq_from, _pk) = pq_pair(VEL1_POOL_SEED);
         state
-            .update_account(crate::state_engine::AccountState::new(me, 10_000_000))
+            .update_account(crate::state_engine::AccountState::new(pq_from, 10_000_000))
             .await;
         let mut rt = ValidatorRuntime::new(key.clone(), validators, state, 1);
-        let to = [0x77u8; 32];
-        for nonce in 0..ntxs {
-            let tx = crate::sharding::Transaction::sign(
-                key,
-                to,
-                1_000,
-                21_000,
-                nonce,
-                crate::sharding::MASTERCHAIN_SHARD,
-                crate::sharding::MASTERCHAIN_SHARD,
-            );
-            rt.add_tx(tx).await;
+        for tx in txs {
+            rt.add_tx(tx.clone()).await;
         }
-        (rt, me)
+        (rt, pq_from)
     }
 
     /// Reuse is byte-identical to a fresh build when nothing changed, and the
@@ -11017,7 +11267,12 @@ mod shard_header_commitment_tests {
         // and timestamp, so any selection divergence is a reuse bug.
         let key = SigningKey::generate(&mut OsRng);
         // A: prebuild during the idle window, then propose (reuse path).
-        let (mut a, _) = vel1_runtime_with_pool(&key, 8).await;
+        // The pool is minted ONCE and cloned into both runtimes (Falcon
+        // signing is randomized, so independent minting would differ in
+        // signature bytes and the inputs would not be identical).
+        let txs: Vec<crate::sharding::Transaction> =
+            (0..8u64).map(|n| pq_tx(VEL1_POOL_SEED, [0x77u8; 32], 1_000, 21_000, n)).collect();
+        let (mut a, _) = vel1_runtime_with_cloned_pool(&key, &txs).await;
         let h = a.hc.height;
         assert!(!a.has_prebuild_for(h), "no prebuild before the idle window");
         a.prebuild_next_proposal(TS).await;
@@ -11030,15 +11285,16 @@ mod shard_header_commitment_tests {
             .await
             .expect("reuse-path propose must succeed");
         // B: no prebuild, straight to propose (fresh path).
-        let (mut b, _) = vel1_runtime_with_pool(&key, 8).await;
+        let (mut b, _) = vel1_runtime_with_cloned_pool(&key, &txs).await;
         assert!(!b.has_prebuild_for(h));
         let bb = b
             .propose(TS)
             .await
             .expect("fresh-path propose must succeed");
         // Same inputs ⇒ same selection, same header, same block hash.
-        // (Ed25519 signing is deterministic, so even the proposer signature
-        // agrees; any divergence here is a reuse bug, not nondeterminism.)
+        // (The pool is shared and proposer signing is deterministic, so
+        // even the signatures agree; any divergence here is a reuse bug,
+        // not nondeterminism.)
         assert_eq!(
             ba.transactions.len(),
             8,
@@ -11124,29 +11380,16 @@ mod shard_header_commitment_tests {
             HashSet::new(),
         );
         let to = [0x77u8; 32];
-        let good = crate::sharding::Transaction::sign(
-            &key,
-            to,
-            1_000,
-            21_000,
-            0,
-            crate::sharding::MASTERCHAIN_SHARD,
-            crate::sharding::MASTERCHAIN_SHARD,
-        );
+        // FULL-PQ fixture: the funded sender is the VEL-1 Falcon-512 pool
+        // identity (same property, PQ envelope — the filter never checks
+        // signatures, only nonce continuity and the fee floor).
+        let good = pq_tx(VEL1_POOL_SEED, to, 1_000, 21_000, 0);
         assert!(
             ValidatorRuntime::pack_filter_accept(&ctx, &good),
             "funded nonce-0 tx must pass"
         );
         // Consumed: the same tx re-checked now fails the nonce (state moved).
-        let gap = crate::sharding::Transaction::sign(
-            &key,
-            to,
-            1_000,
-            21_000,
-            5,
-            crate::sharding::MASTERCHAIN_SHARD,
-            crate::sharding::MASTERCHAIN_SHARD,
-        );
+        let gap = pq_tx(VEL1_POOL_SEED, to, 1_000, 21_000, 5);
         assert!(
             !ValidatorRuntime::pack_filter_accept(&ctx, &gap),
             "nonce gap must be skipped"
@@ -11160,36 +11403,37 @@ mod shard_header_commitment_tests {
     #[tokio::test]
     async fn vel1_prebuild_loaded_pool_reuse_matches_fresh() {
         const TS: u64 = 1_700_000_004;
-        let senders: Vec<SigningKey> = (0..10u8)
-            .map(|s| SigningKey::from_bytes(&[s; 32]))
-            .collect();
-        let me = senders[0].verifying_key().to_bytes();
+        // FULL-PQ: 10 Falcon-512 senders (domain-separated seeds); the
+        // classical `SigningKey` fixtures are refused at admission, so the
+        // loaded pool would stay empty.
+        const BASE_SEED: u8 = 0x50;
+        let valkey = SigningKey::generate(&mut OsRng);
+        let me = valkey.verifying_key().to_bytes();
         let validators = ValidatorSet::from_list(vec![(me, 1)]);
         let mk = || {
             let state = Arc::new(InMemoryStateEngine::new());
-            ValidatorRuntime::new(senders[0].clone(), validators.clone(), state, 1)
+            ValidatorRuntime::new(valkey.clone(), validators.clone(), state, 1)
         };
         let mut a = mk();
         let mut b = mk();
+        // One shared pool: Falcon signing is randomized, so each runtime
+        // must receive CLONES of the same mint (see the reuse test) for the
+        // inputs to be identical.
+        let pool: Vec<crate::sharding::Transaction> = (0..10u8)
+            .flat_map(|s| {
+                let seed = BASE_SEED + s;
+                (0..50u64).map(move |n| pq_tx(seed, [0x77u8; 32], 1_000, 21_000, n))
+            })
+            .collect();
         for rt in [&mut a, &mut b] {
-            for (s, sk) in senders.iter().enumerate() {
-                let from = sk.verifying_key().to_bytes();
+            for s in 0..10u8 {
+                let (from, _pk) = pq_pair(BASE_SEED + s);
                 rt.state
                     .update_account(crate::state_engine::AccountState::new(from, 100_000_000))
                     .await;
-                for n in 0..50u64 {
-                    let tx = crate::sharding::Transaction::sign(
-                        sk,
-                        [0x77u8; 32],
-                        1_000,
-                        21_000,
-                        n,
-                        crate::sharding::MASTERCHAIN_SHARD,
-                        crate::sharding::MASTERCHAIN_SHARD,
-                    );
-                    rt.add_tx(tx).await;
-                }
-                let _ = s;
+            }
+            for tx in &pool {
+                rt.add_tx(tx.clone()).await;
             }
         }
         // Reuse path: prebuild first, then time propose.
@@ -11255,5 +11499,76 @@ mod shard_header_commitment_tests {
         let mut empty: Vec<Transaction> = Vec::new();
         ValidatorRuntime::truncate_to_block_caps(&mut empty);
         assert!(empty.is_empty());
+    }
+
+    /// C-02/P0: the live-path sweep finalizes due proposals at the decided
+    /// height — locks release and the 7200-height timelock schedules.
+    /// // GATE: proves the `sweep_gov_finalize` wiring; extends, never weakens.
+    #[tokio::test]
+    async fn sweep_gov_finalize_releases_locks_and_schedules_timelock() {
+        use crate::governance::{
+            GovAction, ProposalStatus, VoteChoice, GOVERNANCE_VOTING_PERIOD_SECS,
+            GOV_TIMELOCK_HEIGHTS, PROPOSAL_MIN_STAKE_NANO,
+        };
+        let state = Arc::new(InMemoryStateEngine::new());
+        let proposer = [0xA1u8; 32];
+        let voter = [0xB2u8; 32];
+        {
+            let mut ledger = state.staking_write().await;
+            ledger.bond(proposer, PROPOSAL_MIN_STAKE_NANO, 0).unwrap();
+            ledger.bond(voter, PROPOSAL_MIN_STAKE_NANO, 0).unwrap();
+        }
+        let pid = {
+            let mut gov = state.governance_write().await;
+            let mut ledger = state.staking_write().await;
+            let id = gov
+                .propose(
+                    &mut ledger,
+                    proposer,
+                    "t".into(),
+                    GovAction::Signal("s".into()),
+                    0,
+                )
+                .expect("propose");
+            gov.vote(&mut ledger, proposer, id, VoteChoice::Yes, 1)
+                .expect("proposer vote");
+            gov.vote(&mut ledger, voter, id, VoteChoice::Yes, 1)
+                .expect("voter vote");
+            id
+        };
+        // Locks are held before finalization (the C-02 grief: never released).
+        {
+            let ledger = state.staking_read().await;
+            assert!(ledger.locked_governance_of(&proposer) > 0);
+            assert!(ledger.locked_governance_of(&voter) > 0);
+        }
+        // Not due yet (voting window still open): the sweep leaves it Open.
+        let now_due = GOVERNANCE_VOTING_PERIOD_SECS + 1;
+        let early =
+            sweep_gov_finalize(&state, 999, GOVERNANCE_VOTING_PERIOD_SECS - 1).await;
+        assert!(early.is_empty());
+        assert_eq!(
+            state.governance_read().await.get(pid).unwrap().status,
+            ProposalStatus::Open
+        );
+        // Due at the decided height: finalized, locks released, timelock set.
+        let pass_height = 41_000u64;
+        let done = sweep_gov_finalize(&state, pass_height, now_due).await;
+        assert_eq!(done, vec![pid]);
+        assert_eq!(
+            state.governance_read().await.get(pid).unwrap().status,
+            ProposalStatus::Passed
+        );
+        assert!(
+            state.staking_read().await.locked_governance.is_empty(),
+            "finalize must release every gov lock"
+        );
+        assert_eq!(
+            state.governance_read().await.executable_height_of(pid),
+            Some(pass_height + GOV_TIMELOCK_HEIGHTS)
+        );
+        // Idempotent: a second sweep at a later height is a no-op.
+        let again = sweep_gov_finalize(&state, pass_height + 1, now_due).await;
+        assert!(again.is_empty());
     }
 }

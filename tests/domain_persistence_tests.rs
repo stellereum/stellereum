@@ -1,34 +1,34 @@
-//! §9 shielded ledger + §2 zkML registry PERSISTENCE (audit F-B).
+//! §2 zkML registry PERSISTENCE (audit F-B).
 //!
-//! The gap: `ConfidentialState` (balances, spent-input set, fee total) and
-//! `ZkMlModelRegistry` (models + VKs) are committed consensus state (they move
-//! the root when non-empty), but had no storage tree of their own. A node that
-//! restarted from a snapshot came back with EMPTY domains while its accounts
-//! already carried the effects: spent commitments could be spent AGAIN (the
-//! double-spend the spent set exists to prevent), registered models vanished,
-//! and worst of all the restarted node computed a DIFFERENT root than the
-//! network (conditional digest: non-empty -> empty) - a consensus split out
-//! of a routine restart.
+//! The gap: `ZkMlModelRegistry` (models + VKs) is committed consensus state
+//! (it moves the root when non-empty), but had no storage tree of its own.
+//! A node that restarted from a snapshot came back with an EMPTY registry
+//! while its accounts already carried the effects: registered models
+//! vanished, and worst of all the restarted node computed a DIFFERENT root
+//! than the network (conditional digest: non-empty -> empty) - a consensus
+//! split out of a routine restart.
+//!
+//! (The shielded-ledger half of this audit item was deleted with the
+//! shielded protocol removal: the opcodes, curves and state it covered no
+//! longer exist.)
 //!
 //! The fix mirrors the session-key registry and the bridge domain: own sled
-//! trees (`confidential`, `zkml_models`), captured by the same snapshot job
+//! trees (`zkml_models`), captured by the same snapshot job
 //! and applied by BOTH engines `load_full_state_into` touches (the verifying
 //! throwaway and the live one), with an absent entry meaning "empty".
 //!
-//! Invariants pinned here, per domain:
-//!   * the domain persists through `snapshot_domains` -> reopen ->
+//! Invariants pinned here:
+//!   * the registry persists through `snapshot_domains` -> reopen ->
 //!     `load_full_state_into`, and the restored engine computes the IDENTICAL
 //!     state root;
-//!   * after the restore, the safety property still holds (spent input refused;
-//!     registered model still verifies);
-//!   * restoring WITHOUT the domain bytes roots differently (the hole was
+//!   * after the restore, the safety property still holds (registered model
+//!     still verifies);
+//!   * restoring WITHOUT the registry bytes roots differently (the hole was
 //!     real) - and an all-empty snapshot restores to the pre-domain root
 //!     (genesis KAT safety).
 
-use curve25519_dalek::scalar::Scalar;
 use ed25519_dalek::SigningKey;
 
-use stellereum::crypto_privacy::{ConfidentialTransfer, PedersenCommitment};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::OpCode;
@@ -70,63 +70,6 @@ fn block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u8; 32])
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
     }
-}
-
-/// A valid one-in/one-out transfer: input (value), output (value), same
-/// blinding, zero fee, so `C_in - C_out == 0` exactly. Deterministic.
-fn balanced_transfer(value: u64) -> ConfidentialTransfer {
-    let r = Scalar::from(0x5EED_u64);
-    ConfidentialTransfer::new(
-        vec![PedersenCommitment::commit(value, &r)],
-        vec![PedersenCommitment::commit(value, &r)],
-        0,
-    )
-}
-
-fn confidential_tx(
-    sk: &SigningKey,
-    recipient: [u8; 32],
-    transfer: ConfidentialTransfer,
-    nonce: u64,
-) -> Transaction {
-    // Shield + enforced-transfer bundle (audit 2026-10-06 F-A): the only way
-    // to fund inputs under the ownership rule. Zero fee here.
-    use curve25519_dalek::scalar::Scalar;
-    use stellereum::crypto_privacy::RangeProof;
-    let r = Scalar::from(0x5EED_u64);
-    let in_val = 1_000u64;
-    let inp = &transfer.input_commitments;
-    let outp = &transfer.output_commitments;
-    let input_ranges: Vec<RangeProof> = inp
-        .iter()
-        .map(|c| RangeProof::prove(c, in_val, &r, 32))
-        .collect();
-    let output_ranges: Vec<RangeProof> = outp
-        .iter()
-        .map(|c| RangeProof::prove(c, in_val, &r, 32))
-        .collect();
-    Transaction::sign_with_payload(
-        sk,
-        [0xEE; 32],
-        0,
-        100_000,
-        nonce,
-        1,
-        1,
-        vec![
-            OpCode::SysCallConfidentialShield {
-                commitment: inp[0].commitment,
-                amount: in_val,
-                blinding: r.to_bytes(),
-            },
-            OpCode::SysCallConfidentialTransfer2 {
-                recipient,
-                transfer: Box::new(transfer),
-                input_ranges,
-                output_ranges,
-            },
-        ],
-    )
 }
 
 fn register_tx(
@@ -240,105 +183,7 @@ async fn reopen_and_load(
 }
 
 // ===========================================================================
-// 1. Shielded ledger: spent set survives the restart.
-// ===========================================================================
-
-/// A confidential transfer applies, the node restarts from disk, and the SAME
-/// input commitment is still refused (no second spend), at the IDENTICAL root.
-#[tokio::test]
-async fn confidential_spent_set_survives_snapshot_and_restore() {
-    let e = InMemoryStateEngine::new();
-    let payer = key(0x21);
-    let payer_pk = payer.verifying_key().to_bytes();
-    e.update_account(AccountState::new(payer_pk, 10 * STELL))
-        .await;
-    let recipient = [0x22u8; 32];
-
-    let tx = confidential_tx(&payer, recipient, balanced_transfer(1_000), 0);
-    let out = e
-        .apply_block_transition(&block(1, TS, vec![tx], payer_pk), 0)
-        .await;
-    assert_eq!(out.status, vec![true], "the shielded transfer applies");
-    assert!(
-        !e.confidential_read().await.is_empty(),
-        "precondition: the shielded ledger is non-empty"
-    );
-
-    const SNAP_H: u64 = 500;
-    let (dir, root) = persisted_snapshot_dir(&e, SNAP_H, "conf").await;
-    let (_store, fresh, height) = reopen_and_load(&dir).await;
-    assert_eq!(height, SNAP_H);
-    assert_eq!(
-        fresh.get_state_root().await,
-        root,
-        "the commitment digest must round-trip IDENTICALLY through the restore"
-    );
-    assert_eq!(
-        &*fresh.confidential_read().await,
-        &*e.confidential_read().await,
-        "balances, spent set and fee total all come back"
-    );
-
-    // THE GAP, pinned: the same input spent again is refused by the RESTORED
-    // spent set - no second credit, no root movement.
-    let replay = confidential_tx(&payer, recipient, balanced_transfer(1_000), 1);
-    let settled = fresh.get_state_root().await;
-    let out = fresh
-        .apply_block_transition(&block(2, TS + 1, vec![replay], payer_pk), 0)
-        .await;
-    assert_eq!(
-        out.status,
-        vec![false],
-        "double-spend refused after restore"
-    );
-    // The refused replay moves no VALUE (the confidential ledger is
-    // untouched - see the assertion below), but the failed attempt is not
-    // free: it pays the F-01 failure fee it declared, so the root moves by
-    // exactly that.
-    assert!(
-        fresh.get_state_root().await != settled,
-        "the failed attempt pays its fee, so the root moves"
-    );
-
-    // Negative control: restoring accounts + domains WITHOUT the confidential
-    // bytes lands on a different root - the hole was real.
-    let bare = InMemoryStateEngine::new();
-    bare.restore_snapshot(&_store.get_state(SNAP_H).unwrap().unwrap())
-        .await
-        .expect("accounts restore");
-    if let Some(bytes) = _store.latest_domains().unwrap().map(|(_, b)| b) {
-        let snap: stellereum::storage::DomainSnapshot =
-            bincode::deserialize(&bytes).expect("domains decode");
-        snap.apply(&bare).await;
-    }
-    assert_ne!(
-        bare.get_state_root().await,
-        root,
-        "a restore that drops the shielded ledger must NOT compute the committed root"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// An all-empty shielded ledger restores to the pre-domain root (KAT safety).
-#[tokio::test]
-async fn confidential_absent_means_empty() {
-    let e = InMemoryStateEngine::new();
-    let root = e.get_state_root().await;
-    assert!(e.confidential_read().await.is_empty());
-    const SNAP_H: u64 = 500;
-    let (dir, _) = persisted_snapshot_dir(&e, SNAP_H, "confempty").await;
-    let (_store, fresh, _) = reopen_and_load(&dir).await;
-    assert_eq!(
-        fresh.get_state_root().await,
-        root,
-        "empty ledger restores to the written root"
-    );
-    assert!(fresh.confidential_read().await.is_empty());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-// ===========================================================================
-// 2. zkML registry: registered models survive the restart.
+// zkML registry: registered models survive the restart.
 // ===========================================================================
 
 /// A registered model persists through snapshot + reopen at the identical

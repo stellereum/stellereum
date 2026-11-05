@@ -16,7 +16,6 @@
 //!   "headers"     : height(8B BE) -> bincode(BlockHeaderRecord)
 //!   "session_keys": height(8B BE) -> bincode(SessionKeyRegistry)
 //!   "bridge"      : height(8B BE) -> bincode(BridgeState)
-//!   "confidential": height(8B BE) -> bincode(ConfidentialState)  [audit F-B]
 //!   "zkml_models" : height(8B BE) -> bincode(ZkMlModelRegistry)  [audit F-B]
 //!   "cross_shard" : height(8B BE) -> bincode(CrossShardReplaySnapshot) [audit F-I]
 //!   "receipts_v1" : tx_hash (32B) -> bincode(StoredReceipt)   [NEW, additive only]
@@ -73,11 +72,6 @@ pub struct Storage {
     /// `DomainSnapshot` would stop every older snapshot from decoding. This is
     /// what makes a restored node still refuse a replayed `source_tx_hash`.
     bridge: sled::Tree,
-    /// Committed shielded ledger (`ConfidentialState`: balances, spent-input
-    /// set, fee total), keyed by height. Own tree (audit F-B): without it a
-    /// restart wiped the spent set (re-opening double-spends) and changed the
-    /// root (conditional digest went from non-empty to empty = fork).
-    confidential: sled::Tree,
     /// Committed zkML model registry (models + VKs), keyed by height. Own
     /// tree for the same reason: a restart must not un-register models the
     /// chain agreed on, nor move the root.
@@ -104,7 +98,7 @@ pub struct Storage {
 /// field bricks restarts on pre-existing data directories (observed live:
 /// `min_gas_limit` in governance-applied params made every snapshot
 /// undecodable). New committed domains get their OWN tree + snapshot/restore
-/// pair (the session/bridge/confidential/zkml pattern) — never a struct
+/// pair (the session/bridge/zkml pattern) — never a struct
 /// extension. If this rule must ever break, ship a versioned upgrade wrapper
 /// (the `BridgeStateV1`/`ConfidentialStateV1` pattern) in the SAME commit.
 ///
@@ -420,7 +414,6 @@ impl Storage {
         let headers = db.open_tree("headers")?;
         let session_keys = db.open_tree("session_keys")?;
         let bridge = db.open_tree("bridge")?;
-        let confidential = db.open_tree("confidential")?;
         let zkml_models = db.open_tree("zkml_models")?;
         let cross_shard = db.open_tree("cross_shard")?;
         let receipts = db.open_tree("receipts_v1")?;
@@ -435,7 +428,6 @@ impl Storage {
             headers,
             session_keys,
             bridge,
-            confidential,
             zkml_models,
             cross_shard,
             receipts,
@@ -643,6 +635,26 @@ impl Storage {
         Ok(self.blocks.len())
     }
 
+    /// Test-only handle to the raw block-body tree (differential tests
+    /// replicate the pre-batch per-key prune loop against it). `sled::Tree`
+    /// is a cheap cloneable handle, not a copy of the data.
+    #[doc(hidden)]
+    pub fn blocks_tree_for_test(&self) -> sled::Tree {
+        self.blocks.clone()
+    }
+
+    /// Test-only handle to the raw height-index tree (see above).
+    #[doc(hidden)]
+    pub fn by_height_tree_for_test(&self) -> sled::Tree {
+        self.by_height.clone()
+    }
+
+    /// Test-only handle to the raw receipts tree (see above).
+    #[doc(hidden)]
+    pub fn receipts_tree_for_test(&self) -> sled::Tree {
+        self.receipts.clone()
+    }
+
     // ---------- Verified body ingest (adopter replication) ----------
     //
     // Bodies/receipts are ALREADY committed by the proposer; replication must
@@ -749,6 +761,12 @@ impl Storage {
         fees: &[u64],
         events: &[Vec<crate::contract::ContractEvent>],
     ) -> Result<usize> {
+        // Per-transaction inserts (deliberately NOT a sled::Batch): the
+        // single-batch variant was measured 0.3x-0.9x (slower, never faster
+        // across 9 release reps at N=428 — batch machinery exceeds 428 x
+        // ~4us pagecache inserts) and reverted. No durability delta either
+        // way: neither path flushes; the barrier is `flush()` (every 25
+        // heights, shutdown, upgrade — untouched).
         let mut n = 0;
         for (i, tx) in txs.iter().enumerate() {
             let success = statuses.get(i).copied().unwrap_or(false);
@@ -1061,7 +1079,6 @@ impl Storage {
         }
         self.prune_session_keys_below(keep_from)?;
         self.prune_bridge_below(keep_from)?;
-        self.prune_confidential_below(keep_from)?;
         self.prune_zkml_models_below(keep_from)?;
         self.prune_cross_shard_below(keep_from)?;
         Ok(removed)
@@ -1192,53 +1209,6 @@ impl Storage {
             .collect();
         for k in keys {
             self.bridge.remove(k)?;
-            removed += 1;
-        }
-        Ok(removed)
-    }
-
-    // ---------- Shielded ledger snapshots (audit F-B) ----------
-
-    pub fn put_confidential(&self, height: u64, bytes: &[u8]) -> Result<()> {
-        self.confidential.insert(height.to_be_bytes(), bytes)?;
-        Ok(())
-    }
-
-    /// The committed shielded ledger exactly as it stood after `height`.
-    /// `None` for a directory written before confidential transfers existed -
-    /// which is CORRECT: an empty ledger contributes nothing to the digest,
-    /// so a pre-confidential snapshot restores to the root it was written
-    /// with. `Some` means the spent set and balances come back with the node,
-    /// so a restored node still refuses an already-spent commitment instead
-    /// of minting it a second time.
-    pub fn confidential_at(&self, height: u64) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .confidential
-            .get(height.to_be_bytes())?
-            .map(|v| v.to_vec()))
-    }
-
-    /// Drop shielded-ledger snapshots older than `keep_from`. Called from
-    /// `prune_domains_below` so this tree follows the same window. Never
-    /// drops a row at a snapshotted height: see [`Self::aux_retained_heights`].
-    pub fn prune_confidential_below(&self, keep_from: u64) -> Result<usize> {
-        let keep = self.aux_retained_heights();
-        let mut removed = 0;
-        let keys: Vec<sled::IVec> = self
-            .confidential
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .filter(|k| {
-                if k.len() != 8 {
-                    return false;
-                }
-                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
-                h < keep_from && !keep.contains(&h)
-            })
-            .collect();
-        for k in keys {
-            self.confidential.remove(k)?;
             removed += 1;
         }
         Ok(removed)
@@ -1629,11 +1599,8 @@ impl Storage {
                 .await
                 .map_err(|e| anyhow!("restore bridge domain at height {height}: {e}"))?;
         }
-        if let Some(bytes) = self.confidential_at(height)? {
-            tmp.restore_confidential(&bytes)
-                .await
-                .map_err(|e| anyhow!("restore confidential ledger at height {height}: {e}"))?;
-        }
+        // Ristretto deletion wave: confidential/shielded ledger removed with
+        // crypto_privacy; no restore (transparent paths unchanged).
         if let Some(bytes) = self.zkml_models_at(height)? {
             tmp.restore_zkml_models(&bytes)
                 .await
@@ -1981,8 +1948,17 @@ impl Storage {
     }
 
     /// Flush all trees to disk (durability barrier).
+    ///
+    /// Single `db.flush()`: every tree in this store (including `pq_keys`,
+    /// opened via `db.open_tree`) shares the Db's pagecache, and sled 0.34
+    /// `Tree::flush` flushes exactly that shared pagecache — so a separate
+    /// `pq_keys.flush()` ahead of it re-flushed the same already-clean pages
+    /// (a second fsync for zero new bytes). One barrier call keeps the
+    /// identical durability guarantee (all prior writes on ALL trees are
+    /// fsynced before return) with one fewer fsync per barrier. The barrier
+    /// itself is never skipped or weakened: every-25-heights, shutdown and
+    /// upgrade call sites are untouched.
     pub fn flush(&self) -> Result<()> {
-        self.pq_keys.flush()?;
         self.db.flush()?;
         Ok(())
     }
@@ -2437,6 +2413,13 @@ impl GovernanceLegacy {
             next_id: self.next_id,
             quorum_bps: self.quorum_bps,
             applied: self.applied.upgrade(),
+            // KI-23: legacy storage predates the timelock map — no maturities
+            // (pre-timelock Passed executes immediately, one-time migration).
+            timelocks: Default::default(),
+            // Operator-signed governance: legacy storage predates signed
+            // nonces — the set starts empty (exact: no signed nonce existed
+            // when those bytes were written, so nothing can be replayed).
+            gov_propose_nonces: Default::default(),
         }
     }
 }
@@ -2781,11 +2764,7 @@ pub async fn load_full_state_into(
                 .await
                 .map_err(|e| anyhow!("restore bridge domain: {e}"))?;
         }
-        if let Some(bytes) = storage.confidential_at(height)? {
-            tmp.restore_confidential(&bytes)
-                .await
-                .map_err(|e| anyhow!("restore confidential ledger: {e}"))?;
-        }
+        // Ristretto deletion wave: confidential ledger removed; no restore.
         if let Some(bytes) = storage.zkml_models_at(height)? {
             tmp.restore_zkml_models(&bytes)
                 .await
@@ -2826,12 +2805,7 @@ pub async fn load_full_state_into(
             .await
             .map_err(|e| anyhow!("restore bridge domain: {e}"))?;
     }
-    if let Some(bytes) = storage.confidential_at(height)? {
-        engine
-            .restore_confidential(&bytes)
-            .await
-            .map_err(|e| anyhow!("restore confidential ledger: {e}"))?;
-    }
+    // Ristretto deletion wave: confidential ledger removed; no restore.
     if let Some(bytes) = storage.zkml_models_at(height)? {
         engine
             .restore_zkml_models(&bytes)
@@ -2902,7 +2876,6 @@ pub enum PersistJob {
         bytes: Vec<u8>,
         session_keys: Vec<u8>,
         bridge: Vec<u8>,
-        confidential: Vec<u8>,
         zkml_models: Vec<u8>,
         cross_shard: Vec<u8>,
     },
@@ -2989,7 +2962,7 @@ impl AsyncPersistence {
                     PersistJob::State { height, snapshot } => st.put_state(height, &snapshot),
                     // Audit F1(c): `cross_shard` is written FIRST. The old
                     // order wrote it LAST (domains→session→bridge→
-                    // confidential→zkml→cross_shard), so an I/O error anywhere
+                    // zkml→cross_shard), so an I/O error anywhere
                     // in the chain silently skipped the replay set while
                     // keeping the rest — the exact partial write that
                     // re-opens consumed inbounds. Replay-first inverts the
@@ -3004,7 +2977,6 @@ impl AsyncPersistence {
                         bytes,
                         session_keys,
                         bridge,
-                        confidential,
                         zkml_models,
                         cross_shard,
                     } => st
@@ -3012,7 +2984,6 @@ impl AsyncPersistence {
                         .and_then(|()| st.put_domains(height, &bytes))
                         .and_then(|()| st.put_session_keys(height, &session_keys))
                         .and_then(|()| st.put_bridge(height, &bridge))
-                        .and_then(|()| st.put_confidential(height, &confidential))
                         .and_then(|()| st.put_zkml_models(height, &zkml_models)),
                     PersistJob::Consensus(cp) => st.set_consensus(&cp),
                     PersistJob::Finalized { height, hash } => st.set_finalized(height, &hash),
@@ -3198,7 +3169,7 @@ impl AsyncPersistence {
     }
 
     /// Non-blocking: enqueue a domain snapshot (tokens/contracts/...), together
-    /// with the session-key registry, the bridge domain, the shielded ledger,
+    /// with the session-key registry, the bridge domain,
     /// the zkML registry and the cross-shard replay snapshot of the same
     /// height.
     #[allow(clippy::too_many_arguments)]
@@ -3209,7 +3180,6 @@ impl AsyncPersistence {
         bytes: Vec<u8>,
         session_keys: Vec<u8>,
         bridge: Vec<u8>,
-        confidential: Vec<u8>,
         zkml_models: Vec<u8>,
         cross_shard: Vec<u8>,
     ) {
@@ -3218,7 +3188,6 @@ impl AsyncPersistence {
             bytes,
             session_keys,
             bridge,
-            confidential,
             zkml_models,
             cross_shard,
         });
@@ -3250,7 +3219,6 @@ impl AsyncPersistence {
         let snap = DomainSnapshot::capture(engine, staking, governance).await;
         let session_keys = engine.session_keys_snapshot().await;
         let bridge = engine.bridge_snapshot().await;
-        let confidential = engine.confidential_snapshot().await;
         let zkml_models = engine.zkml_models_snapshot().await;
         // Cross-shard replay, engine half (audit F-I): the runtime mirrors are
         // empty wherever this runs (startup healing with a fresh runtime, or
@@ -3291,7 +3259,6 @@ impl AsyncPersistence {
                 bytes,
                 session_keys,
                 bridge,
-                confidential,
                 zkml_models,
                 cross_shard,
             );
@@ -3951,7 +3918,6 @@ mod tests {
             .expect("encode domains");
         let session_keys = engine.session_keys_snapshot().await;
         let bridge = engine.bridge_snapshot().await;
-        let confidential = engine.confidential_snapshot().await;
         let zkml_models = engine.zkml_models_snapshot().await;
         let cross_shard = {
             let mut engine_consumed = engine.cross_shard_consumed_snapshot().await;
@@ -3971,7 +3937,6 @@ mod tests {
         st.put_domains(S, &domain_bytes).unwrap();
         st.put_session_keys(S, &session_keys).unwrap();
         st.put_bridge(S, &bridge).unwrap();
-        st.put_confidential(S, &confidential).unwrap();
         st.put_zkml_models(S, &zkml_models).unwrap();
         st.put_cross_shard(S, &cross_shard).unwrap();
 
@@ -4061,7 +4026,6 @@ mod tests {
             .expect("encode domains");
         let session_keys = engine.session_keys_snapshot().await;
         let bridge = engine.bridge_snapshot().await;
-        let confidential = engine.confidential_snapshot().await;
         let zkml_models = engine.zkml_models_snapshot().await;
         let cross_shard_s = {
             let mut engine_consumed = engine.cross_shard_consumed_snapshot().await;
@@ -4118,7 +4082,6 @@ mod tests {
         st.put_domains(S, &domain_bytes).unwrap();
         st.put_session_keys(S, &session_keys).unwrap();
         st.put_bridge(S, &bridge).unwrap();
-        st.put_confidential(S, &confidential).unwrap();
         st.put_zkml_models(S, &zkml_models).unwrap();
         st.put_cross_shard(S, &cross_shard_newer).unwrap();
         let mut anchor = block(S + 1, [9u8; 32], &sk, None);
@@ -4665,7 +4628,7 @@ mod tests {
 mod archive_proof_tests {
     //! Per-key archive proofs served from the persisted snapshot history.
     use super::*;
-    use crate::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+    use crate::consensus::{FalconKeypair, QuorumCertificate, ValidatorSet, Vote, VoteKind};
     use crate::sharding::{Block, MASTERCHAIN_SHARD};
     use crate::state_engine::AccountState;
     use ed25519_dalek::SigningKey;
@@ -4677,6 +4640,28 @@ mod archive_proof_tests {
             std::process::id(),
             rand::random::<u32>()
         ))
+    }
+
+    /// FULL-PQ QC (mirrors `consensus::tests::fvote` + `VoteSet::certificate`
+    /// idiom): Ed list for membership/power plus Falcon µQC envelope for
+    /// crypto — exactly what `QuorumCertificate::verify` requires.
+    fn pq_cert_for(
+        height: u64,
+        round: u32,
+        block_hash: [u8; 32],
+        parent: [u8; 32],
+        vs: &ValidatorSet,
+        keys: &[(SigningKey, FalconKeypair)],
+    ) -> QuorumCertificate {
+        let mut set = crate::consensus::VoteSet::new();
+        for (sk, fk) in keys {
+            let v =
+                Vote::sign_with_falcon(sk, fk, height, round, VoteKind::Precommit, Some(block_hash));
+            set.add(v, vs, height, round, VoteKind::Precommit)
+                .expect("falcon vote must ingest");
+        }
+        set.certificate_with_parent(Some(block_hash), vs, Some(&parent))
+            .expect("quorum must compile a Falcon µQC")
     }
 
     fn test_block(height: u64, prev: [u8; 32], state_root: [u8; 32], signer: &SigningKey) -> Block {
@@ -4714,12 +4699,22 @@ mod archive_proof_tests {
         account_a: [u8; 32],
         missing: [u8; 32],
         validator: SigningKey,
+        falcon: FalconKeypair,
     }
 
     async fn fixture() -> Fixture {
         let dir = tmp();
         let store = Storage::open(&dir).unwrap();
         let validator = SigningKey::generate(&mut OsRng);
+        // Deterministic Falcon key per validator id would collide across
+        // parallel tests sharing the global PQ registry; generate fresh and
+        // register under this fixture's unique Ed id.
+        let falcon = FalconKeypair::generate();
+        crate::consensus::register_validator_pq_key(
+            validator.verifying_key().to_bytes(),
+            crate::post_quantum::PqScheme::Falcon512,
+            falcon.public_key.clone(),
+        );
 
         let engine = InMemoryStateEngine::new();
         let account_a = [0xA1u8; 32];
@@ -4751,9 +4746,6 @@ mod archive_proof_tests {
             .put_bridge(height, &engine.bridge_snapshot().await)
             .unwrap();
         store
-            .put_confidential(height, &engine.confidential_snapshot().await)
-            .unwrap();
-        store
             .put_zkml_models(height, &engine.zkml_models_snapshot().await)
             .unwrap();
 
@@ -4763,14 +4755,15 @@ mod archive_proof_tests {
         let h_h = store.put_block(&b_h).unwrap();
         let mut b_next = test_block(tip, h_h, root, &validator);
         let h_next = b_next.compute_hash();
-        let vote = Vote::sign(&validator, tip, 0, VoteKind::Precommit, Some(h_next));
-        b_next.precommit_qc = Some(QuorumCertificate {
-            height: tip,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(h_next),
-            signatures: vec![(vote.voter, vote.signature)],
-        });
+        let vs = ValidatorSet::from_list(vec![(validator.verifying_key().to_bytes(), 1)]);
+        b_next.precommit_qc = Some(pq_cert_for(
+            tip,
+            0,
+            h_next,
+            h_h,
+            &vs,
+            &[(validator.clone(), falcon.clone())],
+        ));
         store.put_block(&b_next).unwrap();
         store.set_finalized(tip, &h_next).unwrap();
 
@@ -4783,6 +4776,7 @@ mod archive_proof_tests {
             account_a,
             missing: [0xEEu8; 32],
             validator,
+            falcon,
         }
     }
 
@@ -4960,6 +4954,15 @@ mod archive_proof_tests {
         // it — this is what makes the root trustworthy, and it is checked
         // client-side against the client's OWN set.
         let val_id = f.validator.verifying_key().to_bytes();
+        // Re-pin the Falcon key: the PQ registry is process-global and other
+        // parallel tests may have registered other ids (never this id, which
+        // is unique per fixture) — this keeps the verify path on this
+        // fixture's key.
+        crate::consensus::register_validator_pq_key(
+            val_id,
+            crate::post_quantum::PqScheme::Falcon512,
+            f.falcon.public_key.clone(),
+        );
         let vset = ValidatorSet::from_list(vec![(val_id, 1)]);
         assert!(
             record.cert.verify(&vset),

@@ -23,29 +23,10 @@
 //!   in rounds `0..=qc_round` (plus a +4-round tolerance window when
 //!   `qc_round > 0`), evaluated against the set passed in — which W10.5 call
 //!   sites resolve per-header height (`src/sync.rs:79-84,752`).
-//! * The SORTITION committee (`derive_sortition_committee`, `:839-855`) is a
+//! * The SORTITION committee (`derive_sortition_committee`) is a
 //!   DIFFERENT election over the same `(set, height, round)` PLUS the parent
-//!   block hash as entropy (`sortition_seed`, `:959-965`). Its four live call
-//!   sites pin `VrfActivation::Disabled + None` (`:852-853` wrapper,
-//!   `:2450-2458` certificate build, `:2755-2763` + `:2856-2864`
-//!   micro-cert verification), i.e. byte-identical v5 parent-hash draws.
-//!
-//! ## Where a VRF gate WOULD slot in (read-only; activation wiring + the
-//! primitive belong to other workers — do NOT implement here)
-//!
-//! * Proposer path: `proposer_for` has NO gate today. A VRF-gated proposer
-//!   would mirror `sortition_seed_gated` (`:980-993`): replace the
-//!   `STELL_PROPOSER_V1 || height || round` preimage (or theSeed-derived
-//!   slot) with `vrf::vrf_election_seed(verified_output, height, round)` at
-//!   `height >= activation`, falling back to the hash-slot otherwise. The set
-//!   input MUST stay `validator_set_for_height(h)` — gating the entropy must
-//!   never change WHICH set elects at height h, or nodes pre/post-activation
-//!   disagree about the electorate as well as the draw.
-//! * Sortition path: the four pinned sites already take
-//!   `(activation, verified_output)` via `derive_sortition_committee_gated`
-//!   (`:871-879`); phase 3 threads the configured activation + winning
-//!   ticket's verified output there. No signature/qc changes needed — same
-//!   weighted-draw machinery, different entropy.
+//!   block hash as entropy (`sortition_seed`). Canonical parent-hash draw,
+//!   byte-pinned.
 //!
 //! ## Tests below (no logic changes; pins + measurements only)
 //!
@@ -62,12 +43,11 @@ use std::collections::HashSet;
 
 use ed25519_dalek::SigningKey;
 use stellereum::consensus::{
-    derive_sortition_committee, derive_sortition_committee_gated, sortition_seed,
-    sortition_seed_gated, HeightConsensus, QuorumCertificate, ValidatorSet, Vote, VoteKind,
+    derive_sortition_committee, sortition_seed, HeightConsensus, QuorumCertificate,
+    ValidatorSet, Vote, VoteKind,
 };
 use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::sync::{proposer_matches_schedule, verify_finality_for_header};
-use stellereum::vrf::VrfActivation;
 use std::sync::Arc;
 
 // --- fixtures ----------------------------------------------------------------
@@ -140,25 +120,13 @@ fn proposer_schedule_is_deterministic_across_identical_inputs() {
         }
     }
 
-    // Sortition side is equally pure under the pinned Disabled+None gate.
+    // Sortition side is equally pure: canonical parent-hash draw.
     let parent = [0x5Au8; 32];
     for h in [0u64, 1, 9, 1_000_000] {
         for r in [0u32, 1, 2] {
             assert_eq!(sortition_seed(&parent, h, r), sortition_seed(&parent, h, r));
             assert_eq!(
                 derive_sortition_committee(&vs, h, r, 2, &parent),
-                derive_sortition_committee(&vs, h, r, 2, &parent),
-            );
-            assert_eq!(
-                derive_sortition_committee_gated(
-                    &vs,
-                    h,
-                    r,
-                    2,
-                    &parent,
-                    &VrfActivation::Disabled,
-                    None
-                ),
                 derive_sortition_committee(&vs, h, r, 2, &parent),
             );
         }
@@ -434,17 +402,12 @@ async fn finality_gate_uses_set_at_height_for_schedule_and_qc() {
     let _ = (a, kb);
 }
 
-// --- 7. Disabled+None pinned ---------------------------------------------------
+// --- 7. Canonical draw pinned ---------------------------------------------------
 
 #[test]
-fn disabled_gate_pinned_byte_identical_to_today() {
-    // The gate defaults OFF: live consensus bytes are unchanged.
-    assert_eq!(VrfActivation::default(), VrfActivation::Disabled);
-    assert_eq!(VrfActivation::Disabled.boundary(), None);
-
-    // Fixed vectors captured from the pre-gate path (mirror of
-    // vrf_sortition_gate_tests pins — duplicated here so a silent wiring
-    // change breaks THIS surface's gate too).
+fn canonical_draw_pinned_byte_identical_to_today() {
+    // Live consensus bytes are unchanged: canonical parent-hash draw.
+    // Fixed vectors captured from the canonical path.
     fn h32(s: &str) -> [u8; 32] {
         hex::decode(s).expect("pin hex").as_slice().try_into().expect("32B")
     }
@@ -461,7 +424,7 @@ fn disabled_gate_pinned_byte_identical_to_today() {
     assert_eq!(comm.len(), 2);
     assert_ne!(comm[0], comm[1]);
 
-    // Gated-with-Disabled+None is byte-identical to legacy over a sweep —
+    // Canonical draw is deterministic over a sweep —
     // future wiring may not silently change today's schedule.
     let parents = [[0x5Au8; 32], [0x00u8; 32], [0xFFu8; 32]];
     for p in &parents {
@@ -469,29 +432,18 @@ fn disabled_gate_pinned_byte_identical_to_today() {
             for r in [0u32, 1, 7] {
                 for k in [0u32, 1, 2, 4, 100] {
                     assert_eq!(
-                        derive_sortition_committee_gated(
-                            &vs, h, r, k, p,
-                            &VrfActivation::Disabled, None
-                        ),
                         derive_sortition_committee(&vs, h, r, k, p),
-                        "Disabled+None must equal legacy (h={h} r={r} k={k})"
+                        derive_sortition_committee(&vs, h, r, k, p),
+                        "canonical draw must be deterministic (h={h} r={r} k={k})"
                     );
                     assert_eq!(
-                        sortition_seed_gated(p, h, r, &VrfActivation::Disabled, None),
+                        sortition_seed(p, h, r),
                         sortition_seed(p, h, r)
                     );
                 }
             }
         }
     }
-
-    // A configured activation BELOW the height still ignores VRF-less calls
-    // (no verified output ⇒ parent-hash seed — fail-closed direction).
-    let active = VrfActivation::FromHeight(10);
-    assert_eq!(
-        sortition_seed_gated(&parent, 100, 0, &active, None),
-        sortition_seed(&parent, 100, 0)
-    );
 }
 
 // --- 8. HeightConsensus wiring -------------------------------------------------

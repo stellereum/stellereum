@@ -25,17 +25,15 @@
 //! tx priority-bid envelope (80 B sig)              192 B
 //! vote bare, Some(hash)                            153 B  (= 8+4+4+33+32+72)
 //! vote bare, nil                                     121 B
-//! vote BLS envelope (176 B sig)                     265 B  (flag-off nodes never emit; bls.rs:47-59)
-//! vote Falcon envelope (746 B sig)                  835 B  (post_quantum.rs:109 => 666 B sig)
+//! vote Falcon hybrid envelope (746 B sig)           835 B  (= 8+4+4+33+32+(8+746); sig field = 16 magic + 64 Ed + 666 Falcon per post_quantum.rs:115 FALCON512_SIG_LEN, consensus.rs:214 VOTE_FALCON_PART_LEN)
 //! ConsensusMsg::Vote, locked=None (live path)       158 B
 //! ConsensusMsg::Vote, locked=Some                    190 B
-//! QC(k Ed25519 sigs) = 57 + 104*k B  (k=1:161, 4:473, 7:785, 10:1097, 100:10457)
+//! QC(k Ed25519 sigs, refused under pure PQ) = 57 + 104*k B  (k=1:161, 4:473, 7:785, 10:1097, 100:10457)
+//! µQC Falcon envelope = 73 + ceil(C/8) + s*670 B  (s sigs; 670 = 4 len + 666 Falcon; layout consensus.rs:825-836, formula pinned by pq_qc_sizes_vs_classical; C=4 full-sign: 2754, QC bincode 2851)
 //! block fixed part (0 txs, 1 proposer sig, no QCs)  350 B
 //! ConsensusMsg::Proposal(N) = 366 + 176*N B (16 B msg framing + 350 B header)
 //!   N=0:366  N=1:542  N=100:17966  N=428:75694  N=1000:176366
-//! Committed{100 txs, qc7}                           18747 B
-//! BLS QC envelope fixed header                      161 B  (consensus.rs:271 HEADER)
-//!   + bitfield ceil(C/8) B  (C=7:1, 10:2, 100:13, 1000:125)
+//! Committed{100 txs, qc7} (classical baseline)    18747 B
 //! ```
 //!
 //! Encoding facts the table rests on (bincode 1.3, confirmed by harness):
@@ -61,24 +59,18 @@
 //! Fail-closed: a short-id NEVER authorises execution — the block hash is
 //! still computed over full txs, and a wrong/missing tx fails the hash.
 //!
-//! ## 2b. QC bitfield + aggregate-ready layout (BLS-off forward-compat)
-//! Live reality (BLS-off): `refuse_bls_qc_if_enabled` + bls.rs:47-59 —
-//! counting BLS power requires an explicit non-PQ opt-in the lead has NOT
-//! defined, so the counted path stays `signatures: Vec<(ValidatorId,
+//! ## 2b. QC bitfield (read-only, no wire change yet)
+//! Live reality: the counted path stays `signatures: Vec<(ValidatorId,
 //! Vec<u8>)>` = 57 + 104*k B. The design ADDS (no removal, no wire change
 //! yet) a canonical bitfield alongside the list:
 //! `bitfield: Vec<u8>`, `bit i` (LSB-first) = signer index `i` in the
 //! canonical validator order (sorted `ValidatorId`, same order as
-//! `ValidatorSet::proposer_for`'s explicit sort, consensus.rs:1518-1523).
+//! `ValidatorSet::proposer_for`'s explicit sort).
 //! Trailing unused bits MUST be zero (fail-closed unpack, mirroring the
-//! existing µQC `signers_bitmask` rule and `decode_qc_bls_envelope`'s
-//! bitlen check, consensus.rs:291). Uses NOW: downtime attribution and
+//! existing µQC `signers_bitmask` rule and the PQ envelope bitlen check).
+//! Uses NOW: downtime attribution and
 //! evidence compare bitfields without re-walking sig lists; the verifier
-//! keeps counting the Ed25519 list. At a future BLS activation (spec +
-//! audit): drop the list, keep `96 B aggregate + bitfield` — QC(100) falls
-//! from 10457 B to ~271 B. PQ note: BLS12-381 is classical
-//! (`BLS_IS_POST_QUANTUM = false`, bls.rs:80); the aggregate layout is
-//! legacy-only and MUST stay gated on that marker.
+//! keeps counting the Ed25519 list.
 //!
 //! ## 2c. Header-first + body-pull protocol sketch (no wire change yet)
 //! Precedent (read-only): `network.rs:541-590` already splits announcement
@@ -110,9 +102,7 @@
 //!   N=100,  m=5%:   1846 B  (-89.7%)
 //!   N=428,  m=5%:   6700 B  (-91.1%)
 //!   N=1000, m=5%:  15166 B  (-91.4%)
-//! QC bitfield hybrid (BLS-off): +ceil(C/8)+1 B overhead NOW (C=100: +14 B)
-//! QC @BLS activation, C=100: 271 B vs 10457 B (-97.4%)
-//!   (57 fixed + 32 marker + 8 len + 161 envelope + 13 bitfield)
+//! QC bitfield hybrid: +ceil(C/8)+1 B overhead NOW (C=100: +14 B)
 //! ```
 //! Votes are untouched by this design (158 B live path stays).
 //!
@@ -148,7 +138,6 @@ pub const BLOCK_FIXED_BYTES: usize = 350;
 pub const VOTE_MSG_BYTES: usize = 158;
 pub const QC_FIXED_BYTES: usize = 57;
 pub const QC_ED_SIG_ENTRY_BYTES: usize = 104; // 32 id + 8 len + 64 sig
-pub const BLS_ENVELOPE_FIXED_BYTES: usize = 161;
 
 /// Derive a 6-byte short-id: FNV-1a-64 over `salt || txid`, first 6 bytes
 /// LE. PROTOTYPE HASH — production must use
@@ -215,16 +204,10 @@ pub fn compact_proposal_bytes(n_txs: usize, n_missing: usize) -> usize {
     PROPOSAL_FIXED_BYTES + n_txs * SHORT_ID_LEN + n_missing * TX_PLAIN_BYTES
 }
 
-/// Live (BLS-off) QC bytes for `n_sigs` Ed25519 signatures: 57 + 104*k.
+/// Classical-baseline QC bytes for `n_sigs` Ed25519 signatures (refused under
+/// pure PQ; live path is the Falcon µQC envelope, see §1): 57 + 104*k.
 pub fn qc_bytes_ed(n_sigs: usize) -> usize {
     QC_FIXED_BYTES + n_sigs * QC_ED_SIG_ENTRY_BYTES
-}
-
-/// Aggregate-ready QC bytes for a committee of `c` validators at a future
-/// BLS activation: fixed + marker entry (32 id + 8 len + 161 envelope +
-/// ceil(c/8) bitfield). Counted path stays Ed25519 until then.
-pub fn qc_bytes_aggregate_ready(committee: usize) -> usize {
-    QC_FIXED_BYTES + 32 + 8 + BLS_ENVELOPE_FIXED_BYTES + committee.div_ceil(8)
 }
 
 #[cfg(test)]
@@ -306,9 +289,6 @@ mod tests {
         assert_eq!(compact_proposal_bytes(1000, 0), 6366);
         assert_eq!(compact_proposal_bytes(100, 5), 1846);
         assert_eq!(compact_proposal_bytes(1000, 50), 15166);
-        // Aggregate-ready QC @C=100: 57 + 32 + 8 + 161 + 13 = 271.
-        assert_eq!(qc_bytes_aggregate_ready(100), 271);
-        assert_eq!(qc_bytes_aggregate_ready(7), 259);
         // Savings are real and large: compact(1000,0) < 4% of baseline.
         assert!(compact_proposal_bytes(1000, 0) * 100 < baseline_proposal_bytes(1000) * 4);
     }

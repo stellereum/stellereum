@@ -5,7 +5,6 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
 use stellereum::bridge::{SupportedChain, TeleportBridgeEngine, TeleportDepositEvent};
-use stellereum::crypto_privacy::{ConfidentialTransfer, PedersenCommitment, ViewingKey};
 use stellereum::mempool::Mempool;
 use stellereum::oracle::{OracleSafetyEngine, PriceFeedUpdate};
 use stellereum::sharding::Transaction;
@@ -73,37 +72,8 @@ async fn main() {
         }
     }
 
-    // 3. Confidential: negative/inflated transfer via commitment
-    hdr(3, "Confidential: balance-conservation bypass");
-    {
-        let r_in = PedersenCommitment::random_blinding();
-        let r_out = PedersenCommitment::random_blinding();
-        // inputs 100, outputs 200 (creating 100 from nothing)
-        let tx = ConfidentialTransfer::new(
-            vec![PedersenCommitment::commit(100, &r_in)],
-            vec![PedersenCommitment::commit(200, &r_out)],
-            0,
-        );
-        if tx.verify_balance_conservation() {
-            vuln("outputs > inputs accepted");
-        } else {
-            blocked("inflation rejected by conservation check");
-        }
-    }
-
-    // 4. Confidential: viewing-key decryption with wrong key
-    hdr(4, "Confidential: viewing-key forgery");
-    {
-        let vk = ViewingKey::generate();
-        let other = ViewingKey::generate();
-        let r = PedersenCommitment::random_blinding();
-        let payload = ViewingKey::encrypt_amount_for_auditor(&vk.view_pub, 12345, &r).unwrap();
-        if other.decrypt_amount(&payload).is_ok() {
-            vuln("foreign key decrypted payload");
-        } else {
-            blocked("only the holder of the viewing key can decrypt");
-        }
-    }
+    // 3-4. Confidential/viewing-key checks removed with Ristretto deletion
+    // wave (crypto_privacy excised).
 
     // 5. Oracle: negative/low price
     hdr(5, "Oracle: zero/absurd price");

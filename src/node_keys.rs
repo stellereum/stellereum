@@ -97,7 +97,10 @@ pub fn is_encrypted_blob(raw: &[u8]) -> bool {
 }
 
 /// Derive a 32-byte symmetric key from a passphrase and salt using Argon2id.
-pub fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
+///
+/// Returns the key wrapped in [`Zeroizing`] so the KDF output buffer is
+/// wiped on drop: callers never hold a bare `[u8; 32]` copy on the stack.
+pub fn derive_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     let params = argon2::Params::new(KDF_MEM_KIB, KDF_ITERS, KDF_LANES, Some(32))
         .map_err(|e| anyhow!("argon2 params: {e}"))?;
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
@@ -105,7 +108,7 @@ pub fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32]> {
     argon2
         .hash_password_into(passphrase.as_bytes(), salt, &mut *key)
         .map_err(|e| anyhow!("argon2 kdf: {e}"))?;
-    Ok(*key)
+    Ok(key)
 }
 
 /// Verify that directory exists, is not a symbolic link, and on Unix has strict 0700 permissions.
@@ -225,7 +228,7 @@ pub fn set_private_file_perms(path: &Path) -> Result<()> {
 pub fn encrypt_bytes(data: &[u8], passphrase: &str) -> Result<String> {
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
-    let mut key = Zeroizing::new(derive_key(passphrase, &salt)?);
+    let mut key = derive_key(passphrase, &salt)?;
     let mut nonce = [0u8; 24];
     OsRng.fill_bytes(&mut nonce);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key[..]));
@@ -265,7 +268,7 @@ pub fn decrypt_bytes(raw: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
             let salt = hex::decode(parts[0]).map_err(|e| anyhow!("invalid salt hex: {e}"))?;
             let nonce = hex::decode(parts[1]).map_err(|e| anyhow!("invalid nonce hex: {e}"))?;
             let ct = hex::decode(parts[2]).map_err(|e| anyhow!("invalid ciphertext hex: {e}"))?;
-            let mut key = Zeroizing::new(derive_key(pass, &salt)?);
+            let mut key = derive_key(pass, &salt)?;
             let cipher = XChaCha20Poly1305::new(Key::from_slice(&key[..]));
             let plain = cipher
                 .decrypt(XNonce::from_slice(&nonce), ct.as_ref())
@@ -555,14 +558,18 @@ pub fn load_or_generate_falcon_key(path: &Path) -> Result<crate::post_quantum::F
 ///
 /// OPERATIONAL (audit open risk #4): the returned `NodeKeys` (an `infnode`
 /// type with NO `Zeroize` bound — outside this module's reach) holds the
-/// Ed25519 identity seed and the x25519 e2e secret in process heap. There is
-/// no PFS claim on the e2e channel: a heap disclosure (core dump, swap,
+/// Ed25519 identity seed and the ML-KEM-768 seed in process heap. There is
+/// no PFS claim on the KEM channel: a heap disclosure (core dump, swap,
 /// `/proc/<pid>/mem`) exposes both long-term secrets. Operators MUST disable
-/// core dumps and encrypted-swap-or-no-swap on validators; treat the e2e
-/// secret as long-lived (no forward secrecy) in the threat model. What this
+/// core dumps and encrypted-swap-or-no-swap on validators; treat the KEM
+/// seed as long-lived (no forward secrecy) in the threat model. What this
 /// function DOES guarantee: 0700/0600 enforcement fail-closed, Argon2id
 /// decryption with wrong-passphrase rejection, `Zeroizing` for every
 /// transient buffer up to the (un-wipeable) return value.
+///
+/// FULL-PQ: `e2e.key` carries the 64-byte KEM seed (hex). A legacy 32-byte
+/// X25519 `e2e.key` is REFUSED loudly (wipe — never silently accepted as KEM
+/// material, same rule as `infnode::keyring::NodeKeys::load`).
 ///
 /// A plaintext key file still loads (backward compatibility with the keys
 /// already on live nodes) and is transparently re-encrypted in place when a
@@ -595,12 +602,21 @@ pub fn load_node_keys(dir: &Path) -> Result<infnode::keyring::NodeKeys> {
             .try_into()
             .map_err(|_| anyhow!("identity seed must be 32 bytes"))?,
     );
-    let e2e_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-        hex::decode(e2e_str)
-            .map_err(|e| anyhow!("e2e key hex: {e}"))?
-            .try_into()
-            .map_err(|_| anyhow!("e2e seed must be 32 bytes"))?,
+    let e2e_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
+        hex::decode(e2e_str).map_err(|e| anyhow!("e2e key hex: {e}"))?,
     );
+    if e2e_bytes.len() == 32 {
+        // Wipe-compat: a 32-byte seed is the pre-PQ X25519 static secret —
+        // refused loudly, never silently accepted as KEM material.
+        anyhow::bail!(
+            "e2e.key: legacy x25519 key refused (FULL-PQ wipe: delete e2e.key and restart to generate a KEM key)"
+        );
+    }
+    let kem_seed: [u8; infnode::mailbox::KEM_SEED_LEN] = e2e_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("e2e kem seed must be 64 bytes"))?;
+    let kem_ek = infnode::mailbox::kem_ek_from_seed(&kem_seed);
 
     for (path, raw, plain) in [
         (&id_path, &id_raw, &id_plain),
@@ -626,14 +642,12 @@ pub fn load_node_keys(dir: &Path) -> Result<infnode::keyring::NodeKeys> {
 
     let signing = ed25519_dalek::SigningKey::from_bytes(&id_bytes);
     let verifying = signing.verifying_key();
-    let e2e_sec = x25519_dalek::StaticSecret::from(*e2e_bytes);
-    let e2e_pub = x25519_dalek::PublicKey::from(&e2e_sec);
 
     Ok(infnode::keyring::NodeKeys {
         signing,
         verifying,
-        e2e_sec,
-        e2e_pub,
+        kem_seed,
+        kem_ek,
     })
 }
 
@@ -652,7 +666,7 @@ pub fn load_node_keys(dir: &Path) -> Result<infnode::keyring::NodeKeys> {
 pub fn save_node_keys(dir: &Path, keys: &infnode::keyring::NodeKeys) -> Result<()> {
     ensure_secure_dir(dir)?;
     let id_hex = Zeroizing::new(hex::encode(keys.signing.to_bytes()));
-    let e2e_hex = Zeroizing::new(hex::encode(keys.e2e_sec.to_bytes()));
+    let e2e_hex = Zeroizing::new(hex::encode(keys.kem_seed));
 
     let (id_blob, e2e_blob): (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>) = if plaintext_keys_allowed()
     {
@@ -913,8 +927,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Existing PLAINTEXT keys (live nodes) keep loading, and are transparently
-    /// re-encrypted in place once a passphrase is available.
+    /// Existing PLAINTEXT keys keep loading, and are transparently
+    /// re-encrypted in place once a passphrase is available. (FULL-PQ: this
+    /// covers 64-byte KEM-seed plaintext; a legacy 32-byte X25519 plaintext
+    /// is refused — see `legacy_x25519_e2e_key_is_refused_loudly`.)
     #[test]
     fn plaintext_key_still_loads_and_is_upgraded() {
         let _g = env_lock();
@@ -924,7 +940,7 @@ mod tests {
         let keys = infnode::keyring::NodeKeys::generate();
         let pub_bytes = keys.signing.verifying_key().to_bytes();
         let id_hex = hex::encode(keys.signing.to_bytes());
-        let e2e_hex = hex::encode(keys.e2e_sec.to_bytes());
+        let e2e_hex = hex::encode(keys.kem_seed);
 
         // Exactly what the live nodes have on disk: raw hex, 0600.
         write_plaintext_key(&dir.join("identity.key"), id_hex.as_bytes());
@@ -958,6 +974,57 @@ mod tests {
         // And it still loads as the very same identity.
         let reloaded = load_node_keys(&dir).expect("reload upgraded key");
         assert_eq!(reloaded.signing.verifying_key().to_bytes(), pub_bytes);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FULL-PQ wipe: a legacy 32-byte X25519 `e2e.key` (exactly what the
+    /// pre-PQ nodes have on disk) is REFUSED loudly — never silently
+    /// accepted as KEM material. The operator deletes the file and restarts
+    /// to generate a KEM key.
+    #[test]
+    fn legacy_x25519_e2e_key_is_refused_loudly() {
+        let _g = env_lock();
+        let _env = EnvGuard::new();
+
+        let dir = temp_dir("legacy_refuse");
+        let keys = infnode::keyring::NodeKeys::generate();
+        let id_hex = hex::encode(keys.signing.to_bytes());
+        write_plaintext_key(&dir.join("identity.key"), id_hex.as_bytes());
+        // Pre-PQ shape: 32-byte X25519 static secret, raw hex.
+        write_plaintext_key(&dir.join("e2e.key"), hex::encode([0x77u8; 32]).as_bytes());
+
+        let err = match load_node_keys(&dir) {
+            Err(e) => e,
+            Ok(_) => panic!("legacy x25519 e2e.key must be refused"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("legacy x25519 key refused"),
+            "refusal must name the cause, got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The KEM seed round-trips through save/load and the encapsulation key
+    /// is re-derived deterministically from it (never stored).
+    #[test]
+    fn kem_seed_roundtrips_and_ek_is_derived() {
+        let _g = env_lock();
+        let _env = EnvGuard::new();
+        std::env::set_var(ENV_PASSPHRASE, "kem-roundtrip");
+
+        let dir = temp_dir("kem_rt");
+        let keys = infnode::keyring::NodeKeys::generate();
+        save_node_keys(&dir, &keys).expect("save KEM keys");
+        let loaded = load_node_keys(&dir).expect("reload KEM keys");
+        assert_eq!(loaded.kem_seed, keys.kem_seed, "KEM seed must round-trip");
+        assert_eq!(
+            loaded.kem_ek,
+            infnode::mailbox::kem_ek_from_seed(&keys.kem_seed),
+            "ek must re-derive from the seed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1124,7 +1191,7 @@ mod tests {
         let keys = infnode::keyring::NodeKeys::generate();
         let pub_bytes = keys.signing.verifying_key().to_bytes();
         let id_hex = hex::encode(keys.signing.to_bytes());
-        let e2e_hex = hex::encode(keys.e2e_sec.to_bytes());
+        let e2e_hex = hex::encode(keys.kem_seed);
         write_plaintext_key(&dir.join("identity.key"), id_hex.as_bytes());
         write_plaintext_key(&dir.join("e2e.key"), e2e_hex.as_bytes());
 
@@ -1205,7 +1272,7 @@ mod tests {
         let dir = temp_dir("perms");
         let keys = infnode::keyring::NodeKeys::generate();
         let id_hex = hex::encode(keys.signing.to_bytes());
-        let e2e_hex = hex::encode(keys.e2e_sec.to_bytes());
+        let e2e_hex = hex::encode(keys.kem_seed);
         write_plaintext_key(&dir.join("identity.key"), id_hex.as_bytes());
         write_plaintext_key(&dir.join("e2e.key"), e2e_hex.as_bytes());
         #[cfg(unix)]

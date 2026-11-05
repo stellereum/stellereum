@@ -178,20 +178,8 @@ fn syscall_charges_match_the_priced_table() {
         OpCode::SysCallPmmSell { stell_nano: 1 },
         OpCode::SysCallPublishSessionGrant(Box::new(session_grant())),
         OpCode::SysCallBridge(Box::new(bridge_intent())),
-        // V1 confidential deliberately ABSENT (audit 2026-10-06 F-A): the arm
-        // is disabled and charges nothing — pinning a charge would re-bless it.
-        OpCode::SysCallConfidentialTransfer2 {
-            recipient: [4u8; 32],
-            transfer: Box::new(confidential_transfer()),
-            input_ranges: vec![],
-            output_ranges: vec![],
-        },
-        OpCode::SysCallConfidentialShield {
-            commitment: [0u8; 32],
-            amount: 1,
-            blinding: [0u8; 32],
-        },
-        OpCode::SysCallConfidentialUnshield { inputs: vec![] },
+        // PQ excision: confidential ops (Transfer2/Shield/Unshield) removed
+        // with Ristretto — no charge to pin.
         OpCode::SysCallActorSend {
             recipient: [5u8; 32],
             value: 1,
@@ -461,8 +449,4 @@ fn session_grant() -> stellereum::zkml::SessionKeyAuthorization {
 
 fn bridge_intent() -> stellereum::bridge::BridgeIntent {
     stellereum::bridge::BridgeIntent::Release { req_id: 1 }
-}
-
-fn confidential_transfer() -> stellereum::crypto_privacy::ConfidentialTransfer {
-    stellereum::crypto_privacy::ConfidentialTransfer::new(vec![], vec![], 0)
 }

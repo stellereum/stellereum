@@ -20,18 +20,53 @@
 //!
 //! All three tests are local policy only: height/acceptance untouched.
 
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
+use std::sync::atomic::{AtomicU8, Ordering};
 use stellereum::mempool::{Mempool, MempoolError};
+use stellereum::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
 use stellereum::sharding::Transaction;
 
-fn key() -> SigningKey {
-    SigningKey::generate(&mut OsRng)
+static NEXT_SEED: AtomicU8 = AtomicU8::new(0xC0);
+
+fn key() -> u8 {
+    NEXT_SEED.fetch_add(1, Ordering::Relaxed)
+}
+
+fn addr(seed: &u8) -> [u8; 32] {
+    derive_pq_address(
+        PqScheme::Falcon512,
+        &Transaction::sample_falcon512_pubkey(*seed),
+        &DEFAULT_SALT,
+    )
 }
 
 /// amount 100 + fee 1_000 => cost 1_100 per tx.
-fn tx(sk: &SigningKey, fee: u64, nonce: u64) -> Transaction {
-    Transaction::sign(sk, [1u8; 32], 100, fee, nonce, 1, 1)
+/// FULL-PQ: implicit Falcon-512 (registered globally; no surcharge).
+fn tx(seed: &u8, fee: u64, nonce: u64) -> Transaction {
+    txa(seed, [1u8; 32], 100, fee, nonce)
+}
+
+fn txa(seed: &u8, to: [u8; 32], amount: u64, fee: u64, nonce: u64) -> Transaction {
+    let pk = Transaction::sample_falcon512_pubkey(*seed);
+    let from = addr(seed);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: fee,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, *seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 const TX_COST: u64 = 100 + 1_000;
@@ -40,7 +75,7 @@ const TX_COST: u64 = 100 + 1_000;
 fn squat_256_with_one_funding_is_refused() {
     // One funding covering exactly 2 txs must not back 256 per-sender slots.
     let sk = key();
-    let me = sk.verifying_key().to_bytes();
+    let me = addr(&sk);
     let mut mp = Mempool::new(1024, 256);
     let balance = 2 * TX_COST;
 
@@ -77,11 +112,8 @@ fn full_pool_churn_costs_a_gentle_premium() {
     let mut mp = Mempool::new(4, 100);
     for _ in 0..4u64 {
         let k = key();
-        mp.add_checked(
-            Transaction::sign(&k, [1u8; 32], 10, 100, 0, 1, 1),
-            1_000_000,
-        )
-        .unwrap();
+        mp.add_checked(txa(&k, [1u8; 32], 10, 100, 0), 1_000_000)
+            .unwrap();
     }
     assert_eq!(mp.len(), 4);
 
@@ -89,18 +121,12 @@ fn full_pool_churn_costs_a_gentle_premium() {
     let rich = 1_000_000u64;
     // fee+1 (the old churn price) no longer displaces anything...
     assert_eq!(
-        mp.add_checked(
-            Transaction::sign(&attacker, [2u8; 32], 10, 101, 0, 1, 1),
-            rich
-        ),
+        mp.add_checked(txa(&attacker, [2u8; 32], 10, 101, 0), rich),
         Err(MempoolError::Full)
     );
     // ...nor does anything below the premium (104 < 100 + ceil(100/20) = 105)...
     assert_eq!(
-        mp.add_checked(
-            Transaction::sign(&attacker, [2u8; 32], 10, 104, 0, 1, 1),
-            rich
-        ),
+        mp.add_checked(txa(&attacker, [2u8; 32], 10, 104, 0), rich),
         Err(MempoolError::Full)
     );
     assert_eq!(mp.len(), 4, "pool untouched by sub-premium bids");
@@ -112,11 +138,8 @@ fn full_pool_churn_costs_a_gentle_premium() {
     // the old 2x rule, locking every honest transaction out for good).
     let mut attacker_fees = 0u64;
     for n in 0..4u64 {
-        mp.add_checked(
-            Transaction::sign(&attacker, [2u8; 32], 10, 105, n, 1, 1),
-            rich,
-        )
-        .unwrap_or_else(|e| panic!("premium bid at step {n} must evict: {e:?}"));
+        mp.add_checked(txa(&attacker, [2u8; 32], 10, 105, n), rich)
+            .unwrap_or_else(|e| panic!("premium bid at step {n} must evict: {e:?}"));
         attacker_fees += 105;
     }
     assert_eq!(mp.len(), 4);
@@ -149,11 +172,8 @@ fn honest_burst_is_unaffected() {
         let balance = 20 * (100 + 1_002) + 50_000;
         for n in 0..20u64 {
             let fee = 1_000 + (n % 3); // small honest fee jitter
-            mp.add_checked(
-                Transaction::sign(&kk, [9u8; 32], 100, fee, n, 1, 1),
-                balance,
-            )
-            .unwrap_or_else(|e| panic!("honest burst tx n={n} refused: {e:?}"));
+            mp.add_checked(txa(&kk, [9u8; 32], 100, fee, n), balance)
+                .unwrap_or_else(|e| panic!("honest burst tx n={n} refused: {e:?}"));
         }
     }
     assert_eq!(mp.len(), 200, "whole honest burst must be pooled");

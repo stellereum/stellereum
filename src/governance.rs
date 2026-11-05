@@ -36,6 +36,28 @@ pub const GOVERNANCE_QUORUM_FLOOR_BPS: u64 = 3_333;
 pub const GOVERNANCE_VOTING_PERIOD_SECS: u64 = 3 * 24 * 3600; // 3 days
 /// Minimum stake required to submit a proposal (10,000 STELL), in bps-free nano.
 pub const PROPOSAL_MIN_STAKE_NANO: u64 = 10_000 * 1_000_000_000;
+/// Timelock delay in heights between a proposal passing and its execution
+/// (KI-23 fix: voted proposals no longer execute immediately).
+///
+/// A passed proposal schedules execution at `pass_height +
+/// GOV_TIMELOCK_HEIGHTS`; execution before maturity REFUSES fail-closed
+/// (`GovError::Timelocked`, proposal stays `Passed`). Query via
+/// [`Governance::executable_height_of`] / [`Governance::is_mature`]
+/// (and `get` status `Passed` = pending).
+///
+/// Choice: 7,200 heights ≈ 6 h at 3 s blocks — the SAME exit-window
+/// philosophy as [`crate::staking::COMMISSION_EFFECT_DELAY_HEIGHTS`]
+/// (delegators get a window to exit before a commission raise lands; here
+/// the chain gets a window to react before a passed action lands).
+/// Deterministic const, never env (consensus: every node applying the same
+/// blocks must reach the same maturity; an env knob would fork the chain).
+///
+/// There is deliberately NO emergency bypass in this module (out of scope;
+/// reported as follow-up).
+///
+/// FREEZE (protocol freeze 2026-11-03 style): 7,200 heights, never env.
+/// Change requires spec update + audit note (AGENTS.md §7).
+pub const GOV_TIMELOCK_HEIGHTS: u64 = 7_200;
 
 const BPS: u128 = 10_000;
 /// Basis points as u64 for parameter bounds checks.
@@ -84,6 +106,19 @@ pub enum GovError {
     NotPassed,
     AlreadyExecuted,
     InvalidAction,
+    /// KI-23 timelock: the proposal passed but its executable height has not
+    /// been reached. Fail-closed; the proposal stays `Passed`.
+    Timelocked,
+    /// Operator-signed governance identity: the ingest path requires a wallet
+    /// signature and none was supplied. Fail-closed; the legacy unsigned path
+    /// is refused except behind the dev-test escape.
+    MissingSignature,
+    /// The supplied governance signature does not verify against the claimed
+    /// proposer/voter staking key (wrong key, tampered bytes, or wrong chain).
+    BadSignature,
+    /// The proposal nonce was already consumed by this proposer. Fail-closed;
+    /// the caller must mint a fresh nonce and re-sign.
+    ReplayedNonce,
 }
 
 impl std::fmt::Display for GovError {
@@ -97,6 +132,14 @@ impl std::fmt::Display for GovError {
             GovError::AlreadyVoted => "already voted on this proposal",
             GovError::NotPassed => "proposal has not passed",
             GovError::AlreadyExecuted => "proposal already executed",
+            GovError::Timelocked =>
+                "proposal timelock has not matured (execution refused fail-closed)",
+            GovError::MissingSignature =>
+                "missing governance signature (operator-signed identity required: pass 'signature' over (chain_id || action || nonce))",
+            GovError::BadSignature =>
+                "invalid governance signature (not verifiable against the claimed staking key)",
+            GovError::ReplayedNonce =>
+                "replayed governance nonce (this proposer already consumed this nonce; mint a fresh one)",
             // Names every propose/execute bound (E5 quorum floor 3333 bps,
             // E4 title/signal caps, E6 non-zero publisher) so a rejected
             // action explains the rule at both propose-time and execute-time.
@@ -507,6 +550,32 @@ pub struct Governance {
     pub quorum_bps: u64,
     /// Applied parameter values (last executed action wins).
     pub applied: AppliedParams,
+    /// KI-23 timelock schedule: proposal id -> executable height
+    /// (`pass_height + GOV_TIMELOCK_HEIGHTS`).
+    ///
+    /// Set on the Passed transition by `finalize_at_height` ONLY. No entry
+    /// means unscheduled: Open/Rejected, or a pre-timelock Passed migrated
+    /// from storage (executes immediately via either path — one-time
+    /// migration, not a bypass: all NEW passes schedule `Some`).
+    /// Kept (not drained) after execution as the audit trail of when the
+    /// proposal became executable. `#[serde(default)]` so persisted state
+    /// without this map loads with no maturities (legacy immediate).
+    #[serde(default)]
+    pub timelocks: HashMap<u64, u64>,
+    /// Consumed operator-signature proposal nonces: (proposer, nonce).
+    ///
+    /// Replay protection for the signed propose path (`propose_signed`):
+    /// a signature binds (chain_id || proposer || title || action || nonce),
+    /// and the nonce is consumed here on success, so a captured envelope can
+    /// never open a second proposal. Votes need no nonce: they are
+    /// proposal-scoped (one vote per voter per proposal, see `vote`), so a
+    /// replayed vote envelope is idempotent-or-refused, never double-counted.
+    /// `#[serde(default)]` so pre-signature storage loads with an empty set
+    /// (exact: no signed nonce existed before this path, nothing to replay).
+    /// Deliberately NOT in the commitment digest: admission replay state, not
+    /// tally state (same precedent as `timelocks`).
+    #[serde(default)]
+    pub gov_propose_nonces: std::collections::HashSet<([u8; 32], u64)>,
 }
 
 /// Coordinated software upgrade plan.
@@ -825,6 +894,8 @@ impl Governance {
             next_id: 1,
             quorum_bps: GOVERNANCE_QUORUM_BPS,
             applied: AppliedParams::default(),
+            timelocks: HashMap::new(),
+            gov_propose_nonces: std::collections::HashSet::new(),
         }
     }
 
@@ -901,7 +972,7 @@ impl Governance {
                 title,
                 action,
                 created_at: now,
-                voting_end: now + GOVERNANCE_VOTING_PERIOD_SECS,
+                voting_end: now.saturating_add(GOVERNANCE_VOTING_PERIOD_SECS),
                 yes: 0,
                 no: 0,
                 abstain: 0,
@@ -941,7 +1012,15 @@ impl Governance {
         if now >= p.voting_end {
             return Err(GovError::VotingClosed);
         }
-        if p.voters.contains_key(&voter) {
+        // Vote-equivocation philosophy (never slash, deterministic outcome):
+        // a replayed vote with the SAME choice is idempotent (returns the
+        // recorded weight, touches neither the tally nor the staking lock —
+        // a replay can never double-count). A DIFFERENT choice is refused
+        // (first choice wins); flipping is not supported.
+        if let Some(prev) = p.voters.get(&voter) {
+            if *prev == choice {
+                return Ok(p.weights.get(&voter).copied().unwrap_or(0));
+            }
             return Err(GovError::AlreadyVoted);
         }
         // Voting weight = the stake THIS voter actually owns:
@@ -989,6 +1068,157 @@ impl Governance {
         Ok(weight)
     }
 
+    // =======================================================================
+    // OPERATOR-SIGNED GOVERNANCE IDENTITY (ingest-path entry validation).
+    //
+    // A proposal/vote envelope carries a wallet signature over a
+    // chain-bound, length-framed message. Verification binds the envelope to
+    // the SAME staking key whose stake is locked/voted:
+    //   * the envelope's claimed address must EQUAL the proposer/voter, and
+    //   * that address must hold stake in the ledger snapshot the tally
+    //     reads (propose gate / vote snapshot, enforced by `propose`/`vote`
+    //     themselves — a signature from a stakeless key verifies but still
+    //     lands on `NotStaker`, so the check is never theater);
+    //   * the wallet preimage itself binds `chain_id`, so a testnet envelope
+    //     never verifies on another chain.
+    // No new crypto: envelopes are `crate::wallet_signing::WalletSignature`
+    // (Ed25519/Falcon-512/Hybrid), verified by `verify_message`.
+    // =======================================================================
+
+    /// Domain tag for signed proposal envelopes (framing prefix only; the
+    /// chain binding comes from the wallet preimage).
+    pub const GOV_PROPOSE_TAG: &[u8] = b"STELL-GOV-PROPOSE-V1";
+    /// Domain tag for signed vote envelopes.
+    pub const GOV_VOTE_TAG: &[u8] = b"STELL-GOV-VOTE-V1";
+
+    /// Canonical bytes the proposer signs:
+    /// `TAG || 0x00 || chain_id BE || proposer || nonce BE || title || action`.
+    /// Length-framed (no `a||b` vs `ab` ambiguity); the action is the
+    /// canonical JSON of the EXACT `GovAction` the node will apply, so any
+    /// tampered parameter invalidates the envelope.
+    pub fn gov_propose_message(
+        chain_id: u64,
+        proposer: &[u8; 32],
+        title: &str,
+        action: &GovAction,
+        nonce: u64,
+    ) -> Vec<u8> {
+        let action_json = crate::wallet_signing::canonical_json(
+            &serde_json::to_value(action).unwrap_or(serde_json::Value::Null),
+        );
+        let mut out = Vec::with_capacity(
+            Self::GOV_PROPOSE_TAG.len()
+                + 1
+                + 8
+                + 32
+                + 8
+                + 8
+                + title.len()
+                + 8
+                + action_json.len(),
+        );
+        out.extend_from_slice(Self::GOV_PROPOSE_TAG);
+        out.push(0x00);
+        out.extend_from_slice(&chain_id.to_be_bytes());
+        out.extend_from_slice(proposer);
+        out.extend_from_slice(&nonce.to_be_bytes());
+        out.extend_from_slice(&(title.len() as u64).to_be_bytes());
+        out.extend_from_slice(title.as_bytes());
+        out.extend_from_slice(&(action_json.len() as u64).to_be_bytes());
+        out.extend_from_slice(action_json.as_bytes());
+        out
+    }
+
+    /// Canonical bytes the voter signs:
+    /// `TAG || 0x00 || chain_id BE || proposal_id BE || choice || voter`.
+    /// Proposal-scoped by construction: the envelope names its proposal, so
+    /// cross-proposal replay is impossible and same-proposal replay is
+    /// idempotent-or-refused via the voters map (no nonce store needed).
+    pub fn gov_vote_message(
+        chain_id: u64,
+        proposal_id: u64,
+        choice: VoteChoice,
+        voter: &[u8; 32],
+    ) -> Vec<u8> {
+        let choice_byte = match choice {
+            VoteChoice::Yes => 0u8,
+            VoteChoice::No => 1u8,
+            VoteChoice::Abstain => 2u8,
+        };
+        let mut out = Vec::with_capacity(Self::GOV_VOTE_TAG.len() + 1 + 8 + 8 + 1 + 32);
+        out.extend_from_slice(Self::GOV_VOTE_TAG);
+        out.push(0x00);
+        out.extend_from_slice(&chain_id.to_be_bytes());
+        out.extend_from_slice(&proposal_id.to_be_bytes());
+        out.push(choice_byte);
+        out.extend_from_slice(voter);
+        out
+    }
+
+    /// Whether `(proposer, nonce)` was already consumed by a signed proposal.
+    pub fn propose_nonce_used(&self, proposer: &[u8; 32], nonce: u64) -> bool {
+        self.gov_propose_nonces.contains(&(*proposer, nonce))
+    }
+
+    /// Submit a proposal with operator-signed identity. Verifies the envelope
+    /// against the claimed proposer staking key, consumes the nonce, then
+    /// delegates to [`Governance::propose`] (stake gates and tally paths
+    /// unchanged). The nonce is consumed ONLY on success, so a refused
+    /// proposal (bad stake, bad action) does not burn the caller's nonce.
+    #[allow(clippy::too_many_arguments)]
+    // GATE: signed propose needs identity + envelope + ledger context; callers pass them explicitly.
+    pub fn propose_signed(
+        &mut self,
+        ledger: &mut StakingLedger,
+        proposer: ValidatorId,
+        title: String,
+        action: GovAction,
+        now: u64,
+        chain_id: u64,
+        nonce: u64,
+        sig: &crate::wallet_signing::WalletSignature,
+    ) -> Result<u64, GovError> {
+        if sig.claimed_address() != proposer {
+            return Err(GovError::BadSignature);
+        }
+        let message = Self::gov_propose_message(chain_id, &proposer, &title, &action, nonce);
+        if !crate::wallet_signing::verify_message(&proposer, chain_id, &message, sig) {
+            return Err(GovError::BadSignature);
+        }
+        if self.propose_nonce_used(&proposer, nonce) {
+            return Err(GovError::ReplayedNonce);
+        }
+        let id = self.propose(ledger, proposer, title, action, now)?;
+        self.gov_propose_nonces.insert((proposer, nonce));
+        Ok(id)
+    }
+
+    /// Cast a vote with operator-signed identity. Verifies the envelope
+    /// against the claimed voter staking key, then delegates to
+    /// [`Governance::vote`] (weight snapshot, tally, and lock paths
+    /// unchanged — including same-choice idempotency).
+    #[allow(clippy::too_many_arguments)]
+    // GATE: signed vote needs identity + envelope + ledger context; callers pass them explicitly.
+    pub fn vote_signed(
+        &mut self,
+        ledger: &mut StakingLedger,
+        voter: [u8; 32],
+        proposal_id: u64,
+        choice: VoteChoice,
+        now: u64,
+        chain_id: u64,
+        sig: &crate::wallet_signing::WalletSignature,
+    ) -> Result<u128, GovError> {
+        if sig.claimed_address() != voter {
+            return Err(GovError::BadSignature);
+        }
+        let message = Self::gov_vote_message(chain_id, proposal_id, choice, &voter);
+        if !crate::wallet_signing::verify_message(&voter, chain_id, &message, sig) {
+            return Err(GovError::BadSignature);
+        }
+        self.vote(ledger, voter, proposal_id, choice, now)
+    }
+
     /// Finalize a proposal after voting ends. Turnout must meet the quorum
     /// and yes must strictly exceed no.
     ///
@@ -1011,6 +1241,41 @@ impl Governance {
         ledger: &mut StakingLedger,
         proposal_id: u64,
         now: u64,
+    ) -> Result<ProposalStatus, GovError> {
+        // Legacy path (pre-timelock): no height supplied, so no maturity is
+        // scheduled (`timelocks` stays empty for this proposal and `execute`
+        // allows immediate execution). Kept so existing callers/tests pinning
+        // vote/tally behavior stay byte-identical; NEW passes must use
+        // `finalize_at_height` so execution is timelocked (KI-23).
+        // Vote/quorum/tally math below is UNCHANGED.
+        self.finalize_inner(ledger, proposal_id, now, None)
+    }
+
+    /// Finalize a proposal after voting ends AND schedule its timelock.
+    ///
+    /// Vote/quorum/tally math is byte-identical to [`Governance::finalize`]
+    /// (turnout >= frozen quorum, yes > no, non-zero decisive turnout; locks
+    /// released exactly once on the terminal transition). On the
+    /// Open -> Passed transition ONLY, records
+    /// `timelocks[id] = cur_height.saturating_add(GOV_TIMELOCK_HEIGHTS)`;
+    /// Rejected schedules nothing. Re-finalize of a non-Open proposal
+    /// early-returns WITHOUT touching an existing schedule (idempotent).
+    pub fn finalize_at_height(
+        &mut self,
+        ledger: &mut StakingLedger,
+        proposal_id: u64,
+        now: u64,
+        cur_height: u64,
+    ) -> Result<ProposalStatus, GovError> {
+        self.finalize_inner(ledger, proposal_id, now, Some(cur_height))
+    }
+
+    fn finalize_inner(
+        &mut self,
+        ledger: &mut StakingLedger,
+        proposal_id: u64,
+        now: u64,
+        cur_height: Option<u64>,
     ) -> Result<ProposalStatus, GovError> {
         // Read the gating fields first so the terminal transition below is
         // the single writer (the borrow ends before any unlock call).
@@ -1038,6 +1303,15 @@ impl Governance {
         } else {
             ProposalStatus::Rejected
         };
+        // KI-23: schedule the timelock on the Passed transition only, when a
+        // height was supplied. Saturating: near-u64::MAX maturity clamps,
+        // never wraps.
+        if p.status == ProposalStatus::Passed {
+            if let Some(h) = cur_height {
+                self.timelocks
+                    .insert(proposal_id, h.saturating_add(GOV_TIMELOCK_HEIGHTS));
+            }
+        }
         // E7: release every lock exactly once. This is the only transition
         // out of `Open` (re-finalize early-returns above), so no voter can
         // be unlocked twice and no lock can survive its proposal.
@@ -1058,8 +1332,17 @@ impl Governance {
     /// a passed proposal (no proposer-only gate, so a lost/rotated proposer key
     /// cannot brick execution).
     ///
-    /// NOTE (E5): no timelock by deferred design decision — execution is
-    /// allowed as soon as the proposal has passed (finalized).
+    /// KI-23 TIMELOCK (replaces the E5 "no timelock by deferred design
+    /// decision"): a proposal scheduled via `finalize_at_height` REFUSES
+    /// execution before `executable_height_of(id)` (fail-closed
+    /// `Timelocked`, stays `Passed`). This legacy `execute` supplies NO
+    /// height, so a scheduled proposal ALWAYS refuses here — callers MUST use
+    /// `execute_at_height` with the current chain height. An UNSCHEDULED
+    /// Passed (legacy `finalize`, or pre-timelock storage with no `timelocks`
+    /// entry) executes immediately (one-time migration, not a bypass).
+    ///
+    /// There is deliberately NO emergency bypass in this module (out of
+    /// scope; reported as follow-up).
     ///
     /// Oracle actions cannot be reached from here: the oracle is a separate
     /// committed domain. Passing one fails closed with `InvalidAction` and
@@ -1072,7 +1355,20 @@ impl Governance {
         executor: [u8; 32],
         proposal_id: u64,
     ) -> Result<&AppliedParams, GovError> {
-        self.execute_inner(executor, proposal_id, None)
+        self.execute_inner(executor, proposal_id, None, None)
+    }
+
+    /// Execute a passed proposal at the current chain height, enforcing the
+    /// KI-23 timelock: before `executable_height_of(id)` refuses fail-closed
+    /// (`Timelocked`, stays `Passed`); at/after maturity applies exactly once.
+    /// Anyone may execute (no proposer-only gate).
+    pub fn execute_at_height(
+        &mut self,
+        executor: [u8; 32],
+        proposal_id: u64,
+        cur_height: u64,
+    ) -> Result<&AppliedParams, GovError> {
+        self.execute_inner(executor, proposal_id, None, Some(cur_height))
     }
 
     /// Execute a passed proposal whose action ALSO moves committed oracle state
@@ -1084,13 +1380,55 @@ impl Governance {
     /// same passed proposal against the same starting oracle lands on the same
     /// subsequent state root, and no node can apply the governance half without
     /// the oracle half.
+    ///
+    /// Timelock: same rule as [`Governance::execute`] — a scheduled proposal
+    /// refuses without a height (use `execute_with_oracle_at_height`).
     pub fn execute_with_oracle(
         &mut self,
         executor: [u8; 32],
         proposal_id: u64,
         oracle: &mut crate::oracle::OracleState,
     ) -> Result<&AppliedParams, GovError> {
-        self.execute_inner(executor, proposal_id, Some(oracle))
+        self.execute_inner(executor, proposal_id, Some(oracle), None)
+    }
+
+    /// Oracle-aware execution at the current chain height (timelock-enforcing;
+    /// see [`Governance::execute_at_height`]).
+    pub fn execute_with_oracle_at_height(
+        &mut self,
+        executor: [u8; 32],
+        proposal_id: u64,
+        oracle: &mut crate::oracle::OracleState,
+        cur_height: u64,
+    ) -> Result<&AppliedParams, GovError> {
+        self.execute_inner(executor, proposal_id, Some(oracle), Some(cur_height))
+    }
+
+    /// Height at which a passed proposal becomes executable, if scheduled.
+    ///
+    /// `None` = unscheduled (Open/Rejected, or pre-timelock Passed with no
+    /// `timelocks` entry — executes immediately as the one-time migration).
+    /// Query surface for the timelock alongside `get(id).status == Passed`
+    /// (= pending execution).
+    pub fn executable_height_of(&self, proposal_id: u64) -> Option<u64> {
+        self.timelocks.get(&proposal_id).copied()
+    }
+
+    /// Whether `proposal_id` may execute at `cur_height`.
+    ///
+    /// Unscheduled Passed (no entry) counts as mature (legacy immediate);
+    /// non-Passed never counts as mature. Executed counts as mature only if
+    /// its recorded height is reached (history queries stay truthful).
+    pub fn is_mature(&self, proposal_id: u64, cur_height: u64) -> bool {
+        let status = self.proposals.get(&proposal_id).map(|p| p.status);
+        match status {
+            Some(ProposalStatus::Passed) | Some(ProposalStatus::Executed) => {}
+            _ => return false,
+        }
+        match self.timelocks.get(&proposal_id) {
+            Some(m) => cur_height >= *m,
+            None => true,
+        }
     }
 
     fn execute_inner(
@@ -1098,14 +1436,40 @@ impl Governance {
         _executor: [u8; 32],
         proposal_id: u64,
         mut oracle: Option<&mut crate::oracle::OracleState>,
+        cur_height: Option<u64>,
     ) -> Result<&AppliedParams, GovError> {
+        // KI-23 gate FIRST (before any domain write): a scheduled proposal
+        // refuses without/at-before maturity, fail-closed, staying `Passed`.
+        // `None` height (legacy `execute`) refuses whenever an entry exists;
+        // `None` entry (legacy `finalize` / pre-timelock storage) is the
+        // one-time migration and proceeds immediately.
+        if let Some(maturity) = self.timelocks.get(&proposal_id).copied() {
+            let mature = match cur_height {
+                Some(h) => h >= maturity,
+                None => false,
+            };
+            if !mature {
+                // Existence + status checked below for the exact error
+                // (`UnknownProposal` / `AlreadyExecuted` / `NotPassed` win
+                // over `Timelocked` when the proposal is not in `Passed`).
+                let status = self.proposals.get(&proposal_id).map(|p| p.status);
+                match status {
+                    Some(ProposalStatus::Passed) => return Err(GovError::Timelocked),
+                    Some(ProposalStatus::Executed) => {
+                        return Err(GovError::AlreadyExecuted)
+                    }
+                    Some(_) => return Err(GovError::NotPassed),
+                    None => return Err(GovError::UnknownProposal),
+                }
+            }
+        }
         let p = self
             .proposals
             .get_mut(&proposal_id)
             .ok_or(GovError::UnknownProposal)?;
         // E5: anyone-can-execute — no `p.proposer == executor` (`NotProposer`)
         // gate, so a lost/rotated proposer key cannot brick a passed proposal.
-        // NOTE: no timelock by deferred design decision.
+        // KI-23: maturity enforced above; reaching here means mature-or-legacy.
         match p.status {
             ProposalStatus::Passed => {}
             ProposalStatus::Executed => return Err(GovError::AlreadyExecuted),
@@ -1200,6 +1564,9 @@ impl Governance {
                     .register_publisher(pk);
             }
             GovAction::UnregisterOraclePublisher(pk) => {
+                if pk == [0u8; 32] {
+                    return Err(GovError::InvalidAction);
+                }
                 oracle
                     .as_deref_mut()
                     .ok_or(GovError::InvalidAction)?
@@ -1529,6 +1896,200 @@ mod tests {
                 GOVERNANCE_VOTING_PERIOD_SECS + 1
             ),
             Err(GovError::VotingClosed)
+        );
+    }
+
+    /// Same-choice vote replay is idempotent: the recorded weight is
+    /// returned, the tally does not move, and the staking lock is not
+    /// topped up (a replay can never double-count). A different choice is
+    /// refused (first choice wins) — the vote-equivocation philosophy: never
+    /// slash, deterministic outcome.
+    #[test]
+    fn vote_same_choice_replay_is_idempotent() {
+        let (mut l, ids) = ledger_with(2, 10_000);
+        let mut g = Governance::new();
+        let id = g
+            .propose(&mut l, ids[0], "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
+        let w1 = g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
+        let yes_before = g.proposals.get(&id).unwrap().yes;
+        let lock_before = l.locked_governance_of(&ids[0]);
+        // Replay the identical vote: idempotent success, same weight.
+        let w2 = g.vote(&mut l, ids[0], id, VoteChoice::Yes, 1).unwrap();
+        assert_eq!(w1, w2, "replay must return the recorded weight");
+        let p = g.proposals.get(&id).unwrap();
+        assert_eq!(p.yes, yes_before, "replay must not move the tally");
+        assert_eq!(p.no, 0);
+        assert_eq!(
+            l.locked_governance_of(&ids[0]),
+            lock_before,
+            "replay must not top up the staking lock"
+        );
+        // A different choice on the same proposal is refused (no flipping).
+        assert_eq!(
+            g.vote(&mut l, ids[0], id, VoteChoice::No, 1),
+            Err(GovError::AlreadyVoted)
+        );
+        assert_eq!(
+            g.proposals.get(&id).unwrap().yes,
+            yes_before,
+            "a refused flip must not move the tally either"
+        );
+    }
+
+    /// Signed proposals: a valid envelope opens the proposal; wrong key,
+    /// tampered bytes, wrong chain, and replayed nonces all fail closed.
+    /// A valid signature from a STAKELESS key still lands on `NotStaker` —
+    /// the binding is to the key whose stake is locked, never theater.
+    #[test]
+    fn propose_signed_binds_key_chain_action_and_nonce() {
+        use crate::wallet_signing::WalletSigningKey;
+        const CHAIN: u64 = 777;
+        let key = WalletSigningKey::ed25519([0xA1u8; 32]);
+        let addr = key.address();
+        let other = WalletSigningKey::ed25519([0xB2u8; 32]);
+        let mut l = StakingLedger::new();
+        l.bond(addr, stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+        let mut g = Governance::new();
+        let title = "raise reward".to_string();
+        let action = GovAction::SetBlockReward(stell(9));
+        let nonce = 7u64;
+        // Valid envelope: opens the proposal and consumes the nonce.
+        let msg = Governance::gov_propose_message(CHAIN, &addr, &title, &action, nonce);
+        let sig = key.sign_message(CHAIN, &msg).unwrap();
+        assert!(!g.propose_nonce_used(&addr, nonce));
+        let id = g
+            .propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, nonce, &sig)
+            .unwrap();
+        assert_eq!(id, 1);
+        assert!(g.propose_nonce_used(&addr, nonce));
+        // Exact replay: same envelope, nonce already consumed.
+        assert_eq!(
+            g.propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, nonce, &sig),
+            Err(GovError::ReplayedNonce)
+        );
+        // Owner double-signs a different title under the same nonce: the
+        // signature verifies (they own the key) but the nonce is spent.
+        let msg2 = Governance::gov_propose_message(CHAIN, &addr, "other title", &action, nonce);
+        let sig2 = key.sign_message(CHAIN, &msg2).unwrap();
+        assert_eq!(
+            g.propose_signed(
+                &mut l,
+                addr,
+                "other title".into(),
+                action.clone(),
+                0,
+                CHAIN,
+                nonce,
+                &sig2
+            ),
+            Err(GovError::ReplayedNonce)
+        );
+        // Wrong key: another key's envelope presented as this proposer.
+        let wrong_msg = Governance::gov_propose_message(CHAIN, &addr, &title, &action, 8);
+        let wrong = other.sign_message(CHAIN, &wrong_msg).unwrap();
+        assert_eq!(
+            g.propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, 8, &wrong),
+            Err(GovError::BadSignature)
+        );
+        // Tampered title: sign one title, present for another.
+        let tampered_msg = Governance::gov_propose_message(CHAIN, &addr, "tampered", &action, 9);
+        let tampered_sig = key.sign_message(CHAIN, &tampered_msg).unwrap();
+        assert_eq!(
+            g.propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, 9, &tampered_sig),
+            Err(GovError::BadSignature)
+        );
+        // Wrong chain: minted elsewhere, refused here.
+        let cross_msg = Governance::gov_propose_message(CHAIN + 1, &addr, &title, &action, 10);
+        let cross = key.sign_message(CHAIN + 1, &cross_msg).unwrap();
+        assert_eq!(
+            g.propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, 10, &cross),
+            Err(GovError::BadSignature)
+        );
+        // Stakeless key with a PERFECTLY valid signature: NotStaker, not Open.
+        let lone = WalletSigningKey::ed25519([0xC3u8; 32]);
+        let lone_addr = lone.address();
+        let lone_msg = Governance::gov_propose_message(CHAIN, &lone_addr, &title, &action, 1);
+        let lone_sig = lone.sign_message(CHAIN, &lone_msg).unwrap();
+        assert_eq!(
+            g.propose_signed(&mut l, lone_addr, title, action, 0, CHAIN, 1, &lone_sig),
+            Err(GovError::NotStaker)
+        );
+    }
+
+    /// Signed votes: a valid envelope records the weight; tampered choice,
+    /// wrong voter, and wrong chain fail closed; same-choice replay is
+    /// idempotent; a stakeless signature lands on `NotStaker`.
+    #[test]
+    fn vote_signed_binds_key_chain_proposal_and_choice() {
+        use crate::wallet_signing::WalletSigningKey;
+        const CHAIN: u64 = 777;
+        let voter_key = WalletSigningKey::ed25519([0xB2u8; 32]);
+        let voter = voter_key.address();
+        let proposer_key = WalletSigningKey::ed25519([0xA1u8; 32]);
+        let proposer = proposer_key.address();
+        let mut l = StakingLedger::new();
+        l.bond(proposer, stell(10_000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
+        l.bond(voter, stell(20_000), DEFAULT_COMMISSION_BPS).unwrap();
+        let mut g = Governance::new();
+        let id = g
+            .propose(&mut l, proposer, "x".into(), GovAction::Signal("t".into()), 0)
+            .unwrap();
+        // Valid envelope records the weight.
+        let msg = Governance::gov_vote_message(CHAIN, id, VoteChoice::Yes, &voter);
+        let sig = voter_key.sign_message(CHAIN, &msg).unwrap();
+        let w = g
+            .vote_signed(&mut l, voter, id, VoteChoice::Yes, 1, CHAIN, &sig)
+            .unwrap();
+        assert_eq!(w, stell(20_000) as u128);
+        // Same-choice replay: idempotent, tally unmoved.
+        let w2 = g
+            .vote_signed(&mut l, voter, id, VoteChoice::Yes, 1, CHAIN, &sig)
+            .unwrap();
+        assert_eq!(w, w2);
+        assert_eq!(g.proposals.get(&id).unwrap().yes, w);
+        // Different choice with a FRESH valid signature: refused, first wins.
+        let flip_msg = Governance::gov_vote_message(CHAIN, id, VoteChoice::No, &voter);
+        let flip = voter_key.sign_message(CHAIN, &flip_msg).unwrap();
+        assert_eq!(
+            g.vote_signed(&mut l, voter, id, VoteChoice::No, 1, CHAIN, &flip),
+            Err(GovError::AlreadyVoted)
+        );
+        // Tampered choice: Yes-envelope presented as No.
+        assert_eq!(
+            g.vote_signed(&mut l, voter, id, VoteChoice::No, 1, CHAIN, &sig),
+            Err(GovError::BadSignature)
+        );
+        // Wrong voter: proposer's envelope presented as the voter.
+        let impostor_msg = Governance::gov_vote_message(CHAIN, id, VoteChoice::Yes, &voter);
+        let impostor = proposer_key.sign_message(CHAIN, &impostor_msg).unwrap();
+        assert_eq!(
+            g.vote_signed(&mut l, voter, id, VoteChoice::Yes, 1, CHAIN, &impostor),
+            Err(GovError::BadSignature)
+        );
+        // Wrong proposal id: envelope for another proposal.
+        let elsewhere_msg = Governance::gov_vote_message(CHAIN, id + 100, VoteChoice::Yes, &voter);
+        let elsewhere = voter_key.sign_message(CHAIN, &elsewhere_msg).unwrap();
+        assert_eq!(
+            g.vote_signed(&mut l, voter, id, VoteChoice::Yes, 1, CHAIN, &elsewhere),
+            Err(GovError::BadSignature)
+        );
+        // Wrong chain.
+        let cross_msg = Governance::gov_vote_message(CHAIN + 1, id, VoteChoice::Yes, &voter);
+        let cross = voter_key.sign_message(CHAIN + 1, &cross_msg).unwrap();
+        assert_eq!(
+            g.vote_signed(&mut l, voter, id, VoteChoice::Yes, 1, CHAIN, &cross),
+            Err(GovError::BadSignature)
+        );
+        // Stakeless key, valid signature: NotStaker (binding is not theater).
+        let lone = WalletSigningKey::ed25519([0xC3u8; 32]);
+        let lone_addr = lone.address();
+        let lone_msg = Governance::gov_vote_message(CHAIN, id, VoteChoice::Yes, &lone_addr);
+        let lone_sig = lone.sign_message(CHAIN, &lone_msg).unwrap();
+        assert_eq!(
+            g.vote_signed(&mut l, lone_addr, id, VoteChoice::Yes, 1, CHAIN, &lone_sig),
+            Err(GovError::NotStaker)
         );
     }
 
@@ -2045,7 +2606,7 @@ mod tests {
                     sha256: [7u8; 32],
                 },
                 created_at: now,
-                voting_end: now + GOVERNANCE_VOTING_PERIOD_SECS,
+                voting_end: now.saturating_add(GOVERNANCE_VOTING_PERIOD_SECS),
                 yes: 0,
                 no: 0,
                 abstain: 0,
@@ -2275,5 +2836,248 @@ mod tests {
         assert_eq!(std::fs::read(&staged).unwrap(), payload);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&staged);
+    }
+
+    // -----------------------------------------------------------------------
+    // KI-23 TIMELOCK (voted proposals execute at pass_height + delay)
+    // -----------------------------------------------------------------------
+
+    /// Drive a proposal to Passed via the height-aware finalize (100% yes).
+    fn pass_at_height(
+        l: &mut StakingLedger,
+        g: &mut Governance,
+        proposer: [u8; 32],
+        voters: &[[u8; 32]],
+        action: GovAction,
+        pass_height: u64,
+    ) -> u64 {
+        let id = g
+            .propose(l, proposer, "t".into(), action, 0)
+            .expect("propose");
+        for v in voters {
+            g.vote(l, *v, id, VoteChoice::Yes, 1).expect("vote");
+        }
+        let status = g
+            .finalize_at_height(l, id, GOVERNANCE_VOTING_PERIOD_SECS + 1, pass_height)
+            .expect("finalize");
+        assert_eq!(status, ProposalStatus::Passed);
+        id
+    }
+
+    #[test]
+    fn timelock_const_is_7200_heights_no_env() {
+        // Pinned: same exit-window philosophy as the commission delay.
+        assert_eq!(GOV_TIMELOCK_HEIGHTS, 7_200);
+        assert_eq!(
+            crate::staking::COMMISSION_EFFECT_DELAY_HEIGHTS,
+            7_200,
+            "timelock mirrors the commission exit window"
+        );
+    }
+
+    #[test]
+    fn timelock_schedule_sets_maturity() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let pass_height = 1_000_000u64;
+        let id = pass_at_height(
+            &mut l,
+            &mut g,
+            ids[0],
+            &ids,
+            GovAction::Signal("t".into()),
+            pass_height,
+        );
+        assert_eq!(
+            g.executable_height_of(id),
+            Some(pass_height.saturating_add(GOV_TIMELOCK_HEIGHTS))
+        );
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Passed);
+    }
+
+    #[test]
+    fn timelock_early_execution_refused_fail_closed() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let pass_height = 50_000u64;
+        let id = pass_at_height(
+            &mut l,
+            &mut g,
+            ids[0],
+            &ids,
+            GovAction::SetBlockReward(stell(9)),
+            pass_height,
+        );
+        let maturity = pass_height + GOV_TIMELOCK_HEIGHTS;
+        // Legacy path (no height) refuses a scheduled proposal fail-closed.
+        assert_eq!(g.execute(ids[0], id), Err(GovError::Timelocked));
+        // Height-aware path before maturity refuses too.
+        assert_eq!(
+            g.execute_at_height(ids[0], id, maturity - 1),
+            Err(GovError::Timelocked)
+        );
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Passed);
+        assert!(g.applied.block_reward.is_none());
+        // Retry is identically refused (no partial state).
+        assert_eq!(
+            g.execute_at_height(ids[0], id, maturity - 1),
+            Err(GovError::Timelocked)
+        );
+    }
+
+    #[test]
+    fn timelock_matured_executes_exactly_once() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let pass_height = 77_000u64;
+        let id = pass_at_height(
+            &mut l,
+            &mut g,
+            ids[0],
+            &ids,
+            GovAction::SetBlockReward(stell(9)),
+            pass_height,
+        );
+        let maturity = pass_height + GOV_TIMELOCK_HEIGHTS;
+        g.execute_at_height(ids[1], id, maturity)
+            .expect("matured must execute");
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Executed);
+        assert_eq!(g.applied.block_reward, Some(stell(9)));
+        assert_eq!(
+            g.execute_at_height(ids[1], id, maturity + 1),
+            Err(GovError::AlreadyExecuted)
+        );
+    }
+
+    #[test]
+    fn timelock_exact_boundary_maturity_minus_one_refuses_maturity_executes() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let pass_height = 123_456u64;
+        let id = pass_at_height(
+            &mut l,
+            &mut g,
+            ids[0],
+            &ids,
+            GovAction::Signal("b".into()),
+            pass_height,
+        );
+        let maturity = pass_height + GOV_TIMELOCK_HEIGHTS;
+        assert!(!g.is_mature(id, maturity - 1));
+        assert!(g.is_mature(id, maturity));
+        assert_eq!(
+            g.execute_at_height(ids[0], id, maturity - 1),
+            Err(GovError::Timelocked)
+        );
+        g.execute_at_height(ids[0], id, maturity)
+            .expect("maturity executes");
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn timelock_query_surfaces_pending_and_executable_height() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let pass_height = 9_000u64;
+        let id = pass_at_height(
+            &mut l,
+            &mut g,
+            ids[0],
+            &ids,
+            GovAction::Signal("q".into()),
+            pass_height,
+        );
+        // Pending: Passed (not Executed) + scheduled executable height.
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Passed);
+        assert_eq!(
+            g.executable_height_of(id),
+            Some(pass_height + GOV_TIMELOCK_HEIGHTS)
+        );
+        assert!(!g.is_mature(id, pass_height));
+        assert!(g.is_mature(id, pass_height + GOV_TIMELOCK_HEIGHTS));
+        // Unknown proposal: no schedule, never mature.
+        assert_eq!(g.executable_height_of(999_999), None);
+        assert!(!g.is_mature(999_999, u64::MAX));
+    }
+
+    #[test]
+    fn timelock_oracle_path_enforces_maturity() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let pass_height = 5_000u64;
+        let id = pass_at_height(
+            &mut l,
+            &mut g,
+            ids[0],
+            &ids,
+            GovAction::RegisterOraclePublisher([0x31u8; 32]),
+            pass_height,
+        );
+        let maturity = pass_height + GOV_TIMELOCK_HEIGHTS;
+        let mut oracle = crate::oracle::OracleState::default();
+        // Legacy oracle path (no height) refuses a scheduled proposal.
+        assert_eq!(
+            g.execute_with_oracle(ids[0], id, &mut oracle),
+            Err(GovError::Timelocked)
+        );
+        assert!(oracle.publishers.is_empty());
+        // Height-aware path before maturity refuses too.
+        assert_eq!(
+            g.execute_with_oracle_at_height(ids[1], id, &mut oracle, maturity - 1),
+            Err(GovError::Timelocked)
+        );
+        assert!(oracle.publishers.is_empty());
+        // At maturity applies exactly once (both domains).
+        g.execute_with_oracle_at_height(ids[1], id, &mut oracle, maturity)
+            .expect("matured oracle action must apply");
+        assert!(oracle.publishers.contains(&[0x31u8; 32]));
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Executed);
+    }
+
+    /// C-02/P0: height-aware finalization releases EVERY staking lock
+    /// (proposer + all voters) exactly once, schedules the exact 7200-height
+    /// maturity, and refuses early execution fail-closed.
+    /// // GATE: proves the live-path `finalize_at_height` contract — locks
+    /// cannot outlive the vote; extends, never weakens.
+    #[test]
+    fn finalize_at_height_releases_all_locks_with_exact_maturity() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let now_due = GOVERNANCE_VOTING_PERIOD_SECS + 1;
+        let id = g
+            .propose(&mut l, ids[0], "t".into(), GovAction::Signal("t".into()), 0)
+            .expect("propose");
+        for v in &ids {
+            g.vote(&mut l, *v, id, VoteChoice::Yes, 1).expect("vote");
+        }
+        // Locks are held for the whole voting window (the C-02 grief when
+        // finalization never runs: unbond stays impossible).
+        for v in &ids {
+            assert!(
+                l.locked_governance_of(v) > 0,
+                "voter lock must be held before finalize"
+            );
+        }
+        let pass_height = 7_000u64;
+        let status = g
+            .finalize_at_height(&mut l, id, now_due, pass_height)
+            .expect("finalize");
+        assert_eq!(status, ProposalStatus::Passed);
+        assert!(
+            l.locked_governance.is_empty(),
+            "finalize must release every gov lock exactly once"
+        );
+        // Exact maturity: pass_height + 7200, boundary-checked both sides.
+        let maturity = pass_height + GOV_TIMELOCK_HEIGHTS;
+        assert_eq!(maturity, 14_200);
+        assert_eq!(g.executable_height_of(id), Some(maturity));
+        assert_eq!(
+            g.execute_at_height(ids[0], id, maturity - 1),
+            Err(GovError::Timelocked)
+        );
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Passed);
+        g.execute_at_height(ids[0], id, maturity)
+            .expect("maturity executes");
+        assert_eq!(g.get(id).unwrap().status, ProposalStatus::Executed);
     }
 }

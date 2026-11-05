@@ -38,6 +38,41 @@ fn id_of(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
 }
 
+/// FULL-PQ sender address for a seed: implicit Falcon-512, registered
+/// globally (no activation surcharge).
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+/// FULL-PQ replacement for `Transaction::sign` in fixtures.
+fn pq_tx(seed: u8, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
 fn fabric_key(a: u8, b: u8) -> CrossShardKey {
     CrossShardKey {
         source_shard: MASTERCHAIN_SHARD,
@@ -107,9 +142,6 @@ async fn store_paired_snapshot(
         .unwrap();
     store
         .put_bridge(height, &engine.bridge_snapshot().await)
-        .unwrap();
-    store
-        .put_confidential(height, &engine.confidential_snapshot().await)
         .unwrap();
     store
         .put_zkml_models(height, &engine.zkml_models_snapshot().await)
@@ -242,12 +274,11 @@ fn f2_push_policy_classes() {
         PersistPushPolicy::BoundedWait
     );
     assert_eq!(
-        persist_push_policy(&PersistJob::Domains {
+        persist_push_policy(&        PersistJob::Domains {
             height: 1,
             bytes: vec![],
             session_keys: vec![],
             bridge: vec![],
-            confidential: vec![],
             zkml_models: vec![],
             cross_shard: vec![],
         }),
@@ -499,7 +530,7 @@ fn bond_genesis_callers_only_fund_genesis() {
 
 #[tokio::test]
 async fn f5_slash_after_reward_net_outcome_pinned() {
-    use stellereum::consensus::{QuorumCertificate, Vote, VoteKind};
+    use stellereum::consensus::{Vote, VoteKind};
     use stellereum::staking::{
         DOWNTIME_SLASH_BPS, MIN_VALIDATOR_BOND, REWARDS_POOL, STAKING_POOL, UNBONDING_PERIOD_SECS,
     };
@@ -565,19 +596,26 @@ async fn f5_slash_after_reward_net_outcome_pinned() {
         InMemoryStateEngine,
         stellereum::state_engine::BlockTransitionOutcome,
     ) {
+        use stellereum::consensus::{
+            register_validator_pq_key, VoteSet,
+        };
+        use stellereum::post_quantum::{FalconKeypair, PqScheme};
         let (e, v) = prepared_engine(w_key, w).await;
         // Genuine height-9 QC signed by the witness alone (quorum-alone power,
         // omits the victim): verifies under the pre-transition set and casts
-        // the victim's 10th miss.
-        let vote = Vote::sign(w_key, 9, 0, VoteKind::Precommit, None);
+        // the victim's 10th miss. FULL-PQ: Falcon-half vote + compiled µQC
+        // envelope (a raw ed entry carries no power).
+        let w_fk = FalconKeypair::generate_from_seed(0xF5);
+        register_validator_pq_key(w, PqScheme::Falcon512, w_fk.public_key.clone());
+        let vote = Vote::sign_with_falcon(w_key, &w_fk, 9, 0, VoteKind::Precommit, None);
         assert!(vote.verify(), "witness vote must verify");
-        let qc = QuorumCertificate {
-            height: 9,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: None,
-            signatures: vec![(w, vote.signature.clone())],
-        };
+        let set0 = e.staking_read().await.to_validator_set();
+        let mut vs = VoteSet::new();
+        vs.add(vote, &set0, 9, 0, VoteKind::Precommit)
+            .expect("genuine witness vote admits");
+        let qc = vs
+            .certificate_with_parent(None, &set0, Some(&[0u8; 32]))
+            .expect("quorum-alone witness compiles a µQC");
         {
             let set = e.staking_read().await.to_validator_set();
             assert!(
@@ -653,17 +691,18 @@ async fn fee_parity_fast_path_and_sequential_charge_floor() {
     // 10 independent underpriced plain transfers: the batch shape exercises
     // the multi-wave path (incl. the plain fast path), the singles exercise
     // the sequential loop — both must charge max(declared, floor_base).
-    let senders: Vec<SigningKey> = (0..10u8).map(|i| skey(0x30 + i)).collect();
+    // FULL-PQ: implicit Falcon-512 (registered globally; no surcharge).
+    let senders: Vec<u8> = (0..10u8).map(|i| 0x30 + i).collect();
     let txs: Vec<Transaction> = senders
         .iter()
-        .map(|k| Transaction::sign(k, [0xB0; 32], 1_000, 100, 0, 1, 1))
+        .map(|s| pq_tx(*s, [0xB0; 32], 1_000, 100, 0))
         .collect();
 
     let batch_engine = InMemoryStateEngine::new();
     batch_engine.governance_write().await.applied.min_gas_limit = Some(FLOOR);
     for k in &senders {
         batch_engine
-            .update_account(AccountState::new(id_of(k), BAL))
+            .update_account(AccountState::new(pq_id(*k), BAL))
             .await;
     }
     let (_, _, collected, status, fees) = batch_engine.apply_block_parallel_fees(&txs, TS).await;
@@ -675,7 +714,7 @@ async fn fee_parity_fast_path_and_sequential_charge_floor() {
     for (k, tx) in senders.iter().zip(txs.iter()) {
         let e = InMemoryStateEngine::new();
         e.governance_write().await.applied.min_gas_limit = Some(FLOOR);
-        e.update_account(AccountState::new(id_of(k), BAL)).await;
+        e.update_account(AccountState::new(pq_id(*k), BAL)).await;
         let (_, _, _, s, f) = e
             .apply_block_parallel_fees(std::slice::from_ref(tx), TS)
             .await;
@@ -848,23 +887,38 @@ fn chunk_streaming_bounds_pure() {
 
 #[tokio::test]
 async fn f7_pq_keys_blob_installs_on_sync() {
-    use stellereum::post_quantum::PqScheme;
-    let addr = [0x51u8; 32];
-    let pk = vec![0x42u8; 32];
+    use stellereum::post_quantum::{derive_pq_address, PqScheme};
+    // M-03: the blob entry must validate against its account leaf
+    // (blake3(pk) == leaf pubkey_hash AND derive == address), so the test
+    // pins a REAL key: the leaf carries the hash, the blob carries the key.
+    let scheme = PqScheme::Falcon512;
+    let pk = Transaction::sample_falcon512_pubkey(0xF7);
     let salt = [0x01u8; 16];
+    let addr = derive_pq_address(scheme, &pk, &salt);
     let akey = [b"a:".to_vec(), addr.to_vec()].concat();
-    let aval = bincode::serialize(&(PqScheme::Falcon512, pk.clone(), salt)).unwrap();
+    let aval = bincode::serialize(&(scheme, pk.clone(), salt)).unwrap();
     let blob = bincode::serialize(&vec![(akey, aval)]).unwrap();
+    // Leaf WITHOUT the key (proves the restore installs it): balance +
+    // scheme + pinned hash, synced to the trie via update_account.
+    let mut leaf = AccountState::new(addr, 1_000_000);
+    leaf.scheme = scheme;
+    leaf.pubkey_hash = Some(*blake3::hash(&pk).as_bytes());
 
     // Direct restore: corrupt bytes fail closed, good bytes pin the key.
     let e = InMemoryStateEngine::new();
     assert!(e.restore_pq_keys(&[0xDE, 0xAD]).await.is_err());
+    e.update_account(leaf.clone()).await;
     e.restore_pq_keys(&blob).await.expect("pq blob installs");
-    let (scheme, got) = e
+    let (got_scheme, got) = e
         .get_pinned_pubkey(&addr)
         .expect("key pinned after restore");
-    assert_eq!(scheme, PqScheme::Falcon512);
+    assert_eq!(got_scheme, scheme);
     assert_eq!(got, pk);
+    assert_eq!(
+        e.get_pinned_pubkey_with_salt(&addr),
+        Some((scheme, pk.clone(), salt)),
+        "restore preserves the pinned salt"
+    );
 
     // Sync path: the blob travels beside the snapshot and lands on the target
     // WITHOUT moving the root (keys are not in the digest; they ride the
@@ -872,6 +926,7 @@ async fn f7_pq_keys_blob_installs_on_sync() {
     let src = InMemoryStateEngine::new();
     let user = [0x52u8; 32];
     src.update_account(AccountState::new(user, 777_000)).await;
+    src.update_account(leaf).await;
     let root = src.get_state_root().await;
     let snap = src.create_snapshot().await;
     let target = InMemoryStateEngine::new();
@@ -893,9 +948,10 @@ async fn f7_pq_keys_blob_installs_on_sync() {
     .await
     .expect("sync with pq blob verifies");
     assert_eq!(target.get_state_root().await, root);
-    assert!(
-        target.get_pinned_pubkey(&addr).is_some(),
-        "pq keys installed, not skipped"
+    assert_eq!(
+        target.get_pinned_pubkey_with_salt(&addr),
+        Some((scheme, pk.clone(), salt)),
+        "pq keys installed with pinned salt, not skipped"
     );
 }
 

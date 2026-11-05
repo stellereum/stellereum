@@ -60,7 +60,13 @@ pub fn set_pure_pq_override(enabled: Option<bool>) {
 ///
 /// Checks the override first (thread-local under `cfg(test)`, process-wide
 /// otherwise). If unset (-1), inspects the `STELL_PURE_PQ` environment
-/// variable (enforced on `1`, `true`, or `always`).
+/// variable (enforced on `1`, `true`, or `always`; explicitly opted out
+/// with `0` / `false` / empty). If the variable is UNSET, enforcement
+/// defaults OFF (PQ OPT-IN default — M-01 fallback, 2026-11-04): a
+/// PQ-enforced default was verified and REVERTED (155/1104 lib failures;
+/// classical suite/sim/wallet/genesis assume dual-stack default — see
+/// M-01 fallback note in README/PERF_1K). Operators opt in with
+/// `STELL_PURE_PQ=1` (or `--pure-pq`); `STELL_PURE_PQ=0` pins dual-stack.
 ///
 /// BATCH-MIRROR CONTRACT (audit F-HIGH-2): every batched signature screen
 /// (vote `verify_batch` / `partition_valid` / `add_batch`, tx batch paths)
@@ -115,9 +121,6 @@ pub const FALCON_MODULUS_Q: u32 = 12289;
 pub const FALCON_N: usize = 512;
 pub const FALCON_NORM_BOUND_SQ: i64 = 34034726;
 
-/// ML-DSA-44 infinity norm bound (gamma1 - beta = 131072 - 78 = 130994)
-pub const MLDSA_GAMMA1_MINUS_BETA: i32 = 130994;
-
 /// Cryptographic signature scheme identifiers defined in Stellereum PQ-BFT v4
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
@@ -128,13 +131,15 @@ pub enum PqScheme {
     Falcon512 = 2,
     /// post-quantum lattice-based ML-DSA-44 (1312-byte public key, 2420-byte signature, FIPS 204)
     ///
-    /// DISABLED (audit fail-closed): the `verify_mldsa44` engine below is NOT
-    /// real FIPS-204 math (norm window + self-computed trailer: anyone holding
-    /// the public key can forge a "valid" signature), so the scheme MUST NOT
-    /// verify. `from_id(3)` refuses (loud, admission-level) and
-    /// `verify_pq_signature` returns `false` for it (verify-level). The
-    /// variant is KEPT (not removed) so every `match` over `PqScheme` stays
-    /// exhaustive and every 0x03 code path keeps compiling to a refusal.
+    /// UNKNOWN (KI-01 lead decision, fail-closed): the `verify_mldsa44` stub
+    /// was DELETED (it was not real FIPS-204 math), so there is no verifier
+    /// for 0x03 in this codebase. `from_id(3)` refuses as unknown
+    /// (admission-level) and `verify_pq_signature` returns `false` for it
+    /// (verify-level). The variant is KEPT (not removed) so every `match`
+    /// over `PqScheme` stays exhaustive and every 0x03 code path keeps
+    /// compiling to a refusal — grep shows `MlDsa44` arms in `zkml.rs`,
+    /// `wallet_signing.rs`, `state_engine.rs`, plus `is_disabled()` gates in
+    /// `consensus.rs`, `staking.rs`, `pq_registry.rs`, `light_client.rs`.
     /// Re-enable ONLY behind a real FIPS-204 implementation + coordinated
     /// all-validators upgrade.
     MlDsa44 = 3,
@@ -150,34 +155,32 @@ impl PqScheme {
 
     /// Construct scheme from byte identifier.
     ///
-    /// FAIL-CLOSED (audit): scheme `0x03` (ML-DSA-44) is DISABLED and refused
-    /// here with a loud error, so every byte-driven admission path (PQ1
-    /// envelope decode, session-grant decode, SVM opcode dispatch, storage
-    /// reads) rejects 0x03 at parse time instead of admitting a forgeable
-    /// scheme. All `Err` arms at those call sites already refuse (verified:
-    /// `?`-propagation, `if let Ok` skips, `Err(_) => false`).
+    /// FAIL-CLOSED (KI-01): scheme `0x03` has no verifier in this codebase
+    /// (stub deleted), so it resolves as UNKNOWN here with the same error as
+    /// any unknown id. Every byte-driven admission path (PQ1 envelope decode,
+    /// session-grant decode, SVM opcode dispatch, storage reads) rejects 0x03
+    /// at parse time. All `Err` arms at those call sites already refuse
+    /// (verified: `?`-propagation, `if let Ok` skips, `Err(_) => false`).
     pub fn from_id(id: u8) -> Result<Self, String> {
         match id {
             1 => Ok(Self::Ed25519),
             2 => Ok(Self::Falcon512),
-            3 => Err(
-                "ML-DSA-44 (0x03) DISABLED: forgeable verifier (no FIPS-204 math); \
-                 scheme refused fail-closed, submit with Falcon-512 (0x02) or Hybrid (0x04)"
-                    .to_string(),
-            ),
             4 => Ok(Self::Hybrid),
             other => Err(format!("Unknown post-quantum scheme ID: {other}")),
         }
     }
 
-    /// Whether this scheme is currently DISABLED fail-closed (audit F-CRIT-1).
+    /// Whether this scheme is currently refused fail-closed (KI-01).
     ///
-    /// Today this is true only for [`PqScheme::MlDsa44`] (0x03): its verifier
-    /// is not FIPS-204 math, so every admission path must refuse it. Operator
-    /// call sites that construct a [`PqScheme`] directly from the enum (NOT
-    /// via [`PqScheme::from_id`]) — SVM opcode dispatch, storage reads,
-    /// state-engine pinning — must check this (or route through `from_id`)
-    /// before admitting a key or signature.
+    /// Today this is true only for [`PqScheme::MlDsa44`] (0x03): it has no
+    /// verifier (stub deleted, `from_id(3)` is unknown), so every admission
+    /// path must refuse it. Operator call sites that construct a
+    /// [`PqScheme`] directly from the enum (NOT via [`PqScheme::from_id`]) —
+    /// SVM opcode dispatch, storage reads, state-engine pinning — must check
+    /// this (or route through `from_id`) before admitting a key or signature.
+    /// Kept (not removed): `is_disabled()` gates exist in `consensus.rs`,
+    /// `staking.rs`, `pq_registry.rs`, `light_client.rs`, `wallet_signing.rs`,
+    /// `state_engine.rs` — deleting this would break those crates.
     pub const fn is_disabled(&self) -> bool {
         matches!(self, Self::MlDsa44)
     }
@@ -214,13 +217,13 @@ impl PqScheme {
 
     /// Whether this scheme provides quantum resistance
     ///
-    /// NOTE (audit F-CRIT-1): [`PqScheme::MlDsa44`] reports `true` here as
-    /// taxonomy — it *is* a post-quantum scheme family — but it is DISABLED
-    /// (see [`PqScheme::is_disabled`]): [`verify_pq_signature`] refuses it
-    /// and [`PqScheme::from_id`] rejects byte 0x03. Policy gates must NOT
-    /// treat `is_post_quantum()` as admission; a `true` here never implies
-    /// "safe to verify". In pure-PQ mode a 0x03 envelope is rejected
-    /// downstream (decode refuses it before this is ever consulted).
+    /// NOTE (KI-01): [`PqScheme::MlDsa44`] reports `true` here as taxonomy —
+    /// it *is* a post-quantum scheme family — but it has no verifier (stub
+    /// deleted, see [`PqScheme::is_disabled`]): [`verify_pq_signature`]
+    /// refuses it and [`PqScheme::from_id`] rejects byte 0x03 as unknown.
+    /// Policy gates must NOT treat `is_post_quantum()` as admission; a `true`
+    /// here never implies "safe to verify". In pure-PQ mode a 0x03 envelope
+    /// is rejected downstream (decode refuses it before this is ever consulted).
     pub const fn is_post_quantum(&self) -> bool {
         match self {
             Self::Ed25519 => false,
@@ -287,17 +290,16 @@ impl StatefulImplicitKeyRegistry {
         pubkey: &[u8],
         salt: &[u8; 16],
     ) -> Result<(), String> {
-        // FAIL-CLOSED (audit F-CRIT-1): ML-DSA-44 (0x03) must never enter the
-        // registry — a pinned 0x03 key today would become a live forgery door
-        // the moment any verifier path re-admitted it. Refusal here covers
-        // every caller that funnels through this registry (explicit-tx
-        // first-spend pinning, state-engine mirror); direct-enum siblings
-        // (state_engine::pin_pubkey, storage) must apply the same check —
-        // see the operator hunk in the audit-closure notes.
+        // FAIL-CLOSED (KI-01): 0x03 must never enter the registry — it has
+        // no verifier (stub deleted, `from_id(3)` is unknown). Refusal here
+        // covers every caller that funnels through this registry
+        // (explicit-tx first-spend pinning, state-engine mirror);
+        // direct-enum siblings (state_engine::pin_pubkey, storage) must apply
+        // the same check — see the operator hunk in the audit-closure notes.
         if scheme.is_disabled() {
             return Err(
-                "ML-DSA-44 (0x03) DISABLED: registry refuses to pin a forgeable \
-                 scheme, submit with Falcon-512 (0x02) or Hybrid (0x04)"
+                "Unknown post-quantum scheme ID: 3 (registry refuses 0x03: no verifier; \
+                 submit with Falcon-512 (0x02) or Hybrid (0x04))"
                     .to_string(),
             );
         }
@@ -512,10 +514,9 @@ impl PqSignatureEnvelope {
 /// Implements deterministic verification:
 /// - `Ed25519`: Standard RFC 8032 Ed25519 verification.
 /// - `Falcon512`: Standard NIST Round 3 Falcon-512 lattice verification.
-/// - `MlDsa44`: DISABLED (audit fail-closed) — always returns `false`. The
-///   `verify_mldsa44` engine is NOT real FIPS-204 math (norm window +
-///   self-computed trailer), so any 0x03 signature is refused rather than
-///   checked. No FIPS-204 implementation is attempted here by design.
+/// - `MlDsa44`: UNKNOWN (KI-01, fail-closed) — always returns `false`. The
+///   stub verifier was deleted (no FIPS-204 math in this codebase), so any
+///   0x03 signature is refused rather than checked.
 /// - `Hybrid`: Both Ed25519 and Falcon-512 must verify on the same message.
 pub fn verify_pq_signature(
     scheme: PqScheme,
@@ -523,12 +524,6 @@ pub fn verify_pq_signature(
     message: &[u8],
     signature: &[u8],
 ) -> bool {
-    // FAIL-CLOSED (audit): ML-DSA-44 (0x03) is disabled — refuse every 0x03
-    // signature without running the forgeable engine below. Length checks are
-    // deliberately skipped: the refusal must not depend on attacker bytes.
-    if scheme == PqScheme::MlDsa44 {
-        return false;
-    }
     if pubkey.len() != scheme.pubkey_size() || signature.len() != scheme.signature_size() {
         return false;
     }
@@ -536,8 +531,9 @@ pub fn verify_pq_signature(
     match scheme {
         PqScheme::Ed25519 => verify_ed25519(pubkey, message, signature),
         PqScheme::Falcon512 => verify_falcon512(pubkey, message, signature),
-        // Unreachable: disabled above. Kept so the match stays exhaustive and
-        // any future re-enabling is forced to touch this exact arm.
+        // UNKNOWN (KI-01): no verifier — refuse. Kept so the match stays
+        // exhaustive (other crates match on `MlDsa44`); any re-enabling is
+        // forced to touch this exact arm.
         PqScheme::MlDsa44 => false,
         PqScheme::Hybrid => {
             let ed_pk = &pubkey[..ED25519_PUBKEY_LEN];
@@ -2116,71 +2112,6 @@ fn verify_falcon512(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
     norm_sq <= FALCON_NORM_BOUND_SQ
 }
 
-/// ML-DSA-44 (Dilithium2, FIPS 204) verification engine.
-///
-/// DISABLED — DO NOT CALL (audit fail-closed): this is NOT real FIPS-204
-/// math, only a norm window plus a SELF-COMPUTED trailer (`MLDSA44_BINDING_V4`
-/// over bytes the signer chose), so anyone holding the public key can forge a
-/// "valid" signature for any message. Retained (dead) as the documented
-/// reason for the refusal in `verify_pq_signature`, which returns `false` for
-/// `MlDsa44` without calling this. Re-enable ONLY with a real FIPS-204
-/// implementation behind a coordinated all-validators upgrade.
-#[allow(dead_code)]
-fn verify_mldsa44(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
-    if pubkey.len() != MLDSA44_PUBKEY_LEN || signature.len() != MLDSA44_SIG_LEN {
-        return false;
-    }
-
-    let rho = &pubkey[..32];
-    let t1 = &pubkey[32..];
-
-    if rho.iter().all(|&b| b == 0) {
-        return false;
-    }
-
-    if signature[0] == 0xFF {
-        return false;
-    }
-
-    // ML-DSA-44 norm bound: ||z||_infinity < gamma1 - beta = 131072 - 78 = 130994
-    let z_bytes = &signature[32..2336];
-    let mut acc = 0u64;
-    let mut acc_len = 0u32;
-    let mut z_idx = 0;
-    while z_idx < z_bytes.len() {
-        acc = (acc << 8) | (z_bytes[z_idx] as u64);
-        z_idx += 1;
-        acc_len += 8;
-        while acc_len >= 18 {
-            acc_len -= 18;
-            let w = ((acc >> acc_len) & 0x3FFFF) as i32;
-            let z_val = 131072 - w;
-            if z_val.abs() >= MLDSA_GAMMA1_MINUS_BETA {
-                return false;
-            }
-        }
-    }
-
-    // Cryptographic binding between message and signature
-    let mut h = blake3::Hasher::new_derive_key("MLDSA44_VERIFY_V4");
-    h.update(rho);
-    h.update(t1);
-    h.update(message);
-    let mu = *h.finalize().as_bytes();
-
-    let c_tilde = &signature[..32];
-    let z_without_trailer = &signature[32..signature.len() - 1];
-    let trailer = signature[signature.len() - 1];
-
-    let mut binding = blake3::Hasher::new_derive_key("MLDSA44_BINDING_V4");
-    binding.update(&mu);
-    binding.update(c_tilde);
-    binding.update(z_without_trailer);
-    let expected = binding.finalize();
-
-    expected.as_bytes()[0] == trailer
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2855,23 +2786,23 @@ mod tests {
     }
 
     #[test]
-    fn test_mldsa44_is_disabled_fail_closed() {
-        // 0x03 byte identifier is refused LOUDLY at admission (every envelope /
-        // grant / opcode decode funnels through `from_id`).
+    fn test_mldsa44_is_unknown_fail_closed() {
+        // GATE: KI-01 deletes the ML-DSA-44 stub (no FIPS-204 math in-tree), so
+        // 0x03 resolves as UNKNOWN at admission — `from_id(3)` is `Err` and a
+        // 0x03-signed payload is refused with the unknown-scheme error (never
+        // `Ok(false)`-ambiguity: decode is `Err`, not a `false` verify).
         let err = PqScheme::from_id(3).expect_err("0x03 must be refused");
         assert!(
-            err.contains("ML-DSA-44"),
-            "refusal must name the scheme: {err}"
+            err.contains("Unknown"),
+            "refusal must be unknown-scheme: {err}"
         );
-        assert!(err.contains("DISABLED"), "refusal must be loud: {err}");
         assert!(
-            err.contains("0x03"),
+            err.contains('3'),
             "refusal must name the scheme id: {err}"
         );
 
-        // Verify-level refusal: even well-formed 0x03 material MUST NOT verify.
-        // (The old engine was forgeable — norm window + self-computed trailer —
-        // so refusal is unconditional, not length-dependent.)
+        // Verify-level refusal: even well-formed 0x03 material MUST NOT verify
+        // (no verifier exists — refusal is unconditional, not length-dependent).
         let pk = vec![0x77u8; MLDSA44_PUBKEY_LEN];
         let sig = vec![0x22u8; MLDSA44_SIG_LEN];
         assert!(!verify_pq_signature(
@@ -2897,14 +2828,15 @@ mod tests {
         ));
 
         // Admission-level refusal: a PQ1 envelope carrying scheme byte 0x03
-        // fails to decode with the loud error (never admitted, never verified).
+        // fails to decode with the unknown-scheme error (never admitted,
+        // never verified — `Err`, not `Ok(false)`).
         let env = PqSignatureEnvelope::new_explicit(PqScheme::MlDsa44, pk, sig);
         let bytes = env.encode();
         assert_eq!(bytes[3], 3, "envelope must still frame the 0x03 scheme id");
         let err = PqSignatureEnvelope::decode(&bytes).expect_err("0x03 envelope must not decode");
         assert!(
-            err.contains("ML-DSA-44"),
-            "decode refusal must name the scheme: {err}"
+            err.contains("Unknown"),
+            "decode refusal must be unknown-scheme: {err}"
         );
     }
 

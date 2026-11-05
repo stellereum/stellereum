@@ -55,22 +55,31 @@ documented.
 
 ---
 
-### KI-02 — The legacy Falcon-512 key path has ~32 bits of effective entropy
+### KI-02 — The legacy Falcon-512 key path had ~32 bits of effective entropy — **REMOVED 2026-11-04**
 
 | | |
 | --- | --- |
-| **Severity** | CRITICAL for a key derived through this path |
-| **File** | `src/post_quantum.rs` — `warn_legacy_weak_entropy_key_once` (≈ line 1626), the derivation at ≈ line 1927; the gate is `STELL_LEGACY_GENESIS_ROOT=1` |
-| **Exploitability** | `REMOTE` — an attacker who observes the **public** key can enumerate the parameter space, recover the private key and forge consensus signatures for that validator |
-| **Status** | **Open by design.** The path exists only to reproduce the historical testnet genesis root, so it is not removed; it announces itself loudly (a `tracing::error!` and a stderr `[ERROR]`) and tells the operator to rotate with `stellereum keys rotate-falcon`. |
+| **Severity** | Was CRITICAL for a key derived through this path; now **NONE on this vector** |
+| **File** | `src/post_quantum.rs` — the *only* seed derivation left is `generate_from_seed_bytes` (`src/post_quantum.rs:1803`), full-entropy via `FALCON512_KEYGEN_V5` + `falcon512_keygen`; `grep src/` for `generate_from_seed_bytes_legacy`, `STELL_LEGACY_GENESIS_ROOT`, `warn_legacy_weak_entropy` returns **0 hits** |
+| **Exploitability** | none — there is no legacy derivation left to observe or enumerate |
+| **Status** | **REMOVED, not "open by design".** Commit `03bba5120` (2026-11-03, `stellereum/src/post_quantum.rs`: 9 insertions, 247 deletions) deleted: `generate_from_seed_bytes_legacy`, `warn_legacy_weak_entropy_key_once` (with its `LEGACY_WEAK_WARNED` static, the `tracing::error!` and the stderr `[ERROR]`), and the `STELL_LEGACY_GENESIS_ROOT=1` gate in the Falcon key derivation. The `≈ line 1626 / 1927` pointers below are pre-removal and no longer resolve. What below describes the *deleted* path is kept as history. |
 
-The legacy derivation is an automorphic image of the Falcon reference base
-key: the 32-byte seed only picks `k ∈ {1,3,…,1023} × shift_f ∈ [0,1024) ×
+The (deleted) legacy derivation was an automorphic image of the Falcon reference base
+key: the 32-byte seed only picked `k ∈ {1,3,…,1023} × shift_f ∈ [0,1024) ×
 shift_g ∈ [0,1024) × flags ∈ {neg_f, neg_g, swap}` — at most `2^32` distinct
 keys, i.e. ~32 bits of effective entropy, **not 256**.
 
-**Audit action:** verify that no *live* deployment still runs with
-`STELL_LEGACY_GENESIS_ROOT=1`, and that the rotation command is covered.
+**Residual risk: NONE on this vector, stated plainly.** Setting
+`STELL_LEGACY_GENESIS_ROOT=1` changes nothing — pinned by
+`tests/a_crypto_audit_poc.rs:150` ("escape hatch changes NOTHING",
+`:163-169`) and `tests/genesis_guard_tests.rs:60,74`. Not to be confused
+with KI-03: the pre-FIPS-206 *on-disk NTRU repair* path
+(`warn_legacy_ntru_key_once`, `src/post_quantum.rs:1473`; `rotate-falcon`,
+`src/node_keys.rs:486`) is a different, live mechanism.
+
+**Audit action:** ~~verify that no *live* deployment still runs with
+`STELL_LEGACY_GENESIS_ROOT=1`, and that the rotation command is covered~~ —
+superseded; confirm the three symbols are still absent from `src/`.
 
 ---
 
@@ -153,14 +162,16 @@ high. A VRF-based selection is the structural fix and is out of scope.
 
 ---
 
-### KI-09 — A restarted node resumes a **stale round**
+### KI-09 — A restarted node resumes a **stale round** — **MITIGATED**
 
 | | |
 | --- | --- |
 | **Severity** | MEDIUM (liveness) |
-| **File** | `src/consensus.rs` / `src/storage.rs` — `ConsensusCheckpoint.round` |
+| **File** | `src/storage.rs:1995` `ConsensusCheckpoint.round`; restore `src/main.rs:3449-3490`; breaker `src/consensus.rs:3855,4999` + `src/main.rs:6395-6477`; re-phase window `src/consensus.rs:3885`; drain `src/storage.rs:3488` + `src/main.rs:7975`; heal `src/main.rs:3516` |
 | **Exploitability** | `OPERATOR` |
-| **Status** | Open. Two nodes that were deadlocked at different rounds and restarted resume at different rounds and stay deadlocked. Recovery is a **coordinated wipe of both data directories** (documented in `docs/OPERATIONS.md`). |
+| **Status** | **Mitigated — automatic recovery, no wipe.** The "coordinated wipe of both data directories" below is superseded: four mechanisms, landed after this entry was written, cover the deadlocked-after-restart case. (1) **Capped restore** (`src/main.rs:3466-3468`): the persisted round is restored as `min(cp.round, MAX_RESTORED_ROUND=64)` while the lock is honoured unconditionally — safety kept, runaway view-change rounds (e.g. r806 vs r0, the exact stand incident named in the comment) capped back into convergence range. (2) **Bounded forward-only deadlock breaker** (`src/consensus.rs:3855` bound, `:4999` `deadlock_breaker_target`; `src/main.rs:6413`): after `STELL_DEADLOCK_TIMEOUT_SECS` (default 300) without finalization with verified peers ahead, one jump to max(peer rounds), once per window. (3) **Local re-phase with no peer ahead** (`src/main.rs:6423-6477`; `REPHASE_SCAN_WINDOW = 4096`, `src/consensus.rs:3885`; applied `:5174-5175`): advances the round (never rewinds — re-vote would be self-equivocation), widens the quorum-scan window, drops only a bodyless lock. (4) **Shutdown persist drain** (`wait_for_persist_drain`, `src/storage.rs:3488`, called `src/main.rs:7975`) plus **heal-to-head** (`heal_engine_to_head`, `src/main.rs:3516` — refuses to vote from unproven state, exit(1) over a fork) shrink the crash window that produces a stale checkpoint in the first place. Pins: `tests/consensus_rephase_tests.rs::rephase_widens_the_scan_window_and_never_rewinds`, `::rephase_lets_a_stuck_node_commit_the_quorum_the_network_formed`, `::rephase_is_idempotent_per_height`, `::rephase_never_touches_height_decided_or_the_qc`, `::breaker_closes_a_gap_larger_than_the_vote_acceptance_window`, `::breaker_needs_a_second_peer_to_corroborate_the_round`; `tests/deadlock_breaker_tests.rs::two_nodes_with_1200_round_desync_converge_without_restart`, `::breaker_fires_with_empty_peer_set`, `::breaker_never_moves_height_backward`. |
+
+**Precise residual:** recovery is time-bounded, not instant — the breaker fires only after the 300 s no-finalization timeout (rate-limited to once per window), and the peer-ahead jump requires a corroborating second peer, so a two-node partition with unverified/empty peer rounds converges via the slower local re-phase path; further, conflicting *bodyful* locks at the same height are never dropped (safety half does not expire), so a partition that locked conflicting values still needs a quorum to unlock rather than converging bilaterally.
 
 ---
 
@@ -292,9 +303,9 @@ onto a chain that *does* extend the anchor but is not the canonical one?
 | | |
 | --- | --- |
 | **Severity** | MEDIUM (deployment-dependent) |
-| **File** | `src/rpc.rs` — `RpcState::auth_token` (≈ line 153), the gate at `src/rpc.rs:2715` (mempoolDump) / `:4236` / `:4284` / `:4333` (the write methods) — every one of them refuses with "unauthorized" when no token is configured; the source is `STELL_RPC_AUTH_TOKEN` (`src/main.rs` line 408) |
+| **File** | `src/rpc.rs` — `RpcState::auth_token` (≈ line 153); gates: `stell_mempoolDump` (fail-closed without a token), the signed-payload arms `stell_submitPriceFeed` / `stell_pmmBuy` / `stell_pmmSell` and `stell_deployContract` / `stell_callContract` (open when unset, require the token when set), the governance writes `stell_submitProposal` / `stell_vote` / `stell_executeProposal` (require the token when set; without a token: loopback bind stays open for dev, non-loopback bind refuses fail-closed), the SIGN arms `stell_signMessage` / `stell_signTypedData` (fail-closed without a token, loopback-only, dev key required); `stell_sendRawTransaction` / `eth_sendRawTransaction` stay OPEN by design. Token source `STELL_RPC_AUTH_TOKEN` (`src/main.rs`) |
 | **Exploitability** | `REMOTE` |
-| **Status** | Open by design: the token is **optional**. When it is not configured, the gated methods fail closed (they refuse with "unauthorized: … is disabled when auth_token is not configured") — but a deployment that sets no token exposes the write surface to anyone who can reach the port. The faucet has its own separate token (`STELL_FAUCET_TOKEN`) and refuses to dispense without it. |
+| **Status** | Open by design: the token is **optional**. Without it, only `stell_mempoolDump` and the SIGN arms fail closed; the payload/contract arms stay open, and the governance writes stay open on a loopback bind while refusing on a non-loopback bind. A deployment that publishes the RPC port without a token therefore still exposes the open arms to anyone who can reach the port. The faucet has its own separate token (`STELL_FAUCET_TOKEN`) and refuses to dispense without it. |
 
 **Audit action:** confirm the operator runbook requires `STELL_RPC_AUTH_TOKEN`
 on a public deployment and that the RPC port is not exposed.

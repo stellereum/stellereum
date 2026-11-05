@@ -15,8 +15,11 @@
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
 use std::time::Duration;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{
+    register_validator_pq_key, QuorumCertificate, ValidatorSet, Vote, VoteKind, VoteSet,
+};
 use stellereum::light_client::LightClient;
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::storage::{DomainSnapshot, DomainSnapshotV1};
@@ -32,6 +35,36 @@ fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
+/// FULL-PQ: deterministic Falcon companion per ed id (cached process-wide so
+/// every helper in a test resolves the same keypair for the same voter).
+fn fk_for(k: &SigningKey) -> FalconKeypair {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<[u8; 32], FalconKeypair>>> = OnceLock::new();
+    let id = k.verifying_key().to_bytes();
+    let mut m = CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    m.entry(id)
+        .or_insert_with(|| FalconKeypair::generate_from_seed_bytes(&id))
+        .clone()
+}
+
+fn fks_for(ks: &[SigningKey]) -> Vec<FalconKeypair> {
+    ks.iter().map(fk_for).collect()
+}
+
+fn reg_all(ks: &[SigningKey]) {
+    for k in ks {
+        let fk = fk_for(k);
+        register_validator_pq_key(
+            k.verifying_key().to_bytes(),
+            PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+    }
+}
+
 fn keys4(base: u8) -> Vec<SigningKey> {
     (0..4).map(|i| key(base.wrapping_add(i))).collect()
 }
@@ -44,21 +77,37 @@ fn vset(keys: &[SigningKey]) -> ValidatorSet {
     )
 }
 
-fn qc_for(signers: &[SigningKey], height: u64, hash: [u8; 32]) -> QuorumCertificate {
-    let sigs = signers
-        .iter()
-        .map(|k| {
-            let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(hash));
-            (v.voter, v.signature)
-        })
-        .collect();
-    QuorumCertificate {
-        height,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(hash),
-        signatures: sigs,
+/// FULL-PQ genuine QC: Falcon halves + compiled µQC envelope (a raw ed list
+/// carries no power). Sub-quorum signer sets compile to an ed-only QC that
+/// verification refuses — same fail-closed verdict as before.
+fn qc_for(
+    signers: &[SigningKey],
+    vs: &ValidatorSet,
+    height: u64,
+    hash: [u8; 32],
+    parent: [u8; 32],
+) -> QuorumCertificate {
+    reg_all(signers);
+    let fks = fks_for(signers);
+    let mut set = VoteSet::new();
+    let mut votes = Vec::new();
+    for (k, fk) in signers.iter().zip(fks.iter()) {
+        let v = Vote::sign_with_falcon(k, fk, height, 0, VoteKind::Precommit, Some(hash));
+        // Non-members simply do not count (forged-QC shape); members admit.
+        let _ = set.add(v.clone(), vs, height, 0, VoteKind::Precommit);
+        votes.push(v);
     }
+    // Quorum compiles to a µQC envelope; a sub-quorum signer set cannot
+    // compile one, so fall back to the raw ed list — which verification
+    // refuses (no power), the same fail-closed verdict as before.
+    set.certificate_with_parent(Some(hash), vs, Some(&parent))
+        .unwrap_or(QuorumCertificate {
+            height,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some(hash),
+            signatures: votes.into_iter().map(|v| (v.voter, v.signature)).collect(),
+        })
 }
 
 /// One honest header link at `height`, QC-signed by `signers` under `set`.
@@ -78,7 +127,7 @@ fn header_link(
         prev_hash,
         state_root: [height as u8; 32],
         proposer,
-        qc: qc_for(signers, height, block_hash),
+        qc: qc_for(signers, set, height, block_hash, prev_hash),
     }
 }
 
@@ -124,20 +173,7 @@ fn honest_blocks(keys: &[SigningKey], vs: &ValidatorSet, n: u64, root: [u8; 32])
         };
         b.sign_block(proposer);
         let bh = b.compute_hash();
-        let sigs = keys
-            .iter()
-            .map(|k| {
-                let v = Vote::sign(k, h, 0, VoteKind::Precommit, Some(bh));
-                (v.voter, v.signature)
-            })
-            .collect();
-        b.precommit_qc = Some(QuorumCertificate {
-            height: h,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(bh),
-            signatures: sigs,
-        });
+        b.precommit_qc = Some(qc_for(keys, vs, h, bh, prev));
         prev = bh;
         out.push(b);
     }
@@ -247,7 +283,8 @@ async fn a1_snapshot_anchor_refuses_broken_linkage_and_forged_qc() {
     // Forged QC: height 3 carries a single-signer's certificate (no quorum).
     let mut no_quorum = window.clone();
     let liar = key(0xF0);
-    no_quorum[2].qc = qc_for(std::slice::from_ref(&liar), 3, no_quorum[2].block_hash);
+    let lprev = no_quorum[2].prev_hash;
+    no_quorum[2].qc = qc_for(std::slice::from_ref(&liar), &vs, 3, no_quorum[2].block_hash, lprev);
     let err = verify_snapshot_anchor_with_sets(
         None,
         [0u8; 32],
@@ -519,7 +556,8 @@ async fn b3_walk_refuses_conflicting_qcs_without_stall() {
     let liars = [key(0xF0), key(0xF1), key(0xF2)];
     for b in blocks.iter_mut().skip(3) {
         let bh = b.compute_hash();
-        b.precommit_qc = Some(qc_for(&liars, b.height, bh));
+        let prev = b.prev_hash;
+        b.precommit_qc = Some(qc_for(&liars, &vs, b.height, bh, prev));
     }
     let before_root = root;
     let res = tokio::time::timeout(
@@ -608,20 +646,7 @@ async fn c1_rotation_mid_walk_threads_with_sets_while_single_set_refuses() {
         b.validator_signatures.clear();
         b.sign_block(proposer);
         let bh = b.compute_hash();
-        let sigs = signers
-            .iter()
-            .map(|k| {
-                let v = Vote::sign(k, h, 0, VoteKind::Precommit, Some(bh));
-                (v.voter, v.signature)
-            })
-            .collect();
-        b.precommit_qc = Some(QuorumCertificate {
-            height: h,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(bh),
-            signatures: sigs,
-        });
+        b.precommit_qc = Some(qc_for(signers, set, h, bh, prev));
         prev = bh;
         blocks.push(b);
     }

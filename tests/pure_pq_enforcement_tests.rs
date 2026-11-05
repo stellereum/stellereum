@@ -1,16 +1,12 @@
 //! Integration and Enforcement Tests for Pure Post-Quantum Mode
 //!
+//! FULL-PQ (wipe, no compat): pure-PQ is ALWAYS enforced (no inactive mode).
 //! Verifies:
-//! 1. When Pure PQ mode is inactive (default):
-//!    - Both legacy Ed25519 and PQ transactions are admitted into mempool and verify.
-//!    - Both classical QCs and PQ Micro-QCs verify under consensus.
-//! 2. When Pure PQ mode is active:
-//!    - Legacy transactions are rejected by mempool with `MempoolError::Malformed`.
-//!    - Post-quantum transactions (PQ1 envelope) are admitted.
-//! 3. When Pure PQ mode is active:
-//!    - Classical Ed25519 QCs are rejected by consensus.
-//!    - PQ Micro-QCs (Falcon-512) verify successfully.
-//! 4. Thread-safe overrides and environment variable resolution (`STELL_PURE_PQ`).
+//! 1. Legacy Ed25519 transactions are always rejected by mempool.
+//! 2. Post-quantum transactions (PQ1 envelope) are admitted.
+//! 3. Classical Ed25519 QCs are always rejected by consensus;
+//!    PQ Micro-QCs (Falcon-512) verify successfully.
+//! 4. Override/env knobs are dead no-ops (always enforced).
 
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
@@ -140,9 +136,6 @@ fn make_pq_uqc() -> (ValidatorSet, QuorumCertificate) {
         signers_bitmask: bitmask,
         signatures,
         sortition_parent: parent,
-        // Predates the phase-3 VRF seal (mechanical fallout of the new
-        // trailing field): legacy draw.
-        vrf_beacon: None,
     };
 
     let payload = encode_pq_micro_envelope(&uqc);
@@ -158,41 +151,42 @@ fn make_pq_uqc() -> (ValidatorSet, QuorumCertificate) {
 
 #[test]
 fn test_pure_pq_inactive_admits_both_legacy_and_pq() {
+    // FULL-PQ: no inactive mode exists. Legacy is always rejected, PQ
+    // always admitted, classical QC always refused.
     let _guard = TEST_LOCK.lock().unwrap();
     set_pure_pq_override(Some(false));
-    assert!(!is_pure_pq_enforced(), "Pure PQ mode must be inactive");
+    assert!(is_pure_pq_enforced(), "FULL-PQ always-on");
 
-    // 1. Legacy Ed25519 transaction
+    // 1. Legacy Ed25519 transaction: always rejected.
     let legacy_tx = make_legacy_tx(1);
     assert!(!legacy_tx.is_pq());
-    assert!(legacy_tx.verify_signature());
 
     let mut mp = Mempool::new(100, 100);
     assert!(
-        mp.add(legacy_tx).is_ok(),
-        "Legacy Ed25519 tx must be admitted when pure PQ is inactive"
+        mp.add(legacy_tx).is_err(),
+        "Legacy Ed25519 tx must be rejected under FULL-PQ"
     );
 
-    // 2. Post-Quantum transaction
+    // 2. Post-Quantum transaction: admitted.
     let pq_tx = make_pq_tx(0x42, 1);
     assert!(pq_tx.is_pq());
     assert!(pq_tx.verify_signature());
     assert!(
         mp.add(pq_tx).is_ok(),
-        "PQ Falcon-512 tx must be admitted when pure PQ is inactive"
+        "PQ Falcon-512 tx must be admitted under FULL-PQ"
     );
 
-    // 3. Classical QC and PQ Micro-QC
+    // 3. Classical QC refused; PQ Micro-QC verifies.
     let (vs_classical, classical_qc) = make_classical_qc();
     assert!(
-        classical_qc.verify_unified(&vs_classical),
-        "Classical QC must verify when pure PQ is inactive"
+        !classical_qc.verify_unified(&vs_classical),
+        "Classical QC must be refused under FULL-PQ"
     );
 
     let (vs_pq, pq_qc) = make_pq_uqc();
     assert!(
         pq_qc.verify_unified(&vs_pq),
-        "PQ Micro-QC must verify when pure PQ is inactive"
+        "PQ Micro-QC must verify under FULL-PQ"
     );
 
     set_pure_pq_override(None);
@@ -265,16 +259,16 @@ fn test_pure_pq_active_rejects_classical_qcs_in_consensus() {
 fn test_pure_pq_env_and_override_resolution() {
     let _guard = TEST_LOCK.lock().unwrap();
 
-    // 1. Thread-safe override takes priority over env var
+    // FULL-PQ: override and env are dead no-ops — always enforced.
     std::env::set_var("STELL_PURE_PQ", "1");
     set_pure_pq_override(Some(false));
-    assert!(!is_pure_pq_enforced());
+    assert!(is_pure_pq_enforced());
 
     std::env::set_var("STELL_PURE_PQ", "0");
     set_pure_pq_override(Some(true));
     assert!(is_pure_pq_enforced());
 
-    // 2. When override is None, resolve from STELL_PURE_PQ env var
+    // 2. When override is None, still always enforced regardless of env.
     set_pure_pq_override(None);
 
     std::env::set_var("STELL_PURE_PQ", "1");
@@ -293,14 +287,14 @@ fn test_pure_pq_env_and_override_resolution() {
     assert!(is_pure_pq_enforced());
 
     std::env::set_var("STELL_PURE_PQ", "0");
-    assert!(!is_pure_pq_enforced());
+    assert!(is_pure_pq_enforced());
 
     std::env::set_var("STELL_PURE_PQ", "false");
-    assert!(!is_pure_pq_enforced());
+    assert!(is_pure_pq_enforced());
 
     std::env::set_var("STELL_PURE_PQ", "");
-    assert!(!is_pure_pq_enforced());
+    assert!(is_pure_pq_enforced());
 
     std::env::remove_var("STELL_PURE_PQ");
-    assert!(!is_pure_pq_enforced());
+    assert!(is_pure_pq_enforced());
 }

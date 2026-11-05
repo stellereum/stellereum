@@ -1,7 +1,7 @@
 //! Audit-bundle regression tests (fail-closed, coordinated).
 //!
 //! One file holding the per-item suites for the wip/passport-agents bundle:
-//! M1 (self-bond withdraw opcode), BLS PoP gate (refusal alternative), EVM
+//! M1 (self-bond withdraw opcode), PoP gate (refusal alternative), EVM
 //! chain-id serving, faucet zeroize (no behavior change), F2 persist-queue
 //! metrics wiring, F-02 insert-level nonce-gap check, inbound limiter
 //! semantics. F3 (genesis/faucet guard alignment) lives in the `run` binary
@@ -210,43 +210,6 @@ async fn m1_self_bond_withdraws_only_when_matured() {
         pool_before - floor,
         "replay moves no pool coins"
     );
-}
-
-// ============================================================================
-// BLS PoP (audit-pq-crypto HIGH): hard-refuse alternative
-// ============================================================================
-
-/// PoP at registration is structurally infeasible in one session (registry
-/// wire format `<ed> <bls>` carries no signature slot; every operator would
-/// have to re-register), so the bundle ships the alternative: enabling
-/// STELL_BLS_QC is a loud startup refusal, default-off unaffected.
-#[test]
-fn bls_qc_enabled_is_refused_and_default_off_passes() {
-    let prev = std::env::var(stellereum::bls::BLS_QC_ENV).ok();
-    // Enabled spellings (mirroring QcBlsConfig::from_env) all refuse.
-    for v in ["1", "true", "TRUE", "on", "ON"] {
-        std::env::set_var(stellereum::bls::BLS_QC_ENV, v);
-        let r = stellereum::bls::refuse_bls_qc_if_enabled();
-        assert!(r.is_err(), "STELL_BLS_QC={v} must refuse");
-        assert!(
-            r.unwrap_err().contains("proof-of-possession"),
-            "refusal must name the rogue-key reason"
-        );
-    }
-    // Anything else (including unset) is OFF and passes untouched.
-    for v in ["0", "false", "", "yes"] {
-        std::env::set_var(stellereum::bls::BLS_QC_ENV, v);
-        assert!(
-            stellereum::bls::refuse_bls_qc_if_enabled().is_ok(),
-            "STELL_BLS_QC={v:?} must stay default-off"
-        );
-    }
-    std::env::remove_var(stellereum::bls::BLS_QC_ENV);
-    assert!(stellereum::bls::refuse_bls_qc_if_enabled().is_ok());
-    match prev {
-        Some(v) => std::env::set_var(stellereum::bls::BLS_QC_ENV, v),
-        None => std::env::remove_var(stellereum::bls::BLS_QC_ENV),
-    }
 }
 
 // ============================================================================

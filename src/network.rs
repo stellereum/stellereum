@@ -341,7 +341,7 @@ pub fn parse_header_index(bytes: &[u8]) -> Option<(u64, String)> {
 /// (a miss), never as market evidence.
 pub fn decode_verified_price_feed(val_hex: &str) -> Option<PriceFeedUpdate> {
     let bytes = hex::decode(val_hex.trim()).ok()?;
-    let feed: PriceFeedUpdate = bincode::deserialize(&bytes).ok()?;
+    let feed: PriceFeedUpdate = decode_wire_limited(&bytes, MAX_WIRE_SMALL_BYTES).ok()?;
     feed.verify().then_some(feed)
 }
 
@@ -457,7 +457,6 @@ pub const SNAPSHOT_PUBLISH_DOMAIN_KINDS: &[&str] = &[
     "domains",
     "session",
     "bridge",
-    "confidential",
     "zkml",
     "cross_shard",
 ];
@@ -586,7 +585,7 @@ impl P2pNetworkAdapter {
             )
             .await?;
 
-        bincode::deserialize(&bytes).ok()
+        decode_wire_limited(&bytes, MAX_WIRE_BLOCK_BYTES).ok()
     }
 
     // ==================== Retro-publish of already-finalized bodies ====================
@@ -1050,7 +1049,10 @@ impl P2pNetworkAdapter {
             .ok()
             .flatten();
             if let Some(bytes) = blob_res {
-                match bincode::deserialize::<crate::storage::BlockHeaderRecord>(&bytes) {
+                match decode_wire_limited::<crate::storage::BlockHeaderRecord>(
+                    &bytes,
+                    MAX_WIRE_SMALL_BYTES,
+                ) {
                     Ok(rec) => {
                         if rec.height == height && rec.block_hash == expected_hash {
                             return Some(rec);
@@ -1091,7 +1093,10 @@ impl P2pNetworkAdapter {
             .ok()
             .flatten();
             if let Some(bytes) = blob_res {
-                match bincode::deserialize::<crate::consensus::QuorumCertificate>(&bytes) {
+                match decode_wire_limited::<crate::consensus::QuorumCertificate>(
+                    &bytes,
+                    MAX_WIRE_SMALL_BYTES,
+                ) {
                     Ok(qc) => return Some(qc),
                     Err(_) => last_err = "bad bincode",
                 }
@@ -1536,7 +1541,7 @@ impl P2pNetworkAdapter {
     /// follow-up F-J): snapshot-sync restored ACCOUNTS ONLY, so a far-behind
     /// node on a live chain could never fast-sync (root check failed on any
     /// staking/token/bridge activity). `kind` is one of: domains, session,
-    /// bridge, confidential, zkml, cross_shard. Same FOREVER retention as the
+    /// bridge, zkml, cross_shard. Same FOREVER retention as the
     /// state blob (one set per 100 heights).
     ///
     /// Fail-closed (fix 2026-10-15): a shed/dropped Bulk store is LOUD (not
@@ -1685,7 +1690,9 @@ impl P2pNetworkAdapter {
                                 );
                             }
                         }
-                    } else if let Ok(tx) = bincode::deserialize::<Transaction>(&bytes) {
+                    } else if let Ok(tx) =
+                        decode_wire_limited::<Transaction>(&bytes, MAX_WIRE_SMALL_BYTES)
+                    {
                         entries.push(MempoolEntry::Plain(tx));
                     }
                 }
@@ -1779,7 +1786,8 @@ impl P2pNetworkAdapter {
     /// so an attacker cannot forge a "trusted" message and mint value on the
     /// target shard. Only locally-generated messages (`new_trusted`) are trusted.
     pub fn parse_cross_shard_incoming(bytes: &[u8]) -> Option<CrossShardMessage> {
-        let mut msg: CrossShardMessage = bincode::deserialize(bytes).ok()?;
+        let mut msg: CrossShardMessage =
+            decode_wire_limited(bytes, MAX_CROSS_SHARD_MSG as u64).ok()?;
         msg.trusted = false;
         Some(msg)
     }
@@ -1888,7 +1896,7 @@ impl P2pNetworkAdapter {
         let key = format!("{}{}", PREFIX_MEV_COMMIT, round);
         let val_hex = self.node.get_local_kv(&key).await?;
         let bytes = hex::decode(&val_hex).ok()?;
-        bincode::deserialize(&bytes).ok()
+        decode_wire_limited(&bytes, MAX_WIRE_SMALL_BYTES).ok()
     }
 
     /// Discover known peers and active endpoints in the infnode overlay
@@ -1972,8 +1980,8 @@ pub fn plan_block_body_publish_bytes(
     block_hash: [u8; 32],
     body: &[u8],
 ) -> Result<PublishWrite, String> {
-    let block: Block =
-        bincode::deserialize(body).map_err(|e| format!("block body deserialize failed: {e:?}"))?;
+    let block: Block = decode_wire_limited(body, MAX_WIRE_BLOCK_BYTES)
+        .map_err(|e| format!("block body deserialize failed: {e:?}"))?;
     let computed = block.compute_hash();
     if computed != block_hash {
         return Err(format!(
@@ -2135,7 +2143,7 @@ pub async fn fetch_verified_body(
     // fields existed) applies to the LOCAL STORE only — otherwise a
     // truncated peer body would be silently reinterpreted as a different
     // block (audit W6.4b).
-    let block: Block = match bincode::deserialize(&bytes) {
+    let block: Block = match decode_wire_limited(&bytes, MAX_WIRE_BLOCK_BYTES) {
         Ok(b) => b,
         Err(e) => {
             eprintln!(
@@ -2343,6 +2351,34 @@ impl LocalCrossShardKv {
 /// payload from being pushed into the overlay.
 pub const MAX_CROSS_SHARD_MSG: usize = 4 * 1024 * 1024;
 
+/// Bound for single DHT blobs carrying full block bodies (L-01).
+/// Blocks hold up to 10k txs; 32 MiB mirrors `consensus_net::MAX_CONSENSUS_MSG`
+/// and is two orders above any honest body.
+pub const MAX_WIRE_BLOCK_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Bound for small wire values (price feeds, mempool txs, blind commits).
+/// 1 MiB matches `rpc::MAX_RPC_BODY`-class inputs; honest values are bytes.
+pub const MAX_WIRE_SMALL_BYTES: u64 = 1024 * 1024;
+
+/// Strict decoder for untrusted wire/DHT bytes (L-01).
+///
+/// Wire-compatible with `bincode::deserialize` (fixint, little-endian) but
+/// bounded (`with_limit`) and trailing-rejecting, so a pathological
+/// length-prefix cannot drive allocation and padded re-framings are refused.
+/// Pure so the pathological-prefix fuzz test pins it without a live DHT.
+pub fn decode_wire_limited<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    limit: u64,
+) -> Result<T, String> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(limit)
+        .reject_trailing_bytes()
+        .deserialize(bytes)
+        .map_err(|e| format!("wire decode: {e}"))
+}
+
 /// How many mesh hops a cross-shard gossip message may take.
 ///
 /// The overlay relays a published message to the peers of the peer that
@@ -2521,13 +2557,13 @@ impl InfnodeCrossShardPubSub {
     /// Resolve every configured peer to a node id.
     ///
     /// Same rule as the consensus path (`consensus_net::ConsensusNetwork`):
-    /// the peer-config node id first, the name only as a fallback — name
+    /// the peer-config PQ id first, the name only as a fallback — name
     /// resolution depends on a registry that fills in asymmetrically, and a
     /// failed lookup would silently publish to nobody.
     fn peer_ids(&self) -> Vec<[u8; 20]> {
         let mut out = Vec::new();
         for p in &self.node.cfg.peers {
-            match p.node_id_raw().or_else(|_| self.node.resolve(&p.name)) {
+            match p.primary_id().or_else(|_| self.node.resolve(&p.name)) {
                 Ok(pid) => out.push(pid),
                 Err(e) => tracing::warn!("[cross_shard] cannot resolve peer {}: {e}", p.name),
             }
@@ -3211,6 +3247,42 @@ mod tests {
         assert_eq!(receiver.prune_consumed(2, &[msg2.msg_id]).await, 0);
         assert!(receiver.fetch_cross_shard_inbound(2).await.is_empty());
     }
+
+    #[test]
+    fn l01_wire_decoder_rejects_pathological_prefix_and_trailing() {
+        use std::time::Instant;
+        // Pathological length-prefix: 0xFFFFFFFF count for a Vec<u8> must be
+        // refused by the limit before any large allocation.
+        let mut evil = Vec::new();
+        evil.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        evil.extend_from_slice(&[0x41u8; 16]);
+        let start = Instant::now();
+        let res: Result<Vec<u8>, String> = decode_wire_limited(&evil, MAX_WIRE_SMALL_BYTES);
+        assert!(res.is_err(), "pathological prefix must be refused");
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "refusal took too long: {:?}",
+            start.elapsed()
+        );
+        // Trailing bytes are rejected even when the prefix is valid.
+        let sk = SigningKey::generate(&mut OsRng);
+        let tx = Transaction::sign(&sk, [2u8; 32], 1, 10_000, 0, 0, 0);
+        let mut bytes = bincode::serialize(&tx).expect("tx serializes");
+        bytes.push(0xFF);
+        assert!(
+            decode_wire_limited::<Transaction>(&bytes, MAX_WIRE_SMALL_BYTES).is_err(),
+            "trailing byte must be rejected"
+        );
+        bytes.pop();
+        let back: Transaction =
+            decode_wire_limited(&bytes, MAX_WIRE_SMALL_BYTES).expect("valid tx must decode");
+        assert_eq!(back.compute_tx_hash(), tx.compute_tx_hash());
+        // parse_cross_shard_incoming inherits both guards.
+        assert!(
+            P2pNetworkAdapter::parse_cross_shard_incoming(&evil).is_none(),
+            "evil cross-shard bytes must not decode"
+        );
+    }
 }
 
 /// The header group (header + height index + QC sidecar) must ride ONE
@@ -3814,7 +3886,12 @@ mod retention_tests {
 
     /// VERIFICATION G5: a forged oracle feed planted in local KV (via
     /// `dht.sync` replication from an untrusted peer) must never be served
-    /// as market evidence. Only a correctly signed feed decodes.
+    /// as market evidence.
+    /// FULL-PQ (mirrors `oracle::tests::pure_pq_refuses_classical_feed`):
+    /// classical Ed25519 feed verification is removed with no PQ feed path
+    /// (wire frozen), so EVERY classical feed — genuine, tampered, or
+    /// self-consistent forgery — reads as a miss. Same fail-closed property,
+    /// stronger verdict.
     #[test]
     fn verification_oracle_fetch_reverifies_signature() {
         use ed25519_dalek::SigningKey;
@@ -3822,9 +3899,11 @@ mod retention_tests {
         let sk = SigningKey::generate(&mut OsRng);
         let feed = PriceFeedUpdate::sign("STELL", 250_000, 1_700_000_000, &sk);
         let stored = hex::encode(bincode::serialize(&feed).unwrap());
-        // Genuine feed: served.
-        let back = decode_verified_price_feed(&stored).expect("signed feed must decode");
-        assert_eq!(back.price_micro_usd, 250_000);
+        // Genuine classical feed: refused under FULL-PQ (no PQ feed path).
+        assert!(
+            decode_verified_price_feed(&stored).is_none(),
+            "a classical feed must NOT decode under FULL-PQ"
+        );
         // Tampered price bytes: signature no longer matches -> miss.
         let mut tampered = feed.clone();
         tampered.price_micro_usd = 1;
@@ -3834,17 +3913,15 @@ mod retention_tests {
             "a re-priced feed with the old signature must read as a miss"
         );
         // Forged publisher key (attacker signs with their own key but claims
-        // the asset): structurally valid, cryptographically foreign.
-        // `verify` only checks the signature against the ATTACHED key, so a
-        // self-consistent forgery verifies here — publisher-set membership is
-        // enforced one layer up (`OracleState::apply_update`). The fetch gate
-        // guarantees integrity (bytes == publisher's words), not membership.
+        // the asset): refused — under FULL-PQ even a self-consistent classical
+        // signature fails the integrity gate (membership is checked by
+        // OracleState on top of this).
         let attacker = SigningKey::generate(&mut OsRng);
         let forged = PriceFeedUpdate::sign("STELL", 1, 1_700_000_000, &attacker);
         let forged_hex = hex::encode(bincode::serialize(&forged).unwrap());
         assert!(
-            decode_verified_price_feed(&forged_hex).is_some(),
-            "a self-consistent signature passes the integrity gate (membership is checked by OracleState)"
+            decode_verified_price_feed(&forged_hex).is_none(),
+            "a self-consistent classical signature must still read as a miss under FULL-PQ"
         );
         // Garbage: miss, never a panic or a fabricated feed.
         assert!(decode_verified_price_feed("zzzz").is_none());
@@ -3983,6 +4060,7 @@ mod pointer_overwrite_tests {
         let node = infnode::node::Node::new(
             cfg,
             infnode::keyring::NodeKeys::generate(),
+            infnode::keyring::PqKeys::generate(),
             dir.clone(),
             std::path::PathBuf::new(),
         )

@@ -442,7 +442,7 @@ fn dns_merge_never_overflows_and_dedups_validator_ids() {
     let mk = |seed: u8| stellereum::dns_seeds::DiscoveredPeer {
         node_id: id_of(&ed_of(seed)),
         ed_pub: ed_of(seed),
-        x_pub: None,
+        kem_ek_hash: None,
         host: "n.example".into(),
         port: 9411,
     };
@@ -454,10 +454,10 @@ fn dns_merge_never_overflows_and_dedups_validator_ids() {
     // A discovered record reusing a known ed key is a duplicate, never new.
     let cfg_peer = infnode::config::PeerConfig {
         name: "validator".into(),
-        node_id: id_of(&ed_of(0x77)),
         ed_pub: hex::encode(ed_of(0x77)),
-        x_pub: hex::encode(ed_of(0x78)),
-        pq_pub: None, // GATE: classical-only fixture (no PQ identity announced)
+        // No PQ pin: `primary_id` refuses it, so the spoof below dedups via
+        // the ed leg — same as the live DNS path (DNS pins ed + kem_hash only).
+        pq_pub: None,
         endpoints: vec!["127.0.0.1:9411".into()],
         allow: vec!["*".into()],
         rate_limit_per_sec: 0,

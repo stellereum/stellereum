@@ -960,7 +960,6 @@ pub const SYNC_DOMAIN_KINDS: &[&str] = &[
     "domains",
     "session",
     "bridge",
-    "confidential",
     "zkml",
     "cross_shard",
     "pq_keys",
@@ -1281,12 +1280,9 @@ async fn install_bundle(
                     .await
                     .map_err(|e| format!("fast sync: restore bridge error: {e}"))?;
             }
-            "confidential" => {
-                engine
-                    .restore_confidential(dbytes)
-                    .await
-                    .map_err(|e| format!("fast sync: restore confidential error: {e}"))?;
-            }
+            // Ristretto deletion wave: confidential/shielded ledger removed with
+            // crypto_privacy; fetched blob (if any) falls through to the
+            // forward-compat unhandled arm below (logged, not installed).
             "zkml" => {
                 engine
                     .restore_zkml_models(dbytes)
@@ -1533,10 +1529,19 @@ impl std::fmt::Display for SnapshotChunkFailure {
 /// Assemble `n_chunks` chunk bodies with per-chunk resume.
 ///
 /// `fetch_chunk(i)` resolves chunk `i` to its bytes (`None` = this attempt
-/// missed: drop, timeout, slow peer). Chunks are pulled STRICTLY SERIALLY in
-/// index order (the weak-node pull shape: exactly one chunk stream at a
-/// time), and a `yield_now` runs after every chunk so the tick never wedges
-/// on a 1-vCPU executor.
+/// missed: drop, timeout, slow peer — including a per-chunk expected-hash
+/// mismatch, which the caller reports as a miss exactly like a drop so a
+/// forged chunk is NEVER installed). Chunks are pulled in BOUNDED
+/// index-ordered batches of at most [`chunk_batch_for_blob`](`chunk_batch_for_blob`(`n_chunks`))
+/// (i.e. at most [`FETCH_BLOB_CHUNK_BATCH`] concurrent fetches, and strictly
+/// serial width 1 for blobs above [`LARGE_BLOB_SERIAL_CHUNKS`] — the weak-node
+/// pull shape is unchanged for snapshot-sized blobs), and a `yield_now` runs
+/// after every batch so the tick never wedges on a 1-vCPU executor.
+///
+/// FAIRNESS: every batch covers distinct indices in increasing order, each
+/// missing index gets exactly one attempt per pass (no prioritization, no
+/// starvation of honest peers), and completed slots are assigned back by
+/// index — so assembly order is canonical regardless of completion order.
 ///
 /// RESUME: completed slots are kept across passes and NEVER re-fetched — a
 /// pass only asks for still-missing indices. Up to `max_retries` extra passes
@@ -1555,6 +1560,12 @@ where
     use std::collections::BTreeSet;
     let mut slots: Vec<Option<Vec<u8>>> = (0..n_chunks).map(|_| None).collect();
     let passes = max_retries.saturating_add(1);
+    // Bounded fan-out: at most one `chunk_batch_for_blob` width in flight —
+    // never unbounded — and width 1 (serial) for snapshot-sized blobs, so the
+    // weak-node pull shape is byte-identical to before on large blobs.
+    let width = chunk_batch_for_blob(n_chunks)
+        .max(1)
+        .min(FETCH_BLOB_CHUNK_BATCH.max(1));
     for _pass in 0..passes {
         let mut missing: BTreeSet<usize> = slots
             .iter()
@@ -1567,16 +1578,33 @@ where
         // Snapshot the missing set for this pass: newly-failed indices are
         // retried on the NEXT pass, never by re-walking a mutating set.
         let round: Vec<usize> = missing.iter().copied().collect();
-        for i in round {
-            if slots[i].is_some() {
-                continue;
+        // Index-ordered batches (round-robin fairness: no index is
+        // prioritized, no honest peer starves); assignment back is by index,
+        // so completion order never affects assembly order. Futures are built
+        // sequentially (one `FnMut` borrow at a time) then polled
+        // concurrently via `join_all` on this task — no spawn, no `Send`
+        // bound, no extra threads.
+        for batch in round.chunks(width) {
+            // Build one owned future per missing index (sequential `FnMut`
+            // borrows, each ending with its call — the futures hold owned
+            // bytes, never the closure borrow), then poll the batch
+            // concurrently on this task: at most `width` chunk streams in
+            // flight, never unbounded.
+            let idxs: Vec<usize> = batch
+                .iter()
+                .copied()
+                .filter(|&i| slots[i].is_none())
+                .collect();
+            let futs: Vec<Fut> = idxs.iter().map(|&i| fetch_chunk(i)).collect();
+            let outs = futures::future::join_all(futs).await;
+            for (&i, got) in idxs.iter().zip(outs) {
+                if let Some(bytes) = got {
+                    slots[i] = Some(bytes);
+                    missing.remove(&i);
+                }
             }
-            if let Some(bytes) = fetch_chunk(i).await {
-                slots[i] = Some(bytes);
-                missing.remove(&i);
-            }
-            // Yield per chunk: tens-of-MB assembly must not hold the
-            // executor across dozens of slow fetches on a weak node.
+            // Yield per batch: assembly must not hold the executor across
+            // slow fetches on a weak node.
             tokio::task::yield_now().await;
         }
         if missing.is_empty() && slots.iter().all(|s| s.is_some()) {
@@ -1863,13 +1891,47 @@ pub fn plan_backfill_tip_ward(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consensus::{FalconKeypair, Vote, VoteKind};
     use crate::sharding::MASTERCHAIN_SHARD;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use std::collections::HashMap;
 
+    /// FULL-PQ QC (mirrors `consensus::tests::fvote` + `VoteSet::certificate`
+    /// idiom): Ed list for membership/power plus Falcon µQC envelope for
+    /// crypto — exactly what `QuorumCertificate::verify` requires. `parent`
+    /// must be the block's `prev_hash` (chain binding).
+    fn pq_cert_for(
+        height: u64,
+        round: u32,
+        block_hash: [u8; 32],
+        parent: [u8; 32],
+        vs: &crate::consensus::ValidatorSet,
+        keys: &[(SigningKey, FalconKeypair)],
+    ) -> crate::consensus::QuorumCertificate {
+        let mut set = crate::consensus::VoteSet::new();
+        for (sk, fk) in keys {
+            let v = Vote::sign_with_falcon(sk, fk, height, round, VoteKind::Precommit, Some(block_hash));
+            set.add(v, vs, height, round, VoteKind::Precommit)
+                .expect("falcon vote must ingest");
+        }
+        set.certificate_with_parent(Some(block_hash), vs, Some(&parent))
+            .expect("quorum must compile a Falcon µQC")
+    }
+
     fn chain(len: u64) -> Vec<Block> {
         let sk = SigningKey::generate(&mut OsRng);
+        let fk = FalconKeypair::generate();
+        crate::consensus::register_validator_pq_key(
+            sk.verifying_key().to_bytes(),
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+        let vs = crate::consensus::ValidatorSet::from_list(vec![(
+            sk.verifying_key().to_bytes(),
+            1,
+        )]);
+        let keys = vec![(sk.clone(), fk.clone())];
         let mut out = Vec::new();
         let mut prev = [0u8; 32];
         for h in 0..=len {
@@ -1894,20 +1956,7 @@ mod tests {
             let hash = b.compute_hash();
             // A decision proof travels with the block: without it the chain is
             // exactly what the quorum check must refuse.
-            let v = crate::consensus::Vote::sign(
-                &sk,
-                h,
-                0,
-                crate::consensus::VoteKind::Precommit,
-                Some(hash),
-            );
-            b.precommit_qc = Some(crate::consensus::QuorumCertificate {
-                height: h,
-                round: 0,
-                kind: crate::consensus::VoteKind::Precommit,
-                block_hash: Some(hash),
-                signatures: vec![(v.voter, v.signature)],
-            });
+            b.precommit_qc = Some(pq_cert_for(h, 0, hash, prev, &vs, &keys));
             prev = hash;
             out.push(b);
         }
@@ -1920,10 +1969,17 @@ mod tests {
     /// in its attached precommit QC, equal power. The quorum lives in the QC, not in
     /// the block-signature list (which carries only the proposer), so the set must be
     /// derived from the QC or the threshold is measured against the wrong members.
+    /// Marker entries (`PQ_UQC_MARKER_ID` / `PQ_QC_MARKER_ID`) are envelopes,
+    /// not members, and are skipped.
     fn set_from(b: &Block) -> crate::consensus::ValidatorSet {
         let mut vs = crate::consensus::ValidatorSet::new();
         if let Some(qc) = &b.precommit_qc {
             for (pk, _) in &qc.signatures {
+                if *pk == crate::consensus::PQ_UQC_MARKER_ID
+                    || *pk == crate::consensus::PQ_QC_MARKER_ID
+                {
+                    continue;
+                }
                 vs.add(*pk, 1);
             }
         }
@@ -1938,20 +1994,35 @@ mod tests {
         let keys: Vec<SigningKey> = (0..signers + 1)
             .map(|_| SigningKey::generate(&mut OsRng))
             .collect();
+        let fks: Vec<FalconKeypair> = keys
+            .iter()
+            .map(|k| {
+                let fk = FalconKeypair::generate();
+                crate::consensus::register_validator_pq_key(
+                    k.verifying_key().to_bytes(),
+                    crate::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                );
+                fk
+            })
+            .collect();
         let vs = crate::consensus::ValidatorSet::from_list(
             keys.iter()
                 .map(|k| (k.verifying_key().to_bytes(), 1))
                 .collect(),
         );
+        let all_keys: Vec<(SigningKey, FalconKeypair)> =
+            keys.into_iter().zip(fks).collect();
         let mut out = Vec::new();
         let mut prev = [0u8; 32];
         for h in 0..=len {
             let proposer_id = vs.proposer_for(h, 0).expect("non-empty set has a proposer");
-            let proposer = keys
+            let proposer_idx = all_keys
                 .iter()
-                .find(|k| k.verifying_key().to_bytes() == proposer_id)
-                .expect("proposer is a member")
-                .clone();
+                .position(|(k, _)| k.verifying_key().to_bytes() == proposer_id)
+                .expect("proposer is a member");
+            let (proposer_sk, _) = &all_keys[proposer_idx];
+            let proposer = proposer_sk.clone();
             let mut b = Block {
                 shard_id: MASTERCHAIN_SHARD,
                 height: h,
@@ -1974,24 +2045,7 @@ mod tests {
             // The quorum lives in the attached precommit QC, not in extra block-hash
             // signatures: validators agree via votes (over vote_sign_bytes), and only
             // the QC proves they did.
-            let mut sigs = Vec::new();
-            for k in &keys {
-                let v = crate::consensus::Vote::sign(
-                    k,
-                    h,
-                    0,
-                    crate::consensus::VoteKind::Precommit,
-                    Some(hash),
-                );
-                sigs.push((v.voter, v.signature));
-            }
-            b.precommit_qc = Some(crate::consensus::QuorumCertificate {
-                height: h,
-                round: 0,
-                kind: crate::consensus::VoteKind::Precommit,
-                block_hash: Some(hash),
-                signatures: sigs,
-            });
+            b.precommit_qc = Some(pq_cert_for(h, 0, hash, prev, &vs, &all_keys));
             prev = hash;
             out.push(b);
         }
@@ -2137,6 +2191,20 @@ mod tests {
     #[test]
     fn sync_checks_proposer_schedule_and_shard() {
         let keys: Vec<SigningKey> = (0..4).map(|_| SigningKey::generate(&mut OsRng)).collect();
+        let fks: Vec<FalconKeypair> = keys
+            .iter()
+            .map(|k| {
+                let fk = FalconKeypair::generate();
+                crate::consensus::register_validator_pq_key(
+                    k.verifying_key().to_bytes(),
+                    crate::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                );
+                fk
+            })
+            .collect();
+        let all_keys: Vec<(SigningKey, FalconKeypair)> =
+            keys.clone().into_iter().zip(fks.clone()).collect();
         let vs = crate::consensus::ValidatorSet::from_list(
             keys.iter()
                 .map(|k| (k.verifying_key().to_bytes(), 1))
@@ -2169,26 +2237,7 @@ mod tests {
             };
             b.sign_block(&keys[proposer_idx]);
             let hash = b.compute_hash();
-            let sigs = keys
-                .iter()
-                .map(|k| {
-                    let v = crate::consensus::Vote::sign(
-                        k,
-                        h,
-                        0,
-                        crate::consensus::VoteKind::Precommit,
-                        Some(hash),
-                    );
-                    (v.voter, v.signature)
-                })
-                .collect();
-            b.precommit_qc = Some(crate::consensus::QuorumCertificate {
-                height: h,
-                round: 0,
-                kind: crate::consensus::VoteKind::Precommit,
-                block_hash: Some(hash),
-                signatures: sigs,
-            });
+            b.precommit_qc = Some(pq_cert_for(h, 0, hash, prev, &vs, &all_keys));
             b
         };
         let sched = |h: u64| vs.proposer_for(h, 0).unwrap();
@@ -2505,6 +2554,23 @@ mod tests {
         let honest_vs = set_from(&honest[2]);
         // Attacker committee (disjoint keys) + its validator set.
         let evil_keys: Vec<Sk> = (0..3).map(|_| Sk::generate(&mut OsRng)).collect();
+        let evil_fks: Vec<FalconKeypair> = evil_keys
+            .iter()
+            .map(|k| {
+                let fk = FalconKeypair::generate();
+                crate::consensus::register_validator_pq_key(
+                    k.verifying_key().to_bytes(),
+                    crate::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                );
+                fk
+            })
+            .collect();
+        let evil_all: Vec<(Sk, FalconKeypair)> = evil_keys
+            .clone()
+            .into_iter()
+            .zip(evil_fks.clone().into_iter())
+            .collect();
         let evil_vs = crate::consensus::ValidatorSet::from_list(
             evil_keys
                 .iter()
@@ -2545,24 +2611,7 @@ mod tests {
             };
             eb.sign_block(&proposer);
             let hash = eb.compute_hash();
-            let mut sigs = Vec::new();
-            for k in &evil_keys {
-                let v = crate::consensus::Vote::sign(
-                    k,
-                    h,
-                    0,
-                    crate::consensus::VoteKind::Precommit,
-                    Some(hash),
-                );
-                sigs.push((v.voter, v.signature));
-            }
-            eb.precommit_qc = Some(crate::consensus::QuorumCertificate {
-                height: h,
-                round: 0,
-                kind: crate::consensus::VoteKind::Precommit,
-                block_hash: Some(hash),
-                signatures: sigs,
-            });
+            eb.precommit_qc = Some(pq_cert_for(h, 0, hash, prev, &evil_vs, &evil_all));
             let link = qc_link(&eb);
             prev = link.block_hash;
             links.insert(h, link);
@@ -2615,30 +2664,25 @@ mod tests {
         // Links carry real single-signer QCs (A1: linkage without quorum is
         // refused, so even the synthetic genesis walk is QC-gated).
         let gk = SigningKey::generate(&mut OsRng);
+        let gfk = FalconKeypair::generate();
+        crate::consensus::register_validator_pq_key(
+            gk.verifying_key().to_bytes(),
+            crate::post_quantum::PqScheme::Falcon512,
+            gfk.public_key.clone(),
+        );
         let gpk = gk.verifying_key().to_bytes();
         let vs = crate::consensus::ValidatorSet::from_list(vec![(gpk, 1)]);
+        let gkeys = vec![(gk.clone(), gfk.clone())];
         let mk_link = |h: u64, prev: [u8; 32], root: [u8; 32]| {
             let block_hash = [h as u8; 32];
-            let v = crate::consensus::Vote::sign(
-                &gk,
-                h,
-                0,
-                crate::consensus::VoteKind::Precommit,
-                Some(block_hash),
-            );
+            let qc = pq_cert_for(h, 0, block_hash, prev, &vs, &gkeys);
             HeaderLink {
                 height: h,
                 block_hash,
                 prev_hash: prev,
                 state_root: root,
                 proposer: gpk,
-                qc: crate::consensus::QuorumCertificate {
-                    height: h,
-                    round: 0,
-                    kind: crate::consensus::VoteKind::Precommit,
-                    block_hash: Some(block_hash),
-                    signatures: vec![(v.voter, v.signature)],
-                },
+                qc,
             }
         };
         let mut links: HashMap<u64, HeaderLink> = HashMap::new();

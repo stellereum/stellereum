@@ -67,9 +67,9 @@ fn dummy_tx() -> stellereum::sharding::Transaction {
     }
 }
 
-/// Build a VALID 5757-signed legacy raw tx (EIP-155 signing hash +
+/// Build a VALID legacy raw tx for the given chain id (EIP-155 signing hash +
 /// recoverable secp256k1 + low-s normalize), mirroring the in-tree vectors.
-fn sign_5757_legacy(nonce: u64, value_wei: u128) -> Vec<u8> {
+fn sign_legacy(chain_id: u64, nonce: u64, value_wei: u128) -> Vec<u8> {
     let key = k256::ecdsa::SigningKey::from_slice(&[0x42u8; 32]).unwrap();
     let unsigned = evm::LegacyTransaction {
         nonce,
@@ -81,7 +81,7 @@ fn sign_5757_legacy(nonce: u64, value_wei: u128) -> Vec<u8> {
         v: 0,
         r: [0u8; 32],
         s: [0u8; 32],
-        chain_id: Some(evm::CHAIN_ID),
+        chain_id: Some(chain_id),
     };
     let sighash = unsigned.signing_hash();
     let (sig, recid) = key.sign_prehash_recoverable(&sighash).unwrap();
@@ -108,12 +108,16 @@ fn sign_5757_legacy(nonce: u64, value_wei: u128) -> Vec<u8> {
         (out, recid.to_byte() ^ 1)
     };
     let signed = evm::LegacyTransaction {
-        v: evm::CHAIN_ID * 2 + 35 + recid_b as u64,
+        v: chain_id * 2 + 35 + recid_b as u64,
         r,
         s,
         ..unsigned
     };
     signed.encode()
+}
+
+fn sign_5757_legacy(nonce: u64, value_wei: u128) -> Vec<u8> {
+    sign_legacy(evm::CHAIN_ID, nonce, value_wei)
 }
 
 // ---------------------------------------------------------------------------
@@ -324,16 +328,20 @@ fn verification_pins_stay_5757_under_custom_env() {
     std::env::set_var("STELL_CHAIN_ID", "1234");
     // Serving says 1234 ...
     assert_eq!(evm::eth_chain_id(), "0x4d2");
-    // ... but a valid 5757-signed tx still verifies (pinned, by design: all
-    // nodes must reach the same verdict on the same bytes).
-    let raw = sign_5757_legacy(41, 7);
+    // GATE (M-02 unify): verification follows the effective chain id — a
+    // 5757-signed tx under env 1234 is REFUSED (was: accepted by the pinned
+    // 5757 verifier), and a 1234-signed tx verifies + admits.
+    let raw_old = sign_5757_legacy(41, 7);
+    let decoded_old = evm::parse_legacy_transaction(&raw_old).expect("decodes");
+    assert_eq!(decoded_old.chain_id, Some(5757));
+    assert!(decoded_old.verify_signature().is_err(), "foreign-chain tx refused");
+    assert!(evm::eth_send_raw_transaction_bytes(&raw_old).is_err(), "gate refuses it");
+    let raw = sign_legacy(1234, 41, 7);
     let decoded = evm::parse_legacy_transaction(&raw).expect("decodes");
-    assert_eq!(decoded.chain_id, Some(5757));
-    decoded
-        .verify_signature()
-        .expect("pinned verifier accepts 5757 under any env");
-    // And the admission gate still files it (idempotent on re-admission).
-    let h1 = evm::eth_send_raw_transaction_bytes(&raw).expect("gate admits pinned 5757 tx");
+    assert_eq!(decoded.chain_id, Some(1234));
+    decoded.verify_signature().expect("own-chain tx verifies");
+    // And the admission gate files it (idempotent on re-admission).
+    let h1 = evm::eth_send_raw_transaction_bytes(&raw).expect("gate admits own-chain tx");
     let h2 = evm::eth_send_raw_transaction_bytes(&raw).expect("re-admission is idempotent");
     assert_eq!(h1, h2);
     assert!(h1.starts_with("0x") && h1.len() == 66);

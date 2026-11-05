@@ -85,7 +85,6 @@ fn main() -> Result<()> {
                         "domains" => storage.put_domains(target_height, &plain)?,
                         "session" => storage.put_session_keys(target_height, &plain)?,
                         "bridge" => storage.put_bridge(target_height, &plain)?,
-                        "confidential" => storage.put_confidential(target_height, &plain)?,
                         "zkml" => storage.put_zkml_models(target_height, &plain)?,
                         "cross_shard" => storage.put_cross_shard(target_height, &plain)?,
                         other => println!("  Unknown domain kind: {other}"),

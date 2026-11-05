@@ -149,20 +149,6 @@ pub const UNBOUND_TX_TOTAL: &str = "stell_unbound_tx_total";
 /// activation height (it means a node armed the gate early); after activation
 /// it counts blocked replays.
 pub const UNBOUND_REFUSED_TOTAL: &str = "stell_unbound_refused_total";
-/// Registry entries with a valid proof-of-possession (the phase-2/3 BLS
-/// registry shape). Monotonic counter, never reset: phase-2 readiness reads
-/// as `legacy == 0 && rejected == 0` with `pop_verified == validator count`.
-/// Mirrors the process counter in `crate::bls` (see
-/// `crate::bls::bls_registry_migration_counts`); bumped at the same parse
-/// sites so the scrape and the in-process tuple never diverge.
-pub const BLS_POP_VERIFIED_TOTAL: &str = "stell_bls_pop_verified_total";
-/// Bare `<ed> <bls>` registry entries (accepted, phase-1 behaviour unchanged).
-/// Monotonic counter, never reset: must be zero before phase-2 activation.
-pub const BLS_LEGACY_ENTRY_TOTAL: &str = "stell_bls_legacy_entry_total";
-/// Registry entries skipped: bad lengths, non-curve keys, or INVALID PoPs.
-/// Monotonic counter, never reset: alert on any increase (fail-closed skips
-/// are metering for the migration, but a spike means a bad registry push).
-pub const BLS_POP_REJECTED_TOTAL: &str = "stell_bls_pop_rejected_total";
 
 /// Label carrying the vote kind (`prevote` / `precommit`).
 pub const LABEL_KIND: &str = "kind";
@@ -696,27 +682,6 @@ impl Registry {
                 buckets: &[],
             },
             MetricDef {
-                name: BLS_POP_VERIFIED_TOTAL,
-                help: "BLS registry entries with a valid proof-of-possession (phase-2/3 shape)",
-                kind: MetricKind::Counter,
-                labels: &[],
-                buckets: &[],
-            },
-            MetricDef {
-                name: BLS_LEGACY_ENTRY_TOTAL,
-                help: "Bare BLS registry entries without a PoP (accepted, phase-1 behaviour)",
-                kind: MetricKind::Counter,
-                labels: &[],
-                buckets: &[],
-            },
-            MetricDef {
-                name: BLS_POP_REJECTED_TOTAL,
-                help: "BLS registry entries skipped (bad lengths, non-curve keys, invalid PoPs)",
-                kind: MetricKind::Counter,
-                labels: &[],
-                buckets: &[],
-            },
-            MetricDef {
                 name: BUILD_INFO,
                 help: "Build identity of this binary (always 1; see version, hash and dirty labels)",
                 kind: MetricKind::Gauge,
@@ -772,9 +737,6 @@ impl Registry {
             PERSIST_QUEUE_DROPPED_TOTAL,
             UNBOUND_TX_TOTAL,
             UNBOUND_REFUSED_TOTAL,
-            BLS_POP_VERIFIED_TOTAL,
-            BLS_LEGACY_ENTRY_TOTAL,
-            BLS_POP_REJECTED_TOTAL,
         ] {
             reg.seed(name, &[]);
         }
@@ -1072,25 +1034,6 @@ impl Registry {
         self.add(UNBOUND_REFUSED_TOTAL, &[], 1.0);
     }
 
-    /// One BLS registry entry with a valid proof-of-possession parsed
-    /// (phase-2/3 shape). Bumped at the same sites as the process counter in
-    /// `crate::bls`; monotonic counter, never reset.
-    pub fn inc_bls_pop_verified(&self) {
-        self.add(BLS_POP_VERIFIED_TOTAL, &[], 1.0);
-    }
-
-    /// One bare BLS registry entry accepted (phase-1 behaviour unchanged).
-    /// Monotonic counter, never reset.
-    pub fn inc_bls_legacy_entry(&self) {
-        self.add(BLS_LEGACY_ENTRY_TOTAL, &[], 1.0);
-    }
-
-    /// One BLS registry entry skipped (fail-closed warn-and-skip power loss).
-    /// Monotonic counter, never reset.
-    pub fn inc_bls_pop_rejected(&self) {
-        self.add(BLS_POP_REJECTED_TOTAL, &[], 1.0);
-    }
-
     /// `n` persist jobs dropped because the bounded queue was full.
     pub fn add_persist_queue_dropped(&self, n: u64) {
         self.add(PERSIST_QUEUE_DROPPED_TOTAL, &[], n as f64);
@@ -1222,9 +1165,6 @@ impl Registry {
             unbound_tx: scalar(UNBOUND_TX_TOTAL, &[]),
             unbound_refused: scalar(UNBOUND_REFUSED_TOTAL, &[]),
             straggler_grace_extends: scalar(STRAGGLER_GRACE_EXTENDS_TOTAL, &[]),
-            bls_pop_verified: scalar(BLS_POP_VERIFIED_TOTAL, &[]),
-            bls_legacy_entries: scalar(BLS_LEGACY_ENTRY_TOTAL, &[]),
-            bls_pop_rejected: scalar(BLS_POP_REJECTED_TOTAL, &[]),
         }
     }
 }
@@ -1267,9 +1207,6 @@ pub struct Snapshot {
     pub unbound_tx: f64,
     pub unbound_refused: f64,
     pub straggler_grace_extends: f64,
-    pub bls_pop_verified: f64,
-    pub bls_legacy_entries: f64,
-    pub bls_pop_rejected: f64,
 }
 
 impl Snapshot {
@@ -1296,9 +1233,6 @@ impl Snapshot {
             "unbound_tx": self.unbound_tx,
             "unbound_refused": self.unbound_refused,
             "straggler_grace_extends": self.straggler_grace_extends,
-            "bls_pop_verified": self.bls_pop_verified,
-            "bls_legacy_entries": self.bls_legacy_entries,
-            "bls_pop_rejected": self.bls_pop_rejected,
         })
         .to_string()
     }
@@ -1735,38 +1669,4 @@ mod tests {
         );
     }
 
-    /// Phase-2 readiness: the BLS registry-migration counters exist, start at
-    /// zero, increment monotonically, and render in both the JSON snapshot
-    /// and the Prometheus exposition, so `stell_bls_legacy_entry_total == 0
-    /// and stell_bls_pop_rejected_total == 0` is a working readiness alert.
-    #[test]
-    fn bls_registry_migration_counters_are_exposed_and_monotonic() {
-        let r = Registry::new();
-        let snap = r.snapshot();
-        assert_eq!(snap.bls_pop_verified, 0.0);
-        assert_eq!(snap.bls_legacy_entries, 0.0);
-        assert_eq!(snap.bls_pop_rejected, 0.0);
-        r.inc_bls_pop_verified();
-        r.inc_bls_legacy_entry();
-        r.inc_bls_pop_rejected();
-        r.inc_bls_pop_rejected();
-        let snap = r.snapshot();
-        assert_eq!(snap.bls_pop_verified, 1.0);
-        assert_eq!(snap.bls_legacy_entries, 1.0);
-        assert_eq!(snap.bls_pop_rejected, 2.0);
-        let json = snap.to_json();
-        assert!(json.contains("\"bls_pop_verified\":1"), "{json}");
-        assert!(json.contains("\"bls_pop_rejected\":2"), "{json}");
-        let text = r.render();
-        for name in [
-            "stell_bls_pop_verified_total ",
-            "stell_bls_legacy_entry_total ",
-            "stell_bls_pop_rejected_total ",
-        ] {
-            assert!(
-                text.lines().any(|l| l.starts_with(name)),
-                "{name}must be scraped:\n{text}"
-            );
-        }
-    }
 }

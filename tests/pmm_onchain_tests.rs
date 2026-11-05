@@ -4,10 +4,52 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{OpCode, GAS_PMM_BUY, GAS_PMM_SELL};
 use stellereum::token::{TokenMetadata, TokenOp};
+
+/// FULL-PQ buyer identity: implicit Falcon-512, registered globally (mirrors
+/// the audit_state_sync_closeout pq_tx pattern — Ed-signed txs are refused
+/// at admission, so the live block path needs a PQ sender).
+fn pq_buyer(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+fn pq_payload_tx(
+    seed: u8,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_buyer(seed);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
 
 async fn setup() -> (InMemoryStateEngine, [u8; 32], [u8; 32], [u8; 32]) {
     let engine = InMemoryStateEngine::new();
@@ -157,10 +199,8 @@ const BLOCK_TS: u64 = 1_760_000_000;
 #[tokio::test]
 async fn pmm_buy_sell_roundtrip_on_the_live_block_path() {
     let engine = InMemoryStateEngine::new();
-    let treasury_key = SigningKey::from_bytes(&[0x11u8; 32]);
-    let treasury = treasury_key.verifying_key().to_bytes();
-    let buyer_key = SigningKey::from_bytes(&[0x22u8; 32]);
-    let buyer = buyer_key.verifying_key().to_bytes();
+    let treasury = [0x11u8; 32];
+    let buyer = pq_buyer(0x22);
     let start = 1_000_000u64;
     engine.update_account(AccountState::new(buyer, start)).await;
 
@@ -200,14 +240,12 @@ async fn pmm_buy_sell_roundtrip_on_the_live_block_path() {
         .buy_with_buffer(usdt_micro, stellereum::pmm::PMM_REDEMPTION_BUFFER_BPS)
         .unwrap();
 
-    let buy_tx = Transaction::sign_with_payload(
-        &buyer_key,
+    let buy_tx = pq_payload_tx(
+        0x22,
         buyer,
         0,
         GAS_PMM_BUY,
         0,
-        1,
-        1,
         vec![OpCode::SysCallPmmBuy { usdt_micro }],
     );
     let (applied, failed, fees, status, _) =
@@ -261,13 +299,11 @@ async fn pmm_buy_sell_roundtrip_on_the_live_block_path() {
         (sell_amount, trial2.sell_stell(sell_amount).unwrap())
     };
 
-    let sell_tx = Transaction::sign_with_payload(
-        &buyer_key,
+    let sell_tx = pq_payload_tx(
+        0x22,
         buyer,
         0,
         GAS_PMM_SELL,
-        1,
-        1,
         1,
         vec![OpCode::SysCallPmmSell {
             stell_nano: sell_amount,

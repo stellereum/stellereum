@@ -44,12 +44,27 @@
 //!   aid front-running), the `admit_signed_payload_tx` arms `stell_submitPriceFeed`,
 //!   `stell_pmmBuy`, `stell_pmmSell`.
 //!   Without a token configured these stay open (local/dev mode) — EXCEPT the
-//!   governance writes below, which fail closed on a non-loopback bind.
+//!   governance writes and the contract previews below, which are fail-closed
+//!   without a token on EVERY bind (N-02/N-03; see `require_gov_write_auth`).
 //! * The governance writes `stell_submitProposal`, `stell_vote`,
-//!   `stell_executeProposal` are FAIL-CLOSED without a token on a non-loopback
-//!   bind (GATE: H-01/C-02): no token + loopback bind keeps dev flows; no token +
-//!   non-loopback bind refuses. The bind is the existing `STELL_RPC_LISTEN`
-//!   (no new knob); `stell_sendRawTransaction` stays OPEN by design.
+//!   `stell_executeProposal` require a valid `auth_token` ALWAYS (N-02): no
+//!   token configured, or a missing/invalid presented token, is refused with
+//!   `-32001`, regardless of the `STELL_RPC_LISTEN` bind address. There is no
+//!   loopback escape: a loopback bind is not proof of a loopback peer (the
+//!   node sits behind proxies — nginx on the same host IS a loopback TCP
+//!   peer while the real client is remote — and `X-Forwarded-For` is only
+//!   trustworthy under `STELL_TRUSTED_PROXY_CIDRS`), so any bind- or
+//!   peer-based exception would be a loopback illusion. `dispatch` DOES see
+//!   the real client IP (`peer_ip` via `resolve_client_ip`/`ConnectInfo`),
+//!   but the gate deliberately consults neither bind nor peer: token-always
+//!   is strictly stronger and independent of proxy topology.
+//!   `stell_sendRawTransaction` stays OPEN by design (self-authenticating
+//!   signed txs — see the module docs).
+//! * The contract previews `stell_deployContract` / `stell_callContract`
+//!   require the same token (N-03) and NEVER enter the mempool: they execute
+//!   on a state clone, return the result, and drop the transaction. State
+//!   changes exclusively when a block applies a transaction submitted via
+//!   `stell_sendRawTransaction`.
 //! * The wallet SIGN arms `stell_signMessage`, `stell_signTypedData` are
 //!   SEPARATELY fail-closed (GATE: H-02): they sign with an ephemeral dev-only
 //!   key that exists only when explicit dev mode is on
@@ -176,12 +191,12 @@ pub struct RpcState {
     /// (`stell_mempoolDump`, `stell_submitPriceFeed`, `stell_pmmBuy`,
     /// `stell_pmmSell`). The submission paths (`stell_sendRawTransaction`,
     /// `eth_sendRawTransaction`) are OPEN by design — a caller can only submit
-    /// a validly signed, funded, nonce-sane tx — and the faucet has its own
-    /// fail-closed `faucet_token`. When `None`, the gated arms stay open
-    /// (local/dev mode) — except the governance writes (`stell_submitProposal`,
-    /// `stell_vote`, `stell_executeProposal`), which fail closed without a
-    /// token on a non-loopback bind (GATE: H-01/C-02; see
-    /// `require_gov_write_auth`).
+    /// a validly signed, funded, nonce-sane transaction — and the faucet has its
+    /// own fail-closed `faucet_token`. When `None`, the gated arms stay open
+    /// (local/dev mode) — EXCEPT the governance writes (`stell_submitProposal`,
+    /// `stell_vote`, `stell_executeProposal`) and the contract previews
+    /// (`stell_deployContract`, `stell_callContract`), which require a valid
+    /// token on EVERY bind (N-02/N-03; see `require_gov_write_auth`).
     pub auth_token: Option<String>,
 
     /// Optional channel to forward validated raw transactions into P2P gossip
@@ -2989,8 +3004,9 @@ enum PreviewCall<'a> {
 /// [`crate::state_engine::ContractCallOutcome`] the block-applied execution
 /// would report (same return value, gas and events), but touches NO live
 /// state: no debit/credit, no balance syncs, no outbound-message routing, no
-/// trie writes. State changes happen exclusively when the admitted tx is
-/// applied by a block.
+/// trie writes. State changes happen exclusively when a transaction submitted
+/// via `stell_sendRawTransaction` is applied by a block (N-03: the previewed
+/// tx itself is dropped, never admitted).
 ///
 /// The `value` leg is simulated on the clone with the same failure modes the
 /// old direct path had: a sender that cannot cover `value` fails with
@@ -3087,12 +3103,21 @@ async fn preview_contract_call(
     }
 }
 
-/// H-03/H-04: the single choke point through which the contract arms admit a
-/// transaction. It files the node-local receipt for the CLONE preview
-/// `outcome`, submits the tx to the mempool (state changes only when a block
-/// applies it) and renders the canonical response shape. It never touches
-/// consensus state itself.
-async fn admit_contract_tx_and_respond(
+/// N-03: the single choke point through which the contract arms answer a
+/// preview. It files the node-local receipt for the CLONE preview `outcome`
+/// and renders the canonical response shape — and NOTHING else: the
+/// transaction is DROPPED (never admitted to the mempool, never gossipped).
+/// State changes happen exclusively when a block applies a transaction
+/// submitted via `stell_sendRawTransaction`. It never touches consensus
+/// state itself.
+///
+/// (N-03 mempool-DoS fix: the old shape admitted every preview — including
+/// keyless ephemeral-vehicle txs the caller never funded — into the mempool,
+/// so an unauthenticated caller could fill the pool with unexecutable
+/// transactions at zero cost. Previews now return the result and drop the
+/// tx; callers that want on-chain execution sign locally and submit the
+/// sealed tx via `stell_sendRawTransaction`.)
+async fn preview_contract_tx_and_respond(
     st: &RpcState,
     id: Value,
     tx: Transaction,
@@ -3103,11 +3128,9 @@ async fn admit_contract_tx_and_respond(
     let gas_limit = tx.gas_limit;
     let tx_hash = tx.compute_tx_hash();
 
-    // Submit to mempool & broadcast if available
-    let _ = st.mempool.write().await.add(tx.clone());
-    if let Some(ref bc) = st.tx_broadcast {
-        let _ = bc.send(tx.clone());
-    }
+    // N-03: NO mempool admission, NO gossip broadcast — the preview tx is
+    // dropped here. (The receipt below is a node-local preview record, not
+    // an admission.)
 
     let is_success = outcome.status == "success";
     let events_view: Vec<Value> = outcome
@@ -4417,17 +4440,27 @@ fn require_wallet_sign_loopback(
 }
 
 // ============================================================================
-// Governance-write auth gate (neural audit 2026-11-04 H-01/C-02, P0).
+// Governance-write auth gate (neural audit 2026-11-04 H-01/C-02, hardened
+// N-02 2026-11-05).
 //
 // `stell_submitProposal` / `stell_vote` / `stell_executeProposal` mutate the
-// committed staking/governance domains, so without a token they are
-// fail-CLOSED on a non-loopback bind: an operator that publishes the RPC port
-// without `STELL_RPC_AUTH_TOKEN` refuses gov writes instead of serving them
-// to the network. A loopback bind keeps dev flows (no token needed), and
-// `stell_sendRawTransaction` stays OPEN by design (self-authenticating signed
-// txs — see the module docs). No new env knob: the bind is read from the
-// existing `STELL_RPC_LISTEN` (the same string `serve` binds; default
-// `127.0.0.1:8545`, loopback).
+// committed staking/governance domains, so they require a valid `auth_token`
+// ALWAYS — regardless of the `STELL_RPC_LISTEN` bind address. There is no
+// loopback escape: an operator that publishes the RPC port without
+// `STELL_RPC_AUTH_TOKEN` gets refusals, not open gov writes, on every bind
+// including loopback. `stell_sendRawTransaction` stays OPEN by design
+// (self-authenticating signed txs — see the module docs). No new env knob:
+// the token is the existing `STELL_RPC_AUTH_TOKEN`.
+//
+// Why token-always instead of a real-client (peer-IP) check: `dispatch`
+// DOES see the peer (`peer_ip`, resolved via `crate::client_ip` / axum
+// `ConnectInfo`), so a peer-loopback exception would be implementable
+// without framework surgery — but it would still be wrong. The node sits
+// behind reverse proxies (nginx on the same host is a loopback TCP peer
+// while the real client is remote), so a loopback peer is not proof of a
+// local caller; trusting `X-Forwarded-For` instead leans on
+// `STELL_TRUSTED_PROXY_CIDRS` configuration. A token is independent of
+// proxy topology, so the gate consults neither bind nor peer.
 // ============================================================================
 
 /// Pure loopback check over a bind string (`STELL_RPC_LISTEN` form, e.g.
@@ -4466,8 +4499,11 @@ fn bind_addr_is_loopback(addr: &str) -> bool {
     matches!(host.parse::<std::net::IpAddr>(), Ok(ip) if ip.is_loopback())
 }
 
-/// Effective bind loopback-ness for the gov-write gate: the existing
-/// `STELL_RPC_LISTEN`, defaulting to loopback when unset (local/dev).
+/// Effective bind loopback-ness for the unsigned-dev-test escape below: the
+/// existing `STELL_RPC_LISTEN`, defaulting to loopback when unset (local/dev).
+/// N-02: the gov-write/preview token gate NO LONGER consults this — a token
+/// is required on every bind. Only the explicit
+/// `STELL_DEV_UNSAFE_TESTKEY=1` dev-test escape still checks the bind.
 fn rpc_bind_is_loopback() -> bool {
     #[cfg(test)]
     if let Some(v) = test_bind_loopback_override() {
@@ -4495,42 +4531,45 @@ fn test_bind_loopback_override() -> Option<bool> {
     *TEST_BIND_LOOPBACK.lock().unwrap()
 }
 
-/// Fail-closed gate for the three governance WRITE arms. Returns `Some(err)`
-/// when the call must be refused:
-/// * token configured → the caller must present it (unchanged);
-/// * no token + loopback bind → dev flows stay open (unchanged);
-/// * no token + non-loopback bind → REFUSE (H-01 fix).
+/// Fail-closed gate for the three governance WRITE arms (N-02) and the two
+/// contract PREVIEW arms (N-03). Returns `Some(err)` when the call must be
+/// refused: a valid token is required ALWAYS.
+///
+/// Token configured: the caller must present it (unchanged). No token
+/// configured: REFUSE on every bind, loopback included (N-02: the old
+/// loopback escape is deleted; configure `STELL_RPC_AUTH_TOKEN`).
+///
+/// The gate deliberately consults neither the bind address nor the peer IP
+/// (see the section comment above): a loopback bind/peer is not proof of a
+/// local caller behind a proxy, so any such exception would be spoofable.
 fn require_gov_write_auth(
     st: &RpcState,
     id: &Value,
     params: &Value,
     header_token: Option<&str>,
 ) -> Option<Json<RpcResponse>> {
-    if let Some(expected) = &st.auth_token {
-        let provided = params["token"]
-            .as_str()
-            .or_else(|| params["apiKey"].as_str())
-            .or(header_token);
-        if !provided
-            .map(|p| constant_time_eq(p, expected.as_str()))
-            .unwrap_or(false)
-        {
-            return Some(err(
-                id.clone(),
-                -32001,
-                "unauthorized: missing or invalid API token",
-            ));
-        }
-        return None;
+    let Some(expected) = &st.auth_token else {
+        return Some(err(
+            id.clone(),
+            -32001,
+            "unauthorized: this method requires STELL_RPC_AUTH_TOKEN (fail-closed without a token on every bind, loopback included; configure STELL_RPC_AUTH_TOKEN and present it as `token`, `apiKey`, or header)",
+        ));
+    };
+    let provided = params["token"]
+        .as_str()
+        .or_else(|| params["apiKey"].as_str())
+        .or(header_token);
+    if !provided
+        .map(|p| constant_time_eq(p, expected.as_str()))
+        .unwrap_or(false)
+    {
+        return Some(err(
+            id.clone(),
+            -32001,
+            "unauthorized: missing or invalid API token",
+        ));
     }
-    if rpc_bind_is_loopback() {
-        return None;
-    }
-    Some(err(
-        id.clone(),
-        -32001,
-        "unauthorized: governance writes on a non-loopback bind require STELL_RPC_AUTH_TOKEN (fail-closed without a token; bind loopback for dev)",
-    ))
+    None
 }
 
 /// Bumped write guard for the shared governance object (C-01 staleness half).
@@ -6403,8 +6442,8 @@ async fn dispatch(
             )
         }
         "stell_submitProposal" => {
-            // GATE: H-01/C-02 — fail-closed without a token on a non-loopback
-            // bind (loopback keeps dev flows; sendRawTransaction stays open).
+            // GATE: N-02 — token required ALWAYS, on every bind (the old
+            // loopback escape is deleted; sendRawTransaction stays open).
             if let Some(denied) = require_gov_write_auth(st, &id, params, header_token) {
                 return denied;
             }
@@ -6502,8 +6541,8 @@ async fn dispatch(
             }
         }
         "stell_vote" => {
-            // GATE: H-01/C-02 — fail-closed without a token on a non-loopback
-            // bind (loopback keeps dev flows; sendRawTransaction stays open).
+            // GATE: N-02 — token required ALWAYS, on every bind (the old
+            // loopback escape is deleted; sendRawTransaction stays open).
             if let Some(denied) = require_gov_write_auth(st, &id, params, header_token) {
                 return denied;
             }
@@ -6589,9 +6628,8 @@ async fn dispatch(
             // "anyone may execute" (no proposer-only rule) is preserved so a
             // lost proposer key cannot brick execution — the operator's
             // token is enough.
-            // GATE: H-01/C-02 — same fail-closed rule as the sibling gov
-            // writes (no token + non-loopback bind refuses; loopback dev
-            // stays open).
+            // GATE: N-02 — same fail-closed rule as the sibling gov
+            // writes: token required ALWAYS, on every bind.
             if let Some(denied) = require_gov_write_auth(st, &id, params, header_token) {
                 return denied;
             }
@@ -7275,21 +7313,14 @@ async fn dispatch(
 
         // ---- contract deployment (TON StateInit / deterministic BLAKE3) ----
         "stell_deployContract" => {
-            // P5 FIX: this arm writes consensus state directly (deploys the
-            // contract into the engine + admits a tx). It must take the same
-            // auth_token gate as every other state-writing arm; otherwise an
-            // unauthenticated caller mints contracts when a token is configured.
-            if let Some(expected) = &st.auth_token {
-                let provided = params["token"]
-                    .as_str()
-                    .or_else(|| params["apiKey"].as_str())
-                    .or(header_token);
-                if !provided
-                    .map(|p| constant_time_eq(p, expected.as_str()))
-                    .unwrap_or(false)
-                {
-                    return err(id, -32001, "unauthorized: missing or invalid API token");
-                }
+            // N-02/N-03: this arm deploys nothing itself (preview only), but
+            // it executes contract code on a clone and hands out chain
+            // predictions — so it takes the same fail-closed token gate as
+            // the governance writes: a valid token ALWAYS, on every bind.
+            // Without a token it is refused before parsing (same refusal
+            // properties as the gov arms).
+            if let Some(denied) = require_gov_write_auth(st, &id, params, header_token) {
+                return denied;
             }
             let p = if params.is_array() {
                 params.get(0).unwrap_or(params)
@@ -7367,8 +7398,10 @@ async fn dispatch(
                     }
                 };
                 // H-04: validate read-only. The contract is NOT deployed here:
-                // this arm only admits the signed tx to the mempool — state
-                // changes exclusively when a block applies it (C-01/H-03).
+                // this arm only previews the signed tx (state changes
+                // exclusively when a block applies a tx submitted via
+                // `stell_sendRawTransaction` — N-03: this preview is NOT
+                // admitted to the mempool, NOT gossipped; the tx is dropped).
                 if let Err(e) = crate::contract::ContractRegistry::validate_code(&code) {
                     return err(id, -32000, format!("deploy contract failed: {e}"));
                 }
@@ -7390,11 +7423,9 @@ async fn dispatch(
                 let predicted_stl57 = crate::address::encode_stl57_address(&predicted);
                 let tx_hash = tx.compute_tx_hash();
 
-                // Submit to mempool & broadcast if available
-                let _ = st.mempool.write().await.add(tx.clone());
-                if let Some(ref bc) = st.tx_broadcast {
-                    let _ = bc.send(tx.clone());
-                }
+                // N-03: the signed preview tx is DROPPED here — no mempool
+                // admission, no gossip broadcast. On-chain execution needs a
+                // `stell_sendRawTransaction` submission of the same sealed tx.
 
                 let gas_cost = crate::svm::contract_deploy_gas(code.len());
                 st.receipts.write().await.insert(TxReceipt {
@@ -7423,11 +7454,12 @@ async fn dispatch(
                 );
             }
 
-            // Direct parameters: validated + admitted, never deployed here.
-            // The node signs the mempool vehicle with a fresh ephemeral key
+            // Direct parameters: validated + previewed, never deployed here.
+            // The node signs the preview vehicle with a fresh ephemeral key
             // (it can never leak a user key — none is accepted) and predicts
             // the SDK-canonical address. State changes exclusively when a
-            // block applies the admitted tx (H-04/C-01).
+            // block applies a tx submitted via `stell_sendRawTransaction`
+            // (H-04/C-01; N-03: the preview vehicle is dropped, not admitted).
             let code_str = match p.get("code").and_then(|v| v.as_str()) {
                 Some(s) => s,
                 None => return err(id, -32602, "missing 'code' parameter"),
@@ -7449,21 +7481,22 @@ async fn dispatch(
                 })
                 .unwrap_or(crate::contract::MAX_CONTRACT_FUEL);
 
-            // Optional typed ABI manifest: validated here (it travels inside
-            // the admitted tx's execution path at apply time, committed next
-            // to the code hash by block application — never by this arm).
+            // Optional typed ABI manifest: validated here (it would travel
+            // inside a submitted tx's execution path at apply time, committed
+            // next to the code hash by block application — never by this arm).
             if let Err(e) = parse_abi_manifest_param(p) {
                 return err(id, -32602, format!("invalid abi parameter: {e}"));
             }
 
             // Ephemeral vehicle only: the node cannot sign as the caller (no
-            // key is accepted), so the admitted tx is signed by a fresh
+            // key is accepted), so the preview tx is signed by a fresh
             // random key. Its only purpose is to carry the deploy through
-            // mempool/block admission; the predicted address is what block
-            // application derives for it.
+            // the CLONE preview; it is DROPPED afterwards (N-03: never
+            // admitted, never gossipped). The predicted address is what block
+            // application would derive for it.
             // FULL-PQ: the vehicle is an explicit Falcon-512 tx
             // (self-contained: verifies with no registry and no funding —
-            // admission authenticates the envelope, as with the old ed25519
+            // the preview authenticates the envelope, as with the old ed25519
             // vehicle; execution still fails closed on the unfunded balance).
             let eph_key = crate::post_quantum::FalconKeypair::generate();
             let from_addr = crate::post_quantum::derive_pq_address(
@@ -7507,11 +7540,9 @@ async fn dispatch(
             let tx_hash = tx.compute_tx_hash();
             let raw_tx_hex = hex::encode(bincode::serialize(&tx).unwrap_or_default());
 
-            // Submit to mempool & broadcast if available
-            let _ = st.mempool.write().await.add(tx.clone());
-            if let Some(ref bc) = st.tx_broadcast {
-                let _ = bc.send(tx.clone());
-            }
+            // N-03: the ephemeral preview tx is DROPPED here — no mempool
+            // admission, no gossip broadcast. On-chain execution needs a
+            // locally-signed `stell_sendRawTransaction` submission.
 
             let gas_cost = crate::svm::contract_deploy_gas(code.len());
             st.receipts.write().await.insert(TxReceipt {
@@ -7540,22 +7571,14 @@ async fn dispatch(
             )
         }
         "stell_callContract" => {
-            // H-03/H-04: this arm no longer writes consensus state. It runs
-            // the call on a CLONE of the registry for a result preview and
-            // only admits the (signed or ephemeral-vehicle) tx to the
-            // mempool — state changes exclusively when a block applies it.
-            // Same auth_token gate as the other state-writing arms.
-            if let Some(expected) = &st.auth_token {
-                let provided = params["token"]
-                    .as_str()
-                    .or_else(|| params["apiKey"].as_str())
-                    .or(header_token);
-                if !provided
-                    .map(|p| constant_time_eq(p, expected.as_str()))
-                    .unwrap_or(false)
-                {
-                    return err(id, -32001, "unauthorized: missing or invalid API token");
-                }
+            // N-02/N-03: this arm runs the call on a CLONE of the registry
+            // for a result preview and DROPS the tx (never admitted, never
+            // gossipped — state changes exclusively when a block applies a
+            // tx submitted via `stell_sendRawTransaction`). It takes the same
+            // fail-closed token gate as the governance writes: a valid token
+            // ALWAYS, on every bind.
+            if let Some(denied) = require_gov_write_auth(st, &id, params, header_token) {
+                return denied;
             }
             let p = if params.is_array() {
                 params.get(0).unwrap_or(params)
@@ -7587,7 +7610,7 @@ async fn dispatch(
             // Signed-tx form: a sealed `SysCallCallContract` /
             // `SysCallCallContractArgs` transaction. Verified exactly like
             // `stell_sendRawTransaction`, previewed on a registry clone, and
-            // admitted to the mempool — never executed against live state.
+            // DROPPED — never executed against live state, never admitted.
             if let Some(raw_tx_str) = p.get("tx").and_then(|v| v.as_str()) {
                 let raw_bytes =
                     match hex::decode(raw_tx_str.strip_prefix("0x").unwrap_or(raw_tx_str)) {
@@ -7680,7 +7703,7 @@ async fn dispatch(
                 )
                 .await;
                 let raw_tx_hex = hex::encode(bincode::serialize(&tx).unwrap_or_default());
-                return admit_contract_tx_and_respond(
+                return preview_contract_tx_and_respond(
                     st,
                     id,
                     tx,
@@ -7747,9 +7770,9 @@ async fn dispatch(
                 .unwrap_or(crate::contract::MAX_CONTRACT_FUEL);
 
             // Ephemeral vehicle only (see above: no key is accepted). The
-            // admitted tx is signed by a fresh random key and carries the
-            // call through mempool/block admission; the preview below runs
-            // on a registry clone and changes nothing.
+            // preview tx is signed by a fresh random key and carries the
+            // call through the CLONE preview below; it is DROPPED afterwards
+            // (N-03: never admitted, never gossipped).
             // FULL-PQ: explicit Falcon-512 vehicle (self-contained).
             let eph_key = crate::post_quantum::FalconKeypair::generate();
             let from_addr = crate::post_quantum::derive_pq_address(
@@ -7790,8 +7813,9 @@ async fn dispatch(
             // H-03: the preview runs on a registry CLONE (see
             // `preview_contract_call`): the `value` leg is simulated with
             // the same failure modes, but no account, contract, trie or
-            // mailbox state moves. The admitted tx below is the ONLY thing
-            // that can change state, when a block applies it.
+            // mailbox state moves. The previewed tx is DROPPED (N-03); only
+            // a `stell_sendRawTransaction` submission can change state, when
+            // a block applies it.
             let outcome = match &typed_args {
                 Some(args) => {
                     preview_contract_call(
@@ -7862,9 +7886,8 @@ async fn dispatch(
             .encode();
             let raw_tx_hex = hex::encode(bincode::serialize(&tx).unwrap_or_default());
 
-            admit_contract_tx_and_respond(st, id, tx, contract_addr, raw_tx_hex, outcome).await
+            preview_contract_tx_and_respond(st, id, tx, contract_addr, raw_tx_hex, outcome).await
         }
-
         // ---- the ABI manifest of a contract (typed interface discovery) ----
         "stell_getContractAbi" => {
             let p = if params.is_array() {
@@ -9415,8 +9438,10 @@ fn ws_idle_timeout() -> std::time::Duration {
 //     stell_bridgeDeposits, stell_orderBookPlace, stell_orderBookCancel,
 //     stell_orderBookSnapshot, stell_placeOrder, stell_cancelOrder,
 //     stell_sessionKeyRegister, stell_sessionKeyRevoke, stell_sessionKeys,
-//     stell_oraclePrice, stell_oracleFeeds, stell_shieldedTransfer,
-//     stell_shieldedBalance, stell_unshield, stell_nativeApi.
+//     stell_oraclePrice, stell_oracleFeeds, stell_nativeApi.
+//     (GATE, Ristretto excision: stell_shieldedTransfer,
+//     stell_shieldedBalance and stell_unshield were removed with the
+//     confidential protocol — no row, no bucket.)
 //   (no bucket: unknown method names -> `-32601`; there is no method without
 //   a row above.)
 
@@ -9992,6 +10017,22 @@ async fn standalone_rate_limit(
 
 /// Spawn the RPC server on `addr` (e.g. "127.0.0.1:8545").
 pub async fn serve(addr: &str, state: Arc<RpcState>) -> anyhow::Result<()> {
+    // N-02 fail-LOUD: governance writes and contract previews now require a
+    // valid token on EVERY bind (no loopback escape), so a node started
+    // without `STELL_RPC_AUTH_TOKEN` refuses those methods outright. Still
+    // starts (proxied/dev setups may set the token later), but screams at
+    // startup so a missing token is never mistaken for an open dev node.
+    if state.auth_token.as_ref().is_none_or(|t| t.is_empty()) {
+        let msg = format!(
+            "[security] JSON-RPC on {addr} with NO STELL_RPC_AUTH_TOKEN: \
+             stell_submitProposal / stell_vote / stell_executeProposal and the \
+             stell_deployContract / stell_callContract previews are REFUSED \
+             (fail-closed on every bind, loopback included). Set \
+             STELL_RPC_AUTH_TOKEN to serve them."
+        );
+        eprintln!("{msg}");
+        tracing::warn!("{msg}");
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // The gateway (:8080) has its own limiter; the standalone RPC (:8545)
     // used to have NONE while being the port compose publishes (audit
@@ -10020,6 +10061,12 @@ pub async fn serve(addr: &str, state: Arc<RpcState>) -> anyhow::Result<()> {
 mod tests {
     /// The token the test faucet expects; mirrors `STELL_FAUCET_TOKEN`.
     const FAUCET_TOKEN: &str = "faucet-secret";
+    /// The token N-02/N-03 tests configure and present; mirrors
+    /// `STELL_RPC_AUTH_TOKEN`. Gov writes and contract previews require it
+    /// ALWAYS (no loopback escape), so happy-path tests use a state built by
+    /// `test_state_with_token` plus this token in params, while refusal tests
+    /// use plain `test_state()` (no token configured at all).
+    const TEST_TOKEN: &str = "test-token";
 
     use super::*;
     use crate::state_engine::AccountState;
@@ -10139,6 +10186,42 @@ mod tests {
         r.0.error
             .map(|e| json!({"error": e.message}))
             .unwrap_or(r.0.result.unwrap_or(Value::Null))
+    }
+
+    /// Same empty node as `test_state`, but with an RPC auth token configured
+    /// (N-02/N-03 fixture): the only state on which gov writes and contract
+    /// previews are served. Present `TEST_TOKEN` in params (see
+    /// `call_with_token`); without it every such call is refused.
+    async fn test_state_with_token() -> Arc<RpcState> {
+        let base = test_state().await;
+        Arc::new(RpcState {
+            engine: base.engine.clone(),
+            mempool: base.mempool.clone(),
+            height: base.height.clone(),
+            node_id: base.node_id.clone(),
+            chain_id: base.chain_id,
+            staking: base.staking.clone(),
+            governance: base.governance.clone(),
+            recent_blocks: base.recent_blocks.clone(),
+            receipts: base.receipts.clone(),
+            auth_token: Some(TEST_TOKEN.to_string()),
+            tx_broadcast: base.tx_broadcast.clone(),
+            faucet: base.faucet.clone(),
+            faucet_token: base.faucet_token.clone(),
+            msg_signing_seed: base.msg_signing_seed,
+            archive_store: None,
+            shard_registry: ShardRegistry::single(),
+        })
+    }
+
+    /// `call` with the fixture token injected into object params (N-02/N-03
+    /// happy-path helper). Non-object params pass through untouched; refusal
+    /// tests keep using `call` directly (no token, or an explicitly wrong one).
+    async fn call_with_token(st: &Arc<RpcState>, method: &str, mut params: Value) -> Value {
+        if let Value::Object(map) = &mut params {
+            map.insert("token".to_string(), json!(TEST_TOKEN));
+        }
+        call(st, method, params).await
     }
 
     /// `call` with an explicit peer IP. Tests that hammer the per-IP
@@ -11133,7 +11216,10 @@ mod tests {
     /// any signature check (unchanged fail-closed vocabulary gate).
     #[tokio::test]
     async fn submit_proposal_reaches_every_action_and_refuses_an_unknown_type() {
-        let st = test_state().await;
+        // N-02: gov writes require a token on every bind, so this
+        // reachability pin runs on the token fixture (refusal cases still pin
+        // their own errors — the gate passes, then the vocabulary gate fires).
+        let st = test_state_with_token().await;
         // The proposer is a real signing key: the handler binds the envelope
         // to the claimed staking address, so an arbitrary 0xA1 address can no
         // longer propose.
@@ -11142,7 +11228,7 @@ mod tests {
         let proposer = hex::encode(proposer_addr);
 
         // 1. An unknown action type is REFUSED, and nothing is recorded.
-        let res = call(
+        let res = call_with_token(
             &st,
             "stell_submitProposal",
             json!({
@@ -11165,7 +11251,7 @@ mod tests {
 
         // 2. A known type with a MISSING parameter is refused too (no
         //    defaults: a governance parameter is never silently invented).
-        let res = call(
+        let res = call_with_token(
             &st,
             "stell_submitProposal",
             json!({ "title": "no value", "type": "set_min_gas_limit", "proposer": proposer }),
@@ -11239,7 +11325,7 @@ mod tests {
                 &action,
                 nonce
             ));
-            let res = call(&st, "stell_submitProposal", params).await;
+            let res = call_with_token(&st, "stell_submitProposal", params).await;
             assert!(
                 res.get("error").is_none(),
                 "action '{action_type}' must be reachable: {res}"
@@ -12381,6 +12467,123 @@ mod tests {
         );
     }
 
+    /// N-02/N-03: contract previews require a valid token ALWAYS (no token
+    /// configured at all is refused, on every bind), and a successful preview
+    /// NEVER enters the mempool — it executes on a state clone, returns the
+    /// result, and the tx is dropped. On-chain execution needs a separate
+    /// `stell_sendRawTransaction` submission of a locally-signed tx.
+    /// // GATE: N-02 token-always + N-03 preview mempool-DoS fix.
+    #[tokio::test]
+    async fn contract_previews_require_token_and_never_enter_mempool() {
+        // 1. No token configured at all: both preview arms refuse (even the
+        // keyless direct-params form), and nothing is pooled.
+        let st = test_state().await;
+        for (method, params) in [
+            (
+                "stell_deployContract",
+                json!({ "code": hex::encode(sample_getter_wasm()) }),
+            ),
+            (
+                "stell_callContract",
+                json!({
+                    "contract": hex::encode([0x99u8; 32]),
+                    "method": "get",
+                    "value": 0u64,
+                }),
+            ),
+        ] {
+            let r = call(&st, method, params).await;
+            assert!(
+                r["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("unauthorized"),
+                "{method} with no token configured must be refused: {r}"
+            );
+        }
+        assert_eq!(
+            st.mempool.read().await.len(),
+            0,
+            "refused previews must not pool anything"
+        );
+        assert!(
+            st.governance.read().await.proposals.is_empty(),
+            "refused calls must not record anything"
+        );
+
+        // 2. Token configured + presented: previews succeed AND still pool
+        // nothing. Fixture contract deployed engine-side (the way block
+        // application materializes it).
+        let st = test_state_with_token().await;
+        let creator = [0xABu8; 32];
+        let deployed = st
+            .engine
+            .deploy_contract(creator, sample_getter_wasm(), 0)
+            .await
+            .unwrap();
+        let root_before = st.engine.get_state_root().await;
+
+        let deploy = call_with_token(
+            &st,
+            "stell_deployContract",
+            json!({ "code": hex::encode(sample_getter_wasm()) }),
+        )
+        .await;
+        assert!(
+            deploy["contract_address"].is_string(),
+            "token-authed deploy preview must succeed: {deploy}"
+        );
+        assert!(
+            deploy["tx_hash"].is_string(),
+            "token-authed deploy preview must return its (dropped) tx hash: {deploy}"
+        );
+
+        let previewed = call_with_token(
+            &st,
+            "stell_callContract",
+            json!({
+                "contract": hex::encode(deployed),
+                "method": "double",
+                "args": 21,
+            }),
+        )
+        .await;
+        assert_eq!(previewed["status"], json!("success"));
+        assert_eq!(previewed["return_value"], json!(42));
+
+        // The mempool is STILL empty (both previews dropped their txs) and
+        // the state root is untouched (clone-only execution).
+        assert_eq!(
+            st.mempool.read().await.len(),
+            0,
+            "successful previews must never enter the mempool"
+        );
+        assert_eq!(
+            st.engine.get_state_root().await,
+            root_before,
+            "previews must not move the state root"
+        );
+
+        // 3. Wrong token: same refusal, nothing pooled.
+        let st2 = test_state_with_token().await;
+        let r = call(
+            &st2,
+            "stell_callContract",
+            json!({
+                "contract": hex::encode(deployed),
+                "method": "double",
+                "args": 21,
+                "token": "wrong",
+            }),
+        )
+        .await;
+        assert!(
+            r["error"].as_str().unwrap_or_default().contains("unauthorized"),
+            "wrong-token preview must be refused: {r}"
+        );
+        assert_eq!(st2.mempool.read().await.len(), 0);
+    }
+
     /// H-03/H-04 (rpc.rs `stell_callContract` / `stell_deployContract`):
     /// the old `from` + `private_key` pair let a caller debit ANY account
     /// (`from=victim + private_key=attacker + value=N` drained the victim
@@ -12391,7 +12594,10 @@ mod tests {
     /// the arms never debit — previews simulate `value` on a clone.
     #[tokio::test]
     async fn p5_call_contract_rejects_key_material_and_spoofed_sender() {
-        let st = test_state().await;
+        // N-02: previews require a token on every bind, so the key-material
+        // pins run on the token fixture (the gate passes, then the
+        // no-key-material checks fire).
+        let st = test_state_with_token().await;
         let victim = SigningKey::from_bytes(&[0x51u8; 32]);
         let victim_addr = victim.verifying_key().to_bytes();
         st.engine
@@ -12408,7 +12614,7 @@ mod tests {
         assert_eq!(before, 1_000_000);
         // `private_key` is refused on the call arm (it used to select the
         // debit victim's fate via `from` + attacker key).
-        let r = call(
+        let r = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -12428,7 +12634,7 @@ mod tests {
             "key material over RPC must be refused: {r}"
         );
         // `from` alone is refused too: without a key it cannot be honored.
-        let r_from = call(
+        let r_from = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -12447,7 +12653,7 @@ mod tests {
             "spoofable sender must be refused: {r_from}"
         );
         // And on the deploy arm.
-        let r_deploy = call(
+        let r_deploy = call_with_token(
             &st,
             "stell_deployContract",
             json!({
@@ -12476,7 +12682,7 @@ mod tests {
         // Sanity: the keyless preview is still admitted past the key checks
         // (it fails later on the unknown contract — a clone-exec failure,
         // never a signer error — and files nothing that moves value).
-        let r_self = call(
+        let r_self = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -14355,7 +14561,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_contract_with_multi_argument_method() {
-        let st = test_state().await;
+        // N-02: previews require a token on every bind.
+        let st = test_state_with_token().await;
         let creator = [0x55u8; 32];
         let addr = st
             .engine
@@ -14365,7 +14572,7 @@ mod tests {
         let addr_hex = hex::encode(addr);
 
         // Three arguments reach a three-parameter method.
-        let res = call(
+        let res = call_with_token(
             &st,
             "stell_callContract",
             json!({ "contract": addr_hex, "method": "sum3", "args": [10, 20, 12] }),
@@ -14375,7 +14582,7 @@ mod tests {
         assert_eq!(res["return_value"], json!(42));
 
         // A parameter is never dropped: the arity must match.
-        let res = call(
+        let res = call_with_token(
             &st,
             "stell_callContract",
             json!({ "contract": addr_hex, "method": "sum3", "args": [10, 20] }),
@@ -14866,21 +15073,24 @@ mod tests {
 
     // ==================== stell_deployContract & stell_callContract Tests ====================
 
-    /// H-04/C-01: the deploy arms validate + admit but never deploy. The
-    /// returned address is the SDK-canonical prediction
+    /// H-04/C-01 + N-03: the deploy arms validate + preview but never deploy
+    /// and never admit. The returned address is the SDK-canonical prediction
     /// (`contract_address(tx.from, tx.nonce)` — exactly what block
     /// application derives when this tx applies first for its sender), and
-    /// nothing is visible in state until a block carries the admitted tx.
+    /// nothing is visible in state until a block carries the tx — which must
+    /// arrive via `stell_sendRawTransaction`, because the preview tx is
+    /// DROPPED (mempool stays empty).
     /// (The old BLAKE3(code_hash || salt) address was a phantom the block
     /// path never recreated — `init_data`/`salt` is retired: not part of the
     /// replayable payload, so it cannot influence the chain.)
     #[tokio::test]
     async fn deploy_contract_predicts_address_and_admits_without_writing_state() {
-        let st = test_state().await;
+        // N-02: previews require a token on every bind.
+        let st = test_state_with_token().await;
         let code = sample_getter_wasm();
         let root_before = st.engine.get_state_root().await;
 
-        let res = call(
+        let res = call_with_token(
             &st,
             "stell_deployContract",
             json!({
@@ -14893,13 +15103,30 @@ mod tests {
 
         let tx_hash = res["tx_hash"].as_str().expect("tx_hash present");
         assert_eq!(tx_hash.len(), 64);
-        // The admitted vehicle is a validly signed ephemeral tx; the
+        // N-03: the preview tx is dropped — the mempool stays EMPTY.
+        assert_eq!(
+            st.mempool.read().await.len(),
+            0,
+            "a deploy preview must never enter the mempool"
+        );
+        // The predicted vehicle is a validly signed ephemeral tx; the
         // prediction is derived from it, independent of the retired salt.
-        let pooled: Vec<Transaction> = st.mempool.read().await.all();
-        assert_eq!(pooled.len(), 1, "deploy belongs in the mempool");
-        assert!(pooled[0].verify_signature());
-        let expected_addr =
-            crate::contract::contract_address(&pooled[0].from, pooled[0].nonce);
+        // The vehicle is recovered from the node-local preview receipt (the
+        // mempool no longer carries it).
+        let receipt = call(
+            &st,
+            "stell_getTransactionReceipt",
+            json!({ "hash": tx_hash }),
+        )
+        .await;
+        assert_eq!(receipt["status"], json!("success"));
+        let raw_hex = receipt["raw_tx"]
+            .as_str()
+            .expect("preview receipt carries the raw preview tx");
+        let vehicle: Transaction =
+            bincode::deserialize(&hex::decode(raw_hex).expect("raw_tx hex")).expect("raw_tx decodes");
+        assert!(vehicle.verify_signature());
+        let expected_addr = crate::contract::contract_address(&vehicle.from, vehicle.nonce);
         assert_eq!(res["contract_address"], json!(hex::encode(expected_addr)));
         assert_eq!(
             res["contract_address_stl57"],
@@ -14916,7 +15143,7 @@ mod tests {
         assert_eq!(
             st.engine.get_state_root().await,
             root_before,
-            "admission must not move the state root"
+            "a preview must not move the state root"
         );
         assert!(st.engine.get_contract(&expected_addr).await.is_none());
         assert!(
@@ -14927,13 +15154,6 @@ mod tests {
         );
 
         // Verify receipt is recorded in st.receipts
-        let receipt = call(
-            &st,
-            "stell_getTransactionReceipt",
-            json!({ "hash": tx_hash }),
-        )
-        .await;
-        assert_eq!(receipt["status"], json!("success"));
         assert_eq!(
             receipt["contract_address"],
             json!(hex::encode(expected_addr))
@@ -14950,9 +15170,9 @@ mod tests {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         st.engine
-            .update_account(AccountState::new(pooled[0].from, 1_000_000_000))
+            .update_account(AccountState::new(vehicle.from, 1_000_000_000))
             .await;
-        st.engine.apply_transaction(&pooled[0], now).await.unwrap();
+        st.engine.apply_transaction(&vehicle, now).await.unwrap();
         // Block application materializes the contract in the registry and
         // commits its code hash (the code bytes live in the registry; the
         // trie carries the code hash under the namespaced contract key —
@@ -14970,7 +15190,7 @@ mod tests {
             )
         );
         // Re-applying the same tx is refused (nonce consumed): apply-once.
-        let again = st.engine.apply_transaction(&pooled[0], now).await;
+        let again = st.engine.apply_transaction(&vehicle, now).await;
         assert!(
             again.is_err(),
             "double application must be refused: {again:?}"
@@ -14987,7 +15207,8 @@ mod tests {
 
     #[tokio::test]
     async fn deploy_contract_with_signed_raw_tx_wrapper() {
-        let st = test_state().await;
+        // N-02: previews require a token on every bind.
+        let st = test_state_with_token().await;
         let code = counter_getter_wasm();
 
         // FULL-PQ: implicit Falcon-512 wrapper (registered globally).
@@ -15010,7 +15231,7 @@ mod tests {
         // not change the predicted address.
         let salt = vec![0xAB, 0xCD];
 
-        let res = call(
+        let res = call_with_token(
             &st,
             "stell_deployContract",
             json!({
@@ -15025,11 +15246,16 @@ mod tests {
         let root_after_funding = st.engine.get_state_root().await;
         assert_eq!(res["contract_address"], json!(hex::encode(expected_addr)));
         assert_eq!(res["tx_hash"], json!(hex::encode(tx_hash)));
-        assert_eq!(st.mempool.read().await.len(), 1);
+        // N-03: the preview tx is dropped — the mempool stays EMPTY.
+        assert_eq!(
+            st.mempool.read().await.len(),
+            0,
+            "a deploy preview must never enter the mempool"
+        );
         assert_eq!(
             st.engine.get_state_root().await,
             root_after_funding,
-            "admission must not move the state root"
+            "a preview must not move the state root"
         );
         assert!(st.engine.get_contract(&expected_addr).await.is_none());
 
@@ -15040,7 +15266,7 @@ mod tests {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         st.engine.apply_transaction(&tx, now).await.unwrap();
-        let call_res = call(
+        let call_res = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -15061,8 +15287,10 @@ mod tests {
 
     #[tokio::test]
     async fn deploy_contract_rejects_invalid_wasm() {
-        let st = test_state().await;
-        let res = call(
+        // N-02: the token gate runs before validation, so the fixture token
+        // is presented and the refusal below pins the wasm check (never auth).
+        let st = test_state_with_token().await;
+        let res = call_with_token(
             &st,
             "stell_deployContract",
             json!({
@@ -15076,7 +15304,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_contract_execution_and_receipt_structured_outcomes() {
-        let st = test_state().await;
+        // N-02: previews require a token on every bind.
+        let st = test_state_with_token().await;
         // H-03 fixture setup deploys through the engine directly: the RPC
         // no longer deploys out-of-block, so tests materialize contracts the
         // way block application does.
@@ -15093,7 +15322,7 @@ mod tests {
         let contract_stl57 = contract_stl57_hex.as_str();
 
         // 1. Call with integer argument
-        let call1 = call(
+        let call1 = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -15134,7 +15363,7 @@ mod tests {
         assert_eq!(c_receipt["events"], json!([]));
 
         // 4. Call using branded Stl57 address format and hex args ("0x15")
-        let call2 = call(
+        let call2 = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -15148,7 +15377,7 @@ mod tests {
         assert_eq!(call2["return_value"], json!(42));
 
         // 5. Call using decimal string ("15")
-        let call3 = call(
+        let call3 = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -15162,7 +15391,7 @@ mod tests {
         assert_eq!(call3["return_value"], json!(30));
 
         // 5b. Call using hex string ("0x10" = 16)
-        let call3b = call(
+        let call3b = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -15176,7 +15405,7 @@ mod tests {
         assert_eq!(call3b["return_value"], json!(32));
 
         // 6. Call using array args: [21]
-        let call4 = call(
+        let call4 = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -15190,14 +15419,16 @@ mod tests {
         assert_eq!(call4["return_value"], json!(42));
     }
 
-    /// H-03: previews are result-identical but state-free, and the admitted
-    /// tx applies exactly once. The counter contract is the proof: two
-    /// identical previews return the SAME value (the old suite asserted
-    /// 1-then-2, i.e. live mutation per call), storage stays empty until a
-    /// block applies the tx, and re-application is refused by the nonce rule.
+    /// H-03 + N-03: previews are result-identical but state-free, and the
+    /// previewed tx is dropped (never admitted). The counter contract is the
+    /// proof: two identical previews return the SAME value (the old suite
+    /// asserted 1-then-2, i.e. live mutation per call), storage stays empty
+    /// until a block applies the tx, and re-application is refused by the
+    /// nonce rule.
     #[tokio::test]
     async fn call_contract_state_mutations_and_events() {
-        let st = test_state().await;
+        // N-02: previews require a token on every bind.
+        let st = test_state_with_token().await;
         let creator = [0x33u8; 32];
 
         // 1. Counter contract (persistent storage), deployed engine-side.
@@ -15209,9 +15440,10 @@ mod tests {
         let counter_hex = hex::encode(counter);
         let counter_addr = counter_hex.as_str();
 
-        // Preview twice: same answer both times, nothing persisted.
+        // Preview twice: same answer both times, nothing persisted, nothing
+        // admitted (N-03: the mempool stays empty).
         for _ in 0..2 {
-            let inc = call(
+            let inc = call_with_token(
                 &st,
                 "stell_callContract",
                 json!({ "contract": counter_addr, "method": "inc", "args": 7 }),
@@ -15220,7 +15452,12 @@ mod tests {
             assert_eq!(inc["status"], json!("success"));
             assert_eq!(inc["return_value"], json!(1));
         }
-        let get = call(
+        assert_eq!(
+            st.mempool.read().await.len(),
+            0,
+            "previews must never enter the mempool"
+        );
+        let get = call_with_token(
             &st,
             "stell_callContract",
             json!({ "contract": counter_addr, "method": "get", "args": 7 }),
@@ -15241,7 +15478,7 @@ mod tests {
             "registry storage must be untouched by previews"
         );
 
-        // 2. The funded `tx` form previews the same answer, admits the tx,
+        // 2. The funded `tx` form previews the same answer, drops the tx,
         // and still changes nothing — until block application.
         // FULL-PQ: implicit Falcon-512 caller.
         let (caller_addr, _) = pq_pair(0xC7);
@@ -15261,7 +15498,7 @@ mod tests {
                 arg: 7,
             }],
         );
-        let preview = call(
+        let preview = call_with_token(
             &st,
             "stell_callContract",
             json!({ "tx": hex::encode(bincode::serialize(&call_tx).unwrap()) }),
@@ -15270,9 +15507,14 @@ mod tests {
         assert_eq!(preview["status"], json!("success"));
         assert_eq!(preview["return_value"], json!(1));
         assert_eq!(
+            st.mempool.read().await.len(),
+            0,
+            "a signed-tx preview must never enter the mempool"
+        );
+        assert_eq!(
             st.engine.get_state_root().await,
             root_after_funding,
-            "admission must not move the state root"
+            "a preview must not move the state root"
         );
 
         // 3. Apply-once: the first application persists exactly one
@@ -15297,7 +15539,7 @@ mod tests {
             .and_then(|c| c.storage.get(&7).copied());
         assert_eq!(stored_again, Some(1), "the refused replay must not execute");
         // And the post-apply preview observes the applied state.
-        let get_after = call(
+        let get_after = call_with_token(
             &st,
             "stell_callContract",
             json!({ "contract": counter_addr, "method": "get", "args": 7 }),
@@ -15314,7 +15556,7 @@ mod tests {
         let event_hex = hex::encode(event_contract);
         let event_addr = event_hex.as_str();
 
-        let emit_call = call(
+        let emit_call = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -15352,7 +15594,8 @@ mod tests {
     /// longer deploys out-of-block).
     #[tokio::test]
     async fn call_contract_observable_failures() {
-        let st = test_state().await;
+        // N-02: previews require a token on every bind.
+        let st = test_state_with_token().await;
         let creator = [0x77u8; 32];
         let sample = st
             .engine
@@ -15363,7 +15606,7 @@ mod tests {
         let contract_addr = sample_hex.as_str();
 
         // 1. Trap failure
-        let trap_res = call(
+        let trap_res = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -15385,7 +15628,7 @@ mod tests {
         assert_eq!(trap_receipt["status"], json!("failed"));
 
         // 2. Unknown method failure
-        let unknown_res = call(
+        let unknown_res = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -15402,7 +15645,7 @@ mod tests {
             .contains("does not export"));
 
         // 3. Unknown contract address failure
-        let unknown_c = call(
+        let unknown_c = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -15426,7 +15669,7 @@ mod tests {
             .unwrap();
         let loop_hex = hex::encode(loop_contract);
         let loop_addr = loop_hex.as_str();
-        let oof_res = call(
+        let oof_res = call_with_token(
             &st,
             "stell_callContract",
             json!({
@@ -16950,13 +17193,17 @@ mod tests {
         }
     }
 
-    /// H-01/C-02: gov writes are fail-CLOSED without a token on a non-loopback
-    /// bind (mock bind) and stay open on loopback (dev flows preserved).
-    /// // GATE: P0 fail-closed rule + loopback-dev pin; extends, never weakens.
+    /// N-02: gov writes require a valid token ALWAYS, on EVERY bind — the
+    /// loopback escape is deleted. A missing/unconfigured token refuses on
+    /// both a loopback and a non-loopback bind (mock bind proves
+    /// bind-independence); a correct token serves on both binds.
+    /// // GATE: N-02 token-always; same refusal properties, never weakened.
     #[tokio::test]
-    async fn gov_writes_fail_closed_off_loopback_and_open_on_it() {
+    async fn gov_writes_require_token_on_every_bind() {
         // Panic-safe mock guard: the override is process-wide (a mutex, never
-        // the env), so it must reset even when an assert below fails.
+        // the env), so it must reset even when an assert below fails. The
+        // mock now only steers the unsigned-dev-test escape — the token gate
+        // ignores it, which is exactly what this test pins.
         struct BindGuard;
         impl Drop for BindGuard {
             fn drop(&mut self) {
@@ -16965,88 +17212,112 @@ mod tests {
         }
         let _guard = BindGuard;
 
-        // 1. Non-loopback bind, no token: all three gov writes refuse. The
-        //    gate runs before payload parsing, so garbage params are still
-        //    unauthorized (never a parse error).
-        set_test_bind_loopback(Some(false));
+        // 1. No token configured: all three gov writes refuse on a
+        //    non-loopback bind AND on a loopback bind. The gate runs before
+        //    payload parsing, so garbage params are still unauthorized
+        //    (never a parse error).
         let st = test_state().await;
-        for (method, params) in [
-            (
-                "stell_submitProposal",
-                json!({"title": "t", "type": "signal", "proposer": hex::encode([9u8; 32])}),
-            ),
-            (
-                "stell_vote",
-                json!({"id": 1, "voter": hex::encode([9u8; 32])}),
-            ),
-            ("stell_executeProposal", json!({"id": 1})),
-        ] {
-            let r = call(&st, method, params).await;
-            assert!(
-                r["error"].as_str().unwrap_or("").contains("unauthorized"),
-                "{method} without a token on a non-loopback bind must refuse: {r}"
-            );
+        for mock in [Some(false), Some(true)] {
+            set_test_bind_loopback(mock);
+            for (method, params) in [
+                (
+                    "stell_submitProposal",
+                    json!({"title": "t", "type": "signal", "proposer": hex::encode([9u8; 32])}),
+                ),
+                (
+                    "stell_vote",
+                    json!({"id": 1, "voter": hex::encode([9u8; 32])}),
+                ),
+                ("stell_executeProposal", json!({"id": 1})),
+            ] {
+                let r = call(&st, method, params).await;
+                assert!(
+                    r["error"].as_str().unwrap_or("").contains("unauthorized"),
+                    "{method} without a token (bind loopback={mock:?}) must refuse: {r}"
+                );
+            }
         }
         assert!(
             st.governance.read().await.proposals.is_empty(),
             "refused writes must not record anything"
         );
 
-        // 2. Loopback bind, no token: signed dev flows work end to end.
-        // GATE (operator-signed governance): the dev flow now signs both
-        // writes with the stakers' own keys (the unsigned legacy path stays
-        // refused without STELL_DEV_UNSAFE_TESTKEY=1, which this test does
-        // not set). Justification: the handler requires an operator
-        // signature fail-closed, so the loopback pin must sign.
-        set_test_bind_loopback(Some(true));
-        let st = test_state().await;
-        let proposer_key = TestGovKey::ed25519([0xA1u8; 32]);
-        let proposer = proposer_key.address();
-        let voter_key = TestGovKey::ed25519([0xB2u8; 32]);
-        let voter = voter_key.address();
-        {
-            let mut ledger = st.engine.staking_write().await;
-            ledger
-                .bond(proposer, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
-                .unwrap();
-            ledger
-                .bond(voter, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
-                .unwrap();
+        // 2. Token configured but missing/wrong: still refused, on both binds.
+        let st = test_state_with_token().await;
+        for mock in [Some(false), Some(true)] {
+            set_test_bind_loopback(mock);
+            let r = call(&st, "stell_executeProposal", json!({ "id": 1 })).await;
+            assert!(
+                r["error"].as_str().unwrap_or("").contains("unauthorized"),
+                "missing token (bind loopback={mock:?}) must refuse: {r}"
+            );
+            let r = call(
+                &st,
+                "stell_executeProposal",
+                json!({ "id": 1, "token": "wrong" }),
+            )
+            .await;
+            assert!(
+                r["error"].as_str().unwrap_or("").contains("unauthorized"),
+                "wrong token (bind loopback={mock:?}) must refuse: {r}"
+            );
         }
-        let title = "dev".to_string();
-        let action = crate::governance::GovAction::Signal("hi".to_string());
-        let r = call(
-            &st,
-            "stell_submitProposal",
-            json!({
-                "title": title,
-                "type": "signal",
-                "text": "hi",
-                "proposer": hex::encode(proposer),
-                "nonce": 1u64,
-                "signature": sign_test_proposal(st.chain_id, &proposer_key, &proposer, &title, &action, 1),
-            }),
-        )
-        .await;
-        let pid = r["proposal_id"]
-            .as_u64()
-            .expect("loopback submit must work");
-        assert!(
-            r.get("error").is_none(),
-            "loopback submit must work: {r}"
-        );
-        let r = call(
-            &st,
-            "stell_vote",
-            json!({
-                "id": pid,
-                "voter": hex::encode(voter),
-                "choice": "yes",
-                "signature": sign_test_vote(st.chain_id, &voter_key, &voter, pid, crate::governance::VoteChoice::Yes),
-            }),
-        )
-        .await;
-        assert_eq!(r["voted"], json!(true), "loopback vote must work: {r}");
+
+        // 3. Correct token: signed flows work end to end on BOTH binds.
+        // GATE (operator-signed governance): both writes are signed with the
+        // stakers' own keys (the unsigned legacy path stays refused without
+        // STELL_DEV_UNSAFE_TESTKEY=1, which this test does not set).
+        for mock in [Some(false), Some(true)] {
+            set_test_bind_loopback(mock);
+            let st = test_state_with_token().await;
+            let proposer_key = TestGovKey::ed25519([0xA1u8; 32]);
+            let proposer = proposer_key.address();
+            let voter_key = TestGovKey::ed25519([0xB2u8; 32]);
+            let voter = voter_key.address();
+            {
+                let mut ledger = st.engine.staking_write().await;
+                ledger
+                    .bond(proposer, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
+                    .unwrap();
+                ledger
+                    .bond(voter, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
+                    .unwrap();
+            }
+            let title = "dev".to_string();
+            let action = crate::governance::GovAction::Signal("hi".to_string());
+            let r = call_with_token(
+                &st,
+                "stell_submitProposal",
+                json!({
+                    "title": title,
+                    "type": "signal",
+                    "text": "hi",
+                    "proposer": hex::encode(proposer),
+                    "nonce": 1u64,
+                    "signature": sign_test_proposal(st.chain_id, &proposer_key, &proposer, &title, &action, 1),
+                }),
+            )
+            .await;
+            let pid = r["proposal_id"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("token-authed submit (bind loopback={mock:?}) must work: {r}"));
+            assert!(
+                r.get("error").is_none(),
+                "token-authed submit (bind loopback={mock:?}) must work: {r}"
+            );
+            let r = call_with_token(
+                &st,
+                "stell_vote",
+                json!({
+                    "id": pid,
+                    "voter": hex::encode(voter),
+                    "choice": "yes",
+                    "signature": sign_test_vote(st.chain_id, &voter_key, &voter, pid, crate::governance::VoteChoice::Yes),
+                }),
+            )
+            .await;
+            assert_eq!(r["voted"], json!(true), "token-authed vote (bind loopback={mock:?}) must work: {r}");
+        }
     }
 
     /// Operator-signed governance ingest: valid envelopes are accepted;
@@ -17058,7 +17329,9 @@ mod tests {
     #[tokio::test]
     async fn gov_writes_require_operator_signatures() {
         use crate::governance::{GovAction, VoteChoice};
-        let st = test_state().await;
+        // N-02: the signature pins below run on the token fixture — the auth
+        // gate passes, then the operator-signature checks fire.
+        let st = test_state_with_token().await;
         let chain = st.chain_id;
         let proposer_key = TestGovKey::ed25519([0xA1u8; 32]);
         let proposer = proposer_key.address();
@@ -17078,7 +17351,7 @@ mod tests {
         let title = "sig test".to_string();
         let action = GovAction::Signal("hi".to_string());
         let submit = |title: &str, _action: &GovAction, nonce: u64, sig_hex: &str| {
-            call(
+            call_with_token(
                 &st,
                 "stell_submitProposal",
                 json!({
@@ -17094,7 +17367,7 @@ mod tests {
 
         // 1. Unsigned proposal: refused fail-closed (no new knob involved;
         //    this test process does not arm STELL_DEV_UNSAFE_TESTKEY).
-        let r = call(
+        let r = call_with_token(
             &st,
             "stell_submitProposal",
             json!({
@@ -17170,7 +17443,7 @@ mod tests {
             5,
         );
         let lone_sig = lone_key.sign_message(chain, &lone_msg).unwrap().to_hex();
-        let r = call(
+        let r = call_with_token(
             &st,
             "stell_submitProposal",
             json!({
@@ -17189,7 +17462,7 @@ mod tests {
         );
 
         // 8. Unsigned vote: refused fail-closed.
-        let r = call(
+        let r = call_with_token(
             &st,
             "stell_vote",
             json!({"id": pid, "voter": hex::encode(voter), "choice": "yes"}),
@@ -17202,7 +17475,7 @@ mod tests {
 
         // 9. Valid signed vote: accepted.
         let vsig = sign_test_vote(chain, &voter_key, &voter, pid, VoteChoice::Yes);
-        let r = call(
+        let r = call_with_token(
             &st,
             "stell_vote",
             json!({
@@ -17217,7 +17490,7 @@ mod tests {
         let weight = r["weight"].as_str().unwrap_or("").to_string();
 
         // 10. Same-choice replay: idempotent, same weight.
-        let r = call(
+        let r = call_with_token(
             &st,
             "stell_vote",
             json!({
@@ -17233,7 +17506,7 @@ mod tests {
 
         // 11. Different choice with a fresh valid signature: refused.
         let flip = sign_test_vote(chain, &voter_key, &voter, pid, VoteChoice::No);
-        let r = call(
+        let r = call_with_token(
             &st,
             "stell_vote",
             json!({
@@ -17250,7 +17523,7 @@ mod tests {
         );
 
         // 12. Tampered choice: Yes-envelope presented as No.
-        let r = call(
+        let r = call_with_token(
             &st,
             "stell_vote",
             json!({
@@ -17270,7 +17543,7 @@ mod tests {
         let cross_vmsg =
             crate::governance::Governance::gov_vote_message(chain + 1, pid, VoteChoice::Yes, &voter);
         let cross_vsig = voter_key.sign_message(chain + 1, &cross_vmsg).unwrap().to_hex();
-        let r = call(
+        let r = call_with_token(
             &st,
             "stell_vote",
             json!({
@@ -17290,7 +17563,7 @@ mod tests {
         let lone_vmsg =
             crate::governance::Governance::gov_vote_message(chain, pid, VoteChoice::Yes, &lone);
         let lone_vsig = lone_key.sign_message(chain, &lone_vmsg).unwrap().to_hex();
-        let r = call(
+        let r = call_with_token(
             &st,
             "stell_vote",
             json!({

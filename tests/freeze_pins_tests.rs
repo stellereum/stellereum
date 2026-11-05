@@ -88,7 +88,8 @@ use stellereum::svm::GAS_BASIC_TRANSFER;
 #[test]
 fn frozen_base_timeout_is_pinned() {
     assert_eq!(black_box(FROZEN_ROUND_TIMEOUT_BASE_MS), 3_000);
-    // The frozen base reproduces the canonical ladder rungs.
+    // The frozen base reproduces the canonical ladder rungs (geometric ×2,
+    // papers/02_liveness.md §7 rec 1 — r1 doubles the base, cap unchanged).
     assert_eq!(
         black_box(deterministic_round_timeout_ms(
             FROZEN_ROUND_TIMEOUT_BASE_MS,
@@ -103,7 +104,7 @@ fn frozen_base_timeout_is_pinned() {
             1,
             0
         )),
-        3_500
+        6_000
     );
 }
 

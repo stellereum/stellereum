@@ -2560,6 +2560,17 @@ impl ValidatorRuntime {
         action: crate::governance::GovAction,
         now: u64,
     ) -> Result<u64, crate::governance::GovError> {
+        // Single-node write guard (fail-closed on multi-node deployments):
+        // the in-force validator set size (`self.validators.len()`) is the
+        // canonical multi-node signal — a local-only proposal here would
+        // diverge the state root from peers that never saw it. The
+        // deterministic finalize sweep is NOT gated (it derives from decided
+        // blocks, identically on every node).
+        if let Err(msg) =
+            crate::governance::governance_write_allowed_from_env(self.validators.len())
+        {
+            return Err(crate::governance::GovError::MultiNodeRefused(msg));
+        }
         let mut ledger = self
             .staking
             .try_write()
@@ -2579,6 +2590,14 @@ impl ValidatorRuntime {
         choice: crate::governance::VoteChoice,
         now: u64,
     ) -> Result<u128, crate::governance::GovError> {
+        // Same single-node write guard as `gov_propose` (gate FIRST, before
+        // any lock or lookup, so a multi-node vote is refused as
+        // multi-node — never as some downstream UnknownProposal).
+        if let Err(msg) =
+            crate::governance::governance_write_allowed_from_env(self.validators.len())
+        {
+            return Err(crate::governance::GovError::MultiNodeRefused(msg));
+        }
         // E7: `Governance::vote` locks the voter's stake in the ledger, so it
         // needs a write guard (via the state engine, which also bumps the
         // commitment generation — a bare handle write would leave the root
@@ -11570,5 +11589,124 @@ mod shard_header_commitment_tests {
         // Idempotent: a second sweep at a later height is a no-op.
         let again = sweep_gov_finalize(&state, pass_height + 1, now_due).await;
         assert!(again.is_empty());
+    }
+
+    /// Serializes the env-touching gate tests below: the escape hatch is
+    /// process-global, so the set/restore in the escape test must never
+    /// overlap the unset expectation of the refuse test (parallel lib tests
+    /// share one process).
+    static GOV_GATE_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_gate_env() -> std::sync::MutexGuard<'static, ()> {
+        GOV_GATE_ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Build a runtime with `n` bonded stakers (>= propose minimum) and an
+    /// attached governance engine. The runtime's in-force validator set has
+    /// exactly `n` members, which is what the write guard reads.
+    async fn gate_test_runtime(n: usize) -> (ValidatorRuntime, Vec<ValidatorId>) {
+        use crate::governance::{Governance, PROPOSAL_MIN_STAKE_NANO};
+        let keys: Vec<SigningKey> = (0..n)
+            .map(|i| SigningKey::from_bytes(&[(i as u8).wrapping_add(1); 32]))
+            .collect();
+        let ids: Vec<ValidatorId> = keys
+            .iter()
+            .map(|k| k.verifying_key().to_bytes())
+            .collect();
+        let vs = ValidatorSet::from_list(ids.iter().map(|id| (*id, 1)).collect());
+        let state = Arc::new(InMemoryStateEngine::new());
+        {
+            let mut ledger = state.staking_write().await;
+            for id in &ids {
+                ledger
+                    .bond(
+                        *id,
+                        PROPOSAL_MIN_STAKE_NANO,
+                        crate::staking::DEFAULT_COMMISSION_BPS,
+                    )
+                    .expect("test bond must succeed");
+            }
+        }
+        let rt = ValidatorRuntime::new(keys[0].clone(), vs, state, 1)
+            .with_governance(Governance::new());
+        (rt, ids)
+    }
+
+    /// Solo runtime (1 validator): propose + vote go through (existing
+    /// behavior preserved). Passes with or without the escape env, so no
+    /// env guard is needed.
+    #[tokio::test]
+    async fn gov_write_gate_solo_allows_propose_and_vote() {
+        use crate::governance::{GovAction, VoteChoice};
+        let (mut rt, ids) = gate_test_runtime(1).await;
+        let pid = rt
+            .gov_propose(ids[0], "t".into(), GovAction::Signal("s".into()), 0)
+            .expect("solo propose must succeed");
+        rt.gov_vote(ids[0], pid, VoteChoice::Yes, 1)
+            .expect("solo vote must succeed");
+    }
+
+    /// Multi-node runtime (3 validators): propose AND vote are refused as
+    /// multi-node — the vote refusal proves the gate runs BEFORE any
+    /// proposal lookup (an unknown id would otherwise fail as
+    /// `UnknownProposal`, hiding the real reason).
+    #[tokio::test]
+    async fn gov_write_gate_multi_node_refuses_propose_and_vote() {
+        use crate::governance::{GovAction, GovError, VoteChoice, GOV_MULTINODE_WRITES_ENV};
+        // Built BEFORE arming the env guard: construction touches no env,
+        // and the guard must never be held across an await.
+        let (mut rt, ids) = gate_test_runtime(3).await;
+        {
+            let _guard = lock_gate_env();
+            let saved = std::env::var(GOV_MULTINODE_WRITES_ENV).ok();
+            std::env::remove_var(GOV_MULTINODE_WRITES_ENV);
+            let propose_err = rt
+                .gov_propose(ids[0], "t".into(), GovAction::Signal("s".into()), 0)
+                .expect_err("multi-node propose must be refused");
+            match &propose_err {
+                GovError::MultiNodeRefused(msg) => assert!(
+                    msg.contains(GOV_MULTINODE_WRITES_ENV),
+                    "refusal must name the escape env, got: {msg}"
+                ),
+                other => panic!("expected MultiNodeRefused, got: {other:?}"),
+            }
+            let vote_err = rt
+                .gov_vote(ids[0], 999_999, VoteChoice::Yes, 1)
+                .expect_err("multi-node vote must be refused");
+            assert!(
+                matches!(vote_err, GovError::MultiNodeRefused(_)),
+                "vote must fail at the gate, not at lookup; got: {vote_err:?}"
+            );
+            match saved {
+                Some(v) => std::env::set_var(GOV_MULTINODE_WRITES_ENV, v),
+                None => std::env::remove_var(GOV_MULTINODE_WRITES_ENV),
+            }
+        }
+    }
+
+    /// Escape hatch: with `STELL_GOV_ALLOW_MULTINODE_WRITES=1` the same
+    /// 3-validator runtime proposes and votes (re-allowed explicitly).
+    #[tokio::test]
+    async fn gov_write_gate_escape_reallows_multi_node() {
+        use crate::governance::{GovAction, VoteChoice, GOV_MULTINODE_WRITES_ENV};
+        // Built BEFORE arming the env guard: construction touches no env,
+        // and the guard must never be held across an await.
+        let (mut rt, ids) = gate_test_runtime(3).await;
+        {
+            let _guard = lock_gate_env();
+            let saved = std::env::var(GOV_MULTINODE_WRITES_ENV).ok();
+            std::env::set_var(GOV_MULTINODE_WRITES_ENV, "1");
+            let pid = rt
+                .gov_propose(ids[0], "t".into(), GovAction::Signal("s".into()), 0)
+                .expect("escaped propose must succeed");
+            rt.gov_vote(ids[0], pid, VoteChoice::Yes, 1)
+                .expect("escaped vote must succeed");
+            match saved {
+                Some(v) => std::env::set_var(GOV_MULTINODE_WRITES_ENV, v),
+                None => std::env::remove_var(GOV_MULTINODE_WRITES_ENV),
+            }
+        }
     }
 }

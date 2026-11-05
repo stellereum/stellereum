@@ -51,8 +51,9 @@
 //! * RANK 1 (fits): Falcon-authenticated PQ-KEM transport swap. Keep Feldman VSS + Ristretto
 //!   threshold exactly as-is; replace ONLY the X25519 package encryption (`:1094-1136`) with a
 //!   PQ KEM encaps (e.g. ML-KEM-768) to each recipient's PQ transport key, and sign each
-//!   `DkgContribution` with the contributor's Falcon-512 key (pattern: `VrfBinding::verify`,
-//!   `vrf.rs:25,642-659`; keygen `post_quantum.rs:1959` `FalconKeypair::generate_from_seed_bytes`).
+//!   `DkgContribution` with the contributor's Falcon-512 key over the contribution
+//!   bytes (the old `VrfBinding::verify` pattern was deleted with ECVRF;
+//!   keygen `post_quantum.rs:1959` `FalconKeypair::generate_from_seed_bytes`).
 //!   Production/consumption unchanged: same `P_e`, same partials, same `unseal_transaction`.
 //! * RANK 2 (partial fit): Falcon-signed commit-reveal per the CN-VRF pattern (`cn_vrf.rs:1-43`,
 //!   `cnvrf_commit`/`cnvrf_open`/`cnvrf_verify`, domains `CNVRF_COMMIT_DST`/`CNVRF_OPEN_DST`)

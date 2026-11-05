@@ -5,6 +5,7 @@ use rand::rngs::OsRng;
 use std::sync::Arc;
 
 use stellereum::consensus::{ValidatorSet, Vote, VoteKind};
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::staking::{StakingLedger, DEFAULT_COMMISSION_BPS, EQUIVOCATION_SLASH_BPS};
 use stellereum::state_engine::InMemoryStateEngine;
@@ -15,6 +16,38 @@ fn stell(n: u64) -> u64 {
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
+}
+
+/// Deterministic Falcon companions for an Ed key set (FULL-PQ: votes verify
+/// Falcon-only, while voter identity stays the Ed key). Mirrors
+/// `consensus::tests::vset_with_falcon`: each key is registered in the
+/// global validator-PQ registry that `Vote::verify` reads.
+fn fks(ks: &[SigningKey]) -> Vec<FalconKeypair> {
+    use stellereum::consensus::register_validator_pq_key;
+    use stellereum::post_quantum::PqScheme;
+    ks.iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let fk = FalconKeypair::generate_from_seed(i as u8);
+            register_validator_pq_key(
+                k.verifying_key().to_bytes(),
+                PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+            fk
+        })
+        .collect()
+}
+
+fn fvote(
+    sk: &SigningKey,
+    fk: &FalconKeypair,
+    height: u64,
+    round: u32,
+    kind: VoteKind,
+    bh: Option<[u8; 32]>,
+) -> Vote {
+    Vote::sign_with_falcon(sk, fk, height, round, kind, bh)
 }
 
 /// Validator voting power mirrors bonded stake (self + delegated).
@@ -60,12 +93,14 @@ async fn runtime_slashes_equivocation() {
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs, state, 1).with_staking(ledger);
 
     // The offender double-votes at height 1 round 0: two conflicting prevotes.
-    let a = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some([1u8; 32]));
-    let b = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some([2u8; 32]));
+    let fks = fks(&ks);
+    let a = fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some([1u8; 32]));
+    let b = fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some([2u8; 32]));
     rt.hc.add_prevote(a).unwrap();
     rt.hc
-        .add_precommit(Vote::sign(
+        .add_precommit(fvote(
             &ks[1],
+            &fks[1],
             1,
             0,
             VoteKind::Precommit,
@@ -95,8 +130,9 @@ async fn no_ledger_no_slash() {
     );
     let state = Arc::new(InMemoryStateEngine::new());
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs, state, 1);
-    let a = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some([1u8; 32]));
-    let b = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some([2u8; 32]));
+    let fks = fks(&ks);
+    let a = fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some([1u8; 32]));
+    let b = fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some([2u8; 32]));
     rt.hc.add_prevote(a).unwrap();
     rt.hc.add_prevote(b).unwrap();
     assert_eq!(rt.apply_equivocation_slashes().await, 0);
@@ -131,8 +167,9 @@ async fn proposer_receives_block_reward_on_finalize() {
     use stellereum::runtime::Cluster;
 
     let ks = keys(4);
+    let fks = fks(&ks);
     let mut nodes = Vec::new();
-    for k in &ks {
+    for (i, k) in ks.iter().enumerate() {
         // Every node must start from the SAME ledger. The staking ledger is part
         // of the state root, so a node seeded with only its own bond computes a
         // different root from its peers, and a proposal built on one is correctly
@@ -158,6 +195,9 @@ async fn proposer_receives_block_reward_on_finalize() {
             Arc::new(InMemoryStateEngine::new()),
             1,
         )
+        // FULL-PQ: cluster votes verify Falcon-only — every runtime needs
+        // its Falcon key or `run_height` stalls with refused votes.
+        .with_falcon_key(fks[i].clone())
         .with_staking(ledger)
         .with_block_reward(stell(7));
         nodes.push(rt);
@@ -355,17 +395,20 @@ async fn validator_set_rotates_from_stake() {
     };
     blk.sign_block(pkey);
     let bh = blk.compute_hash();
-    for k in ks.iter() {
-        rt.on_prevote(stellereum::consensus::Vote::sign(
+    let fks = fks(&ks);
+    for (i, k) in ks.iter().enumerate() {
+        rt.on_prevote(stellereum::consensus::Vote::sign_with_falcon(
             k,
+            &fks[i],
             1,
             0,
             stellereum::consensus::VoteKind::Prevote,
             Some(bh),
         ))
         .unwrap();
-        rt.on_precommit(stellereum::consensus::Vote::sign(
+        rt.on_precommit(stellereum::consensus::Vote::sign_with_falcon(
             k,
+            &fks[i],
             1,
             0,
             stellereum::consensus::VoteKind::Precommit,
@@ -388,11 +431,32 @@ async fn validator_set_rotates_from_stake() {
 }
 
 /// Governance is driven through the runtime against the staking ledger.
+/// Multi-validator writes require the explicit escape hatch (fail-closed
+/// single-node guard): the test arms `STELL_GOV_ALLOW_MULTINODE_WRITES=1`
+/// under a serial lock and restores the env afterwards.
 #[tokio::test]
 async fn runtime_governance_flow_is_on_chain() {
     use stellereum::governance::{
         GovAction, Governance, ProposalStatus, VoteChoice, GOVERNANCE_VOTING_PERIOD_SECS,
+        GOV_MULTINODE_WRITES_ENV,
     };
+    static GOV_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _env_guard = GOV_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    struct EnvRestore {
+        saved: Option<String>,
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => std::env::set_var(GOV_MULTINODE_WRITES_ENV, v),
+                None => std::env::remove_var(GOV_MULTINODE_WRITES_ENV),
+            }
+        }
+    }
+    let _restore = EnvRestore {
+        saved: std::env::var(GOV_MULTINODE_WRITES_ENV).ok(),
+    };
+    std::env::set_var(GOV_MULTINODE_WRITES_ENV, "1");
 
     let ks = keys(3);
     let ids: Vec<[u8; 32]> = ks.iter().map(|k| k.verifying_key().to_bytes()).collect();

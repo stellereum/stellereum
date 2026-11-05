@@ -45,6 +45,11 @@ thread_local! {
 /// - `None` => unset (-1), reading `STELL_PURE_PQ` environment variable.
 /// - `Some(false)` => explicitly disabled (0).
 /// - `Some(true)` => explicitly enforced (1).
+///
+/// FULL-PQ NOTE: the node binary pins `Some(true)` at startup
+/// (`main.rs:2849`), so in production the override slot is always `1` and
+/// the env/flag below are dead compat knobs (WARN + ignore). `None` only
+/// restores env-reading in library/test contexts where `main` never ran.
 pub fn set_pure_pq_override(enabled: Option<bool>) {
     let val = match enabled {
         None => -1,
@@ -62,11 +67,15 @@ pub fn set_pure_pq_override(enabled: Option<bool>) {
 /// otherwise). If unset (-1), inspects the `STELL_PURE_PQ` environment
 /// variable (enforced on `1`, `true`, or `always`; explicitly opted out
 /// with `0` / `false` / empty). If the variable is UNSET, enforcement
-/// defaults OFF (PQ OPT-IN default — M-01 fallback, 2026-11-04): a
-/// PQ-enforced default was verified and REVERTED (155/1104 lib failures;
-/// classical suite/sim/wallet/genesis assume dual-stack default — see
-/// M-01 fallback note in README/PERF_1K). Operators opt in with
-/// `STELL_PURE_PQ=1` (or `--pure-pq`); `STELL_PURE_PQ=0` pins dual-stack.
+/// defaults OFF — lib/test default (no `main` override installed).
+///
+/// FULL-PQ (production truth, KEX cut): the node binary installs
+/// `set_pure_pq_override(Some(true))` at startup (`main.rs:2849`), so this
+/// returns `true` unconditionally on the live path; `--pure-pq` /
+/// `STELL_PURE_PQ` are then parsed-and-ignored with a loud WARN
+/// (`main.rs:2839-2847`), never a gate. RPC intake additionally refuses
+/// classical envelopes before any crypto (`rpc.rs:3768-3779`). There is no
+/// dual-stack mode on a running node.
 ///
 /// BATCH-MIRROR CONTRACT (audit F-HIGH-2): every batched signature screen
 /// (vote `verify_batch` / `partition_valid` / `add_batch`, tx batch paths)
@@ -1133,6 +1142,13 @@ extern "C" {
     fn shake256_inc_absorb(state: *mut FalconShake256Ctx, input: *const u8, inlen: usize);
     fn shake256_inc_finalize(state: *mut FalconShake256Ctx);
     fn shake256_inc_ctx_release(state: *mut FalconShake256Ctx);
+    // L-02: both Falcon entry points below return `void` — NOT `int` — per
+    // the linked sources (`pqcrypto-falcon 0.4.1`,
+    // `pqclean/crypto_sign/falcon-512/clean/inner.h:726,785`). Declaring a
+    // `-> i32` return would misread the return register, so the declaration
+    // stays `()` and fail-closed handling lives at the call sites instead
+    // (NTRU post-check in `falcon512_keygen`, range guards plus the verify
+    // self-check in `falcon512_sign_dyn` / `sign_with_seed`).
     fn PQCLEAN_FALCON512_CLEAN_keygen(
         rng: *mut FalconShake256Ctx,
         f: *mut i8,
@@ -1244,6 +1260,13 @@ fn falcon512_keygen(
     zeroize::Zeroize::zeroize(&mut capital_f);
     zeroize::Zeroize::zeroize(&mut capital_g);
     zeroize::Zeroize::zeroize(&mut scratch.0);
+
+    // L-02 (fail-closed): the C entry point returns void, so a broken FFI
+    // output cannot signal failure itself — refuse a key that is not a
+    // genuine NTRU key instead of handing it to the sampler.
+    if !falcon_ntru_relation_holds(&f16, &g16, &f16_cap, &g16_cap) {
+        return None;
+    }
 
     Some((f16, g16, f16_cap, g16_cap, h))
 }
@@ -3359,5 +3382,45 @@ mod tests {
                 next_idx
             );
         }
+    }
+
+    /// L-02: the void-FFI call sites fail closed — an out-of-range private
+    /// coefficient is refused by `falcon512_sign_dyn` (None), a keygen
+    /// output that is not a genuine NTRU key would be refused by
+    /// `falcon512_keygen` (None), and a key whose NTRU partner is destroyed
+    /// is refused by the signer (empty Vec, never a bad signature).
+    #[test]
+    fn l02_ffdsa_failure_paths_refuse() {
+        // Positive control (non-vacuous): fresh keygen output satisfies the
+        // NTRU relation and its key signs.
+        let seed = [0xABu8; FALCON512_KEYGEN_SEED_LEN];
+        let (f, g, capital_f, capital_g, _) =
+            falcon512_keygen(&seed).expect("fresh keygen must succeed");
+        assert!(falcon_ntru_relation_holds(&f, &g, &capital_f, &capital_g));
+        // Failure path 1: a coefficient outside the i8 range is refused.
+        let mut bad_f = f;
+        bad_f[0] = 1000;
+        let c = [0u16; 512];
+        let sampler_seed = [0x11u8; 48];
+        assert!(
+            falcon512_sign_dyn(&bad_f, &g, &capital_f, &capital_g, &c, &sampler_seed).is_none(),
+            "an out-of-range coefficient must be refused"
+        );
+        // Failure path 2: the NTRU predicate detects a destroyed partner.
+        let mut bad_g = capital_g;
+        bad_g[7] ^= 1;
+        assert!(
+            !falcon_ntru_relation_holds(&f, &g, &capital_f, &bad_g),
+            "a corrupted G must fail the NTRU relation check"
+        );
+        // Failure path 3 (end-to-end): signing with a destroyed in-memory
+        // partner refuses instead of emitting a signature.
+        let mut kp = FalconKeypair::generate_from_seed(0x1F);
+        kp.capital_g = [0i16; 512];
+        let sig = kp.sign_with_seed(b"l02 refusal", &[0x22u8; 32]);
+        assert!(
+            sig.is_empty(),
+            "signing with a destroyed G must refuse (empty Vec)"
+        );
     }
 }

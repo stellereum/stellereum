@@ -29,7 +29,8 @@
 //!   the EXISTING downtime path via [`cnvrf_draw_absence`] (caller-tested;
 //!   see `tests/cn_vrf_tests.rs` group 6).
 //! - O6: nonce custody signer-side 0600 ([`load_cnvrf_nonce_from_file`] /
-//!   [`save_cnvrf_nonce_to_file`], mirroring `vrf.rs:360-421`).
+//!   [`save_cnvrf_nonce_to_file`], mirroring the `node_keys.rs` secret-file
+//!   posture — the old `vrf.rs` secret helpers were deleted with ECVRF).
 //! - O7: caller-held side map ([`CnVrfCommitments`]) + pure transition fns
 //!   ([`cnvrf_commit_state`], [`cnvrf_mark_revealed`], [`cnvrf_expire_before`]);
 //!   NO persistence wiring.
@@ -631,7 +632,9 @@ pub fn cnvrf_draw_absence(
 }
 
 // ---------------------------------------------------------------------------
-// Nonce custody (O6): signer-side 0600 file posture, mirrors vrf.rs:360-421
+// Nonce custody (O6): signer-side 0600 file posture, mirrors the
+// `node_keys.rs` secret-file discipline (the old `vrf.rs` secret-file
+// helpers were deleted with the ECVRF excision).
 // ---------------------------------------------------------------------------
 
 /// Save an epoch nonce to `path` with owner-only (0600) permissions.
@@ -661,8 +664,8 @@ pub fn save_cnvrf_nonce_to_file(path: &Path, nonce: &[u8; 32]) -> Result<(), Str
     Ok(())
 }
 
-/// Parse a 32-byte hex nonce (optional `0x` prefix), mirroring
-/// `parse_vrf_secret_hex` (`vrf.rs:342`).
+/// Parse a 32-byte hex nonce (optional `0x` prefix). Hex format mirrors the
+/// deleted VRF secret-file posture; current analogue is `node_keys.rs`.
 pub fn parse_cnvrf_nonce_hex(raw: &str) -> Result<[u8; 32], String> {
     let trimmed = raw.trim();
     let hex_part = trimmed.strip_prefix("0x").unwrap_or(trimmed).trim();
@@ -680,8 +683,9 @@ pub fn parse_cnvrf_nonce_hex(raw: &str) -> Result<[u8; 32], String> {
 }
 
 /// Load an epoch nonce from `path`: 0600-checked (owner-only, fail-closed),
-/// first non-empty line, hex. Mirrors `load_vrf_secret_from_file`
-/// (`vrf.rs:363`). Unit-tested with temp dirs only.
+/// first non-empty line, hex. Same discipline as `node_keys.rs`
+/// (the old `load_vrf_secret_from_file` was deleted with ECVRF).
+/// Unit-tested with temp dirs only.
 pub fn load_cnvrf_nonce_from_file(path: &Path) -> Result<[u8; 32], String> {
     #[cfg(unix)]
     {

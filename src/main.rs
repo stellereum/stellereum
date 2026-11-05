@@ -3724,6 +3724,28 @@ async fn run_consensus_node(
             .join(",")
     );
 
+    // Governance-write mode (visibility only; enforcement lives in the
+    // propose/vote entry paths): a solo validator set allows local writes
+    // (no peer to diverge from); a multi-node set refuses them unless the
+    // documented escape env is armed (default OFF).
+    {
+        let gov_validators = rt.validators.len();
+        let gov_escape = stellereum::governance::governance_multinode_escape_enabled();
+        let gov_mode =
+            match stellereum::governance::governance_write_allowed(gov_validators, gov_escape) {
+                Ok(()) if gov_validators <= 1 => format!(
+                    "ALLOWED (solo validator set size = {gov_validators}; no peer to diverge from)"
+                ),
+                Ok(()) => format!(
+                    "ALLOWED via {}=1 (multi-node validator set size = {gov_validators}; \
+                     local-only writes WILL diverge the state root — escape explicitly armed)",
+                    stellereum::governance::GOV_MULTINODE_WRITES_ENV
+                ),
+                Err(e) => format!("REFUSED ({e})"),
+            };
+        info!("[gov] governance writes: {gov_mode}");
+    }
+
     // §7 Phase 1: the two background lanes the tick submits to instead of
     // awaiting inline, plus the single-flight guards for the periodic blocking
     // jobs. Per node instance (this function runs once per shard), so one
@@ -10569,7 +10591,10 @@ mod round_timeout_tests {
         let a_ms = deterministic_timeout_for(3500, 3, 2);
         let b_ms = deterministic_timeout_for(3500, 3, 2);
         assert_eq!(a_ms, b_ms, "identical state => identical timeout");
-        assert_eq!(a_ms, 3500 + 3 * 500 + 2 * 500);
+        // Geometric ladder (paper 02_liveness §6, B2 wave): min(3500·2^3,
+        // 3500+10000) + min(2·500, 5000) = 13500 + 1000. The determinism
+        // property above is the test's core; the value pins the ladder.
+        assert_eq!(a_ms, 14_500);
         let _ = (a_start, b_start); // clocks exist, value ignores them
                                     // Enumerated inputs, pinned: base + round-backoff (cap 10s) + adaptive (cap 5s).
         assert_eq!(deterministic_timeout_for(3500, 0, 0), 3500);

@@ -1,6 +1,6 @@
 //! 3-Tier Price Safety Network & Oracle Module
 //! Tier 1: Pull-Oracle (Pyth / RedStone style signed data in calldata)
-//! Tier 2: On-Chain DEX TWAP fallback (30-60 min rolling window)
+//! Tier 2: On-Chain DEX TWAP fallback (~91 s rolling VWAP window, W* optimum)
 //! Tier 3: Circuit Breaker (>10% deviation / stale > 15 min / USDT depeg < $0.95)
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -23,7 +23,7 @@ pub const MAX_PRICE_DEVIATION_BPS: u64 = 1000; // 10% = 1000 bps
 /// before, so true moves still trip the alarm no matter who publishes them.
 ///
 /// Explicitly NOT a TWAP-anchored guard (documented out of scope): anchoring
-/// the commit to the 60-min TWAP would need committed TWAP history (new
+/// the commit to the TWAP window would need committed TWAP history (new
 /// consensus state, `COMMITMENT_VERSION` bump, snapshot migration) for a
 /// read-path hint that today is advisory-only by design (`DexTwapCalculator`
 /// / `OracleSafetyEngine` never commit). Key rotation stays Sybil-priced by
@@ -31,7 +31,28 @@ pub const MAX_PRICE_DEVIATION_BPS: u64 = 1000; // 10% = 1000 bps
 /// per key), so alternating two keys still costs two admissions.
 pub const MAX_SAME_PUBLISHER_DEVIATION_BPS: u64 = MAX_PRICE_DEVIATION_BPS / 2; // 5% = 500 bps
 pub const USDT_MIN_PEG_MICRO_USD: u64 = 950_000; // $0.95 (in 6-decimals micro-USD)
-pub const TWAP_WINDOW_SECS: u64 = 3600; // 60 minutes window for TWAP
+/// Rolling VWAP window in seconds: W* ≈ 91 s optimum (report P4 §2, Eq. 2).
+///
+/// VALUE NOTE (frozen-economics audit 2026-11-05, math ref
+/// `stellereum-math/papers/04_oracle.md` + `results/twap.json`): the prior
+/// 3600 s window was ≈40× the MSE optimum (σ=5%/day, one-block 10% shift J:
+/// W*=(6(JΔt)²/σ²)^(1/3)=90.7 s at 0.6 s blocks; MSE at 3600 s ≈26× worse
+/// than at W*). OBSERVATIONAL-ONLY change. Classification proof: the ONLY
+/// readers of this constant are the two `DexTwapCalculator` methods below,
+/// consumed solely by the advisory-only `OracleSafetyEngine` Tier-2 fallback
+/// and Tier-3 read-path check. Consensus commits `OracleState` only — see
+/// the `oracle_digest` commitment function and the persisted `oracle` field
+/// in storage — and apply-path admission goes through `OracleState`
+/// `commit_feed`/`gate_order` in svm, state_engine and native_api, which
+/// never touch this constant. Live main.rs uses the engine for demo/CLI
+/// display only. No apply, commitment or snapshot path reads it. Pinned by
+/// the `twap_window_is_w_star_91s` test below.
+///
+/// CAVEAT (report §2, FOR-LEAD-DECISION): Eq. 2 models a ONE-BLOCK shift;
+/// a shifter that HOLDS J for the whole window is not diluted by it —
+/// long-window protection there is attack-cost, not statistics. Both
+/// regimes must be fixed in the oracle spec before retuning again.
+pub const TWAP_WINDOW_SECS: u64 = 91; // W* ≈ 91 s (was 3600 s)
 /// Maximum committed asset-symbol size in bytes (E10).
 ///
 /// `feeds` is committed consensus state keyed by the publisher-supplied
@@ -114,6 +135,53 @@ pub fn pair_quote_asset(pair_id: u32) -> Option<&'static str> {
         crate::orderbook::PAIR_STELL_USDT => Some("USDT"),
         _ => None,
     }
+}
+
+/// PROPOSAL ONLY — optimal VWAP window, cubic-root law (report P4 §2, Eq. 2).
+///
+/// FOR-LEAD-DECISION: not wired anywhere (`TWAP_WINDOW_SECS` stays the only
+/// live window). Pure reference math for the lead's decision, exercised only
+/// by the tests in this file. W* = (6·(J·Δt)²/σ²)^(1/3): `shift_times_dt`
+/// is the one-block manipulation impulse J·Δt and `sigma` the per-SECOND
+/// volatility, in consistent relative-price units. E.g. σ=5%/day
+/// (σ≈1.701e-4/s), J=10% on a 0.6 s block → W*≈90.7 s (twap.json row).
+/// Returns +∞ for zero volatility (no variance term to balance).
+pub fn twap_optimal_window_secs(shift_times_dt: f64, sigma_per_sec: f64) -> f64 {
+    if sigma_per_sec <= 0.0 || !sigma_per_sec.is_finite() {
+        return f64::INFINITY;
+    }
+    (6.0 * shift_times_dt * shift_times_dt / (sigma_per_sec * sigma_per_sec)).cbrt()
+}
+
+/// PROPOSAL ONLY — Wald SPRT decision boundaries (report P4 §4).
+///
+/// FOR-LEAD-DECISION: not wired; the live Tier-3 check stays the fixed
+/// 10% `MAX_PRICE_DEVIATION_BPS` breaker. Pure math, tested below.
+/// Returns (A, B) = (ln((1−β)/α), ln(β/(1−α))).
+pub fn sprt_wald_bounds(alpha: f64, beta: f64) -> (f64, f64) {
+    debug_assert!(alpha > 0.0 && alpha < 1.0 && beta > 0.0 && beta < 1.0);
+    let a = ((1.0 - beta) / alpha).ln();
+    let b = (beta / (1.0 - alpha)).ln();
+    (a, b)
+}
+
+/// PROPOSAL ONLY — one CUSUM/SPRT log-likelihood step for N(0,σ²) vs N(J,σ²).
+///
+/// FOR-LEAD-DECISION: not wired anywhere. LLR_r step for a relative-price
+/// residual x: (J/σ²)·x − J²/(2σ²). Accumulate while the running sum stays
+/// within the [`sprt_wald_bounds`] interval; crossing A accepts H1 (shift),
+/// crossing B accepts H0. Pure and deterministic.
+pub fn cusum_llr_step(residual: f64, shift: f64, sigma: f64) -> f64 {
+    (shift / (sigma * sigma)) * residual - shift * shift / (2.0 * sigma * sigma)
+}
+
+/// PROPOSAL ONLY — expected SPRT samples to decide under H1 (report P4 §4,
+/// Eq. 5, Wald identity): E[N|H1] = ((1−β)·A + β·B) / (J²/(2σ²)).
+/// FOR-LEAD-DECISION: not wired anywhere. E.g. J=1%, σ=0.5%/block,
+/// α=β=1e-3 → ≈3.45 blocks (twap.json `sprt` table).
+pub fn sprt_expected_samples(alpha: f64, beta: f64, shift: f64, sigma: f64) -> f64 {
+    let (a, b) = sprt_wald_bounds(alpha, beta);
+    ((1.0 - beta) * a + beta * b) / (shift * shift / (2.0 * sigma * sigma))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -281,7 +349,7 @@ impl OracleState {
         //    FULL-FIX PRECONDITION (deferred, explicitly out of scope):
         //    multi-publisher median/quorum or a TWAP-anchored commit guard
         //    (refuse-without-latch when the commit deviates >X% from the
-        //    60-min TWAP) — both need committed TWAP history or a
+        //    TWAP window) — both need committed TWAP history or a
         //    publisher-stake/slash design, i.e. new consensus state
         //    (`COMMITMENT_VERSION` bump + snapshot migration for an
         //    advisory-only read path), not a tightening of this function.
@@ -466,7 +534,12 @@ pub struct TradeObservation {
     pub volume: u64,
 }
 
-/// Rolling On-Chain DEX TWAP Calculator (30-60 min)
+/// Rolling On-Chain DEX VWAP Calculator (~91 s W* window).
+///
+/// NOTE: this computes a VOLUME-weighted mean (weight = trade volume), not
+/// a time-weighted mean (report P4 §1). For manipulation analysis use the
+/// effective averaging time W_eff = Δt·Σv²/(Σv)² (Δt/N for equal weights);
+/// the cubic-root optimum laws are otherwise unchanged.
 #[derive(Clone, Debug, Default)]
 pub struct DexTwapCalculator {
     pub observations: HashMap<String, VecDeque<TradeObservation>>,
@@ -657,6 +730,84 @@ impl OracleSafetyEngine {
         }
 
         Ok(price)
+    }
+}
+
+#[cfg(test)]
+mod oracle_params_truth_tests {
+    use super::*;
+
+    #[test]
+    fn twap_window_is_w_star_91s() {
+        // Pinned observational value (report P4 §2): 3600 s → 91 s.
+        // Advisory-only (see const docs for the per-consumer proof); the
+        // consensus breaker thresholds below are UNCHANGED.
+        assert_eq!(TWAP_WINDOW_SECS, 91);
+        assert_eq!(MAX_PRICE_DEVIATION_BPS, 1000, "Tier-3 breaker stays 10%");
+        assert_eq!(STALE_PRICE_MAX_SECS, 15 * 60, "freshness stays 15 min");
+        assert_eq!(USDT_MIN_PEG_MICRO_USD, 950_000, "USDT peg stays $0.95");
+        assert_eq!(
+            MAX_SAME_PUBLISHER_DEVIATION_BPS, 500,
+            "per-publisher cap stays 5%"
+        );
+    }
+
+    #[test]
+    fn w_star_formula_reproduces_report_headline() {
+        // Report P4 §2 calibration: σ=5%/day → per-second
+        // 0.05/sqrt(86400); J=10% held one 0.6 s block → W*≈90.7 s.
+        let sigma = 0.05 / 86_400f64.sqrt();
+        let w_star = twap_optimal_window_secs(0.10 * 0.6, sigma);
+        assert!((w_star - 90.7).abs() < 0.5, "W*≈90.7 s, got {w_star}");
+        // Scaling law (Corollary 1): doubling σ shrinks W* by 2^(2/3).
+        let w_half = twap_optimal_window_secs(0.10 * 0.6, 2.0 * sigma);
+        assert!((w_star / w_half - 2f64.powf(2.0 / 3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn twap_prunes_at_new_window_and_stays_vwap() {
+        // Pruning honors the 91 s window (was 3600 s): an observation older
+        // than the window drops out of both record and query paths.
+        let mut calc = DexTwapCalculator::new();
+        calc.record_trade("X", 100, 1_000, 1);
+        calc.record_trade("X", 200, 1_000 + TWAP_WINDOW_SECS + 1, 1);
+        assert_eq!(
+            calc.calculate_twap("X", 1_000 + TWAP_WINDOW_SECS + 1),
+            Some(200),
+            "stale observation pruned past the 91 s window"
+        );
+        // Inside the window both legs count, volume-weighted.
+        let mut calc2 = DexTwapCalculator::new();
+        calc2.record_trade("Y", 1_000_000, 5_000, 100);
+        calc2.record_trade("Y", 1_100_000, 5_010, 100);
+        assert_eq!(calc2.calculate_twap("Y", 5_010), Some(1_050_000));
+    }
+
+    #[test]
+    fn sprt_proposal_matches_report_table() {
+        // twap.json `sprt` rows (α=β=1e-3): E[N] for (J, σ) pairs.
+        let cases = [
+            (0.01, 0.005, 3.45),
+            (0.01, 0.01, 13.79),
+            (0.02, 0.005, 0.86),
+            (0.02, 0.01, 3.45),
+        ];
+        for (j, sigma, expected) in cases {
+            let got = sprt_expected_samples(1e-3, 1e-3, j, sigma);
+            assert!(
+                (got - expected).abs() / expected < 0.01,
+                "J={j} σ={sigma}: E[N]≈{expected}, got {got}"
+            );
+        }
+        // Wald bounds: A = ln((1−β)/α) > 0 > B, symmetric at α=β.
+        let (a, b) = sprt_wald_bounds(1e-3, 1e-3);
+        assert!((a - 6.906_755).abs() < 1e-5);
+        assert!((a + b).abs() < 1e-12);
+        // CUSUM step: zero residual = pure −J²/(2σ²) drift; a full-J
+        // residual scores +J²/(2σ²).
+        let drift = cusum_llr_step(0.0, 0.01, 0.005);
+        assert!((drift - (-2.0)).abs() < 1e-12);
+        assert!((cusum_llr_step(0.01, 0.01, 0.005) - 2.0).abs() < 1e-12);
     }
 }
 

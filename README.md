@@ -21,10 +21,13 @@
 
 ## Highlights
 
-- Post-quantum opt-in (M-01): `STELL_PURE_PQ=1` (or `--pure-pq`) enforces
-  Falcon-512-only mode chain-wide; default (env unset) is dual-stack —
-  Ed25519 and PQ envelopes are both admitted. Classical paths are refused
-  only under the opt-in flag.
+- Post-quantum always-on (FULL-PQ): the node binary forces pure-PQ at
+  startup (`src/main.rs:2849` pins `set_pure_pq_override(Some(true))`), so
+  only PQ schemes (Falcon-512 and Hybrid PQ1 envelopes) are admitted
+  chain-wide — classical Ed25519 is refused at intake (`src/rpc.rs:3768`).
+  `STELL_PURE_PQ` / `--pure-pq` are dead operator-compat knobs:
+  parsed-and-ignored with a loud WARN, never a gate (M-01 closed by the
+  FULL-PQ cut).
 - 0.6 s block target with ~11 ms of measured CPU per block height
   (classical path; PQ-path figures are projected, not measured —
   see `docs/PERF_1K.md`)
@@ -76,12 +79,11 @@ under slow and flapping proposers — all pinned by simulation batteries
 
 ### Post-quantum signatures everywhere it counts
 
-Validator votes, blocks and handshakes verify under Falcon-512 (FIPS 206)
-when the operator opts in with `STELL_PURE_PQ=1` (or `--pure-pq`); only
-then are classical Ed25519/BLS/ECVRF code paths refused chain-wide — the
-chain never counts a classical signature on the PQ path. Default (env
-unset) is dual-stack. Validator PQ keys live in an on-chain registry with
-rotation delays, queryable over RPC (`stell_getPqKey`).
+Validator votes, blocks and handshakes verify under Falcon-512 (FIPS 206);
+classical Ed25519/BLS/ECVRF code paths are refused chain-wide — the
+chain never counts a classical signature. The node runs pure-PQ always-on
+(see above); there is no dual-stack mode. Validator PQ keys live in an
+on-chain registry with rotation delays, queryable over RPC (`stell_getPqKey`).
 
 ### Execution: SVM, order book, bridge, oracle
 

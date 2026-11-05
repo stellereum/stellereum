@@ -119,6 +119,15 @@ pub enum GovError {
     /// The proposal nonce was already consumed by this proposer. Fail-closed;
     /// the caller must mint a fresh nonce and re-sign.
     ReplayedNonce,
+    /// Governance write refused on a multi-node deployment. A local-only
+    /// `propose`/`vote` would diverge this node's state root from peers that
+    /// never saw it, so the write is refused fail-closed unless the operator
+    /// explicitly arms [`GOV_MULTINODE_WRITES_ENV`] (default OFF). Carries
+    /// the loud refusal text (validator set size + escape name) so every
+    /// surface (RPC, runtime) reports the same reason. The deterministic
+    /// finalize sweep never returns this (it derives from decided blocks,
+    /// identically on every node).
+    MultiNodeRefused(String),
 }
 
 impl std::fmt::Display for GovError {
@@ -140,6 +149,9 @@ impl std::fmt::Display for GovError {
                 "invalid governance signature (not verifiable against the claimed staking key)",
             GovError::ReplayedNonce =>
                 "replayed governance nonce (this proposer already consumed this nonce; mint a fresh one)",
+            // Multi-node refusal carries its own text (validator set size +
+            // escape env name), so every surface reports the same loud reason.
+            GovError::MultiNodeRefused(msg) => msg.as_str(),
             // Names every propose/execute bound (E5 quorum floor 3333 bps,
             // E4 title/signal caps, E6 non-zero publisher) so a rejected
             // action explains the rule at both propose-time and execute-time.
@@ -885,6 +897,77 @@ pub struct AppliedParams {
     pub min_gas_limit: Option<u64>,
     pub signal: Option<String>,
     pub upgrade_plan: Option<UpgradePlan>,
+}
+
+/// Escape hatch env for the single-node governance-write guard (documented,
+/// default OFF): `1` or case-insensitive `true` opts in; anything else
+/// (including unset) refuses multi-node writes fail-closed.
+///
+/// Arm it ONLY when you accept that a local-only governance mutation is NOT
+/// replicated: every peer that never saw the write derives a different state
+/// root, i.e. the chain forks. Full block-carried governance (proposals as
+/// transactions, voted in blocks) is a separate project; until it lands,
+/// multi-node writes stay refused by default.
+pub const GOV_MULTINODE_WRITES_ENV: &str = "STELL_GOV_ALLOW_MULTINODE_WRITES";
+
+/// Parse the escape-hatch flag: `1` or case-insensitive `true` (surrounding
+/// whitespace trimmed) opts in; anything else (including `None`) is OFF.
+/// Pure (no env read) so tests pin the truth table without touching the
+/// process environment.
+pub fn is_gov_multinode_escape(raw: Option<&str>) -> bool {
+    match raw {
+        Some(s) => {
+            let t = s.trim();
+            t == "1" || t.eq_ignore_ascii_case("true")
+        }
+        None => false,
+    }
+}
+
+/// The escape hatch over the live process environment (default OFF).
+pub fn governance_multinode_escape_enabled() -> bool {
+    is_gov_multinode_escape(std::env::var(GOV_MULTINODE_WRITES_ENV).ok().as_deref())
+}
+
+/// Fail-closed single-node guard for governance WRITES (`propose`/`vote`
+/// entry — NOT the deterministic finalize sweep).
+///
+/// A local-only governance mutation on a multi-node deployment diverges the
+/// state root (peers that never saw the write commit a different root), so:
+/// * `validator_count <= 1` (solo/dev stand: no peer to diverge from) → `Ok`.
+/// * `validator_count > 1` + `allow_multinode_writes` (escape armed) → `Ok`.
+/// * `validator_count > 1` without the escape → `Err` with a loud reason
+///   (validator set size + escape env name + default-OFF note).
+///
+/// `validator_count` is the in-force validator set size
+/// (`ValidatorSet::len` — the same count the runtime gates on); it is the
+/// canonical multi-node signal, not a second peer-count source. The `Err`
+/// text is the single source of truth for the refusal: the runtime maps it
+/// into [`GovError::MultiNodeRefused`] and the RPC hook reports it verbatim.
+pub fn governance_write_allowed(
+    validator_count: usize,
+    allow_multinode_writes: bool,
+) -> Result<(), String> {
+    if validator_count <= 1 || allow_multinode_writes {
+        return Ok(());
+    }
+    Err(format!(
+        "governance writes REFUSED on a multi-node deployment (in-force validator set size = {validator_count} > 1): \
+         a local-only governance mutation would diverge this node's state root from peers that never saw it — \
+         run the write against a solo node, or explicitly opt in with {GOV_MULTINODE_WRITES_ENV}=1 \
+         (default OFF; multi-node writes are local-only and WILL fork the chain)"
+    ))
+}
+
+/// [`governance_write_allowed`] over the live process environment: the count
+/// comes from the caller (runtime: `self.validators.len()`), the escape from
+/// [`governance_multinode_escape_enabled`]. This is the 3-line hook the RPC
+/// layer calls before touching governance state.
+pub fn governance_write_allowed_from_env(validator_count: usize) -> Result<(), String> {
+    governance_write_allowed(
+        validator_count,
+        governance_multinode_escape_enabled(),
+    )
 }
 
 impl Governance {
@@ -3079,5 +3162,75 @@ mod tests {
         g.execute_at_height(ids[0], id, maturity)
             .expect("maturity executes");
         assert_eq!(g.get(id).unwrap().status, ProposalStatus::Executed);
+    }
+
+    /// Single-node write guard: the escape-flag truth table. `1` or
+    /// case-insensitive `true` (trimmed) opts in; everything else — including
+    /// unset — is OFF. Pure parser, no env touched.
+    #[test]
+    fn gov_write_guard_escape_flag_truth_table() {
+        assert!(!is_gov_multinode_escape(None));
+        assert!(is_gov_multinode_escape(Some("1")));
+        assert!(is_gov_multinode_escape(Some("true")));
+        assert!(is_gov_multinode_escape(Some("TRUE")));
+        assert!(is_gov_multinode_escape(Some(" True ")));
+        assert!(!is_gov_multinode_escape(Some("")));
+        assert!(!is_gov_multinode_escape(Some("0")));
+        assert!(!is_gov_multinode_escape(Some("false")));
+        assert!(!is_gov_multinode_escape(Some("yes")));
+        assert!(!is_gov_multinode_escape(Some("2")));
+    }
+
+    /// Single-node write guard: solo (0 or 1 validators — no peer to diverge
+    /// from) allows local writes with or without the escape.
+    #[test]
+    fn gov_write_guard_solo_allows() {
+        for n in [0usize, 1] {
+            for escape in [false, true] {
+                assert!(
+                    governance_write_allowed(n, escape).is_ok(),
+                    "solo set (size = {n}, escape = {escape}) must allow writes"
+                );
+            }
+        }
+    }
+
+    /// Single-node write guard: multi-node without the escape refuses
+    /// fail-closed, and the refusal is loud (names the size + the escape env
+    /// + the default-OFF note).
+    #[test]
+    fn gov_write_guard_multi_refuses_without_escape() {
+        for n in [2usize, 3, 100] {
+            let err = governance_write_allowed(n, false).expect_err(
+                "multi-node set without the escape must refuse writes",
+            );
+            assert!(
+                err.contains("REFUSED"),
+                "refusal must be loud, got: {err}"
+            );
+            assert!(
+                err.contains(&n.to_string()),
+                "refusal must name the validator set size, got: {err}"
+            );
+            assert!(
+                err.contains(GOV_MULTINODE_WRITES_ENV),
+                "refusal must name the escape env, got: {err}"
+            );
+            assert!(
+                err.contains("default OFF"),
+                "refusal must note the default, got: {err}"
+            );
+        }
+    }
+
+    /// Single-node write guard: the escape re-allows multi-node writes.
+    #[test]
+    fn gov_write_guard_escape_reallows_multi() {
+        for n in [2usize, 3, 100] {
+            assert!(
+                governance_write_allowed(n, true).is_ok(),
+                "armed escape (size = {n}) must re-allow writes"
+            );
+        }
     }
 }

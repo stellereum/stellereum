@@ -1,0 +1,21 @@
+name: stellereum-node
+
+listen: "0.0.0.0:9410"
+advertise: "127.0.0.1:9410"
+
+# Storage role: keep both mail-style blobs and file blobs.
+storage-roles:
+  - mail
+  - files
+
+# Solo validator by default (single-node testnet). Add peers + validators for a
+# multi-node cluster; see LAUNCH_STRATEGY.txt.
+peers: []
+
+# PQ MODE: FULL-PQ is always-on (KEM-only sessions, PQ-only NodeId).
+# accept unknown nodes in read-only (TOFU) mode — convenient for testnets
+# DEV/TOFU MODE: this is a development-environment setting. On a public testnet
+# set `allow-unknown: false` (or remove the line) and pin validators under
+# `peers:` instead. It is network config — flipping it is a coordinated
+# network-wide change, not a per-node tweak, so the value is left as-is here.
+allow-unknown: true

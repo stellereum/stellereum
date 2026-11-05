@@ -1,12 +1,15 @@
-//! Byte-equality proof: every SDK shape produces the exact wire bytes a
-//! hand-built node transaction produces (same constructors, same fields).
+//! Liveness + wiring proof: every SDK shape produces a transaction the node
+//! admits (PQ envelope, chain-bound, verifying) with exactly the intended
+//! fields (from/to/amount/gas/nonce/payload).
 //!
-//! Ed25519 signatures are deterministic, so all five shapes assert full
-//! `to_bytes()` equality. Falcon-512/Hybrid signatures are RANDOMIZED (FIPS 206
-//! sampler), so those schemes assert sign+verify round trips, chain binding
-//! and field wiring instead of byte equality.
+//! FULL-PQ: classical Ed25519 transactions are refused by the node, so the
+//! historical byte-equality-vs-hand-built-Ed vectors are gone with the
+//! classical path (an Ed signature cannot verify anymore — pinned by
+//! `ed25519_scheme_is_refused_fail_closed`). Hybrid signatures are
+//! RANDOMIZED (FIPS 206 sampler in the Falcon leg), so these shapes assert
+//! sign+verify round trips, chain binding and field wiring instead of byte
+//! equality — the same contract the node's own PQ tests use.
 
-use ed25519_dalek::SigningKey;
 use stellereum::contract_abi::{AbiMethod, AbiParam, AbiType, AbiValue, ContractAbi};
 use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
 use stellereum::sharding::Transaction;
@@ -19,66 +22,61 @@ const CHAIN: u64 = SDK_DEFAULT_CHAIN_ID;
 const SEED: [u8; 32] = [0x42u8; 32];
 const FALCON_SEED: [u8; 32] = [0x77u8; 32];
 
-fn ed_key() -> SdkKey {
-    SdkKey::ed25519(SEED)
+fn hybrid_key() -> SdkKey {
+    SdkKey::hybrid(SEED, FALCON_SEED)
 }
 
-fn ed_signing_key() -> SigningKey {
-    SigningKey::from_bytes(&SEED)
+fn hybrid_addr() -> [u8; 32] {
+    hybrid_key().address()
 }
 
-fn ed_addr() -> [u8; 32] {
-    ed_signing_key().verifying_key().to_bytes()
+struct Expect {
+    from: [u8; 32],
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
 }
 
-fn hand_ed(to: [u8; 32], amount: u64, gas: u64, nonce: u64, payload: Vec<OpCode>) -> Transaction {
-    Transaction::sign_with_payload_and_chain_id(
-        &ed_signing_key(),
-        to,
-        amount,
-        gas,
-        nonce,
-        0,
-        0,
-        payload,
-        CHAIN,
-    )
-}
-
-fn assert_canonical(sdk_tx: &SignedTx, hand_tx: &Transaction, shape: &str) {
-    let a = sdk_tx.to_bytes();
-    let b = bincode::serialize(hand_tx).unwrap();
-    assert_eq!(a, b, "{shape}: SDK bytes differ from hand-built node bytes");
+fn assert_live(sdk_tx: &SignedTx, e: &Expect, shape: &str) {
+    let node = sdk_tx.as_node_tx();
+    assert_eq!(node.from, e.from, "{shape}: from");
+    assert_eq!(node.to, e.to, "{shape}: to");
+    assert_eq!(node.amount, e.amount, "{shape}: amount");
+    assert_eq!(node.gas_limit, e.gas, "{shape}: gas");
+    assert_eq!(node.nonce, e.nonce, "{shape}: nonce");
     assert_eq!(
-        sdk_tx.tx_hash(),
-        hand_tx.compute_tx_hash(),
-        "{shape}: tx hash differs"
+        bincode::serialize(&node.payload).unwrap(),
+        bincode::serialize(&e.payload).unwrap(),
+        "{shape}: payload differs"
     );
     assert!(sdk_tx.verify(), "{shape}: SDK tx does not verify");
+    assert!(node.verify_signature(), "{shape}: node verify fails");
+    assert!(node.is_pq(), "{shape}: must be a PQ transaction");
     assert!(
-        hand_tx.verify_signature(),
-        "{shape}: hand-built tx does not verify"
+        sdk_tx.is_bound() && sdk_tx.chain_id() == Some(CHAIN),
+        "{shape}: must be chain-bound"
     );
 }
 
 // --- shape 1: transfer ------------------------------------------------------
 
 #[test]
-fn transfer_is_byte_equal_to_hand_built() {
+fn transfer_is_live_with_intended_fields() {
     let to = [0x99u8; 32];
     let sdk = TxBuilder::transfer(to, 1_000)
         .nonce(5)
-        .sign(&ed_key())
+        .sign(&hybrid_key())
         .unwrap();
-    let hand = hand_ed(to, 1_000, GAS_BASIC_TRANSFER, 5, vec![]);
-    assert_canonical(&sdk, &hand, "transfer");
+    assert_live(&sdk, &Expect { from: hybrid_addr(), to, amount: 1_000, gas: GAS_BASIC_TRANSFER, nonce: 5, payload: vec![] }, "transfer");
     assert!(sdk.is_bound() && sdk.chain_id() == Some(CHAIN));
 }
 
 // --- shape 2: token ops -----------------------------------------------------
 
 #[test]
-fn token_transfer_is_byte_equal_to_hand_built() {
+fn token_transfer_is_live_with_intended_fields() {
     let token = [0x11u8; 32];
     let to = [0x22u8; 32];
     let op = OpCode::SysCallTokenTransfer {
@@ -88,14 +86,13 @@ fn token_transfer_is_byte_equal_to_hand_built() {
     };
     let sdk = TxBuilder::token_transfer(token, to, 250)
         .nonce(7)
-        .sign(&ed_key())
+        .sign(&hybrid_key())
         .unwrap();
-    let hand = hand_ed(ed_addr(), 0, opcode_gas(&op), 7, vec![op]);
-    assert_canonical(&sdk, &hand, "token_transfer");
+    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 7, payload: vec![op] }, "token_transfer");
 }
 
 #[test]
-fn token_approve_and_transfer_from_are_byte_equal() {
+fn token_approve_and_transfer_from_are_live() {
     let token = [0x11u8; 32];
     let spender = [0x33u8; 32];
     let op = OpCode::SysCallTokenApprove {
@@ -104,10 +101,9 @@ fn token_approve_and_transfer_from_are_byte_equal() {
         amount: 500,
     };
     let sdk = TxBuilder::token_approve(token, spender, 500)
-        .sign(&ed_key())
+        .sign(&hybrid_key())
         .unwrap();
-    let hand = hand_ed(ed_addr(), 0, opcode_gas(&op), 0, vec![op]);
-    assert_canonical(&sdk, &hand, "token_approve");
+    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 0, payload: vec![op] }, "token_approve");
 
     let from = [0x44u8; 32];
     let to = [0x55u8; 32];
@@ -118,16 +114,15 @@ fn token_approve_and_transfer_from_are_byte_equal() {
         amount: 100,
     };
     let sdk2 = TxBuilder::token_transfer_from(token, from, to, 100)
-        .sign(&ed_key())
+        .sign(&hybrid_key())
         .unwrap();
-    let hand2 = hand_ed(ed_addr(), 0, opcode_gas(&op2), 0, vec![op2]);
-    assert_canonical(&sdk2, &hand2, "token_transfer_from");
+    assert_live(&sdk2, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op2), nonce: 0, payload: vec![op2] }, "token_transfer_from");
 }
 
 // --- shape 3: staking -------------------------------------------------------
 
 #[test]
-fn stake_bond_delegate_undelegate_are_byte_equal() {
+fn stake_bond_delegate_undelegate_are_live() {
     let val = [0x66u8; 32];
 
     let op = OpCode::SysCallStake {
@@ -136,13 +131,9 @@ fn stake_bond_delegate_undelegate_are_byte_equal() {
     };
     let sdk = TxBuilder::stake_bond(val, 10_000)
         .nonce(1)
-        .sign(&ed_key())
+        .sign(&hybrid_key())
         .unwrap();
-    assert_canonical(
-        &sdk,
-        &hand_ed(ed_addr(), 0, opcode_gas(&op), 1, vec![op]),
-        "stake_bond",
-    );
+    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 1, payload: vec![op] }, "stake_bond");
 
     let op = OpCode::SysCallDelegate {
         validator: val,
@@ -150,13 +141,9 @@ fn stake_bond_delegate_undelegate_are_byte_equal() {
     };
     let sdk = TxBuilder::delegate(val, 5_000)
         .nonce(2)
-        .sign(&ed_key())
+        .sign(&hybrid_key())
         .unwrap();
-    assert_canonical(
-        &sdk,
-        &hand_ed(ed_addr(), 0, opcode_gas(&op), 2, vec![op]),
-        "delegate",
-    );
+    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 2, payload: vec![op] }, "delegate");
 
     let op = OpCode::SysCallBeginUndelegate {
         validator: val,
@@ -164,46 +151,34 @@ fn stake_bond_delegate_undelegate_are_byte_equal() {
     };
     let sdk = TxBuilder::begin_undelegate(val, 5_000)
         .nonce(3)
-        .sign(&ed_key())
+        .sign(&hybrid_key())
         .unwrap();
-    assert_canonical(
-        &sdk,
-        &hand_ed(ed_addr(), 0, opcode_gas(&op), 3, vec![op]),
-        "begin_undelegate",
-    );
+    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 3, payload: vec![op] }, "begin_undelegate");
 
     let op = OpCode::SysCallUndelegate { validator: val };
     let sdk = TxBuilder::undelegate_withdraw(val)
         .nonce(4)
-        .sign(&ed_key())
+        .sign(&hybrid_key())
         .unwrap();
-    assert_canonical(
-        &sdk,
-        &hand_ed(ed_addr(), 0, opcode_gas(&op), 4, vec![op]),
-        "undelegate_withdraw",
-    );
+    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 4, payload: vec![op] }, "undelegate_withdraw");
 }
 
 // --- shape 4: contract deploy -----------------------------------------------
 
 #[test]
-fn contract_deploy_is_byte_equal_and_address_uses_node_function() {
+fn contract_deploy_is_live_and_address_uses_node_function() {
     let code = vec![0x00u8, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
     let op = OpCode::SysCallDeployContract { code: code.clone() };
     let sdk = TxBuilder::contract_deploy(code.clone())
         .nonce(9)
-        .sign(&ed_key())
+        .sign(&hybrid_key())
         .unwrap();
-    assert_canonical(
-        &sdk,
-        &hand_ed(ed_addr(), 0, opcode_gas(&op), 9, vec![op]),
-        "contract_deploy",
-    );
+    assert_live(&sdk, &Expect { from: hybrid_addr(), to: hybrid_addr(), amount: 0, gas: opcode_gas(&op), nonce: 9, payload: vec![op] }, "contract_deploy");
 
     // The SDK predicts the deploy address with the node's own function
     // (imported, not reimplemented): sender + sender-nonce.
-    let predicted = predict_contract_address(&ed_addr(), 9);
-    let direct = stellereum::contract::contract_address(&ed_addr(), 9);
+    let predicted = predict_contract_address(&hybrid_addr(), 9);
+    let direct = stellereum::contract::contract_address(&hybrid_addr(), 9);
     assert_eq!(
         predicted, direct,
         "deploy address must be the node's function"
@@ -228,7 +203,7 @@ fn sample_abi() -> ContractAbi {
 }
 
 #[test]
-fn contract_call_is_byte_equal_with_abi_calldata() {
+fn contract_call_is_live_with_abi_calldata() {
     let abi = sample_abi();
     let contract = [0xABu8; 32];
     let args = vec![
@@ -239,11 +214,11 @@ fn contract_call_is_byte_equal_with_abi_calldata() {
     let sdk = TxBuilder::contract_call(contract, "transfer", &abi, &args, 0)
         .unwrap()
         .nonce(3)
-        .sign(&ed_key())
+        .sign(&hybrid_key())
         .unwrap();
 
-    // Hand-built exactly the way `stell_callContract` (src/rpc.rs) builds it:
-    // scalars = as_i64, calldata = abi.encode_args.
+    // Expected opcode exactly the way `stell_callContract` (src/rpc.rs)
+    // builds it: scalars = as_i64, calldata = abi.encode_args.
     let calldata = abi.encode_args("transfer", &args).unwrap();
     let scalars: Vec<i64> = args.iter().map(|v| v.as_i64().unwrap_or(0)).collect();
     let op = OpCode::SysCallCallContractArgs {
@@ -252,18 +227,7 @@ fn contract_call_is_byte_equal_with_abi_calldata() {
         args: scalars,
         calldata: calldata.clone(),
     };
-    let hand = Transaction::sign_with_payload_and_chain_id(
-        &ed_signing_key(),
-        contract,
-        0,
-        opcode_gas(&op),
-        3,
-        0,
-        0,
-        vec![op],
-        CHAIN,
-    );
-    assert_canonical(&sdk, &hand, "contract_call");
+    assert_live(&sdk, &Expect { from: hybrid_addr(), to: contract, amount: 0, gas: opcode_gas(&op), nonce: 3, payload: vec![op] }, "contract_call");
 
     // The calldata on the wire IS the ABI encoding.
     match &sdk.as_node_tx().payload[0] {
@@ -285,23 +249,32 @@ fn bound_by_default_and_unbound_escape_warns() {
         TxBuilder::contract_deploy(vec![0x00]),
     ] {
         assert!(b.is_bound(), "every builder must be bound by default");
-        let signed = b.sign(&ed_key()).unwrap();
+        let signed = b.sign(&hybrid_key()).unwrap();
         assert_eq!(signed.chain_id(), Some(CHAIN));
-        assert!(signed.as_node_tx().is_chain_id_bound());
+        // PQ chain binding lives in the envelope commitment, not the legacy
+        // CH1 tag (`is_chain_id_bound` is Ed-envelope-only): the strict
+        // chain check is the binding proof.
+        assert!(
+            signed.as_node_tx().verify_signature_for_chain(CHAIN, true),
+            "bound PQ tx must pass the strict chain check"
+        );
+        assert!(
+            !signed.as_node_tx().verify_signature_for_chain(CHAIN + 1, true),
+            "wrong chain must fail the strict chain check"
+        );
     }
 
-    // The escape hatch: unbound, still validly signed, but refused when the
-    // node eventually requires chain binding (phase 3 of the A14 rollout).
+    // The escape hatch: unbound, still validly signed (PQ envelope without a
+    // chain commitment), but refused when the node requires chain binding.
     let legacy = TxBuilder::transfer([1u8; 32], 1)
         .unbound_legacy()
-        .sign(&ed_key())
+        .sign(&hybrid_key())
         .unwrap();
     assert!(!legacy.is_bound());
     assert_eq!(legacy.chain_id(), None);
-    assert!(!legacy.as_node_tx().is_chain_id_bound());
     assert!(
         legacy.as_node_tx().verify_signature(),
-        "legacy sig must still verify"
+        "unbound PQ envelope must still verify"
     );
     assert!(
         !legacy.as_node_tx().verify_signature_for_chain(CHAIN, true),
@@ -313,7 +286,7 @@ fn bound_by_default_and_unbound_escape_warns() {
 
 #[test]
 fn fee_estimate_params_match_node_expectation() {
-    let sdk = TxBuilder::transfer([9u8; 32], 42).sign(&ed_key()).unwrap();
+    let sdk = TxBuilder::transfer([9u8; 32], 42).sign(&hybrid_key()).unwrap();
     let params = sdk.fee_estimate_params();
     // Exactly {"tx": "<hex>"}: the raw-transaction arm of handle_estimate_fee
     // (src/rpc.rs) reads params["tx"] as a string, hex-decodes it and
@@ -349,17 +322,21 @@ fn fee_estimate_params_match_node_expectation() {
 // --- sign + verify round trip per scheme -------------------------------------
 
 #[test]
-fn sign_verify_round_trip_ed25519() {
+fn ed25519_scheme_is_refused_fail_closed() {
+    // FULL-PQ: the node refuses classical-only transactions, so the SDK
+    // refuses to sign them HERE — for both bound and unbound builders.
+    // The refusal names the cause and the live schemes.
     let key = SdkKey::ed25519([0x11u8; 32]);
     for bound in [true, false] {
         let mut b = TxBuilder::transfer([0x22u8; 32], 77);
         if !bound {
             b = b.unbound_legacy();
         }
-        let tx = b.sign(&key).unwrap();
-        assert_eq!(tx.is_bound(), bound);
-        assert!(tx.verify());
-        assert!(tx.as_node_tx().verify_signature());
+        let err = b.sign(&key).expect_err("Ed25519 signing must be refused");
+        assert!(
+            err.contains("refused") && err.contains("Falcon512"),
+            "refusal must name the cause and the live schemes, got: {err}"
+        );
     }
 }
 

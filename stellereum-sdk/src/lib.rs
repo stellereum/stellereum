@@ -74,7 +74,14 @@ pub struct SdkKey {
 }
 
 impl SdkKey {
-    /// Classic fast Ed25519 key from a 32-byte seed.
+    /// Classic Ed25519 key from a 32-byte seed.
+    ///
+    /// FULL-PQ: the node refuses classical-only transactions
+    /// (`verify_inner_with_registry` — no classical fallback), so signing
+    /// with this scheme is REFUSED by [`TxBuilder::sign`] (fail-closed).
+    /// Kept for key derivation (Hybrid embeds an Ed key) and for the
+    /// refusal pin in tests. Use [`SdkKey::falcon_from_seed`] or
+    /// [`SdkKey::hybrid`] to sign.
     pub fn ed25519(seed: [u8; 32]) -> Self {
         Self {
             scheme: PqScheme::Ed25519,
@@ -399,41 +406,19 @@ impl TxBuilder {
         self.chain_id.is_some()
     }
 
-    /// Sign with any of the three live schemes and return the sealed transaction.
+    /// Sign with a live scheme and return the sealed transaction.
     ///
-    /// The signature is verified against the freshly built transaction before
-    /// returning (fail-closed self-check), so a `SignedTx` from this function
+    /// FULL-PQ: Ed25519-only transactions are refused by the node, so this
+    /// scheme is refused HERE (fail-closed self-check) — use Falcon512 or
+    /// Hybrid. The signature is verified against the freshly built
+    /// transaction before returning, so a `SignedTx` from this function
     /// always passes node admission's `verify_signature`.
     pub fn sign(self, key: &SdkKey) -> Result<SignedTx, String> {
         let from = key.address();
         let to = self.to.unwrap_or(from);
         let tx = match key.scheme {
             PqScheme::Ed25519 => {
-                let sk = key.ed_signing_key();
-                if let Some(cid) = self.chain_id {
-                    Transaction::sign_with_payload_and_chain_id(
-                        &sk,
-                        to,
-                        self.amount,
-                        self.gas_limit,
-                        self.nonce,
-                        self.source_shard,
-                        self.target_shard,
-                        self.payload,
-                        cid,
-                    )
-                } else {
-                    Transaction::sign_with_payload(
-                        &sk,
-                        to,
-                        self.amount,
-                        self.gas_limit,
-                        self.nonce,
-                        self.source_shard,
-                        self.target_shard,
-                        self.payload,
-                    )
-                }
+                return Err("stellereum-sdk: Ed25519 transactions are refused by the node (FULL-PQ wipe) — sign with Falcon512 or Hybrid".to_string());
             }
             scheme @ (PqScheme::Falcon512 | PqScheme::Hybrid) => {
                 // Same flow the node's own PQ tests use: probe the signing

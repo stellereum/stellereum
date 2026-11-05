@@ -11,7 +11,11 @@ use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use stellereum::explorer::{self, GatewayState};
+use stellereum::post_quantum::{
+    derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT, FALCON512_SIG_LEN,
+};
 use stellereum::rpc::{ReceiptIndex, RpcState};
+use stellereum::sharding::{SessionPolicyError, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::zkml::{now_secs, SessionKeyAuthorization, SCOPE_TRANSFER};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -92,30 +96,37 @@ async fn budget_query(addr: std::net::SocketAddr, params: serde_json::Value) -> 
     serde_json::from_str(&body).expect("rpc must return JSON")
 }
 
-/// Register one session key on-chain via a real session-signed transfer.
-/// Returns (master, session, grant, gas_spent_by_first_tx).
+/// Register one Falcon session key on-chain via a real Falcon-signed
+/// session transfer (the PQ mirror of the pre-excision Ed flow: same fields,
+/// same replay/nonce/expiry/budget/revoke rules, only the signature scheme
+/// changes).
+/// Returns (master keypair, session keypair, grant).
 async fn register_session(
     st: &Arc<RpcState>,
     max_gas_spend: u64,
     gas_limit: u64,
-) -> (SigningKey, SigningKey, SessionKeyAuthorization) {
-    let master = SigningKey::generate(&mut OsRng);
-    let session = SigningKey::generate(&mut OsRng);
-    let master_pub = master.verifying_key().to_bytes();
-    let session_pub = session.verifying_key().to_bytes();
+) -> (FalconKeypair, FalconKeypair, SessionKeyAuthorization) {
+    let master = FalconKeypair::generate_from_seed(0xA1);
+    let session = FalconKeypair::generate_from_seed(0xA2);
+    let master_addr = derive_pq_address(PqScheme::Falcon512, master.public_key(), &DEFAULT_SALT);
     st.engine
-        .update_account(AccountState::new(master_pub, 1_000_000_000_000))
+        .update_account(AccountState::new(master_addr, 1_000_000_000_000))
         .await;
-    let grant = SessionKeyAuthorization::sign_delegation(
+    let grant = SessionKeyAuthorization::sign_delegation_falcon512(
         &master,
-        session_pub,
+        PqScheme::Falcon512,
+        session.public_key(),
         now_secs() + 3600,
         max_gas_spend,
         SCOPE_TRANSFER,
         1_000_000,
         CHAIN_ID,
     );
-    let tx = stellereum::sharding::Transaction::sign_with_session(
+    assert!(
+        grant.verify_signature(),
+        "fresh Falcon grant must verify before use"
+    );
+    let tx = Transaction::sign_with_session_falcon512(
         &session,
         grant.clone(),
         [9u8; 32],
@@ -126,6 +137,11 @@ async fn register_session(
         1,
         vec![],
     );
+    assert!(tx.is_session_keyed());
+    assert!(
+        tx.verify_signature(),
+        "fresh Falcon session transaction must verify before apply"
+    );
     st.engine
         .apply_transaction(&tx, now_secs())
         .await
@@ -133,13 +149,56 @@ async fn register_session(
     (master, session, grant)
 }
 
+/// The master's own (non-delegated) transaction shape: a chain-bound PQ1
+/// envelope signed by the master Falcon key (probe-then-sign, the same shape
+/// `WalletKeyMaterial::sign_bound_payload_transfer` emits).
+fn master_payload_tx(
+    master: &FalconKeypair,
+    payload: Vec<stellereum::svm::OpCode>,
+    gas_limit: u64,
+    nonce: u64,
+) -> Transaction {
+    let master_pub = master.public_key().to_vec();
+    let master_addr = derive_pq_address(PqScheme::Falcon512, master.public_key(), &DEFAULT_SALT);
+    let probe = Transaction::new_pq_explicit_with_chain(
+        PqScheme::Falcon512,
+        master_pub.clone(),
+        vec![0u8; FALCON512_SIG_LEN],
+        master_addr,
+        0,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload.clone(),
+        &DEFAULT_SALT,
+        CHAIN_ID,
+    );
+    let sig = master.sign(&probe.signing_message());
+    Transaction::new_pq_explicit_with_chain(
+        PqScheme::Falcon512,
+        master_pub,
+        sig,
+        master_addr,
+        0,
+        gas_limit,
+        nonce,
+        1,
+        1,
+        payload,
+        &DEFAULT_SALT,
+        CHAIN_ID,
+    )
+}
+
 #[tokio::test]
-#[ignore = "PQ excision: session authorization is Ed25519-native (SK1 envelope); needs Falcon-delegation migration before these flows work again"]
 async fn budget_registered_key_reports_remaining_math() {
     let st = rpc_state().await;
     let addr = spawn(st.clone()).await;
-    let (_master, session, grant) = register_session(&st, 5_000, 100).await;
-    let session_hex = hex::encode(session.verifying_key().to_bytes());
+    let (_master, _session, grant) = register_session(&st, 5_000, 100).await;
+    // The registry keys sessions by the grant's (derived, 32-byte) session
+    // address — the same bytes the grant carries.
+    let session_hex = hex::encode(grant.session_pubkey);
 
     // Object params.
     let resp = budget_query(addr, serde_json::json!({"session": session_hex})).await;
@@ -180,26 +239,25 @@ async fn budget_registered_key_reports_remaining_math() {
 }
 
 #[tokio::test]
-#[ignore = "PQ excision: session authorization is Ed25519-native (SK1 envelope); needs Falcon-delegation migration before these flows work again"]
 async fn budget_revoked_key_reports_revoked() {
     let st = rpc_state().await;
     let addr = spawn(st.clone()).await;
-    let (master, session, _grant) = register_session(&st, 5_000, 100).await;
-    let master_pub = master.verifying_key().to_bytes();
-    let session_pub = session.verifying_key().to_bytes();
+    let (master, _session, grant) = register_session(&st, 5_000, 100).await;
+    let master_addr = grant.master_address;
+    let session_pub = grant.session_pubkey;
 
-    // Master revokes on chain (nonce 1: the session tx used nonce 0).
-    let revoke = stellereum::sharding::Transaction::sign_with_payload(
+    // Master revokes on chain (nonce 1: the session tx used nonce 0), with
+    // the master's own Falcon-signed chain-bound transaction.
+    let revoke = master_payload_tx(
         &master,
-        master_pub,
-        0,
+        vec![stellereum::svm::OpCode::SysCallRevokeSession { session_pubkey: session_pub }],
         50_000,
         1,
-        1,
-        1,
-        vec![stellereum::svm::OpCode::SysCallRevokeSession {
-            session_pubkey: session_pub,
-        }],
+    );
+    assert_eq!(revoke.from, master_addr);
+    assert!(
+        revoke.verify_signature(),
+        "master revoke transaction must verify before apply"
     );
     st.engine
         .apply_transaction(&revoke, now_secs())
@@ -218,6 +276,69 @@ async fn budget_revoked_key_reports_revoked() {
     // Budget audit trail survives the key's death.
     assert_eq!(r["spent"], serde_json::json!(100), "{resp}");
     assert_eq!(r["remaining_gas"], serde_json::json!(4_900), "{resp}");
+}
+
+/// PQ excision proof: Ed25519 delegations stay refused at EVERY layer —
+/// grant signature, session envelope verification, stateless policy, and
+/// engine apply — while Falcon grants (above) are admitted.
+#[tokio::test]
+async fn ed25519_grants_stay_refused_end_to_end() {
+    let st = rpc_state().await;
+    let master = SigningKey::generate(&mut OsRng);
+    let session = SigningKey::generate(&mut OsRng);
+    let master_pub = master.verifying_key().to_bytes();
+    let session_pub = session.verifying_key().to_bytes();
+    st.engine
+        .update_account(AccountState::new(master_pub, 1_000_000_000_000))
+        .await;
+
+    // Same fields as a live grant — only the scheme is classical.
+    let grant = SessionKeyAuthorization::sign_delegation(
+        &master,
+        session_pub,
+        now_secs() + 3600,
+        5_000,
+        SCOPE_TRANSFER,
+        1_000_000,
+        CHAIN_ID,
+    );
+    assert!(
+        !grant.verify_signature(),
+        "Ed master grant signature must stay refused"
+    );
+    assert!(
+        !grant.verify_at(now_secs()),
+        "Ed grant must stay invalid at any time"
+    );
+
+    let tx = Transaction::sign_with_session(
+        &session,
+        grant,
+        [9u8; 32],
+        10,
+        100,
+        0,
+        1,
+        1,
+        vec![],
+    );
+    assert!(tx.is_session_keyed());
+    assert!(
+        !tx.verify_signature(),
+        "Ed (SK1) session envelope must stay refused"
+    );
+    assert_eq!(
+        tx.check_session_policy(now_secs()),
+        Err(SessionPolicyError::BadGrant),
+        "Ed grant must fail the stateless policy as BadGrant"
+    );
+    assert!(
+        st.engine
+            .apply_transaction(&tx, now_secs())
+            .await
+            .is_err(),
+        "Ed session transaction must never apply"
+    );
 }
 
 #[tokio::test]

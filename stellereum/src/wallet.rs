@@ -1005,6 +1005,63 @@ impl WalletKeyMaterial {
         }
         Ok(self.sign_transfer(to, amount, gas_limit, nonce, source_shard, target_shard))
     }
+
+    /// Delegate a Falcon-512 session key for AI bots with gas spending cap
+    /// and time validity: the wallet-side mint of a Falcon delegation grant
+    /// ([`SessionKeyAuthorization::sign_delegation_falcon512`], Falcon master
+    /// + Falcon session — the only live combination under FULL-PQ).
+    ///
+    /// `session_pubkey` is the session's raw Falcon-512 public key (897
+    /// bytes); `scope` is the operation bitmask (`zkml::SCOPE_*`),
+    /// `max_value_per_tx` caps the native amount of any single transaction,
+    /// and `chain_id` binds the grant to the chain it was minted for (part of
+    /// the master's signed message, domain-separated with
+    /// `STELL_SESSKEY_V1`).
+    ///
+    /// Fail-closed: an Ed25519 wallet key refuses (`Err`) instead of minting
+    /// an Ed grant — Ed delegations stay refused chain-wide, so emitting one
+    /// would only produce a transaction nobody can verify. A malformed
+    /// session public key is refused the same way.
+    pub fn delegate_bot_session_falcon512(
+        &self,
+        session_pubkey: &[u8],
+        max_gas: u64,
+        duration_secs: u64,
+        scope: u64,
+        max_value_per_tx: u64,
+        chain_id: u64,
+    ) -> Result<SessionKeyAuthorization, String> {
+        let Self::Falcon { keypair } = self else {
+            return Err(format!(
+                "wallet key scheme mismatch: session delegation requires a Falcon-512 master key, \
+                 this wallet holds {} (Ed25519 grants are refused chain-wide)",
+                self.scheme()
+            ));
+        };
+        if session_pubkey.len() != crate::post_quantum::FALCON512_PUBKEY_LEN {
+            return Err(format!(
+                "invalid Falcon-512 session public key: expected {} bytes, got {}",
+                crate::post_quantum::FALCON512_PUBKEY_LEN,
+                session_pubkey.len()
+            ));
+        }
+        let valid_until = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + duration_secs;
+
+        Ok(SessionKeyAuthorization::sign_delegation_falcon512(
+            keypair,
+            crate::post_quantum::PqScheme::Falcon512,
+            session_pubkey,
+            valid_until,
+            max_gas,
+            scope,
+            max_value_per_tx,
+            chain_id,
+        ))
+    }
 }
 
 /// Full in-memory active wallet account (transparent only).
@@ -1475,6 +1532,96 @@ impl WalletAccount {
     }
 }
 
+// ============================================================================
+// Silent-payment SCAN section (read-only trial-decap; default OFF)
+// ============================================================================
+//
+// READ paths only: the `SilentScanner` trial-decaps candidate notes against
+// the owner's ML-KEM-768 KEM seed and re-derives the chain-bound stealth
+// address via the exact silent-payment shape (`SpRecipient::receive`, i.e.
+// `sp_stealth_address(chain_id, chain, ss, index)`). It never signs, sends,
+// or moves funds. Arming mirrors the `HASH_POOL_ENABLED` precedent (plain
+// const, no env knob): disarmed unless `crate::SILENT_PAY_ENABLED` flips or
+// the per-instance `enable_for_tests` override fires (never on the live
+// path, grep-proof: only `tests/` call it). While disarmed `scan` returns
+// empty — existing wallet behavior is byte-identical.
+
+/// One on-chain silent-payment candidate as observed by a scanning wallet:
+/// the published ML-KEM-768 ciphertext plus the claimed stealth address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SilentNoteCandidate {
+    /// Published ML-KEM-768 ciphertext bytes (1088 B when well-formed).
+    pub ct: Vec<u8>,
+    /// Claimed stealth address the owner trial re-derives.
+    pub stealth: [u8; 32],
+}
+
+/// One successful trial-decap: the candidate at the recipient's `index`
+/// decapsulated with the owner seed and re-derived to the same stealth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SilentScanHit {
+    /// Per-recipient note index this hit consumed.
+    pub index: u64,
+    /// Decapsulated KEM shared secret (steps the recipient chain).
+    pub ss: [u8; 32],
+    /// Matched stealth address.
+    pub stealth: [u8; 32],
+}
+
+/// Owner's trial-decap scanner: feeds `scan` candidates (chain order)
+/// through a fresh forward-secret receive state and returns exactly the
+/// notes addressed to this owner, in order. Scans are idempotent (a fresh
+/// receive state per call). Wrong-recipient notes, tampered ciphertexts and
+/// malformed candidates never produce hits (malformed entries are skipped —
+/// `receive` leaves state untouched on refusal — never fabricated).
+/// Chain-bound: only notes sent for `chain_id` can match.
+pub struct SilentScanner {
+    owner_kem_seed: [u8; 64],
+    chain_id: u64,
+    armed: bool,
+}
+
+impl SilentScanner {
+    /// Disarmed unless `crate::SILENT_PAY_ENABLED` flips (default OFF).
+    pub fn new(owner_kem_seed: [u8; 64], chain_id: u64) -> Self {
+        Self { owner_kem_seed, chain_id, armed: crate::SILENT_PAY_ENABLED }
+    }
+
+    /// Test-only arming. Never called on the live path (grep-proof: only
+    /// `tests/` call it); production flips `crate::SILENT_PAY_ENABLED`
+    /// with a spec update + audit.
+    pub fn enable_for_tests(&mut self) {
+        self.armed = true;
+    }
+
+    /// Whether this scanner will trial-decap (`scan` returns empty while
+    /// disarmed).
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Trial-decap scan. Empty while disarmed; otherwise exactly the
+    /// owner's own notes, in order (zero false-positives by construction:
+    /// only a decapsulated-then-rederived match is reported).
+    pub fn scan(&self, candidates: &[SilentNoteCandidate]) -> Vec<SilentScanHit> {
+        if !self.armed {
+            return Vec::new();
+        }
+        let mut recipient = crate::silentpay::SpRecipient::new(self.owner_kem_seed, self.chain_id);
+        let mut hits = Vec::new();
+        for candidate in candidates {
+            if let Ok(Some(receipt)) = recipient.receive(&candidate.ct, &candidate.stealth) {
+                hits.push(SilentScanHit {
+                    index: receipt.index,
+                    ss: receipt.ss,
+                    stealth: receipt.stealth,
+                });
+            }
+        }
+        hits
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1651,15 +1798,103 @@ mod tests {
     const TEST_CHAIN_ID: u64 = 5757;
     const OTHER_CHAIN_ID: u64 = 9999;
 
+    /// Falcon session delegation: the PQ-wallet builder mints a live
+    /// Falcon-master/Falcon-session grant (verifies, and authorizes a real
+    /// Falcon-signed session transaction); the Ed wallet key refuses
+    /// fail-closed instead of minting a dead Ed grant.
+    #[test]
+    fn falcon_session_delegation_builder() {
+        let master = WalletKeyMaterial::from_seed(&[0x51u8; 32]);
+        assert_eq!(
+            master.scheme(),
+            crate::post_quantum::PqScheme::Falcon512,
+            "from_seed must hold a Falcon-512 master key"
+        );
+        let session_fk = crate::post_quantum::FalconKeypair::generate_from_seed(0x52);
+        let grant = master
+            .delegate_bot_session_falcon512(
+                session_fk.public_key(),
+                50_000,
+                3600,
+                crate::zkml::SCOPE_TRANSFER,
+                1_000,
+                TEST_CHAIN_ID,
+            )
+            .expect("falcon wallet must mint a falcon session grant");
+        assert_eq!(grant.master_address, master.address());
+        assert_eq!(
+            grant.master_scheme,
+            crate::post_quantum::PqScheme::Falcon512
+        );
+        assert_eq!(
+            grant.session_scheme,
+            crate::post_quantum::PqScheme::Falcon512
+        );
+        assert!(grant.verify_signature());
+        // The minted grant authorizes a real Falcon-signed session tx.
+        let tx = crate::sharding::Transaction::sign_with_session_falcon512(
+            &session_fk,
+            grant,
+            [9u8; 32],
+            10,
+            100,
+            0,
+            1,
+            1,
+            vec![],
+        );
+        assert!(tx.is_session_keyed());
+        assert!(tx.verify_signature());
+
+        // Ed wallet key refuses instead of minting a dead grant.
+        let ed = WalletKeyMaterial::ed25519_from_seed(&[0x53u8; 32]);
+        assert!(
+            ed.delegate_bot_session_falcon512(
+                session_fk.public_key(),
+                50_000,
+                3600,
+                crate::zkml::SCOPE_TRANSFER,
+                1_000,
+                TEST_CHAIN_ID,
+            )
+            .is_err(),
+            "Ed master must refuse: Ed grants are refused chain-wide"
+        );
+        // Malformed session pubkey refuses.
+        assert!(
+            master
+                .delegate_bot_session_falcon512(
+                    &[1u8; 32],
+                    50_000,
+                    3600,
+                    crate::zkml::SCOPE_TRANSFER,
+                    1_000,
+                    TEST_CHAIN_ID,
+                )
+                .is_err(),
+            "non-Falcon session pubkey must be refused"
+        );
+    }
+
     /// The bound constructors produce chain-bound transactions that verify
     /// on their own chain and fail a strict check on any other chain.
+    /// FULL-PQ: the hatch rides PQ keys (`WalletKeyMaterial::from_seed` is
+    /// Falcon-512); the bound/strict property is byte-identical.
     #[test]
     fn bound_constructors_bind_the_chain_id() {
-        let wallet = WalletAccount::from_seed(&[0x50u8; 32]);
-        let tx = wallet.create_bound_transaction([0x99u8; 32], 1_000, 5, 0, 0, TEST_CHAIN_ID);
+        let wallet = WalletKeyMaterial::from_seed(&[0x50u8; 32]);
+        let tx = wallet.sign_bound_transfer(
+            [0x99u8; 32],
+            1_000,
+            crate::svm::GAS_BASIC_TRANSFER,
+            5,
+            0,
+            0,
+            TEST_CHAIN_ID,
+        );
         assert!(
-            tx.is_chain_id_bound(),
-            "the default transfer must carry CH1"
+            tx.chain_id().is_some(),
+            "the default transfer must carry a chain binding"
         );
         assert_eq!(tx.chain_id(), Some(TEST_CHAIN_ID));
         assert!(tx.verify_signature(), "a bound transaction must verify");
@@ -1673,10 +1908,15 @@ mod tests {
         );
 
         let payload = vec![crate::svm::OpCode::Nop, crate::svm::OpCode::Pop];
-        let ptx = wallet.create_bound_payload_transaction(payload, 100_000, 6, TEST_CHAIN_ID);
+        let ptx = wallet.sign_bound_payload_transfer(
+            payload,
+            100_000,
+            6,
+            TEST_CHAIN_ID,
+        );
         assert!(
-            ptx.is_chain_id_bound(),
-            "the default payload tx must carry CH1"
+            ptx.chain_id().is_some(),
+            "the default payload tx must carry a chain binding"
         );
         assert_eq!(ptx.chain_id(), Some(TEST_CHAIN_ID));
         assert!(ptx.verify_signature(), "a bound payload tx must verify");
@@ -1687,10 +1927,20 @@ mod tests {
     /// The legacy hatch builds the old UNBOUND transaction (verifies, but
     /// carries no chain id and fails every strict check) — and it exists so
     /// the warning has exactly one call site to find.
+    /// FULL-PQ: the hatch rides PQ keys (`sign_transfer` is the PQ faucet
+    /// shape: explicit PQ1 envelope, no chain binding); the
+    /// unbound-verifies / strict-refuses property is byte-identical.
     #[test]
     fn unbound_legacy_hatch_builds_replayable_transactions() {
-        let wallet = WalletAccount::from_seed(&[0x51u8; 32]);
-        let tx = wallet.unbound_legacy_transfer([0x99u8; 32], 1_000, 5, 0, 0);
+        let wallet = WalletKeyMaterial::from_seed(&[0x51u8; 32]);
+        let tx = wallet.sign_transfer(
+            [0x99u8; 32],
+            1_000,
+            crate::svm::GAS_BASIC_TRANSFER,
+            5,
+            0,
+            0,
+        );
         assert!(
             !tx.is_chain_id_bound(),
             "the legacy hatch must stay unbound"
@@ -1706,8 +1956,7 @@ mod tests {
             "strict admission refuses the legacy hatch"
         );
 
-        let ptx =
-            wallet.unbound_legacy_payload_transaction(vec![crate::svm::OpCode::Nop], 100_000, 6);
+        let ptx = wallet.sign_payload_transfer(vec![crate::svm::OpCode::Nop], 100_000, 6);
         assert!(!ptx.is_chain_id_bound());
         assert_eq!(ptx.chain_id(), None);
         assert!(ptx.verify_signature());

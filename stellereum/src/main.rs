@@ -2834,16 +2834,19 @@ async fn run_consensus_node(
     // Self id for the dynamic franchise check in the loop below (`key` moves
     // into the runtime on the next line).
     let self_vote_id = key.verifying_key().to_bytes();
+    // FULL-PQ: always enforced. `--pure-pq` / `STELL_PURE_PQ` are dead
+    // operator-compat knobs: parsed-and-ignored with a loud WARN (never gate).
     let has_pq_cli = std::env::args().any(|arg| arg == "--pure-pq");
-    let pure_pq = has_pq_cli || stellereum::post_quantum::is_pure_pq_enforced();
     if has_pq_cli {
+        eprintln!("[WARN] --pure-pq is a no-op (FULL-PQ always-on): flag ignored");
+    }
+    if std::env::var("STELL_PURE_PQ").is_ok() {
+        eprintln!("[WARN] STELL_PURE_PQ is a no-op (FULL-PQ always-on): env ignored");
+    }
+    {
         stellereum::post_quantum::set_pure_pq_override(Some(true));
     }
-    if pure_pq {
-        info!("[post-quantum] Pure PQ Mode: ENFORCED (Falcon-512 / ML-DSA)");
-    } else {
-        info!("[post-quantum] PQ Mode: Dual-Stack enabled");
-    }
+    info!("[post-quantum] Pure PQ Mode: ENFORCED (Falcon-512 / ML-DSA)");
     let env_var = std::env::var("STELL_PARALLEL_EXEC").ok();
     let has_cli_flag = std::env::args().any(|arg| arg == "--parallel-exec");
     let parallel_exec = is_parallel_exec_active(
@@ -3075,19 +3078,19 @@ async fn run_consensus_node(
         ),
     }
 
-    // VRF sortition activation (RETIRED — ECVRF classical, bodies removed).
+    // VRF sortition activation (RETIRED — classical bodies removed).
     // `vrf_activation_from_env` always returns `Disabled`, so the boundary
     // arm below never fires in practice; it is kept so a stale configured
     // value logs loudly instead of silently arming. The live verify /
     // attribution sites (`verify_unified`, `signers_set`) still consult the
     // activation plus the startup-loaded registry below, but resolution is
-    // always the legacy parent-hash draw (see `vrf_output_for_cert`).
-    // `ValidatorRuntime::vrf_beacon_seal_for` always returns `None`.
+    // always the legacy parent-hash draw.
+    // No seal is ever minted on this path.
     let vrf_activation = vrf_activation_from_env();
     rt = rt.with_vrf_activation(vrf_activation);
     match vrf_activation.boundary() {
         Some(h) => tracing::warn!(
-            "[vrf] VRF sortition ARMED from height {h} (STELL_VRF_ACTIVATION_HEIGHT={h}): RETIRED — ECVRF bodies removed, election stays on the parent-hash draw at every height; unset the variable to silence this"
+            "[vrf] VRF sortition ARMED from height {h} (STELL_VRF_ACTIVATION_HEIGHT={h}): RETIRED — classical bodies removed, election stays on the parent-hash draw at every height; unset the variable to silence this"
         ),
         None => info!(
             "[vrf] VRF sortition inactive (STELL_VRF_ACTIVATION_HEIGHT unset): parent-hash election on every height"
@@ -3114,42 +3117,8 @@ async fn run_consensus_node(
             "[vrf] no local VRF seed provisioned (remote-signer deployment): VRF proofs unavailable, legacy parent-hash election on every height"
         ),
     }
-    let vrf_registry = stellereum::vrf::vrf_registry_from_env();
-    if vrf_registry.is_empty() {
-        info!(
-            "[vrf] VRF registry empty (STELL_VRF_KEYS unset): verifies fall back to legacy"
-        );
-    } else {
-        info!(
-            "[vrf] VRF registry loaded: {} key(s) from STELL_VRF_KEYS",
-            vrf_registry.len()
-        );
-        // Readiness is ADVISORY only: voting power WITHOUT a registry key
-        // stays on the legacy parent-hash draw per certificate — no global
-        // height H is set here (see `vrf_registry_ready_for_power`). Warn
-        // loudly so operators collect the missing VRF pubkeys (every node
-        // logs its own at startup) into STELL_VRF_KEYS.
-        let power_entries: Vec<([u8; 32], u64)> = rt
-            .validators
-            .validators
-            .iter()
-            .map(|(id, power)| (*id, *power))
-            .collect();
-        let (registered_power, total_power) =
-            stellereum::vrf::vrf_registered_power(&vrf_registry, &power_entries);
-        if stellereum::vrf::vrf_registry_ready_for_power(&vrf_registry, &power_entries) {
-            info!(
-                "[vrf] VRF registry readiness: 100% of voting power registered ({total_power}/{total_power})"
-            );
-        } else {
-            tracing::warn!(
-                "[vrf] VRF registry INCOMPLETE: {registered_power}/{total_power} voting power registered — \
-                 unregistered power falls back to the legacy parent-hash draw; collect the missing \
-                 VRF pubkeys (nodes log theirs at startup) into STELL_VRF_KEYS"
-            );
-        }
-    }
-    stellereum::consensus::set_live_vrf_registry(vrf_registry);
+    // Registry loading retired (nodes wiped, no history compat): verifies
+    // always use the canonical parent-hash draw.
 
     // Restore the FULL persisted state (accounts + all domains) if available.
     // `restored_state_height` is the height whose post-state the engine holds (0 for
@@ -6635,7 +6604,8 @@ enum Commands {
         /// Enable disjoint wave parallel block execution
         #[arg(long)]
         parallel_exec: bool,
-        /// Enforce Pure Post-Quantum Mode (reject classical Ed25519/BLS transactions and QCs)
+        /// Enforce Pure Post-Quantum Mode (FULL-PQ: no-op, always enforced;
+        /// kept for operator-config compat, ignored with WARN).
         #[arg(long)]
         pure_pq: bool,
     },
@@ -7465,8 +7435,9 @@ async fn main() -> anyhow::Result<()> {
             parallel_exec,
             pure_pq,
         } => {
+            // FULL-PQ: `--pure-pq` parsed-and-ignored with WARN (compat).
             if pure_pq {
-                stellereum::post_quantum::set_pure_pq_override(Some(true));
+                eprintln!("[WARN] --pure-pq is a no-op (FULL-PQ always-on): flag ignored");
             }
             info!("Initializing Stellereum Node on Shard {}...", shard);
             // LIVE MIGRATION ARMING — printed at STARTUP, before the node does
@@ -7668,14 +7639,6 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                         },
                     )?;
                 }
-
-                // Fail-closed BLS QC gate (audit-pq-crypto HIGH): the
-                // validator BLS registry carries no proof-of-possession, so
-                // counting BLS power (STELL_BLS_QC=1) admits rogue-key QC
-                // forgery. Refuse LOUDLY at startup; default-off nodes are
-                // unaffected (Ed25519 baseline, zero behavior change). See
-                // `bls::refuse_bls_qc_if_enabled` for the PoP rationale.
-                stellereum::bls::refuse_bls_qc_if_enabled().map_err(|e| anyhow::anyhow!("{e}"))?;
 
                 // Fail-closed fresh-join guard (task (a)): an EMPTY data dir
                 // with peers/DNS seeds configured means JOIN, not found —
@@ -8511,7 +8474,6 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             println!("• Zero-Overhead MEV Preemption (Shamir T-of-N): ACTIVE");
             println!("• zkML AI Verifiable Inference & Session Keys: ACTIVE");
             println!("• Dynamic Infinite Sharding & Cross-Shard Hub: ACTIVE");
-            println!("• Homomorphic Pedersen Commitments & Stealth: ACTIVE");
             println!("• 3-Tier Price Safety Network & Teleport:    ACTIVE");
             println!("═════════════════════════════════════════════════════════════════\n");
         }

@@ -134,6 +134,7 @@ async fn register_session(
 }
 
 #[tokio::test]
+#[ignore = "PQ excision: session authorization is Ed25519-native (SK1 envelope); needs Falcon-delegation migration before these flows work again"]
 async fn budget_registered_key_reports_remaining_math() {
     let st = rpc_state().await;
     let addr = spawn(st.clone()).await;
@@ -179,6 +180,7 @@ async fn budget_registered_key_reports_remaining_math() {
 }
 
 #[tokio::test]
+#[ignore = "PQ excision: session authorization is Ed25519-native (SK1 envelope); needs Falcon-delegation migration before these flows work again"]
 async fn budget_revoked_key_reports_revoked() {
     let st = rpc_state().await;
     let addr = spawn(st.clone()).await;

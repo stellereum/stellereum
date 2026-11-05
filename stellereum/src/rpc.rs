@@ -317,20 +317,22 @@ pub struct Faucet {
     /// endpoint that serves it: a drip built for any other shard would be
     /// dropped by that shard's proposer as shard-filtered.
     shard: ShardId,
-    /// SEED LIFETIME (audit: faucet zeroize): this signing key — and the
-    /// `pq_key` below derived from the same seed — MUST live as long as the
-    /// faucet itself (every drip is signed with it), so the seed material is
-    /// process-lifetime by design, not a leak to fix. What IS wiped: every
-    /// INTERMEDIATE copy on the load path (file bytes, parsed hex line, env
-    /// string — see `load_faucet_seed_from_file` / `load_faucet_seed`, all
-    /// `Zeroizing` or explicitly zeroized) and the `Faucet::new` frame copy
-    /// (wiped before return). Callers: `[u8; 32]` is `Copy`, so YOUR stack
-    /// binding still holds the seed after `Faucet::new(seed, ..)` returns —
-    /// zeroize it at the call site once the faucet owns it. No behavior
-    /// change: signing bytes are identical, only dead copies are wiped.
-    key: ed25519_dalek::SigningKey,
-    /// Falcon-512 keypair derived from the same seed (pure-PQ drip path).
-    /// Same process-lifetime rule as `key`.
+    /// SEED LIFETIME (audit: faucet zeroize): the `pq_key` below derived
+    /// from the seed MUST live as long as the faucet itself (every drip is
+    /// signed with it), so the seed material is process-lifetime by design,
+    /// not a leak to fix. What IS wiped: every INTERMEDIATE copy on the load
+    /// path (file bytes, parsed hex line, env string — see
+    /// `load_faucet_seed_from_file` / `load_faucet_seed`, all `Zeroizing` or
+    /// explicitly zeroized) and the `Faucet::new` frame copy (wiped before
+    /// return). Callers: `[u8; 32]` is `Copy`, so YOUR stack binding still
+    /// holds the seed after `Faucet::new(seed, ..)` returns — zeroize it at
+    /// the call site once the faucet owns it. No behavior change: signing
+    /// bytes are identical, only dead copies are wiped.
+    ///
+    /// FULL-PQ (no compat): the classical ed25519 faucet key is deleted; the
+    /// Falcon-512 `pq_key` is the sole signing key.
+    /// Falcon-512 keypair derived from the seed (sole PQ drip path).
+    /// Same process-lifetime rule as above.
     pq_key: crate::post_quantum::FalconKeypair,
     state: tokio::sync::Mutex<FaucetState>,
     /// Called with the serialized state after every mutation, so the lifetime
@@ -762,8 +764,7 @@ impl Faucet {
     /// before return; zeroize YOUR stack copy at the call site.
     pub fn new(mut key_seed: [u8; 32], shard: ShardId, drip: u64, max_per_address: u64) -> Self {
         let pq_key = crate::post_quantum::FalconKeypair::generate_from_seed_bytes(&key_seed);
-        let key = ed25519_dalek::SigningKey::from_bytes(&key_seed);
-        // Wipe the frame copy: the live material now lives in `key`/`pq_key`
+        // Wipe the frame copy: the live material now lives in `pq_key`
         // (process-lifetime by design). The caller's `Copy` binding is theirs
         // to wipe.
         zeroize::Zeroize::zeroize(&mut key_seed);
@@ -771,7 +772,6 @@ impl Faucet {
             drip,
             max_per_address,
             shard,
-            key,
             pq_key,
             state: tokio::sync::Mutex::new(FaucetState::default()),
             persist: None,
@@ -834,16 +834,15 @@ impl Faucet {
     }
 
     /// The (pre-funded) account the faucet transfers from.
+    ///
+    /// FULL-PQ (no compat): always the Falcon-512 PQ address. The classical
+    /// ed25519 allowance branch is deleted.
     pub fn account(&self) -> [u8; 32] {
-        if crate::post_quantum::is_pure_pq_enforced() {
-            crate::post_quantum::derive_pq_address(
-                crate::post_quantum::PqScheme::Falcon512,
-                &self.pq_key.public_key,
-                &crate::post_quantum::DEFAULT_SALT,
-            )
-        } else {
-            self.key.verifying_key().to_bytes()
-        }
+        crate::post_quantum::derive_pq_address(
+            crate::post_quantum::PqScheme::Falcon512,
+            &self.pq_key.public_key,
+            &crate::post_quantum::DEFAULT_SALT,
+        )
     }
 
     /// The shard this faucet serves: every drip it builds executes there
@@ -905,27 +904,17 @@ impl Faucet {
         // Faucet drips go through mempool admission like any other tx, so the
         // declared gas must clear the base fee (raised x500 with the base
         // transfer fee - a hardcoded 21_000 here silently broke every drip).
-        let tx = if crate::post_quantum::is_pure_pq_enforced() {
-            sign_pq_explicit_transfer(
-                &self.pq_key,
-                who,
-                amount,
-                crate::svm::GAS_BASIC_TRANSFER + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS,
-                nonce,
-                self.shard,
-                self.shard,
-            )
-        } else {
-            Transaction::sign(
-                &self.key,
-                who,
-                amount,
-                crate::svm::GAS_BASIC_TRANSFER,
-                nonce,
-                self.shard,
-                self.shard,
-            )
-        };
+        // FULL-PQ (no compat): drips are always PQ-explicit transfers. The
+        // classical `Transaction::sign` branch is deleted.
+        let tx = sign_pq_explicit_transfer(
+            &self.pq_key,
+            who,
+            amount,
+            crate::svm::GAS_BASIC_TRANSFER + crate::mempool::PQ_ACTIVATION_SURCHARGE_GAS,
+            nonce,
+            self.shard,
+            self.shard,
+        );
         Some((tx, amount))
     }
 
@@ -1166,6 +1155,225 @@ pub const MAX_FINALIZED_HEADERS: usize = 512;
 pub const MAX_RECEIPTS: usize = 50_000;
 
 // ===========================================================================
+// FINALIZED-READ CACHE (perf, safety-first)
+//
+// Hot finalized reads (explorers/wallets poll the same heights) are served
+// from a small bounded cache keyed by `(method, height, params-hash)`:
+//
+// * SOUND because finalized data is immutable: a finalized block, its
+//   receipts, its quorum-certified header and a complete epoch root never
+//   change. The ONLY invalidation triggers are a height move (entries are
+//   tagged with the tip they were filled at and a lookup hits only when the
+//   tip is unchanged, so any advance — forward OR a catch-up backward step —
+//   is a miss and recomputes), the TTL below, and fail-closed eviction when
+//   full. Reads, mempool churn and unfinalized data NEVER invalidate and
+//   NEVER change a finalized key.
+// * Surgical eviction on the finalize/adopt publish paths (`record_block`,
+//   `record_receipts_with_events`, `record_finalized_header`): a late body
+//   arriving for an already-published height (txs `0` -> real count, empty
+//   receipts -> filed) drops that height's keys, so the next read recomputes.
+//   Eviction only ever drops entries (a miss recomputes byte-identical data),
+//   so it is fail-closed by construction.
+// * Only successful (`Ok`) responses of explicitly height-pinned methods are
+//   cached. Errors ("not available yet", "above tip") are NEVER cached: they
+//   can resolve as replication catches up. Live/tip-relative reads
+//   (`stell_getBalance`, `stell_getBalanceSpv`, `stell_getProof`,
+//   `stell_getValidators`, `stell_stakeOf`, receipts with `confirmations`,
+//   every `eth_*` tag/latest read, every mempool-dependent read) BYPASS the
+//   cache always: caching them would risk serving non-finalized data.
+// * `stell_getEpochRoot` is cached ONLY when the served epoch is complete
+//   AND carries its quorum-signed boundary commitment; an incomplete epoch
+//   still finalizes and would otherwise freeze a stale `complete: false`.
+// ===========================================================================
+
+/// Max entries in the finalized-read cache. Const cap: no unbounded growth.
+/// 512 matches [`MAX_FINALIZED_HEADERS`], the largest per-height window.
+pub const FINALIZED_READ_CACHE_CAP: usize = 512;
+
+/// Time-to-live of a cache entry, in seconds. Second invalidation axis next
+/// to height moves; small enough that a pathological stale entry cannot live
+/// long, large enough to cover hot-poll windows.
+pub const FINALIZED_READ_CACHE_TTL_SECS: u64 = 60;
+
+/// Methods served from the finalized-read cache. Every other method bypasses
+/// it (see the module docs above). Deliberately `stell_*` height-pinned reads
+/// only: no `eth_*` (adapter-side mutable state, `latest`/`pending` tags),
+/// no mempool-dependent reads, no live-state reads.
+fn finalized_read_cacheable(method: &str) -> bool {
+    matches!(
+        method,
+        "stell_getBlock"
+            | "stell_getBlockTransactions"
+            | "stell_getFinalizedHeader"
+            | "stell_getEpochRoot"
+    )
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FinalizedReadKey {
+    method: String,
+    height: u64,
+    params_hash: [u8; 32],
+}
+
+struct FinalizedReadEntry {
+    result: Value,
+    filled_tip: u64,
+    filled_at: std::time::Instant,
+}
+
+#[derive(Default)]
+struct FinalizedReadCache {
+    map: HashMap<FinalizedReadKey, FinalizedReadEntry>,
+    hits: u64,
+    misses: u64,
+}
+
+static FINALIZED_READ_CACHE: std::sync::OnceLock<std::sync::Mutex<FinalizedReadCache>> =
+    std::sync::OnceLock::new();
+
+fn finalized_read_cache() -> &'static std::sync::Mutex<FinalizedReadCache> {
+    FINALIZED_READ_CACHE.get_or_init(|| std::sync::Mutex::new(FinalizedReadCache::default()))
+}
+
+/// Canonical hash of the request params: two byte-identical requests share a
+/// key; anything else (even an ignored extra field) is a separate key holding
+/// the same bytes — fail-closed towards extra entries, never wrong bytes.
+pub fn finalized_read_cache_params_hash(params: &Value) -> [u8; 32] {
+    let bytes = serde_json::to_vec(params).unwrap_or_default();
+    *blake3::hash(&bytes).as_bytes()
+}
+
+fn finalized_read_cache_fresh(entry: &FinalizedReadEntry, tip: u64) -> bool {
+    entry.filled_tip == tip
+        && entry.filled_at.elapsed().as_secs() < FINALIZED_READ_CACHE_TTL_SECS
+}
+
+/// Cached finalized response, if any. `None` (miss) means "recompute and
+/// consider filling via [`finalized_read_cache_put`]". Pure read path: no
+/// auth, no budgets, no mutation beyond hit/miss counters.
+pub fn finalized_read_cache_get(method: &str, height: u64, params: &Value, tip: u64) -> Option<Value> {
+    if !finalized_read_cacheable(method) {
+        return None;
+    }
+    let key = FinalizedReadKey {
+        method: method.to_string(),
+        height,
+        params_hash: finalized_read_cache_params_hash(params),
+    };
+    let mut cache = finalized_read_cache().lock().expect("finalized-read cache lock");
+    let hit = match cache.map.get(&key) {
+        Some(entry) if finalized_read_cache_fresh(entry, tip) => Some(entry.result.clone()),
+        _ => None,
+    };
+    match hit {
+        Some(v) => {
+            cache.hits += 1;
+            Some(v)
+        }
+        None => {
+            cache.misses += 1;
+            None
+        }
+    }
+}
+
+/// Fill the cache after a fresh successful computation. No-op for non-listed
+/// methods, for heights above the tip (not finalized), and when full the
+/// oldest/expired entries are evicted first (fail-closed: a miss recomputes).
+pub fn finalized_read_cache_put(
+    method: &str,
+    height: u64,
+    params: &Value,
+    tip: u64,
+    result: Value,
+) {
+    if !finalized_read_cacheable(method) || height > tip {
+        return;
+    }
+    let key = FinalizedReadKey {
+        method: method.to_string(),
+        height,
+        params_hash: finalized_read_cache_params_hash(params),
+    };
+    let mut cache = finalized_read_cache().lock().expect("finalized-read cache lock");
+    if cache.map.len() >= FINALIZED_READ_CACHE_CAP && !cache.map.contains_key(&key) {
+        // Fail-closed eviction: expired entries first, else the oldest fill.
+        // Only entry DROPS happen here — correctness never depends on them.
+        cache.map.retain(|_, e| e.filled_at.elapsed().as_secs() < FINALIZED_READ_CACHE_TTL_SECS);
+        if cache.map.len() >= FINALIZED_READ_CACHE_CAP {
+            let mut oldest: Option<(FinalizedReadKey, std::time::Instant)> = None;
+            for (k, e) in cache.map.iter() {
+                let replace = match &oldest {
+                    None => true,
+                    Some((_, t)) => e.filled_at < *t,
+                };
+                if replace {
+                    oldest = Some((k.clone(), e.filled_at));
+                }
+            }
+            if let Some((k, _)) = oldest {
+                cache.map.remove(&k);
+            }
+        }
+    }
+    cache.map.insert(
+        key,
+        FinalizedReadEntry {
+            result,
+            filled_tip: tip,
+            filled_at: std::time::Instant::now(),
+        },
+    );
+}
+
+/// Drop every cached response that a finalize/adopt publish for `height` can
+/// change (block summary, block transactions, finalized header). Called from
+/// the `record_*` publish paths only — never from reads, never from the
+/// mempool, never from auth/rate code.
+pub fn finalized_read_cache_evict_height(height: u64) {
+    let Ok(mut cache) = finalized_read_cache().lock() else {
+        return;
+    };
+    cache.map.retain(|k, _| k.height != height);
+}
+
+/// Drop every cached epoch root: any new finalized header can complete an
+/// epoch or supply its boundary commitment. Epoch keys are few; a full-method
+/// drop is cheaper than range tracking and equally fail-closed.
+pub fn finalized_read_cache_evict_epoch_roots() {
+    let Ok(mut cache) = finalized_read_cache().lock() else {
+        return;
+    };
+    cache.map.retain(|k, _| k.method != "stell_getEpochRoot");
+}
+
+/// Read-only introspection for tests/monitoring: `(entries, hits, misses)`.
+pub fn finalized_read_cache_stats() -> (usize, u64, u64) {
+    let cache = finalized_read_cache().lock().expect("finalized-read cache lock");
+    (cache.map.len(), cache.hits, cache.misses)
+}
+
+/// Read-only entry count for the bounded-growth gate.
+pub fn finalized_read_cache_len() -> usize {
+    finalized_read_cache_stats().0
+}
+
+/// Test hook: force every entry stale so the next lookup recomputes (proves
+/// expiry is fail-closed). `#[doc(hidden)]`, used by the cache tests only.
+#[doc(hidden)]
+pub fn finalized_read_cache_expire_all_for_tests() {
+    let Ok(mut cache) = finalized_read_cache().lock() else {
+        return;
+    };
+    for (_, e) in cache.map.iter_mut() {
+        e.filled_at = e.filled_at
+            .checked_sub(std::time::Duration::from_secs(FINALIZED_READ_CACHE_TTL_SECS + 1))
+            .unwrap_or(std::time::Instant::now());
+    }
+}
+
+// ===========================================================================
 // EXPENSIVE-READ BUDGET (audit W6.7)
 //
 // `stell_estimateFee` clones the WHOLE engine state (accounts, trie, tokens,
@@ -1383,6 +1591,10 @@ impl RpcState {
 
     /// Record a newly finalized block. Called by the consensus loop.
     pub async fn record_block(&self, height: u64, hash: [u8; 32], tx_count: usize, timestamp: u64) {
+        // Finalized-read cache: a (re)publish for this height (finalize, or a
+        // late adopted body upgrading txs `0` to the real count) drops that
+        // height's cached responses so the next read recomputes. Fail-closed.
+        finalized_read_cache_evict_height(height);
         self.height
             .store(height, std::sync::atomic::Ordering::Relaxed);
         let mut rb = self.recent_blocks.write().await;
@@ -1442,6 +1654,12 @@ impl RpcState {
         while hs.len() > MAX_FINALIZED_HEADERS {
             hs.pop_back();
         }
+        drop(hs);
+        // Finalized-read cache: this header can complete an epoch or supply
+        // its boundary commitment, so cached epoch roots are dropped (they
+        // recompute) and this height's cached header is dropped too.
+        finalized_read_cache_evict_height(block.height);
+        finalized_read_cache_evict_epoch_roots();
     }
 
     /// Record inclusion receipts for a finalized block's transactions.
@@ -1477,6 +1695,10 @@ impl RpcState {
         for tx in txs.iter() {
             crate::evm_adapter::link_secp_settlement(tx);
         }
+        // Finalized-read cache: newly filed receipts change this height's
+        // block-transactions answer (absent -> filed, e.g. a late adopted
+        // body), so that height's cached responses are dropped. Fail-closed.
+        finalized_read_cache_evict_height(height);
         let mut idx = self.receipts.write().await;
         // Batched hashing in a SINGLE pass: one reused hasher + one reused
         // payload scratch buffer + one reused serialization buffer, with the
@@ -3543,6 +3765,21 @@ async fn admit_signed_payload_tx(
         Ok(t) => t,
         Err(e) => return err(id, -32602, format!("decode: {e}")),
     };
+    // FULL-PQ (no compat): classical envelopes refused at intake, before any
+    // crypto. PQ verify/admission below is unchanged.
+    {
+        let pq_ok = match tx.pq_envelope() {
+            Some(env) => env.scheme.is_post_quantum(),
+            None => false,
+        };
+        if !pq_ok {
+            return err(
+                id,
+                -32000,
+                "Pure PQ mode: classical non-PQ transactions rejected, submit with PQ1 envelope",
+            );
+        }
+    }
     if !tx.verify_signature() {
         return err(id, -32000, "invalid transaction signature");
     }
@@ -4916,16 +5153,36 @@ async fn dispatch(
             // `record_adopted_block`, so any node serves adopted heights) ->
             // honest "not available yet". Never fabricated: a height outside the
             // window is a miss, not a zero-tx fabrication.
+            //
+            // Finalized-read cache: the summary for a finalized height is
+            // immutable (any republish evicts via `record_block`), so a fresh
+            // `Ok` is cached keyed by (method, height, params-hash). Errors
+            // bypass: an unknown height can still arrive via replication.
             let want = params["height"].as_u64();
+            if let Some(h) = want {
+                let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+                if h <= tip {
+                    if let Some(hit) = finalized_read_cache_get("stell_getBlock", h, params, tip) {
+                        return ok(id, hit);
+                    }
+                }
+            }
             let rb = st.recent_blocks.read().await;
             let found = rb.iter().find(|b| Some(b.height) == want);
             match found {
-                Some(b) => ok(id, json!({
-                    "height": b.height,
-                    "hash": b.hash,
-                    "txs": b.tx_count,
-                    "timestamp": b.timestamp,
-                })),
+                Some(b) => {
+                    let v = json!({
+                        "height": b.height,
+                        "hash": b.hash,
+                        "txs": b.tx_count,
+                        "timestamp": b.timestamp,
+                    });
+                    if let Some(h) = want {
+                        let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+                        finalized_read_cache_put("stell_getBlock", h, params, tip, v.clone());
+                    }
+                    ok(id, v)
+                }
                 None => err(id, -32004, "block not available yet (not in recent window; replication runs behind finalization)"),
             }
         }
@@ -4950,6 +5207,20 @@ async fn dispatch(
             if !known {
                 return err(id, -32004, "block transactions not available yet (height not adopted/replicated on this node)");
             }
+            // Finalized-read cache: receipts for a finalized height are filed
+            // once (before the height publishes — see `record_*` ordering) and
+            // any late filing evicts via `record_receipts_with_events`. Only
+            // non-empty answers are cached: a cached empty list could freeze
+            // the window between "height known" and "receipts filed" (a late
+            // adopted body only ever ADDS receipts). Errors bypass.
+            let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+            if want <= tip {
+                if let Some(hit) =
+                    finalized_read_cache_get("stell_getBlockTransactions", want, params, tip)
+                {
+                    return ok(id, hit);
+                }
+            }
             let idx = st.receipts.read().await;
             let mut rows: Vec<&TxReceipt> = idx.map.values().filter(|r| r.height == want).collect();
             rows.sort_by_key(|r| r.index);
@@ -4969,7 +5240,12 @@ async fn dispatch(
                     obj
                 })
                 .collect();
-            ok(id, json!({ "height": want, "txs": list }))
+            let v = json!({ "height": want, "txs": list });
+            if want <= tip && !rows.is_empty() {
+                let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+                finalized_read_cache_put("stell_getBlockTransactions", want, params, tip, v.clone());
+            }
+            ok(id, v)
         }
 
         // ---- epoch seal (asymmetric, threshold-sealed transactions) ----
@@ -5294,10 +5570,34 @@ async fn dispatch(
                 Some(h) => h,
                 None => return err(id, -32602, "missing height"),
             };
+            // Finalized-read cache: a quorum-certified header is immutable (any
+            // republish evicts via `record_finalized_header`). Errors bypass:
+            // a pruned/too-old height stays an honest miss.
+            let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+            if want <= tip {
+                if let Some(hit) =
+                    finalized_read_cache_get("stell_getFinalizedHeader", want, params, tip)
+                {
+                    return ok(id, hit);
+                }
+            }
             let store = finalized_headers();
             let hs = store.read().await;
             match hs.iter().find(|h| h.height == want) {
-                Some(h) => ok(id, h.to_json()),
+                Some(h) => {
+                    let v = h.to_json();
+                    if want <= tip {
+                        let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+                        finalized_read_cache_put(
+                            "stell_getFinalizedHeader",
+                            want,
+                            params,
+                            tip,
+                            v.clone(),
+                        );
+                    }
+                    ok(id, v)
+                }
                 None => err(
                     id,
                     -32004,
@@ -5387,6 +5687,15 @@ async fn dispatch(
             let start = crate::mmr::epoch_start(epoch);
             let end = crate::mmr::epoch_end(epoch);
             let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+            // Finalized-read cache: a COMPLETE epoch with its quorum-signed
+            // boundary commitment is immutable (any new header evicts all
+            // epoch roots via `record_finalized_header`). Incomplete epochs
+            // still finalize and errors can resolve, so only
+            // complete-with-commitment answers are cached. Key height is the
+            // epoch start (params-hash pins the exact request shape).
+            if let Some(hit) = finalized_read_cache_get("stell_getEpochRoot", start, params, tip) {
+                return ok(id, hit);
+            }
             let store = finalized_headers();
             let hs = store.read().await;
             // The finalized block hashes of the epoch, in height order.
@@ -5412,9 +5721,7 @@ async fn dispatch(
             // that carries it (the first block of the next epoch).
             let committed = hs.iter().find(|r| r.height == end + 1);
             let committed_root = committed.map(|r| hex::encode(r.mmr_epoch_root));
-            ok(
-                id,
-                json!({
+            let v = json!({
                     "epoch": epoch,
                     "start_height": start,
                     "end_height": end,
@@ -5424,8 +5731,12 @@ async fn dispatch(
                     "leaves": leaves.len(),
                     "committed_root": committed_root,
                     "committed_in_height": committed.map(|r| r.height),
-                }),
-            )
+                });
+            if complete && committed.is_some() {
+                let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
+                finalized_read_cache_put("stell_getEpochRoot", start, params, tip, v.clone());
+            }
+            ok(id, v)
         }
 
         // ---- bridge disputes (optimistic L1; read-only for watchers) ----
@@ -6409,6 +6720,21 @@ async fn dispatch(
                 Ok(t) => t,
                 Err(e) => return err(id, -32602, format!("decode: {e}")),
             };
+            // FULL-PQ (no compat): classical envelopes refused at intake,
+            // before any crypto. PQ verify/admission below is unchanged.
+            {
+                let pq_ok = match tx.pq_envelope() {
+                    Some(env) => env.scheme.is_post_quantum(),
+                    None => false,
+                };
+                if !pq_ok {
+                    return err(
+                        id,
+                        -32000,
+                        "Pure PQ mode: classical non-PQ transactions rejected, submit with PQ1 envelope",
+                    );
+                }
+            }
             if !tx.verify_signature() {
                 return err(id, -32000, "invalid transaction signature");
             }
@@ -7006,6 +7332,20 @@ async fn dispatch(
                 // P5 FIX: the wrapped path admitted an UNSIGNED tx straight
                 // into the engine + mempool (no verify_signature). A forged
                 // `from` deploys as the victim. Verify like sendRawTransaction.
+                // FULL-PQ: classical envelopes refused at intake, before crypto.
+                {
+                    let pq_ok = match tx.pq_envelope() {
+                        Some(env) => env.scheme.is_post_quantum(),
+                        None => false,
+                    };
+                    if !pq_ok {
+                        return err(
+                            id,
+                            -32000,
+                            "Pure PQ mode: classical non-PQ transactions rejected, submit with PQ1 envelope",
+                        );
+                    }
+                }
                 if !tx.verify_signature() {
                     return err(id, -32000, "invalid transaction signature");
                 }
@@ -7121,8 +7461,16 @@ async fn dispatch(
             // random key. Its only purpose is to carry the deploy through
             // mempool/block admission; the predicted address is what block
             // application derives for it.
-            let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-            let from_addr = signing_key.verifying_key().to_bytes();
+            // FULL-PQ: the vehicle is an explicit Falcon-512 tx
+            // (self-contained: verifies with no registry and no funding —
+            // admission authenticates the envelope, as with the old ed25519
+            // vehicle; execution still fails closed on the unfunded balance).
+            let eph_key = crate::post_quantum::FalconKeypair::generate();
+            let from_addr = crate::post_quantum::derive_pq_address(
+                crate::post_quantum::PqScheme::Falcon512,
+                &eph_key.public_key,
+                &crate::post_quantum::DEFAULT_SALT,
+            );
             let nonce = st
                 .engine
                 .get_account(&from_addr)
@@ -7136,16 +7484,26 @@ async fn dispatch(
             let predicted_stl57 = crate::address::encode_stl57_address(&predicted);
             let code_hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&code).into();
 
-            let tx = Transaction::sign_with_payload(
-                &signing_key,
-                predicted,
-                0,
+            let mut tx = Transaction {
+                from: from_addr,
+                to: predicted,
+                amount: 0,
                 gas_limit,
                 nonce,
-                0,
-                0,
-                vec![crate::svm::OpCode::SysCallDeployContract { code: code.clone() }],
-            );
+                source_shard: 0,
+                target_shard: 0,
+                signature: Vec::new(),
+                payload: vec![crate::svm::OpCode::SysCallDeployContract { code: code.clone() }],
+                priority_fee_per_gas: 0,
+            };
+            let msg = tx.signing_message();
+            let sig = eph_key.sign(&msg);
+            tx.signature = crate::sharding::PqSignatureEnvelope::new_explicit(
+                crate::post_quantum::PqScheme::Falcon512,
+                eph_key.public_key.clone(),
+                sig,
+            )
+            .encode();
             let tx_hash = tx.compute_tx_hash();
             let raw_tx_hex = hex::encode(bincode::serialize(&tx).unwrap_or_default());
 
@@ -7241,6 +7599,20 @@ async fn dispatch(
                     Ok(t) => t,
                     Err(e) => return err(id, -32602, format!("failed to decode transaction: {e}")),
                 };
+                // FULL-PQ: classical envelopes refused at intake, before crypto.
+                {
+                    let pq_ok = match tx.pq_envelope() {
+                        Some(env) => env.scheme.is_post_quantum(),
+                        None => false,
+                    };
+                    if !pq_ok {
+                        return err(
+                            id,
+                            -32000,
+                            "Pure PQ mode: classical non-PQ transactions rejected, submit with PQ1 envelope",
+                        );
+                    }
+                }
                 if !tx.verify_signature() {
                     return err(id, -32000, "invalid transaction signature");
                 }
@@ -7378,8 +7750,13 @@ async fn dispatch(
             // admitted tx is signed by a fresh random key and carries the
             // call through mempool/block admission; the preview below runs
             // on a registry clone and changes nothing.
-            let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-            let from_addr = signing_key.verifying_key().to_bytes();
+            // FULL-PQ: explicit Falcon-512 vehicle (self-contained).
+            let eph_key = crate::post_quantum::FalconKeypair::generate();
+            let from_addr = crate::post_quantum::derive_pq_address(
+                crate::post_quantum::PqScheme::Falcon512,
+                &eph_key.public_key,
+                &crate::post_quantum::DEFAULT_SALT,
+            );
 
             // Execute the contract call. When the contract carries an ABI
             // manifest the manifest is authoritative: the method and its
@@ -7463,16 +7840,26 @@ async fn dispatch(
                 }
             };
 
-            let tx = Transaction::sign_with_payload(
-                &signing_key,
-                contract_addr,
-                value,
+            let mut tx = Transaction {
+                from: from_addr,
+                to: contract_addr,
+                amount: value,
                 gas_limit,
                 nonce,
-                0,
-                0,
-                vec![call_opcode],
-            );
+                source_shard: 0,
+                target_shard: 0,
+                signature: Vec::new(),
+                payload: vec![call_opcode],
+                priority_fee_per_gas: 0,
+            };
+            let msg = tx.signing_message();
+            let sig = eph_key.sign(&msg);
+            tx.signature = crate::sharding::PqSignatureEnvelope::new_explicit(
+                crate::post_quantum::PqScheme::Falcon512,
+                eph_key.public_key.clone(),
+                sig,
+            )
+            .encode();
             let raw_tx_hex = hex::encode(bincode::serialize(&tx).unwrap_or_default());
 
             admit_contract_tx_and_respond(st, id, tx, contract_addr, raw_tx_hex, outcome).await
@@ -9673,11 +10060,21 @@ mod tests {
     /// `STELL_FAUCET_TOKEN`.
     async fn test_state_with_untokened_faucet(drip: u64, cap: u64) -> Arc<RpcState> {
         let key_seed = [0x11u8; 32];
-        let faucet_key = ed25519_dalek::SigningKey::from_bytes(&key_seed);
-        let faucet_addr = faucet_key.verifying_key().to_bytes();
+        // FULL-PQ: the faucet account is the Falcon-512 address derived from
+        // the seed (Faucet::account); fund that address, never a classical one.
+        // Funded for the PQ drip cost (amount + gas + activation surcharge,
+        // reserved jointly per pooled tx) across a full lifetime-cap burst.
+        let faucet_addr = {
+            let pq_key = crate::post_quantum::FalconKeypair::generate_from_seed_bytes(&key_seed);
+            crate::post_quantum::derive_pq_address(
+                crate::post_quantum::PqScheme::Falcon512,
+                &pq_key.public_key,
+                &crate::post_quantum::DEFAULT_SALT,
+            )
+        };
         let st = test_state().await;
         st.engine
-            .update_account(AccountState::new(faucet_addr, 1_000_000))
+            .update_account(AccountState::new(faucet_addr, 100_000_000))
             .await;
         Arc::new(RpcState {
             faucet: Some(Arc::new(Faucet::new(key_seed, 1, drip, cap))),
@@ -9701,11 +10098,21 @@ mod tests {
 
     async fn test_state_with_faucet(drip: u64, cap: u64) -> Arc<RpcState> {
         let key_seed = [0x11u8; 32];
-        let faucet_key = ed25519_dalek::SigningKey::from_bytes(&key_seed);
-        let faucet_addr = faucet_key.verifying_key().to_bytes();
+        // FULL-PQ: the faucet account is the Falcon-512 address derived from
+        // the seed (Faucet::account); fund that address, never a classical one.
+        // Funded for the PQ drip cost (amount + gas + activation surcharge,
+        // reserved jointly per pooled tx) across a full lifetime-cap burst.
+        let faucet_addr = {
+            let pq_key = crate::post_quantum::FalconKeypair::generate_from_seed_bytes(&key_seed);
+            crate::post_quantum::derive_pq_address(
+                crate::post_quantum::PqScheme::Falcon512,
+                &pq_key.public_key,
+                &crate::post_quantum::DEFAULT_SALT,
+            )
+        };
         let st = test_state().await;
         st.engine
-            .update_account(AccountState::new(faucet_addr, 1_000_000))
+            .update_account(AccountState::new(faucet_addr, 100_000_000))
             .await;
         Arc::new(RpcState {
             faucet: Some(Arc::new(Faucet::new(key_seed, 1, drip, cap))),
@@ -10203,15 +10610,172 @@ mod tests {
         install_test_hub()
     }
 
-    fn receipt_tx(from: [u8; 32], nonce: u64) -> crate::sharding::Transaction {
-        let key = ed25519_dalek::SigningKey::from_bytes(&from);
-        crate::sharding::Transaction::sign(&key, [0xEE; 32], 10, 1, nonce, 0, 0)
+    fn receipt_tx(seed: u8, nonce: u64) -> crate::sharding::Transaction {
+        // FULL-PQ: implicit Falcon-512 (registered globally; no surcharge),
+        // shard 0 like the old fixture.
+        pq_tx_shard(seed, [0xEE; 32], 10, 1, nonce, 0, 0)
+    }
+
+    /// FULL-PQ test helper: implicit Falcon-512 tx (no activation surcharge,
+    /// so fee/balance assertions match the old classical fixtures exactly).
+    /// The key is pre-registered globally (idempotent) for intake/apply
+    /// verification. `seed` must be distinct per sender within a test.
+    fn pq_pair(seed: u8) -> ([u8; 32], Vec<u8>) {
+        let pk = crate::sharding::Transaction::sample_falcon512_pubkey(seed);
+        let from = crate::post_quantum::derive_pq_address(
+            crate::post_quantum::PqScheme::Falcon512,
+            &pk,
+            &crate::post_quantum::DEFAULT_SALT,
+        );
+        crate::sharding::Transaction::global_implicit_registry()
+            .register(
+                from,
+                crate::post_quantum::PqScheme::Falcon512,
+                &pk,
+                &crate::post_quantum::DEFAULT_SALT,
+            )
+            .expect("PQ test key must register");
+        (from, pk)
+    }
+
+    fn pq_tx_payload(
+        seed: u8,
+        to: [u8; 32],
+        amount: u64,
+        gas: u64,
+        nonce: u64,
+        payload: Vec<crate::svm::OpCode>,
+    ) -> crate::sharding::Transaction {
+        let (from, pk) = pq_pair(seed);
+        let mut tx = crate::sharding::Transaction {
+            from,
+            to,
+            amount,
+            gas_limit: gas,
+            nonce,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload,
+            priority_fee_per_gas: 0,
+        };
+        let msg = tx.signing_message();
+        let sig =
+            crate::sharding::Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+        tx.signature = crate::sharding::PqSignatureEnvelope::new_implicit(
+            crate::post_quantum::PqScheme::Falcon512,
+            sig,
+        )
+        .encode();
+        tx
+    }
+
+    fn pq_tx(
+        seed: u8,
+        to: [u8; 32],
+        amount: u64,
+        gas: u64,
+        nonce: u64,
+    ) -> crate::sharding::Transaction {
+        pq_tx_chain(seed, to, amount, gas, nonce, None)
+    }
+
+    /// FULL-PQ replacement for `Transaction::sign_with_chain_id` in tests.
+    fn pq_tx_chain(
+        seed: u8,
+        to: [u8; 32],
+        amount: u64,
+        gas: u64,
+        nonce: u64,
+        chain: Option<u64>,
+    ) -> crate::sharding::Transaction {
+        pq_tx_shard_chain(seed, to, amount, gas, nonce, 1, 1, chain)
+    }
+
+    fn pq_tx_shard(
+        seed: u8,
+        to: [u8; 32],
+        amount: u64,
+        gas: u64,
+        nonce: u64,
+        s1: crate::sharding::ShardId,
+        s2: crate::sharding::ShardId,
+    ) -> crate::sharding::Transaction {
+        pq_tx_shard_chain(seed, to, amount, gas, nonce, s1, s2, None)
+    }
+
+    // GATE: test-only PQ fixture helper with shard+chain params; splitting it
+    // would churn all callers for zero benefit.
+    #[allow(clippy::too_many_arguments)]
+    fn pq_tx_shard_chain(
+        seed: u8,
+        to: [u8; 32],
+        amount: u64,
+        gas: u64,
+        nonce: u64,
+        s1: crate::sharding::ShardId,
+        s2: crate::sharding::ShardId,
+        chain: Option<u64>,
+    ) -> crate::sharding::Transaction {
+        let pk = crate::sharding::Transaction::sample_falcon512_pubkey(seed);
+        let from = crate::post_quantum::derive_pq_address(
+            crate::post_quantum::PqScheme::Falcon512,
+            &pk,
+            &crate::post_quantum::DEFAULT_SALT,
+        );
+        crate::sharding::Transaction::global_implicit_registry()
+            .register(
+                from,
+                crate::post_quantum::PqScheme::Falcon512,
+                &pk,
+                &crate::post_quantum::DEFAULT_SALT,
+            )
+            .expect("PQ test key must register");
+        let mut tx = crate::sharding::Transaction {
+            from,
+            to,
+            amount,
+            gas_limit: gas,
+            nonce,
+            source_shard: s1,
+            target_shard: s2,
+            signature: Vec::new(),
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        // Chain-bound envelopes commit the chain id in the signed message:
+        // sign the probe message that already carries it (dummy sig of
+        // pinned length — never decoded, only its chain field is read).
+        if let Some(c) = chain {
+            tx.signature = crate::sharding::PqSignatureEnvelope::new_implicit_with_chain(
+                crate::post_quantum::PqScheme::Falcon512,
+                vec![0u8; crate::post_quantum::FALCON512_SIG_LEN],
+                c,
+            )
+            .encode();
+        }
+        let msg = tx.signing_message();
+        let sig =
+            crate::sharding::Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+        let env = match chain {
+            Some(c) => crate::sharding::PqSignatureEnvelope::new_implicit_with_chain(
+                crate::post_quantum::PqScheme::Falcon512,
+                sig,
+                c,
+            ),
+            None => crate::sharding::PqSignatureEnvelope::new_implicit(
+                crate::post_quantum::PqScheme::Falcon512,
+                sig,
+            ),
+        };
+        tx.signature = env.encode();
+        tx
     }
 
     #[tokio::test]
     async fn receipt_reports_height_block_index_and_status() {
         let st = test_state().await;
-        let txs = vec![receipt_tx([1u8; 32], 0), receipt_tx([2u8; 32], 0)];
+        let txs = vec![receipt_tx(0xA1, 0), receipt_tx(0xA2, 0)];
         st.record_receipts(77, [0xAB; 32], &txs, &[true, false], &[1, 0])
             .await;
 
@@ -10253,7 +10817,7 @@ mod tests {
     #[tokio::test]
     async fn receipt_distinguishes_pending_from_unknown() {
         let st = test_state().await;
-        let tx = receipt_tx([3u8; 32], 0);
+        let tx = receipt_tx(0xA3, 0);
         let h = hex::encode(tx.compute_tx_hash());
         assert_eq!(
             call(&st, "stell_getTransactionStatus", json!(h)).await["status"],
@@ -10278,12 +10842,10 @@ mod tests {
         // Guards the invariant main.rs relies on: statuses are captured during
         // the single real application, never produced by re-applying the block
         // (which would execute every transfer a second time).
+        // FULL-PQ: implicit Falcon-512 (no surcharge).
         let engine = Arc::new(InMemoryStateEngine::new());
-        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let from = key.verifying_key().to_bytes();
-        engine.update_account(AccountState::new(from, 1_000)).await;
-
-        let tx = crate::sharding::Transaction::sign(&key, [0xEE; 32], 100, 1, 0, 0, 0);
+        let tx = pq_tx_shard(0xA4, [0xEE; 32], 100, 1, 0, 0, 0);
+        engine.update_account(AccountState::new(tx.from, 1_000)).await;
         let (applied, _failed, _fees, statuses, tx_fees) = engine
             .apply_block_parallel_fees(std::slice::from_ref(&tx), 0)
             .await;
@@ -10300,7 +10862,7 @@ mod tests {
             "the receipt files what commit_native charged"
         );
 
-        let balance_after = engine.get_account(&from).await.unwrap().balance;
+        let balance_after = engine.get_account(&tx.from).await.unwrap().balance;
         assert_eq!(balance_after, 1_000 - 101, "value moved exactly once");
 
         // Statuses must describe the block, not a second execution: re-running
@@ -11150,12 +11712,22 @@ mod tests {
     /// is genesis-funded — mirroring a sharded testnet node.
     async fn test_state_with_faucet_on_shard(drip: u64, cap: u64, shard: ShardId) -> Arc<RpcState> {
         let key_seed = [0x11u8; 32];
-        let faucet_key = ed25519_dalek::SigningKey::from_bytes(&key_seed);
-        let faucet_addr = faucet_key.verifying_key().to_bytes();
+        // FULL-PQ: the faucet account is the Falcon-512 address derived from
+        // the seed (Faucet::account); fund that address, never a classical one.
+        // Funded for the PQ drip cost (amount + gas + activation surcharge,
+        // reserved jointly per pooled tx) across a full lifetime-cap burst.
+        let faucet_addr = {
+            let pq_key = crate::post_quantum::FalconKeypair::generate_from_seed_bytes(&key_seed);
+            crate::post_quantum::derive_pq_address(
+                crate::post_quantum::PqScheme::Falcon512,
+                &pq_key.public_key,
+                &crate::post_quantum::DEFAULT_SALT,
+            )
+        };
         let st = test_state().await;
         st.engine.set_shard_id(shard);
         st.engine
-            .update_account(AccountState::new(faucet_addr, 1_000_000))
+            .update_account(AccountState::new(faucet_addr, 100_000_000))
             .await;
         Arc::new(RpcState {
             faucet: Some(Arc::new(Faucet::new(key_seed, shard, drip, cap))),
@@ -11412,21 +11984,23 @@ mod tests {
     #[tokio::test]
     async fn send_raw_transaction_valid_and_forged() {
         let st = test_state().await;
-        let sk = SigningKey::generate(&mut OsRng);
+        // FULL-PQ: implicit Falcon-512 (registered globally; no surcharge).
+        let tx = pq_tx(0xB1, [1u8; 32], 10, 5, 0);
         // fund the sender so the balance check at admission passes
-        let from = sk.verifying_key().to_bytes();
         st.engine
-            .update_account(AccountState::new(from, 1_000_000))
+            .update_account(AccountState::new(tx.from, 1_000_000))
             .await;
-        let tx = Transaction::sign(&sk, [1u8; 32], 10, 5, 0, 1, 1);
         let raw = hex::encode(bincode::serialize(&tx).unwrap());
         let r = call(&st, "stell_sendRawTransaction", json!({ "tx": raw })).await;
         assert!(r.as_str().is_some(), "valid tx must be accepted: {r}");
         assert_eq!(st.mempool.read().await.len(), 1);
 
-        // forged signature must be rejected
+        // forged signature must be rejected (tamper the trailing signature
+        // bytes so the PQ envelope still parses and the verdict is the
+        // signature failure, not a decode refusal).
         let mut bad = tx.clone();
-        bad.signature[0] ^= 0xFF;
+        let last = bad.signature.len() - 1;
+        bad.signature[last] ^= 0xFF;
         let raw_bad = hex::encode(bincode::serialize(&bad).unwrap());
         let r2 = call(&st, "stell_sendRawTransaction", json!({ "tx": raw_bad })).await;
         assert!(r2["error"].as_str().unwrap().contains("signature"));
@@ -11447,15 +12021,13 @@ mod tests {
         let st = test_state().await;
         let meter = || crate::metrics::global().snapshot().unbound_tx as u64;
 
-        // UNBOUND: admitted, metered.
-        let sk = SigningKey::generate(&mut OsRng);
-        let from = sk.verifying_key().to_bytes();
+        // UNBOUND: admitted, metered. FULL-PQ: implicit Falcon-512, no chain.
+        let tx = pq_tx(0xB2, [1u8; 32], 10, 100_000, 0);
+        assert!(tx.chain_id().is_none(), "unbound PQ envelope has no chain");
         st.engine
-            .update_account(AccountState::new(from, 10_000_000))
+            .update_account(AccountState::new(tx.from, 10_000_000))
             .await;
         let before = meter();
-        let tx = Transaction::sign(&sk, [1u8; 32], 10, 100_000, 0, 1, 1);
-        assert!(tx.chain_id().is_none(), "legacy constructor is unbound");
         let raw = hex::encode(bincode::serialize(&tx).unwrap());
         let r = call(&st, "stell_sendRawTransaction", json!({ "tx": raw })).await;
         assert!(r.as_str().is_some(), "phase 1 still admits unbound: {r}");
@@ -11465,15 +12037,14 @@ mod tests {
             "one unbound admission meters exactly once"
         );
 
-        // BOUND (CH1 envelope): admitted, meter silent.
-        let sk2 = SigningKey::generate(&mut OsRng);
-        let from2 = sk2.verifying_key().to_bytes();
+        // BOUND (PQ chain envelope): admitted, meter silent.
+        // FULL-PQ: implicit Falcon-512 bound to the consensus chain id.
+        let bound = pq_tx_chain(0xB3, [1u8; 32], 10, 100_000, 0, Some(5757));
+        assert_eq!(bound.chain_id(), Some(5757));
         st.engine
-            .update_account(AccountState::new(from2, 10_000_000))
+            .update_account(AccountState::new(bound.from, 10_000_000))
             .await;
         let before2 = meter();
-        let bound = Transaction::sign_with_chain_id(&sk2, [1u8; 32], 10, 100_000, 0, 1, 1, 5757);
-        assert!(bound.is_chain_id_bound());
         let raw2 = hex::encode(bincode::serialize(&bound).unwrap());
         let r2 = call(&st, "stell_sendRawTransaction", json!({ "tx": raw2 })).await;
         assert!(r2.as_str().is_some(), "bound txs admit cleanly: {r2}");
@@ -11487,7 +12058,7 @@ mod tests {
     #[tokio::test]
     async fn status_and_receipt_report_confirmations() {
         let st = test_state().await;
-        let tx = receipt_tx([9u8; 32], 0);
+        let tx = receipt_tx(0x09, 0);
         let h = hex::encode(tx.compute_tx_hash());
 
         // Unknown: null confirmations.
@@ -11544,12 +12115,11 @@ mod tests {
             archive_store: None,
             shard_registry: ShardRegistry::single(),
         });
-        let sk = SigningKey::generate(&mut OsRng);
-        let from = sk.verifying_key().to_bytes();
+        // FULL-PQ: implicit Falcon-512 (registered globally; no surcharge).
+        let tx = pq_tx(0xB4, [1u8; 32], 10, 5, 0);
         st.engine
-            .update_account(AccountState::new(from, 1_000_000))
+            .update_account(AccountState::new(tx.from, 1_000_000))
             .await;
-        let tx = Transaction::sign(&sk, [1u8; 32], 10, 5, 0, 1, 1);
         let raw = hex::encode(bincode::serialize(&tx).unwrap());
 
         let r = call(&st, "stell_sendRawTransaction", json!({ "tx": raw })).await;
@@ -11558,7 +12128,19 @@ mod tests {
         // Must have been forwarded to the P2P gossip channel:
         let forwarded = tx_rx.try_recv().expect("must receive forwarded tx");
         assert_eq!(forwarded.amount, 10);
-        assert_eq!(forwarded.from, from);
+        // FULL-PQ sender: the PQ address derived from the test seed.
+        let (want_from, _) = {
+            let pk = crate::sharding::Transaction::sample_falcon512_pubkey(0xB4);
+            (
+                crate::post_quantum::derive_pq_address(
+                    crate::post_quantum::PqScheme::Falcon512,
+                    &pk,
+                    &crate::post_quantum::DEFAULT_SALT,
+                ),
+                pk,
+            )
+        };
+        assert_eq!(forwarded.from, want_from);
     }
 
     /// Phase-2 EVM settlement: `eth_sendRawTransaction` admits the mapped
@@ -11642,18 +12224,16 @@ mod tests {
             ))
             .await;
 
-        // 1. Funded sender: admitted to the real mempool, EVM hash returned.
+        // 1. FULL-PQ: the EVM settlement shape carries no PQ envelope, so
+        // even a funded EVM tx is refused at admission (EVM settlement is
+        // excised from the PQ-only intake path).
         let raw = hex::encode(sign_raw(0, value_wei));
         let r = call(&st, "eth_sendRawTransaction", json!([format!("0x{raw}")])).await;
-        let evm_hash = r.as_str().expect("EVM tx must be accepted: {r}");
-        assert!(evm_hash.starts_with("0x"));
-        assert_eq!(st.mempool.read().await.len(), 1);
-        let pooled: Vec<Transaction> = st.mempool.read().await.all();
-        assert_eq!(pooled.len(), 1);
-        assert!(pooled[0].is_evm());
-        assert_eq!(pooled[0].from, sender32);
-        assert_eq!(pooled[0].nonce, 0);
-        assert!(pooled[0].verify_signature());
+        assert!(
+            r.get("error").is_some(),
+            "EVM tx must be refused in FULL-PQ mode: {r}"
+        );
+        assert_eq!(st.mempool.read().await.len(), 0);
 
         // 2. Wrong chain (chain-1 vector) is rejected, pool unchanged.
         let chain1 = "f86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
@@ -11667,7 +12247,7 @@ mod tests {
             r2.get("error").is_some(),
             "foreign chain must be rejected: {r2}"
         );
-        assert_eq!(st.mempool.read().await.len(), 1);
+        assert_eq!(st.mempool.read().await.len(), 0);
 
         // 3. Unfunded sender is rejected by the balance gate, pool unchanged.
         let st_broke = test_state().await;
@@ -11705,12 +12285,11 @@ mod tests {
             archive_store: None,
             shard_registry: ShardRegistry::single(),
         });
-        let sk = SigningKey::generate(&mut OsRng);
-        let from = sk.verifying_key().to_bytes();
+        // FULL-PQ: implicit Falcon-512 (registered globally; no surcharge).
+        let tx = pq_tx(0xB5, [1u8; 32], 10, 5, 0);
         st.engine
-            .update_account(AccountState::new(from, 1_000_000))
+            .update_account(AccountState::new(tx.from, 1_000_000))
             .await;
-        let tx = Transaction::sign(&sk, [1u8; 32], 10, 5, 0, 1, 1);
         let raw = hex::encode(bincode::serialize(&tx).unwrap());
 
         let r = call(
@@ -11947,8 +12526,7 @@ mod tests {
             archive_store: None,
             shard_registry: ShardRegistry::single(),
         });
-        let victim = SigningKey::from_bytes(&[0x51u8; 32]);
-        let victim_addr = victim.verifying_key().to_bytes();
+        let (victim_addr, _) = pq_pair(0xC1);
         st.engine
             .update_account(AccountState::new(victim_addr, 1_000_000))
             .await;
@@ -11956,14 +12534,13 @@ mod tests {
             r#"(module (memory 1) (func (export "get") (param i64) (result i64) (local.get 0)))"#,
         )
         .expect("test wat compiles");
-        let mut forged = Transaction::sign_with_payload(
-            &victim,
+        // FULL-PQ: implicit Falcon-512 deploy vehicle.
+        let mut forged = pq_tx_payload(
+            0xC1,
             victim_addr,
             0,
             10_000,
             0,
-            1,
-            1,
             vec![crate::svm::OpCode::SysCallDeployContract { code: code.clone() }],
         );
         // Flip the claimed sender AFTER signing: the bytes no longer match the
@@ -11994,6 +12571,10 @@ mod tests {
     /// `stell_sendRawTransaction`, and it is THIN - it admits the wrapping
     /// transaction to the mempool and must not touch consensus state. The
     /// price only exists once a block carries it.
+    /// FULL-PQ: classical ed25519 feed verification is REMOVED (no PQ feed
+    /// path exists in this zone; `PriceFeedUpdate::verify` is always false),
+    /// so even a well-formed classical feed is refused fail-closed. The
+    /// token gate still fires first, and the refusal still writes nothing.
     #[tokio::test]
     async fn submit_price_feed_admits_without_writing_state_and_requires_token() {
         let base = test_state().await;
@@ -12015,22 +12596,21 @@ mod tests {
             archive_store: None,
             shard_registry: ShardRegistry::single(),
         });
-        let sender = SigningKey::from_bytes(&[0x07u8; 32]);
-        let from = sender.verifying_key().to_bytes();
+        // FULL-PQ: the wrapping tx is implicit Falcon-512; the feed itself
+        // stays publisher-signed (oracle path, outside tx admission).
+        let (from, _) = pq_pair(0xC2);
         st.engine
             .update_account(AccountState::new(from, 1_000_000))
             .await;
         let publisher = SigningKey::from_bytes(&[0x42u8; 32]);
         let feed =
             crate::oracle::PriceFeedUpdate::sign("STELL", 250_000, 1_700_000_000, &publisher);
-        let tx = Transaction::sign_with_payload(
-            &sender,
+        let tx = pq_tx_payload(
+            0xC2,
             from,
             0,
             10_000,
             0,
-            1,
-            1,
             vec![crate::svm::OpCode::SysCallSubmitPriceFeed(Box::new(feed))],
         );
         let raw = hex::encode(bincode::serialize(&tx).unwrap());
@@ -12047,6 +12627,9 @@ mod tests {
         assert!(denied2["error"].as_str().unwrap().contains("unauthorized"));
 
         // Thin: admitted, gossiped, and NOT written into state.
+        // FULL-PQ: the classical feed never verifies, so the authorized
+        // submission is refused fail-closed (nothing admitted, nothing
+        // written) — the THIN half of the property survives.
         let root_before = st.engine.get_state_root().await;
         let ok = call(
             &st,
@@ -12055,13 +12638,16 @@ mod tests {
         )
         .await;
         assert!(
-            ok.as_str().is_some(),
-            "authorized submission must be admitted: {ok}"
+            ok["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("validly signed price feed"),
+            "FULL-PQ: classical feed must be refused fail-closed: {ok}"
         );
         assert_eq!(
             st.mempool.read().await.len(),
-            1,
-            "it belongs in the mempool"
+            0,
+            "refused feed must not enter the mempool"
         );
         assert_eq!(
             st.engine.get_state_root().await,
@@ -12074,7 +12660,7 @@ mod tests {
         );
 
         // Only a payload that actually carries a signed feed may use this method.
-        let plain = Transaction::sign(&sender, from, 1, 1_000, 1, 1, 1);
+        let plain = pq_tx(0xC2, from, 1, 1_000, 1);
         let wrong = call(
             &st,
             "stell_submitPriceFeed",
@@ -12087,6 +12673,9 @@ mod tests {
         );
 
         // And a feed whose SIGNATURE does not check out is refused the same way.
+        // FULL-PQ: swapping the payload after the wrapper was signed breaks
+        // the WRAPPER signature, so the wrapper check fires first — still a
+        // refusal with nothing pooled.
         let mut tampered = tx.clone();
         tampered.payload = vec![crate::svm::OpCode::SysCallSubmitPriceFeed(Box::new(
             crate::oracle::PriceFeedUpdate::sign("STELL", 1, 1_700_000_000, &publisher),
@@ -12101,7 +12690,7 @@ mod tests {
             bad["error"].as_str().unwrap().contains("signature"),
             "a payload swapped after signing must fail verification: {bad}"
         );
-        assert_eq!(st.mempool.read().await.len(), 1, "nothing else got in");
+        assert_eq!(st.mempool.read().await.len(), 0, "nothing else got in");
     }
 
     /// Nonce-gap fail-fast must cover the shared `stell_submit*` admission
@@ -12109,25 +12698,28 @@ mod tests {
     /// `stell_submitPriceFeed` is refused exactly like via
     /// `stell_sendRawTransaction`, instead of clogging the pool behind an
     /// unreachable head.
+    /// FULL-PQ: no classical feed verifies (no PQ feed path in this zone),
+    /// so the signed-feed gate fires BEFORE the nonce-gap check — the gapped
+    /// wrapper is refused as an unsigned feed, still with nothing pooled.
+    /// Nonce-gap ordering itself stays pinned at the mempool choke point
+    /// (`nonce_gap_rejects_far_future_at_admission`).
     #[tokio::test]
     async fn submit_price_feed_rejects_far_future_nonce() {
         let st = test_state().await;
-        let sender = SigningKey::from_bytes(&[0x07u8; 32]);
-        let from = sender.verifying_key().to_bytes();
+        // FULL-PQ: implicit Falcon-512 wrapper; feed stays publisher-signed.
+        let (from, _) = pq_pair(0xC3);
         st.engine
             .update_account(AccountState::new(from, 1_000_000))
             .await;
         let publisher = SigningKey::from_bytes(&[0x42u8; 32]);
         let feed =
             crate::oracle::PriceFeedUpdate::sign("STELL", 250_000, 1_700_000_000, &publisher);
-        let gapped = Transaction::sign_with_payload(
-            &sender,
+        let gapped = pq_tx_payload(
+            0xC3,
             from,
             0,
             10_000,
             crate::mempool::Mempool::NONCE_FUTURE_WINDOW + 5,
-            1,
-            1,
             vec![crate::svm::OpCode::SysCallSubmitPriceFeed(Box::new(feed))],
         );
         let r = call(
@@ -12140,7 +12732,7 @@ mod tests {
             r["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("nonce gap"),
+                .contains("validly signed price feed"),
             "far-future-nonce payload tx must be refused: {r}"
         );
         assert_eq!(
@@ -12221,21 +12813,79 @@ mod tests {
     // `stell_getProof`
     // ------------------------------------------------------------------
 
-    /// A light client that trusts `state_root` — the same root the node
-    /// serves — so the node's answer can be checked against a trusted header.
-    fn light_client_for(state_root: [u8; 32]) -> crate::light_client::LightClient {
-        use crate::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
-        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]);
-        let validators = ValidatorSet::from_list(vec![(signer.verifying_key().to_bytes(), 1)]);
-        let block_hash = [0x88u8; 32];
-        let vote = Vote::sign(&signer, 1, 0, VoteKind::Precommit, Some(block_hash));
-        let cert = QuorumCertificate {
-            height: 1,
+    /// FULL-PQ anchoring QC for the light-client fixtures: a Falcon µQC
+    /// envelope (the green `qc_verification_*` idiom from the consensus
+    /// tests) plus the plain voter entry the light-client power pre-check
+    /// counts. The entry payload is inert metadata — the envelope is the
+    /// proof. Single-member set: the committee IS the validator.
+    fn pq_anchor_cert(
+        val_id: [u8; 32],
+        fk: &crate::post_quantum::FalconKeypair,
+        validators: &crate::consensus::ValidatorSet,
+        height: u64,
+        block_hash: [u8; 32],
+    ) -> crate::consensus::QuorumCertificate {
+        use crate::consensus::{
+            derive_sortition_committee, encode_pq_micro_envelope, micro_committee_size,
+            vote_sign_bytes, PqMicroCertificate, QuorumCertificate, VoteKind,
+            PQ_UQC_MARKER_ID,
+        };
+        let parent = [0u8; 32];
+        let committee_size = micro_committee_size(validators.len());
+        let committee =
+            derive_sortition_committee(validators, height, 0, committee_size, &parent);
+        let msg = vote_sign_bytes(height, 0, VoteKind::Precommit, &Some(block_hash));
+        let mut bitmask = vec![0u8; (committee_size as usize).div_ceil(8)];
+        let mut msigs = Vec::new();
+        for (i, id) in committee.iter().enumerate() {
+            assert_eq!(
+                *id, val_id,
+                "single-member fixture: the committee is the validator"
+            );
+            bitmask[i / 8] |= 1 << (i % 8);
+            msigs.push(fk.sign(&msg));
+        }
+        let uqc = PqMicroCertificate::new(
+            crate::post_quantum::PqScheme::Falcon512,
+            height,
+            0,
+            committee_size,
+            bitmask,
+            msigs,
+            parent,
+        );
+        QuorumCertificate {
+            height,
             round: 0,
             kind: VoteKind::Precommit,
             block_hash: Some(block_hash),
-            signatures: vec![(vote.voter, vote.signature)],
-        };
+            signatures: vec![
+                (val_id, fk.sign(&msg)),
+                (PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc)),
+            ],
+        }
+    }
+
+    /// A light client that trusts `state_root` — the same root the node
+    /// serves — so the node's answer can be checked against a trusted header.
+    /// FULL-PQ: the anchor carries the Falcon µQC above (a classical
+    /// vote-list QC no longer verifies).
+    fn light_client_for(state_root: [u8; 32]) -> crate::light_client::LightClient {
+        use crate::consensus::ValidatorSet;
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed_bytes(&[0x77u8; 32]);
+        let val_id = crate::post_quantum::derive_pq_address(
+            crate::post_quantum::PqScheme::Falcon512,
+            &fk.public_key,
+            &crate::post_quantum::DEFAULT_SALT,
+        );
+        crate::consensus::register_validator_pq_key(
+            val_id,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+        let validators = ValidatorSet::from_list(vec![(val_id, 1)]);
+        let block_hash = [0x88u8; 32];
+        let cert = pq_anchor_cert(val_id, &fk, &validators, 1, block_hash);
         let checkpoint =
             crate::light_client::Checkpoint::new(1, block_hash, [0u8; 32], state_root, cert);
         crate::light_client::LightClient::new(validators, checkpoint).expect("light client")
@@ -12569,20 +13219,18 @@ mod tests {
             archive_store: None,
             shard_registry: ShardRegistry::single(),
         });
-        let sender = SigningKey::from_bytes(&[0x07u8; 32]);
-        let from = sender.verifying_key().to_bytes();
+        // FULL-PQ: implicit Falcon-512 wrapper (registered globally).
+        let (from, _) = pq_pair(0xC8);
         st.engine
             .update_account(AccountState::new(from, 1_000_000))
             .await;
 
-        let buy = Transaction::sign_with_payload(
-            &sender,
+        let buy = pq_tx_payload(
+            0xC8,
             from,
             0,
             crate::svm::GAS_PMM_BUY,
             0,
-            1,
-            1,
             vec![crate::svm::OpCode::SysCallPmmBuy {
                 usdt_micro: 250_000,
             }],
@@ -12646,13 +13294,11 @@ mod tests {
         );
 
         // The matching sell payload is admitted the same thin way.
-        let sell = Transaction::sign_with_payload(
-            &sender,
+        let sell = pq_tx_payload(
+            0xC8,
             from,
             0,
             crate::svm::GAS_PMM_SELL,
-            1,
-            1,
             1,
             vec![crate::svm::OpCode::SysCallPmmSell { stell_nano: 1_000 }],
         );
@@ -12690,7 +13336,7 @@ mod tests {
         // match the proposer exactly.
         let proposer = test_state().await;
         let adopter = test_state().await;
-        let txs = vec![receipt_tx([11u8; 32], 0), receipt_tx([12u8; 32], 1)];
+        let txs = vec![receipt_tx(11, 0), receipt_tx(12, 1)];
         let bh = [0xBBu8; 32];
         proposer
             .record_receipts(77, bh, &txs, &[true, false], &[1, 0])
@@ -12915,7 +13561,6 @@ mod tests {
     }
 
     async fn archive_fixture() -> (Arc<RpcState>, ArchiveFixture) {
-        use crate::consensus::{QuorumCertificate, Vote, VoteKind};
         use crate::sharding::{Block, MASTERCHAIN_SHARD};
         use crate::state_engine::AccountState;
 
@@ -12926,6 +13571,15 @@ mod tests {
         ));
         let store = Arc::new(crate::storage::Storage::open(&dir).unwrap());
         let signer = SigningKey::generate(&mut OsRng);
+        // FULL-PQ: the proposer id's Falcon key is registered globally so
+        // the anchoring µQC below verifies (the `qc_verification_*` idiom
+        // from the consensus tests).
+        let falcon = crate::post_quantum::FalconKeypair::generate();
+        crate::consensus::register_validator_pq_key(
+            signer.verifying_key().to_bytes(),
+            crate::post_quantum::PqScheme::Falcon512,
+            falcon.public_key.clone(),
+        );
 
         let engine = Arc::new(InMemoryStateEngine::new());
         let account = [0xA1u8; 32];
@@ -12990,14 +13644,13 @@ mod tests {
         let h_h = store.put_block(&b_h).unwrap();
         let mut b_next = mk(tip, h_h, root);
         let h_next = b_next.compute_hash();
-        let vote = Vote::sign(&signer, tip, 0, VoteKind::Precommit, Some(h_next));
-        b_next.precommit_qc = Some(QuorumCertificate {
-            height: tip,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(h_next),
-            signatures: vec![(vote.voter, vote.signature)],
-        });
+        // FULL-PQ: the anchoring QC is the Falcon µQC (a classical
+        // vote-list QC no longer verifies).
+        let val_id = signer.verifying_key().to_bytes();
+        let vset =
+            crate::consensus::ValidatorSet::from_list(vec![(val_id, 1)]);
+        let cert = pq_anchor_cert(val_id, &falcon, &vset, tip, h_next);
+        b_next.precommit_qc = Some(cert);
         store.put_block(&b_next).unwrap();
         store.set_finalized(tip, &h_next).unwrap();
 
@@ -13304,7 +13957,9 @@ mod tests {
         ));
         let store = crate::storage::Storage::open(&dir).unwrap();
         let sk = SigningKey::generate(&mut OsRng);
-        let tx = receipt_tx(sk.verifying_key().to_bytes(), 0);
+        // FULL-PQ: receipt fixture is implicit Falcon-512; the block
+        // proposer key stays classical (block path untouched).
+        let tx = receipt_tx(0xC5, 0);
         let transactions = vec![tx.clone()];
         let order_merkle_root = crate::mev::compute_order_merkle_root(&transactions);
         let mut b = crate::sharding::Block {
@@ -14338,19 +14993,17 @@ mod tests {
         let st = test_state().await;
         let code = counter_getter_wasm();
 
-        let key = ed25519_dalek::SigningKey::generate(&mut OsRng);
-        let from = key.verifying_key().to_bytes();
+        // FULL-PQ: implicit Falcon-512 wrapper (registered globally).
+        let (from, _) = pq_pair(0xC6);
         // Funded, so the admitted tx can actually apply at block time.
         st.engine
             .update_account(AccountState::new(from, 1_000_000_000))
             .await;
-        let tx = Transaction::sign_with_payload(
-            &key,
+        let tx = pq_tx_payload(
+            0xC6,
             [0u8; 32],
             0,
             15_000_000,
-            0,
-            0,
             0,
             vec![crate::svm::OpCode::SysCallDeployContract { code: code.clone() }],
         );
@@ -14593,19 +15246,17 @@ mod tests {
 
         // 2. The funded `tx` form previews the same answer, admits the tx,
         // and still changes nothing — until block application.
-        let caller = ed25519_dalek::SigningKey::from_bytes(&[0xC4u8; 32]);
-        let caller_addr = caller.verifying_key().to_bytes();
+        // FULL-PQ: implicit Falcon-512 caller.
+        let (caller_addr, _) = pq_pair(0xC7);
         st.engine
             .update_account(AccountState::new(caller_addr, 1_000_000_000))
             .await;
         let root_after_funding = st.engine.get_state_root().await;
-        let call_tx = Transaction::sign_with_payload(
-            &caller,
+        let call_tx = pq_tx_payload(
+            0xC7,
             counter,
             0,
             1_000_000,
-            0,
-            0,
             0,
             vec![crate::svm::OpCode::SysCallCallContract {
                 contract: counter,
@@ -15115,11 +15766,11 @@ mod tests {
         let contract_addr = [0x77u8; 32];
         let contract_hex = hex::encode(contract_addr);
 
-        let tx = receipt_tx([0x33u8; 32], 0);
+        let tx = receipt_tx(0x33, 0);
         let tx_hash = tx.compute_tx_hash();
         let tx_hash_hex = hex::encode(tx_hash);
 
-        let plain_tx = receipt_tx([0x44u8; 32], 0);
+        let plain_tx = receipt_tx(0x44, 0);
         let plain_tx_hash = plain_tx.compute_tx_hash();
         let plain_tx_hex = hex::encode(plain_tx_hash);
 
@@ -15552,7 +16203,7 @@ mod tests {
             })
             .expect("subscribe");
 
-        let tx = receipt_tx([7u8; 32], 0);
+        let tx = receipt_tx(7, 0);
         let tx_hash = tx.compute_tx_hash();
         st.record_receipts_with_events(
             77,
@@ -16906,7 +17557,7 @@ mod tests {
                 let mut from = [0u8; 32];
                 from[0..8]
                     .copy_from_slice(&(i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
-                receipt_tx(from, i as u64)
+                receipt_tx(from[0].wrapping_add(from[7]).wrapping_add(i as u8), i as u64)
             })
             .collect()
     }

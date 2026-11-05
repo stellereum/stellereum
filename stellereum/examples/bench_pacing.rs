@@ -311,9 +311,6 @@ async fn run_benchmark(mode: BenchmarkMode, total_txs: usize, pacing_ms: u64) ->
                 signers_bitmask: bitmask,
                 signatures,
                 sortition_parent: parent,
-                // Predates the phase-3 VRF seal (mechanical fallout of the new
-                // trailing field): legacy draw.
-                vrf_beacon: None,
             };
 
             for node in &mut cluster.nodes {

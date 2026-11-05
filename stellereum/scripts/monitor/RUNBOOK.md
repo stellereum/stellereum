@@ -2,7 +2,7 @@
 
 Companion to `check.sh` (fast triage), `alerts.rules` (what pages) and
 `prometheus.yml` (what is scraped). All commands assume you are on the box
-(`ssh root@212.113.103.105`); gateway = `127.0.0.1:8080`, RPC = `8545` (A) /
+(`ssh root@<node-A-host>`); gateway = `127.0.0.1:8080`, RPC = `8545` (A) /
 `8546` (B), logs = `/root/nodeA/current.log`, `/root/nodeB/current.log`,
 control script = `/root/stellereum/scripts/stell-node.sh`
 (or `./scripts/stell-node.sh` from a repo checkout with `STELL_ROOT=/root`).

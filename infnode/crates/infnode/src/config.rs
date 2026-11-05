@@ -20,30 +20,23 @@ fn default_unknown_allow() -> Vec<String> {
     ]
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct PeerConfig {
     pub name: String,
-    /// Legacy pinned classical id (`inf1:`). Retained for frozen
-    /// handshake/TLS-pin/DHT call sites (out of zone); NOT the canonical
-    /// `NodeId` in FULL-PQ (canonical = PQ id from `pq_pub` via
-    /// `primary_id`). Follow-up owns its removal once those call sites
-    /// migrate (grep: `node_id_raw` live users in `node.rs`).
-    pub node_id: String,
-    /// Legacy pinned Ed25519 key. Retained for frozen handshake-auth/TLS
-    /// (`PinnedVerifier`, `ed_bytes` call sites); NOT identity in FULL-PQ.
-    /// Follow-up owns removal (grep-proof: live users, see report).
+    /// Pinned Ed25519 key (32 bytes hex). Retained for frozen handshake-auth
+    /// (`PinnedVerifier`, signature `VerifyingKey` checks) and TLS SPKI pin.
+    /// NOT identity in FULL-PQ (identity is PQ-only via `pq_pub`/`primary_id`).
+    /// Auth/TLS policy is frozen (sibling owns); this pin stays until the
+    /// Falcon-TLS/auth follow-up migrates those call sites.
     pub ed_pub: String,
-    /// Legacy pinned X25519 key. Retained for frozen transport-crypto
-    /// (`x_bytes`, X3DH session derivation); NOT identity in FULL-PQ.
-    /// Follow-up owns removal (grep-proof: live users, see report).
-    pub x_pub: String,
     /// Falcon-512 long-term PQ public key (897 bytes, hex). MANDATORY in
     /// FULL-PQ (a peer without it is refused by `primary_id` /
-    /// `dual_announce_ids`). Kept `Option` in serde shape only so old
-    /// operator configs still parse (then fail closed with a clear error
-    /// instead of a serde break).
-    #[serde(default)]
+    /// `dual_announce_ids`). `Option` in the in-memory shape only so
+    /// dynamically discovered (DHT/TOFU) peers — constructed in code, never
+    /// parsed — can exist without a pin (they fail closed at `primary_id`
+    /// and at the KEM-only handshake); parsed operator configs MUST carry
+    /// it (see manual `Deserialize` impl: missing/legacy fails LOUDLY).
     pub pq_pub: Option<String>,
     pub endpoints: Vec<String>,
     #[serde(default = "default_allow")]
@@ -57,6 +50,92 @@ pub struct PeerConfig {
     /// роль хранения пира: ["mail"] / ["files"] / обе (пусто = все бакеты)
     #[serde(default)]
     pub storage_roles: Vec<String>,
+}
+
+// Manual `Deserialize` for FULL-PQ wipe (nodes wiped, no compat):
+// - `node_id` / `x_pub` REMOVED (identity is PQ-only via `pq_pub`;
+//   X3DH leg cut by sibling — no static X25519 remains).
+//   Presence fails LOUDLY with a migration error (never silent, never
+//   ignored via `deny_unknown_fields` generic message).
+// - `pq_pub` MANDATORY for parsed configs: absent fails LOUDLY.
+// - `ed_pub` REQUIRED (frozen auth/TLS pin, sibling owns).
+impl<'de> serde::Deserialize<'de> for PeerConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct Helper {
+            name: String,
+            #[serde(default)]
+            node_id: Option<String>,
+            ed_pub: Option<String>,
+            #[serde(default)]
+            x_pub: Option<String>,
+            #[serde(default)]
+            pq_pub: Option<String>,
+            #[serde(default)]
+            endpoints: Vec<String>,
+            #[serde(default = "default_allow")]
+            allow: Vec<String>,
+            #[serde(default)]
+            rate_limit_per_sec: u32,
+            #[serde(default)]
+            role: Option<String>,
+            #[serde(default)]
+            storage_roles: Vec<String>,
+        }
+        let h = Helper::deserialize(deserializer)?;
+        if h.node_id.is_some() {
+            return Err(serde::de::Error::custom(format!(
+                "peer '{}' uses removed field `node-id`: FULL-PQ wipe — delete `node-id`/`ed-pub`/`x-pub` classical pins, set `pq-pub` (Falcon-512, 897 bytes hex); nodes wiped, no compat",
+                h.name
+            )));
+        }
+        if h.x_pub.is_some() {
+            return Err(serde::de::Error::custom(format!(
+                "peer '{}' uses removed field `x-pub`: FULL-PQ wipe (X3DH leg cut, no static X25519) — delete `node-id`/`x-pub`, keep `ed-pub` (frozen auth/TLS pin) + set mandatory `pq-pub`; nodes wiped, no compat",
+                h.name
+            )));
+        }
+        let ed_pub = h.ed_pub.ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "peer '{}' missing `ed-pub` (frozen auth/TLS pin, still required)",
+                h.name
+            ))
+        })?;
+        let pq_pub = h.pq_pub.filter(|s| !s.is_empty());
+        let Some(pq_pub) = pq_pub else {
+            return Err(serde::de::Error::custom(format!(
+                "peer '{}' missing mandatory `pq-pub` (FULL-PQ wipe: classical-only peer refused; provide Falcon-512 pq_pub hex)",
+                h.name
+            )));
+        };
+        // Fail fast on malformed PQ pin (same rule as `pq_bytes`: 897 bytes hex).
+        let pq_bytes = hex::decode(&pq_pub).map_err(|_| {
+            serde::de::Error::custom(format!(
+                "peer '{}' has malformed `pq-pub` (must be 897 bytes hex)",
+                h.name
+            ))
+        })?;
+        if pq_bytes.len() != crate::proto::PQ_FALCON_PK_LEN {
+            return Err(serde::de::Error::custom(format!(
+                "peer '{}' has malformed `pq-pub` (must be 897 bytes hex)",
+                h.name
+            )));
+        }
+        Ok(PeerConfig {
+            name: h.name,
+            ed_pub,
+            pq_pub: Some(pq_pub),
+            endpoints: h.endpoints,
+            allow: h.allow,
+            rate_limit_per_sec: h.rate_limit_per_sec,
+            role: h.role,
+            storage_roles: h.storage_roles,
+        })
+    }
 }
 
 impl PeerConfig {
@@ -75,31 +154,17 @@ impl PeerConfig {
         out
     }
 
-    pub fn node_id_raw(&self) -> Result<[u8; 20]> {
-        let s = self
-            .node_id
-            .strip_prefix(NODEID_PREFIX)
-            .unwrap_or(&self.node_id);
-        let b = hex::decode(s)?;
-        b.try_into()
-            .map_err(|_| anyhow!("node_id должен быть 20 байт"))
-    }
-
     pub fn ed_bytes(&self) -> Result<[u8; 32]> {
         let b = hex::decode(&self.ed_pub)?;
         b.try_into()
             .map_err(|_| anyhow!("ed_pub должен быть 32 байта"))
     }
 
-    pub fn x_bytes(&self) -> Result<[u8; 32]> {
-        let b = hex::decode(&self.x_pub)?;
-        b.try_into()
-            .map_err(|_| anyhow!("x_pub должен быть 32 байта"))
-    }
-
     /// Raw Falcon-512 public key, or `None` when absent (absent = refused
     /// by `primary_id`/`dual_announce_ids`, never silently classical).
     /// A present-but-malformed value is a hard error (fail closed).
+    /// `None` only occurs for code-constructed dynamic (DHT/TOFU) peers;
+    /// parsed configs always carry `Some` (enforced at parse).
     pub fn pq_bytes(&self) -> Result<Option<[u8; crate::proto::PQ_FALCON_PK_LEN]>> {
         let Some(s) = self.pq_pub.as_deref() else {
             return Ok(None);

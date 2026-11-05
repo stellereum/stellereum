@@ -1136,36 +1136,50 @@ fn build_validator_set(
     self_node_id_hex: &str,
     observer: bool,
 ) -> (ValidatorSet, bool) {
-    // Peers whose node id is listed in `validators:`, canonicalised the way infnode
-    // computes a node id (`blake3(ed_pub)[..20]`). A malformed peer is skipped.
+    // Peers whose ed-derived id is listed in `validators:`, with the id
+    // computed as infnode used to (`blake3(ed_pub)[..20]`). FULL-PQ: peer
+    // configs no longer carry a declared `node-id` (identity is PQ-only via
+    // `pq_pub`), so there is nothing to lie about — the id is DERIVED from
+    // the pinned key, never declared. The validator set itself still pins the
+    // frozen auth key (ed): a peer contributes its key iff its derived id is
+    // listed. A malformed peer is skipped.
     let mut from_peers: Vec<[u8; 32]> = Vec::new();
     for p in &cfg.peers {
-        let Ok(raw) = p.node_id_raw() else { continue };
-        let raw_hex = hex::encode(raw);
+        let Ok(ed) = p.ed_bytes() else { continue };
+        let computed = blake3::hash(&ed);
+        let raw_hex = hex::encode(&computed.as_bytes()[..20]);
         let listed = cfg
             .validators
             .iter()
             .any(|v| v.strip_prefix("inf1:").unwrap_or(v) == raw_hex);
         if listed {
-            if let Ok(ed) = p.ed_bytes() {
-                // F6 binding: the declared node_id MUST be blake3(ed_pub)[..20].
-                // A typo (or a doctored config) naming the wrong id would
-                // otherwise install a stranger's key into the validator set
-                // — or silently drop a real validator. Fail-closed: skip loudly.
-                let computed = blake3::hash(&ed);
-                if computed.as_bytes()[..20] != raw[..] {
-                    eprintln!(
-                        "[config] WARNING: peer '{}' declares node id {} but blake3(ed_pub)[..20] is {}; SKIPPING (not added to validator set)",
-                        p.name,
-                        raw_hex,
-                        hex::encode(&computed.as_bytes()[..20])
-                    );
-                    continue;
-                }
-                if ed == self_ed {
-                    continue; // a peer entry for ourselves; handled below
-                }
-                from_peers.push(ed);
+            // F6 binding (structural now): the listed id MUST be blake3(ed_pub)[..20].
+            // A typo (or a doctored config) naming the wrong id would
+            // otherwise install a stranger's key into the validator set
+            // — or silently drop a real validator. Fail-closed: skip loudly.
+            if ed == self_ed {
+                continue; // a peer entry for ourselves; handled below
+            }
+            from_peers.push(ed);
+        }
+    }
+    // Typo tripwire (F6 spirit): a listed id matching NO peer key is almost
+    // certainly a doctored config — loud, but non-fatal (the set stays a pure
+    // function of the file; an unknown id simply contributes nobody).
+    {
+        use std::collections::HashSet;
+        let known: HashSet<String> = cfg
+            .peers
+            .iter()
+            .filter_map(|p| p.ed_bytes().ok())
+            .map(|ed| hex::encode(&blake3::hash(&ed).as_bytes()[..20]))
+            .collect();
+        for v in &cfg.validators {
+            let listed = v.strip_prefix("inf1:").unwrap_or(v);
+            if !known.contains(listed) && listed != self_node_id_hex.strip_prefix("inf1:").unwrap_or(self_node_id_hex) {
+                eprintln!(
+                    "[config] WARNING: validators entry {v} matches no peer key (nor self); SKIPPING (contributes nobody)"
+                );
             }
         }
     }
@@ -5733,7 +5747,6 @@ async fn run_consensus_node(
                             domains,
                             session_keys,
                             bridge,
-                            confidential,
                             zkml_models,
                         } = bundle;
                         // Serialize on the blocking pool. Bytes are identical to
@@ -5770,7 +5783,6 @@ async fn run_consensus_node(
                                 domain_bytes.clone(),
                                 session_keys.clone(),
                                 bridge.clone(),
-                                confidential.clone(),
                                 zkml_models.clone(),
                                 cross_shard.clone(),
                             );
@@ -5797,7 +5809,6 @@ async fn run_consensus_node(
                                 ("domains", domain_bytes.clone()),
                                 ("session", session_keys.clone()),
                                 ("bridge", bridge.clone()),
-                                ("confidential", confidential.clone()),
                                 ("zkml", zkml_models.clone()),
                                 ("cross_shard", cross_shard.clone()),
                             ];
@@ -7479,6 +7490,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             let data_dir = PathBuf::from("./data");
             let keys_dir = PathBuf::from("./keys");
             let keys = stellereum::node_keys::load_or_generate_node_keys(&keys_dir)?;
+            // PQ identity (Falcon-512, first-boot generated): the transport
+            // NodeId is PQ-only (`ceremony_local_id`); the ed key above stays
+            // the consensus validator key (frozen staking world).
+            let pq_keys = infnode::keyring::PqKeys::load_or_generate(&keys_dir)?;
             let validator_key = keys.signing.clone();
             let validator_pub = keys.verifying.to_bytes();
             // NOTE: genesis accounts are funded AFTER the validator set is known
@@ -7503,14 +7518,21 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
             if config.exists() {
                 info!("Bootstrapping infnode P2P transport from {:?}", config);
                 let node_cfg = node_config::load(&config)?;
-                let node = Node::new(node_cfg, keys, data_dir, config.clone()).await?;
+                let node = Node::new(node_cfg, keys, pq_keys, data_dir, config.clone()).await?;
                 let adapter = Arc::new(P2pNetworkAdapter::new(node));
 
+                // NODE IDENTITY: id is the PQ-only transport id
+                // (`ceremony_local_id`); ed is the consensus validator key;
+                // kem is the blake3 fingerprint of the ML-KEM-768 ek (the full
+                // 1184B key is never printed — it travels the protocol, not logs).
+                let kem_fp = hex::encode(
+                    &blake3::hash(&adapter.node.keys.kem_ek).as_bytes()[..8],
+                );
                 info!(
-                    "NODE IDENTITY: id={} ed={} x={} listen={}",
+                    "NODE IDENTITY: id={} ed={} kem_fp={} listen={}",
                     adapter.node.id_hex,
                     adapter.node.keys.ed_hex(),
-                    adapter.node.keys.x_hex(),
+                    kem_fp,
                     adapter.node.cfg.listen
                 );
 
@@ -9578,7 +9600,7 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                     2,
                     "snapshot-sync: newest usable boundary (latest-snapshot pointer when sane), \
                      state + EVERY domain (accounts incl. the staking LEDGER, domains, session, \
-                     bridge, confidential, zkml, cross_shard), tail-anchored QC proof, \
+                     bridge, zkml, cross_shard), tail-anchored QC proof, \
                      root-checked BEFORE commit — stale domains are rejected with a retry, \
                      never committed"
                 )
@@ -9643,10 +9665,10 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 let keys = stellereum::node_keys::load_or_generate_node_keys(&keys_dir)?;
                 let falcon = stellereum::node_keys::load_or_generate_falcon_key(&falcon_path)?;
                 println!(
-                    "NODE IDENTITY: id={} ed={} x={} falcon={}",
+                    "NODE IDENTITY: id={} ed={} kem_ek={} falcon={}",
                     keys.id_hex(),
                     keys.ed_hex(),
-                    keys.x_hex(),
+                    keys.kem_ek_hex(),
                     hex::encode(&falcon.public_key),
                 );
                 println!("keys dir: {} (0700), files 0600", keys_dir.display());
@@ -9675,13 +9697,15 @@ it off everywhere and let the exit-code-42 path do the restart.\n\
                 })?;
                 let id_hex = keys.id_hex();
                 let ed_hex = keys.ed_hex();
-                let x_hex = keys.x_hex();
                 let falcon_hex = hex::encode(&falcon.public_key);
                 println!("# === STELLEREUM PEER STANZA (send this block to the network admin) ===");
                 println!("  - name: {name}");
-                println!("    node-id: \"{id_hex}\"");
+                // FULL-PQ: no `node-id:`/`x-pub:` (removed fields) — identity
+                // is the Falcon key below; the `validators:` entry still pins
+                // the ed-derived id (frozen staking world, see
+                // `build_validator_set`).
                 println!("    ed-pub: \"{ed_hex}\"");
-                println!("    x-pub: \"{x_hex}\"");
+                println!("    pq-pub: \"{falcon_hex}\"");
                 println!("    endpoints: [\"{endpoint}\"]");
                 println!("    allow: [\"*\"]");
                 println!("# validators entry (admin adds the id to every node's `validators:`):");
@@ -10946,16 +10970,13 @@ mod dns_seed_guard_tests {
     use super::*;
 
     fn peer(name: &str, ed: [u8; 32]) -> node_config::PeerConfig {
-        let id = {
-            let h = blake3::hash(&ed);
-            format!("inf1:{}", hex::encode(&h.as_bytes()[..20]))
-        };
         node_config::PeerConfig {
             name: name.to_string(),
-            node_id: id,
             ed_pub: hex::encode(ed),
-            x_pub: hex::encode([ed[0] ^ 0xFF; 32]),
-            pq_pub: None, // GATE: classical-only test fixture
+            // In-code fixture: PQ pin optional in memory (parsed operator
+            // configs must carry it). The validator-set derivation below keys
+            // on the ed pin, so fixtures stay classical-shaped here.
+            pq_pub: None,
             endpoints: vec!["127.0.0.1:9411".to_string()],
             allow: vec!["*".to_string()],
             rate_limit_per_sec: 0,
@@ -11033,22 +11054,22 @@ mod dns_seed_guard_tests {
     }
 
     #[test]
-    fn peer_with_mismatched_node_id_is_skipped_not_installed() {
-        // F6: a peer entry whose declared node_id is not blake3(ed_pub)[..20]
-        // (typo or doctored config) must NOT contribute its key to the set.
-        // The peer claims OUR id and our id is listed, so the entry reaches
-        // the binding check — which must refuse it.
+    fn unlisted_peer_key_is_excluded_from_validator_set() {
+        // F6 (structural now): peer configs carry NO declared node-id — the
+        // id is derived from the pinned ed key, so a doctored config can no
+        // longer claim our id for a stranger's key (the old lie is
+        // inexpressible). What remains pinned: a peer whose derived id is NOT
+        // listed contributes nothing.
         let self_ed = [0x11u8; 32];
         let peer_ed = [0x22u8; 32];
-        let mut bad = peer("b", peer_ed);
-        bad.node_id = node_id_hex(&self_ed); // lie: claim our id
+        let stranger = peer("b", peer_ed); // derived id != listed self id
         let validators = vec![node_id_hex(&self_ed)];
-        let cfg = cfg_with(vec![bad], validators);
+        let cfg = cfg_with(vec![stranger], validators);
         let (vset, is_val) = build_validator_set(&cfg, self_ed, &node_id_hex(&self_ed), false);
         assert!(is_val, "we are listed, self stays a validator");
         assert!(
             !vset.contains(&peer_ed),
-            "mismatched peer key must not enter the validator set"
+            "unlisted peer key must not enter the validator set"
         );
         assert_eq!(vset.len(), 1, "only self remains");
     }
@@ -11121,7 +11142,7 @@ mod dns_seed_guard_tests {
         let clone_of_validator = stellereum::dns_seeds::DiscoveredPeer {
             node_id: node_id_hex(&validator_ed),
             ed_pub: validator_ed,
-            x_pub: None,
+            kem_ek_hash: None,
             host: "evil.example".to_string(),
             port: 9411,
         };

@@ -65,6 +65,7 @@
 //! transaction, and the fee of a dropped sealed transaction is charged as a
 //! node-local admission bond, not as an on-chain transfer.
 
+use crate::mev_kem_registry::MevKemRegistry;
 use crate::post_quantum::{FalconKeypair, PqScheme, verify_pq_signature};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -1738,6 +1739,105 @@ impl EpochDkg {
             ));
         }
         self.ingest_authenticated_pq(envelope, own_kem_seed, expected_falcon_pk)
+    }
+
+    /// Build our DKG contribution with recipient KEM keys resolved from the
+    /// MEV committee KEM registry (the registry-wired [`Self::contribution_pq`]).
+    ///
+    /// Every OTHER committee member's encapsulation key is read at `height`
+    /// via [`MevKemRegistry::get_active_ek`] (so a rotation is honored from
+    /// its effective height). Fail-closed: an UNREGISTERED recipient (or one
+    /// with no key at this height) is an `Err` — never a classical package,
+    /// never a skipped recipient (a missing package would desynchronise the
+    /// aggregate key across nodes). Threshold math, Feldman commitments and
+    /// the own-evaluation bookkeeping are UNCHANGED (delegated).
+    pub fn contribution_pq_from_registry(
+        &mut self,
+        validator_id: [u8; 32],
+        long_term_secret: &[u8; 32],
+        registry: &MevKemRegistry,
+        height: u64,
+    ) -> Result<DkgContribution, String> {
+        let index = self
+            .committee
+            .index_of(&validator_id)
+            .ok_or_else(|| "validator is not a member of this epoch committee".to_string())?;
+        let mut recipient_kem_pks = std::collections::BTreeMap::new();
+        for (i, member) in self.committee.members.iter().enumerate() {
+            let recipient_index = i as u32 + 1;
+            if recipient_index == index {
+                continue;
+            }
+            let ek = registry
+                .get_active_ek(&member.validator_id, height)
+                .ok_or_else(|| {
+                    format!(
+                        "mev kem registry has no active key for committee index {recipient_index}: \
+                         refusing (unknown recipient, never classical fallback)"
+                    )
+                })?;
+            recipient_kem_pks.insert(recipient_index, ek);
+        }
+        self.contribution_pq(validator_id, long_term_secret, &recipient_kem_pks)
+    }
+
+    /// Ingest and VERIFY a PQ-KEM contribution with the recipient's key
+    /// checked against the MEV committee KEM registry (the registry-wired
+    /// [`Self::ingest_pq`]).
+    ///
+    /// Fail-closed: the registry must hold an active key for
+    /// `own_validator_id` at `height`, AND that key must equal the ek
+    /// derived from `own_kem_seed`
+    /// ([`pq_kem_ek_from_seed`]) — a stale seed after a rotation's effective
+    /// height is refused here (rotated key enforced post-delay), before any
+    /// package is opened. A tampered package then still dies at the AEAD
+    /// open, and the Feldman VSS checks are UNCHANGED (delegated).
+    pub fn ingest_pq_from_registry(
+        &mut self,
+        contribution: DkgContribution,
+        own_kem_seed: &[u8; 64],
+        own_validator_id: &[u8; 32],
+        registry: &MevKemRegistry,
+        height: u64,
+    ) -> Result<(), String> {
+        let expected = registry
+            .get_active_ek(own_validator_id, height)
+            .ok_or_else(|| {
+                "mev kem registry has no active key for this validator at this height: refusing"
+                    .to_string()
+            })?;
+        let derived = pq_kem_ek_from_seed(own_kem_seed);
+        if derived != expected {
+            return Err(
+                "mev kem registry key mismatch: own KEM seed does not match the registered \
+                 key at this height (rotated key enforced post-delay): refusing"
+                    .to_string(),
+            );
+        }
+        self.ingest_pq(contribution, own_kem_seed)
+    }
+
+    /// Ingest a Falcon-authenticated PQ-KEM contribution with the recipient's
+    /// key checked against the MEV committee KEM registry (the registry-wired
+    /// [`Self::ingest_authenticated_pq`]: Falcon envelope verified FIRST,
+    /// then the registry key check, then the KEM ingest).
+    pub fn ingest_authenticated_pq_from_registry(
+        &mut self,
+        envelope: &PqTransportEnvelope,
+        own_kem_seed: &[u8; 64],
+        own_validator_id: &[u8; 32],
+        expected_falcon_pk: &[u8],
+        registry: &MevKemRegistry,
+        height: u64,
+    ) -> Result<(), String> {
+        pq_transport_verify(envelope, expected_falcon_pk)?;
+        self.ingest_pq_from_registry(
+            envelope.contribution.clone(),
+            own_kem_seed,
+            own_validator_id,
+            registry,
+            height,
+        )
     }
 }
 

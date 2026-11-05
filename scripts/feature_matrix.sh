@@ -108,8 +108,9 @@ else
   echo "[matrix] tempo-recipe -> SKIP (file absent)"
 fi
 row cn-vrf-kats                stellereum 300 -- --test cn_vrf_tests
-row bls-classical              stellereum 300 -- --test bls_classical_tests
-row vrf-marker                 stellereum 300 -- --lib vrf_is_marked_classical_not_post_quantum
+row excision-leftovers         stellereum 300 -- --test pentest_excision_leftovers
+row vrf-canonical-draw         stellereum 300 -- --test vrf_canonical_draw_tests
+row mev-kem-registry           stellereum 300 -- --test mev_kem_registry_tests
 if [ -f "$ROOT/stellereum/tests/explorer_ux_tests.rs" ]; then
   row explorer-ux stellereum 300 -- --test explorer_ux_tests
 else

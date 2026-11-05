@@ -170,6 +170,7 @@ async fn test_adapter(tag: &str) -> (P2pNetworkAdapter, std::path::PathBuf) {
     let node = infnode::node::Node::new(
         cfg,
         infnode::keyring::NodeKeys::generate(),
+        infnode::keyring::PqKeys::generate(),
         dir.clone(),
         std::path::PathBuf::new(),
     )

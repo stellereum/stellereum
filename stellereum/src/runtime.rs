@@ -360,7 +360,6 @@ pub struct SnapBundle {
     pub domains: crate::storage::DomainSnapshot,
     pub session_keys: Vec<u8>,
     pub bridge: Vec<u8>,
-    pub confidential: Vec<u8>,
     pub zkml_models: Vec<u8>,
 }
 
@@ -467,9 +466,6 @@ impl ApplyLane {
                             crate::storage::DomainSnapshot::capture(&state, &ledger, &gov).await;
                         let session_keys = state.session_keys_snapshot().await;
                         let bridge = state.bridge_snapshot().await;
-                        // Ristretto excision: shielded ledger removed with crypto_privacy;
-                        // snapshot carries empty bytes (transparent paths unchanged).
-                        let confidential: Vec<u8> = Vec::new();
                         let zkml_models = state.zkml_models_snapshot().await;
                         let _ = job.done.send(Some(SnapBundle {
                             height: job.height,
@@ -477,7 +473,6 @@ impl ApplyLane {
                             domains,
                             session_keys,
                             bridge,
-                            confidential,
                             zkml_models,
                         }));
                     }

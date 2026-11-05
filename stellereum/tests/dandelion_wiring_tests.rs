@@ -77,6 +77,7 @@ async fn test_gossip(tag: &str) -> Arc<TxGossip> {
     let node = infnode::node::Node::new(
         cfg,
         infnode::keyring::NodeKeys::generate(),
+        infnode::keyring::PqKeys::generate(),
         dir,
         std::path::PathBuf::new(),
     )

@@ -354,9 +354,11 @@ fn test_encrypted_falcon_key_roundtrip_and_passphrase_rejection() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Backward compatibility: a plaintext key that is already on disk (the live
-/// testnet nodes) must keep loading — and gets re-encrypted in place once a
-/// passphrase is available.
+/// Backward compatibility: a plaintext key that is already on disk must keep
+/// loading — and gets re-encrypted in place once a passphrase is available.
+/// (FULL-PQ: this covers 64-byte KEM-seed plaintext; a legacy 32-byte X25519
+/// `e2e.key` is refused loudly — pinned by
+/// `legacy_x25519_e2e_key_is_refused_loudly` in the `node_keys` unit tests.)
 #[test]
 fn test_existing_plaintext_key_still_loads_and_is_upgraded() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -366,7 +368,7 @@ fn test_existing_plaintext_key_still_loads_and_is_upgraded() {
     let keys = infnode::keyring::NodeKeys::generate();
     let id_pub = keys.signing.verifying_key().to_bytes();
     let id_hex = hex::encode(keys.signing.to_bytes());
-    let e2e_hex = hex::encode(keys.e2e_sec.to_bytes());
+    let e2e_hex = hex::encode(keys.kem_seed);
 
     // Exactly what the live nodes have: raw hex, 0600, in a 0700 dir.
     std::fs::create_dir_all(&dir).unwrap();

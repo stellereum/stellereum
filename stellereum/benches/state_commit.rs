@@ -198,7 +198,7 @@ fn bench_flush_barrier() {
     }
 }
 
-/// Snapshot pair write: state + 6 domain-tree blobs (the snapshot-job shape).
+/// Snapshot pair write: state + 5 domain-tree blobs (the snapshot-job shape).
 #[test]
 fn bench_snapshot_pair() {
     let blob = vec![0xA5u8; 262_144]; // 256 KiB per tree
@@ -211,7 +211,6 @@ fn bench_snapshot_pair() {
         st.put_domains(100, &blob).unwrap();
         st.put_session_keys(100, &blob).unwrap();
         st.put_bridge(100, &blob).unwrap();
-        st.put_confidential(100, &blob).unwrap();
         st.put_zkml_models(100, &blob).unwrap();
         st.put_cross_shard(100, &blob).unwrap();
         let ms = t0.elapsed().as_secs_f64() * 1000.0;

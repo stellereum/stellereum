@@ -144,9 +144,6 @@ async fn store_paired_snapshot(
         .put_bridge(height, &engine.bridge_snapshot().await)
         .unwrap();
     store
-        .put_confidential(height, &Vec::<u8>::new())
-        .unwrap();
-    store
         .put_zkml_models(height, &engine.zkml_models_snapshot().await)
         .unwrap();
     if let Some(r) = replay {
@@ -277,12 +274,11 @@ fn f2_push_policy_classes() {
         PersistPushPolicy::BoundedWait
     );
     assert_eq!(
-        persist_push_policy(&PersistJob::Domains {
+        persist_push_policy(&        PersistJob::Domains {
             height: 1,
             bytes: vec![],
             session_keys: vec![],
             bridge: vec![],
-            confidential: vec![],
             zkml_models: vec![],
             cross_shard: vec![],
         }),

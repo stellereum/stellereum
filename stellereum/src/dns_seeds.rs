@@ -9,7 +9,7 @@
 //! # Record format (one TXT record per peer, single line)
 //!
 //! ```text
-//! stellereum/v1 node_id=inf1:<hex20> ed=<hex32> host=<name> port=<udp> [x=<hex32>]
+//! stellereum/v1 node_id=inf1:<hex20> ed=<hex32> host=<name> port=<udp> [kem_hash=<hex32>]
 //! ```
 //!
 //! * the first token MUST be the version tag `stellereum/v1`;
@@ -17,9 +17,17 @@
 //!   `inf1:` prefix optional on input and canonical in output) and MUST match
 //!   the `ed` key — a record whose id does not hash from its own key is
 //!   rejected (anti-spoofing, same rule as `infnode::federation`);
-//! * `ed` is the ed25519 public key (32 bytes hex), `x` the optional x25519
-//!   public key (32 bytes hex), `host` a DNS name, `port` the UDP/QUIC port
-//!   (must be in `1024..=65535`);
+//! * `ed` is the ed25519 public key (32 bytes hex), `host` a DNS name, `port`
+//!   the UDP/QUIC port (must be in `1024..=65535`);
+//! * `kem_hash` is the OPTIONAL blake3 hash (32 bytes hex) of the peer's full
+//!   1184-byte ML-KEM-768 encapsulation key (`PQ_KEM_EK_LEN`). The full key
+//!   (2368 hex chars) can never fit the [`MAX_TXT_RECORD_LEN`] (512B) TXT
+//!   budget, so DNS carries only the hash pin; the full key is fetched on
+//!   demand (node-info/DHT provider) and VERIFIED against the pin by
+//!   [`verify_discovered_kem_ek`] / [`fetch_and_verify_kem_ek`] BEFORE use
+//!   (fail-closed on missing pin, wrong length, or hash mismatch);
+//! * legacy `x=<hex32>` (x25519 pin) is REFUSED with a clear error — publish
+//!   `kem_hash=blake3(1184B KEM ek)` instead (FULL-PQ redesign, not removal);
 //! * tokens are whitespace-separated `key=value` pairs; unknown keys are
 //!   ignored (forward compatibility), duplicate or malformed keys reject the
 //!   whole record (typo resistance); any missing required field rejects it.
@@ -33,24 +41,29 @@
 //! normal pinned-key TLS authentication — it can never mint consensus power.
 //!
 //! ACL posture (audit-network F10, aligned, not changed): peers added here go
-//! through infnode's `ensure_dht_peer` with the hardcoded restricted ACL
-//! (`lookup`/`update`/`find_node` — no `store`/`sync`, and no `find_value`),
-//! so a seed-domain takeover buys at most 32 DHT-routing entries (capped by
-//! [`MAX_DNS_PEERS`]), never KV reads/writes by strangers. The testnet
+//! through infnode's `register_dns_candidate` as dialable dynamic peers with
+//! the TOFU-precedent least-privilege ACL (the node's `unknown-allow` set —
+//! never operator-peer `allow: ["*"]`) and the born-rate-limited rule, so a
+//! seed-domain takeover buys at most 32 dial candidates (capped by
+//! [`MAX_DNS_PEERS`]) that still have to pass pinned-key challenge-auth. DNS
+//! candidates can NOT enter DHT routing (which requires a validated Falcon
+//! `pq_hex` deriving the id — DNS never carries one); their real PQ key is
+//! learned over the authenticated channel after first contact. The testnet
 //! `unknown-allow` TOFU-challenge path is a DIFFERENT path (first-contact
 //! peers, not DNS peers) and additionally grants `dht.find_value`: strangers
 //! there can READ DHT KV (public chain data — blob manifests, headers — low
 //! impact, nothing forgeable, nothing writable). That asymmetry is deliberate
 //! and documented here so the code comment at `ensure_dht_peer` ("find_value
-//! is withheld") reads as the DNS-path contract, not the TOFU-path contract.
+//! is withheld") reads as the DHT-path contract, not the TOFU-path contract.
 //!
 //! QUIC/TLS posture (audit-network F11, testnet-accepted): first contact on
 //! the live testnet runs `allow-unknown: true` (TOFU: operator MUST check the
 //! SSH-style fingerprint in the log); mainnet MUST set `allow-unknown: false`
 //! with fully pinned peers. Inbound node-id spoofing without the ed private
-//! key fails challenge-auth; static-file peers without a
-//! `node_id == blake3(ed_pub)` binding (audit-network F6) remain an
-//! operator-file trust boundary — see the F6 note in the final report.
+//! key fails challenge-auth; static-file peers no longer carry a `node-id`
+//! field at all (FULL-PQ wipe — identity is `pq_pub`-derived, so the old
+//! audit-network F6 declared-vs-derived binding is structural now: there is
+//! nothing to lie about).
 //!
 //! The whole feature is opt-in: with `STELL_DNS_SEEDS` unset or empty the node
 //! performs ZERO network calls and behaves exactly as before.
@@ -104,6 +117,12 @@ const MAX_ANSWERS_WALKED: u16 = 64;
 /// (or empty) `STELL_DNS_SEEDS` performs ZERO resolver work.
 static TXT_QUERIES: AtomicUsize = AtomicUsize::new(0);
 
+/// ML-KEM-768 encapsulation-key length (FIPS 203). The full key (1184B, 2368
+/// hex chars) can never fit a [`MAX_TXT_RECORD_LEN`] (512B) TXT record, so DNS
+/// carries only its blake3 hash (32B) via `kem_hash=` and the full key is
+/// fetched on demand and verified (see [`verify_discovered_kem_ek`]).
+pub const PQ_KEM_EK_LEN: usize = 1184;
+
 /// One peer discovered from a DNS TXT record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveredPeer {
@@ -111,8 +130,11 @@ pub struct DiscoveredPeer {
     pub node_id: String,
     /// ed25519 public key (the TLS pin and the consensus identity of the peer).
     pub ed_pub: [u8; 32],
-    /// Optional x25519 public key (encrypted transport).
-    pub x_pub: Option<[u8; 32]>,
+    /// Optional blake3 hash pin of the peer's 1184-byte ML-KEM-768
+    /// encapsulation key. `None` = no PQ KEM pin advertised (PQ transport to
+    /// this peer needs an out-of-band key); `Some` = verify any fetched full
+    /// key against it BEFORE use ([`verify_discovered_kem_ek`]).
+    pub kem_ek_hash: Option<[u8; 32]>,
     /// Advertised DNS name (resolved to addresses via A/AAAA before dialing).
     pub host: String,
     /// Advertised UDP/QUIC port.
@@ -126,6 +148,82 @@ impl DiscoveredPeer {
         let b = hex::decode(s).ok()?;
         b.try_into().ok()
     }
+}
+
+/// blake3 hash of a full KEM encapsulation key (the `kem_hash=` pin value).
+/// Returns `None` when `ek` is not exactly [`PQ_KEM_EK_LEN`] bytes (fail-closed:
+/// only full-length keys are hashable/pinnable).
+pub fn kem_ek_hash(ek: &[u8]) -> Option<[u8; 32]> {
+    if ek.len() != PQ_KEM_EK_LEN {
+        return None;
+    }
+    let h = blake3::hash(ek);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.as_bytes());
+    Some(out)
+}
+
+/// Verify a full KEM encapsulation key against a DNS hash pin (fail-closed).
+/// `false` on wrong length or hash mismatch — never panics on any input.
+pub fn verify_kem_ek_against_pin(pin: &[u8; 32], ek: &[u8]) -> bool {
+    if ek.len() != PQ_KEM_EK_LEN {
+        return false;
+    }
+    blake3::hash(ek).as_bytes() == pin
+}
+
+/// Verify a fetched full KEM key against a discovered peer's DNS hash pin.
+/// Fail-closed with a clear error: missing pin, wrong key length, or hash
+/// mismatch all refuse. Call BEFORE any transport/session use of `ek`.
+pub fn verify_discovered_kem_ek(peer: &DiscoveredPeer, ek: &[u8]) -> Result<(), String> {
+    let Some(pin) = peer.kem_ek_hash else {
+        return Err(format!(
+            "no kem_hash pin for {}: cannot use a KEM key without a DNS pin",
+            peer.node_id
+        ));
+    };
+    if ek.len() != PQ_KEM_EK_LEN {
+        return Err(format!(
+            "KEM ek has the wrong length for {}: got {} bytes, want {PQ_KEM_EK_LEN}",
+            peer.node_id,
+            ek.len()
+        ));
+    }
+    if blake3::hash(ek).as_bytes() != &pin {
+        return Err(format!(
+            "KEM ek hash mismatch for {}: fetched key does not match the DNS kem_hash pin",
+            peer.node_id
+        ));
+    }
+    Ok(())
+}
+
+/// Fetch-then-verify: obtain the full KEM key from the caller-supplied
+/// provider (in production: the node-info/DHT path) and verify it against the
+/// peer's DNS `kem_hash` pin BEFORE returning it for use. Any failure —
+/// missing pin, provider miss, wrong length, hash mismatch — is a hard error
+/// and the key MUST NOT be used.
+pub fn fetch_and_verify_kem_ek(
+    peer: &DiscoveredPeer,
+    fetch: impl FnOnce(&DiscoveredPeer) -> Option<Vec<u8>>,
+) -> Result<Vec<u8>, String> {
+    let Some(pin) = peer.kem_ek_hash else {
+        return Err(format!(
+            "no kem_hash pin for {}: cannot fetch a KEM key without a DNS pin",
+            peer.node_id
+        ));
+    };
+    let ek = fetch(peer).ok_or_else(|| {
+        format!(
+            "KEM ek unavailable for {}: node-info/DHT provider returned nothing",
+            peer.node_id
+        )
+    })?;
+    verify_discovered_kem_ek(peer, &ek)?;
+    // Re-check against `pin` explicitly so the provider->verify wiring stays
+    // pinned even if `verify_discovered_kem_ek` ever changes shape.
+    debug_assert!(verify_kem_ek_against_pin(&pin, &ek));
+    Ok(ek)
 }
 
 /// Outcome of [`merge_seeds`]: the peers that may be added, plus why the rest
@@ -143,63 +241,101 @@ pub struct MergeResult {
 
 /// Parse one TXT record into a [`DiscoveredPeer`]. See the module doc for the
 /// format. Any structural problem — missing required field, bad hex, wrong
-/// lengths, port outside `1024..=65535`, id not matching the ed key, oversized
-/// or empty record — returns `None`; the record is rejected as a whole.
+/// lengths, port outside `1024..=65535`, id not matching the ed key, legacy
+/// `x` pin present, oversized or empty record — returns `None`; the record is
+/// rejected as a whole. For the human-readable reason, see
+/// [`parse_txt_record_with_reason`].
 pub fn parse_txt_record(s: &str) -> Option<DiscoveredPeer> {
+    parse_txt_record_with_reason(s).ok()
+}
+
+/// Parse one TXT record, returning the refusal reason on failure.
+///
+/// The `Ok`/`None` contract of [`parse_txt_record`] is unchanged; this is the
+/// same parser with clear errors: oversized records name the
+/// [`MAX_TXT_RECORD_LEN`] budget, and legacy `x=` pins are refused with the
+/// `kem_hash=` migration message (FULL-PQ redesign, not removal).
+pub fn parse_txt_record_with_reason(s: &str) -> Result<DiscoveredPeer, String> {
     let s = s.trim();
-    if s.is_empty() || s.len() > MAX_TXT_RECORD_LEN {
-        return None;
+    if s.is_empty() {
+        return Err("empty DNS TXT record".to_string());
+    }
+    if s.len() > MAX_TXT_RECORD_LEN {
+        return Err(format!(
+            "DNS TXT record oversized ({}) > {MAX_TXT_RECORD_LEN}B budget: 1184B KEM ek cannot fit, publish kem_hash=blake3(ek) instead",
+            s.len()
+        ));
     }
     let mut tokens = s.split_whitespace();
-    if tokens.next()? != RECORD_VERSION {
-        return None;
+    match tokens.next() {
+        Some(t) if t == RECORD_VERSION => {}
+        _ => return Err("missing or bad version tag (want `stellereum/v1`)".to_string()),
     }
     let mut node_id: Option<String> = None;
     let mut ed: Option<[u8; 32]> = None;
-    let mut x: Option<Option<[u8; 32]>> = None;
+    let mut kem_hash: Option<Option<[u8; 32]>> = None;
     let mut host: Option<String> = None;
     let mut port: Option<u16> = None;
     for tok in tokens {
-        let (key, value) = tok.split_once('=')?;
+        let (key, value) = tok
+            .split_once('=')
+            .ok_or_else(|| format!("malformed token `{tok}` (want key=value)"))?;
         match key {
             "node_id" => {
                 if node_id.is_some() {
-                    return None; // duplicate key: reject, never last-wins
+                    return Err("duplicate `node_id` key".to_string());
                 }
-                let raw = hex::decode(value.strip_prefix("inf1:").unwrap_or(value)).ok()?;
-                let raw: [u8; NODEID_LEN] = raw.try_into().ok()?;
+                let raw = hex::decode(value.strip_prefix("inf1:").unwrap_or(value))
+                    .map_err(|_| "bad `node_id` hex".to_string())?;
+                let raw: [u8; NODEID_LEN] = raw
+                    .try_into()
+                    .map_err(|_| "`node_id` has the wrong length".to_string())?;
                 node_id = Some(format!("inf1:{}", hex::encode(raw)));
             }
             "ed" => {
                 if ed.is_some() {
-                    return None;
+                    return Err("duplicate `ed` key".to_string());
                 }
-                let b = hex::decode(value).ok()?;
-                ed = Some(b.try_into().ok()?);
+                let b = hex::decode(value).map_err(|_| "bad `ed` hex".to_string())?;
+                ed = Some(
+                    b.try_into()
+                        .map_err(|_| "`ed` has the wrong length (want 32 bytes)".to_string())?,
+                );
             }
             "x" => {
-                if x.is_some() {
-                    return None;
+                // FULL-PQ redesign: the 32B X25519 pin is gone. Refuse loudly
+                // so operators republish `kem_hash=blake3(1184B KEM ek)`.
+                return Err(
+                    "legacy `x` pin removed: publish `kem_hash=blake3(1184B KEM ek)` instead"
+                        .to_string(),
+                );
+            }
+            "kem_hash" => {
+                if kem_hash.is_some() {
+                    return Err("duplicate `kem_hash` key".to_string());
                 }
-                let b = hex::decode(value).ok()?;
-                x = Some(Some(b.try_into().ok()?));
+                let b = hex::decode(value).map_err(|_| "bad `kem_hash` hex".to_string())?;
+                kem_hash = Some(Some(b.try_into().map_err(|_| {
+                    "`kem_hash` has the wrong length (want 32 bytes = blake3(1184B KEM ek))"
+                        .to_string()
+                })?));
             }
             "host" => {
                 if host.is_some() {
-                    return None;
+                    return Err("duplicate `host` key".to_string());
                 }
                 if !valid_host(value) {
-                    return None;
+                    return Err("bad `host` value".to_string());
                 }
                 host = Some(value.to_string());
             }
             "port" => {
                 if port.is_some() {
-                    return None;
+                    return Err("duplicate `port` key".to_string());
                 }
-                let p: u16 = value.parse().ok()?;
+                let p: u16 = value.parse().map_err(|_| "bad `port` value".to_string())?;
                 if p < MIN_DISCOVERED_PORT {
-                    return None;
+                    return Err(format!("`port` {p} below minimum {MIN_DISCOVERED_PORT}"));
                 }
                 port = Some(p);
             }
@@ -207,20 +343,20 @@ pub fn parse_txt_record(s: &str) -> Option<DiscoveredPeer> {
             _ => {}
         }
     }
-    let node_id = node_id?;
-    let ed = ed?;
-    let host = host?;
-    let port = port?;
+    let node_id = node_id.ok_or_else(|| "missing `node_id`".to_string())?;
+    let ed = ed.ok_or_else(|| "missing `ed`".to_string())?;
+    let host = host.ok_or_else(|| "missing `host`".to_string())?;
+    let port = port.ok_or_else(|| "missing `port`".to_string())?;
     // Anti-spoofing: the node id must be blake3(ed_pub)[..20], the infnode
     // convention. A record pairing a victim's id with another key is rejected.
     let expected = blake3::hash(&ed);
     if node_id != format!("inf1:{}", hex::encode(&expected.as_bytes()[..NODEID_LEN])) {
-        return None;
+        return Err("`node_id` does not hash from `ed` (spoof attempt)".to_string());
     }
-    Some(DiscoveredPeer {
+    Ok(DiscoveredPeer {
         node_id,
         ed_pub: ed,
-        x_pub: x.flatten(),
+        kem_ek_hash: kem_hash.flatten(),
         host,
         port,
     })
@@ -246,13 +382,17 @@ fn valid_host(h: &str) -> bool {
 }
 
 /// Merge discovered peers with the configured peer set: drop anything whose
-/// node id or ed key is already known (configured peer or earlier discovery),
+/// PQ node id or ed key is already known (configured peer or earlier discovery),
 /// and cap the remainder at [`MAX_DNS_PEERS`]. Pure and order-preserving.
+/// FULL-PQ: configured ids are PQ-only (`primary_id` — refused for peers
+/// without a PQ pin, which then dedup by ed pin only); discovered ids are
+/// ed-derived (DNS pins ed + kem_hash, never a Falcon key). The ed leg is
+/// what keeps re-resolves of known peers from re-entering.
 pub fn merge_seeds(configured: &[PeerConfig], discovered: Vec<DiscoveredPeer>) -> MergeResult {
     let mut known_ids: Vec<[u8; NODEID_LEN]> = Vec::new();
     let mut known_ed: Vec<[u8; 32]> = Vec::new();
     for p in configured {
-        if let Ok(raw) = p.node_id_raw() {
+        if let Ok(raw) = p.primary_id() {
             known_ids.push(raw);
         }
         if let Ok(ed) = p.ed_bytes() {
@@ -665,39 +805,34 @@ pub async fn resolve_peer_endpoints(peer: &DiscoveredPeer) -> Vec<String> {
     }
 }
 
-/// Add discovered peers to a node's peer-set via infnode's existing dynamic
-/// peer API (`Node::ensure_dht_peer`), which is idempotent: peers already in
-/// the map are left untouched, so a repeated pass creates no duplicates.
+/// Add discovered peers to a node's peer-set via infnode's DNS-candidate
+/// registration (`Node::register_dns_candidate` — ed-pinned dialable dynamic
+/// peer, PQ key learned over the authenticated channel after first contact),
+/// which is idempotent: peers already in the map are left untouched, so a
+/// repeated pass creates no duplicates.
+/// FULL-PQ: DNS pins ed + kem_hash only, never a Falcon key, so candidates
+/// can NOT enter DHT routing (fail-closed there) — registration is the only
+/// path. Self-registration is refused inside `register_dns_candidate` (the
+/// local id is PQ-derived while DNS ids are ed-derived, so the check compares
+/// the ed key, not the id).
 /// Returns the number of peers newly added.
 pub async fn add_discovered_peers(node: &Arc<Node>, peers: &[DiscoveredPeer]) -> usize {
     let mut added = 0usize;
     for p in peers {
-        let Some(raw) = p.node_id_raw() else { continue };
-        if raw == node.id {
-            continue; // never dial ourselves
-        }
-        if node.peers.read().await.contains_key(&raw) {
-            continue; // only add peers that are not known yet
-        }
         let endpoints = resolve_peer_endpoints(p).await;
         if endpoints.is_empty() {
             tracing::warn!("[dns-seeds] {}: no A/AAAA addresses, skipping", p.node_id);
             continue;
         }
-        let info = infnode::dht::NodeInfo {
-            id: raw,
-            endpoints,
-            ed_hex: hex::encode(p.ed_pub),
-            x_hex: p.x_pub.map(hex::encode).unwrap_or_default(),
-            last_seen: infnode::dht::now_ms(),
-        };
-        match node.ensure_dht_peer(&info).await {
-            Ok(()) => {
+        match node
+            .register_dns_candidate(&hex::encode(p.ed_pub), endpoints)
+            .await
+        {
+            Ok(_) => {
                 added += 1;
                 tracing::info!(
-                    "[dns-seeds] added peer {} @ {:?} (discovery only, NOT a validator)",
+                    "[dns-seeds] added peer {} (discovery only, NOT a validator)",
                     p.node_id,
-                    info.endpoints
                 );
             }
             Err(e) => {
@@ -781,10 +916,11 @@ mod tests {
         let ed = ed_of(seed);
         PeerConfig {
             name: format!("peer-{seed}"),
-            node_id: id_of(&ed),
             ed_pub: hex::encode(ed),
-            x_pub: hex::encode(ed_of(seed.wrapping_add(1))),
-            pq_pub: None, // GATE: classical-only fixture (no PQ identity announced)
+            // Deterministic PQ identity (length-real Falcon-512 key): merge
+            // dedups configured peers by their PQ id via `primary_id`, and by
+            // ed pin for the DNS (ed-derived id) side.
+            pq_pub: Some(infnode::keyring::PqKeys::from_seed([seed; 32]).pq_pub_hex()),
             endpoints: vec!["127.0.0.1:9411".into()],
             allow: vec!["*".into()],
             rate_limit_per_sec: 0,
@@ -798,10 +934,22 @@ mod tests {
         DiscoveredPeer {
             node_id: id_of(&ed),
             ed_pub: ed,
-            x_pub: Some(ed_of(seed.wrapping_add(1))),
+            kem_ek_hash: None,
             host: format!("node{}.example", seed % 10),
             port: 9411,
         }
+    }
+
+    /// Deterministic 1184B test KEM ek (length-real, value-fake: hash/verify
+    /// pins length + blake3 only, never a real encaps).
+    fn test_ek(seed: u8) -> Vec<u8> {
+        vec![seed; PQ_KEM_EK_LEN]
+    }
+
+    fn valid_record_with_kem_hash(seed: u8, port: u16, ek_seed: u8) -> String {
+        let ek = test_ek(ek_seed);
+        let pin = kem_ek_hash(&ek).expect("test ek is full-length");
+        format!("{} kem_hash={}", valid_record(seed, port), hex::encode(pin))
     }
 
     #[test]
@@ -810,18 +958,139 @@ mod tests {
         let p = parse_txt_record(&rec).expect("valid record must parse");
         assert_eq!(p.node_id, id_of(&ed_of(0x11)));
         assert_eq!(p.ed_pub, ed_of(0x11));
-        assert_eq!(p.x_pub, None, "x is optional and absent here");
+        assert_eq!(p.kem_ek_hash, None, "kem_hash is optional and absent here");
         assert_eq!(p.host, "node7.example"); // 0x11 % 10 == 7
         assert_eq!(p.port, 9411);
 
-        // With the optional x key.
+        // With the optional kem_hash pin (blake3 of the full 1184B KEM ek).
+        let ek = test_ek(0x99);
+        let pin = kem_ek_hash(&ek).expect("test ek hashes");
+        let rec = format!(
+            "{} kem_hash={}",
+            valid_record(0x12, 20000),
+            hex::encode(pin)
+        );
+        let p = parse_txt_record(&rec).expect("record with kem_hash must parse");
+        assert_eq!(p.kem_ek_hash, Some(pin));
+    }
+
+    #[test]
+    fn kem_hash_pin_parses_and_wrong_lengths_are_rejected() {
+        // Happy pin: record carries blake3(1184B ek).
+        let rec = valid_record_with_kem_hash(0x13, 9411, 0x77);
+        let p = parse_txt_record(&rec).expect("kem_hash pin record must parse");
+        let want = kem_ek_hash(&test_ek(0x77)).expect("pin");
+        assert_eq!(p.kem_ek_hash, Some(want));
+        // Short hash (16B) refused.
+        let ed = ed_of(0x13);
+        let bad = format!(
+            "stellereum/v1 node_id={} ed={} host=n.example port=9411 kem_hash={}",
+            id_of(&ed),
+            hex::encode(ed),
+            hex::encode([0x77u8; 16])
+        );
+        assert!(parse_txt_record(&bad).is_none());
+        // Non-hex hash refused.
+        let bad = format!(
+            "stellereum/v1 node_id={} ed={} host=n.example port=9411 kem_hash=zz",
+            id_of(&ed),
+            hex::encode(ed)
+        );
+        assert!(parse_txt_record(&bad).is_none());
+        // Duplicate kem_hash refused (typo resistance, never last-wins).
+        let pin = hex::encode(want);
+        let dup = format!(
+            "stellereum/v1 node_id={} ed={} host=n.example port=9411 kem_hash={pin} kem_hash={pin}",
+            id_of(&ed),
+            hex::encode(ed)
+        );
+        assert!(parse_txt_record(&dup).is_none());
+    }
+
+    #[test]
+    fn legacy_x_pin_is_refused_with_a_clear_error() {
         let rec = format!(
             "{} x={}",
-            valid_record(0x12, 20000),
+            valid_record(0x14, 9411),
             hex::encode(ed_of(0x99))
         );
-        let p = parse_txt_record(&rec).expect("record with x must parse");
-        assert_eq!(p.x_pub, Some(ed_of(0x99)));
+        assert!(
+            parse_txt_record(&rec).is_none(),
+            "legacy x= must be refused"
+        );
+        let err = parse_txt_record_with_reason(&rec).expect_err("legacy x= must err");
+        assert!(
+            err.contains("legacy `x` pin removed") && err.contains("kem_hash"),
+            "clear migration error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn fetched_full_ek_verifies_against_the_dns_pin() {
+        // Happy path: DNS pin + full ek fetched on demand (node-info/DHT
+        // provider) verify OK before use.
+        let rec = valid_record_with_kem_hash(0x15, 9411, 0x5A);
+        let peer = parse_txt_record(&rec).expect("pin record must parse");
+        let full_ek = test_ek(0x5A);
+        assert!(verify_kem_ek_against_pin(
+            &peer.kem_ek_hash.expect("pin"),
+            &full_ek
+        ));
+        verify_discovered_kem_ek(&peer, &full_ek).expect("happy verify must pass");
+        // Provider-shaped fetch+verify (the on-demand node-info/DHT pattern).
+        let got = fetch_and_verify_kem_ek(&peer, |_| Some(test_ek(0x5A)))
+            .expect("fetch+verify happy must pass");
+        assert_eq!(got, full_ek);
+    }
+
+    #[test]
+    fn mismatched_or_wrong_length_ek_is_refused_fail_closed() {
+        let rec = valid_record_with_kem_hash(0x16, 9411, 0x5A);
+        let peer = parse_txt_record(&rec).expect("pin record must parse");
+        // Wrong key bytes (same length, different hash) refused.
+        let wrong = test_ek(0xA5);
+        assert!(!verify_kem_ek_against_pin(
+            &peer.kem_ek_hash.expect("pin"),
+            &wrong
+        ));
+        let err = verify_discovered_kem_ek(&peer, &wrong).expect_err("mismatch must err");
+        assert!(err.contains("mismatch"), "unexpected error: {err}");
+        assert!(
+            fetch_and_verify_kem_ek(&peer, |_| Some(wrong.clone())).is_err(),
+            "fetch+verify must refuse a mismatched ek"
+        );
+        // Short key refused (truncated fetch).
+        let short = vec![0x5Au8; 32];
+        assert!(!verify_kem_ek_against_pin(
+            &peer.kem_ek_hash.expect("pin"),
+            &short
+        ));
+        assert!(verify_discovered_kem_ek(&peer, &short).is_err());
+        assert!(kem_ek_hash(&short).is_none(), "short keys are not hashable");
+        // Missing pin refused (no pin, no use).
+        let mut nopin = peer.clone();
+        nopin.kem_ek_hash = None;
+        assert!(verify_discovered_kem_ek(&nopin, &test_ek(0x5A)).is_err());
+        assert!(fetch_and_verify_kem_ek(&nopin, |_| Some(test_ek(0x5A))).is_err());
+        // Provider miss refused.
+        assert!(fetch_and_verify_kem_ek(&peer, |_| None).is_err());
+    }
+
+    #[test]
+    fn oversized_txt_is_refused_with_a_clear_error() {
+        // A raw 1184B ek can never fit the 512B TXT budget (2368 hex chars).
+        let huge_ek_hex = hex::encode(vec![0xABu8; PQ_KEM_EK_LEN]);
+        assert!(huge_ek_hex.len() > MAX_TXT_RECORD_LEN);
+        // Oversized record refused (Option API).
+        let long = format!("stellereum/v1 junk={}", "a".repeat(MAX_TXT_RECORD_LEN));
+        assert!(long.len() > MAX_TXT_RECORD_LEN);
+        assert!(parse_txt_record(&long).is_none());
+        // ...and with a clear budget error (Result API).
+        let err = parse_txt_record_with_reason(&long).expect_err("oversized must err");
+        assert!(
+            err.contains("oversized") && err.contains(&MAX_TXT_RECORD_LEN.to_string()),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -936,7 +1205,10 @@ mod tests {
     #[test]
     fn merge_dedups_by_node_id_and_ed_pub() {
         let configured = vec![configured_peer(0x51)];
-        let d_id_dup = discovered(0x51); // same node id + ed as the configured peer
+        // Same ed as the configured peer: dedups via the ed leg (configured
+        // ids are PQ-derived now, discovered ids ed-derived — the two id
+        // worlds only meet at the ed pin).
+        let d_id_dup = discovered(0x51); // same ed as the configured peer
         let ed_only = discovered(0x52);
         let mut ed_only_dup = discovered(0x52);
         ed_only_dup.node_id = id_of(&ed_of(0x77)); // different id, SAME ed
@@ -978,10 +1250,11 @@ mod tests {
         for p in &pass1.new_peers {
             now_configured.push(PeerConfig {
                 name: p.node_id.clone(),
-                node_id: p.node_id.clone(),
                 ed_pub: hex::encode(p.ed_pub),
-                x_pub: p.x_pub.map(hex::encode).unwrap_or_default(),
-                pq_pub: None, // GATE: discovered peers carry no PQ identity yet
+                // Discovered peers carry no PQ identity (DNS pins ed +
+                // kem_hash only): `primary_id` refuses them, so the second
+                // pass dedups them by the ed pin — same as the live path.
+                pq_pub: None,
                 endpoints: vec![format!("{}:{}", p.host, p.port)],
                 allow: vec!["*".into()],
                 rate_limit_per_sec: 0,

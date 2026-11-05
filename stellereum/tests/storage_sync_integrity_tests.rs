@@ -944,7 +944,6 @@ fn aux_prune_preserves_snapshotted_heights_and_drops_junk() {
     for h in [5u64, 6, 7] {
         store.put_session_keys(h, b"sk").unwrap();
         store.put_bridge(h, b"br").unwrap();
-        store.put_confidential(h, b"cf").unwrap();
         store.put_zkml_models(h, b"zk").unwrap();
         store.put_cross_shard(h, b"xs").unwrap();
     }
@@ -959,7 +958,6 @@ fn aux_prune_preserves_snapshotted_heights_and_drops_junk() {
     assert!(store.domain_at(7).unwrap().is_some());
     assert!(store.session_keys_at(7).unwrap().is_some());
     assert!(store.bridge_at(7).unwrap().is_some());
-    assert!(store.confidential_at(7).unwrap().is_some());
     assert!(store.zkml_models_at(7).unwrap().is_some());
     assert!(store.cross_shard_at(7).unwrap().is_some());
     assert!(store.session_keys_at(5).unwrap().is_none());

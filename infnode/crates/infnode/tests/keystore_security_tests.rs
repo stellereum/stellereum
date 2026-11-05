@@ -90,6 +90,38 @@ fn keystore_hardening_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// FULL-PQ wipe-compat: a fresh save round-trips the KEM encapsulation key,
+/// and a legacy 32-byte (x25519) `e2e.key` is refused with a clear migration
+/// error — never silently accepted as KEM material.
+#[test]
+fn keystore_kem_roundtrip_and_legacy_x25519_refused() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("INFNODE_KEY_PASSPHRASE");
+    let dir = std::env::temp_dir().join(format!("infnode_kem_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let keys = infnode::keyring::NodeKeys::generate();
+    assert_eq!(
+        keys.kem_ek.len(),
+        infnode::mailbox::KEM_EK_LEN,
+        "KEM ek is 1184 bytes"
+    );
+    keys.save(&dir).unwrap();
+    let back = infnode::keyring::NodeKeys::load(&dir).unwrap();
+    assert_eq!(back.kem_ek, keys.kem_ek, "KEM ek must round-trip");
+    assert_eq!(back.kem_seed, keys.kem_seed, "KEM seed must round-trip");
+    // Legacy: 32-byte x25519 seed hex in e2e.key => loud migration refusal.
+    std::fs::write(dir.join("e2e.key"), hex::encode([0x11u8; 32])).unwrap();
+    let err = match infnode::keyring::NodeKeys::load(&dir) {
+        Ok(_) => panic!("legacy x25519 e2e.key must fail"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        err.contains("legacy x25519 key refused"),
+        "clear migration error, got: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A legacy `enc:` file (old iterated-blake3 format) must still be readable.
 #[test]
 fn legacy_enc_format_still_readable() {

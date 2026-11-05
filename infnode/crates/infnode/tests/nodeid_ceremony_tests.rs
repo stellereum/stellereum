@@ -6,8 +6,8 @@
 //! * first-PQ-wins rebinding refusal (attacker cannot rebind honest ed),
 //! * classical-only refused (no LEGACY arm; `primary_id`/`dual_announce`
 //!   error without `pq_pub`; `resolve_node_id` requires PQ),
-//! * old single-ed configs still parse (serde compat) but are refused as
-//!   peers (fail closed, no silent classical).
+//! * old single-ed configs fail LOUDLY at parse (clear migration error,
+//!   never silent classical).
 //!
 //! Env-safety: no env vars are touched here (passphrase/perms paths are owned
 //! by `keystore_security_tests.rs`); no wall-clock asserts.
@@ -28,12 +28,10 @@ fn fixed_pq() -> PqKeys {
 /// Hardcoded derivation vector for `fixed_pq()` (seed `[0x5A; 32]`).
 const EXPECTED_PQ_ID_HEX: &str = "a2b41ccbd40e4454d025ce9d4587bc8f7af739d8";
 
-fn peer_cfg(node_id_hex: &str, pq_pub: Option<String>) -> PeerConfig {
+fn peer_cfg(pq_pub: Option<String>) -> PeerConfig {
     PeerConfig {
         name: "p".to_string(),
-        node_id: node_id_hex.to_string(),
         ed_pub: hex::encode([2u8; 32]),
-        x_pub: hex::encode([3u8; 32]),
         pq_pub,
         endpoints: vec![],
         allow: vec!["*".to_string()],
@@ -97,7 +95,7 @@ fn ceremony_02_pq_announce_single_id() {
     assert_eq!(parsed, ids);
 
     // PeerConfig mirror: pq pinned => primary is pq, dual is [pq].
-    let cfg = peer_cfg(&ed.id_hex(), Some(pq.pq_pub_hex()));
+    let cfg = peer_cfg(Some(pq.pq_pub_hex()));
     assert_eq!(cfg.primary_id().expect("primary"), pq.pq_id());
     assert_eq!(cfg.dual_announce_ids().expect("dual"), ids);
 
@@ -166,19 +164,24 @@ fn ceremony_04_classical_only_refused() {
     assert_ne!(ed.id(), pq.pq_id(), "classical helper must differ from PQ id");
     assert_eq!(ceremony_local_id(&ed, &pq), pq.pq_id());
 
-    // PeerConfig without pq_pub: parses (serde compat) but is refused.
-    let legacy_cfg = peer_cfg(&ed.id_hex(), None);
+    // PeerConfig without pq_pub (code-constructed dynamic): refused.
+    // Parsed configs without `pq_pub` fail LOUDLY at parse (see
+    // `ceremony_05`), never silently classical.
+    let legacy_cfg = peer_cfg(None);
     assert!(legacy_cfg.primary_id().is_err(), "classical peer refused");
     assert!(legacy_cfg.dual_announce_ids().is_err(), "classical peer refused");
 }
 
 // ---------------------------------------------------------------------------
-// 5. Old single-ed configs parse (serde compat) but are refused as peers.
+// 5. Old single-ed configs fail LOUDLY at parse (clear migration error).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ceremony_05_legacy_config_parses_but_refused() {
-    let yaml = r#"
+fn ceremony_05_legacy_config_fails_loudly_at_parse() {
+    // Old shape with `node-id`/`ed-pub`/`x-pub`, no `pq-pub`: must NOT parse
+    // (FULL-PQ wipe, nodes wiped, no compat). Error is a clear migration
+    // message, never a silent classical fallback.
+    let yaml_old = r#"
 name: oldnode
 listen: "0.0.0.0:9400"
 peers:
@@ -188,10 +191,49 @@ peers:
     x-pub: "0303030303030303030303030303030303030303030303030303030303030303"
     endpoints: []
 "#;
-    let cfg: infnode::config::NodeConfig = serde_yaml::from_str(yaml).expect("old config parses");
+    let err = serde_yaml::from_str::<infnode::config::NodeConfig>(yaml_old)
+        .expect_err("old single-ed config must fail at parse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("FULL-PQ") || msg.contains("pq-pub") || msg.contains("node-id") || msg.contains("x-pub"),
+        "migration error must be clear, got: {msg}"
+    );
+
+    // Missing `pq-pub` (ed-only, new field names) also fails loudly.
+    let yaml_no_pq = r#"
+name: oldnode
+listen: "0.0.0.0:9400"
+peers:
+  - name: pal
+    ed-pub: "0202020202020202020202020202020202020202020202020202020202020202"
+    endpoints: []
+"#;
+    let err2 = serde_yaml::from_str::<infnode::config::NodeConfig>(yaml_no_pq)
+        .expect_err("ed-only config without pq-pub must fail at parse");
+    let msg2 = err2.to_string();
+    assert!(
+        msg2.contains("FULL-PQ") || msg2.contains("pq-pub") || msg2.contains("mandatory"),
+        "migration error must be clear, got: {msg2}"
+    );
+
+    // New shape (ed + pq) parses and derives the PQ id (same property as
+    // `ceremony_02`, PQ materials).
+    let pq = fixed_pq();
+    let yaml_new = format!(
+        r#"
+name: newnode
+listen: "0.0.0.0:9400"
+peers:
+  - name: pal
+    ed-pub: "0202020202020202020202020202020202020202020202020202020202020202"
+    pq-pub: "{}"
+    endpoints: []
+"#,
+        pq.pq_pub_hex()
+    );
+    let cfg: infnode::config::NodeConfig =
+        serde_yaml::from_str(&yaml_new).expect("pq config parses");
     assert_eq!(cfg.peers.len(), 1);
-    assert!(cfg.peers[0].pq_pub.is_none(), "absent stays explicit");
-    assert!(cfg.peers[0].pq_bytes().expect("none").is_none());
-    assert!(cfg.peers[0].primary_id().is_err(), "classical peer refused");
-    assert!(cfg.peers[0].dual_announce_ids().is_err(), "classical peer refused");
+    assert!(cfg.peers[0].pq_pub.is_some());
+    assert_eq!(cfg.peers[0].primary_id().expect("primary"), pq.pq_id());
 }

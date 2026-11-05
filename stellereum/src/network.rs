@@ -457,7 +457,6 @@ pub const SNAPSHOT_PUBLISH_DOMAIN_KINDS: &[&str] = &[
     "domains",
     "session",
     "bridge",
-    "confidential",
     "zkml",
     "cross_shard",
 ];
@@ -1542,7 +1541,7 @@ impl P2pNetworkAdapter {
     /// follow-up F-J): snapshot-sync restored ACCOUNTS ONLY, so a far-behind
     /// node on a live chain could never fast-sync (root check failed on any
     /// staking/token/bridge activity). `kind` is one of: domains, session,
-    /// bridge, confidential, zkml, cross_shard. Same FOREVER retention as the
+    /// bridge, zkml, cross_shard. Same FOREVER retention as the
     /// state blob (one set per 100 heights).
     ///
     /// Fail-closed (fix 2026-10-15): a shed/dropped Bulk store is LOUD (not
@@ -2558,13 +2557,13 @@ impl InfnodeCrossShardPubSub {
     /// Resolve every configured peer to a node id.
     ///
     /// Same rule as the consensus path (`consensus_net::ConsensusNetwork`):
-    /// the peer-config node id first, the name only as a fallback — name
+    /// the peer-config PQ id first, the name only as a fallback — name
     /// resolution depends on a registry that fills in asymmetrically, and a
     /// failed lookup would silently publish to nobody.
     fn peer_ids(&self) -> Vec<[u8; 20]> {
         let mut out = Vec::new();
         for p in &self.node.cfg.peers {
-            match p.node_id_raw().or_else(|_| self.node.resolve(&p.name)) {
+            match p.primary_id().or_else(|_| self.node.resolve(&p.name)) {
                 Ok(pid) => out.push(pid),
                 Err(e) => tracing::warn!("[cross_shard] cannot resolve peer {}: {e}", p.name),
             }
@@ -4061,6 +4060,7 @@ mod pointer_overwrite_tests {
         let node = infnode::node::Node::new(
             cfg,
             infnode::keyring::NodeKeys::generate(),
+            infnode::keyring::PqKeys::generate(),
             dir.clone(),
             std::path::PathBuf::new(),
         )

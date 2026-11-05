@@ -35,23 +35,22 @@ fn node_info(id_byte: u8, ed_pub: &str, endpoints: &[&str]) -> infnode::dht::Nod
         id: [id_byte; 20],
         endpoints: endpoints.iter().map(|s| s.to_string()).collect(),
         ed_hex: ed_pub.to_string(),
-        x_hex: ed('c'),
+        // The filter under test keys on ed only; pq is unused here.
+        pq_hex: String::new(),
         last_seen: 0,
     }
 }
 
 fn peer_config(
     name: &str,
-    node_id_byte: u8,
     ed_pub: &str,
     endpoints: &[&str],
 ) -> infnode::config::PeerConfig {
     infnode::config::PeerConfig {
         name: name.to_string(),
-        node_id: format!("inf1:{}", hex::encode([node_id_byte; 20])),
         ed_pub: ed_pub.to_string(),
-        x_pub: ed('d'),
-        pq_pub: None, // GATE: classical-only test fixture
+        // The filter under test keys on the ed pin; pq is unused here.
+        pq_pub: None,
         endpoints: endpoints.iter().map(|s| s.to_string()).collect(),
         allow: vec!["*".to_string()],
         rate_limit_per_sec: 0,
@@ -64,7 +63,7 @@ fn peer_config(
 fn unknown_identity_is_never_admitted_by_the_filter() {
     // Local config pins exactly one peer identity.
     let pinned_ed = ed('a');
-    let peers = vec![peer_config("honest", 0x01, &pinned_ed, &["10.0.0.1:9410"])];
+    let peers = vec![peer_config("honest", &pinned_ed, &["10.0.0.1:9410"])];
     let pinned = pinned_identity_set(&peers);
     assert_eq!(pinned.len(), 1);
 
@@ -102,7 +101,7 @@ fn unknown_identity_is_never_admitted_by_the_filter() {
 fn known_identity_with_a_new_endpoint_is_admitted() {
     // Identity comes from config (one pinned ed-pub, one static endpoint)...
     let pinned_ed = ed('e');
-    let peers = vec![peer_config("peer", 0x07, &pinned_ed, &["10.0.0.1:9410"])];
+    let peers = vec![peer_config("peer", &pinned_ed, &["10.0.0.1:9410"])];
     let pinned = pinned_identity_set(&peers);
 
     // ...endpoints may come from the network, even in different hex case.

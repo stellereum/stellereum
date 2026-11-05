@@ -1095,7 +1095,7 @@ impl ConsensusNetwork {
 
     /// Resolve every configured peer to a node id.
     ///
-    /// The peer's `node-id` is preferred over its name: name resolution depends
+    /// The peer's PQ id (`primary_id`) is preferred over its name: name resolution depends
     /// on a name registry that fills in asymmetrically (a node can know the name
     /// of a peer that does not yet know its own), and a failed lookup used to
     /// make `broadcast` silently send nothing — stalling consensus with no error
@@ -1104,7 +1104,7 @@ impl ConsensusNetwork {
         let mut out = Vec::new();
         for p in &self.adapter.node.cfg.peers {
             let pid = p
-                .node_id_raw()
+                .primary_id()
                 .or_else(|_| self.adapter.node.resolve(&p.name));
             match pid {
                 Ok(pid) => out.push(pid),
@@ -2039,7 +2039,7 @@ impl TxGossip {
         }
     }
 
-    /// Peer ids, node-id first: the same asymmetric-registry trap fixed in
+    /// Peer ids, PQ-id first: the same asymmetric-registry trap fixed in
     /// `ConsensusNetwork::peer_ids` lived here too — a failed name lookup
     /// silently sent nothing, starving the peer's mempool (and its blocks)
     /// with no error anywhere (audit 2026-10-06).
@@ -2047,7 +2047,7 @@ impl TxGossip {
         let mut out = Vec::new();
         for p in &self.adapter.node.cfg.peers {
             let pid = p
-                .node_id_raw()
+                .primary_id()
                 .or_else(|_| self.adapter.node.resolve(&p.name));
             match pid {
                 Ok(pid) => out.push(pid),
@@ -4729,7 +4729,7 @@ impl ConsensusNetwork {
         }
         let mut statik = std::collections::HashSet::new();
         for p in &self.adapter.node.cfg.peers {
-            if let Ok(pid) = p.node_id_raw() {
+            if let Ok(pid) = p.primary_id() {
                 statik.insert(pid);
             }
         }

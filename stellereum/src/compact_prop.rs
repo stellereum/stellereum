@@ -25,17 +25,15 @@
 //! tx priority-bid envelope (80 B sig)              192 B
 //! vote bare, Some(hash)                            153 B  (= 8+4+4+33+32+72)
 //! vote bare, nil                                     121 B
-//! vote classical envelope (176 B sig)               265 B  (flag-off nodes never emit; see startup gate)
-//! vote Falcon envelope (746 B sig)                  835 B  (post_quantum.rs:109 => 666 B sig)
+//! vote Falcon hybrid envelope (746 B sig)           835 B  (= 8+4+4+33+32+(8+746); sig field = 16 magic + 64 Ed + 666 Falcon per post_quantum.rs:115 FALCON512_SIG_LEN, consensus.rs:214 VOTE_FALCON_PART_LEN)
 //! ConsensusMsg::Vote, locked=None (live path)       158 B
 //! ConsensusMsg::Vote, locked=Some                    190 B
-//! QC(k Ed25519 sigs) = 57 + 104*k B  (k=1:161, 4:473, 7:785, 10:1097, 100:10457)
+//! QC(k Ed25519 sigs, refused under pure PQ) = 57 + 104*k B  (k=1:161, 4:473, 7:785, 10:1097, 100:10457)
+//! µQC Falcon envelope = 73 + ceil(C/8) + s*670 B  (s sigs; 670 = 4 len + 666 Falcon; layout consensus.rs:825-836, formula pinned by pq_qc_sizes_vs_classical; C=4 full-sign: 2754, QC bincode 2851)
 //! block fixed part (0 txs, 1 proposer sig, no QCs)  350 B
 //! ConsensusMsg::Proposal(N) = 366 + 176*N B (16 B msg framing + 350 B header)
 //!   N=0:366  N=1:542  N=100:17966  N=428:75694  N=1000:176366
-//! Committed{100 txs, qc7}                           18747 B
-//! QC classical envelope fixed header                161 B  (consensus HEADER)
-//!   + bitfield ceil(C/8) B  (C=7:1, 10:2, 100:13, 1000:125)
+//! Committed{100 txs, qc7} (classical baseline)    18747 B
 //! ```
 //!
 //! Encoding facts the table rests on (bincode 1.3, confirmed by harness):
@@ -206,7 +204,8 @@ pub fn compact_proposal_bytes(n_txs: usize, n_missing: usize) -> usize {
     PROPOSAL_FIXED_BYTES + n_txs * SHORT_ID_LEN + n_missing * TX_PLAIN_BYTES
 }
 
-/// Live QC bytes for `n_sigs` Ed25519 signatures: 57 + 104*k.
+/// Classical-baseline QC bytes for `n_sigs` Ed25519 signatures (refused under
+/// pure PQ; live path is the Falcon µQC envelope, see §1): 57 + 104*k.
 pub fn qc_bytes_ed(n_sigs: usize) -> usize {
     QC_FIXED_BYTES + n_sigs * QC_ED_SIG_ENTRY_BYTES
 }

@@ -960,7 +960,6 @@ pub const SYNC_DOMAIN_KINDS: &[&str] = &[
     "domains",
     "session",
     "bridge",
-    "confidential",
     "zkml",
     "cross_shard",
     "pq_keys",

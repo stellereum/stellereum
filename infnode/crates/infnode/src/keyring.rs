@@ -5,7 +5,6 @@ use falcon_rust::falcon512;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::path::Path;
-use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 /// Параметры KDF (memory-hard Argon2id): 64 MiB, 3 прохода, 4 линии.
@@ -157,8 +156,13 @@ pub fn secure_dir(dir: &Path) -> Result<()> {
 pub struct NodeKeys {
     pub signing: SigningKey,
     pub verifying: VerifyingKey,
-    pub e2e_sec: StaticSecret,
-    pub e2e_pub: PublicKey,
+    /// Long-term ML-KEM-768 seed (64 bytes, `d || z`); the sole secret input
+    /// for the KEM encapsulation key below.
+    /// FULL-PQ: replaces the X25519 static secret (wipe — no ECDH material
+    /// remains on disk; old 32-byte `e2e.key` files are refused, see `load`).
+    pub kem_seed: [u8; crate::mailbox::KEM_SEED_LEN],
+    /// ML-KEM-768 encapsulation key (1184 bytes) derived from `kem_seed`.
+    pub kem_ek: Vec<u8>,
 }
 
 impl NodeKeys {
@@ -166,13 +170,14 @@ impl NodeKeys {
         let mut csprng = OsRng;
         let signing = SigningKey::generate(&mut csprng);
         let verifying = signing.verifying_key();
-        let e2e_sec = StaticSecret::random_from_rng(OsRng);
-        let e2e_pub = PublicKey::from(&e2e_sec);
+        let mut kem_seed = [0u8; crate::mailbox::KEM_SEED_LEN];
+        OsRng.fill_bytes(&mut kem_seed);
+        let kem_ek = crate::mailbox::kem_ek_from_seed(&kem_seed);
         Self {
             signing,
             verifying,
-            e2e_sec,
-            e2e_pub,
+            kem_seed,
+            kem_ek,
         }
     }
 
@@ -197,19 +202,20 @@ impl NodeKeys {
         hex::encode(self.verifying.as_bytes())
     }
 
-    pub fn x_hex(&self) -> String {
-        hex::encode(self.e2e_pub.as_bytes())
+    /// Hex of the ML-KEM-768 encapsulation key (1184 bytes).
+    pub fn kem_ek_hex(&self) -> String {
+        hex::encode(&self.kem_ek)
     }
 
     pub fn save(&self, dir: &Path) -> Result<()> {
         secure_dir(dir)?;
         // Шифруем (если задана пассфраза) и пишем с правами 0600.
         let mut id_hex = hex::encode(self.signing.to_bytes());
-        let mut e2e_hex = hex::encode(self.e2e_sec.to_bytes());
+        let mut kem_hex = hex::encode(self.kem_seed);
         write_private(&dir.join("identity.key"), &protect(id_hex.as_bytes()))?;
-        write_private(&dir.join("e2e.key"), &protect(e2e_hex.as_bytes()))?;
+        write_private(&dir.join("e2e.key"), &protect(kem_hex.as_bytes()))?;
         id_hex.zeroize();
-        e2e_hex.zeroize();
+        kem_hex.zeroize();
         Ok(())
     }
 
@@ -251,25 +257,33 @@ impl NodeKeys {
         let e2e =
             std::fs::read_to_string(dir.join("e2e.key")).map_err(|e| anyhow!("e2e.key: {e}"))?;
         let mut id_plain = unprotect(id.trim())?;
-        let mut e2e_plain = unprotect(e2e.trim())?;
+        let mut kem_plain = unprotect(e2e.trim())?;
         let id_bytes: [u8; 32] = hex::decode(id_plain.trim())?
             .try_into()
             .map_err(|_| anyhow!("identity seed должен быть 32 байта"))?;
-        let e2e_bytes: [u8; 32] = hex::decode(e2e_plain.trim())?
+        let kem_bytes = hex::decode(kem_plain.trim())?;
+        if kem_bytes.len() == 32 {
+            // Wipe-compat: a 32-byte seed is the pre-PQ X25519 static secret —
+            // refused loudly, never silently accepted as KEM material.
+            kem_plain.zeroize();
+            bail!(
+                "e2e.key: legacy x25519 key refused (FULL-PQ wipe: delete e2e.key and restart to generate a KEM key)"
+            );
+        }
+        let kem_seed: [u8; crate::mailbox::KEM_SEED_LEN] = kem_bytes
             .try_into()
-            .map_err(|_| anyhow!("e2e seed должен быть 32 байта"))?;
+            .map_err(|_| anyhow!("e2e kem seed должен быть 64 байта"))?;
         // Стереть промежуточные plaintext-строки из памяти
         id_plain.zeroize();
-        e2e_plain.zeroize();
+        kem_plain.zeroize();
         let signing = SigningKey::from_bytes(&id_bytes);
         let verifying = signing.verifying_key();
-        let e2e_sec = StaticSecret::from(e2e_bytes);
-        let e2e_pub = PublicKey::from(&e2e_sec);
+        let kem_ek = crate::mailbox::kem_ek_from_seed(&kem_seed);
         Ok(Self {
             signing,
             verifying,
-            e2e_sec,
-            e2e_pub,
+            kem_seed,
+            kem_ek,
         })
     }
 }

@@ -16,7 +16,6 @@
 //!   "headers"     : height(8B BE) -> bincode(BlockHeaderRecord)
 //!   "session_keys": height(8B BE) -> bincode(SessionKeyRegistry)
 //!   "bridge"      : height(8B BE) -> bincode(BridgeState)
-//!   "confidential": height(8B BE) -> bincode(ConfidentialState)  [audit F-B]
 //!   "zkml_models" : height(8B BE) -> bincode(ZkMlModelRegistry)  [audit F-B]
 //!   "cross_shard" : height(8B BE) -> bincode(CrossShardReplaySnapshot) [audit F-I]
 //!   "receipts_v1" : tx_hash (32B) -> bincode(StoredReceipt)   [NEW, additive only]
@@ -73,11 +72,6 @@ pub struct Storage {
     /// `DomainSnapshot` would stop every older snapshot from decoding. This is
     /// what makes a restored node still refuse a replayed `source_tx_hash`.
     bridge: sled::Tree,
-    /// Committed shielded ledger (`ConfidentialState`: balances, spent-input
-    /// set, fee total), keyed by height. Own tree (audit F-B): without it a
-    /// restart wiped the spent set (re-opening double-spends) and changed the
-    /// root (conditional digest went from non-empty to empty = fork).
-    confidential: sled::Tree,
     /// Committed zkML model registry (models + VKs), keyed by height. Own
     /// tree for the same reason: a restart must not un-register models the
     /// chain agreed on, nor move the root.
@@ -104,7 +98,7 @@ pub struct Storage {
 /// field bricks restarts on pre-existing data directories (observed live:
 /// `min_gas_limit` in governance-applied params made every snapshot
 /// undecodable). New committed domains get their OWN tree + snapshot/restore
-/// pair (the session/bridge/confidential/zkml pattern) — never a struct
+/// pair (the session/bridge/zkml pattern) — never a struct
 /// extension. If this rule must ever break, ship a versioned upgrade wrapper
 /// (the `BridgeStateV1`/`ConfidentialStateV1` pattern) in the SAME commit.
 ///
@@ -420,7 +414,6 @@ impl Storage {
         let headers = db.open_tree("headers")?;
         let session_keys = db.open_tree("session_keys")?;
         let bridge = db.open_tree("bridge")?;
-        let confidential = db.open_tree("confidential")?;
         let zkml_models = db.open_tree("zkml_models")?;
         let cross_shard = db.open_tree("cross_shard")?;
         let receipts = db.open_tree("receipts_v1")?;
@@ -435,7 +428,6 @@ impl Storage {
             headers,
             session_keys,
             bridge,
-            confidential,
             zkml_models,
             cross_shard,
             receipts,
@@ -1087,7 +1079,6 @@ impl Storage {
         }
         self.prune_session_keys_below(keep_from)?;
         self.prune_bridge_below(keep_from)?;
-        self.prune_confidential_below(keep_from)?;
         self.prune_zkml_models_below(keep_from)?;
         self.prune_cross_shard_below(keep_from)?;
         Ok(removed)
@@ -1218,53 +1209,6 @@ impl Storage {
             .collect();
         for k in keys {
             self.bridge.remove(k)?;
-            removed += 1;
-        }
-        Ok(removed)
-    }
-
-    // ---------- Shielded ledger snapshots (audit F-B) ----------
-
-    pub fn put_confidential(&self, height: u64, bytes: &[u8]) -> Result<()> {
-        self.confidential.insert(height.to_be_bytes(), bytes)?;
-        Ok(())
-    }
-
-    /// The committed shielded ledger exactly as it stood after `height`.
-    /// `None` for a directory written before confidential transfers existed -
-    /// which is CORRECT: an empty ledger contributes nothing to the digest,
-    /// so a pre-confidential snapshot restores to the root it was written
-    /// with. `Some` means the spent set and balances come back with the node,
-    /// so a restored node still refuses an already-spent commitment instead
-    /// of minting it a second time.
-    pub fn confidential_at(&self, height: u64) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .confidential
-            .get(height.to_be_bytes())?
-            .map(|v| v.to_vec()))
-    }
-
-    /// Drop shielded-ledger snapshots older than `keep_from`. Called from
-    /// `prune_domains_below` so this tree follows the same window. Never
-    /// drops a row at a snapshotted height: see [`Self::aux_retained_heights`].
-    pub fn prune_confidential_below(&self, keep_from: u64) -> Result<usize> {
-        let keep = self.aux_retained_heights();
-        let mut removed = 0;
-        let keys: Vec<sled::IVec> = self
-            .confidential
-            .iter()
-            .keys()
-            .filter_map(|k| k.ok())
-            .filter(|k| {
-                if k.len() != 8 {
-                    return false;
-                }
-                let h = u64::from_be_bytes(k.as_ref().try_into().unwrap());
-                h < keep_from && !keep.contains(&h)
-            })
-            .collect();
-        for k in keys {
-            self.confidential.remove(k)?;
             removed += 1;
         }
         Ok(removed)
@@ -2932,7 +2876,6 @@ pub enum PersistJob {
         bytes: Vec<u8>,
         session_keys: Vec<u8>,
         bridge: Vec<u8>,
-        confidential: Vec<u8>,
         zkml_models: Vec<u8>,
         cross_shard: Vec<u8>,
     },
@@ -3019,7 +2962,7 @@ impl AsyncPersistence {
                     PersistJob::State { height, snapshot } => st.put_state(height, &snapshot),
                     // Audit F1(c): `cross_shard` is written FIRST. The old
                     // order wrote it LAST (domains→session→bridge→
-                    // confidential→zkml→cross_shard), so an I/O error anywhere
+                    // zkml→cross_shard), so an I/O error anywhere
                     // in the chain silently skipped the replay set while
                     // keeping the rest — the exact partial write that
                     // re-opens consumed inbounds. Replay-first inverts the
@@ -3034,7 +2977,6 @@ impl AsyncPersistence {
                         bytes,
                         session_keys,
                         bridge,
-                        confidential,
                         zkml_models,
                         cross_shard,
                     } => st
@@ -3042,7 +2984,6 @@ impl AsyncPersistence {
                         .and_then(|()| st.put_domains(height, &bytes))
                         .and_then(|()| st.put_session_keys(height, &session_keys))
                         .and_then(|()| st.put_bridge(height, &bridge))
-                        .and_then(|()| st.put_confidential(height, &confidential))
                         .and_then(|()| st.put_zkml_models(height, &zkml_models)),
                     PersistJob::Consensus(cp) => st.set_consensus(&cp),
                     PersistJob::Finalized { height, hash } => st.set_finalized(height, &hash),
@@ -3228,7 +3169,7 @@ impl AsyncPersistence {
     }
 
     /// Non-blocking: enqueue a domain snapshot (tokens/contracts/...), together
-    /// with the session-key registry, the bridge domain, the shielded ledger,
+    /// with the session-key registry, the bridge domain,
     /// the zkML registry and the cross-shard replay snapshot of the same
     /// height.
     #[allow(clippy::too_many_arguments)]
@@ -3239,7 +3180,6 @@ impl AsyncPersistence {
         bytes: Vec<u8>,
         session_keys: Vec<u8>,
         bridge: Vec<u8>,
-        confidential: Vec<u8>,
         zkml_models: Vec<u8>,
         cross_shard: Vec<u8>,
     ) {
@@ -3248,7 +3188,6 @@ impl AsyncPersistence {
             bytes,
             session_keys,
             bridge,
-            confidential,
             zkml_models,
             cross_shard,
         });
@@ -3280,9 +3219,6 @@ impl AsyncPersistence {
         let snap = DomainSnapshot::capture(engine, staking, governance).await;
         let session_keys = engine.session_keys_snapshot().await;
         let bridge = engine.bridge_snapshot().await;
-        // Ristretto deletion wave: confidential/shielded ledger removed with
-        // crypto_privacy; persist empty bytes to keep Domains job shape stable.
-        let confidential: Vec<u8> = Vec::new();
         let zkml_models = engine.zkml_models_snapshot().await;
         // Cross-shard replay, engine half (audit F-I): the runtime mirrors are
         // empty wherever this runs (startup healing with a fresh runtime, or
@@ -3323,7 +3259,6 @@ impl AsyncPersistence {
                 bytes,
                 session_keys,
                 bridge,
-                confidential,
                 zkml_models,
                 cross_shard,
             );
@@ -3983,7 +3918,6 @@ mod tests {
             .expect("encode domains");
         let session_keys = engine.session_keys_snapshot().await;
         let bridge = engine.bridge_snapshot().await;
-        let confidential: Vec<u8> = Vec::new();
         let zkml_models = engine.zkml_models_snapshot().await;
         let cross_shard = {
             let mut engine_consumed = engine.cross_shard_consumed_snapshot().await;
@@ -4003,7 +3937,6 @@ mod tests {
         st.put_domains(S, &domain_bytes).unwrap();
         st.put_session_keys(S, &session_keys).unwrap();
         st.put_bridge(S, &bridge).unwrap();
-        st.put_confidential(S, &confidential).unwrap();
         st.put_zkml_models(S, &zkml_models).unwrap();
         st.put_cross_shard(S, &cross_shard).unwrap();
 
@@ -4093,7 +4026,6 @@ mod tests {
             .expect("encode domains");
         let session_keys = engine.session_keys_snapshot().await;
         let bridge = engine.bridge_snapshot().await;
-        let confidential: Vec<u8> = Vec::new();
         let zkml_models = engine.zkml_models_snapshot().await;
         let cross_shard_s = {
             let mut engine_consumed = engine.cross_shard_consumed_snapshot().await;
@@ -4150,7 +4082,6 @@ mod tests {
         st.put_domains(S, &domain_bytes).unwrap();
         st.put_session_keys(S, &session_keys).unwrap();
         st.put_bridge(S, &bridge).unwrap();
-        st.put_confidential(S, &confidential).unwrap();
         st.put_zkml_models(S, &zkml_models).unwrap();
         st.put_cross_shard(S, &cross_shard_newer).unwrap();
         let mut anchor = block(S + 1, [9u8; 32], &sk, None);
@@ -4813,9 +4744,6 @@ mod archive_proof_tests {
             .unwrap();
         store
             .put_bridge(height, &engine.bridge_snapshot().await)
-            .unwrap();
-        store
-            .put_confidential(height, &Vec::<u8>::new())
             .unwrap();
         store
             .put_zkml_models(height, &engine.zkml_models_snapshot().await)

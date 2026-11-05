@@ -35,18 +35,19 @@ enum Cmd {
     },
 }
 
-fn load(cfg: &Path) -> Result<(config::NodeConfig, NodeKeys, PathBuf, PathBuf)> {
+fn load(cfg: &Path) -> Result<(config::NodeConfig, NodeKeys, infnode::keyring::PqKeys, PathBuf, PathBuf)> {
     let cfg_obj = config::load(cfg)?;
     let keys_dir = cfg
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .join("keys");
     let keys = NodeKeys::load(&keys_dir)?;
+    let pq = infnode::keyring::PqKeys::load_or_generate(&keys_dir)?;
     let data_dir = cfg
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
-    Ok((cfg_obj, keys, data_dir, cfg.to_path_buf()))
+    Ok((cfg_obj, keys, pq, data_dir, cfg.to_path_buf()))
 }
 
 #[tokio::main]
@@ -54,9 +55,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Serve { config } => {
-            let (cfg_obj, keys, data_dir, config_path) = load(&config)?;
+            let (cfg_obj, keys, pq, data_dir, config_path) = load(&config)?;
             let rewards_dir = data_dir.clone();
-            let node = Node::new(cfg_obj.clone(), keys, data_dir, config_path)
+            let node = Node::new(cfg_obj.clone(), keys, pq, data_dir, config_path)
                 .await
                 .context("создание ноды")?;
             let web_listen = node.cfg.web_listen.clone().ok_or_else(|| {

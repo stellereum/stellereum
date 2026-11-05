@@ -1,11 +1,11 @@
 //! PQ handshake tests (opt-in `STELL_INF_PQ_HANDSHAKE=1`, default OFF).
 //!
 //! Scope: `infnode` crate only. Covers the PQ handshake paths added in
-//! `proto.rs` (transcript/tag/policy, KEM-hybrid + Falcon-512 tag) and
+//! `proto.rs` (transcript/tag/policy, KEM-only + Falcon-512 tag) and
 //! `node.rs` (ML-KEM-768 offer/answer, PQ identity registry + announce):
 //! KAT pins where possible (Wycheproof ML-KEM-768 vectors, transcript digest),
 //! happy-path agreement, tampered-transcript refusal, wrong-key refusal,
-//! mixed-mode window both directions, hybrid-key properties, PQ identity
+//! mixed-mode window both directions, kem-session-key properties, PQ identity
 //! keygen/load/perms, `pq_pub` announce/bind, Falcon-tag happy/tamper/
 //! wrong-key, absent-identity classical fallback, and classical
 //! invariants (flag OFF = byte-identical classical).
@@ -76,10 +76,6 @@ fn fixed_transcript() -> PqTranscript {
 /// Fixed transcript digest KAT (blake3 over the canonical encoding).
 const TRANSCRIPT_DIGEST_KAT: &str =
     "fde16ec184bc2d20cf32570a5180c19cc945cfe1acd64aa3a54fba4dbe7e8b1b";
-
-/// Classical pins: prove the pre-PQ KDFs are untouched.
-const E2E_KAT_HEX: &str = "223572ada7ec7d5a660706223197bf472d691c5b848e5df0187e01b98751baeb";
-const SESSION_KAT_HEX: &str = "4e6ad0085408c0a66a43ad427f6865d0ea4efc462fbf9707c1af9597627cee5a";
 
 // ---------------------------------------------------------------------------
 // 1. Flag parsing.
@@ -185,7 +181,7 @@ fn pq_transcript_encode_shape_and_kat() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Happy path: both sides agree, hybrid key matches.
+// 4. Happy path: both sides agree, kem-only key matches.
 // ---------------------------------------------------------------------------
 
 fn challenge_frame(src: [u8; NODEID_LEN], dst: [u8; NODEID_LEN], payload: Vec<u8>) -> Frame {
@@ -231,7 +227,6 @@ fn pq_handshake_happy_both_sides_agree() {
         "at": auth_at,
         "eph": hex::encode(eph_init),
         "ed": hex::encode([3u8; 32]),
-        "x": hex::encode([4u8; 32]),
         "pq_ver": PQ_TRANSCRIPT_VERSION,
         "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
         "pq_ek": hex::encode(&offer.ek),
@@ -268,12 +263,11 @@ fn pq_handshake_happy_both_sides_agree() {
     assert_eq!(agreed_i.shared, agreed_r.shared);
     assert_eq!(agreed_i.digest, agreed_r.digest);
 
-    // Hybrid session keys match on both sides and differ from classical.
-    let classical = [0xCCu8; 32];
-    let k_i = proto::pq_hybrid_session_key(&classical, &agreed_i.shared, &agreed_i.digest);
-    let k_r = proto::pq_hybrid_session_key(&classical, &agreed_r.shared, &agreed_r.digest);
+    // KEM-only session keys match on both sides and differ from the raw shared.
+    let k_i = proto::pq_session_key(&agreed_i.shared, &agreed_i.digest);
+    let k_r = proto::pq_session_key(&agreed_r.shared, &agreed_r.digest);
     assert_eq!(k_i, k_r);
-    assert_ne!(k_i, classical);
+    assert_ne!(k_i, agreed_i.shared);
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +290,6 @@ fn pq_tampered_transcript_refused_with_clear_error() {
             "at": auth_at,
             "eph": hex::encode(eph_init),
             "ed": hex::encode([3u8; 32]),
-            "x": hex::encode([4u8; 32]),
             "pq_ver": PQ_TRANSCRIPT_VERSION,
             "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
             "pq_ek": hex::encode(&offer.ek),
@@ -496,7 +489,6 @@ fn pq_mixed_mode_protocol_fallback_both_directions() {
         "at": auth_at,
         "eph": hex::encode(eph_init),
         "ed": hex::encode([3u8; 32]),
-        "x": hex::encode([4u8; 32]),
     });
     let ch = challenge_frame(init_id, resp_id, plain_ch.to_string().into_bytes());
     let got = pq_responder_accept(&eph_init, &plain_ch, &ch.sign_data(), &eph_resp, auth_at, &resp_id)
@@ -530,7 +522,7 @@ fn pq_mixed_mode_protocol_fallback_both_directions() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Hybrid key properties + transcript tamper coverage at the digest layer.
+// 8. KEM-only session-key properties + transcript tamper coverage at the digest layer.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -561,23 +553,19 @@ fn pq_transcript_builder_matches_manual_fields() {
 }
 
 #[test]
-fn pq_hybrid_key_deterministic_and_binds_every_input() {
-    let classical = [0xCCu8; 32];
+fn pq_kem_session_key_deterministic_and_binds_every_input() {
     let shared = [0xDDu8; 32];
     let digest = [0xEEu8; 32];
-    let k0 = proto::pq_hybrid_session_key(&classical, &shared, &digest);
-    assert_eq!(k0, proto::pq_hybrid_session_key(&classical, &shared, &digest));
-    assert_ne!(k0, classical);
+    let k0 = proto::pq_session_key(&shared, &digest);
+    assert_eq!(k0, proto::pq_session_key(&shared, &digest));
     assert_ne!(k0, shared);
-    let mut c2 = classical;
-    c2[0] ^= 0x01;
-    assert_ne!(k0, proto::pq_hybrid_session_key(&c2, &shared, &digest));
+    assert_ne!(k0, digest);
     let mut s2 = shared;
     s2[31] ^= 0x80;
-    assert_ne!(k0, proto::pq_hybrid_session_key(&classical, &s2, &digest));
+    assert_ne!(k0, proto::pq_session_key(&s2, &digest));
     let mut d2 = digest;
     d2[15] ^= 0x01;
-    assert_ne!(k0, proto::pq_hybrid_session_key(&classical, &shared, &d2));
+    assert_ne!(k0, proto::pq_session_key(&shared, &d2));
 }
 
 #[test]
@@ -622,28 +610,23 @@ fn pq_transcript_tamper_anywhere_breaks_tag() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Classical invariants: flag OFF = byte-identical classical behavior.
+// 9. KEM-only KDF pin + frame-auth (classical X3DH KDFs deleted).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn pq_classical_kdfs_and_frame_auth_unchanged() {
-    // Pinned vectors: any change to the classical KDFs breaks these.
-    let e2e = proto::e2e_key_from_shared(&[0x11u8; 32], &[1u8; 20], &[2u8; 20]);
-    assert_eq!(hex::encode(e2e), E2E_KAT_HEX);
-    let sess = proto::session_key(
-        &[0x11u8; 32],
-        &[0x22u8; 32],
-        &[0x33u8; 32],
-        &[0x44u8; 32],
-        &[1u8; 20],
-        &[2u8; 20],
+fn pq_kem_session_kdf_and_frame_auth_unchanged() {
+    // Pinned vector: any change to the KEM-only session KDF breaks this
+    // (same value as the `kex_session_tests` KEM pin — one derivation).
+    let k = proto::pq_session_key(&[0xDDu8; 32], &[0xEEu8; 32]);
+    assert_eq!(
+        hex::encode(k),
+        "f30ff66edf2b9ae8703eda331622c43f37ee768b8dd26750ba42111955d08818"
     );
-    assert_eq!(hex::encode(sess), SESSION_KAT_HEX);
-    // Classical CHALLENGE payload with extra pq_* fields still parses through
+    // KEM-only CHALLENGE payload with extra pq_* fields still parses through
     // the known-keys path (window tolerance is structural: unknown JSON keys
     // are ignored by key lookup).
     let v: serde_json::Value = serde_json::from_str(
-        r#"{"nonce":"abcdef0123456789","at":1700000000001,"eph":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","ed":"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100","x":"102030405060708090a0b0c0d0e0f101102030405060708090a0b0c0d0e0f101","pq_ver":1,"pq_suite":77,"pq_ek":"zz"}"#,
+        r#"{"nonce":"abcdef0123456789","at":1700000000001,"eph":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","ed":"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100","pq_ver":1,"pq_suite":77,"pq_ek":"zz"}"#,
     )
     .expect("json");
     assert_eq!(v["nonce"].as_str().unwrap(), "abcdef0123456789");
@@ -776,9 +759,7 @@ fn pq_identity_wrong_perms_fail_closed() {
 fn pq_peer_cfg(pq_pub: Option<String>) -> PeerConfig {
     PeerConfig {
         name: "p".to_string(),
-        node_id: format!("inf1:{}", hex::encode([1u8; 20])),
         ed_pub: hex::encode([2u8; 32]),
-        x_pub: hex::encode([3u8; 32]),
         pq_pub,
         endpoints: vec![],
         allow: vec!["*".to_string()],
@@ -790,7 +771,9 @@ fn pq_peer_cfg(pq_pub: Option<String>) -> PeerConfig {
 
 #[test]
 fn pq_peer_config_pq_pub_optional_and_pinned() {
-    // Absent: classical-only peer, explicit — not an error.
+    // Absent (code-constructed dynamic): classical-explicit, not an error
+    // at `pq_bytes` (parsed configs without `pq-pub` fail LOUDLY at parse,
+    // see `pq_peer_config_yaml_*` + `ceremony_05`).
     assert!(pq_peer_cfg(None).pq_bytes().expect("none").is_none());
     // Present and well-formed: parses to 897 bytes.
     let keys = PqKeys::from_seed([0x5Au8; 32]);
@@ -806,13 +789,27 @@ fn pq_peer_config_pq_pub_optional_and_pinned() {
 
 #[test]
 fn pq_peer_config_yaml_backward_compatible() {
-    // Old configs without pq-pub parse unchanged (serde default).
-    let old: PeerConfig = serde_yaml::from_str(
+    // Old configs without pq-pub FAIL LOUDLY at parse (FULL-PQ wipe, no
+    // compat) — never silently classical.
+    let err = serde_yaml::from_str::<PeerConfig>(
+        "name: a\ned-pub: '0202020202020202020202020202020202020202020202020202020202020202'\nendpoints: []\n",
+    )
+    .expect_err("ed-only without pq-pub must fail at parse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("FULL-PQ") || msg.contains("pq-pub") || msg.contains("mandatory"),
+        "migration error must be clear, got: {msg}"
+    );
+    // Old shape with node-id/x-pub also fails loudly.
+    let err_old = serde_yaml::from_str::<PeerConfig>(
         "name: a\nnode-id: inf1:0102030405060708090a0b0c0d0e0f1011121314\ned-pub: '0202020202020202020202020202020202020202020202020202020202020202'\nx-pub: '0303030303030303030303030303030303030303030303030303030303030303'\nendpoints: []\n",
     )
-    .expect("old yaml");
-    assert!(old.pq_pub.is_none());
-    assert!(old.pq_bytes().expect("none").is_none());
+    .expect_err("legacy node-id/x-pub must fail at parse");
+    let msg_old = err_old.to_string();
+    assert!(
+        msg_old.contains("FULL-PQ") || msg_old.contains("node-id") || msg_old.contains("x-pub"),
+        "migration error must be clear, got: {msg_old}"
+    );
     // New configs carry pq-pub (kebab-case) and round-trip.
     let keys = PqKeys::from_seed([0x5Au8; 32]);
     let mut cfg = pq_peer_cfg(None);
@@ -1381,7 +1378,7 @@ fn pq_longterm_cache_per_handshake_checks_still_fresh() {
     let offer = pq_initiator_offer().expect("offer");
     let ch_json = serde_json::json!({
         "nonce": "abcdef0123456789", "at": auth_at,
-        "eph": hex::encode(eph_init), "ed": hex::encode([3u8; 32]), "x": hex::encode([4u8; 32]),
+        "eph": hex::encode(eph_init), "ed": hex::encode([3u8; 32]),
         "pq_ver": PQ_TRANSCRIPT_VERSION, "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
         "pq_ek": hex::encode(&offer.ek),
     });

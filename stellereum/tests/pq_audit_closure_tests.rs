@@ -447,7 +447,7 @@ fn node_key_files_enforce_perms_and_roundtrip() {
     let nk = load_or_generate_node_keys(&dir).expect("generate node keys");
     let nk2 = load_or_generate_node_keys(&dir).expect("reload node keys");
     assert_eq!(nk.signing.to_bytes(), nk2.signing.to_bytes());
-    assert_eq!(nk.e2e_sec.to_bytes(), nk2.e2e_sec.to_bytes());
+    assert_eq!(nk.kem_seed, nk2.kem_seed);
     let falcon_path = dir.join("falcon.key");
     let fk = load_or_generate_falcon_key(&falcon_path).expect("generate falcon key");
     let fk2 = load_or_generate_falcon_key(&falcon_path).expect("reload falcon key");

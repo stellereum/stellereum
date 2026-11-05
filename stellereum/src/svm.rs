@@ -119,45 +119,10 @@ pub const GAS_BRIDGE_INTENT: u64 = 600;
 /// (it moves the committed registry), so it is priced like the other
 /// state-writing admin syscalls rather than like arithmetic.
 pub const GAS_SESSION_REVOKE: u64 = 1_000;
-/// Gas to apply a §9 confidential transfer: a handful of Ristretto
-/// decompressions plus the fee-point multiplication, the spent-set insert and
-/// the two (or one, for a self-transfer) balance rewrites. Priced with the
-/// other state-writing syscalls - the work is group arithmetic plus ordered
-/// map writes, and a flood of them must not be cheaper than the block space
-/// it burns.
-pub const GAS_CONFIDENTIAL_TRANSFER: u64 = 2_625;
-/// Gas BASE for the enforced confidential transfer (V2, audit 2026-10-06 F-A):
-/// the table prices per commitment + per proof bit on top (see
-/// `confidential_transfer2_gas`), since one 64-bit proof costs ~64
-/// bit-verifies and counts are uncapped. 1.75x multiplier applied for privacy compute defense.
-pub const GAS_CONFIDENTIAL_TRANSFER2: u64 = 3_500;
-/// Per commitment / per proof bit inside a V2 transfer (1.75x scaled).
-pub const GAS_CONFIDENTIAL_T2_PER_COMMITMENT: u64 = 1_750;
-pub const GAS_CONFIDENTIAL_T2_PER_BIT: u64 = 44;
-
-// PQ excision: `confidential_transfer2_gas` removed with
-// `SysCallConfidentialTransfer2`; the GAS_CONFIDENTIAL_* / MAX_* constants
-// below stay for sibling-owned callers under excision and are otherwise unused.
-/// Gas for a shield entry: one Pedersen recomputation (opening check) plus
-/// the ownership-map insert. 1.75x scaled.
-pub const GAS_CONFIDENTIAL_SHIELD: u64 = 3_500;
-/// Base gas for an unshield exit: per-input opening recomputation is charged
-/// dynamically in `opcode_gas` (1.75x scaled).
-pub const GAS_CONFIDENTIAL_UNSHIELD: u64 = 3_500;
-/// Consensus caps on shielded IO counts (audit: blocks troubles — wire-DoS
-/// asymmetry): one tx may carry at most this many range-proved commitments /
-/// unshield inputs. A 16-proof 64-bit transfer is ~330KB (fits 1MB tx cap
-/// with headroom); 64 unshield inputs are ~4.6KB. Beyond this, split across
-/// txs. Fail-closed in the handlers below.
-pub const MAX_CONFIDENTIAL_IO_PER_TX: usize = 16;
-pub const MAX_UNSHIELD_INPUTS_PER_TX: usize = 64;
-/// Hard cap on viewing payloads per `stell_shieldedBalance` scan (audit F1:
-/// unbounded array = unauth CPU DoS: hex parse + X25519 DH + KDF + Pedersen
-/// commit per entry). Read-only scan, so the cap is generous (4x unshield);
-/// larger histories paginate client-side. Fail-closed in the handler.
-pub const MAX_SHIELDED_SCAN_PAYLOADS: usize = 256;
-/// Per-input cost inside an unshield exit (one Pedersen recomputation, 1.75x scaled).
-pub const GAS_CONFIDENTIAL_UNSHIELD_PER_INPUT: u64 = 525;
+// Confidential/shielded ledger removed with crypto_privacy (Ristretto
+// deletion wave): the GAS_CONFIDENTIAL_* / MAX_* constants are deleted with
+// the sled tree; reserved opcodes keep discriminants and revert with GAS_HALT.
+// Fresh genesis writes nothing confidential, so no migration is needed.
 /// Gas to enqueue an actor message (`OpCode::SysCallActorSend`): the opcode
 /// validation plus the inbox bookkeeping `execute_payload` performs when it
 /// settles the send. Priced with the other state-writing syscalls. The

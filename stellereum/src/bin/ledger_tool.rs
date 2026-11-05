@@ -153,7 +153,6 @@ fn rollback(dir: &std::path::Path, height: u64) {
         "headers",
         "session_keys",
         "bridge",
-        "confidential",
         "zkml_models",
         "cross_shard",
         "pq_keys",

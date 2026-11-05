@@ -19,14 +19,15 @@ order/types of `TransactionWire` (stellereum/src/sharding.rs:2356-2369),
 | tx plain (Ed25519 64 B sig, empty payload) | 176 |
 | tx priority-bid envelope (80 B sig) | 192 |
 | vote bare, `Some(hash)` / nil | 153 / 121 |
-| vote BLS envelope (176 B sig, flag-off nodes never emit) | 265 |
-| vote Falcon envelope (746 B sig) | 835 |
-| `ConsensusMsg::Vote`, locked=None (live path) / locked=Some | 158 / 190 |
-| QC(k Ed25519) = 57 + 104·k (k=1:161, 4:473, 7:785, 10:1097, 100:10457) | — |
+| vote Falcon hybrid envelope (746 B sig = 16 magic + 64 Ed + 666 Falcon) | 835 |
+| `ConsensusMsg::Vote`, locked=None (classical baseline) / locked=Some | 158 / 190 |
+| vote Falcon hybrid anatomy: 8+4+4+33+32+(8+746) = 835 (sig field 746 = `VOTE_FALCON_PART_LEN`, consensus.rs:214) | — |
+| QC(k Ed25519, refused under pure PQ) = 57 + 104·k (k=1:161, 4:473, 7:785, 10:1097, 100:10457) | — |
+| µQC Falcon envelope = 73 + ceil(C/8) + s·670 (s sigs; 670 = 4 len + 666 Falcon) | — |
 | block fixed part (0 txs, 1 proposer sig, no QCs) | 350 |
 | `Proposal(N)` = 366 + 176·N (N=0:366, 1:542, 100:17966, 428:75694, 1000:176366) | — |
-| `Committed{100 txs, qc7}` | 18747 |
-| BLS QC envelope fixed header (consensus.rs:271) + bitfield ceil(C/8) (C=7:1, 10:2, 100:13, 1000:125) | 161 + … |
+| `Committed{100 txs, qc7}` (classical baseline) | 18747 |
+| µQC Falcon envelope C=4 full-sign: 73 + 1 + 4·670 = 2754 (QC bincode 97 + 2754 = 2851) | — |
 
 Encoding (confirmed by harness): fieldless enum = u32 (4 B), `Option` tag =
 1 B, `Vec` len = u64 (8 B). E.g. vote = 8+4+4+33+32+(8+64) = 153. ✓
@@ -49,13 +50,16 @@ envelopes, etc.) always travel full. Receiver resolves via local mempool
 index; miss/ambiguity → bounded `BodyPull`. Fail-closed: block hash is still
 over full txs.
 
-**QC bitfield, aggregate-ready (BLS-off reality).** Live default counts only
-the Ed25519 list (BLS counting refused unless an explicit non-PQ opt-in the
-lead has not defined — bls.rs:47-59; `BLS_IS_POST_QUANTUM=false`). Add a
-canonical bitfield (sorted-`ValidatorId` order, trailing bits zero-or-reject)
-alongside the list: attribution/evidence use it now; verification keeps the
-list. At a future BLS activation: drop the list, keep 96 B aggregate +
-bitfield → QC(100): 10457 → ~271 B.
+**QC bitfield (PQ-live).** Live verification checks the Falcon µQC envelope
+(`QC_UQC_MAGIC` 16 B + `sortition_parent` 32 B + scheme 1 B + height 8 B +
+round 4 B + committee 4 B + bitmask-len 4 B + bitmask + sig-count 4 B +
+s·(4 + 666) sigs; layout consensus.rs:825-836, formula pinned by
+`pq_qc_sizes_vs_classical`) or the CEC epoch envelope (`QC_PQ_MAGIC`);
+standalone classical/BLS legs are refused under pure PQ. The canonical
+bitfield (sorted-`ValidatorId` order, trailing bits zero-or-reject) travels
+inside the µQC envelope as `signers_bitmask`: attribution/evidence reuse it
+without re-walking sig lists. No aggregate swap is defined — there is no BLS
+path to activate.
 
 **Header-first + body-pull sketch.** 1) gossip
 `CompactProposal{header, short_ids}`; 2) resolve locally, pull missing
@@ -72,8 +76,10 @@ bitfield → QC(100): 10457 → ~271 B.
 | 428 | 75694 | 2934 (−96.1%) | 6700 (−91.1%) |
 | 1000 | 176366 | 6366 (−96.4%) | 15166 (−91.4%) |
 
-QC hybrid (BLS-off): +ceil(C/8)+1 B overhead now (C=100: +14 B). Votes
-untouched (158 B live path).
+QC bitfield: already inside the µQC envelope (no extra overhead). PQ
+`ConsensusMsg::Vote` wire size: UNVERIFIED — needs a harness re-measure with
+the 746 B hybrid sig field (the 158 B row above is the refused classical
+baseline). Votes otherwise untouched by this design.
 
 ## 4. Risks
 

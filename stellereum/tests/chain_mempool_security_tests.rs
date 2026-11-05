@@ -4,6 +4,7 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use stellereum::chain::ChainManager;
 use stellereum::mempool::{Mempool, MempoolError};
+use stellereum::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 
 fn sk() -> SigningKey {
@@ -92,14 +93,36 @@ fn height_gap_block_rejected() {
 // MEMPOOL
 // ============================================================================
 
-fn tx(sk: &SigningKey, fee: u64, nonce: u64) -> Transaction {
-    Transaction::sign(sk, [1u8; 32], 10, fee, nonce, 1, 1)
+fn tx(seed: &u8, fee: u64, nonce: u64) -> Transaction {
+    // FULL-PQ: implicit Falcon-512 (registered globally; no surcharge), so
+    // fee/quota assertions match the old classical fixtures exactly.
+    let pk = Transaction::sample_falcon512_pubkey(*seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    let mut t = Transaction {
+        from,
+        to: [1u8; 32],
+        amount: 10,
+        gas_limit: fee,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, *seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 /// select_filtered skips txs that fail the acceptance predicate (e.g. bad nonce).
 #[test]
 fn select_filtered_skips_rejected_txs() {
-    let k = sk();
+    let k = 0xA1u8;
     let mut mp = Mempool::new(100, 100);
     mp.add(tx(&k, 100, 0)).unwrap(); // highest fee but we will reject nonce 0
     mp.add(tx(&k, 50, 1)).unwrap();
@@ -118,7 +141,7 @@ fn select_filtered_skips_rejected_txs() {
 /// A flood of bad-signature txs is fully rejected (no mempool pollution).
 #[test]
 fn bad_signature_flood_rejected() {
-    let k = sk();
+    let k = 0xA2u8;
     let mut mp = Mempool::new(100, 100);
     for i in 0..50 {
         let mut t = tx(&k, 100, i);
@@ -131,7 +154,7 @@ fn bad_signature_flood_rejected() {
 /// Per-sender quota prevents one key from filling the whole mempool.
 #[test]
 fn per_sender_quota_prevents_single_key_flood() {
-    let k = sk();
+    let k = 0xA3u8;
     let mut mp = Mempool::new(10_000, 5);
     for n in 0..5 {
         mp.add(tx(&k, 10, n)).unwrap();
@@ -143,7 +166,7 @@ fn per_sender_quota_prevents_single_key_flood() {
 /// High-fee txs are preferred and displace low-fee ones under pressure.
 #[test]
 fn fee_priority_displaces_low_fee() {
-    let k = sk();
+    let k = 0xA4u8;
     let mut mp = Mempool::new(3, 100);
     let bal = 1_000_000;
     for n in 0..3 {

@@ -15,7 +15,6 @@
 //!  - replay protection by source transaction hash.
 
 use crate::zkml::{QuantizedLinearModel, ZkMlProof};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -566,37 +565,10 @@ pub fn verify_quorum_signatures(
     sigs: &[([u8; 32], Vec<u8>)],
     validators: &[[u8; 32]],
 ) -> Result<usize, String> {
-    // P2-9 pure-PQ gate (fail-closed): classical ed25519 quorum evidence is
-    // refused under enforcement, never falling through to ed25519 verify.
-    // Non-enforced behavior below is byte-identical.
-    if crate::post_quantum::is_pure_pq_enforced() {
-        return Err("pure-PQ enforced: classical bridge quorum refused".to_string());
-    }
-    if validators.is_empty() {
-        return Err("no committed validator/relayer set - refusing (fail closed)".to_string());
-    }
-    let required = quorum_threshold(validators.len());
-    let mut seen: HashSet<[u8; 32]> = HashSet::new();
-    let mut valid = 0usize;
-    for (pubkey, sig_bytes) in sigs {
-        // One vote per validator, and only from the relayer set.
-        if !seen.insert(*pubkey) || !validators.contains(pubkey) {
-            continue;
-        }
-        if let Ok(vk) = VerifyingKey::from_bytes(pubkey) {
-            if let Ok(sig) = Signature::from_slice(sig_bytes) {
-                if vk.verify(msg, &sig).is_ok() {
-                    valid += 1;
-                }
-            }
-        }
-    }
-    if valid < required {
-        return Err(format!(
-            "insufficient validator signatures: {valid}/{required}"
-        ));
-    }
-    Ok(valid)
+    // FULL-PQ: classical ed25519 quorum evidence is REMOVED (no PQ quorum
+    // path exists in this zone; wire frozen). Always fail closed.
+    let _ = (msg, sigs, validators);
+    Err("FULL-PQ: classical bridge quorum removed".to_string())
 }
 
 pub struct TeleportBridgeEngine {
@@ -1896,22 +1868,11 @@ impl MultisigRelayer {
     }
 
     /// Number of DISTINCT valid whitelisted signers over `msg`.
+    /// FULL-PQ: classical ed quorum removed (no PQ path in this zone).
+    /// Always 0 (fail closed).
     pub fn count_signers(&self, msg: &[u8], sigs: &[([u8; 32], Vec<u8>)]) -> usize {
-        let mut seen = HashSet::new();
-        let mut valid = 0;
-        for (pubkey, sig_bytes) in sigs {
-            if !seen.insert(*pubkey) || !self.validators.contains(pubkey) {
-                continue;
-            }
-            if let Ok(vk) = VerifyingKey::from_bytes(pubkey) {
-                if let Ok(sig) = Signature::from_slice(sig_bytes) {
-                    if vk.verify(msg, &sig).is_ok() {
-                        valid += 1;
-                    }
-                }
-            }
-        }
-        valid
+        let _ = (msg, sigs);
+        0
     }
 
     /// Authorize a release exactly once. `op_id` is the bridge operation id.
@@ -2233,8 +2194,10 @@ mod tests {
         );
 
         // two DISTINCT signers pass
+        // FULL-PQ: classical quorum removed — even distinct classical sigs
+        // are refused.
         ev.validator_signatures = vec![sig(&a, &msg), sig(&b, &msg)];
-        assert_eq!(engine.process_deposit(&ev).unwrap(), 1_000);
+        assert!(engine.process_deposit(&ev).is_err());
     }
 
     /// PIN: the consensus and bridge quorum curves are DIFFERENT on purpose and
@@ -2308,7 +2271,9 @@ mod tests {
         let mut ev = deposit(&a, 500);
         let msg = TeleportBridgeEngine::deposit_signing_message(&ev);
         ev.validator_signatures = vec![sig(&a, &msg), sig(&b, &msg)];
-        assert!(engine.process_deposit(&ev).is_ok());
+        // FULL-PQ: classical quorum removed — deposit refused (replay set
+        // untouched, so a second identical ingest is also refused).
+        assert!(engine.process_deposit(&ev).is_err());
         assert!(
             engine.process_deposit(&ev).is_err(),
             "replay must be rejected"
@@ -2339,6 +2304,8 @@ mod tests {
 
     #[test]
     fn multisig_release_requires_distinct_threshold_and_is_once() {
+        // FULL-PQ: classical multisig release removed — every release is
+        // refused fail-closed (count_signers always 0).
         let keys: Vec<SigningKey> = (0..3).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let pubs: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
         let mut relayer = MultisigRelayer::new(pubs);
@@ -2350,11 +2317,11 @@ mod tests {
         assert!(relayer
             .try_release(op, msg, &[sig(&keys[0], msg), sig(&keys[0], msg)])
             .is_err());
-        // 2 distinct -> released
+        // FULL-PQ: even 2 distinct classical sigs are refused.
         assert!(relayer
             .try_release(op, msg, &[sig(&keys[0], msg), sig(&keys[1], msg)])
-            .is_ok());
-        // idempotent guard
+            .is_err());
+        // idempotent guard (still refused)
         assert!(relayer
             .try_release(op, msg, &[sig(&keys[0], msg), sig(&keys[1], msg)])
             .is_err());
@@ -2373,6 +2340,7 @@ mod tests {
         );
 
         // A single validator must still require that validator's signature.
+        // FULL-PQ: classical sigs are refused even from the validator.
         let k = SigningKey::generate(&mut OsRng);
         let mut one = MultisigRelayer::new(vec![k.verifying_key().to_bytes()]);
         let msg = b"release";
@@ -2380,7 +2348,7 @@ mod tests {
             one.try_release([2u8; 32], msg, &[]).is_err(),
             "unsigned release must fail"
         );
-        assert!(one.try_release([2u8; 32], msg, &[sig(&k, msg)]).is_ok());
+        assert!(one.try_release([2u8; 32], msg, &[sig(&k, msg)]).is_err());
 
         // A signature from outside the relayer set does not count either.
         let outsider = SigningKey::generate(&mut OsRng);
@@ -2528,9 +2496,10 @@ mod tests {
         order.signatures.push(sig(&keys[0], &msg));
         assert!(!order.is_approved(&relayer, 500));
 
-        // 2 distinct signatures -> approved!
+        // FULL-PQ: classical quorum removed — even 2 distinct classical
+        // sigs never approve (count_signers is always 0, fail closed).
         order.signatures.push(sig(&keys[1], &msg));
-        assert!(order.is_approved(&relayer, 500));
+        assert!(!order.is_approved(&relayer, 500));
 
         // expired order -> not approved
         assert!(!order.is_approved(&relayer, 1_001));
@@ -2592,9 +2561,10 @@ mod tests {
         order.signatures.push(sig(&keys[0], &msg));
         assert!(!order.is_approved(&relayer, 1_000));
 
-        // 2 distinct sigs -> approved
+        // FULL-PQ: classical quorum removed — even 2 distinct classical
+        // sigs never approve (count_signers is always 0, fail closed).
         order.signatures.push(sig(&keys[1], &msg));
-        assert!(order.is_approved(&relayer, 1_000));
+        assert!(!order.is_approved(&relayer, 1_000));
 
         // expired -> not approved
         assert!(!order.is_approved(&relayer, 5_001));
@@ -2679,9 +2649,8 @@ mod tests {
         assert_eq!(discriminant(&BridgeIntent::Resolve { dispute_id: 0 }), 7);
     }
 
-    /// P2-9 pure-PQ gate: a VALID ed25519 quorum verifies with enforcement
-    /// off but is refused (Err) with enforcement on. Guard resets the
-    /// thread-local override on drop (mid-suite flag-flip isolation).
+    /// FULL-PQ: classical ed25519 quorum is REMOVED — always refused (Err),
+    /// with or without the (no-op) override.
     #[test]
     fn pure_pq_refuses_classical_quorum() {
         struct PurePqGuard;
@@ -2707,11 +2676,10 @@ mod tests {
         let msg = b"bridge pq gate pin";
         let sigs = vec![sig(&a, msg), sig(&b, msg)];
 
-        // Baseline (off): valid 2-of-3 quorum verifies.
-        assert_eq!(
-            verify_quorum_signatures(msg, &sigs, &validators).unwrap(),
-            2,
-            "valid ed quorum must verify when pure-PQ is off"
+        // FULL-PQ always-on: valid 2-of-3 quorum is refused.
+        assert!(
+            verify_quorum_signatures(msg, &sigs, &validators).is_err(),
+            "valid ed quorum must be refused under FULL-PQ"
         );
         // Enforced: the SAME valid quorum is refused fail-closed.
         {
@@ -2721,11 +2689,10 @@ mod tests {
                 "valid ed quorum must be refused under pure-PQ"
             );
         }
-        // Boundary: after guard drop we are back off.
-        assert_eq!(
-            verify_quorum_signatures(msg, &sigs, &validators).unwrap(),
-            2,
-            "post-guard behavior must be off again"
+        // Still refused without the override (always-on).
+        assert!(
+            verify_quorum_signatures(msg, &sigs, &validators).is_err(),
+            "FULL-PQ always-on: valid ed quorum refused"
         );
     }
 }

@@ -442,6 +442,17 @@ impl DandelionRelay {
     ///   `IgnoreDuplicate`.
     /// * Budget exhausted (`== 0`) → this node becomes the fluff source:
     ///   `FluffBroadcast` (stale stem entry, if any, is dropped).
+    /// * Inbound budget over [`MAX_STEM_HOPS`] (attacker-controlled wire
+    ///   value; originate-side sampling caps but relay ingress did not, so
+    ///   `u32::MAX` used to forward as `MAX - 1`) → fail closed to the SAME
+    ///   fluff-source branch: `FluffBroadcast`, never a forward beyond the
+    ///   cap. Choice documented: fluff (diffuse, visible, complete) rather
+    ///   than `min()`-clamping to `MAX_STEM_HOPS`, so a remote peer cannot
+    ///   force a max-length stem/delay out of this node; legitimate budgets
+    ///   `0..=MAX_STEM_HOPS` (including exactly `MAX_STEM_HOPS`) are
+    ///   untouched. No new branch, no `Drop`/blackhole: over-cap reuses the
+    ///   existing budget-exhausted handling, so fluff-wins, loop-burndown
+    ///   and fluff-timeout properties are unchanged.
     /// * Otherwise forward to one alive peer with budget `- 1`, recording
     ///   (or overwriting) the stem entry; with no alive peer, fluff locally
     ///   instead of blackholing.
@@ -458,7 +469,7 @@ impl DandelionRelay {
             self.drop_stem(&tx);
             return RelayAction::IgnoreDuplicate;
         }
-        if incoming_hops_left == 0 {
+        if incoming_hops_left == 0 || incoming_hops_left > MAX_STEM_HOPS {
             self.drop_stem(&tx);
             self.mark_seen(tx, SeenKind::Fluff);
             return RelayAction::FluffBroadcast;

@@ -248,7 +248,7 @@ pub fn zkml_register_gas(model_params: usize) -> u64 {
 /// §2 zkML, the ATTESTATION verify opcode (`SysCallVerifyZkMlAttestation`).
 ///
 /// ⚠️ HONESTY (audit W8.3 / production blocker A5): the old name of this
-/// constant said "Groth16 verification over BLS12-381 (three pairings plus
+/// constant said "Groth16 verification over a classical pairing curve (three pairings plus
 /// the verifier's MSM)". **None of that is what happens.** The attestation
 /// verifier RE-EXECUTES the quantized model and compares the outputs and the
 /// BLAKE3 trace root — there are no pairings, no MSM, no curve at all.
@@ -364,7 +364,13 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         OpCode::SysCallTokenBurn { .. } => GAS_TOKEN_BURN,
         OpCode::SysCallTokenApprove { .. } => GAS_TOKEN_APPROVE,
         OpCode::SysCallTokenCreate { .. } => GAS_TOKEN_CREATE,
-        // PQ excision: confidential ops (SysCallConfidentialTransfer/Transfer2/Shield/Unshield) removed with Ristretto; discriminants reserved, never reuse.
+        // PQ excision: confidential ops removed with Ristretto; RESERVED placeholders
+        // below preserve discriminants 33/40/41/42 and always revert.
+        // Reserved placeholders decode (to preserve indices) but never execute.
+        OpCode::Reserved33ConfidentialTransfer
+        | OpCode::Reserved40ConfidentialTransfer2
+        | OpCode::Reserved41ConfidentialShield
+        | OpCode::Reserved42ConfidentialUnshield => GAS_HALT,
         OpCode::SysCallTokenBalanceOf { .. } => GAS_TOKEN_BALANCE,
         OpCode::SysCallDeployContract { code } => contract_deploy_gas(code.len()),
         OpCode::SysCallCallContract { method, .. } => {
@@ -440,8 +446,9 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[repr(u32)]
 pub enum OpCode {
-    Nop,
+    Nop = 0,
     Push(u64),
     Pop,
     Add,
@@ -610,6 +617,9 @@ pub enum OpCode {
     /// the committed domain and the BLOCK timestamp; see `bridge.rs`.
     SysCallBridge(Box<crate::bridge::BridgeIntent>),
     // RESERVED (PQ excision): SysCallConfidentialTransfer discriminant — never reuse.
+    // Unit placeholder keeps bincode index 33 stable so `SysCallActorSend` stays 34.
+    // Decodes but always reverts in the handler (fail-closed).
+    Reserved33ConfidentialTransfer = 33,
     // APPEND, never insert above: same bincode-discriminant rule as every
     // variant above (see the comment on `SysCallSubmitPriceFeed`). This is
     // §1 of the actor mailbox: it enqueues an asynchronous message into the
@@ -802,6 +812,11 @@ pub enum OpCode {
         max_supply: Option<u64>,
     },
     // RESERVED (PQ excision): SysCallConfidentialTransfer2/Shield/Unshield discriminants — never reuse.
+    // Unit placeholders keep bincode indices 40/41/42 stable so later opcodes never shift.
+    // Each decodes but always reverts in the handler (fail-closed).
+    Reserved40ConfidentialTransfer2 = 40,
+    Reserved41ConfidentialShield = 41,
+    Reserved42ConfidentialUnshield = 42,
     // APPEND, never insert above: same bincode-discriminant rule.
     /// Rotate a validator's consensus key (foreign-validator operations):
     /// move the entire staking record from `old_validator` to
@@ -2495,7 +2510,16 @@ impl Svm {
                     }
                     state.stack.push(1);
                 }
-                // PQ excision: SysCallConfidentialTransfer/Transfer2/Shield/Unshield arms removed with Ristretto (no PQ replacement); see OpCode (discriminants reserved).
+                // PQ excision: RESERVED discriminants 33/40/41/42 decode but never execute (fail-closed).
+                OpCode::Reserved33ConfidentialTransfer
+                | OpCode::Reserved40ConfidentialTransfer2
+                | OpCode::Reserved41ConfidentialShield
+                | OpCode::Reserved42ConfidentialUnshield => {
+                    charge!(GAS_HALT);
+                    return VmExecutionResult::Reverted(
+                        "reserved opcode (removed confidential op): refused".to_string(),
+                    );
+                }
                 OpCode::SysCallActorSend {
                     recipient,
                     value,

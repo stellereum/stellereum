@@ -2108,22 +2108,50 @@ fn decode_balance_nonce(value: &[u8]) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::{Vote, VoteKind};
+    use crate::consensus::{FalconKeypair, Vote, VoteKind};
+
+    /// FULL-PQ fixture (mirrors `consensus::tests::fvote` + `VoteSet::certificate`
+    /// idiom): Ed ids with registered Falcon-512 keys, Falcon-signed votes,
+    /// QC compiled via `VoteSet` so it carries the Ed list (membership/power)
+    /// plus the Falcon µQC envelope (crypto) — exactly what `verify_finality`
+    /// + `QuorumCertificate::verify` require.
+    fn pq_singleton(seed: u8) -> (ValidatorSet, SigningKey, FalconKeypair) {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let fk = FalconKeypair::generate_from_seed(seed);
+        let id = sk.verifying_key().to_bytes();
+        crate::consensus::register_validator_pq_key(
+            id,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+        let vs = ValidatorSet::from_list(vec![(id, 1)]);
+        (vs, sk, fk)
+    }
+
+    fn pq_cert_for(
+        height: u64,
+        round: u32,
+        block_hash: [u8; 32],
+        parent: [u8; 32],
+        vs: &ValidatorSet,
+        keys: &[(SigningKey, FalconKeypair)],
+    ) -> QuorumCertificate {
+        let mut set = crate::consensus::VoteSet::new();
+        for (sk, fk) in keys {
+            let v = Vote::sign_with_falcon(sk, fk, height, round, VoteKind::Precommit, Some(block_hash));
+            set.add(v, vs, height, round, VoteKind::Precommit)
+                .expect("falcon vote must ingest");
+        }
+        set.certificate_with_parent(Some(block_hash), vs, Some(&parent))
+            .expect("quorum must compile a Falcon µQC")
+    }
 
     /// A light client anchored at a checkpoint over `state_root`.
     fn client_for(state_root: CellHash) -> LightClient {
-        let signer = SigningKey::from_bytes(&[0x33u8; 32]);
-        let val_id = signer.verifying_key().to_bytes();
-        let validators = ValidatorSet::from_list(vec![(val_id, 1)]);
+        let (validators, sk, fk) = pq_singleton(0x33);
         let block_hash = [0x44u8; 32];
-        let vote = Vote::sign(&signer, 1, 0, VoteKind::Precommit, Some(block_hash));
-        let cert = QuorumCertificate {
-            height: 1,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(block_hash),
-            signatures: vec![(vote.voter, vote.signature)],
-        };
+        let parent = [0x99u8; 32];
+        let cert = pq_cert_for(1, 0, block_hash, parent, &validators, &[(sk, fk)]);
         let checkpoint = Checkpoint::new(1, block_hash, [0u8; 32], state_root, cert);
         LightClient::new(validators, checkpoint).expect("light client init")
     }
@@ -2317,9 +2345,7 @@ mod tests {
 
     #[test]
     fn test_spv_verification_succeeds_on_49_byte_pinned_account_leaf() {
-        let signer = SigningKey::from_bytes(&[0x11u8; 32]);
-        let val_id = signer.verifying_key().to_bytes();
-        let validators = ValidatorSet::from_list(vec![(val_id, 1)]);
+        let (validators, sk, fk) = pq_singleton(0x11);
 
         let address = [0x55u8; 32];
         let balance: u64 = 42_000_000;
@@ -2337,14 +2363,7 @@ mod tests {
         let proof = trie.generate_merkle_proof(&address).expect("merkle proof");
 
         let block_hash = [0x22u8; 32];
-        let vote = Vote::sign(&signer, 1, 0, VoteKind::Precommit, Some(block_hash));
-        let cert = QuorumCertificate {
-            height: 1,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(block_hash),
-            signatures: vec![(vote.voter, vote.signature)],
-        };
+        let cert = pq_cert_for(1, 0, block_hash, [0x99u8; 32], &validators, &[(sk, fk)]);
         let checkpoint = Checkpoint::new(1, block_hash, [0u8; 32], state_root, cert);
         let lc = LightClient::new(validators, checkpoint).expect("light client init");
 
@@ -2376,9 +2395,7 @@ mod tests {
 
     #[test]
     fn test_spv_verification_succeeds_on_16_byte_legacy_leaf() {
-        let signer = SigningKey::from_bytes(&[0x22u8; 32]);
-        let val_id = signer.verifying_key().to_bytes();
-        let validators = ValidatorSet::from_list(vec![(val_id, 1)]);
+        let (validators, sk, fk) = pq_singleton(0x22);
 
         let address = [0x66u8; 32];
         let balance: u64 = 10_000;
@@ -2393,14 +2410,7 @@ mod tests {
         let proof = trie.generate_merkle_proof(&address).expect("merkle proof");
 
         let block_hash = [0x33u8; 32];
-        let vote = Vote::sign(&signer, 1, 0, VoteKind::Precommit, Some(block_hash));
-        let cert = QuorumCertificate {
-            height: 1,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(block_hash),
-            signatures: vec![(vote.voter, vote.signature)],
-        };
+        let cert = pq_cert_for(1, 0, block_hash, [0x99u8; 32], &validators, &[(sk, fk)]);
         let checkpoint = Checkpoint::new(1, block_hash, [0u8; 32], state_root, cert);
         let lc = LightClient::new(validators, checkpoint).expect("light client init");
 
@@ -2614,29 +2624,17 @@ mod tests {
     }
 
     /// A `stell_getHistoricalRoot`-style answer anchoring `root` at
-    /// `archive_height + 1` with `signer`'s QC, and the matching checkpoint.
+    /// `archive_height + 1` with a Falcon µQC, and the matching checkpoint.
     fn historical_root_fixture(
         archive_height: u64,
         root: CellHash,
-        signer: &SigningKey,
+        vs: &ValidatorSet,
+        keys: &[(SigningKey, FalconKeypair)],
     ) -> (serde_json::Value, Checkpoint, [u8; 32]) {
         let anchor_height = archive_height + 1;
         let anchor_hash = [0xB0u8; 32];
         let parent_hash = [0xA0u8; 32];
-        let vote = Vote::sign(
-            signer,
-            anchor_height,
-            0,
-            VoteKind::Precommit,
-            Some(anchor_hash),
-        );
-        let cert = QuorumCertificate {
-            height: anchor_height,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(anchor_hash),
-            signatures: vec![(vote.voter, vote.signature)],
-        };
+        let cert = pq_cert_for(anchor_height, 0, anchor_hash, parent_hash, vs, keys);
         let answer = serde_json::json!({
             "height": archive_height,
             "state_root": hex::encode(root),
@@ -2804,9 +2802,8 @@ mod tests {
     fn test_historical_root_answer_becomes_a_trusted_checkpoint() {
         // End to end: the client follows a QC-anchored chain from its trusted
         // anchor, then verifies an archive proof against the adopted root.
-        let signer = SigningKey::from_bytes(&[0x77u8; 32]);
-        let val_id = signer.verifying_key().to_bytes();
-        let validators = ValidatorSet::from_list(vec![(val_id, 1)]);
+        let (validators, sk, fk) = pq_singleton(0x77);
+        let keys = vec![(sk.clone(), fk.clone())];
 
         let (trie, root, present, _) = archive_trie();
         let archive_height = 5u64;
@@ -2814,26 +2811,21 @@ mod tests {
         // The client's trusted anchor: the finalized block AT the archive
         // height, committing to the historical root.
         let anchor_hash = [0xA0u8; 32];
-        let anchor_vote = Vote::sign(
-            &signer,
+        let anchor_parent = [0x99u8; 32];
+        let anchor_cert = pq_cert_for(
             archive_height,
             0,
-            VoteKind::Precommit,
-            Some(anchor_hash),
+            anchor_hash,
+            anchor_parent,
+            &validators,
+            &keys,
         );
-        let anchor_cert = QuorumCertificate {
-            height: archive_height,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(anchor_hash),
-            signatures: vec![(anchor_vote.voter, anchor_vote.signature)],
-        };
         let anchor = Checkpoint::new(archive_height, anchor_hash, [0u8; 32], root, anchor_cert);
         let mut lc = LightClient::new(validators.clone(), anchor).expect("anchor");
 
         // The historical-root answer for the SAME height, anchored at
         // height+1 with a fresh QC: parse, verify, adopt.
-        let (answer, cp, _) = historical_root_fixture(archive_height, root, &signer);
+        let (answer, cp, _) = historical_root_fixture(archive_height, root, &validators, &keys);
         let parsed = Checkpoint::from_historical_root_json(&answer).expect("parse");
         assert_eq!(parsed, cp);
         parsed

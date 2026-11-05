@@ -24,14 +24,25 @@ fn default_unknown_allow() -> Vec<String> {
 #[serde(rename_all = "kebab-case")]
 pub struct PeerConfig {
     pub name: String,
+    /// Legacy pinned classical id (`inf1:`). Retained for frozen
+    /// handshake/TLS-pin/DHT call sites (out of zone); NOT the canonical
+    /// `NodeId` in FULL-PQ (canonical = PQ id from `pq_pub` via
+    /// `primary_id`). Follow-up owns its removal once those call sites
+    /// migrate (grep: `node_id_raw` live users in `node.rs`).
     pub node_id: String,
+    /// Legacy pinned Ed25519 key. Retained for frozen handshake-auth/TLS
+    /// (`PinnedVerifier`, `ed_bytes` call sites); NOT identity in FULL-PQ.
+    /// Follow-up owns removal (grep-proof: live users, see report).
     pub ed_pub: String,
+    /// Legacy pinned X25519 key. Retained for frozen transport-crypto
+    /// (`x_bytes`, X3DH session derivation); NOT identity in FULL-PQ.
+    /// Follow-up owns removal (grep-proof: live users, see report).
     pub x_pub: String,
-    /// Falcon-512 long-term PQ public key (897 bytes, hex). `None` (absent)
-    /// = classical-only peer, explicit — never inferred. PQ 9.0 field,
-    /// handshake default-ON since PQ 9.1 (absent stays classical-explicit
-    /// pre-H, refused at/after `proto::PQ_CLASSICAL_REFUSE_AFTER_HEIGHT`):
-    /// old configs without this key parse unchanged (`serde(default)`).
+    /// Falcon-512 long-term PQ public key (897 bytes, hex). MANDATORY in
+    /// FULL-PQ (a peer without it is refused by `primary_id` /
+    /// `dual_announce_ids`). Kept `Option` in serde shape only so old
+    /// operator configs still parse (then fail closed with a clear error
+    /// instead of a serde break).
     #[serde(default)]
     pub pq_pub: Option<String>,
     pub endpoints: Vec<String>,
@@ -86,10 +97,9 @@ impl PeerConfig {
             .map_err(|_| anyhow!("x_pub должен быть 32 байта"))
     }
 
-    /// Raw Falcon-512 public key, or `None` for a classical-only peer
-    /// (explicit absence — not an error, per plan §5 window tolerance).
-    /// A present-but-malformed value is a hard error (fail closed: a pinned
-    /// PQ key that does not parse must never silently become "classical").
+    /// Raw Falcon-512 public key, or `None` when absent (absent = refused
+    /// by `primary_id`/`dual_announce_ids`, never silently classical).
+    /// A present-but-malformed value is a hard error (fail closed).
     pub fn pq_bytes(&self) -> Result<Option<[u8; crate::proto::PQ_FALCON_PK_LEN]>> {
         let Some(s) = self.pq_pub.as_deref() else {
             return Ok(None);
@@ -100,27 +110,26 @@ impl PeerConfig {
             .map(Some)
     }
 
-    /// Primary identity for this peer under the NodeId re-ceremony
-    /// (`keyring::resolve_node_id` peer-side mirror): the PQ id when a PQ key
-    /// is pinned (via `proto::pq_id_from_pub` — no duplicate logic), else the
-    /// pinned classical `node_id`. Pure addition — serde shape unchanged, so
-    /// old single-ed configs parse exactly as before.
+    /// Primary identity for this peer under the PQ-only re-ceremony
+    /// (`keyring::resolve_node_id` peer-side mirror): the PQ id derived via
+    /// `proto::pq_id_from_pub`. PQ is MANDATORY — a peer without a pinned
+    /// `pq_pub` is refused (FULL-PQ wipe, no classical fallback).
     pub fn primary_id(&self) -> Result<[u8; crate::proto::NODEID_LEN]> {
-        if let Some(pq) = self.pq_bytes()? {
-            return Ok(crate::proto::pq_id_from_pub(&pq));
-        }
-        self.node_id_raw()
+        let Some(pq) = self.pq_bytes()? else {
+            return Err(anyhow!("pq_pub is mandatory (classical-only peer refused)"));
+        };
+        Ok(crate::proto::pq_id_from_pub(&pq))
     }
 
-    /// Dual-announce view of this peer during the migration window: both ids,
-    /// PQ FIRST when a PQ key is pinned, else the single classical alias.
+    /// PQ-only announce view: the single PQ id. A peer without a pinned
+    /// PQ key is refused (no legacy alias).
     /// Same ordering rule as `keyring::dual_announce_ids` (recomputed from
     /// the pinned keys, never stored — pins stay the source of truth).
     pub fn dual_announce_ids(&self) -> Result<Vec<[u8; crate::proto::NODEID_LEN]>> {
-        match self.pq_bytes()? {
-            Some(pq) => Ok(vec![crate::proto::pq_id_from_pub(&pq), self.node_id_raw()?]),
-            None => Ok(vec![self.node_id_raw()?]),
-        }
+        let Some(pq) = self.pq_bytes()? else {
+            return Err(anyhow!("pq_pub is mandatory (classical-only peer refused)"));
+        };
+        Ok(vec![crate::proto::pq_id_from_pub(&pq)])
     }
 }
 

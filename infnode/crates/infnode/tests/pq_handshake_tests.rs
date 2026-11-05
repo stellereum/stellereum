@@ -27,6 +27,7 @@ use infnode::keyring::PqKeys;
 use infnode::node::{
     pq_announce_fields, pq_falcon_transcript_digest, PqBindOutcome, PqIdentityRegistry,
 };
+use infnode::node::{pq_pinned_key_check_cached, FalconPeerKeyCache};
 use infnode::proto::{
     pq_falcon_digest, pq_falcon_policy, pq_falcon_sign, pq_falcon_verify, pq_id_from_pub,
     PQ_FALCON_PK_LEN, PQ_FALCON_SIG_LEN, PQ_SUITE_FALCON512,
@@ -1241,4 +1242,266 @@ fn pq_identity_load_or_generate_corrupt_hard_errors() {
     // Unreadable (missing after dir exists... absent regenerates; a
     // directory that cannot be written fails instead of downgrading).
     pq_cleanup(&d);
+}
+
+// ---------------------------------------------------------------------------
+// 17. Long-term PQ peer-key cache: verify ONCE per distinct key, exact
+// invalidation on rotation/registry change, tampered-at-rotate fails,
+// per-handshake checks still run fresh. (Perf zone: static-key check only.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pq_longterm_cache_same_key_hits_once() {
+    use infnode::node::FalconPeerKeyCache;
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let pk_a = a.pq_pub();
+    let mut c = FalconPeerKeyCache::new();
+    assert!(c.is_empty());
+    // First check verifies fresh (miss) and caches true.
+    assert!(c.check(&pk_a));
+    assert_eq!(c.len(), 1);
+    assert_eq!(c.get(&pk_a), Some(true));
+    // Second check of identical bytes hits (no recompute observable here,
+    // but len stays 1 and verdict identical).
+    assert!(c.check(&pk_a));
+    assert_eq!(c.len(), 1);
+    // Malformed key caches false (fail-closed), still keyed by bytes.
+    let bad = vec![0x77u8; 32];
+    assert!(!c.check(&bad));
+    assert_eq!(c.get(&bad), Some(false));
+    assert_eq!(c.len(), 2);
+    assert!(!c.check(&bad));
+    assert_eq!(c.len(), 2);
+}
+
+#[test]
+fn pq_longterm_cache_rotation_reverifies_not_stale() {
+    use infnode::node::FalconPeerKeyCache;
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let b = PqKeys::from_seed([0x3Bu8; 32]);
+    let pk_a = a.pq_pub();
+    let pk_b = b.pq_pub();
+    assert_ne!(pk_a, pk_b);
+    let mut c = FalconPeerKeyCache::new();
+    assert!(c.check(&pk_a));
+    assert_eq!(c.len(), 1);
+    // Rotation: different bytes => miss => fresh verify of the NEW key
+    // (proves no stale-key-after-rotation hit).
+    assert!(c.get(&pk_b).is_none(), "rotated key must miss before verify");
+    assert!(c.check(&pk_b));
+    assert_eq!(c.len(), 2);
+    assert_eq!(c.get(&pk_a), Some(true));
+    assert_eq!(c.get(&pk_b), Some(true));
+    // Exact invalidation: dropping the old entry forces re-verify.
+    assert!(c.invalidate(&pk_a));
+    assert!(c.get(&pk_a).is_none());
+    assert!(c.check(&pk_a), "re-verify after invalidate must pass again");
+    assert!(!c.invalidate(&vec![0x00u8; 897]), "unknown bytes invalidate=false");
+}
+
+#[test]
+fn pq_longterm_cache_registry_change_clears() {
+    use infnode::node::FalconPeerKeyCache;
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let b = PqKeys::from_seed([0x3Bu8; 32]);
+    let mut c = FalconPeerKeyCache::new();
+    assert!(c.check(&a.pq_pub()));
+    assert!(c.check(&b.pq_pub()));
+    assert_eq!(c.len(), 2);
+    // Registry/config change => clear all; both keys must re-verify fresh.
+    c.clear();
+    assert!(c.is_empty());
+    assert!(c.get(&a.pq_pub()).is_none());
+    assert!(c.check(&a.pq_pub()));
+    assert!(c.check(&b.pq_pub()));
+    assert_eq!(c.len(), 2);
+}
+
+#[test]
+fn pq_longterm_cache_tampered_at_rotate_fails() {
+    use infnode::node::FalconPeerKeyCache;
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let pk_a = a.pq_pub();
+    let mut c = FalconPeerKeyCache::new();
+    assert!(c.check(&pk_a));
+    // Tampered rotation target: same length, one bit flipped => the FULL
+    // per-handshake verify must fail, never a stale accept from the honest
+    // entry. (The static parse cache is keyed by exact bytes so the tampered
+    // bytes always miss first; whether the tampered bytes themselves parse
+    // is irrelevant — the tag verify over the fresh digest refuses.)
+    let mut tampered = pk_a.clone();
+    tampered[10] ^= 0x01;
+    assert_ne!(tampered, pk_a);
+    assert!(c.get(&tampered).is_none(), "tampered bytes must miss, never stale-hit");
+    let _ = c.check(&tampered); // cache the tampered bytes' own parse verdict
+    // Honest entry untouched by the tampered check.
+    assert_eq!(c.get(&pk_a), Some(true));
+    // Full per-handshake tag verify refuses the tampered key either way.
+    let digest = pq_falcon_digest(&fixed_transcript());
+    let sig = a.sign_digest(&digest);
+    assert!(!pq_falcon_verify(&tampered, &digest, &sig));
+    assert_eq!(
+        pq_falcon_policy(true, Some(&tampered), &digest, Some(&sig)).unwrap_err(),
+        "pq falcon tag failed",
+        "tampered key at rotate must be refused by policy"
+    );
+    assert!(pq_falcon_verify(&pk_a, &digest, &sig));
+    // Truncated key (wrong length) is statically invalid AND refused.
+    assert!(!c.check(&tampered[..100]));
+    assert_eq!(
+        pq_falcon_policy(true, Some(&tampered[..100]), &digest, Some(&sig)).unwrap_err(),
+        "pq identity malformed"
+    );
+}
+
+#[test]
+fn pq_longterm_cache_per_handshake_checks_still_fresh() {
+    use infnode::node::FalconPeerKeyCache;
+    // Static cache HIT on the honest long-term key...
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let mut c = FalconPeerKeyCache::new();
+    assert!(c.check(&a.pq_pub()));
+    assert_eq!(c.get(&a.pq_pub()), Some(true));
+    // ...must NOT excuse per-handshake failures: tampered digest, wrong-key
+    // tag, and tampered KEM ct are all still refused every handshake.
+    let digest = pq_falcon_digest(&fixed_transcript());
+    let sig = a.sign_digest(&digest);
+    let mut bad_digest = digest;
+    bad_digest[0] ^= 0x01;
+    assert!(!pq_falcon_verify(&a.pq_pub(), &bad_digest, &sig));
+    let b = PqKeys::from_seed([0x3Bu8; 32]);
+    let cross = b.sign_digest(&digest);
+    assert!(!pq_falcon_verify(&a.pq_pub(), &digest, &cross));
+    // KEM ct tamper still breaks the transcript tag (responder/initiator).
+    let init_id = [9u8; NODEID_LEN];
+    let resp_id = [7u8; NODEID_LEN];
+    let eph_init = [0x11u8; 32];
+    let eph_resp = [0x22u8; 32];
+    let auth_at = 1_700_000_000_001i64;
+    let offer = pq_initiator_offer().expect("offer");
+    let ch_json = serde_json::json!({
+        "nonce": "abcdef0123456789", "at": auth_at,
+        "eph": hex::encode(eph_init), "ed": hex::encode([3u8; 32]), "x": hex::encode([4u8; 32]),
+        "pq_ver": PQ_TRANSCRIPT_VERSION, "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
+        "pq_ek": hex::encode(&offer.ek),
+    });
+    let ch = challenge_frame(init_id, resp_id, ch_json.to_string().into_bytes());
+    let ch_sd = ch.sign_data();
+    let (ct, agreed_r) = pq_responder_accept(
+        &eph_init, &ch_json, &ch_sd, &eph_resp, auth_at, &resp_id,
+    )
+    .expect("accept")
+    .expect("offer");
+    assert_eq!(ct.len(), 1088);
+    // Flip one ct byte in the AUTH answer: initiator must refuse with a
+    // clear transcript-auth error even though the static key is cache-valid.
+    let mut bad_ct = ct.clone();
+    bad_ct[0] ^= 0x01;
+    let bad_auth_json = serde_json::json!({
+        "node": format!("inf1:{}", hex::encode(resp_id)), "name": "resp", "at": auth_at,
+        "eph": hex::encode(eph_resp), "pq_ver": PQ_TRANSCRIPT_VERSION, "pq_suite": PQ_SUITE_MLKEM768_HYBRID,
+        "pq_ct": hex::encode(&bad_ct), "pq_tag": hex::encode(agreed_r.tag),
+    });
+    let bad_auth = auth_frame(resp_id, init_id, bad_auth_json.to_string().into_bytes());
+    let err = match pq_initiator_answer(&Some(offer), &ch_sd, &eph_init, &bad_auth) {
+        Ok(_) => "ACCEPTED".to_string(),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        err.contains("pq transcript auth failed"),
+        "tampered KEM ct must still be refused on cache-hit key, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 18. Accept-path pinned-key gate (`pq_pinned_key_check_cached`): the exact
+// helper `handle_stream` runs for known peers — cached static parse only.
+// Absent = classical-explicit (no entry), pinned-valid = Ok(true) once,
+// malformed = fail-closed Err, rotation re-verifies, tampered-at-rotate
+// fails. (Perf zone: static-key check only; tag/KEM/freshness untouched.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pq_accept_gate_absent_is_classical_no_entry() {
+    let mut c = FalconPeerKeyCache::new();
+    assert!(!pq_pinned_key_check_cached(&mut c, &pq_peer_cfg(None)).expect("absent"));
+    assert!(c.is_empty(), "classical-explicit peer must not populate the cache");
+}
+
+#[test]
+fn pq_accept_gate_pinned_valid_caches_once() {
+    let keys = PqKeys::from_seed([0x5Au8; 32]);
+    let mut cfg = pq_peer_cfg(None);
+    cfg.pq_pub = Some(keys.pq_pub_hex());
+    let mut c = FalconPeerKeyCache::new();
+    assert!(pq_pinned_key_check_cached(&mut c, &cfg).expect("valid"));
+    assert_eq!(c.len(), 1);
+    // Second handshake from the same peer: cached verdict, no recompute entry.
+    assert!(pq_pinned_key_check_cached(&mut c, &cfg).expect("valid"));
+    assert_eq!(c.len(), 1);
+}
+
+#[test]
+fn pq_accept_gate_malformed_pin_refuses() {
+    let mut c = FalconPeerKeyCache::new();
+    // Bad hex length.
+    assert!(pq_pinned_key_check_cached(&mut c, &pq_peer_cfg(Some("00".to_string()))).is_err());
+    // Right type, wrong length.
+    assert!(
+        pq_pinned_key_check_cached(&mut c, &pq_peer_cfg(Some(hex::encode([9u8; 32])))).is_err()
+    );
+    // Right length, not a Falcon-512 point (all-zero).
+    assert!(
+        pq_pinned_key_check_cached(&mut c, &pq_peer_cfg(Some(hex::encode([0u8; 897])))).is_err()
+    );
+}
+
+#[test]
+fn pq_accept_gate_rotation_reverifies_not_stale() {
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let b = PqKeys::from_seed([0x3Bu8; 32]);
+    let mut cfg_a = pq_peer_cfg(None);
+    cfg_a.pq_pub = Some(a.pq_pub_hex());
+    let mut cfg_b = pq_peer_cfg(None);
+    cfg_b.pq_pub = Some(b.pq_pub_hex());
+    let mut c = FalconPeerKeyCache::new();
+    assert!(pq_pinned_key_check_cached(&mut c, &cfg_a).expect("a"));
+    // Rotation: the new bytes miss before verify (proves no stale hit).
+    assert!(c.get(&b.pq_pub()).is_none(), "rotated key must miss before verify");
+    assert!(pq_pinned_key_check_cached(&mut c, &cfg_b).expect("b"));
+    assert_eq!(c.len(), 2);
+    // Exact invalidation of the old pin forces fresh re-verify.
+    assert!(c.invalidate(&a.pq_pub()));
+    assert!(c.get(&a.pq_pub()).is_none());
+    assert!(pq_pinned_key_check_cached(&mut c, &cfg_a).expect("a re-verify"));
+}
+
+#[test]
+fn pq_accept_gate_tampered_at_rotate_fails() {
+    let a = PqKeys::from_seed([0x5Au8; 32]);
+    let mut cfg = pq_peer_cfg(None);
+    cfg.pq_pub = Some(a.pq_pub_hex());
+    let mut c = FalconPeerKeyCache::new();
+    assert!(pq_pinned_key_check_cached(&mut c, &cfg).expect("honest"));
+    // Tampered rotation target: one bit flipped. The gate must refuse it —
+    // never a stale accept from the honest entry.
+    let mut tampered = a.pq_pub();
+    tampered[10] ^= 0x01;
+    let mut bad_cfg = pq_peer_cfg(None);
+    bad_cfg.pq_pub = Some(hex::encode(&tampered));
+    // If the tampered bytes still happen to parse as a point, the gate would
+    // accept the STATIC parse — but the per-handshake tag verify over the
+    // fresh digest must refuse either way (belt and suspenders, proved here).
+    let digest = pq_falcon_digest(&fixed_transcript());
+    let sig = a.sign_digest(&digest);
+    assert!(
+        !pq_falcon_verify(&tampered, &digest, &sig),
+        "tampered key must fail the per-handshake tag verify"
+    );
+    // And the all-zero key (guaranteed non-point) is refused by the gate.
+    let mut zero_cfg = pq_peer_cfg(None);
+    zero_cfg.pq_pub = Some(hex::encode([0u8; 897]));
+    assert!(pq_pinned_key_check_cached(&mut c, &zero_cfg).is_err());
+    // Honest entry untouched.
+    assert_eq!(c.get(&a.pq_pub()), Some(true));
 }

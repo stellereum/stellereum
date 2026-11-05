@@ -3887,7 +3887,12 @@ mod retention_tests {
 
     /// VERIFICATION G5: a forged oracle feed planted in local KV (via
     /// `dht.sync` replication from an untrusted peer) must never be served
-    /// as market evidence. Only a correctly signed feed decodes.
+    /// as market evidence.
+    /// FULL-PQ (mirrors `oracle::tests::pure_pq_refuses_classical_feed`):
+    /// classical Ed25519 feed verification is removed with no PQ feed path
+    /// (wire frozen), so EVERY classical feed — genuine, tampered, or
+    /// self-consistent forgery — reads as a miss. Same fail-closed property,
+    /// stronger verdict.
     #[test]
     fn verification_oracle_fetch_reverifies_signature() {
         use ed25519_dalek::SigningKey;
@@ -3895,9 +3900,11 @@ mod retention_tests {
         let sk = SigningKey::generate(&mut OsRng);
         let feed = PriceFeedUpdate::sign("STELL", 250_000, 1_700_000_000, &sk);
         let stored = hex::encode(bincode::serialize(&feed).unwrap());
-        // Genuine feed: served.
-        let back = decode_verified_price_feed(&stored).expect("signed feed must decode");
-        assert_eq!(back.price_micro_usd, 250_000);
+        // Genuine classical feed: refused under FULL-PQ (no PQ feed path).
+        assert!(
+            decode_verified_price_feed(&stored).is_none(),
+            "a classical feed must NOT decode under FULL-PQ"
+        );
         // Tampered price bytes: signature no longer matches -> miss.
         let mut tampered = feed.clone();
         tampered.price_micro_usd = 1;
@@ -3907,17 +3914,15 @@ mod retention_tests {
             "a re-priced feed with the old signature must read as a miss"
         );
         // Forged publisher key (attacker signs with their own key but claims
-        // the asset): structurally valid, cryptographically foreign.
-        // `verify` only checks the signature against the ATTACHED key, so a
-        // self-consistent forgery verifies here — publisher-set membership is
-        // enforced one layer up (`OracleState::apply_update`). The fetch gate
-        // guarantees integrity (bytes == publisher's words), not membership.
+        // the asset): refused — under FULL-PQ even a self-consistent classical
+        // signature fails the integrity gate (membership is checked by
+        // OracleState on top of this).
         let attacker = SigningKey::generate(&mut OsRng);
         let forged = PriceFeedUpdate::sign("STELL", 1, 1_700_000_000, &attacker);
         let forged_hex = hex::encode(bincode::serialize(&forged).unwrap());
         assert!(
-            decode_verified_price_feed(&forged_hex).is_some(),
-            "a self-consistent signature passes the integrity gate (membership is checked by OracleState)"
+            decode_verified_price_feed(&forged_hex).is_none(),
+            "a self-consistent classical signature must still read as a miss under FULL-PQ"
         );
         // Garbage: miss, never a panic or a fabricated feed.
         assert!(decode_verified_price_feed("zzzz").is_none());

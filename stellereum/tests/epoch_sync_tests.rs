@@ -34,7 +34,10 @@ use rand::rngs::OsRng;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{
+    register_validator_pq_key, ValidatorSet, Vote, VoteKind, VoteSet,
+};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::consensus_net::{consensus_topic, tx_topic};
 use stellereum::network::{
     block_body_blob_name, EpochTag, BUCKET_STELLEREUM_BLOCKS, BUCKET_STELLEREUM_HEAD,
@@ -229,24 +232,45 @@ fn vset(ks: &[SigningKey]) -> ValidatorSet {
     )
 }
 
-fn attach_quorum(b: &mut Block, ks: &[SigningKey], height: u64, bh: [u8; 32]) {
-    let sigs = ks
-        .iter()
-        .map(|k| {
-            let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(bh));
-            (v.voter, v.signature)
-        })
-        .collect();
-    b.precommit_qc = Some(QuorumCertificate {
-        height,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: sigs,
-    });
+/// FULL-PQ: deterministic Falcon companions for `ks` (stable within a test).
+fn fks_for(ks: &[SigningKey]) -> Vec<FalconKeypair> {
+    ks.iter()
+        .enumerate()
+        .map(|(i, _)| FalconKeypair::generate_from_seed(i as u8))
+        .collect()
 }
 
-async fn build_chain(ks: &[SigningKey], base: &Arc<InMemoryStateEngine>, n: u64) -> Vec<Block> {
+fn attach_quorum(
+    b: &mut Block,
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    vs: &ValidatorSet,
+    height: u64,
+    bh: [u8; 32],
+    parent: [u8; 32],
+) {
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        register_validator_pq_key(
+            k.verifying_key().to_bytes(),
+            PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+    }
+    let mut set = VoteSet::new();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        let v = Vote::sign_with_falcon(k, fk, height, 0, VoteKind::Precommit, Some(bh));
+        set.add(v, vs, height, 0, VoteKind::Precommit)
+            .expect("genuine vote admits");
+    }
+    b.precommit_qc = set.certificate_with_parent(Some(bh), vs, Some(&parent));
+}
+
+async fn build_chain(
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    base: &Arc<InMemoryStateEngine>,
+    n: u64,
+) -> Vec<Block> {
     let vs = vset(ks);
     let mut out = Vec::new();
     let mut prev = [0u8; 32];
@@ -278,7 +302,7 @@ async fn build_chain(ks: &[SigningKey], base: &Arc<InMemoryStateEngine>, n: u64)
         };
         b.sign_block(&proposer);
         let bh = b.compute_hash();
-        attach_quorum(&mut b, ks, h, bh);
+        attach_quorum(&mut b, ks, fks, &vs, h, bh, prev);
         prev = b.compute_hash();
         out.push(b);
     }
@@ -460,10 +484,11 @@ async fn cross_epoch_reader_finds_nothing_from_foreign_epoch() {
     let net = FakeEpochStore::default();
 
     let ks = keys(3);
+    let fks = fks_for(&ks);
     let base = Arc::new(InMemoryStateEngine::new());
     base.update_account(AccountState::new([0x55u8; 32], 777_000))
         .await;
-    let blocks = build_chain(&ks, &base, 6).await;
+    let blocks = build_chain(&ks, &fks, &base, 6).await;
     let snap = base.create_snapshot().await;
 
     // Epoch A publishes head + headers + snapshot + bodies.
@@ -523,12 +548,13 @@ async fn same_epoch_catch_up_succeeds_and_lands_on_peer_root() {
     let net = FakeEpochStore::default();
 
     let ks = keys(4);
+    let fks = fks_for(&ks);
     let vs = vset(&ks);
     let payer = ks[0].verifying_key().to_bytes();
     let base = Arc::new(InMemoryStateEngine::new());
     base.update_account(AccountState::new(payer, 1_000_000_000_000))
         .await;
-    let blocks = build_chain(&ks, &base, 8).await;
+    let blocks = build_chain(&ks, &fks, &base, 8).await;
     let snap = base.create_snapshot().await;
     let peer_root = blocks.last().unwrap().state_root;
 

@@ -2738,18 +2738,6 @@ fn xpc_activation_from_env() -> stellereum::xshard2pc::XpcActivation {
     }
 }
 
-/// VRF sortition activation, read from the environment (RETIRED).
-///
-/// Same shape as [`xpc_activation_from_env`] (an env height boundary,
-/// default-off), except arming is retired: any configured
-/// `STELL_VRF_ACTIVATION_HEIGHT=<h>` value warns loudly and is ignored —
-/// `stellereum::vrf::vrf_activation_from_env` always returns `Disabled`.
-/// Single source of truth is `stellereum::vrf::vrf_activation_from_env`;
-/// this wrapper is the main.rs-owned startup seam.
-fn vrf_activation_from_env() -> stellereum::vrf::VrfActivation {
-    stellereum::vrf::vrf_activation_from_env()
-}
-
 /// Startup-heal retry budget: missing bodies are transient (a peer that just
 /// restarted is still publishing its window), so the heal loop retries with
 /// backoff instead of exiting on the first miss.
@@ -2911,25 +2899,7 @@ async fn run_consensus_node(
             }
         }
     }
-    // VRF secret provisioning (phase-3 activation): precedence
-    // `STELL_VRF_SECRET_FILE` (0600-checked file) > `STELL_VRF_SECRET`
-    // (inline hex) > derived `BLAKE3("VRF_SUBSEED_V1" || ed_seed_32)` (see
-    // `stellereum::vrf::provision_vrf_secret_seed`) — installed via
-    // `with_vrf_secret_seed` below. Deterministic fallback: the same ed seed
-    // derives the same VRF key forever (across restarts, no new secret to
-    // distribute); a distinct keypair from ed (separate scalar derivation);
-    // the same secrecy level (seed-derived, stored alongside the ed key,
-    // zeroized after use). Remote-signer deployments hold no local VRF seed:
-    // nothing is installed, so `vrf_beacon_seal_for` returns `None` there
-    // (legacy fallback, loud). An explicit-but-broken source warns loudly
-    // and falls through — never fatal to startup.
-    let validator_ed_seed = zeroize::Zeroizing::new(key.to_bytes());
-    let provisioned_vrf_seed: Option<[u8; 32]> =
-        stellereum::vrf::provision_vrf_secret_seed(if remote_signer.is_some() {
-            None
-        } else {
-            Some(&*validator_ed_seed)
-        });
+    // Election is the canonical parent-hash draw (no key material provisioned).
     let mut rt = ValidatorRuntime::new(key, validators, state.clone(), 1)
         .with_mempool(rpc.mempool.clone())
         // The epoch-seal frames (the DKG contribution, the order commitment
@@ -3078,47 +3048,8 @@ async fn run_consensus_node(
         ),
     }
 
-    // VRF sortition activation (RETIRED — classical bodies removed).
-    // `vrf_activation_from_env` always returns `Disabled`, so the boundary
-    // arm below never fires in practice; it is kept so a stale configured
-    // value logs loudly instead of silently arming. The live verify /
-    // attribution sites (`verify_unified`, `signers_set`) still consult the
-    // activation plus the startup-loaded registry below, but resolution is
-    // always the legacy parent-hash draw.
-    // No seal is ever minted on this path.
-    let vrf_activation = vrf_activation_from_env();
-    rt = rt.with_vrf_activation(vrf_activation);
-    match vrf_activation.boundary() {
-        Some(h) => tracing::warn!(
-            "[vrf] VRF sortition ARMED from height {h} (STELL_VRF_ACTIVATION_HEIGHT={h}): RETIRED — classical bodies removed, election stays on the parent-hash draw at every height; unset the variable to silence this"
-        ),
-        None => info!(
-            "[vrf] VRF sortition inactive (STELL_VRF_ACTIVATION_HEIGHT unset): parent-hash election on every height"
-        ),
-    }
-    // Install the provisioned VRF seed (or log the seedless fallback) and
-    // load the operator VRF registry into the live verify/attribution path.
-    match provisioned_vrf_seed {
-        Some(seed) => {
-            // Own the seed in a wiping wrapper (faucet pattern): the copy
-            // installed into the runtime lives there (alongside the ed key);
-            // this binding is wiped on scope exit.
-            let seed = zeroize::Zeroizing::new(seed);
-            let vrf_pk = stellereum::vrf::VrfSecret::from_seed(&seed)
-                .public_key()
-                .to_bytes();
-            rt = rt.with_vrf_secret_seed(*seed);
-            info!(
-                "[vrf] VRF secret provisioned from validator seed (VRF pubkey {}): operators collect this line from every validator to build STELL_VRF_KEYS",
-                hex::encode(vrf_pk)
-            );
-        }
-        None => tracing::warn!(
-            "[vrf] no local VRF seed provisioned (remote-signer deployment): VRF proofs unavailable, legacy parent-hash election on every height"
-        ),
-    }
-    // Registry loading retired (nodes wiped, no history compat): verifies
-    // always use the canonical parent-hash draw.
+    // Election is the canonical parent-hash draw on every height.
+    info!("[sortition] canonical parent-hash draw: election on every height");
 
     // Restore the FULL persisted state (accounts + all domains) if available.
     // `restored_state_height` is the height whose post-state the engine holds (0 for

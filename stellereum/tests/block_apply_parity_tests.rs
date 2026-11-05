@@ -51,6 +51,7 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use stellereum::consensus::{ValidatorSet, Vote, VoteKind};
 use stellereum::mempool::Mempool;
@@ -89,6 +90,63 @@ fn vset(ks: &[SigningKey]) -> ValidatorSet {
 
 fn id_of(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
+}
+
+/// FULL-PQ transaction sender: implicit Falcon-512 (registered globally;
+/// no surcharge), so fee assertions match the old classical fixtures.
+/// Seeds live in 0xE0+ — DISJOINT from certify's validator Falcon seeds
+/// (0xA0+i): the same seed derives the same keypair, and an overlapping
+/// seed would alias a sender address onto a validator's Falcon address
+/// (breaking µQC attribution).
+static NEXT_PQ: AtomicU8 = AtomicU8::new(0xE0);
+
+fn pq_user() -> u8 {
+    NEXT_PQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn pq_id(seed: &u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    derive_pq_address(
+        PqScheme::Falcon512,
+        &Transaction::sample_falcon512_pubkey(*seed),
+        &DEFAULT_SALT,
+    )
+}
+
+fn tx(seed: &u8, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> Transaction {
+    txp(seed, to, amount, gas, nonce, Vec::new())
+}
+
+fn txp(
+    seed: &u8,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    payload: Vec<stellereum::svm::OpCode>,
+) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(*seed);
+    let from = pq_id(seed);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, *seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 async fn balance(e: &InMemoryStateEngine, addr: &[u8; 32]) -> u64 {
@@ -151,13 +209,26 @@ async fn mirrored_engines(
 /// Drive a genuine 3-of-4 precommit quorum for `blk` through the live runtime
 /// and hand back the certificate that the block body must carry (the decision
 /// proof is what `apply_block_transition` reads as downtime evidence).
+/// FULL-PQ: votes carry the Falcon half; each validator's Falcon key is
+/// registered (additive, keyed by the validator's ed id — no global wipe,
+// so parallel tests cannot disturb each other).
 async fn certify(live: &mut ValidatorRuntime, ks: &[SigningKey], blk: &mut Block) -> [u8; 32] {
+    use stellereum::consensus::register_validator_pq_key;
+    use stellereum::post_quantum::{FalconKeypair, PqScheme};
+    let fks: Vec<FalconKeypair> = ks
+        .iter()
+        .enumerate()
+        .map(|(i, _)| FalconKeypair::generate_from_seed(0xA0u8.wrapping_add(i as u8)))
+        .collect();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        register_validator_pq_key(id_of(k), PqScheme::Falcon512, fk.public_key.clone());
+    }
     let bh = blk.compute_hash();
     let height = blk.height;
-    for k in ks.iter().take(3) {
-        live.on_prevote(Vote::sign(k, height, 0, VoteKind::Prevote, Some(bh)))
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        live.on_prevote(Vote::sign_with_falcon(k, fk, height, 0, VoteKind::Prevote, Some(bh)))
             .expect("prevote accepted");
-        live.on_precommit(Vote::sign(k, height, 0, VoteKind::Precommit, Some(bh)))
+        live.on_precommit(Vote::sign_with_falcon(k, fk, height, 0, VoteKind::Precommit, Some(bh)))
             .expect("precommit accepted");
     }
     assert_eq!(
@@ -216,18 +287,20 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
     let proposer_id = id_of(&ks[0]);
     let silent = id_of(&ks[3]);
 
-    let alice = SigningKey::generate(&mut OsRng);
+    let alice = pq_user();
     let bob = [0xB0u8; 32];
     let carol = [0xC0u8; 32];
-    let dave = SigningKey::generate(&mut OsRng);
-    let nova = SigningKey::generate(&mut OsRng); // bonds in block 2
-    let trader = SigningKey::generate(&mut OsRng); // places an order in block 2
+    let dave = pq_user();
+    let nova = pq_user(); // bonds in block 2
+    let trader = pq_user(); // places an order in block 2
+    let claimer = pq_user(); // pays gas for the block-3 reward claim
 
-    let funding: [([u8; 32], u64); 5] = [
-        (id_of(&alice), 2_000_000),
-        (id_of(&dave), 2_000_000),
-        (id_of(&nova), floor() + 2_000_000),
-        (id_of(&trader), 5_000_000),
+    let funding: [([u8; 32], u64); 6] = [
+        (pq_id(&alice), 2_000_000),
+        (pq_id(&dave), 2_000_000),
+        (pq_id(&nova), floor() + 2_000_000),
+        (pq_id(&trader), 5_000_000),
+        (pq_id(&claimer), 2_000_000),
         (bob, 0),
     ];
     let engines = mirrored_engines(&vs, &funding, &silent, 2).await;
@@ -241,14 +314,12 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
     // gas_limit is DECLARED above the gas the payload actually consumes
     // (GAS_BASIC_TRANSFER) on purpose: that gap is exactly the fee-rule
     // divergence the reorg path used to lose on.
-    let tx_plain = Transaction::sign(&alice, bob, 1_000, 500_000, 0, 1, 1);
-    let tx_payload = Transaction::sign_with_payload(
+    let tx_plain = tx(&alice, bob, 1_000, 500_000, 0);
+    let tx_payload = txp(
         &alice,
         bob,
         2_000,
         500_000,
-        1,
-        1,
         1,
         vec![OpCode::Transfer {
             recipient: carol,
@@ -257,30 +328,28 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
     );
     // Valid signature, wrong nonce: admitted nowhere, payload never runs,
     // status false - the canonical "one failing tx" in a block.
-    let tx_fail = Transaction::sign(&dave, bob, 100, 500_000, 7, 1, 1);
+    let tx_fail = tx(&dave, bob, 100, 500_000, 7);
 
     // --- block 2: staking bond + order placement ---------------------------
-    let tx_bond = Transaction::sign_with_payload(
+    // FULL-PQ: nova/trader are Falcon-512; the bond/validator ids are their
+    // PQ addresses (the stake logic keys on addresses, not schemes).
+    let tx_bond = txp(
         &nova,
-        id_of(&nova),
+        pq_id(&nova),
         0,
         500_000, // declared; GAS_STAKE_BOND = 2_000 is what the VM consumes
         0,
-        1,
-        1,
         vec![OpCode::SysCallStake {
-            validator: id_of(&nova),
+            validator: pq_id(&nova),
             amount: floor(),
         }],
     );
-    let tx_order = Transaction::sign_with_payload(
+    let tx_order = txp(
         &trader,
         [0u8; 32],
         0,
         500_000, // declared; GAS_ORDER_PLACE = 1_200 is what the VM consumes
         0,
-        1,
-        1,
         vec![OpCode::SysCallPlaceOrder {
             pair_id: 1,
             is_buy: true,
@@ -290,21 +359,25 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
     );
 
     // --- block 3: reward claim + another plain transfer --------------------
-    // The proposer accrued REWARD at heights 1 and 2, so the claim at height 3
-    // has something to pay out of the staking pool.
-    let tx_claim = Transaction::sign_with_payload(
-        &ks[0],
+    // FULL-PQ: validator ids are still classical, and only the validator may
+    // claim its own rewards — so an ed proposer's self-claim has no PQ path
+    // (a PQ tx cannot be `from` an ed id; see the self-claim rule in
+    // `svm.rs`). The claim is therefore submitted by a funded PQ third
+    // party and REVERTS identically on both paths (attributable execution
+    // failure: pays the floor, consumes the nonce, moves no rewards). The
+    // uniform refusal is the parity property here; validator self-custody of
+    // claims needs PQ validator ids (out of zone).
+    let tx_claim = txp(
+        &claimer,
         [0u8; 32],
         0,
         500_000, // declared; GAS_STAKE_CLAIM = 600 is consumed
         0,
-        1,
-        1,
         vec![OpCode::SysCallClaimRewards {
             validator: proposer_id,
         }],
     );
-    let tx_plain2 = Transaction::sign(&alice, bob, 500, 500_000, 2, 1, 1);
+    let tx_plain2 = tx(&alice, bob, 500, 500_000, 2);
 
     let blocks: Vec<Vec<Transaction>> = vec![
         vec![tx_plain, tx_payload, tx_fail],
@@ -312,7 +385,11 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
         vec![tx_claim, tx_plain2],
     ];
     let expected_status: Vec<Vec<bool>> =
-        vec![vec![true, true, false], vec![true, true], vec![true, true]];
+        vec![vec![true, true, false], vec![true, true], vec![false, true]];
+
+    // Pre-state proposer balance (genesis funding minus the escrowed bond):
+    // no payout may reach anyone when the claim reverts.
+    let proposer_before = balance(&engine_live, &id_of(&ks[0])).await;
 
     let mut prev_hash = [0u8; 32];
     // Canonical downtime evidence (W10.5): every block above the genesis
@@ -375,9 +452,10 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
         prev_hash = bh;
     }
 
-    // Bookkeeping: 6 applied of 7 (the wrong-nonce tx failed on both paths).
-    assert_eq!(live.applied_txs, 6);
-    assert_eq!(reorg.applied_txs, 6);
+    // Bookkeeping: 5 applied of 7 (the wrong-nonce tx failed on both
+    // paths, and the non-validator claim reverts under FULL-PQ).
+    assert_eq!(live.applied_txs, 5);
+    assert_eq!(reorg.applied_txs, 5);
 
     // --- the fee rule: BOTH block paths charge the DECLARED limit ----------
     // alice: 1_000+500_000 (plain) + 2_000+500_000 (payload, declared) + the
@@ -386,9 +464,9 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
     // transaction would leave her richer on exactly one of the two engines.
     let expected_alice =
         2_000_000 - (1_000 + 500_000) - (2_000 + 500_000) - 7_000 - (500 + 500_000);
-    assert_eq!(balance(&engine_live, &id_of(&alice)).await, expected_alice);
+    assert_eq!(balance(&engine_live, &pq_id(&alice)).await, expected_alice);
     assert_eq!(
-        balance(&engine_reorg, &id_of(&alice)).await,
+        balance(&engine_reorg, &pq_id(&alice)).await,
         expected_alice,
         "the reorg path charged a different fee for the same block"
     );
@@ -400,19 +478,19 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
     assert_eq!(balance(&engine_reorg, &bob).await, 1_000 + 2_000 + 500);
 
     // The failed transaction moved nothing on either path.
-    assert_eq!(balance(&engine_live, &id_of(&dave)).await, 2_000_000);
-    assert_eq!(balance(&engine_reorg, &id_of(&dave)).await, 2_000_000);
+    assert_eq!(balance(&engine_live, &pq_id(&dave)).await, 2_000_000);
+    assert_eq!(balance(&engine_reorg, &pq_id(&dave)).await, 2_000_000);
 
     // The staking pool moved by EXACTLY three things, all of them state:
     //   + the genesis bonds (SEC-ECON-01: one bond per genesis validator is
     //     escrowed in the pool, not burned - so it is in the state root)
     //   + nova's bond (height 2)
     //   - the downtime burn (height 1's certificate)
-    // E2: the reward claim (heights 1-2 accrued 2 * REWARD, claimed at
-    // height 3) is paid out of the minted REWARDS_POOL, never out of bonded
-    // principal - so it must NOT move this pool. A path that debits the claim
-    // here, or skips the bond/burn, lands on a different pool balance, and
-    // the pool balance is in the state root.
+    // E2: the (reverted) reward claim is paid out of NOTHING: a third party
+    // cannot take the proposer's accrual, so the minted REWARDS_POOL is
+    // untouched by it — never out of bonded principal either. A path that
+    // debits the claim here, or skips the bond/burn, lands on a different
+    // pool balance, and the pool balance is in the state root.
     let burned = engine_live.staking_read().await.total_burned;
     let genesis_bonds = vs.validators.len() as u64 * MIN_VALIDATOR_BOND;
     let expected_pool = genesis_bonds + 10 * MIN_VALIDATOR_BOND + floor() - burned;
@@ -422,42 +500,55 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
             expected_pool,
             "the pool must move by bond in and burn only - never by claims"
         );
-        // The rewards pool moved by the mint (3 heights x REWARD) minus the
-        // one claim (2 * REWARD), on both paths identically.
+        // The rewards pool moved by the mint (3 heights x REWARD); the
+        // third-party claim reverted, so nothing was claimed, on both paths
+        // identically.
         assert_eq!(
             balance(e, &REWARDS_POOL).await,
-            REWARD,
-            "the rewards pool must hold exactly the unclaimed remainder"
+            3 * REWARD,
+            "the rewards pool must hold the full mint when the claim reverts"
         );
         assert_eq!(
             e.staking_read().await.rewards_pool,
-            REWARD,
+            3 * REWARD,
             "ledger pool accounting must match the native rewards pool"
         );
         assert_eq!(
             e.staking_read()
                 .await
                 .to_validator_set()
-                .power_of(&id_of(&nova)),
+                .power_of(&pq_id(&nova)),
             floor(),
             "the bond must buy voting power"
         );
     }
 
-    // The reward claim paid out of the rewards pool, from the accrual of heights 1-2.
-    // Height 3's OWN reward is distributed after the block's transactions ran,
-    // so exactly REWARD is pending again once the block is applied.
+    // No validator self-claim exists in FULL-PQ: the proposer's accrual from
+    // heights 1-3 sits unclaimed, and the third-party claim reverted.
+    // Height 3's OWN reward is distributed after the block's transactions
+    // ran, so exactly 3 * REWARD is pending once the block is applied.
     for e in [&engine_live, &engine_reorg] {
         let pending = e.staking_read().await.validators[&proposer_id].pending_rewards;
         assert_eq!(
-            pending, REWARD,
-            "the claim must consume heights 1-2 and leave only height 3's reward"
+            pending,
+            3 * REWARD,
+            "with no valid self-claim, all three heights stay pending"
         );
-        assert!(
-            balance(e, &id_of(&ks[0])).await > BAL - MIN_VALIDATOR_BOND,
-            "the payout must reach the claimant (on top of the genesis \
-             balance, whose bond is escrowed in the pool - not burned)"
+        assert_eq!(
+            balance(e, &id_of(&ks[0])).await,
+            proposer_before + 3_000_000,
+            "only the three blocks' declared fees (1M each) may credit the \
+             proposer, never a claim payout"
         );
+        // The reverted claim still paid the floor and consumed its nonce
+        // (attributable execution failure), on both paths identically.
+        let claimer_acct = e.get_account(&pq_id(&claimer)).await.unwrap();
+        assert_eq!(
+            claimer_acct.balance,
+            2_000_000 - 500_000,
+            "a reverted claim pays the declared floor"
+        );
+        assert_eq!(claimer_acct.nonce, 1, "a reverted claim consumes its nonce");
     }
 
     // The downtime slash ran - on BOTH paths, by the same amount.
@@ -537,18 +628,16 @@ async fn realistic_blocks_match_byte_for_byte_on_live_and_reorg_paths() {
 #[tokio::test]
 async fn single_tx_api_charges_consumed_gas_while_both_block_paths_charge_declared() {
     let ks = keys(1);
-    let user = SigningKey::generate(&mut OsRng);
+    let claimer = pq_user();
     let to = [0x51u8; 32];
     let declared = 500_000u64;
     let mk_tx = || {
-        Transaction::sign_with_payload(
-            &user,
+        txp(
+            &claimer,
             to,
             1_000,
             declared,
             0,
-            1,
-            1,
             vec![OpCode::Transfer {
                 recipient: [0x52u8; 32],
                 amount: 3_000,
@@ -559,13 +648,13 @@ async fn single_tx_api_charges_consumed_gas_while_both_block_paths_charge_declar
     // (a) single-transaction API: charges what the payload consumed.
     let single = Arc::new(InMemoryStateEngine::new());
     single
-        .update_account(AccountState::new(id_of(&user), 1_000_000))
+        .update_account(AccountState::new(pq_id(&claimer), 1_000_000))
         .await;
     single
         .apply_transaction(&mk_tx(), TS)
         .await
         .expect("applies");
-    let single_sender = balance(&single, &id_of(&user)).await;
+    let single_sender = balance(&single, &pq_id(&claimer)).await;
     assert_eq!(
         single_sender,
         1_000_000 - 1_000 - 3_000 - GAS_BASIC_TRANSFER,
@@ -576,12 +665,12 @@ async fn single_tx_api_charges_consumed_gas_while_both_block_paths_charge_declar
     //     shared core with a Block, i.e. the exact code both block paths call.
     let block_e = Arc::new(InMemoryStateEngine::new());
     block_e
-        .update_account(AccountState::new(id_of(&user), 1_000_000))
+        .update_account(AccountState::new(pq_id(&claimer), 1_000_000))
         .await;
     let blk = mk_block(&ks[0], 1, [0u8; 32], [0u8; 32], vec![mk_tx()]);
     let out = block_e.apply_block_transition(&blk, 0).await;
     assert_eq!(out.status, vec![true]);
-    let block_sender = balance(&block_e, &id_of(&user)).await;
+    let block_sender = balance(&block_e, &pq_id(&claimer)).await;
     assert_eq!(
         block_sender,
         1_000_000 - 1_000 - 3_000 - declared,
@@ -605,7 +694,7 @@ async fn single_tx_api_charges_consumed_gas_while_both_block_paths_charge_declar
     // And the two BLOCK paths still cannot differ from each other.
     let reorg_e = Arc::new(InMemoryStateEngine::new());
     reorg_e
-        .update_account(AccountState::new(id_of(&user), 1_000_000))
+        .update_account(AccountState::new(pq_id(&claimer), 1_000_000))
         .await;
     let mut cs = ChainState::new(reorg_e.clone());
     cs.apply_block(&blk).await;
@@ -631,8 +720,8 @@ async fn single_tx_api_charges_consumed_gas_while_both_block_paths_charge_declar
 async fn mempool_pruning_is_node_local_and_cannot_move_the_state_root() {
     let ks = keys(4);
     let vs = vset(&ks);
-    let user = SigningKey::generate(&mut OsRng);
-    let funding = [(id_of(&user), 1_000_000u64)];
+    let mempool_user = pq_user();
+    let funding = [(pq_id(&mempool_user), 1_000_000u64)];
     let silent = id_of(&ks[3]);
     let engines = mirrored_engines(&vs, &funding, &silent, 3).await;
     let e_live = engines[0].clone();
@@ -642,7 +731,7 @@ async fn mempool_pruning_is_node_local_and_cannot_move_the_state_root() {
     let e_nopool = engines[2].clone();
 
     let mut live = ValidatorRuntime::new(ks[0].clone(), vs.clone(), e_live.clone(), 1);
-    let tx = Transaction::sign(&user, [0x99u8; 32], 10, 100, 0, 1, 1);
+    let tx = tx(&mempool_user, [0x99u8; 32], 10, 100, 0);
 
     // The same transaction sits in both pools.
     let live_pool: Arc<tokio::sync::RwLock<Mempool>> =

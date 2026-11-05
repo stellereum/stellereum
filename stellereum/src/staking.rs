@@ -2814,7 +2814,7 @@ impl StakingLedger {
             &evidence.block_hash_b,
         );
 
-        // Strip vote BLS envelope when present on standard Ed25519 signatures
+        // Strip the Falcon envelope when present on standard Ed25519 signatures
         let sig_a = if scheme == crate::post_quantum::PqScheme::Ed25519
             && evidence.signature_a.len() != 64
         {
@@ -3640,13 +3640,21 @@ mod tests {
     #[test]
     fn verified_equivocation_burns_five_percent_self_first() {
         use crate::consensus::EquivocationEvidence;
+        // FULL-PQ: votes carry a Falcon half; the accused id's Falcon key is
+        // registered globally (the `fvote` idiom from the consensus tests).
         let mut l = StakingLedger::new();
         let sk = SigningKey::generate(&mut OsRng);
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xE1);
         let offender = sk.verifying_key().to_bytes();
+        crate::consensus::register_validator_pq_key(
+            offender,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
         l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
             .unwrap();
-        let a = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
-        let b = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
+        let a = Vote::sign_with_falcon(&sk, &fk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
+        let b = Vote::sign_with_falcon(&sk, &fk, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
         let ev = EquivocationEvidence::new(offender, a, b);
         let before = l.validators[&offender].self_bond;
         let burned = l.slash_equivocation_verified(&ev).unwrap();
@@ -3659,13 +3667,20 @@ mod tests {
     #[test]
     fn verified_equivocation_dedupes_repeat_offense() {
         use crate::consensus::EquivocationEvidence;
+        // FULL-PQ: Falcon-signed votes (same idiom as above).
         let mut l = StakingLedger::new();
         let sk = SigningKey::generate(&mut OsRng);
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xE2);
         let offender = sk.verifying_key().to_bytes();
+        crate::consensus::register_validator_pq_key(
+            offender,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
         l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
             .unwrap();
-        let a = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
-        let b = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
+        let a = Vote::sign_with_falcon(&sk, &fk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
+        let b = Vote::sign_with_falcon(&sk, &fk, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
         let ev = EquivocationEvidence::new(offender, a.clone(), b.clone());
         let first = l.slash_equivocation_verified(&ev).unwrap();
         assert!(first > 0);
@@ -3676,8 +3691,8 @@ mod tests {
         assert_eq!(l.total_burned, first);
         assert_eq!(l.total_stake(&offender), stell(2000) - first);
         // A DISTINCT pair at the same height/round is a new offense.
-        let a2 = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
-        let c = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([3u8; 32]));
+        let a2 = Vote::sign_with_falcon(&sk, &fk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
+        let c = Vote::sign_with_falcon(&sk, &fk, 1, 0, VoteKind::Prevote, Some([3u8; 32]));
         let fresh = EquivocationEvidence::new(offender, a2, c);
         let second = l.slash_equivocation_verified(&fresh).unwrap();
         assert!(second > 0, "distinct conflicting pair is a new offense");
@@ -3687,20 +3702,29 @@ mod tests {
     #[test]
     fn verified_equivocation_refuses_forgeries_fail_closed() {
         use crate::consensus::EquivocationEvidence;
+        // FULL-PQ: Falcon-signed votes (forgeries still refused, same as the
+        // classical test: framing, zeroed sigs, same-target, unknown voter).
         let mut l = StakingLedger::new();
         let sk = SigningKey::generate(&mut OsRng);
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xE3);
         let offender = sk.verifying_key().to_bytes();
+        crate::consensus::register_validator_pq_key(
+            offender,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
         l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
             .unwrap();
         let other = SigningKey::generate(&mut OsRng);
-        let a = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
+        let other_fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xE4);
+        let a = Vote::sign_with_falcon(&sk, &fk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
         // Framing with another key's vote burns nothing (Finding 12 fixed).
-        let framed = Vote::sign(&other, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
+        let framed = Vote::sign_with_falcon(&other, &other_fk, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
         let ev = EquivocationEvidence::new(offender, a.clone(), framed);
         assert_eq!(l.slash_equivocation_verified(&ev).unwrap(), 0);
         // Zeroed signatures burn nothing.
         let mut za = a.clone();
-        let mut zb = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
+        let mut zb = Vote::sign_with_falcon(&sk, &fk, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
         za.signature = vec![0u8; 64];
         zb.signature = vec![0u8; 64];
         let ev_fake = EquivocationEvidence::new(offender, za, zb);
@@ -3708,11 +3732,19 @@ mod tests {
         // Same target twice burns nothing.
         let ev_same = EquivocationEvidence::new(offender, a.clone(), a);
         assert_eq!(l.slash_equivocation_verified(&ev_same).unwrap(), 0);
-        // Unknown voter errors (transition maps to skip-and-log).
+        // Unknown voter errors (transition maps to skip-and-log): the
+        // outsider's Falcon key IS registered so both votes verify and the
+        // failure is membership, exactly like the classical test.
         let outsider = SigningKey::generate(&mut OsRng);
+        let outsider_fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xE5);
         let oid = outsider.verifying_key().to_bytes();
-        let oa = Vote::sign(&outsider, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
-        let ob = Vote::sign(&outsider, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
+        crate::consensus::register_validator_pq_key(
+            oid,
+            crate::post_quantum::PqScheme::Falcon512,
+            outsider_fk.public_key.clone(),
+        );
+        let oa = Vote::sign_with_falcon(&outsider, &outsider_fk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
+        let ob = Vote::sign_with_falcon(&outsider, &outsider_fk, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
         let ev_out = EquivocationEvidence::new(oid, oa, ob);
         assert_eq!(
             l.slash_equivocation_verified(&ev_out),
@@ -3857,33 +3889,46 @@ mod tests {
     /// which handed out validator power for free.
     #[tokio::test]
     async fn bonding_moves_real_funds_and_grants_validator_power() {
+        use crate::post_quantum::{PqScheme, DEFAULT_SALT};
+        use crate::sharding::{PqSignatureEnvelope, Transaction};
         use crate::state_engine::{AccountState, InMemoryStateEngine};
         use crate::svm::OpCode;
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
 
+        // FULL-PQ: implicit Falcon-512 envelope (the `pq_tx_payload` idiom
+        // from the state_engine tests) — no activation surcharge, so the
+        // gas assertions match the old classical fixture exactly.
+        let seed = 0xA1u8;
+        let pk = Transaction::sample_falcon512_pubkey(seed);
+        let alice_addr =
+            crate::post_quantum::derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+        Transaction::global_implicit_registry()
+            .register(alice_addr, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+            .expect("PQ test key must register");
         let engine = InMemoryStateEngine::new();
-        let alice = SigningKey::generate(&mut OsRng);
-        let alice_addr = alice.verifying_key().to_bytes();
         let validator = [0x77u8; 32];
         let start = 10_000 * 1_000_000_000u64;
         engine
             .update_account(AccountState::new(alice_addr, start))
             .await;
 
-        let tx = crate::sharding::Transaction::sign_with_payload(
-            &alice,
-            alice_addr,
-            0,
-            10_000,
-            0,
-            1,
-            1,
-            vec![OpCode::SysCallStake {
+        let mut tx = Transaction {
+            from: alice_addr,
+            to: alice_addr,
+            amount: 0,
+            gas_limit: 10_000,
+            nonce: 0,
+            source_shard: 1,
+            target_shard: 1,
+            signature: Vec::new(),
+            payload: vec![OpCode::SysCallStake {
                 validator,
                 amount: required_bond_floor_nano(),
             }],
-        );
+            priority_fee_per_gas: 0,
+        };
+        let msg = tx.signing_message();
+        let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+        tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
         engine
             .apply_transaction(&tx, 0)
             .await

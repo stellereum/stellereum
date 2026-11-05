@@ -8,16 +8,16 @@
 use blake3::Hasher;
 use ed25519_dalek::VerifyingKey;
 use serde_json::json;
-use x25519_dalek::{PublicKey as XPublic, StaticSecret};
 
 /// Домен деривации — не даёт пересекаться с другими ключами.
 const DERIVE_DOMAIN: &str = "infmail-nft-key-v1";
 
-/// Вывести x25519-публичный ключ из ed25519-публичного ключа кошелька.
-/// Детерминированно: blake3(domain + ed_pub) → seed → x25519.
+/// Вывести ML-KEM-768 публичный ключ из ed25519-публичного ключа кошелька.
+/// Детерминированно: blake3(domain + ed_pub) x2 → 64B seed → ML-KEM.
+/// FULL-PQ: X25519 удалён (wipe).
 ///
 /// ВНИМАНИЕ (безопасность): НЕ использовать как ключ ШИФРОВАНИЯ писем — wallet_ed_pub
-/// публичен, значит соответствующий x25519-ПРИВАТНЫЙ ключ вычислим любым, кто знает
+/// публичен, значит соответствующий KEM-СИД вычислим любым, кто знает
 /// wallet_ed_pub. Это сломало бы шифрование. Приватный ключ для расшифровки должен
 /// выводиться из ПОДПИСИ кошелька (секрета) в браузере, не из публичного ключа.
 /// Данная функция полезна только как СЛУЖЕБНАЯ (эпоха/метка владельца, тесты).
@@ -32,16 +32,21 @@ pub fn derive_x_pub(wallet_ed_pub_hex: &str) -> Result<String, String> {
             .map_err(|_| "wallet ed_pub: must be 32 bytes".to_string())?,
     )
     .map_err(|e| format!("wallet ed_pub: {e}"))?;
-    // seed из blake3(domain || ed_pub_bytes)
-    let mut h = Hasher::new();
-    h.update(DERIVE_DOMAIN.as_bytes());
-    h.update(vk.as_bytes());
-    let seed = h.finalize();
-    let seed_bytes: [u8; 32] = *seed.as_bytes();
-    // x25519 приватный из seed, публичный из него
-    let secret = StaticSecret::from(seed_bytes);
-    let x_pub = XPublic::from(&secret);
-    Ok(hex::encode(x_pub.as_bytes()))
+    // 64B seed из blake3(domain || ed_pub) x2 (domain-separated halves).
+    let mut h1 = Hasher::new();
+    h1.update(DERIVE_DOMAIN.as_bytes());
+    h1.update(b":1:");
+    h1.update(vk.as_bytes());
+    let half1 = h1.finalize();
+    let mut h2 = Hasher::new();
+    h2.update(DERIVE_DOMAIN.as_bytes());
+    h2.update(b":2:");
+    h2.update(vk.as_bytes());
+    let half2 = h2.finalize();
+    let mut seed = [0u8; 64];
+    seed[..32].copy_from_slice(&half1.as_bytes()[..32]);
+    seed[32..].copy_from_slice(&half2.as_bytes()[..32]);
+    Ok(hex::encode(infnode::mailbox::kem_ek_from_seed(&seed)))
 }
 
 /// Вывести "эпоху" ключей: хэш, меняющийся при смене кошелька.
@@ -69,17 +74,18 @@ pub fn derive_response(wallet_ed_pub_hex: &str) -> serde_json::Value {
 /// Домен деривации КЛЮЧЕЙ ШИФРОВАНИЯ из ПОДПИСИ (безопасная ветка П.3).
 const SIG_DERIVE_DOMAIN: &str = "infmail-nft-keys-sig-v1";
 
-/// Вывести x25519-публичный ключ ШИФРОВАНИЯ из ПОДПИСИ кошелька (ed25519, 64 байта).
+/// Вывести ML-KEM-768 публичный ключ ШИФРОВАНИЯ из ПОДПИСИ кошелька (ed25519, 64 байта).
+/// FULL-PQ: X25519 удалён (wipe).
 ///
 /// Почему из подписи, а не из публичного ключа (см. derive_x_pub): подпись секретна —
 /// её знает только владелец приватного ed25519 ключа кошелька. Поэтому из неё можно
-/// безопасно вывести и ПРИВАТНЫЙ x25519-ключ (для расшифровки) в браузере, и публичный
+/// безопасно вывести и KEM-СИД (для расшифровки) в браузере, и публичный
 /// (для шифрования на бэкенде). Публичный ed_pub кошелька виден всем → выводить из него
-/// приватный x25519 нельзя (сломало бы шифрование).
+/// приватный ключ нельзя (сломало бы шифрование).
 ///
 /// Схема: владелец подписывает фиксированное сообщение "infmail-keys-v1:{email}".
-///   master_seed = blake3(SIG_DERIVE_DOMAIN || подпись)
-///   x25519 secret = master_seed;  x_pub = X25519(secret)
+///   master_seed = blake3(SIG_DERIVE_DOMAIN || подпись) x2 halves → 64B KEM seed
+///   kem_ek = ML-KEM-768(master_seed)
 /// Подпись детерминированна (тот же кошелёк + то же сообщение → та же подпись), значит
 /// тот же владелец всегда выводит тот же ключ. Другой кошелёк → другая подпись → другой
 /// ключ → смена владельца NFT делает старые письма нечитаемыми (эпоха).
@@ -88,14 +94,20 @@ pub fn derive_x_pub_from_signature(sig_hex: &str) -> Result<String, String> {
     if sig.len() != 64 {
         return Err("signature: must be 64 bytes (ed25519)".to_string());
     }
-    let mut h = Hasher::new();
-    h.update(SIG_DERIVE_DOMAIN.as_bytes());
-    h.update(&sig);
-    let seed = h.finalize();
-    let seed_bytes: [u8; 32] = *seed.as_bytes();
-    let secret = StaticSecret::from(seed_bytes);
-    let x_pub = XPublic::from(&secret);
-    Ok(hex::encode(x_pub.as_bytes()))
+    let mut h1 = Hasher::new();
+    h1.update(SIG_DERIVE_DOMAIN.as_bytes());
+    h1.update(b":1:");
+    h1.update(&sig);
+    let half1 = h1.finalize();
+    let mut h2 = Hasher::new();
+    h2.update(SIG_DERIVE_DOMAIN.as_bytes());
+    h2.update(b":2:");
+    h2.update(&sig);
+    let half2 = h2.finalize();
+    let mut seed = [0u8; 64];
+    seed[..32].copy_from_slice(&half1.as_bytes()[..32]);
+    seed[32..].copy_from_slice(&half2.as_bytes()[..32]);
+    Ok(hex::encode(infnode::mailbox::kem_ek_from_seed(&seed)))
 }
 
 /// Эпоха ключей из подписи: меняется при смене кошелька владельца.
@@ -131,7 +143,7 @@ mod tests {
         let x1 = derive_x_pub(ed_pub).unwrap();
         let x2 = derive_x_pub(ed_pub).unwrap();
         assert_eq!(x1, x2, "деривация должна быть детерминированной");
-        assert_eq!(x1.len(), 64, "x25519 pub = 32 байта hex");
+        assert_eq!(x1.len(), 2368, "ML-KEM-768 ek = 1184 байта hex");
         // другой кошелёк → другой ключ (смена владельца меняет ключ)
         let ed_pub2 = "136e8287057a8f121d897e83276542ea83ae036edf85ec8444a84d06baec548e";
         let x3 = derive_x_pub(ed_pub2).unwrap();
@@ -153,7 +165,7 @@ mod tests {
         let x1 = derive_x_pub_from_signature(sig).unwrap();
         let x2 = derive_x_pub_from_signature(sig).unwrap();
         assert_eq!(x1, x2, "деривация из подписи детерминированна");
-        assert_eq!(x1.len(), 64, "x25519 pub = 32 байта hex");
+        assert_eq!(x1.len(), 2368, "ML-KEM-768 ek = 1184 байта hex");
         // другая подпись (другой кошелёк) → другой ключ
         let sig2 = "0000000000000000000000000000000000000000000000000000000000000000\
                     0000000000000000000000000000000000000000000000000000000000000000";
@@ -168,24 +180,32 @@ mod tests {
         assert!(derive_x_pub_from_signature("abcd").is_err()); // < 64 байт
     }
 
-    /// E2E П.3: шифрование письма на x_pub (производный от подписи кошелька)
-    /// → владелец кошелька расшифровывает (приватный x25519 из той же подписи),
+    /// E2E П.3: шифрование письма на KEM-ek (производный от подписи кошелька)
+    /// → владелец кошелька расшифровывает (KEM-сид из той же подписи),
     /// другой кошелёк — НЕ может (эпоха/owner_changed).
     #[test]
     fn p3_e2e_encrypt_decrypt_via_signature() {
         // подпись p3test на "infmail-keys-v1:testp3@infmail.org"
         let sig = "f078a5a6ae9f9d2594342e57795ad26aa5c71d2eb5a1c901e15f2681fb0ee5f4d7b92bd81b2725157109e92113bc300a5a58a804f64f71e5168ceae13e269e03";
         let x_pub_hex = derive_x_pub_from_signature(sig).expect("derive");
-        assert_eq!(x_pub_hex.len(), 64);
+        assert_eq!(x_pub_hex.len(), 2368);
 
-        // приватный x25519 = тот же seed (blake3(domain || sig))
+        // KEM-сид владельца из той же подписи (та же схема halves, что derive).
         let sig_bytes = hex::decode(sig).unwrap();
-        let mut h = Hasher::new();
-        h.update(SIG_DERIVE_DOMAIN.as_bytes());
-        h.update(&sig_bytes);
-        let seed_bytes: [u8; 32] = *h.finalize().as_bytes();
-        let owner_secret = x25519_dalek::StaticSecret::from(seed_bytes);
-        let owner_priv_hex = hex::encode(owner_secret.to_bytes());
+        let mut h1 = Hasher::new();
+        h1.update(SIG_DERIVE_DOMAIN.as_bytes());
+        h1.update(b":1:");
+        h1.update(&sig_bytes);
+        let half1 = h1.finalize();
+        let mut h2 = Hasher::new();
+        h2.update(SIG_DERIVE_DOMAIN.as_bytes());
+        h2.update(b":2:");
+        h2.update(&sig_bytes);
+        let half2 = h2.finalize();
+        let mut seed = [0u8; 64];
+        seed[..32].copy_from_slice(&half1.as_bytes()[..32]);
+        seed[32..].copy_from_slice(&half2.as_bytes()[..32]);
+        let owner_priv_hex = hex::encode(seed);
 
         let plain = "Здравствуйте, это секретное письмо для владельца NFT.";
 
@@ -200,15 +220,24 @@ mod tests {
             infnode::node::proton_unbox_body(&enc, &owner_priv_hex).expect("unbox with owner priv");
         assert_eq!(dec, plain, "владелец видит своё письмо");
 
-        // 3) ДРУГОЙ кошелёк (другая подпись → другой приватный x25519) НЕ может расшифровать
+        // 3) ДРУГОЙ кошелёк (другая подпись → другой KEM-сид) НЕ может расшифровать
         let other_sig = "0000000000000000000000000000000000000000000000000000000000000000\
                          0000000000000000000000000000000000000000000000000000000000000001";
-        let mut h2 = Hasher::new();
-        h2.update(SIG_DERIVE_DOMAIN.as_bytes());
-        h2.update(&hex::decode(other_sig).unwrap());
-        let other_seed: [u8; 32] = *h2.finalize().as_bytes();
-        let other_secret = x25519_dalek::StaticSecret::from(other_seed);
-        let other_priv_hex = hex::encode(other_secret.to_bytes());
+        let other_sig_bytes = hex::decode(other_sig).unwrap();
+        let mut oh1 = Hasher::new();
+        oh1.update(SIG_DERIVE_DOMAIN.as_bytes());
+        oh1.update(b":1:");
+        oh1.update(&other_sig_bytes);
+        let ohalf1 = oh1.finalize();
+        let mut oh2 = Hasher::new();
+        oh2.update(SIG_DERIVE_DOMAIN.as_bytes());
+        oh2.update(b":2:");
+        oh2.update(&other_sig_bytes);
+        let ohalf2 = oh2.finalize();
+        let mut other_seed = [0u8; 64];
+        other_seed[..32].copy_from_slice(&ohalf1.as_bytes()[..32]);
+        other_seed[32..].copy_from_slice(&ohalf2.as_bytes()[..32]);
+        let other_priv_hex = hex::encode(other_seed);
         let dec_other = infnode::node::proton_unbox_body(&enc, &other_priv_hex);
         assert!(
             dec_other.is_none() || dec_other.as_deref() != Some(plain),

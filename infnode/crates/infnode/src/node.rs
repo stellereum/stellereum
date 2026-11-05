@@ -510,6 +510,11 @@ pub struct Node {
     /// identity across IPs and never hit well-behaved peers sharing an
     /// address. See `crate::reputation` for the score model.
     peer_rep: Mutex<HashMap<[u8; NODEID_LEN], RepEntry>>,
+    /// LONG-TERM PQ peer-key verdict cache (perf, safety-first): static
+    /// Falcon-512 parse only, keyed by key bytes. Guard is `std` (never held
+    /// across await — `check` is pure CPU). Exact invalidation on rotation /
+    /// registry change; see `FalconPeerKeyCache`.
+    falcon_peer_key_cache: std::sync::Mutex<FalconPeerKeyCache>,
 }
 
 /// R6: гейт на КАЖДЫЙ персистимый файл. Держится только на время
@@ -629,18 +634,17 @@ impl Node {
     ) -> Result<Arc<Self>> {
         let id = keys.id();
         let id_hex = keys.id_hex();
-        // Re-ceremony mark: `Node::new` is classical-only today (no `PqKeys`
-        // param — signature frozen; startup PQ enrolment via
-        // `keyring::PqKeys::load_or_generate` is a follow-up outside this
-        // change's zone). The local id is therefore the LEGACY alias —
-        // say so in the log, never silently classical.
+        // FULL-PQ: canonical NodeId is PQ-only (`ceremony_local_id` /
+        // `keyring::resolve_node_id`). `Node::new` keeps its signature and
+        // local routing id (handshake/routing frozen — out of zone); the
+        // `node_id_kind` telemetry now only knows `PQ`.
         crate::log::emit(
             2,
             "info",
             &cfg.name,
             0,
             "node_id_kind",
-            json!({ "kind": crate::keyring::NodeIdKind::Legacy.label(), "id": id_hex }),
+            json!({ "kind": crate::keyring::NodeIdKind::Pq.label(), "id": id_hex }),
         );
         let client_bind = cfg
             .client_listen
@@ -789,6 +793,7 @@ impl Node {
             auth_failures: Mutex::new(HashMap::new()),
             auth_bans: Mutex::new(HashMap::new()),
             peer_rep: Mutex::new(HashMap::new()),
+            falcon_peer_key_cache: std::sync::Mutex::new(FalconPeerKeyCache::new()),
         });
         node.load_persistent().await;
         node.load_routing().await;
@@ -2715,6 +2720,20 @@ impl Node {
         let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rc))?;
         let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
         client_cfg.transport_config(Arc::new(transport_config()));
+        // EXACT invalidation on key rotation: if this pid already pins a
+        // DIFFERENT long-term PQ key, drop the old verdict so the next
+        // handshake re-verifies fresh (never a stale hit).
+        if let Some(old) = self.peers.read().await.get(&pid) {
+            let old_pq = old.cfg.pq_bytes().unwrap_or(None);
+            let new_pq = pcfg.pq_bytes().unwrap_or(None);
+            if old_pq != new_pq {
+                if let Some(was) = old_pq {
+                    if let Ok(mut cache) = self.falcon_peer_key_cache.lock() {
+                        cache.invalidate(&was);
+                    }
+                }
+            }
+        }
         let link = PeerLink {
             cfg: pcfg,
             conn: Arc::new(RwLock::new(None)),
@@ -6491,6 +6510,21 @@ impl Node {
                 }
                 link.cfg.rate_limit_per_sec = p.rate_limit_per_sec;
                 link.cfg.role = p.role;
+                // EXACT invalidation on registry change: a rotated pinned PQ
+                // key takes effect here (previously `pq_pub` was never
+                // reloaded, so rotation silently kept the stale pin) and the
+                // old verdict is dropped so the next handshake re-verifies
+                // fresh. Unchanged pins keep their cached verdict.
+                if link.cfg.pq_pub != p.pq_pub {
+                    if let Some(old_hex) = link.cfg.pq_pub.clone() {
+                        if let Ok(old) = hex::decode(&old_hex) {
+                            if let Ok(mut cache) = self.falcon_peer_key_cache.lock() {
+                                cache.invalidate(&old);
+                            }
+                        }
+                    }
+                    link.cfg.pq_pub = p.pq_pub;
+                }
                 updated += 1;
             }
         }
@@ -7201,6 +7235,22 @@ async fn handle_stream(
             if ch_ed != pinned_ed || ch_x != pinned_x {
                 bail!("challenge key mismatch");
             }
+            // LONG-TERM PQ peer-key verify (cached static parse ONLY): a pinned
+            // `pq_pub` parses once per distinct key bytes; absent = classical
+            // (unchanged window behavior). Malformed pins refuse fail-closed.
+            // Per-handshake tag/transcript/freshness/KEM-ct checks below still
+            // run fresh every handshake — this cache never excuses them.
+            // KEM `pq_ek` is deliberately NOT cached: it is a fresh ephemeral
+            // per handshake (`pq_initiator_offer`), so byte-keyed reuse would
+            // never hit and only leak memory; `pq_responder_accept` validates
+            // it fresh every time (see perf note in `FalconPeerKeyCache` tests).
+            {
+                let mut cache = node
+                    .falcon_peer_key_cache
+                    .lock()
+                    .map_err(|_| anyhow!("pq peer-key cache poisoned"))?;
+                pq_pinned_key_check_cached(&mut cache, &peer.cfg)?;
+            }
             peer
         } else if node.cfg.allow_unknown {
             // TOFU: неизвестная нода доказывает владение ключом подписью CHALLENGE
@@ -7247,9 +7297,7 @@ async fn handle_stream(
                 role: None,
                 storage_roles: vec![],
             };
-            if let Err(e) = node.add_dynamic_peer(claimed, pcfg).await {
-                return Err(e);
-            }
+            node.add_dynamic_peer(claimed, pcfg).await?;
             // TOFU: показываем оператору отпечаток для ручной проверки (как SSH fingerprint)
             eprintln!(
                 "[{}] !! TOFU: unknown node inf1:{} ed={} from {} accepted — verify the fingerprint!",
@@ -7948,45 +7996,76 @@ pub fn proton_unbox_body(payload: &str, owner_priv_hex: &str) -> Option<String> 
     String::from_utf8(dec).ok()
 }
 
-/// Box-шифрование 32-байтного ключа на публичный X25519-ключ получателя (Proton-модель).
-/// Использует эфемерный X25519 (ECDH) → общий секрет → XSalsa20-Poly1305. Расшифровать может
-/// только владелец приватного X25519-ключа (браузер). Сервер и ноды ключ блоба не видят.
-/// Возвращает json-значение { "eph": hex, "nonce": hex, "ct": hex }.
+/// Box-шифрование 32-байтного ключа на ML-KEM-768 ключ получателя.
+/// Encapsulate → общий секрет → XSalsa20-Poly1305. Расшифровать может
+/// только владелец KEM-сида (браузер). Сервер и ноды ключ блоба не видят.
+/// Возвращает json-значение { "ct": hex (1088), "nonce": hex, "ct2": hex }.
+/// FULL-PQ: X25519 ECDH удалён (wipe, no compat).
 pub fn box_wrap_key(owner_pub_hex: &str, data_key: &[u8; 32]) -> Option<serde_json::Value> {
-    let owner_pub_bytes = hex::decode(owner_pub_hex).ok()?;
-    if owner_pub_bytes.len() != 32 {
+    let owner_ek = hex::decode(owner_pub_hex).ok()?;
+    if owner_ek.len() != crate::mailbox::KEM_EK_LEN {
         return None;
     }
-    let owner_pub = XPub::from(<[u8; 32]>::try_from(&owner_pub_bytes[..]).ok()?);
-    let eph_sec = XSecret::random_from_rng(rand::rngs::OsRng);
-    let eph_pub = XPub::from(&eph_sec);
-    let shared = eph_sec.diffie_hellman(&owner_pub);
-    let (ct, nonce) = salsa_encrypt(shared.as_bytes(), data_key);
+    let (kem_ct, shared) = kem_encap_for_box(&owner_ek)?;
+    let (ct, nonce) = salsa_encrypt(&shared, data_key);
     Some(json!({
-        "eph": hex::encode(eph_pub.as_bytes()),
+        "ct": hex::encode(&kem_ct),
         "nonce": hex::encode(&nonce),
-        "ct": hex::encode(&ct),
+        "ct2": hex::encode(&ct),
     }))
 }
 
-/// Распаковать key_box: даёт data_key (32 байта), если есть приватный X25519-ключ владельца.
+/// KEM-encap helper for `box_wrap_key` (explicit randomness via OsRng,
+/// same idiom as `mailbox::seal`).
+fn kem_encap_for_box(recipient_ek: &[u8]) -> Option<(Vec<u8>, [u8; 32])> {
+    use rand::RngCore;
+    if recipient_ek.len() != crate::mailbox::KEM_EK_LEN {
+        return None;
+    }
+    let key = ml_kem::kem::Key::<ml_kem::EncapsulationKey768>::try_from(recipient_ek).ok()?;
+    let ek = ml_kem::EncapsulationKey768::new(&key).ok()?;
+    let mut m = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut m);
+    let (ct, ss) = ek.encapsulate_deterministic(&m.into());
+    let mut shared = [0u8; 32];
+    shared.copy_from_slice(ss.as_slice());
+    Some((ct.as_slice().to_vec(), shared))
+}
+
+/// KEM-decap helper for `box_unwrap_key`.
+fn kem_decap_for_box(kem_seed: &[u8; 64], ct: &[u8]) -> Option<[u8; 32]> {
+    use ml_kem::kem::FromSeed;
+    if ct.len() != crate::mailbox::KEM_CT_LEN {
+        return None;
+    }
+    let seed: ml_kem::Seed = (*kem_seed).into();
+    let (dk, _) = ml_kem::MlKem768::from_seed(&seed);
+    let kem_ct: ml_kem::kem::Ciphertext<ml_kem::MlKem768> = ct.try_into().ok()?;
+    use ml_kem::kem::Decapsulate;
+    let ss = dk.decapsulate(&kem_ct);
+    let mut shared = [0u8; 32];
+    shared.copy_from_slice(ss.as_slice());
+    Some(shared)
+}
+
+/// Распаковать key_box: даёт data_key (32 байта), если есть KEM-сид владельца
+/// (64 байта hex). Legacy 32-байтные X25519 ключи отказаны (wipe).
 pub fn box_unwrap_key(key_box: &serde_json::Value, owner_priv_hex: &str) -> Result<[u8; 32]> {
     let priv_bytes = hex::decode(owner_priv_hex)?;
-    if priv_bytes.len() != 32 {
-        bail!("private key: invalid length");
+    if priv_bytes.len() != crate::mailbox::KEM_SEED_LEN {
+        bail!("private key: KEM seed must be 64 bytes (legacy x25519 refused)");
     }
-    let priv_key =
-        XSecret::from(<[u8; 32]>::try_from(&priv_bytes[..]).map_err(|_| anyhow!("priv key"))?);
-    let eph_pub_bytes = hex::decode(key_box["eph"].as_str().unwrap_or(""))?;
-    if eph_pub_bytes.len() != 32 {
-        bail!("eph key: invalid length");
+    let seed: [u8; 64] = priv_bytes.try_into().map_err(|_| anyhow!("priv key"))?;
+    // New framing (`ct` = 1088 kem_ct) with legacy `eph` fallback refused.
+    let kem_ct_hex = key_box.get("ct").and_then(|v| v.as_str()).unwrap_or("");
+    let kem_ct = hex::decode(kem_ct_hex)?;
+    if kem_ct.len() != crate::mailbox::KEM_CT_LEN {
+        bail!("kem ct: invalid length (legacy eph refused)");
     }
-    let eph_pub =
-        XPub::from(<[u8; 32]>::try_from(&eph_pub_bytes[..]).map_err(|_| anyhow!("eph pub"))?);
-    let shared = priv_key.diffie_hellman(&eph_pub);
+    let shared = kem_decap_for_box(&seed, &kem_ct).ok_or_else(|| anyhow!("kem decap"))?;
     let nonce = hex::decode(key_box["nonce"].as_str().unwrap_or(""))?;
-    let ct = hex::decode(key_box["ct"].as_str().unwrap_or(""))?;
-    let dec = salsa_decrypt(shared.as_bytes(), &nonce, &ct)?;
+    let ct = hex::decode(key_box["ct2"].as_str().unwrap_or(""))?;
+    let dec = salsa_decrypt(&shared, &nonce, &ct)?;
     let mut key = [0u8; 32];
     if dec.len() != 32 {
         bail!("key_box: invalid length");
@@ -8440,6 +8519,116 @@ impl PqIdentityRegistry {
     }
 }
 
+/// LONG-TERM PQ peer-key verification cache (perf, safety-first).
+///
+/// Caches ONLY the static check — "does this 897-byte Falcon-512 key parse
+/// as a well-formed public key?" — keyed by key bytes. Per-handshake checks
+/// (transcript digest, Falcon tag over the FRESH digest via
+/// `proto::pq_falcon_verify`, freshness/`ts_ok`, KEM ct/tag via
+/// `pq_responder_accept`/`pq_initiator_answer`) ALWAYS run fresh; this cache
+/// never short-circuits them.
+///
+/// Invalidation is EXACT:
+///
+/// * rotation (different key bytes) naturally misses (new bytes = new entry);
+/// * `invalidate` drops one entry when a pinned key rotates;
+/// * `clear` drops everything when the registry/config changes.
+///
+/// Fail-closed on cap: when full, verification still runs fresh (correct but
+/// uncached), never an accept, never an eviction of a valid entry.
+pub const MAX_FALCON_PEER_KEY_CACHE: usize = 1024;
+
+/// Verdict cache for distinct peer long-term Falcon-512 keys.
+#[derive(Default)]
+pub struct FalconPeerKeyCache {
+    entries: HashMap<Vec<u8>, bool>,
+}
+
+impl FalconPeerKeyCache {
+    /// Empty cache.
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Cached entries (test/monitor hook).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when empty (test hook).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Cached verdict for these exact key bytes, if any.
+    pub fn get(&self, pk: &[u8]) -> Option<bool> {
+        self.entries.get(pk).copied()
+    }
+
+    /// Static long-term-key check, cached: true iff `pk` is exactly
+    /// [`proto::PQ_FALCON_PK_LEN`] bytes and parses as a Falcon-512 public
+    /// key. No digest/signature input — the per-handshake tag verify
+    /// (`proto::pq_falcon_verify`) must still run every handshake.
+    pub fn check(&mut self, pk: &[u8]) -> bool {
+        if let Some(v) = self.entries.get(pk) {
+            return *v;
+        }
+        let ok = falcon_peer_key_parse_ok(pk);
+        if self.entries.len() < MAX_FALCON_PEER_KEY_CACHE {
+            self.entries.insert(pk.to_vec(), ok);
+        }
+        ok
+    }
+
+    /// Exact invalidation for one rotated key: drops its entry so the next
+    /// handshake re-verifies fresh. Returns true when an entry was dropped.
+    pub fn invalidate(&mut self, pk: &[u8]) -> bool {
+        self.entries.remove(pk).is_some()
+    }
+
+    /// Exact invalidation for registry/config change: drops all entries.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Pure static parse: length + Falcon-512 `PublicKey::from_bytes`.
+/// Fail-closed: any malformed input is false (never an error, never a panic).
+pub fn falcon_peer_key_parse_ok(pk: &[u8]) -> bool {
+    if pk.len() != proto::PQ_FALCON_PK_LEN {
+        return false;
+    }
+    falcon_rust::falcon512::PublicKey::from_bytes(pk).is_ok()
+}
+
+/// Accept-path pinned-key gate using the verdict cache.
+///
+/// * `Ok(true)` — peer pins a PQ key and it parses (verdict possibly cached).
+/// * `Ok(false)` — peer pins nothing (`pq_pub = None`): classical-explicit,
+///   unchanged pre-H window behavior, no cache entry.
+/// * `Err` — pinned value present but malformed (bad hex/length via
+///   `pq_bytes`, or 897 bytes that are not a Falcon-512 point):
+///   fail-closed refuse.
+///
+/// Only the STATIC parse is cached. The per-handshake tag verify over the
+/// fresh digest (`proto::pq_falcon_verify`), transcript, freshness, and KEM
+/// ct/tag (`pq_responder_accept` / `pq_initiator_answer`) always run fresh.
+pub fn pq_pinned_key_check_cached(
+    cache: &mut FalconPeerKeyCache,
+    cfg: &PeerConfig,
+) -> Result<bool> {
+    let Some(pq) = cfg.pq_bytes()? else {
+        return Ok(false);
+    };
+    if cache.check(&pq) {
+        Ok(true)
+    } else {
+        bail!("pq peer key malformed")
+    }
+}
+
 /// Additive announce fields for CHALLENGE/AUTH JSON: `(pq_pub_hex,
 /// pq_id_hex, pq_sig_hex)` where `pq_sig` is the Falcon-512 tag over the
 /// finalized transcript digest by the long-term PQ key. The caller merges
@@ -8451,13 +8640,11 @@ pub fn pq_announce_fields(pq: &PqKeys, digest: &[u8; 32]) -> (String, String, St
     (pq.pq_pub_hex(), pq.pq_id_hex(), hex::encode(sig))
 }
 
-/// Canonical re-ceremony call site: PQ-primary `NodeId` derivation
+/// Canonical re-ceremony call site: PQ-only `NodeId` derivation
 /// (`keyring::resolve_node_id` — same construction, no duplicate logic).
-/// This is the one function new code calls to derive a local id; the
-/// pre-ceremony `keys.id()` call sites below stay byte-identical legacy
-/// until startup PQ enrolment lands (follow-up, out of this change's zone).
-pub fn ceremony_local_id(keys: &NodeKeys, pq: Option<&PqKeys>) -> [u8; NODEID_LEN] {
-    crate::keyring::resolve_node_id(keys, pq).id
+/// Requires a PQ identity (no classical fallback).
+pub fn ceremony_local_id(_keys: &NodeKeys, pq: &PqKeys) -> [u8; NODEID_LEN] {
+    crate::keyring::resolve_node_id(_keys, pq).id
 }
 
 /// Finalized transcript digest bytes the Falcon tag covers (same canonical
@@ -8636,35 +8823,41 @@ impl ServerCertVerifier for PinnedVerifier {
 mod proton_tests {
     use super::*;
 
+    fn test_kem_pair() -> ([u8; 64], Vec<u8>) {
+        use rand::RngCore;
+        let mut seed = [0u8; 64];
+        rand::rngs::OsRng.fill_bytes(&mut seed);
+        let ek = crate::mailbox::kem_ek_from_seed(&seed);
+        (seed, ek)
+    }
+
     #[test]
     fn proton_box_body_roundtrip() {
-        // владелец: X25519 ключ пара
-        let owner_sec = XSecret::random_from_rng(rand::rngs::OsRng);
-        let owner_pub = XPub::from(&owner_sec);
+        // владелец: ML-KEM-768 пара
+        let (seed, ek) = test_kem_pair();
         let plain = "Hello, Steam code: 123456";
-        let payload = proton_box_body(&hex::encode(owner_pub.as_bytes()), plain).expect("box body");
+        let payload = proton_box_body(&hex::encode(&ek), plain).expect("box body");
         assert!(payload.contains("infmail-box-v1"));
         // сервер НЕ может расшифровать без приватного ключа: формат не plaintext
         assert!(!payload.contains(plain));
         // браузер (владелец) расшифровывает
-        let dec = proton_unbox_body(&payload, &hex::encode(owner_sec.to_bytes())).expect("unbox");
+        let dec = proton_unbox_body(&payload, &hex::encode(seed)).expect("unbox");
         assert_eq!(dec, plain);
     }
 
     #[test]
     fn proton_box_body_empty() {
-        let owner_sec = XSecret::random_from_rng(rand::rngs::OsRng);
-        let owner_pub = XPub::from(&owner_sec);
-        let payload = proton_box_body(&hex::encode(owner_pub.as_bytes()), "").unwrap();
+        let (seed, ek) = test_kem_pair();
+        let payload = proton_box_body(&hex::encode(&ek), "").unwrap();
         // пустой текст инкапсулируется без шифрования (enc=)
-        let dec = proton_unbox_body(&payload, &hex::encode(owner_sec.to_bytes())).unwrap();
+        let dec = proton_unbox_body(&payload, &hex::encode(seed)).unwrap();
         assert_eq!(dec, "");
     }
 
     #[test]
     fn proton_unbox_wrong_format_returns_none() {
-        assert!(proton_unbox_body("plain text", "00".repeat(32).as_str()).is_none());
-        assert!(proton_unbox_body("{\"proto\":\"other\"}", "00".repeat(32).as_str()).is_none());
+        assert!(proton_unbox_body("plain text", "00".repeat(64).as_str()).is_none());
+        assert!(proton_unbox_body("{\"proto\":\"other\"}", "00".repeat(64).as_str()).is_none());
     }
 }
 

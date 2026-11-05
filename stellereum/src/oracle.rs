@@ -3,7 +3,7 @@
 //! Tier 2: On-Chain DEX TWAP fallback (30-60 min rolling window)
 //! Tier 3: Circuit Breaker (>10% deviation / stale > 15 min / USDT depeg < $0.95)
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -149,24 +149,11 @@ impl PriceFeedUpdate {
     }
 
     pub fn verify(&self) -> bool {
-        // P2-8 pure-PQ gate (fail-closed): classical ed25519 feed signatures
-        // are refused under enforcement. Callers (`commit_feed`, pull-oracle
-        // read path) already map `false` to refuse/fallback, so gating here
-        // covers both with no behavior change when not enforced.
-        if crate::post_quantum::is_pure_pq_enforced() {
-            return false;
-        }
-        let Ok(vk) = VerifyingKey::from_bytes(&self.publisher_pubkey) else {
-            return false;
-        };
-        let Ok(sig) = Signature::from_slice(&self.signature) else {
-            return false;
-        };
-        let mut msg = Vec::new();
-        msg.extend_from_slice(self.asset.as_bytes());
-        msg.extend_from_slice(&self.price_micro_usd.to_be_bytes());
-        msg.extend_from_slice(&self.timestamp.to_be_bytes());
-        vk.verify(&msg, &sig).is_ok()
+        // FULL-PQ: classical ed25519 feed verification is REMOVED.
+        // No PQ feed path exists in this zone (wire frozen); fail closed.
+        // Callers (`commit_feed`, pull-oracle read path) already map `false`
+        // to refuse, so this is the PQ-only behavior.
+        false
     }
 }
 
@@ -699,26 +686,28 @@ mod pq_gate_tests {
         (feed, state)
     }
 
-    /// P2-8 pure-PQ gate: a VALID ed25519 feed verifies/commits with
-    /// enforcement off but `verify()` is false and `commit_feed` errs with
-    /// enforcement on. Guard reset proves mid-suite flag-flip isolation.
+    /// FULL-PQ: a VALID ed25519 feed never verifies and never commits
+    /// (classical feed verification removed; always fail-closed).
     #[test]
     fn pure_pq_refuses_classical_feed() {
         let (feed, mut state) = signed_feed();
 
-        // Baseline (off): valid ed feed verifies and commits.
-        assert!(feed.verify(), "valid ed feed must verify when pure-PQ is off");
+        // FULL-PQ always-on: the valid ed feed is refused.
         assert!(
-            state.commit_feed(&feed, 1_001).is_ok(),
-            "valid ed feed must commit when pure-PQ is off"
+            !feed.verify(),
+            "valid ed feed must NOT verify under FULL-PQ"
+        );
+        assert!(
+            state.commit_feed(&feed, 1_001).is_err(),
+            "ed feed must not commit under FULL-PQ"
         );
 
-        // Enforced: the SAME valid feed is refused fail-closed.
+        // Still refused with the (no-op) override set.
         {
             let _guard = PurePqGuard::enforce();
             assert!(
                 !feed.verify(),
-                "valid ed feed must NOT verify under pure-PQ"
+                "valid ed feed must NOT verify under FULL-PQ"
             );
             let mut enforced_state = OracleState::default();
             enforced_state
@@ -726,14 +715,8 @@ mod pq_gate_tests {
                 .insert(feed.publisher_pubkey);
             assert!(
                 enforced_state.commit_feed(&feed, 1_001).is_err(),
-                "ed feed must not commit under pure-PQ"
+                "ed feed must not commit under FULL-PQ"
             );
         }
-
-        // Boundary: after guard drop we are back off.
-        assert!(
-            feed.verify(),
-            "post-guard behavior must be off again"
-        );
     }
 }

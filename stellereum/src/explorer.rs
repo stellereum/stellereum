@@ -1568,6 +1568,10 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
             "stake-with-commission validator={} amount={amount} commission_bps={commission_bps}",
             hex::encode(validator)
         ),
+        Op::Reserved33ConfidentialTransfer
+        | Op::Reserved40ConfidentialTransfer2
+        | Op::Reserved41ConfidentialShield
+        | Op::Reserved42ConfidentialUnshield => "reserved-removed-confidential".to_string(),
     }
 }
 

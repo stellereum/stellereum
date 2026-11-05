@@ -14,9 +14,9 @@
 //! uncoverable fee, expired sponsor grant, out-of-gas payload). EXTENDS the
 //! apply surface - no existing test is touched or weakened.
 
-use ed25519_dalek::SigningKey;
 use std::collections::{HashMap, HashSet};
-use stellereum::sharding::Transaction;
+use stellereum::post_quantum::{derive_pq_address, FalconKeypair, PqScheme, DEFAULT_SALT};
+use stellereum::sharding::{PqSignatureEnvelope, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::svm::{OpCode, GAS_BASIC_TRANSFER};
 
@@ -44,15 +44,60 @@ impl SplitMix64 {
     }
 }
 
-fn det_key(i: u64) -> SigningKey {
+fn det_seed(id: u64) -> [u8; 32] {
     let mut seed = [0x51u8; 32];
-    seed[..8].copy_from_slice(&i.to_le_bytes());
+    seed[..8].copy_from_slice(&id.to_le_bytes());
     seed[8..16].copy_from_slice(&0x9E37_79B9_7F4A_7C15u64.to_le_bytes());
-    SigningKey::from_bytes(&seed)
+    seed
 }
 
-fn addr_of(i: u64) -> [u8; 32] {
-    det_key(i).verifying_key().to_bytes()
+/// FULL-PQ sender identity: Falcon-512 keypair derived deterministically
+/// from the numeric id (same domain separation as the old ed25519 fixture),
+/// registered globally for implicit-envelope verification.
+fn det_addrs(id: u64) -> ([u8; 32], Vec<u8>) {
+    let kp = FalconKeypair::generate_from_seed_bytes(&det_seed(id));
+    let from = derive_pq_address(PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &kp.public_key, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    (from, kp.public_key.clone())
+}
+
+fn addr_of(id: u64) -> [u8; 32] {
+    det_addrs(id).0
+}
+
+/// Classical ed25519 fixture key, kept ONLY for the paymaster-v1 sponsored
+/// mix: that composition is classical-only by design (plain legacy inner),
+/// so sponsored fixtures stay classical and both paths refuse them
+/// identically (parity by identical refusal). No PQ sponsor composition exists.
+fn det_ed_key(i: u64) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&det_seed(i))
+}
+
+/// FULL-PQ replacement for `Transaction::sign{,_with_payload}` in fixtures:
+/// implicit Falcon-512 (registered globally; no surcharge), so fee/balance
+/// assertions match the old classical fixtures exactly.
+fn pq_tx(id: u64, to: [u8; 32], amount: u64, gas: u64, nonce: u64, payload: Vec<OpCode>) -> Transaction {
+    let (from, pk) = det_addrs(id);
+    let kp = FalconKeypair::generate_from_seed_bytes(&det_seed(id));
+    debug_assert_eq!(kp.public_key, pk);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = kp.sign(&msg);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 fn new_engine(parallel: bool) -> InMemoryStateEngine {
@@ -164,23 +209,15 @@ fn plain_mixed_txs(seed: u64, n: usize) -> (Vec<Transaction>, HashSet<[u8; 32]>)
         } else {
             GAS_BASIC_TRANSFER
         };
-        let from_key = if (13..16).contains(&fail) {
+        let from_id = if (13..16).contains(&fail) {
             // unfunded sender: never admitted, moves nothing.
             let id = 5_000_000 + rng.below(1_000_000);
             addrs.insert(addr_of(id));
-            det_key(id)
+            id
         } else {
-            det_key(s)
+            s
         };
-        txs.push(Transaction::sign(
-            &from_key,
-            to,
-            amount,
-            gas,
-            nonce,
-            1,
-            1,
-        ));
+        txs.push(pq_tx(from_id, to, amount, gas, nonce, Vec::new()));
     }
     (txs, addrs)
 }
@@ -203,14 +240,12 @@ fn payload_mixed_txs(seed: u64, n: usize) -> (Vec<Transaction>, HashSet<[u8; 32]
         nonces[s as usize] += 1;
         let kind = rng.below(100);
         if kind < 50 {
-            txs.push(Transaction::sign_with_payload(
-                &det_key(s),
+            txs.push(pq_tx(
+                s,
                 to,
                 1 + rng.below(1_000),
                 500_000,
                 nonce,
-                1,
-                1,
                 vec![OpCode::Transfer {
                     recipient: inner,
                     amount: 1 + rng.below(500),
@@ -219,28 +254,25 @@ fn payload_mixed_txs(seed: u64, n: usize) -> (Vec<Transaction>, HashSet<[u8; 32]
         } else if kind < 60 {
             // out-of-gas payload: admitted shape, fails at execution, pays
             // the floor via the failure-fee path on both engines.
-            txs.push(Transaction::sign_with_payload(
-                &det_key(s),
+            txs.push(pq_tx(
+                s,
                 to,
                 1,
                 100,
                 nonce,
-                1,
-                1,
                 vec![OpCode::Transfer {
                     recipient: inner,
                     amount: 1,
                 }],
             ));
         } else {
-            txs.push(Transaction::sign(
-                &det_key(s),
+            txs.push(pq_tx(
+                s,
                 to,
                 1 + rng.below(1_000),
                 GAS_BASIC_TRANSFER,
                 nonce,
-                1,
-                1,
+                Vec::new(),
             ));
         }
     }
@@ -259,7 +291,7 @@ fn sponsored_mixed_txs(
     let mut txs = Vec::with_capacity(n);
     let mut addrs = HashSet::from([addr_of(sponsor_id)]);
     let mut nonces = vec![0u64; SENDERS];
-    let sponsor_key = det_key(sponsor_id);
+    let sponsor_key = det_ed_key(sponsor_id);
     for _ in 0..n {
         let s = rng.below(SENDERS as u64);
         let to = addr_of(4_000_000 + rng.below(1_000_000));
@@ -278,7 +310,7 @@ fn sponsored_mixed_txs(
             (10 * GAS_BASIC_TRANSFER, TS + 1_000_000)
         };
         txs.push(Transaction::sign_with_sponsor(
-            &det_key(s),
+            &det_ed_key(s),
             &sponsor_key,
             to,
             1 + rng.below(1_000),
@@ -344,14 +376,13 @@ async fn parallel_large_disjoint_parity_fixed_seed() {
         let to = addr_of(base + n as u64 + i);
         addrs.insert(addr_of(base + i));
         addrs.insert(to);
-        txs.push(Transaction::sign(
-            &det_key(base + i),
+        txs.push(pq_tx(
+            base + i,
             to,
             1 + rng.below(1_000),
             GAS_BASIC_TRANSFER,
             0,
-            1,
-            1,
+            Vec::new(),
         ));
     }
     let funded: Vec<(u64, u64)> = (0..n as u64).map(|i| (base + i, BAL)).collect();

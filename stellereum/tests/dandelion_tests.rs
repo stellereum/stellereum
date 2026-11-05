@@ -767,3 +767,68 @@ fn deterministic_replay_is_identical() {
     assert_ne!((a.stem_path, a.first_fluffer), (c.stem_path, c.first_fluffer),
         "different seeds should diverge (sanity: rng is wired in)");
 }
+
+// ---------------------------------------------------------------------------
+// 8. RELAY INGRESS CLAMP (pentest Medium): adversarial wire budgets fail
+//    closed to fluff; legitimate max-hop stems are untouched.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn inbound_over_cap_budgets_fail_closed_to_fluff() {
+    // The wire budget is attacker-controlled: originate-side sampling caps at
+    // MAX_STEM_HOPS but relay ingress did not, so u32::MAX forwarded as
+    // MAX-1. Over-cap ingress must now take the existing fluff-source path
+    // (no held stem, tagged fluffed), never a forward beyond the cap.
+    let mut rng = NodeRng::new(0xC14A_0001);
+    let all_alive = |_: PeerId| true;
+    for incoming in [MAX_STEM_HOPS + 1, MAX_STEM_HOPS + 100, u32::MAX] {
+        let mut relay = DandelionRelay::with_defaults();
+        let tx = txid_from_u64(900_000 + incoming as u64);
+        assert_eq!(
+            relay.on_stem_receive(&mut rng, tx, incoming, &[2, 3], 1, &all_alive),
+            RelayAction::FluffBroadcast,
+            "over-cap {incoming} must fluff, never forward"
+        );
+        assert!(
+            relay.stem_entry(&tx).is_none(),
+            "over-cap {incoming} must hold no stem (nothing for timeout to chase)"
+        );
+        assert!(
+            relay.is_fluffed(&tx),
+            "over-cap {incoming} marks fluffed (fluff wins / storm termination)"
+        );
+        // No-stall: repeats terminate via the unchanged fluff-wins path.
+        assert_eq!(
+            relay.on_stem_receive(&mut rng, tx, incoming, &[2, 3], 1, &all_alive),
+            RelayAction::IgnoreDuplicate
+        );
+        assert_eq!(relay.on_fluff_receive(tx), RelayAction::IgnoreDuplicate);
+    }
+    println!("[dandelion][clamp] over-cap {{11, 110, u32::MAX}} all fluff with no held stem");
+}
+
+#[test]
+fn inbound_at_or_below_cap_stems_unaffected() {
+    // Legitimate boundary: every budget 1..=MAX_STEM_HOPS still stems with
+    // exactly one less (cap preserved end to end, including exactly MAX).
+    let mut rng = NodeRng::new(0xC14A_0002);
+    let all_alive = |_: PeerId| true;
+    for incoming in 1..=MAX_STEM_HOPS {
+        let mut relay = DandelionRelay::with_defaults();
+        let tx = txid_from_u64(910_000 + incoming as u64);
+        match relay.on_stem_receive(&mut rng, tx, incoming, &[2, 3], 1, &all_alive) {
+            RelayAction::StemForward { .. } => {}
+            other => panic!("in-cap {incoming} must forward, got {other:?}"),
+        }
+        assert_eq!(
+            relay.stem_entry(&tx).expect("entry").hops_left,
+            incoming - 1,
+            "in-cap {incoming} must hand on exactly one less"
+        );
+        assert!(!relay.is_fluffed(&tx));
+    }
+    println!(
+        "[dandelion][clamp] 1..={MAX_STEM_HOPS} all stem with budget-1 (at-cap hands on {})",
+        MAX_STEM_HOPS - 1
+    );
+}

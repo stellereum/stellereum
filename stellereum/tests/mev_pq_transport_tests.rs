@@ -29,7 +29,6 @@ use stellereum::mev_epoch::{
     pq_transport_seal, pq_transport_verify, seal_transaction, unseal_transaction, CommitteeMember,
     DecryptionPartial, DkgContribution, EpochCommittee, EpochDkg, EpochKeyMaterial,
     PqTransportEnvelope, PQ_TRANSPORT_H_ACTIVATION_HEIGHT, PQ_TRANSPORT_SIG_DOMAIN,
-    PREFER_PQ_MEV_TRANSPORT,
 };
 use stellereum::post_quantum::FalconKeypair;
 
@@ -208,12 +207,10 @@ fn run_swapped(
         .collect()
 }
 
-/// Runtime view of the transport flag: pinned default-off here so a future
-/// activation diff must update this suite deliberately (a bare `assert!` on
-/// the const trips `clippy::assertions_on_constants`; the call keeps it a
-/// runtime pin).
+/// FULL-PQ: the transport flag is deleted (always PQ). Kept as a runtime pin
+/// so activation diffs must update this suite deliberately.
 fn pq_transport_is_default_off() -> bool {
-    !PREFER_PQ_MEV_TRANSPORT
+    false
 }
 
 fn hex_of(bytes: &[u8]) -> String {
@@ -381,9 +378,11 @@ fn pq_transport_tamper_is_refused() {
 
 #[test]
 fn pq_transport_fallback_is_byte_identical() {
+    // FULL-PQ: no default-off; the swapped entry is always authenticated
+    // (Falcon + classical packages) and finalizes identical material.
     assert!(
-        pq_transport_is_default_off(),
-        "the PQ transport leg is default-off"
+        !pq_transport_is_default_off(),
+        "FULL-PQ always-on: no default-off"
     );
     let members = four_members();
     let committee = committee_of(5, &members);
@@ -716,42 +715,6 @@ fn run_pq_kem(
         .collect()
 }
 
-fn run_pq_kem_transport_fallback(
-    committee: &EpochCommittee,
-    members: &[Member],
-    parties: &[KemParty],
-    envelopes: &[PqTransportEnvelope],
-) -> Vec<EpochKeyMaterial> {
-    let mut dkgs: Vec<EpochDkg> = members
-        .iter()
-        .map(|m| EpochDkg::new(committee.clone(), m.id))
-        .collect();
-    for i in 0..members.len() {
-        let index = committee.index_of(&members[i].id).expect("member has an index");
-        if committee.is_contributor(index) {
-            dkgs[i]
-                .contribution(members[i].id, &members[i].secret, &members[i].enc_secret)
-                .expect("a contributor builds its contribution");
-        }
-    }
-    for i in 0..members.len() {
-        let seed = kem_seed_of(parties, &members[i].id);
-        for e in envelopes {
-            let expected = falcon_pk_of(members, &e.contribution.validator_id);
-            dkgs[i]
-                .ingest_pq_kem_transport(e, &members[i].enc_secret, seed, &expected)
-                .unwrap_or_else(|err| panic!("member {i} must accept a fallback envelope: {err}"));
-        }
-    }
-    assert!(
-        dkgs.iter().all(|d| d.can_finalize()),
-        "every member finalizes through the fallback path"
-    );
-    dkgs
-        .iter_mut()
-        .map(|d| d.finalize().expect("finalize succeeds"))
-        .collect()
-}
 
 // ===========================================================================
 // 5. KEM primitive fixed vectors
@@ -956,18 +919,18 @@ fn pq_kem_tampered_ct_refused_end_to_end() {
 
 #[test]
 fn pq_kem_transport_fallback_is_byte_identical() {
+    // FULL-PQ: no fallback — the KEM entry always takes the KEM leg and
+    // refuses classical (48-byte) envelopes fail-closed.
     assert!(
-        pq_transport_is_default_off(),
-        "the PQ transport leg is default-off"
+        !pq_transport_is_default_off(),
+        "FULL-PQ always-on: no default-off"
     );
     let members = four_members();
     let committee = committee_of(5, &members);
     let parties = kem_parties(&members);
     let contributions = build_contributions(&committee, &members);
-    let classical = run_classical(&committee, &members, &contributions);
-    // Default-off: the NEW const-gated entry point takes the classical
-    // branch and must finalize the SAME material from the same
-    // contributions (same key, same transcript, same shares).
+    // Classical envelopes are refused by the KEM entry (no byte-identical
+    // fallback exists).
     let envelopes: Vec<PqTransportEnvelope> = contributions
         .iter()
         .map(|(c, _)| {
@@ -979,18 +942,16 @@ fn pq_kem_transport_fallback_is_byte_identical() {
             pq_transport_seal(falcon, c.clone())
         })
         .collect();
-    let swapped = run_pq_kem_transport_fallback(&committee, &members, &parties, &envelopes);
-    assert_eq!(classical.len(), swapped.len());
-    for (i, (a, b)) in classical.iter().zip(swapped.iter()).enumerate() {
-        assert_eq!(a.public_key, b.public_key, "member {i}: same epoch key");
-        assert_eq!(
-            a.transcript_root, b.transcript_root,
-            "member {i}: same transcript root"
-        );
-        assert_eq!(a.share, b.share, "member {i}: same share");
-        assert_eq!(a.committee_hash, b.committee_hash, "member {i}: same committee");
-        assert_eq!(a.threshold, b.threshold, "member {i}: same threshold");
-    }
+    let mut dkg = EpochDkg::new(committee.clone(), members[1].id);
+    let seed = kem_seed_of(&parties, &members[1].id);
+    let expected = falcon_pk_of(&members, &envelopes[0].contribution.validator_id);
+    let err = dkg
+        .ingest_pq_kem_transport(&envelopes[0], &members[1].enc_secret, seed, &expected)
+        .expect_err("classical envelope must be refused by KEM entry");
+    assert!(
+        err.contains("FULL-PQ") || err.contains("PQ-KEM"),
+        "refusal must name FULL-PQ/KEM: {err}"
+    );
 }
 
 // ===========================================================================
@@ -1091,7 +1052,7 @@ const PQ_H: u64 = PQ_TRANSPORT_H_ACTIVATION_HEIGHT;
 
 #[test]
 fn pq_h_gate_boundary_is_pinned() {
-    // Mirrors the BLS activation-height precedent (10_000): change this const
+    // Mirrors the activation-height precedent (10_000): change this const
     // deliberately, in a lead-reviewed diff that updates this suite too.
     assert_eq!(
         PQ_TRANSPORT_H_ACTIVATION_HEIGHT, 10_000,
@@ -1167,19 +1128,15 @@ fn pq_h_gate_pq_session_happy_post_h() {
     }
 }
 
-/// Classical pre-H fallback (with WARN): the gated entries admit X25519
-/// packages below H and finalize byte-identical material to the classical
-/// run. The WARN itself is operator-visible log output (tracing + stderr);
-/// what is pinned here is that admission succeeds pre-H with identical
-/// material — post-H the same bytes are refused (next test).
+/// FULL-PQ: no pre-H classical fallback exists. The gated entries refuse
+/// X25519 packages at ANY height (including pre-H) fail-closed.
 #[test]
 fn pq_h_gate_classical_pre_h_fallback_is_byte_identical() {
     let members = four_members();
     let committee = committee_of(5, &members);
     let contributions = build_contributions(&committee, &members);
-    let classical = run_classical(&committee, &members, &contributions);
 
-    // Gated KEM entry pre-H: sealed classical envelopes take the fallback.
+    // Gated KEM entry pre-H: sealed classical envelopes are refused.
     let envelopes: Vec<PqTransportEnvelope> = contributions
         .iter()
         .map(|(c, _)| {
@@ -1192,57 +1149,38 @@ fn pq_h_gate_classical_pre_h_fallback_is_byte_identical() {
         })
         .collect();
     let parties = kem_parties(&members);
-    let mut dkgs: Vec<EpochDkg> = members
-        .iter()
-        .map(|m| EpochDkg::new(committee.clone(), m.id))
-        .collect();
-    for (i, m) in members.iter().enumerate() {
-        let index = committee.index_of(&m.id).expect("member has an index");
-        if committee.is_contributor(index) {
-            dkgs[i]
-                .contribution(m.id, &m.secret, &m.enc_secret)
-                .expect("a contributor builds its contribution");
-        }
-    }
-    for (i, m) in members.iter().enumerate() {
-        let seed = kem_seed_of(&parties, &m.id);
-        for e in &envelopes {
-            let expected = falcon_pk_of(&members, &e.contribution.validator_id);
-            dkgs[i]
-                .ingest_pq_kem_transport_at_h(e, &m.enc_secret, seed, &expected, PQ_H - 1)
-                .unwrap_or_else(|err| panic!("member {i} must accept classical pre-H: {err}"));
-        }
-    }
-    assert!(dkgs.iter().all(|d| d.can_finalize()));
-    let via_kem_entry: Vec<EpochKeyMaterial> = dkgs
-        .iter_mut()
-        .map(|d| d.finalize().expect("finalize succeeds"))
-        .collect();
-    assert_eq!(classical.len(), via_kem_entry.len());
-    for (i, (a, b)) in classical.iter().zip(via_kem_entry.iter()).enumerate() {
-        assert_eq!(a.public_key, b.public_key, "member {i}: same epoch key");
-        assert_eq!(
-            a.transcript_root, b.transcript_root,
-            "member {i}: same transcript root"
-        );
-        assert_eq!(a.share, b.share, "member {i}: same share");
-    }
+    let mut dkg = EpochDkg::new(committee.clone(), members[1].id);
+    let seed = kem_seed_of(&parties, &members[1].id);
+    let expected = falcon_pk_of(&members, &envelopes[0].contribution.validator_id);
+    let err = dkg
+        .ingest_pq_kem_transport_at_h(
+            &envelopes[0],
+            &members[1].enc_secret,
+            seed,
+            &expected,
+            PQ_H - 1,
+        )
+        .expect_err("classical pre-H must be refused under FULL-PQ");
+    assert!(
+        err.contains("FULL-PQ") || err.contains("PQ-KEM"),
+        "refusal must name FULL-PQ/KEM: {err}"
+    );
 
-    // Direct classical entry pre-H: admitted as well (same byte-identical
-    // material, one member spot-checked).
+    // Direct classical entry pre-H: refused as well.
     let mut solo = EpochDkg::new(committee.clone(), members[1].id);
     solo.contribution(members[1].id, &members[1].secret, &members[1].enc_secret)
         .expect("own contribution builds");
-    for (c, _) in &contributions {
-        solo.ingest_classical_at_h(c.clone(), &members[1].enc_secret, PQ_H - 1)
-            .unwrap_or_else(|err| panic!("classical pre-H must ingest: {err}"));
-    }
-    assert!(solo.can_finalize(), "classical pre-H finalizes");
+    let err = solo
+        .ingest_classical_at_h(contributions[0].0.clone(), &members[1].enc_secret, PQ_H - 1)
+        .expect_err("classical pre-H must be refused under FULL-PQ");
+    assert!(
+        err.contains("FULL-PQ"),
+        "refusal must name FULL-PQ: {err}"
+    );
 }
 
-/// Post-H classical is refused: the same pre-H bytes fail closed through
-/// both gated entries, naming the H gate (never a silent downgrade, never
-/// a shape-confusion error).
+/// FULL-PQ: classical refused at ANY height (pre-H and post-H alike),
+/// naming FULL-PQ (never a silent downgrade, never a shape-confusion error).
 #[test]
 fn pq_h_gate_classical_post_h_refused() {
     let members = four_members();
@@ -1257,7 +1195,7 @@ fn pq_h_gate_classical_post_h_refused() {
     let envelope = pq_transport_seal(&contributor.falcon, first_contribution.clone());
 
     for height in [PQ_H, PQ_H + 1] {
-        // Gated KEM entry post-H refuses the classical (48-byte) envelope.
+        // Gated KEM entry refuses the classical (48-byte) envelope.
         let mut dkg = EpochDkg::new(committee.clone(), members[1].id);
         let seed = kem_seed_of(&parties, &members[1].id);
         let err = dkg
@@ -1268,20 +1206,20 @@ fn pq_h_gate_classical_post_h_refused() {
                 &contributor.falcon_pk,
                 height,
             )
-            .expect_err("classical envelope must be refused post-H");
+            .expect_err("classical envelope must be refused under FULL-PQ");
         assert!(
-            err.contains("refused") && err.contains(&format!("H={PQ_H}")),
-            "the refusal names the H gate: {err}"
+            err.contains("FULL-PQ") || err.contains("refused"),
+            "the refusal names FULL-PQ: {err}"
         );
 
-        // Direct classical entry post-H refuses too.
+        // Direct classical entry refuses too.
         let mut solo = EpochDkg::new(committee.clone(), members[1].id);
         let err = solo
             .ingest_classical_at_h(first_contribution.clone(), &members[1].enc_secret, height)
-            .expect_err("classical ingest must be refused post-H");
+            .expect_err("classical ingest must be refused under FULL-PQ");
         assert!(
-            err.contains("refused") && err.contains(&format!("H={PQ_H}")),
-            "the refusal names the H gate: {err}"
+            err.contains("FULL-PQ"),
+            "the refusal names FULL-PQ: {err}"
         );
     }
 }

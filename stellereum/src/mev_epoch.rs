@@ -1147,14 +1147,11 @@ fn decrypt_share_package(
 //
 // STATUS: the Falcon-authenticated fallback step above is wired and pinned by
 // `tests/mev_pq_transport_tests.rs`. The full RANK-1 swap below it is WIRED
-// TOO (additive, `ml-kem 0.3` — the same audited lineage infnode pins in
-// `kem_kat_tests.rs`): share packages are ML-KEM-768 encapsulations to
-// explicitly supplied recipient keys, still wrapped in the SAME Falcon
-// envelope (`pq_transport_seal`/`verify` cover the packages via
-// `canonical_bytes`, so no new envelope shape). With
-// `PREFER_PQ_MEV_TRANSPORT = false` (default) the new
-// `ingest_pq_kem_transport` entry point below behaves exactly like the
-// classical `ingest` (byte-identical default).
+// FULL-PQ: the PQ-KEM + Falcon transport leg is the ONLY leg (no classical
+// fallback, no flag, no pre-H window). `ingest_pq_kem_transport` always
+// takes the KEM leg; `ingest_classical_at_h` always refuses; H-gate helpers
+// below are retained for height plumbing but classical is refused at any
+// height.
 //
 // SHAPE PRESERVED: Feldman VSS, the Ristretto threshold arithmetic, the
 // X25519 package encryption, `DkgContribution`/`EncryptedShare` (wire
@@ -1164,25 +1161,17 @@ fn decrypt_share_package(
 // PQ-KEM 1136-byte packages are refused by the classical ingest
 // fail-closed (and vice versa).
 //
-// ACTIVATION: flip `PREFER_PQ_MEV_TRANSPORT` to `true` (a future,
-// audited wiring diff) and route gossip through `ingest_pq_kem_transport`
+// ACTIVATION: FULL-PQ wipe — route gossip through `ingest_pq_kem_transport`
 // with the contributor's Falcon-512 key from the validator registry and the
 // recipient KEM keys from the PQ registry. Never silent: a contribution
 // without a valid Falcon envelope or without a KEM package for us is
-// refused when the flag is on, exactly as a contribution without our share
-// package is refused today.
-
-/// PQ transport selector: `false` keeps the classical X25519 package leg
-/// (default, byte-identical); `true` requires Falcon-authenticated
-/// contributions at ingest.
-pub const PREFER_PQ_MEV_TRANSPORT: bool = false;
+// refused, exactly as a contribution without our share package is refused today.
 
 /// PQ transport H-gate: chain height at/above which DKG share-package
 /// transport MUST be post-quantum (Falcon-authenticated ML-KEM-768).
 ///
 /// H-gate philosophy (mirrors the activation-height precedent of
-/// [`crate::bls::DEFAULT_BLS_ACTIVATION_HEIGHT`] /
-/// [`crate::bls::is_bls_active`], the XPC/VRF/chain-binding height gates):
+/// the XPC/VRF/chain-binding height gates):
 /// a plain documented const, no env knob, no silent fallback. Pre-H the
 /// height-gated entry points below take the classical X25519 branch
 /// (byte-identical to [`EpochDkg::ingest`], with an operator WARN); post-H
@@ -1193,9 +1182,8 @@ pub const PREFER_PQ_MEV_TRANSPORT: bool = false;
 /// change) is pinned by `tests/mev_pq_transport_tests.rs`.
 pub const PQ_TRANSPORT_H_ACTIVATION_HEIGHT: u64 = 10_000;
 
-/// Height-gate predicate for the PQ transport leg (mirrors
-/// [`crate::bls::is_bls_active`): true at/above
-/// [`PQ_TRANSPORT_H_ACTIVATION_HEIGHT`].
+/// Height-gate predicate for the PQ transport leg:
+/// true at/above [`PQ_TRANSPORT_H_ACTIVATION_HEIGHT`].
 #[inline]
 pub fn is_pq_transport_active(height: u64) -> bool {
     height >= PQ_TRANSPORT_H_ACTIVATION_HEIGHT
@@ -1290,20 +1278,15 @@ impl EpochDkg {
 
     /// The transport-swapped ingest entry point.
     ///
-    /// Const-gated: with `PREFER_PQ_MEV_TRANSPORT = false` (default) this
-    /// is exactly the classical `ingest` — byte-identical behavior. With
-    /// the flag on, contributions must carry a valid Falcon envelope.
+    /// FULL-PQ: always Falcon-authenticated ingest. The classical
+    /// unauthenticated `ingest` fallback is deleted (no compat).
     pub fn ingest_pq_transport(
         &mut self,
         envelope: &PqTransportEnvelope,
         enc_secret: &[u8; 32],
         expected_falcon_pk: &[u8],
     ) -> Result<(), String> {
-        if PREFER_PQ_MEV_TRANSPORT {
-            self.ingest_authenticated(envelope, enc_secret, expected_falcon_pk)
-        } else {
-            self.ingest(envelope.contribution.clone(), enc_secret)
-        }
+        self.ingest_authenticated(envelope, enc_secret, expected_falcon_pk)
     }
 }
 
@@ -1686,12 +1669,9 @@ impl EpochDkg {
         self.ingest_pq(envelope.contribution.clone(), own_kem_seed)
     }
 
-    /// The KEM-transport-swapped ingest entry point.
-    ///
-    /// Const-gated: with `PREFER_PQ_MEV_TRANSPORT = false` (default) this
-    /// is exactly the classical `ingest` — byte-identical behavior. With
-    /// the flag on, contributions must carry a valid Falcon envelope AND
-    /// KEM-encrypted packages for our KEM seed.
+    /// FULL-PQ: always the PQ-KEM leg. The classical `ingest` fallback is
+    /// deleted (no compat). `enc_secret` is retained in signature for
+    /// call-site compat but ignored (KEM leg uses `own_kem_seed`).
     pub fn ingest_pq_kem_transport(
         &mut self,
         envelope: &PqTransportEnvelope,
@@ -1699,59 +1679,44 @@ impl EpochDkg {
         own_kem_seed: &[u8; 64],
         expected_falcon_pk: &[u8],
     ) -> Result<(), String> {
-        if PREFER_PQ_MEV_TRANSPORT {
-            self.ingest_authenticated_pq(envelope, own_kem_seed, expected_falcon_pk)
-        } else {
-            self.ingest(envelope.contribution.clone(), enc_secret)
+        let _ = enc_secret;
+        // Same fail-closed shape pre-check as `ingest_pq_kem_transport_at_h`:
+        // refuse classical (48-byte) packages before Falcon verify, naming
+        // the FULL-PQ removal (never silently downgraded).
+        let classical = envelope
+            .contribution
+            .packages
+            .iter()
+            .any(|p| p.ciphertext.len() != PQ_KEM_PACKAGE_CT_LEN);
+        if classical {
+            return Err(format!(
+                "FULL-PQ: classical X25519 DKG transport removed: \
+                 PQ-KEM packages must be {PQ_KEM_PACKAGE_CT_LEN} bytes (kem_ct || aead_ct)"
+            ));
         }
+        self.ingest_authenticated_pq(envelope, own_kem_seed, expected_falcon_pk)
     }
 
-    /// Height-gated classical ingest: the drop-in for `ingest` once gossip
-    /// carries a chain height.
-    ///
-    /// Pre-H this IS the classical `ingest` (byte-identical, plus an
-    /// operator WARN that the X25519 leg goes away at H). Post-H the
-    /// classical X25519 leg is refused fail-closed: callers must route
-    /// through [`Self::ingest_pq_kem_transport_at_h`]. Existing callers of
-    /// `ingest` are untouched (pre-H default byte-identical).
+    /// FULL-PQ: classical X25519 transport is always refused, at any height.
+    /// Callers must route through [`Self::ingest_pq_kem_transport_at_h`].
     pub fn ingest_classical_at_h(
         &mut self,
         contribution: DkgContribution,
         enc_secret: &[u8; 32],
         height: u64,
     ) -> Result<(), String> {
-        if is_pq_transport_active(height) {
-            return Err(format!(
-                "classical X25519 DKG transport refused at/above PQ H={} (chain height {height}): \
-                 re-ingest through the Falcon + ML-KEM-768 leg",
-                PQ_TRANSPORT_H_ACTIVATION_HEIGHT
-            ));
-        }
-        tracing::warn!(
-            "[pq-transport] classical X25519 share package ingested pre-H (height {height} < H={}); \
-             the X25519 leg is refused at/above H — migrate gossip to the Falcon + ML-KEM-768 leg",
-            PQ_TRANSPORT_H_ACTIVATION_HEIGHT
-        );
-        eprintln!(
-            "[WARN][pq-transport] classical X25519 share package ingested pre-H (height {height} < H={})",
-            PQ_TRANSPORT_H_ACTIVATION_HEIGHT
-        );
-        self.ingest(contribution, enc_secret)
+        let _ = (contribution, enc_secret);
+        Err(format!(
+            "FULL-PQ: classical X25519 DKG transport removed (chain height {height}): \
+             re-ingest through the Falcon + ML-KEM-768 leg"
+        ))
     }
 
-    /// Height-gated KEM-transport ingest: the H-gate close-out of the
-    /// transport-KEX gap.
-    ///
-    /// Post-H this is PQ-only: a contribution whose packages are not ALL
-    /// ML-KEM-768-shaped (`{PQ_KEM_PACKAGE_CT_LEN}` bytes) is refused
-    /// fail-closed naming the H gate (never silently downgraded), otherwise
-    /// the Falcon envelope is verified and the KEM packages are ingested via
-    /// [`Self::ingest_authenticated_pq`]. Pre-H this defers to the bool-gated
-    /// [`Self::ingest_pq_kem_transport`] policy — default-off that is exactly
-    /// the classical `ingest`, byte-identical — plus the same pre-H WARN as
-    /// [`Self::ingest_classical_at_h`] when the classical fallback is taken.
-    /// The H gate only ever upgrades toward PQ, never downgrades: flipping
-    /// `PREFER_PQ_MEV_TRANSPORT` on pre-H takes the PQ leg at any height.
+    /// FULL-PQ: always the PQ-KEM leg. A contribution whose packages are not
+    /// ALL ML-KEM-768-shaped (`{PQ_KEM_PACKAGE_CT_LEN}` bytes) is refused
+    /// fail-closed (never silently downgraded), otherwise the Falcon envelope
+    /// is verified and KEM packages ingested via
+    /// [`Self::ingest_authenticated_pq`]. No pre-H classical fallback exists.
     pub fn ingest_pq_kem_transport_at_h(
         &mut self,
         envelope: &PqTransportEnvelope,
@@ -1760,31 +1725,19 @@ impl EpochDkg {
         expected_falcon_pk: &[u8],
         height: u64,
     ) -> Result<(), String> {
-        if is_pq_transport_active(height) || PREFER_PQ_MEV_TRANSPORT {
-            let classical = envelope
-                .contribution
-                .packages
-                .iter()
-                .any(|p| p.ciphertext.len() != PQ_KEM_PACKAGE_CT_LEN);
-            if classical {
-                return Err(format!(
-                    "classical X25519 DKG transport refused at/above PQ H={} (chain height {height}): \
-                     PQ-KEM packages must be {PQ_KEM_PACKAGE_CT_LEN} bytes (kem_ct || aead_ct)",
-                    PQ_TRANSPORT_H_ACTIVATION_HEIGHT
-                ));
-            }
-            return self.ingest_authenticated_pq(envelope, own_kem_seed, expected_falcon_pk);
+        let _ = (enc_secret, height);
+        let classical = envelope
+            .contribution
+            .packages
+            .iter()
+            .any(|p| p.ciphertext.len() != PQ_KEM_PACKAGE_CT_LEN);
+        if classical {
+            return Err(format!(
+                "FULL-PQ: classical X25519 DKG transport removed: \
+                 PQ-KEM packages must be {PQ_KEM_PACKAGE_CT_LEN} bytes (kem_ct || aead_ct)"
+            ));
         }
-        tracing::warn!(
-            "[pq-transport] classical X25519 fallback ingested pre-H (height {height} < H={}); \
-             the X25519 leg is refused at/above H — migrate gossip to the Falcon + ML-KEM-768 leg",
-            PQ_TRANSPORT_H_ACTIVATION_HEIGHT
-        );
-        eprintln!(
-            "[WARN][pq-transport] classical X25519 fallback ingested pre-H (height {height} < H={})",
-            PQ_TRANSPORT_H_ACTIVATION_HEIGHT
-        );
-        self.ingest(envelope.contribution.clone(), enc_secret)
+        self.ingest_authenticated_pq(envelope, own_kem_seed, expected_falcon_pk)
     }
 }
 

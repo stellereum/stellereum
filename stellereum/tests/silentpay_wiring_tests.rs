@@ -244,11 +244,14 @@ fn wrong_keys_and_tampered_ct_excluded_state_untouched() {
     assert_eq!(notes[0].recipient, 0);
     let candidates = as_candidates(&notes);
 
-    // Non-owners find nothing through the wired scanner.
+    // Non-owners of note 0 find nothing through the wired scanner: scan
+    // only the note owned by recipient 0 (seeds[1]/seeds[2] own the OTHER
+    // notes in the list — the owner test proves they find those — so the
+    // full list must NOT be expected empty here).
     for seed in [&seeds[1], &seeds[2]] {
         let mut scanner = SilentScanner::new(*seed, CHAIN_A);
         scanner.enable_for_tests();
-        assert!(scanner.scan(&candidates).is_empty());
+        assert!(scanner.scan(&candidates[..1]).is_empty());
     }
 
     // Fine-grained: the crate receive state is untouched by misses.

@@ -34,15 +34,6 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 ureq = "2"
 lazy_static = "1.5"
-# Real pairing-based BLS12-381 for aggregate validator certificates (P1-c). Pure
-# Rust, no C toolchain: `blst` was avoided deliberately so the build stays portable.
-# minimal-signature-size would need 96-byte public keys; minimal-pubkey-size gives
-# 48-byte keys and 96-byte signatures, which is what the certificate carries.
-bls12_381 = { version = "0.9", features = ["experimental"] }
-# NOTE: `group` 0.13 and `ff` 0.13 were dropped as direct dependencies (audit
-# 2026-10-20): nothing in src/, tests/, benches/ or examples/ referenced them.
-# They stay in the lockfile as transitive deps of `k256` -> `elliptic-curve`
-# 0.13, and `bls12_381` 0.9 uses the 0.14 generation instead.
 argon2 = "0.5"
 wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate", "deterministic", "portable-dispatch"] }
 # Post-Quantum STARK / BLAKE3 zkML Engine (100% Quantum-Resistant, zero trusted setup, zero elliptic curves)

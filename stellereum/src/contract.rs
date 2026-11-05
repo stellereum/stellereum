@@ -1366,31 +1366,13 @@ fn host_linker(engine: &Engine) -> Linker<HostState> {
                 .saturating_add(mlen as u64)
                 .saturating_add(64);
             HostState::charge(&mut caller, fuel)?;
-            let pk_bytes = read_wasm_memory(&mut caller, pubkey_ptr, 32)?;
-            let msg_bytes = read_wasm_memory(&mut caller, msg_ptr, mlen)?;
-            let sig_bytes = read_wasm_memory(&mut caller, sig_ptr, 64)?;
-            // P2-6 pure-PQ gate (fail-closed): classical ed25519 verification
-            // is refused under enforcement. Fuel + memory effects above stay
-            // identical; only the cryptographic verdict is forced to false.
-            if crate::post_quantum::is_pure_pq_enforced() {
-                return Ok(0);
-            }
-
-            let pk_arr: [u8; 32] = match pk_bytes.try_into() {
-                Ok(a) => a,
-                Err(_) => return Ok(0),
-            };
-            let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&pk_arr) else {
-                return Ok(0);
-            };
-            let sig_arr: [u8; 64] = match sig_bytes.try_into() {
-                Ok(a) => a,
-                Err(_) => return Ok(0),
-            };
-            let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
-            use ed25519_dalek::Verifier;
-            let valid = verifying_key.verify(&msg_bytes, &signature).is_ok();
-            Ok(if valid { 1 } else { 0 })
+            let _pk_bytes = read_wasm_memory(&mut caller, pubkey_ptr, 32)?;
+            let _msg_bytes = read_wasm_memory(&mut caller, msg_ptr, mlen)?;
+            let _sig_bytes = read_wasm_memory(&mut caller, sig_ptr, 64)?;
+            // FULL-PQ: classical ed25519 host verification is REMOVED.
+            // Fuel + memory effects above stay identical (no free-call
+            // oracle); the cryptographic verdict is always false.
+            Ok(0)
         },
     );
     let _ = linker.func_wrap(
@@ -2598,9 +2580,10 @@ mod tests {
         let mut reg = ContractRegistry::new();
         let addr = reg.deploy([1u8; 32], wasm, 0).unwrap();
 
-        // Valid signature -> returns 1
+        // FULL-PQ: even a VALID classical signature is refused (0).
+        // Valid signature -> returns 0 (classical host removed)
         let (valid_res, ..) = reg.call(&addr, "verify_sig", 0, 100_000).unwrap();
-        assert_eq!(valid_res, 1);
+        assert_eq!(valid_res, 0);
 
         // Corrupted signature -> returns 0
         let (corrupt_res, ..) = reg.call(&addr, "verify_sig", 1, 100_000).unwrap();
@@ -2615,24 +2598,10 @@ mod tests {
         assert!(matches!(fuel_err, ContractError::OutOfFuel));
     }
 
-    /// P2-6 pure-PQ gate: a VALID ed25519 signature verifies (1) with
-    /// enforcement off but is refused (0) with enforcement on. The guard
-    /// resets the thread-local override on drop so the flag flip cannot leak
-    /// into other tests in this suite.
+    /// FULL-PQ: classical `ed25519_verify` host is REMOVED — a VALID ed25519
+    /// signature is always refused (0). Fuel/memory effects still apply.
     #[test]
     fn test_host_ed25519_verify_refused_under_pure_pq() {
-        struct PurePqGuard;
-        impl PurePqGuard {
-            fn enforce() -> Self {
-                crate::post_quantum::set_pure_pq_override(Some(true));
-                Self
-            }
-        }
-        impl Drop for PurePqGuard {
-            fn drop(&mut self) {
-                crate::post_quantum::set_pure_pq_override(None);
-            }
-        }
         use ed25519_dalek::Signer;
         let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.verifying_key().to_bytes();
@@ -2656,27 +2625,20 @@ mod tests {
         );
         let wasm = wat::parse_str(&wat_src).unwrap();
 
-        // Baseline (enforcement off): valid sig verifies.
+        // FULL-PQ always-on: the SAME valid sig is refused (fail-closed 0).
         {
+            crate::post_quantum::set_pure_pq_override(Some(true));
             let mut reg = ContractRegistry::new();
             let addr = reg.deploy([3u8; 32], wasm.clone(), 0).unwrap();
             let (res, ..) = reg.call(&addr, "verify_sig", 0, 100_000).unwrap();
-            assert_eq!(res, 1, "valid ed sig must verify when pure-PQ is off");
+            assert_eq!(res, 0, "valid ed sig must be refused under FULL-PQ");
         }
-        // Enforced: the SAME valid sig is refused (fail-closed 0).
-        {
-            let _guard = PurePqGuard::enforce();
-            let mut reg = ContractRegistry::new();
-            let addr = reg.deploy([3u8; 32], wasm.clone(), 0).unwrap();
-            let (res, ..) = reg.call(&addr, "verify_sig", 0, 100_000).unwrap();
-            assert_eq!(res, 0, "valid ed sig must be refused under pure-PQ");
-        }
-        // Boundary (flag flip isolation): after guard drop we are back off.
+        // Still refused without the override (always-on).
         {
             let mut reg = ContractRegistry::new();
             let addr = reg.deploy([3u8; 32], wasm, 0).unwrap();
             let (res, ..) = reg.call(&addr, "verify_sig", 0, 100_000).unwrap();
-            assert_eq!(res, 1, "post-guard behavior must be off again");
+            assert_eq!(res, 0, "FULL-PQ always-on: valid ed sig refused");
         }
     }
 

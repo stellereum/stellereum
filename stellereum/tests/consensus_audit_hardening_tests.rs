@@ -2,7 +2,7 @@
 //!
 //! NEW file — shared test files are never edited per mission rules. Each test
 //! pins one finding's fix (or fail-closed behavior) in the consensus domain:
-//! lock paths (F7 newest-wins), BLS/schedule ordering (F8), quorum curve (F4),
+//! lock paths (F7 newest-wins), schedule ordering (F8), quorum curve (F4),
 //! hash-slot edge cases, QC assemble/verify power parity, round-sync caps,
 //! the deadlock-reset QC gate (F3), and µQC envelope decode (F9).
 

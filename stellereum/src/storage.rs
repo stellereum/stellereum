@@ -643,6 +643,26 @@ impl Storage {
         Ok(self.blocks.len())
     }
 
+    /// Test-only handle to the raw block-body tree (differential tests
+    /// replicate the pre-batch per-key prune loop against it). `sled::Tree`
+    /// is a cheap cloneable handle, not a copy of the data.
+    #[doc(hidden)]
+    pub fn blocks_tree_for_test(&self) -> sled::Tree {
+        self.blocks.clone()
+    }
+
+    /// Test-only handle to the raw height-index tree (see above).
+    #[doc(hidden)]
+    pub fn by_height_tree_for_test(&self) -> sled::Tree {
+        self.by_height.clone()
+    }
+
+    /// Test-only handle to the raw receipts tree (see above).
+    #[doc(hidden)]
+    pub fn receipts_tree_for_test(&self) -> sled::Tree {
+        self.receipts.clone()
+    }
+
     // ---------- Verified body ingest (adopter replication) ----------
     //
     // Bodies/receipts are ALREADY committed by the proposer; replication must
@@ -749,6 +769,12 @@ impl Storage {
         fees: &[u64],
         events: &[Vec<crate::contract::ContractEvent>],
     ) -> Result<usize> {
+        // Per-transaction inserts (deliberately NOT a sled::Batch): the
+        // single-batch variant was measured 0.3x-0.9x (slower, never faster
+        // across 9 release reps at N=428 — batch machinery exceeds 428 x
+        // ~4us pagecache inserts) and reverted. No durability delta either
+        // way: neither path flushes; the barrier is `flush()` (every 25
+        // heights, shutdown, upgrade — untouched).
         let mut n = 0;
         for (i, tx) in txs.iter().enumerate() {
             let success = statuses.get(i).copied().unwrap_or(false);
@@ -1978,8 +2004,17 @@ impl Storage {
     }
 
     /// Flush all trees to disk (durability barrier).
+    ///
+    /// Single `db.flush()`: every tree in this store (including `pq_keys`,
+    /// opened via `db.open_tree`) shares the Db's pagecache, and sled 0.34
+    /// `Tree::flush` flushes exactly that shared pagecache — so a separate
+    /// `pq_keys.flush()` ahead of it re-flushed the same already-clean pages
+    /// (a second fsync for zero new bytes). One barrier call keeps the
+    /// identical durability guarantee (all prior writes on ALL trees are
+    /// fsynced before return) with one fewer fsync per barrier. The barrier
+    /// itself is never skipped or weakened: every-25-heights, shutdown and
+    /// upgrade call sites are untouched.
     pub fn flush(&self) -> Result<()> {
-        self.pq_keys.flush()?;
         self.db.flush()?;
         Ok(())
     }
@@ -4662,7 +4697,7 @@ mod tests {
 mod archive_proof_tests {
     //! Per-key archive proofs served from the persisted snapshot history.
     use super::*;
-    use crate::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+    use crate::consensus::{FalconKeypair, QuorumCertificate, ValidatorSet, Vote, VoteKind};
     use crate::sharding::{Block, MASTERCHAIN_SHARD};
     use crate::state_engine::AccountState;
     use ed25519_dalek::SigningKey;
@@ -4674,6 +4709,28 @@ mod archive_proof_tests {
             std::process::id(),
             rand::random::<u32>()
         ))
+    }
+
+    /// FULL-PQ QC (mirrors `consensus::tests::fvote` + `VoteSet::certificate`
+    /// idiom): Ed list for membership/power plus Falcon µQC envelope for
+    /// crypto — exactly what `QuorumCertificate::verify` requires.
+    fn pq_cert_for(
+        height: u64,
+        round: u32,
+        block_hash: [u8; 32],
+        parent: [u8; 32],
+        vs: &ValidatorSet,
+        keys: &[(SigningKey, FalconKeypair)],
+    ) -> QuorumCertificate {
+        let mut set = crate::consensus::VoteSet::new();
+        for (sk, fk) in keys {
+            let v =
+                Vote::sign_with_falcon(sk, fk, height, round, VoteKind::Precommit, Some(block_hash));
+            set.add(v, vs, height, round, VoteKind::Precommit)
+                .expect("falcon vote must ingest");
+        }
+        set.certificate_with_parent(Some(block_hash), vs, Some(&parent))
+            .expect("quorum must compile a Falcon µQC")
     }
 
     fn test_block(height: u64, prev: [u8; 32], state_root: [u8; 32], signer: &SigningKey) -> Block {
@@ -4711,12 +4768,22 @@ mod archive_proof_tests {
         account_a: [u8; 32],
         missing: [u8; 32],
         validator: SigningKey,
+        falcon: FalconKeypair,
     }
 
     async fn fixture() -> Fixture {
         let dir = tmp();
         let store = Storage::open(&dir).unwrap();
         let validator = SigningKey::generate(&mut OsRng);
+        // Deterministic Falcon key per validator id would collide across
+        // parallel tests sharing the global PQ registry; generate fresh and
+        // register under this fixture's unique Ed id.
+        let falcon = FalconKeypair::generate();
+        crate::consensus::register_validator_pq_key(
+            validator.verifying_key().to_bytes(),
+            crate::post_quantum::PqScheme::Falcon512,
+            falcon.public_key.clone(),
+        );
 
         let engine = InMemoryStateEngine::new();
         let account_a = [0xA1u8; 32];
@@ -4760,14 +4827,15 @@ mod archive_proof_tests {
         let h_h = store.put_block(&b_h).unwrap();
         let mut b_next = test_block(tip, h_h, root, &validator);
         let h_next = b_next.compute_hash();
-        let vote = Vote::sign(&validator, tip, 0, VoteKind::Precommit, Some(h_next));
-        b_next.precommit_qc = Some(QuorumCertificate {
-            height: tip,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(h_next),
-            signatures: vec![(vote.voter, vote.signature)],
-        });
+        let vs = ValidatorSet::from_list(vec![(validator.verifying_key().to_bytes(), 1)]);
+        b_next.precommit_qc = Some(pq_cert_for(
+            tip,
+            0,
+            h_next,
+            h_h,
+            &vs,
+            &[(validator.clone(), falcon.clone())],
+        ));
         store.put_block(&b_next).unwrap();
         store.set_finalized(tip, &h_next).unwrap();
 
@@ -4780,6 +4848,7 @@ mod archive_proof_tests {
             account_a,
             missing: [0xEEu8; 32],
             validator,
+            falcon,
         }
     }
 
@@ -4957,6 +5026,15 @@ mod archive_proof_tests {
         // it — this is what makes the root trustworthy, and it is checked
         // client-side against the client's OWN set.
         let val_id = f.validator.verifying_key().to_bytes();
+        // Re-pin the Falcon key: the PQ registry is process-global and other
+        // parallel tests may have registered other ids (never this id, which
+        // is unique per fixture) — this keeps the verify path on this
+        // fixture's key.
+        crate::consensus::register_validator_pq_key(
+            val_id,
+            crate::post_quantum::PqScheme::Falcon512,
+            f.falcon.public_key.clone(),
+        );
         let vset = ValidatorSet::from_list(vec![(val_id, 1)]);
         assert!(
             record.cert.verify(&vset),

@@ -35,8 +35,10 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use stellereum::consensus::ValidatorSet;
+use stellereum::post_quantum::{derive_pq_address, PqScheme, PqSignatureEnvelope, DEFAULT_SALT};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
@@ -57,6 +59,57 @@ fn user_key() -> SigningKey {
 
 fn id_of(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
+}
+
+/// FULL-PQ transaction sender: implicit Falcon-512 (registered globally;
+/// no surcharge), so fee assertions match the old classical fixtures.
+static NEXT_PQ: AtomicU8 = AtomicU8::new(0xF0);
+
+fn pq_user() -> u8 {
+    NEXT_PQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn pq_id(seed: &u8) -> [u8; 32] {
+    derive_pq_address(
+        PqScheme::Falcon512,
+        &Transaction::sample_falcon512_pubkey(*seed),
+        &DEFAULT_SALT,
+    )
+}
+
+fn tx(seed: &u8, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> Transaction {
+    txp(seed, to, amount, gas, nonce, Vec::new())
+}
+
+fn txp(
+    seed: &u8,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    payload: Vec<OpCode>,
+) -> Transaction {
+    let pk = Transaction::sample_falcon512_pubkey(*seed);
+    let from = pq_id(seed);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, *seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 /// Engine with the governed consensus floor set (the apply path reads the
@@ -111,12 +164,12 @@ fn mk_block(txs: Vec<Transaction>, proposer: &SigningKey) -> Block {
 #[tokio::test]
 async fn apply_charges_floor_for_underpriced_tx() {
     let engine = engine_with_floor(FLOOR).await;
-    let alice = user_key();
-    let from = id_of(&alice);
+    let alice = pq_user();
+    let from = pq_id(&alice);
     engine.update_account(AccountState::new(from, BAL)).await;
 
     // Declares 100, floor is 500k: applies, pays the floor.
-    let tx = Transaction::sign(&alice, [0xB0; 32], 1_000, 100, 0, 1, 1);
+    let tx = tx(&alice, [0xB0; 32], 1_000, 100, 0);
     let (applied, failed, fees_collected, status, fees) =
         engine.apply_block_parallel_fees(&[tx], TS).await;
 
@@ -139,15 +192,15 @@ async fn apply_charges_floor_for_underpriced_tx() {
 #[tokio::test]
 async fn failed_tx_pays_floor_and_advances_nonce() {
     let engine = engine_with_floor(FLOOR).await;
-    let alice = user_key();
-    let from = id_of(&alice);
+    let alice = pq_user();
+    let from = pq_id(&alice);
     engine.update_account(AccountState::new(from, BAL)).await;
 
     // Gas 100 cannot run a 280k transfer: admitted (0 + 100 is covered),
     // fails at execution, pays the floor.
-    let tx = Transaction::sign_with_payload(&alice, [0xB0; 32], 0, 100, 0, 1, 1, oom_payload());
+    let oom_tx = txp(&alice, [0xB0; 32], 0, 100, 0, oom_payload());
     let (applied, failed, fees_collected, status, fees) =
-        engine.apply_block_parallel_fees(&[tx], TS).await;
+        engine.apply_block_parallel_fees(&[oom_tx], TS).await;
 
     assert_eq!((applied, failed), (0, 1));
     assert_eq!(status, vec![false]);
@@ -163,7 +216,7 @@ async fn failed_tx_pays_floor_and_advances_nonce() {
 
     // The follow-up at the advanced nonce applies: failures no longer
     // cascade, and the consumed nonce cannot be replayed.
-    let next = Transaction::sign(&alice, [0xB0; 32], 0, FLOOR, 1, 1, 1);
+    let next = tx(&alice, [0xB0; 32], 0, FLOOR, 1);
     let (applied2, failed2, _, status2, _) = engine.apply_block_parallel_fees(&[next], TS).await;
     assert_eq!((applied2, failed2), (1, 0));
     assert_eq!(status2, vec![true]);
@@ -179,22 +232,20 @@ async fn failed_tx_pays_floor_and_advances_nonce() {
 #[tokio::test]
 async fn broke_sender_failure_changes_nothing() {
     let engine = engine_with_floor(FLOOR).await;
-    let alice = user_key();
-    let from = id_of(&alice);
+    let alice = pq_user();
+    let from = pq_id(&alice);
     engine
         .update_account(AccountState::new(from, 1_200_000))
         .await;
 
     // tx1: declared 500k, moves 600k via payload. Admitted (500k reserved),
     // applies (1.1M affordable), leaves 100k.
-    let drain = Transaction::sign_with_payload(
+    let drain = txp(
         &alice,
         [0xB0; 32],
         0,
         FLOOR,
         0,
-        1,
-        1,
         vec![OpCode::Transfer {
             recipient: [0xB0; 32],
             amount: 600_000,
@@ -202,7 +253,7 @@ async fn broke_sender_failure_changes_nothing() {
     );
     // tx2: admitted against the simulated remainder, out of gas at
     // execution, with only 100k left against the 500k floor.
-    let broke = Transaction::sign_with_payload(&alice, [0xB0; 32], 0, 100, 1, 1, 1, oom_payload());
+    let broke = txp(&alice, [0xB0; 32], 0, 100, 1, oom_payload());
     let (applied, failed, fees_collected, status, fees) =
         engine.apply_block_parallel_fees(&[drain, broke], TS).await;
 
@@ -222,12 +273,12 @@ async fn broke_sender_failure_changes_nothing() {
 #[tokio::test]
 async fn unfunded_for_floor_fails_free_at_admission() {
     let engine = engine_with_floor(FLOOR).await;
-    let alice = user_key();
-    let from = id_of(&alice);
+    let alice = pq_user();
+    let from = pq_id(&alice);
     // Covers amount (0) + gas (100) but not the 500k floor.
     engine.update_account(AccountState::new(from, 100)).await;
 
-    let tx = Transaction::sign_with_payload(&alice, [0xB0; 32], 0, 100, 0, 1, 1, oom_payload());
+    let tx = txp(&alice, [0xB0; 32], 0, 100, 0, oom_payload());
     let (applied, failed, fees_collected, status, fees) =
         engine.apply_block_parallel_fees(&[tx], TS).await;
 
@@ -250,12 +301,12 @@ async fn unfunded_for_floor_fails_free_at_admission() {
 #[tokio::test]
 async fn replay_and_gap_failures_pay_nothing() {
     let engine = engine_with_floor(0).await;
-    let alice = user_key();
-    let from = id_of(&alice);
+    let alice = pq_user();
+    let from = pq_id(&alice);
     engine.update_account(AccountState::new(from, BAL)).await;
 
     // Gap first: nonce 5 while the head is 0 — never admitted, never charged.
-    let gap = Transaction::sign(&alice, [0xB0; 32], 0, FLOOR, 5, 1, 1);
+    let gap = tx(&alice, [0xB0; 32], 0, FLOOR, 5);
     let (a1, f1, _, s1, fees1) = engine.apply_block_parallel_fees(&[gap], TS).await;
     assert_eq!((a1, f1), (0, 1));
     assert_eq!(s1, vec![false]);
@@ -264,9 +315,9 @@ async fn replay_and_gap_failures_pay_nothing() {
     // Consume nonce 0 honestly (declaring above the one-step penalty the gap
     // just recorded), then replay it: the replay fails free (it already paid
     // when it first applied — charging again is double-charge).
-    let first = Transaction::sign(&alice, [0xB0; 32], 0, FLOOR, 0, 1, 1);
+    let first = tx(&alice, [0xB0; 32], 0, FLOOR, 0);
     assert_eq!(engine.apply_block_parallel_fees(&[first], TS).await.0, 1);
-    let replay = Transaction::sign(&alice, [0xB0; 32], 0, FLOOR, 0, 1, 1);
+    let replay = tx(&alice, [0xB0; 32], 0, FLOOR, 0);
     let (a3, f3, _, s3, fees3) = engine.apply_block_parallel_fees(&[replay], TS).await;
     assert_eq!((a3, f3), (0, 1));
     assert_eq!(s3, vec![false]);
@@ -287,15 +338,15 @@ async fn replay_and_gap_failures_pay_nothing() {
 #[tokio::test]
 async fn fee_accounting_balances_with_floor_and_failure_fees() {
     let engine = engine_with_floor(FLOOR).await;
-    let alice = user_key();
-    let from = id_of(&alice);
+    let alice = pq_user();
+    let from = pq_id(&alice);
     let proposer = user_key();
     let proposer_id = id_of(&proposer);
     engine.update_account(AccountState::new(from, BAL)).await;
 
-    let valid = Transaction::sign(&alice, [0xB0; 32], 1_000, 600_000, 0, 1, 1);
-    let cheap_ok = Transaction::sign(&alice, [0xB0; 32], 500, 100, 1, 1, 1);
-    let fails = Transaction::sign_with_payload(&alice, [0xB0; 32], 0, 100, 2, 1, 1, oom_payload());
+    let valid = tx(&alice, [0xB0; 32], 1_000, 600_000, 0);
+    let cheap_ok = tx(&alice, [0xB0; 32], 500, 100, 1);
+    let fails = txp(&alice, [0xB0; 32], 0, 100, 2, oom_payload());
     let total_before = BAL; // proposer starts at 0
     let out = engine
         .apply_block_transition(&mk_block(vec![valid, cheap_ok, fails], &proposer), 0)
@@ -330,13 +381,13 @@ async fn fee_accounting_balances_with_floor_and_failure_fees() {
 #[tokio::test]
 async fn consensus_penalty_mirror_escalates_and_clears() {
     let engine = engine_with_floor(0).await; // floor = penalty only
-    let alice = user_key();
-    let from = id_of(&alice);
+    let alice = pq_user();
+    let from = pq_id(&alice);
     engine.update_account(AccountState::new(from, BAL)).await;
 
     // Fail once at floor 0: pays 0 and - no pay, no state change - leaves
     // the nonce alone, but the mirror records the failure.
-    let fail = Transaction::sign_with_payload(&alice, [0xB0; 32], 0, 0, 0, 1, 1, oom_payload());
+    let fail = txp(&alice, [0xB0; 32], 0, 0, 0, oom_payload());
     let (_, _, _, s1, fees1) = engine.apply_block_parallel_fees(&[fail], TS).await;
     assert_eq!(s1, vec![false]);
     assert_eq!(fees1, vec![0]);
@@ -346,7 +397,7 @@ async fn consensus_penalty_mirror_escalates_and_clears() {
         "unpaid failure burns no nonce"
     );
     // Next transaction is charged the one-step penalty as its floor.
-    let punished = Transaction::sign(&alice, [0xB0; 32], 0, 100_000, 0, 1, 1);
+    let punished = tx(&alice, [0xB0; 32], 0, 100_000, 0);
     let (_, _, _, s2, fees2) = engine.apply_block_parallel_fees(&[punished], TS).await;
     assert_eq!(s2, vec![true]);
     assert_eq!(
@@ -356,7 +407,7 @@ async fn consensus_penalty_mirror_escalates_and_clears() {
     );
 
     // Success clears the mirror: the floor is 0 again.
-    let cleared = Transaction::sign(&alice, [0xB0; 32], 0, 0, 1, 1, 1);
+    let cleared = tx(&alice, [0xB0; 32], 0, 0, 1);
     let (_, _, _, s3, fees3) = engine.apply_block_parallel_fees(&[cleared], TS).await;
     assert_eq!(s3, vec![true]);
     assert_eq!(fees3, vec![0], "one success clears the penalty");
@@ -432,10 +483,10 @@ async fn validate_accepts_block_at_or_above_floor() {
     rt.mempool.write().await.base_fee = FLOOR;
 
     // Funded above amount + floor, declared above the floor: packed + valid.
-    let alice = user_key();
-    let from = id_of(&alice);
+    let alice = pq_user();
+    let from = pq_id(&alice);
     engine.update_account(AccountState::new(from, BAL)).await;
-    let tx = Transaction::sign(&alice, [0xB0; 32], 1_000, FLOOR, 0, 1, 1);
+    let tx = tx(&alice, [0xB0; 32], 1_000, FLOOR, 0);
     rt.mempool
         .write()
         .await
@@ -462,11 +513,11 @@ async fn validate_refuses_underpriced_block_naming_tx() {
     let mut rt = ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1);
     rt.mempool.write().await.base_fee = FLOOR;
 
-    let alice = user_key();
-    let from = id_of(&alice);
+    let alice = pq_user();
+    let from = pq_id(&alice);
     engine.update_account(AccountState::new(from, BAL)).await;
     // Genuine above-floor block first (fixes height/root/prev/proposer).
-    let good = Transaction::sign(&alice, [0xB0; 32], 1_000, FLOOR, 0, 1, 1);
+    let good = tx(&alice, [0xB0; 32], 1_000, FLOOR, 0);
     rt.mempool
         .write()
         .await
@@ -479,7 +530,7 @@ async fn validate_refuses_underpriced_block_naming_tx() {
 
     // Byzantine swap: same envelope, one underpriced (but correctly signed
     // and funded) transaction, re-signed by the real proposer.
-    let cheap = Transaction::sign(&alice, [0xB0; 32], 1_000, 100, 0, 1, 1);
+    let cheap = tx(&alice, [0xB0; 32], 1_000, 100, 0);
     let cheap_hash = hex::encode(cheap.compute_tx_hash());
     let mut bad = genuine.clone();
     bad.transactions = vec![cheap];
@@ -519,11 +570,11 @@ async fn validate_refuses_activation_missing_surcharge() {
     rt.mempool.write().await.base_fee = FLOOR;
 
     // Genuine block for a correct envelope.
-    let alice = user_key();
+    let alice = pq_user();
     engine
-        .update_account(AccountState::new(id_of(&alice), BAL))
+        .update_account(AccountState::new(pq_id(&alice), BAL))
         .await;
-    let good = Transaction::sign(&alice, [0xB0; 32], 1_000, FLOOR, 0, 1, 1);
+    let good = tx(&alice, [0xB0; 32], 1_000, FLOOR, 0);
     rt.mempool
         .write()
         .await
@@ -576,12 +627,12 @@ async fn validate_enforces_failure_penalty_like_admission() {
         .await;
     let mut rt = ValidatorRuntime::new(key.clone(), vset, engine.clone(), 1);
 
-    let alice = user_key();
-    let from = id_of(&alice);
+    let alice = pq_user();
+    let from = pq_id(&alice);
     engine.update_account(AccountState::new(from, BAL)).await;
     // Admit the envelope block tx BEFORE the penalty lands (`add` enforces
     // the current floor, so it must precede the failure feedback).
-    let ok_tx = Transaction::sign(&alice, [0xB0; 32], 1, FLOOR, 0, 1, 1);
+    let ok_tx = tx(&alice, [0xB0; 32], 1, FLOOR, 0);
     rt.mempool
         .write()
         .await
@@ -595,7 +646,7 @@ async fn validate_enforces_failure_penalty_like_admission() {
         assert_eq!(mp.effective_floor(&from), FLOOR + GAS_BASIC_TRANSFER);
     }
     // Direct admission would refuse this (penalty not covered)...
-    let penalised = Transaction::sign(&alice, [0xB0; 32], 1, FLOOR, 1, 1, 1);
+    let penalised = tx(&alice, [0xB0; 32], 1, FLOOR, 1);
     assert_eq!(
         rt.mempool.write().await.add_checked(penalised.clone(), BAL),
         Err(stellereum::mempool::MempoolError::FeeTooLow)
@@ -615,7 +666,7 @@ async fn validate_enforces_failure_penalty_like_admission() {
     assert!(err.contains("penalty"), "must show the penalty leg: {err}");
 
     // Covering base + penalty validates.
-    let rich = Transaction::sign(&alice, [0xB0; 32], 1, FLOOR + GAS_BASIC_TRANSFER, 1, 1, 1);
+    let rich = tx(&alice, [0xB0; 32], 1, FLOOR + GAS_BASIC_TRANSFER, 1);
     let mut good = genuine.clone();
     good.transactions = vec![rich];
     good.order_merkle_root = stellereum::mev::compute_order_merkle_root(&good.transactions);

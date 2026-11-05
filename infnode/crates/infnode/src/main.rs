@@ -803,8 +803,10 @@ async fn main() -> Result<()> {
                 }
             }
             let rx_hex = rx.ok_or_else(|| anyhow::anyhow!("recipient {dest} is not registered"))?;
-            let rx_bytes: [u8; 32] = hex::decode(&rx_hex)?.try_into().map_err(|_| anyhow::anyhow!("bad x_pub"))?;
-            let recipient_pub = x25519_dalek::PublicKey::from(rx_bytes);
+            let rx_bytes = hex::decode(&rx_hex).map_err(|_| anyhow::anyhow!("bad kem_pub"))?;
+            if rx_bytes.len() != infnode::mailbox::KEM_EK_LEN {
+                return Err(anyhow::anyhow!("bad kem_pub length"));
+            }
             // 1б) реестр отправителя: ed_pub для подписи
             let fkey = format!("user:{from}");
             let fh = blake3::hash(fkey.as_bytes());
@@ -837,7 +839,7 @@ async fn main() -> Result<()> {
             let envelope = json!({ "payload": String::from_utf8_lossy(&plain), "sig": hex::encode(sig) })
                 .to_string()
                 .into_bytes();
-            let blob = infnode::mailbox::seal(&recipient_pub, &envelope)?;
+            let blob = infnode::mailbox::seal(&rx_bytes, &envelope)?;
             let id = hex::encode(blake3::hash(format!("{from}:{dest}:{}", infnode::proto::now_ms()).as_bytes()).as_bytes());
             // 3) храним письмо в storage (репликация)
             let mname = format!("mail:{dest}:{id}");

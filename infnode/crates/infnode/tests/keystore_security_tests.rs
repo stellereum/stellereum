@@ -80,6 +80,11 @@ fn keystore_hardening_roundtrip() {
 
     let mk2 = infnode::mailbox::MailKeys::load(&dir, "alice@example.com").unwrap();
     assert_eq!(mk2.ed_hex(), ed, "mailbox identity must round-trip");
+    // FULL-PQ: KEM seal/open round-trip (X25519 removed).
+    let msg = b"pq mailbox round-trip";
+    let blob = infnode::mailbox::seal(&mk2.kem_ek, msg).expect("kem seal");
+    let back = infnode::mailbox::open(&mk2, &blob).expect("kem open");
+    assert_eq!(back, msg);
 
     std::env::remove_var("INFNODE_KEY_PASSPHRASE");
     let _ = std::fs::remove_dir_all(&dir);

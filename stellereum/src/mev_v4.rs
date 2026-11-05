@@ -66,8 +66,7 @@ pub use crate::commitment::COMMITMENT_VERSION;
 
 /// Env var gating ANY future mev_v4 wiring. Default OFF: unset, empty, or any
 /// spelling other than exactly `1`/`true` (case-insensitive) stays parked.
-/// Mirrors the `STELL_BLS_QC` refusal-alternative pattern: the safe default is
-/// "not wired", and turning the flag on wires NOTHING by itself — it only
+/// The safe default is "not wired", and turning the flag on wires NOTHING by itself — it only
 /// permits a future, explicitly-gated call site to run.
 pub const MEV_V4_ENV: &str = "STELL_MEV_V4";
 

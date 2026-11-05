@@ -773,13 +773,6 @@ fn f10_metrics_exposes_nothing_sensitive() {
             // — verified in src/metrics.rs). Explicit opt-in per this test's
             // design.
             || line.starts_with("stell_straggler_grace_extends_total")
-            // BLS registry migration (phase-2/3 PoP shape): label-free
-            // counters (`BLS_POP_VERIFIED_TOTAL`, `BLS_LEGACY_ENTRY_TOTAL`,
-            // `BLS_POP_REJECTED_TOTAL`, no labels, no secrets — verified in
-            // src/metrics.rs). Explicit opt-in per this test's design.
-            || line.starts_with("stell_bls_pop_verified_total")
-            || line.starts_with("stell_bls_legacy_entry_total")
-            || line.starts_with("stell_bls_pop_rejected_total")
             || line.starts_with("stell_build_info")
             || line.starts_with("stellereum_");
         assert!(known, "unexpected scrape line: {line}");

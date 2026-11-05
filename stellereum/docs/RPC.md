@@ -19,7 +19,7 @@ operating one, see [`OPERATIONS.md`](OPERATIONS.md).
 | Content type | any; the body is read as a string and parsed with `serde_json` |
 | Max body | 1 MiB (`MAX_RPC_BODY`). Larger → `-32600 "request too large"` |
 | Rate limit | standalone RPC: **300 req/s per IP** (`STELL_STANDALONE_RATE_LIMIT`, default `STANDALONE_RATE_LIMIT_DEFAULT = 300`; the legacy `STELL_RPC_RATE_LIMIT_PER_SEC` is honoured when the new name is unset). The gateway nests the same router under its own **30 req/s per IP** limiter (`STELL_RATE_LIMIT_PER_SEC`). Both are in-process fixed windows — a speed bump, not access control. |
-| Auth | none on reads and none on submission: `stell_sendRawTransaction` / `eth_sendRawTransaction` are **open submission by design** (a caller can only submit a validly signed, funded, nonce-sane tx; the tx authenticates itself). `stell_mempoolDump` and the two wallet SIGN arms `stell_signMessage`, `stell_signTypedData` are **fail-closed without a token** (refuse with `-32001`, even on loopback). Gated by `STELL_RPC_AUTH_TOKEN` when set: `stell_submitPriceFeed`, `stell_pmmBuy`, `stell_pmmSell`, `stell_deployContract`, `stell_callContract` (open when unset, require the token when set), and the three governance writes `stell_submitProposal`, `stell_vote`, `stell_executeProposal` (require the token when set; without a token they stay open on a loopback bind and refuse on a non-loopback bind — see the governance section). The VERIFY arms are public. `stell_faucet` requires the separate `STELL_FAUCET_TOKEN` and is **fail-closed**: an enabled faucet with no token refuses to dispense. |
+| Auth | none on reads and none on submission: `stell_sendRawTransaction` / `eth_sendRawTransaction` are **open submission by design** (a caller can only submit a validly signed, funded, nonce-sane tx; the tx authenticates itself). `stell_mempoolDump` and the two wallet SIGN arms `stell_signMessage`, `stell_signTypedData` are **fail-closed without a token** (refuse with `-32001`, even on loopback). Gated by `STELL_RPC_AUTH_TOKEN` when set: `stell_submitPriceFeed`, `stell_pmmBuy`, `stell_pmmSell` (open when unset, require the token when set). TOKEN-ALWAYS (N-02/N-03, no loopback escape): the three governance writes `stell_submitProposal`, `stell_vote`, `stell_executeProposal` and the two contract previews `stell_deployContract`, `stell_callContract` require a valid token on EVERY bind, loopback included — with no token configured they refuse with `-32001` instead of serving (a loopback bind is not proof of a local caller behind a proxy; `src/rpc.rs:49-67`). The VERIFY arms are public. `stell_faucet` requires the separate `STELL_FAUCET_TOKEN` and is **fail-closed**: an enabled faucet with no token refuses to dispense. |
 
 There is exactly one route in the router — `("/", post(rpc_handler))` — so
 `GET /`, or a POST to any other path, returns 404. `/health`, `/healthz`,
@@ -66,7 +66,7 @@ all-notification batch answers `204 No Content`.
 | `-32601` | method not found | unknown method name; also `stell_faucet` when the faucet is disabled |
 | `-32602` | invalid params | missing address/token/validator, bad hex, wrong length, undecodable `tx`, block outside the recent window, unknown proposal id, `tx` over the size cap, unknown subscription topic, too many `storage_keys` |
 | `-32000` | chain error | bad signature, mempool rejection, faucet limit reached, faucet transfer not admitted, subscription budget exhausted, estimate-fee budget exhausted |
-| `-32001` | unauthorized | `stell_mempoolDump` / SIGN arms without a configured `STELL_RPC_AUTH_TOKEN` (fail-closed even on loopback), any token-gated write without the valid token when one is set, governance writes on a non-loopback bind without a token, or `stell_faucet` without a valid `STELL_FAUCET_TOKEN` |
+| `-32001` | unauthorized | `stell_mempoolDump` / SIGN arms without a configured `STELL_RPC_AUTH_TOKEN` (fail-closed even on loopback), any token-gated write without the valid token when one is set, governance writes / contract previews without a configured token (fail-closed on EVERY bind, loopback included — N-02/N-03), or `stell_faucet` without a valid `STELL_FAUCET_TOKEN` |
 | `-32003` | refused by state | the native namespace: committed state refuses the operation (insufficient balance, paused token, thin bond, replayed bridge deposit, revoked session key, …) |
 | `-32004` | not available | `stell_getBlock` for a height outside the recent window, `stell_getShards` for a height above this node's tip, `stell_getProof` for a historical height this node does not serve, an unknown token / validator / pair / session key / asset |
 
@@ -1246,15 +1246,17 @@ governance state; these methods are a valid way to compare it.
 | `stell_listProposals` | read | no |
 | `stell_proposal` | read | no |
 | `stell_governanceParams` | read | no |
-| `stell_submitProposal` | **write** | **yes** (`STELL_RPC_AUTH_TOKEN`; without a token: loopback open, non-loopback refuse) |
-| `stell_vote` | **write** | **yes** (`STELL_RPC_AUTH_TOKEN`; without a token: loopback open, non-loopback refuse) |
-| `stell_executeProposal` | **write** | **yes** (`STELL_RPC_AUTH_TOKEN`; without a token: loopback open, non-loopback refuse) |
+| `stell_submitProposal` | **write** | **yes** (`STELL_RPC_AUTH_TOKEN`, ALWAYS — no loopback escape) |
+| `stell_vote` | **write** | **yes** (`STELL_RPC_AUTH_TOKEN`, ALWAYS — no loopback escape) |
+| `stell_executeProposal` | **write** | **yes** (`STELL_RPC_AUTH_TOKEN`, ALWAYS — no loopback escape) |
 
-The three writes require the token when `STELL_RPC_AUTH_TOKEN` is configured
-(caller presents it as `params.token`, `params.apiKey` or an HTTP header).
-Without a token they stay open on a loopback bind (dev flows) and refuse with
-`-32001` on a non-loopback bind (fail-closed when published without a token).
-A missing or wrong token is `-32001 "unauthorized: missing or invalid API token"`.
+The three writes require a valid token on EVERY bind, loopback included
+(N-02: a loopback bind is not proof of a local caller once a proxy is in
+front, so `require_gov_write_auth` in `src/rpc.rs` consults neither bind nor
+peer). Caller presents it as `params.token`, `params.apiKey` or an HTTP
+header. With no token configured the arms refuse with `-32001` instead of
+serving (dev flows must configure a token); a missing or wrong token is
+`-32001 "unauthorized: missing or invalid API token"`.
 
 > **Why `stell_executeProposal` is gated.** It applies the action of a PASSED
 > proposal, and one of the actions is `SoftwareUpgrade` — the path that ends in
@@ -1333,7 +1335,8 @@ captured irreversibly), `next_id` is the id the next proposal will get,
 
 ### `stell_submitProposal`
 
-**WRITE. Requires the auth token** (when `STELL_RPC_AUTH_TOKEN` is set).
+**WRITE. Requires the auth token ALWAYS** (N-02: no loopback escape — with no
+token configured this arm refuses with `-32001` on every bind).
 
 Parameters: `{"title": <string>, "type": <string>, ...}`, plus
 `{"proposer": "<hex>"}` (optional).
@@ -1415,7 +1418,8 @@ parameter errors, `-32000 "propose failed: …"` for a state refusal.
 
 ### `stell_vote`
 
-**WRITE. Requires the auth token** (when `STELL_RPC_AUTH_TOKEN` is set).
+**WRITE. Requires the auth token ALWAYS** (N-02: no loopback escape — with no
+token configured this arm refuses with `-32001` on every bind).
 
 Parameters: `{"id": <number>, "voter": "<hex>", "choice": "yes"|"no"|"abstain"}`.
 
@@ -1446,7 +1450,8 @@ Errors: `-32001` (no/invalid token), `-32602 "missing proposal id"` /
 
 ### `stell_executeProposal`
 
-**WRITE. Requires the auth token** (when `STELL_RPC_AUTH_TOKEN` is set).
+**WRITE. Requires the auth token ALWAYS** (N-02: no loopback escape — with no
+token configured this arm refuses with `-32001` on every bind).
 
 Parameters: `{"id": <number>, "executor": "<hex>"}` (`executor` optional,
 defaults to the zero address).
@@ -1846,18 +1851,24 @@ can skip a value without knowing its type.
 
 ### `stell_deployContract`
 
-**WRITE-shaped (it admits a deploy transaction to the mempool). Gated by the
-auth token when one is configured; open when none is set.** `private_key` /
-`from` are refused — sign locally and submit via the `tx` form.
+**PREVIEW-ONLY (N-03): it predicts the deploy, NEVER admits it. Requires the
+auth token ALWAYS** (same fail-closed gate as the governance writes —
+`require_gov_write_auth` in `src/rpc.rs:7319`; no token configured refuses on
+every bind, loopback included). `private_key` / `from` are refused with
+`-32602` — sign locally (SDK `TxBuilder::contract_deploy` + `sign`) and submit
+the sealed transaction via the `tx` form. Nothing here touches the mempool or
+gossip: state changes exclusively when a block applies a transaction submitted
+via `stell_sendRawTransaction`.
 
 Two request forms are accepted.
 
-**(a) Direct parameters** — `{code, [init_data|salt], [gas_limit], [private_key], [from], [abi]}`
+**(a) Direct parameters** — `{code, [gas_limit], [abi]}` (no `private_key`,
+no `from`, no `init_data`/`salt` — the salt is retired: it never entered the
+replayable payload, so no block path could observe it).
 
 ```json
 {"method":"stell_deployContract",
  "params":{"code":"<hex of the WASM module>",
-           "init_data":"<hex>",
            "gas_limit":50000000,
            "abi":{"methods":[],"events":[]}}}
 → {"result":{
@@ -1871,18 +1882,18 @@ Two request forms are accepted.
 - `code` — the hex of the WASM module. At most **2 MiB**
   (`MAX_CONTRACT_CODE_SIZE`); a bigger module is refused by the contract
   registry. `0x` prefix optional.
-- `init_data` (alias `salt`) — hex; non-hex is taken as raw bytes.
 - `gas_limit` — default **`MAX_CONTRACT_FUEL` = 50,000,000**. This is the
   contract-execution ceiling.
-- `private_key` — 32-byte hex Ed25519 seed. **When it is omitted a fresh random
-  key is generated**, which is why the resulting `from` address is not yours:
-  pass `private_key` (or `from`) for a call you intend to make.
-- `from` — the sender address. When omitted it is derived from the signing key.
-- `abi` — optional: a JSON manifest (object) or a string containing one. When
-  present it is attached to the contract and committed with it (under
-  `sha256("STELL_CONTRACT_ABI" ‖ address)`).
+- `abi` — optional: a JSON manifest (object) or a string containing one. It is
+  validated here; it is committed with the code only by block application,
+  never by this arm.
+- The `contract_address` predicted here belongs to an EPHEMERAL throwaway key
+  the node generates for the clone preview (a self-contained Falcon-512
+  vehicle) — it is NOT your address. To deploy as yourself, use form (b) with
+  a locally-signed transaction, then submit that same sealed tx via
+  `stell_sendRawTransaction` for the real deploy.
 
-**(b) A signed raw transaction** — `{"tx": "<hex of bincode(Transaction)>"}`
+**(b) A signed raw transaction** — `{"tx": "<hex of bincode(Transaction)>"}"
 
 ```json
 {"method":"stell_deployContract","params":{"tx":"<hex>"}}
@@ -1891,22 +1902,31 @@ Two request forms are accepted.
 ```
 
 The transaction must carry a `SysCallDeployContract` payload; otherwise
-`-32602 "transaction does not contain SysCallDeployContract payload"`. The
-address is derived **deterministically** (creator + code + init data), so the
-same deploy always yields the same address.
+`-32602 "transaction does not contain SysCallDeployContract payload"`. It is
+verified exactly like `stell_sendRawTransaction` (signature check + FULL-PQ
+classical-envelope refusal at intake), the code is validated read-only, and the
+predicted address is the SDK-canonical `contract_address(tx.from, tx.nonce)`:
+exactly what block application derives when this tx applies first for its
+sender. The tx is then DROPPED — a node-local preview receipt is filed, but
+nothing is admitted or gossipped.
 
-Both forms admit the transaction to the mempool and gossip it, and file a
-receipt. The receipt's `contract_address` is the deployed contract.
-
-Errors: `-32602` (missing `code`, bad hex, undecodable `tx`, `private_key` not
-32 bytes, invalid `abi`), `-32000 "deploy contract failed: …"`.
+Errors: `-32001` (no/invalid token, on every bind), `-32602` (missing `code`,
+bad hex, undecodable `tx`, `private_key`/`from` present, invalid `abi`),
+`-32000 "deploy contract failed: …"`.
 
 ### `stell_callContract`
 
-**WRITE-shaped (it previews on a registry clone and admits the call tx to the mempool). Gated by the
-auth token when one is configured; open when none is set.**
+**PREVIEW-ONLY (N-03): it runs the call on a registry CLONE and DROPS the tx —
+never admitted, never gossipped, never executed against live state. Requires
+the auth token ALWAYS** (same fail-closed gate as the governance writes —
+`require_gov_write_auth` in `src/rpc.rs:7576`; no token configured refuses on
+every bind, loopback included). `private_key` / `from` are refused with
+`-32602` — sign locally (SDK `TxBuilder::contract_call` + `sign`) and submit
+the sealed transaction via the `tx` form, or use direct parameters for a
+keyless preview. To move state, submit via `stell_sendRawTransaction`.
 
-Parameters: `{contract, method, args, [value], [gas_limit], [private_key], [from]}`.
+Parameters: `{contract, method, args, [value], [gas_limit]}` (`private_key` /
+`from` are refused with `-32602` — sign locally instead).
 
 ```json
 {"method":"stell_callContract",
@@ -1914,8 +1934,7 @@ Parameters: `{contract, method, args, [value], [gas_limit], [private_key], [from
            "method":"transfer_direct",
            "args":[1,2,1000],
            "value":0,
-           "gas_limit":50000000,
-           "private_key":"<64 hex>"}}
+           "gas_limit":50000000}}
 → {"result":{
      "tx_hash":"<64 hex>",
      "status":"success",
@@ -1936,13 +1955,13 @@ Parameters: `{contract, method, args, [value], [gas_limit], [private_key], [from
   no packing. The dispatch is by exact arity: an argument is never dropped.
   At most **8** arguments (`MAX_CONTRACT_CALL_ARGS`) — the same bound on the
   call path and on the read-only getter path.
-- `value` — nano-STELL to transfer with the call. The sender is debited and the
-  contract credited **immediately** on this node; a sender that cannot cover it
-  gets `-32000 "insufficient funds to transfer value: …"`.
+- `value` — nano-STELL to transfer with the call. Previewed against the
+  CLONE (a sender that cannot cover it gets `-32000 "insufficient funds to
+  transfer value: …"`); nothing is debited or credited on live state — the
+  preview is dropped.
 - `gas_limit` — default **`MAX_CONTRACT_FUEL` = 50,000,000**.
-- `private_key` / `from` — as in `stell_deployContract`; without `private_key`
-  a fresh random key is generated.
-- `status` — `"success"` or a failure string (e.g. `"reverted"`, `"error"`).
+- `status` — `"success"` or a failure string (e.g. `"reverted"`, `"error"`) —
+  the CLONE preview's verdict, not an on-chain receipt.
 - `outcome` — the same result nested, plus `error` (a string when the call
   failed, `null` otherwise). This is the canonical "what happened" object.
 
@@ -1951,7 +1970,8 @@ method must be declared, the number of arguments must match exactly and every
 argument must have the declared type. A call that does not match is rejected
 with `-32602 "ABI validation failed: …"` **before it touches consensus state**.
 
-Errors: `-32602` (missing `contract` / `method`, bad address, bad `args`,
+Errors: `-32001` (no/invalid token, on every bind), `-32602` (missing
+`contract` / `method`, bad address, bad `args`, `private_key`/`from` present,
 `ABI validation failed`, `ABI encoding failed`), `-32000` (insufficient funds
 for `value`, contract execution failure).
 
@@ -2553,23 +2573,16 @@ registered to another master is refused.
 latched circuit breaker: a peg/deviation violation latches it, and only a
 **passed governance vote** can clear it.
 
-#### Shielded path
+#### Shielded path — REMOVED (Ristretto excision)
 
-| method | kind | params | result |
-| --- | --- | --- | --- |
-| `stell_shieldedTransfer` | prepare | `{to, amount, [fee], [sender]}` | the shielded transfer to sign (shield entry + `SysCallConfidentialTransfer2`); also `to`, `amount`, `confidential_fee`, `gas_breakdown`, `openings`, `viewing_payload`, `custody_warning` |
-| `stell_shieldedBalance` | read | `{viewing_key, [payloads]}` | `{view_pub, coins, coin_count, undecryptable, spendable_sum, chain}` — spendable shielded balance scanned with a viewing key |
-| `stell_unshield` | prepare | `{to, amount, inputs, [sender]}` | the shielded exit to sign (pays the signer); also `to`, `amount`, `inputs` |
-
-Transparent stays the base layer: these are the first-class entry/exit arms
-over the existing confidential opcodes (`src/native_api.rs`, `src/crypto_privacy.rs`).
-Both writes are prepare-only — the wallet signs the returned transaction and
-submits it via `stell_sendRawTransaction`. `to` accepts a plain address
-(hex or Stl57) or a stealth object `{view_pub, spend_pub}`. Amounts are
-decimal strings; blindings in `openings` are spend secrets (store like
-private keys). `stell_shieldedBalance` never echoes the viewing key (only the
-public `view_pub` is returned); payloads that fail to decrypt are counted in
-`undecryptable`, never as zero-valued coins.
+The three shielded arms (`stell_shieldedTransfer`, `stell_shieldedBalance`,
+`stell_unshield`) are GONE from dispatch: the RPC audit gate counts 140
+public methods — 143 minus those 3 (`src/rpc.rs:18053-18057`) — and
+`src/crypto_privacy.rs` (Pedersen/Ristretto/range proofs) is deleted. Any
+client calling them gets `-32601 "method not found"`. Privacy work now lives
+only in the UNWIRED, default-OFF prototypes (HashPool / SilentPay /
+Dandelion) documented in [`PRIVACY.md`](PRIVACY.md): stealth + CoinJoin
+unlinkability only, NO amount-hiding, nothing to call over RPC.
 
 #### Discovery
 
@@ -2650,8 +2663,8 @@ for a mistyped token id would show an empty balance instead of a failure.
 | `stell_getTransactionStatus` | read | — | hash (bare or object) | `{status, height}` |
 | `stell_sendRawTransaction` | write (open) | — | `{tx}` | tx hash hex |
 | `stell_faucet` | write | faucet token | `{address, [amount]}` | `{credited_nano, recipient, tx_hash}` |
-| `stell_submitPriceFeed` | write | **yes** | `{tx}` | tx hash hex |
-| `stell_pmmBuy` / `stell_pmmSell` | write | **yes** | `{tx}` | tx hash hex |
+| `stell_submitPriceFeed` | write | gated when set | `{tx}` | tx hash hex |
+| `stell_pmmBuy` / `stell_pmmSell` | write | gated when set | `{tx}` | tx hash hex |
 | `stell_pmmState` | read | — | — | the committed PMM curve |
 | `stell_orderBook` | read | — | `{pair}` | the committed book (≤20 levels/side) |
 | `stell_sessionBudget` | read | — | `{session}` | the session key's gas budget |
@@ -2674,11 +2687,11 @@ for a mistyped token id would show an empty balance instead of a failure.
 | `stell_listProposals` | read | — | — | array of proposals |
 | `stell_proposal` | read | — | `{id}` | proposal, or `-32004` |
 | `stell_governanceParams` | read | — | — | `{quorum_bps, next_id, applied}` |
-| `stell_submitProposal` | **write** | **yes** | `{title, type, …}` (an unknown `type` is refused) | `{proposal_id, status}` |
-| `stell_vote` | **write** | **yes** | `{id, voter, choice}` | `{voted, proposal_id, weight}` |
-| `stell_executeProposal` | **write** | **yes** | `{id, [executor]}` | `{executed, applied}` |
-| `stell_deployContract` | write | gated when set | `{code, [salt], [abi], …}` or `{tx}` | `{contract_address, contract_address_stl57, code_hash, tx_hash}` |
-| `stell_callContract` | write | gated when set | `{contract, method, args, …}` | `{tx_hash, status, return_value, gas_used, events, outcome}` |
+| `stell_submitProposal` | **write** | **yes (always — no loopback escape)** | `{title, type, …}` (an unknown `type` is refused) | `{proposal_id, status}` |
+| `stell_vote` | **write** | **yes (always — no loopback escape)** | `{id, voter, choice}` | `{voted, proposal_id, weight}` |
+| `stell_executeProposal` | **write** | **yes (always — no loopback escape)** | `{id, [executor]}` | `{executed, applied}` |
+| `stell_deployContract` | preview (never admitted) | **yes (always — no loopback escape)** | `{code, [gas_limit], [abi]}` or `{tx}` | `{contract_address, contract_address_stl57, code_hash, tx_hash}` |
+| `stell_callContract` | preview (never admitted) | **yes (always — no loopback escape)** | `{contract, method, args, …}` | `{tx_hash, status, return_value, gas_used, events, outcome}` |
 | `stell_runGetMethod` | read | — | `{address, method, args, [fuel], [height]}` | `{success, return_value, return_typed, shard, local_shard, shard_is_local, …}` |
 | `stell_getContractAbi` | read | — | `{contract}` | `{contract, contract_stl57, abi, abi_json}` |
 | `stell_getContractReceipt` | read | — | hash | `{status, return_value, gas_used, events, tx_hash}` |
@@ -2700,7 +2713,7 @@ for a mistyped token id would show an empty balance instead of a failure.
 | `stell_orderBook*` (5) | read / prepare | — | see §9 | see §9 |
 | `stell_sessionKey*` (3) | read / prepare | — | see §9 | see §9 |
 | `stell_oracle*` (2) | read | — | see §9 | see §9 |
-| `stell_shielded*` / `stell_unshield` (3) | read / prepare | — | see §9 | see §9 |
+| `stell_shielded*` / `stell_unshield` (3) | REMOVED (Ristretto excision; `-32601`) | — | — | see §9 / [`PRIVACY.md`](PRIVACY.md) |
 
 ---
 

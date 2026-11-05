@@ -2948,14 +2948,25 @@ impl AsyncPersistence {
                 // Dequeued: one fewer job waiting, even before the write
                 // lands. `saturating` — a missed count must never wrap the
                 // gauge to u64::MAX.
-                let now_depth = depth_worker
-                    .fetch_update(
+                // L-04: `fetch_update` is deprecated on newer toolchains; the
+                // explicit CAS loop below is exactly its body for an
+                // always-Some closure (same race-safety: concurrent dequeues
+                // serialize on the compare-exchange, the counter saturates at
+                // 0 instead of wrapping).
+                let mut prev = depth_worker.load(std::sync::atomic::Ordering::Relaxed);
+                loop {
+                    let next = prev.saturating_sub(1);
+                    match depth_worker.compare_exchange_weak(
+                        prev,
+                        next,
                         std::sync::atomic::Ordering::Relaxed,
                         std::sync::atomic::Ordering::Relaxed,
-                        |d| Some(d.saturating_sub(1)),
-                    )
-                    .unwrap_or(0)
-                    .saturating_sub(1);
+                    ) {
+                        Ok(_) => break,
+                        Err(actual) => prev = actual,
+                    }
+                }
+                let now_depth = prev.saturating_sub(1);
                 crate::metrics::global().set_persist_queue_depth(now_depth);
                 let res = match job {
                     PersistJob::Block(b) => st.put_block(&b).map(|_| ()),

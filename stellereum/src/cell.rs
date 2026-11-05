@@ -89,7 +89,11 @@ impl Cell {
                 Some(h) => vec![h],
                 None => vec![],
             };
-            let cell = Cell::new(chunk.to_vec(), refs);
+            // L-03: trusted-by-construction (chunks are <= 128 bytes, refs <=
+            // 1) but built through the fallible constructor, so a future
+            // chunking change refuses loudly instead of panicking.
+            let cell = Cell::try_new(chunk.to_vec(), refs)
+                .expect("Cell::from_bytes chunks are bounded by construction");
             let h = boc.add_cell(cell);
             prev_hash = Some(h);
         }
@@ -247,7 +251,11 @@ impl BagOfCells {
                 offset += 32;
             }
 
-            cells.insert(hash, Cell { data, references });
+            // L-03: defense-in-depth backstop behind the L-07 boundary checks
+            // above — a length that slipped the guards is refused as Err here,
+            // never constructed.
+            let cell = Cell::try_new(data, references)?;
+            cells.insert(hash, cell);
         }
 
         Ok(Self { roots, cells })
@@ -462,6 +470,21 @@ mod tests {
         assert!(Cell::try_new(vec![0u8; MAX_CELL_DATA_BYTES + 1], vec![]).is_err());
         assert!(Cell::try_new(vec![], vec![[0u8; 32]; MAX_CELL_REFS]).is_ok());
         assert!(Cell::try_new(vec![], vec![[0u8; 32]; MAX_CELL_REFS + 1]).is_err());
+    }
+
+    #[test]
+    fn l03_from_bytes_never_panics_on_arbitrary_input() {
+        // `from_bytes` accepts arbitrary-length caller input: chunking bounds
+        // every cell, so no length can panic — every input round-trips.
+        for len in [0usize, 1, 127, 128, 129, 255, 256, 1024, 1 << 20] {
+            let input = vec![0xA5u8; len];
+            let (boc, root) = Cell::from_bytes(&input);
+            assert_eq!(
+                boc.read_bytes(&root),
+                Some(input),
+                "from_bytes must round-trip {len} bytes without panic"
+            );
+        }
     }
 
     #[test]

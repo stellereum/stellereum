@@ -1,0 +1,262 @@
+oads/stellereum-audit-2026-11-05-f7c6b88.md
+# Stellereum — новый аудит кода (коммит `f7c6b88`)
+
+- **Репозиторий:** https://github.com/stellereum/stellereum
+- **Коммит:** `f7c6b88efccf35d85670b40d26f1b65a7f09711d` (2026-11-05 18:46 MSK)
+- **Предыдущий аудит:** `d62ff7a` (2026-11-04)
+- **Диф:** 42 файла `src/`, +11 579 / −10 058; 77 файлов `tests/`, +11 175 / −8 488
+- **Тесты:** `cargo test --lib` — **1094 passed, 0 failed** (451.95 s)
+- **Сборка:** успешная (тестовый бинарник собран и прогнан)
+
+## Главный вывод
+
+Это **крупный security-рефакторинг**, а не косметика. Закрыто большинство старых RPC/PQ-находок, добавлены governance-подписи, таймлок, sweep финализации, ограниченный bincode-декод, проверки restore PQ-ключей, BoC-границы, EIP-155 chain-id. Но:
+
+- **Появилась новая критическая проблема**: `Block::compute_hash` по-прежнему коммитит только `msg_id` кросс-шардовых сообщений, а не их содержимое; `msg_id` нигде не пересчитывается. Это даёт **malleability тела блока** и потенциальный cross-shard mint/desync на синхронизации.
+- **C-01 (governance вне блока) остался**: propose/vote по-прежнему RPC-only; signed/finalize/timelock исправлены, но консенсусной репликации governance нет.
+- **PMM sign bug и µQC threshold** (математические P0) **не тронуты** — ожидаемо, математика ещё не введена.
+
+---
+
+## 1. Статус предыдущих находок
+
+| ID | Статус на `f7c6b88` | Доказательство |
+|---|---|---|
+| C-01 governance вне блока | **Open (design)** | `src/rpc.rs:6405,6504,6579`; gov-записи идут в `st.governance`, не через блок; `sweep_gov_finalize` (`src/runtime.rs:930`) финализирует, но propose/vote — нет |
+| C-02 подпись/лок | **Fixed** | `propose_signed` (`src/governance.rs:1170`), `vote_signed` (`:1202`), `sweep_gov_finalize` (`src/runtime.rs:930`) + `GOV_TIMELOCK_HEIGHTS=7200` (`src/governance.rs:60`) |
+| H-01 fail-open RPC | **Partially fixed** | `require_gov_write_auth` (`src/rpc.rs:4503`) fail-closed только для **non-loopback**; см. N-02 ниже |
+| H-02 validator key в signMessage | **Fixed** | `dev_msg_signing_seed_from_env()` (`src/main.rs:551,8002`), не validator key |
+| H-03 callContract double-exec | **Fixed** | preview на clone (`src/rpc.rs:3000,7672`), `debit_native/credit_native` больше не вызываются на live-пути |
+| H-04 private_key в RPC | **Fixed** | `private_key`/`from` отклоняются (`src/rpc.rs:7305,7572`) |
+| M-01 PQ opt-in | **Fixed as documentation** | README теперь честно: dual-stack по умолчанию, `STELL_PURE_PQ=1` — opt-in (`README.md:24-29`) |
+| M-02 EVM chain-id | **Fixed** | `effective_chain_id()` во всех EVM-проверках (`src/evm_adapter.rs:532,571,648`) |
+| M-03 pq_keys restore | **Fixed** | per-entry проверка leaf/scheme/`blake3(pk)` (`src/state_engine.rs:8311-8381`) |
+| M-04 BoC with_capacity | **Fixed** | `roots_len <= remaining/32`, `cells_len <= remaining/35` до `with_capacity` (`src/cell.rs:183-206`) |
+| M-05 Cargo.lock / infnode pin | **Partially fixed** | `Cargo.lock` теперь в git; `infnode` всё ещё `branch = "main"` (`Cargo.toml:7`) |
+| M-06 compact/PQ transport | **Open** | `compact_prop` не в `lib.rs`; PQ transport по-прежнему design-only |
+| L-01 bincode length-prefix | **Fixed (mostly)** | `decode_wire_limited` (`src/network.rs:2369`), используется в RPC/сети/кросс-шарде |
+| L-02 Falcon FFI return codes | **Open** | C-функции по-прежнему объявлены без `int` (`src/post_quantum.rs:1136,1146`) |
+| L-03 Cell::new panic | **Partially fixed** | добавлен `try_new` и проверки в `from_boc_bytes`; `Cell::new` всё ещё `assert!` (`src/cell.rs:41-49`) |
+| L-04 deprecated fetch_update | **Open** | `src/storage.rs:2952` |
+| L-05 docs/RPC drift | **Partially fixed** | README честнее; `docs/RPC.md`/nginx могут ещё расходиться |
+| L-06 KDF zeroize | **Fixed** | `derive_key` возвращает `Zeroizing` (`src/node_keys.rs:103`) |
+| L-07 BoC Cell invariants | **Fixed** | `refs_len > MAX_CELL_REFS` / `data_len > MAX_CELL_DATA_BYTES` на парсинге (`src/cell.rs:215+`) |
+| R-01/R-02 docs/site/scripts | **Restored** | `docs/program`, `site`, `scripts` снова в дереве |
+
+---
+
+## 2. Новые находки
+
+### N-01 (Critical) — Malleability тела блока: cross-shard mint/desync на синхронизации
+
+**Файлы:**
+- `src/sharding.rs:4491-4504` — `msg_id` считается только из `source_shard`, `target_shard`, `tx.compute_tx_hash()`, `finalized_in_block`
+- `src/sharding.rs:5662` — `Block::compute_hash` коммитит **только `m.msg_id`**, не остальные поля `CrossShardMessage`
+- `src/sharding.rs:4621-4665` — `verify_inclusion_untrusted` проверяет Merkle-proof и `from/nonce/balance`, но **не проверяет** `msg_id`, `tx.verify_signature()`, `tx.to`, `tx.amount`
+- `src/state_engine.rs:6321-6324` — apply кредитует `msg.tx.to` / `msg.tx.amount` после strict inclusion
+- `src/runtime.rs:4981-4984` — block hash коммитит **pre-state root only**; post-state не коммитится
+- `src/sync.rs:169` — sync проверяет только `block.compute_hash() == requested_hash`
+- `src/sharding.rs:4938-4945` — replay key `CrossShardKey` использует `msg_id`, поэтому подмена полей не меняет ключ
+
+**Суть.** `CrossShardMessage` — это поля `msg_id, source_shard, target_shard, tx, proof, source_state_root, finalized_in_block, source_balance, bounce, bounced, trusted, sender_* , xpc_phase`. В block hash попадает только `msg_id`, а `msg_id` — только хеш `(source, target, tx_hash, finalized)`. Следовательно:
+
+1. Злоумышленник берёт легитимный блок с валидным QC и **подменяет `tx.to`/`tx.amount`** (или `source_state_root`/proof), оставляя `msg_id` прежним.
+2. `block.compute_hash()` не меняется → QC/подпись валидны.
+3. Синхронизирующийся узел (или adopt/restore) применяет тело; `verify_inclusion_strict` проходит (proof проверяется против **подставленного** `source_state_root`, `tx.to`/`amount` не связаны с proof).
+4. `credit_native(msg.tx.to, msg.tx.amount)` кредитует получателя.
+5. `block.state_root` — **pre-state**, поэтому divergence-check в apply этого не ловит. Post-state разойдётся, но узел уже принял блок/кредит.
+
+**Последствия.** На синхронизации/adopt/restore — подмена получателя/суммы cross-shard перевода, расхождение state root, возможный halt/форк. На live-консенсусе proposal-validation анкорит сообщение и отклонит подделку у честных валидаторов; но любой узел, который применяет тело из сети без повторной validation, уязвим.
+
+**Фикс:**
+- В `Block::compute_hash` коммитить хеш **всех** полей `CrossShardMessage` (или канонический `commitment_bytes()`), а не только `msg_id`.
+- При decode/apply пересчитывать `msg_id` из `(source, target, tx.compute_tx_hash(), finalized)` и сравнивать с полем.
+- Проверять `tx.verify_signature()` на target (или подписывать transfer intent, включая `to/amount`).
+- Желательно коммитить post-state root (отдельно от pre-state) или проверять post-state в apply.
+
+---
+
+### N-02 (High) — `loopback` не является границей доверия: за nginx governance-write открыт без токена
+
+**Файлы:**
+- `src/rpc.rs:4471-4480` — `rpc_bind_is_loopback()` смотрит на `STELL_RPC_LISTEN` (bind-адрес), а не на клиента
+- `src/rpc.rs:4503-4535` — `require_gov_write_auth`: если токена нет и bind loopback → **доступ разрешён**
+- `docs/integrations/nginx-rpc.conf` — документированный публичный прокси на `127.0.0.1:8545`
+
+**Суть.** Публичный деплой по их же nginx-конфигу: клиент → nginx → `127.0.0.1:8545`. Для узла bind loopback, поэтому `require_gov_write_auth` считает окружение «dev» и не требует токен. `stell_executeProposal` (auth-only) становится доступен снаружи; при `STELL_DEV_UNSAFE_TESTKEY=1` (dev) — и unsigned `submitProposal`/`vote` (через `gov_unsigned_dev_escape`, `src/rpc.rs:4559`).
+
+**Фикс.** Проверять реальный peer/`X-Forwarded-For` (trusted proxy) или требовать токен **всегда** для governance-write, независимо от bind; loopback-escape убрать или привязать к локальному peer, а не к адресу bind.
+
+---
+
+### N-03 (High/Medium) — Direct preview `deployContract`/`callContract` забивает mempool несфундированными ephemeral-транзакциями
+
+**Файлы:**
+- `src/rpc.rs:7394` (deploy), `:7511` (call) — `st.mempool.write().await.add(tx.clone())`
+- `src/mempool.rs:1612-1614` — `add` → `insert(..., check_balance=false)`: подпись/floor проверяются, баланс — нет
+- direct-путь генерирует ephemeral Falcon-ключ и сам подписывает tx
+
+**Суть.** Внешний клиент (при отсутствии токена/через nginx) может в цикле вызывать direct preview: каждая итерация создаёт новый ephemeral-адрес, валидную Falcon-подпись и кладёт tx в mempool без баланса. `add` не проверяет баланс и не вытесняет; pool заполняется до `max_size`, после чего честные `add_checked` могут не найти места/вытеснить (особенно при высоком `gas_limit`). Это mempool-DoS без затрат.
+
+**Фикс.** Require auth/token для direct preview; не класть preview в mempool; либо использовать `add_checked` с балансом и отклонять unfunded ephemeral; ограничить per-IP.
+
+---
+
+### N-04 (Info) — Новые privacy-модули по умолчанию выключены
+
+- `src/hashpool.rs` — `HASH_POOL_ENABLED=false` (`src/state_engine.rs:991`), apply только через test-gated entry points; в `lib.rs` объявлен, но live-путь не вызывает.
+- `src/silentpay.rs` — `SILENT_PAY_ENABLED=false` (`src/lib.rs`), send/spend без callers; сканер только в кошельке, `enable_for_tests` — тесты.
+- `src/dandelion.rs` — не в `lib.rs`, policy-only, не в gossip.
+- `src/mev_kem_registry.rs` — pure registry, в live `runtime/main/rpc` нет вызовов.
+
+**Вывод:** live-риска сейчас нет, но при включении нужен отдельный аудит: hashpool operator видит openings (нет amount-hiding), silentpay — forward-secret ratchet, dandelion — stem/fluff DoS/deanonymization.
+
+---
+
+### N-05 (High, design) — C-01 всё ещё: governance propose/vote не реплицируются блоком
+
+**Файлы:** `src/rpc.rs:6405-6579`; `src/governance.rs:903-1070`; `src/commitment.rs` (gov digest).
+
+**Суть.** Signed propose/vote и таймлок исправлены, но propose/vote по-прежнему меняют `st.governance`/staking через RPC, а не через block-carried операцию. На multi-node узел, получивший RPC-запрос, меняет state root локально; другие узлы этого не видят → расхождение/остановка. `sweep_gov_finalize` блок-детерминирован, но только финализирует уже созданные proposals. Нужен либо block-carried governance (opcode/gossip), либо явный запрет governance-write на валидаторах/multi-node.
+
+---
+
+### N-06 (Medium) — Математические P0 всё ещё в коде
+
+- PMM: `src/pmm.rs:244` — `p0.saturating_mul(d.saturating_sub(quad))`; должно быть `d + quad` (см. math-отчёт). Пользовательские выкупы недоплачиваются, при $100M — ~92.5% потери, при $250M — 0.
+- µQC: `src/consensus.rs:677-687` — `network_majority = w/2+1`; при `N>64` (комитет меньше сета) `2T−W` падает до 1–2, `B≥2` ломает safety; `verify_unified` принимает µQC без полного 2/3 QC (`src/consensus.rs:2528`).
+
+Оба **ожидаемо не исправлены** — математика ещё не введена. Это не регрессия, а напоминание, что до релиза их надо закрыть.
+
+---
+
+## 3. Что проверено
+
+- `cargo test --lib` — **1094 passed, 0 failed** (451.95 s).
+- Прочитаны изменённые модули: `rpc.rs`, `governance.rs`, `consensus.rs`, `sharding.rs`, `state_engine.rs`, `sync.rs`, `commitment.rs`, `cell.rs`, `post_quantum.rs`, `evm_adapter.rs`, `mempool.rs`, `node_keys.rs`, новые `hashpool.rs`, `silentpay.rs`, `dandelion.rs`, `mev_kem_registry.rs`.
+- Не запускались: `cargo clippy --all-targets`, полный integration suite (`tests/`, 315 файлов), `scripts/audit-repro.sh`, fuzz, live-кластер.
+
+## 4. Приоритет
+
+1. **P0:** N-01 (cross-shard malleability) — до любого sync/adopt.
+2. **P1:** N-05 (governance вне блока) + N-02 (loopback/proxy auth).
+3. **P1:** N-03 (mempool DoS через preview).
+4. **P2:** N-06 (PMM/µQC math) — когда математика будет введена.
+5. **P3:** L-02, L-03, L-04, M-06, N-04 (при включении).
+
+## 5. Короткий ответ
+
+Рефакторинг **сильный**: большинство старых RPC/PQ-находок реально закрыто, тесты зелёные. Но новый коммит **не закрывает** главный класс «cross-shard body ↔ block hash» и оставляет governance-вне-блока; плюс появляется mempool-DoS через preview и loopback-иллюзия безопасности за nginx. Математические P0 (PMM/µQC) ждут введения математики.
+
++ Thought: 3.5s
+# Wrote Downloads/stellereum-audit-2026-11-05-f7c6b88-findings.csv
+ID,Severity,Status,Area,Title,Location,Summary,Recommendation
+N-01,Critical,New,Cross-shard,Block body malleability: cross-shard fields not committed; sync-time mint/desync,src/sharding.rs:4491-4504,5662,4621-4665; src/state_engine.rs:6321-6324; src/runtime.rs:4981-4984; src/sync.rs:169,Block hash commits only msg_id; msg_id is not recomputed and does not bind proof/source_state_root/balance/to/amount. A malicious peer can serve a valid-hash/QC block with altered cross-shard tx and a syncing node credits it. Pre-state root check does not catch post-state divergence.,Commit full cross-shard message hash; recompute msg_id on decode/apply; verify tx signature; bind to/amount; consider post-state commitment.
+N-02,High,New,RPC auth,Loopback bind is treated as trusted behind the documented nginx proxy,src/rpc.rs:4471-4480,4503-4535; docs/integrations/nginx-rpc.conf,require_gov_write_auth allows governance writes without a token when STELL_RPC_LISTEN is loopback; nginx proxies the public internet to 127.0.0.1. executeProposal is auth-only; dev flag can allow unsigned writes.,Require a token regardless of bind; check real peer/trusted proxy; remove loopback escape.
+N-03,High/Medium,New,Mempool,Direct deploy/call previews admit unfunded ephemeral txs,src/rpc.rs:7394,7511; src/mempool.rs:1612-1614,Preview paths create an ephemeral key, sign, and mempool.add() with no balance check. An external caller can fill the pool with valid-signature but unfunded txs.,Require auth for previews; do not add previews to the pool; use add_checked with balance; per-IP cap.
+N-04,Info,New,Privacy,New privacy modules are default-off/unwired,src/state_engine.rs:991; src/lib.rs; src/hashpool.rs; src/silentpay.rs; src/dandelion.rs; src/mev_kem_registry.rs,HashPool/SilentPay/Dandelion/MEV KEM are not on the live path. No live risk today; hashpool reveals openings at spend and has no amount hiding.,Audit them before wiring; keep the gates.
+N-05,High,Open (design),Governance,Governance propose/vote still mutate consensus state outside a block,src/rpc.rs:6405-6579; src/governance.rs:903-1070; src/commitment.rs,Signatures/timelock/finalize sweep were added, but propose/vote are still RPC-only. On multi-node the node's state root diverges from peers.,Make governance block-carried or forbid writes on validators/multi-node.
+N-06,High,Open (math not introduced),Economics/Consensus,PMM sign bug and µQC threshold still present,src/pmm.rs:244; src/consensus.rs:677-687,2528,Math P0s unchanged: sell_payout uses d-quad; µQC network floor is W/2+1 and verify_unified accepts µQC alone.,Apply the math report patches; add Rust property tests.
+C-01,Critical,Open (design),Consensus/RPC,Governance/staking outside block (same as N-05),src/rpc.rs; src/governance.rs,See N-05.,See N-05.
+C-02,Critical,Fixed,Governance,Signed identity + finalize + timelock,src/governance.rs:1170,1202,60; src/runtime.rs:930,Fixed: propose_signed/vote_signed, nonces, GOV_TIMELOCK_HEIGHTS, sweep_gov_finalize.,Keep.
+H-01,High,Partially fixed,RPC auth,Gated writes,src/rpc.rs:4503,4535; 4471,Governance fail-closed only on non-loopback; preview endpoints still open; see N-02/N-03.,See N-02/N-03.
+H-02,High,Fixed,Keys,signMessage no longer uses validator key,src/main.rs:551,8002,Fixed: dev_msg_signing_seed_from_env only.,Keep.
+H-03,High,Fixed,State,callContract preview on clone,src/rpc.rs:3000,7672,Fixed: no live debit/credit; tx admitted only.,Keep.
+H-04,High,Fixed,Keys,private_key/from refused,src/rpc.rs:7305,7572,Fixed: sign locally and submit tx.,Keep.
+M-01,Medium,Fixed as docs,PQ,PQ is opt-in and documented,README.md:24-29; src/post_quantum.rs:71-89,Default dual-stack; STELL_PURE_PQ=1 opt-in. README now honest.,Keep; decide final policy.
+M-02,Medium,Fixed,EVM,EVM chain id uses effective_chain_id,src/evm_adapter.rs:532,571,648,Fixed.,Keep.
+M-03,Medium,Fixed,PQ/Sync,pq_keys restore validation,src/state_engine.rs:8311-8381,Fixed: leaf/scheme/blake3(pk) per entry.,Keep.
+M-04,Medium,Fixed,Decoding,BoC with_capacity bounds,src/cell.rs:183-206,Fixed: length-vs-remaining guard before capacity.,Keep.
+M-05,Medium,Partially fixed,Supply chain,Cargo.lock + infnode pin,Cargo.toml:7; Cargo.lock,Cargo.lock committed; infnode still branch main.,Pin infnode to a rev.
+M-06,Medium,Open,Perf,Compact propagation/PQ transport design-only,src/compact_prop.rs; docs/program/COMPACT_PROPAGATION.md; PQ transport docs,Still unwired; PQ-path perf remains projected.,Ship and measure.
+L-01,Low,Fixed,Decoding,decode_wire_limited,src/network.rs:2369,Used across RPC/network/cross-shard.,Keep.
+L-02,Low,Open,Crypto,Falcon FFI return codes,src/post_quantum.rs:1136,1146,Still declared without int; failures ignored.,Return i32 and fail closed.
+L-03,Low,Partially fixed,Panics,Cell::new assert,src/cell.rs:41-49,try_new added and parser validates; new still asserts for trusted callers.,Use try_new on untrusted paths.
+L-04,Low,Open,CI,Deprecated fetch_update,src/storage.rs:2952,Still present.,Use try_update or pin toolchain.
+L-05,Low,Partially fixed,Docs,RPC/nginx drift,docs/RPC.md; docs/integrations/nginx-rpc.conf,README improved; docs may still disagree with code.,Align docs.
+L-06,Low,Fixed,Keys,KDF zeroize,src/node_keys.rs:103,derive_key returns Zeroizing.,Keep.
+L-07,Low,Fixed,Decoding,BoC Cell invariants,src/cell.rs:215+,refs_len/data_len validated.,Keep.
+R-01,Info,Fixed,Docs,Restored docs/program, docs/program,Reverted previous deletion.,Keep.
+R-02,Info,Fixed,Ops,Restored site/scripts,sites/ scripts/,Reverted previous deletion.,Keep.
+
++ Thought: 995ms
+Провёл новый аудит по коммиту f7c6b88 (2026-11-05). Это большой security-рефакторинг, и он реально закрыл много старого.
+Что стало лучше
+C-02/H-01/H-02/H-03/H-04: governance-подписи (propose_signed/vote_signed), finalize теперь вызывается на блоке (sweep_gov_finalize), таймлок 7200, signMessage больше не использует ключ валидатора, callContract работает на clone, private_key/from отклоняются.
+M-02/M-03/M-04/M-05/L-01/L-06/L-07: EVM chain-id через effective_chain_id, валидация pq_keys, BoC-границы, decode_wire_limited, Cargo.lock в git, KDF zeroize.
+cargo test --lib: 1094 passed, 0 failed (452 s). Docs/site/scripts восстановлены.
+Новые находки
+N-01 (Critical) — malleability тела блока / cross-shard mint на sync. Block::compute_hash коммитит только msg_id (src/sharding.rs:5662), а msg_id — только (source,target,tx_hash,finalized) (:4491-4504) и нигде не пересчитывается. verify_inclusion_strict (:4621-4665) не проверяет msg_id, tx.verify_signature(), tx.to/amount. Apply кредитует msg.tx.to/amount (src/state_engine.rs:6321-6324). Block hash/QC не меняются при подмене этих полей; block.state_root — pre-state (src/runtime.rs:4981-4984), поэтому post-state divergence не ловится. Итог: злоумышленник отдаёт syncing-узлу валидный по хешу/QC блок с подменённым cross-shard переводом → кредит себе + расхождение состояния. Фикс: коммитить полный хеш сообщения, пересчитывать msg_id, проверять подпись tx и связывать to/amount.
+N-02 (High) — loopback ≠ доверие. require_gov_write_auth (src/rpc.rs:4503) разрешает governance-write без токена, если bind loopback; документированный nginx-прокси как раз loopback → публичный вызов executeProposal (и dev-unsigned при STELL_DEV_UNSAFE_TESTKEY=1).
+N-03 (High/Medium) — mempool DoS. Direct preview deployContract/callContract создаёт ephemeral-ключ и кладёт tx в mempool.add без проверки баланса (src/rpc.rs:7394,7511; src/mempool.rs:1612). Можно забить пул несфундированными валидно-подписанными tx.
+N-05/C-01 (High, design) — governance propose/vote по-прежнему RPC-only, не block-carried; на multi-node state root расходится.
+N-06 — математические P0 не тронуты (PMM src/pmm.rs:244, µQC src/consensus.rs:677-687), как ты и говорил.
+Новые hashpool/silentpay/dandelion/mev_kem_registry — default-off/unwired, live-риска нет; аудит нужен при включении.
+Отчёты:
+~/Downloads/stellereum-audit-2026-11-05-f7c6b88.md
+~/Downloads/stellereum-audit-2026-11-05-f7c6b88-findings.csv
+Коротко: рефакторинг сильный, но N-01 надо закрывать до любого sync/adopt, а loopback-гейт за nginx и mempool-preview — до публичного RPC.
+▣  Build · DeepSeek V4.1 Flash · 18m 12s
+а что там со скрытыми переводами они теперь фулл pq
++ Thought: 8.8s
+$ cd /var/folders/0p/2q4z448x2zx2fhbntlljkc600000gn/T/opencode/stellereum-audit && echo "=== crypto_privacy refs ===" && grep -rn "crypto_privacy\|ConfidentialTransfer\|SysCallConfidential\|shielded\|RangeProof\|Pedersen" src/ | head -40; echo "=== hashpool status ===" && grep -n "HASH_POOL_ENABLED\|pub fn \|fn deposit\|fn spend\|fn coinjoin\|fn verify" src/hashpool.rs | head -60; echo "=== silentpay status ===" && grep -n "pub fn sp_send\|pub fn spend\|SILENT_PAY_ENABLED\|enable_for_tests\|pub fn receive\|pub fn scan" src/silentpay.rs src/wallet.rs | head -40
+=== crypto_privacy refs ===
+src/runtime.rs:46:/// 1785 minimal txs are ~205 KB on the wire (fat shielded blocks stay far
+src/hashpool.rs:77://! Unlike a Merkle-tree shielded pool, membership is a direct map lookup of
+src/state_engine.rs:2613:    /// range-proof pre-verification cache for shielded transfers was removed
+src/state_engine.rs:2614:    /// with the shielded protocol, so every path now runs every check from
+src/state_engine.rs:7229:        //    books, staking, PMM, oracle, shielded ledger are all `None`, so
+src/sync.rs:1283:            // Ristretto deletion wave: confidential/shielded ledger removed with
+src/sync.rs:1284:            // crypto_privacy; fetched blob (if any) falls through to the
+src/svm.rs:122:// Confidential/shielded ledger removed with crypto_privacy (Ristretto
+src/svm.rs:335:        OpCode::Reserved33ConfidentialTransfer
+…
+Click to expand
+$ cd /var/folders/0p/2q4z448x2zx2fhbntlljkc600000gn/T/opencode/stellereum-audit && echo "=== privacy docs ===" && sed -n '1,120p' docs/PRIVACY.md; echo "=== hashpool privacy limitation ===" && sed -n '80,140p' src/hashpool.rs; echo "=== silentpay limitation ===" && sed -n '60,130p' src/silentpay.rs
+=== privacy docs ===
+# Stellereum privacy path
+
+Transparent is the base layer. Privacy is an **opt-in per-transaction path**,
+not a consensus flip: three first-class RPC arms over the existing
+confidential opcodes (`SysCallConfidentialShield`,
+`SysCallConfidentialTransfer2`, `SysCallConfidentialUnshield`). No new
+curves, no new proofs — Pedersen commitments + enforced range proofs,
+Ristretto stealth addresses, viewing keys, all from `src/crypto_privacy.rs`.
+
+…
+Click to expand
++ Thought: 9.0s
+$ cd /var/folders/0p/2q4z448x2zx2fhbntlljkc600000gn/T/opencode/stellereum-audit && grep -n "HashPool\|hashpool" src/state_engine.rs | head -50; echo "=== commitment hashpool ===" && grep -n "hashpool\|HashPool" src/commitment.rs src/storage.rs src/sync.rs | head -30; echo "=== hashpool deposit/spend ===" && sed -n '470,620p' src/hashpool.rs
+775:    /// HashPool note/nullifier sub-state (default-OFF apply wiring).
+778:    /// through the `hashpool_*` accessors below, mutations go through the
+779:    /// gated `apply_hashpool_*` entry points (which refuse with
+780:    /// [`HashPoolOpError::Disabled`] while the gate is off and mirror every
+781:    /// mutation into the state trie under [`hashpool_commitment_key`] /
+782:    /// [`hashpool_nullifier_key`], so pool ops move the state root
+784:    /// [`InMemoryStateEngine::enable_hashpool_for_tests`].
+785:    hashpool: Arc<RwLock<crate::hashpool::HashPool>>,
+789:    /// [`InMemoryStateEngine::enable_hashpool_for_tests`], which is never
+791:    hashpool_tests_on: Arc<std::sync::atomic::AtomicBool>,
+…
+Click to expand
++ Thought: 5.6s
+Да, по криптографии — теперь полностью PQ, но это не «полная приватность», и вживую оно пока не работает.
+Что реально сделали
+Старый crypto_privacy.rs (Pedersen/Ristretto + range proofs, 2233 строки) удалён. Осколки — только зарезервированные opcode'ы (Reserved33/40Confidential...), RPC-методы stell_shielded* убраны.
+Новые прототипы:
+HashPool (src/hashpool.rs): ML-KEM-768 (FIPS 203) + SHAKE256 + Falcon-512, stealth-адреса, hash-commitments, nullifiers, CoinJoin одинакового номинала. Никаких эллиптических кривых.
+SilentPay (src/silentpay.rs): ML-KEM-768 + SHAKE256 + Falcon-512, неинтерактивные stealth-адреса и forward-secret ratchet для получателя.
+Dandelion (src/dandelion.rs): policy для IP-нелинкуемости, pure/unwired.
+В этом смысле — да, «full PQ»: классического Ristretto/Ed25519/EC в самих конструкциях нет.
+Но важные оговорки
+Они default-OFF и не подключены: HASH_POOL_ENABLED=false (src/state_engine.rs:991), SILENT_PAY_ENABLED=false, dandelion не в lib.rs, mev_kem_registry без live-вызовов. То есть живых скрытых переводов сейчас нет вообще — старый путь удалён, новый не включён.
+«PQ» ≠ «приватно»:
+HashPool — operator model: оператор видит value/blinding/stealth в момент spend; нет скрытия суммы на spend, нет range proofs/ZK, нет Merkle-membership (только map lookup), нет анонимного сета. Нелинкуемость — от свежих stealth-адресов и CoinJoin одинаковых номиналов.
+SilentPay — privacy только для получателя (unlinkability) + FS ratchet; суммы тоже не скрываются на spend.
+Нет RingCT, нет amount-hiding на уровне всей цепочки.
+Старый confidential-путь давал скрытие суммы (Pedersen + range proofs), новый — нет: commitment скрывает value только до spend, а оператор видит opening при spend. Это осознанный trade-off «PQ вместо Ristretto», а не апгрейд приватности.
+docs/PRIVACY.md устарел: всё ещё описывает crypto_privacy.rs, Ristretto stealth и range proofs, которых в коде больше нет. Это надо переписать, иначе документация врёт.
+Перед включением нужно проверить: чем обеспечен native-бэкенд депозита (в HashPool нет escrow/движения value — только map + trie-зеркало), коммитится ли pool state в root, кто оператор и как light client проверяет membership без Merkle-путей, анонимный сет CoinJoin на малой сети, fee/DoS, lockstep-ratchet в SilentPay.
+Итог: криптографически full PQ — да; функционально скрытые переводы — пока прототипы за флагом, без amount-hiding и на operator-модели. Если хочешь, сделаю отдельный аудит именно hashpool/silentpay перед их включением.
+▣  Build · DeepSeek V4.1 Flash · 42.2s
+DeepSeek V4.1 FlashOpenCode Go

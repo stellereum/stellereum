@@ -4619,6 +4619,15 @@ impl CrossShardMessage {
     }
 
     fn verify_inclusion_untrusted(&self) -> bool {
+        // XSHARD INTEGRITY (untrusted boundary): the carried `msg_id` is
+        // recomputed from the message body (domain-aware, see
+        // `expected_msg_id`) and a mismatch refuses the message. The id is
+        // assigned at construction and never recomputed on decode/apply, so
+        // without this a Byzantine carrier could rebind a valid proof to a
+        // different (source, target, tx, block) tuple.
+        if !self.verify_msg_id() {
+            return false;
+        }
         let Some(proof) = &self.merkle_inclusion_proof else {
             // No proof from an untrusted source -> reject.
             return false;
@@ -4759,6 +4768,11 @@ impl CrossShardMessage {
 /// therefore a unique, deterministic key for the source (height, shard, id):
 /// two blocks at different source heights cannot share it, and it is identical
 /// on every node that saw the same source block.
+///
+/// The carried `msg_id` is recomputed at every untrusted boundary
+/// ([`CrossShardMessage::verify_msg_id`]): a key built from a rebound id never
+/// matches the honest key, so a forged carrier cannot alias or shadow a real
+/// lifecycle in the consumed/produced/completed sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CrossShardKey {
     pub source_shard: ShardId,
@@ -5033,6 +5047,18 @@ pub const LAST_QC_COMMITMENT_TAG: &[u8; 8] = b"LASTQC01";
 /// hash signs the epoch root too: a bridge (or a light client) can anchor on
 /// one 32-byte root per epoch instead of 128 individual checkpoints.
 pub const MMR_EPOCH_COMMITMENT_TAG: &[u8; 8] = b"MMRROOT1";
+
+/// Domain separator for the FULL-MESSAGE cross-shard commitment inside a block hash.
+///
+/// The commitment binds every consensus-relevant byte of every outbound
+/// cross-shard message (see [`CrossShardMessage::message_commitment`]), so the
+/// BFT quorum that signs the block hash signs the message BODIES too: a
+/// proposer cannot swap a message body under a voted `msg_id`, and a validator
+/// that recomputes the commitment from the proposed body refuses the swap.
+/// Mixed into [`Block::compute_hash`] ONLY for a non-empty `cross_shard_out`
+/// (see the version rule there): empty-cross-shard blocks hash byte-identically
+/// to before this commitment existed.
+pub const XSHARD_FULL_COMMITMENT_TAG: &[u8; 8] = b"XSHARD01";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {
@@ -5660,6 +5686,26 @@ impl Block {
         hasher.update((self.cross_shard_out.len() as u32).to_be_bytes());
         for m in &self.cross_shard_out {
             hasher.update(m.msg_id);
+        }
+        // FULL-MESSAGE COMMITMENT (cross-shard integrity hardening): alongside
+        // the `msg_id` list above, bind the full canonical bytes of every
+        // carried message under a tag, so mutating ANY committed field
+        // (amount, recipient, proof, roots, flags, phase) moves the block hash
+        // even when the `msg_id` is left untouched.
+        //
+        // VERSION RULE (frozen core): the section is mixed in ONLY when
+        // `cross_shard_out` is non-empty — exactly like the order, shard-head,
+        // epoch-key, last-QC and MMR commitments above. A block that carries
+        // no cross-shard message therefore hashes byte-identically to before
+        // this commitment existed (legacy chains keep their block hashes and
+        // every signature over them keeps verifying); a block that carries
+        // messages gets the stronger commitment.
+        if !self.cross_shard_out.is_empty() {
+            hasher.update(XSHARD_FULL_COMMITMENT_TAG);
+            hasher.update((self.cross_shard_out.len() as u32).to_be_bytes());
+            for m in &self.cross_shard_out {
+                hasher.update(m.message_commitment());
+            }
         }
         // SHARD-HEAD COMMITMENTS (TON `shard_hashes`): a masterchain block
         // commits to the latest finalized header of every workchain shard.
@@ -7938,6 +7984,12 @@ impl CrossShardMessage {
     /// but a 2PC record that skipped the proof would be a mint vector, and
     /// the check is cheap.
     pub fn verify_xpc_proof(&self, phases: &[crate::xshard2pc::XpcPhase]) -> bool {
+        // XSHARD INTEGRITY (untrusted boundary): same `msg_id` recompute as
+        // `verify_inclusion_untrusted` — a 2PC record with a rebound id is
+        // refused before any trie work.
+        if !self.verify_msg_id() {
+            return false;
+        }
         let Some(proof) = &self.merkle_inclusion_proof else {
             return false;
         };
@@ -8014,6 +8066,89 @@ impl CrossShardMessage {
         m.bounced = true;
         m.source_balance = 0;
         m
+    }
+
+    /// Recompute the construction-time message id from the message body.
+    ///
+    /// THE untrusted-boundary check (see [`Self::verify_msg_id`]): every
+    /// constructor ([`Self::new`], [`Self::new_xpc`], [`Self::new_ack`],
+    /// [`Self::new_bounce`], [`Self::new_trusted`]) assigns exactly this
+    /// value, using the legacy domain for pre-2PC records and the `XPC2`
+    /// domain (with the phase byte) for §9 2PC records. The id commits to the
+    /// source shard, the target shard, the FULL transaction hash and the
+    /// finalizing source block — never to the proof, the balance or the local
+    /// `trusted` flag. A phase flip (legacy <-> 2PC) therefore also mismatches:
+    /// the recompute follows the CARRIED phase while construction followed the
+    /// original one.
+    pub fn expected_msg_id(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        if self.xpc_phase != crate::xshard2pc::XPC_LEGACY {
+            hasher.update(b"XPC2");
+            hasher.update([self.xpc_phase]);
+        }
+        hasher.update(self.source_shard.to_be_bytes());
+        hasher.update(self.target_shard.to_be_bytes());
+        hasher.update(self.tx.compute_tx_hash());
+        hasher.update(self.finalized_in_block);
+        hasher.finalize().into()
+    }
+
+    /// True when the carried `msg_id` matches the recomputed construction id.
+    ///
+    /// Fail-closed at EVERY untrusted boundary (wire decode, block adoption,
+    /// apply): a mismatch means the carrier rebound the id to a different
+    /// body and the message is refused, never credited.
+    pub fn verify_msg_id(&self) -> bool {
+        self.msg_id == self.expected_msg_id()
+    }
+
+    /// Canonical commitment bytes of the FULL message for the block hash.
+    ///
+    /// Covers every consensus-relevant field: direction, the whole carried
+    /// transaction (INCLUDING its signature bytes, so a signature swap under
+    /// an identical tx hash still moves the commitment), the inclusion/XPC
+    /// proof, both committed roots, the balance, the bounce flags, the sender
+    /// key binding and the 2PC phase.
+    ///
+    /// Deliberately EXCLUDES two fields:
+    /// * `msg_id` — covered by the legacy `msg_id` list in the block hash
+    ///   already; including it here would be a self-reference.
+    /// * `trusted` — a LOCAL-only flag (in-process routing convenience, never
+    ///   consensus): the producing node holds it true while every adopter
+    ///   holds it false for the same body, so covering it would fork the block
+    ///   hash between honest nodes. Verification ignores it on every
+    ///   untrusted path regardless.
+    pub fn commitment_bytes(&self) -> Vec<u8> {
+        // In-memory serialization of `Serialize` fields is infallible in
+        // practice; on error the empty preimage still binds the tag (and the
+        // block hash still binds the `msg_id` list), so fail-closed holds.
+        bincode::serialize(&(
+            self.source_shard,
+            self.target_shard,
+            &self.tx,
+            &self.merkle_inclusion_proof,
+            &self.source_state_root,
+            &self.finalized_in_block,
+            self.source_balance,
+            self.bounce,
+            self.bounced,
+            &self.sender_pubkey_hash,
+            &self.sender_scheme,
+            self.xpc_phase,
+        ))
+        .unwrap_or_default()
+    }
+
+    /// Tagged digest of [`Self::commitment_bytes`], mixed into
+    /// [`Block::compute_hash`] once per carried message (non-empty bodies
+    /// only, so empty-cross-shard blocks hash byte-identically to before).
+    pub fn message_commitment(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(XSHARD_FULL_COMMITMENT_TAG);
+        let bytes = self.commitment_bytes();
+        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update(&bytes);
+        hasher.finalize().into()
     }
 }
 
@@ -8699,6 +8834,255 @@ mod shard_header_commitment_tests {
         }
         // Empty input hashes to an empty output (no panic, no allocation).
         assert!(Transaction::compute_tx_hashes_batched(&[]).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // XSHARD INTEGRITY: msg_id recompute at every untrusted boundary +
+    // full-message commitment in the block hash.
+    //
+    // The carried `msg_id` is assigned at construction and never recomputed
+    // on decode/apply, so every boundary recomputes it (domain-aware) and
+    // refuses a mismatch. The block hash binds the full message bytes
+    // alongside the `msg_id` list — for message-carrying blocks only, so
+    // empty-cross-shard blocks hash byte-identically to before.
+    // -----------------------------------------------------------------------
+
+    fn xshard_test_tx() -> Transaction {
+        Transaction {
+            from: [0x11u8; 32],
+            to: [0x22u8; 32],
+            amount: 1_000,
+            gas_limit: 21_000,
+            nonce: 7,
+            source_shard: 1,
+            target_shard: 2,
+            signature: vec![0x5Au8; 64],
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        }
+    }
+
+    #[test]
+    fn xshard_msg_id_matches_recompute_for_every_constructor() {
+        let tx = xshard_test_tx();
+        let root = [0x33u8; 32];
+        let anchor = [0x44u8; 32];
+
+        // Legacy wire constructor.
+        let m = CrossShardMessage::new(1, 2, tx.clone(), root, anchor, None);
+        assert!(m.verify_msg_id(), "new() id must match the recompute");
+        assert_eq!(m.msg_id, m.expected_msg_id());
+
+        // Locally-trusted constructor assigns the same construction id.
+        let t = CrossShardMessage::new_trusted(1, 2, tx.clone(), root, anchor);
+        assert!(t.verify_msg_id(), "new_trusted() id must match the recompute");
+        assert!(t.trusted, "new_trusted is the ONLY constructor that sets trust");
+
+        // Every 2PC phase uses the XPC2 domain with its phase byte.
+        for phase in [
+            crate::xshard2pc::XPC_PREPARE,
+            crate::xshard2pc::XPC_PREPARE_ACK,
+            crate::xshard2pc::XPC_COMMIT,
+            crate::xshard2pc::XPC_ABORT_REQUEST,
+            crate::xshard2pc::XPC_ABORT_ACK,
+        ] {
+            let x = CrossShardMessage::new_xpc(phase, 1, 2, tx.clone(), root, anchor, None);
+            assert!(
+                x.verify_msg_id(),
+                "new_xpc() id must match the recompute for phase {phase}"
+            );
+            // The phased id can never alias the legacy id of the same body.
+            assert_ne!(
+                x.msg_id, m.msg_id,
+                "a 2PC record must never share the legacy id"
+            );
+        }
+
+        // Ack/bounce linkage records use the legacy domain.
+        let ack = CrossShardMessage::new_ack(tx.clone(), anchor);
+        assert!(ack.verify_msg_id(), "new_ack() id must match the recompute");
+        let bounce = CrossShardMessage::new_bounce(tx.clone(), anchor);
+        assert!(
+            bounce.verify_msg_id(),
+            "new_bounce() id must match the recompute"
+        );
+
+        // No other constructor sets trust: the wire always arrives untrusted.
+        assert!(!m.trusted && !ack.trusted && !bounce.trusted);
+    }
+
+    #[test]
+    fn xshard_rebound_msg_id_is_refused() {
+        let tx = xshard_test_tx();
+        let root = [0x33u8; 32];
+        let anchor = [0x44u8; 32];
+
+        // A forged id (bit flip) fails the recompute ...
+        let mut forged = CrossShardMessage::new(1, 2, tx.clone(), root, anchor, None);
+        forged.msg_id[0] ^= 0xFF;
+        assert!(!forged.verify_msg_id(), "a forged msg_id must be refused");
+        // ... and therefore fails the proof check too, even with no proof to
+        // evaluate: the id gate runs first.
+        assert!(
+            !forged.verify_inclusion_strict(),
+            "a forged id must fail strict inclusion"
+        );
+        assert!(
+            !forged.verify_xpc_proof(&[crate::xshard2pc::XpcPhase::Prepared]),
+            "a forged id must fail the XPC proof check"
+        );
+
+        // A body swap under the original id (amount changed after
+        // construction) also fails the recompute.
+        let mut swapped = CrossShardMessage::new(1, 2, tx.clone(), root, anchor, None);
+        swapped.tx.amount += 1;
+        assert!(
+            !swapped.verify_msg_id(),
+            "a body swapped under a stale id must be refused"
+        );
+
+        // A phase flip (legacy <-> 2PC) fails: the recompute follows the
+        // carried phase while construction followed the original domain.
+        let mut flipped = CrossShardMessage::new(1, 2, tx.clone(), root, anchor, None);
+        flipped.xpc_phase = crate::xshard2pc::XPC_PREPARE;
+        assert!(
+            !flipped.verify_msg_id(),
+            "a flipped phase must fail the recompute"
+        );
+        let mut flipped_back = CrossShardMessage::new_xpc(
+            crate::xshard2pc::XPC_PREPARE,
+            1,
+            2,
+            tx.clone(),
+            root,
+            anchor,
+            None,
+        );
+        flipped_back.xpc_phase = crate::xshard2pc::XPC_LEGACY;
+        assert!(
+            !flipped_back.verify_msg_id(),
+            "a zeroed phase must fail the recompute"
+        );
+    }
+
+    #[test]
+    fn xshard_empty_block_hash_is_byte_identical_to_the_legacy_preimage() {
+        // VERSION RULE proof: an empty-`cross_shard_out` block must hash
+        // EXACTLY as it did before the full-message commitment existed. The
+        // legacy preimage is hashed manually here (no call into the new
+        // section), so equality proves byte-identity, not self-consistency.
+        let block = Block {
+            shard_id: 1,
+            height: 42,
+            prev_hash: [0xABu8; 32],
+            state_root: [0xCDu8; 32],
+            transactions: vec![],
+            cross_shard_out: vec![],
+            timestamp: 1_700_000_500,
+            proposer: [0xEFu8; 32],
+            validator_signatures: vec![],
+            precommit_qc: None,
+            last_qc: None,
+            shard_headers: vec![],
+            order_merkle_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+            mmr_epoch_root: [0u8; 32],
+        };
+        let mut legacy = Sha256::new();
+        legacy.update(b"STELLEREUM_BLOCK_V3");
+        legacy.update(crate::consensus::consensus_chain_id().to_be_bytes());
+        legacy.update(block.shard_id.to_be_bytes());
+        legacy.update(block.height.to_be_bytes());
+        legacy.update(block.prev_hash);
+        legacy.update(block.state_root);
+        legacy.update(0u32.to_be_bytes());
+        legacy.update(0u32.to_be_bytes());
+        legacy.update(block.timestamp.to_be_bytes());
+        legacy.update(block.proposer);
+        let expected: [u8; 32] = legacy.finalize().into();
+        assert_eq!(
+            block.compute_hash(),
+            expected,
+            "an empty-cross-shard block must hash byte-identically to the legacy preimage"
+        );
+    }
+
+    #[test]
+    fn xshard_full_message_commitment_binds_the_body_beyond_msg_id() {
+        let tx = xshard_test_tx();
+        let msg = CrossShardMessage::new(1, 2, tx, [0x33u8; 32], [0x44u8; 32], None);
+        let block = Block {
+            shard_id: 1,
+            height: 9,
+            prev_hash: [0u8; 32],
+            state_root: [0u8; 32],
+            transactions: vec![],
+            cross_shard_out: vec![msg.clone()],
+            timestamp: 1,
+            proposer: [0u8; 32],
+            validator_signatures: vec![],
+            precommit_qc: None,
+            last_qc: None,
+            shard_headers: vec![],
+            order_merkle_root: [0u8; 32],
+            epoch_key_commitment: [0u8; 32],
+            mmr_epoch_root: [0u8; 32],
+        };
+        let honest_hash = block.compute_hash();
+
+        // A body swap that keeps the stale `msg_id` MUST move the block hash:
+        // the commitment binds the body, not just the id.
+        let mut tampered = block.clone();
+        tampered.cross_shard_out[0].tx.amount += 1;
+        assert_ne!(
+            tampered.compute_hash(),
+            honest_hash,
+            "a message body swapped under a stale id must move the block hash"
+        );
+        assert_ne!(
+            tampered.cross_shard_out[0].message_commitment(),
+            msg.message_commitment(),
+            "the per-message commitment must bind the body"
+        );
+
+        // The commitment is deterministic: same body, same digest.
+        assert_eq!(
+            msg.message_commitment(),
+            msg.message_commitment(),
+            "the commitment must be a pure function of the body"
+        );
+        assert_eq!(
+            msg.commitment_bytes(),
+            CrossShardMessage::new(1, 2, xshard_test_tx(), [0x33u8; 32], [0x44u8; 32], None)
+                .commitment_bytes(),
+            "identical bodies commit identically"
+        );
+    }
+
+    #[test]
+    fn xshard_commitment_ignores_the_local_trusted_flag() {
+        // Consensus-safety: the producer holds `trusted == true` in-process
+        // while every adopter holds `false` for the same body. Covering the
+        // flag would fork the block hash between honest nodes, so it must be
+        // excluded — while verification still ignores it on untrusted paths.
+        let tx = xshard_test_tx();
+        let mut msg = CrossShardMessage::new(1, 2, tx, [0x33u8; 32], [0x44u8; 32], None);
+        let untrusted_commitment = msg.message_commitment();
+        msg.trusted = true;
+        assert_eq!(
+            msg.message_commitment(),
+            untrusted_commitment,
+            "the local trusted flag must not move the commitment"
+        );
+        // ... but the flag itself round-trips on the wire (decode sites and
+        // the adoption boundary force it false; see sync.rs).
+        let bytes = bincode::serialize(&msg).expect("message must encode");
+        let decoded: CrossShardMessage = bincode::deserialize(&bytes).expect("must decode");
+        assert!(decoded.trusted, "wire bytes preserve the bit (clearing is the boundary's job)");
+        assert!(
+            decoded.verify_msg_id(),
+            "the id survives the round-trip (it covers no wire-mutable bit)"
+        );
     }
 
     /// Perf: single vs batched hashing over a block-sized batch. Prints

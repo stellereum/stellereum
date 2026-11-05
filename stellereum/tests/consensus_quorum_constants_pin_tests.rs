@@ -8,7 +8,7 @@
 use stellereum::consensus::{
     consensus_quorum_min, deterministic_round_timeout_ms, pq_micro_quorum_threshold,
     ADAPTIVE_EXTENSION_CAP_MS, ADAPTIVE_EXTENSION_PER_MISS_MS, DETERMINISTIC_BACKOFF_CAP_MS,
-    DETERMINISTIC_BACKOFF_PER_ROUND_MS, MAX_COMMIT_CERT_SIGNERS, MAX_DEADLOCK_JUMP,
+    DETERMINISTIC_BACKOFF_FACTOR, MAX_COMMIT_CERT_SIGNERS, MAX_DEADLOCK_JUMP,
     MAX_RETAINED_VOTE_ROUNDS, MAX_ROUND_ADVANCE_PER_MESSAGE, MAX_ROUND_AHEAD, MAX_SCAN_SPAN,
     MAX_SYNC_JUMPS_PER_ROUND, MICRO_COMMITTEE_MAX_SIZE, NIL_CIRCUIT_BREAKER_K,
     PROPOSER_MISS_THRESHOLD_M, REPHASE_SCAN_WINDOW, ROUND_LOOKBACK,
@@ -47,20 +47,25 @@ fn round_sync_and_scan_bounds_are_pinned() {
     assert_eq!(MAX_RETAINED_VOTE_ROUNDS, 4_096);
     assert_eq!(MAX_SCAN_SPAN, 4_096);
     assert_eq!(MAX_COMMIT_CERT_SIGNERS, 4_096);
-    assert_eq!(MICRO_COMMITTEE_MAX_SIZE, 64);
+    // P1: 128 seats clears the 2^-40 capture bound (k ≥ 105 at α=1/3,
+    // papers/01_quorum.md §5: 128 → ≈2^-42.6); 64 reached only ≈2^-25.
+    assert_eq!(MICRO_COMMITTEE_MAX_SIZE, 128);
 }
 
 #[test]
 fn timeout_ladder_values_are_pinned() {
     assert_eq!(NIL_CIRCUIT_BREAKER_K, 3);
-    assert_eq!(DETERMINISTIC_BACKOFF_PER_ROUND_MS, 500);
+    // P-liveness (papers/02_liveness.md §7 rec 1): geometric ladder ×2 per
+    // round, same ceiling (base + 10_000). Base 3500 live default: r0 => base,
+    // r1 => 2× base, adaptive still capped.
+    assert_eq!(DETERMINISTIC_BACKOFF_FACTOR, 2);
     assert_eq!(DETERMINISTIC_BACKOFF_CAP_MS, 10_000);
     assert_eq!(ADAPTIVE_EXTENSION_PER_MISS_MS, 500);
     assert_eq!(ADAPTIVE_EXTENSION_CAP_MS, 5_000);
     assert_eq!(PROPOSER_MISS_THRESHOLD_M, 3);
-    // Base 3500 live default: r0 => base, r1 => +500, adaptive still capped.
+    // Base 3500 live default: r0 => base, r1 => 2× base, adaptive still capped.
     assert_eq!(deterministic_round_timeout_ms(3500, 0, 0), 3500);
-    assert_eq!(deterministic_round_timeout_ms(3500, 1, 0), 4000);
+    assert_eq!(deterministic_round_timeout_ms(3500, 1, 0), 7000);
     assert_eq!(
         deterministic_round_timeout_ms(3500, 0, 1_000_000),
         3500 + ADAPTIVE_EXTENSION_CAP_MS

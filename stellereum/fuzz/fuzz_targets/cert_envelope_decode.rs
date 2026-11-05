@@ -7,8 +7,8 @@
 //     micro-certificate) wire envelope, `QC_UQC_MAGIC || ...`.
 //   * `consensus::decode_pq_epoch_envelope`  - the epoch CEC envelope, the
 //     same body under `QC_PQ_MAGIC`.
-//   * `consensus::decode_qc_bls_envelope`    - the BLS12-381 aggregate
-//     certificate envelope, `QC_BLS_MAGIC || ...`.
+//     (The BLS12-381 aggregate envelope `decode_qc_bls_envelope` was deleted
+//     with the BLS excision — FULL-PQ has no classical aggregate leg.)
 //   * `sharding::PqSignatureEnvelope::decode`      - the consensus tx
 //     signature envelope (salt + chain-id framing).
 //   * `post_quantum::PqSignatureEnvelope::decode`  - the strict, salt-free
@@ -27,10 +27,7 @@
 //      DoS in the node's message handler);
 //   2. a µQC that decodes must round-trip through its own canonical encoder
 //      to an EQUAL certificate (the encoder/decoder pair must be mutually
-//      consistent);
-//   3. a BLS aggregate that decodes must name a signer bitvector whose length
-//      matches the validator count it claims (otherwise the "who signed"
-//      set would be ambiguous).
+//      consistent).
 //
 // Run: cargo +nightly fuzz run cert_envelope_decode
 // Stable fallback: cargo test --test fuzz_decoder_tests cert_
@@ -64,20 +61,7 @@ fuzz_target!(|data: &[u8]| {
             }
         }
 
-        // --- (3) the BLS aggregate certificate envelope -------------------
-        if let Some((_h, _r, _kind, _bh, aggregate)) =
-            stellereum::consensus::decode_qc_bls_envelope(data)
-        {
-            let signers = aggregate.participants.total_validators();
-            assert!(signers > 0, "a decoded BLS aggregate must name at least one signer");
-            assert_eq!(
-                aggregate.participants.bitmask().len(),
-                signers.div_ceil(8),
-                "the BLS signer bitvector length must match the validator count it claims"
-            );
-        }
-
-        // --- (4) the two post-quantum signature envelopes -----------------
+        // --- (3) the two post-quantum signature envelopes -----------------
         let _ = stellereum::sharding::PqSignatureEnvelope::decode(data);
         let _ = stellereum::post_quantum::PqSignatureEnvelope::decode(data);
     }));

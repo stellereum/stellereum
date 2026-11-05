@@ -6310,14 +6310,33 @@ impl InMemoryStateEngine {
             if self.is_cross_shard_consumed(&key).await {
                 continue;
             }
-            // Proof-checked here (not anchored): anchoring is a PROPOSAL-TIME
-            // property enforced at propose+validate (runtime gates a block
-            // through before it can finalize). Apply — including walk/adopt
-            // replay of QC'd history — must accept proof-valid records: a
-            // syncing node holds no headers for old heights yet, and the
-            // block's QC is the trust for everything inside it. Requiring the
-            // anchor here would make historical sync impossible (C1 design
-            // note in `verify_anchored`).
+            // ANCHORED + SIGNED credit (cross-shard integrity hardening): the
+            // legacy credit path anchors the message to a LOCALLY FINALIZED
+            // source header (via `verify_cross_shard_anchored`: proof AND a
+            // committed source root) instead of checking the proof alone. A
+            // self-attested root (attacker trie + valid-for-that-root proof)
+            // names no committed header and is refused here.
+            //
+            // Fail-closed NOT-READY: a missing registry (single-shard
+            // contexts, most unit tests) or an unfinalized source header
+            // SKIPS the credit (never credits, never marks consumed), exactly
+            // like a bad proof. The carrying block's QC is NOT the trust for
+            // the message body: the quorum signs the block hash, and the
+            // block hash binds the full message bytes, but only the source
+            // shard's finalized header proves the claimed state root existed.
+            //
+            // PQ-only (live rule): the carried transaction must pass
+            // `tx.verify_signature()` — a legacy Ed cross-shard message is
+            // refused here, never credited.
+            if !msg.verify_msg_id() {
+                continue;
+            }
+            if !msg.tx.verify_signature() {
+                continue;
+            }
+            if !self.verify_cross_shard_anchored(msg) {
+                continue;
+            }
             if !msg.verify_inclusion_strict() {
                 continue;
             }
@@ -6442,6 +6461,45 @@ impl InMemoryStateEngine {
     ) -> bool {
         use crate::sharding::CrossShardKind;
         use crate::xshard2pc::{XpcPhase, XpcRecord, XpcTransition};
+        // ANCHORED 2PC apply (cross-shard integrity hardening): EVERY phase
+        // verifies proof-only no more. The message must anchor to a LOCALLY
+        // FINALIZED header of the peer shard (`verify_xpc_anchored`
+        // semantics: anchor AND phase proof), read from the process-shared
+        // `FinalizedHeaderRegistry` this engine was given via
+        // `with_finalized_headers` — the same `Arc` every shard runtime in
+        // the process holds, never a global.
+        //
+        // Fail-closed NOT-READY: a missing registry, a poisoned lock, or an
+        // unfinalized source header returns false (no state change, never
+        // verified) — the caller treats it exactly like a bad proof. The
+        // `msg_id` is recomputed at this apply boundary first: a rebound id
+        // is refused before any registry or trie work. The lock guard below
+        // is dropped before any await (the anchor verdict is a bool), so no
+        // async path ever holds the std registry lock across a yield.
+        if !msg.verify_msg_id() {
+            return false;
+        }
+        let anchor_ok = {
+            let slot = self
+                .finalized_headers
+                .read()
+                .ok()
+                .and_then(|guard| guard.clone());
+            let Some(reg_arc) = slot else {
+                return false;
+            };
+            let Ok(reg) = reg_arc.read() else {
+                return false;
+            };
+            reg.anchor_holds(
+                msg.source_shard,
+                &msg.finalized_in_block,
+                &msg.source_state_root,
+            )
+        };
+        if !anchor_ok {
+            return false;
+        }
         let tx = &msg.tx;
         let tx_hash = tx.compute_tx_hash();
         let existing = self.xpc_record(&tx_hash).await;
@@ -6489,6 +6547,13 @@ impl InMemoryStateEngine {
             // really escrowed the value, so this is not a mint.
             CrossShardKind::Commit => {
                 if !msg.verify_xpc_proof(&[XpcPhase::Prepared, XpcPhase::Committed]) {
+                    return false;
+                }
+                // PQ-only on the TARGET-side credit (live rule): the carried
+                // transaction must pass `tx.verify_signature()` — a legacy Ed
+                // COMMIT is refused, never credited. (The anchor + `msg_id`
+                // gates above already ran for this arm.)
+                if !msg.tx.verify_signature() {
                     return false;
                 }
                 let transition = crate::xshard2pc::target_on_commit(existing.as_ref());

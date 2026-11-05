@@ -154,7 +154,7 @@ where
         if !seen.insert(cur) {
             return Err("block sync: cycle detected".to_string());
         }
-        let blk = fetch(cur)
+        let mut blk = fetch(cur)
             .await
             .ok_or_else(|| format!("block sync: missing block {}", hex::encode(cur)))?;
         // Yield per height: on a 1-vCPU node a long walk of slow (2.5s-RTT)
@@ -173,6 +173,24 @@ where
                 blk.height,
                 hex::encode(cur)
             ));
+        }
+        // XSHARD INTEGRITY at the adoption boundary (fail-closed): every
+        // carried cross-shard message must carry its construction-time id —
+        // recomputed here (domain-aware) from (source, target, tx hash,
+        // finalizing block) — and no adopted message may arrive `trusted`.
+        // A forged `msg_id` rebinds a valid proof to a different body; a set
+        // `trusted` bit would bypass the inclusion proof at trusted-honoring
+        // call sites. A forged id refuses the whole block; the flag is
+        // cleared so no downstream path can observe wire-set trust.
+        for m in blk.cross_shard_out.iter_mut() {
+            if !m.verify_msg_id() {
+                return Err(format!(
+                    "block sync: block {} carries a cross-shard message with a forged msg_id \
+                     (recomputed id mismatch; refusing the block)",
+                    blk.height
+                ));
+            }
+            m.trusted = false;
         }
         let prev = blk.prev_hash;
         chain.push(blk);
@@ -2483,6 +2501,80 @@ mod tests {
         assert!(
             err.contains("does not hash"),
             "error names the mismatch: {err}"
+        );
+    }
+
+    // ==================== XSHARD: forged msg_id refused, trust cleared ====================
+
+    fn xshard_test_message() -> crate::sharding::CrossShardMessage {
+        let tx = crate::sharding::Transaction {
+            from: [0x11u8; 32],
+            to: [0x22u8; 32],
+            amount: 1_000,
+            gas_limit: 21_000,
+            nonce: 7,
+            source_shard: 1,
+            target_shard: MASTERCHAIN_SHARD,
+            signature: vec![0x5Au8; 64],
+            payload: Vec::new(),
+            priority_fee_per_gas: 0,
+        };
+        crate::sharding::CrossShardMessage::new(1, MASTERCHAIN_SHARD, tx, [0x33u8; 32], [0x44u8; 32], None)
+    }
+
+    #[tokio::test]
+    async fn collect_missing_blocks_refuses_a_forged_msg_id_and_clears_wire_trust() {
+        let blocks = chain(3);
+        let genesis = blocks[0].compute_hash();
+
+        // A block that honestly carries one cross-shard message (served with
+        // the wire `trusted` bit SET, as a Byzantine serializer would): the
+        // walk adopts it, but the message arrives untrusted.
+        let mut carrier = blocks[1].clone();
+        let mut honest_msg = xshard_test_message();
+        honest_msg.trusted = true;
+        carrier.cross_shard_out = vec![honest_msg];
+        carrier.prev_hash = genesis;
+        let carrier_hash = carrier.compute_hash();
+        let mut map: HashMap<[u8; 32], Block> = blocks
+            .iter()
+            .map(|b| (b.compute_hash(), b.clone()))
+            .collect();
+        map.insert(carrier_hash, carrier.clone());
+        let got = collect_missing_blocks(carrier_hash, genesis, 100, |h| {
+            let b = map.get(&h).cloned();
+            async move { b }
+        })
+        .await
+        .expect("an honestly-identified carrier must be adopted");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].cross_shard_out.len(), 1);
+        assert!(
+            got[0].cross_shard_out[0].verify_msg_id(),
+            "the adopted message carries its construction id"
+        );
+        assert!(
+            !got[0].cross_shard_out[0].trusted,
+            "no adopted message may arrive trusted (wire bit cleared at the boundary)"
+        );
+
+        // A carrier whose message id was rebound (bit flip, then re-hashed so
+        // the body check passes) is refused at the adoption boundary.
+        let mut forged = blocks[2].clone();
+        let mut forged_msg = xshard_test_message();
+        forged_msg.msg_id[0] ^= 0xFF;
+        forged.cross_shard_out = vec![forged_msg];
+        forged.prev_hash = genesis;
+        let forged_hash = forged.compute_hash();
+        let err = collect_missing_blocks(forged_hash, genesis, 100, move |h| {
+            let b = (h == forged_hash).then(|| forged.clone());
+            async move { b }
+        })
+        .await
+        .expect_err("a carrier with a forged msg_id must be refused");
+        assert!(
+            err.contains("forged msg_id"),
+            "error names the forgery: {err}"
         );
     }
 

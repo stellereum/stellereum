@@ -373,7 +373,7 @@ pub const QC_PQ_MAGIC: &[u8; 16] = b"STELL_QC_PQ_V5__";
 ///   stake-weighted sortition.
 /// - Quorum: power-weighted, and ANCHORED TO THE NETWORK
 ///   ([`pq_micro_required_power`]): the signers' summed power must reach
-///   `max(floor(2*W_committee/3) + 1, floor(W_network/2) + 1)`.
+///   `max(floor(2*W_committee/3) + 1, floor(2*W_network/3) + 1)`.
 ///   * While the committee IS the whole validator set (N <= the cap — the
 ///     live N = 4 network) the two terms coincide with the legacy rule
 ///     `floor(2*k/3) + 1` (3 of 4, 11 of 16 for k = 16), so every historic
@@ -382,9 +382,10 @@ pub const QC_PQ_MAGIC: &[u8; 16] = b"STELL_QC_PQ_V5__";
 ///     quorum suffices (e.g. 2 of 3 by heads when their combined power
 ///     covers 2/3+1 of the committee).
 ///   * When the committee is a strict SUBSET of the validator set, the
-///     network anchor dominates: a certificate must carry a STRICT MAJORITY
-///     of the WHOLE network's stake, so a captured committee cannot
-///     finalize a block (audit W6.5 — committee capture).
+///     network anchor dominates: a certificate must carry TWO THIRDS of the
+///     WHOLE network's stake — a strict majority (`floor(W/2)+1`) does NOT
+///     intersect honestly (`2t − W ∈ {1,2}`, `papers/01_quorum.md` §4) — so a
+///     captured committee cannot finalize a block (audit W6.5 + P1).
 /// - Carried inside `QuorumCertificate::signatures` under sentinel marker `PQ_UQC_MARKER_ID`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PqMicroCertificate {
@@ -555,12 +556,19 @@ impl PqMicroCertificate {
 ///
 /// Domain: PBFT/PQ-BFT finality. It is deliberately NOT the bridge threshold
 /// [`crate::bridge::quorum_threshold`] (`floor((2n+2)/3)`, floored at 1): that
-/// counts DISTINCT signers of an external cross-chain signer set and is LOWER
-/// — at n = 3 consensus demands 3 while the bridge accepts 2. The `+1` here
-/// makes a bare 2/3 (exactly two thirds when n % 3 == 0) insufficient, which is
-/// what makes the BFT safety argument hold. The two curves must never be
-/// "unified"; both are pinned for n = 1..8 by
-/// `bridge::tests::quorum_formulas_are_pinned_per_domain`.
+/// counts DISTINCT signers of an external cross-chain signer set. The two
+/// curves MUST still live in separate functions with separate pins
+/// (`bridge::tests::quorum_formulas_are_pinned_per_domain` pins both value
+/// lists for n = 1..8), but the safety narrative is exactly the paper result
+/// (`papers/01_quorum.md` §3, Theorem 2): under the STRICT threat model
+/// `B_w < W/3` the bridge curve `ceil(2n/3)` is the MINIMUM safe threshold
+/// `t*(n)`, and this consensus curve `floor(2n/3)+1` coincides with it except
+/// at `n % 3 == 0`, where it is exactly one vote MORE conservative. That +1
+/// is a deliberate margin, and it is REQUIRED (not redundant) if the model
+/// ever admits `B_w = n/3` exactly: at `2t - W = 0` the `ceil` curve stops
+/// intersecting honestly (paper §3, Oговорка). So: bridge = exact optimum
+/// under `B < W/3`; consensus = optimum + one-vote margin at `3|n`, kept so
+/// both the strict and the non-strict model stay safe.
 pub fn consensus_quorum_min(n: u64) -> u64 {
     // Audit F4: u128 arithmetic — `(n*2)` panics in debug / wraps in release
     // at absurd powers, and saturating would UNDERESTIMATE the quorum
@@ -615,10 +623,18 @@ pub fn pq_micro_quorum_power(committee_total_power: u64) -> u64 {
 /// raised because a 16-seat committee is a very weak finality target — see
 /// [`micro_committee_size`] and [`pq_micro_required_power`].
 ///
-/// 64 seats x 666 B = 42.6 KB per µQC, still well under the ~66.6 KB a full
-/// 100-validator Ed25519 QC costs, and it is the smallest committee that can
-/// hold a MAJORITY of the network's stake at the target scale (N = 100).
-pub const MICRO_COMMITTEE_MAX_SIZE: u32 = 64;
+/// 128 seats x 666 B ≈ 85 KB per µQC. The seat count is NOT sized for
+/// bandwidth anymore: it is sized for CAPTURE RESISTANCE. Under the
+/// conservative with-replacement model (`X ~ Bin(k, α)`, `α = 1/3`) the
+/// Chernoff bound `P[X > 2k/3] ≤ exp(−k·D(2/3‖1/3))` with
+/// `D(2/3‖1/3) = (1/3)·ln 2 ≈ 0.2310` gives `k ≥ 105` for `2^-40`
+/// (`papers/01_quorum.md` §5, `results/q_quorum.json`); `k = 128` clears it
+/// with margin (`exp(−128·0.2310) ≈ 1.4e−13 ≈ 2^−42.6`), while `k = 64` only
+/// reached ≈ 2^−25 — NOT cryptographically negligible. Capture alone still
+/// does not grant finality (the network-anchored quorum of
+/// [`pq_micro_required_power`] holds regardless), but a captured committee
+/// can censor/sabotage the fast path, so the seats are cheap insurance.
+pub const MICRO_COMMITTEE_MAX_SIZE: u32 = 128;
 
 /// Size of the µQC sortition committee for a validator set of `n` members.
 ///
@@ -632,10 +648,11 @@ pub const MICRO_COMMITTEE_MAX_SIZE: u32 = 64;
 /// network's own 2/3 threshold, and a straight break of the "an attacker with
 /// < 1/3 of the stake cannot finalize a block" invariant.
 ///
-/// The seat count is therefore raised to 64 (still `min(N, ...)`): at N = 100
-/// the committee holds ~64% of the stake, and the NETWORK-ANCHORED quorum
-/// rule ([`pq_micro_required_power`]) then demands a STRICT MAJORITY of the
-/// *network's* stake, not just of the committee's.
+/// The seat count is therefore raised to 128 (still `min(N, ...)`): capture
+/// resistance, not bandwidth, sizes it — `k = 128` clears the `2^-40` bound
+/// (`k ≥ 105` at `α = 1/3`, `papers/01_quorum.md` §5) with margin, and the
+/// NETWORK-ANCHORED quorum rule ([`pq_micro_required_power`]) then demands
+/// TWO THIRDS of the *network's* stake, not just of the committee's.
 ///
 /// While `N <= MICRO_COMMITTEE_MAX_SIZE` the committee IS the whole validator
 /// set (see [`derive_sortition_committee`]): the µQC threshold is then exactly
@@ -648,22 +665,31 @@ pub fn micro_committee_size(validator_count: usize) -> u32 {
 /// µQC quorum threshold in voting POWER: the value the signers' summed power
 /// must reach for the certificate to be accepted.
 ///
-/// AUDIT W6.5 (committee capture) — the rule is
+/// AUDIT W6.5 (committee capture) + P1 (quorum intersection) — the rule is
 ///
 /// ```text
 /// required = max( floor(2 * W_committee / 3) + 1,      // the committee's own 2/3
-///                  floor(W_network / 2) + 1 )            // STRICT MAJORITY of the network
+///                  floor(2 * W_network / 3) + 1 )       // the NETWORK's 2/3 (BFT floor)
 /// ```
 ///
 /// The second term is what makes a µQC safe to accept as a FINALITY
-/// certificate on its own:
+/// certificate on its own. Paper `papers/01_quorum.md` §4, Theorems 1–4: a
+/// threshold `t` is safe against Byzantine weight `B_w` iff `2t − W > B_w`.
+/// The OLD network term `floor(W_network/2) + 1` gives `2T − W ∈ {1, 2}`, so
+/// ANY `B_w ≥ 2` breaks it — even though it is a strict majority of the
+/// network. Counterexample (`results/q_quorum.json → weighted.explicit_attack`,
+/// `W = 100, B = 32`): two conflicting 51-power certs (32 Byzantine + 19
+/// honest each, all-Byzantine intersection) BOTH pass `51 = floor(100/2)+1`.
+/// Strict majority does NOT imply quorum intersection; only `2t − W > B_w`
+/// does. The network term is therefore the same BFT curve as
+/// [`consensus_quorum_min`]: `floor(2·W_network/3) + 1`.
 ///
-/// * `floor(W_network/2) + 1` is a strict majority of the WHOLE network's
-///   stake, so any two conflicting certificates (µQC or full QC) must share
-///   at least one signer — the classic BFT quorum-intersection property that
-///   a 16-seat committee's `2/3 of the committee` does NOT have (2/3 of a
-///   16%-of-the-network sample is ~11% of the network: no intersection, and
-///   an attacker with 11% of the stake can finalize a conflicting block).
+/// Cross-level safety (paper §4, Corollary 3): with the network term at the
+/// BFT floor, a mixed pair (µQC at `T_µ`, full QC at `T_f = floor(2W/3)+1`)
+/// satisfies `T_µ + T_f − W ≥ 2·T_f − W > B_w` for every `B_w < W/3`, so no
+/// conflicting µQC/full-QC pair can both verify. Enforced fail-closed by
+/// [`mixed_quorum_pair_safe`], checked in `verify_micro_cert`.
+///
 /// * Because the floor is anchored to the NETWORK, a committee that cannot
 ///   reach it (a small committee of a large network) is REFUSED outright
 ///   rather than silently accepted at a weakened threshold. The µQC is only
@@ -679,11 +705,36 @@ pub fn pq_micro_required_power(committee_total_power: u64, network_total_power: 
         return u64::MAX;
     }
     let committee_two_thirds = consensus_quorum_min(committee_total_power);
-    let network_majority = match network_total_power {
+    let network_two_thirds = match network_total_power {
         0 => u64::MAX,
-        w => w / 2 + 1,
+        w => consensus_quorum_min(w),
     };
-    committee_two_thirds.max(network_majority)
+    committee_two_thirds.max(network_two_thirds)
+}
+
+/// Fail-closed cross-tier intersection gate: a µQC threshold `t_micro` and a
+/// full-QC threshold `t_full` over the same total power `total` can only both
+/// certify conflicting blocks if their signer sets can avoid sharing an
+/// honest validator. By the inclusion–exclusion lemma
+/// (`papers/01_quorum.md` §2, Lemma 1) the guaranteed intersection weight is
+/// `t_micro + t_full − total`, so the pair is safe against Byzantine weight
+/// up to `total/3` (the strict `B_w < W/3` model, conservative integer form)
+/// iff `t_micro + t_full > total + total/3`.
+///
+/// Returns `false` (refuse) on any degenerate input — zero total, or a
+/// threshold at/above the `u64::MAX` fail-closed sentinel — so a caller that
+/// wires this in can never accept on missing data. `u128` arithmetic: no
+/// overflow at any `u64` input.
+///
+/// Pins: `(51, 67, 100) → false` (the `W=100, B=32` mixed attack:
+/// `51 + 67 − 100 = 18 ≤ 33`), `(67, 67, 100) → true`
+/// (`67 + 67 − 100 = 34 > 33`).
+pub fn mixed_quorum_pair_safe(t_micro: u64, t_full: u64, total_power: u64) -> bool {
+    if total_power == 0 || t_micro == u64::MAX || t_full == u64::MAX {
+        return false;
+    }
+    let (t_mu, t_f, w) = (t_micro as u128, t_full as u128, total_power as u128);
+    t_mu + t_f > w + w / 3
 }
 
 /// Deterministic BLAKE3 sortition committee selector.
@@ -2431,14 +2482,16 @@ impl VoteSet {
                     }
                 }
 
-                // Power-weighted µQC quorum: the committee is whatever sortition
-                // elected (unchanged); only the ACCOUNTING changed — sum the
+                // Power-weighted µQC quorum, anchored to the NETWORK: sum the
                 // voting powers of the committee members that actually signed
-                // and require floor(2*W/3)+1 of the committee's total power W.
-                // On uniform power this equals the legacy head-count
-                // floor(2*k/3)+1, so old certificates keep verifying; on a
-                // skewed set (e.g. N=3 with A+B covering quorum) 2 signers
-                // now suffice instead of a fragile 3/3 unanimous.
+                // and require [`pq_micro_required_power`] — the max of the
+                // committee's own 2/3 and the network's 2/3 BFT floor
+                // (`2t − W > B_w`, never the `W/2+1` majority that two
+                // conflicting certs can both clear). On uniform power the
+                // whole-set rule equals the legacy head-count floor(2*k/3)+1,
+                // so old certificates keep verifying; on a skewed set (e.g.
+                // N=3 with A+B covering quorum) 2 signers now suffice instead
+                // of a fragile 3/3 unanimous.
                 let committee_total: u64 = committee.iter().map(|id| validators.power_of(id)).sum();
                 if committee_total == 0 {
                     // Fail-closed: empty committee / zero weight never compiles.
@@ -2785,6 +2838,20 @@ impl QuorumCertificate {
             return false;
         }
         let quorum_power = pq_micro_required_power(committee_total, validators.total_power());
+        // Cross-level gate (P1, `papers/01_quorum.md` §4 Cor. 3): a µQC that
+        // verifies here must ALSO intersect every full-QC threshold honestly —
+        // `T_µ + T_f − W > B`. With the network term at the BFT floor this
+        // holds by construction for all `B_w < W/3`; the check stays as a
+        // fail-closed tripwire so a future threshold edit that breaks the
+        // pair condition refuses instead of finalizing. On the live
+        // (whole-set committee) topology the predicate is identically true.
+        if !mixed_quorum_pair_safe(
+            quorum_power,
+            validators.quorum_power(),
+            validators.total_power(),
+        ) {
+            return false;
+        }
         let valid_power: u64 = valid.iter().map(|id| validators.power_of(id)).sum();
         valid_power >= quorum_power
     }
@@ -3272,13 +3339,19 @@ pub const MAX_SCAN_SPAN: Round = 4_096;
 /// it. Pinned by test.
 pub const NIL_CIRCUIT_BREAKER_K: u32 = 3;
 
-/// Per-round backoff of the DETERMINISTIC round timeout (ms per round).
+/// Multiplicative per-round backoff factor of the DETERMINISTIC round timeout.
 ///
-/// Safety role (liveness): grows the timeout with the round so a slow network
-/// still converges instead of view-changing forever; deterministic on every
-/// node (function of round only) so rounds stay synchronized. Bounded by
-/// [`DETERMINISTIC_BACKOFF_CAP_MS`].
-pub const DETERMINISTIC_BACKOFF_PER_ROUND_MS: u64 = 500;
+/// Safety role (liveness): under PERSISTENT slowdown (a network stuck in the
+/// "slow" state for several rounds) a timeout is evidence of hidden state, so
+/// the optimal ladder is geometric with `ρ ≈ 2` — NOT additive `+500ms`
+/// (`papers/02_liveness.md` §4–§7: i.i.d. optimum `ρ* = 1`, persistent
+/// optimum `ρ* ≈ 2.02`; rec 1 keeps the 3000ms base — near-optimal for
+/// `γ≈2, p50≈660ms, c≈500ms — and replaces the additive rung with `×2`).
+/// At base 3000ms the rungs are 3s, 6s, 12s, 24s, then the cap — a wedged
+/// round on a slow/Byzantine proposer unwedges far faster than `+500ms` per
+/// round. Deterministic on every node (function of round only) so rounds stay
+/// synchronized. Bounded by [`DETERMINISTIC_BACKOFF_CAP_MS`].
+pub const DETERMINISTIC_BACKOFF_FACTOR: u64 = 2;
 /// Cap on the round-driven backoff half of the deterministic timeout.
 ///
 /// Safety role (liveness + DoS bound): keeps a pathological round (round 1M)
@@ -3352,13 +3425,25 @@ pub fn deterministic_round_timeout_ms(
     round: Round,
     proposer_missed_streak: u32,
 ) -> u64 {
-    let backoff = (round as u64)
-        .saturating_mul(DETERMINISTIC_BACKOFF_PER_ROUND_MS)
-        .min(DETERMINISTIC_BACKOFF_CAP_MS);
+    // Geometric ladder `T(r) = min(base·2^r, base + CAP)` (paper 02_liveness
+    // §6, rec 1): `×DETERMINISTIC_BACKOFF_FACTOR` per round, same ceiling as
+    // before (`DETERMINISTIC_BACKOFF_CAP_MS` above the base), so the
+    // saturation rung is byte-identical to the old additive cap.
+    // `saturating_pow`/`saturating_mul`: `Round = u32` can name absurd rounds
+    // (tests pin round 1_000_000) — saturation, never wrap, then the cap.
+    let grown = base_ms.saturating_mul(DETERMINISTIC_BACKOFF_FACTOR.saturating_pow(round));
+    let backoff_capped = grown.min(base_ms.saturating_add(DETERMINISTIC_BACKOFF_CAP_MS));
     let adaptive = (proposer_missed_streak as u64)
         .saturating_mul(ADAPTIVE_EXTENSION_PER_MISS_MS)
         .min(ADAPTIVE_EXTENSION_CAP_MS);
-    base_ms.saturating_add(backoff).saturating_add(adaptive)
+    // ADAPTIVE BASE (paper 02_liveness §5–§6, formula (2) — NOT implemented):
+    // the principled base is `T0 = clamp(0.6·q99_committed, 0.5s, 10s)` where
+    // `q99_committed` is a latency-tail quantile committed into epoch state
+    // (same on every node — never a local clock). No committed-q99 feed
+    // exists yet, so the frozen 3000ms base stays; when the feed lands, it
+    // replaces ONLY `base_ms` upstream — this ladder is already multiplicative
+    // in the base and needs no further change.
+    backoff_capped.saturating_add(adaptive)
 }
 
 impl HeightConsensus {
@@ -4684,9 +4769,15 @@ mod tests {
             t1, t2,
             "same state => same timeout (wall clocks differ, value must not)"
         );
-        // Backoff grows with the ROUND (not a local failure count).
-        assert_eq!(deterministic_round_timeout_ms(3500, 1, 0), 4000);
-        assert_eq!(deterministic_round_timeout_ms(3500, 4, 0), 5500);
+        // Backoff is MULTIPLICATIVE in the round (`x2` per round, paper
+        // 02_liveness §7 rec 1 — persistent-slowdown optimum `ρ* ≈ 2.02`,
+        // i.i.d. optimum needs no backoff at all): r1 doubles the base, r4
+        // saturates at base + cap.
+        assert_eq!(deterministic_round_timeout_ms(3500, 1, 0), 7000);
+        assert_eq!(
+            deterministic_round_timeout_ms(3500, 4, 0),
+            3500 + DETERMINISTIC_BACKOFF_CAP_MS
+        );
         // Adaptive extension for historically-slow proposers, bounded.
         let slow = deterministic_round_timeout_ms(3500, 0, 4);
         assert_eq!(slow, 3500 + 4 * ADAPTIVE_EXTENSION_PER_MISS_MS);
@@ -6388,13 +6479,15 @@ mod post_quantum_uqc_tests {
         assert_eq!(decode_pq_micro_envelope(&bad_magic), None);
     }
 
-    /// AUDIT W6.5 (committee capture) — the pure quorum math.
+    /// AUDIT W6.5 (committee capture) + P1 (quorum intersection) — the pure
+    /// quorum math.
     ///
-    /// The µQC threshold is `max(2/3 of the committee, STRICT MAJORITY of the
-    /// network)`. The second term is what stops a captured committee from
-    /// finalizing a block: without it, a 16-seat committee of a 100-validator
-    /// network (holding ~16% of the stake) would accept a certificate worth
-    /// ~11% of the NETWORK's stake.
+    /// The µQC threshold is `max(2/3 of the committee, 2/3 of the NETWORK)`.
+    /// The second term is what stops a captured committee from finalizing a
+    /// block: without it, a 16-seat committee of a 100-validator network
+    /// (holding ~16% of the stake) would accept a certificate worth ~11% of
+    /// the NETWORK's stake. The old second term (`floor(W/2)+1`) is NOT
+    /// enough either — see `dual_finality_counterexample_w100_b32` below.
     #[test]
     fn test_micro_quorum_power_is_anchored_to_the_network() {
         // Committee 640 of a 1000-power network.
@@ -6402,8 +6495,11 @@ mod post_quantum_uqc_tests {
         let network_total = 1000u64;
         // The committee's own 2/3 would be 427 — 43% of the NETWORK.
         assert_eq!(pq_micro_quorum_power(committee_total), 427);
-        // The network anchor raises it to a strict majority of the network.
-        assert_eq!(pq_micro_required_power(committee_total, network_total), 501);
+        // The network anchor raises it to the network's 2/3 BFT floor (667).
+        // P1: the old strict-majority anchor (501) is UNSAFE — two
+        // conflicting 501-certs can share a purely Byzantine intersection
+        // (`2·501 − 1000 = 2 ≯ 320`); the floor refuses them both.
+        assert_eq!(pq_micro_required_power(committee_total, network_total), 667);
         assert!(
             pq_micro_required_power(committee_total, network_total)
                 > pq_micro_quorum_power(committee_total)
@@ -6416,28 +6512,34 @@ mod post_quantum_uqc_tests {
         assert_eq!(pq_micro_required_power(0, 1000), u64::MAX);
         // The legacy head-count curve is untouched (pinned by the bridge test).
         assert_eq!(pq_micro_quorum_threshold(16), 11);
-        // The committee size is the SHARED production rule.
+        // The committee size is the SHARED production rule (cap now 128 for
+        // the 2^-40 capture bound — N <= 128 is the whole set).
         assert_eq!(micro_committee_size(4), 4);
         assert_eq!(micro_committee_size(16), 16);
-        assert_eq!(micro_committee_size(100), MICRO_COMMITTEE_MAX_SIZE);
+        assert_eq!(micro_committee_size(100), 100);
         assert_eq!(micro_committee_size(10_000), MICRO_COMMITTEE_MAX_SIZE);
     }
 
-    /// AUDIT W6.5 (committee capture) — end to end.
+    /// AUDIT W6.5 (committee capture) + P1 (quorum intersection) — end to end.
     ///
-    /// A µQC whose committee is a STRICT SUBSET of the validator set (N=100,
-    /// a 64-seat committee holding 64% of the stake) must not be accepted on
+    /// A µQC whose committee is a STRICT SUBSET of the validator set (N=190,
+    /// a 128-seat committee holding ~67% of the stake) must not be accepted on
     /// the strength of the committee's own 2/3: the certificate has to carry
-    /// a strict majority of the WHOLE network's stake. This is the property
-    /// that keeps "an attacker with < 1/2 of the stake cannot finalize a
-    /// block" true even when the committee is small relative to the network.
+    /// TWO THIRDS of the WHOLE network's stake (`2t − W > B_w`). This is the
+    /// property that keeps "an attacker with < 1/3 of the stake cannot
+    /// finalize a block" true even when the committee is small relative to
+    /// the network. (N=190, not 100: with the 128-seat cap a 100-member set
+    /// elects the whole set — the subset shape needs N > cap — and N=190
+    /// keeps the network floor (1267) just under what the full 128-seat
+    /// committee can carry (1280), so both the refuse and the accept case
+    /// are constructible.)
     #[test]
     fn test_uqc_of_a_subset_committee_must_reach_a_network_majority() {
-        const N: usize = 100;
+        const N: usize = 190;
         const POWER: u64 = 10;
         let mut vs = ValidatorSet::new();
-        for i in 0..N as u8 {
-            vs.add([i.wrapping_add(1); 32], POWER);
+        for i in 0..N {
+            vs.add([(i % 251 + 1) as u8; 32], POWER);
         }
         let height: Height = 77;
         let round: Round = 0;
@@ -6451,22 +6553,24 @@ mod post_quantum_uqc_tests {
         let network_total = vs.total_power();
         assert_eq!(network_total, N as u64 * POWER);
         assert_eq!(committee_total, MICRO_COMMITTEE_MAX_SIZE as u64 * POWER);
-        // The committee's own 2/3 is BELOW the network anchor.
+        // The committee's own 2/3 (854) is BELOW the network anchor (1267).
         let required = pq_micro_required_power(committee_total, network_total);
+        assert_eq!(required, consensus_quorum_min(network_total));
+        assert_eq!(required, 1267);
         assert!(required > pq_micro_quorum_power(committee_total));
-        // 50 members carry 500 < 501 power: refused. 51 carry 510: accepted.
+        // 126 members carry 1260 < 1267 power: refused. 127 carry 1270: accepted.
         let sub_quorum_members = required.div_ceil(POWER) as usize - 1;
-        assert_eq!(sub_quorum_members, 50);
+        assert_eq!(sub_quorum_members, 126);
 
         let kind = VoteKind::Precommit;
         let block_hash = Some([0x21; 32]);
         let msg = vote_sign_bytes(height, round, kind, &block_hash);
 
-        // Real Falcon keys for the committee members that sign.
+        // Real Falcon keys for the committee members that sign (one distinct
+        // seed per committee position — no key reuse across members).
         let mut signers: Vec<(ValidatorId, crate::post_quantum::FalconKeypair)> = Vec::new();
-        for val_id in committee.iter().take(sub_quorum_members + 1) {
-            let fk =
-                make_sample_falcon512(0x80u8.wrapping_add((*val_id)[0]).wrapping_add((*val_id)[1]));
+        for (idx, val_id) in committee.iter().take(sub_quorum_members + 1).enumerate() {
+            let fk = make_sample_falcon512(0x80u8.wrapping_add((idx % 251) as u8));
             register_validator_pq_key(
                 *val_id,
                 crate::post_quantum::PqScheme::Falcon512,
@@ -6501,23 +6605,315 @@ mod post_quantum_uqc_tests {
             signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(uqc))],
         };
 
-        // 50 of 64 committee members: the committee's own 2/3 (427) is met
-        // (500 >= 427) but the NETWORK's strict majority (501) is not.
+        // 126 of 128 committee members: the committee's own 2/3 (854) is met
+        // (1260 >= 854) but the NETWORK's two-thirds floor (1267) is not —
+        // and the old strict-majority floor (951) WOULD have accepted it:
+        // the P1 gap in one inequality.
         let sub = build_uqc(sub_quorum_members);
+        let old_floor = network_total / 2 + 1;
+        assert_eq!(old_floor, 951);
         assert!(sub.signed_power(&committee, &vs) >= pq_micro_quorum_power(committee_total));
         assert!(sub.signed_power(&committee, &vs) < required);
+        assert!(
+            sub.signed_power(&committee, &vs) >= old_floor,
+            "fixture must sit inside the old vulnerable band (else it proves nothing)"
+        );
         assert!(
             !wrap(&sub).verify(&vs),
             "a µQC that clears only the committee's 2/3 must NOT finalize a block"
         );
 
-        // 51 of 64: the network's strict majority is reached -> accepted.
+        // 127 of 128: the network's two-thirds floor is reached -> accepted,
+        // and the full-quorum gate agrees (item 3: verify subsumes it now).
         let ok = build_uqc(sub_quorum_members + 1);
         assert!(ok.signed_power(&committee, &vs) >= required);
         assert!(
             wrap(&ok).verify(&vs),
-            "a µQC carrying a strict majority of the NETWORK's stake must verify"
+            "a µQC carrying TWO THIRDS of the NETWORK's stake must verify"
         );
+        assert!(
+            vs.qc_meets_quorum(&wrap(&ok)),
+            "an accepted µQC-alone cert carries full-quorum power (no second gate needed)"
+        );
+        assert!(
+            !vs.qc_meets_quorum(&wrap(&sub)),
+            "the refused sub-floor cert carries no full-quorum power either"
+        );
+    }
+
+    /// P1 (Theorems 1+4) — the dual-finality counterexample, pinned live.
+    ///
+    /// Paper `papers/01_quorum.md` §4 Thm. 3 + `results/q_quorum.json →
+    /// weighted.explicit_attack`: with `W = 100, B = 32` the OLD floor
+    /// `t = floor(W/2)+1 = 51` admits TWO conflicting certificates
+    /// (32 Byzantine + 19 honest each, all-Byzantine intersection of weight
+    /// 32), because `2·51 − 100 = 2 ≯ 32`. The theorem `2t − W > B_w` is
+    /// pinned in-test in BOTH directions; the live half of the test scales
+    /// it by 10 (POWER=10: `W = 1000, B_w = 320, t_old = 501, t_new = 667`)
+    /// and proves with REAL Falcon signatures that the new floor refuses
+    /// both conflicting certs while a 67-signer cert still verifies.
+    /// Old-floor acceptance is constructible only as threshold arithmetic
+    /// (the vulnerable code path is gone) — asserted, not executed.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    // GATE: the pinned paper arithmetic 2·51−100=2 / 2·67−100=34 is
+    // intentionally constant — the test's job is to pin Theorem 1 in both
+    // directions, and rewriting it through runtime values would unpin it.
+    fn dual_finality_counterexample_w100_b32() {
+        // --- Paper-unit pins (Theorem 1, both directions) ---
+        let (w, b, t_old, t_new) = (100u64, 32u64, 51u64, 67u64);
+        assert_eq!(t_old, w / 2 + 1, "old floor: strict majority");
+        assert_eq!(t_new, consensus_quorum_min(w), "new floor: BFT 2/3");
+        assert!(
+            2 * t_old - w <= b,
+            "2·51−100 = 2 ≯ 32: old floor UNSAFE (dual finality possible)"
+        );
+        assert!(
+            2 * t_new - w > b,
+            "2·67−100 = 34 > 32: new floor safe"
+        );
+        // Cross-tier form of the same pins (Cor. 3): an old-µQC/new-full pair
+        // shares only 18 guaranteed weight (≤ 33 = B allowance) — attackable;
+        // two new-floor certs share 34 — safe.
+        assert!(!mixed_quorum_pair_safe(t_old, t_new, w));
+        assert!(mixed_quorum_pair_safe(t_new, t_new, w));
+
+        // --- Live scaled replica: N=100 uniform ×10 (whole-set committee) ---
+        const N: usize = 100;
+        const POWER: u64 = 10;
+        const NW: u64 = 1000; // N * POWER
+        const BW: u64 = 320; // 32 "byzantine" members × POWER
+        let mut vs = ValidatorSet::new();
+        for i in 0..N {
+            // 0xE5-domain ids: disjoint from every other test's id space, so
+            // the global PQ-key registry cannot alias across parallel tests.
+            let mut id = [0xE5; 32];
+            id[0] = (i & 0xFF) as u8;
+            id[1] = ((i >> 8) & 0xFF) as u8;
+            id[2] = 0xE5;
+            vs.add(id, POWER);
+        }
+        assert_eq!(vs.total_power(), NW);
+        let height: Height = 101;
+        let round: Round = 0;
+        let parent = [0x43; 32];
+        let committee_size = micro_committee_size(vs.len());
+        assert_eq!(committee_size as usize, N, "N <= cap: whole-set committee");
+        let committee =
+            derive_sortition_committee(&vs, height, round, committee_size, &parent);
+        assert_eq!(committee.len(), N);
+
+        // Threshold pins at live scale.
+        assert_eq!(consensus_quorum_min(NW), 667);
+        assert_eq!(pq_micro_required_power(NW, NW), 667);
+        let old_floor = NW / 2 + 1;
+        assert_eq!(old_floor, 501);
+        assert_eq!(2 * old_floor - NW, 2, "old floor guarantees 2 weight");
+        assert!(2 * old_floor - NW <= BW, "2 ≯ 320: old floor unsafe");
+        assert!(2 * 667 - NW > BW, "334 > 320: new floor safe");
+
+        // 32 shared "byzantine" + 19 distinct honest per conflicting cert.
+        let byz: Vec<ValidatorId> = committee.iter().take(32).copied().collect();
+        let honest_a: Vec<ValidatorId> = committee.iter().skip(32).take(19).copied().collect();
+        let honest_b: Vec<ValidatorId> =
+            committee.iter().skip(32 + 19).take(19).copied().collect();
+        assert_eq!(honest_a.len(), 19);
+        assert_eq!(honest_b.len(), 19);
+
+        // Real Falcon keys for all 70 signers (distinct seed per member).
+        let mut fks: Vec<(ValidatorId, crate::post_quantum::FalconKeypair)> = Vec::new();
+        for (idx, val_id) in byz.iter().chain(honest_a.iter()).chain(honest_b.iter()).enumerate()
+        {
+            let fk = make_sample_falcon512(0x11u8.wrapping_add((idx % 251) as u8));
+            register_validator_pq_key(
+                *val_id,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key().to_vec(),
+            );
+            fks.push((*val_id, fk));
+        }
+        let sign_for = |members: &[ValidatorId],
+                        block: [u8; 32],
+                        fks: &[(ValidatorId, crate::post_quantum::FalconKeypair)]|
+         -> QuorumCertificate {
+            let msg = vote_sign_bytes(height, round, VoteKind::Precommit, &Some(block));
+            let mut bitmask = vec![0u8; (committee_size as usize).div_ceil(8)];
+            let mut sigs = Vec::new();
+            for (i, val_id) in committee.iter().enumerate() {
+                if members.contains(val_id) {
+                    let (_, fk) = fks.iter().find(|(id, _)| id == val_id).unwrap();
+                    sigs.push(fk.sign(&msg));
+                    bitmask[i / 8] |= 1 << (i % 8);
+                }
+            }
+            let uqc = PqMicroCertificate {
+                scheme: crate::post_quantum::PqScheme::Falcon512,
+                height,
+                round,
+                committee_size,
+                signers_bitmask: bitmask,
+                signatures: sigs,
+                sortition_parent: parent,
+            };
+            QuorumCertificate {
+                height,
+                round,
+                kind: VoteKind::Precommit,
+                block_hash: Some(block),
+                signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc))],
+            }
+        };
+
+        let mut members_a = byz.clone();
+        members_a.extend(honest_a.iter().copied());
+        let mut members_b = byz.clone();
+        members_b.extend(honest_b.iter().copied());
+        let qc_a = sign_for(&members_a, [0xA1; 32], &fks);
+        let qc_b = sign_for(&members_b, [0xB2; 32], &fks);
+
+        // Both carry 510 power: the OLD floor (501) accepts each of them —
+        // dual finality under the old rule, constructible here as the exact
+        // arithmetic the old code evaluated.
+        for qc in [&qc_a, &qc_b] {
+            let power = vs.qc_signed_power(qc);
+            assert_eq!(power, 510);
+            assert!(
+                power >= old_floor,
+                "old floor accepts this conflicting cert (501 ≤ 510)"
+            );
+            // ...while the honest signer sets are disjoint by construction
+            // (intersection = the 32 shared Byzantine), and the new floor
+            // refuses both.
+            assert!(
+                !qc.verify(&vs),
+                "new floor (667) MUST refuse a 510-power conflicting cert"
+            );
+            assert!(
+                !vs.qc_meets_quorum(qc),
+                "no full-quorum power either (510 < 667)"
+            );
+        }
+        // Safety is preserved, not just refusal: 67 signers (670 ≥ 667) verify.
+        let members_ok: Vec<ValidatorId> = committee.iter().take(67).copied().collect();
+        for (idx, val_id) in members_ok.iter().enumerate() {
+            if fks.iter().all(|(id, _)| id != val_id) {
+                let fk = make_sample_falcon512(0xC0u8.wrapping_add((idx % 200) as u8));
+                register_validator_pq_key(
+                    *val_id,
+                    crate::post_quantum::PqScheme::Falcon512,
+                    fk.public_key().to_vec(),
+                );
+                fks.push((*val_id, fk));
+            }
+        }
+        let qc_ok = sign_for(&members_ok, [0xCC; 32], &fks);
+        assert!(qc_ok.verify(&vs), "67 of 100 (670 ≥ 667) must verify");
+        assert!(vs.qc_meets_quorum(&qc_ok));
+    }
+
+    /// P1 (Corollary 3) — the mixed-pair gate pins.
+    ///
+    /// `mixed_quorum_pair_safe` is the fail-closed predicate behind the
+    /// tripwire in `verify_micro_cert`: exact paper numbers
+    /// (`results/q_quorum.json → weighted.threshold_table`), degenerate
+    /// inputs refuse, and `u64::MAX` thresholds (the fail-closed sentinel)
+    /// can never pass.
+    #[test]
+    fn mixed_quorum_pair_gate_pins() {
+        // Paper mixed pair: q_micro=51, q_full=67, W=100, B=32 →
+        // guaranteed cross-intersection 18 ≤ 33: UNSAFE.
+        assert!(!mixed_quorum_pair_safe(51, 67, 100));
+        // Post-fix: 67 + 67 − 100 = 34 > 33: safe.
+        assert!(mixed_quorum_pair_safe(67, 67, 100));
+        // Degenerate inputs fail closed.
+        assert!(!mixed_quorum_pair_safe(67, 67, 0));
+        assert!(!mixed_quorum_pair_safe(u64::MAX, 67, 100));
+        assert!(!mixed_quorum_pair_safe(67, u64::MAX, 100));
+        // Live whole-set shape: the two live thresholds always pair safe
+        // (this is why the tripwire in `verify_micro_cert` is behavior-
+        // identical on the current topology — it can only fire if a future
+        // edit breaks the floor).
+        for w in [1u64, 2, 3, 4, 5, 6, 7, 8, 100, 1000, 1900, 2000] {
+            let t = consensus_quorum_min(w);
+            assert!(
+                mixed_quorum_pair_safe(t, t, w),
+                "live pair ({t}, {t}, {w}) must be safe"
+            );
+        }
+    }
+
+    /// Item 3 — the µQC-alone gate, proved instead of changed.
+    ///
+    /// `verify_unified` (≈2528) DOES accept a µQC alone — that is the fast
+    /// path by design. The full-2/3 QC requirement lives one layer up and is
+    /// already enforced twice: [`ValidatorSet::qc_meets_quorum`] (≈1088,
+    /// same-set power ≥ `quorum_power()`) and the LOUD commit-path refusal in
+    /// `runtime.rs` (≈7707: `signed < required` → error + metric, never
+    /// adopt). Post-fix the two gates coincide on every topology: any
+    /// verifying µQC carries ≥ `pq_micro_required_power` ≥ `quorum_power()`,
+    /// so `verify ⇒ meets_quorum` and no second check can disagree.
+    /// This test pins that agreement on the LIVE shape (N=4, whole-set
+    /// committee — the topology the fleet runs): 2-of-4 fails both gates,
+    /// 3-of-4 passes both. Behavior-identical proof for the live network.
+    #[test]
+    fn micro_qc_alone_gate_agrees_with_full_quorum_on_live_shape() {
+        let mut vs = ValidatorSet::new();
+        let mut fks = Vec::new();
+        for i in 0..4u8 {
+            let mut id = [0xE1; 32];
+            id[0] = i;
+            let fk = make_sample_falcon512(0x30 + i);
+            register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key().to_vec(),
+            );
+            vs.add(id, 1);
+            fks.push((id, fk));
+        }
+        let height: Height = 7;
+        let round: Round = 0;
+        let parent = [0x44; 32];
+        let committee_size = micro_committee_size(vs.len());
+        assert_eq!(committee_size, 4);
+        let committee =
+            derive_sortition_committee(&vs, height, round, committee_size, &parent);
+        assert_eq!(committee.len(), 4);
+        let build = |n: usize| -> QuorumCertificate {
+            let block = [0xBB; 32];
+            let msg = vote_sign_bytes(height, round, VoteKind::Precommit, &Some(block));
+            let mut bitmask = vec![0u8; (committee_size as usize).div_ceil(8)];
+            let mut sigs = Vec::new();
+            for (i, val_id) in committee.iter().enumerate().take(n) {
+                let (_, fk) = fks.iter().find(|(id, _)| id == val_id).unwrap();
+                sigs.push(fk.sign(&msg));
+                bitmask[i / 8] |= 1 << (i % 8);
+            }
+            let uqc = PqMicroCertificate {
+                scheme: crate::post_quantum::PqScheme::Falcon512,
+                height,
+                round,
+                committee_size,
+                signers_bitmask: bitmask,
+                signatures: sigs,
+                sortition_parent: parent,
+            };
+            QuorumCertificate {
+                height,
+                round,
+                kind: VoteKind::Precommit,
+                block_hash: Some(block),
+                signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc))],
+            }
+        };
+        // 2-of-4: below every floor — both gates refuse, identically.
+        let sub = build(2);
+        assert!(!sub.verify(&vs), "2-of-4 µQC must not verify");
+        assert!(!vs.qc_meets_quorum(&sub), "2-of-4 carries no full-quorum power");
+        // 3-of-4: the live quorum — both gates accept, identically.
+        let ok = build(3);
+        assert!(ok.verify(&vs), "3-of-4 µQC must verify (live pin)");
+        assert!(vs.qc_meets_quorum(&ok), "3-of-4 carries full-quorum power");
     }
 
     #[test]

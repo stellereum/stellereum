@@ -153,10 +153,12 @@ pub fn twap_optimal_window_secs(shift_times_dt: f64, sigma_per_sec: f64) -> f64 
     (6.0 * shift_times_dt * shift_times_dt / (sigma_per_sec * sigma_per_sec)).cbrt()
 }
 
-/// PROPOSAL ONLY — Wald SPRT decision boundaries (report P4 §4).
+/// Wald SPRT decision boundaries (report P4 §4).
 ///
-/// FOR-LEAD-DECISION: not wired; the live Tier-3 check stays the fixed
-/// 10% `MAX_PRICE_DEVIATION_BPS` breaker. Pure math, tested below.
+/// Wired by the height-gated Tier-3 below ([`tier3_breaker_tripped`]): the
+/// live check stays the fixed 10% `MAX_PRICE_DEVIATION_BPS` breaker while
+/// the gate is inactive (see [`SPRT_TIER3_ACTIVATION_HEIGHT`]). Pure math,
+/// tested below.
 /// Returns (A, B) = (ln((1−β)/α), ln(β/(1−α))).
 pub fn sprt_wald_bounds(alpha: f64, beta: f64) -> (f64, f64) {
     debug_assert!(alpha > 0.0 && alpha < 1.0 && beta > 0.0 && beta < 1.0);
@@ -165,23 +167,123 @@ pub fn sprt_wald_bounds(alpha: f64, beta: f64) -> (f64, f64) {
     (a, b)
 }
 
-/// PROPOSAL ONLY — one CUSUM/SPRT log-likelihood step for N(0,σ²) vs N(J,σ²).
+/// One CUSUM/SPRT log-likelihood step for N(0,σ²) vs N(J,σ²).
 ///
-/// FOR-LEAD-DECISION: not wired anywhere. LLR_r step for a relative-price
-/// residual x: (J/σ²)·x − J²/(2σ²). Accumulate while the running sum stays
-/// within the [`sprt_wald_bounds`] interval; crossing A accepts H1 (shift),
-/// crossing B accepts H0. Pure and deterministic.
+/// Wired by the height-gated Tier-3 below ([`sprt_tier3_llr_sum`]).
+/// LLR_r step for a relative-price residual x: (J/σ²)·x − J²/(2σ²).
+/// Accumulate while the running sum stays within the [`sprt_wald_bounds`]
+/// interval; crossing A accepts H1 (shift), crossing B accepts H0.
+/// Pure and deterministic.
 pub fn cusum_llr_step(residual: f64, shift: f64, sigma: f64) -> f64 {
     (shift / (sigma * sigma)) * residual - shift * shift / (2.0 * sigma * sigma)
 }
 
-/// PROPOSAL ONLY — expected SPRT samples to decide under H1 (report P4 §4,
-/// Eq. 5, Wald identity): E[N|H1] = ((1−β)·A + β·B) / (J²/(2σ²)).
-/// FOR-LEAD-DECISION: not wired anywhere. E.g. J=1%, σ=0.5%/block,
-/// α=β=1e-3 → ≈3.45 blocks (twap.json `sprt` table).
+/// Expected SPRT samples to decide under H1 (report P4 §4, Eq. 5, Wald
+/// identity): E[N|H1] = ((1−β)·A + β·B) / (J²/(2σ²)).
+/// Wired by the height-gated Tier-3 below ([`sprt_tier3_expected_samples`]).
+/// E.g. J=1%, σ=0.5%/block, α=β=1e-3 → ≈3.45 blocks (twap.json `sprt` table).
 pub fn sprt_expected_samples(alpha: f64, beta: f64, shift: f64, sigma: f64) -> f64 {
     let (a, b) = sprt_wald_bounds(alpha, beta);
     ((1.0 - beta) * a + beta * b) / (shift * shift / (2.0 * sigma * sigma))
+}
+
+/// Tier-3 SPRT activation height (report P4 §4, Eq. 5; twap.json `sprt`).
+///
+/// GATE SEMANTICS: at block `height < SPRT_TIER3_ACTIVATION_HEIGHT` the Tier-3
+/// check is the historical fixed 10% `MAX_PRICE_DEVIATION_BPS` rule,
+/// byte-for-byte. At `height >= SPRT_TIER3_ACTIVATION_HEIGHT` the Tier-3
+/// check is the Wald SPRT/CUSUM decision over recent relative-price residuals
+/// (accumulated via [`cusum_llr_step`], decided against [`sprt_wald_bounds`]
+/// at [`SPRT_TIER3_ALPHA`]/[`SPRT_TIER3_BETA`]).
+///
+/// INACTIVE BY DEFAULT (`u64::MAX`): no live height can reach the gate, so
+/// current behavior is unchanged until the lead explicitly flips this constant
+/// at rollout. ADVISORY-ONLY: consumed solely by the read-path
+/// `OracleSafetyEngine` Tier-3; consensus admission
+/// (`OracleState::commit_feed`/`gate_order`) never reads it and is untouched.
+pub const SPRT_TIER3_ACTIVATION_HEIGHT: u64 = u64::MAX;
+/// Tier-3 SPRT false-alarm rate (report P4 §4; twap.json `sprt` rows pin
+/// α=β=1e-3).
+pub const SPRT_TIER3_ALPHA: f64 = 1e-3;
+/// Tier-3 SPRT miss rate (report P4 §4; twap.json `sprt` rows pin α=β=1e-3).
+pub const SPRT_TIER3_BETA: f64 = 1e-3;
+/// Default Tier-3 SPRT target shift: 1% sustained relative-price move.
+/// The pure decision path takes an explicit shift so every twap.json `sprt`
+/// row stays provable; this default only feeds the height-0 delegation of
+/// `OracleSafetyEngine::resolve_price`, whose SPRT branch is unreachable
+/// while the gate is inactive.
+pub const SPRT_TIER3_SHIFT: f64 = 0.01;
+/// Default Tier-3 SPRT per-block volatility: 0.5%/block (first twap.json
+/// `sprt` row). Same delegation-only role as [`SPRT_TIER3_SHIFT`].
+pub const SPRT_TIER3_SIGMA_PER_BLOCK: f64 = 0.005;
+
+/// Height gate predicate: true iff the SPRT Tier-3 is live at `height`.
+/// Pure: integer comparison only.
+#[allow(clippy::absurd_extreme_comparisons)] // GATE: `>=` is the rollout-correct form — at the INACTIVE default (u64::MAX) it reduces to `== MAX`; once the lead flips the constant down it becomes a real range check. `==` would silently deactivate every height above a flipped gate.
+pub fn sprt_tier3_active_at(height: u64) -> bool {
+    height >= SPRT_TIER3_ACTIVATION_HEIGHT
+}
+
+/// Accumulated Tier-3 SPRT log-likelihood over `residuals` (relative-price
+/// deviations, oldest first) for N(0,σ²) vs N(J,σ²), reusing
+/// [`cusum_llr_step`]. Pure and deterministic: strict slice-order summation,
+/// no wall-clock, no RNG, no map iteration (see determinism note on
+/// [`tier3_breaker_tripped`]).
+pub fn sprt_tier3_llr_sum(residuals: &[f64], shift: f64, sigma: f64) -> f64 {
+    let mut acc = 0.0;
+    for r in residuals {
+        acc += cusum_llr_step(*r, shift, sigma);
+    }
+    acc
+}
+
+/// Live Tier-3 SPRT verdict at the report error rates
+/// ([`SPRT_TIER3_ALPHA`]/[`SPRT_TIER3_BETA`]): true = H1 accepted, the
+/// breaker trips. Pure and deterministic.
+pub fn sprt_tier3_decision(residuals: &[f64], shift: f64, sigma: f64) -> bool {
+    let (a, _b) = sprt_wald_bounds(SPRT_TIER3_ALPHA, SPRT_TIER3_BETA);
+    sprt_tier3_llr_sum(residuals, shift, sigma) >= a
+}
+
+/// Wired Tier-3 expectation under H1 at the report error rates (Eq. 5):
+/// pins [`sprt_expected_samples`] to [`SPRT_TIER3_ALPHA`]/[`SPRT_TIER3_BETA`]
+/// so the twap.json `sprt` rows are provable through the wired path, not just
+/// the bare helper. Pure and deterministic.
+pub fn sprt_tier3_expected_samples(shift: f64, sigma: f64) -> f64 {
+    sprt_expected_samples(SPRT_TIER3_ALPHA, SPRT_TIER3_BETA, shift, sigma)
+}
+
+/// Height-gated Tier-3 breaker (the WIRED path).
+///
+/// Below [`SPRT_TIER3_ACTIVATION_HEIGHT`]: the historical fixed rule —
+/// `deviation_bps(price, twap) > MAX_PRICE_DEVIATION_BPS` — integer bps,
+/// exact, byte-identical to the pre-SPRT behavior. The SPRT history is
+/// ignored on this branch.
+/// At/above it: the [`sprt_tier3_decision`] verdict over `sprt_residuals`
+/// (one relative deviation per block, oldest first); the single
+/// price-vs-twap comparison is ignored on this branch.
+///
+/// DETERMINISM DISCIPLINE: the fixed branch is integer exact arithmetic.
+/// The SPRT branch is IEEE-754 binary64 with slice-order accumulation — bit
+/// for bit reproducible for identical input sequences on every node (no
+/// fused operations across terms, no data-dependent branching, no
+/// wall-clock/RNG/locale). Callers must derive each residual from committed
+/// integer micro-USD values in block order, e.g.
+/// `(price_micro_usd as f64 - twap_micro_usd as f64) / twap_micro_usd as f64`.
+/// Where the report allows, prefer the integer-bps fixed branch; the f64
+/// path above is documented here rather than hidden.
+pub fn tier3_breaker_tripped(
+    price_micro_usd: u64,
+    twap_micro_usd: u64,
+    height: u64,
+    sprt_residuals: &[f64],
+    sprt_shift: f64,
+    sprt_sigma: f64,
+) -> bool {
+    if sprt_tier3_active_at(height) {
+        return sprt_tier3_decision(sprt_residuals, sprt_shift, sprt_sigma);
+    }
+    deviation_bps(price_micro_usd, twap_micro_usd) > MAX_PRICE_DEVIATION_BPS
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -652,6 +754,36 @@ impl OracleSafetyEngine {
         asset: &str,
         current_time: u64,
     ) -> Result<u64, String> {
+        // Pre-SPRT behavior, byte-identical: height 0 never reaches the
+        // inactive-by-default gate (`SPRT_TIER3_ACTIVATION_HEIGHT = u64::MAX`),
+        // so Tier-3 is the fixed 10% rule exactly as before.
+        self.resolve_price_at_height(
+            feed,
+            asset,
+            current_time,
+            0,
+            &[],
+            SPRT_TIER3_SHIFT,
+            SPRT_TIER3_SIGMA_PER_BLOCK,
+        )
+    }
+
+    /// Height-gated resolve: Tiers 1–2 identical to [`Self::resolve_price`];
+    /// Tier-3 reads the [`SPRT_TIER3_ACTIVATION_HEIGHT`] gate via
+    /// [`tier3_breaker_tripped`] (`sprt_residuals`: one relative deviation per
+    /// block, oldest first, at the `sprt_shift`/`sprt_sigma` operating point).
+    /// Advisory-only like [`Self::resolve_price`]: never consensus.
+    #[allow(clippy::too_many_arguments)] // GATE: extends `resolve_price` (feed/asset/time) with gate height plus one SPRT operating point (residuals/shift/sigma); grouping them would churn the wired-path tests for no behavioral gain.
+    pub fn resolve_price_at_height(
+        &mut self,
+        feed: Option<&PriceFeedUpdate>,
+        asset: &str,
+        current_time: u64,
+        height: u64,
+        sprt_residuals: &[f64],
+        sprt_shift: f64,
+        sprt_sigma: f64,
+    ) -> Result<u64, String> {
         if self.circuit_breaker_triggered {
             return Err("Circuit breaker is currently active. Trades paused.".to_string());
         }
@@ -719,8 +851,24 @@ impl OracleSafetyEngine {
             if twap > 0 {
                 let deviation_bps = deviation_bps(price, twap);
 
-                if deviation_bps > MAX_PRICE_DEVIATION_BPS {
+                if tier3_breaker_tripped(
+                    price,
+                    twap,
+                    height,
+                    sprt_residuals,
+                    sprt_shift,
+                    sprt_sigma,
+                ) {
                     self.circuit_breaker_triggered = true;
+                    if sprt_tier3_active_at(height) {
+                        return Err(format!(
+                            "SPRT circuit breaker tripped: LLR sum {:.6} reached upper bound {:.6} (shift {}, sigma {})",
+                            sprt_tier3_llr_sum(sprt_residuals, sprt_shift, sprt_sigma),
+                            sprt_wald_bounds(SPRT_TIER3_ALPHA, SPRT_TIER3_BETA).0,
+                            sprt_shift,
+                            sprt_sigma,
+                        ));
+                    }
                     return Err(format!(
                         "Circuit breaker tripped: price deviation {} bps exceeds limit {} bps",
                         deviation_bps, MAX_PRICE_DEVIATION_BPS
@@ -808,6 +956,246 @@ mod oracle_params_truth_tests {
         let drift = cusum_llr_step(0.0, 0.01, 0.005);
         assert!((drift - (-2.0)).abs() < 1e-12);
         assert!((cusum_llr_step(0.01, 0.01, 0.005) - 2.0).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod sprt_tier3_gate_tests {
+    use super::*;
+
+    /// Pre-activation pin: the gate is INACTIVE by default, so the wired path
+    /// is the fixed 10% rule and the SPRT history is ignored on this branch.
+    #[test]
+    fn pre_activation_fixed_10pct_rule_pinned() {
+        assert_eq!(
+            SPRT_TIER3_ACTIVATION_HEIGHT,
+            u64::MAX,
+            "gate inactive by default until the lead flips it at rollout"
+        );
+        assert!(!sprt_tier3_active_at(0));
+        assert!(!sprt_tier3_active_at(u64::MAX - 1));
+
+        // 9% under → pass; exactly 10% → pass (rule is strict `>`); 11% → trip.
+        assert!(!tier3_breaker_tripped(1_090_000, 1_000_000, 0, &[], 0.01, 0.005));
+        assert!(!tier3_breaker_tripped(1_100_000, 1_000_000, 0, &[], 0.01, 0.005));
+        assert!(tier3_breaker_tripped(1_110_000, 1_000_000, 0, &[], 0.01, 0.005));
+        // A maximally alarming SPRT history must NOT trip pre-activation:
+        // the fixed branch ignores residuals entirely.
+        assert!(!tier3_breaker_tripped(
+            1_000_000,
+            1_000_000,
+            0,
+            &[0.01; 64],
+            0.01,
+            0.005
+        ));
+    }
+
+    /// Boundary pin: MAX−1 stays on the fixed rule, MAX switches to SPRT.
+    #[test]
+    fn activation_boundary_height() {
+        // Just below: an 11% single print trips (fixed rule) even with an
+        // empty SPRT history.
+        assert!(tier3_breaker_tripped(
+            1_110_000,
+            1_000_000,
+            u64::MAX - 1,
+            &[],
+            0.01,
+            0.005
+        ));
+        // Just below: on-par price with a trip-worthy SPRT history does NOT
+        // trip (SPRT ignored on the fixed branch).
+        assert!(!tier3_breaker_tripped(
+            1_000_000,
+            1_000_000,
+            u64::MAX - 1,
+            &[0.01; 4],
+            0.01,
+            0.005
+        ));
+        // At the gate: the same on-par price now trips on SPRT evidence…
+        assert!(sprt_tier3_active_at(u64::MAX));
+        assert!(tier3_breaker_tripped(
+            1_000_000,
+            1_000_000,
+            u64::MAX,
+            &[0.01; 4],
+            0.01,
+            0.005
+        ));
+        // …while an 11% single print with NO SPRT history does not (the SPRT
+        // branch reads residuals, not the one-shot deviation).
+        assert!(!tier3_breaker_tripped(
+            1_110_000,
+            1_000_000,
+            u64::MAX,
+            &[],
+            0.01,
+            0.005
+        ));
+    }
+
+    /// All four twap.json `sprt` rows (α=β=1e-3) proved through the WIRED
+    /// expectation path: (J, σ, E[N]) = (1%, 0.5%, 3.45), (1%, 1%, 13.79),
+    /// (2%, 0.5%, 0.86), (2%, 1%, 3.45).
+    #[test]
+    fn wired_expected_samples_match_all_four_report_rows() {
+        assert_eq!(SPRT_TIER3_ALPHA.to_bits(), 0.001f64.to_bits());
+        assert_eq!(SPRT_TIER3_BETA.to_bits(), 0.001f64.to_bits());
+        let cases = [
+            (0.01, 0.005, 3.45),
+            (0.01, 0.01, 13.79),
+            (0.02, 0.005, 0.86),
+            (0.02, 0.01, 3.45),
+        ];
+        for (j, sigma, expected) in cases {
+            let got = sprt_tier3_expected_samples(j, sigma);
+            assert!(
+                (got - expected).abs() / expected < 0.01,
+                "wired E[N] J={j} σ={sigma}: ≈{expected}, got {got}"
+            );
+        }
+    }
+
+    /// Post-activation trip/no-trip vectors through the WIRED gate
+    /// ([`tier3_breaker_tripped`] at `u64::MAX`): sustained full-shift
+    /// residuals `x = J` cross the Wald upper bound exactly at
+    /// `ceil(E[N])` samples — 4 / 14 / 1 / 4 for the four report rows —
+    /// while one fewer sample stays silent, and flat history never trips.
+    #[test]
+    fn post_activation_sprt_trip_no_trip_vectors() {
+        // (shift J, sigma, E[N] from twap.json, samples-to-trip = ceil(E[N])).
+        let cases: [(f64, f64, f64, usize); 4] = [
+            (0.01, 0.005, 3.45, 4),
+            (0.01, 0.01, 13.79, 14),
+            (0.02, 0.005, 0.86, 1),
+            (0.02, 0.01, 3.45, 4),
+        ];
+        for (j, sigma, expected, trip_at) in cases {
+            // Sanity: the trip count really is ceil(E[N]) of the report row.
+            assert_eq!(
+                trip_at,
+                expected.ceil() as usize,
+                "J={j} σ={sigma}: trip count must be ceil({expected})"
+            );
+            let trip_history = vec![j; trip_at];
+            assert!(
+                tier3_breaker_tripped(1_000_000, 1_000_000, u64::MAX, &trip_history, j, sigma),
+                "J={j} σ={sigma}: {trip_at} full-shift samples must trip"
+            );
+            assert!(
+                sprt_tier3_decision(&trip_history, j, sigma),
+                "J={j} σ={sigma}: pure SPRT verdict must agree with the wired gate"
+            );
+            if trip_at > 1 {
+                let quiet_history = vec![j; trip_at - 1];
+                assert!(
+                    !tier3_breaker_tripped(
+                        1_000_000, 1_000_000, u64::MAX, &quiet_history, j, sigma
+                    ),
+                    "J={j} σ={sigma}: {} samples must stay silent",
+                    trip_at - 1
+                );
+            }
+            // Flat market: zeros score pure negative drift, never trip —
+            // even over a long window.
+            assert!(
+                !tier3_breaker_tripped(
+                    1_000_000,
+                    1_000_000,
+                    u64::MAX,
+                    &[0.0; 64],
+                    j,
+                    sigma
+                ),
+                "J={j} σ={sigma}: flat residuals must never trip"
+            );
+        }
+        // Empty history post-activation: LLR = 0 < A, silent.
+        assert!(!tier3_breaker_tripped(
+            1_000_000,
+            1_000_000,
+            u64::MAX,
+            &[],
+            0.01,
+            0.005
+        ));
+    }
+
+    /// Engine wiring: the same on-par price is admitted pre-activation and
+    /// SPRT-tripped post-activation, with the latch set exactly once.
+    #[test]
+    fn engine_wired_path_switches_at_activation() {
+        // Pre-activation: price == TWAP → Ok, latch clear.
+        let mut pre = OracleSafetyEngine::new(vec![]);
+        pre.set_dex_twap("STELL", 1_000_000);
+        assert!(pre
+            .resolve_price_at_height(None, "STELL", 1_000, 0, &[0.01; 64], 0.01, 0.005)
+            .is_ok());
+        assert!(!pre.circuit_breaker_triggered);
+
+        // Post-activation with 4 full-shift residuals (row 1, E[N]=3.45):
+        // trips despite a zero one-shot deviation, and latches.
+        let mut post = OracleSafetyEngine::new(vec![]);
+        post.set_dex_twap("STELL", 1_000_000);
+        let err = post
+            .resolve_price_at_height(None, "STELL", 1_000, u64::MAX, &[0.01; 4], 0.01, 0.005)
+            .expect_err("SPRT evidence must trip post-activation");
+        assert!(
+            err.contains("SPRT"),
+            "post-activation trip must name SPRT, got: {err}"
+        );
+        assert!(post.circuit_breaker_triggered);
+
+        // Legacy entry point is byte-identical to the gated path at height 0:
+        // identical engines give identical outcomes and latch state — even
+        // with a maximally alarming SPRT history, which the fixed branch
+        // ignores. (An 11%-style fixed-rule trip is untriggerable through
+        // the engine while feed verification fail-closes, so the trip
+        // itself is pinned at the `tier3_breaker_tripped` level above.)
+        let mut legacy = OracleSafetyEngine::new(vec![]);
+        legacy.set_dex_twap("STELL", 1_000_000);
+        let mut gated = OracleSafetyEngine::new(vec![]);
+        gated.set_dex_twap("STELL", 1_000_000);
+        let via_legacy = legacy.resolve_price(None, "STELL", 1_000);
+        let via_gated =
+            gated.resolve_price_at_height(None, "STELL", 1_000, 0, &[0.01; 64], 0.01, 0.005);
+        assert_eq!(via_legacy, via_gated);
+        assert_eq!(
+            legacy.circuit_breaker_triggered,
+            gated.circuit_breaker_triggered
+        );
+    }
+
+    /// Determinism: identical inputs → identical outputs on repeat, on both
+    /// branches; documents the integer/fixed-point discipline (fixed branch
+    /// is exact integer bps; SPRT branch is slice-order IEEE-754, bit-stable
+    /// for identical input order — no wall-clock, no RNG, no map iteration).
+    #[test]
+    fn wired_gate_is_deterministic() {
+        let residuals = [0.01, 0.005, -0.002, 0.012, 0.008];
+        let fixed_a = tier3_breaker_tripped(1_050_000, 1_000_000, 0, &residuals, 0.01, 0.005);
+        let sprt_a =
+            tier3_breaker_tripped(1_000_000, 1_000_000, u64::MAX, &residuals, 0.01, 0.005);
+        for _ in 0..16 {
+            assert_eq!(
+                tier3_breaker_tripped(1_050_000, 1_000_000, 0, &residuals, 0.01, 0.005),
+                fixed_a
+            );
+            assert_eq!(
+                tier3_breaker_tripped(1_000_000, 1_000_000, u64::MAX, &residuals, 0.01, 0.005),
+                sprt_a
+            );
+            assert_eq!(
+                sprt_tier3_llr_sum(&residuals, 0.01, 0.005).to_bits(),
+                sprt_tier3_llr_sum(&residuals, 0.01, 0.005).to_bits()
+            );
+            assert_eq!(
+                sprt_tier3_expected_samples(0.01, 0.005).to_bits(),
+                sprt_tier3_expected_samples(0.01, 0.005).to_bits()
+            );
+        }
     }
 }
 

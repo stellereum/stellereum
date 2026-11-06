@@ -870,6 +870,161 @@ pub fn sortition_seed(prev_block_hash: &[u8; 32], height: Height, round: Round) 
     *hasher.finalize().as_bytes()
 }
 
+// ============================================================================
+// BEACON DRAW (gated-OFF; parent-hash draw above stays the live default)
+// ============================================================================
+//
+// The parent-hash draw (`derive_sortition_committee`) is grindable: the
+// proposer of the parent block chooses its bytes, hence its hash, hence the
+// next committee (papers/13_grinding_and_structural_capture.md §A — `1/P_cap`
+// is ~0.03 s classically at `k=64`). The structural fix is an ungrindable
+// beacon draw seeded by the epoch-bound XMSS-VRF output (`crate::xmss_vrf`,
+// sibling workstream: one leaf per epoch, re-signing an epoch burns the leaf
+// and is slashable, so the beacon cannot be re-rolled).
+//
+// This region is PURE draw logic, gated OFF by default:
+// [`BEACON_DRAW_ACTIVATION_HEIGHT`] is `u64::MAX`, so
+// [`beacon_draw_active_at`] is false at every reachable height and NO caller
+// switches draws until the lead flips the constant at rollout. The two live
+// call sites that would swap (`micro_cert_valid_signers`,
+// `verify_micro_cert`) keep calling `derive_sortition_committee` unchanged.
+// Tests below pin the parent-hash draw green unmodified alongside the new one.
+
+/// Activation height of the beacon draw: `u64::MAX` = never (gated OFF).
+///
+/// The lead flips this to a real height at rollout; until then the
+/// parent-hash draw stays the live default and this draw is test-only.
+pub const BEACON_DRAW_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// Domain separator of the beacon draw. Distinct from
+/// [`SORTITION_DRAW_DOMAIN`] so a beacon draw can never be confused with a
+/// parent-hash draw (different entropy, different epoch binding).
+pub const BEACON_DRAW_DOMAIN: &str = "STELL_SORTITION_BEACON_V1";
+
+/// True once the beacon draw is live at `height` (never, while the
+/// activation constant is `u64::MAX`).
+pub fn beacon_draw_active_at(height: Height) -> bool {
+    #[allow(clippy::absurd_extreme_comparisons)]
+    // GATE: `>=` is the rollout semantic (live at/after the flipped height);
+    // the lint fires only because the constant is currently the never-value
+    // `u64::MAX`, and goes quiet on its own when the lead flips it.
+    { height >= BEACON_DRAW_ACTIVATION_HEIGHT }
+}
+
+/// The per-`(epoch, height, round)` beacon seed:
+/// `BLAKE3("STELL_SORTITION_BEACON_V1" || beacon_output || epoch || height || round)`.
+///
+/// The epoch is bound into the seed (not just the height) so a beacon from
+/// one epoch cannot be replayed as the draw of another: the same
+/// `beacon_output` at the same height in a different epoch seeds a different
+/// draw, and [`beacon_draw_committee`] additionally REFUSES a beacon whose
+/// claimed epoch is not the height's epoch.
+pub fn beacon_seed(
+    beacon_output: &[u8; 32],
+    beacon_epoch: u64,
+    height: Height,
+    round: Round,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(BEACON_DRAW_DOMAIN);
+    hasher.update(beacon_output);
+    hasher.update(&beacon_epoch.to_le_bytes());
+    hasher.update(&height.to_le_bytes());
+    hasher.update(&round.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Beacon-draw committee selector: same shape as
+/// [`derive_sortition_committee`] so callers swap trivially (replace the
+/// `prev_block_hash` argument with the `(beacon_output, beacon_epoch)` pair),
+/// except for the one extra epoch argument that carries the epoch binding.
+///
+/// ENTROPY: `beacon_output` MUST be the epoch-bound XMSS-VRF output for
+/// `beacon_epoch` (`crate::xmss_vrf`, sibling workstream). It is taken as a
+/// parameter — never sampled inside — so the draw is a pure deterministic
+/// function of its inputs (no hidden randomness, no clock, no env).
+///
+/// EPOCH BINDING (fail-closed): the height's epoch is
+/// `crate::mev_epoch::epoch_of_height(height)`; a beacon whose claimed
+/// `beacon_epoch` differs is REFUSED (empty committee), exactly like an empty
+/// set or a zero target. A refused draw elects nobody and therefore can never
+/// reach quorum.
+///
+/// GATED OFF: nothing calls this on any live path until the lead flips
+/// [`BEACON_DRAW_ACTIVATION_HEIGHT`]. The parent-hash draw stays canonical.
+pub fn beacon_draw_committee(
+    validators: &ValidatorSet,
+    height: Height,
+    round: Round,
+    committee_size: u32,
+    beacon_output: &[u8; 32],
+    beacon_epoch: u64,
+) -> Vec<ValidatorId> {
+    // Epoch binding first: a beacon from the wrong epoch is not entropy for
+    // this height — refuse before touching any stake table.
+    if beacon_epoch != crate::mev_epoch::epoch_of_height(height) {
+        return Vec::new();
+    }
+    if committee_size == 0 || validators.is_empty() || validators.total_power() == 0 {
+        return Vec::new();
+    }
+
+    // Filter positive-power validators in canonical sorted order (BTreeMap order)
+    let mut pool: Vec<(ValidatorId, u64)> = validators
+        .validators
+        .iter()
+        .filter(|(_, &p)| p > 0)
+        .map(|(&id, &p)| (id, p))
+        .collect();
+
+    let target_k = (committee_size as usize).min(pool.len());
+    if target_k == 0 {
+        return Vec::new();
+    }
+    if target_k == pool.len() {
+        let mut ids: Vec<ValidatorId> = pool.into_iter().map(|(id, _)| id).collect();
+        ids.sort_unstable();
+        return ids;
+    }
+
+    let mut selected = Vec::with_capacity(target_k);
+    let mut total_power: u64 = pool.iter().map(|(_, p)| *p).sum();
+
+    // Same weighted without-replacement ticket loop as the parent-hash draw,
+    // but seeded by the epoch-bound beacon instead of the parent hash.
+    let seed = beacon_seed(beacon_output, beacon_epoch, height, round);
+
+    for step in 0..target_k {
+        if total_power == 0 || pool.is_empty() {
+            break;
+        }
+
+        let mut hasher = blake3::Hasher::new_derive_key(BEACON_DRAW_DOMAIN);
+        hasher.update(&seed);
+        hasher.update(&(step as u32).to_le_bytes());
+        let hash = hasher.finalize();
+
+        let rand_val = u64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap());
+        let ticket = rand_val % total_power;
+
+        let mut acc = 0u64;
+        let mut chosen_idx = 0;
+        for (idx, (_id, power)) in pool.iter().enumerate() {
+            acc += *power;
+            if ticket < acc {
+                chosen_idx = idx;
+                break;
+            }
+        }
+
+        let (winner_id, winner_power) = pool.remove(chosen_idx);
+        total_power = total_power.saturating_sub(winner_power);
+        selected.push(winner_id);
+    }
+
+    selected.sort_unstable();
+    selected
+}
+
 /// Encode a post-quantum micro-certificate (µQC) into its canonical wire envelope.
 ///
 /// Layout:
@@ -6196,6 +6351,125 @@ mod post_quantum_uqc_tests {
             derive_sortition_committee(&vs, 7, 0, 8, &parent_a),
             derive_sortition_committee(&vs, 7, 0, 8, &parent_a),
         );
+    }
+
+    /// BEACON DRAW (gated OFF): determinism — identical inputs elect the
+    /// identical committee, and the activation gate is closed at every
+    /// reachable height.
+    #[test]
+    fn test_beacon_draw_committee_is_deterministic_and_gated_off() {
+        let mut vs = ValidatorSet::new();
+        for i in 0..16u8 {
+            vs.add([i + 1; 32], 10);
+        }
+        let beacon = [0xBBu8; 32];
+        // Height 7 is in epoch 0 (7 / 128 == 0).
+        let a = beacon_draw_committee(&vs, 7, 0, 8, &beacon, 0);
+        let b = beacon_draw_committee(&vs, 7, 0, 8, &beacon, 0);
+        assert_eq!(a, b, "beacon draw must be strictly deterministic");
+        assert_eq!(a.len(), 8);
+
+        // Gated OFF: the activation height is the never-value, so the live
+        // default stays the parent-hash draw at every reachable height.
+        assert_eq!(BEACON_DRAW_ACTIVATION_HEIGHT, u64::MAX);
+        assert!(!beacon_draw_active_at(0));
+        assert!(!beacon_draw_active_at(1));
+        assert!(!beacon_draw_active_at(u64::MAX - 1));
+    }
+
+    /// BEACON DRAW epoch binding: a beacon from the wrong epoch is REFUSED
+    /// (empty committee — elects nobody, reaches no quorum); the height's own
+    /// epoch draws normally.
+    #[test]
+    fn test_beacon_draw_committee_refuses_a_wrong_epoch() {
+        let mut vs = ValidatorSet::new();
+        for i in 0..16u8 {
+            vs.add([i + 1; 32], 10);
+        }
+        let beacon = [0xBBu8; 32];
+        // Height 7 -> epoch 0: epoch 0 draws, epoch 1 refuses.
+        assert_eq!(crate::mev_epoch::epoch_of_height(7), 0);
+        assert_eq!(beacon_draw_committee(&vs, 7, 0, 8, &beacon, 0).len(), 8);
+        assert!(
+            beacon_draw_committee(&vs, 7, 0, 8, &beacon, 1).is_empty(),
+            "a beacon from epoch 1 must not elect any committee at an epoch-0 height"
+        );
+        // Height 128 -> epoch 1: the binding moves with the height.
+        assert_eq!(crate::mev_epoch::epoch_of_height(128), 1);
+        assert_eq!(beacon_draw_committee(&vs, 128, 0, 8, &beacon, 1).len(), 8);
+        assert!(
+            beacon_draw_committee(&vs, 128, 0, 8, &beacon, 0).is_empty(),
+            "a beacon from epoch 0 must not elect any committee at an epoch-1 height"
+        );
+        // The epoch is bound into the seed itself: same beacon bytes, same
+        // height-shape, different epoch -> different seed.
+        assert_ne!(
+            beacon_seed(&beacon, 0, 7, 0),
+            beacon_seed(&beacon, 1, 7, 0),
+            "the beacon seed must commit to the epoch"
+        );
+    }
+
+    /// BEACON DRAW distribution sanity: stake-weighted without replacement —
+    /// a 90% whale wins ~90% of single-seat draws, and the beacon (not the
+    /// parent hash) moves the committee.
+    #[test]
+    fn test_beacon_draw_committee_is_stake_weighted_and_beacon_sourced() {
+        let mut vs = ValidatorSet::new();
+        let id_a = [0x01; 32];
+        let id_b = [0x02; 32];
+        let id_c = [0x03; 32];
+        let id_d = [0x04; 32];
+        vs.add(id_a, 900);
+        vs.add(id_b, 33);
+        vs.add(id_c, 33);
+        vs.add(id_d, 34);
+
+        let beacon = [0xBBu8; 32];
+        let mut a_selected_count = 0;
+        let trials = 100u64;
+        // Heights 1..=100 are all epoch 0, so one epoch-0 beacon covers them.
+        for h in 1..=trials {
+            let comm = beacon_draw_committee(&vs, h, 0, 1, &beacon, 0);
+            assert_eq!(comm.len(), 1);
+            if comm[0] == id_a {
+                a_selected_count += 1;
+            }
+        }
+        assert!(
+            a_selected_count >= 80,
+            "validator with 90% stake should win beacon sortition >= 80% of trials, got {a_selected_count}"
+        );
+
+        // Beacon-sourced: same height/round, different beacon -> a different
+        // committee for at least one of many rounds (16 equal stakes, 8 seats).
+        let mut vs16 = ValidatorSet::new();
+        for i in 0..16u8 {
+            vs16.add([i + 1; 32], 10);
+        }
+        let beacon_b = [0xCCu8; 32];
+        let mut differs = false;
+        for round in 0..32u32 {
+            let a = beacon_draw_committee(&vs16, 7, round, 8, &beacon, 0);
+            let b = beacon_draw_committee(&vs16, 7, round, 8, &beacon_b, 0);
+            assert_eq!(a.len(), 8);
+            assert_eq!(b.len(), 8);
+            if a != b {
+                differs = true;
+                break;
+            }
+        }
+        assert!(
+            differs,
+            "changing the beacon output must change the elected committee"
+        );
+
+        // Edge cases mirror the parent-hash draw: empty set / zero target /
+        // oversize target behave identically.
+        let empty_vs = ValidatorSet::new();
+        assert!(beacon_draw_committee(&empty_vs, 1, 0, 16, &beacon, 0).is_empty());
+        assert!(beacon_draw_committee(&vs, 1, 0, 0, &beacon, 0).is_empty());
+        assert_eq!(beacon_draw_committee(&vs, 1, 0, 100, &beacon, 0).len(), 4);
     }
 
     /// CROSS-CHAIN REPLAY: a vote signed on one chain id must not verify on

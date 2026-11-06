@@ -13,33 +13,45 @@
 use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use stellereum::consensus::{BlockHash, QuorumCertificate, Vote, VoteKind};
+use stellereum::consensus::{BlockHash, QuorumCertificate, ValidatorSet, VoteKind, VoteSet};
 use stellereum::light_client::{verify_mmr_inclusion, EpochRootAnswer};
 use stellereum::rpc::RpcState;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 
-fn keys() -> Vec<SigningKey> {
-    (0..4)
-        .map(|i| SigningKey::from_bytes(&[i as u8 + 1; 32]))
-        .collect()
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
+fn vset(ks: &[SigningKey]) -> ValidatorSet {
+    ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    )
 }
 
-/// A genuine 3-of-4 precommit QC over `hash` at `height`.
-fn cert(signers: &[SigningKey], height: u64, hash: BlockHash) -> QuorumCertificate {
-    let signatures = signers
-        .iter()
-        .map(|k| {
-            let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(hash));
-            (v.voter, v.signature)
-        })
-        .collect();
-    QuorumCertificate {
-        height,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(hash),
-        signatures,
+/// A genuine 3-of-4 precommit QC over `hash` at `height`, compiled by the
+/// same committee path production uses (`VoteSet::certificate`).
+fn cert(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    height: u64,
+    hash: BlockHash,
+    parent: &[u8; 32],
+) -> QuorumCertificate {
+    let vs = vset(ks);
+    let mut set = VoteSet::new();
+    for i in 0..3 {
+        set.add(
+            falcon_votes::fvote(&ks[i], &fks[i], height, 0, VoteKind::Precommit, Some(hash)),
+            &vs,
+            height,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
     }
+    set.certificate(Some(hash), &vs, parent)
+        .expect("3-of-4 reaches quorum")
 }
 
 fn test_state(tip: u64) -> Arc<RpcState> {
@@ -75,6 +87,7 @@ fn test_state(tip: u64) -> Arc<RpcState> {
 async fn record_epoch(
     st: &Arc<RpcState>,
     ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
     range: std::ops::RangeInclusive<u64>,
 ) -> Vec<BlockHash> {
     let mut hashes = Vec::new();
@@ -98,7 +111,7 @@ async fn record_epoch(
             epoch_key_commitment: [0u8; 32],
         };
         let bh = b.compute_hash();
-        b.precommit_qc = Some(cert(&ks[..3], h, bh));
+        b.precommit_qc = Some(cert(ks, fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
         prev = bh;
         hashes.push(bh);
@@ -119,11 +132,11 @@ fn ok_body(v: &Value) -> &Value {
 /// quorum-signed boundary commitment.
 #[tokio::test]
 async fn stell_get_epoch_root_serves_a_complete_epoch_for_light_clients() {
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let st = test_state(200);
     // Epoch 0: heights 0..=127 (this binary's range — no other test here
     // records these heights).
-    let leaves = record_epoch(&st, &ks, 0..=127).await;
+    let leaves = record_epoch(&st, &ks, &fks, 0..=127).await;
     let (expected_root, expected_peaks) = stellereum::mmr::mmr_root_for_leaves(&leaves);
     assert_eq!(expected_peaks.len(), 1, "128 leaves form a single mountain");
 
@@ -159,7 +172,7 @@ async fn stell_get_epoch_root_serves_a_complete_epoch_for_light_clients() {
         epoch_key_commitment: [0u8; 32],
     };
     let boundary_hash = boundary.compute_hash();
-    boundary.precommit_qc = Some(cert(&ks[..3], 128, boundary_hash));
+    boundary.precommit_qc = Some(cert(&ks, &fks, 128, boundary_hash, &leaves[127]));
     st.record_finalized_header(&boundary).await;
 
     let served = st.call("stell_getEpochRoot", json!({ "epoch": 0 })).await;
@@ -188,10 +201,10 @@ async fn stell_get_epoch_root_serves_a_complete_epoch_for_light_clients() {
 /// epoch, and an epoch this node knows nothing about is an honest miss.
 #[tokio::test]
 async fn stell_get_epoch_root_selectors_and_honest_misses() {
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let st = test_state(900);
     // Epoch 7 (this binary's range): two headers only.
-    record_epoch(&st, &ks, 896..=897).await;
+    record_epoch(&st, &ks, &fks, 896..=897).await;
 
     let by_height_raw = st
         .call("stell_getEpochRoot", json!({ "height": 897 }))
@@ -224,10 +237,10 @@ async fn stell_get_epoch_root_selectors_and_honest_misses() {
 /// light client refuses proofs against it.
 #[tokio::test]
 async fn stell_get_epoch_root_marks_partial_epochs_and_proofs_refuse() {
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let st = test_state(642);
     // Epoch 5 (this binary's range): three of 128 heights.
-    let leaves = record_epoch(&st, &ks, 640..=642).await;
+    let leaves = record_epoch(&st, &ks, &fks, 640..=642).await;
 
     let served_raw = st.call("stell_getEpochRoot", json!({ "epoch": 5 })).await;
     let served = ok_body(&served_raw);

@@ -45,9 +45,8 @@
 use ed25519_dalek::SigningKey;
 use stellereum::consensus::{HeightConsensus, ValidatorSet, Vote, VoteKind};
 
-fn key(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
-}
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 fn id(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
@@ -55,20 +54,46 @@ fn id(k: &SigningKey) -> [u8; 32] {
 
 /// Three validators with SKEWED power [2,1,1] (total 4, quorum 3): the
 /// live-stand shape, where the largest holder alone vetoes every polka.
-fn skewed_set() -> (SigningKey, SigningKey, SigningKey, ValidatorSet) {
-    let (a, b, c) = (key(1), key(2), key(3));
-    let vs = ValidatorSet::from_list(vec![(id(&a), 2), (id(&b), 1), (id(&c), 1)]);
+/// Keys come from the shared Falcon fixture so every vote verifies FULL-PQ.
+fn skewed_set() -> (
+    SigningKey,
+    SigningKey,
+    SigningKey,
+    Vec<stellereum::post_quantum::FalconKeypair>,
+    ValidatorSet,
+) {
+    let (ks, fks) = falcon_votes::falcon_set(3);
+    let vs = ValidatorSet::from_list(vec![(id(&ks[0]), 2), (id(&ks[1]), 1), (id(&ks[2]), 1)]);
     assert_eq!(vs.total_power(), 4);
     assert_eq!(vs.quorum_power(), 3, "floor(2*4/3)+1 = 3");
-    (a, b, c, vs)
+    let mut it = ks.into_iter();
+    (
+        it.next().unwrap(),
+        it.next().unwrap(),
+        it.next().unwrap(),
+        fks,
+        vs,
+    )
 }
 
-fn prevote(k: &SigningKey, h: u64, r: u32, target: Option<[u8; 32]>) -> Vote {
-    Vote::sign(k, h, r, VoteKind::Prevote, target)
+fn prevote(
+    k: &SigningKey,
+    fk: &stellereum::post_quantum::FalconKeypair,
+    h: u64,
+    r: u32,
+    target: Option<[u8; 32]>,
+) -> Vote {
+    falcon_votes::fvote(k, fk, h, r, VoteKind::Prevote, target)
 }
 
-fn precommit(k: &SigningKey, h: u64, r: u32, target: Option<[u8; 32]>) -> Vote {
-    Vote::sign(k, h, r, VoteKind::Precommit, target)
+fn precommit(
+    k: &SigningKey,
+    fk: &stellereum::post_quantum::FalconKeypair,
+    h: u64,
+    r: u32,
+    target: Option<[u8; 32]>,
+) -> Vote {
+    falcon_votes::fvote(k, fk, h, r, VoteKind::Precommit, target)
 }
 
 const X: [u8; 32] = [0x58; 32];
@@ -80,16 +105,16 @@ const Y: [u8; 32] = [0x59; 32];
 /// Byzantine power, which is exactly what this simulates).
 #[test]
 fn locked_node_refuses_a_conflicting_precommit_qc() {
-    let (a, b, c, vs) = skewed_set();
+    let (a, b, c, fks, vs) = skewed_set();
     let mut hc = HeightConsensus::new(1, vs);
     hc.locked = Some((X, 0));
 
     // A full Y quorum at the SAME round as the lock (prevotes + precommits,
     // power 4 >= 3). The unlock scan must NOT release the lock (same round
     // is not a higher round), and finalization must refuse.
-    for k in [&a, &b, &c] {
-        hc.add_prevote(prevote(k, 1, 0, Some(Y))).unwrap();
-        hc.add_precommit(precommit(k, 1, 0, Some(Y))).unwrap();
+    for (k, fk) in [&a, &b, &c].into_iter().zip(&fks) {
+        hc.add_prevote(prevote(k, fk, 1, 0, Some(Y))).unwrap();
+        hc.add_precommit(precommit(k, fk, 1, 0, Some(Y))).unwrap();
     }
     assert_eq!(
         hc.locked,
@@ -109,10 +134,10 @@ fn locked_node_refuses_a_conflicting_precommit_qc() {
 /// prevoted cannot finalize it.
 #[test]
 fn precommit_qc_without_a_same_round_prevote_qc_never_decides() {
-    let (a, b, c, vs) = skewed_set();
+    let (a, b, c, fks, vs) = skewed_set();
     let mut hc = HeightConsensus::new(1, vs);
-    for k in [&a, &b, &c] {
-        hc.add_precommit(precommit(k, 1, 0, Some(X))).unwrap();
+    for (k, fk) in [&a, &b, &c].into_iter().zip(&fks) {
+        hc.add_precommit(precommit(k, fk, 1, 0, Some(X))).unwrap();
     }
     assert_eq!(
         hc.try_precommit_quorum(),
@@ -129,11 +154,11 @@ fn precommit_qc_without_a_same_round_prevote_qc_never_decides() {
 /// it never forms and the height parks.
 #[test]
 fn nil_veto_arithmetic_blocks_every_palka() {
-    let (a, b, c, vs) = skewed_set();
+    let (a, b, c, fks, vs) = skewed_set();
     let mut hc = HeightConsensus::new(1, vs);
-    hc.add_prevote(prevote(&a, 1, 0, None)).unwrap();
-    hc.add_prevote(prevote(&b, 1, 0, Some(Y))).unwrap();
-    hc.add_prevote(prevote(&c, 1, 0, Some(Y))).unwrap();
+    hc.add_prevote(prevote(&a, &fks[0], 1, 0, None)).unwrap();
+    hc.add_prevote(prevote(&b, &fks[1], 1, 0, Some(Y))).unwrap();
+    hc.add_prevote(prevote(&c, &fks[2], 1, 0, Some(Y))).unwrap();
 
     assert_eq!(hc.prevote_set(0).unwrap().power_for(Some(Y)), 2);
     assert_eq!(hc.prevote_set(0).unwrap().power_for(None), 2);
@@ -150,13 +175,13 @@ fn nil_veto_arithmetic_blocks_every_palka() {
 /// on a block finalized in round 0 and finalize a conflicting block later.
 #[test]
 fn nil_quorum_at_a_higher_round_never_unlocks() {
-    let (a, b, c, vs) = skewed_set();
+    let (a, b, c, fks, vs) = skewed_set();
     let mut hc = HeightConsensus::new(1, vs);
     hc.locked = Some((X, 0));
     hc.round = 1; // the node timed out into round 1; the scan covers rounds <= local.
 
-    for k in [&a, &b, &c] {
-        hc.add_prevote(prevote(k, 1, 1, None)).unwrap();
+    for (k, fk) in [&a, &b, &c].into_iter().zip(&fks) {
+        hc.add_prevote(prevote(k, fk, 1, 1, None)).unwrap();
     }
     let found = hc.try_prevote_quorum_at();
     assert_eq!(found, Some((1, None)), "the nil quorum is observed");
@@ -172,13 +197,13 @@ fn nil_quorum_at_a_higher_round_never_unlocks() {
 /// without us after a lost vote).
 #[test]
 fn higher_non_nil_palka_unlocks() {
-    let (a, b, c, vs) = skewed_set();
+    let (a, b, c, fks, vs) = skewed_set();
     let mut hc = HeightConsensus::new(1, vs);
     hc.locked = Some((X, 0));
     hc.round = 1; // the node timed out into round 1; the scan covers rounds <= local.
 
-    for k in [&a, &b, &c] {
-        hc.add_prevote(prevote(k, 1, 1, Some(Y))).unwrap();
+    for (k, fk) in [&a, &b, &c].into_iter().zip(&fks) {
+        hc.add_prevote(prevote(k, fk, 1, 1, Some(Y))).unwrap();
     }
     let found = hc.try_prevote_quorum_at();
     assert_eq!(found, Some((1, Some(Y))));
@@ -194,7 +219,7 @@ fn higher_non_nil_palka_unlocks() {
 /// unlocks B; all three precommit X and decide X. No fork, one decision.
 #[test]
 fn split_locks_converge_on_the_authors_reproposal() {
-    let (a, b, c, vs) = skewed_set();
+    let (a, b, c, fks, vs) = skewed_set();
     let mut ha = HeightConsensus::new(1, vs.clone());
     let mut hb = HeightConsensus::new(1, vs.clone());
     let mut hc = HeightConsensus::new(1, vs);
@@ -221,9 +246,9 @@ fn split_locks_converge_on_the_authors_reproposal() {
 
     // The round's prevotes (A:X, B:nil, C:X) reach every node.
     let votes = vec![
-        prevote(&a, 1, 1, Some(X)),
-        prevote(&b, 1, 1, None),
-        prevote(&c, 1, 1, Some(X)),
+        prevote(&a, &fks[0], 1, 1, Some(X)),
+        prevote(&b, &fks[1], 1, 1, None),
+        prevote(&c, &fks[2], 1, 1, Some(X)),
     ];
     for h in [&mut ha, &mut hb, &mut hc] {
         for v in &votes {
@@ -246,8 +271,8 @@ fn split_locks_converge_on_the_authors_reproposal() {
     // All three precommit X at the polka's round and decide X — one value,
     // no fork.
     for h in [&mut ha, &mut hb, &mut hc] {
-        for k in [&a, &b, &c] {
-            h.add_precommit(precommit(k, 1, 1, Some(X))).unwrap();
+        for (k, fk) in [&a, &b, &c].into_iter().zip(&fks) {
+            h.add_precommit(precommit(k, fk, 1, 1, Some(X))).unwrap();
         }
     }
     assert_eq!(ha.try_precommit_quorum(), Some(X));
@@ -274,7 +299,7 @@ fn split_locks_converge_on_the_authors_reproposal() {
 /// converge.
 #[test]
 fn symmetric_split_lock_never_converges_without_unlocked_power() {
-    let (a, b, _, _) = skewed_set();
+    let (a, b, _, fks, _) = skewed_set();
     let vs22 = ValidatorSet::from_list(vec![(id(&a), 2), (id(&b), 2)]);
     assert_eq!(vs22.quorum_power(), 3, "floor(2*4/3)+1 = 3");
 
@@ -309,10 +334,10 @@ fn symmetric_split_lock_never_converges_without_unlocked_power() {
                 "r{r}: the lock decides the vote (value on match, nil on mismatch)"
             );
         }
-        ha.add_prevote(prevote(&a, 1, r, a_vote)).unwrap();
-        ha.add_prevote(prevote(&b, 1, r, b_vote)).unwrap();
-        hb.add_prevote(prevote(&a, 1, r, a_vote)).unwrap();
-        hb.add_prevote(prevote(&b, 1, r, b_vote)).unwrap();
+        ha.add_prevote(prevote(&a, &fks[0], 1, r, a_vote)).unwrap();
+        ha.add_prevote(prevote(&b, &fks[1], 1, r, b_vote)).unwrap();
+        hb.add_prevote(prevote(&a, &fks[0], 1, r, a_vote)).unwrap();
+        hb.add_prevote(prevote(&b, &fks[1], 1, r, b_vote)).unwrap();
         assert_eq!(
             ha.try_prevote_quorum_at(),
             None,
@@ -324,10 +349,14 @@ fn symmetric_split_lock_never_converges_without_unlocked_power() {
             "r{r}: no polka for either value"
         );
 
-        ha.add_precommit(precommit(&a, 1, r, a_vote)).unwrap();
-        ha.add_precommit(precommit(&b, 1, r, b_vote)).unwrap();
-        hb.add_precommit(precommit(&a, 1, r, a_vote)).unwrap();
-        hb.add_precommit(precommit(&b, 1, r, b_vote)).unwrap();
+        ha.add_precommit(precommit(&a, &fks[0], 1, r, a_vote))
+            .unwrap();
+        ha.add_precommit(precommit(&b, &fks[1], 1, r, b_vote))
+            .unwrap();
+        hb.add_precommit(precommit(&a, &fks[0], 1, r, a_vote))
+            .unwrap();
+        hb.add_precommit(precommit(&b, &fks[1], 1, r, b_vote))
+            .unwrap();
         assert_eq!(ha.try_precommit_quorum(), None, "r{r}: no decision on A");
         assert_eq!(hb.try_precommit_quorum(), None, "r{r}: no decision on B");
     }

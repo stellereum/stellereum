@@ -18,18 +18,17 @@
 //! decide, on nothing but a proposer-grade prevote quorum.
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::sync::Arc;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind, VoteSet};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::Block;
 use stellereum::state_engine::InMemoryStateEngine;
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 const N: usize = 4;
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
-}
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(
         ks.iter()
@@ -68,20 +67,41 @@ fn block(k: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
     b
 }
 
-fn cert_of(ks: &[SigningKey], kind: VoteKind, bh: [u8; 32], n: usize) -> QuorumCertificate {
+// GATE: fixture helper threads parallel signer/key/set slices plus the
+// height/round/kind/hash/n/parent the QC shape needs; splitting it would
+// obscure the call sites that pin each binding.
+#[allow(clippy::too_many_arguments)]
+fn cert_of(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    vs: &ValidatorSet,
+    h: u64,
+    r: u32,
+    kind: VoteKind,
+    bh: [u8; 32],
+    n: usize,
+    parent: &[u8; 32],
+) -> QuorumCertificate {
+    // Genuine committee-compiled QC of the first `n` signers against the full
+    // set `vs`, bound to `parent`; below quorum falls through to the
+    // envelope-less shape, unconditionally invalid under FULL-PQ.
+    let mut set = VoteSet::new();
+    let mut ed_sigs = Vec::new();
+    for (i, k) in ks.iter().enumerate().take(n) {
+        let v = falcon_votes::fvote(k, &fks[i], h, r, kind, Some(bh));
+        if set.add(v.clone(), vs, h, r, kind).is_ok() {
+            ed_sigs.push((v.voter, v.ed25519_signature().to_vec()));
+        }
+    }
+    if let Some(qc) = set.certificate(Some(bh), vs, parent) {
+        return qc;
+    }
     QuorumCertificate {
-        height: 1,
-        round: 0,
+        height: h,
+        round: r,
         kind,
         block_hash: Some(bh),
-        signatures: ks
-            .iter()
-            .take(n)
-            .map(|k| {
-                let v = Vote::sign(k, 1, 0, kind, Some(bh));
-                (v.voter, v.signature)
-            })
-            .collect(),
+        signatures: ed_sigs,
     }
 }
 
@@ -89,7 +109,7 @@ fn cert_of(ks: &[SigningKey], kind: VoteKind, bh: [u8; 32], n: usize) -> QuorumC
 
 #[tokio::test]
 async fn hunt_finding_15_adopt_committed_refuses_a_prevote_quorum() {
-    let ks = keys(N);
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let mut rt = node(&ks).await;
     let root = rt.state.get_state_root().await;
     let proposer = ks[1].clone();
@@ -99,8 +119,9 @@ async fn hunt_finding_15_adopt_committed_refuses_a_prevote_quorum() {
     // The proposer broadcasts a block. Three honest validators PREVOTE it and
     // stop there -- no precommit quorum is ever reached, so the network NEVER
     // decides this block.
-    let prevotes = cert_of(&ks, VoteKind::Prevote, bh, 3);
-    let precommits = cert_of(&ks, VoteKind::Precommit, bh, 3);
+    let vs = rt.validators.clone();
+    let prevotes = cert_of(&ks, &fks, &vs, 1, 0, VoteKind::Prevote, bh, 3, &[0u8; 32]);
+    let precommits = cert_of(&ks, &fks, &vs, 1, 0, VoteKind::Precommit, bh, 3, &[0u8; 32]);
     println!(
         "[FINDING 15] prevote QC verifies:   {}",
         prevotes.verify(&rt.validators)
@@ -156,18 +177,19 @@ async fn hunt_finding_15_adopt_committed_refuses_a_prevote_quorum() {
 async fn hunt_finding_15b_the_precommit_quorum_is_not_required_at_all() {
     // Same attack, one fewer signature: 2 of 4 is BELOW the precommit quorum but
     // still... let's check what verify() says. (4 validators, quorum_power 3.)
-    let ks = keys(N);
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let rt = node(&ks).await;
+    let vs = rt.validators.clone();
     let bh = [0x21u8; 32];
     for n in 1..=N {
-        let c = cert_of(&ks, VoteKind::Prevote, bh, n);
+        let c = cert_of(&ks, &fks, &vs, 1, 0, VoteKind::Prevote, bh, n, &[0u8; 32]);
         println!(
             "[FINDING 15b] prevote QC with {n} signature(s) verifies: {}",
             c.verify(&rt.validators)
         );
     }
     for n in 1..=N {
-        let c = cert_of(&ks, VoteKind::Precommit, bh, n);
+        let c = cert_of(&ks, &fks, &vs, 1, 0, VoteKind::Precommit, bh, n, &[0u8; 32]);
         println!(
             "[FINDING 15b] precommit QC with {n} signature(s) verifies: {}",
             c.verify(&rt.validators)
@@ -175,8 +197,10 @@ async fn hunt_finding_15b_the_precommit_quorum_is_not_required_at_all() {
     }
     // Both curves are identical: `kind` is not consulted at all.
     for n in 1..=N {
-        let p = cert_of(&ks, VoteKind::Prevote, bh, n).verify(&rt.validators);
-        let c = cert_of(&ks, VoteKind::Precommit, bh, n).verify(&rt.validators);
+        let p = cert_of(&ks, &fks, &vs, 1, 0, VoteKind::Prevote, bh, n, &[0u8; 32])
+            .verify(&rt.validators);
+        let c = cert_of(&ks, &fks, &vs, 1, 0, VoteKind::Precommit, bh, n, &[0u8; 32])
+            .verify(&rt.validators);
         assert_eq!(
             p, c,
             "kind must not change the verdict, yet it must not change finality either"
@@ -191,7 +215,7 @@ async fn hunt_finding_16_adopt_committed_binds_the_certificate_height() {
     // A certificate minted for a different height is accepted as long as its
     // block_hash matches. The block hash binds the height, so this is currently
     // contained -- but the check the code obviously intends is simply absent.
-    let ks = keys(N);
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let mut rt = node(&ks).await;
     let root = rt.state.get_state_root().await;
     let blk = block(&ks[1], 1, [0u8; 32], root);
@@ -199,20 +223,18 @@ async fn hunt_finding_16_adopt_committed_binds_the_certificate_height() {
 
     // A quorum that genuinely signed a PRECOMMIT for (height 99999, round 77,
     // block B). Every signature is real and verifies over its own height/round.
-    let far = QuorumCertificate {
-        height: 99_999,
-        round: 77,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: ks
-            .iter()
-            .take(3)
-            .map(|k| {
-                let v = Vote::sign(k, 99_999, 77, VoteKind::Precommit, Some(bh));
-                (v.voter, v.signature)
-            })
-            .collect(),
-    };
+    let vs = rt.validators.clone();
+    let far = cert_of(
+        &ks,
+        &fks,
+        &vs,
+        99_999,
+        77,
+        VoteKind::Precommit,
+        bh,
+        3,
+        &[0u8; 32],
+    );
     assert!(
         far.verify(&rt.validators),
         "the signatures are genuine over height 99999"

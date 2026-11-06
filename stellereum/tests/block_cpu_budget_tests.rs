@@ -29,6 +29,9 @@ use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::storage::Storage;
 use stellereum::svm::GAS_BASIC_TRANSFER;
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 const TS: u64 = 9_000_000_007;
 const BAL: u64 = 1_000_000_000_000;
 const RECIPIENT: [u8; 32] = [9u8; 32];
@@ -163,7 +166,7 @@ async fn measure_n(n: usize) -> BudgetRow {
     // QC-assemble + QC-verify: 4-validator committee, fresh votes per rep
     // (fresh signatures defeat the verified-vote cache, so every rep pays
     // real crypto). Assembly = admit + certify; verification = full QC check.
-    let vkeys: Vec<SigningKey> = (0..4u64).map(|i| det_key(800_000 + i)).collect();
+    let (vkeys, vfks) = falcon_votes::falcon_set(4);
     let vids: Vec<[u8; 32]> = vkeys.iter().map(|k| k.verifying_key().to_bytes()).collect();
     let vs = ValidatorSet::from_list(vids.iter().map(|id| (*id, 1)).collect());
     let mut qc_asm = Vec::with_capacity(REPS);
@@ -171,7 +174,17 @@ async fn measure_n(n: usize) -> BudgetRow {
     for r in 0..REPS {
         let votes: Vec<Vote> = vkeys
             .iter()
-            .map(|k| Vote::sign(k, 1, r as u32, VoteKind::Precommit, Some(block_hash)))
+            .enumerate()
+            .map(|(i, k)| {
+                falcon_votes::fvote(
+                    k,
+                    &vfks[i],
+                    1,
+                    r as u32,
+                    VoteKind::Precommit,
+                    Some(block_hash),
+                )
+            })
             .collect();
         let t = Instant::now();
         let mut set = VoteSet::new();

@@ -94,6 +94,20 @@ pub const GAS_STAKE_BOND: u64 = 2_000;
 pub const GAS_STAKE_UNBOND: u64 = 800;
 /// Gas to claim staking rewards.
 pub const GAS_STAKE_CLAIM: u64 = 600;
+/// Gas for `OpCode::SysCallGovPropose`: the ledger scan + electorate snapshot
+/// write plus the proposer's stake lock, the most expensive gov op. Anchored
+/// to [`GAS_STAKE_BOND`] (same shape: stake read + ledger write), per the
+/// gov block-carried design (§1: propose = bond scale). Rule: propose ≥ vote
+/// (pinned below); spam is bounded by the 10k-STELL propose gate + the
+/// admission base-fee floor, not by this table entry (gov ops move no
+/// tokens, so the token-transfer floor rule does not apply).
+pub const GAS_GOV_PROPOSE: u64 = 2_000;
+/// Gas for `OpCode::SysCallGovVote`: a single map insert/update (tally +
+/// weight snapshot + stake lock), the cheapest gov op. Anchored to
+/// [`GAS_STAKE_CLAIM`] (same shape: single ledger touch), per the gov
+/// block-carried design (§1: vote = claim scale).
+pub const GAS_GOV_VOTE: u64 = 600;
+const _: () = assert!(GAS_GOV_PROPOSE >= GAS_GOV_VOTE);
 /// Gas charged per PRICE LEVEL an order crosses during matching.
 /// Anti-DoS: matching work scales with levels crossed, so gas must too.
 pub const GAS_PER_MATCH_LEVEL: u64 = 40;
@@ -406,6 +420,15 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         // Same bond work as `SysCallStake` (floor check, ledger bond,
         // pool move): same price, no discount for naming a commission.
         OpCode::SysCallStakeWithCommission { .. } => GAS_STAKE_BOND,
+        // Gov ops (appended at the enum end, never inserted above): fixed
+        // carrier price from the `GAS_GOV_*` consts beside the enum. The
+        // authoritative apply is the state-engine scan
+        // (`InMemoryStateEngine::apply_gov_ops`), which enforces the
+        // activation gate and the full validation; the dispatch arms below
+        // are pure carriers (charge + push) so every existing payload prices
+        // byte-identically (no existing payload carries these discriminants).
+        OpCode::SysCallGovPropose { .. } => GAS_GOV_PROPOSE,
+        OpCode::SysCallGovVote { .. } => GAS_GOV_VOTE,
         OpCode::Halt => GAS_HALT,
     }
 }
@@ -999,6 +1022,44 @@ pub enum OpCode {
         validator: [u8; 32],
         amount: u64,
         commission_bps: u64,
+    },
+    // APPEND, never insert above: same bincode-discriminant rule as every
+    // variant above (see the comment on `SysCallSubmitPriceFeed`). Appending
+    // is what keeps every already-signed payload and every pinned tx hash
+    // byte-identical while an old node's decoder fails closed on these bytes.
+    //
+    // BLOCK-CARRIED GOVERNANCE (K2 contract: K2 builds these txs in rpc from
+    // the enum NAMES, so the names + field shapes below are the contract).
+    // The sender is ALWAYS `ctx.sender` (the tx signer) — never an opcode
+    // field, so the proposer/voter cannot be forged. The authoritative apply
+    // is `InMemoryStateEngine::apply_gov_ops` (activation-gated, pure
+    // function of state + block); the dispatch arms below are pure carriers.
+    /// Block-carried governance proposal. The authoritative scan requires
+    /// `proposal_id == governance.next_id` (duplicates/stale/future ids
+    /// refuse fail-closed), `height_observed == block.height` (cross-height
+    /// replay refuses), and then runs the direct path
+    /// (`Governance::propose` with `sender = tx.from`, `now =
+    /// block.timestamp`): same title/action/stake validation, same
+    /// electorate snapshot + proposer lock. Any refusal reverts nothing
+    /// except the reporter's gas (the scan never fails the block).
+    SysCallGovPropose {
+        proposal_id: u64,
+        title: String,
+        action: Box<crate::governance::GovAction>,
+        height_observed: u64,
+    },
+    // APPEND, never insert above: same bincode-discriminant rule as above.
+    /// Block-carried governance vote. The authoritative scan requires
+    /// `height_observed == block.height`, then runs the direct path
+    /// (`Governance::vote` with `voter = tx.from`, `now = block.timestamp`):
+    /// same voting-window check (closed refuses), same one-vote rule
+    /// (a different choice refuses `AlreadyVoted`; a same-choice replay is
+    /// idempotent, exactly as the direct path), same snapshot-weighted tally
+    /// + stake lock. Any refusal moves nothing except the reporter's gas.
+    SysCallGovVote {
+        proposal_id: u64,
+        choice: crate::governance::VoteChoice,
+        height_observed: u64,
     },
 }
 
@@ -2904,6 +2965,24 @@ impl Svm {
                                 .to_string(),
                         );
                     }
+                    state.stack.push(1);
+                }
+                // PURE CARRIER (gov block-carried wiring — see the `OpCode`
+                // docs above): charge the fixed `GAS_GOV_*` price and succeed.
+                // Moves NO coins and touches NO ledger state here: the
+                // authoritative apply is `InMemoryStateEngine::apply_gov_ops`,
+                // which scans the decided block and re-derives every verdict
+                // from block bytes alone (gate, height pin, duplicate/window/
+                // one-vote rules). Keeping the carrier state-free is what
+                // makes pre-activation byte-identical (no existing payload
+                // carries these discriminants) and what keeps a reverted
+                // carrier from ever half-applying governance.
+                OpCode::SysCallGovPropose { .. } => {
+                    charge!(GAS_GOV_PROPOSE);
+                    state.stack.push(1);
+                }
+                OpCode::SysCallGovVote { .. } => {
+                    charge!(GAS_GOV_VOTE);
                     state.stack.push(1);
                 }
             }

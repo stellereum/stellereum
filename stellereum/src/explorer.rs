@@ -1568,6 +1568,21 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
             "stake-with-commission validator={} amount={amount} commission_bps={commission_bps}",
             hex::encode(validator)
         ),
+        // Block-carried governance (appended OpCode variants): indexed labels
+        // only, same bounded-text rule as every arm above (title truncated,
+        // no byte blobs echoed). Required for exhaustiveness: the variants
+        // were appended at the enum end, so this match must name them.
+        Op::SysCallGovPropose {
+            proposal_id, title, ..
+        } => format!(
+            "gov-propose id={proposal_id} title={}",
+            truncate_text(title, 64)
+        ),
+        Op::SysCallGovVote {
+            proposal_id,
+            choice,
+            ..
+        } => format!("gov-vote id={proposal_id} choice={choice:?}"),
         Op::Reserved33ConfidentialTransfer
         | Op::Reserved40ConfidentialTransfer2
         | Op::Reserved41ConfidentialShield

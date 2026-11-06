@@ -20,7 +20,7 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use stellereum::consensus::{QuorumCertificate, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, VoteKind};
 use stellereum::consensus_net::{
     inbound_bulk_burst_bytes, inbound_bulk_bytes_per_sec, inbound_is_critical, pace_due,
     pace_wait_ms, ConsensusMsg, InboundBulkLimiter, InboundDecision,
@@ -39,6 +39,9 @@ use stellereum::network::{
     REPL_STORE_MAX_ATTEMPTS_DEFAULT, REPL_STORE_TIMEOUT_MS_DEFAULT,
 };
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 // ==================== network: defaults & env parsing ====================
 
@@ -325,9 +328,9 @@ fn sample_block() -> Block {
 }
 
 fn sample_vote() -> ConsensusMsg {
-    let sk = SigningKey::generate(&mut OsRng);
+    let (sks, fks) = falcon_votes::falcon_set(1);
     ConsensusMsg::Vote {
-        vote: Vote::sign(&sk, 1, 0, VoteKind::Prevote, None),
+        vote: falcon_votes::fvote(&sks[0], &fks[0], 1, 0, VoteKind::Prevote, None),
         locked: None,
     }
 }

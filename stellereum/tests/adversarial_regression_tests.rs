@@ -13,7 +13,9 @@ use rand::rngs::OsRng;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use stellereum::consensus::{HeightConsensus, QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{
+    HeightConsensus, QuorumCertificate, ValidatorSet, Vote, VoteKind, VoteSet,
+};
 use stellereum::orderbook::{OrderSide, OrderType};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
@@ -24,6 +26,9 @@ use stellereum::sync::{collect_missing_blocks, validate_sync_chain};
 use stellereum::token::{TokenMetadata, TokenOp};
 
 const NANO: u64 = 1_000_000_000;
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 /// Bond floor every bond in this file must clear: bare-MIN bonds are refused.
 fn floor() -> u64 {
@@ -82,22 +87,39 @@ fn mkblock(signer: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block
 
 fn precommit_qc(
     ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
     idx: &[usize],
     height: u64,
     hash: [u8; 32],
+    parent: &[u8; 32],
 ) -> QuorumCertificate {
+    // FULL-PQ: a QC verifies only with the PQ envelope, so it is compiled by
+    // the same committee path production uses (`VoteSet::certificate`); the
+    // envelope embeds `parent`, which must be the block's real prev_hash on
+    // the sync path (`binds_to_parent`).
+    let vs = vset(ks);
+    let mut set = VoteSet::new();
+    for &i in idx {
+        set.add(
+            falcon_votes::fvote(&ks[i], &fks[i], height, 0, VoteKind::Precommit, Some(hash)),
+            &vs,
+            height,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
+    }
+    if let Some(qc) = set.certificate(Some(hash), &vs, parent) {
+        return qc;
+    }
+    // Below quorum no envelope can be compiled; the envelope-less shape is
+    // unconditionally invalid under FULL-PQ (fail-closed, as asserted).
     QuorumCertificate {
         height,
         round: 0,
         kind: VoteKind::Precommit,
         block_hash: Some(hash),
-        signatures: idx
-            .iter()
-            .map(|&i| {
-                let v = Vote::sign(&ks[i], height, 0, VoteKind::Precommit, Some(hash));
-                (v.voter, v.signature)
-            })
-            .collect(),
+        signatures: vec![],
     }
 }
 
@@ -624,6 +646,8 @@ async fn adv_sync_refuses_chain_signed_only_by_non_members() {
             signatures: atk
                 .iter()
                 .map(|k| {
+                    // NEGATIVE-PATH (forgery): non-member Ed-only votes stay
+                    // unconditionally invalid under FULL-PQ — do not convert.
                     let v = Vote::sign(k, 8 + i, 0, VoteKind::Precommit, Some(bh));
                     (v.voter, v.signature)
                 })
@@ -643,7 +667,7 @@ async fn adv_sync_refuses_chain_signed_only_by_non_members() {
 
 #[tokio::test]
 async fn adv_sync_refuses_power_below_quorum() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     assert_eq!(vs.quorum_power(), 3);
     let our_last = [0x11u8; 32];
@@ -655,7 +679,7 @@ async fn adv_sync_refuses_power_below_quorum() {
         let mut b = mkblock(&ks[0], 8 + i, prev, root);
         let bh = b.compute_hash();
         // Only ONE genuine member signed: power 1 < quorum 3.
-        b.precommit_qc = Some(precommit_qc(&ks, &[0], 8 + i, bh));
+        b.precommit_qc = Some(precommit_qc(&ks, &fks, &[0], 8 + i, bh, &prev));
         assert!(!b.precommit_qc.as_ref().unwrap().verify(&vs));
         prev = b.compute_hash();
         chain.push(b);
@@ -676,7 +700,7 @@ async fn adv_sync_refuses_power_below_quorum() {
             .expect("proposer is a member");
         let mut b = mkblock(signer, h, prev, root);
         let bh = b.compute_hash();
-        b.precommit_qc = Some(precommit_qc(&ks, &[0, 1, 2], h, bh));
+        b.precommit_qc = Some(precommit_qc(&ks, &fks, &[0, 1, 2], h, bh, &prev));
         prev = b.compute_hash();
         good.push(b);
     }
@@ -691,24 +715,38 @@ async fn adv_sync_refuses_power_below_quorum() {
 
 #[tokio::test]
 async fn adv_cannot_finalize_a_block_never_received() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vs, 1_000_000_000_000_000).await;
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), st.clone(), 1);
 
     let phantom = blake3::hash(b"attacker-chosen-block-contents").into();
-    for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(phantom)))
-            .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            0,
+            VoteKind::Prevote,
+            Some(phantom),
+        ))
+        .unwrap();
     }
     assert!(
         rt.hc.try_prevote_quorum().is_some(),
         "prevote quorum exists"
     );
-    for k in ks.iter().take(3) {
-        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(phantom)))
-            .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        rt.on_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            0,
+            VoteKind::Precommit,
+            Some(phantom),
+        ))
+        .unwrap();
     }
     assert!(
         !rt.blocks.contains_key(&phantom),
@@ -732,7 +770,7 @@ async fn adv_cannot_finalize_a_block_never_received() {
 
 #[tokio::test]
 async fn adv_cannot_decide_on_precommits_with_no_prevotes() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     // Block IS present (isolates the quorum check from the presence check).
     let st = Arc::new(InMemoryStateEngine::new());
@@ -742,9 +780,16 @@ async fn adv_cannot_decide_on_precommits_with_no_prevotes() {
     let held_hash = held.compute_hash();
     rt.blocks.insert(held_hash, held);
     // Three genuine precommits, ZERO prevotes.
-    for k in ks.iter().take(3) {
-        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(held_hash)))
-            .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        rt.on_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            0,
+            VoteKind::Precommit,
+            Some(held_hash),
+        ))
+        .unwrap();
     }
     assert!(rt.hc.prevote_qc.is_empty(), "precondition: zero prevotes");
     assert_eq!(
@@ -762,7 +807,7 @@ async fn adv_cannot_decide_on_precommits_with_no_prevotes() {
 
 #[tokio::test]
 async fn adv_cannot_decide_when_prevotes_and_precommits_disagree() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vs, 1_000_000_000_000_000).await;
@@ -770,13 +815,20 @@ async fn adv_cannot_decide_when_prevotes_and_precommits_disagree() {
 
     let a = bh(0xA1);
     let b = bh(0xB2);
-    for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(a)))
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        rt.on_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(a)))
             .unwrap();
     }
-    for k in ks.iter().take(3) {
-        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(b)))
-            .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        rt.on_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            0,
+            VoteKind::Precommit,
+            Some(b),
+        ))
+        .unwrap();
     }
     let blk = mkblock(&ks[0], 1, [0u8; 32], st.get_state_root().await);
     let blk_hash = blk.compute_hash();
@@ -793,7 +845,7 @@ async fn adv_cannot_decide_when_prevotes_and_precommits_disagree() {
 
 #[tokio::test]
 async fn adv_cannot_decide_against_an_existing_lock() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vs, 1_000_000_000_000_000).await;
@@ -801,13 +853,20 @@ async fn adv_cannot_decide_against_an_existing_lock() {
 
     rt.hc.locked = Some((bh(0xA1), 0));
     let b = bh(0xB2);
-    for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(b)))
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        rt.on_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(b)))
             .unwrap();
     }
-    for k in ks.iter().take(3) {
-        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(b)))
-            .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        rt.on_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            0,
+            VoteKind::Precommit,
+            Some(b),
+        ))
+        .unwrap();
     }
     let blk = mkblock(&ks[0], 1, [0u8; 32], st.get_state_root().await);
     rt.blocks.insert(blk.compute_hash(), blk);
@@ -836,7 +895,7 @@ fn adv_single_far_future_round_buys_at_most_one() {
 #[test]
 fn adv_five_hundred_far_future_rounds_buy_at_most_500() {
     use stellereum::consensus::MAX_ROUND_AHEAD;
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(1, vs.clone());
     for i in 0..500u32 {
@@ -852,9 +911,16 @@ fn adv_five_hundred_far_future_rounds_buy_at_most_500() {
     let r = hc.round;
     let proposer = vs.proposer_for(1, r).unwrap();
     hc.receive_proposal(proposer, bh(2)).unwrap();
-    for k in ks.iter() {
-        hc.add_prevote(Vote::sign(k, 1, r, VoteKind::Prevote, Some(bh(2))))
-            .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            r,
+            VoteKind::Prevote,
+            Some(bh(2)),
+        ))
+        .unwrap();
     }
     assert!(hc.try_prevote_quorum().is_some());
 }
@@ -879,22 +945,26 @@ async fn adopt_fixture(ks: &[SigningKey]) -> (ValidatorRuntime, Block, [u8; 32])
 // 6a. Adopt with a prevote-kind cert (src/runtime.rs kind check).
 #[tokio::test]
 async fn adv_adopt_refuses_prevote_kind_cert() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let (mut rt, block, hash) = adopt_fixture(&ks).await;
-    let cert = QuorumCertificate {
-        height: 1,
-        round: 0,
-        kind: VoteKind::Prevote,
-        block_hash: Some(hash),
-        signatures: ks
-            .iter()
-            .take(3)
-            .map(|k| {
-                let v = Vote::sign(k, 1, 0, VoteKind::Prevote, Some(hash));
-                (v.voter, v.signature)
-            })
-            .collect(),
-    };
+    // FULL-PQ: a QC verifies only with the PQ envelope, so the (genuine,
+    // prevote-kind) cert is compiled by the committee path production uses.
+    let vs = vset(&ks);
+    let mut set = VoteSet::new();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        set.add(
+            falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(hash)),
+            &vs,
+            1,
+            0,
+            VoteKind::Prevote,
+        )
+        .expect("genuine vote admits");
+    }
+    let cert = set
+        .certificate(Some(hash), &vs, &[0u8; 32])
+        .expect("3-of-4 prevotes reach quorum");
+    assert_eq!(cert.kind, VoteKind::Prevote);
     assert!(cert.verify(&rt.validators), "prevote QC self-consistent");
     let r = rt.adopt_committed(1, block, cert).await;
     assert!(r.is_err(), "prevote cert must not finalize: {r:?}");
@@ -906,22 +976,27 @@ async fn adv_adopt_refuses_prevote_kind_cert() {
 // 6b. Adopt with cert height != block height (src/runtime.rs height binding).
 #[tokio::test]
 async fn adv_adopt_refuses_wrong_height_cert() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let (mut rt, block, hash) = adopt_fixture(&ks).await;
-    let cert = QuorumCertificate {
-        height: 999,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(hash),
-        signatures: ks
-            .iter()
-            .take(3)
-            .map(|k| {
-                let v = Vote::sign(k, 999, 0, VoteKind::Precommit, Some(hash));
-                (v.voter, v.signature)
-            })
-            .collect(),
-    };
+    // FULL-PQ: the (genuine, height-999) cert is compiled by the committee
+    // path production uses, so it verifies and the height binding is what
+    // refuses the adoption.
+    let vs = vset(&ks);
+    let mut set = VoteSet::new();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        set.add(
+            falcon_votes::fvote(k, fk, 999, 0, VoteKind::Precommit, Some(hash)),
+            &vs,
+            999,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
+    }
+    let cert = set
+        .certificate(Some(hash), &vs, &[0u8; 32])
+        .expect("3-of-4 precommits reach quorum");
+    assert_eq!(cert.height, 999);
     assert!(cert.verify(&rt.validators));
     let r = rt.adopt_committed(1, block, cert).await;
     assert!(r.is_err(), "wrong-height cert must not finalize: {r:?}");
@@ -932,7 +1007,7 @@ async fn adv_adopt_refuses_wrong_height_cert() {
 // 6c. Adopt with a non-scheduled proposer (src/runtime.rs proposer check).
 #[tokio::test]
 async fn adv_adopt_refuses_non_scheduled_proposer() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vs, 1_000_000_000_000_000).await;
@@ -942,7 +1017,7 @@ async fn adv_adopt_refuses_non_scheduled_proposer() {
     let imposter = ks.iter().find(|k| id(k) != real).unwrap().clone();
     let block = mkblock(&imposter, 1, [0u8; 32], st.get_state_root().await);
     let hash = block.compute_hash();
-    let cert = precommit_qc(&ks, &[0, 1, 2], 1, hash);
+    let cert = precommit_qc(&ks, &fks, &[0, 1, 2], 1, hash, &[0u8; 32]);
     assert!(cert.verify(&vs));
     let r = rt.adopt_committed(1, block, cert).await;
     assert!(r.is_err(), "imposter block must not be adopted: {r:?}");
@@ -953,7 +1028,7 @@ async fn adv_adopt_refuses_non_scheduled_proposer() {
 // 6d. Adopt with a fabricated state root (src/runtime.rs state-root binding).
 #[tokio::test]
 async fn adv_adopt_refuses_fabricated_state_root() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let (mut rt, mut block, hash) = adopt_fixture(&ks).await;
     block.state_root = [0xABu8; 32];
     // Re-sign after mutating the header so the failure is the root, not the sig.
@@ -963,7 +1038,7 @@ async fn adv_adopt_refuses_fabricated_state_root() {
     block.sign_block(&pk);
     let hash2 = block.compute_hash();
     let _ = hash;
-    let cert = precommit_qc(&ks, &[0, 1, 2], 1, hash2);
+    let cert = precommit_qc(&ks, &fks, &[0, 1, 2], 1, hash2, &[0u8; 32]);
     let r = rt.adopt_committed(1, block, cert).await;
     assert!(r.is_err(), "fabricated root must be refused: {r:?}");
     assert!(r.unwrap_err().contains("parent state root"));
@@ -975,9 +1050,18 @@ async fn adv_adopt_refuses_fabricated_state_root() {
 //     self.validators; no set parameter exists).
 #[tokio::test]
 async fn adv_adopt_uses_only_the_local_validator_set() {
-    let ks = keys(4);
+    let (ks, _fks) = falcon_votes::falcon_set(4);
     let real = vset(&ks);
+    // Fresh attacker key, distinct from the committee (as before); its Falcon
+    // companion is registered so the 1-of-1 cert below genuinely verifies
+    // under the forged set.
     let attacker = SigningKey::generate(&mut OsRng);
+    let attacker_fk = stellereum::post_quantum::FalconKeypair::generate_from_seed(0xE0);
+    stellereum::consensus::register_validator_pq_key(
+        id(&attacker),
+        stellereum::post_quantum::PqScheme::Falcon512,
+        attacker_fk.public_key.clone(),
+    );
     let forged = ValidatorSet::from_list(vec![(id(&attacker), 1)]);
 
     let st = Arc::new(InMemoryStateEngine::new());
@@ -987,14 +1071,27 @@ async fn adv_adopt_uses_only_the_local_validator_set() {
     let pk = ks.iter().find(|k| id(k) == proposer_id).unwrap().clone();
     let block = mkblock(&pk, 1, [0u8; 32], st.get_state_root().await);
     let hash = block.compute_hash();
-    let v = Vote::sign(&attacker, 1, 0, VoteKind::Precommit, Some(hash));
-    let cert = QuorumCertificate {
-        height: 1,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(hash),
-        signatures: vec![(v.voter, v.signature)],
-    };
+    // FULL-PQ: the attacker's 1-of-1 cert is compiled by the committee path
+    // under the FORGED set, so it genuinely verifies there (and only there).
+    let mut aset = VoteSet::new();
+    aset.add(
+        falcon_votes::fvote(
+            &attacker,
+            &attacker_fk,
+            1,
+            0,
+            VoteKind::Precommit,
+            Some(hash),
+        ),
+        &forged,
+        1,
+        0,
+        VoteKind::Precommit,
+    )
+    .expect("genuine vote admits");
+    let cert = aset
+        .certificate(Some(hash), &forged, &[0u8; 32])
+        .expect("1-of-1 reaches quorum under the forged set");
     assert!(!cert.verify(&real), "worthless against the real set");
     assert!(cert.verify(&forged), "valid against the attacker set");
 
@@ -1011,7 +1108,7 @@ async fn adv_adopt_uses_only_the_local_validator_set() {
 
 #[tokio::test]
 async fn adv_equivocation_replay_does_not_compound() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vs, 1_000_000_000_000_000).await;
@@ -1020,8 +1117,8 @@ async fn adv_equivocation_replay_does_not_compound() {
     let victim = ks[3].clone();
     let vid = id(&victim);
 
-    let a = Vote::sign(&victim, 1, 0, VoteKind::Prevote, Some(bh(0xA1)));
-    let b = Vote::sign(&victim, 1, 0, VoteKind::Prevote, Some(bh(0xA2)));
+    let a = falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA1)));
+    let b = falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA2)));
     for _ in 0..200u32 {
         rt.on_prevote(a.clone()).unwrap();
         rt.on_prevote(b.clone()).unwrap();
@@ -1205,7 +1302,9 @@ async fn adv_grafted_vote_signatures_are_not_a_decision_proof() {
     let mut grafted = probe.clone();
     // Keep the proposer's genuine block signature (so the proposer check passes
     // and the QC check is what refuses), and graft a quorum of real vote
-    // signatures alongside it.
+    // signatures alongside it. NEGATIVE-PATH (forgery): grafted as BLOCK
+    // signatures, these must fail the block-sig check on the message, so they
+    // stay Ed-only — do not convert.
     for k in ks.iter().take(3) {
         let v = Vote::sign(k, 8, 0, VoteKind::Precommit, Some(probe_hash));
         grafted.validator_signatures.push((v.voter, v.signature));
@@ -1222,6 +1321,7 @@ async fn adv_grafted_vote_signatures_are_not_a_decision_proof() {
         for i in 0..4u64 {
             let mut g = mkblock(&ks[0], 8 + i, prev, root);
             let h = g.compute_hash();
+            // NEGATIVE-PATH (forgery, same as above): do not convert.
             for k in ks.iter().take(3) {
                 let v = Vote::sign(k, 8 + i, 0, VoteKind::Precommit, Some(h));
                 g.validator_signatures.push((v.voter, v.signature));

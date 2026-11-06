@@ -15,18 +15,16 @@
 //! others never saw.
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::sync::Arc;
-use stellereum::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, VoteKind, VoteSet};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
 
-const BAL: u64 = 10_000_000_000_000;
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
-}
+const BAL: u64 = 10_000_000_000_000;
 
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(
@@ -76,26 +74,35 @@ fn proposer_key<'a>(ks: &'a [SigningKey], vs: &ValidatorSet, h: u64, r: u32) -> 
         .expect("schedule proposer is one of our keys")
 }
 
-/// A genuine precommit certificate over `bh` signed by every validator in `ks`.
-fn full_precommit_qc(ks: &[SigningKey], h: u64, r: u32, bh: [u8; 32]) -> QuorumCertificate {
-    QuorumCertificate {
-        height: h,
-        round: r,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: ks
-            .iter()
-            .map(|k| {
-                let v = Vote::sign(k, h, r, VoteKind::Precommit, Some(bh));
-                (v.voter, v.signature)
-            })
-            .collect(),
+/// A genuine precommit certificate over `bh` signed by every validator in
+/// `ks`, compiled by the production committee path and bound to `parent`.
+fn full_precommit_qc(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    h: u64,
+    r: u32,
+    bh: [u8; 32],
+    parent: &[u8; 32],
+) -> QuorumCertificate {
+    let vs = vset(ks);
+    let mut set = VoteSet::new();
+    for (i, k) in ks.iter().enumerate() {
+        set.add(
+            falcon_votes::fvote(k, &fks[i], h, r, VoteKind::Precommit, Some(bh)),
+            &vs,
+            h,
+            r,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
     }
+    set.certificate(Some(bh), &vs, parent)
+        .expect("4-of-4 reaches quorum")
 }
 
 #[tokio::test]
 async fn f4_all_routes_reach_identical_state_root_with_equivocation_evidence() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let idv = ids(&ks);
     let cheater = ks[3].clone();
@@ -115,27 +122,28 @@ async fn f4_all_routes_reach_identical_state_root_with_equivocation_evidence() {
     let pkey = proposer_key(&ks, &vs, 1, 0).clone();
     let block = mkblock(&pkey, 1, [0u8; 32], root0);
     let bh = block.compute_hash();
-    let qc = full_precommit_qc(&ks, 1, 0, bh);
+    let qc = full_precommit_qc(&ks, &fks, 1, 0, bh, &[0u8; 32]);
     assert!(qc.verify(&vs), "precondition: certificate is genuine");
 
     // ---- Route A: LOCAL FINALIZE. Node A additionally observes a CONFLICTING
     // prevote from the cheater, so it genuinely holds equivocation evidence the
     // other routes never see.
     let mut a = ValidatorRuntime::new(ks[0].clone(), vs.clone(), st_a.clone(), 1);
-    for k in ks.iter() {
-        a.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+    for (i, k) in ks.iter().enumerate() {
+        a.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(bh)))
             .unwrap();
     }
-    a.on_prevote(Vote::sign(
+    a.on_prevote(falcon_votes::fvote(
         &cheater,
+        &fks[3],
         1,
         0,
         VoteKind::Prevote,
         Some([0x99u8; 32]),
     ))
     .unwrap();
-    for k in ks.iter() {
-        a.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+    for (i, k) in ks.iter().enumerate() {
+        a.on_precommit(falcon_votes::fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(bh)))
             .unwrap();
     }
     assert_eq!(
@@ -223,7 +231,7 @@ async fn f4_all_routes_reach_identical_state_root_with_equivocation_evidence() {
 /// transition leaves the offender's bond and the global burn counter untouched.
 #[tokio::test]
 async fn f4_local_finalize_ignores_observed_equivocation() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let cheater = ks[3].clone();
     let cheater_id = cheater.verifying_key().to_bytes();
@@ -233,19 +241,20 @@ async fn f4_local_finalize_ignores_observed_equivocation() {
     let pkey = proposer_key(&ks, &vs, 1, 0).clone();
     let block = mkblock(&pkey, 1, [0u8; 32], root0);
     let bh = block.compute_hash();
-    let qc = full_precommit_qc(&ks, 1, 0, bh);
+    let qc = full_precommit_qc(&ks, &fks, 1, 0, bh, &[0u8; 32]);
 
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), st.clone(), 1);
     // A quorum prevotes the block...
-    for k in ks.iter() {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+    for (i, k) in ks.iter().enumerate() {
+        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(bh)))
             .unwrap();
     }
     // ...and the cheater ALSO sends a conflicting second prevote, observed
     // locally. The first prevote stays counted for quorum; the second is
     // recorded as evidence.
-    rt.on_prevote(Vote::sign(
+    rt.on_prevote(falcon_votes::fvote(
         &cheater,
+        &fks[3],
         1,
         0,
         VoteKind::Prevote,
@@ -256,8 +265,8 @@ async fn f4_local_finalize_ignores_observed_equivocation() {
     assert_eq!(victim_evidence.len(), 1);
     assert!(victim_evidence[0].1.verify() && victim_evidence[0].2.verify());
 
-    for k in ks.iter() {
-        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+    for (i, k) in ks.iter().enumerate() {
+        rt.on_precommit(falcon_votes::fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(bh)))
             .unwrap();
     }
     assert_eq!(rt.hc.try_precommit_quorum(), Some(bh));

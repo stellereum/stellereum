@@ -1,13 +1,15 @@
-//! Compact block / vote propagation — DESIGN DOC + KAT PROTOTYPE (UNWIRED).
+//! Compact block / vote propagation — DESIGN DOC + KAT PROTOTYPE, FIRST WIRING.
 //!
-//! # Status: NOT WIRED — read-only design, no wire change
+//! # Status: WIRED (read-only inclusion, INACTIVE on the wire)
 //!
-//! This module is intentionally NOT referenced by any `mod` declaration
-//! (verified: `grep -rn compact_prop` hits only this file). It compiles
-//! standalone via `rustc --test` and depends on nothing but `std`, so it
-//! cannot affect the build. Wiring (even test-only `mod`) is a LEAD
-//! decision. Per `AGENTS.md` §7 (frozen core: wire format), none of this
-//! ships without a spec update + audit note + full gate.
+//! Wired via `consensus_net.rs` (`#[path = "compact_prop.rs"] pub mod
+//! compact_prop`, mirroring the `dandelion.rs` precedent): this file now
+//! compiles inside the crate and its codec (`encode_compact_qc` /
+//! `decode_compact_qc`) backs the compact-µQC gossip frame, but emission AND
+//! admission stay gated on `COMPACT_GOSSIP_ACTIVATION_HEIGHT = u64::MAX`, so
+//! no node emits or accepts the new frame until the lead flips the const.
+//! The file still depends on nothing but `std` and still compiles standalone
+//! via `rustc --test`.
 //!
 //! # 1. Measured current wire sizes (bincode 1.3.3, = stellereum/Cargo.toml:20)
 //!
@@ -210,6 +212,272 @@ pub fn qc_bytes_ed(n_sigs: usize) -> usize {
     QC_FIXED_BYTES + n_sigs * QC_ED_SIG_ENTRY_BYTES
 }
 
+// ---------------------------------------------------------------------------
+// Compact µQC gossip envelope (FIRST WIRING — gated, see header).
+//
+// The live path gossips finality as `ConsensusMsg::Committed` carrying the
+// full bincode `QuorumCertificate`: outer framing plus one 32-byte
+// `ValidatorId` per signer. The compact frame carries the SAME certificate
+// content bitfield-indexed instead: no per-signer ids, no outer struct
+// framing. Verification is untouched — the receiver rebuilds the identical
+// certificate and runs the unmodified `QuorumCertificate::verify`.
+// ---------------------------------------------------------------------------
+
+/// Wire magic of a compact-µQC gossip frame.
+///
+/// Distinct from every existing magic (`STELL_UQC_PQ_V5_` /
+/// `STELL_QC_PQ_V5__` µQC envelopes, `PQ1`, `STDL` dandelion stem,
+/// `MLKEM*`, `STX1/STD1/…` epoch seals): old software never emits this
+/// prefix, and its bincode-only `ConsensusMsg::decode` fails closed on it
+/// (unknown first bytes), so old nodes IGNORE the frame, never choke.
+pub const COMPACT_QC_MAGIC: &[u8; 8] = b"STCMQC01";
+
+/// Largest committee a compact frame may name.
+///
+/// Mirrors `MAX_COMMIT_CERT_SIGNERS` (`consensus.rs:194`): the bitmask and
+/// the signature count are both bounded by it, so one frame can never pin a
+/// decoder past what the verifier already accepts. This file stays `std`-only
+/// (standalone `rustc --test`), hence the local mirror with citation instead
+/// of an import.
+pub const COMPACT_QC_MAX_COMMITTEE: usize = 4096;
+
+/// Largest single signature a compact frame may carry.
+///
+/// New DoS bound (no live counterpart: the µQC envelope has no per-sig cap,
+/// only the total-frame cap): Falcon-512 signatures are 666 B
+/// (`post_quantum.rs:115 FALCON512_SIG_LEN`), so 2048 B admits the live
+/// scheme with headroom while bounding per-sig allocation. Fail-closed:
+/// larger sigs refuse the whole frame.
+pub const COMPACT_QC_MAX_SIG_BYTES: usize = 2048;
+
+/// Largest compact frame in bytes.
+///
+/// Mirrors `MAX_CONSENSUS_MSG` (`consensus_net.rs:71`): a gossip frame is
+/// still a gossip frame, so the infnode 32 MiB frame cap applies unchanged.
+/// Local mirror with citation (file stays `std`-only).
+pub const COMPACT_QC_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Falcon-512 wire signature length in bytes (`post_quantum.rs:115`).
+/// Cited here so the size projector below stays honest about the live
+/// signature width without importing the crate.
+pub const COMPACT_QC_SIG_LEN_FALCON: usize = 666;
+
+/// Vote-kind tags on the compact wire: 0 = Prevote, 1 = Precommit.
+/// Mirrors `vote_kind_tag` (`consensus_net.rs:164`); anything else refuses.
+pub const COMPACT_QC_KIND_PREVOTE: u8 = 0;
+pub const COMPACT_QC_KIND_PRECOMMIT: u8 = 1;
+
+/// A quorum certificate in compact gossip form: bitfield-indexed signers,
+/// signatures only (no per-signer `ValidatorId`s, no bincode struct framing).
+///
+/// Field-for-field the content of the live `PqMicroCertificate` plus the
+/// outer `QuorumCertificate` routing fields (`kind`, `block_hash`) needed to
+/// rebuild a verifiable certificate on receipt. Plain owned data, no crate
+/// deps (file stays `std`-only); `consensus_net` maps to/from the live types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactQc {
+    pub height: u64,
+    pub round: u32,
+    /// 0 = Prevote, 1 = Precommit (`COMPACT_QC_KIND_*`).
+    pub kind_tag: u8,
+    pub block_hash: Option<[u8; 32]>,
+    /// Raw `PqScheme::id()` (`post_quantum.rs:161`): 1 = Ed25519, 2 =
+    /// Falcon512, 4 = Hybrid. Opaque here; `consensus_net` resolves it.
+    pub scheme_id: u8,
+    pub committee_size: u32,
+    pub sortition_parent: [u8; 32],
+    /// `ceil(committee_size / 8)` bytes, LSB-first, trailing bits zero
+    /// (same rule as the µQC `signers_bitmask`).
+    pub bitfield: Vec<u8>,
+    /// Exactly one entry per SET bit (compact leg only — no sparse/full
+    /// legs; anything else refuses fail-closed).
+    pub signatures: Vec<Vec<u8>>,
+}
+
+/// Projected compact-frame bytes for a committee of `committee_size` with
+/// `n_sigs` signatures of `sig_len` bytes each.
+///
+/// Layout: `MAGIC(8) || height(8) || round(4) || kind(1) || hash_flag(1) ||`
+/// `hash(0|32) || scheme(1) || committee(4) || parent(32) || bitmask_len(4) ||`
+/// `bitmask(ceil(C/8)) || sig_count(4) || n * (len(4) + sig)`.
+/// The size test pins this projector against measured `encode_compact_qc`
+/// output, so drift in either breaks the build loudly.
+pub fn compact_qc_bytes(
+    committee_size: usize,
+    n_sigs: usize,
+    sig_len: usize,
+    has_hash: bool,
+) -> usize {
+    8 + 8 + 4 + 1 + 1
+        + if has_hash { 32 } else { 0 }
+        + 1
+        + 4
+        + 32
+        + 4
+        + committee_size.div_ceil(8)
+        + 4
+        + n_sigs * (4 + sig_len)
+}
+
+/// Encode a compact QC gossip frame (canonical layout, see
+/// [`compact_qc_bytes`]).
+///
+/// Fail-closed at encode: non-canonical inputs (`kind_tag > 1`,
+/// `committee_size == 0` or over [`COMPACT_QC_MAX_COMMITTEE`], bitfield
+/// length mismatch, trailing bits set, `signatures.len()` != set-bit count,
+/// empty/oversized sigs, over [`COMPACT_QC_MAX_BYTES`]) return `Err` instead
+/// of emitting a frame the decoder (or a peer) would refuse.
+pub fn encode_compact_qc(qc: &CompactQc) -> Result<Vec<u8>, String> {
+    if qc.kind_tag != COMPACT_QC_KIND_PREVOTE && qc.kind_tag != COMPACT_QC_KIND_PRECOMMIT {
+        return Err("compact qc: bad kind tag".to_string());
+    }
+    if qc.committee_size == 0 || qc.committee_size as usize > COMPACT_QC_MAX_COMMITTEE {
+        return Err("compact qc: bad committee size".to_string());
+    }
+    // Bitfield MUST be canonical: exact length + trailing bits zero. Reuses
+    // `unpack_bitfield` (prototype §2b rule) as the validator.
+    let present =
+        unpack_bitfield(&qc.bitfield, qc.committee_size as usize).ok_or_else(|| {
+            "compact qc: bad bitfield (length or trailing bits)".to_string()
+        })?;
+    let set_bits = present.iter().filter(|&&b| b).count();
+    // Compact leg only: exactly one signature per set bit.
+    if qc.signatures.len() != set_bits {
+        return Err("compact qc: sig count != set-bit count".to_string());
+    }
+    for sig in &qc.signatures {
+        if sig.is_empty() || sig.len() > COMPACT_QC_MAX_SIG_BYTES {
+            return Err("compact qc: bad signature length".to_string());
+        }
+    }
+    let mut out = Vec::with_capacity(
+        compact_qc_bytes(
+            qc.committee_size as usize,
+            qc.signatures.len(),
+            qc.signatures.iter().map(|s| s.len()).max().unwrap_or(0),
+            qc.block_hash.is_some(),
+        )
+        .max(8),
+    );
+    out.extend_from_slice(COMPACT_QC_MAGIC);
+    out.extend_from_slice(&qc.height.to_le_bytes());
+    out.extend_from_slice(&qc.round.to_le_bytes());
+    out.push(qc.kind_tag);
+    match &qc.block_hash {
+        Some(h) => {
+            out.push(1);
+            out.extend_from_slice(h);
+        }
+        None => out.push(0),
+    }
+    out.push(qc.scheme_id);
+    out.extend_from_slice(&qc.committee_size.to_le_bytes());
+    out.extend_from_slice(&qc.sortition_parent);
+    out.extend_from_slice(&(qc.bitfield.len() as u32).to_le_bytes());
+    out.extend_from_slice(&qc.bitfield);
+    out.extend_from_slice(&(qc.signatures.len() as u32).to_le_bytes());
+    for sig in &qc.signatures {
+        out.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+        out.extend_from_slice(sig);
+    }
+    if out.len() > COMPACT_QC_MAX_BYTES {
+        return Err("compact qc: frame too large".to_string());
+    }
+    Ok(out)
+}
+
+/// Decode a compact QC gossip frame. `None` on ANY malformed input
+/// (fail-closed): short buffers, wrong magic, out-of-range kind/hash flags,
+/// bad committee size, bitfield length mismatch, set trailing bits, sig
+/// count != set-bit count, empty/oversized sigs, truncation, OR trailing
+/// bytes past the last signature.
+pub fn decode_compact_qc(bytes: &[u8]) -> Option<CompactQc> {
+    if bytes.len() < COMPACT_QC_MAGIC.len() || &bytes[..8] != COMPACT_QC_MAGIC {
+        return None;
+    }
+    if bytes.len() > COMPACT_QC_MAX_BYTES {
+        return None;
+    }
+    let mut cursor = 8usize;
+    let take = |cursor: &mut usize, n: usize| -> Option<&[u8]> {
+        if bytes.len() < *cursor + n {
+            return None;
+        }
+        let s = &bytes[*cursor..*cursor + n];
+        *cursor += n;
+        Some(s)
+    };
+    let height = u64::from_le_bytes(take(&mut cursor, 8)?.try_into().ok()?);
+    let round = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().ok()?);
+    let kind_tag = *take(&mut cursor, 1)?.first()?;
+    if kind_tag != COMPACT_QC_KIND_PREVOTE && kind_tag != COMPACT_QC_KIND_PRECOMMIT {
+        return None;
+    }
+    let hash_flag = *take(&mut cursor, 1)?.first()?;
+    let block_hash = match hash_flag {
+        0 => None,
+        1 => {
+            let s = take(&mut cursor, 32)?;
+            let mut h = [0u8; 32];
+            h.copy_from_slice(s);
+            Some(h)
+        }
+        _ => return None,
+    };
+    let scheme_id = *take(&mut cursor, 1)?.first()?;
+    let committee_size = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().ok()?);
+    if committee_size == 0 || committee_size as usize > COMPACT_QC_MAX_COMMITTEE {
+        return None;
+    }
+    let sortition_parent: [u8; 32] = {
+        let s = take(&mut cursor, 32)?;
+        let mut p = [0u8; 32];
+        p.copy_from_slice(s);
+        p
+    };
+    let bitmask_len = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().ok()?) as usize;
+    if bitmask_len != (committee_size as usize).div_ceil(8) {
+        return None;
+    }
+    let bitfield = take(&mut cursor, bitmask_len)?.to_vec();
+    // Canonical-bitfield rule (prototype §2b, via the prototype's own fn):
+    // exact length (checked above) + trailing unused bits zero.
+    let present = unpack_bitfield(&bitfield, committee_size as usize)?;
+    let set_bits = present.iter().filter(|&&b| b).count();
+    let sig_count =
+        u32::from_le_bytes(take(&mut cursor, 4)?.try_into().ok()?) as usize;
+    // Compact leg only (mirrors the strict half of the µQC `is_compact`
+    // check): sig count MUST equal the set-bit count.
+    if sig_count != set_bits || sig_count > COMPACT_QC_MAX_COMMITTEE {
+        return None;
+    }
+    let mut signatures = Vec::with_capacity(sig_count);
+    for _ in 0..sig_count {
+        let sig_len =
+            u32::from_le_bytes(take(&mut cursor, 4)?.try_into().ok()?) as usize;
+        if sig_len == 0 || sig_len > COMPACT_QC_MAX_SIG_BYTES {
+            return None;
+        }
+        signatures.push(take(&mut cursor, sig_len)?.to_vec());
+    }
+    // No trailing bytes (mirrors `ConsensusMsg::decode`'s
+    // `reject_trailing_bytes`): padding must not ride along.
+    if cursor != bytes.len() {
+        return None;
+    }
+    Some(CompactQc {
+        height,
+        round,
+        kind_tag,
+        block_hash,
+        scheme_id,
+        committee_size,
+        sortition_parent,
+        bitfield,
+        signatures,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,12 +512,12 @@ mod tests {
         s[8] = true;
         assert_eq!(pack_bitfield(&s), vec![0x05, 0x01]);
         assert_eq!(pack_bitfield(&[]), Vec::<u8>::new());
-        assert_eq!(pack_bitfield(&vec![false; 8]), vec![0x00]);
-        assert_eq!(pack_bitfield(&vec![true; 8]), vec![0xff]);
+        assert_eq!(pack_bitfield(&[false; 8]), vec![0x00]);
+        assert_eq!(pack_bitfield(&[true; 8]), vec![0xff]);
         // 100-validator committee, first 7 sign => 13 bytes, byte0 = 0x7f.
         let mut c = vec![false; 100];
-        for i in 0..7 {
-            c[i] = true;
+        for b in c.iter_mut().take(7) {
+            *b = true;
         }
         let packed = pack_bitfield(&c);
         assert_eq!(packed.len(), 13);
@@ -291,5 +559,169 @@ mod tests {
         assert_eq!(compact_proposal_bytes(1000, 50), 15166);
         // Savings are real and large: compact(1000,0) < 4% of baseline.
         assert!(compact_proposal_bytes(1000, 0) * 100 < baseline_proposal_bytes(1000) * 4);
+    }
+
+    /// Deterministic 64-seat compact-QC fixture (structural only — signature
+    /// bytes are patterned filler, NOT crypto; verification stays in
+    /// `QuorumCertificate::verify` and is never exercised here).
+    fn fixture_64_seat(all_sign: bool) -> CompactQc {
+        let mut signers = vec![false; 64];
+        if all_sign {
+            for b in signers.iter_mut() {
+                *b = true;
+            }
+        } else {
+            // Quorum of a uniform 64-seat committee: floor(2*64/3)+1 = 43.
+            for b in signers.iter_mut().take(43) {
+                *b = true;
+            }
+        }
+        let n = signers.iter().filter(|&&b| b).count();
+        CompactQc {
+            height: 900,
+            round: 3,
+            kind_tag: COMPACT_QC_KIND_PRECOMMIT,
+            block_hash: Some([0xABu8; 32]),
+            scheme_id: 2, // Falcon512 (`post_quantum.rs:161`).
+            committee_size: 64,
+            sortition_parent: [0x77u8; 32],
+            bitfield: pack_bitfield(&signers),
+            signatures: (0..n)
+                .map(|i| vec![(i as u8).wrapping_mul(7).wrapping_add(1); COMPACT_QC_SIG_LEN_FALCON])
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn compact_qc_round_trip() {
+        for qc in [fixture_64_seat(true), fixture_64_seat(false)] {
+            let bytes = encode_compact_qc(&qc).expect("fixture must encode");
+            assert_eq!(
+                bytes.len(),
+                compact_qc_bytes(
+                    64,
+                    qc.signatures.len(),
+                    COMPACT_QC_SIG_LEN_FALCON,
+                    true
+                ),
+                "projector must match measured bytes exactly"
+            );
+            let back = decode_compact_qc(&bytes).expect("must decode");
+            assert_eq!(back, qc);
+        }
+        // Nil-hash (prevote) frame round-trips too.
+        let mut nil = fixture_64_seat(false);
+        nil.block_hash = None;
+        nil.kind_tag = COMPACT_QC_KIND_PREVOTE;
+        let bytes = encode_compact_qc(&nil).expect("nil frame must encode");
+        assert_eq!(
+            bytes.len(),
+            compact_qc_bytes(64, 43, COMPACT_QC_SIG_LEN_FALCON, false)
+        );
+        assert_eq!(decode_compact_qc(&bytes).expect("must decode"), nil);
+    }
+
+    #[test]
+    fn compact_qc_tamper_refusal() {
+        let qc = fixture_64_seat(true);
+        let good = encode_compact_qc(&qc).expect("fixture must encode");
+        // Baseline sanity.
+        assert!(decode_compact_qc(&good).is_some());
+        // Wrong magic (old/new interop: no magic, no parse).
+        let mut bad_magic = good.clone();
+        bad_magic[0] ^= 0xFF;
+        assert_eq!(decode_compact_qc(&bad_magic), None);
+        assert_eq!(decode_compact_qc(&[]), None);
+        assert_eq!(decode_compact_qc(&good[..7]), None);
+        // Every truncation refuses.
+        for n in [8usize, 20, 60, 100, 1000] {
+            assert_eq!(
+                decode_compact_qc(&good[..n.min(good.len() - 1)]),
+                None,
+                "truncation to {n} must refuse"
+            );
+        }
+        // Trailing byte refuses (no padding rides along).
+        let mut padded = good.clone();
+        padded.push(0x00);
+        assert_eq!(decode_compact_qc(&padded), None);
+        // Bad kind / hash flags refuse.
+        let mut bad_kind = good.clone();
+        bad_kind[8 + 8 + 4] = 2;
+        assert_eq!(decode_compact_qc(&bad_kind), None);
+        let mut bad_flag = good.clone();
+        bad_flag[8 + 8 + 4 + 1] = 2;
+        assert_eq!(decode_compact_qc(&bad_flag), None);
+        // Trailing bit set in the bitfield refuses (64 seats: no spare bits,
+        // so corrupt the length prefix instead: bitmask_len 8 -> 9).
+        let bitlen_off = 8 + 8 + 4 + 1 + 1 + 32 + 1 + 4 + 32;
+        let mut bad_len = good.clone();
+        bad_len[bitlen_off] = 9;
+        assert_eq!(decode_compact_qc(&bad_len), None);
+        // Non-multiple-of-8 committee exercises the trailing-bit rule: build
+        // a 10-seat frame, then set bit 10 (first out-of-range bit).
+        let mut s10 = vec![false; 10];
+        s10[0] = true;
+        s10[9] = true;
+        let qc10 = CompactQc {
+            height: 1,
+            round: 0,
+            kind_tag: COMPACT_QC_KIND_PREVOTE,
+            block_hash: None,
+            scheme_id: 2,
+            committee_size: 10,
+            sortition_parent: [0u8; 32],
+            bitfield: pack_bitfield(&s10),
+            signatures: vec![vec![1u8; 64], vec![2u8; 64]],
+        };
+        let mut b10 = encode_compact_qc(&qc10).expect("10-seat must encode");
+        // Bitfield starts after magic(8)+height(8)+round(4)+kind(1)+flag(1)+
+        // scheme(1)+committee(4)+parent(32)+len(4) = 63; byte 1 bit 2 = index 10.
+        b10[63 + 1] |= 1 << 2;
+        assert_eq!(decode_compact_qc(&b10), None);
+        // Sig count != set-bit count refuses.
+        let mut qc_mismatch = qc.clone();
+        qc_mismatch.signatures.pop();
+        assert!(encode_compact_qc(&qc_mismatch).is_err());
+        // Empty / oversized sigs refuse at encode.
+        let mut qc_empty_sig = qc.clone();
+        qc_empty_sig.signatures[0].clear();
+        assert!(encode_compact_qc(&qc_empty_sig).is_err());
+        let mut qc_big_sig = qc.clone();
+        qc_big_sig.signatures[0] = vec![0u8; COMPACT_QC_MAX_SIG_BYTES + 1];
+        assert!(encode_compact_qc(&qc_big_sig).is_err());
+        // Bad committee sizes refuse at encode.
+        let mut qc_zero = qc.clone();
+        qc_zero.committee_size = 0;
+        qc_zero.bitfield = vec![];
+        qc_zero.signatures = vec![];
+        assert!(encode_compact_qc(&qc_zero).is_err());
+        let mut qc_huge = qc.clone();
+        qc_huge.committee_size = COMPACT_QC_MAX_COMMITTEE as u32 + 1;
+        assert!(encode_compact_qc(&qc_huge).is_err());
+        let mut qc_kind = qc.clone();
+        qc_kind.kind_tag = 7;
+        assert!(encode_compact_qc(&qc_kind).is_err());
+    }
+
+    #[test]
+    fn compact_qc_size_64_seat_savings() {
+        // 64 seats, full-sign, Falcon-512 sigs, block hash present — the live
+        // finality shape (µQC over the whole set).
+        let qc = fixture_64_seat(true);
+        let measured = encode_compact_qc(&qc).expect("fixture must encode").len();
+        // Fixed overhead: 8+8+4+1+1+32+1+4+32+4+8+4 = 107; sigs 64*(4+666).
+        assert_eq!(measured, 107 + 64 * (4 + COMPACT_QC_SIG_LEN_FALCON));
+        assert_eq!(measured, 42987);
+        assert_eq!(
+            measured,
+            compact_qc_bytes(64, 64, COMPACT_QC_SIG_LEN_FALCON, true)
+        );
+        // Quorum-sign (43 of 64) frame is smaller still.
+        let q43 = fixture_64_seat(false);
+        let m43 = encode_compact_qc(&q43).expect("must encode").len();
+        assert_eq!(m43, 107 + 43 * (4 + COMPACT_QC_SIG_LEN_FALCON));
+        assert_eq!(m43, 28917);
+        assert!(m43 < measured);
     }
 }

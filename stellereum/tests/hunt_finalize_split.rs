@@ -26,17 +26,15 @@ use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, Transaction};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 const N: usize = 4;
 
 /// `fund_genesis` bonds `min(MIN_VALIDATOR_BOND, balance)`, so the balance has to
 /// be at least MIN_VALIDATOR_BOND (1e12) for ANY validator to end up bonded.
 const BONDABLE_BALANCE: u64 = 10_000_000_000_000;
 
-type Ns = Vec<SigningKey>;
-
-fn keys(n: usize) -> Ns {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
-}
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(
         ks.iter()
@@ -106,29 +104,47 @@ fn mkblock(
     b
 }
 
-/// A GENUINE 3-of-4 precommit certificate: real keys, real signatures, real
-/// `vote_sign_bytes` message. The omitted validator is the "silent" one.
-fn genuine_cert(ks: &[SigningKey], signer_idx: &[usize], bh: [u8; 32]) -> QuorumCertificate {
-    QuorumCertificate {
-        height: 1,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: signer_idx
-            .iter()
-            .map(|&i| {
-                let v = Vote::sign(&ks[i], 1, 0, VoteKind::Precommit, Some(bh));
-                (v.voter, v.signature)
-            })
-            .collect(),
+/// A GENUINE 3-of-4 precommit certificate: real keys, real Falcon signatures,
+/// compiled by the production committee path against the set derived from
+/// `ks` and bound to `parent`.
+fn genuine_cert(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    signer_idx: &[usize],
+    bh: [u8; 32],
+    parent: &[u8; 32],
+) -> QuorumCertificate {
+    let vs = vset(ks);
+    let mut set = stellereum::consensus::VoteSet::new();
+    for &i in signer_idx {
+        set.add(
+            falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Precommit, Some(bh)),
+            &vs,
+            1,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
     }
+    set.certificate(Some(bh), &vs, parent)
+        .expect("3-of-4 reaches quorum")
 }
 
-fn precommit_for(ks: &[SigningKey], i: usize, bh: [u8; 32]) -> Vote {
-    Vote::sign(&ks[i], 1, 0, VoteKind::Precommit, Some(bh))
+fn precommit_for(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    i: usize,
+    bh: [u8; 32],
+) -> Vote {
+    falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Precommit, Some(bh))
 }
-fn prevote_for(ks: &[SigningKey], i: usize, bh: [u8; 32]) -> Vote {
-    Vote::sign(&ks[i], 1, 0, VoteKind::Prevote, Some(bh))
+fn prevote_for(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    i: usize,
+    bh: [u8; 32],
+) -> Vote {
+    falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Prevote, Some(bh))
 }
 
 // ===========================================================================
@@ -152,7 +168,7 @@ fn prevote_for(ks: &[SigningKey], i: usize, bh: [u8; 32]) -> Vote {
 /// assertions that the height does not advance.
 #[tokio::test]
 async fn hunt_finding_2_finalize_without_the_block_splits_state() {
-    let ks = keys(N);
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let user = SigningKey::generate(&mut OsRng);
     let from = user.verifying_key().to_bytes();
     let to = [0x77u8; 32];
@@ -192,14 +208,14 @@ async fn hunt_finding_2_finalize_without_the_block_splits_state() {
     let signers: Vec<usize> = (0..N).filter(|&i| i != victim).collect();
     assert_eq!(signers.len(), 3);
     for &i in &signers {
-        let pv = prevote_for(&ks, i, bh);
+        let pv = prevote_for(&ks, &fks, i, bh);
         for n in nodes.iter_mut() {
             n.on_prevote(pv.clone()).unwrap();
         }
     }
     let mut precommits = vec![];
     for &i in &signers {
-        let pc = precommit_for(&ks, i, bh);
+        let pc = precommit_for(&ks, &fks, i, bh);
         for n in nodes.iter_mut() {
             n.on_precommit(pc.clone()).unwrap();
         }
@@ -244,12 +260,12 @@ async fn hunt_finding_2_finalize_without_the_block_splits_state() {
         if i == victim {
             continue;
         }
-        for k in ks.iter().take(3) {
-            n.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+        for (j, k) in ks.iter().enumerate().take(3) {
+            n.on_prevote(falcon_votes::fvote(k, &fks[j], 1, 0, VoteKind::Prevote, Some(bh)))
                 .unwrap();
         }
-        for k in ks.iter().take(3) {
-            n.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+        for (j, k) in ks.iter().enumerate().take(3) {
+            n.on_precommit(falcon_votes::fvote(k, &fks[j], 1, 0, VoteKind::Precommit, Some(bh)))
                 .unwrap();
         }
         assert_eq!(
@@ -335,7 +351,7 @@ async fn hunt_finding_2_finalize_without_the_block_splits_state() {
 /// and reach the same root.
 #[tokio::test]
 async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
-    let ks = keys(N);
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let user = SigningKey::generate(&mut OsRng);
     let from = user.verifying_key().to_bytes();
     let to = [0x88u8; 32];
@@ -364,7 +380,7 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
     let bh1 = block1.compute_hash();
 
     // Three of the four validators signed; validator 3 is silent.
-    let cert1 = genuine_cert(&ks, &[0, 1, 2], bh1);
+    let cert1 = genuine_cert(&ks, &fks, &[0, 1, 2], bh1, &[0u8; 32]);
     let ids: Vec<ValidatorId> = ks.iter().map(|k| k.verifying_key().to_bytes()).collect();
     let silent = ids[3];
     assert!(cert1.verify(&vset(&ks)));
@@ -376,14 +392,14 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
 
     // Path A: finalized locally.
     let mut local = cluster(&ks, from, BONDABLE_BALANCE).await;
-    for k in ks.iter().take(3) {
+    for (j, k) in ks.iter().enumerate().take(3) {
         local[0]
             .hc
-            .add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh1)))
+            .add_prevote(falcon_votes::fvote(k, &fks[j], 1, 0, VoteKind::Prevote, Some(bh1)))
             .unwrap();
         local[0]
             .hc
-            .add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh1)))
+            .add_precommit(falcon_votes::fvote(k, &fks[j], 1, 0, VoteKind::Precommit, Some(bh1)))
             .unwrap();
     }
     assert_eq!(
@@ -425,19 +441,6 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
     block2.validator_signatures.clear();
     block2.sign_block(&pkey2);
     let bh2 = block2.compute_hash();
-    let cert2 = QuorumCertificate {
-        height: 2,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh2),
-        signatures: [0usize, 1, 2]
-            .iter()
-            .map(|&i| {
-                let v = Vote::sign(&ks[i], 2, 0, VoteKind::Precommit, Some(bh2));
-                (v.voter, v.signature)
-            })
-            .collect(),
-    };
 
     // Both paths must agree which set decides height 2 (same committed
     // prefix ⇒ same derivation), or the test setup itself is broken.
@@ -447,20 +450,37 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
         live_set_h2.validators, peer_set_h2.validators,
         "both paths must judge height 2 by the same set"
     );
+    // Genuine committee-compiled QC for height 2, bound to the height-1 block
+    // it finalizes on top of.
+    let mut h2set = stellereum::consensus::VoteSet::new();
+    for (j, k) in ks.iter().enumerate().take(3) {
+        h2set
+            .add(
+                falcon_votes::fvote(k, &fks[j], 2, 0, VoteKind::Precommit, Some(bh2)),
+                &live_set_h2,
+                2,
+                0,
+                VoteKind::Precommit,
+            )
+            .expect("genuine vote admits");
+    }
+    let cert2 = h2set
+        .certificate(Some(bh2), &live_set_h2, &bh1)
+        .expect("3-of-4 reaches quorum");
     assert!(
         cert2.verify(&live_set_h2),
         "the height-2 decision QC must verify"
     );
 
     // Path A: drive a real round at height 2 and finalize locally.
-    for k in ks.iter().take(3) {
+    for (j, k) in ks.iter().enumerate().take(3) {
         local[0]
             .hc
-            .add_prevote(Vote::sign(k, 2, 0, VoteKind::Prevote, Some(bh2)))
+            .add_prevote(falcon_votes::fvote(k, &fks[j], 2, 0, VoteKind::Prevote, Some(bh2)))
             .unwrap();
         local[0]
             .hc
-            .add_precommit(Vote::sign(k, 2, 0, VoteKind::Precommit, Some(bh2)))
+            .add_precommit(falcon_votes::fvote(k, &fks[j], 2, 0, VoteKind::Precommit, Some(bh2)))
             .unwrap();
     }
     assert_eq!(
@@ -525,7 +545,7 @@ async fn hunt_finding_3_adopt_path_slashes_identically_to_the_local_path() {
 
 #[tokio::test]
 async fn hunt_finding_4_adopt_committed_binds_the_state_root() {
-    let ks = keys(N);
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let user = SigningKey::generate(&mut OsRng);
     let from = user.verifying_key().to_bytes();
     let to = [0x99u8; 32];
@@ -552,7 +572,7 @@ async fn hunt_finding_4_adopt_committed_binds_the_state_root() {
     assert!(e1.contains("state root"));
 
     // ...the PEER-COMMIT path accepts it.
-    let cert = genuine_cert(&ks, &[0, 1, 2], bh);
+    let cert = genuine_cert(&ks, &fks, &[0, 1, 2], bh, &[0u8; 32]);
     let _set = nodes[2].validators.clone();
     let r = nodes[2].adopt_committed(1, block.clone(), cert).await;
     println!(
@@ -591,7 +611,7 @@ async fn hunt_finding_4_adopt_committed_binds_the_state_root() {
 
 #[tokio::test]
 async fn hunt_finding_5_adopt_committed_uses_only_the_local_validator_set() {
-    let ks = keys(N);
+    let (ks, _fks) = falcon_votes::falcon_set(N);
     let real = vset(&ks);
     assert_eq!(real.len(), 4);
     assert_eq!(real.quorum_power(), 3, "the node's real quorum is 3 of 4");
@@ -623,14 +643,32 @@ async fn hunt_finding_5_adopt_committed_uses_only_the_local_validator_set() {
         vec![Transaction::sign(&user, [1u8; 32], 999_999, 0, 0, 1, 1)],
     );
     let bh = block.compute_hash();
-    let v = Vote::sign(&attacker, 1, 0, VoteKind::Precommit, Some(bh));
-    let cert = QuorumCertificate {
-        height: 1,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: vec![(v.voter, v.signature)],
+    // The attacker's own Falcon companion, registered under its id: the
+    // envelope it compiles verifies inside the caller-supplied set — exactly
+    // the forged authority the test pins.
+    let attacker_fk = {
+        use stellereum::consensus::register_validator_pq_key;
+        use stellereum::post_quantum::{FalconKeypair, PqScheme};
+        let fk = FalconKeypair::generate_from_seed(0xE5);
+        register_validator_pq_key(
+            attacker.verifying_key().to_bytes(),
+            PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+        fk
     };
+    let mut aset = stellereum::consensus::VoteSet::new();
+    aset.add(
+        falcon_votes::fvote(&attacker, &attacker_fk, 1, 0, VoteKind::Precommit, Some(bh)),
+        &forged_set,
+        1,
+        0,
+        VoteKind::Precommit,
+    )
+    .expect("genuine vote admits");
+    let cert = aset
+        .certificate(Some(bh), &forged_set, &[0u8; 32])
+        .expect("1-of-1 reaches quorum");
     println!(
         "[FINDING 5] cert.verify(REAL 4-validator set)     = {}",
         cert.verify(&real)

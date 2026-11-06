@@ -16,7 +16,10 @@
 //! or oversized payloads are rejected. Vote signatures are verified downstream by
 //! the consensus engine, so a forged vote is dropped there.
 
-use crate::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use crate::consensus::{
+    PqMicroCertificate, QuorumCertificate, ValidatorSet, Vote, VoteKind,
+    decode_pq_micro_envelope, encode_pq_micro_envelope, PQ_UQC_MARKER_ID,
+};
 use crate::network::P2pNetworkAdapter;
 use crate::sharding::{Block, ShardRegistry};
 use serde::{Deserialize, Serialize};
@@ -1840,6 +1843,171 @@ pub fn parse_incoming(raw: &str) -> Option<ConsensusMsg> {
     let data = v["data"].as_str()?;
     let bytes = hex::decode(data).ok()?;
     ConsensusMsg::decode(&bytes).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Compact µQC gossip (FIRST WIRING — INACTIVE, activation-gated).
+//
+// The live path gossips finality as `ConsensusMsg::Committed` (full block +
+// full bincode `QuorumCertificate`). This section wires the COMPACT
+// alternative: the same certificate content bitfield-indexed in a
+// magic-prefixed frame (`compact_prop::COMPACT_QC_MAGIC`), carried in the
+// same pubsub `data` field on the same topic. Verification is untouched —
+// the receiver rebuilds the identical `QuorumCertificate` and runs the
+// unmodified `QuorumCertificate::verify`.
+//
+// Interop: old software never emits the magic and its bincode-only
+// `ConsensusMsg::decode` fails closed on the frame (unknown leading bytes),
+// so old nodes IGNORE it, never choke — pinned by
+// `old_parser_ignores_compact_qc` below. Pre-activation this node is
+// byte-identical: emission (`compact_gossip_bytes_for`) and admission
+// (`parse_compact_qc_incoming`) both consult `compact_gossip_active`, which
+// is false for every realistic height until the lead flips
+// `COMPACT_GOSSIP_ACTIVATION_HEIGHT`.
+//
+// Lead flip hookup (deferred, one const + two call sites):
+// * emit: in the broadcast path, `compact_gossip_bytes_for(&msg)` first —
+//   `Some(frame)` replaces the full `Committed` encode for that send;
+// * admit: in the inbound drain, `parse_compact_qc_incoming(&raw)` alongside
+//   `parse_incoming` — `Some(qc)` enters catch-up with the body fetched via
+//   the existing sync path. Neither call site is touched by this change.
+// ---------------------------------------------------------------------------
+
+/// Compact-µQC gossip codec (prototype's first wiring). Included by path so
+/// no other file changes (the `dandelion.rs` precedent below); the module
+/// itself stays `std`-only and standalone-`rustc --test` compatible.
+#[path = "compact_prop.rs"]
+pub mod compact_prop;
+
+/// First height whose finality may gossip in compact form. `u64::MAX` =
+/// INACTIVE by default: `compact_gossip_active` is false for every realistic
+/// height, so emission and admission both stay off and the wire is
+/// byte-identical. The lead flips this const (plus the two call sites above)
+/// to arm compact gossip — never any other edit.
+pub const COMPACT_GOSSIP_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// True once compact-µQC gossip is live for `height`.
+#[allow(clippy::absurd_extreme_comparisons)] // GATE: `>= MAX` is the intentional INACTIVE gate; `>=` (not `==`) stays correct after the lead flips to a real height.
+pub fn compact_gossip_active(height: u64) -> bool {
+    height >= COMPACT_GOSSIP_ACTIVATION_HEIGHT
+}
+
+/// Encode a live QC as a compact gossip frame.
+///
+/// Extracts the first post-quantum µQC envelope carried under
+/// `PQ_UQC_MARKER_ID` (the same entry `QuorumCertificate::verify` consults)
+/// and re-frames it bitfield-indexed via `compact_prop`. Epoch/CEC
+/// envelopes (`PQ_QC_MARKER_ID`) and marker-less QCs keep the full
+/// `Committed` path: this returns `Err` and the caller sends the message
+/// unchanged (fail-closed, never half-compact).
+pub fn encode_compact_qc_gossip(qc: &QuorumCertificate) -> Result<Vec<u8>, String> {
+    let mut micro: Option<PqMicroCertificate> = None;
+    for (voter, payload) in &qc.signatures {
+        if *voter == PQ_UQC_MARKER_ID {
+            if let Some(cert) = decode_pq_micro_envelope(payload) {
+                if cert.scheme.is_post_quantum() {
+                    micro = Some(cert);
+                    break;
+                }
+            }
+        }
+    }
+    let cert = micro.ok_or_else(|| "compact gossip: QC carries no µQC envelope".to_string())?;
+    if cert.height != qc.height || cert.round != qc.round {
+        return Err("compact gossip: µQC height/round mismatch".to_string());
+    }
+    let kind_tag = match qc.kind {
+        VoteKind::Prevote => compact_prop::COMPACT_QC_KIND_PREVOTE,
+        VoteKind::Precommit => compact_prop::COMPACT_QC_KIND_PRECOMMIT,
+    };
+    compact_prop::encode_compact_qc(&compact_prop::CompactQc {
+        height: qc.height,
+        round: qc.round,
+        kind_tag,
+        block_hash: qc.block_hash,
+        scheme_id: cert.scheme.id(),
+        committee_size: cert.committee_size,
+        sortition_parent: cert.sortition_parent,
+        bitfield: cert.signers_bitmask,
+        signatures: cert.signatures,
+    })
+}
+
+/// Decode a compact gossip frame back into the identical live QC shape
+/// (µQC envelope under `PQ_UQC_MARKER_ID`, ready for the unmodified
+/// `QuorumCertificate::verify`). Pure codec — no activation gate (gating
+/// lives at `compact_gossip_bytes_for` / `parse_compact_qc_incoming`).
+/// `None` on any malformed frame; non-PQ schemes refuse (FULL-PQ).
+pub fn decode_compact_qc_gossip(bytes: &[u8]) -> Option<QuorumCertificate> {
+    if bytes.len() < compact_prop::COMPACT_QC_MAGIC.len()
+        || &bytes[..compact_prop::COMPACT_QC_MAGIC.len()] != compact_prop::COMPACT_QC_MAGIC
+    {
+        return None;
+    }
+    let compact = compact_prop::decode_compact_qc(bytes)?;
+    let scheme = crate::post_quantum::PqScheme::from_id(compact.scheme_id).ok()?;
+    if !scheme.is_post_quantum() {
+        return None;
+    }
+    let kind = match compact.kind_tag {
+        t if t == compact_prop::COMPACT_QC_KIND_PREVOTE => VoteKind::Prevote,
+        t if t == compact_prop::COMPACT_QC_KIND_PRECOMMIT => VoteKind::Precommit,
+        _ => return None,
+    };
+    let cert = PqMicroCertificate::new(
+        scheme,
+        compact.height,
+        compact.round,
+        compact.committee_size,
+        compact.bitfield,
+        compact.signatures,
+        compact.sortition_parent,
+    );
+    let envelope = encode_pq_micro_envelope(&cert);
+    Some(QuorumCertificate {
+        height: compact.height,
+        round: compact.round,
+        kind,
+        block_hash: compact.block_hash,
+        signatures: vec![(PQ_UQC_MARKER_ID, envelope)],
+    })
+}
+
+/// Live-path emit selector: `Some(compact frame)` IFF `msg` is a
+/// `Committed` whose height is compact-active AND whose QC carries a
+/// convertible µQC; `None` otherwise (caller sends the message unchanged).
+/// Pre-activation this is `None` for every input — the proof the send path
+/// is byte-identical while the gate is off.
+pub fn compact_gossip_bytes_for(msg: &ConsensusMsg) -> Option<Vec<u8>> {
+    match msg {
+        ConsensusMsg::Committed {
+            height,
+            certificate,
+            ..
+        } => {
+            if !compact_gossip_active(*height) {
+                return None;
+            }
+            encode_compact_qc_gossip(certificate).ok()
+        }
+        _ => None,
+    }
+}
+
+/// Parse a raw pubsub payload (same JSON `{ "topic", "data" }` framing as
+/// [`parse_incoming`]) carrying a compact-µQC frame. Returns the rebuilt QC
+/// (body fetched via the existing sync path by the caller) IFF the frame is
+/// well-formed AND its height is compact-active; `None` otherwise
+/// (fail-closed — pre-activation every input is `None`).
+pub fn parse_compact_qc_incoming(raw: &str) -> Option<QuorumCertificate> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let data = v["data"].as_str()?;
+    let bytes = hex::decode(data).ok()?;
+    let qc = decode_compact_qc_gossip(&bytes)?;
+    if !compact_gossip_active(qc.height) {
+        return None;
+    }
+    Some(qc)
 }
 
 // ---------------------------------------------------------------------------
@@ -4205,6 +4373,256 @@ mod tests {
             cap,
             "a refused enqueue must not consume a slot"
         );
+    }
+
+    /// Structural µQC QC fixture (signature bytes are patterned filler, NOT
+    /// crypto — verification stays in `QuorumCertificate::verify` and is
+    /// never exercised here; only framing round-trips).
+    fn sample_micro_qc(
+        committee_size: u32,
+        signers: &[usize],
+        sig_len: usize,
+    ) -> crate::consensus::QuorumCertificate {
+        use crate::consensus::PqMicroCertificate;
+        let mut bits = vec![false; committee_size as usize];
+        for &i in signers {
+            bits[i] = true;
+        }
+        let cert = PqMicroCertificate::new(
+            crate::post_quantum::PqScheme::Falcon512,
+            900,
+            3,
+            committee_size,
+            compact_prop::pack_bitfield(&bits),
+            signers
+                .iter()
+                .map(|&i| vec![(i as u8).wrapping_mul(3).wrapping_add(5); sig_len])
+                .collect(),
+            [0x77u8; 32],
+        );
+        let env = crate::consensus::encode_pq_micro_envelope(&cert);
+        crate::consensus::QuorumCertificate {
+            height: 900,
+            round: 3,
+            kind: VoteKind::Precommit,
+            block_hash: Some([0xABu8; 32]),
+            signatures: vec![(crate::consensus::PQ_UQC_MARKER_ID, env)],
+        }
+    }
+
+    #[test]
+    fn compact_qc_gossip_round_trip() {
+        // µQC QC -> compact frame -> rebuilt QC: routing fields equal and the
+        // re-wrapped envelope byte-identical (verifier sees the same bytes).
+        let qc = sample_micro_qc(7, &[0, 2, 4], 666);
+        let frame = encode_compact_qc_gossip(&qc).expect("µQC QC must compact-encode");
+        assert!(
+            frame.starts_with(compact_prop::COMPACT_QC_MAGIC),
+            "new envelope kind carries the new magic"
+        );
+        let back = decode_compact_qc_gossip(&frame).expect("must decode");
+        assert_eq!(back.height, qc.height);
+        assert_eq!(back.round, qc.round);
+        assert_eq!(back.kind, qc.kind);
+        assert_eq!(back.block_hash, qc.block_hash);
+        assert_eq!(
+            back.signatures, qc.signatures,
+            "rebuilt µQC envelope must be byte-identical"
+        );
+        // A QC with no µQC envelope refuses: the caller keeps the full path.
+        let bare = crate::consensus::QuorumCertificate {
+            height: 1,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: None,
+            signatures: vec![],
+        };
+        assert!(encode_compact_qc_gossip(&bare).is_err());
+        // An Epoch/CEC envelope is NOT compacted either (µQC-only wiring).
+        let mut epoch_qc = sample_micro_qc(7, &[0, 2, 4], 666);
+        let (cert_h, cert_r) = (epoch_qc.height, epoch_qc.round);
+        let bits = vec![true, false, true, false, true, false, false];
+        let cert = crate::consensus::PqMicroCertificate::new(
+            crate::post_quantum::PqScheme::Falcon512,
+            cert_h,
+            cert_r,
+            7,
+            compact_prop::pack_bitfield(&bits),
+            vec![vec![9u8; 666], vec![10u8; 666], vec![11u8; 666]],
+            [0x77u8; 32],
+        );
+        epoch_qc.signatures = vec![(
+            crate::consensus::PQ_QC_MARKER_ID,
+            crate::consensus::encode_pq_epoch_envelope(&cert),
+        )];
+        assert!(
+            encode_compact_qc_gossip(&epoch_qc).is_err(),
+            "epoch envelopes keep the full Committed path"
+        );
+    }
+
+    #[test]
+    fn old_parser_ignores_compact_qc() {
+        // Interop: software WITHOUT this change (old nodes) never emits the
+        // new magic and must IGNORE the frame, never choke. Today's parser IS
+        // the old parser for an un-upgraded node, so the frame must fail
+        // closed through it — no misread, no panic.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        enum OldConsensusMsg {
+            Proposal {
+                height: u64,
+                round: u32,
+                block: Block,
+            },
+            Vote {
+                vote: Vote,
+                locked: Option<[u8; 32]>,
+            },
+            Committed {
+                height: u64,
+                block: Block,
+                certificate: crate::consensus::QuorumCertificate,
+            },
+            Batch(Vec<OldConsensusMsg>),
+        }
+        let qc = sample_micro_qc(7, &[0, 2, 4], 666);
+        let frame = encode_compact_qc_gossip(&qc).expect("must encode");
+        assert!(
+            ConsensusMsg::decode(&frame).is_err(),
+            "the current (== old) parser must reject the new frame"
+        );
+        let res: Result<OldConsensusMsg, _> = bincode::deserialize(&frame);
+        assert!(res.is_err(), "old decoder must reject the new frame");
+        // Same at the pubsub framing layer: the old path ignores it.
+        let raw = serde_json::json!({ "topic": consensus_topic("test"), "data": hex::encode(&frame) })
+            .to_string();
+        assert!(
+            parse_incoming(&raw).is_none(),
+            "old inbound path must ignore the new frame"
+        );
+    }
+
+    #[test]
+    fn compact_qc_gossip_tamper_refusal() {
+        // Frame-level fail-closed on STRUCTURE (crypto verification
+        // downstream stays untouched and refuses forgeries anyway: a flip
+        // inside a signature PAYLOAD still decodes structurally — different
+        // bytes — and only fails at `QuorumCertificate::verify`).
+        let qc = sample_micro_qc(7, &[0, 2, 4], 666);
+        let frame = encode_compact_qc_gossip(&qc).expect("must encode");
+        assert!(decode_compact_qc_gossip(&frame).is_some());
+        // Structural flips refuse: kind tag (to an out-of-range value) and
+        // bitmask-length prefix.
+        let mut flipped_kind = frame.clone();
+        flipped_kind[8 + 8 + 4] = 0x02;
+        assert_eq!(decode_compact_qc_gossip(&flipped_kind), None);
+        let bitlen_off = 8 + 8 + 4 + 1 + 1 + 32 + 1 + 4 + 32;
+        let mut flipped_len = frame.clone();
+        flipped_len[bitlen_off] ^= 0x01;
+        assert_eq!(decode_compact_qc_gossip(&flipped_len), None);
+        // Signature-payload flip decodes structurally but to DIFFERENT
+        // content (downstream `verify` refuses the forgery — the codec is
+        // structural, never crypto).
+        let mut flipped = frame.clone();
+        flipped[frame.len() / 2] ^= 0x01;
+        let tampered = decode_compact_qc_gossip(&flipped)
+            .expect("payload flip stays structurally valid");
+        let orig = decode_compact_qc_gossip(&frame).expect("must decode");
+        assert_ne!(tampered, orig, "payload mutation must change the QC");
+        assert_eq!(decode_compact_qc_gossip(&frame[..frame.len() - 1]), None);
+        let mut padded = frame.clone();
+        padded.push(0x00);
+        assert_eq!(decode_compact_qc_gossip(&padded), None);
+        assert_eq!(decode_compact_qc_gossip(&[]), None);
+        assert_eq!(decode_compact_qc_gossip(&[0xFF; 100]), None);
+        assert_eq!(
+            decode_compact_qc_gossip(&frame[8..]),
+            None,
+            "stripped magic must refuse"
+        );
+    }
+
+    #[test]
+    fn compact_gossip_activation_boundary() {
+        // INACTIVE by default: the gate is false for every realistic height
+        // and true only at the (unreachable) MAX the lead flips from.
+        assert!(!compact_gossip_active(0));
+        assert!(!compact_gossip_active(1));
+        assert!(!compact_gossip_active(u64::MAX - 1));
+        assert!(compact_gossip_active(u64::MAX));
+        assert_eq!(
+            COMPACT_GOSSIP_ACTIVATION_HEIGHT,
+            u64::MAX,
+            "live only after the lead flips the const"
+        );
+        // Pre-activation NOTHING compacts — every variant, even a convertible
+        // Committed with a real µQC inside: the send path is byte-identical.
+        let qc = sample_micro_qc(7, &[0, 2, 4], 666);
+        let commit = ConsensusMsg::Committed {
+            height: 900,
+            block: sample_block(),
+            certificate: qc,
+        };
+        assert!(compact_gossip_bytes_for(&commit).is_none());
+        assert!(compact_gossip_bytes_for(&tagged_vote(1)).is_none());
+        assert!(compact_gossip_bytes_for(&ConsensusMsg::Proposal {
+            height: 1,
+            round: 0,
+            block: sample_block(),
+        })
+        .is_none());
+        assert!(compact_gossip_bytes_for(&ConsensusMsg::Batch(vec![tagged_vote(1)])).is_none());
+        // And admission refuses even a well-formed frame pre-activation.
+        let cert = match &commit {
+            ConsensusMsg::Committed { certificate, .. } => certificate,
+            _ => unreachable!(),
+        };
+        let frame = encode_compact_qc_gossip(cert).expect("codec itself is ungated");
+        let raw = serde_json::json!({ "topic": consensus_topic("test"), "data": hex::encode(&frame) })
+            .to_string();
+        assert!(
+            parse_compact_qc_incoming(&raw).is_none(),
+            "admission stays off until the flip"
+        );
+    }
+
+    #[test]
+    fn compact_vs_full_qc_size_64_seat() {
+        // 64 seats, full-sign, Falcon-512 sigs — the live finality shape.
+        // Full = bincode `QuorumCertificate` carrying ONE µQC envelope under
+        // `PQ_UQC_MARKER_ID` (the live path: outer framing 97 B + envelope
+        // 42961 B); compact = the new frame (bitfield-indexed, 107 B +
+        // sigs). Same signatures, so the delta is pure framing savings —
+        // honest wire math, measured here, not projected.
+        let signers: Vec<usize> = (0..64).collect();
+        let qc = sample_micro_qc(64, &signers, compact_prop::COMPACT_QC_SIG_LEN_FALCON);
+        let full = bincode::serialize(&qc).expect("QC must serialize").len();
+        let compact = encode_compact_qc_gossip(&qc).expect("must compact").len();
+        // Layout math (live µQC-envelope shape, consensus.rs:883-904):
+        // envelope = 16 magic + 32 parent + 1 scheme + 8 height + 4 round
+        //   + 4 committee + 4 bitmask_len + 8 bitmask + 4 sig_count
+        //   + 64*(4 len + 666 sig) = 42961;
+        // full = 8 height + 4 round + 4 kind + 1 hash_flag + 32 hash
+        //   + 8 vec_len + 32 marker + 8 env_len + envelope = 97 + 42961;
+        // compact (compact_prop.rs:compact_qc_bytes) = 8 magic + 8 height
+        //   + 4 round + 1 kind + 1 hash_flag + 32 hash + 1 scheme + 4
+        //   committee + 32 parent + 4 bitmask_len + 8 bitmask + 4 sig_count
+        //   + 64*(4 len + 666 sig) = 107 + 64*(4+666).
+        assert_eq!(full, 97 + 42961);
+        assert_eq!(full, 43058);
+        assert_eq!(compact, 107 + 64 * (4 + 666));
+        assert_eq!(compact, 42987);
+        assert_eq!(
+            compact,
+            compact_prop::compact_qc_bytes(64, 64, compact_prop::COMPACT_QC_SIG_LEN_FALCON, true)
+        );
+        assert!(
+            compact < full,
+            "compact {compact} must beat full {full} on identical sig material"
+        );
+        // 71 B saved on the live shape = 97 (outer QC framing) - 26
+        // (compact cert framing 107 vs envelope 81).
+        assert_eq!(full - compact, 71);
     }
 }
 

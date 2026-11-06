@@ -20,13 +20,18 @@
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use std::time::Instant;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
+use stellereum::consensus::register_validator_pq_key;
 use stellereum::runtime::{count_block_actor_sends, ChainState, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{
     AccountState, ActorMessage, InMemoryStateEngine, MAX_ACTOR_MSGS_PER_BLOCK,
 };
 use stellereum::svm::OpCode;
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 /// Realistic block timestamp - never 0.
 const TS: u64 = 1_760_000_000;
@@ -39,6 +44,19 @@ fn key(seed: u8) -> SigningKey {
 
 fn id_of(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
+}
+
+/// Falcon half for the fixed single-validator key (seed 0x11): registers the
+/// Falcon pin under the Ed id so `falcon_votes::fvote` verifies. Registration
+/// is idempotent, so call sites may re-derive freely.
+fn val_fk(val_sk: &SigningKey) -> FalconKeypair {
+    let fk = FalconKeypair::generate_from_seed(0x11);
+    register_validator_pq_key(
+        id_of(val_sk),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+    fk
 }
 
 /// One actor-send opcode (v1 requires `bounce = true`).
@@ -56,6 +74,7 @@ fn send_op(recipient: [u8; 32], value: u64) -> OpCode {
 async fn single_runtime() -> (ValidatorRuntime, SigningKey, SigningKey) {
     let val_sk = key(0x11);
     let val = id_of(&val_sk);
+    let _ = val_fk(&val_sk);
     let user_sk = key(0x22);
     let user = id_of(&user_sk);
     let engine = Arc::new(InMemoryStateEngine::new());
@@ -396,7 +415,7 @@ async fn loop_drains_votes_while_apply_pending() {
 
     // Votes never read post-H state, so they keep ingesting while the worker
     // runs: a nil prevote at our height/round is accepted into the set.
-    let nil_prevote = Vote::sign(&val_sk, 1, 0, VoteKind::Prevote, None);
+    let nil_prevote = falcon_votes::fvote(&val_sk, &val_fk(&val_sk), 1, 0, VoteKind::Prevote, None);
     assert!(
         rt.on_prevote(nil_prevote).is_ok(),
         "vote drain must keep working while apply pending"
@@ -596,7 +615,7 @@ async fn overcap_actor_block_rejected_at_adopt() {
     assert!(err.contains("actor"), "got: {err}");
 
     // Adopt side: a genuine QC for the same body, still refused pre-execution.
-    let v = Vote::sign(&val_sk, 1, 0, VoteKind::Precommit, Some(bh));
+    let v = falcon_votes::fvote(&val_sk, &val_fk(&val_sk), 1, 0, VoteKind::Precommit, Some(bh));
     let cert = QuorumCertificate {
         height: 1,
         round: 0,

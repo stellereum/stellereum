@@ -1853,7 +1853,7 @@ can skip a value without knowing its type.
 
 **PREVIEW-ONLY (N-03): it predicts the deploy, NEVER admits it. Requires the
 auth token ALWAYS** (same fail-closed gate as the governance writes —
-`require_gov_write_auth` in `src/rpc.rs:7319`; no token configured refuses on
+`require_gov_write_auth` in `src/rpc.rs:4545`; no token configured refuses on
 every bind, loopback included). `private_key` / `from` are refused with
 `-32602` — sign locally (SDK `TxBuilder::contract_deploy` + `sign`) and submit
 the sealed transaction via the `tx` form. Nothing here touches the mempool or
@@ -1919,7 +1919,7 @@ bad hex, undecodable `tx`, `private_key`/`from` present, invalid `abi`),
 **PREVIEW-ONLY (N-03): it runs the call on a registry CLONE and DROPS the tx —
 never admitted, never gossipped, never executed against live state. Requires
 the auth token ALWAYS** (same fail-closed gate as the governance writes —
-`require_gov_write_auth` in `src/rpc.rs:7576`; no token configured refuses on
+`require_gov_write_auth` in `src/rpc.rs:4545`; no token configured refuses on
 every bind, loopback included). `private_key` / `from` are refused with
 `-32602` — sign locally (SDK `TxBuilder::contract_call` + `sign`) and submit
 the sealed transaction via the `tx` form, or use direct parameters for a
@@ -2577,7 +2577,7 @@ latched circuit breaker: a peg/deviation violation latches it, and only a
 
 The three shielded arms (`stell_shieldedTransfer`, `stell_shieldedBalance`,
 `stell_unshield`) are GONE from dispatch: the RPC audit gate counts 140
-public methods — 143 minus those 3 (`src/rpc.rs:18053-18057`) — and
+public methods — 143 minus those 3 (`src/rpc.rs:18824-18828`) — and
 `src/crypto_privacy.rs` (Pedersen/Ristretto/range proofs) is deleted. Any
 client calling them gets `-32601 "method not found"`. Privacy work now lives
 only in the UNWIRED, default-OFF prototypes (HashPool / SilentPay /

@@ -33,7 +33,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use stellereum::bootstrap;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{
+    derive_sortition_committee, encode_pq_micro_envelope, micro_committee_size,
+    vote_sign_bytes, PqMicroCertificate, QuorumCertificate, ValidatorSet, VoteKind,
+    PQ_UQC_MARKER_ID,
+};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
@@ -51,6 +56,9 @@ const BOND_HEIGHT: u64 = 350;
 const STALE_LEDGER_HEIGHT: u64 = 200; // до-бондовый доменный снапшот
 const BOUNDARY: u64 = 600; // новейшая %100-граница под типом
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 fn effect_account(h: u64) -> [u8; 32] {
     let mut addr = [0u8; 32];
     addr[0..8].copy_from_slice(&h.to_le_bytes());
@@ -62,8 +70,8 @@ fn effect_balance(h: u64) -> u64 {
     1_000_000 + h * 7
 }
 
-fn observer_keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
+fn observer_keys(n: usize) -> (Vec<SigningKey>, Vec<FalconKeypair>) {
+    falcon_votes::falcon_set(n)
 }
 
 fn observer_vset(ks: &[SigningKey]) -> ValidatorSet {
@@ -74,20 +82,50 @@ fn observer_vset(ks: &[SigningKey]) -> ValidatorSet {
     )
 }
 
-fn attach_quorum(b: &mut Block, ks: &[SigningKey], height: u64, bh: [u8; 32]) {
+fn attach_quorum(
+    b: &mut Block,
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    height: u64,
+    bh: [u8; 32],
+) {
     let sigs = ks
         .iter()
-        .map(|k| {
-            let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(bh));
+        .zip(fks.iter())
+        .map(|(k, fk)| {
+            let v = falcon_votes::fvote(k, fk, height, 0, VoteKind::Precommit, Some(bh));
             (v.voter, v.signature)
         })
-        .collect();
+        .collect::<Vec<_>>();
+    // FULL-PQ: classical legs are inert under `verify` — the quorum lives in
+    // the Falcon-512 µQC envelope, assembled here in the live shape (whole
+    // set committee, quorum floor(2n/3)+1, every member signs).
+    let vs = observer_vset(ks);
+    let k = micro_committee_size(vs.len());
+    let parent = b.prev_hash;
+    let committee = derive_sortition_committee(&vs, height, 0, k, &parent);
+    let msg = vote_sign_bytes(height, 0, VoteKind::Precommit, &Some(bh));
+    let mut bitmask = vec![0u8; (k as usize).div_ceil(8)];
+    let mut msigs = Vec::new();
+    for (i, id) in committee.iter().enumerate() {
+        let fk = ks
+            .iter()
+            .zip(fks.iter())
+            .find(|(k, _)| k.verifying_key().to_bytes() == *id)
+            .map(|(_, fk)| fk)
+            .expect("committee is members");
+        bitmask[i / 8] |= 1 << (i % 8);
+        msigs.push(fk.sign(&msg));
+    }
+    let uqc = PqMicroCertificate::new(PqScheme::Falcon512, height, 0, k, bitmask, msigs, parent);
+    let mut signatures = sigs;
+    signatures.push((PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc)));
     b.precommit_qc = Some(QuorumCertificate {
         height,
         round: 0,
         kind: VoteKind::Precommit,
         block_hash: Some(bh),
-        signatures: sigs,
+        signatures,
     });
 }
 
@@ -102,6 +140,7 @@ struct LiveChain {
 /// С бондом — восстановит ЧУЖОЙ сет (ловушка ноды C).
 async fn build_live_chain(
     ks: &[SigningKey],
+    fks: &[FalconKeypair],
     bonded: &SigningKey,
     tip: u64,
     bond_at: u64,
@@ -141,7 +180,7 @@ async fn build_live_chain(
         };
         b.sign_block(&proposer);
         let bh = b.compute_hash();
-        attach_quorum(&mut b, ks, h, bh);
+        attach_quorum(&mut b, ks, fks, h, bh);
         prev = bh;
         blocks.push(b);
         engine
@@ -308,11 +347,11 @@ fn flaky_peers<'a>(
 /// связи. Каждый переход с честной проверкой.
 #[tokio::test]
 async fn stale_observer_returns_via_protocol_only_no_copy() {
-    let ks = observer_keys(2);
+    let (ks, fks) = observer_keys(2);
     let bonded = SigningKey::generate(&mut OsRng);
     let bonded_id = bonded.verifying_key().to_bytes();
     let vs = observer_vset(&ks);
-    let (chain, source_engine) = build_live_chain(&ks, &bonded, TIP, BOND_HEIGHT).await;
+    let (chain, source_engine) = build_live_chain(&ks, &fks, &bonded, TIP, BOND_HEIGHT).await;
     let source_tip_root = source_engine.get_state_root().await;
     assert!(
         source_engine

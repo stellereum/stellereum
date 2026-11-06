@@ -10,21 +10,20 @@
 //!
 //! Construction reuses the hunt_* cluster pattern: `keys()`, `vset()`,
 //! `cluster()` (fresh funded state engine per node via `fund_genesis`),
-//! `mkblock()` signed by the scheduled proposer, `Vote::sign`.
+//! `mkblock()` signed by the scheduled proposer, genuine Falcon `fvote`s.
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::sync::Arc;
-use stellereum::consensus::{ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{ValidatorSet, VoteKind};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
 
 const BAL: u64 = 10_000_000_000_000;
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
-}
 fn id(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
 }
@@ -79,6 +78,7 @@ fn idx_of(ks: &[SigningKey], target: [u8; 32]) -> usize {
 async fn drive_round(
     nodes: &mut [ValidatorRuntime],
     ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
     voters: &[usize],
     recipients: &[usize],
 ) -> ([u8; 32], Vec<Option<[u8; 32]>>) {
@@ -155,13 +155,13 @@ async fn drive_round(
     // Votes from the live subset go to every recipient; the silent ones simply
     // never send, and nothing is delivered on their behalf.
     for &i in voters {
-        let pv = Vote::sign(&ks[i], h, 0, VoteKind::Prevote, Some(bh));
+        let pv = falcon_votes::fvote(&ks[i], &fks[i], h, 0, VoteKind::Prevote, Some(bh));
         for &r in recipients {
             nodes[r].on_prevote(pv.clone()).unwrap();
         }
     }
     for &i in voters {
-        let pc = Vote::sign(&ks[i], h, 0, VoteKind::Precommit, Some(bh));
+        let pc = falcon_votes::fvote(&ks[i], &fks[i], h, 0, VoteKind::Precommit, Some(bh));
         for &r in recipients {
             nodes[r].on_precommit(pc.clone()).unwrap();
         }
@@ -184,14 +184,14 @@ async fn roots(nodes: &[ValidatorRuntime]) -> Vec<[u8; 32]> {
 // Test 1 — 4/4 live: full quorum finalizes, all agree on hash and state root.
 #[tokio::test]
 async fn bft_4_of_4_finalize_and_agree() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     assert_eq!(vs.total_power(), 4);
     assert_eq!(vs.quorum_power(), 3, "floor(2*4/3)+1 = 3; F = 4-3 = 1");
     let mut nodes = cluster(&ks).await;
 
     let all = vec![0usize, 1, 2, 3];
-    let (bh, got) = drive_round(&mut nodes, &ks, &all, &all).await;
+    let (bh, got) = drive_round(&mut nodes, &ks, &fks, &all, &all).await;
     for (i, g) in got.iter().enumerate() {
         assert_eq!(*g, Some(bh), "node {i} must finalize the block");
         assert_eq!(nodes[i].finalized, vec![(1u64, bh)]);
@@ -207,7 +207,7 @@ async fn bft_4_of_4_finalize_and_agree() {
 // Test 2 — 1 of 4 down: the other three still finalize; heights advance.
 #[tokio::test]
 async fn bft_1_down_3_finalize_liveness() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut nodes = cluster(&ks).await;
     let proposer = idx_of(&ks, nodes[0].validators.proposer_for(1, 0).unwrap());
     let silent = (proposer + 1) % 4; // never the proposer, so proposals stay valid
@@ -215,7 +215,7 @@ async fn bft_1_down_3_finalize_liveness() {
     assert_eq!(live.len(), 3, "quorum = 3 with F = 1 down");
 
     // Height 1 with one silent validator: deliver it no votes, collect none.
-    let (bh1, got) = drive_round(&mut nodes, &ks, &live, &live).await;
+    let (bh1, got) = drive_round(&mut nodes, &ks, &fks, &live, &live).await;
     for &i in &live {
         assert_eq!(got[live.iter().position(|&x| x == i).unwrap()], Some(bh1));
         assert_eq!(nodes[i].height(), 2, "live node {i} must advance");
@@ -224,7 +224,7 @@ async fn bft_1_down_3_finalize_liveness() {
     assert!(nodes[silent].finalized.is_empty());
 
     // Height 2, still one down: liveness means heights keep advancing.
-    let (bh2, got2) = drive_round(&mut nodes, &ks, &live, &live).await;
+    let (bh2, got2) = drive_round(&mut nodes, &ks, &fks, &live, &live).await;
     for &i in &live {
         assert_eq!(got2[live.iter().position(|&x| x == i).unwrap()], Some(bh2));
         assert_eq!(nodes[i].height(), 3, "live node {i} must advance again");
@@ -243,14 +243,14 @@ async fn bft_1_down_3_finalize_liveness() {
 // Test 3 — 2 of 4 down: only two vote; NOTHING finalizes (safety for F = 1).
 #[tokio::test]
 async fn bft_2_down_no_finalization() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut nodes = cluster(&ks).await;
     let proposer = idx_of(&ks, nodes[0].validators.proposer_for(1, 0).unwrap());
     // The proposer authors but only two validators vote: 2 < quorum 3.
     let voters = vec![proposer, (proposer + 1) % 4];
     let all = vec![0usize, 1, 2, 3];
 
-    let (_bh, got) = drive_round(&mut nodes, &ks, &voters, &all).await;
+    let (_bh, got) = drive_round(&mut nodes, &ks, &fks, &voters, &all).await;
     for (i, g) in got.iter().enumerate() {
         assert_eq!(*g, None, "node {i} must NOT finalize on 2 votes");
         assert!(nodes[i].finalized.is_empty(), "node {i} commits nothing");
@@ -263,7 +263,7 @@ async fn bft_2_down_no_finalization() {
 // all four converge on the same root.
 #[tokio::test]
 async fn bft_partition_heals_and_converges() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut nodes = cluster(&ks).await;
     let proposer = idx_of(&ks, nodes[0].validators.proposer_for(1, 0).unwrap());
     let back_half: Vec<usize> = (0..4)
@@ -273,7 +273,7 @@ async fn bft_partition_heals_and_converges() {
     let all = vec![0usize, 1, 2, 3];
 
     // Partitioned phase: only two vote -> no finalization anywhere.
-    let (_bh, got) = drive_round(&mut nodes, &ks, &first_half, &all).await;
+    let (_bh, got) = drive_round(&mut nodes, &ks, &fks, &first_half, &all).await;
     assert!(
         got.iter().all(|g| g.is_none()),
         "partitioned: no quorum yet"
@@ -291,8 +291,8 @@ async fn bft_partition_heals_and_converges() {
         .copied()
         .expect("block was proposed");
     for &i in &back_half {
-        let pv = Vote::sign(&ks[i], h, 0, VoteKind::Prevote, Some(bh));
-        let pc = Vote::sign(&ks[i], h, 0, VoteKind::Precommit, Some(bh));
+        let pv = falcon_votes::fvote(&ks[i], &fks[i], h, 0, VoteKind::Prevote, Some(bh));
+        let pc = falcon_votes::fvote(&ks[i], &fks[i], h, 0, VoteKind::Precommit, Some(bh));
         for n in nodes.iter_mut() {
             n.on_prevote(pv.clone()).unwrap();
             n.on_precommit(pc.clone()).unwrap();
@@ -314,7 +314,7 @@ async fn bft_partition_heals_and_converges() {
     );
 
     // The chain resumes: a full round finalizes on all four.
-    let (bh2, got2) = drive_round(&mut nodes, &ks, &all, &all).await;
+    let (bh2, got2) = drive_round(&mut nodes, &ks, &fks, &all, &all).await;
     assert!(
         got2.iter().all(|g| *g == Some(bh2)),
         "chain resumes post-heal"
@@ -333,7 +333,7 @@ async fn bft_partition_heals_and_converges() {
 // three still finalize, and the evidence is recorded exactly once.
 #[tokio::test]
 async fn bft_equivocator_does_not_halt_or_multi_slash() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut nodes = cluster(&ks).await;
     let proposer = idx_of(&ks, nodes[0].validators.proposer_for(1, 0).unwrap());
     let equiv = (proposer + 1) % 4; // not the proposer: its votes are noise only
@@ -361,8 +361,8 @@ async fn bft_equivocator_does_not_halt_or_multi_slash() {
         }
     }
     for &i in &honest {
-        let pv = Vote::sign(&ks[i], h, 0, VoteKind::Prevote, Some(bh));
-        let pc = Vote::sign(&ks[i], h, 0, VoteKind::Precommit, Some(bh));
+        let pv = falcon_votes::fvote(&ks[i], &fks[i], h, 0, VoteKind::Prevote, Some(bh));
+        let pc = falcon_votes::fvote(&ks[i], &fks[i], h, 0, VoteKind::Precommit, Some(bh));
         for &r in &honest {
             nodes[r].on_prevote(pv.clone()).unwrap();
             nodes[r].on_precommit(pc.clone()).unwrap();
@@ -373,8 +373,8 @@ async fn bft_equivocator_does_not_halt_or_multi_slash() {
     // "rebroadcasts" the conflicting vote 5 more times. Each honest node must
     // record the equivocation exactly once (the no-dedup fix), not 6 times.
     let eq_id = id(&ks[equiv]);
-    let first = Vote::sign(&ks[equiv], h, 0, VoteKind::Prevote, Some(bh));
-    let second = Vote::sign(&ks[equiv], h, 0, VoteKind::Prevote, Some(fake));
+    let first = falcon_votes::fvote(&ks[equiv], &fks[equiv], h, 0, VoteKind::Prevote, Some(bh));
+    let second = falcon_votes::fvote(&ks[equiv], &fks[equiv], h, 0, VoteKind::Prevote, Some(fake));
     for &r in &honest {
         nodes[r].on_prevote(first.clone()).unwrap();
         nodes[r].on_prevote(second.clone()).unwrap();

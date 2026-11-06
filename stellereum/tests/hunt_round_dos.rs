@@ -28,6 +28,9 @@ use stellereum::consensus::{
 use stellereum::consensus_net::{parse_incoming, ConsensusMsg};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 use stellereum::state_engine::InMemoryStateEngine;
 
 fn keys(n: usize) -> Vec<SigningKey> {
@@ -214,7 +217,7 @@ fn hunt_finding_1b_honest_proposers_are_still_accepted() {
 
 #[test]
 fn hunt_finding_1c_quorum_at_the_victims_round_now_finalises() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut v = VictimLoop {
         hc: HeightConsensus::new(1, vs.clone()),
@@ -232,16 +235,16 @@ fn hunt_finding_1c_quorum_at_the_victims_round_now_finalises() {
     v.hc.receive_proposal(proposer, bh(r as u8))
         .expect("honest proposal for the victim's own round is accepted");
 
-    for k in ks.iter() {
-        v.hc.add_prevote(Vote::sign(k, 1, r, VoteKind::Prevote, Some(bh(r as u8))))
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        v.hc.add_prevote(falcon_votes::fvote(k, fk, 1, r, VoteKind::Prevote, Some(bh(r as u8))))
             .unwrap();
     }
     assert!(
         v.hc.try_prevote_quorum().is_some(),
         "a real 4/4 prevote quorum is visible at the round the node is in"
     );
-    for k in ks.iter() {
-        v.hc.add_precommit(Vote::sign(k, 1, r, VoteKind::Precommit, Some(bh(r as u8))))
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        v.hc.add_precommit(falcon_votes::fvote(k, fk, 1, r, VoteKind::Precommit, Some(bh(r as u8))))
             .unwrap();
     }
     let qc =
@@ -324,13 +327,17 @@ fn hunt_finding_1d_one_datagram_buys_at_most_one_round() {
 //    mirrors that fixed arm exactly.
 // ===========================================================================
 
-async fn two_validator_rt() -> (ValidatorRuntime, Vec<SigningKey>) {
-    let ks = keys(2);
+async fn two_validator_rt() -> (
+    ValidatorRuntime,
+    Vec<SigningKey>,
+    Vec<stellereum::post_quantum::FalconKeypair>,
+) {
+    let (ks, fks) = falcon_votes::falcon_set(2);
     let vs = vset(&ks);
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vs, 1_000_000_000_000_000).await;
     let rt = ValidatorRuntime::new(ks[0].clone(), vs, state, 1);
-    (rt, ks)
+    (rt, ks, fks)
 }
 
 /// Mirrors the FIXED vote-drain arm in src/main.rs: run the kind handler
@@ -351,7 +358,7 @@ fn drain_vote(rt: &mut ValidatorRuntime, v: Vote, locked: Option<[u8; 32]>) -> b
 
 #[tokio::test]
 async fn hunt_finding_f2_junk_votes_never_move_the_round() {
-    let (mut rt, ks) = two_validator_rt().await;
+    let (mut rt, ks, _fks) = two_validator_rt().await;
     let h = rt.hc.height;
     let r = rt.hc.round;
     let member = ks[1].verifying_key().to_bytes();
@@ -363,6 +370,8 @@ async fn hunt_finding_f2_junk_votes_never_move_the_round() {
     // signature (Vote::verify fails), half are correctly signed by a
     // non-member (power_of == 0). Neither is attributable, so neither may move
     // the round.
+    // NEGATIVE-PATH (forgeries): `signed_with` garbage and non-member Ed-only
+    // votes stay unconditionally invalid under FULL-PQ — do not convert.
     for i in 0..64u32 {
         let target_round = r + 64 + i;
         let v = if i % 2 == 0 {
@@ -391,7 +400,7 @@ async fn hunt_finding_f2_junk_votes_never_move_the_round() {
 
 #[tokio::test]
 async fn hunt_finding_f2_verified_far_vote_still_syncs_bounded() {
-    let (mut rt, ks) = two_validator_rt().await;
+    let (mut rt, ks, fks) = two_validator_rt().await;
     let h = rt.hc.height;
     let r = rt.hc.round;
 
@@ -399,7 +408,7 @@ async fn hunt_finding_f2_verified_far_vote_still_syncs_bounded() {
     // It converges us toward the peer's round, bounded by the per-round jump
     // budget (MAX_SYNC_JUMPS_PER_ROUND capped jumps of ROUND_LOOKBACK each):
     // the Tendermint future-round rule, with the round-DoS bound intact.
-    let v = Vote::sign(&ks[1], h, r + 100, VoteKind::Prevote, None);
+    let v = falcon_votes::fvote(&ks[1], &fks[1], h, r + 100, VoteKind::Prevote, None);
     assert!(
         drain_vote(&mut rt, v, None),
         "verified far vote must be accepted"
@@ -418,13 +427,15 @@ async fn hunt_finding_f2_verified_far_vote_still_syncs_bounded() {
 
 #[tokio::test]
 async fn hunt_finding_f2_batch_of_32_junk_votes_does_not_inflate() {
-    let (mut rt, _ks) = two_validator_rt().await;
+    let (mut rt, _ks, _fks) = two_validator_rt().await;
     let h = rt.hc.height;
     let r = rt.hc.round;
     let outsider = SigningKey::generate(&mut OsRng);
 
     // A Batch of 32 junk votes. Under the old ordering this bought
     // 32 * MAX_SYNC_JUMP(64) = 2048 rounds; now it must buy zero.
+    // NEGATIVE-PATH (forgery): non-member Ed-only votes stay unconditionally
+    // invalid under FULL-PQ — do not convert.
     let batch = ConsensusMsg::Batch(
         (0..32u32)
             .map(|i| ConsensusMsg::Vote {

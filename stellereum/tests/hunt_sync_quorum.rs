@@ -27,6 +27,12 @@ use stellereum::sharding::Block;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::sync::{collect_missing_blocks, validate_sync_chain};
 
+// Only `fvote` is used here (file-local Falcon keys are built inline);
+// `falcon_set` covers the fixed-seed case and is unused here.
+#[allow(dead_code)]
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
 }
@@ -191,27 +197,43 @@ fn hunt_finding_7_quorum_power_is_used_as_a_signature_count_so_sync_is_dead() {
     // where 3 of 4 signatures is a genuine quorum. Two different meanings of the
     // same word, in the same codebase, on the same chain.
     let bh = [0x33u8; 32];
-    let sigs: Vec<(stellereum::consensus::ValidatorId, Vec<u8>)> = real_keys
+    // Falcon companions for the test's OWN keys (NOT `falcon_set`: the votes
+    // must be attributed to `bonded` members, so the committee path must see
+    // the same ids the verifier sees).
+    let real_fks: Vec<_> = real_keys
         .iter()
-        .take(3)
-        .map(|k| {
-            let v = stellereum::consensus::Vote::sign(
+        .enumerate()
+        .map(|(i, k)| {
+            let fk = stellereum::post_quantum::FalconKeypair::generate_from_seed(0xE0 + i as u8);
+            stellereum::consensus::register_validator_pq_key(
+                k.verifying_key().to_bytes(),
+                stellereum::post_quantum::PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+            fk
+        })
+        .collect();
+    let mut qset = stellereum::consensus::VoteSet::new();
+    for (k, fk) in real_keys.iter().zip(real_fks.iter()).take(3) {
+        qset.add(
+            falcon_votes::fvote(
                 k,
+                fk,
                 1,
                 0,
                 stellereum::consensus::VoteKind::Precommit,
                 Some(bh),
-            );
-            (v.voter, v.signature)
-        })
-        .collect();
-    let qc = stellereum::consensus::QuorumCertificate {
-        height: 1,
-        round: 0,
-        kind: stellereum::consensus::VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: sigs,
-    };
+            ),
+            &bonded,
+            1,
+            0,
+            stellereum::consensus::VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
+    }
+    let qc = qset
+        .certificate(Some(bh), &bonded, &[0u8; 32])
+        .expect("3-of-4 bonded power reaches quorum");
     assert!(
         qc.verify(&bonded),
         "3 of 4 bonded validators is a real quorum"

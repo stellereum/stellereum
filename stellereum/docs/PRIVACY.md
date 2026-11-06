@@ -5,7 +5,7 @@ confidential-transfer feature on chain: `src/crypto_privacy.rs` (Pedersen
 commitments, Ristretto stealth, range proofs) is deleted, and the three
 shielded RPC arms (`stell_shieldedTransfer`, `stell_shieldedBalance`,
 `stell_unshield`) are removed from dispatch (the RPC audit gate counts 140
-public methods — 143 minus those 3; `src/rpc.rs:18053-18057`). Anything that
+public methods — 143 minus those 3; `src/rpc.rs:18824-18828`). Anything that
 still names them is stale.
 
 What exists instead are three UNWIRED prototypes — research code that no
@@ -44,8 +44,9 @@ Operator model (`src/hashpool.rs:75-81`): membership is a direct map lookup of
 the recomputed `C` — no paths, no proofs. The operator sees linkable
 `(C, stealth)` registrations at deposit and full openings at spend.
 
-Wiring status: NOT declared in `lib.rs`, NOTHING in production calls it
-(`src/hashpool.rs:1-14`).
+Wiring status: declared in `lib.rs` (`pub mod hashpool`, test access),
+but NOTHING in production calls it and the apply gate is default-OFF
+(`HASH_POOL_ENABLED = false`, `src/state_engine.rs:1016`).
 
 ## 2. SilentPay: non-interactive KEM stealth (`src/silentpay.rs:1-78`)
 
@@ -56,8 +57,9 @@ ss)`, `index += 1` per note). Privacy LIMITATION is identical
 stealth addresses per note, NOT amount hiding. Lockstep LIMITATION: sender and
 recipient `(chain, index)` mirrors must match; lost/reordered notes
 desynchronize the pair (detectable, fail-closed). Resync transport is OUT OF
-SCOPE for the prototype. Wiring status: same as HashPool — not in `lib.rs`,
-nothing calls it (`src/silentpay.rs:1-14`).
+SCOPE for the prototype. Wiring status: same as HashPool — declared in
+`lib.rs` (`pub mod silentpay`, test access), nothing in production calls it
+(`SILENT_PAY_ENABLED = false`, `src/lib.rs:49`).
 
 ## 3. Dandelion relay policy (`src/dandelion.rs:1-17`)
 

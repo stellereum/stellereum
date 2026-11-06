@@ -34,45 +34,69 @@ use stellereum::consensus::{HeightConsensus, ValidatorSet, Vote, VoteKind};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
-fn key(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
-}
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 fn id(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
 }
 
 /// Four validators, power 1 each: total 4, quorum `floor(2*4/3)+1 = 3`.
-fn four() -> (Vec<SigningKey>, ValidatorSet) {
-    let ks = vec![key(11), key(22), key(33), key(44)];
+/// Keys come from the shared Falcon fixture so every vote verifies FULL-PQ.
+fn four() -> (
+    Vec<SigningKey>,
+    Vec<stellereum::post_quantum::FalconKeypair>,
+    ValidatorSet,
+) {
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
     assert_eq!(vs.quorum_power(), 3);
-    (ks, vs)
+    (ks, fks, vs)
 }
 
-fn prevote(k: &SigningKey, h: u64, r: u32, target: Option<[u8; 32]>) -> Vote {
-    Vote::sign(k, h, r, VoteKind::Prevote, target)
+fn prevote(
+    k: &SigningKey,
+    fk: &stellereum::post_quantum::FalconKeypair,
+    h: u64,
+    r: u32,
+    target: Option<[u8; 32]>,
+) -> Vote {
+    falcon_votes::fvote(k, fk, h, r, VoteKind::Prevote, target)
 }
 
-fn precommit(k: &SigningKey, h: u64, r: u32, target: Option<[u8; 32]>) -> Vote {
-    Vote::sign(k, h, r, VoteKind::Precommit, target)
+fn precommit(
+    k: &SigningKey,
+    fk: &stellereum::post_quantum::FalconKeypair,
+    h: u64,
+    r: u32,
+    target: Option<[u8; 32]>,
+) -> Vote {
+    falcon_votes::fvote(k, fk, h, r, VoteKind::Precommit, target)
 }
 
-fn quorum_prevotes(hc: &mut HeightConsensus, ks: &[SigningKey], h: u64, r: u32, t: Option<[u8; 32]>) {
-    for k in ks {
-        hc.add_prevote(prevote(k, h, r, t)).unwrap();
+fn quorum_prevotes(
+    hc: &mut HeightConsensus,
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    h: u64,
+    r: u32,
+    t: Option<[u8; 32]>,
+) {
+    for (i, k) in ks.iter().enumerate() {
+        hc.add_prevote(prevote(k, &fks[i], h, r, t)).unwrap();
     }
 }
 
 fn quorum_precommits(
     hc: &mut HeightConsensus,
     ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
     h: u64,
     r: u32,
     t: Option<[u8; 32]>,
 ) {
-    for k in ks {
-        hc.add_precommit(precommit(k, h, r, t)).unwrap();
+    for (i, k) in ks.iter().enumerate() {
+        hc.add_precommit(precommit(k, &fks[i], h, r, t)).unwrap();
     }
 }
 
@@ -87,7 +111,7 @@ const Y: [u8; 32] = [0x59; 32];
 /// against its own lock), while the same lock offered X votes X.
 #[test]
 fn locked_prevote_must_nil_on_conflicting_proposal() {
-    let (_, vs) = four();
+    let (_, _, vs) = four();
     let mut hc = HeightConsensus::new(1, vs);
     hc.locked = Some((X, 0));
     hc.round = 1;
@@ -114,7 +138,7 @@ fn locked_prevote_must_nil_on_conflicting_proposal() {
 /// an older round is NOT live and must not be voted either.
 #[test]
 fn no_live_proposal_means_nil_prevote() {
-    let (_, vs) = four();
+    let (_, _, vs) = four();
     let mut hc = HeightConsensus::new(1, vs);
     hc.round = 1;
     assert_eq!(hc.decide_prevote(), None, "no proposal: nil");
@@ -134,12 +158,12 @@ fn no_live_proposal_means_nil_prevote() {
 /// must agree on the release.
 #[test]
 fn higher_round_conflicting_polka_unlocks() {
-    let (ks, vs) = four();
+    let (ks, fks, vs) = four();
     let mut hc = HeightConsensus::new(1, vs);
     hc.locked = Some((X, 0));
     hc.round = 1;
 
-    quorum_prevotes(&mut hc, &ks, 1, 1, Some(Y));
+    quorum_prevotes(&mut hc, &ks, &fks, 1, 1, Some(Y));
     assert_eq!(hc.try_prevote_quorum_at(), Some((1, Some(Y))));
     assert_eq!(hc.observed_polka(), Some((1, Y)));
     assert_eq!(hc.locked, None, "higher Y polka must release the X lock");
@@ -150,12 +174,12 @@ fn higher_round_conflicting_polka_unlocks() {
 /// Byzantine quorum bounce an honest node off its lock in the round it took it.
 #[test]
 fn equal_round_conflicting_polka_must_not_unlock() {
-    let (ks, vs) = four();
+    let (ks, fks, vs) = four();
     let mut hc = HeightConsensus::new(1, vs);
     hc.locked = Some((X, 1));
     hc.round = 1;
 
-    quorum_prevotes(&mut hc, &ks, 1, 1, Some(Y));
+    quorum_prevotes(&mut hc, &ks, &fks, 1, 1, Some(Y));
     // The ledger records what the network said ...
     assert_eq!(hc.observed_polka(), Some((1, Y)));
     // ... but the lock holds: 1 > 1 is false.
@@ -166,7 +190,7 @@ fn equal_round_conflicting_polka_must_not_unlock() {
     );
 
     // And the decide path refuses the conflict too.
-    quorum_precommits(&mut hc, &ks, 1, 1, Some(Y));
+    quorum_precommits(&mut hc, &ks, &fks, 1, 1, Some(Y));
     assert_eq!(hc.try_precommit_quorum(), None);
     assert_eq!(hc.decided, None);
     assert_eq!(hc.locked, Some((X, 1)));
@@ -176,12 +200,12 @@ fn equal_round_conflicting_polka_must_not_unlock() {
 /// newest-wins, an older quorum is superseded evidence.
 #[test]
 fn lower_round_conflicting_polka_must_not_unlock() {
-    let (ks, vs) = four();
+    let (ks, fks, vs) = four();
     let mut hc = HeightConsensus::new(1, vs);
     hc.locked = Some((X, 5));
     hc.round = 5;
 
-    quorum_prevotes(&mut hc, &ks, 1, 3, Some(Y));
+    quorum_prevotes(&mut hc, &ks, &fks, 1, 3, Some(Y));
     hc.try_prevote_quorum_at();
     assert_eq!(
         hc.locked,
@@ -195,12 +219,12 @@ fn lower_round_conflicting_polka_must_not_unlock() {
 /// a block finalized one round earlier and fork.
 #[test]
 fn nil_quorum_at_higher_round_must_not_unlock() {
-    let (ks, vs) = four();
+    let (ks, fks, vs) = four();
     let mut hc = HeightConsensus::new(1, vs);
     hc.locked = Some((X, 0));
     hc.round = 1;
 
-    quorum_prevotes(&mut hc, &ks, 1, 1, None);
+    quorum_prevotes(&mut hc, &ks, &fks, 1, 1, None);
     assert_eq!(hc.try_prevote_quorum_at(), Some((1, None)));
     assert_eq!(hc.observed_polka(), None, "nil is not a polka");
     assert_eq!(
@@ -213,10 +237,10 @@ fn nil_quorum_at_higher_round_must_not_unlock() {
 /// A nil precommit quorum neither locks nor decides, locked or not.
 #[test]
 fn nil_qc_never_locks_nor_decides() {
-    let (ks, vs) = four();
+    let (ks, fks, vs) = four();
     let mut hc = HeightConsensus::new(1, vs);
-    quorum_prevotes(&mut hc, &ks, 1, 0, None);
-    quorum_precommits(&mut hc, &ks, 1, 0, None);
+    quorum_prevotes(&mut hc, &ks, &fks, 1, 0, None);
+    quorum_precommits(&mut hc, &ks, &fks, 1, 0, None);
     assert_eq!(hc.try_precommit_quorum(), None);
     assert_eq!(hc.locked, None, "nil must never create a value lock");
     assert_eq!(hc.decided, None);
@@ -227,12 +251,12 @@ fn nil_qc_never_locks_nor_decides() {
 /// network's latest word wherever it formed.
 #[test]
 fn late_polka_outside_scan_window_still_unlocks_via_ledger() {
-    let (ks, vs) = four();
+    let (ks, fks, vs) = four();
     let mut hc = HeightConsensus::new(1, vs);
     hc.locked = Some((X, 0));
     hc.round = 20; // raced far ahead; the scan window covers [12..20].
 
-    quorum_prevotes(&mut hc, &ks, 1, 2, Some(Y)); // lands outside the window
+    quorum_prevotes(&mut hc, &ks, &fks, 1, 2, Some(Y)); // lands outside the window
     assert_eq!(hc.observed_polka(), Some((2, Y)), "ledger must record it");
     hc.try_prevote_quorum_at();
     assert_eq!(
@@ -244,12 +268,12 @@ fn late_polka_outside_scan_window_still_unlocks_via_ledger() {
 /// A stale ledger entry below the lock round does not unlock either.
 #[test]
 fn stale_ledger_below_lock_does_not_unlock() {
-    let (ks, vs) = four();
+    let (ks, fks, vs) = four();
     let mut hc = HeightConsensus::new(1, vs);
     hc.locked = Some((X, 5));
     hc.round = 5;
 
-    quorum_prevotes(&mut hc, &ks, 1, 3, Some(Y));
+    quorum_prevotes(&mut hc, &ks, &fks, 1, 3, Some(Y));
     hc.try_prevote_quorum_at();
     assert_eq!(hc.locked, Some((X, 5)));
 }
@@ -262,12 +286,12 @@ fn stale_ledger_below_lock_does_not_unlock() {
 /// must not decide past a held lock (fail-closed refusal).
 #[test]
 fn locked_decide_refuses_conflicting_qc() {
-    let (ks, vs) = four();
+    let (ks, fks, vs) = four();
     let mut hc = HeightConsensus::new(1, vs);
     hc.locked = Some((X, 0));
 
-    quorum_prevotes(&mut hc, &ks, 1, 0, Some(Y));
-    quorum_precommits(&mut hc, &ks, 1, 0, Some(Y));
+    quorum_prevotes(&mut hc, &ks, &fks, 1, 0, Some(Y));
+    quorum_precommits(&mut hc, &ks, &fks, 1, 0, Some(Y));
     // Same round, so no unlock ...
     assert_eq!(hc.locked, Some((X, 0)));
     // ... and no decision against the lock.
@@ -280,13 +304,13 @@ fn locked_decide_refuses_conflicting_qc() {
 /// violation: a round-7 B polka would release a lock dropped from 9 to 5).
 #[test]
 fn decide_must_not_regress_lock_round() {
-    let (ks, vs) = four();
+    let (ks, fks, vs) = four();
     let mut hc = HeightConsensus::new(1, vs);
     hc.locked = Some((X, 9));
     hc.round = 9;
 
-    quorum_prevotes(&mut hc, &ks, 1, 5, Some(X));
-    quorum_precommits(&mut hc, &ks, 1, 5, Some(X));
+    quorum_prevotes(&mut hc, &ks, &fks, 1, 5, Some(X));
+    quorum_precommits(&mut hc, &ks, &fks, 1, 5, Some(X));
     assert_eq!(
         hc.try_precommit_quorum(),
         Some(X),
@@ -302,12 +326,12 @@ fn decide_must_not_regress_lock_round() {
 /// The happy path still locks forward: deciding X at round 1 locks (X,1).
 #[test]
 fn decide_advances_lock_forward() {
-    let (ks, vs) = four();
+    let (ks, fks, vs) = four();
     let mut hc = HeightConsensus::new(1, vs);
     hc.round = 1;
 
-    quorum_prevotes(&mut hc, &ks, 1, 1, Some(X));
-    quorum_precommits(&mut hc, &ks, 1, 1, Some(X));
+    quorum_prevotes(&mut hc, &ks, &fks, 1, 1, Some(X));
+    quorum_precommits(&mut hc, &ks, &fks, 1, 1, Some(X));
     assert_eq!(hc.try_precommit_quorum(), Some(X));
     assert_eq!(hc.locked, Some((X, 1)));
     assert_eq!(hc.decided, Some(X));
@@ -321,12 +345,12 @@ fn decide_advances_lock_forward() {
 /// unlocked, follows its own proposal, and rejects height-1 votes.
 #[test]
 fn lock_does_not_survive_height_advance() {
-    let (ks, vs) = four();
+    let (ks, fks, vs) = four();
     let mut h1 = HeightConsensus::new(1, vs.clone());
     h1.locked = Some((X, 0));
     h1.round = 1;
-    quorum_prevotes(&mut h1, &ks, 1, 1, Some(X));
-    quorum_precommits(&mut h1, &ks, 1, 1, Some(X));
+    quorum_prevotes(&mut h1, &ks, &fks, 1, 1, Some(X));
+    quorum_precommits(&mut h1, &ks, &fks, 1, 1, Some(X));
     assert_eq!(h1.try_precommit_quorum(), Some(X));
 
     // Height 2 starts with a clean slate (this mirrors the runtime, which
@@ -339,7 +363,9 @@ fn lock_does_not_survive_height_advance() {
     assert_eq!(h2.decide_prevote(), Some(Y));
 
     // A stale height-1 vote is out of scope at height 2, not a phantom polka.
-    assert!(h2.add_prevote(prevote(&ks[0], 1, 0, Some(X))).is_err());
+    assert!(h2
+        .add_prevote(prevote(&ks[0], &fks[0], 1, 0, Some(X)))
+        .is_err());
     assert_eq!(h2.observed_polka(), None);
 }
 
@@ -354,13 +380,19 @@ async fn funded_state(owner: [u8; 32]) -> Arc<InMemoryStateEngine> {
     st
 }
 
-async fn runtime4() -> (Vec<SigningKey>, ValidatorRuntime) {
-    let ks = vec![key(11), key(22), key(33), key(44)];
+async fn runtime4() -> (
+    Vec<SigningKey>,
+    Vec<stellereum::post_quantum::FalconKeypair>,
+    ValidatorRuntime,
+) {
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
     let me = id(&ks[0]);
     let st = funded_state(me).await;
-    let rt = ValidatorRuntime::new(ks[0].clone(), vs, st, 1);
-    (ks, rt)
+    // FULL-PQ: the runtime must carry its Falcon key, otherwise
+    // `make_precommit` mints Ed-only votes `Vote::verify` refuses.
+    let rt = ValidatorRuntime::new(ks[0].clone(), vs, st, 1).with_falcon_key(fks[0].clone());
+    (ks, fks, rt)
 }
 
 /// Locked on X at round 1, the node must NOT precommit a round-1 Y polka
@@ -368,14 +400,14 @@ async fn runtime4() -> (Vec<SigningKey>, ValidatorRuntime) {
 /// re-lock there.
 #[tokio::test]
 async fn precommit_casting_refuses_equal_round_conflict_follows_higher() {
-    let (ks, mut rt) = runtime4().await;
+    let (ks, fks, mut rt) = runtime4().await;
     let h = rt.hc.height;
     rt.hc.locked = Some((X, 1));
     rt.hc.round = 1;
 
     // Equal-round Y polka: the network speaks, but not above our lock.
-    for k in &ks {
-        rt.on_prevote(prevote(k, h, 1, Some(Y))).unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        rt.on_prevote(prevote(k, fk, h, 1, Some(Y))).unwrap();
     }
     assert_eq!(rt.hc.observed_polka(), Some((1, Y)));
     assert_eq!(
@@ -388,8 +420,8 @@ async fn precommit_casting_refuses_equal_round_conflict_follows_higher() {
     // Strictly higher Y polka: unlock and follow.
     rt.next_round();
     assert_eq!(rt.hc.round, 2);
-    for k in &ks {
-        rt.on_prevote(prevote(k, h, 2, Some(Y))).unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        rt.on_prevote(prevote(k, fk, h, 2, Some(Y))).unwrap();
     }
     let pc = rt
         .make_precommit()
@@ -402,13 +434,13 @@ async fn precommit_casting_refuses_equal_round_conflict_follows_higher() {
 /// A nil quorum never becomes a precommit while a value lock is held.
 #[tokio::test]
 async fn precommit_casting_ignores_nil_quorum_under_value_lock() {
-    let (ks, mut rt) = runtime4().await;
+    let (ks, fks, mut rt) = runtime4().await;
     let h = rt.hc.height;
     rt.hc.locked = Some((X, 0));
     rt.hc.round = 1;
 
-    for k in &ks {
-        rt.on_prevote(prevote(k, h, 1, None)).unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        rt.on_prevote(prevote(k, fk, h, 1, None)).unwrap();
     }
     assert_eq!(rt.hc.observed_polka(), None);
     assert_eq!(

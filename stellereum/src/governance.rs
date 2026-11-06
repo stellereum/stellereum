@@ -1243,6 +1243,37 @@ impl Governance {
         self.gov_propose_nonces.contains(&(*proposer, nonce))
     }
 
+    /// Read-only half of [`Governance::propose_signed`]: verifies the
+    /// operator envelope against the claimed proposer staking key and checks
+    /// nonce freshness, WITHOUT consuming the nonce or opening a proposal.
+    ///
+    /// The block-carried RPC path calls this before admitting a gov tx (same
+    /// refusals as the direct path, nothing consumed); the authoritative
+    /// nonce consumption stays in [`Governance::propose_signed`] (direct
+    /// path) and in the block scan's id-gate (`proposal_id == next_id`,
+    /// which makes a replayed block-carried propose refuse at apply).
+    pub fn check_propose_envelope(
+        &self,
+        proposer: ValidatorId,
+        title: &str,
+        action: &GovAction,
+        chain_id: u64,
+        nonce: u64,
+        sig: &crate::wallet_signing::WalletSignature,
+    ) -> Result<(), GovError> {
+        if sig.claimed_address() != proposer {
+            return Err(GovError::BadSignature);
+        }
+        let message = Self::gov_propose_message(chain_id, &proposer, title, action, nonce);
+        if !crate::wallet_signing::verify_message(&proposer, chain_id, &message, sig) {
+            return Err(GovError::BadSignature);
+        }
+        if self.propose_nonce_used(&proposer, nonce) {
+            return Err(GovError::ReplayedNonce);
+        }
+        Ok(())
+    }
+
     /// Submit a proposal with operator-signed identity. Verifies the envelope
     /// against the claimed proposer staking key, consumes the nonce, then
     /// delegates to [`Governance::propose`] (stake gates and tally paths
@@ -1261,19 +1292,32 @@ impl Governance {
         nonce: u64,
         sig: &crate::wallet_signing::WalletSignature,
     ) -> Result<u64, GovError> {
-        if sig.claimed_address() != proposer {
-            return Err(GovError::BadSignature);
-        }
-        let message = Self::gov_propose_message(chain_id, &proposer, &title, &action, nonce);
-        if !crate::wallet_signing::verify_message(&proposer, chain_id, &message, sig) {
-            return Err(GovError::BadSignature);
-        }
-        if self.propose_nonce_used(&proposer, nonce) {
-            return Err(GovError::ReplayedNonce);
-        }
+        self.check_propose_envelope(proposer, &title, &action, chain_id, nonce, sig)?;
         let id = self.propose(ledger, proposer, title, action, now)?;
         self.gov_propose_nonces.insert((proposer, nonce));
         Ok(id)
+    }
+
+    /// Read-only half of [`Governance::vote_signed`]: verifies the operator
+    /// envelope against the claimed voter staking key, WITHOUT recording a
+    /// vote. Same refusals as the direct path (`BadSignature` first, then
+    /// the vote's own gates on a live check), nothing locked or tallied.
+    pub fn check_vote_envelope(
+        &self,
+        voter: [u8; 32],
+        proposal_id: u64,
+        choice: VoteChoice,
+        chain_id: u64,
+        sig: &crate::wallet_signing::WalletSignature,
+    ) -> Result<(), GovError> {
+        if sig.claimed_address() != voter {
+            return Err(GovError::BadSignature);
+        }
+        let message = Self::gov_vote_message(chain_id, proposal_id, choice, &voter);
+        if !crate::wallet_signing::verify_message(&voter, chain_id, &message, sig) {
+            return Err(GovError::BadSignature);
+        }
+        Ok(())
     }
 
     /// Cast a vote with operator-signed identity. Verifies the envelope
@@ -1292,14 +1336,134 @@ impl Governance {
         chain_id: u64,
         sig: &crate::wallet_signing::WalletSignature,
     ) -> Result<u128, GovError> {
-        if sig.claimed_address() != voter {
-            return Err(GovError::BadSignature);
-        }
-        let message = Self::gov_vote_message(chain_id, proposal_id, choice, &voter);
-        if !crate::wallet_signing::verify_message(&voter, chain_id, &message, sig) {
-            return Err(GovError::BadSignature);
-        }
+        self.check_vote_envelope(voter, proposal_id, choice, chain_id, sig)?;
         self.vote(ledger, voter, proposal_id, choice, now)
+    }
+
+    // -----------------------------------------------------------------------
+    // Block-carried governance builders (HDAE-GOV write path).
+    //
+    // The opcodes below are built by NAME (`OpCode::SysCallGovPropose` /
+    // `OpCode::SysCallGovVote` — never raw discriminants): the names + field
+    // shapes are the K1 contract (see the `OpCode` docs). Identity on the
+    // block path is the TRANSACTION signer (`tx.from` = proposer/voter, whose
+    // stake the apply gates on) — no operator envelope rides the opcode, so
+    // these builders take no `WalletSignature`: the caller authorizes by
+    // PQ-signing the assembled transaction with their own key (the session/PQ
+    // signing path: `Transaction::signing_message` + PQ envelope, or
+    // `sign_with_session_falcon512`), exactly like every other tx-building
+    // flow, and submits it through the normal admission path (mempool ->
+    // block). The node never signs as the caller.
+    // -----------------------------------------------------------------------
+
+    /// Build the block-carried propose opcode for the proposal the caller
+    /// names. `proposal_id` MUST be the `next_id` the chain will hold when
+    /// the tx applies (read it from `stell_governanceParams`; the apply
+    /// refuses any other id fail-closed, so a stale read wastes gas but
+    /// moves nothing). `height_observed` MUST be the block height the tx
+    /// applies at (the apply refuses any other height: no cross-height
+    /// replay); the earliest includable height is finalized-tip + 1.
+    ///
+    /// Fail-fast (same rules the apply enforces): an oversize title or an
+    /// out-of-bounds action is refused HERE with `InvalidAction`, so a
+    /// wallet learns before paying admission + gas. The apply re-validates
+    /// authoritatively (a passed check here never excuses a refusal there).
+    pub fn gov_propose_opcode(
+        proposal_id: u64,
+        title: String,
+        action: GovAction,
+        height_observed: u64,
+    ) -> Result<crate::svm::OpCode, GovError> {
+        if title.len() > MAX_PROPOSAL_TITLE_BYTES {
+            return Err(GovError::InvalidAction);
+        }
+        action.validate()?;
+        Ok(crate::svm::OpCode::SysCallGovPropose {
+            proposal_id,
+            title,
+            action: Box::new(action),
+            height_observed,
+        })
+    }
+
+    /// Build the block-carried vote opcode. `height_observed` pins the exact
+    /// block height (same rule as the propose twin). The voting window,
+    /// one-vote rule and weight snapshot are enforced at apply (a vote for
+    /// an unknown/closed proposal refuses there, moving nothing but gas).
+    pub fn gov_vote_opcode(
+        proposal_id: u64,
+        choice: VoteChoice,
+        height_observed: u64,
+    ) -> crate::svm::OpCode {
+        crate::svm::OpCode::SysCallGovVote {
+            proposal_id,
+            choice,
+            height_observed,
+        }
+    }
+
+    /// Assemble the UNSIGNED block-carried propose transaction: envelope
+    /// (`from` = proposer, caller nonce/gas/shards) + the propose opcode.
+    /// `signature` is left empty for the caller to fill by PQ-signing
+    /// `tx.signing_message()` with their own key; submit the sealed tx via
+    /// `stell_submitProposal` (`tx` form) or `stell_sendRawTransaction`.
+    /// `to` is the sender itself (self-directed carrier, same convention as
+    /// the `SysCallStake` flow); `amount` is zero (gov ops move no tokens).
+    #[allow(clippy::too_many_arguments)]
+    // GATE: a signing template names every signed byte explicitly (identity + replay + fee + route + intent); callers pass them, no defaults.
+    pub fn gov_propose_tx(
+        from: [u8; 32],
+        tx_nonce: u64,
+        gas_limit: u64,
+        source_shard: crate::sharding::ShardId,
+        target_shard: crate::sharding::ShardId,
+        proposal_id: u64,
+        title: String,
+        action: GovAction,
+        height_observed: u64,
+    ) -> Result<crate::sharding::Transaction, GovError> {
+        let op = Self::gov_propose_opcode(proposal_id, title, action, height_observed)?;
+        Ok(crate::sharding::Transaction {
+            from,
+            to: from,
+            amount: 0,
+            gas_limit,
+            nonce: tx_nonce,
+            source_shard,
+            target_shard,
+            signature: Vec::new(),
+            payload: vec![op],
+            priority_fee_per_gas: 0,
+        })
+    }
+
+    /// Assemble the UNSIGNED block-carried vote transaction (same envelope
+    /// convention as [`Governance::gov_propose_tx`]; `from` = voter).
+    #[allow(clippy::too_many_arguments)]
+    // GATE: same explicit-bytes rule as the propose template.
+    pub fn gov_vote_tx(
+        from: [u8; 32],
+        tx_nonce: u64,
+        gas_limit: u64,
+        source_shard: crate::sharding::ShardId,
+        target_shard: crate::sharding::ShardId,
+        proposal_id: u64,
+        choice: VoteChoice,
+        height_observed: u64,
+    ) -> crate::sharding::Transaction {
+        let op = Self::gov_vote_opcode(proposal_id, choice, height_observed);
+        crate::sharding::Transaction {
+            from,
+            to: from,
+            amount: 0,
+            gas_limit,
+            nonce: tx_nonce,
+            source_shard,
+            target_shard,
+            signature: Vec::new(),
+            payload: vec![op],
+            priority_fee_per_gas: 0,
+        }
     }
 
     /// Finalize a proposal after voting ends. Turnout must meet the quorum
@@ -1715,6 +1879,82 @@ impl Governance {
             .filter(|p| p.status == status)
             .count()
     }
+
+    // -----------------------------------------------------------------------
+    // Block-carried governance migration (startup hook, in-memory only).
+    //
+    // Pre-activation proposals were opened by direct writes (not by block
+    // ops) and are restored from storage as-is. Before block-carried
+    // proposes can flow, the loaded state must satisfy the ONE invariant the
+    // block scan assumes: every future propose mints a fresh id. The scan
+    // requires `proposal_id == gov.next_id` and refuses anything else, so a
+    // restored `next_id` at/below an existing id would make the next
+    // block-carried propose refuse forever (liveness), and a `next_id`
+    // colliding with a live id would overwrite it. The repair below is the
+    // entire "import into the block-carried format": proposals themselves
+    // need no rewrite (tally/electorate/timelock shapes are versioned
+    // explicitly: `electorate_weights: None` keeps the documented live-
+    // weight fallback, a missing `timelocks` entry keeps the documented
+    // legacy-immediate execution — both load-bearing for pre-upgrade
+    // proposals and deliberately NOT backfilled here, since the propose-time
+    // weights are unknowable post-hoc and inventing a maturity would change
+    // execution behavior).
+    //
+    // INVOKED once from the main.rs startup hook right after the persisted
+    // state is installed. IN-MEMORY ONLY: no storage, disk, or network I/O
+    // (takes `&mut self`, returns counts).
+    // -----------------------------------------------------------------------
+
+    /// Import pre-existing (pre-activation) proposals into the block-carried
+    /// format: repairs `next_id` to `max(next_id, max_existing_id + 1, 1)`
+    /// so block-minted proposes can never collide with (or stall behind)
+    /// restored proposals, and reports the status census. IDEMPOTENT:
+    /// running twice changes nothing — the second run finds `next_id`
+    /// already sufficient and mutates zero bytes (only its
+    /// `next_id_repaired` reads `false`).
+    pub fn migrate_gov_proposals_to_genesis(&mut self) -> GovMigrationSummary {
+        let max_id = self.proposals.keys().copied().max();
+        let want = max_id.map(|m| m.saturating_add(1)).unwrap_or(1).max(1);
+        let next_id_repaired = if self.next_id < want {
+            self.next_id = want;
+            true
+        } else {
+            false
+        };
+        GovMigrationSummary {
+            proposals_seen: self.proposals.len(),
+            next_id_repaired,
+            open: self.count_status(ProposalStatus::Open),
+            passed: self.count_status(ProposalStatus::Passed),
+            rejected: self.count_status(ProposalStatus::Rejected),
+            executed: self.count_status(ProposalStatus::Executed),
+            invalid_actions: self
+                .proposals
+                .values()
+                .filter(|p| p.action.validate().is_err())
+                .count(),
+        }
+    }
+}
+
+/// Outcome of one [`Governance::migrate_gov_proposals_to_genesis`] run: pure
+/// counts. The ONLY state change a run may make is the `next_id` repair
+/// (`next_id_repaired`); every other field reports what was seen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GovMigrationSummary {
+    /// Pre-existing proposals found (all statuses).
+    pub proposals_seen: usize,
+    /// `next_id` was below `max_id + 1` (or below 1) and was raised.
+    pub next_id_repaired: bool,
+    /// Proposals by status (observability for the startup log).
+    pub open: usize,
+    pub passed: usize,
+    pub rejected: usize,
+    pub executed: usize,
+    /// Proposals whose action fails TODAY's `validate` (read-only count, no
+    /// removal: locked stake releases at finalize, so dropping one would
+    /// brick funds; execute-time backstops already refuse them fail-closed).
+    pub invalid_actions: usize,
 }
 
 #[cfg(test)]
@@ -2174,6 +2414,241 @@ mod tests {
             g.vote_signed(&mut l, lone_addr, id, VoteChoice::Yes, 1, CHAIN, &lone_sig),
             Err(GovError::NotStaker)
         );
+    }
+
+    /// The read-only envelope checks agree with the signed paths exactly,
+    /// and consume nothing: check-twice passes, the signed call then opens,
+    /// and only afterwards does the check report the spent nonce.
+    #[test]
+    fn check_envelope_helpers_agree_with_signed_paths() {
+        use crate::wallet_signing::WalletSigningKey;
+        const CHAIN: u64 = 777;
+        let key = WalletSigningKey::ed25519([0xA1u8; 32]);
+        let addr = key.address();
+        let mut l = StakingLedger::new();
+        l.bond(addr, stell(10_000), DEFAULT_COMMISSION_BPS).unwrap();
+        let mut g = Governance::new();
+        let title = "t".to_string();
+        let action = GovAction::Signal("s".into());
+        let msg = Governance::gov_propose_message(CHAIN, &addr, &title, &action, 1);
+        let sig = key.sign_message(CHAIN, &msg).unwrap();
+        // Read-only: twice is fine, nothing consumed, nothing opened.
+        assert!(g.check_propose_envelope(addr, &title, &action, CHAIN, 1, &sig).is_ok());
+        assert!(g.check_propose_envelope(addr, &title, &action, CHAIN, 1, &sig).is_ok());
+        assert!(!g.propose_nonce_used(&addr, 1));
+        assert!(g.proposals.is_empty());
+        // The signed path opens and consumes.
+        let id = g
+            .propose_signed(&mut l, addr, title.clone(), action.clone(), 0, CHAIN, 1, &sig)
+            .unwrap();
+        // ...and only now does the check report the spent nonce.
+        assert_eq!(
+            g.check_propose_envelope(addr, &title, &action, CHAIN, 1, &sig),
+            Err(GovError::ReplayedNonce)
+        );
+        // Vote checks verify without recording (tally unmoved).
+        let vmsg = Governance::gov_vote_message(CHAIN, id, VoteChoice::Yes, &addr);
+        let vsig = key.sign_message(CHAIN, &vmsg).unwrap();
+        assert!(g.check_vote_envelope(addr, id, VoteChoice::Yes, CHAIN, &vsig).is_ok());
+        assert_eq!(g.proposals.get(&id).unwrap().yes, 0);
+        let w = g
+            .vote_signed(&mut l, addr, id, VoteChoice::Yes, 1, CHAIN, &vsig)
+            .unwrap();
+        assert_eq!(w, stell(10_000) as u128);
+    }
+
+    /// Block-carried opcode builders: enum NAMES (never discriminants),
+    /// exact field shapes, fail-fast validation, and unsigned tx templates
+    /// whose only missing piece is the caller's own PQ signature.
+    #[test]
+    fn gov_opcode_builders_use_names_and_validate() {
+        let action = GovAction::SetBlockReward(stell(9));
+        let op = Governance::gov_propose_opcode(4, "t".into(), action.clone(), 41).unwrap();
+        match op {
+            crate::svm::OpCode::SysCallGovPropose {
+                proposal_id,
+                title,
+                action: a,
+                height_observed,
+            } => {
+                assert_eq!(proposal_id, 4);
+                assert_eq!(title, "t");
+                assert_eq!(*a, action);
+                assert_eq!(height_observed, 41);
+            }
+            other => panic!("propose builder must mint SysCallGovPropose, got: {other:?}"),
+        }
+        // Oversize title and out-of-bounds actions refuse HERE (fail-fast,
+        // same `InvalidAction` the apply reports — never admitted blind).
+        assert!(
+            matches!(
+                Governance::gov_propose_opcode(
+                    4,
+                    "x".repeat(MAX_PROPOSAL_TITLE_BYTES + 1),
+                    action.clone(),
+                    41
+                ),
+                Err(GovError::InvalidAction)
+            ),
+            "oversize title must refuse fail-fast"
+        );
+        assert!(
+            matches!(
+                Governance::gov_propose_opcode(
+                    4,
+                    "t".into(),
+                    GovAction::SetBlockReward(u64::MAX),
+                    41
+                ),
+                Err(GovError::InvalidAction)
+            ),
+            "out-of-bounds action must refuse fail-fast"
+        );
+        let vop = Governance::gov_vote_opcode(4, VoteChoice::No, 41);
+        match vop {
+            crate::svm::OpCode::SysCallGovVote {
+                proposal_id,
+                choice,
+                height_observed,
+            } => {
+                assert_eq!(proposal_id, 4);
+                assert_eq!(choice, VoteChoice::No);
+                assert_eq!(height_observed, 41);
+            }
+            other => panic!("vote builder must mint SysCallGovVote, got: {other:?}"),
+        }
+        // Templates: self-directed carrier, caller nonce/gas/shards, empty
+        // signature slot for the caller's own PQ signature, one-op payload.
+        let from = [0xA1u8; 32];
+        let tx = Governance::gov_propose_tx(from, 7, 100_000, 0, 0, 4, "t".into(), action, 41)
+            .unwrap();
+        assert_eq!(tx.from, from);
+        assert_eq!(tx.to, from);
+        assert_eq!(tx.amount, 0);
+        assert_eq!(tx.nonce, 7);
+        assert_eq!(tx.gas_limit, 100_000);
+        assert!(tx.signature.is_empty(), "template is unsigned: the caller signs");
+        assert_eq!(tx.payload.len(), 1);
+        assert!(matches!(
+            tx.payload[0],
+            crate::svm::OpCode::SysCallGovPropose { .. }
+        ));
+        let vtx = Governance::gov_vote_tx(from, 8, 100_000, 0, 0, 4, VoteChoice::Yes, 41);
+        assert_eq!((vtx.from, vtx.nonce), (from, 8));
+        assert!(vtx.signature.is_empty());
+        assert!(matches!(
+            vtx.payload[0],
+            crate::svm::OpCode::SysCallGovVote { .. }
+        ));
+    }
+
+    /// Migration on a mixed-status chain with a stale `next_id` plus one
+    /// smuggled invalid action: repairs the id, censuses every status, and
+    /// counts (never removes) the invalid one.
+    #[test]
+    fn migrate_repairs_next_id_and_censuses() {
+        let (mut l, ids) = ledger_with(3, 10_000);
+        let mut g = Governance::new();
+        let p1 = g
+            .propose(&mut l, ids[0], "a".into(), GovAction::Signal("a".into()), 0)
+            .unwrap();
+        let p2 = g
+            .propose(&mut l, ids[1], "b".into(), GovAction::Signal("b".into()), 0)
+            .unwrap();
+        let p3 = g
+            .propose(&mut l, ids[2], "c".into(), GovAction::Signal("c".into()), 0)
+            .unwrap();
+        let end = GOVERNANCE_VOTING_PERIOD_SECS + 1;
+        // p1 passes unanimously and executes; p2 gets no votes (rejected).
+        for id in &ids {
+            g.vote(&mut l, *id, p1, VoteChoice::Yes, 1).unwrap();
+        }
+        assert_eq!(g.finalize(&mut l, p1, end).unwrap(), ProposalStatus::Passed);
+        g.execute([0xEu8; 32], p1).unwrap();
+        assert_eq!(g.finalize(&mut l, p2, end).unwrap(), ProposalStatus::Rejected);
+        // p3 stays Open. Smuggle one invalid action past propose-time checks
+        // (direct map insert, as a pre-activation byte shape would).
+        g.proposals.insert(
+            9,
+            Proposal {
+                id: 9,
+                proposer: ids[0],
+                title: "smuggled".into(),
+                action: GovAction::SetBlockReward(u64::MAX),
+                created_at: 0,
+                voting_end: end,
+                yes: 0,
+                no: 0,
+                abstain: 0,
+                voters: Default::default(),
+                status: ProposalStatus::Open,
+                electorate: 1,
+                electorate_weights: None,
+                proposer_lock: 0,
+                weights: Default::default(),
+            },
+        );
+        // Stale the id counter the way a pre-activation restore can.
+        g.next_id = 2;
+        let sum = g.migrate_gov_proposals_to_genesis();
+        assert_eq!(sum.proposals_seen, 4);
+        assert!(sum.next_id_repaired);
+        assert_eq!(g.next_id, 10, "next_id must clear the highest restored id");
+        assert_eq!(sum.open, 2);
+        assert_eq!(sum.passed, 0);
+        assert_eq!(sum.rejected, 1);
+        assert_eq!(sum.executed, 1);
+        assert_eq!(sum.invalid_actions, 1, "counted, never removed");
+        assert!(g.proposals.contains_key(&9), "migration must not drop proposals");
+        assert!(g.proposals.contains_key(&p3));
+    }
+
+    /// Migration idempotency: running twice changes nothing. The second run
+    /// reports identical counts with `next_id_repaired == false`, and the
+    /// serialized state is byte-identical between runs.
+    #[test]
+    fn migrate_gov_proposals_to_genesis_is_idempotent() {
+        let (mut l, ids) = ledger_with(1, 10_000);
+        let mut g = Governance::new();
+        g.propose(&mut l, ids[0], "a".into(), GovAction::Signal("a".into()), 0)
+            .unwrap();
+        g.next_id = 1; // stale restore: id 1 exists, counter claims 1
+        // Byte-compare via bincode (serde_json cannot map the nonce/proposal
+        // keys, which are not strings — same wire form the RPC tests use).
+        let before = bincode::serialize(&g).expect("governance serializes");
+        let first = g.migrate_gov_proposals_to_genesis();
+        assert!(first.next_id_repaired);
+        assert_eq!(g.next_id, 2);
+        let mid = bincode::serialize(&g).expect("governance serializes");
+        assert_ne!(before, mid, "the repair must actually change state once");
+        let second = g.migrate_gov_proposals_to_genesis();
+        let after = bincode::serialize(&g).expect("governance serializes");
+        assert_eq!(mid, after, "second run must change zero bytes");
+        assert!(!second.next_id_repaired);
+        assert_eq!(
+            (second.proposals_seen, second.open),
+            (first.proposals_seen, first.open)
+        );
+        // Empty chain: nothing to repair, still idempotent.
+        let mut fresh = Governance::new();
+        let f1 = fresh.migrate_gov_proposals_to_genesis();
+        assert_eq!((f1.proposals_seen, f1.next_id_repaired), (0, false));
+        let f2 = fresh.migrate_gov_proposals_to_genesis();
+        assert_eq!(f1, f2);
+    }
+
+    /// Migration never rewinds a healthy counter (a `next_id` already ahead
+    /// of every restored id is left alone).
+    #[test]
+    fn migrate_never_rewinds_next_id() {
+        let (mut l, ids) = ledger_with(1, 10_000);
+        let mut g = Governance::new();
+        g.propose(&mut l, ids[0], "a".into(), GovAction::Signal("a".into()), 0)
+            .unwrap();
+        g.next_id = 100;
+        let sum = g.migrate_gov_proposals_to_genesis();
+        assert!(!sum.next_id_repaired);
+        assert_eq!(g.next_id, 100);
     }
 
     #[test]

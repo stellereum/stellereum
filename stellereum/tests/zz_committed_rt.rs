@@ -1,16 +1,18 @@
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-use stellereum::consensus::{QuorumCertificate, Vote, VoteKind};
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
+use stellereum::consensus::{QuorumCertificate, VoteKind};
 use stellereum::consensus_net::ConsensusMsg;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 #[test]
 fn committed_with_qc_roundtrips() {
-    let ks: Vec<SigningKey> = (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
+    let (ks, fks) = falcon_votes::falcon_set(2);
     let bh = [5u8; 32];
     let sigs: Vec<([u8; 32], Vec<u8>)> = ks
         .iter()
-        .map(|k| {
-            let v = Vote::sign(k, 9, 0, VoteKind::Precommit, Some(bh));
+        .zip(fks.iter())
+        .map(|(k, fk)| {
+            let v = falcon_votes::fvote(k, fk, 9, 0, VoteKind::Precommit, Some(bh));
             (v.voter, v.signature)
         })
         .collect();

@@ -1842,6 +1842,318 @@ impl EpochDkg {
 }
 
 // ===========================================================================
+// Proactive DKG reshare — B1/B2 state machine (INACTIVE by default)
+// ===========================================================================
+//
+// MATH (task-pinned B1-B2 formulas; paper unavailable in this tree — UNVERIFIED):
+// * B1 (static secret): a (t,n)-Shamir secret with f captures/epoch and NO
+//   refresh lives T = ceil(t/f) epochs.
+// * B2 (proactive): with a refresh every Delta epochs and a fresh epoch key,
+//   old shares are useless; the adversary must collect t shares INSIDE one
+//   interval. At capture rate lambda*n per epoch the failure probability is
+//   P[fail] = P[Bin(n, lambda*Delta) >= t] <= exp(-n*Delta*D(t/(n*Delta)||lambda)),
+//   so secrecy is indefinite while Delta <= Delta*, where Delta* solves
+//   P[fail] <= delta.
+//
+// REPORT ROW (task-pinned; math ref unavailable in this tree — UNVERIFIED):
+// n=100, t=34, lambda=0.05/epoch -> Delta* ~= 1.7 epochs. The const below
+// pins ceil(1.7) = 2 integer epochs as the default interval.
+//
+// STATUS: INACTIVE — MEV_RESHARE_ACTIVATION_HEIGHT = u64::MAX, so the
+// runtime hook never fires and the single-DKG path is byte-identical
+// (pinned by the pre-activation no-op test and the unmodified mev suites).
+// The lead flips the activation height to enable; threshold math, Feldman
+// VSS, sealing and the wire format are UNCHANGED.
+
+/// MEV reshare activation height: the chain height at/above which the
+/// proactive reshare hook is live. INACTIVE by default (u64::MAX — the lead
+/// flips to a real height to enable). While inactive the runtime hook is a
+/// no-op and single-DKG behavior is byte-identical.
+pub const MEV_RESHARE_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// Default reshare interval in integer epochs: ceil(Delta*) with
+/// Delta* ~= 1.7 epochs from the task-pinned report row (n=100, t=34,
+/// lambda=0.05) solving P[Bin(n, lambda*Delta) >= t] <= delta. Two integer
+/// epochs conservatively cover the ~1.7-epoch bound.
+pub const MEV_RESHARE_DELTA_STAR_EPOCHS: u64 = 2;
+
+/// Whether the proactive reshare hook is active at `height`.
+#[allow(clippy::absurd_extreme_comparisons)] // GATE: `>=` is the activation semantic the lead needs once the const flips to a real height; `==` (what the lint suggests for MAX) would miss every height past activation.
+#[inline]
+pub fn is_reshare_active(height: u64) -> bool {
+    height >= MEV_RESHARE_ACTIVATION_HEIGHT
+}
+
+/// Pure reshare-due predicate: true when `epoch` is at least `delta_star`
+/// epochs past `last_reshare_epoch`.
+///
+/// * `epoch < last_reshare_epoch` (reorg / rollback): false, never rewind.
+/// * `delta_star == 0`: any `epoch >= last` is due (degenerate, documented).
+/// * saturating subtraction otherwise: `epoch - last >= delta`.
+#[inline]
+pub fn reshare_due(epoch: u64, last_reshare_epoch: u64, delta_star_epochs: u64) -> bool {
+    if epoch < last_reshare_epoch {
+        return false;
+    }
+    epoch.saturating_sub(last_reshare_epoch) >= delta_star_epochs
+}
+
+/// Carry the committee forward into a reshare epoch with fresh KEM transport keys.
+///
+/// Pure transition: `next_epoch` gets the SAME member set (same validator ids,
+/// same order-independent sort) and therefore the SAME threshold `t`
+/// ([`threshold_for`] is a pure function of `n`). The committee hash changes
+/// (the epoch is bound in), so the next DKG round derives a FRESH epoch seed,
+/// FRESH share polynomials and a FRESH epoch key — old shares do not verify
+/// against the new transcript and sealed payloads do not cross epochs (AAD).
+///
+/// Fail-closed on:
+/// * `next_epoch <= committee.epoch` (reshare only moves forward);
+/// * a threshold/member mismatch (never silently shrink the set — rebuilds
+///   via [`EpochCommittee::build`] and compares);
+/// * any member missing an active KEM key at `height` in `registry`
+///   ([`MevKemRegistry::get_active_ek`] — unknown recipient is `Err`, never
+///   a classical fallback, so the fresh DKG round has KEM transport for every
+///   recipient before it starts).
+pub fn reshare_transition(
+    committee: &EpochCommittee,
+    next_epoch: u64,
+    registry: &MevKemRegistry,
+    height: u64,
+) -> Result<EpochCommittee, String> {
+    if next_epoch <= committee.epoch {
+        return Err("reshare must move the committee forward to a later epoch".to_string());
+    }
+    let members = committee.members.clone();
+    let next = EpochCommittee::build(next_epoch, members);
+    if next.threshold != committee.threshold {
+        return Err("reshare must preserve the threshold".to_string());
+    }
+    if next.members.len() != committee.members.len() {
+        return Err("reshare must preserve the member set".to_string());
+    }
+    for (a, b) in next.members.iter().zip(committee.members.iter()) {
+        if a.validator_id != b.validator_id || a.enc_pk != b.enc_pk {
+            return Err("reshare must preserve the member set".to_string());
+        }
+    }
+    for m in &next.members {
+        registry
+            .get_active_ek(&m.validator_id, height)
+            .ok_or_else(|| {
+                format!(
+                    "mev kem registry has no active key for reshare recipient {}: refusing",
+                    hex::encode(m.validator_id)
+                )
+            })?;
+    }
+    Ok(next)
+}
+
+#[cfg(test)]
+mod reshare_tests {
+    use super::*;
+
+    /// A test validator identity: (consensus id, Ed25519 long-term secret).
+    type IdSecret = ([u8; 32], [u8; 32]);
+
+    fn test_id(seed_byte: u8) -> IdSecret {
+        let mut secret = [0u8; 32];
+        secret[0] = seed_byte;
+        secret[1] = 0xA5;
+        let signing = ed25519_dalek::SigningKey::from_bytes(&secret);
+        let id = signing.verifying_key().to_bytes();
+        (id, secret)
+    }
+
+    fn committee_of(epoch: u64, n: usize) -> (EpochCommittee, Vec<IdSecret>) {
+        let mut pairs = Vec::new();
+        let mut members = Vec::new();
+        // Deterministic distinct Ed25519 seeds: [i, 0xA5, ...] is vanishingly
+        // unlikely to collide; retry on the 2^-200 event instead of hanging.
+        for i in 0..n {
+            let (id, secret) = test_id(i as u8 + 1);
+            let enc_pk =
+                encryption_public_key_from_ed25519(&id).expect("derived test id must convert");
+            members.push(CommitteeMember {
+                validator_id: id,
+                enc_pk,
+            });
+            pairs.push((id, secret));
+        }
+        (EpochCommittee::build(epoch, members), pairs)
+    }
+
+    fn registry_for(committee: &EpochCommittee, height: u64) -> MevKemRegistry {
+        let mut reg = MevKemRegistry::new();
+        for (i, m) in committee.members.iter().enumerate() {
+            let mut seed = [0u8; 64];
+            seed[0] = i as u8 + 1;
+            seed[1] = 0x5A;
+            let ek = pq_kem_ek_from_seed(&seed);
+            reg.register(m.validator_id, ek, 0, height, true)
+                .expect("test registration must succeed");
+        }
+        reg
+    }
+
+    fn run_classical_dkg(
+        committee: &EpochCommittee,
+        pairs: &[IdSecret],
+    ) -> Vec<EpochKeyMaterial> {
+        let enc: Vec<[u8; 32]> = pairs
+            .iter()
+            .map(|(_, s)| encryption_secret_from_ed25519(s))
+            .collect();
+        let mut dkgs: Vec<EpochDkg> = pairs
+            .iter()
+            .map(|(id, _)| EpochDkg::new(committee.clone(), *id))
+            .collect();
+        let mut contributions = Vec::new();
+        for (i, (id, secret)) in pairs.iter().enumerate() {
+            if let Ok(c) = dkgs[i].contribution(*id, secret, &enc[i]) {
+                dkgs[i].set_own(c.clone());
+                contributions.push(c);
+            }
+        }
+        assert_eq!(contributions.len(), committee.contributors.len());
+        for i in 0..pairs.len() {
+            for c in &contributions {
+                dkgs[i].ingest(c.clone(), &enc[i]).expect("ingest");
+            }
+        }
+        dkgs.into_iter()
+            .map(|mut d| d.finalize().expect("finalize"))
+            .collect()
+    }
+
+    #[test]
+    fn reshare_due_boundaries() {
+        // delta = 2: due exactly at last+2, not before.
+        assert!(!reshare_due(10, 10, 2));
+        assert!(!reshare_due(11, 10, 2));
+        assert!(reshare_due(12, 10, 2));
+        assert!(reshare_due(13, 10, 2));
+        // Reorg: epoch behind last is never due.
+        assert!(!reshare_due(9, 10, 2));
+        // delta = 1: every new epoch is due.
+        assert!(!reshare_due(10, 10, 1));
+        assert!(reshare_due(11, 10, 1));
+        // Degenerate delta = 0: any epoch >= last is due.
+        assert!(reshare_due(10, 10, 0));
+        assert!(!reshare_due(9, 10, 0));
+    }
+
+    #[test]
+    fn reshare_transition_preserves_threshold_and_members() {
+        let (committee, _) = committee_of(7, 4);
+        let reg = registry_for(&committee, 0);
+        let next = reshare_transition(&committee, 9, &reg, 0).expect("transition");
+        assert_eq!(next.epoch, 9);
+        assert_eq!(next.threshold, committee.threshold);
+        assert_eq!(next.members.len(), committee.members.len());
+        for (a, b) in next.members.iter().zip(committee.members.iter()) {
+            assert_eq!(a.validator_id, b.validator_id);
+            assert_eq!(a.enc_pk, b.enc_pk);
+        }
+        // The epoch is bound into the hash: the reshare epoch differs.
+        assert_ne!(next.hash, committee.hash);
+        // Non-forward epochs are refused.
+        assert!(reshare_transition(&committee, 7, &reg, 0).is_err());
+        assert!(reshare_transition(&committee, 3, &reg, 0).is_err());
+        // A member without a KEM key is refused (fail-closed, never fallback).
+        let mut reg_missing = MevKemRegistry::new();
+        let mut seed = [0u8; 64];
+        seed[0] = 1;
+        seed[1] = 0x5A;
+        reg_missing
+            .register(
+                committee.members[0].validator_id,
+                pq_kem_ek_from_seed(&seed),
+                0,
+                0,
+                true,
+            )
+            .unwrap();
+        assert!(reshare_transition(&committee, 9, &reg_missing, 0).is_err());
+    }
+
+    #[test]
+    fn post_activation_reshare_rekeys_and_old_shares_refuse() {
+        // Activation is INACTIVE by default; simulate the post-activation
+        // world by driving the transition explicitly at a height where the
+        // caller considers reshare live (the const itself stays MAX).
+        let (committee, pairs) = committee_of(20, 4);
+        let reg = registry_for(&committee, 0);
+        let next = reshare_transition(&committee, 20 + MEV_RESHARE_DELTA_STAR_EPOCHS, &reg, 0)
+            .expect("transition");
+        let old_mats = run_classical_dkg(&committee, &pairs);
+        let new_mats = run_classical_dkg(&next, &pairs);
+        // Re-keyed: the epoch public key differs.
+        assert_ne!(old_mats[0].public_key, new_mats[0].public_key);
+        // A ciphertext sealed to the NEW key does not open under OLD shares:
+        // combine old partials but check against the new committee hash (AAD
+        // binds the committee) — must fail.
+        let new_key = new_mats[0].public_key();
+        let meta = TransparentMeta {
+            from: [7u8; 32],
+            nonce: 3,
+            gas_limit: 21_000,
+            priority_fee_per_gas: 5,
+            source_shard: 0,
+            target_shard: 0,
+        };
+        let envelope = seal_transaction(&new_key, b"reshare-payload", [9u8; 32], meta).unwrap();
+        let old_partials: Vec<DecryptionPartial> = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, _)| DecryptionPartial {
+                validator_index: committee.index_of(&pairs[i].0).unwrap(),
+                point: compute_partial(&old_mats[i].share, &envelope.ephemeral_pk).unwrap(),
+            })
+            .collect();
+        assert!(
+            unseal_transaction(
+                &envelope,
+                &old_partials[..committee.threshold],
+                committee.threshold,
+                &next.hash,
+            )
+            .is_err(),
+            "old shares must not unseal the reshared epoch"
+        );
+        // Sanity: NEW shares DO unseal the new ciphertext.
+        let new_partials: Vec<DecryptionPartial> = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, _)| DecryptionPartial {
+                validator_index: next.index_of(&pairs[i].0).unwrap(),
+                point: compute_partial(&new_mats[i].share, &envelope.ephemeral_pk).unwrap(),
+            })
+            .collect();
+        let plain = unseal_transaction(
+            &envelope,
+            &new_partials[..next.threshold],
+            next.threshold,
+            &next.hash,
+        )
+        .expect("new shares must unseal the reshared epoch");
+        assert_eq!(plain, b"reshare-payload");
+    }
+
+    #[test]
+    fn pre_activation_noop_is_pinned() {
+        // INACTIVE by default: the lead flips this const to enable.
+        assert_eq!(MEV_RESHARE_ACTIVATION_HEIGHT, u64::MAX);
+        assert!(!is_reshare_active(0));
+        assert!(!is_reshare_active(u64::MAX - 1));
+        assert!(is_reshare_active(u64::MAX));
+        // The default interval pins the report row ceil(1.71) = 2.
+        assert_eq!(MEV_RESHARE_DELTA_STAR_EPOCHS, 2);
+    }
+}
+
+// ===========================================================================
 // Sealed envelopes
 // ===========================================================================
 

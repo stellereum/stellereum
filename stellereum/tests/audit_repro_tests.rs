@@ -5,7 +5,7 @@
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use stellereum::cell::PatriciaTrie;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{ValidatorSet, VoteKind, VoteSet};
 use stellereum::cpat2::ACCOUNT_LEAF_LEN_PQ;
 use stellereum::light_client::{Checkpoint, LightClient};
 use stellereum::mempool::{Mempool, MempoolError, PQ_ACTIVATION_SURCHARGE_GAS};
@@ -25,6 +25,9 @@ use stellereum::sharding::{PqSignatureEnvelope, Transaction};
 // All tests below hold this mutex to serialize the flag window. No protocol
 // logic is touched.
 static PQ_MODE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 #[test]
 fn repro_1_custom_salt_counterfactual_address_activation_succeeds() {
@@ -231,14 +234,27 @@ fn repro_4_light_client_spv_accepts_both_16b_and_49b_leaves() {
     let proof = trie.generate_merkle_proof(&address).expect("merkle proof");
 
     let block_hash = [0x99u8; 32];
-    let vote = Vote::sign(&signer, 1, 0, VoteKind::Precommit, Some(block_hash));
-    let cert = QuorumCertificate {
-        height: 1,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(block_hash),
-        signatures: vec![(vote.voter, vote.signature)],
-    };
+    // FULL-PQ: `LightClient::new` verifies the checkpoint, so the 1-of-1
+    // cert is compiled by the committee path production uses.
+    let s_fk = stellereum::post_quantum::FalconKeypair::generate_from_seed(0x11);
+    stellereum::consensus::register_validator_pq_key(
+        val_id,
+        stellereum::post_quantum::PqScheme::Falcon512,
+        s_fk.public_key.clone(),
+    );
+    let mut vset1 = VoteSet::new();
+    vset1
+        .add(
+            falcon_votes::fvote(&signer, &s_fk, 1, 0, VoteKind::Precommit, Some(block_hash)),
+            &validators,
+            1,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
+    let cert = vset1
+        .certificate(Some(block_hash), &validators, &[0u8; 32])
+        .expect("1-of-1 reaches quorum");
     let checkpoint = Checkpoint::new(1, block_hash, [0u8; 32], state_root, cert);
     let lc = LightClient::new(validators, checkpoint).expect("light client init");
 

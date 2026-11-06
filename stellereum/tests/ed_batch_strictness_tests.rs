@@ -1,12 +1,20 @@
 //! Batch-vs-scalar strictness differential (F-MED-6): an S-malleated Ed25519
 //! signature must NOT verify in batch while scalar refuses it.
+//!
+//! FULL-PQ note: `Vote::verify`/`verify_batch` are Falcon-only, so the
+//! Ed-half games below are refused because they strip the Falcon half (the
+//! malleated/garbage shapes carry no verifiable Falcon signature). The
+//! controls use genuine Falcon votes; the strictness-gap asserts hold
+//! trivially with no gap between the (scalar-Falcon) paths.
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use stellereum::consensus::{Vote, VoteKind};
 
-fn mkvote(k: &SigningKey) -> Vote {
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
+fn mkvote(k: &SigningKey, fk: &stellereum::post_quantum::FalconKeypair) -> Vote {
     let bh = [0xabu8; 32];
-    Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh))
+    falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh))
 }
 
 // Ed25519 group order L (little-endian).
@@ -37,8 +45,8 @@ fn add_l(s: &[u8; 32]) -> [u8; 32] {
 
 #[test]
 fn batch_and_scalar_agree_on_valid_and_garbage() {
-    let k = SigningKey::generate(&mut OsRng);
-    let v = mkvote(&k);
+    let (ks, fks) = falcon_votes::falcon_set(1);
+    let v = mkvote(&ks[0], &fks[0]);
     assert!(v.verify(), "control: valid vote verifies scalar");
     assert!(
         Vote::verify_batch(std::slice::from_ref(&v)),
@@ -55,8 +63,8 @@ fn batch_and_scalar_agree_on_valid_and_garbage() {
 
 #[test]
 fn high_s_malleation_must_not_pass_batch_when_scalar_refuses() {
-    let k = SigningKey::generate(&mut OsRng);
-    let v = mkvote(&k);
+    let (ks, fks) = falcon_votes::falcon_set(1);
+    let v = mkvote(&ks[0], &fks[0]);
     // Malleate S -> S + L (still verifies the equation, non-canonical).
     let raw = v.ed25519_signature().to_vec();
     assert_eq!(raw.len(), 64);

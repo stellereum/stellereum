@@ -28,7 +28,8 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::Arc;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::runtime::{
     count_block_actor_sends, fund_genesis, ValidatorRuntime, PROPOSAL_ALIGN_WINDOW_ROUNDS,
 };
@@ -36,10 +37,13 @@ use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{InMemoryStateEngine, MAX_ACTOR_MSGS_PER_BLOCK};
 use stellereum::svm::OpCode;
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 const BAL: u64 = 1_000_000_000_000_000;
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
+fn keys(n: usize) -> (Vec<SigningKey>, Vec<FalconKeypair>) {
+    falcon_votes::falcon_set(n)
 }
 
 fn id(k: &SigningKey) -> [u8; 32] {
@@ -97,6 +101,7 @@ async fn genuine(
 /// A precommit/prevote QC over `bh` at `(h, r)` signed by `ks[idx]`.
 fn qc_over(
     ks: &[SigningKey],
+    fks: &[FalconKeypair],
     idx: &[usize],
     h: u64,
     r: u32,
@@ -111,7 +116,7 @@ fn qc_over(
         signatures: idx
             .iter()
             .map(|&i| {
-                let v = Vote::sign(&ks[i], h, r, kind, bh);
+                let v = falcon_votes::fvote(&ks[i], &fks[i], h, r, kind, bh);
                 (v.voter, v.signature)
             })
             .collect(),
@@ -166,7 +171,7 @@ async fn actor_block(
 
 #[tokio::test]
 async fn stale_envelope_refused_and_seats_nothing() {
-    let ks = keys(2);
+    let (ks, _fks) = keys(2);
     let mut rt = runtime_for(&ks, 0).await;
     let r = rt.hc.round;
     let sched = sched_key(&rt, &ks, rt.hc.height, r);
@@ -211,7 +216,7 @@ async fn future_envelope_within_window_aligns_and_accepts() {
         PROPOSAL_ALIGN_WINDOW_ROUNDS, 8,
         "widening the align window must be a deliberate spec change"
     );
-    let ks = keys(2);
+    let (ks, _fks) = keys(2);
     let mut rt = runtime_for(&ks, 0).await;
     let peer = ks[1].clone();
     let peer_id = id(&peer);
@@ -251,7 +256,7 @@ async fn future_envelope_within_window_aligns_and_accepts() {
 
 #[tokio::test]
 async fn far_future_envelope_beyond_window_refused_without_moving() {
-    let ks = keys(2);
+    let (ks, _fks) = keys(2);
     let vs = vset(&ks);
     let peer_id = id(&ks[1]);
 
@@ -305,7 +310,7 @@ async fn far_future_envelope_beyond_window_refused_without_moving() {
 
 #[tokio::test]
 async fn forged_future_envelope_never_moves_round() {
-    let ks = keys(2);
+    let (ks, _fks) = keys(2);
     let mut rt = runtime_for(&ks, 0).await;
     let peer = ks[1].clone();
     let peer_id = id(&peer);
@@ -338,7 +343,7 @@ async fn forged_future_envelope_never_moves_round() {
 
 #[tokio::test]
 async fn non_member_proposal_refused_as_wrong_proposer() {
-    let ks = keys(2);
+    let (ks, _fks) = keys(2);
     let mut rt = runtime_for(&ks, 0).await;
     let outsider = SigningKey::generate(&mut OsRng);
     let oid = id(&outsider);
@@ -368,7 +373,9 @@ async fn non_member_proposal_refused_as_wrong_proposer() {
 
 #[tokio::test]
 async fn evidence_none_accepted_when_node_knows_no_parent() {
-    let ks = keys(4);
+    // `_fks`: Falcon keys register as a side effect of `keys()` (needed by
+    // vote verification elsewhere in this binary); this test builds no votes.
+    let (ks, _fks) = keys(4);
     let mut rt = runtime_for(&ks, 0).await;
     assert!(rt.last_decision.is_none());
     let r = rt.hc.round;
@@ -382,7 +389,7 @@ async fn evidence_none_accepted_when_node_knows_no_parent() {
 
 #[tokio::test]
 async fn evidence_none_refused_when_node_knows_parent() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let mut rt = runtime_for(&ks, 0).await;
 
     // Parent at height 1, proposed by its scheduled proposer.
@@ -390,7 +397,7 @@ async fn evidence_none_refused_when_node_knows_parent() {
     let p_sched = sched_key(&rt, &ks, 1, r);
     let parent = genuine(&rt, &p_sched, 1, [0u8; 32], 1_000, None).await;
     let ph = parent.compute_hash();
-    let parent_qc = qc_over(&ks, &[0, 1, 2], 1, 0, VoteKind::Precommit, Some(ph));
+    let parent_qc = qc_over(&ks, &fks, &[0, 1, 2], 1, 0, VoteKind::Precommit, Some(ph));
 
     // We HAVE finalized the parent: its decision is recorded locally.
     rt.blocks.insert(ph, parent.clone());
@@ -423,13 +430,13 @@ async fn evidence_none_refused_when_node_knows_parent() {
 
 #[tokio::test]
 async fn evidence_good_qc_accepted() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let mut rt = runtime_for(&ks, 0).await;
     let r = rt.hc.round;
     let sched = sched_key(&rt, &ks, 1, r);
     let sid = id(&sched);
     // 3-of-4 precommit QC for parent 0 naming the zero prev_hash: quorum.
-    let good = qc_over(&ks, &[0, 1, 2], 0, 0, VoteKind::Precommit, Some([0u8; 32]));
+    let good = qc_over(&ks, &fks, &[0, 1, 2], 0, 0, VoteKind::Precommit, Some([0u8; 32]));
     let block = genuine(&rt, &sched, 1, [0u8; 32], 1_000, Some(good)).await;
     rt.on_proposal(sid, block, r)
         .await
@@ -438,13 +445,13 @@ async fn evidence_good_qc_accepted() {
 
 #[tokio::test]
 async fn evidence_weak_qc_refused() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let mut rt = runtime_for(&ks, 0).await;
     let r = rt.hc.round;
     let sched = sched_key(&rt, &ks, 1, r);
     let sid = id(&sched);
     // 2-of-4 carries power 2 < quorum 3: an attacker QC subset.
-    let weak = qc_over(&ks, &[0, 1], 0, 0, VoteKind::Precommit, Some([0u8; 32]));
+    let weak = qc_over(&ks, &fks, &[0, 1], 0, 0, VoteKind::Precommit, Some([0u8; 32]));
     let block = genuine(&rt, &sched, 1, [0u8; 32], 1_000, Some(weak)).await;
     let err = rt
         .on_proposal(sid, block, r)
@@ -459,13 +466,13 @@ async fn evidence_weak_qc_refused() {
 
 #[tokio::test]
 async fn evidence_wrong_height_refused() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let mut rt = runtime_for(&ks, 0).await;
     let r = rt.hc.round;
     let sched = sched_key(&rt, &ks, 1, r);
     let sid = id(&sched);
     // Names height 1, but the parent of a height-1 block is height 0.
-    let wrong_h = qc_over(&ks, &[0, 1, 2], 1, 0, VoteKind::Precommit, Some([0u8; 32]));
+    let wrong_h = qc_over(&ks, &fks, &[0, 1, 2], 1, 0, VoteKind::Precommit, Some([0u8; 32]));
     let block = genuine(&rt, &sched, 1, [0u8; 32], 1_000, Some(wrong_h)).await;
     let err = rt
         .on_proposal(sid, block, r)
@@ -480,13 +487,13 @@ async fn evidence_wrong_height_refused() {
 
 #[tokio::test]
 async fn evidence_wrong_hash_refused() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let mut rt = runtime_for(&ks, 0).await;
     let r = rt.hc.round;
     let sched = sched_key(&rt, &ks, 1, r);
     let sid = id(&sched);
     // Right height, but names a parent block that is not our prev_hash.
-    let wrong_bh = qc_over(&ks, &[0, 1, 2], 0, 0, VoteKind::Precommit, Some([7u8; 32]));
+    let wrong_bh = qc_over(&ks, &fks, &[0, 1, 2], 0, 0, VoteKind::Precommit, Some([7u8; 32]));
     let block = genuine(&rt, &sched, 1, [0u8; 32], 1_000, Some(wrong_bh)).await;
     let err = rt
         .on_proposal(sid, block, r)
@@ -501,13 +508,13 @@ async fn evidence_wrong_hash_refused() {
 
 #[tokio::test]
 async fn evidence_wrong_kind_prevote_refused() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let mut rt = runtime_for(&ks, 0).await;
     let r = rt.hc.round;
     let sched = sched_key(&rt, &ks, 1, r);
     let sid = id(&sched);
     // Prevotes never prove finality: only a precommit QC is evidence.
-    let prevote = qc_over(&ks, &[0, 1, 2], 0, 0, VoteKind::Prevote, Some([0u8; 32]));
+    let prevote = qc_over(&ks, &fks, &[0, 1, 2], 0, 0, VoteKind::Prevote, Some([0u8; 32]));
     let block = genuine(&rt, &sched, 1, [0u8; 32], 1_000, Some(prevote)).await;
     let err = rt
         .on_proposal(sid, block, r)
@@ -526,7 +533,7 @@ async fn evidence_wrong_kind_prevote_refused() {
 
 #[tokio::test]
 async fn actor_cap_exact_boundary_accepted() {
-    let ks = keys(2);
+    let (ks, _fks) = keys(2);
     let mut rt = runtime_for(&ks, 0).await;
     let r = rt.hc.round;
     let sched = sched_key(&rt, &ks, rt.hc.height, r);
@@ -553,7 +560,7 @@ async fn actor_cap_exact_boundary_accepted() {
 
 #[tokio::test]
 async fn actor_cap_one_over_refused() {
-    let ks = keys(2);
+    let (ks, _fks) = keys(2);
     let mut rt = runtime_for(&ks, 0).await;
     let r = rt.hc.round;
     let sched = sched_key(&rt, &ks, rt.hc.height, r);
@@ -618,7 +625,7 @@ async fn actor_send_count_is_transitive_over_nested_bodies() {
 
 #[tokio::test]
 async fn equivocating_proposer_second_distinct_body_refused() {
-    let ks = keys(2);
+    let (ks, _fks) = keys(2);
     let mut rt = runtime_for(&ks, 0).await;
     let r = rt.hc.round;
     let sched = sched_key(&rt, &ks, rt.hc.height, r);
@@ -656,7 +663,7 @@ async fn equivocating_proposer_second_distinct_body_refused() {
 
 #[tokio::test]
 async fn identical_rebroadcast_is_idempotent_ok() {
-    let ks = keys(2);
+    let (ks, _fks) = keys(2);
     let mut rt = runtime_for(&ks, 0).await;
     let r = rt.hc.round;
     let sched = sched_key(&rt, &ks, rt.hc.height, r);
@@ -681,7 +688,7 @@ async fn identical_rebroadcast_is_idempotent_ok() {
 
 #[tokio::test]
 async fn timed_validation_matches_untimed_verdict_with_stages() {
-    let ks = keys(2);
+    let (ks, _fks) = keys(2);
     let rt = runtime_for(&ks, 0).await;
     let r = rt.hc.round;
     let sched = sched_key(&rt, &ks, rt.hc.height, r);

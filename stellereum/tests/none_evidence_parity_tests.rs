@@ -26,18 +26,21 @@
 //! burns, the other three skip), passes after (replay skips like live).
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::sync::Arc;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::staking::{DOWNTIME_MISS_THRESHOLD, MIN_VALIDATOR_BOND, STAKING_POOL};
 use stellereum::state_engine::InMemoryStateEngine;
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 const BAL: u64 = 10_000_000_000_000;
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
+fn keys(n: usize) -> (Vec<SigningKey>, Vec<FalconKeypair>) {
+    falcon_votes::falcon_set(n)
 }
 
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
@@ -106,7 +109,13 @@ fn mkblock(pkey: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
 }
 
 /// A genuine 3-of-4 precommit QC over `bh` (the silent validator omitted).
-fn three_of_four_qc(ks: &[SigningKey], h: u64, r: u32, bh: [u8; 32]) -> QuorumCertificate {
+fn three_of_four_qc(
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    h: u64,
+    r: u32,
+    bh: [u8; 32],
+) -> QuorumCertificate {
     QuorumCertificate {
         height: h,
         round: r,
@@ -114,8 +123,9 @@ fn three_of_four_qc(ks: &[SigningKey], h: u64, r: u32, bh: [u8; 32]) -> QuorumCe
         block_hash: Some(bh),
         signatures: ks[..3]
             .iter()
-            .map(|k| {
-                let v = Vote::sign(k, h, r, VoteKind::Precommit, Some(bh));
+            .zip(fks[..3].iter())
+            .map(|(k, fk)| {
+                let v = falcon_votes::fvote(k, fk, h, r, VoteKind::Precommit, Some(bh));
                 (v.voter, v.signature)
             })
             .collect(),
@@ -124,7 +134,7 @@ fn three_of_four_qc(ks: &[SigningKey], h: u64, r: u32, bh: [u8; 32]) -> QuorumCe
 
 #[tokio::test]
 async fn none_evidence_block_reaches_identical_roots_on_all_four_routes() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let vs = vset(&ks);
     let silent_id = ks[3].verifying_key().to_bytes();
 
@@ -144,7 +154,7 @@ async fn none_evidence_block_reaches_identical_roots_on_all_four_routes() {
         .expect("schedule proposer is one of our keys");
     let block = mkblock(&pkey, 1, [0u8; 32], root0);
     let bh = block.compute_hash();
-    let qc = three_of_four_qc(&ks, 1, 0, bh);
+    let qc = three_of_four_qc(&ks, &fks, 1, 0, bh);
     assert!(
         qc.verify(&vs),
         "precondition: 3-of-4 certificate is genuine"
@@ -152,10 +162,10 @@ async fn none_evidence_block_reaches_identical_roots_on_all_four_routes() {
 
     // ---- Route LIVE: local finalize. ----
     let mut live = ValidatorRuntime::new(ks[0].clone(), vs.clone(), st_live.clone(), 1);
-    for k in ks[..3].iter() {
-        live.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+    for (k, fk) in ks[..3].iter().zip(fks[..3].iter()) {
+        live.on_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh)))
             .expect("prevote accepted");
-        live.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+        live.on_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)))
             .expect("precommit accepted");
     }
     assert_eq!(live.hc.try_precommit_quorum(), Some(bh));

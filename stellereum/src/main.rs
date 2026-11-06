@@ -3073,7 +3073,7 @@ async fn run_consensus_node(
     let mut restored_checkpoint: Option<stellereum::storage::ConsensusCheckpoint> = None;
     if let Some(ap) = &persistence {
         match stellereum::storage::load_full_state_into(&ap.storage(), &rt.state).await {
-            Ok(Some((h, ledger, gov))) => {
+            Ok(Some((h, ledger, mut gov))) => {
                 restored_state_height = h;
                 info!(
                     "[storage] restored full state from height {h}, resuming at {}",
@@ -3092,6 +3092,24 @@ async fn run_consensus_node(
                 if let Some((_, fh)) = rt.finalized.last().copied() {
                     rt.hc.set_parent_hash(fh);
                 }
+                // Block-carried governance migration (HDAE-GOV startup hook,
+                // in-memory only): pre-activation proposals restored from
+                // storage are normalized BEFORE install so engine, runtime
+                // and RPC observe the migrated state identically (`next_id`
+                // repair + status census; see
+                // `Governance::migrate_gov_proposals_to_genesis`).
+                // Idempotent: a second run changes nothing.
+                let gov_migration = gov.migrate_gov_proposals_to_genesis();
+                info!(
+                    "[gov] migration: {} pre-existing proposal(s) (open={} passed={} rejected={} executed={} invalid_actions={}) next_id_repaired={}",
+                    gov_migration.proposals_seen,
+                    gov_migration.open,
+                    gov_migration.passed,
+                    gov_migration.rejected,
+                    gov_migration.executed,
+                    gov_migration.invalid_actions,
+                    gov_migration.next_id_repaired,
+                );
                 *rt.state.governance_write().await = gov.clone();
                 // The ledger is restored into the state engine (consensus state),
                 // which the runtime shares by reference.

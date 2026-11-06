@@ -54,9 +54,16 @@ const REQUIRED: &[(&str, &str)] = &[
     ("stell_nil_breaker_fires_total", "counter"),
     ("stell_proposer_missed_total", "counter"),
     ("stell_slow_validation_total", "counter"),
+    // Straggler-grace observability (see src/metrics.rs
+    // STRAGGLER_GRACE_EXTENDS_TOTAL, declared Counter): the registry renders
+    // it, so the exposition parser must accept it here too.
+    ("stell_straggler_grace_extends_total", "counter"),
     // A14 chain-binding rollout meter (see src/metrics.rs UNBOUND_TX_TOTAL):
     // declared by the registry, so the parser must accept it here too.
     ("stell_unbound_tx_total", "counter"),
+    // A14 refusal leg (see src/metrics.rs UNBOUND_REFUSED_TOTAL, Counter):
+    // rendered by the registry, so the parser must accept it here too.
+    ("stell_unbound_refused_total", "counter"),
     ("stell_build_info", "gauge"),
 ];
 
@@ -85,7 +92,9 @@ fn populated() -> Arc<Registry> {
     reg.inc_nil_breaker_fire();
     reg.inc_proposer_miss();
     reg.inc_slow_validation();
+    reg.inc_straggler_grace_extends();
     reg.inc_unbound_tx();
+    reg.inc_unbound_refused();
     reg.inc_state_root_commit();
     reg.add_state_root_commits(2);
     reg.inc_vote(VoteKind::Prevote);
@@ -799,7 +808,9 @@ fn two_renders_with_identical_data_are_byte_identical() {
         r.inc_nil_breaker_fire();
         r.inc_proposer_miss();
         r.inc_slow_validation();
+        r.inc_straggler_grace_extends();
         r.inc_unbound_tx();
+        r.inc_unbound_refused();
         r.inc_state_root_commit();
         r.add_state_root_commits(2);
         r.inc_vote(VoteKind::Prevote);

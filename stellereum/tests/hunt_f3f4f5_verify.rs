@@ -22,12 +22,15 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::collections::HashMap;
 use std::sync::Arc;
-use stellereum::consensus::{ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{ValidatorSet, VoteKind};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::staking::MIN_VALIDATOR_BOND;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::sync::{collect_missing_blocks, validate_sync_chain, walked_head_anchor};
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -72,6 +75,7 @@ fn bare_block(k: &SigningKey, h: u64, prev: [u8; 32]) -> Block {
 /// `validate_sync_chain`, incl. the F8 proposer-schedule gate).
 fn qc_block(
     ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
     vs: &ValidatorSet,
     h: u64,
     prev: [u8; 32],
@@ -101,20 +105,24 @@ fn qc_block(
     };
     b.sign_block(pkey);
     let hash = b.compute_hash();
-    let sigs = ks
-        .iter()
-        .map(|k| {
-            let v = Vote::sign(k, h, 0, VoteKind::Precommit, Some(hash));
-            (v.voter, v.signature)
-        })
-        .collect();
-    b.precommit_qc = Some(stellereum::consensus::QuorumCertificate {
-        height: h,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(hash),
-        signatures: sigs,
-    });
+    // Genuine committee-compiled QC against the full set `vs`, bound to the
+    // block's real parent (the F8 schedule gate and the chain binding both
+    // read it).
+    let mut set = stellereum::consensus::VoteSet::new();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        set.add(
+            falcon_votes::fvote(k, fk, h, 0, VoteKind::Precommit, Some(hash)),
+            vs,
+            h,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
+    }
+    b.precommit_qc = Some(
+        set.certificate(Some(hash), vs, &prev)
+            .expect("full set reaches quorum"),
+    );
     b
 }
 
@@ -201,7 +209,7 @@ fn f3b_fixed_advertised_head_must_equal_walked_tail() {
 
 #[tokio::test]
 async fn f4_fixed_no_path_slashes_on_local_equivocation_evidence() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let payer = ks[0].verifying_key().to_bytes();
     let bal = 10_000 * MIN_VALIDATOR_BOND;
@@ -221,21 +229,35 @@ async fn f4_fixed_no_path_slashes_on_local_equivocation_evidence() {
     let bh = blk.compute_hash();
 
     for n in nodes.iter_mut() {
-        for k in ks.iter().take(3) {
-            n.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
-                .unwrap();
+        for (i, k) in ks.iter().enumerate().take(3) {
+            n.on_prevote(falcon_votes::fvote(
+                k,
+                &fks[i],
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
+            .unwrap();
         }
-        for k in ks.iter().take(3) {
-            n.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
-                .unwrap();
+        for (i, k) in ks.iter().enumerate().take(3) {
+            n.on_precommit(falcon_votes::fvote(
+                k,
+                &fks[i],
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
+            .unwrap();
         }
     }
     nodes[0].blocks.insert(bh, blk.clone());
     nodes[1].blocks.insert(bh, blk.clone());
 
     // Attacker shows the conflicting vote ONLY to node 0.
-    let v1 = Vote::sign(&ks[3], 1, 0, VoteKind::Prevote, Some(bh));
-    let v2 = Vote::sign(&ks[3], 1, 0, VoteKind::Prevote, Some([0x99u8; 32]));
+    let v1 = falcon_votes::fvote(&ks[3], &fks[3], 1, 0, VoteKind::Prevote, Some(bh));
+    let v2 = falcon_votes::fvote(&ks[3], &fks[3], 1, 0, VoteKind::Prevote, Some([0x99u8; 32]));
     nodes[0].on_prevote(v1.clone()).unwrap();
     nodes[1].on_prevote(v1.clone()).unwrap();
     nodes[0].on_prevote(v2.clone()).unwrap();
@@ -283,16 +305,16 @@ async fn f4_fixed_no_path_slashes_on_local_equivocation_evidence() {
 current-set quorum vouches for old heights. Ignored so it cannot gate CI \
 until per-height set snapshots land."]
 async fn f5_open_current_quorum_rewrites_old_heights() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let current = vset(&ks);
     let anchor = [0u8; 32]; // our finalized hash before height 8
 
-    let a8 = qc_block(&ks, &current, 8, anchor, [0xAAu8; 32]);
+    let a8 = qc_block(&ks, &fks, &current, 8, anchor, [0xAAu8; 32]);
     let a8h = a8.compute_hash();
-    let chain_a = vec![a8, qc_block(&ks, &current, 9, a8h, [0xAAu8; 32])];
-    let b8 = qc_block(&ks, &current, 8, anchor, [0xBBu8; 32]);
+    let chain_a = vec![a8, qc_block(&ks, &fks, &current, 9, a8h, [0xAAu8; 32])];
+    let b8 = qc_block(&ks, &fks, &current, 8, anchor, [0xBBu8; 32]);
     let b8h = b8.compute_hash();
-    let chain_b = vec![b8, qc_block(&ks, &current, 9, b8h, [0xBBu8; 32])];
+    let chain_b = vec![b8, qc_block(&ks, &fks, &current, 9, b8h, [0xBBu8; 32])];
     assert_ne!(
         chain_a[1].compute_hash(),
         chain_b[1].compute_hash(),

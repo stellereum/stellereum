@@ -43,12 +43,16 @@ use std::collections::HashSet;
 
 use ed25519_dalek::SigningKey;
 use stellereum::consensus::{
-    derive_sortition_committee, sortition_seed, HeightConsensus, QuorumCertificate,
-    ValidatorSet, Vote, VoteKind,
+    derive_sortition_committee, register_validator_pq_key, sortition_seed, HeightConsensus,
+    QuorumCertificate, ValidatorSet, VoteKind,
 };
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::sync::{proposer_matches_schedule, verify_finality_for_header};
 use std::sync::Arc;
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -76,6 +80,18 @@ fn floor() -> u64 {
     stellereum::staking::required_bond_floor_nano()
 }
 
+/// Falcon half for a fixed-seed Ed key: deterministic from the Ed seed byte,
+/// registered under the Ed id, so Ed ids stay byte-identical.
+fn fk_for(k: &SigningKey) -> FalconKeypair {
+    let fk = FalconKeypair::generate_from_seed(k.to_bytes()[0]);
+    register_validator_pq_key(
+        k.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+    fk
+}
+
 fn precommit_qc(
     signers: &[&SigningKey],
     height: u64,
@@ -85,7 +101,7 @@ fn precommit_qc(
     let sigs = signers
         .iter()
         .map(|k| {
-            let v = Vote::sign(k, height, round, VoteKind::Precommit, Some(block_hash));
+            let v = falcon_votes::fvote(k, &fk_for(k), height, round, VoteKind::Precommit, Some(block_hash));
             (v.voter, v.signature)
         })
         .collect();

@@ -14,20 +14,17 @@ use ed25519_dalek::{Signer, SigningKey};
 use std::collections::HashSet;
 use stellereum::cell::{CellHash, MerkleProof, PatriciaTrie};
 use stellereum::consensus::{
-    BlockHash, QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind,
+    BlockHash, QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind, VoteSet,
 };
 use stellereum::light_client::{
     Checkpoint, LightClient, LightError, LightHeader, MAX_MERKLE_PATH_STEPS,
 };
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 
-const N: usize = 4; // 4 validators at power 1 => quorum is 3
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
-fn keys() -> Vec<SigningKey> {
-    (0..N)
-        .map(|i| SigningKey::from_bytes(&[i as u8 + 1; 32]))
-        .collect()
-}
+const N: usize = 4; // 4 validators at power 1 => quorum is 3
 
 fn validators(keys: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(
@@ -45,21 +42,62 @@ fn outsider(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[0xF0 ^ seed; 32])
 }
 
-/// A certificate for `hash` at `height`, signed by `signers`.
-fn cert(signers: &[SigningKey], height: u64, kind: VoteKind, hash: BlockHash) -> QuorumCertificate {
-    let signatures = signers
-        .iter()
-        .map(|k| {
-            let v = Vote::sign(k, height, 0, kind, Some(hash));
-            (v.voter, v.signature)
+/// Falcon companions for file-local (non-`falcon_set`) Ed keys, registered
+/// globally like `falcon_set` does. `tag` separates Falcon-key domains so
+/// fixtures sharing one test binary never collide (same inputs stay
+/// idempotent, mirroring `falcon_set`).
+fn pq_for(keys: &[SigningKey], tag: u8) -> Vec<stellereum::post_quantum::FalconKeypair> {
+    use stellereum::consensus::register_validator_pq_key;
+    use stellereum::post_quantum::{FalconKeypair, PqScheme};
+    keys.iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let fk = FalconKeypair::generate_from_seed(tag.wrapping_add(i as u8));
+            register_validator_pq_key(
+                k.verifying_key().to_bytes(),
+                PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+            fk
         })
-        .collect();
+        .collect()
+}
+
+/// A certificate for `hash` at `height` over `kind`, compiled by the
+/// production committee path (`VoteSet::certificate`) against the FULL set
+/// `vs` (the committee is elected from the full set, so a subset-derived set
+/// would elect a committee no verifier re-derives) and bound to `parent`.
+///
+/// Refusal fixtures fall through to the envelope-less shape: below quorum,
+/// or with non-member signers, no PQ envelope can be compiled, and the
+/// envelope-less shape is unconditionally invalid under FULL-PQ — while the
+/// preserved Ed list keeps the power-counting refusal messages identical.
+fn cert(
+    signers: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    vs: &ValidatorSet,
+    height: u64,
+    kind: VoteKind,
+    hash: BlockHash,
+    parent: &[u8; 32],
+) -> QuorumCertificate {
+    let mut set = VoteSet::new();
+    let mut ed_sigs = Vec::new();
+    for (k, fk) in signers.iter().zip(fks.iter()) {
+        let v = falcon_votes::fvote(k, fk, height, 0, kind, Some(hash));
+        if set.add(v.clone(), vs, height, 0, kind).is_ok() {
+            ed_sigs.push((v.voter, v.ed25519_signature().to_vec()));
+        }
+    }
+    if let Some(qc) = set.certificate(Some(hash), vs, parent) {
+        return qc;
+    }
     QuorumCertificate {
         height,
         round: 0,
         kind,
         block_hash: Some(hash),
-        signatures,
+        signatures: ed_sigs,
     }
 }
 
@@ -68,10 +106,20 @@ fn cert(signers: &[SigningKey], height: u64, kind: VoteKind, hash: BlockHash) ->
 /// after the fact.
 fn relabelled(
     signers: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    vs: &ValidatorSet,
     signed_height: u64,
     claimed_height: u64,
 ) -> QuorumCertificate {
-    let mut c = cert(signers, signed_height, VoteKind::Precommit, hash_of(9));
+    let mut c = cert(
+        signers,
+        fks,
+        vs,
+        signed_height,
+        VoteKind::Precommit,
+        hash_of(9),
+        &[0u8; 32],
+    );
     c.height = claimed_height;
     c
 }
@@ -89,6 +137,7 @@ fn account_value(balance: u64, nonce: u64) -> Vec<u8> {
 
 struct Fixture {
     keys: Vec<SigningKey>,
+    fks: Vec<stellereum::post_quantum::FalconKeypair>,
     validators: ValidatorSet,
     trie: PatriciaTrie,
     state_root: CellHash,
@@ -103,7 +152,7 @@ impl Fixture {
     /// `roots` gives the state root committed at each height, so a test can ask
     /// for a chain whose state moves, or rolls back.
     fn new(mut roots: Vec<CellHash>) -> Fixture {
-        let keys = keys();
+        let (keys, fks) = falcon_votes::falcon_set(N);
         let validators = validators(&keys);
         let alice = [0xA1u8; 32];
         let bob = [0xB0u8; 32];
@@ -157,6 +206,7 @@ impl Fixture {
 
         Fixture {
             keys,
+            fks,
             validators,
             trie,
             state_root: trie_root,
@@ -179,7 +229,15 @@ impl Fixture {
             block_hash: bh,
             timestamp: b.timestamp,
             proposer: b.proposer,
-            cert: cert(&self.keys[..3], b.height, VoteKind::Precommit, bh),
+            cert: cert(
+                &self.keys[..3],
+                &self.fks[..3],
+                &self.validators,
+                b.height,
+                VoteKind::Precommit,
+                bh,
+                &b.prev_hash,
+            ),
             signatures: b.validator_signatures.clone(),
         }
     }
@@ -202,14 +260,29 @@ impl Fixture {
     /// Re-point a header at a new block hash: a different `state_root`/`height`
     /// pair is a different block, so its block hash, certificate and block
     /// signatures all have to be rebuilt for it.
-    fn rehash(header: &mut LightHeader, keys: &[SigningKey], new_hash: BlockHash) {
+    fn rehash(
+        header: &mut LightHeader,
+        keys: &[SigningKey],
+        fks: &[stellereum::post_quantum::FalconKeypair],
+        vs: &ValidatorSet,
+        new_hash: BlockHash,
+    ) {
         let height = header.height;
+        let prev = header.prev_hash;
         header.block_hash = new_hash;
         header.signatures.clear();
         for k in keys.iter().take(3) {
             header.sign_with(k);
         }
-        header.cert = cert(&keys[..3], height, VoteKind::Precommit, new_hash);
+        header.cert = cert(
+            &keys[..3],
+            &fks[..3],
+            vs,
+            height,
+            VoteKind::Precommit,
+            new_hash,
+            &prev,
+        );
     }
 
     fn account_proof(&self, addr: &[u8; 32]) -> MerkleProof {
@@ -266,7 +339,31 @@ fn a_genuine_checkpoint_verifies_and_advances_the_client() {
         0,
         "re-anchoring resets the header window"
     );
-    assert_eq!(lc.checkpoint(), Some(&f.checkpoint(4)));
+    // FULL-PQ: Falcon signatures are randomized, so two compilations of the
+    // same quorum differ in signature bytes — compare checkpoint identity
+    // instead of whole-struct equality (the stored cert was verified at
+    // advance time, and is re-verified below).
+    let anchored = f.checkpoint(4);
+    let stored = lc.checkpoint().expect("re-anchor stores its checkpoint");
+    assert_eq!(
+        (
+            stored.height,
+            stored.block_hash,
+            stored.parent_hash,
+            stored.state_root
+        ),
+        (
+            anchored.height,
+            anchored.block_hash,
+            anchored.parent_hash,
+            anchored.state_root
+        ),
+        "re-anchor must store the height-5 checkpoint"
+    );
+    assert!(
+        stored.cert.verify(&f.validators),
+        "the stored checkpoint must carry a verifying quorum"
+    );
 
     // And the client keeps following from there.
     lc.apply_header(f.header(5)).unwrap();
@@ -282,7 +379,15 @@ fn a_prevote_quorum_is_not_finality_and_is_refused() {
     let f = Fixture::new(vec![]);
     let h = f.header(0);
     let prevote = Checkpoint {
-        cert: cert(&f.keys, h.height, VoteKind::Prevote, h.block_hash),
+        cert: cert(
+            &f.keys,
+            &f.fks,
+            &f.validators,
+            h.height,
+            VoteKind::Prevote,
+            h.block_hash,
+            &h.prev_hash,
+        ),
         ..f.checkpoint(0)
     };
 
@@ -308,7 +413,15 @@ fn a_prevote_quorum_is_not_finality_and_is_refused() {
 
     // The same forgery at the header layer.
     let mut forged = h.clone();
-    forged.cert = cert(&f.keys, h.height, VoteKind::Prevote, h.block_hash);
+    forged.cert = cert(
+        &f.keys,
+        &f.fks,
+        &f.validators,
+        h.height,
+        VoteKind::Prevote,
+        h.block_hash,
+        &h.prev_hash,
+    );
     let err = forged
         .verify(&f.validators)
         .expect_err("header must be refused");
@@ -324,9 +437,10 @@ fn a_prevote_quorum_is_not_finality_and_is_refused() {
             signatures: f
                 .keys
                 .iter()
+                .zip(f.fks.iter())
                 .take(3)
-                .map(|k| {
-                    let v = Vote::sign(k, h.height, 0, VoteKind::Precommit, None);
+                .map(|(k, fk)| {
+                    let v = falcon_votes::fvote(k, fk, h.height, 0, VoteKind::Precommit, None);
                     (v.voter, v.signature)
                 })
                 .collect(),
@@ -347,7 +461,15 @@ fn a_certificate_bound_to_another_height_is_refused() {
     // A certificate lifted from another height's consensus: real signatures,
     // over the same block hash, but for height 9.
     let cp = Checkpoint {
-        cert: cert(&f.keys[..3], 9, VoteKind::Precommit, h.block_hash),
+        cert: cert(
+            &f.keys[..3],
+            &f.fks[..3],
+            &f.validators,
+            9,
+            VoteKind::Precommit,
+            h.block_hash,
+            &[0u8; 32],
+        ),
         ..f.checkpoint(0)
     };
     let err = cp
@@ -365,7 +487,15 @@ fn a_certificate_bound_to_another_height_is_refused() {
 
     // The same forgery carried by a header.
     let mut forged = h.clone();
-    forged.cert = cert(&f.keys[..3], 9, VoteKind::Precommit, h.block_hash);
+    forged.cert = cert(
+        &f.keys[..3],
+        &f.fks[..3],
+        &f.validators,
+        9,
+        VoteKind::Precommit,
+        h.block_hash,
+        &[0u8; 32],
+    );
     let err = forged.verify(&f.validators).expect_err("refused");
     assert!(
         err.contains("bound to height 9") || err.contains("does not name this block hash"),
@@ -376,7 +506,7 @@ fn a_certificate_bound_to_another_height_is_refused() {
     // binding check is satisfied (it claims height 1) but the signatures were
     // made for height 9, so it is still refused — and for the right reason.
     let rewritten = Checkpoint {
-        cert: relabelled(&f.keys[..3], 9, 1),
+        cert: relabelled(&f.keys[..3], &f.fks[..3], &f.validators, 9, 1),
         ..f.checkpoint(0)
     };
     let err = rewritten.verify(&f.validators).expect_err("refused");
@@ -399,13 +529,19 @@ fn a_certificate_from_a_non_validator_is_refused() {
     let imposter = outsider(1);
     let h = f.header(0);
 
-    // One throwaway key, signing correctly, with power of its own.
+    // One throwaway key, signing correctly, with power of its own — but not a
+    // member of the validator set, so its vote is refused on membership and
+    // no envelope can be compiled for it.
+    let imposter_fk = pq_for(std::slice::from_ref(&imposter), 0xD1);
     let cp = Checkpoint {
         cert: cert(
             std::slice::from_ref(&imposter),
+            &imposter_fk,
+            &f.validators,
             h.height,
             VoteKind::Precommit,
             h.block_hash,
+            &h.prev_hash,
         ),
         ..f.checkpoint(0)
     };
@@ -425,7 +561,17 @@ fn a_certificate_from_a_non_validator_is_refused() {
     // adds nothing, however valid its signature.
     let mixed = Checkpoint {
         cert: {
-            let mut c = cert(&f.keys[..2], h.height, VoteKind::Precommit, h.block_hash);
+            let mut c = cert(
+                &f.keys[..2],
+                &f.fks[..2],
+                &f.validators,
+                h.height,
+                VoteKind::Precommit,
+                h.block_hash,
+                &h.prev_hash,
+            );
+            // NEGATIVE-PATH (forgery): the outsider's Ed-only bytes stay
+            // unconditionally invalid under FULL-PQ — do not convert.
             let v = Vote::sign(
                 &imposter,
                 h.height,
@@ -447,7 +593,17 @@ fn a_certificate_from_a_non_validator_is_refused() {
     // not counted and the quorum stands on the members.
     let with_imposter = Checkpoint {
         cert: {
-            let mut c = cert(&f.keys[..3], h.height, VoteKind::Precommit, h.block_hash);
+            let mut c = cert(
+                &f.keys[..3],
+                &f.fks[..3],
+                &f.validators,
+                h.height,
+                VoteKind::Precommit,
+                h.block_hash,
+                &h.prev_hash,
+            );
+            // NEGATIVE-PATH (forgery): the outsider's Ed-only bytes stay
+            // unconditionally invalid under FULL-PQ — do not convert.
             let v = Vote::sign(
                 &imposter,
                 h.height,
@@ -481,7 +637,15 @@ fn quorum_is_power_weighted_distinct_and_fails_closed() {
 
     // Two of four is below quorum, even though both signatures are genuine.
     let sub = Checkpoint {
-        cert: cert(&f.keys[..2], h.height, VoteKind::Precommit, h.block_hash),
+        cert: cert(
+            &f.keys[..2],
+            &f.fks[..2],
+            &f.validators,
+            h.height,
+            VoteKind::Precommit,
+            h.block_hash,
+            &h.prev_hash,
+        ),
         ..f.checkpoint(0)
     };
     let err = sub
@@ -492,8 +656,9 @@ fn quorum_is_power_weighted_distinct_and_fails_closed() {
     // One validator signing many times is still one validator's power.
     let dup = Checkpoint {
         cert: {
-            let v = Vote::sign(
+            let v = falcon_votes::fvote(
                 &f.keys[0],
+                &f.fks[0],
                 h.height,
                 0,
                 VoteKind::Precommit,
@@ -516,7 +681,15 @@ fn quorum_is_power_weighted_distinct_and_fails_closed() {
 
     // Power, not head count. The same three signers are a quorum of four equal
     // validators and nowhere near a quorum when the fourth holds the stake.
-    let c = cert(&f.keys[..3], h.height, VoteKind::Precommit, h.block_hash);
+    let c = cert(
+        &f.keys[..3],
+        &f.fks[..3],
+        &f.validators,
+        h.height,
+        VoteKind::Precommit,
+        h.block_hash,
+        &h.prev_hash,
+    );
     assert!(c.verify(&f.validators), "3 of 4 equal stake is a quorum");
     let mut topheavy = ValidatorSet::new();
     for k in f.keys.iter().take(3) {
@@ -544,11 +717,30 @@ fn quorum_is_power_weighted_distinct_and_fails_closed() {
     );
     assert!(LightClient::new(empty, f.checkpoint(0)).is_err());
 
-    // A tampered signature (right voter, wrong bytes) does not verify.
+    // A tampered envelope (right voter, wrong bytes) does not verify: flip a
+    // byte in the PQ marker payload, the layer that carries quorum under
+    // FULL-PQ (the classical list is vestigial).
     let tampered = Checkpoint {
         cert: {
-            let mut c = cert(&f.keys[..3], h.height, VoteKind::Precommit, h.block_hash);
-            c.signatures[0].1[0] ^= 0xFF;
+            let mut c = cert(
+                &f.keys[..3],
+                &f.fks[..3],
+                &f.validators,
+                h.height,
+                VoteKind::Precommit,
+                h.block_hash,
+                &h.prev_hash,
+            );
+            let marker = c
+                .signatures
+                .iter_mut()
+                .find(|(id, _)| {
+                    *id == stellereum::consensus::PQ_UQC_MARKER_ID
+                        || *id == stellereum::consensus::PQ_QC_MARKER_ID
+                })
+                .expect("enveloped fixture must carry a PQ marker entry");
+            let last = marker.1.len() - 1;
+            marker.1[last] ^= 0xFF;
             c
         },
         ..f.checkpoint(0)
@@ -574,7 +766,7 @@ fn a_header_forking_from_a_known_parent_is_refused() {
     fork.height = 4;
     fork.prev_hash = f.blocks[1].compute_hash();
     fork.state_root = [0x5Au8; 32];
-    Fixture::rehash(&mut fork, &f.keys, hash_of(0xF1));
+    Fixture::rehash(&mut fork, &f.keys, &f.fks, &f.validators, hash_of(0xF1));
 
     let err = lc
         .apply_header(fork)
@@ -642,25 +834,59 @@ fn a_header_without_a_real_validator_quorum_is_refused() {
     let (bh, ht) = (base.block_hash, base.height);
 
     // Right shape, right parent, but the certificate is signed by a single
-    // non-validator.
+    // non-validator: not a member of the set, so no envelope compiles for it.
+    let o2 = outsider(2);
+    let o2_fk = pq_for(std::slice::from_ref(&o2), 0xD2);
     let mut h = base.clone();
-    h.cert = cert(&[outsider(2)], ht, VoteKind::Precommit, bh);
+    h.cert = cert(
+        std::slice::from_ref(&o2),
+        &o2_fk,
+        &f.validators,
+        ht,
+        VoteKind::Precommit,
+        bh,
+        &base.prev_hash,
+    );
     assert!(
         lc.apply_header(h.clone()).is_err(),
         "one non-validator must not extend the chain"
     );
 
     // A sub-quorum of real validators is still refused.
-    h.cert = cert(&f.keys[..2], ht, VoteKind::Precommit, bh);
+    h.cert = cert(
+        &f.keys[..2],
+        &f.fks[..2],
+        &f.validators,
+        ht,
+        VoteKind::Precommit,
+        bh,
+        &base.prev_hash,
+    );
     assert!(lc.apply_header(h.clone()).is_err());
 
     // A certificate for a different height is refused.
-    h.cert = cert(&f.keys[..3], 7, VoteKind::Precommit, bh);
+    h.cert = cert(
+        &f.keys[..3],
+        &f.fks[..3],
+        &f.validators,
+        7,
+        VoteKind::Precommit,
+        bh,
+        &[0u8; 32],
+    );
     assert!(lc.apply_header(h.clone()).is_err());
 
     // Correct certificate, but the block-level signatures present do not reach
     // a quorum: two of the three real ones the block carries.
-    h.cert = cert(&f.keys[..3], ht, VoteKind::Precommit, bh);
+    h.cert = cert(
+        &f.keys[..3],
+        &f.fks[..3],
+        &f.validators,
+        ht,
+        VoteKind::Precommit,
+        bh,
+        &base.prev_hash,
+    );
     h.signatures.truncate(2);
     let err = lc
         .apply_header(h)
@@ -751,7 +977,15 @@ fn a_checkpoint_cannot_walk_the_client_back_onto_a_fork() {
     // the window conflict, not the finality check.
     let mut conflicting = f.checkpoint(3);
     conflicting.block_hash = hash_of(0xEE);
-    conflicting.cert = cert(&f.keys[..3], 4, VoteKind::Precommit, hash_of(0xEE));
+    conflicting.cert = cert(
+        &f.keys[..3],
+        &f.fks[..3],
+        &f.validators,
+        4,
+        VoteKind::Precommit,
+        hash_of(0xEE),
+        &[0u8; 32],
+    );
     let err = lc
         .advance_to_checkpoint(conflicting)
         .expect_err("a conflicting checkpoint must be refused");
@@ -776,19 +1010,33 @@ fn a_checkpoint_cannot_walk_the_client_back_onto_a_fork() {
     moved.height = 9;
     moved.cert = cert(
         &f.keys[..3],
+        &f.fks[..3],
+        &f.validators,
         9,
         VoteKind::Precommit,
         f.blocks[3].compute_hash(),
+        &[0u8; 32],
     );
     let err = lc
         .advance_to_checkpoint(moved)
         .expect_err("a block cannot move between heights");
     assert!(err.contains("already accepted at height 4"), "got: {err}");
 
-    // An unverified checkpoint cannot re-anchor the client either.
+    // An unverified checkpoint cannot re-anchor the client either: the signer
+    // is not a member of the set, so no envelope compiles for it.
+    let o3 = outsider(3);
+    let o3_fk = pq_for(std::slice::from_ref(&o3), 0xD3);
     let mut forged = f.checkpoint(5);
     let forged_hash = forged.block_hash;
-    forged.cert = cert(&[outsider(3)], 6, VoteKind::Precommit, forged_hash);
+    forged.cert = cert(
+        std::slice::from_ref(&o3),
+        &o3_fk,
+        &f.validators,
+        6,
+        VoteKind::Precommit,
+        forged_hash,
+        &forged.parent_hash,
+    );
     let err = lc
         .advance_to_checkpoint(forged)
         .expect_err("a non-validator's certificate is not a checkpoint");
@@ -821,7 +1069,7 @@ fn a_header_may_not_roll_the_state_back_to_a_superseded_root() {
 
     let mut rollback = f.header(3).clone();
     rollback.state_root = f.blocks[0].state_root; // back to A
-    Fixture::rehash(&mut rollback, &f.keys, hash_of(0xC1));
+    Fixture::rehash(&mut rollback, &f.keys, &f.fks, &f.validators, hash_of(0xC1));
     let err = lc
         .apply_header(rollback)
         .expect_err("state must not roll back below a finalized height");
@@ -838,7 +1086,7 @@ fn a_header_may_not_roll_the_state_back_to_a_superseded_root() {
     // the client on a chain of no-op blocks, which is over-tightening.
     let mut noop = f.header(3).clone();
     noop.state_root = f.blocks[2].state_root;
-    Fixture::rehash(&mut noop, &f.keys, hash_of(0xC2));
+    Fixture::rehash(&mut noop, &f.keys, &f.fks, &f.validators, hash_of(0xC2));
     assert!(
         lc.apply_header(noop).is_ok(),
         "an unchanged state root is not a rollback"
@@ -1047,9 +1295,12 @@ fn an_absent_key_is_reported_as_not_included_and_never_as_a_zero() {
             state_root: single_root,
             cert: cert(
                 &f.keys[..3],
+                &f.fks[..3],
+                &f.validators,
                 1,
                 VoteKind::Precommit,
                 f.blocks[0].compute_hash(),
+                &f.blocks[0].prev_hash,
             ),
         },
     )
@@ -1143,9 +1394,21 @@ fn a_light_client_inherits_whatever_validator_set_it_was_given() {
     let h = f.header(0);
     let impostors: Vec<SigningKey> = (0..N).map(|i| outsider(0x10 + i as u8)).collect();
     let fake_set = validators(&impostors);
+    // The fabricated set signs for itself: Falcon companions registered under
+    // the impostor ids, so the envelope verifies inside the fake set (and
+    // nowhere else).
+    let impostor_fks = pq_for(&impostors, 0xC0);
 
     let cp = Checkpoint {
-        cert: cert(&impostors, h.height, VoteKind::Precommit, h.block_hash),
+        cert: cert(
+            &impostors,
+            &impostor_fks,
+            &fake_set,
+            h.height,
+            VoteKind::Precommit,
+            h.block_hash,
+            &h.prev_hash,
+        ),
         ..f.checkpoint(0)
     };
     assert!(
@@ -1161,7 +1424,13 @@ fn a_light_client_inherits_whatever_validator_set_it_was_given() {
     theirs.height = 2;
     theirs.prev_hash = lc.tip_hash();
     theirs.state_root = [0x42u8; 32];
-    Fixture::rehash(&mut theirs, &impostors, hash_of(0xC1));
+    Fixture::rehash(
+        &mut theirs,
+        &impostors,
+        &impostor_fks,
+        &fake_set,
+        hash_of(0xC1),
+    );
     assert!(
         lc.apply_header(theirs).is_ok(),
         "a client that trusts a fabricated set will follow a fabricated chain"
@@ -1191,8 +1460,25 @@ fn only_distinct_validator_signers_are_counted() {
     // the signers the client counts are a set, and every one of them is a
     // member of the set it was given.
     let f = Fixture::new(vec![]);
-    let c = cert(&f.keys[..3], 1, VoteKind::Precommit, hash_of(1));
-    let counted: HashSet<ValidatorId> = c.signatures.iter().map(|(v, _)| *v).collect();
+    let c = cert(
+        &f.keys[..3],
+        &f.fks[..3],
+        &f.validators,
+        1,
+        VoteKind::Precommit,
+        hash_of(1),
+        &[0u8; 32],
+    );
+    // FULL-PQ: the compiled QC carries the PQ envelope entry alongside the
+    // member signatures; the envelope id is protocol metadata, never a
+    // signer — the client counts only power-holding members.
+    use stellereum::consensus::{PQ_QC_MARKER_ID, PQ_UQC_MARKER_ID};
+    let counted: HashSet<ValidatorId> = c
+        .signatures
+        .iter()
+        .map(|(v, _)| *v)
+        .filter(|v| *v != PQ_UQC_MARKER_ID && *v != PQ_QC_MARKER_ID)
+        .collect();
     assert_eq!(counted.len(), 3, "three distinct signers");
     for v in &counted {
         assert!(f.validators.contains(v), "only members are counted");

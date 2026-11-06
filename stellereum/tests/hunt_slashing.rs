@@ -22,17 +22,17 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::Arc;
-use stellereum::consensus::{ValidatorId, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{ValidatorId, ValidatorSet, VoteKind};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::Block;
 use stellereum::staking::{StakingLedger, MIN_VALIDATOR_BOND};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 const N: usize = 4;
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
-}
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(
         ks.iter()
@@ -85,7 +85,7 @@ fn mkblock(k: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
 
 #[tokio::test]
 async fn hunt_finding_10_downtime_verdict_depends_on_which_votes_arrived() {
-    let ks = keys(N);
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let idv = ids(&ks);
     let payer = idv[0];
     let mut nodes = cluster(&ks, payer).await;
@@ -99,24 +99,59 @@ async fn hunt_finding_10_downtime_verdict_depends_on_which_votes_arrived() {
     // is best-effort, so this is an ordinary dropped message, not a Byzantine act.
     // A block may only be decided on a prevote quorum for the SAME block, so the
     // prevotes come first. Both nodes prevote the same block, then precommit.
-    for k in ks.iter().take(3) {
+    for (i, k) in ks.iter().enumerate().take(3) {
         nodes[0]
-            .on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+            .on_prevote(falcon_votes::fvote(
+                k,
+                &fks[i],
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
             .unwrap();
         nodes[1]
-            .on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+            .on_prevote(falcon_votes::fvote(
+                k,
+                &fks[i],
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
             .unwrap();
     }
-    for k in ks.iter().take(3) {
+    for (i, k) in ks.iter().enumerate().take(3) {
         nodes[0]
-            .on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+            .on_precommit(falcon_votes::fvote(
+                k,
+                &fks[i],
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
             .unwrap();
         nodes[1]
-            .on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+            .on_precommit(falcon_votes::fvote(
+                k,
+                &fks[i],
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
             .unwrap();
     }
     nodes[0]
-        .on_precommit(Vote::sign(&ks[3], 1, 0, VoteKind::Precommit, Some(bh)))
+        .on_precommit(falcon_votes::fvote(
+            &ks[3],
+            &fks[3],
+            1,
+            0,
+            VoteKind::Precommit,
+            Some(bh),
+        ))
         .unwrap();
     assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh));
     assert_eq!(nodes[1].hc.try_precommit_quorum(), Some(bh));
@@ -172,7 +207,7 @@ async fn hunt_finding_10_downtime_verdict_depends_on_which_votes_arrived() {
 
 #[tokio::test]
 async fn hunt_finding_11_equivocation_is_no_longer_node_local_in_the_transition() {
-    let ks = keys(N);
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let idv = ids(&ks);
     let payer = idv[0];
     let mut nodes = cluster(&ks, payer).await;
@@ -188,15 +223,29 @@ async fn hunt_finding_11_equivocation_is_no_longer_node_local_in_the_transition(
     // The honest three prevote, then precommit, the decided block. A block is
     // only decided on a prevote quorum for the same block, so both are needed.
     for n in nodes.iter_mut() {
-        for k in ks.iter().take(3) {
-            n.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
-                .unwrap();
+        for (i, k) in ks.iter().enumerate().take(3) {
+            n.on_prevote(falcon_votes::fvote(
+                k,
+                &fks[i],
+                1,
+                0,
+                VoteKind::Prevote,
+                Some(bh),
+            ))
+            .unwrap();
         }
     }
     for n in nodes.iter_mut() {
-        for k in ks.iter().take(3) {
-            n.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
-                .unwrap();
+        for (i, k) in ks.iter().enumerate().take(3) {
+            n.on_precommit(falcon_votes::fvote(
+                k,
+                &fks[i],
+                1,
+                0,
+                VoteKind::Precommit,
+                Some(bh),
+            ))
+            .unwrap();
         }
     }
     assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh));
@@ -205,10 +254,17 @@ async fn hunt_finding_11_equivocation_is_no_longer_node_local_in_the_transition(
     nodes[1].blocks.insert(bh, blk.clone());
 
     // The double-voter sends its FIRST prevote to everyone...
-    let v1 = Vote::sign(&dyvader, 1, 0, VoteKind::Prevote, Some(bh));
+    let v1 = falcon_votes::fvote(&dyvader, &fks[3], 1, 0, VoteKind::Prevote, Some(bh));
     // ...and its CONFLICTING second prevote to node 0 only. The attacker picks
     // which node forms the evidence; the block never carries it.
-    let v2 = Vote::sign(&dyvader, 1, 0, VoteKind::Prevote, Some([0x99u8; 32]));
+    let v2 = falcon_votes::fvote(
+        &dyvader,
+        &fks[3],
+        1,
+        0,
+        VoteKind::Prevote,
+        Some([0x99u8; 32]),
+    );
     nodes[0].on_prevote(v1.clone()).unwrap();
     nodes[1].on_prevote(v1.clone()).unwrap();
     nodes[0].on_prevote(v2.clone()).unwrap();
@@ -256,11 +312,11 @@ async fn hunt_finding_11b_equivocation_evidence_is_never_in_the_block() {
     // The certificate broadcast on the wire (ConsensusMsg::Committed) carries
     // only the PRECOMMIT quorum. The equivocation evidence is local to whichever
     // node happened to observe both conflicting votes, and is never gossiped.
-    let ks = keys(2);
+    let (ks, fks) = falcon_votes::falcon_set(2);
     let vs = vset(&ks);
     let mut hc = stellereum::consensus::HeightConsensus::new(1, vs);
-    let a = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some([1u8; 32]));
-    let b = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some([2u8; 32]));
+    let a = falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some([1u8; 32]));
+    let b = falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some([2u8; 32]));
     hc.add_prevote(a).unwrap();
     hc.add_prevote(b).unwrap();
     let ev = hc.equivocations();
@@ -284,16 +340,17 @@ async fn hunt_finding_11b_equivocation_evidence_is_never_in_the_block() {
 #[test]
 fn hunt_finding_12_slash_equivocation_trusts_the_caller_supplied_tuple() {
     let mut l = StakingLedger::new();
-    let a_key = SigningKey::generate(&mut OsRng);
-    let b_key = SigningKey::generate(&mut OsRng);
+    let (ab_keys, ab_fks) = falcon_votes::falcon_set(2);
+    let a_key = ab_keys[0].clone();
+    let b_key = ab_keys[1].clone();
     let aid = a_key.verifying_key().to_bytes();
     let bid = b_key.verifying_key().to_bytes();
     l.bond(aid, 10 * MIN_VALIDATOR_BOND, 0).unwrap();
     l.bond(bid, 10 * MIN_VALIDATOR_BOND, 0).unwrap();
 
     // Two votes by TWO DIFFERENT validators. A never equivocated.
-    let va = Vote::sign(&a_key, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
-    let vb = Vote::sign(&b_key, 1, 0, VoteKind::Prevote, Some([2u8; 32]));
+    let va = falcon_votes::fvote(&a_key, &ab_fks[0], 1, 0, VoteKind::Prevote, Some([1u8; 32]));
+    let vb = falcon_votes::fvote(&b_key, &ab_fks[1], 1, 0, VoteKind::Prevote, Some([2u8; 32]));
     assert!(va.verify() && vb.verify());
     assert_ne!(va.voter, vb.voter);
     let before = l.total_stake(&aid);
@@ -333,14 +390,21 @@ fn hunt_finding_12_slash_equivocation_trusts_the_caller_supplied_tuple() {
 
 #[test]
 fn hunt_finding_13_prevote_precommit_divergence_escapes_all_slashing() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut hc = stellereum::consensus::HeightConsensus::new(1, vs.clone());
     let id = ks[0].verifying_key().to_bytes();
 
     // Same height, same round, two DIFFERENT values, two different kinds.
-    let pv = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some([0xAAu8; 32]));
-    let pc = Vote::sign(&ks[0], 1, 0, VoteKind::Precommit, Some([0xBBu8; 32]));
+    let pv = falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some([0xAAu8; 32]));
+    let pc = falcon_votes::fvote(
+        &ks[0],
+        &fks[0],
+        1,
+        0,
+        VoteKind::Precommit,
+        Some([0xBBu8; 32]),
+    );
     hc.add_prevote(pv.clone()).unwrap();
     hc.add_precommit(pc.clone()).unwrap();
     assert_eq!(
@@ -369,23 +433,33 @@ fn hunt_finding_13_prevote_precommit_divergence_escapes_all_slashing() {
 
 #[tokio::test]
 async fn hunt_finding_14_a_single_bond_makes_every_prior_certificate_fail() {
-    let ks = keys(N);
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let real_ids = ids(&ks);
     let before = vset(&ks);
     let bh = [0x55u8; 32];
 
-    let mk = |signers: &[usize]| stellereum::consensus::QuorumCertificate {
-        height: 1,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: signers
-            .iter()
-            .map(|&i| {
-                let v = Vote::sign(&ks[i], 1, 0, VoteKind::Precommit, Some(bh));
-                (v.voter, v.signature)
-            })
-            .collect(),
+    let mk = |signers: &[usize]| {
+        let mut set = stellereum::consensus::VoteSet::new();
+        let mut ed_sigs = Vec::new();
+        for &i in signers {
+            let v = falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Precommit, Some(bh));
+            if set
+                .add(v.clone(), &before, 1, 0, VoteKind::Precommit)
+                .is_ok()
+            {
+                ed_sigs.push((v.voter, v.ed25519_signature().to_vec()));
+            }
+        }
+        if let Some(qc) = set.certificate(Some(bh), &before, &[0u8; 32]) {
+            return qc;
+        }
+        stellereum::consensus::QuorumCertificate {
+            height: 1,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some(bh),
+            signatures: ed_sigs,
+        }
     };
     let cert = mk(&[0, 1, 2]);
     assert!(cert.verify(&before), "3 of 4 is a quorum before the bond");

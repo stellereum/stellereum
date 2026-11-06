@@ -20,6 +20,33 @@ pub const BASE_STELL_PRICE_MICRO_USD: u64 = 250_000; // $0.25 USD (6 decimals)
 /// would disagree about the proposer credit of the very same block.
 pub const BLOCK_REWARD_NANO: u64 = 317_000_000;
 
+/// Height gate for the cap-exact geometric emission (report §11, Eq. 4).
+///
+/// INACTIVE by default (`u64::MAX` — lead flips at rollout). While inactive
+/// every reachable height takes the flat branch, so live emission is
+/// byte-identical to [`StakingEmissionSchedule::calculate_block_reward`]
+/// (pinned by `gated_pre_activation_pins_current_values` below and the
+/// unmodified external `flat_block_reward_is_live_and_schedule_is_dead`).
+/// The single boundary height `== u64::MAX` takes the geometric leg and is
+/// pinned by `gated_boundary_is_exact`.
+// GATE: task-mandated identifier spelling `EMISSIONCapEXACT_ACTIVATION_HEIGHT`
+// (the exact rollout knob the lead flips); casing allow is per-item, not blanket.
+#[allow(non_upper_case_globals)]
+pub const EMISSIONCapEXACT_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// Cap-exact geometric schedule parameters: 7-yr horizon at 0.6 s blocks
+/// (`results/emission.json` row: half-life 1.054 yr, R0 4.380869639 STELL).
+/// Integer constants only — no float in this file's new code; the float
+/// lives solely in the sibling-owned pure helpers, REUSED via delegation
+/// (never duplicated here).
+///
+/// H = 1.054 yr × 52,560,000 blocks/yr (0.6 s) = 55,398,240 blocks.
+/// R0 = Eq. 4 `P·(1−2^(−1/H))` at (350M STELL, H), pinned to the
+/// `geometric_schedule_r0_nano` helper output and cross-checked against the
+/// emission.json row (±1%) in `cap_exact_r0_matches_eq4_and_json_row`.
+pub const CAP_EXACT_HALF_LIFE_BLOCKS: u64 = 55_398_240;
+pub const CAP_EXACT_R0_NANO: u64 = 4_379_227_780;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenAllocation {
     pub genesis_vault: u64,      // 25% - 250M
@@ -325,15 +352,49 @@ impl StakingEmissionSchedule {
         // clock only — see truth table above; 21.01 yr at the 0.6 s target].
         BLOCK_REWARD_NANO / (active_validators as u64)
     }
+
+    /// Height-gated live emission (cap-exact rollout knob).
+    ///
+    /// Below [`EMISSIONCapEXACT_ACTIVATION_HEIGHT`] → the current schedule
+    /// ([`Self::calculate_block_reward`], flat per-proposer semantics).
+    /// At/above → the cap-exact geometric leg
+    /// `geometric_reward_at_height(CAP_EXACT_R0_NANO, CAP_EXACT_HALF_LIFE_BLOCKS,
+    /// height − activation)` (RELATIVE height, so the boundary pays exactly
+    /// R0). The geometric leg is per-proposer like the live flat reward —
+    /// no division by `active_validators`.
+    ///
+    /// Integer dispatch only — no float in this body; the geometric float
+    /// math is sibling-owned ([`geometric_reward_at_height`]), REUSED via
+    /// delegation, never duplicated. While the activation is `u64::MAX`
+    /// every reachable height takes the flat branch: byte-identical to
+    /// [`Self::calculate_block_reward`].
+    pub fn calculate_block_reward_at_height(&self, active_validators: usize, height: u64) -> u64 {
+        if self.emitted >= self.total_pool || active_validators == 0 {
+            return 0;
+        }
+        if height < EMISSIONCapEXACT_ACTIVATION_HEIGHT {
+            self.calculate_block_reward(active_validators)
+        } else {
+            geometric_reward_at_height(
+                CAP_EXACT_R0_NANO,
+                CAP_EXACT_HALF_LIFE_BLOCKS,
+                height - EMISSIONCapEXACT_ACTIVATION_HEIGHT,
+            )
+        }
+    }
 }
 
-/// PROPOSAL ONLY — cap-exact geometric emission schedule (report §11, Eq. 4).
+/// GATED cap-exact geometric emission schedule (report §11, Eq. 4).
 ///
-/// FOR-LEAD-DECISION: not wired anywhere. The live path stays the flat
-/// per-proposer [`BLOCK_REWARD_NANO`] (consensus-feeding — see the truth
-/// note on [`StakingEmissionSchedule::calculate_block_reward`]). These
-/// helpers are pure reference math for the lead's decision, exercised only
-/// by the pinning/proposal tests in this file.
+/// The live path stays the flat per-proposer [`BLOCK_REWARD_NANO`]
+/// (consensus-feeding — see the truth note on
+/// [`StakingEmissionSchedule::calculate_block_reward`]) while
+/// [`EMISSIONCapEXACT_ACTIVATION_HEIGHT`] is `u64::MAX` (INACTIVE). These
+/// helpers are the pure reference math for the schedule the height gate in
+/// [`StakingEmissionSchedule::calculate_block_reward_at_height`] delegates
+/// to at/above activation — REUSED there, never duplicated.
+/// (Flipping the activation to a reachable height is a consensus change:
+/// needs a spec update + audit note per frozen-core rule 7.)
 ///
 /// R_h = R0 · 2^(−h/H), with R0 = P · (1 − 2^(−1/H)); Σ_{h≥0} R_h = P
 /// exactly (infinite tail; 99% emitted by H·log2(100) blocks per Thm. 4).
@@ -346,9 +407,10 @@ pub fn geometric_schedule_r0_nano(pool_nano: u64, half_life_blocks: u64) -> u64 
     ((pool_nano as f64) * (1.0 - decay)) as u64
 }
 
-/// PROPOSAL ONLY — geometric per-height reward (report §11, Eq. 4).
-/// Pure: R_h = R0 · 2^(−h/H), floored to whole nano-STELL. No callers
-/// outside tests; wiring it into any payout path is a consensus change.
+/// Geometric per-height reward (report §11, Eq. 4).
+/// Pure: R_h = R0 · 2^(−h/H), floored to whole nano-STELL. Called by the
+/// height gate ([`StakingEmissionSchedule::calculate_block_reward_at_height`])
+/// and by tests; wiring any OTHER payout path to it is a consensus change.
 pub fn geometric_reward_at_height(r0_nano: u64, half_life_blocks: u64, height: u64) -> u64 {
     if r0_nano == 0 || half_life_blocks == 0 {
         return 0;
@@ -439,5 +501,155 @@ mod econ_truth_tests {
         }
         let frac = sum as f64 / pool as f64;
         assert!((frac - 0.99).abs() < 0.005, "99% by H·log2(100), got {frac}");
+    }
+
+    #[test]
+    fn cap_exact_gate_is_inactive_by_default() {
+        assert_eq!(
+            EMISSIONCapEXACT_ACTIVATION_HEIGHT,
+            u64::MAX,
+            "gate INACTIVE until the lead flips it at rollout"
+        );
+    }
+
+    #[test]
+    fn gated_pre_activation_pins_current_values() {
+        // While inactive every reachable height takes the flat branch:
+        // byte-identical to the current schedule (values locked, unmodified).
+        let sched = StakingEmissionSchedule::default();
+        for &h in &[0u64, 1, 100, 1_104_100_945, 1_104_100_946, u64::MAX - 1] {
+            assert_eq!(
+                sched.calculate_block_reward_at_height(1, h),
+                BLOCK_REWARD_NANO,
+                "N=1 flat 0.317 @ h={h}"
+            );
+            assert_eq!(
+                sched.calculate_block_reward_at_height(3, h),
+                BLOCK_REWARD_NANO / 3,
+                "N=3 @ h={h}"
+            );
+            assert_eq!(
+                sched.calculate_block_reward_at_height(0, h),
+                0,
+                "N=0 @ h={h}"
+            );
+        }
+        let mut drained = StakingEmissionSchedule::default();
+        drained.emitted = drained.total_pool;
+        assert_eq!(drained.calculate_block_reward_at_height(1, 0), 0);
+        assert_eq!(
+            drained.calculate_block_reward_at_height(1, u64::MAX),
+            0,
+            "drained stays 0 even at the boundary height"
+        );
+    }
+
+    #[test]
+    fn cap_exact_r0_matches_eq4_and_json_row() {
+        // emission.json 7-yr@0.6s row: half-life 1.054 yr, R0 4.380869639
+        // STELL. Integer-only derivation (no float): blocks/yr at 0.6 s =
+        // 31,536,000·10/6; H = 1.054 yr = ×1054/1000.
+        let blocks_per_year = 31_536_000u64 * 10 / 6;
+        assert_eq!(blocks_per_year, 52_560_000);
+        assert_eq!(
+            CAP_EXACT_HALF_LIFE_BLOCKS,
+            blocks_per_year * 1054 / 1000,
+            "H = 1.054 yr in blocks"
+        );
+        assert_eq!(CAP_EXACT_HALF_LIFE_BLOCKS, 55_398_240);
+        let pool = StakingEmissionSchedule::default().total_pool;
+        // Exact R0 from Eq. 4 via the sibling helper (REUSED, not duplicated).
+        assert_eq!(
+            CAP_EXACT_R0_NANO,
+            geometric_schedule_r0_nano(pool, CAP_EXACT_HALF_LIFE_BLOCKS),
+            "R0 pinned to Eq.4 helper output"
+        );
+        // Cross-check against the emission.json row 4_380_869_639 nano
+        // (±1% integer band: helper float floors ≈0.037% under the row).
+        let json_r0_nano = 4_380_869_639u64;
+        let lo = json_r0_nano * 99 / 100;
+        let hi = json_r0_nano * 101 / 100;
+        assert!(
+            (lo..=hi).contains(&CAP_EXACT_R0_NANO),
+            "R0 {} within ±1% of json row {json_r0_nano}",
+            CAP_EXACT_R0_NANO,
+        );
+        // R0 ≈ 4.381 STELL (integer whole-STELL part, no float).
+        assert_eq!(CAP_EXACT_R0_NANO / 1_000_000_000, 4);
+    }
+
+    #[test]
+    fn gated_boundary_is_exact() {
+        let sched = StakingEmissionSchedule::default();
+        let a = EMISSIONCapEXACT_ACTIVATION_HEIGHT;
+        assert_eq!(
+            sched.calculate_block_reward_at_height(1, a - 1),
+            BLOCK_REWARD_NANO,
+            "just below activation: flat 0.317"
+        );
+        assert_eq!(
+            sched.calculate_block_reward_at_height(1, a),
+            CAP_EXACT_R0_NANO,
+            "boundary: exactly R0 (relative height 0)"
+        );
+        assert_eq!(
+            sched.calculate_block_reward_at_height(1, a),
+            geometric_reward_at_height(CAP_EXACT_R0_NANO, CAP_EXACT_HALF_LIFE_BLOCKS, 0)
+        );
+    }
+
+    #[test]
+    fn cap_exact_integer_discipline_no_overflow() {
+        // New gate code is integer nano math only (u64 domain, u128
+        // accumulators): prove no overflow at pool magnitudes.
+        let pool = StakingEmissionSchedule::default().total_pool as u128;
+        let r0 = CAP_EXACT_R0_NANO as u128;
+        assert!(pool < u64::MAX as u128, "pool fits u64 with headroom");
+        assert!(r0 < pool, "R0 is a small fraction of pool");
+        assert!(CAP_EXACT_R0_NANO.checked_mul(2).is_some(), "2×R0 fits u64");
+        // 99% horizon H·log2(100) in integer math (6.64385619 → 6643856/1e6).
+        let n99 = CAP_EXACT_HALF_LIFE_BLOCKS
+            .checked_mul(6_643_856)
+            .expect("n99 multiply fits u64")
+            / 1_000_000;
+        assert!(n99 > CAP_EXACT_HALF_LIFE_BLOCKS);
+        // Rewards never exceed R0 and never wrap (sampled relative heights).
+        for &rel in &[
+            0u64,
+            1,
+            CAP_EXACT_HALF_LIFE_BLOCKS,
+            2 * CAP_EXACT_HALF_LIFE_BLOCKS,
+        ] {
+            let r = geometric_reward_at_height(CAP_EXACT_R0_NANO, CAP_EXACT_HALF_LIFE_BLOCKS, rel);
+            assert!(r <= CAP_EXACT_R0_NANO, "rel={rel}: {r} <= R0");
+        }
+        // u128 accumulator smoke: first 1000 rewards sum far below pool.
+        let mut sum: u128 = 0;
+        for rel in 0..1000u64 {
+            sum += geometric_reward_at_height(CAP_EXACT_R0_NANO, CAP_EXACT_HALF_LIFE_BLOCKS, rel)
+                as u128;
+        }
+        assert!(sum < pool, "1000-block prefix {sum} < pool {pool}");
+    }
+
+    #[test]
+    fn cap_exact_checksum_99_by_h_log2_100_integer() {
+        // Thm. 4 spot-check on small H (the real-H horizon is 368M blocks —
+        // unloopable in a unit test). Integer-only: horizon via integer
+        // ratio, percent via u128 math (floor → 98 or 99 both pass).
+        let half_life_blocks = 1_000u64;
+        let pool = StakingEmissionSchedule::default().total_pool;
+        let r0 = geometric_schedule_r0_nano(pool, half_life_blocks);
+        let n = half_life_blocks * 6_643_856 / 1_000_000; // H·log2(100)
+        assert_eq!(n, 6643);
+        let mut sum: u128 = 0;
+        for h in 0..n {
+            sum += geometric_reward_at_height(r0, half_life_blocks, h) as u128;
+        }
+        let pct = sum * 100 / pool as u128;
+        assert!(
+            (98..=99).contains(&pct),
+            "99% by H·log2(100), integer pct={pct}"
+        );
     }
 }

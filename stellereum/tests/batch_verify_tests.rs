@@ -68,8 +68,11 @@ fn batch_mixed_keys() {
 
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{ValidatorSet, Vote, VoteKind};
 use stellereum::sharding::Block;
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 fn det_rng() -> StdRng {
     StdRng::seed_from_u64(0xBA7C4)
@@ -195,16 +198,42 @@ fn vote_keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
 }
 
-fn vote_set(ks: &[SigningKey], bh: [u8; 32]) -> Vec<Vote> {
+fn vote_set(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    bh: [u8; 32],
+) -> Vec<Vote> {
     ks.iter()
-        .map(|k| Vote::sign(k, 7, 2, VoteKind::Precommit, Some(bh)))
+        .zip(fks.iter())
+        .map(|(k, fk)| falcon_votes::fvote(k, fk, 7, 2, VoteKind::Precommit, Some(bh)))
         .collect()
+}
+
+/// FULL-PQ companions for an existing Ed committee (used where the Ed keys
+/// come from a seeded RNG rather than `falcon_set`): the Falcon seed is the
+/// key's own first byte, so the same voter id always maps to the same Falcon
+/// key. Registers each companion globally, which `Vote::verify` reads.
+fn fks_for(ks: &[SigningKey]) -> Vec<stellereum::post_quantum::FalconKeypair> {
+    use stellereum::consensus::register_validator_pq_key;
+    use stellereum::post_quantum::{FalconKeypair, PqScheme};
+    let fks: Vec<FalconKeypair> = ks
+        .iter()
+        .map(|k| FalconKeypair::generate_from_seed(k.to_bytes()[0]))
+        .collect();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        register_validator_pq_key(
+            k.verifying_key().to_bytes(),
+            PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+    }
+    fks
 }
 
 #[test]
 fn vote_batch_accepts_all_valid() {
-    let ks = vote_keys(32);
-    let votes = vote_set(&ks, [0x42u8; 32]);
+    let (ks, fks) = falcon_votes::falcon_set(32);
+    let votes = vote_set(&ks, &fks, [0x42u8; 32]);
     assert!(Vote::verify_batch(&votes));
     assert!(Vote::partition_valid(&votes).iter().all(|b| *b));
     assert!(votes.iter().all(|v| v.verify()));
@@ -212,8 +241,8 @@ fn vote_batch_accepts_all_valid() {
 
 #[test]
 fn vote_batch_rejects_one_forgery_and_keeps_good() {
-    let ks = vote_keys(32);
-    let mut votes = vote_set(&ks, [0x42u8; 32]);
+    let (ks, fks) = falcon_votes::falcon_set(32);
+    let mut votes = vote_set(&ks, &fks, [0x42u8; 32]);
     votes[9].signature[7] ^= 0xFF;
     assert!(!votes[9].verify());
     // Fail closed...
@@ -237,10 +266,12 @@ fn vote_batch_matches_scalar_differential_randomized() {
                 SigningKey::from_bytes(&b)
             })
             .collect();
+        let fks = fks_for(&ks);
         let mut votes: Vec<Vote> = ks
             .iter()
+            .zip(fks.iter())
             .enumerate()
-            .map(|(i, k)| {
+            .map(|(i, (k, fk))| {
                 // Vary height/round/kind/target per vote: distinct messages.
                 let kind = if i % 2 == 0 {
                     VoteKind::Prevote
@@ -250,7 +281,7 @@ fn vote_batch_matches_scalar_differential_randomized() {
                 let mut bh = [0u8; 32];
                 rng.fill_bytes(&mut bh);
                 let target = if i % 3 == 0 { None } else { Some(bh) };
-                Vote::sign(k, round as u64, (i % 4) as u32, kind, target)
+                falcon_votes::fvote(k, fk, round as u64, (i % 4) as u32, kind, target)
             })
             .collect();
         // Corrupt a random subset.
@@ -299,7 +330,8 @@ fn voteset_add_batch_matches_sequential_and_keeps_good() {
             .collect(),
     );
     let bh = [0x11u8; 32];
-    let mut votes = vote_set(&ks, bh);
+    let fks = fks_for(&ks);
+    let mut votes = vote_set(&ks, &fks, bh);
     // One forged vote and one outsider vote: both rejected, good kept.
     votes[3].signature[0] ^= 0xFF;
     let outsider = SigningKey::generate(&mut OsRng);
@@ -338,7 +370,8 @@ fn voteset_add_batch_is_permutation_independent() {
             .collect(),
     );
     let bh = [0x22u8; 32];
-    let votes = vote_set(&ks, bh);
+    let fks = fks_for(&ks);
+    let votes = vote_set(&ks, &fks, bh);
     // Reverse the input: same admitted SET and same quorum either way.
     let rev: Vec<Vote> = votes.iter().rev().cloned().collect();
     let mut a = stellereum::consensus::VoteSet::new();
@@ -506,25 +539,26 @@ fn qc_batch_still_covers_quorum_path() {
     // Existing verify_batch precedent (commit 687ec90) keeps working: a full
     // QC verifies, a tampered one does not.
     let ks = vote_keys(7);
+    let fks = fks_for(&ks);
     let bh = [0x77u8; 32];
-    let sigs: Vec<([u8; 32], Vec<u8>)> = ks
-        .iter()
-        .map(|k| {
-            let v = Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh));
-            (v.voter, v.signature)
-        })
-        .collect();
-    let qc = QuorumCertificate {
-        height: 1,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: sigs,
-    };
     let vs = ValidatorSet::from_list(
         ks.iter()
             .map(|k| (k.verifying_key().to_bytes(), 1))
             .collect(),
     );
+    let mut set = stellereum::consensus::VoteSet::new();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        set.add(
+            falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)),
+            &vs,
+            1,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
+    }
+    let qc = set
+        .certificate(Some(bh), &vs, &[0u8; 32])
+        .expect("7-of-7 reaches quorum");
     assert!(qc.verify(&vs));
 }

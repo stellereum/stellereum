@@ -16,29 +16,36 @@
 //! `note_peer_vote_round` refuses to abandon a live round for a near peer.
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::sync::Arc;
 use stellereum::consensus::ValidatorSet;
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
-}
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 fn id(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
 }
 
-/// Two validators, shared genesis state, height 1. Returns (us, us_key, peer_key).
-async fn two_node() -> (ValidatorRuntime, SigningKey, SigningKey) {
-    let ks = keys(2);
+/// Two validators, shared genesis state, height 1. Returns (us, us_key,
+/// peer_key, falcon_keys) — Falcon companions keep every vote FULL-PQ.
+async fn two_node() -> (
+    ValidatorRuntime,
+    SigningKey,
+    SigningKey,
+    Vec<stellereum::post_quantum::FalconKeypair>,
+) {
+    let (ks, fks) = falcon_votes::falcon_set(2);
     let vset = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-    let rt = ValidatorRuntime::new(ks[0].clone(), vset, state, 1);
-    (rt, ks[0].clone(), ks[1].clone())
+    // FULL-PQ: the runtime must carry its Falcon key (mirrors
+    // `Cluster::new`), otherwise `make_prevote`/`make_precommit` mint Ed-only
+    // votes `Vote::verify` refuses.
+    let rt = ValidatorRuntime::new(ks[0].clone(), vset, state, 1).with_falcon_key(fks[0].clone());
+    (rt, ks[0].clone(), ks[1].clone(), fks)
 }
 
 /// A block genuinely built by `proposer_key` on top of `rt`'s current state.
@@ -72,7 +79,7 @@ async fn genuine_block(rt: &ValidatorRuntime, proposer_key: &SigningKey) -> Bloc
 
 #[tokio::test]
 async fn proposal_phase_align_accepts_next_round_and_votes() {
-    let (mut rt, us, peer) = two_node().await;
+    let (mut rt, us, peer, _fks) = two_node().await;
     // Find a round WE own where the peer owns R+1. Under hash-slot scheduling
     // consecutive rounds are independent draws (no round-robin alternation),
     // so search forward (P(miss in 64 tries) ~ 2^-64).
@@ -129,7 +136,7 @@ async fn proposal_phase_align_accepts_next_round_and_votes() {
 
 #[tokio::test]
 async fn near_verified_vote_pulls_us_up() {
-    let (mut rt, _us, peer) = two_node().await;
+    let (mut rt, _us, peer, _fks) = two_node().await;
     while rt.hc.proposer().unwrap() != id(&peer) {
         rt.hc.next_round();
     }
@@ -168,7 +175,7 @@ async fn near_verified_vote_pulls_us_up() {
 #[tokio::test]
 async fn far_vote_syncs_despite_live_proposal() {
     use stellereum::consensus::{MAX_SYNC_JUMPS_PER_ROUND, ROUND_LOOKBACK};
-    let (mut rt, _us, peer) = two_node().await;
+    let (mut rt, _us, peer, fks) = two_node().await;
     while rt.hc.proposer().unwrap() != id(&peer) {
         rt.hc.next_round();
     }
@@ -183,8 +190,9 @@ async fn far_vote_syncs_despite_live_proposal() {
     // Past the first +8 step the chase needs corroboration (P3-R1); here the
     // vote's own record corroborates (2-member set: one reporter suffices),
     // so one verified far vote still converges within the per-round budget.
-    let far = stellereum::consensus::Vote::sign(
+    let far = falcon_votes::fvote(
         &peer,
+        &fks[1],
         rt.hc.height,
         r + 100,
         stellereum::consensus::VoteKind::Prevote,
@@ -213,7 +221,7 @@ async fn far_vote_syncs_despite_live_proposal() {
 
 #[tokio::test]
 async fn forged_proposal_never_moves_round() {
-    let (mut rt, us, peer) = two_node().await;
+    let (mut rt, us, peer, _fks) = two_node().await;
     while rt.hc.proposer().unwrap() != id(&us) {
         rt.hc.next_round();
     }
@@ -240,18 +248,27 @@ async fn forged_proposal_never_moves_round() {
 // ===========================================================================
 
 /// Drive `rt` to lock `bh` at its current round: both prevotes, then precommit.
-async fn lock_on(rt: &mut ValidatorRuntime, us: &SigningKey, peer: &SigningKey, bh: [u8; 32]) {
+async fn lock_on(
+    rt: &mut ValidatorRuntime,
+    us: &SigningKey,
+    us_fk: &stellereum::post_quantum::FalconKeypair,
+    peer: &SigningKey,
+    peer_fk: &stellereum::post_quantum::FalconKeypair,
+    bh: [u8; 32],
+) {
     let h = rt.hc.height;
     let r = rt.hc.round;
-    let mine = stellereum::consensus::Vote::sign(
+    let mine = falcon_votes::fvote(
         us,
+        us_fk,
         h,
         r,
         stellereum::consensus::VoteKind::Prevote,
         Some(bh),
     );
-    let theirs = stellereum::consensus::Vote::sign(
+    let theirs = falcon_votes::fvote(
         peer,
+        peer_fk,
         h,
         r,
         stellereum::consensus::VoteKind::Prevote,
@@ -275,14 +292,14 @@ async fn lock_on(rt: &mut ValidatorRuntime, us: &SigningKey, peer: &SigningKey, 
 
 #[tokio::test]
 async fn locked_proposer_reproposes_locked_value() {
-    let (mut rt, us, peer) = two_node().await;
+    let (mut rt, us, peer, fks) = two_node().await;
     while rt.hc.proposer().unwrap() != id(&us) {
         rt.hc.next_round();
     }
     // Propose fresh X and lock it (peer "saw" it too -- then its vote is lost).
     let x = rt.propose(1).await.expect("proposer must propose");
     let xh = x.compute_hash();
-    lock_on(&mut rt, &us, &peer, xh).await;
+    lock_on(&mut rt, &us, &fks[0], &peer, &fks[1], xh).await;
 
     // Next round, still our proposer turn eventually: we must re-propose X,
     // not build something the network (and we) can never agree on.
@@ -313,14 +330,14 @@ async fn locked_proposer_reproposes_locked_value() {
 
 #[tokio::test]
 async fn polka_for_other_value_at_higher_round_unlocks() {
-    let (mut rt, us, peer) = two_node().await;
+    let (mut rt, us, peer, fks) = two_node().await;
     while rt.hc.proposer().unwrap() != id(&us) {
         rt.hc.next_round();
     }
     let x = rt.propose(1).await.expect("proposer must propose");
     let xh = x.compute_hash();
     let r = rt.hc.round;
-    lock_on(&mut rt, &us, &peer, xh).await;
+    lock_on(&mut rt, &us, &fks[0], &peer, &fks[1], xh).await;
 
     // A quorum for a DIFFERENT value at a higher round proves the network
     // moved on: unlock so we can follow it.
@@ -328,9 +345,10 @@ async fn polka_for_other_value_at_higher_round_unlocks() {
     rt.hc.next_round();
     assert_eq!(rt.hc.round, r + 1);
     let h = rt.hc.height;
-    for k in [&us, &peer] {
-        let v = stellereum::consensus::Vote::sign(
+    for (k, fk) in [&us, &peer].into_iter().zip([&fks[0], &fks[1]]) {
+        let v = falcon_votes::fvote(
             k,
+            fk,
             h,
             r + 1,
             stellereum::consensus::VoteKind::Prevote,
@@ -356,18 +374,12 @@ async fn polka_for_other_value_at_higher_round_unlocks() {
     // validators. A nil polka is a TIMEOUT, not a decision: only a non-nil
     // polka for another value supersedes a lock.
     rt.hc.next_round();
-    lock_on(&mut rt, &us, &peer, xh).await;
+    lock_on(&mut rt, &us, &fks[0], &peer, &fks[1], xh).await;
     rt.hc.next_round();
     let h = rt.hc.height;
     let r2 = rt.hc.round;
-    for k in [&us, &peer] {
-        let v = stellereum::consensus::Vote::sign(
-            k,
-            h,
-            r2,
-            stellereum::consensus::VoteKind::Prevote,
-            None,
-        );
+    for (k, fk) in [&us, &peer].into_iter().zip([&fks[0], &fks[1]]) {
+        let v = falcon_votes::fvote(k, fk, h, r2, stellereum::consensus::VoteKind::Prevote, None);
         rt.on_prevote(v).unwrap();
     }
     assert_eq!(rt.hc.try_prevote_quorum(), Some(None));
@@ -378,13 +390,14 @@ async fn polka_for_other_value_at_higher_round_unlocks() {
 
     // A quorum for our OWN value keeps the lock.
     rt.hc.next_round();
-    lock_on(&mut rt, &us, &peer, xh).await;
+    lock_on(&mut rt, &us, &fks[0], &peer, &fks[1], xh).await;
     rt.hc.next_round();
     let h = rt.hc.height;
     let r3 = rt.hc.round;
-    for k in [&us, &peer] {
-        let v = stellereum::consensus::Vote::sign(
+    for (k, fk) in [&us, &peer].into_iter().zip([&fks[0], &fks[1]]) {
+        let v = falcon_votes::fvote(
             k,
+            fk,
             h,
             r3,
             stellereum::consensus::VoteKind::Prevote,
@@ -409,7 +422,7 @@ async fn polka_for_other_value_at_higher_round_unlocks() {
 
 #[tokio::test]
 async fn stale_envelope_is_rejected_but_timely_aligns() {
-    let (mut rt, _us, peer) = two_node().await;
+    let (mut rt, _us, peer, _fks) = two_node().await;
     while rt
         .validators
         .proposer_for(rt.hc.height, rt.hc.round)
@@ -468,14 +481,16 @@ async fn stale_envelope_is_rejected_but_timely_aligns() {
 
 #[tokio::test]
 async fn lock_hint_rescue_converges() {
-    use stellereum::consensus::{Vote, VoteKind};
+    use stellereum::consensus::VoteKind;
 
-    let ks = keys(2);
+    let (ks, fks) = falcon_votes::falcon_set(2);
     let vset = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-    let mut a = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state.clone(), 1);
-    let mut b = ValidatorRuntime::new(ks[1].clone(), vset.clone(), state.clone(), 1);
+    let mut a = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state.clone(), 1)
+        .with_falcon_key(fks[0].clone());
+    let mut b = ValidatorRuntime::new(ks[1].clone(), vset.clone(), state.clone(), 1)
+        .with_falcon_key(fks[1].clone());
     let (_aid, bid) = (id(&ks[0]), id(&ks[1]));
 
     // B proposes X at its own slot; A accepts (aligning if behind) and locks
@@ -492,9 +507,16 @@ async fn lock_hint_rescue_converges() {
         .expect("A accepts B's block");
     assert!(a.hc.round >= era, "A aligns forward to the proposal");
     let ra = a.hc.round;
-    for k in [&ks[0], &ks[1]] {
-        a.on_prevote(Vote::sign(k, 1, ra, VoteKind::Prevote, Some(xh)))
-            .unwrap();
+    for (k, fk) in [&ks[0], &ks[1]].into_iter().zip([&fks[0], &fks[1]]) {
+        a.on_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            ra,
+            VoteKind::Prevote,
+            Some(xh),
+        ))
+        .unwrap();
     }
     assert_eq!(a.hc.try_prevote_quorum(), Some(Some(xh)));
     assert!(a.make_precommit().is_some());
@@ -554,7 +576,7 @@ async fn lock_hint_rescue_converges() {
 async fn lock_hint_ignores_foreign_and_missing_bodies() {
     use stellereum::consensus::VoteKind;
 
-    let (mut rt, us, peer) = two_node().await;
+    let (mut rt, us, peer, _fks) = two_node().await;
     while rt.hc.proposer().unwrap() != id(&us) {
         rt.hc.next_round();
     }
@@ -597,21 +619,28 @@ async fn lock_hint_ignores_foreign_and_missing_bodies() {
 
 #[tokio::test]
 async fn finalize_stashes_decision_proof_for_broadcast() {
-    use stellereum::consensus::{Vote, VoteKind};
+    use stellereum::consensus::VoteKind;
 
-    let (mut rt, us, peer) = two_node().await;
+    let (mut rt, us, peer, fks) = two_node().await;
     while rt.hc.proposer().unwrap() != id(&us) {
         rt.hc.next_round();
     }
     assert!(rt.last_decision.is_none());
     let b = rt.propose(1).await.expect("propose");
     let bh = b.compute_hash();
-    lock_on(&mut rt, &us, &peer, bh).await;
+    lock_on(&mut rt, &us, &fks[0], &peer, &fks[1], bh).await;
     // Peer precommit completes the QC.
     let h = rt.hc.height;
     let r = rt.hc.round;
-    rt.on_precommit(Vote::sign(&peer, h, r, VoteKind::Precommit, Some(bh)))
-        .unwrap();
+    rt.on_precommit(falcon_votes::fvote(
+        &peer,
+        &fks[1],
+        h,
+        r,
+        VoteKind::Precommit,
+        Some(bh),
+    ))
+    .unwrap();
     let done = rt.try_finalize().await;
     assert_eq!(done, Some(bh), "must finalize with both precommits");
     let (dh, block, cert) = rt.last_decision.clone().expect("decision must be stashed");
@@ -629,10 +658,10 @@ async fn finalize_stashes_decision_proof_for_broadcast() {
 
 #[tokio::test]
 async fn batch_of_peer_votes_counts_in_order() {
-    use stellereum::consensus::{Vote, VoteKind};
+    use stellereum::consensus::VoteKind;
     use stellereum::consensus_net::ConsensusMsg;
 
-    let (mut rt, us, peer) = two_node().await;
+    let (mut rt, us, peer, fks) = two_node().await;
     while rt.hc.proposer().unwrap() != id(&us) {
         rt.hc.next_round();
     }
@@ -642,11 +671,11 @@ async fn batch_of_peer_votes_counts_in_order() {
     let r = rt.hc.round;
     let bytes = ConsensusMsg::batch_encode(&[
         ConsensusMsg::Vote {
-            vote: Vote::sign(&peer, h, r, VoteKind::Prevote, Some(bh)),
+            vote: falcon_votes::fvote(&peer, &fks[1], h, r, VoteKind::Prevote, Some(bh)),
             locked: None,
         },
         ConsensusMsg::Vote {
-            vote: Vote::sign(&peer, h, r, VoteKind::Precommit, Some(bh)),
+            vote: falcon_votes::fvote(&peer, &fks[1], h, r, VoteKind::Precommit, Some(bh)),
             locked: None,
         },
     ])
@@ -684,7 +713,7 @@ async fn batch_of_peer_votes_counts_in_order() {
         }
     }
     // Our own prevote + the peer's: QC forms on the proposed value.
-    let mine = Vote::sign(&us, h, r, VoteKind::Prevote, Some(bh));
+    let mine = falcon_votes::fvote(&us, &fks[0], h, r, VoteKind::Prevote, Some(bh));
     rt.on_prevote(mine).unwrap();
     assert_eq!(rt.hc.try_prevote_quorum(), Some(Some(bh)));
 }
@@ -696,14 +725,15 @@ async fn batch_of_peer_votes_counts_in_order() {
 
 #[tokio::test]
 async fn batch_vote_then_proposal_accepts_and_hints_recorded() {
-    use stellereum::consensus::{Vote, VoteKind};
+    use stellereum::consensus::VoteKind;
     use stellereum::consensus_net::ConsensusMsg;
 
-    let ks = keys(2);
+    let (ks, fks) = falcon_votes::falcon_set(2);
     let vset = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset, state, 1);
+    let mut rt =
+        ValidatorRuntime::new(ks[0].clone(), vset, state, 1).with_falcon_key(fks[0].clone());
     let (aid, bid) = (id(&ks[0]), id(&ks[1]));
     // Our own body, so a nil hint naming it is demand we must serve.
     while rt.hc.proposer().unwrap() != aid {
@@ -718,7 +748,7 @@ async fn batch_vote_then_proposal_accepts_and_hints_recorded() {
     let peer_block = genuine_block(&rt, &ks[1]).await;
     let h = rt.hc.height;
     let r = rt.hc.round;
-    let peer_nil = Vote::sign(&ks[1], h, r, VoteKind::Prevote, None);
+    let peer_nil = falcon_votes::fvote(&ks[1], &fks[1], h, r, VoteKind::Prevote, None);
     let bytes = ConsensusMsg::batch_encode(&[
         ConsensusMsg::Vote {
             vote: peer_nil,
@@ -777,7 +807,7 @@ async fn batch_vote_then_proposal_accepts_and_hints_recorded() {
 
 #[tokio::test]
 async fn refused_proposal_still_records_peer_head() {
-    let (mut rt, _us, peer) = two_node().await;
+    let (mut rt, _us, peer, _fks) = two_node().await;
     assert!(rt.peer_hint.is_none());
     // A genuine proposal for a height above ours: we must refuse it (wrong
     // height) AND still learn finalized height-1 from its prev_hash.

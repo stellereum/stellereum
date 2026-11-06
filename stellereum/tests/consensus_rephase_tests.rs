@@ -20,9 +20,12 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use stellereum::consensus::{
-    HeightConsensus, ValidatorSet, Vote, VoteKind, MAX_DEADLOCK_JUMP, MAX_ROUND_AHEAD,
+    HeightConsensus, ValidatorSet, VoteKind, MAX_DEADLOCK_JUMP, MAX_ROUND_AHEAD,
     REPHASE_SCAN_WINDOW, ROUND_LOOKBACK,
 };
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
@@ -73,7 +76,7 @@ fn breaker_needs_a_second_peer_to_corroborate_the_round() {
     // moves forward, so a node that jumped to a bogus round could never come
     // back. The breaker therefore requires the target round to be reported
     // by MORE THAN ONE validator.
-    let ks = keys(4);
+    let (ks, _fks) = falcon_votes::falcon_set(4);
     let mut hc = HeightConsensus::new(H, vset(&ks));
     hc.round = 100;
     // One liar claims the far future.
@@ -116,7 +119,7 @@ fn breaker_never_fires_before_the_timeout_or_without_a_peer() {
 
 #[test]
 fn rephase_widens_the_scan_window_and_never_rewinds() {
-    let ks = keys(4);
+    let (ks, _fks) = falcon_votes::falcon_set(4);
     let mut hc = HeightConsensus::new(H, vset(&ks));
     hc.round = 412;
     hc.locked = Some(([7u8; 32], 400));
@@ -147,16 +150,30 @@ fn rephase_lets_a_stuck_node_commit_the_quorum_the_network_formed() {
     // and never converges. The re-phase widens the window, and the node
     // COMMITS the old round's quorum (the Tendermint rule: a node must
     // still commit a round it has left if the quorum turns up).
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(H, vs.clone());
     hc.round = 500;
     let block = [0x42u8; 32];
-    for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, H, 412, VoteKind::Prevote, Some(block)))
-            .unwrap();
-        hc.add_precommit(Vote::sign(k, H, 412, VoteKind::Precommit, Some(block)))
-            .unwrap();
+    for (i, k) in ks.iter().enumerate().take(3) {
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            412,
+            VoteKind::Prevote,
+            Some(block),
+        ))
+        .unwrap();
+        hc.add_precommit(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            412,
+            VoteKind::Precommit,
+            Some(block),
+        ))
+        .unwrap();
     }
     // The POLKA LEDGER sees the quorum even before the re-phase: the moment
     // the quorum-completing prevote is admitted, the polka EXISTS (the
@@ -173,11 +190,25 @@ fn rephase_lets_a_stuck_node_commit_the_quorum_the_network_formed() {
     // seen the quorum), and it moves forward, never backwards.
     let mut hc = HeightConsensus::new(H, vs.clone());
     hc.round = 500;
-    for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, H, 412, VoteKind::Prevote, Some(block)))
-            .unwrap();
-        hc.add_precommit(Vote::sign(k, H, 412, VoteKind::Precommit, Some(block)))
-            .unwrap();
+    for (i, k) in ks.iter().enumerate().take(3) {
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            412,
+            VoteKind::Prevote,
+            Some(block),
+        ))
+        .unwrap();
+        hc.add_precommit(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            412,
+            VoteKind::Precommit,
+            Some(block),
+        ))
+        .unwrap();
     }
     assert!(hc.apply_deadlock_local_reset(false));
     assert_eq!(
@@ -196,16 +227,30 @@ fn rephase_lets_a_stuck_node_commit_the_quorum_the_network_formed() {
 fn rephase_retains_the_old_rounds_the_quorum_lives_in() {
     // The re-phase must not only WIDEN the scan: the votes themselves have
     // to survive the prune, or the quorum is gone before it is looked for.
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(H, vs.clone());
     hc.round = 500;
     let block = [0x42u8; 32];
-    for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, H, 412, VoteKind::Prevote, Some(block)))
-            .unwrap();
-        hc.add_precommit(Vote::sign(k, H, 412, VoteKind::Precommit, Some(block)))
-            .unwrap();
+    for (i, k) in ks.iter().enumerate().take(3) {
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            412,
+            VoteKind::Prevote,
+            Some(block),
+        ))
+        .unwrap();
+        hc.add_precommit(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            412,
+            VoteKind::Precommit,
+            Some(block),
+        ))
+        .unwrap();
     }
     assert!(hc.apply_deadlock_local_reset(false));
     // The round-412 vote sets are still there.
@@ -220,7 +265,7 @@ fn rephase_is_idempotent_per_height() {
     // The re-phase widens the window and clears a stale lock — both happen
     // ONCE. Re-firing it every timeout window would advance the round by one
     // (which the round timer does anyway) and change nothing else.
-    let ks = keys(4);
+    let (ks, _fks) = falcon_votes::falcon_set(4);
     let mut hc = HeightConsensus::new(H, vset(&ks));
     hc.round = 412;
     hc.locked = Some(([7u8; 32], 400));
@@ -235,16 +280,30 @@ fn rephase_is_idempotent_per_height() {
 
 #[test]
 fn rephase_never_touches_height_decided_or_the_qc() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(H, vs.clone());
     hc.round = 5;
     let block = [0x11u8; 32];
-    for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, H, 5, VoteKind::Prevote, Some(block)))
-            .unwrap();
-        hc.add_precommit(Vote::sign(k, H, 5, VoteKind::Precommit, Some(block)))
-            .unwrap();
+    for (i, k) in ks.iter().enumerate().take(3) {
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            5,
+            VoteKind::Prevote,
+            Some(block),
+        ))
+        .unwrap();
+        hc.add_precommit(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            5,
+            VoteKind::Precommit,
+            Some(block),
+        ))
+        .unwrap();
     }
     assert_eq!(hc.try_precommit_quorum(), Some(block));
     let qc = hc.precommit_qc.clone();
@@ -272,14 +331,21 @@ fn the_narrow_window_still_bounds_the_scan_in_the_normal_case() {
     // The widened window is installed by the re-phase ONLY. A node that has
     // not re-phased must keep the narrow window, or a peer could make it
     // scan an unbounded number of rounds per tick.
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(H, vs.clone());
     hc.round = 500;
     let block = [0x42u8; 32];
-    for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, H, 412, VoteKind::Prevote, Some(block)))
-            .unwrap();
+    for (i, k) in ks.iter().enumerate().take(3) {
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            412,
+            VoteKind::Prevote,
+            Some(block),
+        ))
+        .unwrap();
     }
     assert_eq!(hc.scan_lookback, ROUND_LOOKBACK);
     assert_eq!(hc.try_prevote_quorum(), None, "no re-phase => no wide scan");
@@ -292,7 +358,7 @@ fn a_lone_byzantine_peer_cannot_wedge_the_node() {
     // SINGLE peer, a lone liar that claims a huge round keeps BOTH paths
     // from firing: the breaker sees no corroborated round, the re-phase sees
     // a peer ahead. The node would then wedge with no way out.
-    let ks = keys(4);
+    let (ks, _fks) = falcon_votes::falcon_set(4);
     let mut hc = HeightConsensus::new(H, vset(&ks));
     hc.round = 100;
     // One liar claims the far future.

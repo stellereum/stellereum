@@ -12,17 +12,21 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::collections::HashMap;
 use std::sync::Arc;
-use stellereum::consensus::{HeightConsensus, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{HeightConsensus, ValidatorSet, VoteKind};
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::sync::{collect_missing_blocks, validate_sync_chain};
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
+fn keys(n: usize) -> (Vec<SigningKey>, Vec<FalconKeypair>) {
+    falcon_votes::falcon_set(n)
 }
 
 fn id(k: &SigningKey) -> [u8; 32] {
@@ -77,12 +81,13 @@ fn mkblock(
 ///
 /// The quorum lives in the QC, not in extra block-hash signatures: validators agree
 /// via votes (over vote_sign_bytes), and only the QC proves they did.
-fn quorum_sign(b: &mut Block, ks: &[SigningKey], round: u32) {
+fn quorum_sign(b: &mut Block, ks: &[SigningKey], fks: &[FalconKeypair], round: u32) {
     let bh = b.compute_hash();
     let sigs = ks
         .iter()
-        .map(|k| {
-            let v = Vote::sign(k, b.height, round, VoteKind::Precommit, Some(bh));
+        .zip(fks.iter())
+        .map(|(k, fk)| {
+            let v = falcon_votes::fvote(k, fk, b.height, round, VoteKind::Precommit, Some(bh));
             (v.voter, v.signature)
         })
         .collect();
@@ -158,18 +163,26 @@ async fn catch_up(
 fn decide_with(
     hc: &mut HeightConsensus,
     voters: &[SigningKey],
+    vfks: &[FalconKeypair],
     height: u64,
     round: u32,
     bh: [u8; 32],
 ) -> Option<[u8; 32]> {
-    for k in voters {
-        hc.add_prevote(Vote::sign(k, height, round, VoteKind::Prevote, Some(bh)))
+    for (k, fk) in voters.iter().zip(vfks.iter()) {
+        hc.add_prevote(falcon_votes::fvote(k, fk, height, round, VoteKind::Prevote, Some(bh)))
             .unwrap();
     }
     hc.try_prevote_quorum();
-    for k in voters {
-        hc.add_precommit(Vote::sign(k, height, round, VoteKind::Precommit, Some(bh)))
-            .unwrap();
+    for (k, fk) in voters.iter().zip(vfks.iter()) {
+        hc.add_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            height,
+            round,
+            VoteKind::Precommit,
+            Some(bh),
+        ))
+        .unwrap();
     }
     hc.try_precommit_quorum()
 }
@@ -180,7 +193,7 @@ fn decide_with(
 
 #[tokio::test]
 async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let vs = vset(&ks);
     assert_eq!(vs.quorum_power(), 3, "4 validators need 3 for quorum");
 
@@ -203,7 +216,7 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
     let mut block = mkblock(1, [0u8; 32], pre_root, &ks[proposer_idx], vec![tx], 1_000);
     // Only the two sides' own keys ever sign: each partition holds 2 of 3 needed.
     // On heal both sides' votes combine into one QC over all four keys.
-    quorum_sign(&mut block, &ks, 0);
+    quorum_sign(&mut block, &ks, &fks, 0);
     let bh = block.compute_hash();
     {
         let qc = block
@@ -220,20 +233,20 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
     side_b.receive_proposal(prop, bh).unwrap();
 
     // Partition {0,1} vs {2,3}: each side sees only its own two votes.
-    for k in &ks[..2] {
+    for (k, fk) in ks[..2].iter().zip(fks[..2].iter()) {
         side_a
-            .add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+            .add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh)))
             .unwrap();
         side_a
-            .add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+            .add_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)))
             .unwrap();
     }
-    for k in &ks[2..] {
+    for (k, fk) in ks[2..].iter().zip(fks[2..].iter()) {
         side_b
-            .add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+            .add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh)))
             .unwrap();
         side_b
-            .add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+            .add_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)))
             .unwrap();
     }
 
@@ -254,20 +267,20 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
     assert_eq!(side_b.decided, None);
 
     // HEAL: deliver all cross-partition votes and blocks.
-    for k in &ks[2..] {
+    for (k, fk) in ks[2..].iter().zip(fks[2..].iter()) {
         side_a
-            .add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+            .add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh)))
             .unwrap();
         side_a
-            .add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+            .add_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)))
             .unwrap();
     }
-    for k in &ks[..2] {
+    for (k, fk) in ks[..2].iter().zip(fks[..2].iter()) {
         side_b
-            .add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+            .add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh)))
             .unwrap();
         side_b
-            .add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+            .add_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)))
             .unwrap();
     }
     // Late votes for the round we waited in still count (rounds_to_inspect).
@@ -283,7 +296,7 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
     // Both sides apply the reunited block after the F3.2 root check.
     // The block already carries the reunited 4-of-4 QC attached above; re-assert
     // it here so the applied block keeps a genuine quorum (not a sub-quorum).
-    quorum_sign(&mut block, &ks, 0);
+    quorum_sign(&mut block, &ks, &fks, 0);
     for (eng, name) in [(&eng_a, "A"), (&eng_b, "B")] {
         assert_eq!(
             eng.get_state_root().await,
@@ -308,9 +321,10 @@ async fn split_brain_two_plus_two_finalizes_nothing_then_heals() {
 
 #[tokio::test]
 async fn asymmetric_partition_three_plus_one_heals_via_block_sync() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let vs = vset(&ks);
     let majority: Vec<SigningKey> = ks[..3].to_vec();
+    let majority_fks: Vec<FalconKeypair> = fks[..3].to_vec();
     let lone = &ks[3];
 
     let payer_key = SigningKey::generate(&mut OsRng);
@@ -355,7 +369,7 @@ async fn asymmetric_partition_three_plus_one_heals_via_block_sync() {
         }
         let tx = Transaction::sign(&payer_key, recipient, 1_000, 0, h - 1, 1, 1);
         let mut b = mkblock(h, prev, pre_root, &proposer, vec![tx], 1_000 + h);
-        quorum_sign(&mut b, &majority, round);
+        quorum_sign(&mut b, &majority, &majority_fks, round);
         let bh = b.compute_hash();
         assert!(b.verify_proposer_signature());
         // The quorum lives in the attached precommit QC, not in extra block-hash
@@ -374,7 +388,7 @@ async fn asymmetric_partition_three_plus_one_heals_via_block_sync() {
         // The 3-side runs a real round and finalizes without the isolated node.
         maj_hc.receive_proposal(prop, bh).unwrap();
         assert_eq!(
-            decide_with(&mut maj_hc, &majority, h, round, bh),
+            decide_with(&mut maj_hc, &majority, &majority_fks, h, round, bh),
             Some(bh),
             "the 3-side finalizes height {h}"
         );
@@ -432,7 +446,7 @@ async fn asymmetric_partition_three_plus_one_heals_via_block_sync() {
 #[tokio::test]
 async fn long_gap_replays_exactly_n_and_a_hole_is_an_error() {
     const N: u64 = 25;
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let vs = vset(&ks);
 
     let payer_key = SigningKey::generate(&mut OsRng);
@@ -449,7 +463,7 @@ async fn long_gap_replays_exactly_n_and_a_hole_is_an_error() {
         let pre_root = builder.get_state_root().await;
         let tx = Transaction::sign(&payer_key, recipient, 1_000, 0, h - 1, 1, 1);
         let mut b = mkblock(h, prev, pre_root, &proposer, vec![tx], 2_000 + h);
-        quorum_sign(&mut b, &ks, 0);
+        quorum_sign(&mut b, &ks, &fks, 0);
         let (applied, failed, _, _, _) = builder
             .apply_block_parallel_fees(&b.transactions, b.timestamp)
             .await;
@@ -506,10 +520,10 @@ async fn long_gap_replays_exactly_n_and_a_hole_is_an_error() {
 
 #[tokio::test]
 async fn forked_history_with_a_foreign_quorum_is_refused() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let vs = vset(&ks);
     // A DIFFERENT validator set: same size, disjoint keys, its own quorum.
-    let foreign_keys = keys(4);
+    let (foreign_keys, foreign_fks) = keys(4);
     for k in &foreign_keys {
         assert_eq!(vs.power_of(&id(k)), 0, "foreign keys hold no power here");
     }
@@ -528,7 +542,7 @@ async fn forked_history_with_a_foreign_quorum_is_refused() {
         let pre_root = ours.get_state_root().await;
         let tx = Transaction::sign(&payer_key, [0xAAu8; 32], 1_000, 0, h - 1, 1, 1);
         let mut b = mkblock(h, prev, pre_root, &proposer, vec![tx], 3_000 + h);
-        quorum_sign(&mut b, &ks, 0);
+        quorum_sign(&mut b, &ks, &fks, 0);
         let (applied, failed, _, _, _) = ours
             .apply_block_parallel_fees(&b.transactions, b.timestamp)
             .await;
@@ -559,7 +573,7 @@ async fn forked_history_with_a_foreign_quorum_is_refused() {
         let pre_root = fork_state.get_state_root().await;
         let tx = Transaction::sign(&payer_key, [0xBBu8; 32], 9_999, 0, h - 1, 1, 1);
         let mut b = mkblock(h, fprev, pre_root, &proposer, vec![tx], 9_000 + h);
-        quorum_sign(&mut b, &foreign_keys, 0);
+        quorum_sign(&mut b, &foreign_keys, &foreign_fks, 0);
         let (applied, failed, _, _, _) = fork_state
             .apply_block_parallel_fees(&b.transactions, b.timestamp)
             .await;
@@ -610,7 +624,7 @@ async fn forked_history_with_a_foreign_quorum_is_refused() {
 
 #[tokio::test]
 async fn stale_round_returnee_accepts_the_network_proposal_and_converges() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let vs = vset(&ks);
 
     let payer_key = SigningKey::generate(&mut OsRng);
@@ -638,11 +652,11 @@ async fn stale_round_returnee_accepts_the_network_proposal_and_converges() {
         vec![Transaction::sign(&payer_key, recipient, 1_000, 0, 0, 1, 1)],
         4_001,
     );
-    quorum_sign(&mut b1, &ks[..3], round1);
+    quorum_sign(&mut b1, &ks[..3], &fks[..3], round1);
     let bh1 = b1.compute_hash();
     hc_net.receive_proposal(prop1, bh1).unwrap();
     assert_eq!(
-        decide_with(&mut hc_net, &ks[..3], 1, round1, bh1),
+        decide_with(&mut hc_net, &ks[..3], &fks[..3], 1, round1, bh1),
         Some(bh1)
     );
     assert_eq!(net_state.get_state_root().await, b1.state_root);
@@ -678,8 +692,9 @@ async fn stale_round_returnee_accepts_the_network_proposal_and_converges() {
     );
     // And a stale far-round vote stored on arrival does not wedge the round
     // the network is actually running.
-    let stale = Vote::sign(
+    let stale = falcon_votes::fvote(
         &ks[3],
+        &fks[3],
         2,
         hc_ret.round,
         VoteKind::Prevote,
@@ -721,15 +736,15 @@ async fn stale_round_returnee_accepts_the_network_proposal_and_converges() {
         vec![Transaction::sign(&payer_key, recipient, 2_000, 0, 1, 1, 1)],
         4_002,
     );
-    quorum_sign(&mut b2, &ks, 0);
+    quorum_sign(&mut b2, &ks, &fks, 0);
     let bh2 = b2.compute_hash();
     // The returnee accepts the network's proposal for the current height/round.
     hc_net2.receive_proposal(prop2, bh2).unwrap();
     hc_ret2
         .receive_proposal(prop2, bh2)
         .expect("the returnee must accept the network proposal, not wedge");
-    assert_eq!(decide_with(&mut hc_net2, &ks, 2, 0, bh2), Some(bh2));
-    assert_eq!(decide_with(&mut hc_ret2, &ks, 2, 0, bh2), Some(bh2));
+    assert_eq!(decide_with(&mut hc_net2, &ks, &fks, 2, 0, bh2), Some(bh2));
+    assert_eq!(decide_with(&mut hc_ret2, &ks, &fks, 2, 0, bh2), Some(bh2));
     assert_eq!(
         hc_net2.decided, hc_ret2.decided,
         "both sides decide the same block"

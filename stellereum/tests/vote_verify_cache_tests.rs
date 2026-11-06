@@ -10,19 +10,35 @@
 //! The cache is process-global, so the tests serialize on `TEST_LOCK` and use
 //! fresh random keys per test; stats are asserted as deltas.
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use stellereum::consensus::{
     Vote, VoteKind, VoteSet, ValidatorSet, clear_verified_vote_cache,
-    invalidate_verified_vote_cache, verified_vote_cache_len, verified_vote_cache_reset_stats,
-    verified_vote_cache_stats,
+    invalidate_verified_vote_cache, register_validator_pq_key, verified_vote_cache_len,
+    verified_vote_cache_reset_stats, verified_vote_cache_stats,
 };
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use std::time::Instant;
 
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn fixture(n: usize) -> (Vec<SigningKey>, ValidatorSet, Vec<Vote>) {
-    let keys: Vec<SigningKey> = (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect();
+    // n DISTINCT voters. `falcon_set` seeds Ed keys with `i as u8`, which
+    // wraps at 256 seats (2000 votes would collapse to 256 voters and the
+    // `set.len() == n` pin would fail) — so build full-width deterministic
+    // keys here. `0xA5` domain-separates them from every u8-seed fixture,
+    // keeping the process-global PQ registry collision-free. The Falcon
+    // half is a pure function of the key bytes and is registered per voter
+    // id, so the mapping stays idempotent across parallel tests.
+    let keys: Vec<SigningKey> = (0..n)
+        .map(|i| {
+            let mut b = [0xA5u8; 32];
+            b[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            SigningKey::from_bytes(&b)
+        })
+        .collect();
     let vs = ValidatorSet::from_list(
         keys.iter()
             .map(|k| (k.verifying_key().to_bytes(), 1))
@@ -30,7 +46,15 @@ fn fixture(n: usize) -> (Vec<SigningKey>, ValidatorSet, Vec<Vote>) {
     );
     let votes: Vec<Vote> = keys
         .iter()
-        .map(|k| Vote::sign(k, 1, 0, VoteKind::Prevote, Some([7u8; 32])))
+        .map(|k| {
+            let fk = FalconKeypair::generate_from_seed(k.to_bytes()[0]);
+            register_validator_pq_key(
+                k.verifying_key().to_bytes(),
+                PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+            Vote::sign_with_falcon(k, &fk, 1, 0, VoteKind::Prevote, Some([7u8; 32]))
+        })
         .collect();
     (keys, vs, votes)
 }
@@ -98,8 +122,9 @@ fn vote_ingest_baseline_timing_reports() {
 fn verified_vote_hit_path_skips_crypto() {
     let _guard = TEST_LOCK.lock().unwrap();
     clean();
-    let sk = SigningKey::generate(&mut OsRng);
-    let vote = Vote::sign(&sk, 11, 3, VoteKind::Prevote, Some([9u8; 32]));
+    let (sks, fks) = falcon_votes::falcon_set(1);
+    let (sk, fk) = (&sks[0], &fks[0]);
+    let vote = falcon_votes::fvote(sk, fk, 11, 3, VoteKind::Prevote, Some([9u8; 32]));
     assert!(vote.verify(), "fixture must verify");
     let (hits, misses) = verified_vote_cache_stats();
     assert_eq!((hits, misses), (0, 1));
@@ -116,10 +141,11 @@ fn verified_vote_hit_path_skips_crypto() {
 fn stale_entry_after_set_change_must_miss() {
     let _guard = TEST_LOCK.lock().unwrap();
     clean();
-    let sk = SigningKey::generate(&mut OsRng);
+    let (sks, fks) = falcon_votes::falcon_set(1);
+    let (sk, fk) = (&sks[0], &fks[0]);
     let voter = sk.verifying_key().to_bytes();
     let vs = ValidatorSet::from_list(vec![(voter, 1)]);
-    let vote = Vote::sign(&sk, 21, 0, VoteKind::Prevote, Some([1u8; 32]));
+    let vote = falcon_votes::fvote(sk, fk, 21, 0, VoteKind::Prevote, Some([1u8; 32]));
 
     let mut set = VoteSet::new();
     assert!(set.add(vote.clone(), &vs, 21, 0, VoteKind::Prevote).is_ok());
@@ -151,9 +177,10 @@ fn stale_entry_after_set_change_must_miss() {
 fn cross_round_confusion_misses() {
     let _guard = TEST_LOCK.lock().unwrap();
     clean();
-    let sk = SigningKey::generate(&mut OsRng);
-    let va = Vote::sign(&sk, 31, 0, VoteKind::Prevote, Some([5u8; 32]));
-    let vb = Vote::sign(&sk, 31, 1, VoteKind::Prevote, Some([5u8; 32]));
+    let (sks, fks) = falcon_votes::falcon_set(1);
+    let (sk, fk) = (&sks[0], &fks[0]);
+    let va = falcon_votes::fvote(sk, fk, 31, 0, VoteKind::Prevote, Some([5u8; 32]));
+    let vb = falcon_votes::fvote(sk, fk, 31, 1, VoteKind::Prevote, Some([5u8; 32]));
     assert!(va.verify());
     assert_eq!(verified_vote_cache_stats(), (0, 1));
     // Same voter, same target, different round: different key → miss.
@@ -164,7 +191,7 @@ fn cross_round_confusion_misses() {
     assert_eq!(verified_vote_cache_stats(), (1, 2));
 
     // Same round, different target (equivocating shape): also a miss.
-    let vc = Vote::sign(&sk, 31, 0, VoteKind::Prevote, Some([6u8; 32]));
+    let vc = falcon_votes::fvote(sk, fk, 31, 0, VoteKind::Prevote, Some([6u8; 32]));
     assert!(vc.verify());
     assert_eq!(verified_vote_cache_stats(), (1, 3));
 }
@@ -173,11 +200,12 @@ fn cross_round_confusion_misses() {
 fn equivocating_votes_never_count_twice_from_cache() {
     let _guard = TEST_LOCK.lock().unwrap();
     clean();
-    let sk = SigningKey::generate(&mut OsRng);
+    let (sks, fks) = falcon_votes::falcon_set(1);
+    let (sk, fk) = (&sks[0], &fks[0]);
     let voter = sk.verifying_key().to_bytes();
     let vs = ValidatorSet::from_list(vec![(voter, 7)]);
-    let a = Vote::sign(&sk, 41, 2, VoteKind::Precommit, Some([0xAAu8; 32]));
-    let b = Vote::sign(&sk, 41, 2, VoteKind::Precommit, Some([0xBBu8; 32]));
+    let a = falcon_votes::fvote(sk, fk, 41, 2, VoteKind::Precommit, Some([0xAAu8; 32]));
+    let b = falcon_votes::fvote(sk, fk, 41, 2, VoteKind::Precommit, Some([0xBBu8; 32]));
     assert!(a.verify() && b.verify(), "both equivocating votes are genuinely signed");
 
     let mut set = VoteSet::new();
@@ -199,10 +227,11 @@ fn equivocating_votes_never_count_twice_from_cache() {
 fn forged_vote_fail_closed_and_never_valid() {
     let _guard = TEST_LOCK.lock().unwrap();
     clean();
-    let sk = SigningKey::generate(&mut OsRng);
+    let (sks, fks) = falcon_votes::falcon_set(1);
+    let (sk, fk) = (&sks[0], &fks[0]);
     let voter = sk.verifying_key().to_bytes();
     let vs = ValidatorSet::from_list(vec![(voter, 1)]);
-    let mut bad = Vote::sign(&sk, 51, 0, VoteKind::Prevote, Some([3u8; 32]));
+    let mut bad = falcon_votes::fvote(sk, fk, 51, 0, VoteKind::Prevote, Some([3u8; 32]));
     bad.signature[7] ^= 0xFF;
     assert!(!bad.verify(), "forgery must not verify");
     assert_eq!(verified_vote_cache_stats(), (0, 1));
@@ -244,8 +273,9 @@ fn batch_path_hits_and_matches_scalar() {
 fn invalidation_hook_forces_reverify() {
     let _guard = TEST_LOCK.lock().unwrap();
     clean();
-    let sk = SigningKey::generate(&mut OsRng);
-    let vote = Vote::sign(&sk, 61, 0, VoteKind::Prevote, None);
+    let (sks, fks) = falcon_votes::falcon_set(1);
+    let (sk, fk) = (&sks[0], &fks[0]);
+    let vote = falcon_votes::fvote(sk, fk, 61, 0, VoteKind::Prevote, None);
     assert!(vote.verify());
     assert!(vote.verify());
     assert_eq!(verified_vote_cache_stats(), (1, 1));

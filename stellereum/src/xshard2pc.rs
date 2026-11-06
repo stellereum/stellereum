@@ -608,3 +608,405 @@ mod tests {
         assert_ne!(key, [0u8; 32]);
     }
 }
+
+/// Executable refinement pin for P14 §B + P15 §A (R1–R5, 9-state ANCHORED
+/// machine, PROOF-ONLY violations).
+///
+/// Port of the transition enumerations in
+/// `stellereum-math/code/xpc_refinement_full.py::concrete_reachable`
+/// (NOT a copy of the Python): each successor first checks local
+/// admissibility against the REAL [`XpcTransition`] functions above, then
+/// applies the peer guard. `anchored = true` is VALIDATE
+/// (`xpc_admissible` / `verify_xpc_anchored`: claimed peer phase must equal
+/// the actual peer phase); `anchored = false` is APPLY
+/// (`apply_xpc_record` / `verify_xpc_proof`: proof against the
+/// attacker-controlled `source_state_root`, so the claimed phase is
+/// unconstrained). Deterministic: fixed seeds, no randomness, no clock.
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+    use std::collections::{BTreeSet, VecDeque};
+
+    /// Model phase: `N` = no record, the rest wrap the real [`XpcPhase`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    enum M {
+        N,
+        P,
+        C,
+        A,
+    }
+
+    impl M {
+        fn phase(self) -> Option<XpcPhase> {
+            match self {
+                M::N => None,
+                M::P => Some(XpcPhase::Prepared),
+                M::C => Some(XpcPhase::Committed),
+                M::A => Some(XpcPhase::Aborted),
+            }
+        }
+    }
+
+    /// Concrete model state: source/target records plus value counters.
+    /// `credit` moves only on target COMMIT, `refund` only on source ABORT.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct St {
+        s: M,
+        t: M,
+        credit: u8,
+        refund: u8,
+    }
+
+    fn mk_rec(phase: XpcPhase) -> XpcRecord {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let tx = crate::sharding::Transaction::sign(&signer, [3u8; 32], 100, 280_000, 0, 0, 1);
+        let mut r = XpcRecord::prepared(tx, 0, 1, 10);
+        r.phase = phase;
+        r
+    }
+
+    /// The 9 documented abstract states (P15 A.1):
+    /// `(N,N) (P,N) (P,P) (P,C) (P,A) (A,N) (A,A) (C,P) (C,C)`.
+    fn abstract_states() -> BTreeSet<(M, M)> {
+        use M::{A, C, N, P};
+        BTreeSet::from([
+            (N, N),
+            (P, N),
+            (P, P),
+            (P, C),
+            (P, A),
+            (A, N),
+            (A, A),
+            (C, P),
+            (C, C),
+        ])
+    }
+
+    /// Port of `concrete_reachable`: the six transition families. Each arm
+    /// asserts the corresponding REAL transition agrees locally; the
+    /// `anchored` flag then enforces the peer guard (R1/R4).
+    fn successors(cur: St, anchored: bool) -> Vec<St> {
+        let mut out = Vec::new();
+        // 1. Source PREPARE (local escrow, no peer check in either mode).
+        if cur.s == M::N {
+            assert_eq!(source_prepare(None), XpcTransition::Created);
+            out.push(St {
+                s: M::P,
+                t: cur.t,
+                credit: cur.credit,
+                refund: cur.refund,
+            });
+        }
+        // 2. Target PREPARE: local `target_prepare(None) == Created`;
+        //    ANCHORED needs source escrow `s in {P, C}`.
+        if cur.t == M::N {
+            assert_eq!(target_prepare(None), XpcTransition::Created);
+            if !anchored || cur.s == M::P || cur.s == M::C {
+                out.push(St {
+                    s: cur.s,
+                    t: M::P,
+                    credit: cur.credit,
+                    refund: cur.refund,
+                });
+            }
+        }
+        // 3. Source on PREPARE-ACK: local Prepared -> Committed;
+        //    ANCHORED needs target voted YES `t in {P, C}`.
+        if cur.s == M::P && cur.credit == 0 {
+            let r = mk_rec(XpcPhase::Prepared);
+            assert_eq!(
+                source_on_prepare_ack(Some(&r)),
+                XpcTransition::Advanced(XpcPhase::Committed)
+            );
+            if !anchored || cur.t == M::P || cur.t == M::C {
+                out.push(St {
+                    s: M::C,
+                    t: cur.t,
+                    credit: cur.credit,
+                    refund: cur.refund,
+                });
+            }
+        }
+        // 4. Source on ABORT-ACK: local Prepared -> Aborted (+1 refund);
+        //    ANCHORED needs target never-prepared `t in {N, A}`.
+        if cur.s == M::P && cur.refund == 0 {
+            let r = mk_rec(XpcPhase::Prepared);
+            assert_eq!(
+                source_on_abort_ack(Some(&r)),
+                XpcTransition::Advanced(XpcPhase::Aborted)
+            );
+            if !anchored || cur.t == M::N || cur.t == M::A {
+                out.push(St {
+                    s: M::A,
+                    t: cur.t,
+                    credit: cur.credit,
+                    refund: cur.refund + 1,
+                });
+            }
+        }
+        // 5. Target on COMMIT: local Prepared -> Committed (+1 credit);
+        //    ANCHORED needs source escrow `s in {P, C}`.
+        if cur.t == M::P && cur.credit == 0 {
+            let r = mk_rec(XpcPhase::Prepared);
+            assert_eq!(
+                target_on_commit(Some(&r)),
+                XpcTransition::Advanced(XpcPhase::Committed)
+            );
+            if !anchored || cur.s == M::P || cur.s == M::C {
+                out.push(St {
+                    s: cur.s,
+                    t: M::C,
+                    credit: cur.credit + 1,
+                    refund: cur.refund,
+                });
+            }
+        }
+        // 6. Target on ABORT-REQUEST: local None -> Aborted (authorisation
+        //    for the source refund); ANCHORED needs source escrow
+        //    `s in {P, C}` (the request carries the source Prepared leaf).
+        if cur.t == M::N {
+            assert_eq!(
+                target_on_abort_request(None),
+                XpcTransition::Advanced(XpcPhase::Aborted)
+            );
+            if !anchored || cur.s == M::P || cur.s == M::C {
+                out.push(St {
+                    s: cur.s,
+                    t: M::A,
+                    credit: cur.credit,
+                    refund: cur.refund,
+                });
+            }
+        }
+        out
+    }
+
+    fn bfs(anchored: bool) -> BTreeSet<St> {
+        let mut seen = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        let start = St {
+            s: M::N,
+            t: M::N,
+            credit: 0,
+            refund: 0,
+        };
+        seen.insert(start);
+        queue.push_back(start);
+        while let Some(cur) = queue.pop_front() {
+            for nx in successors(cur, anchored) {
+                if seen.insert(nx) {
+                    queue.push_back(nx);
+                }
+            }
+        }
+        seen
+    }
+
+    /// I1–I4 + I2 counters as plain booleans (P15 A.1).
+    fn holds_invariants(st: St) -> bool {
+        let i1 = !(st.s == M::A && st.t == M::C);
+        let i2 = st.credit <= 1 && st.refund <= 1;
+        let i3 = st.t != M::C || st.s == M::P || st.s == M::C;
+        let i4 = st.s != M::A || st.t == M::N || st.t == M::A;
+        i1 && i2 && i3 && i4
+    }
+
+    /// Violation labels mirroring `check()` in
+    /// `code/xpc_refinement_full.py`: projection outside the 9 abstract
+    /// states, double credit/refund, and the two named counterexamples.
+    fn violations_of(st: St, abs: &BTreeSet<(M, M)>) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if !abs.contains(&(st.s, st.t)) {
+            v.push("projection not in abstract reachable");
+        }
+        if st.credit > 1 || st.refund > 1 {
+            v.push("double credit/refund");
+        }
+        if st.s == M::A && st.t == M::C && st.credit == 1 && st.refund == 1 {
+            v.push("double spend");
+        }
+        if st.s == M::N && st.t == M::C && st.credit == 1 {
+            v.push("mint without source");
+        }
+        v
+    }
+
+    fn count_violations(set: &BTreeSet<St>, abs: &BTreeSet<(M, M)>) -> usize {
+        set.iter().map(|st| violations_of(*st, abs).len()).sum()
+    }
+
+    #[test]
+    fn real_guards_match_model_assumptions() {
+        // Local admissibility the model relies on (successors() asserts
+        // these on every visit; pinned here as a direct unit check).
+        assert_eq!(source_prepare(None), XpcTransition::Created);
+        assert_eq!(target_prepare(None), XpcTransition::Created);
+        let p = mk_rec(XpcPhase::Prepared);
+        assert_eq!(
+            source_on_prepare_ack(Some(&p)),
+            XpcTransition::Advanced(XpcPhase::Committed)
+        );
+        assert_eq!(
+            source_on_abort_ack(Some(&p)),
+            XpcTransition::Advanced(XpcPhase::Aborted)
+        );
+        assert_eq!(
+            target_on_commit(Some(&p)),
+            XpcTransition::Advanced(XpcPhase::Committed)
+        );
+        assert_eq!(
+            target_on_abort_request(None),
+            XpcTransition::Advanced(XpcPhase::Aborted)
+        );
+        // Monotone refusals: the double-spend / re-credit edges stay shut.
+        let c = mk_rec(XpcPhase::Committed);
+        let a = mk_rec(XpcPhase::Aborted);
+        assert!(matches!(
+            source_on_abort_ack(Some(&c)),
+            XpcTransition::Refused(_)
+        ));
+        assert!(matches!(
+            target_on_commit(Some(&a)),
+            XpcTransition::Refused(_)
+        ));
+        assert!(matches!(
+            target_on_abort_request(Some(&p)),
+            XpcTransition::Refused(_)
+        ));
+        // Model phases cover the real phase codes 1/2/3.
+        assert_eq!(M::P.phase(), Some(XpcPhase::Prepared));
+        assert_eq!(M::C.phase(), Some(XpcPhase::Committed));
+        assert_eq!(M::A.phase(), Some(XpcPhase::Aborted));
+        assert_eq!(M::N.phase(), None);
+    }
+
+    #[test]
+    fn anchored_bfs_nine_states_zero_violations() {
+        let abs = abstract_states();
+        let seen = bfs(true);
+        assert_eq!(seen.len(), 9, "ANCHORED must reach exactly 9 states");
+        let proj: BTreeSet<(M, M)> = seen.iter().map(|st| (st.s, st.t)).collect();
+        assert_eq!(
+            proj, abs,
+            "ANCHORED projections must equal the 9 abstract states"
+        );
+        for st in &seen {
+            assert!(holds_invariants(*st), "I1–I4 violated at {st:?}");
+            assert!(st.credit <= 1 && st.refund <= 1, "I2 violated at {st:?}");
+            assert!(
+                violations_of(*st, &abs).is_empty(),
+                "unexpected violation at {st:?}"
+            );
+        }
+        assert_eq!(count_violations(&seen, &abs), 0);
+    }
+
+    #[test]
+    fn proof_only_bfs_sixteen_states_nine_violations() {
+        let abs = abstract_states();
+        let seen = bfs(false);
+        assert_eq!(seen.len(), 16, "PROOF-ONLY must reach 16 states");
+        assert_eq!(
+            count_violations(&seen, &abs),
+            9,
+            "PROOF-ONLY must reproduce the 9 documented violations"
+        );
+    }
+
+    #[test]
+    fn proof_only_mint_without_source_regression() {
+        // Counterexample `(N,C)` with `credit=1`: target credited with no
+        // source escrow (fake `source_state_root` + proof passes proof-only).
+        let abs = abstract_states();
+        let proof_only = bfs(false);
+        let mint = St {
+            s: M::N,
+            t: M::C,
+            credit: 1,
+            refund: 0,
+        };
+        assert!(
+            proof_only.contains(&mint),
+            "(N,C) mint must be reachable under PROOF-ONLY"
+        );
+        assert!(
+            violations_of(mint, &abs).contains(&"mint without source"),
+            "(N,C) must be flagged as mint without source"
+        );
+        // Honest gate: unreachable under ANCHORED, so a future fix that
+        // re-anchors apply flips THIS assert honestly (it will fail).
+        assert!(
+            !bfs(true).contains(&mint),
+            "(N,C) mint must stay unreachable under ANCHORED"
+        );
+    }
+
+    #[test]
+    fn proof_only_double_spend_regression() {
+        // Counterexample `(A,C)` with `credit=1, refund=1`: credited on the
+        // target AND refunded on the source.
+        let abs = abstract_states();
+        let proof_only = bfs(false);
+        let ds = St {
+            s: M::A,
+            t: M::C,
+            credit: 1,
+            refund: 1,
+        };
+        assert!(
+            proof_only.contains(&ds),
+            "(A,C) double spend must be reachable under PROOF-ONLY"
+        );
+        assert!(
+            violations_of(ds, &abs).contains(&"double spend"),
+            "(A,C) must be flagged as double spend"
+        );
+        assert!(
+            !holds_invariants(ds),
+            "(A,C) must violate I1 (source=A yet target=C)"
+        );
+        assert!(
+            !bfs(true).contains(&ds),
+            "(A,C) double spend must stay unreachable under ANCHORED"
+        );
+    }
+
+    #[test]
+    fn ninth_state_p_c_commit_holds_escrow() {
+        // The 9th state of P15 (missing from P5's 8): the target credits on
+        // the source's `[Prepared, Committed]` leaf while the source still
+        // holds the escrow (`s == P`). COMMIT accepts both phases.
+        let anchored = bfs(true);
+        let pc = St {
+            s: M::P,
+            t: M::C,
+            credit: 1,
+            refund: 0,
+        };
+        assert!(
+            anchored.contains(&pc),
+            "(P,C) must be reachable under ANCHORED"
+        );
+        assert!(holds_invariants(pc), "(P,C) must satisfy I1–I4");
+        // The credit edge fires from Prepared exactly once; replays are
+        // no-ops, never a second credit.
+        let p = mk_rec(XpcPhase::Prepared);
+        let c = mk_rec(XpcPhase::Committed);
+        assert_eq!(
+            target_on_commit(Some(&p)),
+            XpcTransition::Advanced(XpcPhase::Committed)
+        );
+        assert_eq!(target_on_commit(Some(&c)), XpcTransition::Noop);
+        // Escrow held: the source record behind `(P,C)` is still Prepared,
+        // so it can still decide COMMIT (no premature refund).
+        let src = mk_rec(XpcPhase::Prepared);
+        assert_eq!(
+            source_on_prepare_ack(Some(&src)),
+            XpcTransition::Advanced(XpcPhase::Committed)
+        );
+        assert!(matches!(
+            source_on_abort_ack(Some(&c)),
+            XpcTransition::Refused(_)
+        ));
+    }
+}

@@ -22,18 +22,15 @@ use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use stellereum::cell::CellHash;
-use stellereum::consensus::{BlockHash, QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{BlockHash, QuorumCertificate, ValidatorSet, VoteKind, VoteSet};
 use stellereum::light_client::{Checkpoint, LightClient, LightError, ProofAnswer};
 use stellereum::rpc::RpcState;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 
-const N: usize = 4; // 4 validators at power 1 => quorum is 3
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
-fn keys() -> Vec<SigningKey> {
-    (0..N)
-        .map(|i| SigningKey::from_bytes(&[i as u8 + 1; 32]))
-        .collect()
-}
+const N: usize = 4; // 4 validators at power 1 => quorum is 3
 
 fn validators(keys: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(
@@ -43,23 +40,61 @@ fn validators(keys: &[SigningKey]) -> ValidatorSet {
     )
 }
 
-/// A precommit quorum certificate over `hash` at `height`, signed by the
-/// first three validators (a genuine power quorum).
-fn cert(signers: &[SigningKey], height: u64, hash: BlockHash) -> QuorumCertificate {
-    let signatures = signers
-        .iter()
-        .map(|k| {
-            let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(hash));
-            (v.voter, v.signature)
-        })
-        .collect();
+/// A precommit quorum certificate over `hash` at `height`, compiled by the
+/// production committee path against the FULL set `vs` and bound to `parent`.
+/// Refusal fixtures fall through to the envelope-less shape: below quorum,
+/// or with non-member signers, no PQ envelope can be compiled, and the
+/// envelope-less shape is unconditionally invalid under FULL-PQ — while the
+/// preserved Ed list keeps the power-counting refusal messages identical.
+fn cert(
+    signers: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    vs: &ValidatorSet,
+    height: u64,
+    hash: BlockHash,
+    parent: &[u8; 32],
+) -> QuorumCertificate {
+    let mut set = VoteSet::new();
+    let mut ed_sigs = Vec::new();
+    for (k, fk) in signers.iter().zip(fks.iter()) {
+        let v = falcon_votes::fvote(k, fk, height, 0, VoteKind::Precommit, Some(hash));
+        if set
+            .add(v.clone(), vs, height, 0, VoteKind::Precommit)
+            .is_ok()
+        {
+            ed_sigs.push((v.voter, v.ed25519_signature().to_vec()));
+        }
+    }
+    if let Some(qc) = set.certificate(Some(hash), vs, parent) {
+        return qc;
+    }
     QuorumCertificate {
         height,
         round: 0,
         kind: VoteKind::Precommit,
         block_hash: Some(hash),
-        signatures,
+        signatures: ed_sigs,
     }
+}
+
+/// Falcon companions for file-local (non-`falcon_set`) Ed keys, registered
+/// globally like `falcon_set` does. `tag` separates Falcon-key domains so
+/// fixtures sharing one test binary never collide.
+fn pq_for(keys: &[SigningKey], tag: u8) -> Vec<stellereum::post_quantum::FalconKeypair> {
+    use stellereum::consensus::register_validator_pq_key;
+    use stellereum::post_quantum::{FalconKeypair, PqScheme};
+    keys.iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let fk = FalconKeypair::generate_from_seed(tag.wrapping_add(i as u8));
+            register_validator_pq_key(
+                k.verifying_key().to_bytes(),
+                PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+            fk
+        })
+        .collect()
 }
 
 /// A minimal RPC state with an account that has a balance.
@@ -97,8 +132,9 @@ async fn rpc_state_with_account(addr: [u8; 32], balance: u64) -> Arc<RpcState> {
 /// The anchor a light client trusts: a finalized header with a real quorum
 /// certificate over the state root the proofs authenticate against.
 fn anchor_over(
-    _validators: &ValidatorSet,
+    validators: &ValidatorSet,
     keys: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
     height: u64,
     block_hash: BlockHash,
     state_root: CellHash,
@@ -108,7 +144,14 @@ fn anchor_over(
         block_hash,
         [0x11u8; 32],
         state_root,
-        cert(&keys[..3], height, block_hash),
+        cert(
+            &keys[..3],
+            &fks[..3],
+            validators,
+            height,
+            block_hash,
+            &[0x11u8; 32],
+        ),
     )
 }
 
@@ -118,7 +161,7 @@ fn anchor_over(
 
 #[tokio::test]
 async fn an_honest_proof_from_an_honest_node_verifies() {
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let vs = validators(&ks);
     let alice = [0xA1u8; 32];
     let st = rpc_state_with_account(alice, 5_000).await;
@@ -136,7 +179,7 @@ async fn an_honest_proof_from_an_honest_node_verifies() {
     assert_eq!(answer.address, alice);
 
     // The light client anchors on a QUORUM-CERTIFIED header over that root.
-    let cp = anchor_over(&vs, &ks, 43, [0x22u8; 32], answer.state_root);
+    let cp = anchor_over(&vs, &ks, &fks, 43, [0x22u8; 32], answer.state_root);
     let lc = LightClient::new(vs.clone(), cp).expect("the anchor verifies");
 
     let proven = lc
@@ -153,7 +196,7 @@ async fn an_honest_proof_from_an_honest_node_verifies() {
 
 #[tokio::test]
 async fn a_tampered_leaf_is_refused() {
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let vs = validators(&ks);
     let alice = [0xA1u8; 32];
     let st = rpc_state_with_account(alice, 5_000).await;
@@ -161,7 +204,7 @@ async fn a_tampered_leaf_is_refused() {
         .call("stell_getProof", json!({ "address": hex::encode(alice) }))
         .await;
     let mut answer = ProofAnswer::from_json(&raw).expect("the answer parses");
-    let cp = anchor_over(&vs, &ks, 43, [0x22u8; 32], answer.state_root);
+    let cp = anchor_over(&vs, &ks, &fks, 43, [0x22u8; 32], answer.state_root);
     let lc = LightClient::new(vs.clone(), cp).expect("the anchor verifies");
 
     // The server inflates the balance it reports. The proof still commits to
@@ -195,7 +238,7 @@ async fn a_tampered_leaf_is_refused() {
 
 #[tokio::test]
 async fn a_tampered_root_is_refused() {
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let vs = validators(&ks);
     let alice = [0xA1u8; 32];
     let st = rpc_state_with_account(alice, 5_000).await;
@@ -203,7 +246,7 @@ async fn a_tampered_root_is_refused() {
         .call("stell_getProof", json!({ "address": hex::encode(alice) }))
         .await;
     let mut answer = ProofAnswer::from_json(&raw).expect("the answer parses");
-    let cp = anchor_over(&vs, &ks, 43, [0x22u8; 32], answer.state_root);
+    let cp = anchor_over(&vs, &ks, &fks, 43, [0x22u8; 32], answer.state_root);
     let lc = LightClient::new(vs.clone(), cp).expect("the anchor verifies");
 
     // The server names a root of its own: the client has never finalized it.
@@ -223,7 +266,7 @@ async fn a_tampered_root_is_refused() {
 
 #[tokio::test]
 async fn a_lying_server_cannot_make_the_client_believe_a_made_up_root() {
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let vs = validators(&ks);
     let alice = [0xA1u8; 32];
     let st = rpc_state_with_account(alice, 5_000).await;
@@ -239,7 +282,9 @@ async fn a_lying_server_cannot_make_the_client_believe_a_made_up_root() {
     let liars3 = SigningKey::from_bytes(&[0xF2u8; 32]);
     let lying_root = [0x77u8; 32];
     let lying_hash = [0x66u8; 32];
-    let lying_cert = cert(&[liars, liars2, liars3], 43, lying_hash);
+    let liar_keys = [liars, liars2, liars3];
+    let liar_fks = pq_for(&liar_keys, 0xE1);
+    let lying_cert = cert(&liar_keys, &liar_fks, &vs, 43, lying_hash, &[0x11u8; 32]);
 
     // (a) The certificate is checked against the OPERATOR'S set: three
     //     signatures that are not from it carry no power, so the anchor is
@@ -254,7 +299,7 @@ async fn a_lying_server_cannot_make_the_client_believe_a_made_up_root() {
     //     (it signed one for a root of its own), the root it commits to is
     //     not the root the proof is against — the client notices the two
     //     stories do not match.
-    let honest_cert = cert(&ks[..3], 43, lying_hash);
+    let honest_cert = cert(&ks[..3], &fks[..3], &vs, 43, lying_hash, &[0x11u8; 32]);
     let honest_but_wrong_root =
         Checkpoint::new(43, lying_hash, [0x11u8; 32], lying_root, honest_cert);
     let lc = LightClient::new(vs.clone(), honest_but_wrong_root).expect("the anchor verifies");
@@ -272,7 +317,7 @@ async fn a_lying_server_that_serves_a_foreign_proof_is_detected() {
     // A server that answers about a DIFFERENT chain: the proof authenticates
     // at a root the operator's chain never had. The client's trusted-root
     // check catches it before the Merkle check even runs.
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let vs = validators(&ks);
     let alice = [0xA1u8; 32];
     let foreign = rpc_state_with_account(alice, 999).await;
@@ -291,7 +336,7 @@ async fn a_lying_server_that_serves_a_foreign_proof_is_detected() {
         "the two chains must have different roots"
     );
 
-    let cp = anchor_over(&vs, &ks, 43, [0x22u8; 32], honest_answer.state_root);
+    let cp = anchor_over(&vs, &ks, &fks, 43, [0x22u8; 32], honest_answer.state_root);
     let lc = LightClient::new(vs.clone(), cp).expect("the anchor verifies");
     assert!(
         matches!(
@@ -308,7 +353,7 @@ async fn a_lying_server_that_serves_a_foreign_proof_is_detected() {
 
 #[tokio::test]
 async fn the_rpc_serves_the_quorum_certified_header_and_the_anchor() {
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let vs = validators(&ks);
     let st = rpc_state_with_account([0xA1u8; 32], 5_000).await;
 
@@ -331,7 +376,7 @@ async fn the_rpc_serves_the_quorum_certified_header_and_the_anchor() {
         epoch_key_commitment: [0u8; 32],
     };
     let bh = b.compute_hash();
-    b.precommit_qc = Some(cert(&ks, 43, bh));
+    b.precommit_qc = Some(cert(&ks, &fks, &vs, 43, bh, &b.prev_hash));
     st.record_finalized_header(&b).await;
 
     // The header is served, with its certificate.
@@ -347,11 +392,12 @@ async fn the_rpc_serves_the_quorum_certified_header_and_the_anchor() {
     assert_eq!(served["state_root"], hex::encode([0x33u8; 32]));
     assert_eq!(served["cert"]["kind"], "Precommit");
     // The certificate is served VERBATIM: every signer's signature the node
-    // recorded, so a verifier can count the quorum itself.
+    // recorded, plus the PQ envelope entry that carries the quorum under
+    // FULL-PQ, so a verifier can count the quorum itself.
     assert_eq!(
         served["cert"]["signatures"].as_array().unwrap().len(),
-        N,
-        "the served certificate must carry every signer's signature"
+        N + 1,
+        "the served certificate must carry every signer's signature plus the envelope entry"
     );
 
     // The anchor is served too.
@@ -427,7 +473,7 @@ fn the_cli_refuses_to_run_without_an_out_of_band_validator_set() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("validators.json");
-    let ks = keys();
+    let (ks, _fks) = falcon_votes::falcon_set(N);
     let list: Vec<Value> = ks
         .iter()
         .map(|k| json!({ "validator": hex::encode(k.verifying_key().to_bytes()), "power": "1" }))
@@ -458,15 +504,19 @@ fn the_cli_refuses_to_run_without_an_out_of_band_validator_set() {
 
 #[test]
 fn the_cli_parses_a_served_header_and_refuses_a_certificate_it_cannot_check() {
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(N);
+    let vs = validators(&ks);
+    // The served shape is produced by the same committee path as a real QC,
+    // then rendered to wire JSON (member signatures plus the PQ envelope
+    // entry, which is what a verifying light client receives).
+    let qc = cert(&ks[..3], &fks[..3], &vs, 43, [0x22u8; 32], &[0x11u8; 32]);
     let cert_json = json!({
-        "height": 43u64,
-        "round": 0u64,
+        "height": qc.height,
+        "round": qc.round,
         "kind": "Precommit",
         "block_hash": hex::encode([0x22u8; 32]),
-        "signatures": ks[..3].iter().map(|k| {
-            let v = Vote::sign(k, 43, 0, VoteKind::Precommit, Some([0x22u8; 32]));
-            json!({ "validator": hex::encode(v.voter), "signature": hex::encode(v.signature) })
+        "signatures": qc.signatures.iter().map(|(v, s)| {
+            json!({ "validator": hex::encode(v), "signature": hex::encode(s) })
         }).collect::<Vec<Value>>(),
     });
     let served = json!({
@@ -482,10 +532,10 @@ fn the_cli_parses_a_served_header_and_refuses_a_certificate_it_cannot_check() {
         stellereum::light_client_cli::parse_served_header(&served).expect("the header parses");
     assert_eq!(header.height, 43);
     assert_eq!(header.cert.kind, VoteKind::Precommit);
-    assert_eq!(header.cert.signatures.len(), 3);
+    // FULL-PQ: three member signatures plus the PQ envelope entry.
+    assert_eq!(header.cert.signatures.len(), 4);
 
     // The certificate verifies against the operator's set: the anchor holds.
-    let vs = validators(&ks);
     let cp = Checkpoint::new(
         header.height,
         header.block_hash,
@@ -531,7 +581,13 @@ fn the_cli_parses_a_served_header_and_refuses_a_certificate_it_cannot_check() {
 // ===========================================================================
 
 /// A chain of blocks at heights 1..=n, each with a genuine precommit QC.
-fn chain(keys: &[SigningKey], n: u64, root: CellHash) -> Vec<Block> {
+fn chain(
+    keys: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    vs: &ValidatorSet,
+    n: u64,
+    root: CellHash,
+) -> Vec<Block> {
     let mut out = Vec::new();
     let mut prev = [0u8; 32];
     for h in 1..=n {
@@ -553,7 +609,8 @@ fn chain(keys: &[SigningKey], n: u64, root: CellHash) -> Vec<Block> {
             epoch_key_commitment: [0u8; 32],
         };
         let bh = b.compute_hash();
-        b.precommit_qc = Some(cert(keys, h, bh));
+        let parent = b.prev_hash;
+        b.precommit_qc = Some(cert(keys, fks, vs, h, bh, &parent));
         prev = bh;
         out.push(b);
     }
@@ -562,10 +619,10 @@ fn chain(keys: &[SigningKey], n: u64, root: CellHash) -> Vec<Block> {
 
 #[test]
 fn a_peer_chain_that_extends_the_anchor_is_accepted() {
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let vs = validators(&ks);
     let root = [0x42u8; 32];
-    let blocks = chain(&ks, 3, root);
+    let blocks = chain(&ks, &fks, &vs, 3, root);
 
     // The node's anchor: the genesis (height 0, the zero sentinel).
     let light =
@@ -579,10 +636,10 @@ fn a_peer_chain_that_extends_the_anchor_is_accepted() {
 
 #[test]
 fn a_peer_chain_that_forks_off_the_anchor_is_refused() {
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let vs = validators(&ks);
     let root = [0x42u8; 32];
-    let blocks = chain(&ks, 3, root);
+    let blocks = chain(&ks, &fks, &vs, 3, root);
     let light =
         LightClient::with_genesis_anchor(vs.clone(), stellereum::sync::genesis_light_anchor(root))
             .expect("the genesis anchor");
@@ -591,7 +648,7 @@ fn a_peer_chain_that_forks_off_the_anchor_is_refused() {
     let mut forked = blocks.clone();
     forked[1].prev_hash = [0xEEu8; 32];
     let bh = forked[1].compute_hash();
-    forked[1].precommit_qc = Some(cert(&ks, 2, bh));
+    forked[1].precommit_qc = Some(cert(&ks, &fks, &vs, 2, bh, &forked[1].prev_hash));
     assert!(
         stellereum::sync::verify_synced_blocks_against_anchor(&light, &forked).is_err(),
         "a chain that forks off the anchor must be refused"
@@ -608,10 +665,10 @@ fn a_peer_chain_that_forks_off_the_anchor_is_refused() {
 
 #[test]
 fn a_peer_chain_without_a_quorum_certificate_is_refused() {
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let vs = validators(&ks);
     let root = [0x42u8; 32];
-    let mut blocks = chain(&ks, 2, root);
+    let mut blocks = chain(&ks, &fks, &vs, 2, root);
     // The peer drops the decision proof from its second block.
     blocks[1].precommit_qc = None;
     let light =
@@ -625,17 +682,20 @@ fn a_peer_chain_without_a_quorum_certificate_is_refused() {
 
 #[test]
 fn a_peer_chain_signed_by_outsiders_is_refused() {
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let vs = validators(&ks);
     let root = [0x42u8; 32];
-    let mut blocks = chain(&ks, 2, root);
+    let mut blocks = chain(&ks, &fks, &vs, 2, root);
     // The peer re-signs the second block with keys that are NOT validators.
     let liars = [
         SigningKey::from_bytes(&[0xF0u8; 32]),
         SigningKey::from_bytes(&[0xF1u8; 32]),
         SigningKey::from_bytes(&[0xF2u8; 32]),
     ];
-    blocks[1].precommit_qc = Some(cert(&liars, 2, blocks[1].compute_hash()));
+    let liar_fks = pq_for(&liars, 0xE1);
+    let prev = blocks[1].prev_hash;
+    let bh = blocks[1].compute_hash();
+    blocks[1].precommit_qc = Some(cert(&liars, &liar_fks, &vs, 2, bh, &prev));
     let light =
         LightClient::with_genesis_anchor(vs.clone(), stellereum::sync::genesis_light_anchor(root))
             .expect("the genesis anchor");
@@ -725,18 +785,26 @@ fn spawn_fake_rpc(proof: Value, header: Value) -> String {
     format!("http://{addr}")
 }
 
-/// The certificate in the wire form the node serves it in.
-fn cert_json(signers: &[SigningKey], height: u64, hash: BlockHash) -> Value {
+/// The certificate in the wire form the node serves it in: a real enveloped
+/// QC rendered to JSON (member signatures plus the PQ envelope entry).
+fn cert_json(
+    signers: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    vs: &ValidatorSet,
+    height: u64,
+    hash: BlockHash,
+    parent: &[u8; 32],
+) -> Value {
+    let qc = cert(signers, fks, vs, height, hash, parent);
     json!({
-        "height": height,
-        "round": 0u64,
+        "height": qc.height,
+        "round": qc.round,
         "kind": "Precommit",
         "block_hash": hex::encode(hash),
-        "signatures": signers
+        "signatures": qc.signatures
             .iter()
-            .map(|k| {
-                let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(hash));
-                json!({ "validator": hex::encode(v.voter), "signature": hex::encode(v.signature) })
+            .map(|(v, s)| {
+                json!({ "validator": hex::encode(v), "signature": hex::encode(s) })
             })
             .collect::<Vec<Value>>(),
     })
@@ -771,7 +839,7 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 #[test]
 fn the_light_client_command_verifies_an_honest_proof_end_to_end() {
     let rt = tokio::runtime::Runtime::new().expect("a runtime");
-    let ks = keys();
+    let (ks, fks) = falcon_votes::falcon_set(N);
     let alice = [0xA1u8; 32];
 
     let (proof, header) = rt.block_on(async {
@@ -794,7 +862,7 @@ fn the_light_client_command_verifies_an_honest_proof_end_to_end() {
             "state_root": hex::encode(answer.state_root),
             "proposer": hex::encode(ks[0].verifying_key().to_bytes()),
             "timestamp": 1_700_000_000u64,
-            "cert": cert_json(&ks[..3], height, block_hash),
+            "cert": cert_json(&ks[..3], &fks[..3], &validators(&ks), height, block_hash, &[0x11u8; 32]),
         });
         (raw, header)
     });
@@ -840,7 +908,7 @@ fn the_light_client_command_verifies_an_honest_proof_end_to_end() {
 #[test]
 fn the_light_client_command_detects_a_lying_server_end_to_end() {
     let rt = tokio::runtime::Runtime::new().expect("a runtime");
-    let ks = keys();
+    let (ks, _fks) = falcon_votes::falcon_set(N);
     let alice = [0xA1u8; 32];
 
     let (proof, header) = rt.block_on(async {
@@ -851,12 +919,15 @@ fn the_light_client_command_detects_a_lying_server_end_to_end() {
         let answer = ProofAnswer::from_json(&raw).expect("the answer parses");
         let height = answer.height.expect("the answer carries a height") + 1;
         let block_hash = [0x22u8; 32];
-        // The liar's certificate: signed by OUTSIDERS.
+        // The liar's certificate: signed by OUTSIDERS. They are not members
+        // of the operator's set, so no envelope can be compiled for them and
+        // the served shape stays envelope-less (refused at power counting).
         let liars = [
             SigningKey::from_bytes(&[0xF0u8; 32]),
             SigningKey::from_bytes(&[0xF1u8; 32]),
             SigningKey::from_bytes(&[0xF2u8; 32]),
         ];
+        let liar_fks = pq_for(&liars, 0xE1);
         let header = json!({
             "height": height,
             "block_hash": hex::encode(block_hash),
@@ -864,7 +935,7 @@ fn the_light_client_command_detects_a_lying_server_end_to_end() {
             "state_root": hex::encode(answer.state_root),
             "proposer": hex::encode([0xEEu8; 32]),
             "timestamp": 1_700_000_000u64,
-            "cert": cert_json(&liars, height, block_hash),
+            "cert": cert_json(&liars, &liar_fks, &validators(&ks), height, block_hash, &[0x11u8; 32]),
         });
         (raw, header)
     });

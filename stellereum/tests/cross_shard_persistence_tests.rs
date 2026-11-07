@@ -41,6 +41,46 @@ fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
+/// FULL-PQ sender address for a seed: implicit Falcon-512, registered
+/// globally (no activation surcharge). Mirrors the `pq_tx` pattern in
+/// `audit_state_sync_closeout_tests.rs`.
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+/// FULL-PQ cross-shard transfer fixture (implicit Falcon-512 envelope).
+/// Same shards/amount/gas/nonce shape as the classical `Transaction::sign`
+/// fixture it replaces: FULL-PQ refuses classical envelopes at admission
+/// ("Pure PQ mode"), so the classical fixture can no longer produce an
+/// outbound and every consume below would fail its precondition.
+fn pq_xshard_tx(seed: u8, to: [u8; 32], amount: u64, gas: u64, nonce: u64) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: SHARD0,
+        target_shard: SHARD1,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
 fn sharded() -> ShardRegistry {
     ShardRegistry::from_ids([SHARD0, SHARD1])
 }
@@ -50,13 +90,29 @@ async fn sharded_pair(
     shard0_funding: &[([u8; 32], u64)],
     shard1_funding: &[([u8; 32], u64)],
 ) -> ShardedCluster {
+    // FULL-PQ: funded PQ senders must live as 49-byte pinned leaves, else the
+    // source proof (49-byte, via registry metadata) mismatches the funded
+    // 16-byte leaf and target verification fails (mirrors
+    // `cross_shard_e2e_pq_tests::setup_two_shard_cluster`).
     let s0 = Arc::new(InMemoryStateEngine::new());
     for (addr, bal) in shard0_funding {
         s0.update_account(AccountState::new(*addr, *bal)).await;
+        if let Some((scheme, pk)) = Transaction::global_implicit_registry().lookup(addr) {
+            use stellereum::post_quantum::DEFAULT_SALT;
+            s0.pin_pubkey(*addr, scheme, &pk, &DEFAULT_SALT)
+                .await
+                .expect("PQ sender must pin");
+        }
     }
     let s1 = Arc::new(InMemoryStateEngine::new());
     for (addr, bal) in shard1_funding {
         s1.update_account(AccountState::new(*addr, *bal)).await;
+        if let Some((scheme, pk)) = Transaction::global_implicit_registry().lookup(addr) {
+            use stellereum::post_quantum::DEFAULT_SALT;
+            s1.pin_pubkey(*addr, scheme, &pk, &DEFAULT_SALT)
+                .await
+                .expect("PQ sender must pin");
+        }
     }
     ShardedCluster::new(
         sharded(),
@@ -91,17 +147,15 @@ async fn balance(cluster: &Cluster, shard: u32, addr: &[u8; 32]) -> u64 {
 /// consumed message (as committed in the target block) for later replay.
 async fn consume_one(
     sc: &mut ShardedCluster,
-    sender: &SigningKey,
+    sender_seed: u8,
     recipient_addr: [u8; 32],
     amount: u64,
 ) -> stellereum::sharding::CrossShardMessage {
-    let sender_addr = sender.verifying_key().to_bytes();
-    let tx = Transaction::sign(sender, recipient_addr, amount, 10, 0, SHARD0, SHARD1);
+    let tx = pq_xshard_tx(sender_seed, recipient_addr, amount, 10, 0);
     sc.shard_mut(SHARD0).broadcast_tx(tx.clone()).await;
     sc.shard_mut(SHARD1).broadcast_tx(tx.clone()).await;
     let _ = sc.run_height(SHARD0, TS).await;
     let tbh = sc.run_height(SHARD1, TS + 1).await;
-    let _ = sender_addr;
     sc.shard(SHARD1).nodes[0]
         .blocks
         .get(&tbh)
@@ -150,12 +204,12 @@ async fn persist_and_reopen(
 #[tokio::test]
 async fn restart_replay_refused_at_propose_validate_and_apply() {
     let validator = key(1);
-    let sender = key(2);
+    const SENDER_SEED: u8 = 2;
     let recipient_addr = key(3).verifying_key().to_bytes();
-    let sender_addr = sender.verifying_key().to_bytes();
+    let sender_addr = pq_id(SENDER_SEED);
 
     let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000_000)], &[]).await;
-    let consumed_msg = consume_one(&mut sc, &sender, recipient_addr, 100).await;
+    let consumed_msg = consume_one(&mut sc, SENDER_SEED, recipient_addr, 100).await;
     assert_eq!(
         balance(sc.shard(SHARD1), SHARD1, &recipient_addr).await,
         100,
@@ -305,13 +359,15 @@ async fn restart_replay_refused_at_propose_validate_and_apply() {
 async fn produced_completed_survive_restore_and_timeout_bounce_fires() {
     use stellereum::sharding::bounce_eligible;
     let validator = key(11);
-    let sender = key(12);
+    const SENDER_SEED: u8 = 12;
     let recipient_addr = key(13).verifying_key().to_bytes();
-    let sender_addr = sender.verifying_key().to_bytes();
+    let sender_addr = pq_id(SENDER_SEED);
 
     let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000_000)], &[]).await;
     // Outbound committed on SHARD0, never acked (SHARD1 never runs).
-    let tx = Transaction::sign(&sender, recipient_addr, 100, 10, 0, SHARD0, SHARD1);
+    // FULL-PQ: implicit Falcon-512 envelope (classical `Transaction::sign`
+    // is refused at admission, so no outbound would be produced).
+    let tx = pq_xshard_tx(SENDER_SEED, recipient_addr, 100, 10, 0);
     sc.shard_mut(SHARD0).broadcast_tx(tx.clone()).await;
     let src_bh = sc.run_height(SHARD0, TS).await;
     let tx_hash = tx.compute_tx_hash();
@@ -411,12 +467,12 @@ async fn produced_completed_survive_restore_and_timeout_bounce_fires() {
 #[tokio::test]
 async fn engine_gate_backstops_empty_runtime() {
     let validator = key(21);
-    let sender = key(22);
+    const SENDER_SEED: u8 = 22;
     let recipient_addr = key(23).verifying_key().to_bytes();
-    let sender_addr = sender.verifying_key().to_bytes();
+    let sender_addr = pq_id(SENDER_SEED);
 
     let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000_000)], &[]).await;
-    let consumed_msg = consume_one(&mut sc, &sender, recipient_addr, 100).await;
+    let consumed_msg = consume_one(&mut sc, SENDER_SEED, recipient_addr, 100).await;
 
     const H: u64 = 702;
     let (dir, back) = persist_and_reopen(&sc, SHARD1, H, "engback").await;

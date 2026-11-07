@@ -13,12 +13,12 @@
 
 use std::collections::HashMap;
 
-use ed25519_dalek::SigningKey;
 use stellereum::governance::{
     GovAction, GovError, Governance, Proposal, ProposalStatus, VoteChoice,
     GOVERNANCE_VOTING_PERIOD_SECS,
 };
-use stellereum::oracle::{OracleState, PriceFeedUpdate};
+use stellereum::oracle::{OracleState, PqPriceFeedUpdate};
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::staking::{StakingLedger, DEFAULT_COMMISSION_BPS, UNBONDING_PERIOD_SECS};
 
 const BLOCK_TIME: u64 = 1_700_000_000;
@@ -27,8 +27,8 @@ fn stell(n: u64) -> u64 {
     n * 1_000_000_000
 }
 
-fn pubkey(n: u8) -> SigningKey {
-    SigningKey::from_bytes(&[n; 32])
+fn pq_key(n: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed_bytes(&[n; 32])
 }
 
 /// Ledger: validator A (10k self), validator C (10k self, silent),
@@ -45,11 +45,10 @@ fn ledger_29k() -> (StakingLedger, [u8; 32], [u8; 32], [u8; 32]) {
     (l, a, b, c)
 }
 
-fn oracle_with_publisher(sk: &SigningKey) -> (OracleState, [u8; 32]) {
+fn oracle_with_publisher(sk: &FalconKeypair) -> (OracleState, [u8; 32]) {
     let mut o = OracleState::default();
-    let pk = sk.verifying_key().to_bytes();
-    o.publishers.insert(pk);
-    (o, pk)
+    assert!(o.register_pq_publisher(sk.pubkey()));
+    (o, stellereum::oracle::pq_publisher_binding(sk.pubkey()))
 }
 
 // ---------- E4: title length ----------
@@ -291,11 +290,11 @@ fn e7_vote_then_exit_cannot_flip_rejected_to_passed() {
 
 #[test]
 fn e9_zero_price_feed_is_refused_without_commit_or_latch() {
-    let sk = pubkey(0x42);
+    let sk = pq_key(0x42);
     let (mut o, _) = oracle_with_publisher(&sk);
-    let zero = PriceFeedUpdate::sign("STELL", 0, BLOCK_TIME - 10, &sk);
+    let zero = PqPriceFeedUpdate::sign("STELL", 0, BLOCK_TIME - 10, &sk);
     let err = o
-        .commit_feed(&zero, BLOCK_TIME)
+        .commit_feed_pq(&zero, BLOCK_TIME)
         .expect_err("E9: price 0 must be refused");
     assert!(
         err.contains("price"),
@@ -307,11 +306,11 @@ fn e9_zero_price_feed_is_refused_without_commit_or_latch() {
 
 #[test]
 fn e9_zero_price_usdt_is_malformed_not_a_depeg_latch() {
-    let sk = pubkey(0x42);
+    let sk = pq_key(0x42);
     let (mut o, _) = oracle_with_publisher(&sk);
-    let zero = PriceFeedUpdate::sign("USDT", 0, BLOCK_TIME - 10, &sk);
+    let zero = PqPriceFeedUpdate::sign("USDT", 0, BLOCK_TIME - 10, &sk);
     let err = o
-        .commit_feed(&zero, BLOCK_TIME)
+        .commit_feed_pq(&zero, BLOCK_TIME)
         .expect_err("E9: price 0 must be refused");
     assert!(err.contains("price"), "got: {err}");
     assert!(o.feeds.is_empty());
@@ -325,7 +324,7 @@ fn e9_zero_price_usdt_is_malformed_not_a_depeg_latch() {
 
 #[test]
 fn e10_malformed_asset_symbols_are_refused() {
-    let sk = pubkey(0x42);
+    let sk = pq_key(0x42);
     for bad in [
         "",
         " ",
@@ -336,9 +335,9 @@ fn e10_malformed_asset_symbols_are_refused() {
         &"X".repeat(1024),
     ] {
         let (mut o, _) = oracle_with_publisher(&sk);
-        let feed = PriceFeedUpdate::sign(bad, 250_000, BLOCK_TIME - 10, &sk);
+        let feed = PqPriceFeedUpdate::sign(bad, 250_000, BLOCK_TIME - 10, &sk);
         let err = o
-            .commit_feed(&feed, BLOCK_TIME)
+            .commit_feed_pq(&feed, BLOCK_TIME)
             .expect_err(&format!("E10: asset {bad:?} must be refused"));
         assert!(
             err.contains("asset"),
@@ -351,13 +350,13 @@ fn e10_malformed_asset_symbols_are_refused() {
 
 #[test]
 fn e10_legitimate_assets_still_commit() {
-    let sk = pubkey(0x42);
+    let sk = pq_key(0x42);
     for asset in ["STELL", "USDT", "TON", "BTC", "STELL/USDT"] {
         let (mut o, _) = oracle_with_publisher(&sk);
         let price = if asset == "USDT" { 1_000_000 } else { 250_000 };
-        let feed = PriceFeedUpdate::sign(asset, price, BLOCK_TIME - 10, &sk);
+        let feed = PqPriceFeedUpdate::sign(asset, price, BLOCK_TIME - 10, &sk);
         assert!(
-            o.commit_feed(&feed, BLOCK_TIME).is_ok(),
+            o.commit_feed_pq(&feed, BLOCK_TIME).is_ok(),
             "E10: legitimate asset {asset:?} must still commit"
         );
         assert_eq!(o.feeds[asset].price_micro_usd, price);

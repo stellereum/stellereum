@@ -4,25 +4,26 @@
 //!
 //! NEW file — never edits shared tests.
 
-use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
 use stellereum::governance::{
     GovAction, GovError, Governance, Proposal, ProposalStatus, VoteChoice,
     GOVERNANCE_QUORUM_FLOOR_BPS, GOVERNANCE_VOTING_PERIOD_SECS,
 };
 use stellereum::oracle::{
-    check_freshness, deviation_bps, is_valid_asset_symbol, DexTwapCalculator, OracleSafetyEngine,
-    OracleState, PriceFeedUpdate, MAX_PRICE_DEVIATION_BPS, STALE_PRICE_MAX_SECS,
+    check_freshness, deviation_bps, is_valid_asset_symbol, pq_publisher_binding, DexTwapCalculator,
+    OracleSafetyEngine, OracleState, PqPriceFeedUpdate, MAX_PRICE_DEVIATION_BPS,
+    STALE_PRICE_MAX_SECS,
 };
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::staking::{StakingLedger, DEFAULT_COMMISSION_BPS};
 
 const STELL: u64 = 1_000_000_000;
 
-fn key(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
+fn key(seed: u8) -> FalconKeypair {
+    FalconKeypair::generate_from_seed_bytes(&[seed; 32])
 }
 fn pk(seed: u8) -> [u8; 32] {
-    key(seed).verifying_key().to_bytes()
+    pq_publisher_binding(key(seed).pubkey())
 }
 fn stell(n: u64) -> u64 {
     n * STELL
@@ -32,31 +33,30 @@ fn stell(n: u64) -> u64 {
 // O1: baseline drift — cap holds per step, walkable across steps
 // ===========================================================================
 
-fn state_with_publisher(publisher: [u8; 32]) -> OracleState {
+fn state_with_pq_publisher(kp: &FalconKeypair) -> OracleState {
     let mut s = OracleState::default();
-    assert!(s.register_publisher(publisher));
+    assert!(s.register_pq_publisher(kp.pubkey()));
     s
 }
 
-fn feed_at(sk: &SigningKey, asset: &str, price: u64, ts: u64) -> PriceFeedUpdate {
-    PriceFeedUpdate::sign(asset, price, ts, sk)
+fn feed_at(sk: &FalconKeypair, asset: &str, price: u64, ts: u64) -> PqPriceFeedUpdate {
+    PqPriceFeedUpdate::sign(asset, price, ts, sk)
 }
 
 #[test]
 fn o1_per_step_drift_cap_holds_and_resets_only_via_governance() {
     let pubk = key(0xA0);
-    let publisher = pubk.verifying_key().to_bytes();
-    let mut s = state_with_publisher(publisher);
+    let mut s = state_with_pq_publisher(&pubk);
     let t0 = 1_760_000_000u64;
     let p0 = 1_000_000u64;
     assert_eq!(
-        s.commit_feed(&feed_at(&pubk, "STELL", p0, t0), t0).unwrap(),
+        s.commit_feed_pq(&feed_at(&pubk, "STELL", p0, t0), t0).unwrap(),
         p0
     );
     // Same-key walk is capped at 5%/step (O1 fix): +5% commits without latching.
     let p1 = p0 * 105 / 100;
     assert_eq!(
-        s.commit_feed(&feed_at(&pubk, "STELL", p1, t0 + 1), t0 + 1)
+        s.commit_feed_pq(&feed_at(&pubk, "STELL", p1, t0 + 1), t0 + 1)
             .unwrap(),
         p1
     );
@@ -65,14 +65,14 @@ fn o1_per_step_drift_cap_holds_and_resets_only_via_governance() {
     // step from the SAME key is refused WITHOUT latching; +5% steps walk.
     let p2 = p1 * 105 / 100;
     assert_eq!(
-        s.commit_feed(&feed_at(&pubk, "STELL", p2, t0 + 2), t0 + 2)
+        s.commit_feed_pq(&feed_at(&pubk, "STELL", p2, t0 + 2), t0 + 2)
             .unwrap(),
         p2
     );
     assert!(!s.breaker_tripped);
     let too_fast = p2 * 110 / 100;
     assert!(s
-        .commit_feed(&feed_at(&pubk, "STELL", too_fast, t0 + 3), t0 + 3)
+        .commit_feed_pq(&feed_at(&pubk, "STELL", too_fast, t0 + 3), t0 + 3)
         .is_err());
     assert!(!s.breaker_tripped, "same-key 10% step refused, not latched");
     assert_eq!(s.feeds.get("STELL").unwrap().price_micro_usd, p2);
@@ -80,17 +80,17 @@ fn o1_per_step_drift_cap_holds_and_resets_only_via_governance() {
     let over = p2 + p2 * 1001 / 10_000 + 1;
     assert!(deviation_bps(over, p2) > MAX_PRICE_DEVIATION_BPS);
     assert!(s
-        .commit_feed(&feed_at(&pubk, "STELL", over, t0 + 3), t0 + 3)
+        .commit_feed_pq(&feed_at(&pubk, "STELL", over, t0 + 3), t0 + 3)
         .is_err());
     assert!(s.breaker_tripped, "deviation violation latches");
     assert_eq!(s.feeds.get("STELL").unwrap().price_micro_usd, p2);
     // Latched: even a perfect feed is refused until governance resets.
     assert!(s
-        .commit_feed(&feed_at(&pubk, "STELL", p2, t0 + 4), t0 + 4)
+        .commit_feed_pq(&feed_at(&pubk, "STELL", p2, t0 + 4), t0 + 4)
         .is_err());
     assert!(s.reset_breaker(), "reset reports a real reset");
     assert_eq!(
-        s.commit_feed(&feed_at(&pubk, "STELL", p2, t0 + 4), t0 + 4)
+        s.commit_feed_pq(&feed_at(&pubk, "STELL", p2, t0 + 4), t0 + 4)
             .unwrap(),
         p2
     );
@@ -101,31 +101,30 @@ fn o1_distinct_publisher_key_is_unaffected_by_drift_or_latch() {
     let a = key(0xA0);
     let b = key(0xB1);
     let mut s = OracleState::default();
-    assert!(s.register_publisher(a.verifying_key().to_bytes()));
-    assert!(s.register_publisher(b.verifying_key().to_bytes()));
+    assert!(s.register_pq_publisher(a.pubkey()));
+    assert!(s.register_pq_publisher(b.pubkey()));
     let t0 = 1_760_000_000u64;
     assert!(s
-        .commit_feed(&feed_at(&a, "STELL", 1_000_000, t0), t0)
+        .commit_feed_pq(&feed_at(&a, "STELL", 1_000_000, t0), t0)
         .is_ok());
     // A second publisher's in-cap feed commits against the first's baseline.
     assert!(s
-        .commit_feed(&feed_at(&b, "STELL", 1_050_000, t0 + 1), t0 + 1)
+        .commit_feed_pq(&feed_at(&b, "STELL", 1_050_000, t0 + 1), t0 + 1)
         .is_ok());
     assert_eq!(
         s.feeds.get("STELL").unwrap().publisher,
-        b.verifying_key().to_bytes()
+        pq_publisher_binding(b.pubkey())
     );
 }
 
 #[test]
 fn oracle_freshness_monotonicity_peg_and_shape_are_fail_closed() {
     let pubk = key(0xA0);
-    let publisher = pubk.verifying_key().to_bytes();
-    let mut s = state_with_publisher(publisher);
+    let mut s = state_with_pq_publisher(&pubk);
     let t0 = 1_760_000_000u64;
     // Stale refused, no latch.
     assert!(s
-        .commit_feed(
+        .commit_feed_pq(
             &feed_at(&pubk, "STELL", 1_000_000, t0 - STALE_PRICE_MAX_SECS - 1),
             t0
         )
@@ -134,32 +133,32 @@ fn oracle_freshness_monotonicity_peg_and_shape_are_fail_closed() {
     assert!(check_freshness(t0 - STALE_PRICE_MAX_SECS - 1, t0).is_err());
     // Future-dated refused.
     assert!(s
-        .commit_feed(&feed_at(&pubk, "STELL", 1_000_000, t0 + 1), t0)
+        .commit_feed_pq(&feed_at(&pubk, "STELL", 1_000_000, t0 + 1), t0)
         .is_err());
     // Baseline commits, then a rewind (older timestamp) is refused even
     // though it is still within the freshness window.
     assert!(s
-        .commit_feed(&feed_at(&pubk, "STELL", 1_000_000, t0), t0)
+        .commit_feed_pq(&feed_at(&pubk, "STELL", 1_000_000, t0), t0)
         .is_ok());
     assert!(s
-        .commit_feed(&feed_at(&pubk, "STELL", 1_000_000, t0 - 5), t0 + 5)
+        .commit_feed_pq(&feed_at(&pubk, "STELL", 1_000_000, t0 - 5), t0 + 5)
         .is_err());
     // USDT depeg latches; a non-peg asset never trips the peg arm.
     assert!(s
-        .commit_feed(&feed_at(&pubk, "USDT", 1_000_000, t0 + 6), t0 + 6)
+        .commit_feed_pq(&feed_at(&pubk, "USDT", 1_000_000, t0 + 6), t0 + 6)
         .is_ok());
     assert!(s
-        .commit_feed(&feed_at(&pubk, "USDT", 940_000, t0 + 7), t0 + 7)
+        .commit_feed_pq(&feed_at(&pubk, "USDT", 940_000, t0 + 7), t0 + 7)
         .is_err());
     assert!(s.breaker_tripped);
     // Malformed inputs are refused WITHOUT latching (fresh state here).
-    let mut s2 = state_with_publisher(publisher);
-    assert!(s2.commit_feed(&feed_at(&pubk, "STELL", 0, t0), t0).is_err());
+    let mut s2 = state_with_pq_publisher(&pubk);
+    assert!(s2.commit_feed_pq(&feed_at(&pubk, "STELL", 0, t0), t0).is_err());
     assert!(s2
-        .commit_feed(&feed_at(&pubk, "", 1_000_000, t0), t0)
+        .commit_feed_pq(&feed_at(&pubk, "", 1_000_000, t0), t0)
         .is_err());
     assert!(s2
-        .commit_feed(
+        .commit_feed_pq(
             &feed_at(
                 &pubk,
                 "WAY-TOO-LONG-SYMBOL-OVER-32-BYTES-LIMIT",
@@ -184,29 +183,32 @@ fn publisher_set_is_governance_gated_and_sybil_priced() {
     let mut s = OracleState::default();
     let t0 = 1_760_000_000u64;
     let err = s
-        .commit_feed(&feed_at(&outsider, "STELL", 1_000_000, t0), t0)
+        .commit_feed_pq(&feed_at(&outsider, "STELL", 1_000_000, t0), t0)
         .expect_err("unknown publisher refused");
     assert!(err.contains("publisher"), "got: {err}");
     // Zero key refused at the registry (mirrors the governance backstop).
     assert!(!s.register_publisher([0u8; 32]));
     assert!(!s.publishers.contains(&[0u8; 32]));
     // Registration is idempotent; revocation retires FUTURE feeds only.
-    let publisher = key(0xA0).verifying_key().to_bytes();
-    assert!(s.register_publisher(publisher));
+    let publisher_kp = key(0xA0);
+    let publisher = pq_publisher_binding(publisher_kp.pubkey());
+    assert!(s.register_pq_publisher(publisher_kp.pubkey()));
+    assert!(s.publishers.contains(&publisher));
     assert!(
-        !s.register_publisher(publisher),
+        !s.register_pq_publisher(publisher_kp.pubkey()),
         "repeat is an observable no-op"
     );
     assert!(s
-        .commit_feed(&feed_at(&key(0xA0), "STELL", 1_000_000, t0), t0)
+        .commit_feed_pq(&feed_at(&publisher_kp, "STELL", 1_000_000, t0), t0)
         .is_ok());
-    assert!(s.unregister_publisher(publisher));
+    assert!(s.unregister_pq_publisher(publisher_kp.pubkey()));
+    assert!(!s.publishers.contains(&publisher));
     assert!(
-        !s.unregister_publisher(publisher),
+        !s.unregister_pq_publisher(publisher_kp.pubkey()),
         "repeat is an observable no-op"
     );
     assert!(s
-        .commit_feed(&feed_at(&key(0xA0), "STELL", 1_000_000, t0 + 1), t0 + 1)
+        .commit_feed_pq(&feed_at(&key(0xA0), "STELL", 1_000_000, t0 + 1), t0 + 1)
         .is_err());
     assert_eq!(
         s.feeds.get("STELL").unwrap().price_micro_usd,
@@ -235,8 +237,10 @@ fn twap_is_advisory_only_and_never_commits() {
         1_050_000
     );
     // A pull feed >10% from TWAP trips the ENGINE-local breaker only.
-    let far = PriceFeedUpdate::sign("STELL", 2_000_000, t0 + 10, &key(0xA0));
-    assert!(engine.resolve_price(Some(&far), "STELL", t0 + 10).is_err());
+    let far = PqPriceFeedUpdate::sign("STELL", 2_000_000, t0 + 10, &key(0xA0));
+    assert!(engine
+        .resolve_price_pq(Some(&far), "STELL", t0 + 10)
+        .is_err());
     assert!(engine.circuit_breaker_triggered);
     // DexTwapCalculator prunes outside the window (pure, deterministic).
     let mut calc = DexTwapCalculator::new();

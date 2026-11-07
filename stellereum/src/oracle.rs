@@ -3,6 +3,7 @@
 //! Tier 2: On-Chain DEX TWAP fallback (~91 s rolling VWAP window, W* optimum)
 //! Tier 3: Circuit Breaker (>10% deviation / stale > 15 min / USDT depeg < $0.95)
 
+use crate::post_quantum::{FalconKeypair, FALCON512_PUBKEY_LEN};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -327,6 +328,95 @@ impl PriceFeedUpdate {
     }
 }
 
+/// Falcon-512 price feed: the PQ successor of [`PriceFeedUpdate`].
+///
+/// WIRE NOTE: [`PriceFeedUpdate`] is byte-frozen consensus wire and its
+/// `verify()` fail-closes (always false) now that no classical feed path
+/// exists. This is a NEW, ADDITIVE type — old bytes decode exactly as before
+/// (the Ed struct is untouched above) and these bytes never alias the Ed
+/// layout, so the frozen wire is preserved while a valid feed exists again.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PqPriceFeedUpdate {
+    pub asset: String,
+    pub price_micro_usd: u64, // e.g. 1 STELL = $0.25 => 250_000
+    pub timestamp: u64,
+    /// Full 897-byte Falcon-512 public key, carried inline (see identity note).
+    ///
+    /// `Vec` (not `[u8; 897]`) because serde only derives `Deserialize` for
+    /// arrays up to 32 elements; length is enforced fail-closed instead —
+    /// `verify()` returns false on any non-897-byte key and
+    /// `register_pq_publisher` refuses to register one.
+    pub publisher_falcon_pubkey: Vec<u8>,
+    /// 666-byte Falcon-512 signature over the feed message.
+    pub falcon_sig: Vec<u8>,
+}
+
+impl PqPriceFeedUpdate {
+    pub fn sign(
+        asset: &str,
+        price_micro_usd: u64,
+        timestamp: u64,
+        publisher_key: &FalconKeypair,
+    ) -> Self {
+        // Message layout mirrors `PriceFeedUpdate::sign` byte-for-byte
+        // (asset bytes || price_be || timestamp_be); only the signature scheme
+        // changes. Keep the two constructions in lockstep.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(asset.as_bytes());
+        msg.extend_from_slice(&price_micro_usd.to_be_bytes());
+        msg.extend_from_slice(&timestamp.to_be_bytes());
+
+        let sig = publisher_key.sign(&msg);
+
+        Self {
+            asset: asset.to_string(),
+            price_micro_usd,
+            timestamp,
+            publisher_falcon_pubkey: publisher_key.pubkey().to_vec(),
+            falcon_sig: sig,
+        }
+    }
+
+    pub fn verify(&self) -> bool {
+        // Same message layout as `PriceFeedUpdate::sign`; verified with the
+        // tree's existing Falcon-512 verifier — the same function validator
+        // votes verify against (`Vote::verify_uncached` via
+        // `crate::consensus::verify_falcon_signature`, i.e. real FIPS 206 in
+        // every build). Wrong-length keys/sigs fail closed inside it.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(self.asset.as_bytes());
+        msg.extend_from_slice(&self.price_micro_usd.to_be_bytes());
+        msg.extend_from_slice(&self.timestamp.to_be_bytes());
+
+        crate::consensus::verify_falcon_signature(
+            &self.publisher_falcon_pubkey,
+            &msg,
+            &self.falcon_sig,
+        )
+    }
+}
+
+/// 32-byte consensus binding of a Falcon-512 publisher key.
+///
+/// PUBLISHER IDENTITY (no Ed alias): an 897-byte Falcon-512 key CANNOT fit in
+/// the `[u8; 32]` publisher slots (`OracleState.publishers`,
+/// `CommittedFeed.publisher`, governance `RegisterOraclePublisher`), so those
+/// slots hold THIS binding — never an Ed25519 key, never a truncation. The
+/// feed signature is verified against the full inline 897-byte key and
+/// admission requires this binding in the committed set, so the identity is
+/// Falcon-key-bound end to end.
+///
+/// Reusing the existing `[u8; 32]` slots (instead of widening consensus state)
+/// keeps the commitment digest layout (`commitment.rs` `oracle_digest`) and
+/// the governance action wire byte-identical: no `COMMITMENT_VERSION` bump,
+/// no snapshot migration. Cross-type confusion would need an Ed25519 public
+/// key equal to a BLAKE3 digest of a Falcon key (second preimage) — infeasible.
+pub fn pq_publisher_binding(falcon_pubkey: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("STELL_ORACLE_PQ_BIND_V1");
+    h.update(falcon_pubkey);
+    *h.finalize().as_bytes()
+}
+
 /// One price observation that a block has committed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommittedFeed {
@@ -491,6 +581,118 @@ impl OracleState {
         Ok(price)
     }
 
+    /// Commit a Falcon-signed feed at `block_time`.
+    ///
+    /// MIRROR of [`Self::commit_feed`]: every check is the same (breaker
+    /// latch, symbol/price shape, membership, freshness, monotonicity, USDT
+    /// peg, 10% deviation + 5% same-publisher cap, same latch semantics, same
+    /// error strings), only the signature scheme changes — Falcon `verify()`
+    /// over the full inline key plus membership of the key's
+    /// [`pq_publisher_binding`] in the committed set. Keep the two functions
+    /// in lockstep: any rule change applies to both.
+    ///
+    /// Returns the committed price, or `Err` with no price committed. A `Err`
+    /// for the peg/deviation cases also latches `breaker_tripped`, exactly
+    /// like [`Self::commit_feed`].
+    pub fn commit_feed_pq(&mut self, feed: &PqPriceFeedUpdate, block_time: u64) -> Result<u64, String> {
+        // 0. Breaker latch: once tripped nothing gets through.
+        if self.breaker_tripped {
+            return Err("Circuit breaker is currently active. Trades paused.".to_string());
+        }
+        // 0a. Malformed-input guards (E9/E10): shape and sanity BEFORE
+        // cryptography. A zero price or a junk symbol is malformed publisher
+        // output, not market evidence, so it is refused WITHOUT latching
+        // (latching would turn one fat-finger into a chain-wide halt until a
+        // 3-day governance reset) and commits nothing.
+        if !is_valid_asset_symbol(&feed.asset) {
+            return Err(format!(
+                "invalid asset symbol {:?}: must be 1..=32 ASCII alnum/-_./ chars",
+                feed.asset
+            ));
+        }
+        if feed.price_micro_usd == 0 {
+            return Err(format!(
+                "invalid oracle price 0 for {}: price must be > 0",
+                feed.asset
+            ));
+        }
+        // 1. Signature: the feed must be the publisher's own words (Falcon).
+        if !feed.verify() {
+            return Err("invalid oracle signature".to_string());
+        }
+        // 2. Publisher set: a correctly signed feed from a key outside the
+        //    committed set is still an unknown key. The set holds
+        //    [`pq_publisher_binding`]s (see its docs for why the raw 897-byte
+        //    key cannot live there), so membership is checked on the binding.
+        let binding = pq_publisher_binding(&feed.publisher_falcon_pubkey);
+        if !self.publishers.contains(&binding) {
+            return Err("oracle publisher is not in the committed set".to_string());
+        }
+        // 3. Freshness against the BLOCK timestamp - the same check the
+        //    read-time path runs (`check_freshness`).
+        check_freshness(feed.timestamp, block_time)?;
+        // 4. Monotonic per asset: an older observation can never replace a
+        //    newer one, so a delayed/replayed feed cannot rewind the price.
+        if let Some(prev) = self.feeds.get(&feed.asset) {
+            if feed.timestamp <= prev.timestamp {
+                return Err(format!(
+                    "non-monotonic price feed for {}: timestamp {} does not exceed {}",
+                    feed.asset, feed.timestamp, prev.timestamp
+                ));
+            }
+        }
+        // 5. USDT peg - the same check the read path runs, and it latches.
+        if let Err(e) = check_usdt_peg(&feed.asset, feed.price_micro_usd) {
+            self.breaker_tripped = true;
+            return Err(e);
+        }
+        // 6. Deviation against the previously committed price: the Tier-3
+        //    breaker rule with the last committed feed as the baseline (the
+        //    on-chain analogue of the read path's TWAP reference). Same
+        //    per-publisher cap as [`Self::commit_feed`]: the SAME key twice in
+        //    a row may move an asset at most `MAX_SAME_PUBLISHER_DEVIATION_BPS`
+        //    (5%); past 10% the global rule latches regardless of key. Key
+        //    equality here is binding equality — a Falcon key re-signing under
+        //    the same key carries the same binding, a rotated key a different
+        //    one — so same-key walks and rotations behave exactly as on the Ed
+        //    path. See `commit_feed` step 6 for the full residual/deferred-fix
+        //    rationale, which applies verbatim.
+        if let Some(prev) = self.feeds.get(&feed.asset) {
+            let bps = deviation_bps(feed.price_micro_usd, prev.price_micro_usd);
+            if bps > MAX_PRICE_DEVIATION_BPS {
+                self.breaker_tripped = true;
+                return Err(format!(
+                    "circuit breaker tripped: price deviation {bps} bps exceeds limit {MAX_PRICE_DEVIATION_BPS} bps"
+                ));
+            }
+            if binding == prev.publisher && bps > MAX_SAME_PUBLISHER_DEVIATION_BPS {
+                tracing::warn!(
+                    "ORACLE-SINGLE-PUBLISHER-DRIFT REFUSED {asset}: same publisher {pubkey} moved the committed baseline {bps} bps (cap {cap} bps, global {global} bps): feed refused, breaker NOT latched",
+                    asset = feed.asset,
+                    pubkey = hex::encode(binding),
+                    bps = bps,
+                    cap = MAX_SAME_PUBLISHER_DEVIATION_BPS,
+                    global = MAX_PRICE_DEVIATION_BPS,
+                );
+                return Err(format!(
+                    "same-publisher drift refused for {}: deviation {bps} bps exceeds the per-publisher cap {MAX_SAME_PUBLISHER_DEVIATION_BPS} bps (global {MAX_PRICE_DEVIATION_BPS} bps)",
+                    feed.asset
+                ));
+            }
+        }
+
+        let price = feed.price_micro_usd;
+        self.feeds.insert(
+            feed.asset.clone(),
+            CommittedFeed {
+                price_micro_usd: price,
+                timestamp: feed.timestamp,
+                publisher: binding,
+            },
+        );
+        Ok(price)
+    }
+
     /// Authorise a publisher key in the committed registry.
     ///
     /// This is the ONLY way a key enters `publishers`, and its only caller is
@@ -521,6 +723,32 @@ impl OracleState {
     /// Idempotent: returns whether the set actually changed.
     pub fn unregister_publisher(&mut self, publisher: [u8; 32]) -> bool {
         self.publishers.remove(&publisher)
+    }
+
+    /// Authorise a Falcon-512 publisher key in the committed registry.
+    ///
+    /// PQ counterpart of [`Self::register_publisher`]: the committed set holds
+    /// [`pq_publisher_binding`]s, so this binds the 897-byte key and inserts
+    /// the binding (idempotent, returns whether the set changed). A
+    /// wrong-length key is refused (`false`, inserts nothing) — the shape
+    /// analogue of the all-zero-key refusal in `register_publisher`: only a
+    /// real Falcon-512 key can ever produce a committable feed.
+    pub fn register_pq_publisher(&mut self, falcon_pubkey: &[u8]) -> bool {
+        if falcon_pubkey.len() != FALCON512_PUBKEY_LEN {
+            return false;
+        }
+        self.register_publisher(pq_publisher_binding(falcon_pubkey))
+    }
+
+    /// Revoke a Falcon-512 publisher key. Like [`Self::unregister_publisher`],
+    /// already-committed feeds stay (committed history cannot be un-observed)
+    /// while no FUTURE feed may carry the key. Idempotent: returns whether the
+    /// set actually changed. A wrong-length key removes nothing (`false`).
+    pub fn unregister_pq_publisher(&mut self, falcon_pubkey: &[u8]) -> bool {
+        if falcon_pubkey.len() != FALCON512_PUBKEY_LEN {
+            return false;
+        }
+        self.unregister_publisher(pq_publisher_binding(falcon_pubkey))
     }
 
     /// Clear the latched circuit breaker.
@@ -820,6 +1048,137 @@ impl OracleSafetyEngine {
                 && update.price_micro_usd > 0
                 && update.verify()
                 && self.trusted_publishers.contains(&update.publisher_pubkey)
+                // Check freshness (reject if older than 15 minutes / in the future)
+                && check_freshness(update.timestamp, current_time).is_ok()
+            {
+                chosen_price = Some(update.price_micro_usd);
+            }
+        }
+
+        // Tier 2: Fallback to on-chain DEX TWAP if Tier 1 failed or stale
+        let price = match chosen_price {
+            Some(p) => p,
+            None => {
+                let twap_calc = self.twap_calculator.calculate_twap(asset, current_time);
+                match twap_calc {
+                    Some(p) => p,
+                    None => *self.dex_twap_prices.get(asset).ok_or_else(|| {
+                        "No valid price source: Pull oracle failed/stale and no DEX TWAP available".to_string()
+                    })?,
+                }
+            }
+        };
+
+        // Tier 3: Circuit Breaker validation against TWAP
+        let twap_ref = self
+            .twap_calculator
+            .calculate_twap(asset, current_time)
+            .or_else(|| self.dex_twap_prices.get(asset).copied());
+
+        if let Some(twap) = twap_ref {
+            if twap > 0 {
+                let deviation_bps = deviation_bps(price, twap);
+
+                if tier3_breaker_tripped(
+                    price,
+                    twap,
+                    height,
+                    sprt_residuals,
+                    sprt_shift,
+                    sprt_sigma,
+                ) {
+                    self.circuit_breaker_triggered = true;
+                    if sprt_tier3_active_at(height) {
+                        return Err(format!(
+                            "SPRT circuit breaker tripped: LLR sum {:.6} reached upper bound {:.6} (shift {}, sigma {})",
+                            sprt_tier3_llr_sum(sprt_residuals, sprt_shift, sprt_sigma),
+                            sprt_wald_bounds(SPRT_TIER3_ALPHA, SPRT_TIER3_BETA).0,
+                            sprt_shift,
+                            sprt_sigma,
+                        ));
+                    }
+                    return Err(format!(
+                        "Circuit breaker tripped: price deviation {} bps exceeds limit {} bps",
+                        deviation_bps, MAX_PRICE_DEVIATION_BPS
+                    ));
+                }
+            }
+        }
+
+        Ok(price)
+    }
+
+    /// PQ counterpart of [`Self::resolve_price`]: Tier-1 accepts a
+    /// Falcon-signed feed whose key binding is trusted; Tiers 2–3 are
+    /// identical (same TWAP fallback, same height-gated Tier-3 verdict).
+    /// Advisory-only like [`Self::resolve_price`]: never consensus.
+    pub fn resolve_price_pq(
+        &mut self,
+        feed: Option<&PqPriceFeedUpdate>,
+        asset: &str,
+        current_time: u64,
+    ) -> Result<u64, String> {
+        // Pre-SPRT behavior, byte-identical delegation to the gated path at
+        // height 0, exactly like `resolve_price`.
+        self.resolve_price_at_height_pq(
+            feed,
+            asset,
+            current_time,
+            0,
+            &[],
+            SPRT_TIER3_SHIFT,
+            SPRT_TIER3_SIGMA_PER_BLOCK,
+        )
+    }
+
+    /// PQ counterpart of [`Self::resolve_price_at_height`]: Tiers 1–2
+    /// identical with a Falcon feed; Tier-3 reads the
+    /// [`SPRT_TIER3_ACTIVATION_HEIGHT`] gate via [`tier3_breaker_tripped`]
+    /// exactly as the Ed path does. Advisory-only: never consensus.
+    #[allow(clippy::too_many_arguments)] // GATE: mirrors `resolve_price_at_height` (feed/asset/time + gate height + one SPRT operating point); grouping them would churn the wired-path tests for no behavioral gain.
+    pub fn resolve_price_at_height_pq(
+        &mut self,
+        feed: Option<&PqPriceFeedUpdate>,
+        asset: &str,
+        current_time: u64,
+        height: u64,
+        sprt_residuals: &[f64],
+        sprt_shift: f64,
+        sprt_sigma: f64,
+    ) -> Result<u64, String> {
+        if self.circuit_breaker_triggered {
+            return Err("Circuit breaker is currently active. Trades paused.".to_string());
+        }
+
+        // Hardcoded check for USDT peg
+        if asset == "USDT" {
+            let usdt_price = if let Some(update) = feed {
+                update.price_micro_usd
+            } else {
+                1_000_000
+            };
+
+            if let Err(e) = check_usdt_peg(asset, usdt_price) {
+                self.circuit_breaker_triggered = true;
+                return Err(e);
+            }
+            return Ok(1_000_000); // 1.00 USD
+        }
+
+        // Tier 1: Try Pull-Oracle. Same cross-asset/zero-price guards as the Ed
+        // path (audit BR-OR-01/BR-02): the feed must name THIS asset and carry
+        // a positive price, verify under Falcon, and its key BINDING
+        // (`pq_publisher_binding` — the 897-byte key cannot fit the trusted
+        // `[u8; 32]` slots) must be trusted; freshness is block-time checked.
+        // A feed failing any check is ignored (TWAP fallback), never chosen.
+        let mut chosen_price: Option<u64> = None;
+        if let Some(update) = feed {
+            if update.asset == asset
+                && update.price_micro_usd > 0
+                && update.verify()
+                && self
+                    .trusted_publishers
+                    .contains(&pq_publisher_binding(&update.publisher_falcon_pubkey))
                 // Check freshness (reject if older than 15 minutes / in the future)
                 && check_freshness(update.timestamp, current_time).is_ok()
             {
@@ -1257,5 +1616,175 @@ mod pq_gate_tests {
                 "ed feed must not commit under FULL-PQ"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pq_feed_tests {
+    use super::*;
+    use crate::post_quantum::FalconKeypair;
+
+    fn test_kp(seed: u8) -> FalconKeypair {
+        FalconKeypair::generate_from_seed(seed)
+    }
+
+    fn signed(asset: &str, price: u64, ts: u64, kp: &FalconKeypair) -> PqPriceFeedUpdate {
+        PqPriceFeedUpdate::sign(asset, price, ts, kp)
+    }
+
+    fn state_with(kp: &FalconKeypair) -> OracleState {
+        let mut s = OracleState::default();
+        assert!(
+            s.register_pq_publisher(kp.pubkey()),
+            "test key must register"
+        );
+        s
+    }
+
+    #[test]
+    fn pq_feed_verify_happy_path() {
+        let kp = test_kp(0xA1);
+        let feed = signed("STELL", 250_000, 1_000, &kp);
+        assert!(feed.verify(), "a fresh Falcon feed must verify");
+        // Falcon signing is randomized: two signatures over the same message
+        // both verify (and differ), so committed state never depends on sig
+        // bytes — only on asset/price/timestamp/binding.
+        let again = signed("STELL", 250_000, 1_000, &kp);
+        assert!(again.verify(), "second signature must also verify");
+        assert_ne!(
+            feed.falcon_sig, again.falcon_sig,
+            "test bug: Falcon signatures must be randomized per signing"
+        );
+    }
+
+    #[test]
+    fn pq_feed_bad_signature_is_refused() {
+        let kp = test_kp(0xA1);
+        let mut feed = signed("STELL", 250_000, 1_000, &kp);
+        let last = feed.falcon_sig.len() - 1;
+        feed.falcon_sig[last] ^= 0x01;
+        assert!(!feed.verify(), "a tampered signature must NOT verify");
+    }
+
+    #[test]
+    fn pq_feed_wrong_key_is_refused() {
+        let kp = test_kp(0xA1);
+        let other = test_kp(0xB2);
+        let mut feed = signed("STELL", 250_000, 1_000, &kp);
+        // Swap the embedded key: the signature no longer matches the claimed
+        // publisher, so verification must fail.
+        feed.publisher_falcon_pubkey = other.pubkey().to_vec();
+        assert!(!feed.verify(), "signature under a different key must NOT verify");
+    }
+
+    #[test]
+    fn pq_feed_tampered_fields_are_refused() {
+        let kp = test_kp(0xA1);
+        let mut feed = signed("STELL", 250_000, 1_000, &kp);
+        feed.price_micro_usd = 251_000;
+        assert!(!feed.verify(), "a re-priced feed must NOT verify");
+        let mut feed = signed("STELL", 250_000, 1_000, &kp);
+        feed.asset = "BTC".to_string();
+        assert!(!feed.verify(), "a re-asseted feed must NOT verify");
+        let mut feed = signed("STELL", 250_000, 1_000, &kp);
+        feed.timestamp += 1;
+        assert!(!feed.verify(), "a re-timestamped feed must NOT verify");
+    }
+
+    #[test]
+    fn pq_feed_short_signature_is_refused() {
+        let kp = test_kp(0xA1);
+        let mut feed = signed("STELL", 250_000, 1_000, &kp);
+        feed.falcon_sig.clear();
+        assert!(!feed.verify(), "an empty signature must NOT verify");
+        feed.falcon_sig = vec![0u8; 64];
+        assert!(!feed.verify(), "a short signature must NOT verify");
+    }
+
+    #[test]
+    fn pq_publisher_binding_is_deterministic_and_key_bound() {
+        let a = test_kp(0xA1);
+        let b = test_kp(0xB2);
+        assert_eq!(
+            pq_publisher_binding(a.pubkey()),
+            pq_publisher_binding(a.pubkey()),
+            "binding must be deterministic"
+        );
+        assert_ne!(
+            pq_publisher_binding(a.pubkey()),
+            pq_publisher_binding(b.pubkey()),
+            "distinct Falcon keys must bind distinctly"
+        );
+        assert_ne!(
+            pq_publisher_binding(a.pubkey()),
+            [0u8; 32],
+            "a real key must never bind to the refused zero slot"
+        );
+    }
+
+    #[test]
+    fn pq_registry_refuses_malformed_keys() {
+        let mut s = OracleState::default();
+        assert!(
+            !s.register_pq_publisher(&[0u8; 64]),
+            "wrong-length key must be refused"
+        );
+        assert!(
+            !s.unregister_pq_publisher(&[0u8; 64]),
+            "wrong-length key removes nothing"
+        );
+        assert!(s.publishers.is_empty());
+        // A real key registers idempotently, exactly like the Ed path.
+        let kp = test_kp(0xA1);
+        assert!(s.register_pq_publisher(kp.pubkey()));
+        assert!(!s.register_pq_publisher(kp.pubkey()));
+        assert!(s.unregister_pq_publisher(kp.pubkey()));
+        assert!(!s.unregister_pq_publisher(kp.pubkey()));
+    }
+
+    #[test]
+    fn commit_feed_pq_happy_path() {
+        let kp = test_kp(0xA1);
+        let mut s = state_with(&kp);
+        let price = s
+            .commit_feed_pq(&signed("STELL", 250_000, 1_000, &kp), 1_001)
+            .expect("a fresh Falcon feed from a registered publisher must commit");
+        assert_eq!(price, 250_000);
+        let committed = &s.feeds["STELL"];
+        assert_eq!(committed.price_micro_usd, 250_000);
+        assert_eq!(committed.timestamp, 1_000);
+        assert_eq!(
+            committed.publisher,
+            pq_publisher_binding(kp.pubkey()),
+            "the committed publisher is the Falcon key binding"
+        );
+        assert!(!s.breaker_tripped);
+    }
+
+    #[test]
+    fn commit_feed_pq_refusals() {
+        let kp = test_kp(0xA1);
+        // Unknown publisher: correctly signed yet unauthorised.
+        let mut s = OracleState::default();
+        let err = s
+            .commit_feed_pq(&signed("STELL", 250_000, 1_000, &kp), 1_001)
+            .expect_err("an unregistered PQ publisher must be refused");
+        assert!(err.contains("publisher"), "refusal must name the set: {err}");
+        assert!(s.feeds.is_empty());
+        assert!(!s.breaker_tripped);
+
+        // Bad signature from a REGISTERED publisher: still refused.
+        let mut s = state_with(&kp);
+        let mut bad = signed("STELL", 250_000, 1_000, &kp);
+        bad.falcon_sig[10] ^= 0xFF;
+        let err = s
+            .commit_feed_pq(&bad, 1_001)
+            .expect_err("a bad Falcon signature must be refused");
+        assert!(
+            err.contains("invalid oracle signature"),
+            "refusal must name the signature: {err}"
+        );
+        assert!(s.feeds.is_empty());
+        assert!(!s.breaker_tripped);
     }
 }

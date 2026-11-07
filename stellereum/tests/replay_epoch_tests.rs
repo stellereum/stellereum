@@ -43,13 +43,72 @@ use stellereum::consensus::consensus_chain_id;
 use stellereum::mempool::{Mempool, MempoolError};
 use stellereum::sharding::Transaction;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::wallet::WalletAccount;
 
 const FUNDING: u64 = 100_000_000;
 const RECIPIENT: [u8; 32] = [0x99u8; 32];
 
-fn wallet(seed: u8) -> WalletAccount {
-    WalletAccount::from_seed(&[seed; 32])
+/// FULL-PQ sender address for a seed: implicit Falcon-512, registered
+/// globally (no activation surcharge). Mirrors the `pq_tx` pattern in
+/// `audit_state_sync_closeout_tests.rs`.
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+/// FULL-PQ replacement for the wallet fixtures below: same to/amount/nonce/
+/// shards, implicit Falcon-512 envelope. Classical wallet envelopes are
+/// refused at admission under FULL-PQ ("Pure PQ mode") before any
+/// chain-id/nonce gate is reached, so every differential below must ride PQ
+/// envelopes. `chain: None` = unbound (`chain_id()` is None, legacy
+/// nonce-only path); `Some(c)` = bound via `new_implicit_with_chain`
+/// (two-step sign over the chain-committed message, mirroring
+/// `rpc.rs::pq_tx_shard_chain`).
+fn pq_fixture(seed: u8, nonce: u64, chain: Option<u64>) -> Transaction {
+    pq_fixture_amount(seed, nonce, chain, 1_000)
+}
+
+fn pq_fixture_amount(seed: u8, nonce: u64, chain: Option<u64>, amount: u64) -> Transaction {
+    use stellereum::post_quantum::PqScheme;
+    use stellereum::sharding::PqSignatureEnvelope;
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut tx = Transaction {
+        from,
+        to: RECIPIENT,
+        amount,
+        gas_limit: stellereum::svm::GAS_BASIC_TRANSFER,
+        nonce,
+        source_shard: 0,
+        target_shard: 0,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    // Chain-bound envelopes commit the chain id in the signed message: sign
+    // the probe message that already carries it (dummy sig of pinned length
+    // — never decoded, only its chain field is read).
+    if let Some(c) = chain {
+        tx.signature = PqSignatureEnvelope::new_implicit_with_chain(
+            PqScheme::Falcon512,
+            vec![0u8; stellereum::post_quantum::FALCON512_SIG_LEN],
+            c,
+        )
+        .encode();
+    }
+    let msg = tx.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    tx.signature = match chain {
+        Some(c) => {
+            PqSignatureEnvelope::new_implicit_with_chain(PqScheme::Falcon512, sig, c).encode()
+        }
+        None => PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode(),
+    };
+    tx
 }
 
 /// OUR chain id: whatever this node froze (default 5757). Read dynamically
@@ -65,13 +124,13 @@ fn foreign() -> u64 {
 }
 
 fn own_fixture(seed: u8, nonce: u64) -> Transaction {
-    let tx = wallet(seed).create_bound_transaction(RECIPIENT, 1_000, nonce, 0, 0, ours());
+    let tx = pq_fixture(seed, nonce, Some(ours()));
     assert_eq!(tx.chain_id(), Some(ours()), "own fixture must bind OUR chain");
     tx
 }
 
 fn foreign_fixture(seed: u8, nonce: u64) -> Transaction {
-    let tx = wallet(seed).create_bound_transaction(RECIPIENT, 1_000, nonce, 0, 0, foreign());
+    let tx = pq_fixture(seed, nonce, Some(foreign()));
     assert_eq!(
         tx.chain_id(),
         Some(foreign()),
@@ -81,7 +140,7 @@ fn foreign_fixture(seed: u8, nonce: u64) -> Transaction {
 }
 
 fn legacy_fixture(seed: u8, nonce: u64) -> Transaction {
-    let tx = wallet(seed).unbound_legacy_transfer(RECIPIENT, 1_000, nonce, 0, 0);
+    let tx = pq_fixture(seed, nonce, None);
     assert_eq!(tx.chain_id(), None, "legacy fixture must stay unbound");
     tx
 }
@@ -166,8 +225,8 @@ fn envelope_without_chain_id_keeps_legacy_nonce_only_path() {
 // ============================================================================
 
 /// The transparent envelope genuinely cannot carry epoch (compile-time proof
-/// by construction: fixtures built through the public wallet constructors
-/// expose `nonce` but no epoch setter — there is no field to set), so this
+/// by construction: fixtures built as implicit-Falcon PQ envelopes expose
+/// `nonce` but no epoch setter — there is no field to set), so this
 /// pins the three nonce-based fences that cover the residual instead:
 ///
 /// 1. byte-identical resubmission while pooled → `Duplicate`;
@@ -253,7 +312,7 @@ async fn same_nonce_refused_at_later_height_after_first_execution() {
     // Same consumed nonce with FRESH bytes (a separately signed transfer for
     // a different amount ⇒ different hash, valid signature) is equally
     // refused: it is the NONCE that is spent, not the hash.
-    let rebuilt = wallet(0xB3).unbound_legacy_transfer(RECIPIENT, 2_000, 0, 0, 0);
+    let rebuilt = pq_fixture_amount(0xB3, 0, None, 2_000);
     assert!(
         rebuilt.verify_signature(),
         "rebuilt tx must be signature-valid (otherwise the refusal proves nothing)"

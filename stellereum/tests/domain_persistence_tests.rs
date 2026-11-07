@@ -42,6 +42,52 @@ fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
+/// FULL-PQ sender address for a seed: implicit Falcon-512, registered
+/// globally (no activation surcharge). Mirrors the `pq_tx` pattern in
+/// `audit_state_sync_closeout_tests.rs`.
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+/// FULL-PQ replacement for `Transaction::sign_with_payload` in fixtures:
+/// same shape (self-send, payload-carrying), implicit Falcon-512 envelope.
+/// Classical envelopes are refused at admission ("Pure PQ mode"), so the
+/// classical fixture could never register the model.
+fn pq_tx_payload(
+    seed: u8,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    payload: Vec<stellereum::svm::OpCode>,
+) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard: 1,
+        target_shard: 1,
+        signature: Vec::new(),
+        payload,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
 fn tmp_store_dir(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "stell-domainpersist-{}-{}-{:?}",
@@ -73,20 +119,18 @@ fn block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u8; 32])
 }
 
 fn register_tx(
-    sk: &SigningKey,
+    seed: u8,
     to: [u8; 32],
     nonce: u64,
     id: [u8; 32],
     m: &QuantizedLinearModel,
 ) -> Transaction {
-    Transaction::sign_with_payload(
-        sk,
+    pq_tx_payload(
+        seed,
         to,
         0,
         50_000_000,
         nonce,
-        1,
-        1,
         vec![OpCode::SysCallRegisterZkMlModel {
             model_id: id,
             model: Box::new(m.clone()),
@@ -191,12 +235,14 @@ async fn reopen_and_load(
 #[tokio::test]
 async fn zkml_registry_survives_snapshot_and_restore() {
     let e = InMemoryStateEngine::new();
-    let payer = key(0x31);
-    let payer_pk = payer.verifying_key().to_bytes();
+    // FULL-PQ: the payer is an implicit Falcon-512 sender (registered
+    // globally); `to` stays the sender itself, amounts/gas/nonce unchanged.
+    const PAYER_SEED: u8 = 0x31;
+    let payer_pk = pq_id(PAYER_SEED);
     e.update_account(AccountState::new(payer_pk, 10 * STELL))
         .await;
     let model_id = [0x41u8; 32];
-    let tx = register_tx(&payer, payer_pk, 0, model_id, &ref_model());
+    let tx = register_tx(PAYER_SEED, payer_pk, 0, model_id, &ref_model());
     let out = e
         .apply_block_transition(&block(1, TS, vec![tx], payer_pk), 0)
         .await;

@@ -20,7 +20,12 @@
 #[path = "support/consensus_cluster.rs"]
 mod consensus_cluster;
 
+#[path = "support/falcon_votes.rs"]
+#[allow(dead_code)] // GATE: replay test uses only `fvote_deterministic`; `fvote` stays for other suites.
+mod falcon_votes;
+
 use consensus_cluster::{ConsensusCluster, NodeProfile};
+use stellereum::consensus::VoteKind;
 
 /// Fixed seed for the whole scenario (harness PRNG + deterministic keys).
 /// Any change to this constant changes every number below.
@@ -128,12 +133,68 @@ async fn happy3_steady_finalization() {
 
 /// The same scenario twice must produce the same result: seeded keys, seeded
 /// PRNG, virtual clock — no wall clock, no OS randomness anywhere.
+///
+/// NOTE (Falcon W4.1): production vote signing draws fresh OS randomness per
+/// signature (REQUIRED — a deterministic signer leaks the key), and block
+/// hashes commit `last_qc` sig bytes, so two runs can never be byte-identical
+/// past h1. The replay therefore compares the consensus-deterministic
+/// projection (liveness, safety, state — everything that MUST match) via
+/// `run_once` below, not the raw `fingerprint()` (which commits fresh
+/// randomness). The TEST-ONLY `fvote_deterministic` canary pins that the
+/// deterministic vote path itself is stable across the two runs.
 #[tokio::test]
 async fn happy3_deterministic_replay() {
     async fn run_once() -> String {
+        // Canary: same vote contents must sign to the same bytes across runs
+        // (second run hits the process-global cache — see `fvote_deterministic`).
+        let (cks, cfks) = falcon_votes::falcon_set(1);
+        let canary = falcon_votes::fvote_deterministic(
+            0,
+            &cks[0],
+            &cfks[0],
+            1,
+            0,
+            VoteKind::Prevote,
+            Some([7u8; 32]),
+        );
         let mut c = happy3_cluster();
         c.seed_transactions(3).await;
-        c.run_until(TARGET_HEIGHT, BUDGET_MS).await.fingerprint()
+        let r = c.run_until(TARGET_HEIGHT, BUDGET_MS).await;
+        // Deterministic projection: excludes finalized block hashes and vote
+        // targets (both commit fresh Falcon randomness via `last_qc`).
+        let mut out = format!(
+            "run(vm={},ticks={},best={},common={})|canary={:?}",
+            r.virtual_ms, r.ticks, r.best_height, r.common_height, canary.signature,
+        );
+        for n in &r.nodes {
+            out.push_str(&format!(
+                "|n{}(h={},r={},fh={},pc={},pp={},cc={},cp={},pr={},pf={},pvqc={:?},pcqc={:?},sr={:?},sj={},dr={:?})",
+                n.index,
+                n.height,
+                n.round,
+                n.finalized_height,
+                n.prevotes_cast,
+                n.prevotes_received,
+                n.precommits_cast,
+                n.precommits_received,
+                n.proposals_received,
+                n.proposals_refused,
+                n.prevote_qc_round,
+                n.precommit_qc_round,
+                n.state_root,
+                n.sync_jumps,
+                n.decide_rounds,
+            ));
+            // Voting PATTERN only: targets are block-hash prefixes (random).
+            for v in &n.cast_votes {
+                let kind = match v.kind {
+                    VoteKind::Prevote => "p",
+                    VoteKind::Precommit => "c",
+                };
+                out.push_str(&format!("v{}/{}/{} ", v.height, v.round, kind));
+            }
+        }
+        out
     }
     let (a, b) = (run_once().await, run_once().await);
     assert_eq!(a, b, "two identical runs must fingerprint identically");

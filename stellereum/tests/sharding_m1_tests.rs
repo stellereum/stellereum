@@ -21,6 +21,52 @@ fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
+/// FULL-PQ sender address for a seed: implicit Falcon-512, registered
+/// globally (no activation surcharge). Mirrors
+/// `audit_state_sync_closeout_tests.rs::pq_id`.
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+/// FULL-PQ replacement for `Transaction::sign` in fixtures: same
+/// amount/gas/nonce/shards, implicit Falcon-512 envelope.
+#[allow(clippy::too_many_arguments)]
+fn pq_tx(
+    seed: u8,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard,
+        target_shard,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
 /// Best-effort subscriber so `--nocapture` shows the producer's
 /// `propose h=.. shard=1` line (M1 evidence). The first test to start wins;
 /// later calls are no-ops.
@@ -53,12 +99,11 @@ async fn shard1_cluster(validator: &SigningKey, dev: [u8; 32]) -> Cluster {
 async fn shard1_transaction_lands_in_a_shard1_block() {
     init_tracing();
     let validator = key(1);
-    let user = key(2);
-    let from = user.verifying_key().to_bytes();
+    let from = pq_id(2);
     let mut cluster = shard1_cluster(&validator, from).await;
 
     let genesis_root = cluster.nodes[0].state_root().await;
-    let tx = Transaction::sign(&user, [9u8; 32], 100, 1_000, 0, 1, SHARD1);
+    let tx = pq_tx(2, [9u8; 32], 100, 1_000, 0, 1, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx).await;
 
@@ -95,8 +140,7 @@ async fn shard1_transaction_lands_in_a_shard1_block() {
 #[tokio::test]
 async fn shard0_chain_is_untouched_by_a_shard1_transaction() {
     let validator = key(3);
-    let user = key(4);
-    let from = user.verifying_key().to_bytes();
+    let from = pq_id(4);
 
     let engine = Arc::new(InMemoryStateEngine::new());
     engine
@@ -107,9 +151,7 @@ async fn shard0_chain_is_untouched_by_a_shard1_transaction() {
     let genesis_root = cluster.nodes[0].state_root().await;
     // Targeted at shard 1: in a sharded process it must NOT enter shard 0.
     cluster
-        .broadcast_tx(Transaction::sign(
-            &user, [8u8; 32], 100, 1_000, 0, 1, SHARD1,
-        ))
+        .broadcast_tx(pq_tx(4, [8u8; 32], 100, 1_000, 0, 1, SHARD1))
         .await;
 
     let bh = cluster.run_height(1).await;
@@ -133,8 +175,7 @@ async fn shard0_chain_is_untouched_by_a_shard1_transaction() {
 
 #[tokio::test]
 async fn two_independent_shard1_nodes_compute_the_same_root() {
-    let user = key(20);
-    let from = user.verifying_key().to_bytes();
+    let from = pq_id(20);
 
     // Same validator identity and config, two independent state engines: this
     // is what two separately-started nodes for the same shard look like.
@@ -142,7 +183,7 @@ async fn two_independent_shard1_nodes_compute_the_same_root() {
     let mut roots = Vec::new();
     for _ in 0..2 {
         let mut cluster = shard1_cluster(&validator, from).await;
-        let tx = Transaction::sign(&user, [42u8; 32], 1_234, 1_000, 0, 1, SHARD1);
+        let tx = pq_tx(20, [42u8; 32], 1_234, 1_000, 0, 1, SHARD1);
         cluster.broadcast_tx(tx).await;
         let _ = cluster.run_height(77).await;
         roots.push(cluster.nodes[0].state_root().await);
@@ -157,8 +198,7 @@ async fn two_independent_shard1_nodes_compute_the_same_root() {
 #[tokio::test]
 async fn sharded_node_rejects_a_proposal_for_the_wrong_shard() {
     let validator = key(30);
-    let user = key(31);
-    let from = user.verifying_key().to_bytes();
+    let from = pq_id(31);
     let mut cluster = shard1_cluster(&validator, from).await;
 
     let mut block = cluster.nodes[0]
@@ -180,15 +220,7 @@ async fn sharded_node_rejects_a_proposal_for_the_wrong_shard() {
     // A shard-1 block carrying a shard-0-targeted transaction is refused too.
     let mut block2 = cluster.nodes[0].blocks.values().next().cloned().unwrap();
     block2.shard_id = SHARD1;
-    block2.transactions = vec![Transaction::sign(
-        &user,
-        [1u8; 32],
-        1,
-        1_000,
-        0,
-        0,
-        MASTERCHAIN_SHARD,
-    )];
+    block2.transactions = vec![pq_tx(31, [1u8; 32], 1, 1_000, 0, 0, MASTERCHAIN_SHARD)];
     block2.validator_signatures.clear();
     block2.sign_block(&validator);
     let err = cluster.nodes[0]

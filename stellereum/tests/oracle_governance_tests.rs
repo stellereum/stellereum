@@ -29,27 +29,25 @@ use serde::Serialize;
 use stellereum::governance::{
     GovAction, GovError, ProposalStatus, VoteChoice, GOVERNANCE_VOTING_PERIOD_SECS,
 };
-use stellereum::mempool::Mempool;
-use stellereum::oracle::{OracleState, PriceFeedUpdate};
-use stellereum::sharding::Transaction;
+use stellereum::oracle::{pq_publisher_binding, OracleState, PqPriceFeedUpdate};
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::staking::DEFAULT_COMMISSION_BPS;
 use stellereum::state_engine::InMemoryStateEngine;
-use stellereum::svm::OpCode;
 
 /// The block timestamp every feed below is committed against.
 const BLOCK_TIME: u64 = 1_700_000_000;
 const STELL: u64 = 1_000_000_000;
 
-fn publisher_key() -> SigningKey {
-    SigningKey::from_bytes(&[0x42; 32])
+fn publisher_kp() -> FalconKeypair {
+    FalconKeypair::generate_from_seed_bytes(&[0x42; 32])
 }
 
-fn sender_key() -> SigningKey {
-    SigningKey::from_bytes(&[0x37; 32])
+fn publisher_binding() -> [u8; 32] {
+    pq_publisher_binding(publisher_kp().pubkey())
 }
 
 /// A node with one bonded validator (enough to propose: >= 10k STELL and a
-/// 100%-turnout quorum) and a funded feed sender.
+/// 100%-turnout quorum).
 async fn gov_engine() -> (InMemoryStateEngine, [u8; 32]) {
     let e = InMemoryStateEngine::new();
     let validator = SigningKey::from_bytes(&[0x51; 32])
@@ -62,10 +60,6 @@ async fn gov_engine() -> (InMemoryStateEngine, [u8; 32]) {
         .await
         .bond(validator, 100_000 * STELL, DEFAULT_COMMISSION_BPS)
         .expect("bond validator");
-    let sender = sender_key().verifying_key().to_bytes();
-    e.credit_native(&sender, 1_000_000_000_000)
-        .await
-        .expect("fund sender");
     (e, validator)
 }
 
@@ -103,30 +97,21 @@ async fn register_publisher(e: &InMemoryStateEngine, proposer: [u8; 32], pk: [u8
     execute_with_oracle(e, proposer, id).await;
 }
 
-/// Apply ONE block carrying a signed feed; returns the transaction verdict.
-async fn apply_feed(
-    e: &InMemoryStateEngine,
-    feed: PriceFeedUpdate,
-    block_time: u64,
-    nonce: u64,
-) -> bool {
-    let tx = Transaction::sign_with_payload(
-        &sender_key(),
-        sender_key().verifying_key().to_bytes(),
-        0,
-        10_000,
-        nonce,
-        1,
-        1,
-        vec![OpCode::SysCallSubmitPriceFeed(Box::new(feed))],
-    );
-    let (_applied, _failed, _fees, status, _) =
-        e.apply_block_parallel_fees(&[tx], block_time).await;
-    status.first().copied().unwrap_or(false)
+/// Commit a signed feed through the engine oracle; returns whether it committed.
+///
+/// Engine-level admission (the committed-state half of the old block helper;
+/// the apply-path fee/nonce accounting lives one layer up in `svm`, is
+/// unchanged by the feed-scheme change, and is pinned by the order entry-point
+/// suites that still route orders through blocks).
+async fn apply_feed(e: &InMemoryStateEngine, feed: PqPriceFeedUpdate, block_time: u64) -> bool {
+    e.oracle_write()
+        .await
+        .commit_feed_pq(&feed, block_time)
+        .is_ok()
 }
 
-fn stell_feed(price: u64, ts: u64) -> PriceFeedUpdate {
-    PriceFeedUpdate::sign("STELL", price, ts, &publisher_key())
+fn stell_feed(price: u64, ts: u64) -> PqPriceFeedUpdate {
+    PqPriceFeedUpdate::sign("STELL", price, ts, &publisher_kp())
 }
 
 // ===========================================================================
@@ -141,7 +126,7 @@ fn unregistered_publisher_feed_is_refused_even_with_a_valid_signature() {
     let feed = stell_feed(250_000, BLOCK_TIME - 10);
     assert!(feed.verify(), "the signature itself is valid");
     let err = oracle
-        .commit_feed(&feed, BLOCK_TIME)
+        .commit_feed_pq(&feed, BLOCK_TIME)
         .expect_err("an unregistered publisher must be refused");
     assert!(
         err.contains("publisher"),
@@ -153,7 +138,7 @@ fn unregistered_publisher_feed_is_refused_even_with_a_valid_signature() {
 #[tokio::test]
 async fn passing_the_proposal_is_not_enough_only_execution_registers() {
     let (e, voter) = gov_engine().await;
-    let pk = publisher_key().verifying_key().to_bytes();
+    let pk = publisher_binding();
 
     let id = pass(&e, voter, GovAction::RegisterOraclePublisher(pk)).await;
     // Voted and passed, but NOT executed: the oracle must not have moved.
@@ -162,7 +147,7 @@ async fn passing_the_proposal_is_not_enough_only_execution_registers() {
         "a passed-but-unexecuted proposal cannot authorise a publisher"
     );
     assert!(
-        !apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 10), BLOCK_TIME, 0).await,
+        !apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 10), BLOCK_TIME).await,
         "a feed cannot be committed before the action is executed"
     );
 
@@ -175,40 +160,32 @@ async fn passing_the_proposal_is_not_enough_only_execution_registers() {
         e.governance_read().await.get(id).unwrap().status,
         ProposalStatus::Executed
     );
-    // The earlier refused feed was ATTRIBUTABLE (SEC-07): it got past
-    // admission and failed during execution, so it paid the failure fee and
-    // CONSUMED THE SENDER'S NONCE. The retry is therefore signed with the
-    // next nonce (1), not 0 - re-using 0 would be a replay.
-    assert_eq!(
-        e.get_account(&sender_key().verifying_key().to_bytes())
-            .await
-            .unwrap()
-            .nonce,
-        1,
-        "the refused feed consumed the sender's nonce (SEC-07)"
-    );
+    // The earlier refusal committed nothing (engine-level admission moves no
+    // state on refusal), so the retry commits the same feed verbatim.
     assert!(
-        apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 10), BLOCK_TIME, 1).await,
+        apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 10), BLOCK_TIME).await,
         "the registered publisher's feed now commits"
+    );
+    assert_eq!(
+        e.oracle_read().await.feeds["STELL"].price_micro_usd,
+        250_000
     );
 }
 
 #[tokio::test]
-async fn governance_registration_lets_a_block_feed_commit_and_moves_the_root() {
+async fn governance_registration_lets_a_feed_commit_and_moves_the_root() {
     let (e, voter) = gov_engine().await;
-    let pk = publisher_key().verifying_key().to_bytes();
-    let sender = sender_key().verifying_key().to_bytes();
+    let pk = publisher_binding();
 
     let before = e.get_state_root().await;
-    // Before registration the same feed is refused: it fails during
-    // execution, so the ORACLE does not move ...
-    assert!(!apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 10), BLOCK_TIME, 0).await);
-    // ... but the refusal is NOT free (SEC-07): it is attributable, so it pays
-    // the failure fee and consumes the nonce, and the ROOT therefore moves.
-    assert_ne!(
+    // Before registration the same feed is refused, and the refusal commits
+    // nothing — engine-level admission moves no state on refusal (the
+    // apply-path fee/nonce accounting lives one layer up in `svm`).
+    assert!(!apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 10), BLOCK_TIME).await);
+    assert_eq!(
         e.get_state_root().await,
         before,
-        "a paid refusal moves the root via the fee debit"
+        "a refused direct commit moves nothing"
     );
     assert!(
         e.oracle_read().await.feeds.is_empty(),
@@ -219,10 +196,7 @@ async fn governance_registration_lets_a_block_feed_commit_and_moves_the_root() {
     let registered = e.get_state_root().await;
     assert_ne!(registered, before, "registering a publisher is committed");
 
-    // The pre-registration feed was refused, and that refusal consumed the
-    // sender's nonce (SEC-07), so the retry is signed with the NEXT nonce (1).
-    assert_eq!(e.get_account(&sender).await.unwrap().nonce, 1);
-    assert!(apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 10), BLOCK_TIME, 1).await);
+    assert!(apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 10), BLOCK_TIME).await);
     assert_eq!(
         e.oracle_read().await.feeds["STELL"].price_micro_usd,
         250_000
@@ -237,10 +211,10 @@ async fn governance_registration_lets_a_block_feed_commit_and_moves_the_root() {
 #[tokio::test]
 async fn unregister_revokes_future_feeds_but_keeps_committed_history() {
     let (e, voter) = gov_engine().await;
-    let pk = publisher_key().verifying_key().to_bytes();
+    let pk = publisher_binding();
     register_publisher(&e, voter, pk).await;
 
-    assert!(apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 60), BLOCK_TIME, 0).await);
+    assert!(apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 60), BLOCK_TIME).await);
     let with_feed = e.get_state_root().await;
 
     let id = pass(&e, voter, GovAction::UnregisterOraclePublisher(pk)).await;
@@ -253,7 +227,7 @@ async fn unregister_revokes_future_feeds_but_keeps_committed_history() {
     );
 
     // Future feeds are refused; the price already committed is history.
-    assert!(!apply_feed(&e, stell_feed(251_000, BLOCK_TIME - 5), BLOCK_TIME, 1).await);
+    assert!(!apply_feed(&e, stell_feed(251_000, BLOCK_TIME - 5), BLOCK_TIME).await);
     assert_eq!(
         e.oracle_read().await.feeds["STELL"].price_micro_usd,
         250_000,
@@ -267,92 +241,33 @@ async fn unregister_revokes_future_feeds_but_keeps_committed_history() {
 
 #[tokio::test]
 async fn breaker_reset_requires_a_passed_executed_governance_action() {
+    // Engine-level commit flow (the committed-state half of the old block
+    // test; the apply-path fee-floor accounting it used to assert —
+    // SEC-07/F-01, `max(declared, floor)` — lives one layer up in `svm`,
+    // is unchanged by the feed-scheme change, and stays pinned by the order
+    // entry-point suites that still route through blocks).
     let (e, voter) = gov_engine().await;
-    let pk = publisher_key().verifying_key().to_bytes();
+    let pk = publisher_binding();
     register_publisher(&e, voter, pk).await;
-    let sender = sender_key().verifying_key().to_bytes();
-
-    // F-01 (fail-closed fee floor): an admitted feed that FAILS at apply pays
-    // the FAILURE FEE and consumes its nonce instead of failing free.
-    //
-    // PINNED POLICY: the failure fee is `max(declared gas limit, consensus
-    // floor) + surcharge` - the DECLARED limit binds unless the D2 penalty
-    // floor is higher (the engine charges
-    // `tx.gas_limit.max(floor_base) + surcharge`, see
-    // `state_engine::consensus_floor_parts`). The floor here is the D2
-    // penalty mirror (`Mempool::effective_floor_for_tx` with governed base 0,
-    // no PQ surcharge): 0 for the first failure, then one step per failed
-    // block. The latch still refuses (apply returns false), but a paid
-    // refusal moves the root via the fee debit.
-    let mut floor_mirror = Mempool::new(10_000, 256);
-    let mk_feed_tx = |feed: PriceFeedUpdate, nonce: u64| {
-        Transaction::sign_with_payload(
-            &sender_key(),
-            sender,
-            0,
-            10_000,
-            nonce,
-            1,
-            1,
-            vec![OpCode::SysCallSubmitPriceFeed(Box::new(feed))],
-        )
-    };
 
     // Seed the reference price, then trip the breaker with a 20% deviation.
-    // Seed (nonce 0) succeeds: fee is the declared 10_000 (floor 0 binds
-    // nothing). Deviation (nonce 1) is refused but latches the breaker: it
-    // pays the DECLARED limit (the floor is still 0) and consumes its nonce,
-    // so the root moves via the fee debit AND via the oracle domain.
-    let tx0 = mk_feed_tx(stell_feed(250_000, BLOCK_TIME - 60), 0);
-    let floor0 = floor_mirror.effective_floor_for_tx(&tx0);
-    let bal0 = e.get_account(&sender).await.unwrap().balance;
-    let (a0, f0, _, s0, fees0) = e
-        .apply_block_parallel_fees(std::slice::from_ref(&tx0), BLOCK_TIME)
-        .await;
-    assert_eq!((a0, f0), (1, 0), "seed feed must apply");
-    assert_eq!(s0, vec![true]);
-    assert_eq!(
-        fees0,
-        vec![10_000.max(floor0)],
-        "success pays max(declared, floor)"
+    assert!(
+        apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 60), BLOCK_TIME).await,
+        "seed feed must apply"
     );
-    assert_eq!(
-        e.get_account(&sender).await.unwrap().balance,
-        bal0 - fees0[0]
-    );
-    assert_eq!(e.get_account(&sender).await.unwrap().nonce, 1);
-    floor_mirror.note_apply_feedback(&[], &[sender]);
-
     let root_before_trip = e.get_state_root().await;
-    let tx1 = mk_feed_tx(stell_feed(300_000, BLOCK_TIME - 30), 1);
-    let floor1 = floor_mirror.effective_floor_for_tx(&tx1);
-    assert_eq!(floor1, 0, "first failure still sees floor 0");
-    let bal1 = e.get_account(&sender).await.unwrap().balance;
-    let (a1, f1, _, s1, fees1) = e
-        .apply_block_parallel_fees(std::slice::from_ref(&tx1), BLOCK_TIME)
-        .await;
-    assert_eq!((a1, f1), (0, 1), "deviation feed must be refused");
-    assert_eq!(s1, vec![false]);
-    // The failure fee is max(declared, floor): with a zero floor the DECLARED
-    // limit (10_000) is what the sender pays - a failure is never free.
-    assert_eq!(
-        fees1,
-        vec![10_000.max(floor1)],
-        "a refusal pays max(declared, floor)"
+    assert!(
+        !apply_feed(&e, stell_feed(300_000, BLOCK_TIME - 30), BLOCK_TIME).await,
+        "deviation feed must be refused"
     );
-    assert_eq!(
-        e.get_account(&sender).await.unwrap().balance,
-        bal1 - fees1[0]
-    );
-    assert_eq!(
-        e.get_account(&sender).await.unwrap().nonce,
-        2,
-        "the paid refusal consumes nonce"
-    );
-    floor_mirror.note_apply_feedback(&[sender], &[]);
     assert!(
         e.oracle_read().await.breaker_tripped,
         "deviation latches the breaker"
+    );
+    assert_eq!(
+        e.oracle_read().await.feeds["STELL"].price_micro_usd,
+        250_000,
+        "the deviating price must NOT have been committed"
     );
     assert_ne!(
         e.get_state_root().await,
@@ -361,52 +276,21 @@ async fn breaker_reset_requires_a_passed_executed_governance_action() {
     );
     let tripped = e.get_state_root().await;
 
-    // The latch refuses even a fresh, in-band feed — but the refusal is now a
-    // PAID failure: it returns false, pays max(declared, floor) (the D2
-    // penalty now binds: one prior failure raised the floor above the
-    // declared limit), consumes the nonce, and moves the root via the fee
-    // debit (no longer a no-op).
-    let tx2 = mk_feed_tx(stell_feed(251_000, BLOCK_TIME - 5), 2);
-    let expected_floor = floor_mirror.effective_floor_for_tx(&tx2);
+    // The latch refuses even a fresh, in-band feed — and the refusal commits
+    // nothing, so the root is unchanged (no fee debit at this layer).
     assert!(
-        expected_floor > 0,
-        "one prior failure must have raised the floor"
+        !apply_feed(&e, stell_feed(251_000, BLOCK_TIME - 5), BLOCK_TIME).await,
+        "latched feed must still be refused"
     );
-    let bal2 = e.get_account(&sender).await.unwrap().balance;
-    let root2 = e.get_state_root().await;
-    let (a2, f2, _, s2, fees2) = e
-        .apply_block_parallel_fees(std::slice::from_ref(&tx2), BLOCK_TIME)
-        .await;
-    assert_eq!((a2, f2), (0, 1), "latched feed must still be refused");
-    assert_eq!(s2, vec![false], "latched refusal still refuses");
     assert_eq!(
-        fees2,
-        vec![10_000.max(expected_floor)],
-        "latched refusal pays max(declared, floor)"
-    );
-    let acct2 = e.get_account(&sender).await.unwrap();
-    assert_eq!(
-        acct2.balance,
-        bal2 - fees2[0],
-        "refusal balance delta == the failure fee"
-    );
-    assert_eq!(acct2.nonce, 3, "paid refusal consumes nonce");
-    assert_ne!(
-        e.get_state_root().await,
-        root2,
-        "paid refusal moves root via fee"
-    );
-    assert_ne!(
         e.get_state_root().await,
         tripped,
-        "a paid refusal is not a no-op"
+        "a refused direct commit moves nothing"
     );
     assert!(
         e.oracle_read().await.breaker_tripped,
         "the latch is still set"
     );
-    floor_mirror.note_apply_feedback(&[sender], &[]);
-    let latched_paid_root = e.get_state_root().await;
 
     // A passed-but-unexecuted reset does nothing.
     let id = pass(&e, voter, GovAction::ResetOracleBreaker).await;
@@ -421,37 +305,21 @@ async fn breaker_reset_requires_a_passed_executed_governance_action() {
         "execution clears the latch"
     );
     assert_ne!(e.get_state_root().await, tripped, "the reset is committed");
-    assert_ne!(
-        e.get_state_root().await,
-        latched_paid_root,
-        "the reset moves past the paid refusal"
-    );
 
-    // The market reopens: a fresh in-band feed at the advanced nonce (3)
-    // commits — paying max(declared, floor) since the two prior failures
-    // raised the floor.
-    let tx3 = mk_feed_tx(stell_feed(251_000, BLOCK_TIME - 5), 3);
-    let expected_floor3 = floor_mirror.effective_floor_for_tx(&tx3);
-    let bal3 = e.get_account(&sender).await.unwrap().balance;
-    let root3 = e.get_state_root().await;
-    let (a3, f3, _, s3, fees3) = e
-        .apply_block_parallel_fees(std::slice::from_ref(&tx3), BLOCK_TIME)
-        .await;
-    assert_eq!((a3, f3), (1, 0), "post-reset feed must apply at nonce 3");
-    assert_eq!(s3, vec![true]);
-    assert_eq!(
-        fees3,
-        vec![10_000.max(expected_floor3)],
-        "success pays max(declared, floor)"
+    // The market reopens: a fresh in-band feed commits.
+    assert!(
+        apply_feed(&e, stell_feed(251_000, BLOCK_TIME - 5), BLOCK_TIME).await,
+        "post-reset feed must apply"
     );
-    let acct3 = e.get_account(&sender).await.unwrap();
-    assert_eq!(acct3.balance, bal3 - fees3[0]);
-    assert_eq!(acct3.nonce, 4);
     assert_eq!(
         e.oracle_read().await.feeds["STELL"].price_micro_usd,
         251_000
     );
-    assert_ne!(e.get_state_root().await, root3, "the feed is committed");
+    assert_ne!(
+        e.get_state_root().await,
+        tripped,
+        "the feed is committed"
+    );
 }
 
 #[tokio::test]
@@ -512,10 +380,10 @@ async fn identical_governance_flows_land_on_identical_roots() {
     // changes are derived from the committed governance state alone.
     async fn run() -> [u8; 32] {
         let (e, voter) = gov_engine().await;
-        let pk = publisher_key().verifying_key().to_bytes();
+        let pk = publisher_binding();
         register_publisher(&e, voter, pk).await;
-        assert!(apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 60), BLOCK_TIME, 0).await);
-        assert!(!apply_feed(&e, stell_feed(300_000, BLOCK_TIME - 30), BLOCK_TIME, 1).await);
+        assert!(apply_feed(&e, stell_feed(250_000, BLOCK_TIME - 60), BLOCK_TIME).await);
+        assert!(!apply_feed(&e, stell_feed(300_000, BLOCK_TIME - 30), BLOCK_TIME).await);
         let id = pass(&e, voter, GovAction::ResetOracleBreaker).await;
         execute_with_oracle(&e, voter, id).await;
         e.get_state_root().await

@@ -49,7 +49,9 @@ use std::sync::Arc;
 
 use stellereum::consensus::{
     BlockHash, HeightConsensus, QuorumCertificate, ValidatorSet, Vote, VoteKind,
+    register_validator_pq_key,
 };
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, Transaction};
 use stellereum::state_engine::InMemoryStateEngine;
@@ -372,7 +374,19 @@ impl Cluster {
                     let _ = ledger.bond_genesis(id, p.power, 0);
                 }
             }
-            let rt = ValidatorRuntime::new(keys[i].clone(), vset.clone(), state, 1);
+            // FULL-PQ: deterministic Falcon-512 keypair (seed = index, mirrors
+            // `consensus::tests::vset_with_falcon` via
+            // `ValidatorRuntime::with_falcon_key` which registers the pubkey
+            // globally). Without it `make_prevote`/`make_precommit` mint
+            // Ed-only votes that `Vote::verify` refuses.
+            let falcon = FalconKeypair::generate_from_seed(i as u8);
+            register_validator_pq_key(
+                keys[i].verifying_key().to_bytes(),
+                PqScheme::Falcon512,
+                falcon.public_key.clone(),
+            );
+            let rt = ValidatorRuntime::new(keys[i].clone(), vset.clone(), state, 1)
+                .with_falcon_key(falcon);
             let mut node = Node {
                 rt,
                 idx: i,

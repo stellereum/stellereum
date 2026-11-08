@@ -917,11 +917,20 @@ impl Registry {
     // -- counters ----------------------------------------------------------
 
     /// One vote of `kind` seen (broadcast, received, or self-cast).
+    ///
+    /// CALIBRATION FEED (workspace-root `STELLEREUM_BLOCKCHAIN_FIXES.md`
+    /// §2.12): the per-kind totals are the vote-count input the calibration
+    /// runbooks read (`p̂` for `q = 1 − p̂ − λ̂`). The runtime emits exactly
+    /// one count per VERIFIED same-height member vote at ingest
+    /// (`ValidatorRuntime::observe_peer_vote`); forged, non-member and
+    /// wrong-height votes never reach this counter, so attacker traffic
+    /// cannot inflate the calibration input. Emission only: counting never
+    /// feeds back into any quorum or round decision.
     pub fn inc_vote(&self, kind: VoteKind) {
         self.add_votes(kind, 1);
     }
 
-    /// `n` votes of `kind`.
+    /// `n` votes of `kind` (same calibration contract as [`Self::inc_vote`]).
     pub fn add_votes(&self, kind: VoteKind, n: u64) {
         self.add(
             CONSENSUS_VOTES_TOTAL,
@@ -1044,6 +1053,17 @@ impl Registry {
     /// Seconds since the previously finalized block. Observe once per finalised
     /// block, not once per proposal — proposal cadence is a different (and much
     /// noisier) story than how fast the chain actually commits.
+    ///
+    /// CALIBRATION FEED (workspace-root `STELLEREUM_BLOCKCHAIN_FIXES.md`
+    /// §2.12): this histogram is the block-interval sample stream the
+    /// calibration runbooks read (`c = mean(interval|VC) − T − E[X]` and
+    /// `Var(ĉ) ≈ Var(interval|VC)/m + Var(Ê[X])`). The runtime emits one
+    /// wall-clock sample per LIVE commit (`try_finalize` for the inline path,
+    /// `install_apply_outcome` for the sequenced worker path), measured as
+    /// the time since the previous finalization progress stamp — i.e. the
+    /// node's observed commit cadence, not block timestamps. Adopt/replay
+    /// paths deliberately do not emit (a sync catch-up burst is not commit
+    /// cadence). Emission only: observing never affects finalization.
     pub fn observe_block_interval(&self, seconds: f64) {
         self.add(BLOCK_INTERVAL_SECONDS, &[], seconds);
     }
@@ -1055,6 +1075,15 @@ impl Registry {
 
     /// Round-trip latency to `peer`, in seconds. The peer id is sanitised
     /// before it reaches the exposition — see [`sanitize_label_value`].
+    ///
+    /// CALIBRATION FEED (workspace-root `STELLEREUM_BLOCKCHAIN_FIXES.md`
+    /// §2.12): the per-peer RTT sample stream the calibration runbooks read
+    /// for the network-delay side (`E[X]`, timeout-ladder tuning). The
+    /// consensus ping probe emits one sample per ANSWERED probe
+    /// (`record_probe_rtt` in `consensus_net.rs`): successes carry the
+    /// measured `core.ping` round-trip, timeouts and fast errors emit
+    /// nothing (absence of data, not a zero). Emission only: measuring never
+    /// affects peer selection, backoff or eviction.
     pub fn observe_peer_latency(&self, peer: &str, seconds: f64) {
         self.add(PEER_LATENCY_SECONDS, &[(LABEL_PEER, peer)], seconds);
     }

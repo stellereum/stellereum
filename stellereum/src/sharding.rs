@@ -5817,6 +5817,39 @@ impl Block {
             .push((validator_key.verifying_key().to_bytes(), sig.to_vec()));
     }
 
+    /// Sign this block with a validator Ed25519 key plus a Falcon-512 key.
+    ///
+    /// Mirrors EXACTLY what production `propose` does (`runtime.rs`: pushes
+    /// `(ed_id, ed_sig)` then `(fk.validator_id(), fk.sign(hash))` over the
+    /// single [`Self::compute_hash`] message — signatures are excluded from
+    /// the hash, so one hash covers both halves), so that
+    /// [`crate::consensus::verify_proposer_signature`] (Falcon-only,
+    /// height-indexed) passes on the resulting block.
+    ///
+    /// The caller MUST register the Falcon public key for the proposer's Ed
+    /// id first (via [`crate::consensus::register_validator_pq_key`); this
+    /// helper does NOT register — mirroring the vote-fixture pattern where
+    /// `Vote::sign_with_falcon` signs and the test registers separately.
+    ///
+    /// Deterministic in (block, keys) EXCEPT Falcon randomness:
+    /// [`FalconKeypair::sign`] mixes fresh OS entropy per signature (FIPS 206
+    /// discrete Gaussian sampling), so two calls with the same inputs yield
+    /// two DIFFERENT (both valid) Falcon halves, while the Ed25519 half is
+    /// byte-identical.
+    pub fn sign_block_with_falcon(
+        &mut self,
+        validator_key: &SigningKey,
+        falcon_key: &FalconKeypair,
+    ) {
+        let block_hash = self.compute_hash();
+        let ed_sig = validator_key.sign(&block_hash);
+        self.validator_signatures
+            .push((validator_key.verifying_key().to_bytes(), ed_sig.to_vec()));
+        let falcon_sig = falcon_key.sign(&block_hash);
+        self.validator_signatures
+            .push((falcon_key.validator_id(), falcon_sig));
+    }
+
     /// Verify the block carries a valid signature by its DECLARED proposer.
     ///
     /// SECURITY: proposal authenticity. Without this, any peer could broadcast a
@@ -8617,6 +8650,37 @@ mod shard_header_commitment_tests {
 
         // Restore the frozen default for the rest of this thread.
         crate::consensus::set_consensus_chain_id_for_tests(0);
+    }
+
+    /// `sign_block_with_falcon` round-trips through the Falcon-only proposal
+    /// verifier. The caller registers the Falcon key first (the helper does
+    /// not); the Ed-only refusal is pinned in `consensus.rs`
+    /// (`proposer_signature_refuses_ed_only_no_classical_fallback`) and is
+    /// not re-asserted here.
+    #[test]
+    fn sign_block_with_falcon_round_trips_through_proposal_verifier() {
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let fk = FalconKeypair::generate_from_seed(0xB1);
+        let proposer = sk.verifying_key().to_bytes();
+        crate::consensus::register_validator_pq_key(
+            proposer,
+            PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+        let mut block = block_with(vec![]);
+        block.proposer = proposer;
+        block.sign_block_with_falcon(&sk, &fk);
+        assert_eq!(
+            block.validator_signatures.len(),
+            2,
+            "propose shape: (ed_id, ed_sig) then (falcon_id, falcon_sig)"
+        );
+        assert_eq!(block.validator_signatures[0].0, proposer);
+        assert_eq!(block.validator_signatures[1].0, fk.validator_id());
+        assert!(
+            crate::consensus::verify_proposer_signature(&block),
+            "Falcon-signed block must verify under the registered key"
+        );
     }
 
     /// Backward compatibility: a block persisted BEFORE the shard-head field

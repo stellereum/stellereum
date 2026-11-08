@@ -570,6 +570,63 @@ pub fn pq_equivocation_dedup_key(
     *hasher.finalize().as_bytes()
 }
 
+/// Domain separator for [`xmss_equivocation_offense_key`]. Distinct from the
+/// vote ([`crate::consensus::EQUIVOCATION_OFFENSE_DOMAIN`]), proposal
+/// ([`crate::consensus::PROPOSAL_EQUIVOCATION_OFFENSE_DOMAIN`]), and PQ arms,
+/// so XMSS offense keys can share the [`StakingLedger::equivocation_dedup`]
+/// set without ever colliding with them.
+pub const XMSS_EQUIVOCATION_OFFENSE_DOMAIN: &[u8] =
+    b"STELLEREUM_XMSS_EQUIVOCATION_OFFENSE_V1";
+
+/// Hard cap on one XMSS equivocation evidence envelope's wire size
+/// (fail-closed: larger is refused, never truncated).
+///
+/// An honest proof (32 B seeds, `h <= 12`) is ~5 KB
+/// (`49 + 2*(2 + 32 + 4 + 2528)` at `h = 12`); the cap is a DoS bound, not
+/// a format limit — anything bigger is a probe, not evidence.
+pub const MAX_XMSS_EQUIVOCATION_EVIDENCE_BYTES: usize = 8_192;
+
+/// Canonical per-offense key for XMSS beacon equivocation:
+/// `BLAKE3(domain ‖ validator ‖ epoch_be64 ‖ leg_lo ‖ leg_hi)`, with the two
+/// `(seed, sig)` legs in canonical (lexicographic) order so leg order never
+/// matters. Each leg encodes as `seed_len_u16le ‖ seed ‖ sig_len_u32le ‖
+/// sig`, mirroring the length-prefixed canonical evidence bytes.
+pub fn xmss_equivocation_offense_key(
+    validator: &ValidatorId,
+    epoch: u64,
+    seed_a: &[u8],
+    sig_a: &[u8],
+    seed_b: &[u8],
+    sig_b: &[u8],
+) -> [u8; 32] {
+    fn enc_leg(seed: &[u8], sig: &[u8], out: &mut Vec<u8>) {
+        out.extend_from_slice(&(seed.len() as u16).to_le_bytes());
+        out.extend_from_slice(seed);
+        out.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+        out.extend_from_slice(sig);
+    }
+    let mut la = Vec::new();
+    let mut lb = Vec::new();
+    enc_leg(seed_a, sig_a, &mut la);
+    enc_leg(seed_b, sig_b, &mut lb);
+    let (lo, hi) = if la <= lb { (la, lb) } else { (lb, la) };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(XMSS_EQUIVOCATION_OFFENSE_DOMAIN);
+    hasher.update(validator);
+    hasher.update(&epoch.to_be_bytes());
+    hasher.update(&lo);
+    hasher.update(&hi);
+    *hasher.finalize().as_bytes()
+}
+
+/// Infer the XMSS tree height from a wire signature length
+/// (`67*32 + h*32` for `h` in `1..=12`). `None` when the length matches no
+/// valid height — the caller refuses fail-closed.
+fn infer_xmss_height(sig_len: usize) -> Option<u8> {
+    (crate::xmss_vrf::MIN_HEIGHT..=crate::xmss_vrf::MAX_HEIGHT)
+        .find(|h| crate::xmss_vrf::signature_len(*h) == sig_len)
+}
+
 /// A single delegation from one delegator to one validator.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delegation {
@@ -2570,6 +2627,167 @@ impl StakingLedger {
         Ok(burned)
     }
 
+    /// Slash for XMSS-VRF beacon equivocation evidence — THE WIRED PATH.
+    ///
+    /// The XMSS mirror of [`Self::slash_equivocation_verified`]: same 5%
+    /// burn ([`EQUIVOCATION_SLASH_BPS`]), same fail-closed verification
+    /// (shape + both one-time signatures + binding + membership), same
+    /// per-offense chain dedup in the shared [`Self::equivocation_dedup`]
+    /// set — fed ONLY by block-carried evidence, pool-debited at the call
+    /// site like downtime. Reuses the sibling module's verifier
+    /// ([`crate::xmss_vrf::verify_equivocation`] /
+    /// [`crate::xmss_vrf::parse_equivocation_evidence`]) — no second
+    /// verifier lives here.
+    ///
+    ///  1. SHAPE+VERIFY: `evidence` must parse as canonical
+    ///     `XMSS-EQV1 || root || epoch_be64 || len || seed_a || sig_a ||
+    ///     len || seed_b || sig_b` with distinct seeds, equal-length
+    ///     signatures matching `67*32 + h*32` for some `h` in
+    ///     `1..=12`, and BOTH legs must re-verify under `(root, epoch)`
+    ///     through the module verifier. Malformed, forged, tampered, or
+    ///     single-sign attempt records (the `LeafReuse` refusal bytes are
+    ///     NOT length-prefixed proofs and never parse here) burn 0 with a
+    ///     loud WARN — never an error, so block application can never fail
+    ///     on hostile evidence.
+    ///  2. BINDING: the evidence root must equal the accused `validator`
+    ///     (the XMSS Merkle root IS the beacon public key, exactly as the
+    ///     vote `voter` field binds a double-vote to its signer). A proof
+    ///     for another key burns 0 with a loud WARN (framing refused).
+    ///  3. MEMBERSHIP: unknown validators get `Err(NotValidator)` (house
+    ///     style; transition callers map it to skip-and-log, never block
+    ///     failure).
+    ///  4. DEDUP: the per-offense key ([`xmss_equivocation_offense_key`]:
+    ///     offender ‖ epoch ‖ canonical-ordered legs under a distinct
+    ///     BLAKE3 domain) is consumed on first processing in the shared
+    ///     `equivocation_dedup` set — the vote, proposal, and XMSS keys
+    ///     live under distinct domains, so the sets can never collide. A
+    ///     repeat of the same offense (either leg order, any number of
+    ///     rebroadcasts or re-inclusions) burns 0. Same offense slashed
+    ///     once per chain, on every node identically.
+    ///  5. BURN: 5% of total stake ([`EQUIVOCATION_SLASH_BPS`]), self-bond
+    ///     first with the audited `slash` spillover to delegators.
+    ///
+    /// LEDGER-ONLY like `slash` itself: the coins move at the caller, which
+    /// MUST debit [`STAKING_POOL`] by the returned `burned`, or pool/ledger
+    /// drift by `burned`.
+    ///
+    /// HEIGHT / ROTATION REQUIREMENT (honest, no silent assumption): the
+    /// XMSS tree height `h` caps the key lifetime — `h = 10` (default)
+    /// covers 1024 one-time leaves ≈ ~22 h of beacon at 128 blocks/epoch
+    /// and 0.6 s/block, `h = 12` (build ceiling) ≈ ~4.6 days at the same
+    /// cadence. Exhaustion is fail-closed in the signer (further `sign`
+    /// returns `Exhausted`); rotation is OPERATOR DUTY until XMSS^MT
+    /// (multi-tree) rotation exists, which the `xmss_vrf` module does NOT
+    /// implement. This slash path verifies whatever valid `h` the evidence
+    /// infers from its signature length — it never extends, resets, or
+    /// assumes a key lifetime.
+    ///
+    /// Eject WARNs ride along via `slash` (below-MIN eject / WARN-gap loud
+    /// logs), exactly like the downtime and vote-equivocation paths.
+    pub fn slash_xmss_equivocation_verified(
+        &mut self,
+        validator: ValidatorId,
+        evidence: &[u8],
+    ) -> Result<u64, StakingError> {
+        // 1. DoS cap first (cheap): honest proofs (32 B seeds, h <= 12) are
+        // ~5 KB; anything bigger is a probe, not evidence.
+        if evidence.len() > MAX_XMSS_EQUIVOCATION_EVIDENCE_BYTES {
+            tracing::warn!(
+                "xmss equivocation REFUSED (oversize {} > {}) for {}: refusing to slash",
+                evidence.len(),
+                MAX_XMSS_EQUIVOCATION_EVIDENCE_BYTES,
+                hex::encode(validator),
+            );
+            return Ok(0);
+        }
+        // 1b. Shape: canonical proof bytes (single-sign refusal records
+        // never parse here — they are attempt logs, not fraud proofs).
+        let parsed = match crate::xmss_vrf::parse_equivocation_evidence(evidence) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "xmss equivocation REFUSED (malformed evidence) for {}: refusing to slash",
+                    hex::encode(validator),
+                );
+                return Ok(0);
+            }
+        };
+        // 2. Binding: the proof's root IS the accused beacon key.
+        if parsed.root != validator {
+            tracing::warn!(
+                "xmss equivocation REFUSED (root mismatch — framing with another key's proof) for {}: refusing to slash",
+                hex::encode(validator),
+            );
+            return Ok(0);
+        }
+        // 1c. Signatures: infer h from the wire length (67*32 + h*32 pins
+        // it unambiguously), then re-verify BOTH legs through the module
+        // verifier. Forged/tampered legs burn 0.
+        if parsed.sig_a.len() != parsed.sig_b.len() {
+            tracing::warn!(
+                "xmss equivocation REFUSED (signature length mismatch) for {}: refusing to slash",
+                hex::encode(validator),
+            );
+            return Ok(0);
+        }
+        let height = match infer_xmss_height(parsed.sig_a.len()) {
+            Some(h) => h,
+            None => {
+                tracing::warn!(
+                    "xmss equivocation REFUSED (no valid tree height for sig length {}) for {}: refusing to slash",
+                    parsed.sig_a.len(),
+                    hex::encode(validator),
+                );
+                return Ok(0);
+            }
+        };
+        let rechecked = crate::xmss_vrf::verify_equivocation(
+            &parsed.root,
+            height,
+            parsed.epoch,
+            &parsed.seed_a,
+            &parsed.sig_a,
+            &parsed.seed_b,
+            &parsed.sig_b,
+        );
+        if rechecked.is_none() {
+            tracing::warn!(
+                "xmss equivocation REFUSED (signature does not verify) for {}: refusing to slash",
+                hex::encode(validator),
+            );
+            return Ok(0);
+        }
+        // 3. Membership.
+        if !self.validators.contains_key(&validator) {
+            return Err(StakingError::NotValidator);
+        }
+        // 4. Per-offense dedup — consume the key on first processing.
+        let key = xmss_equivocation_offense_key(
+            &validator,
+            parsed.epoch,
+            &parsed.seed_a,
+            &parsed.sig_a,
+            &parsed.seed_b,
+            &parsed.sig_b,
+        );
+        if self.equivocation_dedup.contains(&key) {
+            return Ok(0);
+        }
+        self.equivocation_dedup.insert(key);
+        // 5. Burn 5% (self-bond first, audited spillover).
+        let burned = self.slash(validator, EQUIVOCATION_SLASH_BPS)?;
+        if burned > 0 {
+            tracing::warn!(
+                "xmss equivocation SLASHED {} (5%): offender {} at epoch {}, burned {}",
+                hex::encode(validator),
+                hex::encode(validator),
+                parsed.epoch,
+                burned,
+            );
+        }
+        Ok(burned)
+    }
+
     /// Register or update a post-quantum public key and scheme for an active validator.
     pub fn register_pq_key(
         &mut self,
@@ -3866,6 +4084,128 @@ mod tests {
         );
         // Nothing moved anywhere.
         assert_eq!(l.total_stake(&offender), stell(2000));
+        assert_eq!(l.total_burned, 0);
+    }
+
+    /// Build a canonical XMSS equivocation proof for one `(master, epoch)`:
+    /// two signer instances (the API refuses the second sign on one
+    /// instance), one leaf each, combined through the sibling verifier.
+    /// Returns the beacon root (= the bonded validator id) and the proof.
+    fn xmss_proof(
+        height: u8,
+        master: [u8; 32],
+        epoch: u64,
+        seed_a: &[u8],
+        seed_b: &[u8],
+    ) -> (ValidatorId, Vec<u8>) {
+        use crate::xmss_vrf::{verify_equivocation, XmssVrf};
+        let mut a = XmssVrf::new(master, height).unwrap();
+        let mut b = XmssVrf::new(master, height).unwrap();
+        let (_, sig_a) = a.sign(epoch, seed_a).unwrap();
+        let (_, sig_b) = b.sign(epoch, seed_b).unwrap();
+        let root = a.root();
+        assert_eq!(root, b.root());
+        let ev = verify_equivocation(
+            &root,
+            height,
+            epoch,
+            seed_a,
+            &sig_a.to_bytes(),
+            seed_b,
+            &sig_b.to_bytes(),
+        )
+        .expect("two valid same-leaf sigs are an equivocation proof");
+        (root, ev)
+    }
+
+    #[test]
+    fn xmss_equivocation_burns_five_percent_self_first() {
+        let mut l = StakingLedger::new();
+        let (offender, ev) = xmss_proof(2, [21u8; 32], 0, b"seed-A", b"seed-B");
+        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
+        let before = l.validators[&offender].self_bond;
+        let burned = l.slash_xmss_equivocation_verified(offender, &ev).unwrap();
+        assert_eq!(burned, stell(100), "5% of 2000 STELL");
+        assert_eq!(l.validators[&offender].self_bond, before - burned);
+        assert_eq!(l.validators[&offender].total_slashed, burned);
+        assert_eq!(l.total_burned, burned);
+        // Replay of the same offense burns 0, stake untouched.
+        assert_eq!(l.slash_xmss_equivocation_verified(offender, &ev).unwrap(), 0);
+        assert_eq!(l.total_burned, burned);
+        assert_eq!(l.total_stake(&offender), stell(2000) - burned);
+    }
+
+    #[test]
+    fn xmss_equivocation_refuses_forgeries_fail_closed() {
+        let mut l = StakingLedger::new();
+        let (offender, ev) = xmss_proof(2, [22u8; 32], 0, b"seed-A", b"seed-B");
+        l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
+            .unwrap();
+        // Tampered tail (inside sig_b): parses but never re-verifies.
+        let mut tampered = ev.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        assert_eq!(
+            l.slash_xmss_equivocation_verified(offender, &tampered)
+                .unwrap(),
+            0
+        );
+        // Garbage and truncation never parse.
+        assert_eq!(
+            l.slash_xmss_equivocation_verified(offender, b"junk")
+                .unwrap(),
+            0
+        );
+        let mut truncated = ev.clone();
+        truncated.pop();
+        assert_eq!(
+            l.slash_xmss_equivocation_verified(offender, &truncated)
+                .unwrap(),
+            0
+        );
+        // Framing with another key's proof burns nothing (root mismatch).
+        assert_eq!(
+            l.slash_xmss_equivocation_verified(vid(9), &ev).unwrap(),
+            0
+        );
+        // Nothing moved anywhere.
+        assert_eq!(l.total_stake(&offender), stell(2000));
+        assert_eq!(l.total_burned, 0);
+    }
+
+    #[test]
+    fn xmss_single_sign_is_never_slashable() {
+        use crate::xmss_vrf::{XmssError, XmssVrf};
+        let mut l = StakingLedger::new();
+        let mut signer = XmssVrf::new([23u8; 32], 2).unwrap();
+        let root = signer.root();
+        l.bond(root, stell(2000), DEFAULT_COMMISSION_BPS).unwrap();
+        let _ = signer.sign(0, b"only-seed").unwrap();
+        // The API refuses the second sign with attempt-record bytes (NOT a
+        // fraud proof): feeding them must burn 0.
+        let refusal = match signer.sign(0, b"second") {
+            Err(XmssError::LeafReuse { evidence, .. }) => evidence,
+            other => panic!("double-sign must be LeafReuse, got {other:?}"),
+        };
+        assert_eq!(
+            l.slash_xmss_equivocation_verified(root, &refusal).unwrap(),
+            0
+        );
+        // Nothing moved anywhere.
+        assert_eq!(l.total_stake(&root), stell(2000));
+        assert_eq!(l.total_burned, 0);
+    }
+
+    #[test]
+    fn xmss_equivocation_unknown_validator_is_not_validator() {
+        let mut l = StakingLedger::new();
+        let (outsider, ev) = xmss_proof(2, [24u8; 32], 0, b"seed-A", b"seed-B");
+        // Valid proof, but the root was never bonded: membership fails.
+        assert_eq!(
+            l.slash_xmss_equivocation_verified(outsider, &ev),
+            Err(StakingError::NotValidator)
+        );
         assert_eq!(l.total_burned, 0);
     }
 
@@ -5267,13 +5607,22 @@ mod tests {
     }
 
     /// Build two conflicting bodies for one height, both signed by `sk`.
+    /// Falconize: Ed-only refuses `verify_proposer_signature`, so each body
+    /// carries the runtime-style `(falcon_id, falcon_sig)` half (mirroring
+    /// `runtime.rs` pushes) under a key registered for the proposer's Ed id.
     fn proposal_pair(
         sk: &SigningKey,
+        fk: &crate::post_quantum::FalconKeypair,
         height: u64,
         t1: u64,
         t2: u64,
     ) -> crate::consensus::ProposalEquivocationEvidence {
         use crate::consensus::ProposalEquivocationEvidence;
+        crate::consensus::register_validator_pq_key(
+            sk.verifying_key().to_bytes(),
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
         let mk = |ts: u64| {
             let mut b = crate::sharding::Block {
                 height,
@@ -5282,6 +5631,10 @@ mod tests {
                 ..Default::default()
             };
             b.sign_block(sk);
+            let hash = b.compute_hash();
+            let falcon_id = fk.validator_id();
+            let falcon_sig = fk.sign(&hash);
+            b.validator_signatures.push((falcon_id, falcon_sig));
             b
         };
         ProposalEquivocationEvidence::new(sk.verifying_key().to_bytes(), mk(t1), mk(t2))
@@ -5294,7 +5647,8 @@ mod tests {
         let offender = sk.verifying_key().to_bytes();
         l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
             .unwrap();
-        let ev = proposal_pair(&sk, 5, 1_000, 2_000);
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xD1);
+        let ev = proposal_pair(&sk, &fk, 5, 1_000, 2_000);
         assert_ne!(
             ev.block_a.compute_hash(),
             ev.block_b.compute_hash(),
@@ -5315,7 +5669,8 @@ mod tests {
         let offender = sk.verifying_key().to_bytes();
         l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
             .unwrap();
-        let ev = proposal_pair(&sk, 5, 1_000, 2_000);
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xD2);
+        let ev = proposal_pair(&sk, &fk, 5, 1_000, 2_000);
         let first = l.slash_proposal_equivocation_verified(&ev).unwrap();
         assert!(first > 0);
         // Same pair again, and blocks-swapped: both burn 0, stake untouched.
@@ -5329,7 +5684,7 @@ mod tests {
         assert_eq!(l.total_burned, first);
         assert_eq!(l.total_stake(&offender), stell(2000) - first);
         // A DISTINCT conflicting pair at the same height is a new offense.
-        let fresh = proposal_pair(&sk, 5, 3_000, 4_000);
+        let fresh = proposal_pair(&sk, &fk, 5, 3_000, 4_000);
         let second = l.slash_proposal_equivocation_verified(&fresh).unwrap();
         assert!(second > 0, "distinct conflicting pair is a new offense");
         assert_eq!(l.total_burned, first + second);
@@ -5342,11 +5697,18 @@ mod tests {
         let offender = sk.verifying_key().to_bytes();
         l.bond(offender, stell(2000), DEFAULT_COMMISSION_BPS)
             .unwrap();
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xD3);
         // Same block twice burns nothing (single proposal repeated).
-        let same = proposal_pair(&sk, 5, 1_000, 1_000);
+        let same = proposal_pair(&sk, &fk, 5, 1_000, 1_000);
         assert_eq!(l.slash_proposal_equivocation_verified(&same).unwrap(), 0);
         // Framing with another key's block burns nothing.
         let other = SigningKey::generate(&mut OsRng);
+        let other_fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xD4);
+        crate::consensus::register_validator_pq_key(
+            other.verifying_key().to_bytes(),
+            crate::post_quantum::PqScheme::Falcon512,
+            other_fk.public_key.clone(),
+        );
         let mut ob = crate::sharding::Block {
             height: 5,
             proposer: other.verifying_key().to_bytes(),
@@ -5354,19 +5716,35 @@ mod tests {
             ..Default::default()
         };
         ob.sign_block(&other);
+        {
+            let hash = ob.compute_hash();
+            let falcon_id = other_fk.validator_id();
+            let falcon_sig = other_fk.sign(&hash);
+            ob.validator_signatures.push((falcon_id, falcon_sig));
+        }
         let framed = crate::consensus::ProposalEquivocationEvidence::new(
             offender,
-            proposal_pair(&sk, 5, 1_000, 2_000).block_a.clone(),
+            proposal_pair(&sk, &fk, 5, 1_000, 2_000).block_a.clone(),
             ob,
         );
         assert_eq!(l.slash_proposal_equivocation_verified(&framed).unwrap(), 0);
-        // Forged signature burns nothing.
-        let mut forged = proposal_pair(&sk, 5, 1_000, 2_000);
-        forged.block_b.validator_signatures[0].1[0] ^= 0xFF;
+        // Forged signature burns nothing (flip the Falcon half: the Ed half
+        // is not what `verify_proposer_signature` checks).
+        let mut forged = proposal_pair(&sk, &fk, 5, 1_000, 2_000);
+        forged.block_b.validator_signatures.last_mut().unwrap().1[0] ^= 0xFF;
         assert_eq!(l.slash_proposal_equivocation_verified(&forged).unwrap(), 0);
         // Unknown proposer errors (transition maps to skip-and-log).
+        // Falconize the outsider pair too: with valid signatures the
+        // refusal lands on membership (`NotValidator`), not on the
+        // signature gate (`Ok(0)`).
         let outsider = SigningKey::generate(&mut OsRng);
         let oid = outsider.verifying_key().to_bytes();
+        let outsider_fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xD5);
+        crate::consensus::register_validator_pq_key(
+            oid,
+            crate::post_quantum::PqScheme::Falcon512,
+            outsider_fk.public_key.clone(),
+        );
         let oev = crate::consensus::ProposalEquivocationEvidence::new(
             oid,
             {
@@ -5377,6 +5755,10 @@ mod tests {
                     ..Default::default()
                 };
                 b.sign_block(&outsider);
+                let hash = b.compute_hash();
+                let falcon_id = outsider_fk.validator_id();
+                let falcon_sig = outsider_fk.sign(&hash);
+                b.validator_signatures.push((falcon_id, falcon_sig));
                 b
             },
             {
@@ -5387,6 +5769,10 @@ mod tests {
                     ..Default::default()
                 };
                 b.sign_block(&outsider);
+                let hash = b.compute_hash();
+                let falcon_id = outsider_fk.validator_id();
+                let falcon_sig = outsider_fk.sign(&hash);
+                b.validator_signatures.push((falcon_id, falcon_sig));
                 b
             },
         );

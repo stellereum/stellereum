@@ -929,6 +929,21 @@ pub async fn join_with_timeout<T: Send + 'static>(
     }
 }
 
+/// Record one ANSWERED ping-probe round trip as a per-peer latency sample.
+///
+/// CALIBRATION FEED (workspace-root `STELLEREUM_BLOCKCHAIN_FIXES.md` §2.12):
+/// the `stell_peer_latency_seconds{peer}` samples the calibration runbooks
+/// read for the network-delay side. `peer_hex` is the hex peer id (already
+/// label-safe; the registry sanitises regardless) and `elapsed` the measured
+/// `core.ping` round trip. Called on probe success ONLY: a timeout has no
+/// RTT to report and a fast error proves liveness, not speed, so both emit
+/// nothing (absent data, never a zero). Emission only: the sample never
+/// affects peer selection, backoff or eviction, and when metrics are
+/// disabled (nothing scrapes the registry) this is a plain no-op write.
+fn record_probe_rtt(peer_hex: &str, elapsed: Duration) {
+    crate::metrics::global().observe_peer_latency(peer_hex, elapsed.as_secs_f64());
+}
+
 impl ConsensusNetwork {
     pub fn new(adapter: Arc<P2pNetworkAdapter>) -> Self {
         // Epoch-scoped: the adapter knows the chain it belongs to, so the topic is
@@ -1239,6 +1254,12 @@ impl ConsensusNetwork {
                 Ok(Ok(_)) => {
                     let fails_before = self.peer_record(pid, true);
                     self.probe_timeout_clear(&pid);
+                    // EMISSION ONLY (calibration feed, FIXES.md §2.12 peer-
+                    // latency series): the just-measured `core.ping` round
+                    // trip for this peer. Success arm only — see
+                    // `record_probe_rtt`. Never affects the health/backoff
+                    // verdicts below, which are computed independently.
+                    record_probe_rtt(&hex::encode(pid), t.elapsed());
                     if fails_before >= PEER_SKIP_THRESHOLD {
                         // Recovery already logged its one loud line inside
                         // `record_health`; keep this attempt quiet.
@@ -3036,6 +3057,44 @@ mod tests {
     }
 
     #[test]
+    fn probe_rtt_emission_populates_latency_series() {
+        // HDAE calibration-emission: an answered ping probe populates
+        // `stell_peer_latency_seconds{peer}` with the measured RTT
+        // (workspace-root FIXES.md §2.12 latency side).
+        //
+        // The process-global registry is shared with every concurrently
+        // running test, so exact count/sum assertions need a series nobody
+        // else writes: this peer label is unique to this test.
+        let peer = "hdae-cal-probe-rtt";
+        record_probe_rtt(peer, Duration::from_millis(25));
+        let text = crate::metrics::global().render();
+
+        // Emit -> scrape -> assert present with sane values.
+        let count_line = format!("stell_peer_latency_seconds_count{{peer=\"{peer}\"}} 1");
+        assert!(
+            text.contains(&count_line),
+            "exactly one latency sample for this peer:\n{text}"
+        );
+        let sum: f64 = text
+            .lines()
+            .find(|l| l.starts_with(&format!("stell_peer_latency_seconds_sum{{peer=\"{peer}\"}}")))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+            .expect("latency _sum sample must be present");
+        assert!(
+            (sum - 0.025).abs() < 1e-12,
+            "25ms probe must sum to 0.025s, got {sum}"
+        );
+        // The +Inf bucket is the total: the sample landed in the histogram.
+        let inf_line =
+            format!("stell_peer_latency_seconds_bucket{{le=\"+Inf\",peer=\"{peer}\"}} 1");
+        assert!(
+            text.contains(&inf_line),
+            "+Inf bucket must equal the observation count:\n{text}"
+        );
+    }
+
+    #[test]
     fn peer_cooldown_skips_only_inside_the_window() {
         use std::time::{Duration, Instant};
         let now = Instant::now();
@@ -3858,7 +3917,23 @@ mod tests {
         validators.validators.insert(proposer, 100);
         let mut block = sample_block();
         block.proposer = proposer;
+        // Falconize: Ed-only refuses `verify_proposer_signature` (no
+        // classical fallback); mirror the runtime proposal path
+        // (`runtime.rs` pushes `(self.id, ed_sig)` + `(falcon_id,
+        // falcon_sig)`) so the genuine member verifies.
+        let fk = crate::consensus::FalconKeypair::generate_from_seed(0xC1);
+        crate::consensus::register_validator_pq_key(
+            proposer,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
         block.sign_block(&sk);
+        {
+            let hash = block.compute_hash();
+            let falcon_id = fk.validator_id();
+            let falcon_sig = fk.sign(&hash);
+            block.validator_signatures.push((falcon_id, falcon_sig));
+        }
         assert!(
             proposal_hint_admissible(&block, &validators),
             "a genuine member proposal must plant the hint"
@@ -3874,7 +3949,21 @@ mod tests {
         let outsider_sk = SigningKey::generate(&mut OsRng);
         let mut outsider = sample_block();
         outsider.proposer = outsider_sk.verifying_key().to_bytes();
+        // Falconize the outsider too (valid signature, still no stake):
+        // membership — not signature shape — must be the refusal reason.
+        let outsider_fk = crate::consensus::FalconKeypair::generate_from_seed(0xC2);
+        crate::consensus::register_validator_pq_key(
+            outsider.proposer,
+            crate::post_quantum::PqScheme::Falcon512,
+            outsider_fk.public_key.clone(),
+        );
         outsider.sign_block(&outsider_sk);
+        {
+            let hash = outsider.compute_hash();
+            let falcon_id = outsider_fk.validator_id();
+            let falcon_sig = outsider_fk.sign(&hash);
+            outsider.validator_signatures.push((falcon_id, falcon_sig));
+        }
         assert!(
             !proposal_hint_admissible(&outsider, &validators),
             "a non-member proposal must not plant a hint"
@@ -3913,12 +4002,39 @@ mod tests {
         validators.validators.insert(proposer, 100);
         let mut block = sample_block();
         block.proposer = proposer;
+        // Falconize (same envelope as the G1 test above): Ed-only refuses
+        // `verify_proposer_signature`, so the genuine member carries the
+        // runtime-style `(falcon_id, falcon_sig)` half.
+        let fk = crate::consensus::FalconKeypair::generate_from_seed(0xC3);
+        crate::consensus::register_validator_pq_key(
+            proposer,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
         block.sign_block(&sk);
+        {
+            let hash = block.compute_hash();
+            let falcon_id = fk.validator_id();
+            let falcon_sig = fk.sign(&hash);
+            block.validator_signatures.push((falcon_id, falcon_sig));
+        }
         assert!(proposal_hint_admissible(&block, &validators));
         let outsider_sk = SigningKey::generate(&mut OsRng);
         let mut outsider = sample_block();
         outsider.proposer = outsider_sk.verifying_key().to_bytes();
+        let outsider_fk = crate::consensus::FalconKeypair::generate_from_seed(0xC4);
+        crate::consensus::register_validator_pq_key(
+            outsider.proposer,
+            crate::post_quantum::PqScheme::Falcon512,
+            outsider_fk.public_key.clone(),
+        );
         outsider.sign_block(&outsider_sk);
+        {
+            let hash = outsider.compute_hash();
+            let falcon_id = outsider_fk.validator_id();
+            let falcon_sig = outsider_fk.sign(&hash);
+            outsider.validator_signatures.push((falcon_id, falcon_sig));
+        }
         assert!(!proposal_hint_admissible(&outsider, &validators));
         // Bookend G5: stored oracle bytes are re-verified on the way out —
         // under FULL-PQ every classical feed reads as a miss (no PQ feed

@@ -5548,6 +5548,14 @@ impl ValidatorRuntime {
         // counter be updated for EVERY verified vote - accepted or not -
         // without also chasing on votes the caller has already accounted for.
         self.hc.note_peer_round(vote.voter, vote.round);
+        // EMISSION ONLY (calibration feed, FIXES.md §2.12 `q = 1 − p̂ − λ̂`):
+        // one vote counted per verified same-height member vote, by kind, on
+        // the process-global registry. Unverified, non-member and
+        // wrong-height votes return false above and never reach this line, so
+        // forged traffic cannot inflate the series. This statement cannot
+        // affect consensus: it neither reads nor writes any engine state and
+        // the return value below is unchanged.
+        crate::metrics::global().inc_vote(crate::metrics::VoteKind::from(vote.kind));
         true
     }
 
@@ -6405,6 +6413,14 @@ impl ValidatorRuntime {
         // candidate branch it superseded is pruned (and signalled).
         self.note_finalized_block(block);
         // Any finalize is progress: the deadlock breaker measures silence.
+        // EMISSION ONLY (calibration feed, FIXES.md §2.12 block-interval
+        // series): wall-clock seconds since the previous finalization
+        // progress stamp — the sequenced worker path's live-commit cadence
+        // (mirrors the inline `try_finalize` emission; exactly one of the two
+        // fires per commit). Read BEFORE the stamp below is reset; on the
+        // process-global registry; never feeds back into any decision.
+        crate::metrics::global()
+            .observe_block_interval(self.last_progress_at.elapsed().as_secs_f64());
         self.last_progress_at = std::time::Instant::now();
         // C1 anchor: every finalized block (live, replayed, adopted) feeds
         // the process-shared header registry its own and sibling shards read.
@@ -6613,6 +6629,13 @@ impl ValidatorRuntime {
         // The block is final: it anchors the fork-choice tree, and every
         // candidate branch it superseded is pruned (and signalled).
         self.note_finalized_block(&block);
+        // EMISSION ONLY (calibration feed, FIXES.md §2.12 block-interval
+        // series): wall-clock seconds since the previous finalization
+        // progress stamp — the node's observed live-commit cadence. Read
+        // BEFORE the stamp below is reset; on the process-global registry;
+        // never feeds back into any finalize/apply decision.
+        crate::metrics::global()
+            .observe_block_interval(self.last_progress_at.elapsed().as_secs_f64());
         self.last_progress_at = std::time::Instant::now();
         self.note_finalized_header(&block).await;
         self.note_light_anchor(&block);
@@ -8814,7 +8837,11 @@ mod tests {
         let validators = ValidatorSet::from_list(vec![(me, 1), (peer, 1)]);
         let st = Arc::new(InMemoryStateEngine::new());
         st.update_account(AccountState::new(me, 100_000_000)).await;
-        let mut rt = ValidatorRuntime::new(valkey.clone(), validators, st, 1);
+        // Falconize the proposer: production `propose` pushes BOTH halves,
+        // and serve-time re-validation refuses Ed-only blocks.
+        let fk = FalconKeypair::generate_from_seed(0xB1);
+        let mut rt =
+            ValidatorRuntime::new(valkey.clone(), validators, st, 1).with_falcon_key(fk);
         while rt.hc.proposer() != Some(me) {
             rt.next_round();
         }
@@ -9313,6 +9340,170 @@ mod tests {
                 "must not finalize without quorum"
             );
         }
+    }
+
+    /// Unlabeled `stell_block_interval_seconds_count` sample from a scrape.
+    fn block_interval_count(text: &str) -> f64 {
+        text.lines()
+            .find(|l| l.starts_with("stell_block_interval_seconds_count "))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .expect("block-interval _count sample must be present")
+    }
+
+    /// HDAE calibration-emission: every verified ingested vote and every live
+    /// commit populates its series (workspace-root FIXES.md §2.12), forged
+    /// votes emit nothing, and consensus decisions are unchanged.
+    ///
+    /// Thresholds/logic untouched: this drives the production paths
+    /// (`on_prevote` / `on_precommit` / `try_finalize`) and asserts on the
+    /// scraped registry only. Counter/histogram deltas use `>=` because the
+    /// process-global registry is shared with concurrently running tests and
+    /// every series here is add-only (monotone), so a concurrent test can
+    /// only raise a delta, never lower one.
+    #[tokio::test]
+    async fn metrics_vote_ingest_and_commit_interval_populate() {
+        // Cold (metrics-disabled equivalent): a fresh registry declares the
+        // families but carries no samples — scraping a disabled/unwired node
+        // is a safe no-op, never an error and never phantom data.
+        let cold = crate::metrics::Registry::shared().render();
+        assert!(cold.contains("stell_consensus_votes_total{kind=\"prevote\"} 0"));
+        assert!(cold.contains("stell_consensus_votes_total{kind=\"precommit\"} 0"));
+        assert!(cold.contains("stell_block_interval_seconds_count 0"));
+        assert!(cold.contains("# TYPE stell_peer_latency_seconds histogram"));
+        assert!(
+            !cold.contains("stell_peer_latency_seconds_count"),
+            "no peer series before any probe"
+        );
+
+        let g = crate::metrics::global();
+        let snap_before = g.snapshot();
+        let count_before = block_interval_count(&g.render());
+
+        // 4 validators, quorum 3. Falcon-keyed cluster: classical fixtures
+        // are refused by admission now.
+        let val_keys = signer_keys(4);
+        const USER_SEED: u8 = 0xB3;
+        let mut states = Vec::new();
+        for _ in &val_keys {
+            states.push(pq_funded_state(USER_SEED, 10_000_000).await);
+        }
+        let mut cluster = falcon_cluster(&val_keys, states, 0xE0);
+
+        let tx = pq_tx(USER_SEED, [9u8; 32], 500, 0, 0);
+        cluster.broadcast_tx(tx).await;
+
+        let proposer_idx = cluster.nodes.iter().position(|n| n.is_proposer()).unwrap();
+        let block = cluster.nodes[proposer_idx].propose(1_000).await.unwrap();
+        let bh = block.compute_hash();
+        let proposer_id = cluster.nodes[proposer_idx].id;
+        for (i, n) in cluster.nodes.iter_mut().enumerate() {
+            if i != proposer_idx {
+                let r = n.hc.round;
+                n.on_proposal(proposer_id, block.clone(), r).await.unwrap();
+            }
+        }
+        // 3-of-4 quorum votes fanned out to every node: 3 x 4 ingest events
+        // per kind, all verified member votes at the same height.
+        let prevotes: Vec<Vote> = cluster
+            .nodes
+            .iter()
+            .take(3)
+            .filter_map(|n| n.make_prevote())
+            .collect();
+        assert_eq!(prevotes.len(), 3);
+        for v in &prevotes {
+            for n in cluster.nodes.iter_mut() {
+                let _ = n.on_prevote(v.clone());
+            }
+        }
+        let precommits: Vec<Vote> = cluster
+            .nodes
+            .iter_mut()
+            .take(3)
+            .filter_map(|n| n.make_precommit())
+            .collect();
+        assert_eq!(precommits.len(), 3);
+        for v in &precommits {
+            for n in cluster.nodes.iter_mut() {
+                let _ = n.on_precommit(v.clone());
+            }
+        }
+
+        // Emit -> scrape -> assert: both vote series present with sane values.
+        let snap_after_votes = g.snapshot();
+        assert!(
+            snap_after_votes.votes_prevote - snap_before.votes_prevote >= 12.0,
+            "each fanned-out prevote must be counted: {} -> {}",
+            snap_before.votes_prevote,
+            snap_after_votes.votes_prevote
+        );
+        assert!(
+            snap_after_votes.votes_precommit - snap_before.votes_precommit >= 12.0,
+            "each fanned-out precommit must be counted: {} -> {}",
+            snap_before.votes_precommit,
+            snap_after_votes.votes_precommit
+        );
+        let text = g.render();
+        assert!(
+            text.contains("stell_consensus_votes_total{kind=\"prevote\"}"),
+            "prevote series missing:\n{text}"
+        );
+        assert!(
+            text.contains("stell_consensus_votes_total{kind=\"precommit\"}"),
+            "precommit series missing:\n{text}"
+        );
+
+        // Forged votes are a metrics no-op: tampered signature and non-member
+        // voter both fail verification, so `observe_peer_vote` returns false
+        // and control never reaches the emission line behind the gate.
+        // (No global-counter assertions: the registry is shared with other
+        // tests, so exact-zero is not assertable — the load-bearing gate is
+        // the verified==false return pinned here.)
+        let mut forged = prevotes[0].clone();
+        assert!(!forged.signature.is_empty());
+        forged.signature[0] ^= 0xFF;
+        assert!(
+            !cluster.nodes[0].observe_peer_vote(&forged),
+            "tampered vote must not verify, hence never emit"
+        );
+        let outsider = SigningKey::generate(&mut OsRng);
+        let height = cluster.nodes[0].hc.height;
+        let round = cluster.nodes[0].hc.round;
+        let alien = crate::consensus::Vote::sign(
+            &outsider,
+            height,
+            round,
+            crate::consensus::VoteKind::Prevote,
+            None,
+        );
+        assert!(
+            !cluster.nodes[0].observe_peer_vote(&alien),
+            "non-member vote must not count, hence never emit"
+        );
+
+        // Commit on 3 nodes: the decision itself proves metrics did not affect
+        // consensus, and the interval series must advance once per commit.
+        let mut finalized_count = 0;
+        for n in cluster.nodes.iter_mut().take(3) {
+            if n.try_finalize().await == Some(bh) {
+                finalized_count += 1;
+            }
+        }
+        assert_eq!(
+            finalized_count, 3,
+            "quorum must finalize (emission must not affect consensus)"
+        );
+        let text = g.render();
+        let count_after = block_interval_count(&text);
+        assert!(
+            count_after - count_before >= 3.0,
+            "one interval sample per live commit: {count_before} -> {count_after}"
+        );
+        assert!(
+            text.contains("stell_block_interval_seconds_bucket"),
+            "interval buckets missing:\n{text}"
+        );
     }
 
     #[tokio::test]
@@ -10364,12 +10555,15 @@ mod tests {
         let st = funded_state(me).await;
         let mut rt = ValidatorRuntime::new(ks[0].clone(), vs.clone(), st, 1);
 
+        let fks = falcon_for_keys(&ks, 0xA0);
         let make_block = |round: Round, root: [u8; 32]| -> Block {
             let proposer = vs.proposer_for(1, round).unwrap();
-            let pk = ks
+            let idx = ks
                 .iter()
-                .find(|k| k.verifying_key().to_bytes() == proposer)
+                .position(|k| k.verifying_key().to_bytes() == proposer)
                 .unwrap();
+            let pk = &ks[idx];
+            let fk = &fks[idx];
             let mut b = Block {
                 shard_id: MASTERCHAIN_SHARD,
                 height: 1,
@@ -10388,10 +10582,18 @@ mod tests {
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             };
             b.sign_block(pk);
+            // Falconize: the proposer half under the derived Falcon address
+            // (registered for this Ed id by `falcon_for_keys` above),
+            // mirroring the runtime proposal path.
+            {
+                let hash = b.compute_hash();
+                let falcon_id = fk.validator_id();
+                let falcon_sig = fk.sign(&hash);
+                b.validator_signatures.push((falcon_id, falcon_sig));
+            }
             b
         };
 
-        let fks = falcon_for_keys(&ks, 0xA0);
         let make_qc = |round: Round, bh: BlockHash| -> crate::consensus::QuorumCertificate {
             // FULL-PQ: the certificate is a Falcon µQC compiled from genuine
             // votes (a classical `Vote::sign` QC fails `verify` before the
@@ -11062,9 +11264,13 @@ mod shard_header_commitment_tests {
         let hdrs: Arc<std::sync::RwLock<FinalizedHeaderRegistry>> =
             Arc::new(std::sync::RwLock::new(FinalizedHeaderRegistry::default()));
 
+        // Falconize the proposer: production `propose` pushes BOTH halves,
+        // and `validate_proposal` refuses Ed-only blocks.
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xC7);
         let mut rt = ValidatorRuntime::new(key.clone(), validators, state, 1)
             .with_shard(MASTERCHAIN_SHARD, shard_registry)
-            .with_finalized_headers(hdrs.clone());
+            .with_finalized_headers(hdrs.clone())
+            .with_falcon_key(fk.clone());
 
         let shard_block = workchain_block(7, [0x22; 32]);
         {
@@ -11091,6 +11297,13 @@ mod shard_header_commitment_tests {
         forged.shard_headers[0].state_root = [0x99; 32];
         forged.validator_signatures.clear();
         forged.sign_block(&key);
+        // Falconize the re-signed body (same envelope as `propose`).
+        {
+            let hash = forged.compute_hash();
+            let falcon_id = fk.validator_id();
+            let falcon_sig = fk.sign(&hash);
+            forged.validator_signatures.push((falcon_id, falcon_sig));
+        }
         let err = rt
             .validate_proposal(&forged, root)
             .expect_err("a contradicting shard head must be refused");
@@ -11115,6 +11328,13 @@ mod shard_header_commitment_tests {
         });
         unsorted.validator_signatures.clear();
         unsorted.sign_block(&key);
+        // Falconize the re-signed body (same envelope as `propose`).
+        {
+            let hash = unsorted.compute_hash();
+            let falcon_id = fk.validator_id();
+            let falcon_sig = fk.sign(&hash);
+            unsorted.validator_signatures.push((falcon_id, falcon_sig));
+        }
         let err = rt
             .validate_proposal(&unsorted, root)
             .expect_err("a non-canonical shard head set must be refused");
@@ -11383,6 +11603,10 @@ mod shard_header_commitment_tests {
         const TS: u64 = 1_700_000_002;
         let key = SigningKey::generate(&mut OsRng);
         let (mut rt, me) = vel1_runtime_with_pool(&key, 6).await;
+        // Falconize the proposer: production `propose` pushes BOTH halves,
+        // and `validate_proposal_unaligned` refuses Ed-only blocks.
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xC8);
+        rt = rt.with_falcon_key(fk);
         let h = rt.hc.height;
         rt.prebuild_next_proposal(TS).await;
         assert!(rt.has_prebuild_for(h));

@@ -3677,6 +3677,47 @@ mod tests {
         )
     }
 
+    /// Falcon-carrying variant of [`signed_proposal_evidence`] for the
+    /// happy-path carrier test: Ed-only refuses
+    /// `verify_proposer_signature` (no classical fallback), so both bodies
+    /// carry the runtime-style `(falcon_id, falcon_sig)` half (mirroring
+    /// `runtime.rs` pushes) under a key registered for the proposer's Ed id.
+    /// The shared Ed-only helper above stays untouched for the fail-closed
+    /// rejection tests (they expect `Reverted`, which an unverified envelope
+    /// already yields).
+    fn signed_proposal_evidence_falcon(
+        sk: &ed25519_dalek::SigningKey,
+        fk: &crate::post_quantum::FalconKeypair,
+        height: u64,
+        t1: u64,
+        t2: u64,
+    ) -> crate::consensus::ProposalEquivocationEvidence {
+        crate::consensus::register_validator_pq_key(
+            sk.verifying_key().to_bytes(),
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+        let mk = |ts: u64| {
+            let mut b = crate::sharding::Block {
+                height,
+                proposer: sk.verifying_key().to_bytes(),
+                timestamp: ts,
+                ..Default::default()
+            };
+            b.sign_block(sk);
+            let hash = b.compute_hash();
+            let falcon_id = fk.validator_id();
+            let falcon_sig = fk.sign(&hash);
+            b.validator_signatures.push((falcon_id, falcon_sig));
+            b
+        };
+        crate::consensus::ProposalEquivocationEvidence::new(
+            sk.verifying_key().to_bytes(),
+            mk(t1),
+            mk(t2),
+        )
+    }
+
     /// THE HAPPY PATH: a valid proposal evidence is ACCEPTED by the carrier
     /// (stack 1) and moves NOTHING — no coins, no ledger state. The slash
     /// itself fires at the block step, which re-verifies from block bytes;
@@ -3692,7 +3733,8 @@ mod tests {
         ledger.bond(proposer, 1_100 * NANO, 0).unwrap();
         let before = ledger.validators[&proposer].self_bond;
 
-        let evidence = signed_proposal_evidence(&sk, 9, 1_000, 2_000);
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xE1);
+        let evidence = signed_proposal_evidence_falcon(&sk, &fk, 9, 1_000, 2_000);
         assert_ne!(
             evidence.block_a.compute_hash(),
             evidence.block_b.compute_hash(),

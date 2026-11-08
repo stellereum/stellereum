@@ -10404,6 +10404,21 @@ mod gossip_batch_tests {
         use stellereum::sharding::MASTERCHAIN_SHARD;
         let ks: Vec<SigningKey> = (0..2).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let id = |k: &SigningKey| k.verifying_key().to_bytes();
+        // FULL-PQ: votes and proposals verify Falcon-only — register
+        // deterministic Falcon companions (voter identities stay Ed).
+        let fks: Vec<stellereum::post_quantum::FalconKeypair> = ks
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let fk = stellereum::post_quantum::FalconKeypair::generate_from_seed(i as u8);
+                stellereum::consensus::register_validator_pq_key(
+                    id(k),
+                    stellereum::post_quantum::PqScheme::Falcon512,
+                    fk.public_key.clone(),
+                );
+                fk
+            })
+            .collect();
         let vset = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
         let state = Arc::new(InMemoryStateEngine::new());
         fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
@@ -10429,8 +10444,9 @@ mod gossip_batch_tests {
             order_merkle_root: [0u8; 32],
             epoch_key_commitment: [0u8; 32],
         };
-        block.sign_block(&ks[1]);
-        let peer_vote = Vote::sign(&ks[1], rt.hc.height, r, VoteKind::Prevote, None);
+        block.sign_block_with_falcon(&ks[1], &fks[1]);
+        let peer_vote =
+            Vote::sign_with_falcon(&ks[1], &fks[1], rt.hc.height, r, VoteKind::Prevote, None);
         let batch = ConsensusMsg::Batch(vec![
             ConsensusMsg::Vote {
                 vote: peer_vote,

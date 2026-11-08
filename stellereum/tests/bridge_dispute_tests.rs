@@ -9,11 +9,13 @@
 //! truth gate). Every test below runs through `apply_block_transition`, the
 //! same entry point consensus uses — no direct `plan()` calls.
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use stellereum::bridge::{
     bridge_adapters::DepositEvidence, BridgeIntent, SupportedChain, TeleportBridgeEngine,
     CHALLENGE_BOND_NANO, DISPUTE_WINDOW_SECS,
 };
+use stellereum::consensus::register_validator_pq_key;
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::InMemoryStateEngine;
@@ -26,6 +28,27 @@ const STELL: u64 = 1_000_000_000;
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
+}
+
+/// Deterministic Falcon-512 companion for an Ed-identity fixture key (FIXES
+/// §1.1: the bridge quorum counts REGISTERED Falcon keys; the `[u8; 32]` id
+/// is Ed identity only). Derived from the Ed secret bytes, so every test
+/// registering the same fixture id converges on the same Falcon key.
+fn falcon_for(sk: &SigningKey) -> FalconKeypair {
+    FalconKeypair::generate_from_seed_bytes(&sk.to_bytes())
+}
+
+fn register_falcon(sk: &SigningKey) {
+    let fk = falcon_for(sk);
+    register_validator_pq_key(
+        sk.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+}
+
+fn falcon_sig(sk: &SigningKey, msg: &[u8]) -> ([u8; 32], Vec<u8>) {
+    (sk.verifying_key().to_bytes(), falcon_for(sk).sign(msg))
 }
 
 async fn balance(e: &InMemoryStateEngine, addr: &[u8; 32]) -> u64 {
@@ -46,6 +69,9 @@ async fn setup(n: usize) -> (InMemoryStateEngine, Vec<SigningKey>) {
             .await
             .bond(pk, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
             .expect("bond it into the committed ledger");
+        // FIXES §1.1: the committed Ed identity carries a registered
+        // Falcon-512 key the bridge quorum verifies against.
+        register_falcon(&k);
         keys.push(k);
     }
     (e, keys)
@@ -67,10 +93,7 @@ fn deposit(source_tx_hash: [u8; 32], recipient: [u8; 32], amount: u64) -> Bridge
 fn attest(dep: &BridgeIntent, signers: &[SigningKey]) -> BridgeIntent {
     let event = dep.deposit_event(Vec::new()).expect("deposit event");
     let msg = TeleportBridgeEngine::deposit_signing_message(&event);
-    let signatures = signers
-        .iter()
-        .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
-        .collect();
+    let signatures = signers.iter().map(|k| falcon_sig(k, &msg)).collect();
     let source_tx_hash = match dep {
         BridgeIntent::Deposit { source_tx_hash, .. } => *source_tx_hash,
         other => panic!("attest() only pairs with a Deposit: {other:?}"),
@@ -101,18 +124,42 @@ fn quorum_proof(
     }
 }
 
-fn bridge_tx(payer: &SigningKey, nonce: u64, ops: Vec<OpCode>) -> Transaction {
+
+/// Implicit Falcon-512 sender for a seed, registered globally. Pure-PQ tx
+/// admission refuses legacy `Transaction::sign_with_payload`, so the wrapping
+/// txs in these tests ride the sanctioned implicit-Falcon envelope (the same
+/// pattern as `bridge_persistence_tests::bridge_tx`).
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+fn bridge_tx(payer_seed: u8, nonce: u64, ops: Vec<OpCode>) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(payer_seed);
+    let from = pq_id(payer_seed);
     let gas = GAS_BRIDGE_INTENT * ops.len() as u64 + 1_000;
-    Transaction::sign_with_payload(
-        payer,
-        payer.verifying_key().to_bytes(),
-        0,
-        gas,
+    let mut t = Transaction {
+        from,
+        to: from,
+        amount: 0,
+        gas_limit: gas,
         nonce,
-        MASTERCHAIN_SHARD,
-        MASTERCHAIN_SHARD,
-        ops,
-    )
+        source_shard: MASTERCHAIN_SHARD,
+        target_shard: MASTERCHAIN_SHARD,
+        signature: Vec::new(),
+        payload: ops,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, payer_seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 fn bridge_block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> Block {
@@ -153,10 +200,10 @@ async fn settle_deposit(
     amount: u64,
 ) {
     // The wrapping-tx payer (key 0x03) needs gas money of its own.
-    fund(e, &key(0x03).verifying_key().to_bytes(), 1_000_000).await;
+    fund(e, &pq_id(0x03), 1_000_000).await;
     let dep = deposit(hash, recipient, amount);
     let att = attest(&dep, &vals[..2]);
-    let tx = bridge_tx(&key(0x03), 0, ops_list(vec![att, dep]));
+    let tx = bridge_tx(0x03, 0, ops_list(vec![att, dep]));
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
@@ -171,17 +218,16 @@ async fn settle_deposit(
 #[tokio::test]
 async fn challenge_freezes_quorum_deposit() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let challenger = key(0xC0);
-    let challenger_pk = challenger.verifying_key().to_bytes();
+    let payer_pk = pq_id(0x03);
+    let challenger_seed: u8 = 0xC0;
+    let challenger_pk = pq_id(challenger_seed);
     fund(&e, &challenger_pk, 10 * STELL).await;
     let recipient = [0xADu8; 32];
     let amount = 100 * STELL;
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
-    let tx = bridge_tx(
-        &challenger,
+    let tx = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -226,15 +272,14 @@ async fn challenge_freezes_quorum_deposit() {
 #[tokio::test]
 async fn double_challenge_is_refused() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let challenger = key(0xC0);
-    fund(&e, &challenger.verifying_key().to_bytes(), 10 * STELL).await;
+    let payer_pk = pq_id(0x03);
+    let challenger_seed: u8 = 0xC0;
+    fund(&e, &pq_id(challenger_seed), 10 * STELL).await;
     let recipient = [0xADu8; 32];
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, 100 * STELL).await;
 
-    let tx_a = bridge_tx(
-        &challenger,
+    let tx_a = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -246,14 +291,13 @@ async fn double_challenge_is_refused() {
                 2,
                 TS + 10,
                 vec![tx_a],
-                challenger.verifying_key().to_bytes(),
+                pq_id(challenger_seed),
             ),
             0,
         )
         .await;
     assert_eq!(out.status, vec![true]);
-    let tx_b = bridge_tx(
-        &challenger,
+    let tx_b = bridge_tx(challenger_seed,
         1,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -266,7 +310,7 @@ async fn double_challenge_is_refused() {
                 3,
                 TS + 20,
                 vec![tx_b],
-                challenger.verifying_key().to_bytes(),
+                pq_id(challenger_seed),
             ),
             0,
         )
@@ -311,11 +355,10 @@ async fn double_challenge_is_refused() {
 #[tokio::test]
 async fn challenge_unknown_hash_is_refused() {
     let (e, _vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let challenger = key(0xC0);
-    fund(&e, &challenger.verifying_key().to_bytes(), 10 * STELL).await;
-    let tx = bridge_tx(
-        &challenger,
+    let payer_pk = pq_id(0x03);
+    let challenger_seed: u8 = 0xC0;
+    fund(&e, &pq_id(challenger_seed), 10 * STELL).await;
+    let tx = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: [0x99u8; 32],
@@ -330,16 +373,15 @@ async fn challenge_unknown_hash_is_refused() {
 #[tokio::test]
 async fn challenge_stale_deposit_is_refused() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let challenger = key(0xC0);
-    fund(&e, &challenger.verifying_key().to_bytes(), 10 * STELL).await;
+    let payer_pk = pq_id(0x03);
+    let challenger_seed: u8 = 0xC0;
+    fund(&e, &pq_id(challenger_seed), 10 * STELL).await;
     let recipient = [0xADu8; 32];
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, 100 * STELL).await;
 
     // 25h later: past the 24h challenge age even though no dispute exists.
-    let tx = bridge_tx(
-        &challenger,
+    let tx = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -363,17 +405,16 @@ async fn challenge_stale_deposit_is_refused() {
 #[tokio::test]
 async fn resolve_confirms_with_evidence_and_slashes_bond_to_recipient() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let challenger = key(0xC0);
-    let challenger_pk = challenger.verifying_key().to_bytes();
+    let payer_pk = pq_id(0x03);
+    let challenger_seed: u8 = 0xC0;
+    let challenger_pk = pq_id(challenger_seed);
     fund(&e, &challenger_pk, 10 * STELL).await;
     let recipient = [0xADu8; 32];
     let amount = 100 * STELL;
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
-    let tx_c = bridge_tx(
-        &challenger,
+    let tx_c = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -385,11 +426,10 @@ async fn resolve_confirms_with_evidence_and_slashes_bond_to_recipient() {
     assert_eq!(out.status, vec![true]);
 
     // Anyone resolves: evidence overrules the challenge.
-    let resolver = key(0xD0);
-    let resolver_pk = resolver.verifying_key().to_bytes();
+    let resolver_seed: u8 = 0xD0;
+    let resolver_pk = pq_id(resolver_seed);
     fund(&e, &resolver_pk, 10 * STELL).await;
-    let tx_r = bridge_tx(
-        &resolver,
+    let tx_r = bridge_tx(resolver_seed,
         0,
         ops_list(vec![
             quorum_proof(hash, recipient, amount, &vals),
@@ -411,8 +451,7 @@ async fn resolve_confirms_with_evidence_and_slashes_bond_to_recipient() {
         assert!(d.resolved && d.confirmed);
     }
     // Terminal: resolving again refuses.
-    let tx_r2 = bridge_tx(
-        &resolver,
+    let tx_r2 = bridge_tx(resolver_seed,
         1,
         ops_list(vec![BridgeIntent::Resolve { dispute_id: 0 }]),
     );
@@ -457,15 +496,14 @@ async fn resolve_confirms_with_evidence_and_slashes_bond_to_recipient() {
 #[tokio::test]
 async fn resolve_before_deadline_without_evidence_is_refused() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let challenger = key(0xC0);
-    let challenger_pk = challenger.verifying_key().to_bytes();
+    let payer_pk = pq_id(0x03);
+    let challenger_seed: u8 = 0xC0;
+    let challenger_pk = pq_id(challenger_seed);
     fund(&e, &challenger_pk, 10 * STELL).await;
     let recipient = [0xADu8; 32];
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, 100 * STELL).await;
-    let tx_c = bridge_tx(
-        &challenger,
+    let tx_c = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -476,8 +514,7 @@ async fn resolve_before_deadline_without_evidence_is_refused() {
         .await;
     assert_eq!(out.status, vec![true]);
 
-    let tx_r = bridge_tx(
-        &challenger,
+    let tx_r = bridge_tx(challenger_seed,
         1,
         ops_list(vec![BridgeIntent::Resolve { dispute_id: 0 }]),
     );
@@ -494,17 +531,16 @@ async fn resolve_before_deadline_without_evidence_is_refused() {
 #[tokio::test]
 async fn resolve_revokes_after_expiry_and_rewards_challenger() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let challenger = key(0xC0);
-    let challenger_pk = challenger.verifying_key().to_bytes();
+    let payer_pk = pq_id(0x03);
+    let challenger_seed: u8 = 0xC0;
+    let challenger_pk = pq_id(challenger_seed);
     fund(&e, &challenger_pk, 10 * STELL).await;
     let recipient = [0xADu8; 32];
     let amount = 100 * STELL;
     let bond = stellereum::bridge::challenge_bond_for(amount);
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
-    let tx_c = bridge_tx(
-        &challenger,
+    let tx_c = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -518,8 +554,7 @@ async fn resolve_revokes_after_expiry_and_rewards_challenger() {
     // Past the 1h window with FAILING evidence (fraud signal) and no valid
     // evidence: revoke. (An empty resolve here would DEFER with no payout —
     // the B2 truth gate, pinned in bridge_challenge_tests.)
-    let tx_r = bridge_tx(
-        &challenger,
+    let tx_r = bridge_tx(challenger_seed,
         1,
         ops_list(vec![
             BridgeIntent::DepositProof {
@@ -579,10 +614,7 @@ fn failure_proof(
         recipient,
         amount,
     );
-    let signatures = signers
-        .iter()
-        .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
-        .collect();
+    let signatures = signers.iter().map(|k| falcon_sig(k, &msg)).collect();
     BridgeIntent::DepositProof {
         source_tx_hash: hash,
         evidence: Box::new(DepositEvidence::QuorumAttested { signatures }),
@@ -592,9 +624,9 @@ fn failure_proof(
 #[tokio::test]
 async fn verified_fraud_proof_revokes_pays_the_finder_and_burns_the_rest() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let challenger = key(0xC0);
-    let challenger_pk = challenger.verifying_key().to_bytes();
+    let payer_pk = pq_id(0x03);
+    let challenger_seed: u8 = 0xC0;
+    let challenger_pk = pq_id(challenger_seed);
     fund(&e, &challenger_pk, 10 * STELL).await;
     let recipient = [0xADu8; 32];
     let amount = 100 * STELL;
@@ -603,8 +635,7 @@ async fn verified_fraud_proof_revokes_pays_the_finder_and_burns_the_rest() {
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
-    let tx_c = bridge_tx(
-        &challenger,
+    let tx_c = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -623,8 +654,7 @@ async fn verified_fraud_proof_revokes_pays_the_finder_and_burns_the_rest() {
 
     // The relayer quorum retracts the deposit (a genuine, verifiable fraud
     // proof): the finder is paid bond + reward, the rest burns.
-    let tx_r = bridge_tx(
-        &challenger,
+    let tx_r = bridge_tx(challenger_seed,
         1,
         ops_list(vec![
             failure_proof(hash, recipient, amount, &vals),
@@ -674,17 +704,16 @@ async fn verified_fraud_proof_revokes_pays_the_finder_and_burns_the_rest() {
 #[tokio::test]
 async fn challenge_evidence_path_deposit_is_refused() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
+    let payer_pk = pq_id(0x03);
     fund(&e, &payer_pk, 1_000_000).await;
-    let challenger = key(0xC0);
-    fund(&e, &challenger.verifying_key().to_bytes(), 10 * STELL).await;
+    let challenger_seed: u8 = 0xC0;
+    fund(&e, &pq_id(challenger_seed), 10 * STELL).await;
     let recipient = [0xC1u8; 32];
     let amount = 77 * STELL;
     let hash = [0x81u8; 32];
 
     // Admit via the evidence path (no quorum attestation at all).
-    let tx = bridge_tx(
-        &key(0x03),
+    let tx = bridge_tx(0x03,
         0,
         ops_list(vec![
             quorum_proof(hash, recipient, amount, &vals),
@@ -700,8 +729,7 @@ async fn challenge_evidence_path_deposit_is_refused() {
         assert!(!br.deposit_records.get(&hash).unwrap().via_quorum);
     }
 
-    let tx_c = bridge_tx(
-        &challenger,
+    let tx_c = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -725,15 +753,15 @@ async fn challenge_evidence_path_deposit_is_refused() {
 #[tokio::test]
 async fn challenge_without_bond_cover_is_refused() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let poor = key(0xC1);
-    fund(&e, &poor.verifying_key().to_bytes(), 100).await; // dust: no bond
+    let payer_pk = pq_id(0x03);
+    let poor_seed: u8 = 0xC1;
+    fund(&e, &pq_id(poor_seed), 100).await; // dust: no bond
     let recipient = [0xADu8; 32];
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, 100 * STELL).await;
 
     let tx = bridge_tx(
-        &poor,
+        poor_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -803,9 +831,9 @@ async fn v2_and_v1_snapshots_restore_as_unchallengeable() {
 #[tokio::test]
 async fn dispute_state_is_committed_in_the_root() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let challenger = key(0xC0);
-    let challenger_pk = challenger.verifying_key().to_bytes();
+    let payer_pk = pq_id(0x03);
+    let challenger_seed: u8 = 0xC0;
+    let challenger_pk = pq_id(challenger_seed);
     fund(&e, &challenger_pk, 10 * STELL).await;
     let recipient = [0xADu8; 32];
     let hash = [0x73u8; 32];
@@ -814,8 +842,7 @@ async fn dispute_state_is_committed_in_the_root() {
     // The bridge domain is already non-empty (records commit on deposit).
     assert!(!e.bridge_read().await.is_empty());
     let root_with_record = e.get_state_root().await;
-    let tx_c = bridge_tx(
-        &challenger,
+    let tx_c = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,

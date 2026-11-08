@@ -273,46 +273,53 @@ pub fn verify_falcon_signature_or_test(pubkey: &[u8], message: &[u8], signature:
     verify_falcon_signature(pubkey, message, signature)
 }
 
-/// Verify the block proposal signature, supporting Falcon-512 and Pure PQ enforcement.
+/// Verify the block proposal signature: Falcon-only, height-indexed, no
+/// classical fallback.
+///
+/// Resolution uses the SAME height-indexed committed-registry source as the
+/// vote path ([`pq_key_at_height`] at `block.height`): the key authoritative
+/// for the block's height verifies, anything else (unknown validator, no key
+/// at that height, wrong-scheme or tampered signature) refuses fail-closed.
+/// The legacy `Block::verify_proposer_signature` Ed25519 fallback is deleted
+/// (no new fallback): an Ed-only proposal refuses here. The function itself
+/// is KEPT (not deleted) — callers in staking/main/consensus_net/runtime
+/// depend on it.
 pub fn verify_proposer_signature(block: &crate::sharding::Block) -> bool {
     let hash = block.compute_hash();
 
-    // Check if proposer signed with Falcon-512 key
-    for (signer_id, sig_bytes) in &block.validator_signatures {
-        if sig_bytes.len() == crate::post_quantum::FALCON512_SIG_LEN {
-            let matches_proposer = *signer_id == block.proposer
-                || get_validator_pq_key(&block.proposer).is_some_and(|(scheme, pk)| {
-                    let addr = crate::post_quantum::derive_pq_address(
-                        scheme,
-                        &pk,
-                        &crate::post_quantum::DEFAULT_SALT,
-                    );
-                    addr == *signer_id
-                })
-                || get_validator_pq_key(signer_id).is_some_and(|(scheme, pk)| {
-                    let addr = crate::post_quantum::derive_pq_address(
-                        scheme,
-                        &pk,
-                        &crate::post_quantum::DEFAULT_SALT,
-                    );
-                    addr == block.proposer || *signer_id == block.proposer
-                });
-
-            if matches_proposer {
-                let pk_opt = get_validator_pq_key(signer_id)
-                    .or_else(|| get_validator_pq_key(&block.proposer))
-                    .map(|(_, pk)| pk);
-                if let Some(pk) = pk_opt {
-                    if verify_falcon_signature(&pk, &hash, sig_bytes) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-        }
+    // Height-indexed committed read (rotation-aware): fail-closed when the
+    // proposer has no key at this height (unknown validator, pre-activation,
+    // or pruned history).
+    let Some((scheme, pk)) = pq_key_at_height(&block.proposer, block.height) else {
+        return false;
+    };
+    if scheme.is_disabled() {
+        return false;
     }
-
-    block.verify_proposer_signature()
+    // The Falcon address this key controls (runtime stores the Falcon half
+    // under the derived address, not under the Ed proposer id).
+    let expected_addr =
+        crate::post_quantum::derive_pq_address(scheme, &pk, &crate::post_quantum::DEFAULT_SALT);
+    for (signer_id, sig_bytes) in &block.validator_signatures {
+        // Same registered-key source as votes: only the proposer's slot (by
+        // Ed id or by derived Falcon address) counts; a neighbor's valid
+        // signature never verifies for this proposer.
+        if *signer_id != block.proposer && *signer_id != expected_addr {
+            continue;
+        }
+        // Size-gated to the registered scheme (Falcon-512 today, Hybrid
+        // tomorrow): an Ed-only 64-byte entry never reaches crypto here.
+        if sig_bytes.len() != scheme.signature_size() {
+            continue;
+        }
+        if crate::post_quantum::verify_pq_signature(scheme, &pk, &hash, sig_bytes) {
+            return true;
+        }
+        // A matching slot with a bad signature refuses at once: the Ed
+        // fallback is gone, so there is no second chance for this block.
+        return false;
+    }
+    false
 }
 
 pub trait BlockProposerExt {
@@ -710,6 +717,58 @@ pub fn pq_micro_required_power(committee_total_power: u64, network_total_power: 
         w => consensus_quorum_min(w),
     };
     committee_two_thirds.max(network_two_thirds)
+}
+
+/// C1 split activation height (FIXES §1.7, sketch §4.1, formulas §2.3).
+///
+/// At/after this height the µQC is ADVISORY-ONLY and never finalizes: the
+/// µQC branch of finality verification refuses outright and finality
+/// requires the FULL network QC (`pq_full_required_power` over the network's
+/// total power, enforced on the epoch/CEC path). Before this height the
+/// legacy network-anchored `max` rule ([`pq_micro_required_power`]) applies
+/// byte-identically.
+///
+/// INACTIVE default (`u64::MAX`, unreachable): the lead flips it via
+/// governance rollout. Pre-activation behavior is unchanged — proven by the
+/// existing QC pins running green unmodified.
+pub const QC_SPLIT_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// True once the C1 advisory/finality split is active at `height`.
+#[allow(clippy::absurd_extreme_comparisons)]
+// GATE: `QC_SPLIT_ACTIVATION_HEIGHT` is deliberately `u64::MAX` (INACTIVE
+// default, flipped only by the lead); `>=` is the correct activation
+// semantics once it names a reachable height.
+fn qc_split_active_at(height: Height) -> bool {
+    height >= QC_SPLIT_ACTIVATION_HEIGHT
+}
+
+/// Advisory µQC threshold (sketch §4.1): `floor(2*W_committee/3) + 1`.
+///
+/// ADVISORY ONLY — reaching this never finalizes a block. It measures the
+/// committee's own two-thirds so a small committee of a large network can
+/// still signal (liveness), while finality stays gated on
+/// [`pq_full_required_power`]. Fail-closed (`u64::MAX`) on zero committee
+/// power, exactly like [`pq_micro_quorum_power`].
+pub fn pq_micro_advisory_power(committee_total_power: u64) -> u64 {
+    if committee_total_power == 0 {
+        return u64::MAX;
+    }
+    consensus_quorum_min(committee_total_power)
+}
+
+/// Finality gate (sketch §4.1): `floor(2*W_network/3) + 1` over the NETWORK.
+///
+/// Post-activation every finality path requires THIS — never
+/// `max(committee, network)`, which is the documented liveness trap: when
+/// `W_c < floor(2*W_n/3)+1` the committee alone can never reach the max, so
+/// no µQC ever forms. Fail-closed (`u64::MAX`) on zero network power,
+/// exactly like [`ValidatorSet::quorum_power`] — the same curve the
+/// epoch/CEC finality path already enforces.
+pub fn pq_full_required_power(network_total_power: u64) -> u64 {
+    if network_total_power == 0 {
+        return u64::MAX;
+    }
+    consensus_quorum_min(network_total_power)
 }
 
 /// Fail-closed cross-tier intersection gate: a µQC threshold `t_micro` and a
@@ -1172,12 +1231,90 @@ pub fn register_validator_pq_key(
     }
     let mut lock = PQ_VALIDATOR_KEYS.write().unwrap_or_else(|e| e.into_inner());
     let map = lock.get_or_insert_with(HashMap::new);
-    map.insert(id, (scheme, pubkey));
+    map.insert(id, (scheme, pubkey.clone()));
     drop(lock);
+    // Mirror into the height-indexed committed registry as a pre-tracking
+    // legacy key (`activated_at = 0`): the widest truthful window, so votes
+    // at every height keep verifying exactly as before until a rotation is
+    // announced for this validator. `AlreadyRegistered` means rotation state
+    // already exists — keep it (never clobber history from a head-key sync).
+    {
+        let mut reg = PQ_COMMITTED_REGISTRY
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = reg.adopt_legacy_key(id, scheme, pubkey, true);
+    }
     // KEY-ROTATION INVALIDATION (in-zone trigger): a (re-)registration
     // changes what `Vote::verify` computes for this voter, so every cached
     // verdict — keyed on the old key bytes — is dropped. Miss = full verify.
     clear_verified_vote_cache();
+}
+
+/// Height-indexed committed PQ registry (rotation-aware verify source).
+///
+/// Tracks the SAME lifecycle as [`crate::pq_registry::PqRegistry`]
+/// (announce-now / effective-at-`+delay`, bounded superseded history) and
+/// reuses its read — [`crate::pq_registry::PqRegistry::get_active_key`] —
+/// instead of duplicating the window math. `register_validator_pq_key`
+/// mirrors every head key here via `adopt_legacy_key` (`activated_at = 0`);
+/// rotations are announced against this registry, so readers resolve the
+/// key authoritative AT the vote/block height, not the current head key.
+static PQ_COMMITTED_REGISTRY: std::sync::LazyLock<
+    std::sync::RwLock<crate::pq_registry::PqRegistry>,
+> = std::sync::LazyLock::new(|| {
+    std::sync::RwLock::new(crate::pq_registry::PqRegistry::new())
+});
+
+/// Resolve the authoritative PQ key for `validator` AT `height`.
+///
+/// Committed-registry read FIRST ([`crate::pq_registry::PqRegistry::get_active_key`]
+/// semantics, reused not duplicated): when the validator has a tracked record,
+/// that record is authoritative fail-closed (`None` = no key at this height —
+/// unknown validator, pre-activation, or pruned history). Validators never
+/// tracked fall back to the legacy head map (pre-rotation nodes/tests).
+/// Fail-closed in every doubt branch: `None` refuses verification.
+pub fn pq_key_at_height(
+    validator: &ValidatorId,
+    height: Height,
+) -> Option<(crate::post_quantum::PqScheme, Vec<u8>)> {
+    let reg = PQ_COMMITTED_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    if reg.record_of(validator).is_some() {
+        return reg.get_active_key(validator, height);
+    }
+    drop(reg);
+    get_validator_pq_key(validator)
+}
+
+/// Announce a PQ key rotation for tests: the replacement takes effect at
+/// `now_height + PQ_ROTATION_DELAY_HEIGHTS`; the current key stays
+/// authoritative until then (reads via [`pq_key_at_height`] resolve the
+/// pending key only for heights `>= effective_height`).
+///
+/// Test-only driver for the committed registry above (production rotations
+/// arrive through the staking hooks, out of this file's scope). Fail-closed
+/// exactly like [`crate::pq_registry::PqRegistry::announce_rotation`];
+/// clears the verified-vote cache so pre-announcement verdicts (keyed on the
+/// old key bytes) can never serve post-rotation heights.
+#[cfg(any(test, debug_assertions))]
+pub fn pq_announce_rotation_for_tests(
+    validator: ValidatorId,
+    scheme: crate::post_quantum::PqScheme,
+    pubkey: Vec<u8>,
+    now_height: Height,
+) -> Result<u64, crate::pq_registry::PqRegistryError> {
+    let effective = {
+        let mut reg = PQ_COMMITTED_REGISTRY
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        reg.announce_rotation(validator, scheme, pubkey, now_height, true)?;
+        reg.pending_of(&validator)
+            .map(|p| p.effective_height)
+            .unwrap_or(now_height.saturating_add(crate::pq_registry::PQ_ROTATION_DELAY_HEIGHTS))
+    };
+    clear_verified_vote_cache();
+    Ok(effective)
 }
 
 /// Retrieve a registered validator's post-quantum scheme and public key.
@@ -1510,15 +1647,21 @@ impl Vote {
     ///
     /// FULL-PQ (nodes wiped, no compat): Falcon-only. The Ed25519 legs are
     /// deleted. A vote is valid iff it carries a Falcon half that verifies
-    /// under the voter's registered PQ key — exactly the old pure-PQ branch,
-    /// now unconditional.
+    /// under the voter's REGISTERED key AT THE VOTE'S HEIGHT — exactly the
+    /// old pure-PQ branch, now height-indexed.
+    ///
+    /// Rotation: `self.height` threads into [`pq_key_at_height`] (the
+    /// committed [`crate::pq_registry::PqRegistry::get_active_key`] read,
+    /// reused not duplicated). After `effective_height` only the new key
+    /// verifies; before it only the old one; a validator with no key at
+    /// this height refuses fail-closed (`None`).
     fn verify_uncached(&self) -> bool {
         let msg = vote_sign_bytes(self.height, self.round, self.kind, &self.block_hash);
 
         // FULL-PQ: Falcon-only. Ed25519 branches deleted (no compat).
         if let Some(falcon_sig) = self.falcon_signature() {
-            if let Some((_scheme, pk)) = get_validator_pq_key(&self.voter) {
-                return verify_falcon_signature(&pk, &msg, falcon_sig);
+            if let Some((scheme, pk)) = pq_key_at_height(&self.voter, self.height) {
+                return crate::post_quantum::verify_pq_signature(scheme, &pk, &msg, falcon_sig);
             }
         }
         false
@@ -1688,6 +1831,11 @@ impl Vote {
 const VERIFIED_VOTE_CACHE_CAP: usize = 65_536;
 
 /// Cache key: everything `verify_uncached` reads. Same key ⇒ same verdict.
+///
+/// Rotation-safe: the PQ entry is the key bytes AT THE VOTE'S HEIGHT
+/// ([`pq_key_at_height`]), not the head key — an old-vs-new key at the same
+/// `(voter, height, round, ...)` misses by construction, so a cached verdict
+/// from before `effective_height` can never serve after it (and vice versa).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct VerifiedVoteCacheKey {
     voter: ValidatorId,
@@ -1696,7 +1844,7 @@ struct VerifiedVoteCacheKey {
     kind: u8,
     block_hash: Option<BlockHash>,
     signature: Vec<u8>,
-    /// PQ registry entry for `voter` at verify time (trigger 2).
+    /// PQ registry entry for `voter` AT `height` at verify time (trigger 2).
     pq_key: Option<(u8, Vec<u8>)>,
     /// Pure-PQ flag at verify time (trigger 6).
     pure_pq: bool,
@@ -1758,7 +1906,7 @@ fn vote_cache_key(vote: &Vote) -> VerifiedVoteCacheKey {
         },
         block_hash: vote.block_hash,
         signature: vote.signature.clone(),
-        pq_key: get_validator_pq_key(&vote.voter).map(|(scheme, pk)| (scheme as u8, pk)),
+        pq_key: pq_key_at_height(&vote.voter, vote.height).map(|(scheme, pk)| (scheme as u8, pk)),
         pure_pq: crate::post_quantum::is_pure_pq_enforced(),
         chain_id: consensus_chain_id(),
     }
@@ -2706,6 +2854,12 @@ impl QuorumCertificate {
     /// Unified certificate verification supporting:
     /// 1. Post-quantum µQC (`PQ_UQC_MARKER_ID`) and CEC Epoch (`PQ_QC_MARKER_ID`) envelopes.
     ///
+    /// C1 split (FIXES §1.7): at/after `QC_SPLIT_ACTIVATION_HEIGHT` the µQC
+    /// branch is advisory-only and refuses (`verify_micro_cert` fails closed
+    /// when the split is active), so only the full network QC (epoch/CEC,
+    /// ≥ `pq_full_required_power`) verifies. Pre-activation the legacy
+    /// network-anchored `max` rule applies unchanged.
+    ///
     /// FULL-PQ: classical Ed25519 threshold deleted (no compat). A QC without
     /// a verifying PQ envelope is rejected.
     pub fn verify_unified(&self, validators: &ValidatorSet) -> bool {
@@ -2759,7 +2913,9 @@ impl QuorumCertificate {
                         continue;
                     }
                     // Canonical parent-hash draw.
-                    if self.verify_micro_cert(&cert, validators, msg, pq_keys) {
+                    // Borrow-compat: `verify_micro_cert` takes an owned snapshot;
+                    // clone the (small, test/override-only) map. Same data.
+                    if self.verify_micro_cert(&cert, validators, msg, pq_keys.cloned()) {
                         return true;
                     }
                 }
@@ -2966,10 +3122,19 @@ impl QuorumCertificate {
         cert: &PqMicroCertificate,
         validators: &ValidatorSet,
         msg: &[u8],
-        pq_keys: Option<&HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
+        pq_keys: Option<HashMap<ValidatorId, (crate::post_quantum::PqScheme, Vec<u8>)>>,
     ) -> bool {
+        // C1 split (FIXES §1.7): at/after `QC_SPLIT_ACTIVATION_HEIGHT` the
+        // µQC is ADVISORY-ONLY and never finalizes — refuse outright, even
+        // at full-network power. Finality requires the full network QC (the
+        // epoch/CEC path, `verify_epoch_cert` ≥ `pq_full_required_power`).
+        // Before activation this gate is inert (`u64::MAX` default) and the
+        // legacy network-anchored `max` rule below applies byte-identically.
+        if qc_split_active_at(self.height) {
+            return false;
+        }
         let Some(valid) =
-            self.micro_cert_valid_signers(cert, validators, msg, pq_keys)
+            self.micro_cert_valid_signers(cert, validators, msg, pq_keys.as_ref())
         else {
             return false;
         };
@@ -3498,9 +3663,10 @@ pub const NIL_CIRCUIT_BREAKER_K: u32 = 3;
 ///
 /// Safety role (liveness): under PERSISTENT slowdown (a network stuck in the
 /// "slow" state for several rounds) a timeout is evidence of hidden state, so
-/// the optimal ladder is geometric with `ρ ≈ 2` — NOT additive `+500ms`
-/// (`papers/02_liveness.md` §4–§7: i.i.d. optimum `ρ* = 1`, persistent
-/// optimum `ρ* ≈ 2.02`; rec 1 keeps the 3000ms base — near-optimal for
+/// the ladder is geometric with `ρ = 2` — NOT additive `+500ms`. Per the
+/// report correction (FIXES §1.8, §2.9): a persistent `ρ ≈ 2` is NOT
+/// identifiable (selection bias); the `×2` ladder is a heuristic, not an
+/// optimum (`papers/02_liveness.md` §4–§7; rec 1 keeps the 3000ms base for
 /// `γ≈2, p50≈660ms, c≈500ms — and replaces the additive rung with `×2`).
 /// At base 3000ms the rungs are 3s, 6s, 12s, 24s, then the cap — a wedged
 /// round on a slow/Byzantine proposer unwedges far faster than `+500ms` per
@@ -4925,7 +5091,8 @@ mod tests {
             "same state => same timeout (wall clocks differ, value must not)"
         );
         // Backoff is MULTIPLICATIVE in the round (`x2` per round, paper
-        // 02_liveness §7 rec 1 — persistent-slowdown optimum `ρ* ≈ 2.02`,
+        // 02_liveness §7 rec 1 — heuristic, NOT an optimum: a persistent
+        // `ρ ≈ 2` is not identifiable (selection bias, FIXES §1.8/§2.9);
         // i.i.d. optimum needs no backoff at all): r1 doubles the base, r4
         // saturates at base + cap.
         assert_eq!(deterministic_round_timeout_ms(3500, 1, 0), 7000);
@@ -5086,6 +5253,74 @@ mod tests {
     }
 
     #[test]
+    fn vote_verify_is_height_indexed_across_rotation() {
+        // FIXES §1.2 acceptance: the vote verify path threads the vote's
+        // height into the height-indexed committed registry
+        // (`pq_key_at_height` → `PqRegistry::get_active_key`, reused not
+        // duplicated) and fails closed when the height has no key.
+        //
+        // Rotation sketch (§4.3): announce at `now`, effective at
+        // `now + PQ_ROTATION_DELAY_HEIGHTS`. Old key verifies before the
+        // effective height and refuses at/after it; new key is the mirror.
+        use crate::pq_registry::PQ_ROTATION_DELAY_HEIGHTS;
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let voter = sk.verifying_key().to_bytes();
+        let old_fk = FalconKeypair::generate();
+        let new_fk = FalconKeypair::generate();
+        register_validator_pq_key(
+            voter,
+            crate::post_quantum::PqScheme::Falcon512,
+            old_fk.public_key.clone(),
+        );
+        let now: Height = 1_000;
+        let effective = pq_announce_rotation_for_tests(
+            voter,
+            crate::post_quantum::PqScheme::Falcon512,
+            new_fk.public_key.clone(),
+            now,
+        )
+        .expect("rotation announcement must be accepted");
+        assert_eq!(effective, now.saturating_add(PQ_ROTATION_DELAY_HEIGHTS));
+        let target = Some(block_hash(1));
+        let old_vote_before = Vote::sign_with_falcon(&sk, &old_fk, effective - 1, 0, VoteKind::Prevote, target);
+        let new_vote_before = Vote::sign_with_falcon(&sk, &new_fk, effective - 1, 0, VoteKind::Prevote, target);
+        let old_vote_at = Vote::sign_with_falcon(&sk, &old_fk, effective, 0, VoteKind::Prevote, target);
+        let new_vote_at = Vote::sign_with_falcon(&sk, &new_fk, effective, 0, VoteKind::Prevote, target);
+        assert!(
+            old_vote_before.verify(),
+            "old key must verify before effective_height"
+        );
+        assert!(
+            !new_vote_before.verify(),
+            "new key must refuse before effective_height"
+        );
+        assert!(
+            !old_vote_at.verify(),
+            "old key must refuse at/after effective_height"
+        );
+        assert!(
+            new_vote_at.verify(),
+            "new key must verify at/after effective_height"
+        );
+        // Fail-closed: a validator with no key at the height refuses, even
+        // with a well-formed Falcon half.
+        let outsider_sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let outsider_fk = FalconKeypair::generate();
+        let outsider_vote = Vote::sign_with_falcon(
+            &outsider_sk,
+            &outsider_fk,
+            effective,
+            0,
+            VoteKind::Prevote,
+            target,
+        );
+        assert!(
+            !outsider_vote.verify(),
+            "unknown validator (no key at height) must refuse fail-closed"
+        );
+    }
+
+    #[test]
     fn non_validator_vote_rejected() {
         let keys = keys(4);
         let vs = vset(&keys);
@@ -5241,20 +5476,85 @@ mod tests {
         b
     }
 
+    /// Build a Falcon-signed block (PQ proposal): Ed `sign_block` plus the
+    /// Falcon half under the derived Falcon address, mirroring the runtime
+    /// proposal path (`runtime.rs` pushes `(self.id, ed_sig)` +
+    /// `(falcon_id, falcon_sig)`). Registers `fk` for the proposer's Ed id
+    /// so [`verify_proposer_signature`] resolves it height-indexed.
+    fn signed_block_with_falcon(
+        key: &SigningKey,
+        fk: &FalconKeypair,
+        height: Height,
+        timestamp: u64,
+    ) -> crate::sharding::Block {
+        let proposer = key.verifying_key().to_bytes();
+        register_validator_pq_key(
+            proposer,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+        let mut b = crate::sharding::Block {
+            height,
+            proposer,
+            timestamp,
+            ..Default::default()
+        };
+        b.sign_block(key);
+        let hash = b.compute_hash();
+        let falcon_id = fk.validator_id();
+        let falcon_sig = fk.sign(&hash);
+        b.validator_signatures.push((falcon_id, falcon_sig));
+        b
+    }
+
     #[test]
     fn proposal_evidence_verifies_genuine_double_propose() {
+        // Falconize: genuine double-propose carries PQ signatures and
+        // verifies; the Ed-only refusal is pinned separately below.
         let ks = keys(3);
+        let fk0 = FalconKeypair::generate_from_seed(0xD0);
         let vs = vset(&ks);
         let member = |v: &ValidatorId| vs.validators.contains_key(v);
-        let a = signed_block(&ks[0], 5, 1_000);
-        let b = signed_block(&ks[0], 5, 2_000);
+        let a = signed_block_with_falcon(&ks[0], &fk0, 5, 1_000);
+        let b = signed_block_with_falcon(&ks[0], &fk0, 5, 2_000);
         assert_ne!(
             a.compute_hash(),
             b.compute_hash(),
             "need two distinct bodies"
         );
+        assert!(
+            verify_proposer_signature(&a) && verify_proposer_signature(&b),
+            "PQ-signed proposals must verify under the registered key"
+        );
         let ev = ProposalEquivocationEvidence::new(ids(&ks)[0], a, b);
         assert!(verify_proposal_equivocation_evidence(&ev, &member));
+    }
+
+    #[test]
+    fn proposer_signature_refuses_ed_only_no_classical_fallback() {
+        // Falconize retarget: the deleted Ed25519 fallback refuses — an
+        // Ed-only proposal (valid Ed signature, no PQ half) does NOT verify.
+        // Same strictness as before (genuine pass / forged fail), enforced
+        // PQ-only: the genuine-PQ pass lives in the test above.
+        let ks = keys(2);
+        let ed_only = signed_block(&ks[0], 5, 1_000);
+        // Sanity: the Ed signature itself is well-formed (would have passed
+        // the old fallback) — refusal comes from Falconize, not malformation.
+        assert!(ed_only.verify_proposer_signature());
+        assert!(
+            !verify_proposer_signature(&ed_only),
+            "Ed-only proposal must be refused (no classical fallback)"
+        );
+        assert!(
+            !verify_proposer_signature_falcon_via_ext(&ed_only),
+            "BlockProposerExt agrees: Ed-only refuses"
+        );
+    }
+
+    /// [`BlockProposerExt`] probe that stays inside this file's scope.
+    fn verify_proposer_signature_falcon_via_ext(b: &crate::sharding::Block) -> bool {
+        use super::BlockProposerExt;
+        b.verify_proposer_signature_falcon()
     }
 
     #[test]
@@ -5272,31 +5572,39 @@ mod tests {
     #[test]
     fn proposal_evidence_refuses_same_block_forgeries_and_shapes_fail_closed() {
         let ks = keys(3);
+        let fk0 = FalconKeypair::generate_from_seed(0xD1);
         let vs = vset(&ks);
         let member = |v: &ValidatorId| vs.validators.contains_key(v);
         let proposer = ids(&ks)[0];
-        let good_a = signed_block(&ks[0], 5, 1_000);
-        let good_b = signed_block(&ks[0], 5, 2_000);
+        let good_a = signed_block_with_falcon(&ks[0], &fk0, 5, 1_000);
+        let good_b = signed_block_with_falcon(&ks[0], &fk0, 5, 2_000);
         // Same body twice: one block repeated is not a double-propose.
         assert!(!verify_proposal_equivocation_evidence(
             &ProposalEquivocationEvidence::new(proposer, good_a.clone(), good_a.clone()),
             &member
         ));
         // Different heights: a re-proposal at a new height is not an offense.
-        let other_height = signed_block(&ks[0], 6, 1_000);
+        let other_height = signed_block_with_falcon(&ks[0], &fk0, 6, 1_000);
         assert!(!verify_proposal_equivocation_evidence(
             &ProposalEquivocationEvidence::new(proposer, good_a.clone(), other_height),
             &member
         ));
         // Framing: the envelope names ks[0] but block_b is signed by ks[1].
-        let foreign = signed_block(&ks[1], 5, 3_000);
+        let fk1 = FalconKeypair::generate_from_seed(0xD2);
+        let foreign = signed_block_with_falcon(&ks[1], &fk1, 5, 3_000);
         assert!(!verify_proposal_equivocation_evidence(
             &ProposalEquivocationEvidence::new(proposer, good_a.clone(), foreign),
             &member
         ));
-        // Forged: tamper with a signature byte after signing.
+        // Forged: tamper with the Falcon half after signing (the Ed half is
+        // ignored — Falconize — so the tamper must land on the PQ bytes).
         let mut forged = good_b.clone();
-        forged.validator_signatures[0].1[0] ^= 0xFF;
+        let falcon_idx = forged
+            .validator_signatures
+            .iter()
+            .position(|(_, s)| s.len() == crate::post_quantum::FALCON512_SIG_LEN)
+            .expect("PQ proposal carries a Falcon half");
+        forged.validator_signatures[falcon_idx].1[50] ^= 0xFF;
         assert!(!verify_proposal_equivocation_evidence(
             &ProposalEquivocationEvidence::new(proposer, good_a.clone(), forged),
             &member
@@ -5317,14 +5625,15 @@ mod tests {
     #[test]
     fn proposal_evidence_canonicalize_sorts_and_dedupes() {
         let ks = keys(2);
+        let fk0 = FalconKeypair::generate_from_seed(0xD3);
         let vs = vset(&ks);
         let member = |v: &ValidatorId| vs.validators.contains_key(v);
         let proposer = ids(&ks)[0];
         let mk = |t1: u64, t2: u64| {
             ProposalEquivocationEvidence::new(
                 proposer,
-                signed_block(&ks[0], 9, t1),
-                signed_block(&ks[0], 9, t2),
+                signed_block_with_falcon(&ks[0], &fk0, 9, t1),
+                signed_block_with_falcon(&ks[0], &fk0, 9, t2),
             )
         };
         let (e1, e2) = (mk(1, 2), mk(3, 4));
@@ -5332,11 +5641,11 @@ mod tests {
         let e1dup = mk(1, 2);
         let e1swapped = ProposalEquivocationEvidence::new(
             proposer,
-            signed_block(&ks[0], 9, 2),
-            signed_block(&ks[0], 9, 1),
+            signed_block_with_falcon(&ks[0], &fk0, 9, 2),
+            signed_block_with_falcon(&ks[0], &fk0, 9, 1),
         );
         // Garbage: same-body pair never survives shaping.
-        let same = signed_block(&ks[0], 9, 7);
+        let same = signed_block_with_falcon(&ks[0], &fk0, 9, 7);
         let garbage = ProposalEquivocationEvidence::new(proposer, same.clone(), same);
         let out = canonicalize_proposal_equivocation_evidence(
             vec![e2.clone(), garbage, e1dup, e1swapped, e1.clone()],
@@ -7188,6 +7497,181 @@ mod post_quantum_uqc_tests {
         let ok = build(3);
         assert!(ok.verify(&vs), "3-of-4 µQC must verify (live pin)");
         assert!(vs.qc_meets_quorum(&ok), "3-of-4 carries full-quorum power");
+    }
+
+    /// C1 split (FIXES §1.7, sketch §4.1, formulas §2.3) — threshold math pins.
+    ///
+    /// * `pq_micro_advisory_power(W_c) = floor(2W_c/3)+1` — advisory, NEVER
+    ///   finality;
+    /// * `pq_full_required_power(W_n) = floor(2W_n/3)+1` — the finality gate;
+    /// * the split is height-gated and INACTIVE by default
+    ///   (`QC_SPLIT_ACTIVATION_HEIGHT = u64::MAX`, flipped only by the lead);
+    /// * the liveness trap the split removes: a small committee reaches its
+    ///   advisory threshold but can never reach `max(committee, network)` —
+    ///   so `max` must not serve as the finality bar.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    // GATE: the pinned values ARE the spec (formulas §2.3, inactive default);
+    // rewriting them through runtime values would unpin the test's job.
+    fn qc_split_threshold_math_pins() {
+        // Sketch §4.1 shapes.
+        assert_eq!(pq_micro_advisory_power(1000), 667);
+        assert_eq!(pq_full_required_power(1000), 667);
+        assert_eq!(pq_micro_advisory_power(640), 427);
+        // Fail-closed on zero power, like `quorum_power` / `pq_micro_quorum_power`.
+        assert_eq!(pq_micro_advisory_power(0), u64::MAX);
+        assert_eq!(pq_full_required_power(0), u64::MAX);
+        // Legacy `max` rule preserved pre-activation (byte-identical behavior).
+        assert_eq!(pq_micro_required_power(640, 1000), 667);
+        assert_eq!(pq_micro_required_power(1000, 1000), 667);
+        assert_eq!(pq_micro_required_power(0, 1000), u64::MAX);
+        // The liveness trap (FIXES §1.7): committee 640 of network 1000 —
+        // advisory (427) is reachable by the committee alone, the full gate
+        // (667) is NOT, so `max` (= 667) as a finality bar strands the µQC.
+        assert!(pq_micro_advisory_power(640) <= 640, "advisory reachable");
+        assert!(pq_full_required_power(1000) > 640, "full gate unreachable alone");
+        // Inactive default: only `u64::MAX` itself counts as active.
+        assert_eq!(QC_SPLIT_ACTIVATION_HEIGHT, u64::MAX);
+        assert!(!qc_split_active_at(0));
+        assert!(!qc_split_active_at(u64::MAX - 1));
+        assert!(qc_split_active_at(u64::MAX));
+        assert!(qc_split_active_at(QC_SPLIT_ACTIVATION_HEIGHT));
+    }
+
+    /// C1 split — advisory ≠ finality, end to end with real Falcon signatures.
+    ///
+    /// N=4 whole-set committee. Post-activation height (the inactive-default
+    /// gate itself, `u64::MAX`):
+    /// * a 3-of-4 µQC MEETS the advisory threshold yet `verify`/`verify_unified`
+    ///   REFUSE it — µQC-alone never finalizes post-activation;
+    /// * the same-strength epoch/CEC (full-set envelope) VERIFIES — the full
+    ///   network QC (`quorum_power() == pq_full_required_power(total)`)
+    ///   finalizes;
+    /// * pre-activation control: the identical µQC at a small height verifies
+    ///   (legacy `max` rule, byte-identical — existing pins unmodified);
+    /// * the W=100/B=32 counterexample pair still refuses (the
+    ///   `mixed_quorum_pair_safe` tripwire is untouched).
+    #[test]
+    fn qc_split_post_activation_micro_alone_never_finalizes() {
+        // Fresh id domain (0x9C): the PQ-key registry is global, so parallel
+        // tests must not share ids with different keys.
+        let mut vs = ValidatorSet::new();
+        let mut fks = Vec::new();
+        for i in 0..4u8 {
+            let mut id = [0x9Cu8; 32];
+            id[0] = i;
+            let fk = make_sample_falcon512(0x70 + i);
+            register_validator_pq_key(
+                id,
+                crate::post_quantum::PqScheme::Falcon512,
+                fk.public_key().to_vec(),
+            );
+            vs.add(id, 1);
+            fks.push((id, fk));
+        }
+        assert_eq!(vs.total_power(), 4);
+        assert_eq!(vs.quorum_power(), pq_full_required_power(vs.total_power()));
+        assert_eq!(vs.quorum_power(), 3);
+
+        const PRE: Height = 7;
+        const POST: Height = QC_SPLIT_ACTIVATION_HEIGHT;
+        let round: Round = 0;
+        let kind = VoteKind::Precommit;
+        let block = [0xBBu8; 32];
+        let committee_size = micro_committee_size(vs.len());
+        assert_eq!(committee_size, 4);
+
+        // Build a 3-of-4 µQC at `height` (first 3 committee members sign).
+        let build_micro = |height: Height, parent: [u8; 32]| -> QuorumCertificate {
+            let committee =
+                derive_sortition_committee(&vs, height, round, committee_size, &parent);
+            assert_eq!(committee.len(), 4);
+            let msg = vote_sign_bytes(height, round, kind, &Some(block));
+            let mut bitmask = vec![0u8; (committee_size as usize).div_ceil(8)];
+            let mut sigs = Vec::new();
+            for (i, val_id) in committee.iter().enumerate().take(3) {
+                let (_, fk) = fks.iter().find(|(id, _)| id == val_id).unwrap();
+                sigs.push(fk.sign(&msg));
+                bitmask[i / 8] |= 1 << (i % 8);
+            }
+            let committee_total: u64 =
+                committee.iter().map(|id| vs.power_of(id)).sum();
+            assert_eq!(
+                sigs.len(),
+                3,
+                "fixture must carry advisory power before proving refusal"
+            );
+            let signed: u64 = 3; // power 1 each
+            assert!(signed >= pq_micro_advisory_power(committee_total));
+            let uqc = PqMicroCertificate {
+                scheme: crate::post_quantum::PqScheme::Falcon512,
+                height,
+                round,
+                committee_size,
+                signers_bitmask: bitmask,
+                signatures: sigs,
+                sortition_parent: parent,
+            };
+            QuorumCertificate {
+                height,
+                round,
+                kind,
+                block_hash: Some(block),
+                signatures: vec![(PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc))],
+            }
+        };
+        // Build the same-strength full-set epoch/CEC cert at `height`.
+        let build_full = |height: Height| -> QuorumCertificate {
+            let mut ids: Vec<ValidatorId> = vs.validators.keys().copied().collect();
+            ids.sort_unstable();
+            let msg = vote_sign_bytes(height, round, kind, &Some(block));
+            let mut bitmask = vec![0u8; ids.len().div_ceil(8)];
+            let mut sigs = Vec::new();
+            for (i, val_id) in ids.iter().enumerate().take(3) {
+                let (_, fk) = fks.iter().find(|(id, _)| id == val_id).unwrap();
+                sigs.push(fk.sign(&msg));
+                bitmask[i / 8] |= 1 << (i % 8);
+            }
+            let cec = PqMicroCertificate {
+                scheme: crate::post_quantum::PqScheme::Falcon512,
+                height,
+                round,
+                committee_size: ids.len() as u32,
+                signers_bitmask: bitmask,
+                signatures: sigs,
+                sortition_parent: [0u8; 32],
+            };
+            QuorumCertificate {
+                height,
+                round,
+                kind,
+                block_hash: Some(block),
+                signatures: vec![(PQ_QC_MARKER_ID, encode_pq_epoch_envelope(&cec))],
+            }
+        };
+
+        // Pre-activation control: legacy `max` rule — 3-of-4 verifies.
+        let pre = build_micro(PRE, [0xC7; 32]);
+        assert!(pre.verify(&vs), "pre-activation µQC must verify (legacy pin)");
+        assert!(pre.verify_unified(&vs));
+
+        // Post-activation: advisory met, finality REFUSED for µQC-alone.
+        let post = build_micro(POST, [0xC8; 32]);
+        assert!(!post.verify(&vs), "post-activation µQC-alone must never verify");
+        assert!(
+            !post.verify_unified(&vs),
+            "post-activation µQC-alone must never verify_unified"
+        );
+
+        // Post-activation: the full network QC finalizes.
+        let full = build_full(POST);
+        assert!(full.verify(&vs), "post-activation full QC must verify");
+        assert!(full.verify_unified(&vs));
+        assert!(vs.qc_meets_quorum(&full));
+
+        // Counterexample W=100/B=32 still refused (tripwire untouched).
+        assert!(!mixed_quorum_pair_safe(51, 67, 100));
+        assert!(mixed_quorum_pair_safe(67, 67, 100));
     }
 
     #[test]

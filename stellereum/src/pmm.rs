@@ -732,4 +732,59 @@ mod tests {
         let s = c.sell_stell(stell(100)).unwrap();
         assert_eq!(c.reserve_micro, usdt(5_000) as u128 - s.usdt_paid as u128);
     }
+
+    /// FIXES §1.9 lock (variant B — WITHHELD): buys fund the reserve while
+    /// withholding the buffer fraction, and sells are capped by the usable
+    /// reserve. One test pins BOTH sides of the binding rule
+    /// (`usable = reserve − buffer`, lines 192-195): a full-position sell
+    /// after a default buy MUST fail, `max_redeemable` MUST fit usable, and
+    /// `max + 1` MUST NOT (up to 1-nano dust flooring, same guard as
+    /// `no_exploit_with_partial_redemption_exceeding_buffer`). Economics
+    /// unchanged — this only locks behavior.
+    #[test]
+    fn buffer_withheld_variant_b_buy_and_sell_respect_usable() {
+        let mut pmm = PrimaryMarketMaker::new();
+        let r = pmm.buy_with_usdt(usdt(10_000)).unwrap();
+        // Buy side: full proceeds enter the reserve; 20% is withheld.
+        assert_eq!(pmm.reserve_micro, usdt(10_000) as u128);
+        assert_eq!(pmm.redemption_buffer_micro, usdt(2_000) as u128);
+        assert_eq!(
+            pmm.usable_reserve_micro(),
+            pmm.reserve_micro.saturating_sub(pmm.redemption_buffer_micro),
+            "variant B binding rule: usable = reserve - buffer"
+        );
+        assert_eq!(pmm.usable_reserve_micro(), usdt(8_000) as u128);
+        // Sell side: the full position does NOT fit the usable reserve.
+        assert_eq!(
+            pmm.sell_stell(r.stell_minted),
+            Err(PmmError::InsufficientReserve),
+            "withheld buffer must block a full instant drain"
+        );
+        // The maximum redeemable position fits; one nano more does not —
+        // unless it prices identically (1-nano dust floors to equal micro).
+        let max = pmm.max_redeemable_stell();
+        assert!(max > 0 && (max as u128) < pmm.minted_nano);
+        let usable_before = pmm.usable_reserve_micro();
+        let payout = pmm.sell_payout_micro(pmm.minted_nano, max as u128);
+        assert!(
+            payout <= usable_before,
+            "max payout {payout} must fit usable {usable_before}"
+        );
+        if (max as u128) < pmm.minted_nano {
+            let over = pmm.sell_payout_micro(pmm.minted_nano, (max as u128) + 1);
+            assert!(
+                over > usable_before || over == payout,
+                "max+1 payout {over} must exceed usable {usable_before} (or price identically)"
+            );
+        }
+        let receipt = pmm.sell_stell(max).unwrap();
+        assert_eq!(receipt.usdt_paid as u128, payout);
+        // Conservation + buffer invariant survive the sell.
+        assert_eq!(pmm.reserve_micro, usdt(10_000) as u128 - payout);
+        assert!(pmm.redemption_buffer_micro <= pmm.reserve_micro);
+        assert_eq!(
+            pmm.usable_reserve_micro(),
+            pmm.reserve_micro.saturating_sub(pmm.redemption_buffer_micro)
+        );
+    }
 }

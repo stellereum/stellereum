@@ -201,12 +201,13 @@ async fn bridge_replay_set_survives_snapshot_and_restore() {
     let recipient = [0xABu8; 32];
     let amount = 5_000 * STELL;
 
-    // DESIGNED REFUSAL (FULL-PQ, nodes wiped, no compat): the classical
-    // ed25519 bridge quorum is removed — `verify_quorum_signatures` fails
-    // closed on every input, so a quorum-attested deposit can never credit,
-    // even wrapped in a valid PQ transport envelope. Prove it loudly at both
-    // layers: the quorum helper names the removal, and the block path refuses
-    // the attested deposit (status false, nothing minted).
+    // DESIGNED REFUSAL (FIXES §1.1, nodes wiped, no compat): the bridge
+    // quorum counts REGISTERED Falcon-512 keys only — Ed identity never
+    // verifies — so a quorum-attested deposit carrying classical ed25519
+    // signatures can never credit, even wrapped in a valid PQ transport
+    // envelope. Prove it loudly at both layers: the quorum helper refuses
+    // fail-closed (empty set, and unregistered keys), and the block path
+    // refuses the attested deposit (status false, nothing minted).
     let dep = deposit([0x71u8; 32], recipient, amount);
     let att = attest(&dep, &vals[..2]);
     {
@@ -220,10 +221,10 @@ async fn bridge_replay_set_survives_snapshot_and_restore() {
             })
             .collect();
         let err = stellereum::bridge::verify_quorum_signatures(&msg, &sigs, &[])
-            .expect_err("classical quorum must be refused under FULL-PQ");
+            .expect_err("classical quorum must be refused under the Falcon rule");
         assert!(
-            err.contains("FULL-PQ: classical bridge quorum removed"),
-            "quorum refusal must name the designed removal: {err}"
+            err.contains("bridge quorum: empty validator set refuses fail-closed"),
+            "quorum refusal must name the fail-closed empty set: {err}"
         );
     }
     let tx = bridge_tx(PAYER_SEED, 0, ops(att.clone(), dep.clone()));
@@ -233,7 +234,7 @@ async fn bridge_replay_set_survives_snapshot_and_restore() {
     assert_eq!(
         out.status,
         vec![false],
-        "a quorum-attested deposit is refused under FULL-PQ (quorum removed)"
+        "a classically-attested deposit is refused under the Falcon rule (Ed never counts)"
     );
     assert_eq!(
         balance(&e, &recipient).await,
@@ -415,9 +416,10 @@ async fn bridge_replay_set_survives_snapshot_and_restore() {
 #[tokio::test]
 async fn bridge_snapshot_bytes_round_trip_and_absent_means_empty() {
     let (e, _) = setup(3).await;
-    // FULL-PQ: the quorum-attested deposit path is removed (see test 1), so
-    // the non-empty domain is seeded directly — the bytes round-trip property
-    // under test is unchanged (one credited source tx in the replay set).
+    // The classically-attested deposit path refuses under the Falcon rule
+    // (see test 1), so the non-empty domain is seeded directly — the bytes
+    // round-trip property under test is unchanged (one credited source tx in
+    // the replay set).
     e.bridge_write()
         .await
         .processed_source_txs

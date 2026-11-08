@@ -652,4 +652,86 @@ mod econ_truth_tests {
             "99% by H·log2(100), integer pct={pct}"
         );
     }
+
+    /// FIXES §1.10/§4.7 lock: H_b is in BLOCKS —
+    /// H_b = T·SEC_PER_YEAR/τ / log2(100) — derived here with INTEGER-ONLY
+    /// math (no f64 in this test body).
+    ///
+    /// 7-yr horizon at τ = 0.6 s: N_T = 7·31,536,000·10/6 = 367,920,000
+    /// blocks; log2(100) = 6.64385618977… → 6_643_856/1e6 (floor, same scale
+    /// as `cap_exact_checksum_99_by_h_log2_100_integer`).
+    /// Exact-formula floor: 367,920,000·1e6/6_643_856 = 55,377,479.
+    /// Pinned `CAP_EXACT_HALF_LIFE_BLOCKS` = 55,398,240 (= 1.054 yr in blocks,
+    /// the emission.json row's 3-decimal half-life) sits 20,761 blocks
+    /// (+0.037%) above the exact floor: 1.054 rounds the true 1.05360498… yr
+    /// UP. REPORTED rounding gap (not an economics change): the pinned value
+    /// stays frozen; this test locks BOTH numbers and the <0.1% band so any
+    /// future H_b change trips loudly.
+    #[test]
+    fn hb_is_in_blocks_per_spec_section_1_10_integer() {
+        let blocks_per_year = 31_536_000u64 * 10 / 6; // τ = 0.6 s, integer
+        assert_eq!(blocks_per_year, 52_560_000);
+        let n_t = 7u64 * blocks_per_year; // T = 7 yr horizon
+        assert_eq!(n_t, 367_920_000);
+        let h_exact_floor = n_t * 1_000_000 / 6_643_856; // N_T / log2(100)
+        assert_eq!(h_exact_floor, 55_377_479);
+        assert_eq!(CAP_EXACT_HALF_LIFE_BLOCKS, 55_398_240);
+        let delta = CAP_EXACT_HALF_LIFE_BLOCKS - h_exact_floor;
+        assert_eq!(delta, 20_761);
+        // Rounded spec value stays within 0.1% of the exact formula.
+        assert!(
+            delta * 1000 <= h_exact_floor,
+            "delta {delta} must be <0.1% of {h_exact_floor}"
+        );
+    }
+
+    /// FIXES §2.8/§4.7 lock: Σ_{h≥0} R_h = P (infinite-tail checksum).
+    ///
+    /// The real-H horizon (368M blocks) is unloopable, so this test checks the
+    /// SAME helper family at small H exhaustively: sum every nonzero floored
+    /// reward until the helper returns 0, then bound the dust. Flooring can
+    /// only UNDERpay (each term loses < 1 nano; the sub-nano tail past the
+    /// last nonzero term integrates to < H/ln2 + 1 nano), so P − dust ≤ sum ≤
+    /// P with dust = terms + 2·H (generous integer bound). Integer-only test
+    /// body (u128 accumulators); the helpers' own float is the REPORTED §4.7
+    /// gap (tokenomics.rs:402-419), not re-proven here.
+    #[test]
+    fn infinite_sum_checksum_within_flooring_dust_small_h() {
+        let pool = StakingEmissionSchedule::default().total_pool;
+        let h = 1_000u64;
+        let r0 = geometric_schedule_r0_nano(pool, h);
+        assert!(r0 > 0 && r0 < pool);
+        let mut sum: u128 = 0;
+        let mut terms: u128 = 0;
+        let mut height: u64 = 0;
+        loop {
+            let r = geometric_reward_at_height(r0, h, height) as u128;
+            if r == 0 {
+                break;
+            }
+            sum += r;
+            terms += 1;
+            height += 1;
+            assert!(height < 1_000_000, "must reach zero reward (H={h})");
+        }
+        assert!(terms > 0);
+        assert!(
+            sum <= pool as u128,
+            "floored sum {sum} must never exceed pool {pool}"
+        );
+        let deficit = pool as u128 - sum;
+        // Generous integer dust bound: <1 nano per floored term plus a 2·H
+        // nano allowance covering the sub-nano tail (true tail < H/ln2 + 1).
+        let dust_bound = terms + 2 * h as u128;
+        assert!(
+            deficit <= dust_bound,
+            "ΣR_h must equal P within flooring dust: deficit={deficit} bound={dust_bound} terms={terms}"
+        );
+        // Sanity: essentially the whole pool is emitted (far above the 99%
+        // spot already pinned elsewhere).
+        assert!(
+            sum * 100_000 >= pool as u128 * 99_999,
+            "sum={sum} pool={pool}"
+        );
+    }
 }

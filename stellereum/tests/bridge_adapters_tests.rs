@@ -19,13 +19,35 @@ use stellereum::bridge::{
     SupportedChain, ARBITRUM_FINALITY_BLOCKS, ETHEREUM_FINALITY_BLOCKS, MIN_TON_CONFIRMATIONS,
 };
 use stellereum::cell::{BagOfCells, Cell, PatriciaTrie};
+use stellereum::consensus::register_validator_pq_key;
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
+/// Deterministic Falcon-512 companion for an Ed-identity fixture key: derived
+/// from the Ed secret bytes, so every test registering the same fixture id
+/// converges on the same Falcon key (idempotent overwrite across the
+/// parallel tests in this binary).
+fn falcon_for(sk: &SigningKey) -> FalconKeypair {
+    FalconKeypair::generate_from_seed_bytes(&sk.to_bytes())
+}
+
+fn register_falcon(sk: &SigningKey) {
+    let fk = falcon_for(sk);
+    register_validator_pq_key(
+        sk.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+}
+
 fn validators(n: usize, base: u8) -> (Vec<SigningKey>, Vec<[u8; 32]>) {
     let keys: Vec<SigningKey> = (0..n).map(|i| key(base.wrapping_add(i as u8))).collect();
+    for k in &keys {
+        register_falcon(k);
+    }
     let pks: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
     (keys, pks)
 }
@@ -33,7 +55,7 @@ fn validators(n: usize, base: u8) -> (Vec<SigningKey>, Vec<[u8; 32]>) {
 fn sign_all(header: &StoredHeader, keys: &[SigningKey]) -> Vec<([u8; 32], Vec<u8>)> {
     let msg = header.signing_message();
     keys.iter()
-        .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
+        .map(|k| (k.verifying_key().to_bytes(), falcon_for(k).sign(&msg)))
         .collect()
 }
 
@@ -274,12 +296,12 @@ fn binary_merkle_proof_verifies_and_rejects_tampering() {
 fn quorum_evidence_adapts_the_live_threshold() {
     let (keys, pks) = validators(3, 0xA0);
     let claim = ton_claim();
-    // FULL-PQ: classical ed25519 quorum removed (src/bridge.rs:571 always
-    // Err, no PQ quorum path in this zone). Even a valid 2-of-3 quorum over
-    // `deposit_signing_message` is refused fail-closed — mirrors
-    // `bridge::tests::pure_pq_refuses_classical_quorum`. Threshold math
-    // (`bridge_threshold`/`quorum_threshold`) stays pinned; only the
-    // mechanism leg changes.
+    // FIXES §1.1: the shared Falcon DISTINCT quorum is live. A valid 2-of-3
+    // quorum of REGISTERED Falcon-512 signatures over
+    // `deposit_signing_message` verifies — mirrors
+    // `bridge::tests::falcon_quorum_three_of_four_returns_ok_three`.
+    // Threshold math (`bridge_threshold`/`quorum_threshold`) stays pinned;
+    // only the mechanism leg changed (Ed identity, Falcon key).
     let event = stellereum::bridge::TeleportDepositEvent {
         source_chain: claim.chain,
         source_tx_hash: claim.source_tx_hash,
@@ -292,21 +314,17 @@ fn quorum_evidence_adapts_the_live_threshold() {
     let msg = stellereum::bridge::TeleportBridgeEngine::deposit_signing_message(&event);
     let sigs: Vec<([u8; 32], Vec<u8>)> = keys[..2]
         .iter()
-        .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
+        .map(|k| (k.verifying_key().to_bytes(), falcon_for(k).sign(&msg)))
         .collect();
     let ev = DepositEvidence::QuorumAttested { signatures: sigs };
-    let err = verify_evidence(&claim, &ev, &pks).unwrap_err();
-    assert!(
-        err.contains("FULL-PQ"),
-        "2/3 classical quorum must be refused under FULL-PQ, got: {err}"
-    );
+    verify_evidence(&claim, &ev, &pks).expect("2/3 Falcon quorum must verify");
 
     // One signature is sub-quorum.
     let one = DepositEvidence::QuorumAttested {
         signatures: {
             let s = &keys[..1];
             s.iter()
-                .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
+                .map(|k| (k.verifying_key().to_bytes(), falcon_for(k).sign(&msg)))
                 .collect()
         },
     };
@@ -354,7 +372,7 @@ fn quorum_evidence_adapts_the_live_threshold() {
 }
 
 fn k_sign(k: &SigningKey, msg: &[u8]) -> ([u8; 32], Vec<u8>) {
-    (k.verifying_key().to_bytes(), k.sign(msg).to_vec())
+    (k.verifying_key().to_bytes(), falcon_for(k).sign(msg))
 }
 
 // ===========================================================================
@@ -367,23 +385,15 @@ fn ton_adapter_verifies_valid_cell_evidence() {
     let claim = ton_claim();
     let (ev, _) = valid_ton_evidence(&claim, &keys, None, None);
     ev.validate_shape().expect("valid shape");
-    // FULL-PQ (src/bridge.rs:571): header quorum is removed, so even a
-    // fully valid TON cell bundle is refused fail-closed at the header gate.
-    // Inclusion cryptography itself is unchanged (see tampering test + BoC
-    // fixture test); only the quorum leg changes.
-    let err = TonAdapter::new(MIN_TON_CONFIRMATIONS)
+    // FIXES §1.1: the header carries a 2/3 DISTINCT Falcon quorum, so the
+    // fully valid TON cell bundle verifies. Inclusion cryptography itself is
+    // unchanged (see tampering test + BoC fixture test); only the quorum leg
+    // changed (Ed identity, Falcon key).
+    TonAdapter::new(MIN_TON_CONFIRMATIONS)
         .verify_deposit(&claim, &ev, &pks)
-        .unwrap_err();
-    assert!(
-        err.contains("FULL-PQ"),
-        "valid TON evidence must be refused under FULL-PQ, got: {err}"
-    );
+        .expect("valid TON evidence must verify under the Falcon quorum");
     // Same through the consensus dispatcher.
-    let derr = verify_evidence(&claim, &ev, &pks).unwrap_err();
-    assert!(
-        derr.contains("FULL-PQ"),
-        "dispatcher must refuse TON evidence under FULL-PQ, got: {derr}"
-    );
+    verify_evidence(&claim, &ev, &pks).expect("dispatcher must verify TON evidence");
 }
 
 #[test]
@@ -504,21 +514,13 @@ fn evm_adapter_verifies_valid_receipt_evidence() {
     let claim = evm_claim();
     let (ev, _) = valid_evm_evidence(&claim, &keys, 0, None);
     ev.validate_shape().expect("valid shape");
-    // FULL-PQ (src/bridge.rs:571): header quorum removed — valid EVM receipt
-    // bundle refused fail-closed at the header gate. Receipt binding + MPT
-    // cryptography unchanged (see tampering test).
-    let err = EvmAdapter::new(SupportedChain::Ethereum, ETHEREUM_FINALITY_BLOCKS)
+    // FIXES §1.1: the header carries a 2/3 DISTINCT Falcon quorum, so the
+    // valid EVM receipt bundle verifies. Receipt binding + MPT cryptography
+    // unchanged (see tampering test).
+    EvmAdapter::new(SupportedChain::Ethereum, ETHEREUM_FINALITY_BLOCKS)
         .verify_deposit(&claim, &ev, &pks)
-        .unwrap_err();
-    assert!(
-        err.contains("FULL-PQ"),
-        "valid EVM evidence must be refused under FULL-PQ, got: {err}"
-    );
-    let derr = verify_evidence(&claim, &ev, &pks).unwrap_err();
-    assert!(
-        derr.contains("FULL-PQ"),
-        "dispatcher must refuse EVM evidence under FULL-PQ, got: {derr}"
-    );
+        .expect("valid EVM evidence must verify under the Falcon quorum");
+    verify_evidence(&claim, &ev, &pks).expect("dispatcher must verify EVM evidence");
 }
 
 #[test]
@@ -596,13 +598,9 @@ fn evm_adapter_rejects_every_tampering() {
         "cross-chain header must fail"
     );
     // ... while the Arbitrum adapter (32 confirmations) accepts it.
-    // FULL-PQ (src/bridge.rs:571): header quorum removed — even the
-    // Arbitrum-header bundle is refused fail-closed (no PQ quorum path).
-    let arb_err = verify_evidence(&arb, &ev, &pks).unwrap_err();
-    assert!(
-        arb_err.contains("FULL-PQ"),
-        "Arbitrum evidence must be refused under FULL-PQ, got: {arb_err}"
-    );
+    // FIXES §1.1: the header carries a 2/3 DISTINCT Falcon quorum, so the
+    // Arbitrum-header bundle verifies through the dispatcher.
+    verify_evidence(&arb, &ev, &pks).expect("Arbitrum evidence must verify under the Falcon quorum");
 }
 
 // ===========================================================================
@@ -615,21 +613,13 @@ fn solana_adapter_verifies_valid_tx_evidence() {
     let claim = sol_claim();
     let (ev, _) = valid_sol_evidence(&claim, &keys, None);
     ev.validate_shape().expect("valid shape");
-    // FULL-PQ (src/bridge.rs:571): header quorum removed — valid Solana
-    // Merkle bundle refused fail-closed at the header gate. Leaf binding +
-    // binary-Merkle cryptography unchanged (see tampering test).
-    let err = SolanaAdapter::new(SOLANA_FINALITY_SLOTS)
+    // FIXES §1.1: the header carries a 2/3 DISTINCT Falcon quorum, so the
+    // valid Solana Merkle bundle verifies. Leaf binding + binary-Merkle
+    // cryptography unchanged (see tampering test).
+    SolanaAdapter::new(SOLANA_FINALITY_SLOTS)
         .verify_deposit(&claim, &ev, &pks)
-        .unwrap_err();
-    assert!(
-        err.contains("FULL-PQ"),
-        "valid Solana evidence must be refused under FULL-PQ, got: {err}"
-    );
-    let derr = verify_evidence(&claim, &ev, &pks).unwrap_err();
-    assert!(
-        derr.contains("FULL-PQ"),
-        "dispatcher must refuse Solana evidence under FULL-PQ, got: {derr}"
-    );
+        .expect("valid Solana evidence must verify under the Falcon quorum");
+    verify_evidence(&claim, &ev, &pks).expect("dispatcher must verify Solana evidence");
 }
 
 #[test]
@@ -739,26 +729,18 @@ fn dispatcher_routes_by_claim_chain_and_rejects_mismatches() {
     let (evm_ev, _) = valid_evm_evidence(&evm, &keys, 0, None);
     assert!(verify_evidence(&ton, &evm_ev, &pks).is_err());
     assert!(verify_evidence(&evm, &ton_ev, &pks).is_err());
-    // FULL-PQ (src/bridge.rs:571): each chain's own evidence is refused
-    // fail-closed at the header quorum gate (no PQ quorum path). Chain
-    // namespacing itself is unchanged — mismatches still refuse.
+    // FIXES §1.1: each chain's own evidence carries a 2/3 DISTINCT Falcon
+    // quorum and verifies. Chain namespacing itself is unchanged — mismatches
+    // still refuse.
     for (claim, ev) in [
         (&ton, &ton_ev),
         (&evm, &evm_ev),
     ] {
-        let err = verify_evidence(claim, ev, &pks).unwrap_err();
-        assert!(
-            err.contains("FULL-PQ"),
-            "own-chain evidence must be refused under FULL-PQ, got: {err}"
-        );
+        verify_evidence(claim, ev, &pks).expect("own-chain evidence must verify under the Falcon quorum");
     }
     let sol = sol_claim();
     let (sol_ev, _) = valid_sol_evidence(&sol, &keys, None);
-    let serr = verify_evidence(&sol, &sol_ev, &pks).unwrap_err();
-    assert!(
-        serr.contains("FULL-PQ"),
-        "own-chain Solana evidence must be refused under FULL-PQ, got: {serr}"
-    );
+    verify_evidence(&sol, &sol_ev, &pks).expect("own-chain Solana evidence must verify");
 }
 
 #[test]

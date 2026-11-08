@@ -552,10 +552,21 @@ pub fn quorum_threshold(n: usize) -> usize {
 /// ([`bridge_adapters::verify_quorum_evidence`]) all count through here, so
 /// the three cannot drift.
 ///
-/// * one vote per validator (a single key signing twice counts once);
-/// * only keys in `validators` count (outsiders are ignored, not errors);
-/// * malformed keys/signatures are ignored (a garbage bundle is sub-quorum,
-///   not a crash);
+/// FULL-PQ (FIXES §1.1, sketch §4.2): each `(id, sig)` is checked against
+/// the REGISTERED Falcon-512 key for `id`
+/// ([`crate::consensus::get_validator_pq_key`], read-only) and verified with
+/// [`crate::consensus::verify_falcon_signature`]:
+///
+/// * one vote per validator (a single key signing twice counts once —
+///   `BTreeSet` dedup);
+/// * the `[u8; 32]` id is Ed IDENTITY only — an Ed25519 signature never
+///   verifies as Falcon (length-gated to 666 bytes) and a registered
+///   non-Falcon scheme refuses fail-closed;
+/// * only keys in `validators` count; an UNKNOWN signer (not in the set, no
+///   registered PQ key, or non-Falcon scheme) refuses fail-closed with `Err`
+///   (never a silent skip that a quorum could route around);
+/// * an invalid Falcon signature from a KNOWN signer does not count (a
+///   garbage bundle is sub-quorum, not a crash);
 /// * an EMPTY validator set fails closed even though the arithmetic
 ///   threshold would be 0;
 /// * deterministic: the RETURNED COUNT is the only observable (no pubkey
@@ -565,10 +576,61 @@ pub fn verify_quorum_signatures(
     sigs: &[([u8; 32], Vec<u8>)],
     validators: &[[u8; 32]],
 ) -> Result<usize, String> {
-    // FULL-PQ: classical ed25519 quorum evidence is REMOVED (no PQ quorum
-    // path exists in this zone; wire frozen). Always fail closed.
-    let _ = (msg, sigs, validators);
-    Err("FULL-PQ: classical bridge quorum removed".to_string())
+    let need = bridge_threshold(validators.len());
+    let count = distinct_falcon_signers(msg, sigs, validators)?;
+    if count >= need {
+        Ok(count)
+    } else {
+        Err(format!(
+            "bridge quorum not reached: {count} distinct Falcon-512 signer(s), need {need} (fail closed)"
+        ))
+    }
+}
+
+/// DISTINCT Falcon-512 signer count behind [`verify_quorum_signatures`] and
+/// [`MultisigRelayer::count_signers`]: `Ok` = number of distinct validators
+/// in `validators` whose REGISTERED Falcon-512 key verifies `msg`; `Err` =
+/// fail-closed refusal (empty set, or ANY unknown/non-Falcon signer entry).
+///
+/// Fail-closed direction: an unknown entry aborts the whole count with `Err`
+/// instead of being skipped, so a bundle smuggling an unregistered key can
+/// never reach quorum no matter how many valid signatures accompany it.
+fn distinct_falcon_signers(
+    msg: &[u8],
+    sigs: &[([u8; 32], Vec<u8>)],
+    validators: &[[u8; 32]],
+) -> Result<usize, String> {
+    if validators.is_empty() {
+        return Err("bridge quorum: empty validator set refuses fail-closed".to_string());
+    }
+    let allowed: std::collections::BTreeSet<[u8; 32]> =
+        validators.iter().copied().collect();
+    let mut seen: std::collections::BTreeSet<[u8; 32]> = std::collections::BTreeSet::new();
+    for (id, sig) in sigs {
+        if seen.contains(id) {
+            continue;
+        }
+        if !allowed.contains(id) {
+            return Err(
+                "bridge quorum: unknown signer (not in validator set) refused fail-closed"
+                    .to_string(),
+            );
+        }
+        let (scheme, pk) = crate::consensus::get_validator_pq_key(id).ok_or_else(|| {
+            "bridge quorum: no registered PQ key for signer refused fail-closed".to_string()
+        })?;
+        if scheme != crate::post_quantum::PqScheme::Falcon512 {
+            return Err(
+                "bridge quorum: non-Falcon registered scheme refused fail-closed (Ed id is identity only)"
+                    .to_string(),
+            );
+        }
+        if !crate::consensus::verify_falcon_signature(&pk, msg, sig) {
+            continue;
+        }
+        seen.insert(*id);
+    }
+    Ok(seen.len())
 }
 
 pub struct TeleportBridgeEngine {
@@ -1867,12 +1929,15 @@ impl MultisigRelayer {
         }
     }
 
-    /// Number of DISTINCT valid whitelisted signers over `msg`.
-    /// FULL-PQ: classical ed quorum removed (no PQ path in this zone).
-    /// Always 0 (fail closed).
+    /// Number of DISTINCT valid Falcon-512 signers over `msg` (FIXES §1.1).
+    /// Counts through the shared [`verify_quorum_signatures`] rule: the
+    /// signer's REGISTERED Falcon-512 key must verify; duplicates count once;
+    /// unknown/non-Falcon signers refuse fail-closed as `0` so
+    /// [`MultisigRelayer::try_release`] (and every `is_approved` gate) refuses
+    /// the release.
     pub fn count_signers(&self, msg: &[u8], sigs: &[([u8; 32], Vec<u8>)]) -> usize {
-        let _ = (msg, sigs);
-        0
+        let validators: Vec<[u8; 32]> = self.validators.iter().copied().collect();
+        distinct_falcon_signers(msg, sigs, &validators).unwrap_or(0)
     }
 
     /// Authorize a release exactly once. `op_id` is the bridge operation id.
@@ -2194,8 +2259,8 @@ mod tests {
         );
 
         // two DISTINCT signers pass
-        // FULL-PQ: classical quorum removed — even distinct classical sigs
-        // are refused.
+        // FIXES §1.1: the quorum counts REGISTERED Falcon-512 keys only —
+        // these classical sigs carry no registered key, so they are refused.
         ev.validator_signatures = vec![sig(&a, &msg), sig(&b, &msg)];
         assert!(engine.process_deposit(&ev).is_err());
     }
@@ -2271,8 +2336,9 @@ mod tests {
         let mut ev = deposit(&a, 500);
         let msg = TeleportBridgeEngine::deposit_signing_message(&ev);
         ev.validator_signatures = vec![sig(&a, &msg), sig(&b, &msg)];
-        // FULL-PQ: classical quorum removed — deposit refused (replay set
-        // untouched, so a second identical ingest is also refused).
+        // FIXES §1.1: classical sigs carry no registered Falcon key —
+        // deposit refused (replay set untouched, so a second identical
+        // ingest is also refused).
         assert!(engine.process_deposit(&ev).is_err());
         assert!(
             engine.process_deposit(&ev).is_err(),
@@ -2304,8 +2370,9 @@ mod tests {
 
     #[test]
     fn multisig_release_requires_distinct_threshold_and_is_once() {
-        // FULL-PQ: classical multisig release removed — every release is
-        // refused fail-closed (count_signers always 0).
+        // FIXES §1.1: the relayer counts REGISTERED Falcon keys only —
+        // classical sigs carry no registered key, so every release here is
+        // refused fail-closed (count_signers 0).
         let keys: Vec<SigningKey> = (0..3).map(|_| SigningKey::generate(&mut OsRng)).collect();
         let pubs: Vec<[u8; 32]> = keys.iter().map(|k| k.verifying_key().to_bytes()).collect();
         let mut relayer = MultisigRelayer::new(pubs);
@@ -2317,7 +2384,8 @@ mod tests {
         assert!(relayer
             .try_release(op, msg, &[sig(&keys[0], msg), sig(&keys[0], msg)])
             .is_err());
-        // FULL-PQ: even 2 distinct classical sigs are refused.
+        // FIXES §1.1: even 2 distinct classical sigs are refused (no
+        // registered Falcon key).
         assert!(relayer
             .try_release(op, msg, &[sig(&keys[0], msg), sig(&keys[1], msg)])
             .is_err());
@@ -2340,7 +2408,8 @@ mod tests {
         );
 
         // A single validator must still require that validator's signature.
-        // FULL-PQ: classical sigs are refused even from the validator.
+        // FIXES §1.1: classical sigs carry no registered Falcon key, so they
+        // are refused even from the validator.
         let k = SigningKey::generate(&mut OsRng);
         let mut one = MultisigRelayer::new(vec![k.verifying_key().to_bytes()]);
         let msg = b"release";
@@ -2496,8 +2565,8 @@ mod tests {
         order.signatures.push(sig(&keys[0], &msg));
         assert!(!order.is_approved(&relayer, 500));
 
-        // FULL-PQ: classical quorum removed — even 2 distinct classical
-        // sigs never approve (count_signers is always 0, fail closed).
+        // FIXES §1.1: classical sigs carry no registered Falcon key, so
+        // even 2 distinct ones never approve (count_signers 0, fail closed).
         order.signatures.push(sig(&keys[1], &msg));
         assert!(!order.is_approved(&relayer, 500));
 
@@ -2561,8 +2630,8 @@ mod tests {
         order.signatures.push(sig(&keys[0], &msg));
         assert!(!order.is_approved(&relayer, 1_000));
 
-        // FULL-PQ: classical quorum removed — even 2 distinct classical
-        // sigs never approve (count_signers is always 0, fail closed).
+        // FIXES §1.1: classical sigs carry no registered Falcon key, so
+        // even 2 distinct ones never approve (count_signers 0, fail closed).
         order.signatures.push(sig(&keys[1], &msg));
         assert!(!order.is_approved(&relayer, 1_000));
 
@@ -2649,8 +2718,10 @@ mod tests {
         assert_eq!(discriminant(&BridgeIntent::Resolve { dispute_id: 0 }), 7);
     }
 
-    /// FULL-PQ: classical ed25519 quorum is REMOVED — always refused (Err),
-    /// with or without the (no-op) override.
+    /// FIXES §1.1: classical ed25519 signatures never count toward the
+    /// Falcon DISTINCT quorum — always refused (Err), with or without the
+    /// (no-op) pure-PQ override. The ids below carry no registered Falcon
+    /// key, and a 64-byte Ed signature can never verify as Falcon-512.
     #[test]
     fn pure_pq_refuses_classical_quorum() {
         struct PurePqGuard;
@@ -2693,6 +2764,146 @@ mod tests {
         assert!(
             verify_quorum_signatures(msg, &sigs, &validators).is_err(),
             "FULL-PQ always-on: valid ed quorum refused"
+        );
+    }
+
+    // --- FIXES §1.1 / §5 acceptance: Falcon DISTINCT quorum. ---
+
+    /// Register a deterministic Falcon-512 key for an Ed-identity validator
+    /// id. Ed ids are fixed per test (`ed_seed`); the Falcon key derives from
+    /// `falcon_seed`, so parallel tests registering the same id converge on
+    /// the same key (idempotent overwrite, no cross-test flake).
+    fn falcon_id(
+        ed_seed: u8,
+        falcon_seed: u8,
+    ) -> ([u8; 32], crate::post_quantum::FalconKeypair) {
+        let sk = SigningKey::from_bytes(&[ed_seed; 32]);
+        let id = sk.verifying_key().to_bytes();
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(falcon_seed);
+        crate::consensus::register_validator_pq_key(
+            id,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+        (id, fk)
+    }
+
+    fn fsig(
+        id: &[u8; 32],
+        fk: &crate::post_quantum::FalconKeypair,
+        msg: &[u8],
+    ) -> ([u8; 32], Vec<u8>) {
+        (*id, fk.sign(msg))
+    }
+
+    #[test]
+    fn falcon_quorum_three_of_four_returns_ok_three() {
+        // bridge_threshold(4) = ceil(8/3) = 3. Three DISTINCT registered
+        // Falcon-512 signers reach quorum: Ok(3).
+        let (a, fa) = falcon_id(0xC0, 0xC0);
+        let (b, fb) = falcon_id(0xC1, 0xC1);
+        let (c, fc) = falcon_id(0xC2, 0xC2);
+        let (d, _) = falcon_id(0xC3, 0xC3);
+        let validators = vec![a, b, c, d];
+        let msg = b"bridge falcon 3-of-4";
+        let sigs = vec![fsig(&a, &fa, msg), fsig(&b, &fb, msg), fsig(&c, &fc, msg)];
+        assert_eq!(
+            verify_quorum_signatures(msg, &sigs, &validators),
+            Ok(3),
+            "3 distinct Falcon signers of 4 must reach quorum"
+        );
+    }
+
+    #[test]
+    fn falcon_quorum_two_of_four_is_refused() {
+        // Two valid Falcon signatures of four (need 3) stay sub-quorum: Err.
+        let (a, fa) = falcon_id(0xD0, 0xD0);
+        let (b, fb) = falcon_id(0xD1, 0xD1);
+        let (c, _) = falcon_id(0xD2, 0xD2);
+        let (d, _) = falcon_id(0xD3, 0xD3);
+        let validators = vec![a, b, c, d];
+        let msg = b"bridge falcon 2-of-4";
+        let sigs = vec![fsig(&a, &fa, msg), fsig(&b, &fb, msg)];
+        assert!(
+            verify_quorum_signatures(msg, &sigs, &validators).is_err(),
+            "2 of 4 Falcon signers must not reach quorum"
+        );
+    }
+
+    #[test]
+    fn falcon_duplicate_signer_counts_once() {
+        // n = 3 needs 2 DISTINCT. One signer twice = 1: Err, and the relayer
+        // counts exactly 1.
+        let (a, fa) = falcon_id(0xE0, 0xE0);
+        let (b, _) = falcon_id(0xE1, 0xE1);
+        let (c, _) = falcon_id(0xE2, 0xE2);
+        let validators = vec![a, b, c];
+        let msg = b"bridge falcon duplicate";
+        let sigs = vec![fsig(&a, &fa, msg), fsig(&a, &fa, msg)];
+        assert!(
+            verify_quorum_signatures(msg, &sigs, &validators).is_err(),
+            "a duplicated signer must not fake quorum"
+        );
+        let mut relayer = MultisigRelayer::new(validators);
+        assert_eq!(
+            relayer.count_signers(msg, &sigs),
+            1,
+            "a duplicated signer counts exactly once"
+        );
+        assert!(
+            relayer.try_release([0xD0; 32], msg, &sigs).is_err(),
+            "one distinct signer must not release (need 2)"
+        );
+    }
+
+    #[test]
+    fn falcon_unknown_key_is_refused_fail_closed() {
+        // n = 4 needs 3. Three valid Falcon sigs PLUS one unregistered key:
+        // a skip-unknown counter would report Ok(3); the fail-closed rule
+        // refuses the whole bundle with Err.
+        let (a, fa) = falcon_id(0xF0, 0xF0);
+        let (b, fb) = falcon_id(0xF1, 0xF1);
+        let (c, fc) = falcon_id(0xF2, 0xF2);
+        let (d, _) = falcon_id(0xF3, 0xF3);
+        let validators = vec![a, b, c, d];
+        let msg = b"bridge falcon unknown";
+        let stranger = SigningKey::from_bytes(&[0xEE; 32]);
+        let mut sigs = vec![fsig(&a, &fa, msg), fsig(&b, &fb, msg), fsig(&c, &fc, msg)];
+        sigs.push(sig(&stranger, msg));
+        assert!(
+            verify_quorum_signatures(msg, &sigs, &validators).is_err(),
+            "an unregistered key in the bundle must refuse fail-closed"
+        );
+        // An outsider outside the validator set refuses even alone.
+        let relayer = MultisigRelayer::new(validators);
+        assert_eq!(
+            relayer.count_signers(msg, &[sig(&stranger, msg)]),
+            0,
+            "outsider signatures count for nothing"
+        );
+    }
+
+    #[test]
+    fn falcon_ed_signature_never_counts() {
+        // The id is REGISTERED with a Falcon-512 key, but the bundle carries
+        // an Ed25519 signature (64 bytes) for it: Ed is identity only, so the
+        // entry never verifies and quorum is not reached.
+        let sk = SigningKey::from_bytes(&[0xB0; 32]);
+        let id = sk.verifying_key().to_bytes();
+        let fk = crate::post_quantum::FalconKeypair::generate_from_seed(0xB0);
+        crate::consensus::register_validator_pq_key(
+            id,
+            crate::post_quantum::PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+        let (b, _) = falcon_id(0xB1, 0xB1);
+        let (c, _) = falcon_id(0xB2, 0xB2);
+        let validators = vec![id, b, c];
+        let msg = b"bridge ed never counts";
+        let sigs = vec![sig(&sk, msg)];
+        assert!(
+            verify_quorum_signatures(msg, &sigs, &validators).is_err(),
+            "an Ed25519 signature must never count toward the Falcon quorum"
         );
     }
 }

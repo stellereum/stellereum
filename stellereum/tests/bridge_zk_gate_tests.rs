@@ -11,8 +11,10 @@
 //! These tests run the offline engine directly (the only path that can carry
 //! a `zk_proof`: live `BridgeIntent::Deposit` sets `zk_proof: None`).
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use stellereum::bridge::{SupportedChain, TeleportBridgeEngine, TeleportDepositEvent};
+use stellereum::consensus::register_validator_pq_key;
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::zkml::{QuantizedLayer, QuantizedLinearModel, ZkMlProof};
 
 /// Same model as the `zkml` forgery regression test.
@@ -33,8 +35,27 @@ fn keys() -> Vec<SigningKey> {
     ]
 }
 
+/// Deterministic Falcon-512 companion for an Ed-identity fixture key (FIXES
+/// §1.1: the bridge quorum counts REGISTERED Falcon keys; the `[u8; 32]` id
+/// is Ed identity only).
+fn falcon_for(sk: &SigningKey) -> FalconKeypair {
+    FalconKeypair::generate_from_seed_bytes(&sk.to_bytes())
+}
+
+fn register_falcon(sk: &SigningKey) {
+    let fk = falcon_for(sk);
+    register_validator_pq_key(
+        sk.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+}
+
 fn engine_with_quorum() -> (TeleportBridgeEngine, Vec<SigningKey>) {
     let ks = keys();
+    for k in &ks {
+        register_falcon(k);
+    }
     let pubs = ks.iter().map(|k| k.verifying_key().to_bytes()).collect();
     (TeleportBridgeEngine::new(pubs), ks)
 }
@@ -58,10 +79,10 @@ fn event_with_proof(
         zk_proof: None,
     };
     let msg = TeleportBridgeEngine::deposit_signing_message(&draft);
-    // First two signers: DISTINCT, reaches the n=3 quorum of 2.
+    // First two signers: DISTINCT, reaches the n=3 quorum of 2 (Falcon).
     let sigs = signers[..2]
         .iter()
-        .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
+        .map(|k| (k.verifying_key().to_bytes(), falcon_for(k).sign(&msg)))
         .collect();
     TeleportDepositEvent {
         validator_signatures: sigs,
@@ -142,7 +163,7 @@ fn proof_for_unknown_route_rejected_fail_closed() {
     });
     ev.validator_signatures = signers[..2]
         .iter()
-        .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
+        .map(|k| (k.verifying_key().to_bytes(), falcon_for(k).sign(&msg)))
         .collect();
     let err = engine
         .process_deposit(&ev)
@@ -213,7 +234,7 @@ fn no_proof_deposit_behavior_unchanged() {
     let msg = TeleportBridgeEngine::deposit_signing_message(&draft);
     let one_sig = vec![(
         signers3[0].verifying_key().to_bytes(),
-        signers3[0].sign(&msg).to_vec(),
+        falcon_for(&signers3[0]).sign(&msg),
     )];
     let ev3 = TeleportDepositEvent {
         validator_signatures: one_sig,

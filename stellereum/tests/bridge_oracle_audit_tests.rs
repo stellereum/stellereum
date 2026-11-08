@@ -15,7 +15,7 @@
 //! * BR-OR-04 watchers/adapters refuse future (unfinalized) observations;
 //! * BR-OR-05 EVM release orders refuse non-EVM chains (UNK-tag transplant).
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use stellereum::bridge::{
     BridgeIntent, BridgeState, EvmDepositEvent, EvmReleaseOrder, EvmWatcher, MultisigRelayer,
@@ -23,6 +23,8 @@ use stellereum::bridge::{
     ARBITRUM_FINALITY_BLOCKS, ETHEREUM_FINALITY_BLOCKS, MIN_TON_CONFIRMATIONS,
 };
 use stellereum::bridge::bridge_adapters as adapters;
+use stellereum::consensus::register_validator_pq_key;
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::oracle::{
     OracleSafetyEngine, OracleState, PriceFeedUpdate, STALE_PRICE_MAX_SECS as ORACLE_STALE_MAX,
 };
@@ -37,7 +39,20 @@ fn pub_of(sk: &SigningKey) -> [u8; 32] {
 }
 
 fn sign_msg(sk: &SigningKey, msg: &[u8]) -> ([u8; 32], Vec<u8>) {
-    (pub_of(sk), sk.sign(msg).to_vec())
+    (pub_of(sk), falcon_for(sk).sign(msg))
+}
+
+/// Deterministic Falcon-512 companion for an Ed-identity key (FIXES §1.1:
+/// the bridge quorum counts REGISTERED Falcon keys; the `[u8; 32]` id is Ed
+/// identity only). Register ONLY committed validator keys with
+/// `register_falcon` — outsiders stay unregistered and refuse fail-closed.
+fn falcon_for(sk: &SigningKey) -> FalconKeypair {
+    FalconKeypair::generate_from_seed_bytes(&sk.to_bytes())
+}
+
+fn register_falcon(sk: &SigningKey) {
+    let fk = falcon_for(sk);
+    register_validator_pq_key(pub_of(sk), PqScheme::Falcon512, fk.public_key.clone());
 }
 
 /// Build a deposit event skeleton (unsigned) for the given claim.
@@ -68,6 +83,10 @@ fn forged_attestation_refused_engine_and_plan() {
     let a = gen_key();
     let b = gen_key();
     let outsider = gen_key();
+    // FIXES §1.1: the committed validators carry registered Falcon keys;
+    // the outsider stays unregistered (refuses fail-closed).
+    register_falcon(&a);
+    register_falcon(&b);
     let validators = vec![pub_of(&a), pub_of(&b)];
 
     // Engine level: quorum of outsider signatures over the right message.
@@ -124,6 +143,8 @@ fn forged_attestation_refused_engine_and_plan() {
 fn replayed_attestation_refused_engine_and_plan() {
     let a = gen_key();
     let b = gen_key();
+    register_falcon(&a);
+    register_falcon(&b);
     let validators = vec![pub_of(&a), pub_of(&b)];
 
     // Engine level: identical valid deposit twice.
@@ -468,6 +489,10 @@ fn spv_depth_refuses_header_ahead_of_finalized_head() {
     let a = gen_key();
     let b = gen_key();
     let c = gen_key();
+    // The header quorum must PASS so the depth gate is what refuses.
+    register_falcon(&a);
+    register_falcon(&b);
+    register_falcon(&c);
     let validators = vec![pub_of(&a), pub_of(&b), pub_of(&c)];
 
     // A header ABOVE the watcher-claimed finalized head must not verify, even
@@ -525,6 +550,11 @@ fn spv_depth_refuses_header_ahead_of_finalized_head() {
 #[test]
 fn evm_release_order_refuses_non_evm_chain() {
     let keys: Vec<SigningKey> = (0..3).map(|_| gen_key()).collect();
+    // FIXES §1.1: the relayer set carries registered Falcon keys so the
+    // Arbitrum control quorum verifies.
+    for k in &keys {
+        register_falcon(k);
+    }
     let pubs: Vec<[u8; 32]> = keys.iter().map(pub_of).collect();
     let relayer = MultisigRelayer::new(pubs);
 

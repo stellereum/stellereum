@@ -17,12 +17,14 @@
 //! Every test runs through `apply_block_transition`, the same entry point
 //! consensus uses — no direct `plan()` calls.
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use stellereum::bridge::{
     bridge_adapters::DepositEvidence, challenge_bond_for, BridgeIntent, SupportedChain,
     TeleportBridgeEngine, CHALLENGE_MAX_AGE_SECS, DISPUTE_WINDOW_SECS, MAX_RESOLVE_DEFERRALS,
     RESOLVE_DEFER_SECS,
 };
+use stellereum::consensus::register_validator_pq_key;
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::InMemoryStateEngine;
@@ -35,6 +37,27 @@ const STELL: u64 = 1_000_000_000;
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
+}
+
+/// Deterministic Falcon-512 companion for an Ed-identity fixture key (FIXES
+/// §1.1: the bridge quorum counts REGISTERED Falcon keys; the `[u8; 32]` id
+/// is Ed identity only). Derived from the Ed secret bytes, so every test
+/// registering the same fixture id converges on the same Falcon key.
+fn falcon_for(sk: &SigningKey) -> FalconKeypair {
+    FalconKeypair::generate_from_seed_bytes(&sk.to_bytes())
+}
+
+fn register_falcon(sk: &SigningKey) {
+    let fk = falcon_for(sk);
+    register_validator_pq_key(
+        sk.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+}
+
+fn falcon_sig(sk: &SigningKey, msg: &[u8]) -> ([u8; 32], Vec<u8>) {
+    (sk.verifying_key().to_bytes(), falcon_for(sk).sign(msg))
 }
 
 async fn balance(e: &InMemoryStateEngine, addr: &[u8; 32]) -> u64 {
@@ -55,6 +78,9 @@ async fn setup(n: usize) -> (InMemoryStateEngine, Vec<SigningKey>) {
             .await
             .bond(pk, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
             .expect("bond it into the committed ledger");
+        // FIXES §1.1: the committed Ed identity carries a registered
+        // Falcon-512 key the bridge quorum verifies against.
+        register_falcon(&k);
         keys.push(k);
     }
     (e, keys)
@@ -76,10 +102,7 @@ fn deposit(source_tx_hash: [u8; 32], recipient: [u8; 32], amount: u64) -> Bridge
 fn attest(dep: &BridgeIntent, signers: &[SigningKey]) -> BridgeIntent {
     let event = dep.deposit_event(Vec::new()).expect("deposit event");
     let msg = TeleportBridgeEngine::deposit_signing_message(&event);
-    let signatures = signers
-        .iter()
-        .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
-        .collect();
+    let signatures = signers.iter().map(|k| falcon_sig(k, &msg)).collect();
     let source_tx_hash = match dep {
         BridgeIntent::Deposit { source_tx_hash, .. } => *source_tx_hash,
         other => panic!("attest() only pairs with a Deposit: {other:?}"),
@@ -122,18 +145,42 @@ fn failing_proof(hash: [u8; 32]) -> BridgeIntent {
     }
 }
 
-fn bridge_tx(payer: &SigningKey, nonce: u64, ops: Vec<OpCode>) -> Transaction {
+
+/// Implicit Falcon-512 sender for a seed, registered globally. Pure-PQ tx
+/// admission refuses legacy `Transaction::sign_with_payload`, so the wrapping
+/// txs in these tests ride the sanctioned implicit-Falcon envelope (the same
+/// pattern as `bridge_persistence_tests::bridge_tx`).
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+fn bridge_tx(payer_seed: u8, nonce: u64, ops: Vec<OpCode>) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(payer_seed);
+    let from = pq_id(payer_seed);
     let gas = GAS_BRIDGE_INTENT * ops.len() as u64 + 1_000;
-    Transaction::sign_with_payload(
-        payer,
-        payer.verifying_key().to_bytes(),
-        0,
-        gas,
+    let mut t = Transaction {
+        from,
+        to: from,
+        amount: 0,
+        gas_limit: gas,
         nonce,
-        MASTERCHAIN_SHARD,
-        MASTERCHAIN_SHARD,
-        ops,
-    )
+        source_shard: MASTERCHAIN_SHARD,
+        target_shard: MASTERCHAIN_SHARD,
+        signature: Vec::new(),
+        payload: ops,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, payer_seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 fn bridge_block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> Block {
@@ -174,10 +221,10 @@ async fn settle_deposit(
     amount: u64,
 ) {
     // The wrapping-tx payer (key 0x03) needs gas money of its own.
-    fund(e, &key(0x03).verifying_key().to_bytes(), 1_000_000).await;
+    fund(e, &pq_id(0x03), 1_000_000).await;
     let dep = deposit(hash, recipient, amount);
     let att = attest(&dep, &vals[..2]);
-    let tx = bridge_tx(&key(0x03), 0, ops_list(vec![att, dep]));
+    let tx = bridge_tx(0x03, 0, ops_list(vec![att, dep]));
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
@@ -193,9 +240,9 @@ async fn settle_deposit(
 #[tokio::test]
 async fn false_challenge_is_slashed_even_past_deadline_no_profit() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let challenger = key(0xC0);
-    let challenger_pk = challenger.verifying_key().to_bytes();
+    let payer_pk = pq_id(0x03);
+    let challenger_seed: u8 = 0xC0;
+    let challenger_pk = pq_id(challenger_seed);
     // The audit's whale: 50k STELL deposit, 500 STELL bond, 5k STELL would-be
     // profit under the old empty-resolve rule.
     let amount = 50_000 * STELL;
@@ -207,8 +254,7 @@ async fn false_challenge_is_slashed_even_past_deadline_no_profit() {
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
     // False challenge freezes the honest deposit.
-    let tx_c = bridge_tx(
-        &challenger,
+    let tx_c = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -222,8 +268,7 @@ async fn false_challenge_is_slashed_even_past_deadline_no_profit() {
 
     // Suppression window passes with no confirm — then the evidence lands
     // LATE, past the deadline. Truth still beats timing: confirm + slash.
-    let tx_r = bridge_tx(
-        &challenger,
+    let tx_r = bridge_tx(challenger_seed,
         1,
         ops_list(vec![
             quorum_proof(hash, recipient, amount, &vals),
@@ -262,9 +307,9 @@ async fn false_challenge_is_slashed_even_past_deadline_no_profit() {
 #[tokio::test]
 async fn failing_evidence_past_deadline_never_pays_reward() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let challenger = key(0xC0);
-    let challenger_pk = challenger.verifying_key().to_bytes();
+    let payer_pk = pq_id(0x03);
+    let challenger_seed: u8 = 0xC0;
+    let challenger_pk = pq_id(challenger_seed);
     fund(&e, &challenger_pk, 10 * STELL).await;
     let recipient = [0xADu8; 32];
     let amount = 100 * STELL;
@@ -272,8 +317,7 @@ async fn failing_evidence_past_deadline_never_pays_reward() {
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
-    let tx_c = bridge_tx(
-        &challenger,
+    let tx_c = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -286,8 +330,7 @@ async fn failing_evidence_past_deadline_never_pays_reward() {
 
     // SEC-01 FIX: Submitting failing evidence past the deadline does NOT trigger
     // fraud payout. It simply defers (Path 3) without paying a single coin to the challenger.
-    let tx_r = bridge_tx(
-        &challenger,
+    let tx_r = bridge_tx(challenger_seed,
         1,
         ops_list(vec![
             failing_proof(hash),
@@ -337,9 +380,9 @@ async fn failing_evidence_past_deadline_never_pays_reward() {
 #[tokio::test]
 async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let challenger = key(0xC0);
-    let challenger_pk = challenger.verifying_key().to_bytes();
+    let payer_pk = pq_id(0x03);
+    let challenger_seed: u8 = 0xC0;
+    let challenger_pk = pq_id(challenger_seed);
     fund(&e, &challenger_pk, 10 * STELL).await;
     let recipient = [0xADu8; 32];
     let amount = 100 * STELL;
@@ -351,8 +394,7 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
     // deferral cap binds after exactly MAX_RESOLVE_DEFERRALS extensions:
     // D0 = CH_T + WINDOW, cap = TS + MAX_AGE + WINDOW*(1+K).
     let challenge_at = TS + CHALLENGE_MAX_AGE_SECS - 100;
-    let tx_c = bridge_tx(
-        &challenger,
+    let tx_c = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -371,8 +413,7 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
     let mut now = d0;
     let mut defers = 0u32;
     for _ in 0..10 {
-        let tx_r = bridge_tx(
-            &challenger,
+        let tx_r = bridge_tx(challenger_seed,
             nonce,
             ops_list(vec![BridgeIntent::Resolve { dispute_id: 0 }]),
         );
@@ -418,8 +459,7 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
     // nonce), so the stale `nonce` would be refused at ADMISSION - free, and
     // it would not exercise the paid-refusal path at all.
     let challenger_before = e.get_account(&challenger_pk).await.unwrap();
-    let tx_last = bridge_tx(
-        &challenger,
+    let tx_last = bridge_tx(challenger_seed,
         challenger_before.nonce,
         ops_list(vec![BridgeIntent::Resolve { dispute_id: 0 }]),
     );
@@ -460,11 +500,10 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
 
     // Honest recovery is never bricked: valid evidence confirms even after
     // the deferral bound is exhausted — and the suppressor is slashed.
-    let resolver = key(0xD0);
-    let resolver_pk = resolver.verifying_key().to_bytes();
+    let resolver_seed: u8 = 0xD0;
+    let resolver_pk = pq_id(resolver_seed);
     fund(&e, &resolver_pk, 10 * STELL).await;
-    let tx_rec = bridge_tx(
-        &resolver,
+    let tx_rec = bridge_tx(resolver_seed,
         0,
         ops_list(vec![
             quorum_proof(hash, recipient, amount, &vals),
@@ -493,9 +532,9 @@ async fn suppressed_evidence_resolve_defers_then_refuses_without_payout() {
 #[tokio::test]
 async fn failing_evidence_before_deadline_revokes_nothing() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
-    let challenger = key(0xC0);
-    let challenger_pk = challenger.verifying_key().to_bytes();
+    let payer_pk = pq_id(0x03);
+    let challenger_seed: u8 = 0xC0;
+    let challenger_pk = pq_id(challenger_seed);
     fund(&e, &challenger_pk, 10 * STELL).await;
     let recipient = [0xADu8; 32];
     let amount = 100 * STELL;
@@ -503,8 +542,7 @@ async fn failing_evidence_before_deadline_revokes_nothing() {
     let hash = [0x73u8; 32];
     settle_deposit(&e, &vals, payer_pk, hash, recipient, amount).await;
 
-    let tx_c = bridge_tx(
-        &challenger,
+    let tx_c = bridge_tx(challenger_seed,
         0,
         ops_list(vec![BridgeIntent::Challenge {
             source_tx_hash: hash,
@@ -517,8 +555,7 @@ async fn failing_evidence_before_deadline_revokes_nothing() {
 
     // Garbage evidence while the window is still open: refused, dispute open.
     let settled = e.get_state_root().await;
-    let tx_r = bridge_tx(
-        &challenger,
+    let tx_r = bridge_tx(challenger_seed,
         1,
         ops_list(vec![
             failing_proof(hash),
@@ -566,7 +603,7 @@ async fn failing_evidence_before_deadline_revokes_nothing() {
 #[tokio::test]
 async fn honest_relay_unaffected_by_the_truth_gate() {
     let (e, vals) = setup(3).await;
-    let payer_pk = key(0x03).verifying_key().to_bytes();
+    let payer_pk = pq_id(0x03);
     fund(&e, &payer_pk, 1_000_000).await;
 
     // Quorum path, no challenge: credits exactly as before.
@@ -575,7 +612,7 @@ async fn honest_relay_unaffected_by_the_truth_gate() {
     let hash_q = [0x81u8; 32];
     let dep_q = deposit(hash_q, recipient_q, amount_q);
     let att_q = attest(&dep_q, &vals[..2]);
-    let tx = bridge_tx(&key(0x03), 0, ops_list(vec![att_q, dep_q]));
+    let tx = bridge_tx(0x03, 0, ops_list(vec![att_q, dep_q]));
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
@@ -590,8 +627,7 @@ async fn honest_relay_unaffected_by_the_truth_gate() {
     let recipient_e = [0xC2u8; 32];
     let amount_e = 55 * STELL;
     let hash_e = [0x82u8; 32];
-    let tx = bridge_tx(
-        &key(0x03),
+    let tx = bridge_tx(0x03,
         1,
         ops_list(vec![
             quorum_proof(hash_e, recipient_e, amount_e, &vals),

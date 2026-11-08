@@ -22,13 +22,15 @@
 //!   a payload, never from a refused block, never from reading;
 //! * (I1) mutating the committed bridge domain moves `commitment_digest`.
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use stellereum::bridge::{
     BridgeIntent, BridgeState, SupportedChain, TeleportBridgeEngine, BRIDGE_ESCROW,
     BRIDGE_MINT_CAP_NANO, HOURLY_DEPOSIT_LIMIT_NANO, HOURLY_RATE_LIMIT_NANO,
     LARGE_WITHDRAWAL_THRESHOLD_NANO, WITHDRAWAL_TIME_LOCK_SECS,
 };
 use stellereum::commitment::{commitment_digest, CommitmentSnapshot};
+use stellereum::consensus::register_validator_pq_key;
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::sharding::{Block, Transaction, BASE_WORKCHAIN_SHARD_INITIAL, MASTERCHAIN_SHARD};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::InMemoryStateEngine;
@@ -42,6 +44,27 @@ const STELL: u64 = 1_000_000_000;
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
+}
+
+/// Deterministic Falcon-512 companion for an Ed-identity fixture key (FIXES
+/// §1.1: the bridge quorum counts REGISTERED Falcon keys; the `[u8; 32]` id
+/// is Ed identity only). Derived from the Ed secret bytes, so every test
+/// registering the same fixture id converges on the same Falcon key.
+fn falcon_for(sk: &SigningKey) -> FalconKeypair {
+    FalconKeypair::generate_from_seed_bytes(&sk.to_bytes())
+}
+
+fn register_falcon(sk: &SigningKey) {
+    let fk = falcon_for(sk);
+    register_validator_pq_key(
+        sk.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+}
+
+fn falcon_sig(sk: &SigningKey, msg: &[u8]) -> ([u8; 32], Vec<u8>) {
+    (sk.verifying_key().to_bytes(), falcon_for(sk).sign(msg))
 }
 
 async fn balance(e: &InMemoryStateEngine, addr: &[u8; 32]) -> u64 {
@@ -64,6 +87,9 @@ async fn setup(n: usize) -> (InMemoryStateEngine, Vec<SigningKey>) {
             .await
             .bond(pk, MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER, 0)
             .expect("bond it into the committed ledger");
+        // FIXES §1.1: the committed Ed identity carries a registered
+        // Falcon-512 key the bridge quorum verifies against.
+        register_falcon(&k);
         keys.push(k);
     }
     (e, keys)
@@ -78,16 +104,13 @@ fn deposit(source_tx_hash: [u8; 32], recipient: [u8; 32], amount: u64) -> Bridge
     }
 }
 
-/// The `Attest` companion for `dep`: signatures over the SAME canonical
-/// message `TeleportBridgeEngine::deposit_signing_message` builds, by the
-/// first `quorum` of the committed validators.
+/// The `Attest` companion for `dep`: Falcon-512 signatures (FIXES §1.1) over
+/// the SAME canonical message `TeleportBridgeEngine::deposit_signing_message`
+/// builds, by the first `quorum` of the committed validators.
 fn attest(dep: &BridgeIntent, signers: &[SigningKey]) -> BridgeIntent {
     let event = dep.deposit_event(Vec::new()).expect("deposit event");
     let msg = TeleportBridgeEngine::deposit_signing_message(&event);
-    let signatures = signers
-        .iter()
-        .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
-        .collect();
+    let signatures = signers.iter().map(|k| falcon_sig(k, &msg)).collect();
     let source_tx_hash = match dep {
         BridgeIntent::Deposit { source_tx_hash, .. } => *source_tx_hash,
         other => panic!("attest() only pairs with a Deposit: {other:?}"),
@@ -98,22 +121,45 @@ fn attest(dep: &BridgeIntent, signers: &[SigningKey]) -> BridgeIntent {
     }
 }
 
+/// Implicit Falcon-512 sender for a seed, registered globally. Pure-PQ tx
+/// admission refuses legacy `Transaction::sign_with_payload`, so the wrapping
+/// txs in these tests ride the sanctioned implicit-Falcon envelope (the same
+/// pattern as `bridge_persistence_tests::bridge_tx`).
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
 /// A wrapping transaction carrying the intents. `from == to == proposer`, so
 /// the declared gas the block path charges is credited straight back to the
 /// payer as the proposer fee: balance assertions below see ONLY the bridge's
 /// own movement.
-fn bridge_tx(payer: &SigningKey, nonce: u64, ops: Vec<OpCode>) -> Transaction {
+fn bridge_tx(payer_seed: u8, nonce: u64, ops: Vec<OpCode>) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(payer_seed);
+    let from = pq_id(payer_seed);
     let gas = GAS_BRIDGE_INTENT * ops.len() as u64 + 1_000;
-    Transaction::sign_with_payload(
-        payer,
-        payer.verifying_key().to_bytes(),
-        0,
-        gas,
+    let mut t = Transaction {
+        from,
+        to: from,
+        amount: 0,
+        gas_limit: gas,
         nonce,
-        MASTERCHAIN_SHARD,
-        MASTERCHAIN_SHARD,
-        ops,
-    )
+        source_shard: MASTERCHAIN_SHARD,
+        target_shard: MASTERCHAIN_SHARD,
+        signature: Vec::new(),
+        payload: ops,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, payer_seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 fn bridge_block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> Block {
@@ -157,8 +203,8 @@ fn ops(att: Option<BridgeIntent>, intent: BridgeIntent) -> Vec<OpCode> {
 #[tokio::test]
 async fn sub_quorum_deposit_is_refused_on_the_block_path() {
     let (e, vals) = setup(3).await;
-    let payer = key(0x01);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x01;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000)
         .await
         .expect("fund the payer");
@@ -166,7 +212,7 @@ async fn sub_quorum_deposit_is_refused_on_the_block_path() {
 
     let dep = deposit([0x71u8; 32], recipient, 5_000 * STELL);
     let att = attest(&dep, &vals[..1]); // 1 of the 2 required
-    let tx = bridge_tx(&payer, 0, ops(Some(att), dep));
+    let tx = bridge_tx(payer_seed, 0, ops(Some(att), dep));
     let before = e.get_state_root().await;
 
     let out = e
@@ -204,8 +250,8 @@ async fn sub_quorum_deposit_is_refused_on_the_block_path() {
 #[tokio::test]
 async fn missing_and_foreign_attestations_are_sub_quorum() {
     let (e, vals) = setup(3).await;
-    let payer = key(0x02);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x02;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let recipient = [0xACu8; 32];
 
@@ -215,14 +261,14 @@ async fn missing_and_foreign_attestations_are_sub_quorum() {
     let foreign = attest(&dep, &[outsider, key(0xEF)]);
 
     // (a) no attestation at all.
-    let tx = bridge_tx(&payer, 0, ops(None, dep.clone()));
+    let tx = bridge_tx(payer_seed, 0, ops(None, dep.clone()));
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
     assert_eq!(out.status, vec![false], "an unattested deposit must fail");
 
     // (b) two signatures, both from outside the validator set: still sub-quorum.
-    let tx = bridge_tx(&payer, 0, ops(Some(foreign), dep));
+    let tx = bridge_tx(payer_seed, 0, ops(Some(foreign), dep));
     let out = e
         .apply_block_transition(&bridge_block(2, TS, vec![tx], payer_pk), 0)
         .await;
@@ -247,8 +293,8 @@ async fn missing_and_foreign_attestations_are_sub_quorum() {
 #[tokio::test]
 async fn quorum_deposit_credits_exactly_once() {
     let (e, vals) = setup(3).await;
-    let payer = key(0x03);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x03;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let recipient = [0xADu8; 32];
     let amount = 12_345 * STELL;
@@ -256,9 +302,9 @@ async fn quorum_deposit_credits_exactly_once() {
     let dep = deposit([0x73u8; 32], recipient, amount);
     let att = attest(&dep, &vals[..2]); // exactly the 2/3 quorum
     let dup = dep.clone();
-    let tx_a = bridge_tx(&payer, 0, ops(Some(att.clone()), dep));
+    let tx_a = bridge_tx(payer_seed, 0, ops(Some(att.clone()), dep));
     // Second claim, same source tx hash, in the SAME block: must not credit.
-    let tx_b = bridge_tx(&payer, 1, ops(Some(att), dup));
+    let tx_b = bridge_tx(payer_seed, 1, ops(Some(att), dup));
 
     let before = e.get_state_root().await;
     let out = e
@@ -300,15 +346,15 @@ async fn quorum_deposit_credits_exactly_once() {
 #[tokio::test]
 async fn replayed_source_tx_is_refused_in_a_later_block() {
     let (e, vals) = setup(3).await;
-    let payer = key(0x04);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x04;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let recipient = [0xAEu8; 32];
     let amount = 999 * STELL;
 
     let dep = deposit([0x74u8; 32], recipient, amount);
     let att = attest(&dep, &vals[..2]);
-    let first = bridge_tx(&payer, 0, ops(Some(att.clone()), dep.clone()));
+    let first = bridge_tx(payer_seed, 0, ops(Some(att.clone()), dep.clone()));
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![first], payer_pk), 0)
         .await;
@@ -316,7 +362,7 @@ async fn replayed_source_tx_is_refused_in_a_later_block() {
     assert_eq!(balance(&e, &recipient).await, amount);
 
     // Replay in the next block.
-    let replay = bridge_tx(&payer, 1, ops(Some(att), dep));
+    let replay = bridge_tx(payer_seed, 1, ops(Some(att), dep));
     let settled = e.get_state_root().await;
     let out = e
         .apply_block_transition(&bridge_block(2, TS + 1, vec![replay], payer_pk), 0)
@@ -354,8 +400,8 @@ async fn replayed_source_tx_is_refused_in_a_later_block() {
 #[tokio::test]
 async fn large_withdrawal_is_time_locked_until_the_block_clock_matures_it() {
     let (e, _vals) = setup(3).await;
-    let payer = key(0x05);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x05;
+    let payer_pk = pq_id(payer_seed);
     let start = LARGE_WITHDRAWAL_THRESHOLD_NANO + 10 * STELL;
     e.credit_native(&payer_pk, start).await.expect("fund");
     let escrow = BRIDGE_ESCROW;
@@ -365,7 +411,7 @@ async fn large_withdrawal_is_time_locked_until_the_block_clock_matures_it() {
         target_address: "0xdeadbeef".to_string(),
         amount: LARGE_WITHDRAWAL_THRESHOLD_NANO,
     };
-    let tx = bridge_tx(&payer, 0, vec![OpCode::SysCallBridge(Box::new(withdraw))]);
+    let tx = bridge_tx(payer_seed, 0, vec![OpCode::SysCallBridge(Box::new(withdraw))]);
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
@@ -402,7 +448,7 @@ async fn large_withdrawal_is_time_locked_until_the_block_clock_matures_it() {
 
     // Release 60s in: still time-locked, so the block refuses it.
     let early = BridgeIntent::Release { req_id: 0 };
-    let tx = bridge_tx(&payer, 1, vec![OpCode::SysCallBridge(Box::new(early))]);
+    let tx = bridge_tx(payer_seed, 1, vec![OpCode::SysCallBridge(Box::new(early))]);
     let out = e
         .apply_block_transition(&bridge_block(2, TS + 60, vec![tx], payer_pk), 0)
         .await;
@@ -420,7 +466,7 @@ async fn large_withdrawal_is_time_locked_until_the_block_clock_matures_it() {
     // (Nonce 2: the refused early release consumed its nonce - a refused
     // transaction still advances the nonce.)
     let matured = BridgeIntent::Release { req_id: 0 };
-    let tx = bridge_tx(&payer, 2, vec![OpCode::SysCallBridge(Box::new(matured))]);
+    let tx = bridge_tx(payer_seed, 2, vec![OpCode::SysCallBridge(Box::new(matured))]);
     let out = e
         .apply_block_transition(
             &bridge_block(3, TS + WITHDRAWAL_TIME_LOCK_SECS, vec![tx], payer_pk),
@@ -435,7 +481,7 @@ async fn large_withdrawal_is_time_locked_until_the_block_clock_matures_it() {
 
     // ...and a second release of the same request is a double-release.
     let twice = BridgeIntent::Release { req_id: 0 };
-    let tx = bridge_tx(&payer, 2, vec![OpCode::SysCallBridge(Box::new(twice))]);
+    let tx = bridge_tx(payer_seed, 2, vec![OpCode::SysCallBridge(Box::new(twice))]);
     let out = e
         .apply_block_transition(
             &bridge_block(4, TS + WITHDRAWAL_TIME_LOCK_SECS + 1, vec![tx], payer_pk),
@@ -454,8 +500,8 @@ async fn large_withdrawal_is_time_locked_until_the_block_clock_matures_it() {
 #[tokio::test]
 async fn small_withdrawal_unlocks_immediately_but_is_still_queued() {
     let (e, _vals) = setup(3).await;
-    let payer = key(0x06);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x06;
+    let payer_pk = pq_id(payer_seed);
     let start = 1_000 * STELL;
     e.credit_native(&payer_pk, start).await.expect("fund");
 
@@ -464,7 +510,7 @@ async fn small_withdrawal_unlocks_immediately_but_is_still_queued() {
         target_address: "EQD-test".to_string(),
         amount: 100 * STELL,
     };
-    let tx = bridge_tx(&payer, 0, vec![OpCode::SysCallBridge(Box::new(withdraw))]);
+    let tx = bridge_tx(payer_seed, 0, vec![OpCode::SysCallBridge(Box::new(withdraw))]);
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
@@ -477,7 +523,7 @@ async fn small_withdrawal_unlocks_immediately_but_is_still_queued() {
     drop(br);
 
     let release = BridgeIntent::Release { req_id: 0 };
-    let tx = bridge_tx(&payer, 1, vec![OpCode::SysCallBridge(Box::new(release))]);
+    let tx = bridge_tx(payer_seed, 1, vec![OpCode::SysCallBridge(Box::new(release))]);
     let out = e
         .apply_block_transition(&bridge_block(2, TS, vec![tx], payer_pk), 0)
         .await;
@@ -494,8 +540,8 @@ async fn small_withdrawal_unlocks_immediately_but_is_still_queued() {
 #[tokio::test]
 async fn hourly_rate_limit_is_enforced_on_the_block_clock() {
     let (e, _vals) = setup(3).await;
-    let payer = key(0x07);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x07;
+    let payer_pk = pq_id(payer_seed);
     let start = 1_000_000 * STELL;
     e.credit_native(&payer_pk, start).await.expect("fund");
 
@@ -511,8 +557,8 @@ async fn hourly_rate_limit_is_enforced_on_the_block_clock() {
         "precondition: these two together breach the hourly cap"
     );
 
-    let tx_a = bridge_tx(&payer, 0, vec![OpCode::SysCallBridge(Box::new(w(first)))]);
-    let tx_b = bridge_tx(&payer, 1, vec![OpCode::SysCallBridge(Box::new(w(second)))]);
+    let tx_a = bridge_tx(payer_seed, 0, vec![OpCode::SysCallBridge(Box::new(w(first)))]);
+    let tx_b = bridge_tx(payer_seed, 1, vec![OpCode::SysCallBridge(Box::new(w(second)))]);
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx_a, tx_b], payer_pk), 0)
         .await;
@@ -544,7 +590,7 @@ async fn hourly_rate_limit_is_enforced_on_the_block_clock() {
     // One hour later the window rolls over and the same amount is admitted.
     // (The payer's nonce is 2: the refused withdrawal consumed its nonce -
     // a refused transaction still advances the nonce.)
-    let tx_c = bridge_tx(&payer, 2, vec![OpCode::SysCallBridge(Box::new(w(second)))]);
+    let tx_c = bridge_tx(payer_seed, 2, vec![OpCode::SysCallBridge(Box::new(w(second)))]);
     let out = e
         .apply_block_transition(
             &bridge_block(2, TS + WITHDRAWAL_TIME_LOCK_SECS, vec![tx_c], payer_pk),
@@ -571,8 +617,8 @@ async fn hourly_rate_limit_is_enforced_on_the_block_clock() {
 #[tokio::test]
 async fn empty_validator_set_fails_closed_on_deposits() {
     let (e, _none) = setup(0).await; // no committed validators at all
-    let payer = key(0x09);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x09;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let recipient = [0xB0u8; 32];
 
@@ -580,7 +626,7 @@ async fn empty_validator_set_fails_closed_on_deposits() {
     // under the raw formula: the guard must refuse BEFORE any of that matters.
     let dep = deposit([0x76u8; 32], recipient, 42 * STELL);
     let att = attest(&dep, &[key(0xC1), key(0xC2)]);
-    let tx = bridge_tx(&payer, 0, ops(Some(att), dep));
+    let tx = bridge_tx(payer_seed, 0, ops(Some(att), dep));
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
@@ -606,8 +652,8 @@ async fn empty_validator_set_fails_closed_on_deposits() {
 #[tokio::test]
 async fn committed_root_changes_only_from_the_block() {
     let (e, vals) = setup(3).await;
-    let payer = key(0x08);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x08;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let recipient = [0xAFu8; 32];
 
@@ -621,7 +667,7 @@ async fn committed_root_changes_only_from_the_block() {
     // Prepared, signed, NOT applied: the root cannot move.
     let dep = deposit([0x75u8; 32], recipient, 77 * STELL);
     let att = attest(&dep, &vals[..2]);
-    let prepared = bridge_tx(&payer, 0, ops(Some(att), dep.clone()));
+    let prepared = bridge_tx(payer_seed, 0, ops(Some(att), dep.clone()));
     assert_eq!(
         e.get_state_root().await,
         genesis_like,
@@ -631,7 +677,7 @@ async fn committed_root_changes_only_from_the_block() {
 
     // A block that carries the claim WITHOUT its attestation is refused
     // (sub-quorum) and changes nothing.
-    let bare = bridge_tx(&payer, 0, ops(None, dep.clone()));
+    let bare = bridge_tx(payer_seed, 0, ops(None, dep.clone()));
     let refused = e
         .apply_block_transition(&bridge_block(1, TS, vec![bare], payer_pk), 0)
         .await;
@@ -651,7 +697,7 @@ async fn committed_root_changes_only_from_the_block() {
     let att = attest(&dep, &vals[..2]);
     // Nonce 1: the refused block above consumed nonce 0 (a refused
     // transaction still advances the nonce).
-    let tx = bridge_tx(&payer, 1, ops(Some(att), dep));
+    let tx = bridge_tx(payer_seed, 1, ops(Some(att), dep));
     let applied = e
         .apply_block_transition(&bridge_block(2, TS, vec![tx], payer_pk), 0)
         .await;
@@ -884,10 +930,7 @@ fn ton_proof(
         tx_root: root_override.unwrap_or(root),
     };
     let msg = header.signing_message();
-    let header_signatures = keys[..2]
-        .iter()
-        .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
-        .collect();
+    let header_signatures = keys[..2].iter().map(|k| falcon_sig(k, &msg)).collect();
     BridgeIntent::DepositProof {
         source_tx_hash,
         evidence: Box::new(DepositEvidence::TonCell {
@@ -927,10 +970,7 @@ fn evm_proof(
         tx_root: trie.root_hash(),
     };
     let msg = header.signing_message();
-    let header_signatures = keys[..2]
-        .iter()
-        .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
-        .collect();
+    let header_signatures = keys[..2].iter().map(|k| falcon_sig(k, &msg)).collect();
     BridgeIntent::DepositProof {
         source_tx_hash,
         evidence: Box::new(DepositEvidence::EvmReceipt {
@@ -959,15 +999,14 @@ fn proof_ops(proof: BridgeIntent, intent: BridgeIntent) -> Vec<OpCode> {
 #[tokio::test]
 async fn adapter_ton_evidence_deposit_credits_on_the_block_path() {
     let (e, vals) = setup(3).await;
-    let payer = key(0x21);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x21;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let recipient = [0xC1u8; 32];
     let amount = 77 * STELL;
     let hash = [0x81u8; 32];
 
-    let tx = bridge_tx(
-        &payer,
+    let tx = bridge_tx(payer_seed,
         0,
         proof_ops(
             ton_proof(hash, recipient, amount, &vals, None),
@@ -992,8 +1031,7 @@ async fn adapter_ton_evidence_deposit_credits_on_the_block_path() {
     );
 
     // Replay with the SAME valid evidence in a later block: refused.
-    let replay = bridge_tx(
-        &payer,
+    let replay = bridge_tx(payer_seed,
         1,
         proof_ops(
             ton_proof(hash, recipient, amount, &vals, None),
@@ -1024,8 +1062,8 @@ async fn adapter_ton_evidence_deposit_credits_on_the_block_path() {
 #[tokio::test]
 async fn adapter_evm_evidence_deposit_credits_on_the_block_path() {
     let (e, vals) = setup(3).await;
-    let payer = key(0x22);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x22;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let recipient = [0xC2u8; 32];
     let amount = 500_000_000;
@@ -1036,8 +1074,7 @@ async fn adapter_evm_evidence_deposit_credits_on_the_block_path() {
         recipient,
         amount,
     };
-    let tx = bridge_tx(
-        &payer,
+    let tx = bridge_tx(payer_seed,
         0,
         proof_ops(evm_proof(hash, recipient, amount, &vals), dep),
     );
@@ -1059,14 +1096,13 @@ async fn adapter_evm_evidence_deposit_credits_on_the_block_path() {
 #[tokio::test]
 async fn adapter_tampered_evidence_is_refused_on_the_block_path() {
     let (e, vals) = setup(3).await;
-    let payer = key(0x23);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x23;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let recipient = [0xC3u8; 32];
     let hash = [0x83u8; 32];
 
-    let tx = bridge_tx(
-        &payer,
+    let tx = bridge_tx(payer_seed,
         0,
         proof_ops(
             ton_proof(hash, recipient, 9 * STELL, &vals, Some([0xFFu8; 32])),
@@ -1100,8 +1136,8 @@ async fn adapter_tampered_evidence_is_refused_on_the_block_path() {
 async fn zk_placeholder_evidence_is_refused_on_the_block_path() {
     let (e, vals) = setup(3).await;
     let _ = vals;
-    let payer = key(0x24);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x24;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let recipient = [0xC4u8; 32];
     let hash = [0x84u8; 32];
@@ -1113,8 +1149,7 @@ async fn zk_placeholder_evidence_is_refused_on_the_block_path() {
             },
         ),
     };
-    let tx = bridge_tx(
-        &payer,
+    let tx = bridge_tx(payer_seed,
         0,
         proof_ops(placeholder, deposit(hash, recipient, 5 * STELL)),
     );
@@ -1145,8 +1180,8 @@ async fn zk_placeholder_evidence_is_refused_on_the_block_path() {
 #[tokio::test]
 async fn quorum_path_ignores_bogus_evidence() {
     let (e, vals) = setup(3).await;
-    let payer = key(0x25);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x25;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let recipient = [0xC5u8; 32];
     let amount = 11 * STELL;
@@ -1155,8 +1190,7 @@ async fn quorum_path_ignores_bogus_evidence() {
     let dep = deposit(hash, recipient, amount);
     let att = attest(&dep, &vals[..2]);
     let bogus = ton_proof(hash, recipient, amount, &vals, Some([0xFFu8; 32]));
-    let tx = bridge_tx(
-        &payer,
+    let tx = bridge_tx(payer_seed,
         0,
         vec![
             OpCode::SysCallBridge(Box::new(att)),
@@ -1183,12 +1217,11 @@ async fn quorum_path_ignores_bogus_evidence() {
 #[tokio::test]
 async fn lone_deposit_proof_commits_nothing() {
     let (e, vals) = setup(3).await;
-    let payer = key(0x26);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x26;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let hash = [0x86u8; 32];
-    let lone = bridge_tx(
-        &payer,
+    let lone = bridge_tx(payer_seed,
         0,
         vec![OpCode::SysCallBridge(Box::new(ton_proof(
             hash,
@@ -1237,8 +1270,8 @@ async fn lone_deposit_proof_commits_nothing() {
 #[tokio::test]
 async fn deposit_hourly_cap_enforced_on_the_block_clock() {
     let (e, vals) = setup(3).await;
-    let payer = key(0x0D);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x0D;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let recipient = [0xD0u8; 32];
 
@@ -1257,8 +1290,8 @@ async fn deposit_hourly_cap_enforced_on_the_block_clock() {
     let att_a = attest(&dep_a, &vals[..2]);
     let dep_b = deposit([0xD2u8; 32], recipient, second);
     let att_b = attest(&dep_b, &vals[..2]);
-    let tx_a = bridge_tx(&payer, 0, ops(Some(att_a), dep_a));
-    let tx_b = bridge_tx(&payer, 1, ops(Some(att_b), dep_b));
+    let tx_a = bridge_tx(payer_seed, 0, ops(Some(att_a), dep_a));
+    let tx_b = bridge_tx(payer_seed, 1, ops(Some(att_b), dep_b));
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx_a, tx_b], payer_pk), 0)
         .await;
@@ -1294,7 +1327,7 @@ async fn deposit_hourly_cap_enforced_on_the_block_clock() {
     // still advances the nonce.)
     let dep_c = deposit([0xD2u8; 32], recipient, second);
     let att_c = attest(&dep_c, &vals[..2]);
-    let tx_c = bridge_tx(&payer, 2, ops(Some(att_c), dep_c));
+    let tx_c = bridge_tx(payer_seed, 2, ops(Some(att_c), dep_c));
     let out = e
         .apply_block_transition(&bridge_block(2, TS + 3600, vec![tx_c], payer_pk), 0)
         .await;
@@ -1314,15 +1347,14 @@ async fn deposit_hourly_cap_enforced_on_the_block_clock() {
 async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     use stellereum::bridge::REFUND_GRACE_SECS;
     let (e, _vals) = setup(3).await;
-    let payer = key(0x05);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x05;
+    let payer_pk = pq_id(payer_seed);
     let start = 10 * STELL;
     e.credit_native(&payer_pk, start).await.expect("fund");
 
     // Small withdrawal parks immediately (unlock_at = now).
     let amount = STELL;
-    let tx = bridge_tx(
-        &payer,
+    let tx = bridge_tx(payer_seed,
         0,
         vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Withdraw {
             chain: SupportedChain::Arbitrum,
@@ -1337,8 +1369,7 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     assert_eq!(balance(&e, &BRIDGE_ESCROW).await, amount);
 
     // Too early: grace has not passed.
-    let early = bridge_tx(
-        &payer,
+    let early = bridge_tx(payer_seed,
         1,
         vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Refund {
             req_id: 0,
@@ -1350,13 +1381,12 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     assert_eq!(out.status, vec![false], "grace not passed");
 
     // Wrong sender: refused.
-    let stranger = key(0x06);
-    let stranger_pk = stranger.verifying_key().to_bytes();
+    let stranger_seed: u8 = 0x06;
+    let stranger_pk = pq_id(stranger_seed);
     e.credit_native(&stranger_pk, STELL)
         .await
         .expect("fund stranger");
-    let wrong = bridge_tx(
-        &stranger,
+    let wrong = bridge_tx(stranger_seed,
         0,
         vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Refund {
             req_id: 0,
@@ -1373,8 +1403,7 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     // Past grace, right sender: escrow back, request gone. Nonce is 2: the
     // refused early refund consumed its nonce (a refused transaction still
     // advances the nonce and pays the D2 floor step).
-    let ok = bridge_tx(
-        &payer,
+    let ok = bridge_tx(payer_seed,
         2,
         vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Refund {
             req_id: 0,
@@ -1394,8 +1423,7 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     );
 
     // Double refund: unknown id now. (Nonce 3: the refund above consumed 2.)
-    let again = bridge_tx(
-        &payer,
+    let again = bridge_tx(payer_seed,
         3,
         vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Refund {
             req_id: 0,
@@ -1410,8 +1438,7 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
     assert_eq!(out.status, vec![false], "second refund finds nothing");
 
     // Release after refund: also unknown.
-    let rel = bridge_tx(
-        &payer,
+    let rel = bridge_tx(payer_seed,
         2,
         vec![OpCode::SysCallBridge(Box::new(BridgeIntent::Release {
             req_id: 0,
@@ -1438,18 +1465,27 @@ async fn refund_returns_parked_funds_after_grace_and_closes_the_request() {
 
 /// A workchain-source transaction carrying bridge intents, on an engine with
 /// cross-shard enabled (so the C7 condition is fully armed).
-fn workchain_bridge_tx(payer: &SigningKey, nonce: u64, ops: Vec<OpCode>) -> Transaction {
+fn workchain_bridge_tx(payer_seed: u8, nonce: u64, ops: Vec<OpCode>) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(payer_seed);
+    let from = pq_id(payer_seed);
     let gas = GAS_BRIDGE_INTENT * ops.len() as u64 + 1_000;
-    Transaction::sign_with_payload(
-        payer,
-        payer.verifying_key().to_bytes(),
-        0,
-        gas,
+    let mut t = Transaction {
+        from,
+        to: from,
+        amount: 0,
+        gas_limit: gas,
         nonce,
-        BASE_WORKCHAIN_SHARD_INITIAL,
-        BASE_WORKCHAIN_SHARD_INITIAL,
-        ops,
-    )
+        source_shard: BASE_WORKCHAIN_SHARD_INITIAL,
+        target_shard: BASE_WORKCHAIN_SHARD_INITIAL,
+        signature: Vec::new(),
+        payload: ops,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, payer_seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 #[tokio::test]
@@ -1463,8 +1499,8 @@ async fn bridge_intents_from_a_workchain_are_refused() {
     e.enable_cross_shard();
     assert!(e.cross_shard_enabled());
 
-    let payer = key(0x0B);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x0B;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, STELL).await.expect("fund payer");
 
     // Control: quorum deposit on the masterchain applies exactly once.
@@ -1476,7 +1512,7 @@ async fn bridge_intents_from_a_workchain_are_refused() {
             &bridge_block(
                 1,
                 TS,
-                vec![bridge_tx(&payer, 0, ops(Some(att_mc), dep_mc))],
+                vec![bridge_tx(payer_seed, 0, ops(Some(att_mc), dep_mc))],
                 payer_pk,
             ),
             0,
@@ -1495,7 +1531,7 @@ async fn bridge_intents_from_a_workchain_are_refused() {
             &bridge_block(
                 2,
                 TS + 1,
-                vec![workchain_bridge_tx(&payer, 1, ops(Some(att_wc), dep_wc))],
+                vec![workchain_bridge_tx(payer_seed, 1, ops(Some(att_wc), dep_wc))],
                 payer_pk,
             ),
             0,
@@ -1579,8 +1615,8 @@ async fn xpc_two_phase_commit_stays_off_until_an_activation_height() {
 async fn bridge_same_source_tx_replayed_from_workchain_stays_refused() {
     let (e, vals) = setup(3).await;
     e.enable_cross_shard();
-    let payer = key(0x0C);
-    let payer_pk = payer.verifying_key().to_bytes();
+    let payer_seed: u8 = 0x0C;
+    let payer_pk = pq_id(payer_seed);
     e.credit_native(&payer_pk, STELL).await.expect("fund payer");
 
     let recipient = [0xB2u8; 32];
@@ -1594,7 +1630,7 @@ async fn bridge_same_source_tx_replayed_from_workchain_stays_refused() {
             &bridge_block(
                 1,
                 TS,
-                vec![bridge_tx(&payer, 0, ops(Some(att.clone()), dep.clone()))],
+                vec![bridge_tx(payer_seed, 0, ops(Some(att.clone()), dep.clone()))],
                 payer_pk,
             ),
             0,
@@ -1614,8 +1650,7 @@ async fn bridge_same_source_tx_replayed_from_workchain_stays_refused() {
             &bridge_block(
                 2,
                 TS + 1,
-                vec![workchain_bridge_tx(
-                    &payer,
+                vec![workchain_bridge_tx(payer_seed,
                     1,
                     ops(Some(att.clone()), dep.clone()),
                 )],
@@ -1655,7 +1690,7 @@ async fn bridge_same_source_tx_replayed_from_workchain_stays_refused() {
     // The global replay set survived: a masterchain replay is still refused.
     let out = e
         .apply_block_transition(
-            &bridge_block(3, TS + 2, vec![bridge_tx(&payer, 2, ops(Some(att), dep))], payer_pk),
+            &bridge_block(3, TS + 2, vec![bridge_tx(payer_seed, 2, ops(Some(att), dep))], payer_pk),
             0,
         )
         .await;

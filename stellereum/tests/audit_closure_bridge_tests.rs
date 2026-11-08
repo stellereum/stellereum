@@ -5,13 +5,15 @@
 //! (pure policy gate, no balances needed: settlement Pass-1 escrow checks live
 //! in `state_engine`, already covered by `bridge_*` suites).
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use stellereum::bridge::{
     bridge_adapters::DepositEvidence, challenge_bond_for, dispute_reward_for, BridgeEffect,
     BridgeIntent, BridgePlan, BridgeState, SupportedChain, TeleportBridgeEngine,
     BRIDGE_MINT_CAP_NANO, CHALLENGE_MAX_AGE_SECS, DISPUTE_WINDOW_SECS, LIVE_DEPOSIT_ASSET,
     MAX_RESOLVE_DEFERRALS, REFUND_GRACE_SECS, RESOLVE_DEFER_SECS,
 };
+use stellereum::consensus::register_validator_pq_key;
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::zkml::{QuantizedLayer, QuantizedLinearModel, ZkMlProof};
 
 const TS: u64 = 1_760_000_000;
@@ -22,8 +24,32 @@ fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
+/// Deterministic Falcon-512 companion for an Ed-identity fixture key (FIXES
+/// §1.1: the bridge quorum counts REGISTERED Falcon keys; the `[u8; 32]` id
+/// is Ed identity only). Derived from the Ed secret bytes, so every test
+/// registering the same fixture id converges on the same Falcon key.
+fn falcon_for(sk: &SigningKey) -> FalconKeypair {
+    FalconKeypair::generate_from_seed_bytes(&sk.to_bytes())
+}
+
+fn register_falcon(sk: &SigningKey) {
+    let fk = falcon_for(sk);
+    register_validator_pq_key(
+        sk.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+}
+
+fn falcon_sig(sk: &SigningKey, msg: &[u8]) -> ([u8; 32], Vec<u8>) {
+    (sk.verifying_key().to_bytes(), falcon_for(sk).sign(msg))
+}
+
 fn validators() -> (Vec<SigningKey>, Vec<[u8; 32]>) {
     let ks = vec![key(0xA0), key(0xA1), key(0xA2)];
+    for k in &ks {
+        register_falcon(k);
+    }
     let pubs = ks.iter().map(|k| k.verifying_key().to_bytes()).collect();
     (ks, pubs)
 }
@@ -40,10 +66,7 @@ fn deposit(hash: [u8; 32], recipient: [u8; 32], amount: u64) -> BridgeIntent {
 fn attest_for(dep: &BridgeIntent, signers: &[SigningKey]) -> BridgeIntent {
     let event = dep.deposit_event(Vec::new()).expect("deposit event");
     let msg = TeleportBridgeEngine::deposit_signing_message(&event);
-    let signatures = signers
-        .iter()
-        .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
-        .collect();
+    let signatures = signers.iter().map(|k| falcon_sig(k, &msg)).collect();
     let source_tx_hash = match dep {
         BridgeIntent::Deposit { source_tx_hash, .. } => *source_tx_hash,
         other => panic!("attest only pairs with a Deposit: {other:?}"),
@@ -102,10 +125,7 @@ fn genuine_failure_proof(
         recipient,
         amount,
     );
-    let signatures = signers
-        .iter()
-        .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
-        .collect();
+    let signatures = signers.iter().map(|k| falcon_sig(k, &msg)).collect();
     BridgeIntent::DepositProof {
         source_tx_hash: hash,
         evidence: Box::new(DepositEvidence::QuorumAttested { signatures }),
@@ -167,7 +187,7 @@ fn b1_live_plan_admits_deposit_with_no_proof_and_no_registry() {
     let msg = TeleportBridgeEngine::deposit_signing_message(&draft);
     let sigs = [&key(0xA0), &key(0xA1)]
         .iter()
-        .map(|k| (k.verifying_key().to_bytes(), k.sign(&msg).to_vec()))
+        .map(|k| falcon_sig(k, &msg))
         .collect();
     let ev = stellereum::bridge::TeleportDepositEvent {
         validator_signatures: sigs,

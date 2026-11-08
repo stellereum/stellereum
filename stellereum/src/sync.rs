@@ -1971,6 +1971,16 @@ mod tests {
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             };
             b.sign_block(&sk);
+            // Falconize: Ed-only refuses `verify_proposer_signature` (no
+            // classical fallback); mirror the runtime proposal path
+            // (`runtime.rs` pushes `(self.id, ed_sig)` + `(falcon_id,
+            // falcon_sig)`) so `validate_sync_chain` admits the chain.
+            {
+                let hash = b.compute_hash();
+                let falcon_id = fk.validator_id();
+                let falcon_sig = fk.sign(&hash);
+                b.validator_signatures.push((falcon_id, falcon_sig));
+            }
             let hash = b.compute_hash();
             // A decision proof travels with the block: without it the chain is
             // exactly what the quorum check must refuse.
@@ -2039,8 +2049,9 @@ mod tests {
                 .iter()
                 .position(|(k, _)| k.verifying_key().to_bytes() == proposer_id)
                 .expect("proposer is a member");
-            let (proposer_sk, _) = &all_keys[proposer_idx];
+            let (proposer_sk, proposer_fk) = &all_keys[proposer_idx];
             let proposer = proposer_sk.clone();
+            let proposer_fk = proposer_fk.clone();
             let mut b = Block {
                 shard_id: MASTERCHAIN_SHARD,
                 height: h,
@@ -2059,6 +2070,14 @@ mod tests {
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             };
             b.sign_block(&proposer);
+            // Falconize (same envelope as `chain` above): the proposer half
+            // under the derived Falcon address, registered for the Ed id.
+            {
+                let hash = b.compute_hash();
+                let falcon_id = proposer_fk.validator_id();
+                let falcon_sig = proposer_fk.sign(&hash);
+                b.validator_signatures.push((falcon_id, falcon_sig));
+            }
             let hash = b.compute_hash();
             // The quorum lives in the attached precommit QC, not in extra block-hash
             // signatures: validators agree via votes (over vote_sign_bytes), and only
@@ -2254,6 +2273,14 @@ mod tests {
                 mmr_epoch_root: [0u8; 32], // MMR: zero commits to no epoch; the legacy hash is preserved (see Block::mmr_epoch_root docs).
             };
             b.sign_block(&keys[proposer_idx]);
+            // Falconize: the derived-address half registered for this Ed id
+            // above, mirroring the runtime proposal path.
+            {
+                let hash = b.compute_hash();
+                let falcon_id = fks[proposer_idx].validator_id();
+                let falcon_sig = fks[proposer_idx].sign(&hash);
+                b.validator_signatures.push((falcon_id, falcon_sig));
+            }
             let hash = b.compute_hash();
             b.precommit_qc = Some(pq_cert_for(h, 0, hash, prev, &vs, &all_keys));
             b

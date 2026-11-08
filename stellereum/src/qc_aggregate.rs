@@ -1,6 +1,6 @@
 //! Quorum-certificate aggregation framework.
 //!
-//! Two pieces live here, and nothing else:
+//! Three pieces live here, and nothing else:
 //!
 //! 1. **Concatenation baseline** — the CURRENT wire behavior, pinned
 //!    byte-for-byte: a QC carries the raw concatenation of the `k`
@@ -16,6 +16,13 @@
 //!    signatures with per-signer inclusion proofs, so a light client checks
 //!    membership with `O(log k)` SHA-256 hashes plus ONE Falcon-512 verify
 //!    (the signature itself is revealed alongside the proof).
+//!
+//! 3. **Multisig + bitmap** ([`verify_multisig_bitmap`]) — the ONLY
+//!    slashing-relevant QC presentation: every claimed signer bit is bound
+//!    to one checked Falcon-512 verify, so the signer set is explicit and
+//!    attributable. Threshold signatures (TSS) MUST NOT be used here: a TSS
+//!    hides WHO signed, and a bitmap stapled next to a TSS is not binding
+//!    (the TSS commits to nothing about the bitmap — frameability).
 //!
 //! # Honest scope (read before extending)
 //!
@@ -100,6 +107,28 @@ pub const STARK_PROOF_500KIB: usize = 512_000;
 /// Raw concatenation size at `k = 64`: `666·64 + 8 = 42 632` B — smaller
 /// than any STARK ≥ 50 KiB, so small committees stay raw (P10 §C, вывод C).
 pub const RAW_QC_64: usize = 42_632;
+
+/// Raw concatenation size at `k = 128`: `666·128 + 16 = 85 264` B
+/// (FIXES §2.6: "`k=128`: QC = **85 264 B**").
+pub const RAW_QC_128: usize = 85_264;
+
+/// Raw concatenation size at `k = 1024`: `666·1024 + 128 = 682 112` B
+/// (FIXES §2.6: "`k=1024`: QC ≈ **682 КБ**").
+pub const RAW_QC_1024: usize = 682_112;
+
+/// Checkpoint size model (FIXES §2.6): `|checkpoint| = |TS_sig| + h·32 +
+/// ceil(n/8)` — the threshold-signature bytes, plus `h` 32-byte hashes,
+/// plus the `n`-member validator bitmap (same [`bitmap_len`] as the QC).
+#[must_use]
+pub const fn checkpoint_size(ts_sig_bytes: usize, h: usize, n: usize) -> usize {
+    ts_sig_bytes
+        .saturating_add(h.saturating_mul(32))
+        .saturating_add(bitmap_len(n))
+}
+
+/// Pinned FIXES §2.6 row: `TS_sig = 3309`, `h = 20`, `n = 128` →
+/// `3309 + 640 + 16 = 3 965` B.
+pub const CHECKPOINT_128_H20: usize = 3_965;
 
 /// Concatenate `k` signatures in order, byte-for-byte the current behavior.
 ///
@@ -322,6 +351,94 @@ pub fn verify_membership_with_falcon(
     }
     verify_membership(root, signature, proof)
         && verify_pq_signature(PqScheme::Falcon512, public_key, message, signature)
+}
+
+// ---------------------------------------------------------------------------
+// Multisig + bitmap: the slashing-relevant QC presentation (FIXES §1.12).
+// ---------------------------------------------------------------------------
+//
+// Accountability needs to name WHO signed so a faulty signer can be slashed.
+// A threshold signature (TSS) verifies but hides the composition — and a
+// bitmap stapled next to a TSS is NOT binding, because the TSS commits to
+// nothing about the bitmap: a presenter can claim any signer set it likes,
+// framing honest members or exonerating faulty ones (frameability). So for
+// slashing, the QC MUST be multisig + bitmap, never an opaque aggregate:
+// every set bit below is bound to exactly one checked Falcon-512 verify
+// under that index's key, which makes the claimed signer set explicit and
+// attributable.
+//
+// Bit convention: LSB-first — signer `i` is claimed iff
+// `bitmap[i / 8] & (1 << (i % 8)) != 0`.
+
+/// Verify a multisig + bitmap QC claim over `message`.
+///
+/// * `pubkeys[i]` is member `i`'s Falcon-512 public key (`k` members total).
+/// * `bitmap` is exactly `bitmap_len(k)` bytes; trailing bits past `k`
+///   must be zero (a set trailing bit is a tampered bitmap — refuse).
+/// * `signatures` carries ONE 666-byte signature per SET bit, in ascending
+///   signer-index order; `signatures.len()` must equal the bitmap popcount
+///   (flipping any claimed bit breaks the count — tampered bitmaps refuse).
+/// * `threshold` distinct verified signers are required: the SAME key in two
+///   committee slots counts ONCE (one key, one voice — no double-counting
+///   toward quorum), and `threshold == 0` / `threshold > k` refuse
+///   fail-closed.
+///
+/// Pure verification over caller-supplied bytes: returns `false` (never
+/// panics) on every malformed, mismatched, or unverifying input.
+#[must_use]
+pub fn verify_multisig_bitmap(
+    pubkeys: &[impl AsRef<[u8]>],
+    message: &[u8],
+    signatures: &[impl AsRef<[u8]>],
+    bitmap: &[u8],
+    threshold: usize,
+) -> bool {
+    let k = pubkeys.len();
+    if k == 0 || threshold == 0 || threshold > k {
+        return false;
+    }
+    if bitmap.len() != bitmap_len(k) {
+        return false;
+    }
+    // Trailing bits past `k` must be zero (at most 7 are checked).
+    for i in k..bitmap.len().saturating_mul(8) {
+        if bitmap[i / 8] & (1u8 << (i % 8)) != 0 {
+            return false;
+        }
+    }
+    // Claimed signer indices, ascending.
+    let mut claimed: Vec<usize> = Vec::new();
+    for i in 0..k {
+        if bitmap[i / 8] & (1u8 << (i % 8)) != 0 {
+            claimed.push(i);
+        }
+    }
+    // Bitmap↔presentation binding: exactly one blob per claimed signer.
+    if claimed.len() != signatures.len() {
+        return false;
+    }
+    // One key, one voice: duplicate committee keys count once toward quorum.
+    {
+        let mut distinct: std::collections::HashSet<&[u8]> =
+            std::collections::HashSet::with_capacity(claimed.len());
+        for &i in &claimed {
+            distinct.insert(pubkeys[i].as_ref());
+        }
+        if distinct.len() < threshold {
+            return false;
+        }
+    }
+    // Every claimed bit verifies under its own index's key, in order.
+    for (blob, &i) in signatures.iter().zip(claimed.iter()) {
+        let sig = blob.as_ref();
+        if sig.len() != FALCON512_SIG_LEN {
+            return false;
+        }
+        if !verify_pq_signature(PqScheme::Falcon512, pubkeys[i].as_ref(), message, sig) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -557,5 +674,139 @@ mod tests {
     #[should_panic(expected = "wrong length")]
     fn concat_rejects_bad_sig_len() {
         let _ = concat_signatures(&[vec![0u8; 665]]);
+    }
+
+    #[test]
+    fn size_rows_128_and_checkpoint_pin() {
+        // FIXES §2.6: `|QC| = 666k + ceil(k/8)` — the k=128 and k=1024 rows.
+        assert_eq!(concat_qc_size(128), RAW_QC_128);
+        assert_eq!(RAW_QC_128, 85_264);
+        assert_eq!(concat_qc_size(128), 666 * 128 + 128usize.div_ceil(8));
+        assert_eq!(concat_qc_size(1024), RAW_QC_1024);
+        assert_eq!(RAW_QC_1024, 682_112);
+        // FIXES §2.6: `|checkpoint| = |TS_sig| + h·32 + ceil(n/8)` —
+        // 3309 + 640 + 16 = 3 965 B (h=20, n=128).
+        assert_eq!(checkpoint_size(3_309, 20, 128), CHECKPOINT_128_H20);
+        assert_eq!(CHECKPOINT_128_H20, 3_965);
+        assert_eq!(checkpoint_size(3_309, 20, 128), 3_309 + 20 * 32 + 16);
+    }
+
+    /// LSB-first bitmap with `bits` set over `k` members.
+    fn bitmap_of(k: usize, bits: &[usize]) -> Vec<u8> {
+        let mut b = vec![0u8; bitmap_len(k)];
+        for &i in bits {
+            b[i / 8] |= 1u8 << (i % 8);
+        }
+        b
+    }
+
+    #[test]
+    fn multisig_bitmap_round_trip_and_threshold() {
+        let msg = b"multisig-bitmap qc";
+        let keys: Vec<FalconKeypair> = (0..5).map(FalconKeypair::generate_from_seed).collect();
+        let pubs: Vec<Vec<u8>> = keys.iter().map(|k| k.pubkey().to_vec()).collect();
+        let claimed = [0usize, 2, 4];
+        let sigs: Vec<Vec<u8>> = claimed.iter().map(|&i| keys[i].sign(msg)).collect();
+        let bitmap = bitmap_of(5, &claimed);
+        // Quorum met: 3 distinct verified signers ≥ 3.
+        assert!(verify_multisig_bitmap(&pubs, msg, &sigs, &bitmap, 3));
+        // Quorum missed: 3 < 4.
+        assert!(!verify_multisig_bitmap(&pubs, msg, &sigs, &bitmap, 4));
+        // Degenerate thresholds refuse fail-closed.
+        assert!(!verify_multisig_bitmap(&pubs, msg, &sigs, &bitmap, 0));
+        assert!(!verify_multisig_bitmap(&pubs, msg, &sigs, &bitmap, 6));
+        // Empty committee refuses at any threshold.
+        let empty: Vec<Vec<u8>> = vec![];
+        let no_sigs: Vec<Vec<u8>> = vec![];
+        assert!(!verify_multisig_bitmap(&empty, msg, &no_sigs, &[], 1));
+        assert!(!verify_multisig_bitmap(&empty, msg, &no_sigs, &[], 0));
+        // Nobody claimed: popcount 0 < threshold 1.
+        assert!(!verify_multisig_bitmap(
+            &pubs,
+            msg,
+            &no_sigs,
+            &bitmap_of(5, &[]),
+            1
+        ));
+    }
+
+    #[test]
+    fn multisig_bitmap_duplicate_signer_counts_once() {
+        let msg = b"multisig-bitmap dup";
+        let ka = FalconKeypair::generate_from_seed(0xA0);
+        let kb = FalconKeypair::generate_from_seed(0xB0);
+        let pa = ka.pubkey().to_vec();
+        // Committee slots 0 and 1 hold the SAME key (one key, two slots).
+        let pubs = vec![pa.clone(), pa.clone(), kb.pubkey().to_vec()];
+        // Both A-slots claimed, two (distinct, valid) A signatures shown.
+        let bitmap = bitmap_of(3, &[0, 1]);
+        let sigs = vec![ka.sign(msg), ka.sign(msg)];
+        // Popcount is 2 but distinct signers are 1: quorum 2 must refuse.
+        assert!(!verify_multisig_bitmap(&pubs, msg, &sigs, &bitmap, 2));
+        // ...while quorum 1 (the one distinct voice) passes.
+        assert!(verify_multisig_bitmap(&pubs, msg, &sigs, &bitmap, 1));
+        // A + B claimed: two distinct voices reach quorum 2.
+        let bitmap_ab = bitmap_of(3, &[0, 2]);
+        let sigs_ab = vec![ka.sign(msg), kb.sign(msg)];
+        assert!(verify_multisig_bitmap(&pubs, msg, &sigs_ab, &bitmap_ab, 2));
+    }
+
+    #[test]
+    fn multisig_bitmap_tamper_refusal() {
+        let msg = b"multisig-bitmap tamper";
+        let keys: Vec<FalconKeypair> = (20..25).map(FalconKeypair::generate_from_seed).collect();
+        let pubs: Vec<Vec<u8>> = keys.iter().map(|k| k.pubkey().to_vec()).collect();
+        let claimed = [0usize, 2, 4];
+        let sigs: Vec<Vec<u8>> = claimed.iter().map(|&i| keys[i].sign(msg)).collect();
+        let bitmap = bitmap_of(5, &claimed);
+        assert!(verify_multisig_bitmap(&pubs, msg, &sigs, &bitmap, 3));
+
+        // Clearing a claimed bit breaks the bitmap↔presentation count.
+        assert!(!verify_multisig_bitmap(
+            &pubs,
+            msg,
+            &sigs,
+            &bitmap_of(5, &[0, 4]),
+            2
+        ));
+        // Setting an extra bit breaks the count the other way.
+        assert!(!verify_multisig_bitmap(
+            &pubs,
+            msg,
+            &sigs,
+            &bitmap_of(5, &[0, 1, 2, 4]),
+            3
+        ));
+        // Wrong bitmap length (truncated / padded) refuses.
+        assert!(!verify_multisig_bitmap(&pubs, msg, &sigs, &[], 1));
+        let mut long = bitmap.clone();
+        long.push(0);
+        assert!(!verify_multisig_bitmap(&pubs, msg, &sigs, &long, 3));
+        // Trailing bit past k=5 with a MATCHING popcount still refuses:
+        // bits {0,2,7} carry 3 blobs, but bit 7 is outside the member set.
+        let mut trailing = bitmap_of(5, &[0, 2]);
+        trailing[0] |= 1u8 << 7;
+        let three = vec![keys[0].sign(msg), keys[2].sign(msg), keys[4].sign(msg)];
+        assert_eq!(three.len(), 3);
+        assert!(!verify_multisig_bitmap(&pubs, msg, &three, &trailing, 2));
+        // Flipped signature byte under a correctly-claimed bit refuses.
+        let mut bad = sigs.clone();
+        bad[1][100] ^= 0x01;
+        assert!(!verify_multisig_bitmap(&pubs, msg, &bad, &bitmap, 3));
+        // Swapped presentation order refuses (blob `j` must verify under
+        // claimed index `j`'s own key).
+        let swapped = vec![sigs[1].clone(), sigs[0].clone(), sigs[2].clone()];
+        assert!(!verify_multisig_bitmap(&pubs, msg, &swapped, &bitmap, 3));
+        // Short blob in a claimed slot refuses.
+        let short = vec![sigs[0].clone(), vec![0u8; 100], sigs[2].clone()];
+        assert!(!verify_multisig_bitmap(&pubs, msg, &short, &bitmap, 3));
+        // Right blobs, wrong message refuse.
+        assert!(!verify_multisig_bitmap(
+            &pubs,
+            b"other message",
+            &sigs,
+            &bitmap,
+            3
+        ));
     }
 }

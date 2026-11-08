@@ -1470,6 +1470,9 @@ fn describe_intent_op(op: &crate::svm::OpCode) -> String {
         }
         Op::Halt => "halt".to_string(),
         Op::SysCallSubmitPriceFeed(_) => "submit-price-feed".to_string(),
+        // PQ price feed (appended variant): indexed label only, no byte
+        // blobs echoed (publisher key/signature render as lengths elsewhere).
+        Op::SysCallSubmitPqPriceFeed(_) => "submit-pq-price-feed".to_string(),
         Op::SysCallRevokeSession { session_pubkey } => {
             format!("revoke-session key={}", hex::encode(session_pubkey))
         }

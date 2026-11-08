@@ -290,12 +290,6 @@ impl Node {
     }
 }
 
-/// Standalone helper for `remove_node` on a `Node`.
-#[allow(dead_code)]
-fn remove_node(node: Node, key: &Key, depth: usize) -> Option<Node> {
-    node.remove_node(key, depth)
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct CompressedTrie {
     root: Option<Node>,

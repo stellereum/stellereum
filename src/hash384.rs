@@ -154,11 +154,11 @@ mod tests {
     use super::*;
     use crate::cn_vrf::{shake256_32, shake256_xof as tree_xof};
 
-    /// In-tree NIST ShortMsgKAT pin (`src/post_quantum.rs:2168`,
+    /// In-tree NIST ShortMsgKAT pin (`test_shake256_matches_the_nist_test_vectors`,
     /// `tests/cn_vrf_tests.rs:48`): `SHAKE256("")` 32 bytes out.
     const NIST_EMPTY_32: &str =
         "46b9dd2b0ba88d13233b3feb743eeb243fcd52ea62b81b82b50c27646ed5762f";
-    /// In-tree NIST ShortMsgKAT pin (`src/post_quantum.rs:2175`,
+    /// In-tree NIST ShortMsgKAT pin (`test_shake256_matches_the_nist_test_vectors`,
     /// `tests/cn_vrf_tests.rs:52`): `SHAKE256("abc")` 32 bytes out.
     const NIST_ABC_32: &str =
         "483366601360a8771c6863080cc4114d8db44530f8f1e1ee4f94ea37e78b5739";

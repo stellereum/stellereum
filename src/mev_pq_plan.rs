@@ -10,37 +10,37 @@
 //! # 1. Audit (read-only): what the MEV DKG produces, who consumes it, X25519's role
 //!
 //! DKG PRODUCES (all in `stellereum/src/mev_epoch.rs`):
-//! * `EpochPublicKey` (`mev_epoch.rs:331`): epoch `P_e`, a Ristretto255 point that is the
-//!   AGGREGATE of contributors' constant-term Feldman commitments (`finalize`, `:981-988`).
-//! * `EpochKeyMaterial` (`mev_epoch.rs:426`): per-member Shamir share = sum of contributors'
-//!   evaluations at our index (`:955-971`), plus `transcript_root` binding every accepted
-//!   contribution (`:989-999`), plus `committee_hash` + `threshold`.
-//! * DKG inputs: `EpochCommittee` (`:239`) with DERIVED contributor set (`contributor_set`, `:184`);
-//!   `DkgContribution` (`:528`) carries Feldman `commitments` + per-recipient `EncryptedShare`
-//!   packages (`:515`); `EpochDkg::{contribution, ingest, finalize}` (`:671, :744, :929`) enforce
-//!   Feldman VSS + exact-contributor-set finalization (`can_finalize`, `:911`).
+//! * `EpochPublicKey` (`EpochPublicKey` in mev_epoch.rs): epoch `P_e`, a Ristretto255 point that is the
+//!   AGGREGATE of contributors' constant-term Feldman commitments (`EpochDkg::finalize`).
+//! * `EpochKeyMaterial` (`EpochKeyMaterial` in mev_epoch.rs): per-member Shamir share = sum of contributors'
+//!   evaluations at our index, plus `transcript_root` binding every accepted
+//!   contribution, plus `committee_hash` + `threshold`.
+//! * DKG inputs: `EpochCommittee` (mev_epoch.rs) with DERIVED contributor set (`contributor_set`);
+//!   `DkgContribution` carries Feldman `commitments` + per-recipient `EncryptedShare`
+//!   packages; `EpochDkg::{contribution, ingest, finalize}` enforce
+//!   Feldman VSS + exact-contributor-set finalization (`can_finalize`).
 //!
 //! CONSUMERS of the DKG output:
-//! * Wallet sealing: `seal_transaction` (`:1257`) — ephemeral Ristretto DH `e * P_e` (`:1268-1272`)
-//!   + XChaCha20-Poly1305; entry via `wallet.rs:55` `seal_transaction_for_epoch`.
-//! * Threshold unseal: `compute_partial` (`:1334`, `C^x_i`), `combine_partials` (`:1351`,
-//!   Lagrange-in-the-exponent), `unseal_transaction` (`:1405`); called by the proposer path
-//!   `runtime.rs:3336`, partial release `runtime.rs:3200` (`EpochSealManager::release_partial`,
-//!   `mev_epoch.rs:2242`), gossip `MevFrame::Dkg` (`runtime.rs:3056`), sealed pool
-//!   (`mempool.rs:626,642`), broadcast (`consensus_net.rs:2087`).
-//! * Chain binding: `epoch_key_commitment` (`:493`) carried by the block, checked by
-//!   `light_client.rs:719` `verify_epoch_key_against_block`.
+//! * Wallet sealing: `seal_transaction` (mev_epoch.rs — ephemeral Ristretto DH `e * P_e`)
+//!   + XChaCha20-Poly1305; entry via `seal_transaction_for_epoch` (wallet.rs).
+//! * Threshold unseal: `compute_partial` (`C^x_i`), `combine_partials`
+//!   (Lagrange-in-the-exponent), `unseal_transaction` (mev_epoch.rs); called by the proposer path
+//!   (`propose` in runtime.rs), partial release (`EpochSealManager::release_partial`,
+//!   mev_epoch.rs), gossip `MevFrame::Dkg` (runtime.rs), sealed pool
+//!   (`sealed`/`sealed_epoch` in mempool.rs), broadcast (`broadcast_mev_frame` in consensus_net.rs).
+//! * Chain binding: `epoch_key_commitment` (mev_epoch.rs) carried by the block, checked by
+//!   `verify_epoch_key_against_block` (light_client.rs).
 //!
 //! X25519'S EXACT ROLE — transport encryption of DKG share packages ONLY:
-//! * `encrypt_share_package` (`:1094`): ephemeral `XStaticSecret::random_from_rng` + DH
-//!   `ephemeral.diffie_hellman(recipient_pk)` (`:1099-1102`), key via `derive_seal_key`, XChaCha seal.
-//! * `decrypt_share_package` (`:1115`): `secret.diffie_hellman(ephemeral_pk)` (`:1119-1121`).
-//! * Key derivation: `encryption_secret_from_ed25519` (`:1060`), `encryption_public_key_from_ed25519`
-//!   (`:1078`, birational map, keeps DKG to ONE round), `encryption_public_key` (`:1086-1088`);
-//!   `CommitteeMember.enc_pk` (`:232-235`); `committee_for` derives `enc_pk` (`:1906`).
-//! * X25519 is NOT the sealing primitive (sealing is Ristretto DH + XChaCha, `:1268-1286`),
+//! * `encrypt_share_package` (mev_epoch.rs): ephemeral `XStaticSecret::random_from_rng` + DH
+//!   `ephemeral.diffie_hellman(recipient_pk)`, key via `derive_seal_key`, XChaCha seal.
+//! * `decrypt_share_package` (mev_epoch.rs): `secret.diffie_hellman(ephemeral_pk)`.
+//! * Key derivation: `encryption_secret_from_ed25519` (mev_epoch.rs), `encryption_public_key_from_ed25519`
+//!   (birational map, keeps DKG to ONE round), `encryption_public_key`;
+//!   `CommitteeMember.enc_pk`, `committee_for` derives `enc_pk` (mev_epoch.rs).
+//! * X25519 is NOT the sealing primitive (sealing is Ristretto DH + XChaCha, `seal_transaction`),
 //!   NOT the threshold arithmetic (Ristretto is linear, X25519 clamping is not — `:49-56`),
-//!   and NOT the E2E transport (`node_keys.rs:629-630` `e2e.key` is a separate channel).
+//!   and NOT the E2E transport (`e2e.key` in node_keys.rs is a separate channel).
 //!
 //! # 2. Design: ranked PQ replacement (honest fit assessment)
 //!
@@ -53,12 +53,12 @@
 //!   PQ KEM encaps (e.g. ML-KEM-768) to each recipient's PQ transport key, and sign each
 //!   `DkgContribution` with the contributor's Falcon-512 key over the contribution
 //!   bytes (the old `VrfBinding::verify` pattern was deleted with ECVRF;
-//!   keygen `post_quantum.rs:1959` `FalconKeypair::generate_from_seed_bytes`).
+//!   keygen `FalconKeypair::generate_from_seed_bytes` in post_quantum.rs).
 //!   Production/consumption unchanged: same `P_e`, same partials, same `unseal_transaction`.
-//! * RANK 2 (partial fit): Falcon-signed commit-reveal per the CN-VRF pattern (`cn_vrf.rs:1-43`,
+//! * RANK 2 (partial fit): Falcon-signed commit-reveal per the CN-VRF pattern (`cn_vrf.rs` header +
 //!   `cnvrf_commit`/`cnvrf_open`/`cnvrf_verify`, domains `CNVRF_COMMIT_DST`/`CNVRF_OPEN_DST`)
-//!   for the EPOCH SEED / public randomness only (replacing `EPOCH_SEED_DOMAIN` `:90` +
-//!   `DKG_POLY_DOMAIN` `:92` determinism). It removes DKG input bias surface but has NO threshold
+//!   for the EPOCH SEED / public randomness only (replacing `EPOCH_SEED_DOMAIN` +
+//!   `DKG_POLY_DOMAIN` determinism). It removes DKG input bias surface but has NO threshold
 //!   decryption property: alone it CANNOT unseal wallet ciphertexts.
 //! * RANK 3 / REJECTED for this path: pure hash-DRB replacing the DKG. A DRB outputs public
 //!   randomness, not a threshold-shared secret; it cannot produce `t`-of-`n` decryption partials
@@ -104,7 +104,7 @@ fn pq_plan_feed(state: &mut u64, bytes: &[u8]) {
 /// Domain-separated digest over length-prefixed parts, expanded to 32 bytes.
 ///
 /// MODEL ONLY: FNV-1a-64 over 4 golden-ratio-separated lanes. Production replaces this
-/// 1:1 with BLAKE3 (see `TRANSCRIPT_DOMAIN`, `mev_epoch.rs:101`) or SHAKE-256 (see `cn_vrf.rs`
+/// 1:1 with BLAKE3 (see `TRANSCRIPT_DOMAIN`, `mev_epoch.rs`) or SHAKE-256 (see `cn_vrf.rs`
 /// O8). The framing contract pinned here — domain first, every part `u32-BE-len || bytes` —
 /// is what carries over.
 pub fn pq_plan_digest(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -165,7 +165,7 @@ pub fn pq_plan_beta(commitment: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
 
 /// Bind `(epoch, contributions...)` into a transcript root.
 ///
-/// Mirrors `EpochDkg::finalize` (`mev_epoch.rs:989-999`): `epoch || canonical(contribution_i...)`
+/// Mirrors `EpochDkg::finalize` (mev_epoch.rs): `epoch || canonical(contribution_i...)`
 /// under a domain. Order-sensitive by construction: swapping two contributions changes the root.
 pub fn pq_plan_transcript(epoch: u64, contributions: &[&[u8]]) -> [u8; 32] {
     let mut parts: Vec<&[u8]> = Vec::with_capacity(contributions.len() + 1);

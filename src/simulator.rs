@@ -110,8 +110,6 @@ pub const MAX_DEVNET_ACCOUNTS: usize = 256;
 pub enum SimError {
     /// The requested configuration is not usable.
     InvalidConfig(String),
-    /// The seed could not be interpreted.
-    InvalidSeed(String),
     /// The sender account does not exist.
     UnknownAccount([u8; 32]),
     /// The proposer is not a member of the validator set.
@@ -156,7 +154,6 @@ impl fmt::Display for SimError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SimError::InvalidConfig(m) => write!(f, "invalid simulator config: {m}"),
-            SimError::InvalidSeed(m) => write!(f, "invalid seed: {m}"),
             SimError::UnknownAccount(a) => {
                 write!(f, "unknown account {}", hex::encode(a))
             }

@@ -114,7 +114,7 @@ pub type CnVrfCommitments = BTreeMap<(ValidatorId, u64), CommitmentRecord>;
 /// which is module-private): 136-byte rate, `0x1F` domain pad, `0x80` final
 /// bit. The permutation IS the tree one
 /// (`crate::post_quantum::keccak_f1600`) — same code path as the NIST-KAT
-/// test at `post_quantum.rs:2450`. Pinned against the NIST vectors in
+/// test `test_shake256_matches_the_nist_test_vectors` (post_quantum.rs). Pinned against the NIST vectors in
 /// `tests/cn_vrf_tests.rs` (empty + "abc" 32-byte digests, 64-byte squeeze).
 pub fn shake256_32(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -639,7 +639,7 @@ pub fn cnvrf_draw_absence(
 
 /// Save an epoch nonce to `path` with owner-only (0600) permissions.
 ///
-/// Mirrors the `vrf.rs:360-421` secret-file posture: hex-encoded first line.
+/// Mirrors the `node_keys.rs` secret-file posture: hex-encoded first line.
 /// Parent directories are created as needed; permissions are forced to 0600
 /// after writing (umask-independent). Unit-tested with temp dirs only.
 pub fn save_cnvrf_nonce_to_file(path: &Path, nonce: &[u8; 32]) -> Result<(), String> {

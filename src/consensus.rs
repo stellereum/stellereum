@@ -520,8 +520,8 @@ impl PqMicroCertificate {
     /// `u64::MAX` guard for the empty set.
     ///
     /// AUDIT W6.5: the threshold is the NETWORK-ANCHORED one
-    /// ([`pq_micro_required_power`]) — the committee's own `2/3` AND a strict
-    /// majority of the whole network's stake. When the committee is the whole
+    /// ([`pq_micro_required_power`]) — the committee's own `2/3` AND two-thirds
+    /// of the whole network's stake. When the committee is the whole
     /// validator set (N <= the committee cap) the two coincide and the legacy
     /// value is unchanged; when the committee is a strict subset the network
     /// anchor is what stops a captured committee from finalizing a block.
@@ -769,16 +769,16 @@ pub fn mixed_quorum_pair_safe(t_micro: u64, t_full: u64, total_power: u64) -> bo
 /// parent's bytes, hence its hash, hence the committee of the next height.
 /// A proposer that can vary the parent hash (a nonce, a timestamp, the tx
 /// set) can therefore SEARCH for a favourable committee: each candidate
-/// parent hash is a fresh 16-draw sortition, and BLAKE3 is cheap enough
+/// parent hash is a fresh sortition draw, and BLAKE3 is cheap enough
 /// (10^9+ draws/s on a GPU) that a capture is a matter of minutes, not
 /// years, for an attacker who controls a meaningful share of the set.
 ///
 /// The parent hash is therefore NOT the security boundary — the
 /// NETWORK-ANCHORED QUORUM is (see [`pq_micro_required_power`]): a µQC must
-/// carry a strict majority of the WHOLE network's stake, so grinding for a
+/// carry two-thirds of the WHOLE network's stake, so grinding for a
 /// favourable committee does not lower the bar an attacker has to clear.
 /// Grinding can only pick WHICH honest validators are asked to sign, not
-/// manufacture the 1/2-of-the-network the certificate needs. A VRF-based
+/// manufacture the 2/3-of-the-network the certificate needs. A VRF-based
 /// (ungrindable) selection would remove the grinding surface entirely; that
 /// is the structural fix and is out of scope here.
 ///

@@ -7,11 +7,12 @@
 //! (`tests/hashpool_tests.rs`: `#[path = "../src/hashpool.rs"] mod hashpool;`).
 //! To wire it for real, the lead adds `#[cfg(test)] mod hashpool;` to
 //! `lib.rs` (never a production `mod` before audit) and re-runs the gates.
-//! No new dependencies: `ml-kem` (already vendored, `Cargo.toml:59`) + `std`
+//! No new dependencies: `ml-kem` (already vendored, `Cargo.toml`) + `std`
 //! only. The SHAKE-256 sponge below is a self-contained copy of the tree
-//! sponge (`post_quantum.rs:573` `keccak_f1600`, absorb/squeeze shape of
-//! `cn_vrf.rs:118` `shake256_32`); it is pinned against the NIST vectors in
-//! the test file, exactly like `post_quantum.rs:2143`.
+//! sponge (`keccak_f1600` in post_quantum.rs, absorb/squeeze shape of
+//! `shake256_32` in cn_vrf.rs); it is pinned against the NIST vectors in
+//! the test file, exactly like `test_shake256_matches_the_nist_test_vectors`
+//! (post_quantum.rs).
 //!
 //! # Construction (lead-designed PQ private transfers WITHOUT ZK)
 //!
@@ -24,7 +25,7 @@
 //!    exactly 1184 B). The sender runs `stealth_encap` (the
 //!    `from_seed` / `encapsulate_deterministic` / `decapsulate` idiom pinned
 //!    in `infnode/crates/infnode/tests/kem_kat_tests.rs:139-177` and mirrored
-//!    in `mev_epoch.rs:1365` `pq_kem_encapsulate_deterministic`):
+//!    in `mev_epoch.rs` `pq_kem_encapsulate_deterministic`):
 //!    encap to `ek_bytes` with explicit 32-byte randomness `m` yields
 //!    `(ct, ss)`, and the stealth address is
 //!    `SHAKE256("STELL_HP_STEALTH_V1" || ss || index_be64)`.
@@ -51,9 +52,9 @@
 //!    `D` (distinct stealth addresses, distinct nullifiers) + K Falcon-512
 //!    owner signatures (one per input, verified each via a caller-supplied
 //!    closure — production passes
-//!    `post_quantum.rs:521` `verify_pq_signature(PqScheme::Falcon512, …)`;
-//!    test keys come from `post_quantum.rs:1799`
-//!    `FalconKeypair::generate_from_seed_bytes`, signatures from `:1864`
+//!    `verify_pq_signature(PqScheme::Falcon512, …)` (post_quantum.rs);
+//!    test keys come from
+//!    `FalconKeypair::generate_from_seed_bytes` (post_quantum.rs), signatures from
 //!    `sign`) + explicit `fee` with conservation `sum_in == sum_out + fee`
 //!    (checked arithmetic). Flow: `coinjoin_sig_msg` (pure) -> caller signs
 //!    per input -> `coinjoin_build` (assembles + sorts deterministically) ->
@@ -287,7 +288,7 @@ fn hp_keccak_f1600(state: &mut [u64; 25]) {
 }
 
 /// SHAKE-256 XOF squeeze over `data` (136-byte rate, `0x1F` pad, `0x80` final
-/// bit — the same sponge as `cn_vrf.rs:126` `shake256_xof`).
+/// bit — the same sponge as `shake256_xof` in cn_vrf.rs).
 pub fn hp_shake256(data: &[u8], out: &mut [u8]) {
     const RATE: usize = 136;
     const WORDS: usize = RATE / 8;

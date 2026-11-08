@@ -1,10 +1,11 @@
 //! A-CONSENSUS PoC suite (adversarial, read-only + tests).
 //! Each test asserts the SECURE behavior; a FAIL proves the bug on current code.
 
-use stellereum::consensus::{
-    HeightConsensus, ValidatorSet, Vote, VoteKind,
-};
+use stellereum::consensus::{HeightConsensus, ValidatorSet, VoteKind};
 use stellereum::mempool::Mempool;
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 fn keys(n: usize) -> Vec<ed25519_dalek::SigningKey> {
     (0..n)
@@ -29,7 +30,8 @@ fn poc_proposal_overwrite_same_round_is_rejected() {
     let prop = hc.proposer().expect("proposer");
     let h1 = [11u8; 32];
     let h2 = [22u8; 32];
-    hc.receive_proposal(prop, h1).expect("first proposal accepted");
+    hc.receive_proposal(prop, h1)
+        .expect("first proposal accepted");
     let second = hc.receive_proposal(prop, h2);
     assert!(
         second.is_err(),
@@ -44,8 +46,9 @@ fn poc_proposal_overwrite_same_round_is_rejected() {
 fn poc_sealed_epoch_rotation_releases_sender_quota() {
     let mut pool = Mempool::new(100, 1);
     let sender = [7u8; 32];
-    let eph =
-        curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT.compress().to_bytes();
+    let eph = curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT
+        .compress()
+        .to_bytes();
     let mk = |tx_hash: [u8; 32], epoch: u64| stellereum::mev_epoch::SealedEnvelope {
         epoch,
         tx_hash,
@@ -62,7 +65,8 @@ fn poc_sealed_epoch_rotation_releases_sender_quota() {
         },
     };
     let cur = pool.sealed_epoch();
-    pool.add_sealed(mk([9u8; 32], cur)).expect("first sealed admitted");
+    pool.add_sealed(mk([9u8; 32], cur))
+        .expect("first sealed admitted");
     pool.set_sealed_epoch(cur + 1);
     // Fresh epoch: sender quota must be free again.
     let r = pool.add_sealed(mk([10u8; 32], cur + 1));
@@ -94,18 +98,21 @@ fn poc_single_far_future_vote_does_not_drag_round() {
 fn poc_quorum_arithmetic_saturates_on_huge_power() {
     // Must not panic in debug nor wrap in release.
     let q = stellereum::consensus::consensus_quorum_min(u64::MAX);
-    assert!(q > u64::MAX / 2, "quorum for MAX power must stay huge, got {q}");
+    assert!(
+        q > u64::MAX / 2,
+        "quorum for MAX power must stay huge, got {q}"
+    );
 }
 
 /// F5 (SAFE, control): duplicate vote counts once + nil never unlocks.
 #[test]
 fn poc_control_dedup_and_nil_lock_safety() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     // Dedup: same voter, two targets -> power counted once, equivocation recorded once.
     let mut hc = HeightConsensus::new(1, vs.clone());
-    let v1 = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some([1u8; 32]));
-    let v2 = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some([2u8; 32]));
+    let v1 = falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some([1u8; 32]));
+    let v2 = falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some([2u8; 32]));
     hc.add_prevote(v1).unwrap();
     hc.add_prevote(v2).unwrap();
     let set = hc.prevote_set(0).unwrap();
@@ -116,8 +123,8 @@ fn poc_control_dedup_and_nil_lock_safety() {
     // Nil never unlocks: lock on A@0, nil quorum @1 -> lock stays.
     let mut hc2 = HeightConsensus::new(1, vs);
     hc2.locked = Some(([0xAAu8; 32], 0));
-    for k in ks.iter().take(3) {
-        hc2.add_prevote(Vote::sign(k, 1, 1, VoteKind::Prevote, None))
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        hc2.add_prevote(falcon_votes::fvote(k, fk, 1, 1, VoteKind::Prevote, None))
             .unwrap();
     }
     let _ = hc2.try_prevote_quorum_at();

@@ -21,6 +21,9 @@ use stellereum::consensus::{QuorumCertificate, Vote, VoteKind};
 use stellereum::consensus_net::{parse_incoming, parse_tx_incoming, ConsensusMsg};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 // ---------------------------------------------------------------------------
 // Deterministic PRNG (xorshift64*, fixed seeds — no OS entropy in mutations).
 // ---------------------------------------------------------------------------
@@ -92,8 +95,8 @@ fn sample_block() -> Block {
 }
 
 fn valid_consensus_vote() -> Vec<u8> {
-    let sk = SigningKey::generate(&mut OsRng);
-    let v = Vote::sign(&sk, 3, 1, VoteKind::Prevote, Some([9u8; 32]));
+    let (ks, fks) = falcon_votes::falcon_set(1);
+    let v = falcon_votes::fvote(&ks[0], &fks[0], 3, 1, VoteKind::Prevote, Some([9u8; 32]));
     ConsensusMsg::Vote {
         vote: v,
         locked: None,
@@ -568,8 +571,8 @@ fn block_validator_signatures_abuse_never_panics() {
 
 #[test]
 fn vote_and_qc_decode_never_panic() {
-    let sk = SigningKey::generate(&mut OsRng);
-    let v = Vote::sign(&sk, 1, 0, VoteKind::Precommit, Some([5u8; 32]));
+    let (ks, fks) = falcon_votes::falcon_set(1);
+    let v = falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Precommit, Some([5u8; 32]));
     let venv = bincode::serialize(&v).unwrap();
     assert!(bincode::deserialize::<Vote>(&venv).is_ok());
     let qc = QuorumCertificate {
@@ -653,8 +656,8 @@ fn report_decode_accepts_semantically_invalid_values() {
     //  - Transaction with empty / 1 KiB signature;
     //  - Block with zero signatures, duplicate signers, or 1 MiB signatures;
     //  - CrossShardMessage with trusted=true (verify_inclusion bypass flag).
-    let sk = SigningKey::generate(&mut OsRng);
-    let mut v = Vote::sign(&sk, 1, 0, VoteKind::Prevote, Some([1u8; 32]));
+    let (rks, rfks) = falcon_votes::falcon_set(1);
+    let mut v = falcon_votes::fvote(&rks[0], &rfks[0], 1, 0, VoteKind::Prevote, Some([1u8; 32]));
     v.signature.clear();
     let enc = bincode::serialize(&v).unwrap();
     let back: Vote = bincode::deserialize(&enc).unwrap();

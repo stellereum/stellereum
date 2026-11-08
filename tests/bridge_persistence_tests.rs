@@ -97,21 +97,46 @@ fn attest(dep: &BridgeIntent, signers: &[SigningKey]) -> BridgeIntent {
     }
 }
 
+/// FULL-PQ sender address for a seed: implicit Falcon-512, registered
+/// globally (no activation surcharge). Mirrors the `pq_tx` pattern in
+/// `audit_state_sync_closeout_tests.rs`.
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
 /// A wrapping transaction carrying the intents. `from == proposer`, so the
 /// declared gas the block path charges is credited straight back to the payer
 /// as the proposer fee: balance assertions see only the bridge's own movement.
-fn bridge_tx(payer: &SigningKey, nonce: u64, ops: Vec<OpCode>) -> Transaction {
+/// FULL-PQ: implicit Falcon-512 envelope (classical
+/// `Transaction::sign_with_payload` is refused at admission — "Pure PQ
+/// mode" — so no bridge intent could even reach the bridge gate).
+fn bridge_tx(seed: u8, nonce: u64, ops: Vec<OpCode>) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
     let gas = GAS_BRIDGE_INTENT * ops.len() as u64 + 1_000;
-    Transaction::sign_with_payload(
-        payer,
-        payer.verifying_key().to_bytes(),
-        0,
-        gas,
+    let mut t = Transaction {
+        from,
+        to: from,
+        amount: 0,
+        gas_limit: gas,
         nonce,
-        MASTERCHAIN_SHARD,
-        MASTERCHAIN_SHARD,
-        ops,
-    )
+        source_shard: MASTERCHAIN_SHARD,
+        target_shard: MASTERCHAIN_SHARD,
+        signature: Vec::new(),
+        payload: ops,
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 fn bridge_block(height: u64, timestamp: u64, txs: Vec<Transaction>, proposer: [u8; 32]) -> Block {
@@ -168,21 +193,65 @@ async fn bridge_replay_set_survives_snapshot_and_restore() {
     const NEXT_H: u64 = SNAP_H + 1;
 
     let (e, vals) = setup(3).await;
-    let payer = key(0x01);
-    let payer_pk = payer.verifying_key().to_bytes();
+    // FULL-PQ: the payer is an implicit Falcon-512 sender; the quorum
+    // evidence stays classical ed25519 (that is the designed refusal below).
+    const PAYER_SEED: u8 = 0x01;
+    let payer_pk = pq_id(PAYER_SEED);
     e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
     let recipient = [0xABu8; 32];
     let amount = 5_000 * STELL;
 
-    // Apply a quorum-attested deposit through the live block path.
+    // DESIGNED REFUSAL (FULL-PQ, nodes wiped, no compat): the classical
+    // ed25519 bridge quorum is removed — `verify_quorum_signatures` fails
+    // closed on every input, so a quorum-attested deposit can never credit,
+    // even wrapped in a valid PQ transport envelope. Prove it loudly at both
+    // layers: the quorum helper names the removal, and the block path refuses
+    // the attested deposit (status false, nothing minted).
     let dep = deposit([0x71u8; 32], recipient, amount);
     let att = attest(&dep, &vals[..2]);
-    let tx = bridge_tx(&payer, 0, ops(att.clone(), dep.clone()));
+    {
+        let event = dep.deposit_event(Vec::new()).expect("deposit event");
+        let msg = stellereum::bridge::TeleportBridgeEngine::deposit_signing_message(&event);
+        let sigs: Vec<([u8; 32], Vec<u8>)> = vals[..2]
+            .iter()
+            .map(|k| {
+                use ed25519_dalek::Signer;
+                (k.verifying_key().to_bytes(), k.sign(&msg).to_vec())
+            })
+            .collect();
+        let err = stellereum::bridge::verify_quorum_signatures(&msg, &sigs, &[])
+            .expect_err("classical quorum must be refused under FULL-PQ");
+        assert!(
+            err.contains("FULL-PQ: classical bridge quorum removed"),
+            "quorum refusal must name the designed removal: {err}"
+        );
+    }
+    let tx = bridge_tx(PAYER_SEED, 0, ops(att.clone(), dep.clone()));
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
-    assert_eq!(out.status, vec![true], "the deposit applies");
-    assert_eq!(balance(&e, &recipient).await, amount);
+    assert_eq!(
+        out.status,
+        vec![false],
+        "a quorum-attested deposit is refused under FULL-PQ (quorum removed)"
+    );
+    assert_eq!(
+        balance(&e, &recipient).await,
+        0,
+        "the refused deposit mints nothing"
+    );
+
+    // Seed the committed replay set directly (the persistence precondition:
+    // one credited source tx, as the pre-PQ quorum path used to produce) and
+    // credit the recipient natively, so the snapshot below carries the same
+    // shape — replay set + credit — that the restore must preserve.
+    e.bridge_write()
+        .await
+        .processed_source_txs
+        .insert([0x71u8; 32]);
+    e.credit_native(&recipient, amount)
+        .await
+        .expect("credit the seeded deposit");
     assert!(
         e.bridge_read()
             .await
@@ -310,9 +379,9 @@ async fn bridge_replay_set_survives_snapshot_and_restore() {
     );
 
     // After the restore, the SAME claim is refused by the committed replay
-    // set: no second credit, no root movement, nothing written.
+    // set: no second credit, nothing written.
     let settled = fresh.get_state_root().await;
-    let replay = bridge_tx(&payer, 1, ops(att, dep));
+    let replay = bridge_tx(PAYER_SEED, 1, ops(att, dep));
     let out = fresh
         .apply_block_transition(&bridge_block(2, TS + 1, vec![replay], payer_pk), 0)
         .await;
@@ -345,19 +414,21 @@ async fn bridge_replay_set_survives_snapshot_and_restore() {
 
 #[tokio::test]
 async fn bridge_snapshot_bytes_round_trip_and_absent_means_empty() {
-    let (e, vals) = setup(3).await;
-    let payer = key(0x02);
-    let payer_pk = payer.verifying_key().to_bytes();
-    e.credit_native(&payer_pk, 1_000_000).await.expect("fund");
-    let recipient = [0xB0u8; 32];
-
-    let dep = deposit([0x72u8; 32], recipient, 1_000 * STELL);
-    let att = attest(&dep, &vals[..2]);
-    let tx = bridge_tx(&payer, 0, ops(att, dep));
-    let out = e
-        .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
-        .await;
-    assert_eq!(out.status, vec![true]);
+    let (e, _) = setup(3).await;
+    // FULL-PQ: the quorum-attested deposit path is removed (see test 1), so
+    // the non-empty domain is seeded directly — the bytes round-trip property
+    // under test is unchanged (one credited source tx in the replay set).
+    e.bridge_write()
+        .await
+        .processed_source_txs
+        .insert([0x72u8; 32]);
+    assert!(
+        e.bridge_read()
+            .await
+            .processed_source_txs
+            .contains(&[0x72u8; 32]),
+        "precondition: the replay set is non-empty"
+    );
 
     let bytes = e.bridge_snapshot().await;
     assert!(!bytes.is_empty(), "a non-empty domain must serialize");
@@ -413,8 +484,10 @@ async fn bridge_snapshot_bytes_round_trip_and_absent_means_empty() {
 #[tokio::test]
 async fn withdrawal_queue_and_rate_window_survive_the_restore() {
     let (e, _vals) = setup(3).await;
-    let payer = key(0x03);
-    let payer_pk = payer.verifying_key().to_bytes();
+    // FULL-PQ: the payer is an implicit Falcon-512 sender (amounts, queue
+    // shape and time-lock asserts unchanged).
+    const PAYER_SEED: u8 = 0x03;
+    let payer_pk = pq_id(PAYER_SEED);
     let start = LARGE_WITHDRAWAL_THRESHOLD_NANO + 10 * STELL;
     e.credit_native(&payer_pk, start).await.expect("fund");
 
@@ -423,7 +496,11 @@ async fn withdrawal_queue_and_rate_window_survive_the_restore() {
         target_address: "0xdeadbeef".to_string(),
         amount: LARGE_WITHDRAWAL_THRESHOLD_NANO,
     };
-    let tx = bridge_tx(&payer, 0, vec![OpCode::SysCallBridge(Box::new(withdraw))]);
+    let tx = bridge_tx(
+        PAYER_SEED,
+        0,
+        vec![OpCode::SysCallBridge(Box::new(withdraw))],
+    );
     let out = e
         .apply_block_transition(&bridge_block(1, TS, vec![tx], payer_pk), 0)
         .await;
@@ -469,7 +546,11 @@ async fn withdrawal_queue_and_rate_window_survive_the_restore() {
     // in is refused by the block, exactly as before the restart.
     // Fresh engine: the payer's account starts at nonce 0 here.
     let early = BridgeIntent::Release { req_id: 0 };
-    let tx = bridge_tx(&payer, 0, vec![OpCode::SysCallBridge(Box::new(early))]);
+    let tx = bridge_tx(
+        PAYER_SEED,
+        0,
+        vec![OpCode::SysCallBridge(Box::new(early))],
+    );
     let out = fresh
         .apply_block_transition(&bridge_block(2, TS + 60, vec![tx], payer_pk), 0)
         .await;
@@ -490,7 +571,11 @@ async fn withdrawal_queue_and_rate_window_survive_the_restore() {
     // still advances the nonce and pays the D2 floor step), so the payer is
     // at 1 now.
     let matured = BridgeIntent::Release { req_id: 0 };
-    let tx = bridge_tx(&payer, 1, vec![OpCode::SysCallBridge(Box::new(matured))]);
+    let tx = bridge_tx(
+        PAYER_SEED,
+        1,
+        vec![OpCode::SysCallBridge(Box::new(matured))],
+    );
     let out = fresh
         .apply_block_transition(
             &bridge_block(3, TS + WITHDRAWAL_TIME_LOCK_SECS, vec![tx], payer_pk),

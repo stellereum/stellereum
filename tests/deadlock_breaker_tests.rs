@@ -9,18 +9,16 @@
 //! bounded forward-only jump to max(peer rounds), at most once per window.
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use stellereum::consensus::{
-    HeightConsensus, ValidatorSet, Vote, VoteKind, MAX_SYNC_JUMPS_PER_ROUND, ROUND_LOOKBACK,
+    HeightConsensus, ValidatorSet, VoteKind, MAX_SYNC_JUMPS_PER_ROUND, ROUND_LOOKBACK,
 };
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::state_engine::InMemoryStateEngine;
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
-}
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 fn id(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
@@ -38,13 +36,20 @@ fn rt_at(ks: &[SigningKey], me: usize, height: u64) -> ValidatorRuntime {
 
 #[test]
 fn stale_vote_feeds_round_counter_without_voting() {
-    let ks = keys(2);
+    let (ks, fks) = falcon_votes::falcon_set(2);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(92078, vs.clone());
     hc.round = 318;
 
     // Peer's far-ahead vote: absurd (>1000) so `add_prevote` rejects it.
-    let far = Vote::sign(&ks[0], 92078, 1550, VoteKind::Prevote, Some([1u8; 32]));
+    let far = falcon_votes::fvote(
+        &ks[0],
+        &fks[0],
+        92078,
+        1550,
+        VoteKind::Prevote,
+        Some([1u8; 32]),
+    );
     assert!(hc.add_prevote(far.clone()).is_err());
     // ...but the verified round still lands in the counter (no voting).
     assert!(far.verify());
@@ -61,7 +66,14 @@ fn stale_vote_feeds_round_counter_without_voting() {
     assert_eq!(hc.max_peer_round(), Some(1550));
     // A SECOND distinct validator vouching for the same far round is the
     // network's real position: corroboration re-opens the bounded chase.
-    let corroborator = Vote::sign(&ks[1], 92078, 1550, VoteKind::Prevote, Some([1u8; 32]));
+    let corroborator = falcon_votes::fvote(
+        &ks[1],
+        &fks[1],
+        92078,
+        1550,
+        VoteKind::Prevote,
+        Some([1u8; 32]),
+    );
     assert!(corroborator.verify());
     let moved2 = hc.observe_peer_round(id(&ks[1]), corroborator.round);
     assert!(moved2, "corroborated far round must chase");
@@ -73,12 +85,19 @@ fn stale_vote_feeds_round_counter_without_voting() {
 
 #[test]
 fn stale_behind_vote_never_drags_ahead_backwards() {
-    let ks = keys(2);
+    let (ks, fks) = falcon_votes::falcon_set(2);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(92078, vs.clone());
     hc.round = 1550;
 
-    let behind = Vote::sign(&ks[1], 92078, 318, VoteKind::Prevote, Some([2u8; 32]));
+    let behind = falcon_votes::fvote(
+        &ks[1],
+        &fks[1],
+        92078,
+        318,
+        VoteKind::Prevote,
+        Some([2u8; 32]),
+    );
     // Stored under its own round bucket, but far outside the 8-round
     // finalization window — so it can never vote or form a quorum here...
     let _ = hc.add_prevote(behind.clone());
@@ -96,7 +115,7 @@ fn stale_behind_vote_never_drags_ahead_backwards() {
 
 #[test]
 fn breaker_decision_is_pure_and_forward_only() {
-    let ks = keys(2);
+    let (ks, _fks) = falcon_votes::falcon_set(2);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(92078, vs.clone());
     hc.round = 318;
@@ -132,7 +151,7 @@ fn deadlock_timeout_defaults_to_300s() {
 
 #[tokio::test]
 async fn two_nodes_with_1200_round_desync_converge_without_restart() {
-    let ks = keys(2);
+    let (ks, fks) = falcon_votes::falcon_set(2);
     const H: u64 = 92078;
     let mut a = rt_at(&ks, 0, H);
     let mut b = rt_at(&ks, 1, H);
@@ -149,7 +168,7 @@ async fn two_nodes_with_1200_round_desync_converge_without_restart() {
     // peer round (counter only) with a budget-bounded chase toward it (the
     // future-round rule: converge within the per-round jump budget, never
     // teleport -- the corroborated breaker below still owns the huge jump).
-    let a_vote = Vote::sign(&ks[0], H, 1550, VoteKind::Prevote, Some([7u8; 32]));
+    let a_vote = falcon_votes::fvote(&ks[0], &fks[0], H, 1550, VoteKind::Prevote, Some([7u8; 32]));
     assert!(
         b.on_prevote(a_vote.clone()).is_err(),
         "far-ahead vote must not count as a vote"
@@ -166,7 +185,7 @@ async fn two_nodes_with_1200_round_desync_converge_without_restart() {
     );
 
     // And B's stale vote to A records without dragging A backwards.
-    let b_vote = Vote::sign(&ks[1], H, 318, VoteKind::Prevote, Some([7u8; 32]));
+    let b_vote = falcon_votes::fvote(&ks[1], &fks[1], H, 318, VoteKind::Prevote, Some([7u8; 32]));
     let _ = a.on_prevote(b_vote);
     assert_eq!(a.hc.round, 1550, "ahead node never moves backwards");
 
@@ -193,15 +212,15 @@ async fn two_nodes_with_1200_round_desync_converge_without_restart() {
 
     // Same objects, no restart: both can now form quorums at the joined round.
     let bh = [9u8; 32];
-    for k in &ks {
-        let v = Vote::sign(k, H, 1550, VoteKind::Prevote, Some(bh));
+    for (i, k) in ks.iter().enumerate() {
+        let v = falcon_votes::fvote(k, &fks[i], H, 1550, VoteKind::Prevote, Some(bh));
         let _ = a.on_prevote(v.clone());
         let _ = b.on_prevote(v);
     }
     assert!(a.hc.try_prevote_quorum().is_some());
     assert!(b.hc.try_prevote_quorum().is_some());
-    for k in &ks {
-        let v = Vote::sign(k, H, 1550, VoteKind::Precommit, Some(bh));
+    for (i, k) in ks.iter().enumerate() {
+        let v = falcon_votes::fvote(k, &fks[i], H, 1550, VoteKind::Precommit, Some(bh));
         let _ = a.on_precommit(v.clone());
         let _ = b.on_precommit(v);
     }
@@ -222,7 +241,7 @@ async fn two_nodes_with_1200_round_desync_converge_without_restart() {
 
 #[test]
 fn breaker_fires_with_empty_peer_set() {
-    let ks = keys(2);
+    let (ks, _fks) = falcon_votes::falcon_set(2);
     let vs = vset(&ks);
     // Live shape: high round, zero verified peer votes (empty counter).
     let mut hc = HeightConsensus::new(92079, vs.clone());
@@ -275,7 +294,7 @@ fn breaker_local_reset_keeps_bodyless_lock_when_precommit_qc_observed() {
     // A observed (votes seen, body missing), no prevote QC run, so nothing is
     // decided and the no-progress reset is still due.
     const H: u64 = 92079;
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let a = [42u8; 32];
     let mut hc = HeightConsensus::new(H, vs.clone());
@@ -283,8 +302,8 @@ fn breaker_local_reset_keeps_bodyless_lock_when_precommit_qc_observed() {
     hc.locked = Some((a, 400)); // bodyless: `blocks` has no `a`
                                 // 3-of-4 precommits for A at the current round: QC observable, but no
                                 // prevote QC, so `try_precommit_quorum` could never decide (not called).
-    for k in ks.iter().take(3) {
-        let v = Vote::sign(k, H, 412, VoteKind::Precommit, Some(a));
+    for (i, k) in ks.iter().enumerate().take(3) {
+        let v = falcon_votes::fvote(k, &fks[i], H, 412, VoteKind::Precommit, Some(a));
         hc.add_precommit(v).unwrap();
     }
     assert!(
@@ -323,16 +342,30 @@ fn breaker_local_reset_keeps_lock_when_deciding_qc_banked() {
     // Same rule via the banked-QC half of the gate: once `precommit_qc` is set,
     // no reset drops the lock even with empty vote sets (e.g. post-prune).
     const H: u64 = 92079;
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let a = [7u8; 32];
     let mut hc = HeightConsensus::new(H, vs.clone());
     hc.round = 5;
-    for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, H, 5, VoteKind::Prevote, Some(a)))
-            .unwrap();
-        hc.add_precommit(Vote::sign(k, H, 5, VoteKind::Precommit, Some(a)))
-            .unwrap();
+    for (i, k) in ks.iter().enumerate().take(3) {
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            5,
+            VoteKind::Prevote,
+            Some(a),
+        ))
+        .unwrap();
+        hc.add_precommit(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            5,
+            VoteKind::Precommit,
+            Some(a),
+        ))
+        .unwrap();
     }
     assert_eq!(
         hc.try_precommit_quorum(),
@@ -356,7 +389,7 @@ fn breaker_local_reset_keeps_lock_when_deciding_qc_banked() {
 
 #[test]
 fn breaker_local_reset_keeps_lock_whose_body_we_hold() {
-    let ks = keys(2);
+    let (ks, _fks) = falcon_votes::falcon_set(2);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(92079, vs.clone());
     hc.round = 1595;
@@ -382,7 +415,7 @@ fn breaker_local_reset_keeps_lock_whose_body_we_hold() {
 fn breaker_peer_ahead_path_still_owns_the_jump() {
     // Existing behavior unchanged: with a verified peer ahead, the jump path
     // fires and the local reset defers to it.
-    let ks = keys(2);
+    let (ks, _fks) = falcon_votes::falcon_set(2);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(92078, vs.clone());
     hc.round = 318;
@@ -396,7 +429,7 @@ fn breaker_peer_ahead_path_still_owns_the_jump() {
 
 #[test]
 fn breaker_does_not_fire_when_finality_progresses() {
-    let ks = keys(2);
+    let (ks, _fks) = falcon_votes::falcon_set(2);
     const H: u64 = 92079;
     // Consensus-level: fresh progress => neither path is due.
     let mut hc = HeightConsensus::new(H, vset(&ks));
@@ -426,7 +459,7 @@ fn breaker_does_not_fire_when_finality_progresses() {
 
 #[test]
 fn breaker_never_moves_height_backward() {
-    let ks = keys(2);
+    let (ks, _fks) = falcon_votes::falcon_set(2);
     const H: u64 = 92079;
     let mut hc = HeightConsensus::new(H, vset(&ks));
     hc.round = 1595;

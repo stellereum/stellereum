@@ -19,7 +19,9 @@
 
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
+use stellereum::consensus::VoteKind;
 use stellereum::network::CrossShardTransport;
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::runtime::ShardedCluster;
 use stellereum::sharding::{
     bounce_eligible, Block, CrossShardKey, ShardRegistry, Transaction,
@@ -27,11 +29,61 @@ use stellereum::sharding::{
 };
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 
+#[path = "support/falcon_votes.rs"]
+#[allow(dead_code)] // GATE: replay test uses only `fvote_deterministic`; `fvote` stays for other suites (realism preserved).
+mod falcon_votes;
+
 const SHARD0: u32 = MASTERCHAIN_SHARD;
 const SHARD1: u32 = BASE_WORKCHAIN_SHARD_INITIAL;
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
+}
+
+/// FULL-PQ sender address for a seed: implicit Falcon-512, registered
+/// globally (no activation surcharge). Mirrors
+/// `audit_state_sync_closeout_tests.rs::pq_id`.
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+/// FULL-PQ replacement for `Transaction::sign` in fixtures: same
+/// amount/gas/nonce/shards, implicit Falcon-512 envelope.
+#[allow(clippy::too_many_arguments)]
+fn pq_tx(
+    seed: u8,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard,
+        target_shard,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
 }
 
 fn sharded() -> ShardRegistry {
@@ -46,10 +98,26 @@ async fn sharded_pair(
     let s0 = Arc::new(InMemoryStateEngine::new());
     for (addr, bal) in shard0_funding {
         s0.update_account(AccountState::new(*addr, *bal)).await;
+        // PQ senders must live as 49-byte pinned leaves, else the source
+        // proof (49-byte, via registry metadata) mismatches the funded
+        // 16-byte leaf and target verification fails. Classical addrs miss
+        // the registry and stay 16-byte. Balances/addresses unchanged.
+        if let Some((scheme, pk)) = Transaction::global_implicit_registry().lookup(addr) {
+            use stellereum::post_quantum::DEFAULT_SALT;
+            s0.pin_pubkey(*addr, scheme, &pk, &DEFAULT_SALT)
+                .await
+                .expect("PQ sender must pin");
+        }
     }
     let s1 = Arc::new(InMemoryStateEngine::new());
     for (addr, bal) in shard1_funding {
         s1.update_account(AccountState::new(*addr, *bal)).await;
+        if let Some((scheme, pk)) = Transaction::global_implicit_registry().lookup(addr) {
+            use stellereum::post_quantum::DEFAULT_SALT;
+            s1.pin_pubkey(*addr, scheme, &pk, &DEFAULT_SALT)
+                .await
+                .expect("PQ sender must pin");
+        }
     }
     ShardedCluster::new(
         sharded(),
@@ -81,15 +149,84 @@ fn block_of(sc: &ShardedCluster, shard: u32, bh: [u8; 32]) -> Block {
 /// Produce one outbound transfer on the source shard and return its tx hash.
 async fn produce_transfer(
     sc: &mut ShardedCluster,
-    sender: &SigningKey,
+    sender_seed: u8,
     to: [u8; 32],
     ts: u64,
 ) -> [u8; 32] {
-    let tx = Transaction::sign(sender, to, 100, 10, 0, SHARD0, SHARD1);
+    let tx = pq_tx(sender_seed, to, 100, 10, 0, SHARD0, SHARD1);
+    produce_transfer_of(sc, &tx, ts).await
+}
+
+/// Broadcast an already-signed transfer and run the source height.
+/// Byte-identical input across callers: Falcon signing randomizes per
+/// signing (FIPS 206), so two independent signings are two DIFFERENT
+/// transfers. Determinism tests feed the SAME signed bytes here; every
+/// assert matches `produce_transfer`.
+async fn produce_transfer_of(sc: &mut ShardedCluster, tx: &Transaction, ts: u64) -> [u8; 32] {
     let txh = tx.compute_tx_hash();
     sc.shard_mut(SHARD0).broadcast_tx(tx.clone()).await;
-    sc.shard_mut(SHARD1).broadcast_tx(tx).await;
+    sc.shard_mut(SHARD1).broadcast_tx(tx.clone()).await;
     let bh = sc.run_height(SHARD0, ts).await;
+    let blk = block_of(sc, SHARD0, bh);
+    assert_eq!(blk.cross_shard_out.len(), 1);
+    assert!(blk.cross_shard_out[0].is_transfer());
+    assert_eq!(
+        sc.shard(SHARD0).nodes[0].produced_cross_shard_height(&txh),
+        Some(1)
+    );
+    txh
+}
+
+/// TEST-ONLY deterministic height driver for the bounce-replay test.
+///
+/// Mirrors `Cluster::run_height` for the single-node shard but mints the
+/// prevote/precommit via `falcon_votes::fvote_deterministic` (seed 0 = the
+/// single node's Falcon index, matching `Cluster::new_sharded`'s
+/// `generate_from_seed(i)`). Same vote contents reuse the same Falcon bytes
+/// (process-global cache), so two independent clusters fed the same tx walk
+/// derive the same QCs, the same block hashes, the same msg_ids and the same
+/// state roots. Production `run_height` (fresh randomness per sig) is
+/// untouched; every other test keeps it (realism preserved).
+async fn det_run_height(sc: &mut ShardedCluster, validator: &SigningKey, ts: u64) -> [u8; 32] {
+    let cluster = sc.shard_mut(SHARD0);
+    assert_eq!(
+        cluster.nodes.len(),
+        1,
+        "det path is single-node only (bounce replay)"
+    );
+    let h = cluster.nodes[0].hc.height;
+    let r = cluster.nodes[0].hc.round;
+    let block = cluster.nodes[0]
+        .propose(ts)
+        .await
+        .expect("det propose must succeed");
+    let bh = block.compute_hash();
+    // Single-node Falcon index is 0 (see `Cluster::new_sharded`).
+    let fk = FalconKeypair::generate_from_seed(0);
+    let pv = falcon_votes::fvote_deterministic(0, validator, &fk, h, r, VoteKind::Prevote, Some(bh));
+    let _ = cluster.nodes[0].on_prevote(pv);
+    let pc =
+        falcon_votes::fvote_deterministic(0, validator, &fk, h, r, VoteKind::Precommit, Some(bh));
+    let _ = cluster.nodes[0].on_precommit(pc);
+    let finalized = cluster.nodes[0]
+        .try_finalize()
+        .await
+        .expect("det finalize must succeed");
+    assert_eq!(finalized, bh, "det finalize must return the proposed hash");
+    bh
+}
+
+/// Deterministic variant of `produce_transfer_of` for the replay test.
+async fn det_produce_transfer_of(
+    sc: &mut ShardedCluster,
+    validator: &SigningKey,
+    tx: &Transaction,
+    ts: u64,
+) -> [u8; 32] {
+    let txh = tx.compute_tx_hash();
+    sc.shard_mut(SHARD0).broadcast_tx(tx.clone()).await;
+    sc.shard_mut(SHARD1).broadcast_tx(tx.clone()).await;
+    let bh = det_run_height(sc, validator, ts).await;
     let blk = block_of(sc, SHARD0, bh);
     assert_eq!(blk.cross_shard_out.len(), 1);
     assert!(blk.cross_shard_out[0].is_transfer());
@@ -117,9 +254,10 @@ async fn timeout_rule_is_in_heights_not_seconds() {
 /// Kind encoding uses only pre-existing fields: direction + flags.
 #[tokio::test]
 async fn message_kinds_come_from_direction_and_flags_only() {
-    let a = key(21);
     let b = key(22);
-    let tx = Transaction::sign(&a, b.verifying_key().to_bytes(), 10, 1, 0, SHARD0, SHARD1);
+    // FULL-PQ: same amount/gas/nonce/shards as the classical fixture;
+    // sender is implicit Falcon-512 (seed 21), recipient unchanged.
+    let tx = pq_tx(21, b.verifying_key().to_bytes(), 10, 1, 0, SHARD0, SHARD1);
     let transfer = stellereum::sharding::CrossShardMessage::new(
         SHARD0,
         SHARD1,
@@ -155,13 +293,11 @@ async fn message_kinds_come_from_direction_and_flags_only() {
 #[tokio::test]
 async fn ack_flow_completes_transfer_and_blocks_any_later_bounce() {
     let validator = key(1);
-    let sender = key(2);
-    let recipient = key(3);
-    let sender_addr = sender.verifying_key().to_bytes();
-    let recipient_addr = recipient.verifying_key().to_bytes();
+    let sender_addr = pq_id(2);
+    let recipient_addr = key(3).verifying_key().to_bytes();
 
     let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000)], &[]).await;
-    let txh = produce_transfer(&mut sc, &sender, recipient_addr, 1).await;
+    let txh = produce_transfer(&mut sc, 2, recipient_addr, 1).await;
 
     // Target consumes: recipient credited, ack published to the transport.
     sc.run_height(SHARD1, 2).await;
@@ -251,13 +387,11 @@ async fn ack_flow_completes_transfer_and_blocks_any_later_bounce() {
 #[tokio::test]
 async fn bounce_on_failure_refunds_sender_after_timeout_exactly_once() {
     let validator = key(11);
-    let sender = key(12);
-    let recipient = key(13);
-    let sender_addr = sender.verifying_key().to_bytes();
-    let recipient_addr = recipient.verifying_key().to_bytes();
+    let sender_addr = pq_id(12);
+    let recipient_addr = key(13).verifying_key().to_bytes();
 
     let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000)], &[]).await;
-    let txh = produce_transfer(&mut sc, &sender, recipient_addr, 1).await;
+    let txh = produce_transfer(&mut sc, 12, recipient_addr, 1).await;
     assert_eq!(balance(&sc, SHARD0, &sender_addr).await, 1_000 - 100 - 10);
 
     // Target NEVER runs: heights 2..=64 carry no bounce (timeout not reached).
@@ -337,13 +471,11 @@ async fn bounce_on_failure_refunds_sender_after_timeout_exactly_once() {
 #[tokio::test]
 async fn proof_carrying_ack_or_bounce_is_refused() {
     let validator = key(31);
-    let sender = key(32);
-    let recipient = key(33);
-    let sender_addr = sender.verifying_key().to_bytes();
-    let recipient_addr = recipient.verifying_key().to_bytes();
+    let sender_addr = pq_id(32);
+    let recipient_addr = key(33).verifying_key().to_bytes();
 
     let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000)], &[]).await;
-    produce_transfer(&mut sc, &sender, recipient_addr, 1).await;
+    produce_transfer(&mut sc, 32, recipient_addr, 1).await;
     // Steal the genuine transfer's proof onto a bounce-shaped record.
     let src_bh = sc.shard(SHARD0).nodes[0]
         .finalized
@@ -395,17 +527,24 @@ async fn proof_carrying_ack_or_bounce_is_refused() {
 /// timeout walk, derive the SAME state root (bounce determinism).
 #[tokio::test]
 async fn two_independent_sources_applying_the_same_bounce_derive_the_same_root() {
+    // Falcon signing randomizes per signing (FIPS 206): two independent
+    // signings are different transfers with different hashes. Feed the SAME
+    // signed bytes to both clusters so the test compares bounce application
+    // determinism, not re-signing randomness. Amount/nonce/shards identical.
+    // Votes use TEST-ONLY `fvote_deterministic` (seed 0): same vote contents
+    // reuse the same Falcon bytes, so QCs, block hashes, msg_ids and state
+    // roots are byte-identical across the two runs. Production signing
+    // (fresh randomness) is untouched; every other test keeps it.
+    let recipient_addr = key(43).verifying_key().to_bytes();
+    let shared_tx = pq_tx(42, recipient_addr, 100, 10, 0, SHARD0, SHARD1);
     let mut roots = Vec::new();
     for _ in 0..2 {
         let validator = key(41);
-        let sender = key(42);
-        let recipient = key(43);
-        let sender_addr = sender.verifying_key().to_bytes();
-        let recipient_addr = recipient.verifying_key().to_bytes();
+        let sender_addr = pq_id(42);
         let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000)], &[]).await;
-        produce_transfer(&mut sc, &sender, recipient_addr, 1).await;
+        det_produce_transfer_of(&mut sc, &validator, &shared_tx, 1).await;
         for h in 2..=(1 + CROSS_SHARD_TIMEOUT_HEIGHTS) {
-            sc.run_height(SHARD0, 10 + h).await;
+            det_run_height(&mut sc, &validator, 10 + h).await;
         }
         let bounce_block = sc.shard(SHARD0).nodes[0]
             .blocks

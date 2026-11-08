@@ -17,18 +17,25 @@
 //!    client from it (via the offline CLI file helpers), and re-verify the
 //!    same proof there.
 //!
-//! Every quorum certificate is really signed (ed25519 [`Vote::sign`]), so a
+//! Every quorum certificate is really signed (genuine Falcon `fvote`s compiled
+//! by `VoteSet::certificate`), so a forgery fails for the same reason it would
 //! forgery fails for the same reason it would live: not enough genuine power
 //! from the set in force behind the point. All fixtures live in per-test temp
 //! dirs; no network is touched; everything is deterministic.
 
 use ed25519_dalek::SigningKey;
-use stellereum::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, VoteKind};
 use stellereum::light_client::{
     Checkpoint, GenesisAnchor, LightAnchor, LightClient, LightHeader, ProofAnswer,
     StorageProofAnswer, ValidatorSetRotation,
 };
 use std::path::{Path, PathBuf};
+
+// This file uses `fvote` with file-local keys (`pq_for` below); `falcon_set`
+// in the shared helper covers the fixed-seed case and is unused here.
+#[allow(dead_code)]
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 // ============================================================================
 // Fixtures (same idiom as `light_cli_tests.rs`)
@@ -48,21 +55,59 @@ fn set_of(keys: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(ids_of(keys).iter().map(|id| (*id, 1u64)).collect())
 }
 
-fn qc_from(keys: &[SigningKey], height: u64, block_hash: [u8; 32]) -> QuorumCertificate {
-    let votes: Vec<(ValidatorId, Vec<u8>)> = keys
-        .iter()
-        .map(|k| {
-            let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(block_hash));
-            (v.voter, v.signature)
-        })
-        .collect();
+fn qc_from(
+    keys: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    vs: &ValidatorSet,
+    height: u64,
+    block_hash: [u8; 32],
+    parent: &[u8; 32],
+) -> QuorumCertificate {
+    // Genuine committee-compiled QC against the full set `vs`, bound to
+    // `parent`; below quorum (or non-member signers) falls through to the
+    // envelope-less shape, unconditionally invalid under FULL-PQ.
+    use stellereum::consensus::VoteSet;
+    let mut set = VoteSet::new();
+    let mut ed_sigs = Vec::new();
+    for (k, fk) in keys.iter().zip(fks.iter()) {
+        let v = falcon_votes::fvote(k, fk, height, 0, VoteKind::Precommit, Some(block_hash));
+        if set
+            .add(v.clone(), vs, height, 0, VoteKind::Precommit)
+            .is_ok()
+        {
+            ed_sigs.push((v.voter, v.ed25519_signature().to_vec()));
+        }
+    }
+    if let Some(qc) = set.certificate(Some(block_hash), vs, parent) {
+        return qc;
+    }
     QuorumCertificate {
         height,
         round: 0,
         kind: VoteKind::Precommit,
         block_hash: Some(block_hash),
-        signatures: votes,
+        signatures: ed_sigs,
     }
+}
+
+/// Falcon companions for file-local Ed keys, registered globally like
+/// `falcon_set` does. `tag` separates Falcon-key domains so fixtures sharing
+/// one test binary never collide.
+fn pq_for(keys: &[SigningKey], tag: u8) -> Vec<stellereum::post_quantum::FalconKeypair> {
+    use stellereum::consensus::register_validator_pq_key;
+    use stellereum::post_quantum::{FalconKeypair, PqScheme};
+    keys.iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let fk = FalconKeypair::generate_from_seed(tag.wrapping_add(i as u8));
+            register_validator_pq_key(
+                k.verifying_key().to_bytes(),
+                PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+            fk
+        })
+        .collect()
 }
 
 /// Deterministic opaque block identity for the fixture chain.
@@ -80,6 +125,8 @@ fn header_at(
     state_root: [u8; 32],
     proposer: ValidatorId,
     signers: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    vs: &ValidatorSet,
 ) -> LightHeader {
     let hash = block_hash(height, &prev_hash, &state_root);
     LightHeader {
@@ -89,7 +136,7 @@ fn header_at(
         block_hash: hash,
         timestamp: 1_700_000_000 + height,
         proposer,
-        cert: qc_from(signers, height, hash),
+        cert: qc_from(signers, fks, vs, height, hash, &prev_hash),
         signatures: Vec::new(),
     }
 }
@@ -191,7 +238,9 @@ const MISSING: [u8; 32] = [0xEEu8; 32];
 
 struct E2eChain {
     old_keys: Vec<SigningKey>,
+    old_fks: Vec<stellereum::post_quantum::FalconKeypair>,
     new_keys: Vec<SigningKey>,
+    new_fks: Vec<stellereum::post_quantum::FalconKeypair>,
     old_set: ValidatorSet,
     new_set: ValidatorSet,
     client: LightClient,
@@ -202,7 +251,9 @@ struct E2eChain {
 
 fn build_chain() -> E2eChain {
     let old_keys = test_keys(1, 4);
+    let old_fks = pq_for(&old_keys, 0xB0);
     let new_keys = test_keys(101, 4);
+    let new_fks = pq_for(&new_keys, 0xB1);
     let old_set = set_of(&old_keys);
     let new_set = set_of(&new_keys);
 
@@ -234,16 +285,40 @@ fn build_chain() -> E2eChain {
     // --- step 3: follow N=3 headers under the genesis set -----------------
     // h1/h2 are no-op blocks (they repeat the parent root, which is legal);
     // h3 moves the state to r1.
-    let h1 = header_at(1, prev, r0, proposer, &old_keys[..3]);
+    let h1 = header_at(
+        1,
+        prev,
+        r0,
+        proposer,
+        &old_keys[..3],
+        &old_fks[..3],
+        &old_set,
+    );
     client.apply_header(h1.clone()).expect("h1 must apply");
     prev = h1.block_hash;
-    let h2 = header_at(2, prev, r0, proposer, &old_keys[1..4]);
+    let h2 = header_at(
+        2,
+        prev,
+        r0,
+        proposer,
+        &old_keys[1..4],
+        &old_fks[1..4],
+        &old_set,
+    );
     client.apply_header(h2.clone()).expect("h2 must apply");
     prev = h2.block_hash;
     trie.insert(&ACCOUNT, &account_leaf(750_000, 3));
     trie.insert(&SLOT, b"slot-v1");
     let r1 = trie.root_hash();
-    let h3 = header_at(3, prev, r1, proposer, &old_keys[..3]);
+    let h3 = header_at(
+        3,
+        prev,
+        r1,
+        proposer,
+        &old_keys[..3],
+        &old_fks[..3],
+        &old_set,
+    );
     client.apply_header(h3.clone()).expect("h3 must apply");
     prev = h3.block_hash;
     assert_eq!(client.tip_height(), 3);
@@ -251,7 +326,15 @@ fn build_chain() -> E2eChain {
     // --- step 4: rotation event at h4 (old-set supermajority signs) -------
     trie.insert(&ACCOUNT, &account_leaf(600_000, 4));
     let r2 = trie.root_hash();
-    let rotation = header_at(4, prev, r2, proposer, &old_keys[..3]);
+    let rotation = header_at(
+        4,
+        prev,
+        r2,
+        proposer,
+        &old_keys[..3],
+        &old_fks[..3],
+        &old_set,
+    );
     client
         .rotate_validator_set(ValidatorSetRotation::new(rotation.clone(), new_set.clone()))
         .expect("rotation must apply");
@@ -260,13 +343,29 @@ fn build_chain() -> E2eChain {
 
     // --- step 5: keep following under the NEW set --------------------------
     let new_proposer = ids_of(&new_keys)[0];
-    let h5 = header_at(5, prev, r2, new_proposer, &new_keys[..3]);
+    let h5 = header_at(
+        5,
+        prev,
+        r2,
+        new_proposer,
+        &new_keys[..3],
+        &new_fks[..3],
+        &new_set,
+    );
     client.apply_header(h5.clone()).expect("h5 must apply");
     prev = h5.block_hash;
     trie.insert(&ACCOUNT, &account_leaf(500_000, 5));
     trie.insert(&SLOT, b"slot-v2");
     let r3 = trie.root_hash();
-    let h6 = header_at(6, prev, r3, new_proposer, &new_keys[1..4]);
+    let h6 = header_at(
+        6,
+        prev,
+        r3,
+        new_proposer,
+        &new_keys[1..4],
+        &new_fks[1..4],
+        &new_set,
+    );
     client.apply_header(h6.clone()).expect("h6 must apply");
     assert_eq!(client.tip_height(), 6);
     assert_eq!(client.trusted_height_of_root(&r3), Some(6));
@@ -284,7 +383,9 @@ fn build_chain() -> E2eChain {
 
     E2eChain {
         old_keys,
+        old_fks,
         new_keys,
+        new_fks,
         old_set,
         new_set,
         client,
@@ -380,7 +481,15 @@ fn light_e2e_forgery_classes_refused() {
 
     // 1. Bad QC: correct chaining, but only 1 of 4 new-set power signs
     //    (quorum is 3).
-    let bad_qc = header_at(7, tip_hash, chain.roots[3], new_proposer, &chain.new_keys[..1]);
+    let bad_qc = header_at(
+        7,
+        tip_hash,
+        chain.roots[3],
+        new_proposer,
+        &chain.new_keys[..1],
+        &chain.new_fks[..1],
+        &chain.new_set,
+    );
     let err = chain
         .client
         .apply_header(bad_qc)
@@ -393,7 +502,15 @@ fn light_e2e_forgery_classes_refused() {
 
     // 2. Stale set: correct chaining, quorum QC — but from the SUPERSEDED
     //    old set, which is no longer authoritative after height 4.
-    let stale = header_at(7, tip_hash, chain.roots[3], old_proposer, &chain.old_keys[..3]);
+    let stale = header_at(
+        7,
+        tip_hash,
+        chain.roots[3],
+        old_proposer,
+        &chain.old_keys[..3],
+        &chain.old_fks[..3],
+        &chain.new_set,
+    );
     let err = chain
         .client
         .apply_header(stale)
@@ -405,7 +522,15 @@ fn light_e2e_forgery_classes_refused() {
     eprintln!("forgery 2 refused (stale set): {err}");
 
     // 3. Forked header: valid new-set QC, but the parent is not the tip.
-    let forked = header_at(7, [0xF0u8; 32], chain.roots[3], new_proposer, &chain.new_keys[..3]);
+    let forked = header_at(
+        7,
+        [0xF0u8; 32],
+        chain.roots[3],
+        new_proposer,
+        &chain.new_keys[..3],
+        &chain.new_fks[..3],
+        &chain.new_set,
+    );
     let err = chain
         .client
         .apply_header(forked)
@@ -425,7 +550,14 @@ fn light_e2e_forgery_classes_refused() {
         rollback_hash,
         [0x99u8; 32],
         chain.roots[1],
-        qc_from(&chain.new_keys[..3], 3, rollback_hash),
+        qc_from(
+            &chain.new_keys[..3],
+            &chain.new_fks[..3],
+            &chain.new_set,
+            3,
+            rollback_hash,
+            &[0x99u8; 32],
+        ),
     );
     rollback
         .verify(&chain.new_set)

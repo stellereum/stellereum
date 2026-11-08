@@ -6,10 +6,13 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
@@ -55,21 +58,31 @@ fn block_at(vset: &ValidatorSet, ks: &[SigningKey], height: u64, root: [u8; 32])
     b
 }
 
-fn precommit_cert(ks: &[SigningKey], n: usize, height: u64, hash: [u8; 32]) -> QuorumCertificate {
-    QuorumCertificate {
-        height,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(hash),
-        signatures: ks
-            .iter()
-            .take(n)
-            .map(|k| {
-                let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(hash));
-                (v.voter, v.signature)
-            })
-            .collect(),
+fn precommit_cert(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    vs: &ValidatorSet,
+    n: usize,
+    height: u64,
+    hash: [u8; 32],
+    parent: &[u8; 32],
+) -> QuorumCertificate {
+    // Genuine committee-compiled QC of the first `n` signers against the full
+    // set `vs`, bound to `parent`.
+    use stellereum::consensus::VoteSet;
+    let mut set = VoteSet::new();
+    for (i, k) in ks.iter().enumerate().take(n) {
+        set.add(
+            falcon_votes::fvote(k, &fks[i], height, 0, VoteKind::Precommit, Some(hash)),
+            vs,
+            height,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
     }
+    set.certificate(Some(hash), vs, parent)
+        .expect("quorum of members reaches quorum")
 }
 
 // ===========================================================================
@@ -83,7 +96,7 @@ fn precommit_cert(ks: &[SigningKey], n: usize, height: u64, hash: [u8; 32]) -> Q
 
 #[tokio::test]
 async fn hunt10_peer_gossip_no_longer_diverges_the_ledger_and_the_state_root() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vset = vs_of(&ks);
     let victim = ks[3].clone();
 
@@ -108,16 +121,16 @@ async fn hunt10_peer_gossip_no_longer_diverges_the_ledger_and_the_state_root() {
     let before_b = missed_map(&st_b).await;
     assert_eq!(before_a, before_b, "identical genesis");
 
-    let cert = precommit_cert(&ks, 3, 1, block_hash);
+    let cert = precommit_cert(&ks, &fks, &vset, 3, 1, block_hash, &[0u8; 32]);
     assert!(cert.verify(&vset));
 
     // ---- Node A: the peer ALSO gossips an equivocating pair from validator #4.
     let mut node_a = ValidatorRuntime::new(ksa[0].clone(), vs_a.clone(), st_a.clone(), 1);
     node_a
-        .on_prevote(Vote::sign(&victim, 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
+        .on_prevote(falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
         .unwrap();
     node_a
-        .on_prevote(Vote::sign(&victim, 1, 0, VoteKind::Prevote, Some(bh(0xA2))))
+        .on_prevote(falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA2))))
         .unwrap();
     // Node A genuinely holds the double-vote evidence...
     assert_eq!(
@@ -183,7 +196,7 @@ async fn hunt10_peer_gossip_no_longer_diverges_the_ledger_and_the_state_root() {
 
 #[tokio::test]
 async fn hunt11_equivocation_burn_is_never_debited_from_the_pool() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vset = vs_of(&ks);
     let victim = ks[3].clone();
     let st = Arc::new(InMemoryStateEngine::new());
@@ -196,12 +209,12 @@ async fn hunt11_equivocation_burn_is_never_debited_from_the_pool() {
         .await
         .map(|a| a.balance);
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), st.clone(), 1);
-    rt.on_prevote(Vote::sign(&victim, 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
+    rt.on_prevote(falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
         .unwrap();
-    rt.on_prevote(Vote::sign(&victim, 1, 0, VoteKind::Prevote, Some(bh(0xA2))))
+    rt.on_prevote(falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA2))))
         .unwrap();
     assert_eq!(rt.hc.equivocations().len(), 1, "evidence recorded locally");
-    rt.adopt_committed(1, blk, precommit_cert(&ks, 3, 1, block_hash))
+    rt.adopt_committed(1, blk, precommit_cert(&ks, &fks, &vset, 3, 1, block_hash, &[0u8; 32]))
         .await
         .unwrap();
 
@@ -237,7 +250,7 @@ async fn hunt11_equivocation_burn_is_never_debited_from_the_pool() {
 
 #[tokio::test]
 async fn hunt12_finalize_with_zero_prevotes_and_against_the_local_lock() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vset = vs_of(&ks);
     let mut rt = {
         let st = Arc::new(InMemoryStateEngine::new());
@@ -249,8 +262,8 @@ async fn hunt12_finalize_with_zero_prevotes_and_against_the_local_lock() {
     let _ = &rt.hc.locked;
 
     // Three validators precommit B. Nobody prevoted anything at all.
-    for k in ks.iter().take(3) {
-        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh(0xB2))))
+    for (i, k) in ks.iter().enumerate().take(3) {
+        rt.on_precommit(falcon_votes::fvote(k, &fks[i], 1, 0, VoteKind::Precommit, Some(bh(0xB2))))
             .unwrap();
     }
     assert!(rt.hc.prevote_qc.is_empty(), "no prevote QC exists");
@@ -302,7 +315,7 @@ async fn hunt12_finalize_with_zero_prevotes_and_against_the_local_lock() {
 #[tokio::test]
 async fn hunt13_exited_validators_are_not_slashed_for_quorums_they_are_not_in() {
     use stellereum::staking::{DOWNTIME_MISS_THRESHOLD, MIN_VALIDATOR_BOND};
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vset = vs_of(&ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vset, 1_000_000_000_000_000).await;
@@ -348,16 +361,16 @@ async fn hunt13_exited_validators_are_not_slashed_for_quorums_they_are_not_in() 
         rt.blocks.insert(bhash, b);
         // Finalising now requires a prevote quorum for the same block, so the
         // test drives a real round instead of only precommitting.
-        for k in ks.iter().take(3) {
-            rt.on_prevote(Vote::sign(k, h, 0, VoteKind::Prevote, Some(bhash)))
+        for (i, k) in ks.iter().enumerate().take(3) {
+            rt.on_prevote(falcon_votes::fvote(k, &fks[i], h, 0, VoteKind::Prevote, Some(bhash)))
                 .unwrap();
         }
         assert!(
             rt.hc.try_prevote_quorum().is_some(),
             "prevote quorum at height {h}"
         );
-        for k in ks.iter().take(3) {
-            rt.on_precommit(Vote::sign(k, h, 0, VoteKind::Precommit, Some(bhash)))
+        for (i, k) in ks.iter().enumerate().take(3) {
+            rt.on_precommit(falcon_votes::fvote(k, &fks[i], h, 0, VoteKind::Precommit, Some(bhash)))
                 .unwrap();
         }
         assert_eq!(rt.try_finalize().await, Some(bhash), "height {h} finalized");

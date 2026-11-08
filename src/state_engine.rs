@@ -789,6 +789,13 @@ pub struct InMemoryStateEngine {
     /// [`InMemoryStateEngine::enable_hashpool_for_tests`], which is never
     /// called on the live path (grep-proof: only `tests/` call it).
     hashpool_tests_on: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only per-instance override of [`GOV_OPS_ACTIVATION_HEIGHT`].
+    ///
+    /// Default `false` (gate closed): flipped ONLY by
+    /// [`InMemoryStateEngine::enable_gov_ops_for_tests`], which is never
+    /// called on the live path (grep-proof: only `tests/` call it). Live
+    /// activation flips the const, never this flag.
+    gov_ops_tests_on: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for InMemoryStateEngine {
@@ -910,6 +917,24 @@ pub struct BlockTransitionOutcome {
     pub events: Vec<Vec<crate::contract::ContractEvent>>,
 }
 
+/// Outcome of one [`InMemoryStateEngine::apply_gov_ops`] scan: the
+/// block-carried governance verdict for a decided block.
+///
+/// Module scope (not an associated type): Rust forbids item definitions
+/// inside `impl` blocks, and the scan returns this by value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GovOpsOutcome {
+    /// Proposals opened by this block.
+    pub proposed: usize,
+    /// Votes recorded by this block (including idempotent same-choice
+    /// replays, which the direct path answers `Ok` without moving the
+    /// tally — see `vote_same_choice_replay_is_idempotent`).
+    pub voted: usize,
+    /// Gov ops refused (inactive gate, failed step-1 tx, height-pin
+    /// mismatch, duplicate id, closed window, double vote, zero weight).
+    pub refused: usize,
+}
+
 /// Namespaced trie key for a token balance: sha256("STS_BAL" || token_id || account)
 /// This commits token balances into the same state root as native STELL balances,
 /// enabling SPV Merkle proofs for token holdings.
@@ -989,6 +1014,21 @@ pub fn contract_source_key(address: &[u8; 32]) -> [u8; 32] {
 /// [`InMemoryStateEngine::enable_hashpool_for_tests`] (never on the live
 /// path); production flips this const only with a spec update + audit.
 pub const HASH_POOL_ENABLED: bool = false;
+
+/// Activation height for block-carried governance ops
+/// (`OpCode::SysCallGovPropose` / `OpCode::SysCallGovVote`, applied by
+/// [`InMemoryStateEngine::apply_gov_ops`]).
+///
+/// INACTIVE by default (`u64::MAX`, so no reachable height activates): the
+/// lead flips this const to the ratified height with a spec update + audit
+/// (AGENTS.md §7 frozen-core rule) — never an env knob (every node applying
+/// the same blocks must reach the same verdict; an env knob would fork the
+/// chain). While inactive the scan refuses every gov op and moves no state,
+/// so the standard apply path is byte-identical (proven by the pre-activation
+/// pin test + the unmodified gov suites). Tests open the gate per-instance
+/// via [`InMemoryStateEngine::enable_gov_ops_for_tests`] (never on the live
+/// path); production opens it only by flipping this const.
+pub const GOV_OPS_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
 /// Namespaced trie key for a deposited HashPool commitment:
 /// `sha256("STELL_HP_TRIE_COMMIT_V1" || commitment)`.
@@ -1718,6 +1758,7 @@ impl InMemoryStateEngine {
                 crate::zkml::effective_chain_id(),
             ))),
             hashpool_tests_on: Arc::new(std::sync::atomic::AtomicBool::new(HASH_POOL_ENABLED)),
+            gov_ops_tests_on: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1815,6 +1856,10 @@ impl InMemoryStateEngine {
             hashpool: Arc::new(RwLock::new(hashpool)),
             hashpool_tests_on: Arc::new(std::sync::atomic::AtomicBool::new(
                 self.hashpool_tests_on
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            gov_ops_tests_on: Arc::new(std::sync::atomic::AtomicBool::new(
+                self.gov_ops_tests_on
                     .load(std::sync::atomic::Ordering::Relaxed),
             )),
         }
@@ -6850,6 +6895,16 @@ impl InMemoryStateEngine {
         //     nothing at all when the block carries no (valid) evidence.
         let eq_slashed = self.apply_equivocation_slash(block).await;
 
+        // 5c. Block-carried governance ops, from block-carried opcodes. Same
+        //     verdict contract as 5b: the scan re-derives every propose/vote
+        //     from block bytes alone (gate, height pin, duplicate/window/
+        //     one-vote rules against committed state), in block order, so
+        //     every route that applies this block opens the same proposals
+        //     and records the same tallies. Pre-activation (or a block with
+        //     no gov ops) this is a proven no-op. Refused ops never fail the
+        //     block — the reporter already paid gas in step 1.
+        let _gov_ops = self.apply_gov_ops(block, &status).await;
+
         BlockTransitionOutcome {
             applied,
             failed,
@@ -6872,6 +6927,29 @@ impl InMemoryStateEngine {
     /// (always `false` in production builds) OR the test-only override.
     pub fn hashpool_enabled(&self) -> bool {
         HASH_POOL_ENABLED || self.hashpool_tests_on.load(Ordering::Relaxed)
+    }
+
+    /// Whether block-carried gov ops apply at `height` on this instance: the
+    /// test-only override OR the ratified activation height. Default
+    /// (override off, const `u64::MAX`) is INACTIVE at every reachable
+    /// height, on every node identically. Pure function of instance state +
+    /// the block height: no env reads, no wall clock.
+    pub fn gov_ops_active_at(&self, height: u64) -> bool {
+        // GATE: `>=` is the ratified-height semantic (every height at/after
+        // activation applies); the lint fires only because the const ships at
+        // `u64::MAX` (INACTIVE default the lead flips with spec + audit).
+        // `==` would silently break post-activation heights on the flip day.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        let ratified = height >= GOV_OPS_ACTIVATION_HEIGHT;
+        self.gov_ops_tests_on.load(Ordering::Relaxed) || ratified
+    }
+
+    /// Test-only switch: open the block-carried gov gate on this instance.
+    ///
+    /// Never called on the live path (only `tests/` call it). Live
+    /// activation flips [`GOV_OPS_ACTIVATION_HEIGHT`], never this flag.
+    pub fn enable_gov_ops_for_tests(&self) {
+        self.gov_ops_tests_on.store(true, Ordering::Release);
     }
 
     /// Test-only switch: bind a FRESH empty pool to this engine's current
@@ -7679,6 +7757,214 @@ impl InMemoryStateEngine {
     /// Verify a block's signatures in one batch (parallel-friendly fast path).
     pub fn verify_block_signatures(txs: &[crate::sharding::Transaction]) -> bool {
         crate::sharding::Transaction::verify_signatures_batch(txs)
+    }
+
+    // -----------------------------------------------------------------------
+    // Block-carried governance ops (default-OFF; see GOV_OPS_ACTIVATION_HEIGHT).
+    //
+    // The SVM dispatch arms for `SysCallGovPropose` / `SysCallGovVote` are
+    // PURE CARRIERS (charge + push, no state); THIS scan is the authoritative
+    // apply, mirroring the equivocation step-5b wiring above: it re-derives
+    // every verdict from block bytes alone, in block order, so finalized /
+    // adopted / walked / replayed / re-applied blocks converge identically.
+    // A refused op is counted loudly and never fails the block (hostile
+    // bytes cost the reporter gas in step 1, never the chain).
+    // -----------------------------------------------------------------------
+
+    /// Open one block-carried proposal: the UNGATED core of the propose arm.
+    ///
+    /// Calls the DIRECT path (`Governance::propose`) with the block as the
+    /// clock (`now = block.timestamp`) and the tx signer as the proposer, so
+    /// title/action/stake validation, the electorate snapshot and the
+    /// proposer lock are byte-identical to the direct path. The tx must name
+    /// exactly the proposal it opens (`proposal_id == gov.next_id`): a
+    /// replayed or racing propose with an already-consumed id refuses BEFORE
+    /// any state is read, and can never move `next_id` past an unconsumed
+    /// one. Pure function of committed gov + ledger state and tx bytes.
+    fn apply_gov_propose_inner(
+        gov: &mut crate::governance::Governance,
+        ledger: &mut crate::staking::StakingLedger,
+        sender: [u8; 32],
+        proposal_id: u64,
+        title: String,
+        action: crate::governance::GovAction,
+        now: u64,
+    ) -> Result<u64, String> {
+        if proposal_id != gov.next_id {
+            return Err(format!(
+                "gov propose refused: proposal_id {proposal_id} does not match next proposal id {}",
+                gov.next_id
+            ));
+        }
+        let id = gov
+            .propose(ledger, sender, title, action, now)
+            .map_err(|e| format!("gov propose refused: {e}"))?;
+        // `propose` assigns `next_id` then bumps it: any other id here means
+        // the direct path changed under us — fail closed rather than commit
+        // a proposal the tx did not name.
+        if id != proposal_id {
+            return Err(format!(
+                "gov propose refused: opened proposal id {id} != named proposal_id {proposal_id}"
+            ));
+        }
+        Ok(id)
+    }
+
+    /// Record one block-carried vote: the UNGATED core of the vote arm.
+    ///
+    /// Calls the DIRECT path (`Governance::vote`) with the block as the
+    /// clock and the tx signer as the voter, so the voting-window check, the
+    /// one-vote rule (a different choice refuses `AlreadyVoted`; a
+    /// same-choice replay is idempotent, exactly as the direct path), the
+    /// snapshot-weighted tally and the stake lock are byte-identical to the
+    /// direct path. Pure function of committed gov + ledger state and tx bytes.
+    fn apply_gov_vote_inner(
+        gov: &mut crate::governance::Governance,
+        ledger: &mut crate::staking::StakingLedger,
+        voter: [u8; 32],
+        proposal_id: u64,
+        choice: crate::governance::VoteChoice,
+        now: u64,
+    ) -> Result<u128, String> {
+        gov.vote(ledger, voter, proposal_id, choice, now)
+            .map_err(|e| format!("gov vote refused: {e}"))
+    }
+
+    /// Apply every block-carried gov op in `block`, in block order.
+    ///
+    /// Deterministic end to end (the same purity contract as
+    /// [`InMemoryStateEngine::apply_equivocation_slash`]): the ONLY inputs
+    /// are the committed gov + staking state, the block bytes (opcodes, the
+    /// `from` signer of each tx, `block.height`, `block.timestamp`) and the
+    /// step-1 `status` receipts derived from the same block + state. No env
+    /// reads, no wall clock (`now` is the block timestamp, never
+    /// `SystemTime::now` — the wall clock was the determinism bug being
+    /// removed). `status` parallels `block.transactions`: ops from a
+    /// step-1-failed transaction apply nothing (their carriers never ran).
+    ///
+    /// Lock order mirrors the RPC direct path (`governance_write` then
+    /// `staking_write`); both guards are held across one synchronous apply
+    /// loop (no `.await` inside), so the scan is a single critical section.
+    /// The two write accessors bump `commitment_generation`, so an applied
+    /// proposal/vote moves the state root exactly like the direct path.
+    pub async fn apply_gov_ops(
+        &self,
+        block: &crate::sharding::Block,
+        status: &[bool],
+    ) -> GovOpsOutcome {
+        use crate::svm::OpCode::*;
+        // Collect first (no locks): the scan order IS the apply order (tx
+        // order, payload order), fixed by the block bytes.
+        let mut ops: Vec<(usize, &crate::svm::OpCode)> = Vec::new();
+        for (i, tx) in block.transactions.iter().enumerate() {
+            for op in &tx.payload {
+                if matches!(
+                    op,
+                    SysCallGovPropose { .. } | SysCallGovVote { .. }
+                ) {
+                    ops.push((i, op));
+                }
+            }
+        }
+        let mut out = GovOpsOutcome::default();
+        if ops.is_empty() {
+            // Fast path: legacy blocks queue nothing, so the scan takes no
+            // lock and allocates nothing measurable.
+            return out;
+        }
+        // Activation gate FIRST (before any lock, read or write):
+        // pre-activation every gov op refuses and nothing moves — the
+        // standard apply path stays byte-identical.
+        if !self.gov_ops_active_at(block.height) {
+            out.refused = ops.len();
+            tracing::warn!(
+                "gov ops refused: block-carried governance is inactive at height {} ({} op(s) skipped, activation = {})",
+                block.height,
+                ops.len(),
+                GOV_OPS_ACTIVATION_HEIGHT,
+            );
+            return out;
+        }
+        let mut gov = self.governance_write().await;
+        let mut ledger = self.staking_write().await;
+        for (tx_idx, op) in ops {
+            // A step-1-failed transaction contributes no gov effect.
+            if !status.get(tx_idx).copied().unwrap_or(false) {
+                out.refused += 1;
+                tracing::warn!(
+                    "gov op skipped: tx #{tx_idx} failed step 1, no gov effect applies"
+                );
+                continue;
+            }
+            // Authenticated transport: the signer is the tx signer (verified
+            // in step 1 for every `status == true` tx) — never an opcode
+            // field, so the proposer/voter cannot be forged.
+            let sender = block.transactions[tx_idx].from;
+            match op {
+                SysCallGovPropose {
+                    proposal_id,
+                    title,
+                    action,
+                    height_observed,
+                } => {
+                    // Height pin: the op names the exact height it applies
+                    // at; any other height refuses (no cross-height replay).
+                    if *height_observed != block.height {
+                        out.refused += 1;
+                        tracing::warn!(
+                            "gov propose refused: height_observed {height_observed} != block height {}",
+                            block.height
+                        );
+                        continue;
+                    }
+                    match Self::apply_gov_propose_inner(
+                        &mut gov,
+                        &mut ledger,
+                        sender,
+                        *proposal_id,
+                        title.clone(),
+                        action.as_ref().clone(),
+                        block.timestamp,
+                    ) {
+                        Ok(_) => out.proposed += 1,
+                        Err(e) => {
+                            out.refused += 1;
+                            tracing::warn!("{e}");
+                        }
+                    }
+                }
+                SysCallGovVote {
+                    proposal_id,
+                    choice,
+                    height_observed,
+                } => {
+                    if *height_observed != block.height {
+                        out.refused += 1;
+                        tracing::warn!(
+                            "gov vote refused: height_observed {height_observed} != block height {}",
+                            block.height
+                        );
+                        continue;
+                    }
+                    match Self::apply_gov_vote_inner(
+                        &mut gov,
+                        &mut ledger,
+                        sender,
+                        *proposal_id,
+                        *choice,
+                        block.timestamp,
+                    ) {
+                        Ok(_) => out.voted += 1,
+                        Err(e) => {
+                            out.refused += 1;
+                            tracing::warn!("{e}");
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// The state root: the Patricia trie's root.
@@ -15157,5 +15443,472 @@ mod tests {
             "[perf] engine commit populated (1500 tokens/300 contracts/200 vals): cold={cold_ms:.2}ms single-domain-touch={touched_ms:.2}ms no-change={noop_ms:.3}ms speedup={:.1}x",
             if touched_ms > 0.0 { cold_ms / touched_ms } else { f64::INFINITY },
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Block-carried governance ops (SysCallGovPropose / SysCallGovVote).
+    //
+    // The SVM dispatch arms are pure carriers (charge + push); the
+    // authoritative apply is `apply_gov_ops` (step 5c of
+    // `apply_block_transition`), gated by `GOV_OPS_ACTIVATION_HEIGHT`
+    // (INACTIVE default) with a per-instance test override. These tests open
+    // the gate via `enable_gov_ops_for_tests` (never on the live path) and
+    // drive the FULL block path, so carrier pricing, step-1 status plumbing
+    // and the scan are all covered together.
+    // -----------------------------------------------------------------------
+
+    /// Bonded stake per gov-ops test validator: 20k STELL, above
+    /// `PROPOSAL_MIN_STAKE_NANO` (10k STELL) so propose passes the stake gate.
+    const GOV_OPS_TEST_STAKE_NANO: u64 = 20_000 * 1_000_000_000;
+    /// Native funds per gov-ops test account: covers carrier gas with margin.
+    const GOV_OPS_TEST_FUNDS: u64 = 5_000_000;
+
+    /// Fresh engine with the gov gate open and `seeds` bonded as validators
+    /// (each seed also funds its Falcon-512 test account). Returns the engine
+    /// plus the validator addresses in seed order.
+    async fn gov_ops_engine_with_validators(seeds: &[u8]) -> (InMemoryStateEngine, Vec<[u8; 32]>) {
+        let engine = InMemoryStateEngine::new();
+        engine.enable_gov_ops_for_tests();
+        let mut addrs = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            let (addr, _pk) = pq_pair(*seed);
+            engine.credit_native(&addr, GOV_OPS_TEST_FUNDS).await.unwrap();
+            engine
+                .staking_write()
+                .await
+                .bond(
+                    addr,
+                    GOV_OPS_TEST_STAKE_NANO,
+                    crate::staking::DEFAULT_COMMISSION_BPS,
+                )
+                .expect("gov-ops test validator must bond");
+            addrs.push(addr);
+        }
+        (engine, addrs)
+    }
+
+    /// Minimal decided block carrying `txs` at (`height`, `timestamp`),
+    /// signed by a fresh classical proposer key (block-signature
+    /// verification is outside tx admission, same as the existing block-path
+    /// tests).
+    fn gov_ops_block(
+        proposer: &ed25519_dalek::SigningKey,
+        height: u64,
+        timestamp: u64,
+        txs: Vec<crate::sharding::Transaction>,
+    ) -> crate::sharding::Block {
+        use crate::sharding::{Block, MASTERCHAIN_SHARD};
+        let order_merkle_root = crate::mev::compute_order_merkle_root(&txs);
+        let mut block = Block {
+            shard_id: MASTERCHAIN_SHARD,
+            height,
+            prev_hash: [0u8; 32],
+            state_root: [0u8; 32],
+            transactions: txs,
+            cross_shard_out: vec![],
+            timestamp,
+            proposer: proposer.verifying_key().to_bytes(),
+            validator_signatures: vec![],
+            shard_headers: vec![],
+            precommit_qc: None,
+            last_qc: None,
+            order_merkle_root,
+            epoch_key_commitment: [0u8; 32],
+            mmr_epoch_root: [0u8; 32],
+        };
+        block.sign_block(proposer);
+        block
+    }
+
+    fn gov_ops_proposer() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+    }
+
+    fn gov_ops_signal_action() -> Box<crate::governance::GovAction> {
+        Box::new(crate::governance::GovAction::Signal("gov-ops test".to_string()))
+    }
+
+    /// Post-activation happy path: a bonded validator's block-carried propose
+    /// opens proposal 1 through the full block path, byte-identical to the
+    /// direct path (same proposer, same electorate snapshot, same lock).
+    #[tokio::test]
+    async fn gov_ops_propose_happy_path_post_activation() {
+        use crate::svm::OpCode;
+        let (engine, addrs) = gov_ops_engine_with_validators(&[0xC1]).await;
+        let proposer = gov_ops_proposer();
+        let (tx, _, _) = pq_tx_payload(
+            0xC1,
+            [0x77u8; 32],
+            0,
+            1_000_000,
+            0,
+            vec![OpCode::SysCallGovPropose {
+                proposal_id: 1,
+                title: "gov-ops propose".to_string(),
+                action: gov_ops_signal_action(),
+                height_observed: 1,
+            }],
+        );
+        let block = gov_ops_block(&proposer, 1, 1000, vec![tx]);
+        let outcome = engine.apply_block_transition(&block, 0).await;
+        assert_eq!(outcome.status, vec![true], "carrier must succeed step 1");
+        let gov = engine.governance_read().await;
+        assert_eq!(gov.next_id, 2, "one proposal consumed id 1");
+        let p = gov.proposals.get(&1).expect("proposal 1 must exist");
+        assert_eq!(p.proposer, addrs[0], "proposer is the tx signer, never a field");
+        assert_eq!(p.title, "gov-ops propose");
+        assert_eq!(p.created_at, 1000, "block timestamp is the clock, never wall-clock");
+        assert_eq!(
+            p.voting_end,
+            1000 + crate::governance::GOVERNANCE_VOTING_PERIOD_SECS
+        );
+        assert!(matches!(
+            p.action,
+            crate::governance::GovAction::Signal(_)
+        ));
+    }
+
+    /// Post-activation happy path: a block-carried vote records the
+    /// snapshot-weighted tally (self-bond, no delegations) and the voter.
+    #[tokio::test]
+    async fn gov_ops_vote_happy_path_post_activation() {
+        use crate::svm::OpCode;
+        let (engine, addrs) = gov_ops_engine_with_validators(&[0xC2]).await;
+        let proposer = gov_ops_proposer();
+        let (ptx, _, _) = pq_tx_payload(
+            0xC2,
+            [0x77u8; 32],
+            0,
+            1_000_000,
+            0,
+            vec![OpCode::SysCallGovPropose {
+                proposal_id: 1,
+                title: "gov-ops vote base".to_string(),
+                action: gov_ops_signal_action(),
+                height_observed: 1,
+            }],
+        );
+        let block1 = gov_ops_block(&proposer, 1, 1000, vec![ptx]);
+        let o1 = engine.apply_block_transition(&block1, 0).await;
+        assert_eq!(o1.status, vec![true]);
+        let (vtx, _, _) = pq_tx_payload(
+            0xC2,
+            [0x77u8; 32],
+            0,
+            1_000_000,
+            1,
+            vec![OpCode::SysCallGovVote {
+                proposal_id: 1,
+                choice: crate::governance::VoteChoice::Yes,
+                height_observed: 2,
+            }],
+        );
+        let block2 = gov_ops_block(&proposer, 2, 1001, vec![vtx]);
+        let o2 = engine.apply_block_transition(&block2, 0).await;
+        assert_eq!(o2.status, vec![true], "carrier must succeed step 1");
+        let expected_weight = GOV_OPS_TEST_STAKE_NANO as u128;
+        let gov = engine.governance_read().await;
+        let p = gov.proposals.get(&1).expect("proposal 1 must exist");
+        assert_eq!(p.yes, expected_weight, "tally is the propose-time snapshot weight");
+        assert_eq!(p.no, 0);
+        assert_eq!(
+            p.voters.get(&addrs[0]),
+            Some(&crate::governance::VoteChoice::Yes)
+        );
+    }
+
+    /// Duplicate refusal: a second propose naming an already-consumed id
+    /// refuses WITHOUT failing the block (the carrier still succeeds; only
+    /// the scan refuses) and moves no governance state.
+    #[tokio::test]
+    async fn gov_ops_duplicate_propose_refuses() {
+        use crate::svm::OpCode;
+        let (engine, _) = gov_ops_engine_with_validators(&[0xC3]).await;
+        let proposer = gov_ops_proposer();
+        let mk_propose = |nonce: u64, height: u64| {
+            pq_tx_payload(
+                0xC3,
+                [0x77u8; 32],
+                0,
+                1_000_000,
+                nonce,
+                vec![OpCode::SysCallGovPropose {
+                    proposal_id: 1,
+                    title: "dup".to_string(),
+                    action: gov_ops_signal_action(),
+                    height_observed: height,
+                }],
+            )
+            .0
+        };
+        let o1 = engine
+            .apply_block_transition(&gov_ops_block(&proposer, 1, 1000, vec![mk_propose(0, 1)]), 0)
+            .await;
+        assert_eq!(o1.status, vec![true]);
+        // Same id again in the next block: stale id, must refuse.
+        let o2 = engine
+            .apply_block_transition(&gov_ops_block(&proposer, 2, 1001, vec![mk_propose(1, 2)]), 0)
+            .await;
+        assert_eq!(
+            o2.status,
+            vec![true],
+            "duplicate refusal never fails the block (gas already paid)"
+        );
+        let gov = engine.governance_read().await;
+        assert_eq!(gov.next_id, 2, "duplicate consumed no id");
+        assert_eq!(gov.proposals.len(), 1, "duplicate opened nothing");
+        // A future id also refuses (no skipping past unconsumed ids).
+        drop(gov);
+        let (future_tx, _, _) = pq_tx_payload(
+            0xC3,
+            [0x77u8; 32],
+            0,
+            1_000_000,
+            2,
+            vec![OpCode::SysCallGovPropose {
+                proposal_id: 7,
+                title: "future".to_string(),
+                action: gov_ops_signal_action(),
+                height_observed: 3,
+            }],
+        );
+        let o3 = engine
+            .apply_block_transition(&gov_ops_block(&proposer, 3, 1002, vec![future_tx]), 0)
+            .await;
+        assert_eq!(o3.status, vec![true]);
+        let gov = engine.governance_read().await;
+        assert_eq!(gov.next_id, 2, "future id consumed no id");
+        assert_eq!(gov.proposals.len(), 1, "future id opened nothing");
+    }
+
+    /// One-vote rule: a different choice refuses `AlreadyVoted` (tally
+    /// frozen); a same-choice replay is idempotent (Ok, tally unchanged).
+    /// Neither refusal fails its block.
+    #[tokio::test]
+    async fn gov_ops_double_vote_refuses_and_replay_idempotent() {
+        use crate::svm::OpCode;
+        let (engine, addrs) = gov_ops_engine_with_validators(&[0xC4]).await;
+        let proposer = gov_ops_proposer();
+        let (ptx, _, _) = pq_tx_payload(
+            0xC4,
+            [0x77u8; 32],
+            0,
+            1_000_000,
+            0,
+            vec![OpCode::SysCallGovPropose {
+                proposal_id: 1,
+                title: "one-vote".to_string(),
+                action: gov_ops_signal_action(),
+                height_observed: 1,
+            }],
+        );
+        let o1 = engine
+            .apply_block_transition(&gov_ops_block(&proposer, 1, 1000, vec![ptx]), 0)
+            .await;
+        assert_eq!(o1.status, vec![true]);
+        let mk_vote = |nonce: u64, height: u64, choice: crate::governance::VoteChoice| {
+            pq_tx_payload(
+                0xC4,
+                [0x77u8; 32],
+                0,
+                1_000_000,
+                nonce,
+                vec![OpCode::SysCallGovVote {
+                    proposal_id: 1,
+                    choice,
+                    height_observed: height,
+                }],
+            )
+            .0
+        };
+        let yes_w = GOV_OPS_TEST_STAKE_NANO as u128;
+        let o2 = engine
+            .apply_block_transition(
+                &gov_ops_block(
+                    &proposer,
+                    2,
+                    1001,
+                    vec![mk_vote(1, 2, crate::governance::VoteChoice::Yes)],
+                ),
+                0,
+            )
+            .await;
+        assert_eq!(o2.status, vec![true]);
+        // Different choice: refused, tally frozen.
+        let o3 = engine
+            .apply_block_transition(
+                &gov_ops_block(
+                    &proposer,
+                    3,
+                    1002,
+                    vec![mk_vote(2, 3, crate::governance::VoteChoice::No)],
+                ),
+                0,
+            )
+            .await;
+        assert_eq!(o3.status, vec![true], "double-vote refusal never fails the block");
+        // Same-choice replay: idempotent Ok, tally unchanged.
+        let o4 = engine
+            .apply_block_transition(
+                &gov_ops_block(
+                    &proposer,
+                    4,
+                    1003,
+                    vec![mk_vote(3, 4, crate::governance::VoteChoice::Yes)],
+                ),
+                0,
+            )
+            .await;
+        assert_eq!(o4.status, vec![true]);
+        let gov = engine.governance_read().await;
+        let p = gov.proposals.get(&1).expect("proposal 1 must exist");
+        assert_eq!(p.yes, yes_w, "exactly one counted weight after flip attempt + replay");
+        assert_eq!(p.no, 0, "refused flip recorded nothing");
+        assert_eq!(
+            p.voters.get(&addrs[0]),
+            Some(&crate::governance::VoteChoice::Yes),
+            "first choice wins"
+        );
+    }
+
+    /// Closed-window refusal: a vote at/after `voting_end` refuses
+    /// (`VotingClosed`, same as the direct path) and records nothing.
+    #[tokio::test]
+    async fn gov_ops_closed_window_vote_refuses() {
+        use crate::svm::OpCode;
+        let (engine, _) = gov_ops_engine_with_validators(&[0xC5]).await;
+        let proposer = gov_ops_proposer();
+        let (ptx, _, _) = pq_tx_payload(
+            0xC5,
+            [0x77u8; 32],
+            0,
+            1_000_000,
+            0,
+            vec![OpCode::SysCallGovPropose {
+                proposal_id: 1,
+                title: "window".to_string(),
+                action: gov_ops_signal_action(),
+                height_observed: 1,
+            }],
+        );
+        let o1 = engine
+            .apply_block_transition(&gov_ops_block(&proposer, 1, 1000, vec![ptx]), 0)
+            .await;
+        assert_eq!(o1.status, vec![true]);
+        let late_ts = 1000 + crate::governance::GOVERNANCE_VOTING_PERIOD_SECS + 1;
+        let (vtx, _, _) = pq_tx_payload(
+            0xC5,
+            [0x77u8; 32],
+            0,
+            1_000_000,
+            1,
+            vec![OpCode::SysCallGovVote {
+                proposal_id: 1,
+                choice: crate::governance::VoteChoice::Yes,
+                height_observed: 2,
+            }],
+        );
+        let o2 = engine
+            .apply_block_transition(&gov_ops_block(&proposer, 2, late_ts, vec![vtx]), 0)
+            .await;
+        assert_eq!(o2.status, vec![true], "closed-window refusal never fails the block");
+        let gov = engine.governance_read().await;
+        let p = gov.proposals.get(&1).expect("proposal 1 must exist");
+        assert_eq!(p.yes, 0, "late vote recorded no weight");
+        assert!(p.voters.is_empty(), "late vote recorded no voter");
+    }
+
+    /// Pre-activation refusal: with the gate closed (default: no test
+    /// override, const `u64::MAX`), a block-carried propose moves NOTHING —
+    /// the standard apply path is byte-identical — while the carrier itself
+    /// still succeeds (gas paid, no block failure).
+    #[tokio::test]
+    async fn gov_ops_pre_activation_refuses_and_moves_nothing() {
+        use crate::svm::OpCode;
+        assert_eq!(
+            GOV_OPS_ACTIVATION_HEIGHT,
+            u64::MAX,
+            "gate must ship INACTIVE (lead flips with spec + audit)"
+        );
+        let engine = InMemoryStateEngine::new();
+        // Gate closed on a fresh instance by default.
+        assert!(!engine.gov_ops_active_at(1));
+        assert!(!engine.gov_ops_active_at(u64::MAX - 1));
+        let (addr, _pk) = pq_pair(0xC6);
+        engine.credit_native(&addr, GOV_OPS_TEST_FUNDS).await.unwrap();
+        engine
+            .staking_write()
+            .await
+            .bond(
+                addr,
+                GOV_OPS_TEST_STAKE_NANO,
+                crate::staking::DEFAULT_COMMISSION_BPS,
+            )
+            .expect("bond");
+        let proposer = gov_ops_proposer();
+        let (tx, _, _) = pq_tx_payload(
+            0xC6,
+            [0x77u8; 32],
+            0,
+            1_000_000,
+            0,
+            vec![OpCode::SysCallGovPropose {
+                proposal_id: 1,
+                title: "pre-activation".to_string(),
+                action: gov_ops_signal_action(),
+                height_observed: 1,
+            }],
+        );
+        let block = gov_ops_block(&proposer, 1, 1000, vec![tx]);
+        let outcome = engine.apply_block_transition(&block, 0).await;
+        assert_eq!(outcome.status, vec![true], "carrier succeeds even pre-activation");
+        let scan = engine.apply_gov_ops(&block, &outcome.status).await;
+        assert_eq!(scan.proposed, 0);
+        assert_eq!(scan.voted, 0);
+        assert_eq!(scan.refused, 1, "the lone gov op refused at the closed gate");
+        let gov = engine.governance_read().await;
+        assert_eq!(gov.next_id, 1, "pre-activation consumed no id");
+        assert!(gov.proposals.is_empty(), "pre-activation opened nothing");
+    }
+
+    /// Determinism: applying the SAME block twice reaches the SAME state.
+    /// The replay's tx fails step 1 (nonce consumed), the scan refuses the
+    /// duplicate id, and neither the state root nor governance moves.
+    #[tokio::test]
+    async fn gov_ops_same_block_twice_same_state() {
+        use crate::svm::OpCode;
+        let (engine, _) = gov_ops_engine_with_validators(&[0xC7]).await;
+        let proposer = gov_ops_proposer();
+        let (tx, _, _) = pq_tx_payload(
+            0xC7,
+            [0x77u8; 32],
+            0,
+            1_000_000,
+            0,
+            vec![OpCode::SysCallGovPropose {
+                proposal_id: 1,
+                title: "determinism".to_string(),
+                action: gov_ops_signal_action(),
+                height_observed: 1,
+            }],
+        );
+        let block = gov_ops_block(&proposer, 1, 1000, vec![tx]);
+        let o1 = engine.apply_block_transition(&block, 0).await;
+        assert_eq!(o1.status, vec![true]);
+        let root1 = engine.get_state_root().await;
+        let (next1, n1) = {
+            let gov = engine.governance_read().await;
+            (gov.next_id, gov.proposals.len())
+        };
+        let o2 = engine.apply_block_transition(&block, 0).await;
+        assert_eq!(o2.status, vec![false], "replay fails step 1 (nonce consumed)");
+        let root2 = engine.get_state_root().await;
+        let (next2, n2) = {
+            let gov = engine.governance_read().await;
+            (gov.next_id, gov.proposals.len())
+        };
+        assert_eq!(root1, root2, "same block twice yields the same state root");
+        assert_eq!((next1, n1), (next2, n2), "same block twice moves no governance");
+        assert_eq!((next1, n1), (2, 1));
     }
 }

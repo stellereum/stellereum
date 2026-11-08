@@ -3,6 +3,7 @@
 //! Tier 2: On-Chain DEX TWAP fallback (~91 s rolling VWAP window, W* optimum)
 //! Tier 3: Circuit Breaker (>10% deviation / stale > 15 min / USDT depeg < $0.95)
 
+use crate::post_quantum::{FalconKeypair, FALCON512_PUBKEY_LEN};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -153,10 +154,12 @@ pub fn twap_optimal_window_secs(shift_times_dt: f64, sigma_per_sec: f64) -> f64 
     (6.0 * shift_times_dt * shift_times_dt / (sigma_per_sec * sigma_per_sec)).cbrt()
 }
 
-/// PROPOSAL ONLY — Wald SPRT decision boundaries (report P4 §4).
+/// Wald SPRT decision boundaries (report P4 §4).
 ///
-/// FOR-LEAD-DECISION: not wired; the live Tier-3 check stays the fixed
-/// 10% `MAX_PRICE_DEVIATION_BPS` breaker. Pure math, tested below.
+/// Wired by the height-gated Tier-3 below ([`tier3_breaker_tripped`]): the
+/// live check stays the fixed 10% `MAX_PRICE_DEVIATION_BPS` breaker while
+/// the gate is inactive (see [`SPRT_TIER3_ACTIVATION_HEIGHT`]). Pure math,
+/// tested below.
 /// Returns (A, B) = (ln((1−β)/α), ln(β/(1−α))).
 pub fn sprt_wald_bounds(alpha: f64, beta: f64) -> (f64, f64) {
     debug_assert!(alpha > 0.0 && alpha < 1.0 && beta > 0.0 && beta < 1.0);
@@ -165,23 +168,123 @@ pub fn sprt_wald_bounds(alpha: f64, beta: f64) -> (f64, f64) {
     (a, b)
 }
 
-/// PROPOSAL ONLY — one CUSUM/SPRT log-likelihood step for N(0,σ²) vs N(J,σ²).
+/// One CUSUM/SPRT log-likelihood step for N(0,σ²) vs N(J,σ²).
 ///
-/// FOR-LEAD-DECISION: not wired anywhere. LLR_r step for a relative-price
-/// residual x: (J/σ²)·x − J²/(2σ²). Accumulate while the running sum stays
-/// within the [`sprt_wald_bounds`] interval; crossing A accepts H1 (shift),
-/// crossing B accepts H0. Pure and deterministic.
+/// Wired by the height-gated Tier-3 below ([`sprt_tier3_llr_sum`]).
+/// LLR_r step for a relative-price residual x: (J/σ²)·x − J²/(2σ²).
+/// Accumulate while the running sum stays within the [`sprt_wald_bounds`]
+/// interval; crossing A accepts H1 (shift), crossing B accepts H0.
+/// Pure and deterministic.
 pub fn cusum_llr_step(residual: f64, shift: f64, sigma: f64) -> f64 {
     (shift / (sigma * sigma)) * residual - shift * shift / (2.0 * sigma * sigma)
 }
 
-/// PROPOSAL ONLY — expected SPRT samples to decide under H1 (report P4 §4,
-/// Eq. 5, Wald identity): E[N|H1] = ((1−β)·A + β·B) / (J²/(2σ²)).
-/// FOR-LEAD-DECISION: not wired anywhere. E.g. J=1%, σ=0.5%/block,
-/// α=β=1e-3 → ≈3.45 blocks (twap.json `sprt` table).
+/// Expected SPRT samples to decide under H1 (report P4 §4, Eq. 5, Wald
+/// identity): E[N|H1] = ((1−β)·A + β·B) / (J²/(2σ²)).
+/// Wired by the height-gated Tier-3 below ([`sprt_tier3_expected_samples`]).
+/// E.g. J=1%, σ=0.5%/block, α=β=1e-3 → ≈3.45 blocks (twap.json `sprt` table).
 pub fn sprt_expected_samples(alpha: f64, beta: f64, shift: f64, sigma: f64) -> f64 {
     let (a, b) = sprt_wald_bounds(alpha, beta);
     ((1.0 - beta) * a + beta * b) / (shift * shift / (2.0 * sigma * sigma))
+}
+
+/// Tier-3 SPRT activation height (report P4 §4, Eq. 5; twap.json `sprt`).
+///
+/// GATE SEMANTICS: at block `height < SPRT_TIER3_ACTIVATION_HEIGHT` the Tier-3
+/// check is the historical fixed 10% `MAX_PRICE_DEVIATION_BPS` rule,
+/// byte-for-byte. At `height >= SPRT_TIER3_ACTIVATION_HEIGHT` the Tier-3
+/// check is the Wald SPRT/CUSUM decision over recent relative-price residuals
+/// (accumulated via [`cusum_llr_step`], decided against [`sprt_wald_bounds`]
+/// at [`SPRT_TIER3_ALPHA`]/[`SPRT_TIER3_BETA`]).
+///
+/// INACTIVE BY DEFAULT (`u64::MAX`): no live height can reach the gate, so
+/// current behavior is unchanged until the lead explicitly flips this constant
+/// at rollout. ADVISORY-ONLY: consumed solely by the read-path
+/// `OracleSafetyEngine` Tier-3; consensus admission
+/// (`OracleState::commit_feed`/`gate_order`) never reads it and is untouched.
+pub const SPRT_TIER3_ACTIVATION_HEIGHT: u64 = u64::MAX;
+/// Tier-3 SPRT false-alarm rate (report P4 §4; twap.json `sprt` rows pin
+/// α=β=1e-3).
+pub const SPRT_TIER3_ALPHA: f64 = 1e-3;
+/// Tier-3 SPRT miss rate (report P4 §4; twap.json `sprt` rows pin α=β=1e-3).
+pub const SPRT_TIER3_BETA: f64 = 1e-3;
+/// Default Tier-3 SPRT target shift: 1% sustained relative-price move.
+/// The pure decision path takes an explicit shift so every twap.json `sprt`
+/// row stays provable; this default only feeds the height-0 delegation of
+/// `OracleSafetyEngine::resolve_price`, whose SPRT branch is unreachable
+/// while the gate is inactive.
+pub const SPRT_TIER3_SHIFT: f64 = 0.01;
+/// Default Tier-3 SPRT per-block volatility: 0.5%/block (first twap.json
+/// `sprt` row). Same delegation-only role as [`SPRT_TIER3_SHIFT`].
+pub const SPRT_TIER3_SIGMA_PER_BLOCK: f64 = 0.005;
+
+/// Height gate predicate: true iff the SPRT Tier-3 is live at `height`.
+/// Pure: integer comparison only.
+#[allow(clippy::absurd_extreme_comparisons)] // GATE: `>=` is the rollout-correct form — at the INACTIVE default (u64::MAX) it reduces to `== MAX`; once the lead flips the constant down it becomes a real range check. `==` would silently deactivate every height above a flipped gate.
+pub fn sprt_tier3_active_at(height: u64) -> bool {
+    height >= SPRT_TIER3_ACTIVATION_HEIGHT
+}
+
+/// Accumulated Tier-3 SPRT log-likelihood over `residuals` (relative-price
+/// deviations, oldest first) for N(0,σ²) vs N(J,σ²), reusing
+/// [`cusum_llr_step`]. Pure and deterministic: strict slice-order summation,
+/// no wall-clock, no RNG, no map iteration (see determinism note on
+/// [`tier3_breaker_tripped`]).
+pub fn sprt_tier3_llr_sum(residuals: &[f64], shift: f64, sigma: f64) -> f64 {
+    let mut acc = 0.0;
+    for r in residuals {
+        acc += cusum_llr_step(*r, shift, sigma);
+    }
+    acc
+}
+
+/// Live Tier-3 SPRT verdict at the report error rates
+/// ([`SPRT_TIER3_ALPHA`]/[`SPRT_TIER3_BETA`]): true = H1 accepted, the
+/// breaker trips. Pure and deterministic.
+pub fn sprt_tier3_decision(residuals: &[f64], shift: f64, sigma: f64) -> bool {
+    let (a, _b) = sprt_wald_bounds(SPRT_TIER3_ALPHA, SPRT_TIER3_BETA);
+    sprt_tier3_llr_sum(residuals, shift, sigma) >= a
+}
+
+/// Wired Tier-3 expectation under H1 at the report error rates (Eq. 5):
+/// pins [`sprt_expected_samples`] to [`SPRT_TIER3_ALPHA`]/[`SPRT_TIER3_BETA`]
+/// so the twap.json `sprt` rows are provable through the wired path, not just
+/// the bare helper. Pure and deterministic.
+pub fn sprt_tier3_expected_samples(shift: f64, sigma: f64) -> f64 {
+    sprt_expected_samples(SPRT_TIER3_ALPHA, SPRT_TIER3_BETA, shift, sigma)
+}
+
+/// Height-gated Tier-3 breaker (the WIRED path).
+///
+/// Below [`SPRT_TIER3_ACTIVATION_HEIGHT`]: the historical fixed rule —
+/// `deviation_bps(price, twap) > MAX_PRICE_DEVIATION_BPS` — integer bps,
+/// exact, byte-identical to the pre-SPRT behavior. The SPRT history is
+/// ignored on this branch.
+/// At/above it: the [`sprt_tier3_decision`] verdict over `sprt_residuals`
+/// (one relative deviation per block, oldest first); the single
+/// price-vs-twap comparison is ignored on this branch.
+///
+/// DETERMINISM DISCIPLINE: the fixed branch is integer exact arithmetic.
+/// The SPRT branch is IEEE-754 binary64 with slice-order accumulation — bit
+/// for bit reproducible for identical input sequences on every node (no
+/// fused operations across terms, no data-dependent branching, no
+/// wall-clock/RNG/locale). Callers must derive each residual from committed
+/// integer micro-USD values in block order, e.g.
+/// `(price_micro_usd as f64 - twap_micro_usd as f64) / twap_micro_usd as f64`.
+/// Where the report allows, prefer the integer-bps fixed branch; the f64
+/// path above is documented here rather than hidden.
+pub fn tier3_breaker_tripped(
+    price_micro_usd: u64,
+    twap_micro_usd: u64,
+    height: u64,
+    sprt_residuals: &[f64],
+    sprt_shift: f64,
+    sprt_sigma: f64,
+) -> bool {
+    if sprt_tier3_active_at(height) {
+        return sprt_tier3_decision(sprt_residuals, sprt_shift, sprt_sigma);
+    }
+    deviation_bps(price_micro_usd, twap_micro_usd) > MAX_PRICE_DEVIATION_BPS
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -225,6 +328,95 @@ impl PriceFeedUpdate {
     }
 }
 
+/// Falcon-512 price feed: the PQ successor of [`PriceFeedUpdate`].
+///
+/// WIRE NOTE: [`PriceFeedUpdate`] is byte-frozen consensus wire and its
+/// `verify()` fail-closes (always false) now that no classical feed path
+/// exists. This is a NEW, ADDITIVE type — old bytes decode exactly as before
+/// (the Ed struct is untouched above) and these bytes never alias the Ed
+/// layout, so the frozen wire is preserved while a valid feed exists again.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PqPriceFeedUpdate {
+    pub asset: String,
+    pub price_micro_usd: u64, // e.g. 1 STELL = $0.25 => 250_000
+    pub timestamp: u64,
+    /// Full 897-byte Falcon-512 public key, carried inline (see identity note).
+    ///
+    /// `Vec` (not `[u8; 897]`) because serde only derives `Deserialize` for
+    /// arrays up to 32 elements; length is enforced fail-closed instead —
+    /// `verify()` returns false on any non-897-byte key and
+    /// `register_pq_publisher` refuses to register one.
+    pub publisher_falcon_pubkey: Vec<u8>,
+    /// 666-byte Falcon-512 signature over the feed message.
+    pub falcon_sig: Vec<u8>,
+}
+
+impl PqPriceFeedUpdate {
+    pub fn sign(
+        asset: &str,
+        price_micro_usd: u64,
+        timestamp: u64,
+        publisher_key: &FalconKeypair,
+    ) -> Self {
+        // Message layout mirrors `PriceFeedUpdate::sign` byte-for-byte
+        // (asset bytes || price_be || timestamp_be); only the signature scheme
+        // changes. Keep the two constructions in lockstep.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(asset.as_bytes());
+        msg.extend_from_slice(&price_micro_usd.to_be_bytes());
+        msg.extend_from_slice(&timestamp.to_be_bytes());
+
+        let sig = publisher_key.sign(&msg);
+
+        Self {
+            asset: asset.to_string(),
+            price_micro_usd,
+            timestamp,
+            publisher_falcon_pubkey: publisher_key.pubkey().to_vec(),
+            falcon_sig: sig,
+        }
+    }
+
+    pub fn verify(&self) -> bool {
+        // Same message layout as `PriceFeedUpdate::sign`; verified with the
+        // tree's existing Falcon-512 verifier — the same function validator
+        // votes verify against (`Vote::verify_uncached` via
+        // `crate::consensus::verify_falcon_signature`, i.e. real FIPS 206 in
+        // every build). Wrong-length keys/sigs fail closed inside it.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(self.asset.as_bytes());
+        msg.extend_from_slice(&self.price_micro_usd.to_be_bytes());
+        msg.extend_from_slice(&self.timestamp.to_be_bytes());
+
+        crate::consensus::verify_falcon_signature(
+            &self.publisher_falcon_pubkey,
+            &msg,
+            &self.falcon_sig,
+        )
+    }
+}
+
+/// 32-byte consensus binding of a Falcon-512 publisher key.
+///
+/// PUBLISHER IDENTITY (no Ed alias): an 897-byte Falcon-512 key CANNOT fit in
+/// the `[u8; 32]` publisher slots (`OracleState.publishers`,
+/// `CommittedFeed.publisher`, governance `RegisterOraclePublisher`), so those
+/// slots hold THIS binding — never an Ed25519 key, never a truncation. The
+/// feed signature is verified against the full inline 897-byte key and
+/// admission requires this binding in the committed set, so the identity is
+/// Falcon-key-bound end to end.
+///
+/// Reusing the existing `[u8; 32]` slots (instead of widening consensus state)
+/// keeps the commitment digest layout (`commitment.rs` `oracle_digest`) and
+/// the governance action wire byte-identical: no `COMMITMENT_VERSION` bump,
+/// no snapshot migration. Cross-type confusion would need an Ed25519 public
+/// key equal to a BLAKE3 digest of a Falcon key (second preimage) — infeasible.
+pub fn pq_publisher_binding(falcon_pubkey: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("STELL_ORACLE_PQ_BIND_V1");
+    h.update(falcon_pubkey);
+    *h.finalize().as_bytes()
+}
+
 /// One price observation that a block has committed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommittedFeed {
@@ -263,6 +455,20 @@ pub struct OracleState {
     pub publishers: BTreeSet<[u8; 32]>,
     /// Latest committed feed per asset, keyed by asset symbol.
     pub feeds: BTreeMap<String, CommittedFeed>,
+    /// Genesis anchor price per asset (micro-USD), set to the committed price
+    /// on the FIRST commit per asset and NEVER ratcheted afterwards.
+    ///
+    /// WHY THE ANCHOR MUST NOT MOVE: the per-step caps above ratchet the
+    /// baseline forward — each committed feed becomes the next step's
+    /// reference — so a slow walk (+5%/feed, inside every per-step cap)
+    /// escapes any step-relative guard while drifting +15.8% over three
+    /// steps. The cumulative latch in `commit_feed_pq` measures against THIS
+    /// anchor instead, so the walk trips the breaker once the total drift
+    /// exceeds `MAX_PRICE_DEVIATION_BPS` no matter how small the steps are.
+    /// A moved anchor is a moved goalpost; genesis is the only goalpost that
+    /// cannot be walked.
+    #[serde(default)]
+    pub anchor_price_micro_usd: BTreeMap<String, u64>,
     /// Circuit-breaker latch. Once true it refuses new feeds AND new orders
     /// until something deliberately resets it. Sticky by design: a gate that
     /// fires keeps the alarm even though its own transaction rolls back.
@@ -389,6 +595,153 @@ impl OracleState {
         Ok(price)
     }
 
+    /// Commit a Falcon-signed feed at `block_time`.
+    ///
+    /// MIRROR of [`Self::commit_feed`]: every check is the same (breaker
+    /// latch, symbol/price shape, membership, freshness, monotonicity, USDT
+    /// peg, 10% deviation + 5% same-publisher cap, same latch semantics, same
+    /// error strings), only the signature scheme changes — Falcon `verify()`
+    /// over the full inline key plus membership of the key's
+    /// [`pq_publisher_binding`] in the committed set. Keep the two functions
+    /// in lockstep: any rule change applies to both.
+    ///
+    /// Returns the committed price, or `Err` with no price committed. A `Err`
+    /// for the peg/deviation cases also latches `breaker_tripped`, exactly
+    /// like [`Self::commit_feed`].
+    pub fn commit_feed_pq(&mut self, feed: &PqPriceFeedUpdate, block_time: u64) -> Result<u64, String> {
+        // 0. Breaker latch: once tripped nothing gets through.
+        if self.breaker_tripped {
+            return Err("Circuit breaker is currently active. Trades paused.".to_string());
+        }
+        // 0a. Malformed-input guards (E9/E10): shape and sanity BEFORE
+        // cryptography. A zero price or a junk symbol is malformed publisher
+        // output, not market evidence, so it is refused WITHOUT latching
+        // (latching would turn one fat-finger into a chain-wide halt until a
+        // 3-day governance reset) and commits nothing.
+        if !is_valid_asset_symbol(&feed.asset) {
+            return Err(format!(
+                "invalid asset symbol {:?}: must be 1..=32 ASCII alnum/-_./ chars",
+                feed.asset
+            ));
+        }
+        if feed.price_micro_usd == 0 {
+            return Err(format!(
+                "invalid oracle price 0 for {}: price must be > 0",
+                feed.asset
+            ));
+        }
+        // 1. Signature: the feed must be the publisher's own words (Falcon).
+        if !feed.verify() {
+            return Err("invalid oracle signature".to_string());
+        }
+        // 2. Publisher set: a correctly signed feed from a key outside the
+        //    committed set is still an unknown key. The set holds
+        //    [`pq_publisher_binding`]s (see its docs for why the raw 897-byte
+        //    key cannot live there), so membership is checked on the binding.
+        let binding = pq_publisher_binding(&feed.publisher_falcon_pubkey);
+        if !self.publishers.contains(&binding) {
+            return Err("oracle publisher is not in the committed set".to_string());
+        }
+        // 3. Freshness against the BLOCK timestamp - the same check the
+        //    read-time path runs (`check_freshness`).
+        check_freshness(feed.timestamp, block_time)?;
+        // 4. Monotonic per asset: an older observation can never replace a
+        //    newer one, so a delayed/replayed feed cannot rewind the price.
+        if let Some(prev) = self.feeds.get(&feed.asset) {
+            if feed.timestamp <= prev.timestamp {
+                return Err(format!(
+                    "non-monotonic price feed for {}: timestamp {} does not exceed {}",
+                    feed.asset, feed.timestamp, prev.timestamp
+                ));
+            }
+        }
+        // 5. USDT peg - the same check the read path runs, and it latches.
+        if let Err(e) = check_usdt_peg(&feed.asset, feed.price_micro_usd) {
+            self.breaker_tripped = true;
+            return Err(e);
+        }
+        // 6. Deviation against the previously committed price: the Tier-3
+        //    breaker rule with the last committed feed as the baseline (the
+        //    on-chain analogue of the read path's TWAP reference). Same
+        //    per-publisher cap as [`Self::commit_feed`]: the SAME key twice in
+        //    a row may move an asset at most `MAX_SAME_PUBLISHER_DEVIATION_BPS`
+        //    (5%); past 10% the global rule latches regardless of key. Key
+        //    equality here is binding equality — a Falcon key re-signing under
+        //    the same key carries the same binding, a rotated key a different
+        //    one — so same-key walks and rotations behave exactly as on the Ed
+        //    path. See `commit_feed` step 6 for the full residual/deferred-fix
+        //    rationale, which applies verbatim.
+        if let Some(prev) = self.feeds.get(&feed.asset) {
+            let bps = deviation_bps(feed.price_micro_usd, prev.price_micro_usd);
+            if bps > MAX_PRICE_DEVIATION_BPS {
+                self.breaker_tripped = true;
+                return Err(format!(
+                    "circuit breaker tripped: price deviation {bps} bps exceeds limit {MAX_PRICE_DEVIATION_BPS} bps"
+                ));
+            }
+            if binding == prev.publisher && bps > MAX_SAME_PUBLISHER_DEVIATION_BPS {
+                tracing::warn!(
+                    "ORACLE-SINGLE-PUBLISHER-DRIFT REFUSED {asset}: same publisher {pubkey} moved the committed baseline {bps} bps (cap {cap} bps, global {global} bps): feed refused, breaker NOT latched",
+                    asset = feed.asset,
+                    pubkey = hex::encode(binding),
+                    bps = bps,
+                    cap = MAX_SAME_PUBLISHER_DEVIATION_BPS,
+                    global = MAX_PRICE_DEVIATION_BPS,
+                );
+                return Err(format!(
+                    "same-publisher drift refused for {}: deviation {bps} bps exceeds the per-publisher cap {MAX_SAME_PUBLISHER_DEVIATION_BPS} bps (global {MAX_PRICE_DEVIATION_BPS} bps)",
+                    feed.asset
+                ));
+            }
+        }
+        // 6b. Cumulative-drift latch (B-GOV/O1): deviation of the CANDIDATE
+        // price against the GENESIS anchor (`anchor_price_micro_usd`), NOT the
+        // last feed. Per-step caps ratchet the baseline forward, so a slow
+        // walk stays inside every step while the total escapes; the anchor
+        // never moves, so the total cannot escape this. First commit per
+        // asset sets the anchor and passes (there is no drift from oneself);
+        // a legacy asset with a feed but no anchor yet (pre-latch state,
+        // direct-insert fixtures) is treated the same way — anchored at the
+        // candidate price, passing this once — so rollout needs no height
+        // gate and no migration. Past `MAX_PRICE_DEVIATION_BPS` cumulative
+        // (same 10% const, no new threshold) the breaker latches fail-closed
+        // with the same latch semantics as every other breaker trip, and the
+        // feed commits nothing.
+        //
+        // Ed `commit_feed` path: INTENTIONALLY untouched — that path is
+        // dead/refusing by design (`PriceFeedUpdate::verify` always fails
+        // closed under FULL-PQ), so no feed can commit through it and there
+        // is no walk to latch there. Keep the two functions' RULES in
+        // lockstep if the Ed path ever lives again.
+        if let Some(&anchor) = self.anchor_price_micro_usd.get(&feed.asset) {
+            let cumulative_bps = deviation_bps(feed.price_micro_usd, anchor);
+            if cumulative_bps > MAX_PRICE_DEVIATION_BPS {
+                self.breaker_tripped = true;
+                return Err(format!(
+                    "circuit breaker tripped: cumulative price drift {cumulative_bps} bps from genesis anchor exceeds limit {MAX_PRICE_DEVIATION_BPS} bps"
+                ));
+            }
+        }
+
+        let price = feed.price_micro_usd;
+        // Genesis anchor: set once, on the first commit per asset, and never
+        // ratcheted afterwards (see the field docs for why it must not move).
+        // `or_insert` keeps a legacy anchor (pre-latch state anchored above)
+        // instead of overwriting it.
+        self.anchor_price_micro_usd
+            .entry(feed.asset.clone())
+            .or_insert(price);
+        self.feeds.insert(
+            feed.asset.clone(),
+            CommittedFeed {
+                price_micro_usd: price,
+                timestamp: feed.timestamp,
+                publisher: binding,
+            },
+        );
+        Ok(price)
+    }
+
     /// Authorise a publisher key in the committed registry.
     ///
     /// This is the ONLY way a key enters `publishers`, and its only caller is
@@ -421,6 +774,32 @@ impl OracleState {
         self.publishers.remove(&publisher)
     }
 
+    /// Authorise a Falcon-512 publisher key in the committed registry.
+    ///
+    /// PQ counterpart of [`Self::register_publisher`]: the committed set holds
+    /// [`pq_publisher_binding`]s, so this binds the 897-byte key and inserts
+    /// the binding (idempotent, returns whether the set changed). A
+    /// wrong-length key is refused (`false`, inserts nothing) — the shape
+    /// analogue of the all-zero-key refusal in `register_publisher`: only a
+    /// real Falcon-512 key can ever produce a committable feed.
+    pub fn register_pq_publisher(&mut self, falcon_pubkey: &[u8]) -> bool {
+        if falcon_pubkey.len() != FALCON512_PUBKEY_LEN {
+            return false;
+        }
+        self.register_publisher(pq_publisher_binding(falcon_pubkey))
+    }
+
+    /// Revoke a Falcon-512 publisher key. Like [`Self::unregister_publisher`],
+    /// already-committed feeds stay (committed history cannot be un-observed)
+    /// while no FUTURE feed may carry the key. Idempotent: returns whether the
+    /// set actually changed. A wrong-length key removes nothing (`false`).
+    pub fn unregister_pq_publisher(&mut self, falcon_pubkey: &[u8]) -> bool {
+        if falcon_pubkey.len() != FALCON512_PUBKEY_LEN {
+            return false;
+        }
+        self.unregister_publisher(pq_publisher_binding(falcon_pubkey))
+    }
+
     /// Clear the latched circuit breaker.
     ///
     /// Latching is automatic (a peg or deviation violation is evidence, not a
@@ -428,8 +807,16 @@ impl OracleState {
     /// `GovAction::ResetOracleBreaker` may call this. Returns whether the
     /// breaker was latched, so "reset an already-clear breaker" is a no-op the
     /// caller (and the committed proposal) can tell apart from a real reset.
+    /// Governance reset: clears the latch AND the cumulative anchors,
+    /// returning the oracle to a genesis-like state — the next committed
+    /// feed re-anchors. Without anchor reset a legitimate regime change
+    /// (>10% from an ancient anchor) would brick the oracle forever; with
+    /// it, recovery is an explicit governance act (quorum + timelock), not
+    /// a silent ratchet an attacker can ride.
     pub fn reset_breaker(&mut self) -> bool {
-        std::mem::replace(&mut self.breaker_tripped, false)
+        let was = std::mem::replace(&mut self.breaker_tripped, false);
+        self.anchor_price_micro_usd.clear();
+        was
     }
 
     /// Freshness of the COMMITTED feed for `asset` against the BLOCK
@@ -652,6 +1039,36 @@ impl OracleSafetyEngine {
         asset: &str,
         current_time: u64,
     ) -> Result<u64, String> {
+        // Pre-SPRT behavior, byte-identical: height 0 never reaches the
+        // inactive-by-default gate (`SPRT_TIER3_ACTIVATION_HEIGHT = u64::MAX`),
+        // so Tier-3 is the fixed 10% rule exactly as before.
+        self.resolve_price_at_height(
+            feed,
+            asset,
+            current_time,
+            0,
+            &[],
+            SPRT_TIER3_SHIFT,
+            SPRT_TIER3_SIGMA_PER_BLOCK,
+        )
+    }
+
+    /// Height-gated resolve: Tiers 1–2 identical to [`Self::resolve_price`];
+    /// Tier-3 reads the [`SPRT_TIER3_ACTIVATION_HEIGHT`] gate via
+    /// [`tier3_breaker_tripped`] (`sprt_residuals`: one relative deviation per
+    /// block, oldest first, at the `sprt_shift`/`sprt_sigma` operating point).
+    /// Advisory-only like [`Self::resolve_price`]: never consensus.
+    #[allow(clippy::too_many_arguments)] // GATE: extends `resolve_price` (feed/asset/time) with gate height plus one SPRT operating point (residuals/shift/sigma); grouping them would churn the wired-path tests for no behavioral gain.
+    pub fn resolve_price_at_height(
+        &mut self,
+        feed: Option<&PriceFeedUpdate>,
+        asset: &str,
+        current_time: u64,
+        height: u64,
+        sprt_residuals: &[f64],
+        sprt_shift: f64,
+        sprt_sigma: f64,
+    ) -> Result<u64, String> {
         if self.circuit_breaker_triggered {
             return Err("Circuit breaker is currently active. Trades paused.".to_string());
         }
@@ -719,8 +1136,155 @@ impl OracleSafetyEngine {
             if twap > 0 {
                 let deviation_bps = deviation_bps(price, twap);
 
-                if deviation_bps > MAX_PRICE_DEVIATION_BPS {
+                if tier3_breaker_tripped(
+                    price,
+                    twap,
+                    height,
+                    sprt_residuals,
+                    sprt_shift,
+                    sprt_sigma,
+                ) {
                     self.circuit_breaker_triggered = true;
+                    if sprt_tier3_active_at(height) {
+                        return Err(format!(
+                            "SPRT circuit breaker tripped: LLR sum {:.6} reached upper bound {:.6} (shift {}, sigma {})",
+                            sprt_tier3_llr_sum(sprt_residuals, sprt_shift, sprt_sigma),
+                            sprt_wald_bounds(SPRT_TIER3_ALPHA, SPRT_TIER3_BETA).0,
+                            sprt_shift,
+                            sprt_sigma,
+                        ));
+                    }
+                    return Err(format!(
+                        "Circuit breaker tripped: price deviation {} bps exceeds limit {} bps",
+                        deviation_bps, MAX_PRICE_DEVIATION_BPS
+                    ));
+                }
+            }
+        }
+
+        Ok(price)
+    }
+
+    /// PQ counterpart of [`Self::resolve_price`]: Tier-1 accepts a
+    /// Falcon-signed feed whose key binding is trusted; Tiers 2–3 are
+    /// identical (same TWAP fallback, same height-gated Tier-3 verdict).
+    /// Advisory-only like [`Self::resolve_price`]: never consensus.
+    pub fn resolve_price_pq(
+        &mut self,
+        feed: Option<&PqPriceFeedUpdate>,
+        asset: &str,
+        current_time: u64,
+    ) -> Result<u64, String> {
+        // Pre-SPRT behavior, byte-identical delegation to the gated path at
+        // height 0, exactly like `resolve_price`.
+        self.resolve_price_at_height_pq(
+            feed,
+            asset,
+            current_time,
+            0,
+            &[],
+            SPRT_TIER3_SHIFT,
+            SPRT_TIER3_SIGMA_PER_BLOCK,
+        )
+    }
+
+    /// PQ counterpart of [`Self::resolve_price_at_height`]: Tiers 1–2
+    /// identical with a Falcon feed; Tier-3 reads the
+    /// [`SPRT_TIER3_ACTIVATION_HEIGHT`] gate via [`tier3_breaker_tripped`]
+    /// exactly as the Ed path does. Advisory-only: never consensus.
+    #[allow(clippy::too_many_arguments)] // GATE: mirrors `resolve_price_at_height` (feed/asset/time + gate height + one SPRT operating point); grouping them would churn the wired-path tests for no behavioral gain.
+    pub fn resolve_price_at_height_pq(
+        &mut self,
+        feed: Option<&PqPriceFeedUpdate>,
+        asset: &str,
+        current_time: u64,
+        height: u64,
+        sprt_residuals: &[f64],
+        sprt_shift: f64,
+        sprt_sigma: f64,
+    ) -> Result<u64, String> {
+        if self.circuit_breaker_triggered {
+            return Err("Circuit breaker is currently active. Trades paused.".to_string());
+        }
+
+        // Hardcoded check for USDT peg
+        if asset == "USDT" {
+            let usdt_price = if let Some(update) = feed {
+                update.price_micro_usd
+            } else {
+                1_000_000
+            };
+
+            if let Err(e) = check_usdt_peg(asset, usdt_price) {
+                self.circuit_breaker_triggered = true;
+                return Err(e);
+            }
+            return Ok(1_000_000); // 1.00 USD
+        }
+
+        // Tier 1: Try Pull-Oracle. Same cross-asset/zero-price guards as the Ed
+        // path (audit BR-OR-01/BR-02): the feed must name THIS asset and carry
+        // a positive price, verify under Falcon, and its key BINDING
+        // (`pq_publisher_binding` — the 897-byte key cannot fit the trusted
+        // `[u8; 32]` slots) must be trusted; freshness is block-time checked.
+        // A feed failing any check is ignored (TWAP fallback), never chosen.
+        let mut chosen_price: Option<u64> = None;
+        if let Some(update) = feed {
+            if update.asset == asset
+                && update.price_micro_usd > 0
+                && update.verify()
+                && self
+                    .trusted_publishers
+                    .contains(&pq_publisher_binding(&update.publisher_falcon_pubkey))
+                // Check freshness (reject if older than 15 minutes / in the future)
+                && check_freshness(update.timestamp, current_time).is_ok()
+            {
+                chosen_price = Some(update.price_micro_usd);
+            }
+        }
+
+        // Tier 2: Fallback to on-chain DEX TWAP if Tier 1 failed or stale
+        let price = match chosen_price {
+            Some(p) => p,
+            None => {
+                let twap_calc = self.twap_calculator.calculate_twap(asset, current_time);
+                match twap_calc {
+                    Some(p) => p,
+                    None => *self.dex_twap_prices.get(asset).ok_or_else(|| {
+                        "No valid price source: Pull oracle failed/stale and no DEX TWAP available".to_string()
+                    })?,
+                }
+            }
+        };
+
+        // Tier 3: Circuit Breaker validation against TWAP
+        let twap_ref = self
+            .twap_calculator
+            .calculate_twap(asset, current_time)
+            .or_else(|| self.dex_twap_prices.get(asset).copied());
+
+        if let Some(twap) = twap_ref {
+            if twap > 0 {
+                let deviation_bps = deviation_bps(price, twap);
+
+                if tier3_breaker_tripped(
+                    price,
+                    twap,
+                    height,
+                    sprt_residuals,
+                    sprt_shift,
+                    sprt_sigma,
+                ) {
+                    self.circuit_breaker_triggered = true;
+                    if sprt_tier3_active_at(height) {
+                        return Err(format!(
+                            "SPRT circuit breaker tripped: LLR sum {:.6} reached upper bound {:.6} (shift {}, sigma {})",
+                            sprt_tier3_llr_sum(sprt_residuals, sprt_shift, sprt_sigma),
+                            sprt_wald_bounds(SPRT_TIER3_ALPHA, SPRT_TIER3_BETA).0,
+                            sprt_shift,
+                            sprt_sigma,
+                        ));
+                    }
                     return Err(format!(
                         "Circuit breaker tripped: price deviation {} bps exceeds limit {} bps",
                         deviation_bps, MAX_PRICE_DEVIATION_BPS
@@ -812,6 +1376,246 @@ mod oracle_params_truth_tests {
 }
 
 #[cfg(test)]
+mod sprt_tier3_gate_tests {
+    use super::*;
+
+    /// Pre-activation pin: the gate is INACTIVE by default, so the wired path
+    /// is the fixed 10% rule and the SPRT history is ignored on this branch.
+    #[test]
+    fn pre_activation_fixed_10pct_rule_pinned() {
+        assert_eq!(
+            SPRT_TIER3_ACTIVATION_HEIGHT,
+            u64::MAX,
+            "gate inactive by default until the lead flips it at rollout"
+        );
+        assert!(!sprt_tier3_active_at(0));
+        assert!(!sprt_tier3_active_at(u64::MAX - 1));
+
+        // 9% under → pass; exactly 10% → pass (rule is strict `>`); 11% → trip.
+        assert!(!tier3_breaker_tripped(1_090_000, 1_000_000, 0, &[], 0.01, 0.005));
+        assert!(!tier3_breaker_tripped(1_100_000, 1_000_000, 0, &[], 0.01, 0.005));
+        assert!(tier3_breaker_tripped(1_110_000, 1_000_000, 0, &[], 0.01, 0.005));
+        // A maximally alarming SPRT history must NOT trip pre-activation:
+        // the fixed branch ignores residuals entirely.
+        assert!(!tier3_breaker_tripped(
+            1_000_000,
+            1_000_000,
+            0,
+            &[0.01; 64],
+            0.01,
+            0.005
+        ));
+    }
+
+    /// Boundary pin: MAX−1 stays on the fixed rule, MAX switches to SPRT.
+    #[test]
+    fn activation_boundary_height() {
+        // Just below: an 11% single print trips (fixed rule) even with an
+        // empty SPRT history.
+        assert!(tier3_breaker_tripped(
+            1_110_000,
+            1_000_000,
+            u64::MAX - 1,
+            &[],
+            0.01,
+            0.005
+        ));
+        // Just below: on-par price with a trip-worthy SPRT history does NOT
+        // trip (SPRT ignored on the fixed branch).
+        assert!(!tier3_breaker_tripped(
+            1_000_000,
+            1_000_000,
+            u64::MAX - 1,
+            &[0.01; 4],
+            0.01,
+            0.005
+        ));
+        // At the gate: the same on-par price now trips on SPRT evidence…
+        assert!(sprt_tier3_active_at(u64::MAX));
+        assert!(tier3_breaker_tripped(
+            1_000_000,
+            1_000_000,
+            u64::MAX,
+            &[0.01; 4],
+            0.01,
+            0.005
+        ));
+        // …while an 11% single print with NO SPRT history does not (the SPRT
+        // branch reads residuals, not the one-shot deviation).
+        assert!(!tier3_breaker_tripped(
+            1_110_000,
+            1_000_000,
+            u64::MAX,
+            &[],
+            0.01,
+            0.005
+        ));
+    }
+
+    /// All four twap.json `sprt` rows (α=β=1e-3) proved through the WIRED
+    /// expectation path: (J, σ, E[N]) = (1%, 0.5%, 3.45), (1%, 1%, 13.79),
+    /// (2%, 0.5%, 0.86), (2%, 1%, 3.45).
+    #[test]
+    fn wired_expected_samples_match_all_four_report_rows() {
+        assert_eq!(SPRT_TIER3_ALPHA.to_bits(), 0.001f64.to_bits());
+        assert_eq!(SPRT_TIER3_BETA.to_bits(), 0.001f64.to_bits());
+        let cases = [
+            (0.01, 0.005, 3.45),
+            (0.01, 0.01, 13.79),
+            (0.02, 0.005, 0.86),
+            (0.02, 0.01, 3.45),
+        ];
+        for (j, sigma, expected) in cases {
+            let got = sprt_tier3_expected_samples(j, sigma);
+            assert!(
+                (got - expected).abs() / expected < 0.01,
+                "wired E[N] J={j} σ={sigma}: ≈{expected}, got {got}"
+            );
+        }
+    }
+
+    /// Post-activation trip/no-trip vectors through the WIRED gate
+    /// ([`tier3_breaker_tripped`] at `u64::MAX`): sustained full-shift
+    /// residuals `x = J` cross the Wald upper bound exactly at
+    /// `ceil(E[N])` samples — 4 / 14 / 1 / 4 for the four report rows —
+    /// while one fewer sample stays silent, and flat history never trips.
+    #[test]
+    fn post_activation_sprt_trip_no_trip_vectors() {
+        // (shift J, sigma, E[N] from twap.json, samples-to-trip = ceil(E[N])).
+        let cases: [(f64, f64, f64, usize); 4] = [
+            (0.01, 0.005, 3.45, 4),
+            (0.01, 0.01, 13.79, 14),
+            (0.02, 0.005, 0.86, 1),
+            (0.02, 0.01, 3.45, 4),
+        ];
+        for (j, sigma, expected, trip_at) in cases {
+            // Sanity: the trip count really is ceil(E[N]) of the report row.
+            assert_eq!(
+                trip_at,
+                expected.ceil() as usize,
+                "J={j} σ={sigma}: trip count must be ceil({expected})"
+            );
+            let trip_history = vec![j; trip_at];
+            assert!(
+                tier3_breaker_tripped(1_000_000, 1_000_000, u64::MAX, &trip_history, j, sigma),
+                "J={j} σ={sigma}: {trip_at} full-shift samples must trip"
+            );
+            assert!(
+                sprt_tier3_decision(&trip_history, j, sigma),
+                "J={j} σ={sigma}: pure SPRT verdict must agree with the wired gate"
+            );
+            if trip_at > 1 {
+                let quiet_history = vec![j; trip_at - 1];
+                assert!(
+                    !tier3_breaker_tripped(
+                        1_000_000, 1_000_000, u64::MAX, &quiet_history, j, sigma
+                    ),
+                    "J={j} σ={sigma}: {} samples must stay silent",
+                    trip_at - 1
+                );
+            }
+            // Flat market: zeros score pure negative drift, never trip —
+            // even over a long window.
+            assert!(
+                !tier3_breaker_tripped(
+                    1_000_000,
+                    1_000_000,
+                    u64::MAX,
+                    &[0.0; 64],
+                    j,
+                    sigma
+                ),
+                "J={j} σ={sigma}: flat residuals must never trip"
+            );
+        }
+        // Empty history post-activation: LLR = 0 < A, silent.
+        assert!(!tier3_breaker_tripped(
+            1_000_000,
+            1_000_000,
+            u64::MAX,
+            &[],
+            0.01,
+            0.005
+        ));
+    }
+
+    /// Engine wiring: the same on-par price is admitted pre-activation and
+    /// SPRT-tripped post-activation, with the latch set exactly once.
+    #[test]
+    fn engine_wired_path_switches_at_activation() {
+        // Pre-activation: price == TWAP → Ok, latch clear.
+        let mut pre = OracleSafetyEngine::new(vec![]);
+        pre.set_dex_twap("STELL", 1_000_000);
+        assert!(pre
+            .resolve_price_at_height(None, "STELL", 1_000, 0, &[0.01; 64], 0.01, 0.005)
+            .is_ok());
+        assert!(!pre.circuit_breaker_triggered);
+
+        // Post-activation with 4 full-shift residuals (row 1, E[N]=3.45):
+        // trips despite a zero one-shot deviation, and latches.
+        let mut post = OracleSafetyEngine::new(vec![]);
+        post.set_dex_twap("STELL", 1_000_000);
+        let err = post
+            .resolve_price_at_height(None, "STELL", 1_000, u64::MAX, &[0.01; 4], 0.01, 0.005)
+            .expect_err("SPRT evidence must trip post-activation");
+        assert!(
+            err.contains("SPRT"),
+            "post-activation trip must name SPRT, got: {err}"
+        );
+        assert!(post.circuit_breaker_triggered);
+
+        // Legacy entry point is byte-identical to the gated path at height 0:
+        // identical engines give identical outcomes and latch state — even
+        // with a maximally alarming SPRT history, which the fixed branch
+        // ignores. (An 11%-style fixed-rule trip is untriggerable through
+        // the engine while feed verification fail-closes, so the trip
+        // itself is pinned at the `tier3_breaker_tripped` level above.)
+        let mut legacy = OracleSafetyEngine::new(vec![]);
+        legacy.set_dex_twap("STELL", 1_000_000);
+        let mut gated = OracleSafetyEngine::new(vec![]);
+        gated.set_dex_twap("STELL", 1_000_000);
+        let via_legacy = legacy.resolve_price(None, "STELL", 1_000);
+        let via_gated =
+            gated.resolve_price_at_height(None, "STELL", 1_000, 0, &[0.01; 64], 0.01, 0.005);
+        assert_eq!(via_legacy, via_gated);
+        assert_eq!(
+            legacy.circuit_breaker_triggered,
+            gated.circuit_breaker_triggered
+        );
+    }
+
+    /// Determinism: identical inputs → identical outputs on repeat, on both
+    /// branches; documents the integer/fixed-point discipline (fixed branch
+    /// is exact integer bps; SPRT branch is slice-order IEEE-754, bit-stable
+    /// for identical input order — no wall-clock, no RNG, no map iteration).
+    #[test]
+    fn wired_gate_is_deterministic() {
+        let residuals = [0.01, 0.005, -0.002, 0.012, 0.008];
+        let fixed_a = tier3_breaker_tripped(1_050_000, 1_000_000, 0, &residuals, 0.01, 0.005);
+        let sprt_a =
+            tier3_breaker_tripped(1_000_000, 1_000_000, u64::MAX, &residuals, 0.01, 0.005);
+        for _ in 0..16 {
+            assert_eq!(
+                tier3_breaker_tripped(1_050_000, 1_000_000, 0, &residuals, 0.01, 0.005),
+                fixed_a
+            );
+            assert_eq!(
+                tier3_breaker_tripped(1_000_000, 1_000_000, u64::MAX, &residuals, 0.01, 0.005),
+                sprt_a
+            );
+            assert_eq!(
+                sprt_tier3_llr_sum(&residuals, 0.01, 0.005).to_bits(),
+                sprt_tier3_llr_sum(&residuals, 0.01, 0.005).to_bits()
+            );
+            assert_eq!(
+                sprt_tier3_expected_samples(0.01, 0.005).to_bits(),
+                sprt_tier3_expected_samples(0.01, 0.005).to_bits()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod pq_gate_tests {
     use super::*;
     use ed25519_dalek::SigningKey;
@@ -869,5 +1673,175 @@ mod pq_gate_tests {
                 "ed feed must not commit under FULL-PQ"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pq_feed_tests {
+    use super::*;
+    use crate::post_quantum::FalconKeypair;
+
+    fn test_kp(seed: u8) -> FalconKeypair {
+        FalconKeypair::generate_from_seed(seed)
+    }
+
+    fn signed(asset: &str, price: u64, ts: u64, kp: &FalconKeypair) -> PqPriceFeedUpdate {
+        PqPriceFeedUpdate::sign(asset, price, ts, kp)
+    }
+
+    fn state_with(kp: &FalconKeypair) -> OracleState {
+        let mut s = OracleState::default();
+        assert!(
+            s.register_pq_publisher(kp.pubkey()),
+            "test key must register"
+        );
+        s
+    }
+
+    #[test]
+    fn pq_feed_verify_happy_path() {
+        let kp = test_kp(0xA1);
+        let feed = signed("STELL", 250_000, 1_000, &kp);
+        assert!(feed.verify(), "a fresh Falcon feed must verify");
+        // Falcon signing is randomized: two signatures over the same message
+        // both verify (and differ), so committed state never depends on sig
+        // bytes — only on asset/price/timestamp/binding.
+        let again = signed("STELL", 250_000, 1_000, &kp);
+        assert!(again.verify(), "second signature must also verify");
+        assert_ne!(
+            feed.falcon_sig, again.falcon_sig,
+            "test bug: Falcon signatures must be randomized per signing"
+        );
+    }
+
+    #[test]
+    fn pq_feed_bad_signature_is_refused() {
+        let kp = test_kp(0xA1);
+        let mut feed = signed("STELL", 250_000, 1_000, &kp);
+        let last = feed.falcon_sig.len() - 1;
+        feed.falcon_sig[last] ^= 0x01;
+        assert!(!feed.verify(), "a tampered signature must NOT verify");
+    }
+
+    #[test]
+    fn pq_feed_wrong_key_is_refused() {
+        let kp = test_kp(0xA1);
+        let other = test_kp(0xB2);
+        let mut feed = signed("STELL", 250_000, 1_000, &kp);
+        // Swap the embedded key: the signature no longer matches the claimed
+        // publisher, so verification must fail.
+        feed.publisher_falcon_pubkey = other.pubkey().to_vec();
+        assert!(!feed.verify(), "signature under a different key must NOT verify");
+    }
+
+    #[test]
+    fn pq_feed_tampered_fields_are_refused() {
+        let kp = test_kp(0xA1);
+        let mut feed = signed("STELL", 250_000, 1_000, &kp);
+        feed.price_micro_usd = 251_000;
+        assert!(!feed.verify(), "a re-priced feed must NOT verify");
+        let mut feed = signed("STELL", 250_000, 1_000, &kp);
+        feed.asset = "BTC".to_string();
+        assert!(!feed.verify(), "a re-asseted feed must NOT verify");
+        let mut feed = signed("STELL", 250_000, 1_000, &kp);
+        feed.timestamp += 1;
+        assert!(!feed.verify(), "a re-timestamped feed must NOT verify");
+    }
+
+    #[test]
+    fn pq_feed_short_signature_is_refused() {
+        let kp = test_kp(0xA1);
+        let mut feed = signed("STELL", 250_000, 1_000, &kp);
+        feed.falcon_sig.clear();
+        assert!(!feed.verify(), "an empty signature must NOT verify");
+        feed.falcon_sig = vec![0u8; 64];
+        assert!(!feed.verify(), "a short signature must NOT verify");
+    }
+
+    #[test]
+    fn pq_publisher_binding_is_deterministic_and_key_bound() {
+        let a = test_kp(0xA1);
+        let b = test_kp(0xB2);
+        assert_eq!(
+            pq_publisher_binding(a.pubkey()),
+            pq_publisher_binding(a.pubkey()),
+            "binding must be deterministic"
+        );
+        assert_ne!(
+            pq_publisher_binding(a.pubkey()),
+            pq_publisher_binding(b.pubkey()),
+            "distinct Falcon keys must bind distinctly"
+        );
+        assert_ne!(
+            pq_publisher_binding(a.pubkey()),
+            [0u8; 32],
+            "a real key must never bind to the refused zero slot"
+        );
+    }
+
+    #[test]
+    fn pq_registry_refuses_malformed_keys() {
+        let mut s = OracleState::default();
+        assert!(
+            !s.register_pq_publisher(&[0u8; 64]),
+            "wrong-length key must be refused"
+        );
+        assert!(
+            !s.unregister_pq_publisher(&[0u8; 64]),
+            "wrong-length key removes nothing"
+        );
+        assert!(s.publishers.is_empty());
+        // A real key registers idempotently, exactly like the Ed path.
+        let kp = test_kp(0xA1);
+        assert!(s.register_pq_publisher(kp.pubkey()));
+        assert!(!s.register_pq_publisher(kp.pubkey()));
+        assert!(s.unregister_pq_publisher(kp.pubkey()));
+        assert!(!s.unregister_pq_publisher(kp.pubkey()));
+    }
+
+    #[test]
+    fn commit_feed_pq_happy_path() {
+        let kp = test_kp(0xA1);
+        let mut s = state_with(&kp);
+        let price = s
+            .commit_feed_pq(&signed("STELL", 250_000, 1_000, &kp), 1_001)
+            .expect("a fresh Falcon feed from a registered publisher must commit");
+        assert_eq!(price, 250_000);
+        let committed = &s.feeds["STELL"];
+        assert_eq!(committed.price_micro_usd, 250_000);
+        assert_eq!(committed.timestamp, 1_000);
+        assert_eq!(
+            committed.publisher,
+            pq_publisher_binding(kp.pubkey()),
+            "the committed publisher is the Falcon key binding"
+        );
+        assert!(!s.breaker_tripped);
+    }
+
+    #[test]
+    fn commit_feed_pq_refusals() {
+        let kp = test_kp(0xA1);
+        // Unknown publisher: correctly signed yet unauthorised.
+        let mut s = OracleState::default();
+        let err = s
+            .commit_feed_pq(&signed("STELL", 250_000, 1_000, &kp), 1_001)
+            .expect_err("an unregistered PQ publisher must be refused");
+        assert!(err.contains("publisher"), "refusal must name the set: {err}");
+        assert!(s.feeds.is_empty());
+        assert!(!s.breaker_tripped);
+
+        // Bad signature from a REGISTERED publisher: still refused.
+        let mut s = state_with(&kp);
+        let mut bad = signed("STELL", 250_000, 1_000, &kp);
+        bad.falcon_sig[10] ^= 0xFF;
+        let err = s
+            .commit_feed_pq(&bad, 1_001)
+            .expect_err("a bad Falcon signature must be refused");
+        assert!(
+            err.contains("invalid oracle signature"),
+            "refusal must name the signature: {err}"
+        );
+        assert!(s.feeds.is_empty());
+        assert!(!s.breaker_tripped);
     }
 }

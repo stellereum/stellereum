@@ -29,6 +29,9 @@ use stellereum::consensus::{
 use stellereum::consensus_net::{ConsensusMsg, MAX_BATCH_BYTES, MAX_BATCH_ITEMS};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 /// Per-input wall-clock budget. Anything slower than this on a sub-32 MiB
 /// input is unbounded work (allocation or loop) on peer-controlled bytes, not
 /// legitimate parsing.
@@ -109,14 +112,15 @@ fn keypair_at(i: u64) -> SigningKey {
 /// Header layout: `[0..4]` = enum variant tag (u32 LE, `Batch` = 3),
 /// `[4..12]` = Vec item count (u64 LE).
 fn valid_batch_bytes() -> Vec<u8> {
-    let sk = keypair_at(0);
+    let (ks, fks) = falcon_votes::falcon_set(1);
+    let (sk, fk) = (&ks[0], &fks[0]);
     let items = vec![
         ConsensusMsg::Vote {
-            vote: Vote::sign(&sk, 7, 0, VoteKind::Prevote, Some([1u8; 32])),
+            vote: falcon_votes::fvote(sk, fk, 7, 0, VoteKind::Prevote, Some([1u8; 32])),
             locked: None,
         },
         ConsensusMsg::Vote {
-            vote: Vote::sign(&sk, 7, 0, VoteKind::Precommit, Some([1u8; 32])),
+            vote: falcon_votes::fvote(sk, fk, 7, 0, VoteKind::Precommit, Some([1u8; 32])),
             locked: Some([2u8; 32]),
         },
         ConsensusMsg::Proposal {
@@ -387,9 +391,9 @@ fn batch_huge_declared_counts_fail_closed_fast() {
 
 #[test]
 fn nested_batches_fail_closed_at_every_depth() {
-    let sk = keypair_at(1);
+    let (nks, nfks) = falcon_votes::falcon_set(1);
     let one = ConsensusMsg::Vote {
-        vote: Vote::sign(&sk, 1, 0, VoteKind::Prevote, None),
+        vote: falcon_votes::fvote(&nks[0], &nfks[0], 1, 0, VoteKind::Prevote, None),
         locked: None,
     };
 
@@ -452,14 +456,19 @@ fn nested_batches_fail_closed_at_every_depth() {
 
 /// `n` validators (power 1 each) + a QC with one honest precommit signature
 /// from each.
+///
+/// FULL-PQ: the hand-assembled shape carries NO PQ envelope, so it is
+/// unconditionally invalid (fail-closed) — exactly the attacker's position.
+/// Every test using this fixture asserts refusal. The two tests that need a
+/// VERIFYING quorum use `qc_fixture_verified` below.
 fn qc_fixture(n: u64) -> (ValidatorSet, QuorumCertificate) {
     let hash = [7u8; 32];
+    let (ks, fks) = falcon_votes::falcon_set(n as usize);
     let mut set = ValidatorSet::new();
     let mut sigs = Vec::new();
-    for i in 0..n {
-        let sk = keypair_at(i);
+    for (sk, fk) in ks.iter().zip(fks.iter()) {
         set.add(sk.verifying_key().to_bytes(), 1);
-        let v = Vote::sign(&sk, 10, 0, VoteKind::Precommit, Some(hash));
+        let v = falcon_votes::fvote(sk, fk, 10, 0, VoteKind::Precommit, Some(hash));
         sigs.push((v.voter, v.signature));
     }
     let qc = QuorumCertificate {
@@ -469,6 +478,36 @@ fn qc_fixture(n: u64) -> (ValidatorSet, QuorumCertificate) {
         block_hash: Some(hash),
         signatures: sigs,
     };
+    (set, qc)
+}
+
+/// `n` validators (power 1 each) + a genuinely VERIFYING precommit QC over
+/// the same fixture hash, compiled by the production committee path
+/// (`VoteSet::certificate`) and bound to a fixed fixture parent.
+fn qc_fixture_verified(n: u64) -> (ValidatorSet, QuorumCertificate) {
+    use stellereum::consensus::VoteSet;
+    let hash = [7u8; 32];
+    let parent = [0xAAu8; 32];
+    let (ks, fks) = falcon_votes::falcon_set(n as usize);
+    let mut set = ValidatorSet::new();
+    for k in ks.iter() {
+        set.add(k.verifying_key().to_bytes(), 1);
+    }
+    let mut votes = VoteSet::new();
+    for (sk, fk) in ks.iter().zip(fks.iter()) {
+        votes
+            .add(
+                falcon_votes::fvote(sk, fk, 10, 0, VoteKind::Precommit, Some(hash)),
+                &set,
+                10,
+                0,
+                VoteKind::Precommit,
+            )
+            .expect("genuine vote admits");
+    }
+    let qc = votes
+        .certificate(Some(hash), &set, &parent)
+        .expect("n-of-n reaches quorum");
     (set, qc)
 }
 
@@ -579,6 +618,8 @@ fn qc_verify_mismatched_and_malformed_signatures_false() {
     let (set, mut qc) = qc_fixture(4);
 
     // (a) Voters that are not in the validator set (even with valid sigs).
+    // NEGATIVE-PATH (forgery): non-member Ed-only votes stay unconditionally
+    // invalid under FULL-PQ — do not convert.
     let mut foreign = qc.clone();
     foreign.signatures = (0..4u64)
         .map(|i| {
@@ -677,28 +718,51 @@ fn qc_verify_mismatched_and_malformed_signatures_false() {
 
 #[test]
 fn qc_verify_accepts_true_quorum_and_survives_single_bad_sig() {
-    let (set, qc) = qc_fixture(4);
+    let (set, qc) = qc_fixture_verified(4);
     let t = Instant::now();
     assert!(
         qc.verify(&set),
         "4/4 honest precommits must verify (quorum = 3)"
     );
 
-    // One corrupted signature: batch verify fails, slow path must still count
-    // the 3 good ones and accept (an attacker must not be able to break a real
-    // quorum by appending one bad signature).
+    // One corrupted CLASSICAL entry: the Ed list is vestigial under FULL-PQ
+    // (the µQC envelope carries the quorum), so classical-list garbage must
+    // not break a real quorum.
     let mut one_bad = qc.clone();
     one_bad.signatures[2].1[0] ^= 0x01;
     assert!(
         one_bad.verify(&set),
-        "3/4 valid must still reach quorum (slow path)"
+        "envelope intact: classical garbage must not break quorum"
     );
 
-    // Two corrupted: 2 < 3 -> false.
+    // Two corrupted classical entries: same — the envelope decides, so the
+    // QC still verifies. Below-quorum is now a property of the ENVELOPE.
     let mut two_bad = qc.clone();
     two_bad.signatures[2].1[0] ^= 0x01;
     two_bad.signatures[3].1[0] ^= 0x01;
-    assert!(!two_bad.verify(&set), "2/4 valid must not reach quorum");
+    assert!(
+        two_bad.verify(&set),
+        "classical entries are vestigial: the intact envelope still carries quorum"
+    );
+
+    // Corrupting the ENVELOPE itself fails closed: flip a byte in the marker
+    // payload and the QC must not verify (no classical fallback under
+    // FULL-PQ).
+    let mut bad_env = qc.clone();
+    let marker = bad_env
+        .signatures
+        .iter_mut()
+        .find(|(id, _)| {
+            *id == stellereum::consensus::PQ_UQC_MARKER_ID
+                || *id == stellereum::consensus::PQ_QC_MARKER_ID
+        })
+        .expect("enveloped fixture must carry a PQ marker entry");
+    let last = marker.1.len() - 1;
+    marker.1[last] ^= 0x01;
+    assert!(
+        !bad_env.verify(&set),
+        "a corrupted PQ envelope must fail closed"
+    );
 
     let dt = t.elapsed();
     assert!(dt < Duration::from_secs(1), "QC verify battery took {dt:?}");
@@ -775,7 +839,7 @@ fn vote_sign_bytes_is_deterministic_and_field_injective() {
 fn block_precommit_qc_roundtrip_and_old_format_assumptions() {
     // --- Roundtrip: a finalized block carries its QC through encode/decode
     // byte-for-byte (Block is consensus state: the encoding must be canonical).
-    let (set, qc) = qc_fixture(4);
+    let (set, qc) = qc_fixture_verified(4);
     assert!(qc.verify(&set), "fixture QC must be a real quorum");
     let mut block = sample_block();
     block.precommit_qc = Some(qc.clone());

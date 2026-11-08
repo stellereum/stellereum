@@ -44,11 +44,14 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use stellereum::consensus::{QuorumCertificate, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind, VoteSet};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::svm::OpCode;
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 const BOND: u64 = MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER;
 const TS: u64 = 1_760_000_000;
@@ -81,27 +84,42 @@ async fn four_member_engine(keys: &[SigningKey]) -> InMemoryStateEngine {
     engine
 }
 
-/// A genuine precommit QC for `height` over `hash`, signed by `signers`.
+/// A genuine precommit QC for `height` over `hash`, signed by `signers`,
+/// compiled by the production committee path and bound to the block's real
+/// parent (the adopt/attribution paths check the binding).
 fn genuine_qc(
     keys: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
     signers: &[usize],
     height: u64,
     hash: [u8; 32],
+    parent: &[u8; 32],
 ) -> QuorumCertificate {
-    let signatures = signers
-        .iter()
-        .map(|&i| {
-            let v = Vote::sign(&keys[i], height, 0, VoteKind::Precommit, Some(hash));
-            (v.voter, v.signature)
-        })
-        .collect();
-    QuorumCertificate {
-        height,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(hash),
-        signatures,
+    let vs = ValidatorSet::from_list(
+        keys.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    );
+    let mut set = VoteSet::new();
+    for &i in signers {
+        set.add(
+            falcon_votes::fvote(
+                &keys[i],
+                &fks[i],
+                height,
+                0,
+                VoteKind::Precommit,
+                Some(hash),
+            ),
+            &vs,
+            height,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
     }
+    set.certificate(Some(hash), &vs, parent)
+        .expect("3-of-4 reaches quorum")
 }
 
 fn block_h2_with_bond(
@@ -133,7 +151,7 @@ fn block_h2_with_bond(
 /// evidence is judged by.
 #[tokio::test]
 async fn bond_in_block_does_not_raise_the_quorum_under_parent_evidence() {
-    let keys: Vec<SigningKey> = (0..4).map(|_| SigningKey::generate(&mut OsRng)).collect();
+    let (keys, fks) = falcon_votes::falcon_set(4);
     let engine = four_member_engine(&keys).await;
     let (a, b, c, d) = (
         id_of(&keys[0]),
@@ -145,7 +163,8 @@ async fn bond_in_block_does_not_raise_the_quorum_under_parent_evidence() {
     // The H-1 evidence: A, B, C signed; D missed. Genuine quorum of the
     // 4-member set (3 of 4 by headcount AND by power: 3*B >= floor(8*B/3)+1).
     let evidence_hash = [0xAA; 32];
-    let qc = genuine_qc(&keys, &[0, 1, 2], 1, evidence_hash);
+    // Parent binds to the block that will carry this QC as `last_qc`.
+    let qc = genuine_qc(&keys, &fks, &[0, 1, 2], 1, evidence_hash, &[0x11; 32]);
     assert!(
         qc.verify(&engine.staking_read().await.to_validator_set()),
         "precondition: the evidence must verify under the pre-transition set"
@@ -186,7 +205,7 @@ async fn bond_in_block_does_not_raise_the_quorum_under_parent_evidence() {
         "the bond transaction must have joined the set"
     );
     assert!(
-        !genuine_qc(&keys, &[0, 1, 2], 1, evidence_hash).verify(&post),
+        !genuine_qc(&keys, &fks, &[0, 1, 2], 1, evidence_hash, &[0x11; 32]).verify(&post),
         "precondition: the same signatures must be a sub-quorum of the post-transition set"
     );
 
@@ -223,7 +242,7 @@ async fn bond_in_block_does_not_raise_the_quorum_under_parent_evidence() {
 /// explicit one is the boundary-correct one.
 #[tokio::test]
 async fn explicit_set_oracle_differs_from_the_live_oracle_at_a_rotation() {
-    let keys: Vec<SigningKey> = (0..4).map(|_| SigningKey::generate(&mut OsRng)).collect();
+    let (keys, fks) = falcon_votes::falcon_set(4);
     let (a, _b, _c, d) = (
         id_of(&keys[0]),
         id_of(&keys[1]),
@@ -231,7 +250,9 @@ async fn explicit_set_oracle_differs_from_the_live_oracle_at_a_rotation() {
         id_of(&keys[3]),
     );
     let evidence_hash = [0xBB; 32];
-    let qc = genuine_qc(&keys, &[0, 1, 2], 7, evidence_hash);
+    // Fixture-only parent: this evidence is judged directly by the oracle,
+    // never carried in a block, so no chain parent exists to bind.
+    let qc = genuine_qc(&keys, &fks, &[0, 1, 2], 7, evidence_hash, &[0u8; 32]);
 
     // Half 1: the pre-rotation oracle attributes.
     let engine1 = four_member_engine(&keys).await;

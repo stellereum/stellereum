@@ -19,9 +19,26 @@
 
 use ed25519_dalek::SigningKey;
 use stellereum::consensus::{
-    consensus_quorum_min, BlockHash, HeightConsensus, QuorumCertificate, ValidatorId,
-    ValidatorSet, Vote, VoteKind, VoteSet, PQ_QC_MARKER_ID, PQ_UQC_MARKER_ID,
+    consensus_quorum_min, register_validator_pq_key, BlockHash, HeightConsensus,
+    QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind, VoteSet, PQ_QC_MARKER_ID,
+    PQ_UQC_MARKER_ID,
 };
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
+
+/// FULL-PQ fixture voter: the Falcon half for an Ed key, registered under the
+/// voter id (the same pattern as `tests/support/falcon_votes.rs`). A pure
+/// function of the key bytes, so parallel tests sharing the process-global PQ
+/// registry cannot collide: the same key always maps to the same Falcon key
+/// and re-registration is idempotent.
+fn fk_for(key: &SigningKey) -> FalconKeypair {
+    let fk = FalconKeypair::generate_from_seed(key.to_bytes()[0]);
+    register_validator_pq_key(
+        key.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+    fk
+}
 
 fn signing_key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -49,7 +66,11 @@ fn prevote(
     round: u32,
     target: Option<BlockHash>,
 ) -> Vote {
-    Vote::sign(key, height, round, VoteKind::Prevote, target)
+    // FULL-PQ: votes verify Falcon-only (`Vote::verify` rejects Ed-only
+    // votes), so every fixture vote carries the registered Falcon half.
+    // `fk_for` is a pure function of the key, so call sites are unchanged.
+    let fk = fk_for(key);
+    Vote::sign_with_falcon(key, &fk, height, round, VoteKind::Prevote, target)
 }
 
 fn precommit(
@@ -58,7 +79,8 @@ fn precommit(
     round: u32,
     target: Option<BlockHash>,
 ) -> Vote {
-    Vote::sign(key, height, round, VoteKind::Precommit, target)
+    let fk = fk_for(key);
+    Vote::sign_with_falcon(key, &fk, height, round, VoteKind::Precommit, target)
 }
 
 /// Fill `set` with prevotes for `target` from the first `count` keys.
@@ -234,7 +256,10 @@ fn headcount_majority_without_power_is_refused() {
     };
     assert!(!hand_qc.verify(&vs), "3 light signers must not verify at power 3 of 5");
     assert!(!vs.qc_meets_quorum(&hand_qc));
-    assert_eq!(vs.qc_signed_power(&hand_qc), 3);
+    // FULL-PQ: attribution mirrors verification exactly (`signers_set`
+    // names only µQC/epoch-envelope signers), so inert classical legs
+    // contribute zero power — the pair is refused together as (false, 0).
+    assert_eq!(vs.qc_signed_power(&hand_qc), 0);
 
     // Heavy + two lights = power 5: same signer count class, different power.
     let mut enough = VoteSet::new();
@@ -564,7 +589,9 @@ fn sub_quorum_qc_fails_both_gates_together() {
         block_hash: Some(block_hash(1)),
         signatures: three_lights_signatures(&ks[..2], 1, 0, Some(block_hash(1))),
     };
-    assert_eq!(vs.qc_signed_power(&qc), 2);
+    // FULL-PQ: the hand-built classical legs are inert (see above), so a
+    // sub-quorum classical shape carries no power and both gates refuse.
+    assert_eq!(vs.qc_signed_power(&qc), 0);
     assert!(!qc.verify(&vs));
     assert!(!vs.qc_meets_quorum(&qc));
 }
@@ -574,13 +601,29 @@ fn sub_quorum_qc_fails_both_gates_together() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn classical_qc_carries_no_envelopes_by_default() {
+fn assembled_qc_carries_exactly_one_uqc_envelope() {
+    // FULL-PQ assembly shape (replaces the deleted classical-only shape):
+    // `VoteSet::certificate` keeps the bare-Ed25519 legs (audit trail) and
+    // attaches exactly one Falcon-512 µQC envelope, which is what `verify`
+    // and power accounting read — the classical legs alone verify nothing.
     let (_, _, qc) = assembled_prevote_qc();
-    for (voter, _) in &qc.signatures {
-        assert_ne!(*voter, PQ_UQC_MARKER_ID, "no µQC envelope expected");
-        assert_ne!(*voter, PQ_QC_MARKER_ID, "no CEC envelope expected");
-    }
-    assert_eq!(qc.signatures.len(), 3);
+    let markers = qc
+        .signatures
+        .iter()
+        .filter(|(v, _)| *v == PQ_UQC_MARKER_ID)
+        .count();
+    let legs = qc
+        .signatures
+        .iter()
+        .filter(|(v, _)| *v != PQ_UQC_MARKER_ID && *v != PQ_QC_MARKER_ID)
+        .count();
+    assert_eq!(markers, 1, "exactly one µQC envelope expected");
+    assert_eq!(legs, 3, "the 3 classical legs are retained, got {legs}");
+    assert_eq!(qc.signatures.len(), 4);
+    assert!(
+        qc.pq_micro_certificate().is_some(),
+        "the marker entry must decode as a µQC envelope"
+    );
 }
 
 #[test]
@@ -594,7 +637,7 @@ fn garbage_envelope_markers_contribute_zero_power() {
     let mut forged = qc.clone();
     forged.signatures.push((PQ_UQC_MARKER_ID, vec![0u8; 32]));
     forged.signatures.push((PQ_QC_MARKER_ID, vec![0u8; 64]));
-    assert!(forged.verify(&vs), "garbage markers must not break the classical quorum");
+    assert!(forged.verify(&vs), "garbage markers must not break the µQC quorum");
     assert_eq!(
         vs.qc_signed_power(&forged),
         honest_power,

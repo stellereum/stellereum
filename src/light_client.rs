@@ -2105,6 +2105,174 @@ fn decode_balance_nonce(value: &[u8]) -> (u64, u64) {
     (u64::from_be_bytes(balance), u64::from_be_bytes(nonce))
 }
 
+// ============================================================================
+// Sampled QC verification (gated-OFF policy fns; no live caller yet)
+// ============================================================================
+//
+// A light client that cannot afford all `k` signature checks verifies a
+// random `s`-of-`k` subset instead. Papers `11_pq_phase3.md` §A proves what
+// this buys and — more importantly — what it does NOT:
+//
+// * exact detection: `P_det = 1 − C(k−e,s)/C(k,s)` for `e` bad signatures;
+//   worst case `e=1` gives `P_det = s/k`, so `s = k` (the FULL sample) is the
+//   only way to CERTAINTY — sampling is probabilistic evidence, never a
+//   finality proof on its own;
+// * economic soundness: with block value `V` and slashable bond `B`, a
+//   rational attacker ships a bad QC only if `(1−P_det)·V − P_det·B > 0`, so
+//   sampling is sound only behind the bond gate `B > V·(1−P_det)/P_det`
+//   (worst case `e=1`: `B· s > V·(k−s)`), enforced fail-closed below.
+//
+// These are PURE policy functions over DETERMINISTIC inputs only: the caller
+// passes the beacon bytes, the per-member verdicts, the bond and the value.
+// Nothing here samples randomness, reads the clock, or touches the network.
+//
+// # ⛔ UNPREDICTABLE-CHALLENGE REQUIREMENT (read before wiring this in)
+//
+// The challenge MUST be unpredictable to the QC prover at commit time: the
+// beacon must be revealed (or fixed) only AFTER the QC's member set is
+// committed, and the verifier must re-derive the challenge itself from the
+// beacon via [`sampling_challenge_indices`] — never accept an index list the
+// prover hands it. A prover that predicts the challenge plants its `e` faults
+// exactly outside the sample and `P_det` collapses to 0 no matter how large
+// `s` is. Likewise, sampling WITHOUT the bond gate ([`sampled_qc_verify`]
+// refuses when [`sampling_bond_sufficient`] fails) is not sound: detection
+// below certainty must be backed by a slashable bond plus a fraud proof,
+// never by the sample alone.
+
+/// Domain separator of the sampling challenge draw.
+pub const SAMPLING_CHALLENGE_DOMAIN: &str = "STELL_SAMPLING_CHALLENGE_V1";
+
+/// Deterministic `s`-of-`k` challenge: the sorted indices a verifier must
+/// check, derived as `BLAKE3("STELL_SAMPLING_CHALLENGE_V1" || beacon ||
+/// height || draw)` with a partial Fisher–Yates shuffle.
+///
+/// Pure and deterministic: same `(beacon, height, k, s)` → same indices on
+/// every node. Empty (fail-closed shape) when `k == 0`, `s == 0`, or
+/// `s > k` — the caller ([`sampled_qc_verify`]) refuses those before asking.
+pub fn sampling_challenge_indices(
+    beacon: &[u8; 32],
+    height: u64,
+    k: usize,
+    s: usize,
+) -> Vec<usize> {
+    if k == 0 || s == 0 || s > k {
+        return Vec::new();
+    }
+    let mut idx: Vec<usize> = (0..k).collect();
+    for draw in 0..s {
+        let mut hasher = blake3::Hasher::new_derive_key(SAMPLING_CHALLENGE_DOMAIN);
+        hasher.update(beacon);
+        hasher.update(&height.to_le_bytes());
+        hasher.update(&(draw as u64).to_le_bytes());
+        let hash = hasher.finalize();
+        let rand_val = u64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap());
+        let remaining = k - draw;
+        #[allow(clippy::cast_possible_truncation)]
+        // GATE: `remaining <= k <= usize::MAX` on every live shape; the modulo
+        // lands in `[0, remaining)` by construction, so the truncation is exact.
+        let offset = (rand_val % remaining as u64) as usize;
+        idx.swap(draw, draw + offset);
+    }
+    idx.truncate(s);
+    idx.sort_unstable();
+    idx
+}
+
+/// Worst-case (`e=1`) detection probability `P_det = s/k`.
+///
+/// Degenerate shapes (`k == 0`, `s == 0`) report `0.0` (nothing is detected);
+/// `s >= k` reports `1.0` (the full sample is certain). Exact rational form:
+/// with one bad signature the miss is `C(k−1,s)/C(k,s) = (k−s)/k`.
+pub fn sampling_detection_prob_e1(s: usize, k: usize) -> f64 {
+    if k == 0 || s == 0 {
+        return 0.0;
+    }
+    (s.min(k) as f64) / (k as f64)
+}
+
+/// Bond gate: `true` iff the slashable bond `B` makes a bad QC unprofitable
+/// behind an `s`-of-`k` sample at block value `V`, worst case `e=1`
+/// (`P_det = s/k`, papers `11_pq_phase3.md` §A.2):
+///
+/// ```text
+/// B > V·(1 − P_det)/P_det   ⟺   B·s > V·(k−s)      (integer, strict)
+/// ```
+///
+/// Fail-closed: `k == 0`, `s == 0`, or `s > k` return `false` (no sample, no
+/// soundness). `V == 0` returns `true` (nothing at stake needs no bond), and
+/// the FULL sample (`s >= k`) returns `true` at any bond — detection is
+/// certain, so there is nothing for the bond to deter. `u128` arithmetic: no
+/// overflow at any `u64` input.
+pub fn sampling_bond_sufficient(bond: u64, value: u64, s: usize, k: usize) -> bool {
+    if k == 0 || s == 0 || s > k {
+        return false;
+    }
+    if value == 0 {
+        return true;
+    }
+    if s >= k {
+        return true;
+    }
+    (bond as u128) * (s as u128) > (value as u128) * ((k - s) as u128)
+}
+
+/// Verify an `s`-of-`k` sample of a QC: the bond gate first, then exactly the
+/// beacon-derived challenge.
+///
+/// * `validity[i]` is the INDEPENDENTLY VERIFIED verdict for member `i`
+///   (`true` = that member's signature verified under the set in force) —
+///   wiring must feed genuine per-signature verdicts here, never
+///   self-reported bits: a prover-chosen verdict vector passes trivially.
+/// * the challenge is re-derived inside via [`sampling_challenge_indices`]
+///   from `(beacon, height)` — the caller passes the beacon, never an index
+///   list (see the unpredictable-challenge requirement above).
+/// * the bond gate ([`sampling_bond_sufficient`]) runs BEFORE any verdict is
+///   read: an under-bonded sample is refused even when every member verifies
+///   (fail-closed; without the gate the sample proves nothing — §A.2).
+///
+/// Full-sample equivalence: at `s == k` the challenge is every index, so this
+/// is exactly full verification (and the bond gate is vacuous — certain
+/// detection needs no bond). Every refusal names its reason.
+pub fn sampled_qc_verify(
+    validity: &[bool],
+    beacon: &[u8; 32],
+    height: u64,
+    s: usize,
+    bond: u64,
+    value: u64,
+) -> Result<(), String> {
+    let k = validity.len();
+    if k == 0 {
+        return Err("sampled QC verify: empty member set: refusing".to_string());
+    }
+    if s == 0 {
+        return Err("sampled QC verify: empty sample (s=0) detects nothing: refusing".to_string());
+    }
+    if s > k {
+        return Err(format!(
+            "sampled QC verify: sample {s} exceeds member count {k}: refusing"
+        ));
+    }
+    if !sampling_bond_sufficient(bond, value, s, k) {
+        return Err(format!(
+            "sampled QC verify: bond {bond} insufficient for value {value} at s={s}/k={k}: \
+             sampling without a sufficient bond is unsound (B·s > V·(k−s) required): refusing"
+        ));
+    }
+    let challenge = sampling_challenge_indices(beacon, height, k, s);
+    if challenge.len() != s {
+        return Err("sampled QC verify: challenge derivation failed: refusing".to_string());
+    }
+    for &i in &challenge {
+        if !validity[i] {
+            return Err(format!(
+                "sampled QC verify: sampled member {i} failed verification: refusing"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2846,5 +3014,162 @@ mod tests {
         let mut draft = answer.clone();
         draft["finalized"] = serde_json::json!(false);
         assert!(Checkpoint::from_historical_root_json(&draft).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Sampled QC verification (papers/11_pq_phase3.md §A)
+    // ------------------------------------------------------------------
+
+    /// The challenge is deterministic (same inputs, same indices), well
+    /// formed (sorted, distinct, in range), and degenerate shapes fail
+    /// closed (empty challenge).
+    #[test]
+    fn sampling_challenge_is_deterministic_and_well_formed() {
+        let beacon = [0x5Au8; 32];
+        let a = sampling_challenge_indices(&beacon, 9, 64, 16);
+        let b = sampling_challenge_indices(&beacon, 9, 64, 16);
+        assert_eq!(a, b, "the challenge must be deterministic");
+        assert_eq!(a.len(), 16);
+        let mut sorted = a.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 16, "challenge indices must be distinct");
+        assert_eq!(a, sorted, "challenge indices must come out sorted");
+        assert!(
+            a.iter().all(|&i| i < 64),
+            "challenge indices must be in range"
+        );
+
+        // A different beacon re-draws (at least one index differs over a few
+        // heights — same non-flaky pattern as the sortition parent-hash pin).
+        let other = [0xA5u8; 32];
+        let mut differs = false;
+        for height in 0..8u64 {
+            if sampling_challenge_indices(&beacon, height, 64, 16)
+                != sampling_challenge_indices(&other, height, 64, 16)
+            {
+                differs = true;
+                break;
+            }
+        }
+        assert!(differs, "changing the beacon must re-draw the challenge");
+
+        // Degenerate shapes fail closed.
+        assert!(sampling_challenge_indices(&beacon, 9, 0, 0).is_empty());
+        assert!(sampling_challenge_indices(&beacon, 9, 64, 0).is_empty());
+        assert!(sampling_challenge_indices(&beacon, 9, 64, 65).is_empty());
+        // The full sample challenges every index.
+        assert_eq!(
+            sampling_challenge_indices(&beacon, 9, 8, 8),
+            (0..8usize).collect::<Vec<_>>()
+        );
+    }
+
+    /// Bond-gate pins (`B·s > V·(k−s)`, strict; worst case `e=1`):
+    /// `k=64, s=32` needs `B > V`; `k=64, s=16` needs `B > 3V`; the full
+    /// sample needs no bond; degenerate shapes refuse.
+    #[test]
+    fn sampling_bond_gate_enforces_the_economic_bound() {
+        // k=64, s=32: P_det=1/2, B > V.
+        assert!(!sampling_bond_sufficient(1_000, 1_000, 32, 64));
+        assert!(sampling_bond_sufficient(1_001, 1_000, 32, 64));
+        // k=64, s=16: P_det=1/4, B > 3V.
+        assert!(!sampling_bond_sufficient(3_000, 1_000, 16, 64));
+        assert!(sampling_bond_sufficient(3_001, 1_000, 16, 64));
+        // Pinned table row (papers/11 §A.2): k=1024, s=128 needs B > 7V.
+        assert!(!sampling_bond_sufficient(7_000, 1_000, 128, 1024));
+        assert!(sampling_bond_sufficient(7_001, 1_000, 128, 1024));
+        // Full sample: certain detection, bond vacuous (even zero bond).
+        assert!(sampling_bond_sufficient(0, 1_000, 64, 64));
+        assert!(sampling_bond_sufficient(0, u64::MAX, 64, 64));
+        // Nothing at stake needs no bond.
+        assert!(sampling_bond_sufficient(0, 0, 16, 64));
+        // Degenerate shapes refuse, however large the bond.
+        assert!(!sampling_bond_sufficient(u64::MAX, 0, 0, 64));
+        assert!(!sampling_bond_sufficient(u64::MAX, 0, 16, 0));
+        assert!(!sampling_bond_sufficient(u64::MAX, 0, 65, 64));
+        // Detection-probability helper agrees with the gate's P_det.
+        assert_eq!(sampling_detection_prob_e1(32, 64), 0.5);
+        assert_eq!(sampling_detection_prob_e1(16, 64), 0.25);
+        assert_eq!(sampling_detection_prob_e1(64, 64), 1.0);
+        assert_eq!(sampling_detection_prob_e1(0, 64), 0.0);
+    }
+
+    /// Full-sample ≡ full verification: at `s == k` the verifier accepts
+    /// iff EVERY member verifies (one planted fault refuses), with zero bond.
+    #[test]
+    fn sampled_qc_verify_full_sample_is_full_verify() {
+        let beacon = [0x5Au8; 32];
+        let all_good = vec![true; 8];
+        assert!(
+            sampled_qc_verify(&all_good, &beacon, 3, 8, 0, 1_000).is_ok(),
+            "full sample of an all-valid set must verify (bond vacuous)"
+        );
+        let mut one_bad = vec![true; 8];
+        one_bad[5] = false;
+        assert!(
+            sampled_qc_verify(&one_bad, &beacon, 3, 8, 0, 1_000).is_err(),
+            "full sample must catch the single fault (P_det=1)"
+        );
+        // Degenerate inputs refuse, even all-valid.
+        assert!(sampled_qc_verify(&[], &beacon, 3, 0, 0, 0).is_err());
+        assert!(sampled_qc_verify(&all_good, &beacon, 3, 0, u64::MAX, 0).is_err());
+        assert!(sampled_qc_verify(&all_good, &beacon, 3, 9, u64::MAX, 0).is_err());
+    }
+
+    /// Partial sample + sufficient bond passes over an all-valid set, while
+    /// the SAME sample with an insufficient bond is refused BEFORE any
+    /// verdict is read (fail-closed economics, not signature luck).
+    #[test]
+    fn sampled_qc_verify_partial_sample_needs_its_bond() {
+        let beacon = [0x5Au8; 32];
+        let validity = vec![true; 64];
+        // k=64, s=16, V=1_000: sufficient bond is B > 3_000.
+        assert!(
+            sampled_qc_verify(&validity, &beacon, 3, 16, 3_001, 1_000).is_ok(),
+            "partial sample + sufficient bond over valid members must pass"
+        );
+        assert!(
+            sampled_qc_verify(&validity, &beacon, 3, 16, 3_000, 1_000).is_err(),
+            "the SAME valid sample with an insufficient bond must be refused"
+        );
+    }
+
+    /// Sampling semantics: a fault OUTSIDE the drawn challenge passes (the
+    /// sample cannot see it — which is exactly why the bond gate exists),
+    /// while a fault INSIDE the challenge refuses.
+    #[test]
+    fn sampled_qc_verify_catches_only_sampled_faults() {
+        // Find a beacon whose s=8 challenge over k=64 avoids at least one
+        // index (deterministic search: same code, same beacon, every run).
+        let mut avoided: Option<([u8; 32], usize)> = None;
+        for tag in 0..64u8 {
+            let mut beacon = [0x5Au8; 32];
+            beacon[0] = tag;
+            let challenge = sampling_challenge_indices(&beacon, 3, 64, 8);
+            assert_eq!(challenge.len(), 8);
+            if let Some(missed) = (0..64usize).find(|i| !challenge.contains(i)) {
+                avoided = Some((beacon, missed));
+                break;
+            }
+        }
+        let (beacon, missed) = avoided.expect("some beacon must leave an index unsampled");
+        let challenge = sampling_challenge_indices(&beacon, 3, 64, 8);
+        assert!(!challenge.contains(&missed));
+
+        // Fault outside the sample + sufficient bond: passes (bond covers it).
+        let mut outside = vec![true; 64];
+        outside[missed] = false;
+        assert!(
+            sampled_qc_verify(&outside, &beacon, 3, 8, 8_000, 1_000).is_ok(),
+            "a fault outside the challenge is invisible to the sample"
+        );
+        // Fault inside the sample: refuses.
+        let mut inside = vec![true; 64];
+        inside[challenge[0]] = false;
+        assert!(
+            sampled_qc_verify(&inside, &beacon, 3, 8, 8_000, 1_000).is_err(),
+            "a fault inside the challenge must be caught"
+        );
     }
 }

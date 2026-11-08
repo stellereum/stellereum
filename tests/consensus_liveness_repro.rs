@@ -54,6 +54,9 @@ use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction};
 use stellereum::state_engine::InMemoryStateEngine;
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 /// The production consensus tick is 100 ms.
 const TICK_MS: u64 = 100;
 
@@ -206,6 +209,25 @@ impl Sim {
     ) -> Sim {
         let n = powers.len();
         let ks: Vec<SigningKey> = keys(n);
+        // FULL-PQ: every runtime carries its Falcon keypair (mirrors
+        // `Cluster::new`), otherwise `make_prevote`/`make_precommit` mint
+        // Ed-only votes `Vote::verify` refuses.
+        let fks: Vec<stellereum::post_quantum::FalconKeypair> = {
+            use stellereum::consensus::register_validator_pq_key;
+            use stellereum::post_quantum::{FalconKeypair, PqScheme};
+            ks.iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let fk = FalconKeypair::generate_from_seed(0xF0 + i as u8);
+                    register_validator_pq_key(
+                        k.verifying_key().to_bytes(),
+                        PqScheme::Falcon512,
+                        fk.public_key.clone(),
+                    );
+                    fk
+                })
+                .collect()
+        };
         let vset = ValidatorSet::from_list(
             ks.iter()
                 .zip(powers.iter())
@@ -218,7 +240,8 @@ impl Sim {
             // mutable state in reality).
             let state = Arc::new(InMemoryStateEngine::new());
             fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-            let rt = ValidatorRuntime::new(ks[i].clone(), vset.clone(), state, 1);
+            let rt = ValidatorRuntime::new(ks[i].clone(), vset.clone(), state, 1)
+                .with_falcon_key(fks[i].clone());
             nodes.push(Node {
                 rt,
                 idx: i,
@@ -669,19 +692,19 @@ async fn a_thirty_round_skew_still_converges() {
 /// precommit QC.
 #[tokio::test]
 async fn polka_is_not_masked_by_a_newer_nil_quorum() {
-    let ks = keys(3);
+    let (ks, fks) = falcon_votes::falcon_set(3);
     let vset = live_vset(&ks);
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1);
+    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
+        .with_falcon_key(fks[0].clone());
 
     let block = [0xABu8; 32];
     let polka_round = 0u32;
 
     // Round 0: A and B prevote the block -> 2500 >= 2334 -> a POLKA.
-    for k in ks.iter().take(2) {
-        rt.on_prevote(Vote::sign(
-            k,
+    for (i, k) in ks.iter().enumerate().take(2) {
+        rt.on_prevote(falcon_votes::fvote(k, &fks[i],
             1,
             polka_round,
             VoteKind::Prevote,
@@ -698,8 +721,8 @@ async fn polka_is_not_masked_by_a_newer_nil_quorum() {
     // Round 1: A and B prevote NIL -> also 2500 power -> a NIL quorum in a
     // LATER round than the polka.
     rt.next_round();
-    for k in ks.iter().take(2) {
-        rt.on_prevote(Vote::sign(k, 1, 1, VoteKind::Prevote, None))
+    for (i, k) in ks.iter().enumerate().take(2) {
+        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 1, VoteKind::Prevote, None))
             .unwrap();
     }
     assert_eq!(
@@ -733,20 +756,21 @@ async fn polka_is_not_masked_by_a_newer_nil_quorum() {
 /// different round and a different statement, so it is still owed.
 #[tokio::test]
 async fn a_nil_precommit_does_not_suppress_the_real_one() {
-    let ks = keys(3);
+    let (ks, fks) = falcon_votes::falcon_set(3);
     let vset = live_vset(&ks);
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1);
+    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
+        .with_falcon_key(fks[0].clone());
 
     let block = [0xCDu8; 32];
-    for k in ks.iter().take(2) {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(block)))
+    for (i, k) in ks.iter().enumerate().take(2) {
+        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 0, VoteKind::Prevote, Some(block)))
             .unwrap();
     }
     rt.next_round();
-    for k in ks.iter().take(2) {
-        rt.on_prevote(Vote::sign(k, 1, 1, VoteKind::Prevote, None))
+    for (i, k) in ks.iter().enumerate().take(2) {
+        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 1, VoteKind::Prevote, None))
             .unwrap();
     }
 
@@ -770,20 +794,20 @@ async fn a_nil_precommit_does_not_suppress_the_real_one() {
 /// never precommitted: the chain could not finalize.
 #[tokio::test]
 async fn a_node_ahead_of_the_network_still_precommits_the_network_polka() {
-    let ks = keys(3);
+    let (ks, fks) = falcon_votes::falcon_set(3);
     let vset = live_vset(&ks);
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1);
+    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
+        .with_falcon_key(fks[0].clone());
 
     let network_round = 40u32;
     let block = [0x5Eu8; 32];
 
     // The network forms the polka in ITS round (40): A and B prevote the
     // block, so 1500 + 1000 = 2500 >= 2334.
-    for k in ks.iter().take(2) {
-        rt.on_prevote(Vote::sign(
-            k,
+    for (i, k) in ks.iter().enumerate().take(2) {
+        rt.on_prevote(falcon_votes::fvote(k, &fks[i],
             1,
             network_round,
             VoteKind::Prevote,
@@ -794,9 +818,9 @@ async fn a_node_ahead_of_the_network_still_precommits_the_network_polka() {
     // We learn where the network is (its round), then drift AHEAD of it.
     // `observe_peer_vote` is the pre-existing public entry point for "a
     // verified vote told us where that peer is".
-    let peer_vote = Vote::sign(&ks[1], 1, network_round, VoteKind::Prevote, Some(block));
+    let peer_vote = falcon_votes::fvote(&ks[1], &fks[1], 1, network_round, VoteKind::Prevote, Some(block));
     rt.observe_peer_vote(&peer_vote);
-    let peer_vote2 = Vote::sign(&ks[2], 1, network_round, VoteKind::Prevote, Some(block));
+    let peer_vote2 = falcon_votes::fvote(&ks[2], &fks[2], 1, network_round, VoteKind::Prevote, Some(block));
     rt.observe_peer_vote(&peer_vote2);
     while rt.hc.round < network_round + 30 {
         rt.hc.next_round();
@@ -824,11 +848,12 @@ async fn a_node_ahead_of_the_network_still_precommits_the_network_polka() {
 /// embedder — ran WITHOUT it and could never rejoin the network's round.
 #[tokio::test]
 async fn a_vote_for_a_future_round_advances_us() {
-    let ks = keys(3);
+    let (ks, fks) = falcon_votes::falcon_set(3);
     let vset = live_vset(&ks);
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1);
+    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
+        .with_falcon_key(fks[0].clone());
 
     assert_eq!(rt.hc.round, 0);
     // CORROBORATION GATE (P3-R1 round-DoS fix, see
@@ -843,7 +868,7 @@ async fn a_vote_for_a_future_round_advances_us() {
     // validator for round 25 move us 0 -> 8 and then stall (dedup + gate).
     // Without the future-round rule we would never leave round 0.
     for _ in 0..8 {
-        let v = Vote::sign(&ks[1], 1, 25, VoteKind::Prevote, None);
+        let v = falcon_votes::fvote(&ks[1], &fks[1], 1, 25, VoteKind::Prevote, None);
         let _ = rt.on_prevote(v);
     }
     assert_eq!(
@@ -855,7 +880,7 @@ async fn a_vote_for_a_future_round_advances_us() {
     // evidence (not a replay), so it re-opens the chase and we converge the
     // rest of the way to the network's round.
     for _ in 0..8 {
-        let v = Vote::sign(&ks[2], 1, 25, VoteKind::Prevote, None);
+        let v = falcon_votes::fvote(&ks[2], &fks[2], 1, 25, VoteKind::Prevote, None);
         let _ = rt.on_prevote(v);
     }
     assert_eq!(
@@ -869,16 +894,17 @@ async fn a_vote_for_a_future_round_advances_us() {
 /// self-equivocation, which is slashable evidence).
 #[tokio::test]
 async fn a_vote_for_an_old_round_never_rewinds_us() {
-    let ks = keys(3);
+    let (ks, fks) = falcon_votes::falcon_set(3);
     let vset = live_vset(&ks);
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1);
+    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
+        .with_falcon_key(fks[0].clone());
 
     while rt.hc.round < 50 {
         rt.hc.next_round();
     }
-    let v = Vote::sign(&ks[1], 1, 3, VoteKind::Prevote, None);
+    let v = falcon_votes::fvote(&ks[1], &fks[1], 1, 3, VoteKind::Prevote, None);
     rt.on_prevote(v).unwrap();
     assert_eq!(
         rt.hc.round, 50,
@@ -892,14 +918,15 @@ async fn a_vote_for_an_old_round_never_rewinds_us() {
 /// network (it only ever saw the votes it could not use).
 #[tokio::test]
 async fn every_verified_vote_teaches_us_the_network_round() {
-    let ks = keys(3);
+    let (ks, fks) = falcon_votes::falcon_set(3);
     let vset = live_vset(&ks);
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1);
+    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
+        .with_falcon_key(fks[0].clone());
 
     // An ACCEPTED vote (a plain nil prevote in the current round).
-    let v = Vote::sign(&ks[1], 1, 0, VoteKind::Prevote, None);
+    let v = falcon_votes::fvote(&ks[1], &fks[1], 1, 0, VoteKind::Prevote, None);
     rt.on_prevote(v.clone()).unwrap();
     assert_eq!(
         rt.hc.max_peer_round(),
@@ -909,7 +936,7 @@ async fn every_verified_vote_teaches_us_the_network_round() {
 
     // A vote for a round we cannot use (absurdly far ahead) is still
     // information about where the peer is.
-    let far = Vote::sign(&ks[2], 1, 5_000, VoteKind::Prevote, None);
+    let far = falcon_votes::fvote(&ks[2], &fks[2], 1, 5_000, VoteKind::Prevote, None);
     assert!(rt.on_prevote(far).is_err(), "the far vote must be refused");
     assert_eq!(
         rt.hc.max_peer_round(),
@@ -926,18 +953,19 @@ async fn every_verified_vote_teaches_us_the_network_round() {
 /// must never precommit against its own lock.
 #[tokio::test]
 async fn the_lock_refuses_a_conflicting_precommit() {
-    let ks = keys(3);
+    let (ks, fks) = falcon_votes::falcon_set(3);
     let vset = live_vset(&ks);
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1);
+    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
+        .with_falcon_key(fks[0].clone());
 
     let a = [0x11u8; 32];
     let b = [0x22u8; 32];
 
     // We lock on A at round 10.
-    for k in ks.iter().take(2) {
-        rt.on_prevote(Vote::sign(k, 1, 10, VoteKind::Prevote, Some(a)))
+    for (i, k) in ks.iter().enumerate().take(2) {
+        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 10, VoteKind::Prevote, Some(a)))
             .unwrap();
     }
     let pc = rt
@@ -948,8 +976,8 @@ async fn the_lock_refuses_a_conflicting_precommit() {
 
     // Now a polka for a DIFFERENT block at the SAME round must not make us
     // precommit against our lock.
-    for k in ks.iter().take(2) {
-        let _ = rt.on_prevote(Vote::sign(k, 1, 10, VoteKind::Prevote, Some(b)));
+    for (i, k) in ks.iter().enumerate().take(2) {
+        let _ = rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 10, VoteKind::Prevote, Some(b)));
     }
     // (The vote set keeps the FIRST vote per validator, so the polka for A
     // is still the one in the set: the lock and the polka agree.)
@@ -964,17 +992,18 @@ async fn the_lock_refuses_a_conflicting_precommit() {
 /// (Tendermint's unlock rule): the node must then follow the network.
 #[tokio::test]
 async fn a_higher_round_polka_releases_the_lock() {
-    let ks = keys(3);
+    let (ks, fks) = falcon_votes::falcon_set(3);
     let vset = live_vset(&ks);
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1);
+    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
+        .with_falcon_key(fks[0].clone());
 
     let a = [0x11u8; 32];
     let b = [0x22u8; 32];
 
-    for k in ks.iter().take(2) {
-        rt.on_prevote(Vote::sign(k, 1, 10, VoteKind::Prevote, Some(a)))
+    for (i, k) in ks.iter().enumerate().take(2) {
+        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 10, VoteKind::Prevote, Some(a)))
             .unwrap();
     }
     let _ = rt
@@ -984,8 +1013,8 @@ async fn a_higher_round_polka_releases_the_lock() {
 
     // A polka for B at round 12 (higher): the lock is released and the
     // node follows the network.
-    for k in ks.iter().take(2) {
-        rt.on_prevote(Vote::sign(k, 1, 12, VoteKind::Prevote, Some(b)))
+    for (i, k) in ks.iter().enumerate().take(2) {
+        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 12, VoteKind::Prevote, Some(b)))
             .unwrap();
     }
     let pc = rt
@@ -1001,15 +1030,16 @@ async fn a_higher_round_polka_releases_the_lock() {
 /// would drop its lock on a block finalized in an earlier round).
 #[tokio::test]
 async fn a_nil_quorum_never_unlocks_the_lock() {
-    let ks = keys(3);
+    let (ks, fks) = falcon_votes::falcon_set(3);
     let vset = live_vset(&ks);
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
-    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1);
+    let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), state, 1)
+        .with_falcon_key(fks[0].clone());
 
     let a = [0x11u8; 32];
-    for k in ks.iter().take(2) {
-        rt.on_prevote(Vote::sign(k, 1, 10, VoteKind::Prevote, Some(a)))
+    for (i, k) in ks.iter().enumerate().take(2) {
+        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 10, VoteKind::Prevote, Some(a)))
             .unwrap();
     }
     let _ = rt
@@ -1018,8 +1048,8 @@ async fn a_nil_quorum_never_unlocks_the_lock() {
     assert_eq!(rt.hc.locked, Some((a, 10)));
 
     // A nil quorum in a LATER round must not release the lock.
-    for k in ks.iter().take(2) {
-        rt.on_prevote(Vote::sign(k, 1, 12, VoteKind::Prevote, None))
+    for (i, k) in ks.iter().enumerate().take(2) {
+        rt.on_prevote(falcon_votes::fvote(k, &fks[i], 1, 12, VoteKind::Prevote, None))
             .unwrap();
     }
     let _ = rt.make_precommit();

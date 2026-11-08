@@ -6030,6 +6030,10 @@ impl SharedLiquidityHub {
             return 0;
         }
 
+        // Routing-only check (Q-02): the `trusted` bypass inside
+        // `verify_inclusion` is legitimate HERE (locally produced messages
+        // carry it) but MUST NEVER reach credit — every apply path
+        // re-verifies via strict/anchored/proof checks that ignore the flag.
         if !msg.verify_inclusion() {
             if msg.bounce && !msg.bounced {
                 msg.bounced = true;

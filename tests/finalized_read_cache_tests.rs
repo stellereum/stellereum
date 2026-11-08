@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Instant;
 
-use stellereum::consensus::{QuorumCertificate, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind, VoteSet};
 use stellereum::mempool::{AdmissionCtx, Mempool};
 use stellereum::rpc::{ReceiptIndex, RpcState};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
@@ -31,10 +31,40 @@ use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 static TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-fn test_keys() -> Vec<ed25519_dalek::SigningKey> {
-    (0..4)
-        .map(|i| ed25519_dalek::SigningKey::from_bytes(&[(i as u8) + 1; 32]))
-        .collect()
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
+fn vset(ks: &[ed25519_dalek::SigningKey]) -> ValidatorSet {
+    ValidatorSet::from_list(
+        ks.iter()
+            .map(|k| (k.verifying_key().to_bytes(), 1))
+            .collect(),
+    )
+}
+
+fn qc_for(
+    ks: &[ed25519_dalek::SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    height: u64,
+    hash: [u8; 32],
+    parent: &[u8; 32],
+) -> QuorumCertificate {
+    // Genuine 3-of-4 precommit QC compiled by the production committee path
+    // (`VoteSet::certificate`).
+    let vs = vset(ks);
+    let mut set = VoteSet::new();
+    for i in 0..3 {
+        set.add(
+            falcon_votes::fvote(&ks[i], &fks[i], height, 0, VoteKind::Precommit, Some(hash)),
+            &vs,
+            height,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
+    }
+    set.certificate(Some(hash), &vs, parent)
+        .expect("3-of-4 reaches quorum")
 }
 
 fn test_state(tip: u64) -> Arc<RpcState> {
@@ -63,27 +93,6 @@ fn test_state(tip: u64) -> Arc<RpcState> {
     })
 }
 
-fn qc_for(
-    signers: &[ed25519_dalek::SigningKey],
-    height: u64,
-    hash: [u8; 32],
-) -> QuorumCertificate {
-    let signatures = signers
-        .iter()
-        .map(|k| {
-            let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(hash));
-            (v.voter, v.signature)
-        })
-        .collect();
-    QuorumCertificate {
-        height,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(hash),
-        signatures,
-    }
-}
-
 fn block_hash_of(h: u64, tag: u8) -> [u8; 32] {
     let mut b = [0u8; 32];
     b[..8].copy_from_slice(&h.to_be_bytes());
@@ -93,7 +102,13 @@ fn block_hash_of(h: u64, tag: u8) -> [u8; 32] {
 
 /// Publish height `h` in production order: receipts first, then the block
 /// summary (the order RPC readers depend on), then the finalized header.
-async fn publish_height(st: &Arc<RpcState>, ks: &[ed25519_dalek::SigningKey], h: u64, ntx: u64) {
+async fn publish_height(
+    st: &Arc<RpcState>,
+    ks: &[ed25519_dalek::SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    h: u64,
+    ntx: u64,
+) {
     let bh = block_hash_of(h, 0xB0);
     let mut txs = Vec::new();
     for i in 0..ntx {
@@ -130,7 +145,8 @@ async fn publish_height(st: &Arc<RpcState>, ks: &[ed25519_dalek::SigningKey], h:
         epoch_key_commitment: [0u8; 32],
     };
     let fbh = b.compute_hash();
-    b.precommit_qc = Some(qc_for(&ks[..3], h, fbh));
+    let prev = b.prev_hash;
+    b.precommit_qc = Some(qc_for(ks, fks, h, fbh, &prev));
     st.record_finalized_header(&b).await;
     st.height
         .store(h, std::sync::atomic::Ordering::Relaxed);
@@ -195,7 +211,7 @@ async fn fixed_workload() -> Arc<RpcState> {
         st.record_receipts(h, block_hash_of(h, 0xB0), &txs, &statuses, &fees)
             .await;
     }
-    let ks = test_keys();
+    let (ks, fks) = falcon_votes::falcon_set(4);
     for h in 1024u64..=1152 {
         let mut b = Block {
             shard_id: MASTERCHAIN_SHARD,
@@ -215,7 +231,8 @@ async fn fixed_workload() -> Arc<RpcState> {
             epoch_key_commitment: [0u8; 32],
         };
         let bh = b.compute_hash();
-        b.precommit_qc = Some(qc_for(&ks[..3], h, bh));
+        let prev = b.prev_hash;
+        b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
     }
     st.height
@@ -300,10 +317,10 @@ async fn finalized_read_latency_probe() {
 #[tokio::test]
 async fn finalized_read_cache_soundness_and_invalidation() {
     let _g = TEST_LOCK.lock().await;
-    let ks = test_keys();
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let st = test_state(4000);
     for h in 4000u64..=4010 {
-        publish_height(&st, &ks, h, 3).await;
+        publish_height(&st, &ks, &fks, h, 3).await;
     }
     // Full epoch 40 plus its boundary commitment, then pin the tip there.
     for h in 5120u64..=5248 {
@@ -325,7 +342,8 @@ async fn finalized_read_cache_soundness_and_invalidation() {
             epoch_key_commitment: [0u8; 32],
         };
         let bh = b.compute_hash();
-        b.precommit_qc = Some(qc_for(&ks[..3], h, bh));
+        let prev = b.prev_hash;
+        b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
     }
     st.height
@@ -431,7 +449,7 @@ async fn finalized_read_cache_soundness_and_invalidation() {
     // 4. Height advance invalidates (miss) but serves identical bytes; the
     // new height serves fresh and then caches.
     {
-        publish_height(&st, &ks, 5249, 2).await;
+        publish_height(&st, &ks, &fks, 5249, 2).await;
         let tip = st.height.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(tip, 5249);
         let (l0, h0, m0) = stats();
@@ -622,11 +640,11 @@ async fn finalized_read_cache_live_reads_bypass() {
 #[tokio::test]
 async fn finalized_read_cache_bounded_growth() {
     let _g = TEST_LOCK.lock().await;
-    let ks = test_keys();
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let st = test_state(6000);
     // 100 blocks with 2 receipts each (production order) + 100 block-tx keys.
     for h in 6000u64..6100 {
-        publish_height(&st, &ks, h, 2).await;
+        publish_height(&st, &ks, &fks, h, 2).await;
     }
     // 350 finalized headers -> 350 header keys. Epoch 55 (7040..7167) is
     // fully covered plus its boundary 7168, so one epoch key joins too.
@@ -649,7 +667,8 @@ async fn finalized_read_cache_bounded_growth() {
             epoch_key_commitment: [0u8; 32],
         };
         let bh = b.compute_hash();
-        b.precommit_qc = Some(qc_for(&ks[..3], h, bh));
+        let prev = b.prev_hash;
+        b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
     }
     st.height
@@ -713,10 +732,10 @@ async fn finalized_read_cache_bounded_growth() {
 #[tokio::test]
 async fn finalized_read_cache_before_after() {
     let _g = TEST_LOCK.lock().await;
-    let ks = test_keys();
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let st = test_state(8000);
     for h in 8000u64..=8010 {
-        publish_height(&st, &ks, h, 5).await;
+        publish_height(&st, &ks, &fks, h, 5).await;
     }
     for h in 8192u64..=8320 {
         let mut b = Block {
@@ -737,7 +756,8 @@ async fn finalized_read_cache_before_after() {
             epoch_key_commitment: [0u8; 32],
         };
         let bh = b.compute_hash();
-        b.precommit_qc = Some(qc_for(&ks[..3], h, bh));
+        let prev = b.prev_hash;
+        b.precommit_qc = Some(qc_for(&ks, &fks, h, bh, &prev));
         st.record_finalized_header(&b).await;
     }
     st.height

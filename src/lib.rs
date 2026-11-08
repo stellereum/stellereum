@@ -17,6 +17,7 @@ pub mod dns_seeds;
 pub mod evm_adapter;
 pub mod explorer;
 pub mod governance;
+pub mod hash384;
 // GATE: HashPool apply wiring is default-OFF (`state_engine::HASH_POOL_ENABLED
 // = false`, no env knob). The pool only mutates via the test-gated
 // `apply_hashpool_*` / `apply_block_transition_with_hashpool` entry points;
@@ -96,6 +97,7 @@ pub mod parallel_exec;
 pub mod pmm;
 pub mod post_quantum;
 pub mod pq_registry;
+pub mod qc_aggregate;
 pub mod remote_signer;
 pub mod rpc;
 pub mod runtime;
@@ -114,5 +116,6 @@ pub mod vrf;
 pub mod wallet;
 pub mod wallet_signing;
 pub mod xshard2pc;
+pub mod xmss_vrf;
 pub mod zkml;
 pub mod zkml_attestation;

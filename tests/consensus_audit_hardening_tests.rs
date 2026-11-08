@@ -15,6 +15,9 @@ use stellereum::consensus::{
 };
 use stellereum::post_quantum::{FalconKeypair, PqScheme};
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 // --- fixtures ----------------------------------------------------------------
 
 fn keys(n: usize) -> Vec<SigningKey> {
@@ -426,14 +429,14 @@ fn round_advance_single_message_moves_at_most_one() {
 
 #[test]
 fn far_ahead_votes_rejected_from_voteset() {
-    let ks = keys(2);
+    let (ks, fks) = falcon_votes::falcon_set(2);
     let mut hc = HeightConsensus::new(H, vset1(&ks));
-    let bad = Vote::sign(&ks[0], H, 1001, VoteKind::Prevote, Some(A_BLK));
+    let bad = falcon_votes::fvote(&ks[0], &fks[0], H, 1001, VoteKind::Prevote, Some(A_BLK));
     assert!(
         hc.add_prevote(bad).is_err(),
         "round > +1000 must be dropped"
     );
-    let bad_c = Vote::sign(&ks[0], H, 1001, VoteKind::Precommit, Some(A_BLK));
+    let bad_c = falcon_votes::fvote(&ks[0], &fks[0], H, 1001, VoteKind::Precommit, Some(A_BLK));
     assert!(hc.add_precommit(bad_c).is_err());
 }
 

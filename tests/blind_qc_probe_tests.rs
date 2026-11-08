@@ -11,8 +11,9 @@
 //! These tests pin the SYNC PRIMITIVE that fallback rests on — NOT
 //! `try_catch_up` itself (needs the full runtime). A canned 1-block chain
 //! (parent = our tip, height = tip+1) with a REAL `QuorumCertificate` (built
-//! exactly like `src/sync.rs` tests build QCs: every validator signs
-//! `Vote::sign(.., Precommit, Some(hash))` over the block hash) must pass
+//! exactly like `src/sync.rs` tests build QCs: every validator signs a
+//! genuine Falcon `fvote(.., Precommit, Some(hash))` over the block hash,
+//! compiled by `VoteSet::certificate` and bound to the block's parent) must
 //! `collect_missing_blocks` + `walked_head_anchor` +
 //! `validate_sync_chain_for_shard_with_sets`; the same chain with a FORGED QC
 //! (wrong signers, no quorum power) must be refused at validation.
@@ -21,18 +22,24 @@ use rand::rngs::OsRng;
 use std::collections::HashMap;
 
 use ed25519_dalek::SigningKey;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind, VoteSet};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::sync::{
     collect_missing_blocks, validate_sync_chain_for_shard_with_sets, walked_head_anchor,
 };
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 /// Build one finalized block at `height` on top of `prev_hash`, carrying a
 /// REAL precommit QC from every key in `keys` (the `src/sync.rs`
 /// `quorum_chain` pattern: proposer = schedule slot at round 0, block signed
-/// by the proposer, QC = one Precommit vote per validator over the hash).
+/// by the proposer, QC = one genuine Falcon precommit vote per validator over
+/// the hash, compiled by the production committee path
+/// `VoteSet::certificate` and bound to this block's parent).
 fn finalized_block(
     keys: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
     validators: &ValidatorSet,
     height: u64,
     prev_hash: [u8; 32],
@@ -64,20 +71,21 @@ fn finalized_block(
     };
     b.sign_block(&proposer);
     let hash = b.compute_hash();
-    let sigs = keys
-        .iter()
-        .map(|k| {
-            let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(hash));
-            (v.voter, v.signature)
-        })
-        .collect();
-    b.precommit_qc = Some(QuorumCertificate {
-        height,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(hash),
-        signatures: sigs,
-    });
+    let mut set = VoteSet::new();
+    for (k, fk) in keys.iter().zip(fks.iter()) {
+        set.add(
+            falcon_votes::fvote(k, fk, height, 0, VoteKind::Precommit, Some(hash)),
+            validators,
+            height,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
+    }
+    b.precommit_qc = Some(
+        set.certificate(Some(hash), validators, &prev_hash)
+            .expect("full set reaches quorum"),
+    );
     b
 }
 
@@ -93,12 +101,12 @@ fn validator_set(keys: &[SigningKey]) -> ValidatorSet {
 /// sidecar pins height 1, the body walk serves exactly that block.
 #[tokio::test]
 async fn blind_qc_probe_walk_accepts_genuine_qc() {
-    let keys: Vec<SigningKey> = (0..3).map(|_| SigningKey::generate(&mut OsRng)).collect();
+    let (keys, fks) = falcon_votes::falcon_set(3);
     let vs = validator_set(&keys);
     assert_eq!(vs.quorum_power(), 3);
 
     let our_tip = [0u8; 32];
-    let block = finalized_block(&keys, &vs, 1, our_tip);
+    let block = finalized_block(&keys, &fks, &vs, 1, our_tip);
     let head_hash = block.compute_hash();
 
     // The QC sidecar is height-bound and genuine.
@@ -130,13 +138,15 @@ async fn blind_qc_probe_walk_accepts_genuine_qc() {
 /// linkage), but full validation refuses the chain.
 #[tokio::test]
 async fn blind_qc_probe_refuses_forged_qc() {
-    let keys: Vec<SigningKey> = (0..3).map(|_| SigningKey::generate(&mut OsRng)).collect();
+    let (keys, fks) = falcon_votes::falcon_set(3);
     let vs = validator_set(&keys);
 
     let our_tip = [0u8; 32];
-    let mut block = finalized_block(&keys, &vs, 1, our_tip);
+    let mut block = finalized_block(&keys, &fks, &vs, 1, our_tip);
 
     // Forge: replace the QC signers with keys the set never heard of.
+    // NEGATIVE-PATH (forgery): non-member Ed-only votes stay unconditionally
+    // invalid under FULL-PQ — do not convert.
     let forgers: Vec<SigningKey> = (0..3).map(|_| SigningKey::generate(&mut OsRng)).collect();
     let hash = block.compute_hash();
     let forged_sigs = forgers

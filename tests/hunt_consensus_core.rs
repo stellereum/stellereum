@@ -14,6 +14,29 @@ use stellereum::consensus::{
 };
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
+/// Falcon companions for file-local Ed keys, registered globally like
+/// `falcon_set` does. `tag` separates Falcon-key domains so fixtures sharing
+/// one test binary never collide.
+fn pq_for(keys: &[SigningKey], tag: u8) -> Vec<stellereum::post_quantum::FalconKeypair> {
+    use stellereum::consensus::register_validator_pq_key;
+    use stellereum::post_quantum::{FalconKeypair, PqScheme};
+    keys.iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let fk = FalconKeypair::generate_from_seed(tag.wrapping_add(i as u8));
+            register_validator_pq_key(
+                k.verifying_key().to_bytes(),
+                PqScheme::Falcon512,
+                fk.public_key.clone(),
+            );
+            fk
+        })
+        .collect()
+}
+
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
 }
@@ -259,6 +282,7 @@ async fn hunt3_adopt_committed_accepts_a_prevote_certificate() {
     use stellereum::state_engine::InMemoryStateEngine;
 
     let ks = keys(4);
+    let fks = pq_for(&ks, 0x30);
     let vset = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
     let state = std::sync::Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
@@ -291,21 +315,20 @@ async fn hunt3_adopt_committed_accepts_a_prevote_certificate() {
     let block_hash = block.compute_hash();
 
     // A PREVOTE certificate — nobody ever precommitted this block.
-    let sigs: Vec<([u8; 32], Vec<u8>)> = ks
-        .iter()
-        .take(3)
-        .map(|k| {
-            let v = Vote::sign(k, 1, 0, VoteKind::Prevote, Some(block_hash));
-            (v.voter, v.signature)
-        })
-        .collect();
-    let cert = QuorumCertificate {
-        height: 1,
-        round: 0,
-        kind: VoteKind::Prevote, // <-- NOT a precommit
-        block_hash: Some(block_hash),
-        signatures: sigs,
-    };
+    let mut pset = stellereum::consensus::VoteSet::new();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        pset.add(
+            falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(block_hash)),
+            &vset,
+            1,
+            0,
+            VoteKind::Prevote,
+        )
+        .expect("genuine vote admits");
+    }
+    let cert = pset
+        .certificate(Some(block_hash), &vset, &[0u8; 32])
+        .expect("3-of-4 reaches quorum");
     assert!(cert.verify(&vset), "prevote QC is self-consistent");
 
     // FIXED: `adopt_committed` now requires the certificate to be a PRECOMMIT
@@ -349,6 +372,7 @@ async fn hunt4_adopt_committed_never_binds_certificate_height() {
     use stellereum::state_engine::InMemoryStateEngine;
 
     let ks = keys(4);
+    let fks = pq_for(&ks, 0x31);
     let vset = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
     let state = std::sync::Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vset, 1_000_000_000_000_000).await;
@@ -380,21 +404,23 @@ async fn hunt4_adopt_committed_never_binds_certificate_height() {
     let block_hash = block.compute_hash();
 
     // Certificate claims height 999 / round 4242 — fields nothing checks.
-    let sigs: Vec<([u8; 32], Vec<u8>)> = ks
-        .iter()
-        .take(3)
-        .map(|k| {
-            let v = Vote::sign(k, 999, 4242, VoteKind::Precommit, Some(block_hash));
-            (v.voter, v.signature)
-        })
-        .collect();
-    let cert = QuorumCertificate {
-        height: 999,
-        round: 4242,
-        kind: VoteKind::Precommit,
-        block_hash: Some(block_hash),
-        signatures: sigs,
-    };
+    // Compiled by the committee path against the height-999 sortition parent
+    // the block does not have (fixture: genesis parent); it verifies on its
+    // own terms and is refused at adopt on the height binding.
+    let mut hset = stellereum::consensus::VoteSet::new();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        hset.add(
+            falcon_votes::fvote(k, fk, 999, 4242, VoteKind::Precommit, Some(block_hash)),
+            &vset,
+            999,
+            4242,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
+    }
+    let cert = hset
+        .certificate(Some(block_hash), &vset, &[0u8; 32])
+        .expect("3-of-4 reaches quorum");
     assert!(cert.verify(&vset));
 
     // FIXED: the certificate's height and round are now bound to the height it is
@@ -430,6 +456,7 @@ async fn hunt5_adopt_vs_local_finalize_split_the_state_root() {
     use stellereum::state_engine::InMemoryStateEngine;
 
     let ks = keys(4);
+    let fks = pq_for(&ks, 0x32);
     let vset = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
 
     // The one block both nodes will process. `root` is passed in pre-computed.
@@ -464,27 +491,26 @@ async fn hunt5_adopt_vs_local_finalize_split_the_state_root() {
     let block_hash = block_a.compute_hash();
     let mut node_a = ValidatorRuntime::new(ks[0].clone(), vset.clone(), st_a.clone(), 1);
     // 3 of 4 validators precommit; validator #4 is partitioned and does not.
-    for k in ks.iter().take(3) {
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
         node_a
-            .on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(block_hash)))
+            .on_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(block_hash)))
             .unwrap();
     }
     let cert = {
-        let sigs: Vec<([u8; 32], Vec<u8>)> = ks
-            .iter()
-            .take(3)
-            .map(|k| {
-                let v = Vote::sign(k, 1, 0, VoteKind::Precommit, Some(block_hash));
-                (v.voter, v.signature)
-            })
-            .collect();
-        QuorumCertificate {
-            height: 1,
-            round: 0,
-            kind: VoteKind::Precommit,
-            block_hash: Some(block_hash),
-            signatures: sigs,
+        let mut cset = stellereum::consensus::VoteSet::new();
+        for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+            cset.add(
+                falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(block_hash)),
+                &vset,
+                1,
+                0,
+                VoteKind::Precommit,
+            )
+            .expect("genuine vote admits");
         }
+        cset
+            .certificate(Some(block_hash), &vset, &[0u8; 32])
+            .expect("3-of-4 reaches quorum")
     };
     assert!(
         cert.verify(&vset),
@@ -521,6 +547,7 @@ async fn hunt6_finalize_a_block_this_node_never_saw_or_validated() {
     use stellereum::state_engine::InMemoryStateEngine;
 
     let ks = keys(4);
+    let fks = pq_for(&ks, 0x33);
     let vset = ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect());
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vset, 1_000_000_000_000_000).await;
@@ -530,8 +557,8 @@ async fn hunt6_finalize_a_block_this_node_never_saw_or_validated() {
     // The attacker is not even a validator in this set: but 3 of 4 real
     // validators signing is enough, and we simply never deliver the block.
     let phantom = blake3::hash(b"attacker-chosen-block-contents").into();
-    for k in ks.iter().take(3) {
-        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(phantom)))
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        rt.on_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(phantom)))
             .unwrap();
     }
     assert!(
@@ -573,6 +600,7 @@ async fn hunt6_finalize_a_block_this_node_never_saw_or_validated() {
 #[test]
 fn hunt7_peer_messages_cannot_drag_the_round_counter_past_the_network() {
     let (vset, ks) = live_node_set(4);
+    let fks = pq_for(&ks, 0x34);
     let mut hc = HeightConsensus::new(1, vset.clone());
     assert_eq!(hc.round, 0);
 
@@ -596,29 +624,17 @@ fn hunt7_peer_messages_cannot_drag_the_round_counter_past_the_network() {
     let honest = vset.proposer_for(1, honest_round).unwrap();
     hc.advance_to_round(honest_round);
     hc.receive_proposal(honest, bh(2)).unwrap();
-    for k in ks.iter() {
-        hc.add_prevote(Vote::sign(
-            k,
-            1,
-            honest_round,
-            VoteKind::Prevote,
-            Some(bh(2)),
-        ))
-        .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        hc.add_prevote(falcon_votes::fvote(k, fk, 1, honest_round, VoteKind::Prevote, Some(bh(2))))
+            .unwrap();
     }
     assert!(
         hc.try_prevote_quorum().is_some(),
         "a real 4/4 prevote quorum at our own round is still visible"
     );
-    for k in ks.iter() {
-        hc.add_precommit(Vote::sign(
-            k,
-            1,
-            honest_round,
-            VoteKind::Precommit,
-            Some(bh(2)),
-        ))
-        .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        hc.add_precommit(falcon_votes::fvote(k, fk, 1, honest_round, VoteKind::Precommit, Some(bh(2))))
+            .unwrap();
     }
     assert!(
         hc.try_precommit_quorum().is_some(),
@@ -686,16 +702,20 @@ fn hunt7b_proposal_round_field_is_unauthenticated_metadata() {
 #[test]
 fn hunt8_negative_power_attribution_checks() {
     let (vset, ks) = live_node_set(4);
+    let fks = pq_for(&ks, 0x35);
     let outsider = keys(1);
     let mut set = stellereum::consensus::VoteSet::new();
 
     // (a) outsider vote: rejected.
+    // NEGATIVE-PATH (forgery): a non-member's Ed-only vote stays
+    // unconditionally invalid under FULL-PQ — do not convert.
     let v = Vote::sign(&outsider[0], 1, 0, VoteKind::Prevote, Some(bh(1)));
     assert!(set.add(v, &vset, 1, 0, VoteKind::Prevote).is_err());
     assert_eq!(set.power_for(Some(bh(1))), 0);
 
     // (b) tampered voter field: signature is over the whole sign-bytes, and
     // verify() is called BEFORE power_of(), so a forged voter fails the sig.
+    // NEGATIVE-PATH (forgery): do not convert.
     let mut forged = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(bh(1)));
     forged.voter = id(&ks[1]);
     assert!(!forged.verify());
@@ -703,7 +723,7 @@ fn hunt8_negative_power_attribution_checks() {
 
     // (c) double counting: same validator, different target.
     set.add(
-        Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(bh(1))),
+        falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(bh(1))),
         &vset,
         1,
         0,
@@ -711,7 +731,7 @@ fn hunt8_negative_power_attribution_checks() {
     )
     .unwrap();
     set.add(
-        Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(bh(2))),
+        falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(bh(2))),
         &vset,
         1,
         0,
@@ -723,20 +743,23 @@ fn hunt8_negative_power_attribution_checks() {
     assert_eq!(set.equivocations().len(), 1);
 
     // (d) prevote cannot be replayed as a precommit (kind is in the sign bytes).
-    let pv = Vote::sign(&ks[1], 1, 0, VoteKind::Prevote, Some(bh(1)));
+    let pv = falcon_votes::fvote(&ks[1], &fks[1], 1, 0, VoteKind::Prevote, Some(bh(1)));
     let mut as_precommit = pv.clone();
     as_precommit.kind = VoteKind::Precommit;
     assert!(!as_precommit.verify());
 
     // (e) nil vote vs all-zero-hash vote must not collide.
-    let nil = Vote::sign(&ks[2], 1, 0, VoteKind::Prevote, None);
-    let zero = Vote::sign(&ks[2], 1, 0, VoteKind::Prevote, Some([0u8; 32]));
+    let nil = falcon_votes::fvote(&ks[2], &fks[2], 1, 0, VoteKind::Prevote, None);
+    let zero = falcon_votes::fvote(&ks[2], &fks[2], 1, 0, VoteKind::Prevote, Some([0u8; 32]));
     assert!(nil.verify() && zero.verify());
     let mut nil_as_zero = nil.clone();
     nil_as_zero.block_hash = Some([0u8; 32]);
     assert!(!nil_as_zero.verify(), "nil vs zero-hash is unambiguous");
 
     // (f) QC duplicate-signers cannot fake power.
+    // NEGATIVE-PATH (forgery): the hand-assembled shape carries no PQ
+    // envelope, so it is unconditionally invalid under FULL-PQ — do not
+    // convert.
     let sigs = vec![
         (
             id(&ks[0]),
@@ -780,7 +803,9 @@ fn hunt9_zero_power_quorum_guard_cannot_be_bypassed() {
 
     // a) ValidatorSet::add drops zero-power entries, so a set that LOOKS
     //    non-empty cannot be built out of zero-power members.
-    let ks = keys(3);
+    //    Falcon-registered keys: the votes below verify, so the refusal below
+    //    is genuinely the non-membership the comment pins.
+    let (ks, fks) = falcon_votes::falcon_set(3);
     let mut vs = ValidatorSet::new();
     for k in &ks {
         vs.add(id(k), 0);
@@ -791,10 +816,10 @@ fn hunt9_zero_power_quorum_guard_cannot_be_bypassed() {
     // b) quorum_target with u64::MAX threshold can never fire, and
     //    try_precommit_quorum is gated on it.
     let mut hc = HeightConsensus::new(1, vs.clone());
-    for k in ks.iter() {
+    for (k, fk) in ks.iter().zip(fks.iter()) {
         // Nobody is a validator, so every vote is rejected as non-validator.
         assert!(hc
-            .add_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh(1))))
+            .add_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh(1))))
             .is_err());
     }
     assert_eq!(hc.try_prevote_quorum(), None);

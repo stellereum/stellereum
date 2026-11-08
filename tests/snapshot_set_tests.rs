@@ -16,7 +16,9 @@
 
 use ed25519_dalek::SigningKey;
 use std::collections::HashMap;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
+use stellereum::consensus::register_validator_pq_key;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::storage::{
     decode_domain_snapshot_strict, snapshot_validator_set_strict, DomainSnapshot,
@@ -27,8 +29,24 @@ use stellereum::sync::{
     verify_snapshot_anchor_tail_with_sets, HeaderLink,
 };
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 fn test_key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
+}
+
+/// Falcon half for a `test_key`-derived Ed key: derived deterministically
+/// from the Ed seed byte and registered under the Ed id, so the Ed ids stay
+/// byte-identical while the vote carries a verifying Falcon envelope.
+fn fk_for(k: &SigningKey) -> FalconKeypair {
+    let fk = FalconKeypair::generate_from_seed(k.to_bytes()[0]);
+    register_validator_pq_key(
+        k.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+    fk
 }
 
 fn ledger_for(keys: &[SigningKey]) -> stellereum::staking::StakingLedger {
@@ -370,7 +388,7 @@ fn qc_for(signers: &[SigningKey], height: u64, block_hash: [u8; 32]) -> QuorumCe
     let sigs = signers
         .iter()
         .map(|k| {
-            let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(block_hash));
+            let v = falcon_votes::fvote(k, &fk_for(k), height, 0, VoteKind::Precommit, Some(block_hash));
             (v.voter, v.signature)
         })
         .collect();

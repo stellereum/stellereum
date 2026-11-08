@@ -18,7 +18,12 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::collections::HashMap;
-use stellereum::consensus::{HeightConsensus, QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{
+    derive_sortition_committee, encode_pq_micro_envelope, micro_committee_size,
+    vote_sign_bytes, HeightConsensus, PqMicroCertificate, QuorumCertificate, ValidatorSet,
+    VoteKind, PQ_UQC_MARKER_ID,
+};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::network::{
     head_publish_allowed, peer_head_is_ahead, SNAPSHOT_PUBLISH_DOMAIN_KINDS,
 };
@@ -28,6 +33,9 @@ use stellereum::sync::{
     collect_missing_blocks, fast_sync_state, validate_sync_chain_for_shard, verify_snapshot_anchor,
     verify_snapshot_anchor_tail, HeaderLink, SNAPSHOT_ANCHOR_TAIL_WINDOW, SYNC_DOMAIN_KINDS,
 };
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 /// infnode derives a node id as `blake3(ed25519_pub)[..20]`, which is what a
 /// `validators:` entry names. Getting this wrong is how a node ends up in the wrong
@@ -175,8 +183,8 @@ fn effect_balance(h: u64) -> u64 {
     1_000_000 + h * 7
 }
 
-fn observer_keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
+fn observer_keys(n: usize) -> (Vec<SigningKey>, Vec<FalconKeypair>) {
+    falcon_votes::falcon_set(n)
 }
 
 fn observer_vset(ks: &[SigningKey]) -> ValidatorSet {
@@ -187,20 +195,51 @@ fn observer_vset(ks: &[SigningKey]) -> ValidatorSet {
     )
 }
 
-fn attach_quorum(b: &mut Block, ks: &[SigningKey], height: u64, bh: [u8; 32]) {
+fn attach_quorum(
+    b: &mut Block,
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    height: u64,
+    bh: [u8; 32],
+) {
     let sigs = ks
         .iter()
-        .map(|k| {
-            let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(bh));
+        .zip(fks.iter())
+        .map(|(k, fk)| {
+            let v = falcon_votes::fvote(k, fk, height, 0, VoteKind::Precommit, Some(bh));
             (v.voter, v.signature)
         })
-        .collect();
+        .collect::<Vec<_>>();
+    // FULL-PQ: classical legs are inert under `verify` — the quorum lives in
+    // the Falcon-512 µQC envelope (`VoteSet::certificate` attaches it on the
+    // live path; this fake assembles the same shape directly). Committee is
+    // the whole 2-of-2 set, quorum floor(2*2/3)+1 = 2, both members sign.
+    let vs = observer_vset(ks);
+    let k = micro_committee_size(vs.len());
+    let parent = b.prev_hash;
+    let committee = derive_sortition_committee(&vs, height, 0, k, &parent);
+    let msg = vote_sign_bytes(height, 0, VoteKind::Precommit, &Some(bh));
+    let mut bitmask = vec![0u8; (k as usize).div_ceil(8)];
+    let mut msigs = Vec::new();
+    for (i, id) in committee.iter().enumerate() {
+        let fk = ks
+            .iter()
+            .zip(fks.iter())
+            .find(|(k, _)| k.verifying_key().to_bytes() == *id)
+            .map(|(_, fk)| fk)
+            .expect("committee is members");
+        bitmask[i / 8] |= 1 << (i % 8);
+        msigs.push(fk.sign(&msg));
+    }
+    let uqc = PqMicroCertificate::new(PqScheme::Falcon512, height, 0, k, bitmask, msigs, parent);
+    let mut signatures = sigs;
+    signatures.push((PQ_UQC_MARKER_ID, encode_pq_micro_envelope(&uqc)));
     b.precommit_qc = Some(QuorumCertificate {
         height,
         round: 0,
         kind: VoteKind::Precommit,
         block_hash: Some(bh),
-        signatures: sigs,
+        signatures,
     });
 }
 
@@ -212,7 +251,11 @@ struct LiveChain {
     roots: HashMap<u64, [u8; 32]>,
 }
 
-async fn build_live_chain(ks: &[SigningKey], tip: u64) -> (LiveChain, InMemoryStateEngine) {
+async fn build_live_chain(
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    tip: u64,
+) -> (LiveChain, InMemoryStateEngine) {
     let vs = observer_vset(ks);
     let engine = InMemoryStateEngine::new();
     let mut blocks = Vec::new();
@@ -247,7 +290,7 @@ async fn build_live_chain(ks: &[SigningKey], tip: u64) -> (LiveChain, InMemorySt
         };
         b.sign_block(&proposer);
         let bh = b.compute_hash();
-        attach_quorum(&mut b, ks, h, bh);
+        attach_quorum(&mut b, ks, fks, h, bh);
         prev = bh;
         blocks.push(b);
         // The block's effect lands AFTER it commits to the pre-state.
@@ -330,9 +373,9 @@ impl<'a> PrunedPeers<'a> {
 async fn observer_catches_up_from_pruned_peers_via_tail_anchored_snapshot() {
     const TIP: u64 = 350;
     const KEEP: u64 = 120;
-    let ks = observer_keys(2);
+    let (ks, fks) = observer_keys(2);
     let vs = observer_vset(&ks);
-    let (chain, source_engine) = build_live_chain(&ks, TIP).await;
+    let (chain, source_engine) = build_live_chain(&ks, &fks, TIP).await;
     let peers = PrunedPeers {
         chain: &chain,
         tip: TIP,
@@ -437,9 +480,9 @@ async fn observer_catches_up_from_pruned_peers_via_tail_anchored_snapshot() {
 async fn tail_anchor_rejects_forgery_missing_qc_and_wrong_proposer() {
     const TIP: u64 = 350;
     const KEEP: u64 = 120;
-    let ks = observer_keys(2);
+    let (ks, fks) = observer_keys(2);
     let vs = observer_vset(&ks);
-    let (chain, _) = build_live_chain(&ks, TIP).await;
+    let (chain, _) = build_live_chain(&ks, &fks, TIP).await;
     let peers = PrunedPeers {
         chain: &chain,
         tip: TIP,

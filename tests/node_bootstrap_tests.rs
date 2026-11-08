@@ -26,13 +26,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use stellereum::bootstrap;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
 use stellereum::sync::{
     collect_missing_blocks, fast_sync_state, validate_sync_chain_for_shard,
     verify_snapshot_anchor_tail, HeaderLink,
 };
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 fn effect_account(h: u64) -> [u8; 32] {
     let mut addr = [0u8; 32];
@@ -45,8 +49,8 @@ fn effect_balance(h: u64) -> u64 {
     1_000_000 + h * 7
 }
 
-fn observer_keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
+fn observer_keys(n: usize) -> (Vec<SigningKey>, Vec<FalconKeypair>) {
+    falcon_votes::falcon_set(n)
 }
 
 fn observer_vset(ks: &[SigningKey]) -> ValidatorSet {
@@ -57,11 +61,18 @@ fn observer_vset(ks: &[SigningKey]) -> ValidatorSet {
     )
 }
 
-fn attach_quorum(b: &mut Block, ks: &[SigningKey], height: u64, bh: [u8; 32]) {
+fn attach_quorum(
+    b: &mut Block,
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    height: u64,
+    bh: [u8; 32],
+) {
     let sigs = ks
         .iter()
-        .map(|k| {
-            let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(bh));
+        .zip(fks.iter())
+        .map(|(k, fk)| {
+            let v = falcon_votes::fvote(k, fk, height, 0, VoteKind::Precommit, Some(bh));
             (v.voter, v.signature)
         })
         .collect();
@@ -86,6 +97,7 @@ struct LiveChain {
 /// half of the bootstrap criterion — accounts alone are not enough).
 async fn build_live_chain(
     ks: &[SigningKey],
+    fks: &[FalconKeypair],
     bonded: &SigningKey,
     tip: u64,
 ) -> (LiveChain, InMemoryStateEngine) {
@@ -124,7 +136,7 @@ async fn build_live_chain(
         };
         b.sign_block(&proposer);
         let bh = b.compute_hash();
-        attach_quorum(&mut b, ks, h, bh);
+        attach_quorum(&mut b, ks, fks, h, bh);
         prev = bh;
         blocks.push(b);
         engine
@@ -274,11 +286,11 @@ impl<'a> FlakyPeers<'a> {
 async fn node_bootstrap_reaches_tip_from_zero_over_weak_link_and_stale_peers() {
     const TIP: u64 = 350;
     const KEEP: u64 = 120;
-    let ks = observer_keys(2);
+    let (ks, fks) = observer_keys(2);
     let bonded = SigningKey::generate(&mut OsRng);
     let bonded_id = bonded.verifying_key().to_bytes();
     let vs = observer_vset(&ks);
-    let (chain, source_engine) = build_live_chain(&ks, &bonded, TIP).await;
+    let (chain, source_engine) = build_live_chain(&ks, &fks, &bonded, TIP).await;
     let source_tip_root = source_engine.get_state_root().await;
     // The bond is real on the source: the observer must inherit it via the
     // domains blob, not via any manual copy.

@@ -29,6 +29,52 @@ fn test_key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
+/// FULL-PQ sender address for a seed: implicit Falcon-512, registered
+/// globally (no activation surcharge). Mirrors
+/// `audit_state_sync_closeout_tests.rs::pq_id`.
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+/// FULL-PQ replacement for `Transaction::sign` in fixtures: same
+/// amount/gas/nonce/shards, implicit Falcon-512 envelope.
+#[allow(clippy::too_many_arguments)]
+fn pq_tx(
+    seed: u8,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard,
+        target_shard,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
 async fn setup_two_shard_cluster(
     val_key: &SigningKey,
     shard0_accounts: &[([u8; 32], u64)],
@@ -37,10 +83,26 @@ async fn setup_two_shard_cluster(
     let s0 = Arc::new(InMemoryStateEngine::new());
     for (addr, bal) in shard0_accounts {
         s0.update_account(AccountState::new(*addr, *bal)).await;
+        // PQ senders must live as 49-byte pinned leaves, else the source
+        // proof (49-byte, via registry metadata) mismatches the funded
+        // 16-byte leaf and target verification fails. Classical addrs miss
+        // the registry and stay 16-byte. Balances/addresses unchanged.
+        if let Some((scheme, pk)) = Transaction::global_implicit_registry().lookup(addr) {
+            use stellereum::post_quantum::DEFAULT_SALT;
+            s0.pin_pubkey(*addr, scheme, &pk, &DEFAULT_SALT)
+                .await
+                .expect("PQ sender must pin");
+        }
     }
     let s1 = Arc::new(InMemoryStateEngine::new());
     for (addr, bal) in shard1_accounts {
         s1.update_account(AccountState::new(*addr, *bal)).await;
+        if let Some((scheme, pk)) = Transaction::global_implicit_registry().lookup(addr) {
+            use stellereum::post_quantum::DEFAULT_SALT;
+            s1.pin_pubkey(*addr, scheme, &pk, &DEFAULT_SALT)
+                .await
+                .expect("PQ sender must pin");
+        }
     }
 
     ShardedCluster::new(
@@ -56,10 +118,11 @@ async fn setup_two_shard_cluster(
 #[tokio::test]
 async fn test_cross_shard_transfer_and_ack_lifecycle() {
     let validator = test_key(10);
-    let sender = test_key(20);
     let recipient = test_key(30);
 
-    let sender_addr = sender.verifying_key().to_bytes();
+    // FULL-PQ: sender is implicit Falcon-512 (seed 20); recipient and
+    // validator stay classical. Amounts/fees/nonces/shards unchanged.
+    let sender_addr = pq_id(20);
     let recipient_addr = recipient.verifying_key().to_bytes();
 
     let initial_balance = 5_000_000_000u64; // 5 STELL
@@ -70,8 +133,8 @@ async fn test_cross_shard_transfer_and_ack_lifecycle() {
         setup_two_shard_cluster(&validator, &[(sender_addr, initial_balance)], &[]).await;
 
     // 1. Send cross-shard transfer from Shard 0 to Shard 1
-    let tx = Transaction::sign(
-        &sender,
+    let tx = pq_tx(
+        20,
         recipient_addr,
         transfer_amount,
         fee,
@@ -176,16 +239,17 @@ async fn test_cross_shard_transfer_and_ack_lifecycle() {
 #[tokio::test]
 async fn test_unanchored_fake_root_attack_is_rejected() {
     let validator = test_key(11);
-    let sender = test_key(21);
     let recipient = test_key(31);
 
-    let sender_addr = sender.verifying_key().to_bytes();
+    // FULL-PQ: sender is implicit Falcon-512 (seed 21); recipient and
+    // validator stay classical. Amounts/fees/nonces/shards unchanged.
+    let sender_addr = pq_id(21);
     let recipient_addr = recipient.verifying_key().to_bytes();
 
     let mut cluster = setup_two_shard_cluster(&validator, &[(sender_addr, 1_000_000)], &[]).await;
 
     // Build a forged message with a random, uncommitted block hash and fake root
-    let tx = Transaction::sign(&sender, recipient_addr, 500_000, 280_000, 0, SHARD0, SHARD1);
+    let tx = pq_tx(21, recipient_addr, 500_000, 280_000, 0, SHARD0, SHARD1);
     let fake_root = [0xEE; 32];
     let fake_block_hash = [0xFF; 32];
 
@@ -214,10 +278,11 @@ async fn test_unanchored_fake_root_attack_is_rejected() {
 #[tokio::test]
 async fn test_cross_shard_timeout_bounce_and_refund() {
     let validator = test_key(12);
-    let sender = test_key(22);
     let recipient = test_key(32);
 
-    let sender_addr = sender.verifying_key().to_bytes();
+    // FULL-PQ: sender is implicit Falcon-512 (seed 22); recipient and
+    // validator stay classical. Amounts/fees/nonces/shards unchanged.
+    let sender_addr = pq_id(22);
     let recipient_addr = recipient.verifying_key().to_bytes();
     let initial_balance = 2_000_000_000u64;
     let transfer_amount = 500_000_000u64;
@@ -226,15 +291,7 @@ async fn test_cross_shard_timeout_bounce_and_refund() {
     let mut cluster =
         setup_two_shard_cluster(&validator, &[(sender_addr, initial_balance)], &[]).await;
 
-    let tx = Transaction::sign(
-        &sender,
-        recipient_addr,
-        transfer_amount,
-        fee,
-        0,
-        SHARD0,
-        SHARD1,
-    );
+    let tx = pq_tx(22, recipient_addr, transfer_amount, fee, 0, SHARD0, SHARD1);
     let tx_hash = tx.compute_tx_hash();
     cluster.broadcast_tx(tx).await;
 

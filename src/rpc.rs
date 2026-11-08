@@ -4590,6 +4590,29 @@ async fn gov_write(
     }
 }
 
+/// Single-node write guard for the DIRECT governance-mutation RPC paths
+/// (`stell_submitProposal` / `stell_vote` / `stell_executeProposal` without
+/// a `tx`: they mutate governance state in this process only).
+///
+/// Returns the refusal body when a local-only mutation would fork a
+/// multi-node deployment (`validator_count > 1` without the documented
+/// escape env, default OFF); `None` on solo sets (no peer to diverge from)
+/// or when the escape is explicitly armed. The count is the ELECTED set
+/// derived from the engine's committed staking ledger — the same
+/// `ValidatorSet::len` the runtime gates on, read from the same ledger the
+/// direct paths mutate (never the detached `st.staking` fixture handle).
+///
+/// Call FIRST in the direct form — before parsing, locks, or lookups — so a
+/// multi-node write is refused as multi-node, never as some downstream
+/// error (same gate-first discipline as the runtime `gov_propose` /
+/// `gov_vote`). The block-carried `tx` forms NEVER call this: admitting a
+/// caller-signed transaction mutates nothing, so multi-node nodes admit
+/// freely (that is how multi-node governance works now) and diverge never.
+async fn multinode_gov_write_refusal(st: &RpcState) -> Option<String> {
+    let n = st.engine.staking_read().await.to_validator_set().len();
+    crate::governance::governance_write_allowed_from_env(n).err()
+}
+
 /// Loopback-dev escape for UNSIGNED gov writes: ONLY when the existing
 /// dev-test flag is armed (`STELL_DEV_UNSAFE_TESTKEY=1`, the same flag the
 /// wallet SIGN arms and the faucet test key use) AND the bind is loopback.
@@ -6447,6 +6470,43 @@ async fn dispatch(
             if let Some(denied) = require_gov_write_auth(st, &id, params, header_token) {
                 return denied;
             }
+            // BLOCK FORM (primary, block-carried): the caller built the
+            // sibling's opcode tx (`Governance::gov_propose_tx`, opcode by
+            // NAME `SysCallGovPropose`) and PQ-signed it with their own key
+            // via the session/PQ signing path. THIN admission, exactly like
+            // `stell_pmmBuy` / `stell_submitPriceFeed`: verify the wrapping
+            // transaction and admit it to the mempool — NEVER mutate
+            // governance state here. The proposal opens when a proposer
+            // includes the tx in a block and every node re-runs the opcode
+            // (the `tx.from` signer is the proposer; the scan gates id,
+            // height, stake and shape). No single-node guard here: admission
+            // mutates nothing, so multi-node nodes admit freely.
+            if params.get("tx").and_then(|v| v.as_str()).is_some() {
+                return admit_signed_payload_tx(
+                    st,
+                    id,
+                    params,
+                    header_token,
+                    method,
+                    |op| matches!(op, crate::svm::OpCode::SysCallGovPropose { .. }),
+                    "payload does not carry SysCallGovPropose",
+                )
+                .await;
+            }
+            // DIRECT FORM (solo-only): the legacy operator-signed params
+            // mutate governance state in this process, so the single-node
+            // write guard runs FIRST (multi-node without the documented
+            // escape env refuses here, never as a downstream error).
+            if let Some(body) = multinode_gov_write_refusal(st).await {
+                return err(
+                    id,
+                    -32000,
+                    format!(
+                        "propose failed: {}",
+                        crate::governance::GovError::MultiNodeRefused(body)
+                    ),
+                );
+            }
             let title = match params["title"].as_str() {
                 Some(t) => t.to_string(),
                 None => return err(id, -32602, "missing proposal title"),
@@ -6546,6 +6606,38 @@ async fn dispatch(
             if let Some(denied) = require_gov_write_auth(st, &id, params, header_token) {
                 return denied;
             }
+            // BLOCK FORM (primary, block-carried): the caller built the
+            // sibling's opcode tx (`Governance::gov_vote_tx`, opcode by NAME
+            // `SysCallGovVote`) and PQ-signed it with their own key. THIN
+            // admission like the propose twin: verify + admit, never mutate.
+            // The tally moves when a block applies the tx (`tx.from` is the
+            // voter; the scan enforces window, one-vote and weight rules).
+            // No single-node guard: admission mutates nothing.
+            if params.get("tx").and_then(|v| v.as_str()).is_some() {
+                return admit_signed_payload_tx(
+                    st,
+                    id,
+                    params,
+                    header_token,
+                    method,
+                    |op| matches!(op, crate::svm::OpCode::SysCallGovVote { .. }),
+                    "payload does not carry SysCallGovVote",
+                )
+                .await;
+            }
+            // DIRECT FORM (solo-only): guard FIRST, same discipline as the
+            // propose twin (multi-node refuses as multi-node, never as
+            // UnknownProposal or a tally error).
+            if let Some(body) = multinode_gov_write_refusal(st).await {
+                return err(
+                    id,
+                    -32000,
+                    format!(
+                        "vote failed: {}",
+                        crate::governance::GovError::MultiNodeRefused(body)
+                    ),
+                );
+            }
             let pid = match params["id"].as_u64() {
                 Some(p) => p,
                 None => return err(id, -32602, "missing proposal id"),
@@ -6632,6 +6724,20 @@ async fn dispatch(
             // writes: token required ALWAYS, on every bind.
             if let Some(denied) = require_gov_write_auth(st, &id, params, header_token) {
                 return denied;
+            }
+            // DIRECT mutation (marks Executed + applies params in this
+            // process only): same single-node guard as the propose/vote
+            // twins — a multi-node execution without the documented escape
+            // env refuses here instead of forking the state root.
+            if let Some(body) = multinode_gov_write_refusal(st).await {
+                return err(
+                    id,
+                    -32000,
+                    format!(
+                        "execute failed: {:?}",
+                        crate::governance::GovError::MultiNodeRefused(body)
+                    ),
+                );
             }
             let pid = match params["id"].as_u64() {
                 Some(p) => p,
@@ -7591,7 +7697,7 @@ async fn dispatch(
             // sign locally (SDK `TxBuilder::contract_call` + `sign`) and
             // submit the sealed transaction via the `tx` form, or use the
             // direct parameters for a keyless preview (an ephemeral vehicle
-            // carries the call through mempool/block admission).
+            // carries the call through the CLONE preview; DROPPED afterwards).
             if p.get("private_key").is_some() {
                 return err(
                     id,
@@ -10291,6 +10397,33 @@ mod tests {
         let msg =
             crate::governance::Governance::gov_vote_message(chain_id, proposal_id, choice, voter);
         key.sign_message(chain_id, &msg).unwrap().to_hex()
+    }
+
+    /// PQ-sign an assembled block-carried gov template with the sender's own
+    /// key (the session/PQ signing path callers use): implicit Falcon-512
+    /// envelope over `signing_message`, key pre-registered globally via
+    /// `pq_pair` (the `pq_tx_payload` idiom — `seed` must be distinct per
+    /// sender within a test). The node never signs: this helper stands in
+    /// for the caller's wallet.
+    fn sign_gov_block_tx(
+        seed: u8,
+        pk: &[u8],
+        mut tx: crate::sharding::Transaction,
+    ) -> crate::sharding::Transaction {
+        let msg = tx.signing_message();
+        let sig =
+            crate::sharding::Transaction::create_falcon512_test_signature(pk, &msg, seed);
+        tx.signature = crate::sharding::PqSignatureEnvelope::new_implicit(
+            crate::post_quantum::PqScheme::Falcon512,
+            sig,
+        )
+        .encode();
+        tx
+    }
+
+    /// Hex of the bincode wire bytes of a signed tx (the `tx` param shape).
+    fn gov_tx_hex(tx: &crate::sharding::Transaction) -> String {
+        hex::encode(bincode::serialize(tx).unwrap())
     }
 
     // GATE: H-02 — fixed test seed 0x42 stands in for the ephemeral dev-only
@@ -17264,23 +17397,23 @@ mod tests {
         }
 
         // 3. Correct token: signed flows work end to end on BOTH binds.
-        // GATE (operator-signed governance): both writes are signed with the
-        // stakers' own keys (the unsigned legacy path stays refused without
-        // STELL_DEV_UNSAFE_TESTKEY=1, which this test does not set).
+        // Block-carried update (HDAE-GOV): the DIRECT form mutates in this
+        // process only, so it serves on SOLO sets (one bonded staker — the
+        // single-node guard passes), pinned here with a self-vote; on a
+        // TWO-staker set the same "correct token serves" property holds via
+        // the BLOCK form (caller-signed tx into the mempool, nothing
+        // recorded). Same property, per form, on both binds — never
+        // weakened, only routed.
         for mock in [Some(false), Some(true)] {
             set_test_bind_loopback(mock);
+            // 3a. Solo direct: propose + self-vote record end to end.
             let st = test_state_with_token().await;
             let proposer_key = TestGovKey::ed25519([0xA1u8; 32]);
             let proposer = proposer_key.address();
-            let voter_key = TestGovKey::ed25519([0xB2u8; 32]);
-            let voter = voter_key.address();
             {
                 let mut ledger = st.engine.staking_write().await;
                 ledger
                     .bond(proposer, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
-                    .unwrap();
-                ledger
-                    .bond(voter, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
                     .unwrap();
             }
             let title = "dev".to_string();
@@ -17310,13 +17443,58 @@ mod tests {
                 "stell_vote",
                 json!({
                     "id": pid,
-                    "voter": hex::encode(voter),
+                    "voter": hex::encode(proposer),
                     "choice": "yes",
-                    "signature": sign_test_vote(st.chain_id, &voter_key, &voter, pid, crate::governance::VoteChoice::Yes),
+                    "signature": sign_test_vote(st.chain_id, &proposer_key, &proposer, pid, crate::governance::VoteChoice::Yes),
                 }),
             )
             .await;
-            assert_eq!(r["voted"], json!(true), "token-authed vote (bind loopback={mock:?}) must work: {r}");
+            assert_eq!(r["voted"], json!(true), "token-authed self-vote (bind loopback={mock:?}) must work: {r}");
+            // 3b. Multi-node block form: a caller-signed propose tx is
+            // admitted on a two-staker set (direct would refuse there).
+            let st2 = test_state_with_token().await;
+            let (from, pk) = pq_pair(0xB1);
+            {
+                let mut ledger = st2.engine.staking_write().await;
+                ledger
+                    .bond(from, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
+                    .unwrap();
+                ledger
+                    .bond([0xB2u8; 32], crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
+                    .unwrap();
+            }
+            st2.engine
+                .update_account(crate::state_engine::AccountState::new(from, 1_000_000_000_000))
+                .await;
+            let height = st2.height.load(std::sync::atomic::Ordering::Relaxed) + 1;
+            let ptx = crate::governance::Governance::gov_propose_tx(
+                from,
+                0,
+                500_000,
+                1,
+                1,
+                1,
+                "dev".to_string(),
+                action.clone(),
+                height,
+            )
+            .expect("test propose template must build");
+            let ptx = sign_gov_block_tx(0xB1, &pk, ptx);
+            let r = call_with_token(&st2, "stell_submitProposal", json!({ "tx": gov_tx_hex(&ptx) }))
+                .await;
+            assert!(
+                r.as_str().is_some(),
+                "token-authed block submit (bind loopback={mock:?}) must admit: {r}"
+            );
+            assert_eq!(
+                st2.mempool.read().await.len(),
+                1,
+                "the tx must reach the mempool"
+            );
+            assert!(
+                st2.governance.read().await.proposals.is_empty(),
+                "admission must not record a proposal"
+            );
         }
     }
 
@@ -17339,13 +17517,18 @@ mod tests {
         let voter = voter_key.address();
         let lone_key = TestGovKey::ed25519([0xC3u8; 32]);
         let lone = lone_key.address();
+        // Block-carried update (HDAE-GOV): the direct form below mutates in
+        // this process only, so this matrix runs on a SOLO set (the proposer
+        // alone is bonded — the single-node guard passes). Lifecycle pins
+        // use a SELF-vote (one vote per voter; the proposer's own stake
+        // votes exactly like a second staker's would, and the refusal pins
+        // fire before any stake check, so no property is weakened). The
+        // block-form twins of these pins live in the block-form tests below
+        // (admitted, never recorded).
         {
             let mut ledger = st.engine.staking_write().await;
             ledger
                 .bond(proposer, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
-                .unwrap();
-            ledger
-                .bond(voter, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
                 .unwrap();
         }
         let title = "sig test".to_string();
@@ -17473,14 +17656,14 @@ mod tests {
             "unsigned vote must be refused: {r}"
         );
 
-        // 9. Valid signed vote: accepted.
-        let vsig = sign_test_vote(chain, &voter_key, &voter, pid, VoteChoice::Yes);
+        // 9. Valid signed vote: accepted (self-vote on the solo set).
+        let vsig = sign_test_vote(chain, &proposer_key, &proposer, pid, VoteChoice::Yes);
         let r = call_with_token(
             &st,
             "stell_vote",
             json!({
                 "id": pid,
-                "voter": hex::encode(voter),
+                "voter": hex::encode(proposer),
                 "choice": "yes",
                 "signature": vsig,
             }),
@@ -17495,7 +17678,7 @@ mod tests {
             "stell_vote",
             json!({
                 "id": pid,
-                "voter": hex::encode(voter),
+                "voter": hex::encode(proposer),
                 "choice": "yes",
                 "signature": vsig,
             }),
@@ -17505,13 +17688,13 @@ mod tests {
         assert_eq!(r["weight"].as_str().unwrap_or(""), weight);
 
         // 11. Different choice with a fresh valid signature: refused.
-        let flip = sign_test_vote(chain, &voter_key, &voter, pid, VoteChoice::No);
+        let flip = sign_test_vote(chain, &proposer_key, &proposer, pid, VoteChoice::No);
         let r = call_with_token(
             &st,
             "stell_vote",
             json!({
                 "id": pid,
-                "voter": hex::encode(voter),
+                "voter": hex::encode(proposer),
                 "choice": "no",
                 "signature": flip,
             }),
@@ -17528,7 +17711,7 @@ mod tests {
             "stell_vote",
             json!({
                 "id": pid,
-                "voter": hex::encode(voter),
+                "voter": hex::encode(proposer),
                 "choice": "no",
                 "signature": vsig,
             }),
@@ -17541,14 +17724,14 @@ mod tests {
 
         // 13. Cross-chain vote.
         let cross_vmsg =
-            crate::governance::Governance::gov_vote_message(chain + 1, pid, VoteChoice::Yes, &voter);
-        let cross_vsig = voter_key.sign_message(chain + 1, &cross_vmsg).unwrap().to_hex();
+            crate::governance::Governance::gov_vote_message(chain + 1, pid, VoteChoice::Yes, &proposer);
+        let cross_vsig = proposer_key.sign_message(chain + 1, &cross_vmsg).unwrap().to_hex();
         let r = call_with_token(
             &st,
             "stell_vote",
             json!({
                 "id": pid,
-                "voter": hex::encode(voter),
+                "voter": hex::encode(proposer),
                 "choice": "yes",
                 "signature": cross_vsig,
             }),
@@ -17578,6 +17761,321 @@ mod tests {
             r["error"].as_str().unwrap_or_default().contains("no staked balance"),
             "stakeless voter must be refused: {r}"
         );
+
+        // 15-17. Block-form twins: caller-signed txs admit without recording.
+        // The recorded proposal above (direct, solo) is the baseline: block
+        // submissions must leave it exactly alone.
+        let recorded = st.governance.read().await.proposals.len();
+        let (bfrom, bpk) = pq_pair(0xD1);
+        st.engine
+            .update_account(crate::state_engine::AccountState::new(bfrom, 1_000_000_000_000))
+            .await;
+        let bheight = st.height.load(std::sync::atomic::Ordering::Relaxed) + 1;
+        // 15. Propose tx admitted, nothing recorded.
+        let bptx = crate::governance::Governance::gov_propose_tx(
+            bfrom,
+            0,
+            500_000,
+            1,
+            1,
+            99,
+            "block twin".to_string(),
+            GovAction::Signal("hi".to_string()),
+            bheight,
+        )
+        .expect("test propose template must build");
+        let r = call_with_token(
+            &st,
+            "stell_submitProposal",
+            json!({ "tx": gov_tx_hex(&sign_gov_block_tx(0xD1, &bpk, bptx)) }),
+        )
+        .await;
+        assert!(
+            r.as_str().is_some(),
+            "block-form propose must admit: {r}"
+        );
+        // 16. Vote tx admitted, tally unmoved.
+        let tally_before = st.governance.read().await.get(pid).map(|p| p.yes);
+        let bvtx = crate::governance::Governance::gov_vote_tx(
+            bfrom,
+            1,
+            500_000,
+            1,
+            1,
+            pid,
+            VoteChoice::Yes,
+            bheight,
+        );
+        let r = call_with_token(
+            &st,
+            "stell_vote",
+            json!({ "tx": gov_tx_hex(&sign_gov_block_tx(0xD1, &bpk, bvtx)) }),
+        )
+        .await;
+        assert!(r.as_str().is_some(), "block-form vote must admit: {r}");
+        assert_eq!(st.mempool.read().await.len(), 2);
+        let g = st.governance.read().await;
+        assert_eq!(
+            g.proposals.len(),
+            recorded,
+            "block-form admissions must not record proposals"
+        );
+        assert_eq!(
+            g.get(pid).map(|p| p.yes),
+            tally_before,
+            "block-form admissions must not move tallies"
+        );
+        drop(g);
+        // 17. A non-gov tx under the gov method name is refused, admitted
+        // nowhere (the payload predicate is the method's promise).
+        let plain = pq_tx(0xD2, [0xEEu8; 32], 10, 100_000, 0);
+        st.engine
+            .update_account(crate::state_engine::AccountState::new(plain.from, 10_000_000))
+            .await;
+        let r = call_with_token(
+            &st,
+            "stell_submitProposal",
+            json!({ "tx": gov_tx_hex(&plain) }),
+        )
+        .await;
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SysCallGovPropose"),
+            "non-gov payload must be refused: {r}"
+        );
+        assert_eq!(
+            st.mempool.read().await.len(),
+            2,
+            "refused payload must not enter the mempool"
+        );
+    }
+
+    /// Multi-node direct writes stay refused (HDAE-GOV): on a two-staker set
+    /// the DIRECT propose/vote/execute forms refuse with the documented
+    /// escape-env reason — the vote/execute refusals prove the guard runs
+    /// FIRST (unknown ids would otherwise fail as `UnknownProposal`), while
+    /// the BLOCK form on the SAME set admits (that is how multi-node
+    /// governance works now: admission mutates nothing).
+    ///
+    /// The escape env is pinned to explicit OFF (`0`, no-restore: `0` reads
+    /// exactly like the default-off unset for every guard in the suite, so
+    /// residue is harmless; the only concurrent setter is the runtime escape
+    /// test's microsecond window).
+    #[tokio::test]
+    async fn gov_direct_writes_refuse_on_multi_node() {
+        use crate::governance::{GovAction, VoteChoice, GOV_MULTINODE_WRITES_ENV};
+        std::env::set_var(GOV_MULTINODE_WRITES_ENV, "0");
+        let st = test_state_with_token().await;
+        let proposer_key = TestGovKey::ed25519([0xA1u8; 32]);
+        let proposer = proposer_key.address();
+        {
+            let mut ledger = st.engine.staking_write().await;
+            ledger
+                .bond(proposer, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
+                .unwrap();
+            ledger
+                .bond([0xB2u8; 32], crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
+                .unwrap();
+        }
+        // Direct propose (valid envelope: the ONLY refusal cause is the guard).
+        let title = "multi".to_string();
+        let action = GovAction::Signal("hi".to_string());
+        let r = call_with_token(
+            &st,
+            "stell_submitProposal",
+            json!({
+                "title": title,
+                "type": "signal",
+                "text": "hi",
+                "proposer": hex::encode(proposer),
+                "nonce": 1u64,
+                "signature": sign_test_proposal(st.chain_id, &proposer_key, &proposer, &title, &action, 1),
+            }),
+        )
+        .await;
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(GOV_MULTINODE_WRITES_ENV),
+            "multi-node propose must name the escape env: {r}"
+        );
+        // Direct vote for an UNKNOWN id: still the guard, never the lookup.
+        let vsig = sign_test_vote(st.chain_id, &proposer_key, &proposer, 999_999, VoteChoice::Yes);
+        let r = call_with_token(
+            &st,
+            "stell_vote",
+            json!({
+                "id": 999_999u64,
+                "voter": hex::encode(proposer),
+                "choice": "yes",
+                "signature": vsig,
+            }),
+        )
+        .await;
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(GOV_MULTINODE_WRITES_ENV),
+            "multi-node vote must refuse at the gate, not at lookup: {r}"
+        );
+        // Direct execute of an UNKNOWN id: still the guard.
+        let r = call_with_token(&st, "stell_executeProposal", json!({ "id": 999_999u64 })).await;
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(GOV_MULTINODE_WRITES_ENV),
+            "multi-node execute must refuse at the gate: {r}"
+        );
+        assert!(
+            st.governance.read().await.proposals.is_empty(),
+            "refused writes must not record anything"
+        );
+        assert_eq!(st.mempool.read().await.len(), 0);
+        // Block form on the SAME set: admitted, nothing recorded.
+        let (from, pk) = pq_pair(0xC1);
+        st.engine
+            .update_account(crate::state_engine::AccountState::new(from, 1_000_000_000_000))
+            .await;
+        let height = st.height.load(std::sync::atomic::Ordering::Relaxed) + 1;
+        let ptx = crate::governance::Governance::gov_propose_tx(
+            from,
+            0,
+            500_000,
+            1,
+            1,
+            1,
+            "multi".to_string(),
+            GovAction::Signal("hi".to_string()),
+            height,
+        )
+        .expect("test propose template must build");
+        let r = call_with_token(
+            &st,
+            "stell_submitProposal",
+            json!({ "tx": gov_tx_hex(&sign_gov_block_tx(0xC1, &pk, ptx)) }),
+        )
+        .await;
+        assert!(r.as_str().is_some(), "block form must admit on multi-node: {r}");
+        assert_eq!(st.mempool.read().await.len(), 1);
+        assert!(
+            st.governance.read().await.proposals.is_empty(),
+            "admission must not record a proposal"
+        );
+    }
+
+    /// Minimal decided-block shell for gov apply tests (same literal shape
+    /// as the `apply_floor_tests` block builder; the apply path consumes
+    /// decided blocks and never checks block signatures).
+    fn gov_block(
+        txs: Vec<crate::sharding::Transaction>,
+        height: u64,
+        timestamp: u64,
+    ) -> crate::sharding::Block {
+        crate::sharding::Block {
+            shard_id: crate::sharding::MASTERCHAIN_SHARD,
+            height,
+            prev_hash: [0u8; 32],
+            state_root: [0u8; 32],
+            transactions: txs.clone(),
+            cross_shard_out: vec![],
+            timestamp,
+            proposer: [0x99u8; 32],
+            validator_signatures: vec![],
+            shard_headers: vec![],
+            precommit_qc: None,
+            last_qc: None,
+            order_merkle_root: crate::mev::compute_order_merkle_root(&txs),
+            epoch_key_commitment: [0u8; 32],
+            mmr_epoch_root: [0u8; 32],
+        }
+    }
+
+    /// Same lifecycle properties as the direct path, via blocks (HDAE-GOV):
+    /// a builder-built, caller-signed propose tx admitted through RPC opens
+    /// the proposal when its block applies (id/title/action/electorate
+    /// identical to the direct path), and builder-built vote txs in the next
+    /// block record the snapshot-weighted tally. Nothing is recorded or
+    /// tallied before the blocks apply.
+    #[tokio::test]
+    async fn gov_propose_and_vote_apply_via_blocks() {
+        use crate::governance::{GovAction, ProposalStatus, VoteChoice};
+        let st = test_state_with_token().await;
+        // Test-only activation: the live gate flips via the const, never
+        // this flag (see `enable_gov_ops_for_tests`).
+        st.engine.enable_gov_ops_for_tests();
+        let (proposer, proposer_pk) = pq_pair(0xA1);
+        let (voter, voter_pk) = pq_pair(0xB2);
+        {
+            let mut ledger = st.engine.staking_write().await;
+            ledger
+                .bond(proposer, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
+                .unwrap();
+            ledger
+                .bond(voter, crate::governance::PROPOSAL_MIN_STAKE_NANO, 0)
+                .unwrap();
+        }
+        st.engine
+            .update_account(crate::state_engine::AccountState::new(proposer, 1_000_000_000_000))
+            .await;
+        st.engine
+            .update_account(crate::state_engine::AccountState::new(voter, 1_000_000_000_000))
+            .await;
+        // The RPC admits the propose tx without recording anything.
+        let action = GovAction::Signal("via blocks".to_string());
+        let ptx = crate::governance::Governance::gov_propose_tx(
+            proposer, 0, 500_000, 1, 1, 1, "blk".to_string(), action.clone(), 43,
+        )
+        .expect("test propose template must build");
+        let ptx = sign_gov_block_tx(0xA1, &proposer_pk, ptx);
+        let r = call_with_token(&st, "stell_submitProposal", json!({ "tx": gov_tx_hex(&ptx) }))
+            .await;
+        assert!(r.as_str().is_some(), "propose tx must admit: {r}");
+        assert!(
+            st.engine.governance_read().await.proposals.is_empty(),
+            "admission must not open the proposal"
+        );
+        // Block 43 applies it: same record the direct path would write.
+        let out = st.engine.apply_block_transition(&gov_block(vec![ptx], 43, 1_700_000_000), 0).await;
+        assert_eq!(out.status, vec![true], "carrier step must succeed");
+        {
+            let g = st.engine.governance_read().await;
+            let p = g.get(1).expect("the block must open proposal 1");
+            assert_eq!(p.title, "blk");
+            assert_eq!(p.action, action);
+            assert_eq!(p.status, ProposalStatus::Open);
+            assert_eq!(p.yes, 0, "no tally before any vote block");
+        }
+        // Vote txs (both stakers) admit cleanly, then block 44 tallies.
+        let vtx_p = crate::governance::Governance::gov_vote_tx(
+            proposer, 1, 500_000, 1, 1, 1, VoteChoice::Yes, 44,
+        );
+        let vtx_p = sign_gov_block_tx(0xA1, &proposer_pk, vtx_p);
+        let vtx_v = crate::governance::Governance::gov_vote_tx(
+            voter, 0, 500_000, 1, 1, 1, VoteChoice::Yes, 44,
+        );
+        let vtx_v = sign_gov_block_tx(0xB2, &voter_pk, vtx_v);
+        for (method, tx) in [
+            ("stell_vote", &vtx_p),
+            ("stell_vote", &vtx_v),
+        ] {
+            let r = call_with_token(&st, method, json!({ "tx": gov_tx_hex(tx) })).await;
+            assert!(r.as_str().is_some(), "vote tx must admit: {r}");
+        }
+        let out = st
+            .engine
+            .apply_block_transition(&gov_block(vec![vtx_p, vtx_v], 44, 1_700_000_012), 0)
+            .await;
+        assert_eq!(out.status, vec![true, true]);
+        let g = st.engine.governance_read().await;
+        let p = g.get(1).expect("proposal 1");
+        let one = crate::governance::PROPOSAL_MIN_STAKE_NANO as u128;
+        assert_eq!(p.yes, 2 * one, "both snapshot weights tally yes");
+        assert_eq!(p.no, 0);
     }
 
     /// `stell_getEvents` must answer a BOUNDED list: the receipt index holds

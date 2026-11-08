@@ -10,16 +10,14 @@
 //!     the first test pins that residual gap explicitly.
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::sync::Arc;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind, VoteSet};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::Block;
 use stellereum::state_engine::InMemoryStateEngine;
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
-}
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 fn id(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
 }
@@ -60,21 +58,27 @@ async fn good_block(rt: &ValidatorRuntime, ks: &[SigningKey]) -> Block {
     b
 }
 
-fn precommit_cert(ks: &[SigningKey], bh: [u8; 32]) -> QuorumCertificate {
-    QuorumCertificate {
-        height: 1,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: ks
-            .iter()
-            .take(3)
-            .map(|k| {
-                let v = Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh));
-                (v.voter, v.signature)
-            })
-            .collect(),
+fn precommit_cert(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    bh: [u8; 32],
+) -> QuorumCertificate {
+    let vs = vs_of(ks);
+    let mut set = VoteSet::new();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        set.add(
+            falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)),
+            &vs,
+            1,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
     }
+    // FULL-PQ: QC must carry the PQ envelope, so it is compiled by the same
+    // committee path production uses (height-1 block is genesis here).
+    set.certificate(Some(bh), &vs, &[0u8; 32])
+        .expect("3-of-4 precommits reach quorum")
 }
 
 /// Residual gap, pinned: a fresh node that observed NO prevotes accepts a valid
@@ -82,11 +86,11 @@ fn precommit_cert(ks: &[SigningKey], bh: [u8; 32]) -> QuorumCertificate {
 /// it has no evidence to check -- refusing here would make catch-up impossible.
 #[tokio::test]
 async fn precommit_without_any_local_prevote_is_accepted_gap_pinned() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = runtime(&ks, 0).await;
     let blk = good_block(&rt, &ks).await;
     let bh = blk.compute_hash();
-    let cert = precommit_cert(&ks, bh);
+    let cert = precommit_cert(&ks, &fks, bh);
     assert!(cert.verify(&rt.validators));
     assert!(rt.hc.prevote_set(0).is_none(), "fresh node saw no prevotes");
     let r = rt.adopt_committed(1, blk, cert).await;
@@ -100,15 +104,22 @@ async fn precommit_without_any_local_prevote_is_accepted_gap_pinned() {
 /// Matching prevote quorum + precommit QC is accepted.
 #[tokio::test]
 async fn matching_prevote_and_precommit_is_accepted() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = runtime(&ks, 0).await;
     let blk = good_block(&rt, &ks).await;
     let bh = blk.compute_hash();
-    for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
-            .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            0,
+            VoteKind::Prevote,
+            Some(bh),
+        ))
+        .unwrap();
     }
-    let cert = precommit_cert(&ks, bh);
+    let cert = precommit_cert(&ks, &fks, bh);
     let r = rt.adopt_committed(1, blk, cert).await;
     assert_eq!(r, Ok(bh));
 }
@@ -116,17 +127,24 @@ async fn matching_prevote_and_precommit_is_accepted() {
 /// Local prevote quorum for a DIFFERENT block refuses the adoption.
 #[tokio::test]
 async fn conflicting_local_prevote_quorum_refuses_adoption() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = runtime(&ks, 0).await;
     let blk = good_block(&rt, &ks).await;
     let bh = blk.compute_hash();
     let other = [0xEEu8; 32];
     assert_ne!(other, bh);
-    for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(other)))
-            .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            1,
+            0,
+            VoteKind::Prevote,
+            Some(other),
+        ))
+        .unwrap();
     }
-    let cert = precommit_cert(&ks, bh);
+    let cert = precommit_cert(&ks, &fks, bh);
     assert!(cert.verify(&rt.validators), "precommit QC itself is valid");
     let r = rt.adopt_committed(1, blk, cert).await;
     assert!(
@@ -143,12 +161,12 @@ async fn conflicting_local_prevote_quorum_refuses_adoption() {
 /// Adopting against our own lock is refused (mirror of try_precommit_quorum).
 #[tokio::test]
 async fn anti_lock_adoption_is_refused() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = runtime(&ks, 0).await;
     let blk = good_block(&rt, &ks).await;
     let bh = blk.compute_hash();
     rt.hc.locked = Some(([0xAAu8; 32], 0));
-    let cert = precommit_cert(&ks, bh);
+    let cert = precommit_cert(&ks, &fks, bh);
     let r = rt.adopt_committed(1, blk, cert).await;
     assert!(r.is_err());
     assert!(r.unwrap_err().contains("lock"));
@@ -158,12 +176,12 @@ async fn anti_lock_adoption_is_refused() {
 /// Adopting the block we are locked on succeeds.
 #[tokio::test]
 async fn adopting_the_locked_block_succeeds() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = runtime(&ks, 0).await;
     let blk = good_block(&rt, &ks).await;
     let bh = blk.compute_hash();
     rt.hc.locked = Some((bh, 0));
-    let cert = precommit_cert(&ks, bh);
+    let cert = precommit_cert(&ks, &fks, bh);
     let r = rt.adopt_committed(1, blk, cert).await;
     assert_eq!(r, Ok(bh));
 }

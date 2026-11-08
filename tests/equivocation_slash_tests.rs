@@ -27,16 +27,18 @@
 //!     envelopes without touching state.
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::sync::Arc;
 use stellereum::consensus::{
-    EquivocationEvidence, QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind,
+    EquivocationEvidence, QuorumCertificate, ValidatorId, ValidatorSet, VoteKind,
 };
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::staking::{EQUIVOCATION_SLASH_BPS, MIN_VALIDATOR_BOND, STAKING_POOL};
 use stellereum::state_engine::InMemoryStateEngine;
 use stellereum::svm::OpCode;
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 /// Genesis balance per validator account (far above the bonded stake, so fees
 /// never bind).
@@ -53,10 +55,6 @@ fn expected_burn() -> u64 {
     (MIN_VALIDATOR_BOND as u128 * EQUIVOCATION_SLASH_BPS as u128 / 10_000u128) as u64
 }
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
-}
-
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(
         ks.iter()
@@ -70,17 +68,23 @@ fn id_of(k: &SigningKey) -> ValidatorId {
 }
 
 /// A genuine conflicting pair by `offender` at consensus height 1.
-fn double_sign(offender: &SigningKey) -> EquivocationEvidence {
-    let a = Vote::sign(offender, 1, 0, VoteKind::Prevote, Some([0x11u8; 32]));
-    let b = Vote::sign(offender, 1, 0, VoteKind::Prevote, Some([0x22u8; 32]));
+fn double_sign(
+    offender: &SigningKey,
+    fk: &stellereum::post_quantum::FalconKeypair,
+) -> EquivocationEvidence {
+    let a = falcon_votes::fvote(offender, fk, 1, 0, VoteKind::Prevote, Some([0x11u8; 32]));
+    let b = falcon_votes::fvote(offender, fk, 1, 0, VoteKind::Prevote, Some([0x22u8; 32]));
     assert!(a.verify() && b.verify(), "precondition: both votes verify");
     EquivocationEvidence::new(id_of(offender), a, b)
 }
 
 /// A non-pair: the SAME vote twice (a single vote repeated is not
 /// equivocation and must burn nothing).
-fn single_vote_repeated(offender: &SigningKey) -> EquivocationEvidence {
-    let a = Vote::sign(offender, 1, 0, VoteKind::Prevote, Some([0x11u8; 32]));
+fn single_vote_repeated(
+    offender: &SigningKey,
+    fk: &stellereum::post_quantum::FalconKeypair,
+) -> EquivocationEvidence {
+    let a = falcon_votes::fvote(offender, fk, 1, 0, VoteKind::Prevote, Some([0x11u8; 32]));
     EquivocationEvidence::new(id_of(offender), a.clone(), a)
 }
 
@@ -158,14 +162,29 @@ async fn mirrored_engines(vs: &ValidatorSet, n: usize) -> Vec<Arc<InMemoryStateE
 fn certify_full(
     rt: &mut ValidatorRuntime,
     ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
     height: u64,
     bh: [u8; 32],
 ) -> QuorumCertificate {
-    for k in ks.iter() {
-        rt.on_prevote(Vote::sign(k, height, 0, VoteKind::Prevote, Some(bh)))
-            .expect("prevote accepted");
-        rt.on_precommit(Vote::sign(k, height, 0, VoteKind::Precommit, Some(bh)))
-            .expect("precommit accepted");
+    for (i, k) in ks.iter().enumerate() {
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            height,
+            0,
+            VoteKind::Prevote,
+            Some(bh),
+        ))
+        .expect("prevote accepted");
+        rt.on_precommit(falcon_votes::fvote(
+            k,
+            &fks[i],
+            height,
+            0,
+            VoteKind::Precommit,
+            Some(bh),
+        ))
+        .expect("precommit accepted");
     }
     assert_eq!(
         rt.hc.try_precommit_quorum(),
@@ -188,7 +207,7 @@ async fn pool_of(e: &Arc<InMemoryStateEngine>) -> u64 {
 
 #[tokio::test]
 async fn double_sign_slashed_exactly_five_percent() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let offender = id_of(&ks[3]);
     let engines = mirrored_engines(&vs, 1).await;
@@ -207,7 +226,7 @@ async fn double_sign_slashed_exactly_five_percent() {
     let pool_before = pool_of(&engine).await;
     let burned_before = engine.staking_read().await.total_burned;
 
-    let evidence = double_sign(&ks[3]);
+    let evidence = double_sign(&ks[3], &fks[3]);
     let root = engine.get_state_root().await;
     let mut blk = mk_block(
         &ks[0],
@@ -217,7 +236,7 @@ async fn double_sign_slashed_exactly_five_percent() {
         vec![report_tx(&ks[0], 0, evidence)],
     );
     let bh = blk.compute_hash();
-    blk.precommit_qc = Some(certify_full(&mut rt, &ks, 1, bh));
+    blk.precommit_qc = Some(certify_full(&mut rt, &ks, &fks, 1, bh));
     rt.blocks.insert(bh, blk.clone());
     assert_eq!(rt.try_finalize().await, Some(bh), "must finalize height 1");
 
@@ -257,7 +276,7 @@ async fn double_sign_slashed_exactly_five_percent() {
 
 #[tokio::test]
 async fn repeat_offense_slashed_once() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let offender = id_of(&ks[3]);
     let engines = mirrored_engines(&vs, 1).await;
@@ -267,7 +286,7 @@ async fn repeat_offense_slashed_once() {
 
     // Block 1 carries the SAME offense twice (two reporter transactions).
     // Canonicalization drops the in-block duplicate: one 5% burn, not two.
-    let evidence = double_sign(&ks[3]);
+    let evidence = double_sign(&ks[3], &fks[3]);
     let root = engine.get_state_root().await;
     let mut blk1 = mk_block(
         &ks[0],
@@ -280,7 +299,7 @@ async fn repeat_offense_slashed_once() {
         ],
     );
     let bh1 = blk1.compute_hash();
-    blk1.precommit_qc = Some(certify_full(&mut rt, &ks, 1, bh1));
+    blk1.precommit_qc = Some(certify_full(&mut rt, &ks, &fks, 1, bh1));
     rt.blocks.insert(bh1, blk1.clone());
     assert_eq!(rt.try_finalize().await, Some(bh1), "must finalize height 1");
     // Both report transactions are valid evidence, so both succeed — but the
@@ -307,11 +326,25 @@ async fn repeat_offense_slashed_once() {
     let root2 = engine.get_state_root().await;
     let mut blk2 = mk_block(&ks[0], 2, bh1, root2, vec![report_tx(&ks[0], 2, evidence)]);
     let bh2 = blk2.compute_hash();
-    for k in survivors.iter() {
-        rt.on_prevote(Vote::sign(k, 2, 0, VoteKind::Prevote, Some(bh2)))
-            .expect("prevote accepted");
-        rt.on_precommit(Vote::sign(k, 2, 0, VoteKind::Precommit, Some(bh2)))
-            .expect("precommit accepted");
+    for (i, k) in survivors.iter().enumerate() {
+        rt.on_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            2,
+            0,
+            VoteKind::Prevote,
+            Some(bh2),
+        ))
+        .expect("prevote accepted");
+        rt.on_precommit(falcon_votes::fvote(
+            k,
+            &fks[i],
+            2,
+            0,
+            VoteKind::Precommit,
+            Some(bh2),
+        ))
+        .expect("precommit accepted");
     }
     assert_eq!(
         rt.hc.try_precommit_quorum(),
@@ -351,7 +384,7 @@ async fn repeat_offense_slashed_once() {
 
 #[tokio::test]
 async fn single_vote_repeated_burns_nothing() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let offender = id_of(&ks[3]);
     let engines = mirrored_engines(&vs, 1).await;
@@ -365,10 +398,10 @@ async fn single_vote_repeated_burns_nothing() {
         1,
         [0u8; 32],
         root,
-        vec![report_tx(&ks[0], 0, single_vote_repeated(&ks[3]))],
+        vec![report_tx(&ks[0], 0, single_vote_repeated(&ks[3], &fks[3]))],
     );
     let bh = blk.compute_hash();
-    blk.precommit_qc = Some(certify_full(&mut rt, &ks, 1, bh));
+    blk.precommit_qc = Some(certify_full(&mut rt, &ks, &fks, 1, bh));
     rt.blocks.insert(bh, blk.clone());
     assert_eq!(rt.try_finalize().await, Some(bh), "must finalize height 1");
 
@@ -396,7 +429,7 @@ async fn single_vote_repeated_burns_nothing() {
 
 #[tokio::test]
 async fn two_engines_same_block_same_root() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let offender = id_of(&ks[3]);
     let engines = mirrored_engines(&vs, 2).await;
@@ -405,7 +438,7 @@ async fn two_engines_same_block_same_root() {
     let mut b = ValidatorRuntime::new(ks[1].clone(), vs.clone(), engine_b.clone(), 1);
     let burn = expected_burn();
 
-    let evidence = double_sign(&ks[3]);
+    let evidence = double_sign(&ks[3], &fks[3]);
     // The adopt route checks the block proposer against the schedule
     // (`proposer_for`), so build the block under the scheduled key —
     // otherwise adoption fails closed on proposer mismatch while local
@@ -424,7 +457,7 @@ async fn two_engines_same_block_same_root() {
         vec![report_tx(&ks[0], 0, evidence)],
     );
     let bh = blk.compute_hash();
-    let qc = certify_full(&mut a, &ks, 1, bh);
+    let qc = certify_full(&mut a, &ks, &fks, 1, bh);
     blk.precommit_qc = Some(qc.clone());
 
     // Route A: local finalize (this node ALSO holds the gossip evidence, but
@@ -460,7 +493,7 @@ async fn two_engines_same_block_same_root() {
 
 #[tokio::test]
 async fn feed_converts_local_observations_without_touching_state() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let engines = mirrored_engines(&vs, 1).await;
     let engine = engines[0].clone();
@@ -475,10 +508,18 @@ async fn feed_converts_local_observations_without_touching_state() {
     // Observe a double-vote over gossip (first vote counts for quorum, the
     // conflicting second is recorded as evidence).
     let bh = [0xABu8; 32];
-    rt.on_prevote(Vote::sign(&ks[3], 1, 0, VoteKind::Prevote, Some(bh)))
-        .unwrap();
-    rt.on_prevote(Vote::sign(
+    rt.on_prevote(falcon_votes::fvote(
         &ks[3],
+        &fks[3],
+        1,
+        0,
+        VoteKind::Prevote,
+        Some(bh),
+    ))
+    .unwrap();
+    rt.on_prevote(falcon_votes::fvote(
+        &ks[3],
+        &fks[3],
         1,
         0,
         VoteKind::Prevote,

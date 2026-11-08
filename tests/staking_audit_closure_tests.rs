@@ -30,7 +30,8 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::Arc;
 
-use stellereum::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, VoteKind};
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::staking::{
@@ -38,6 +39,9 @@ use stellereum::staking::{
     STAKING_POOL, STELL_MIN_BOND_BUFFER, UNBONDING_PERIOD_SECS,
 };
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 const STELL: u64 = 1_000_000_000;
 /// New-bond floor: bare MIN is refused, MIN+buffer is accepted.
@@ -272,8 +276,8 @@ async fn m2_delegator_cycle_pays_from_pool() {
 // M3 — downtime is elected-only (end to end through finalize)
 // ============================================================================
 
-fn cluster_keys() -> Vec<SigningKey> {
-    (0..4).map(|_| SigningKey::generate(&mut OsRng)).collect()
+fn cluster_keys() -> (Vec<SigningKey>, Vec<FalconKeypair>) {
+    falcon_votes::falcon_set(4)
 }
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(ks.iter().map(|k| (id(k), 1)).collect())
@@ -313,7 +317,7 @@ fn mkblock(pkey: &SigningKey, h: u64, prev: [u8; 32], root: [u8; 32]) -> Block {
 /// the evidence the height-2 block carries, and the slash lands there.
 #[tokio::test]
 async fn m3_downtime_skips_unelected_while_elected_slashes() {
-    let ks = cluster_keys();
+    let (ks, fks) = cluster_keys();
     let vs = vset(&ks);
     let ids: Vec<ValidatorId> = ks.iter().map(id).collect();
     let silent_elected = ids[3];
@@ -360,10 +364,10 @@ async fn m3_downtime_skips_unelected_while_elected_slashes() {
     let pkey = ks.iter().find(|k| id(k) == want).unwrap().clone();
     let block = mkblock(&pkey, 1, [0u8; 32], root);
     let bh = block.compute_hash();
-    for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh)))
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        rt.on_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh)))
             .unwrap();
-        rt.on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh)))
+        rt.on_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh)))
             .unwrap();
     }
     assert_eq!(rt.hc.try_precommit_quorum(), Some(bh));
@@ -398,10 +402,10 @@ async fn m3_downtime_skips_unelected_while_elected_slashes() {
     block2.validator_signatures.clear();
     block2.sign_block(&pkey2);
     let bh2 = block2.compute_hash();
-    for k in ks.iter().take(3) {
-        rt.on_prevote(Vote::sign(k, 2, 0, VoteKind::Prevote, Some(bh2)))
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        rt.on_prevote(falcon_votes::fvote(k, fk, 2, 0, VoteKind::Prevote, Some(bh2)))
             .unwrap();
-        rt.on_precommit(Vote::sign(k, 2, 0, VoteKind::Precommit, Some(bh2)))
+        rt.on_precommit(falcon_votes::fvote(k, fk, 2, 0, VoteKind::Precommit, Some(bh2)))
             .unwrap();
     }
     assert_eq!(rt.hc.try_precommit_quorum(), Some(bh2));
@@ -761,25 +765,25 @@ async fn rewards_shortfall_never_touches_principal() {
 /// non-conflicting burns 0 and moves nothing.
 #[tokio::test]
 async fn equivocation_primitive_burns_5pct_on_conflict_only() {
-    use ed25519_dalek::SigningKey as SK;
-    let sk = SK::generate(&mut OsRng);
+    let (sks, fks) = falcon_votes::falcon_set(1);
+    let (sk, fk) = (&sks[0], &fks[0]);
     let voter = sk.verifying_key().to_bytes();
     let mut l = StakingLedger::new();
     l.bond(voter, stell(1100), 0).unwrap();
     l.delegate([0xF1u8; 32], voter, stell(1000)).unwrap();
 
     // Same height/round/kind, different target → 5% of 2100 = 105.
-    let a = Vote::sign(&sk, 7, 0, VoteKind::Prevote, Some([1u8; 32]));
-    let b = Vote::sign(&sk, 7, 0, VoteKind::Prevote, Some([2u8; 32]));
+    let a = falcon_votes::fvote(sk, fk, 7, 0, VoteKind::Prevote, Some([1u8; 32]));
+    let b = falcon_votes::fvote(sk, fk, 7, 0, VoteKind::Prevote, Some([2u8; 32]));
     assert_eq!(l.slash_equivocation(&(voter, a, b)).unwrap(), stell(105));
     assert_eq!(l.total_burned, stell(105));
     assert_eq!(l.total_stake(&voter), stell(2100) - stell(105));
 
     // Same target → not equivocation. Different round → not equivocation.
-    let c = Vote::sign(&sk, 7, 0, VoteKind::Prevote, Some([1u8; 32]));
-    let c2 = Vote::sign(&sk, 7, 0, VoteKind::Prevote, Some([1u8; 32]));
+    let c = falcon_votes::fvote(sk, fk, 7, 0, VoteKind::Prevote, Some([1u8; 32]));
+    let c2 = falcon_votes::fvote(sk, fk, 7, 0, VoteKind::Prevote, Some([1u8; 32]));
     assert_eq!(l.slash_equivocation(&(voter, c.clone(), c2)).unwrap(), 0);
-    let e = Vote::sign(&sk, 7, 1, VoteKind::Prevote, Some([9u8; 32]));
+    let e = falcon_votes::fvote(sk, fk, 7, 1, VoteKind::Prevote, Some([9u8; 32]));
     assert_eq!(l.slash_equivocation(&(voter, c, e)).unwrap(), 0);
     assert_eq!(l.total_burned, stell(105), "non-conflicts move nothing");
 }

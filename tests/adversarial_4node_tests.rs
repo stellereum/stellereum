@@ -6,12 +6,10 @@
 //! deterministic, fast, no sleeps, no `#[ignore]`.
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
-use stellereum::consensus::{HeightConsensus, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{HeightConsensus, ValidatorSet, VoteKind};
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
-}
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 fn id(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
 }
@@ -32,13 +30,14 @@ fn h(x: u8) -> [u8; 32] {
 fn vote_all(
     hcs: &mut [HeightConsensus],
     ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
     height: u64,
     round: u32,
     bh: [u8; 32],
     voters: &[usize],
 ) {
     for &i in voters {
-        let pv = Vote::sign(&ks[i], height, round, VoteKind::Prevote, Some(bh));
+        let pv = falcon_votes::fvote(&ks[i], &fks[i], height, round, VoteKind::Prevote, Some(bh));
         for hc in hcs.iter_mut() {
             hc.add_prevote(pv.clone()).unwrap();
         }
@@ -47,7 +46,14 @@ fn vote_all(
         hc.try_prevote_quorum();
     }
     for &i in voters {
-        let pc = Vote::sign(&ks[i], height, round, VoteKind::Precommit, Some(bh));
+        let pc = falcon_votes::fvote(
+            &ks[i],
+            &fks[i],
+            height,
+            round,
+            VoteKind::Precommit,
+            Some(bh),
+        );
         for hc in hcs.iter_mut() {
             hc.add_precommit(pc.clone()).unwrap();
         }
@@ -59,7 +65,7 @@ fn vote_all(
 // Neither half may finalize; a later honest proposer reunites all four on Z.
 #[test]
 fn adv_equivocating_proposer_splits_halves_but_cannot_hold_the_split() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     assert_eq!(vs.quorum_power(), 3);
     let height = 1u64;
@@ -89,13 +95,13 @@ fn adv_equivocating_proposer_splits_halves_but_cannot_hold_the_split() {
     // Each half prevotes what it saw; broadcast everything so every node
     // sees a 2-vs-2 split.
     for &i in &gx {
-        let v = Vote::sign(&ks[i], height, 0, VoteKind::Prevote, Some(x));
+        let v = falcon_votes::fvote(&ks[i], &fks[i], height, 0, VoteKind::Prevote, Some(x));
         for hc in hcs.iter_mut() {
             hc.add_prevote(v.clone()).unwrap();
         }
     }
     for &i in &gy {
-        let v = Vote::sign(&ks[i], height, 0, VoteKind::Prevote, Some(y));
+        let v = falcon_votes::fvote(&ks[i], &fks[i], height, 0, VoteKind::Prevote, Some(y));
         for hc in hcs.iter_mut() {
             hc.add_prevote(v.clone()).unwrap();
         }
@@ -112,13 +118,13 @@ fn adv_equivocating_proposer_splits_halves_but_cannot_hold_the_split() {
 
     // Even if both halves precommit their halves, 2 < 3 everywhere.
     for &i in &gx {
-        let v = Vote::sign(&ks[i], height, 0, VoteKind::Precommit, Some(x));
+        let v = falcon_votes::fvote(&ks[i], &fks[i], height, 0, VoteKind::Precommit, Some(x));
         for hc in hcs.iter_mut() {
             hc.add_precommit(v.clone()).unwrap();
         }
     }
     for &i in &gy {
-        let v = Vote::sign(&ks[i], height, 0, VoteKind::Precommit, Some(y));
+        let v = falcon_votes::fvote(&ks[i], &fks[i], height, 0, VoteKind::Precommit, Some(y));
         for hc in hcs.iter_mut() {
             hc.add_precommit(v.clone()).unwrap();
         }
@@ -150,7 +156,7 @@ fn adv_equivocating_proposer_splits_halves_but_cannot_hold_the_split() {
         hc.receive_proposal(honest_id, z).unwrap();
     }
     let all = vec![0usize, 1, 2, 3];
-    vote_all(&mut hcs, &ks, height, r, z, &all);
+    vote_all(&mut hcs, &ks, &fks, height, r, z, &all);
     for (i, hc) in hcs.iter_mut().enumerate() {
         assert_eq!(
             hc.try_precommit_quorum(),
@@ -170,7 +176,7 @@ fn adv_equivocating_proposer_splits_halves_but_cannot_hold_the_split() {
 // message and still finalizes with the honest three.
 #[test]
 fn adv_targeted_round_inflation_is_capped_and_victim_still_finalizes() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let height = 1u64;
     let byz = 3usize;
@@ -184,7 +190,7 @@ fn adv_targeted_round_inflation_is_capped_and_victim_still_finalizes() {
 
     // Far-future vote delivered ONLY to the victim.
     let far: u32 = 500;
-    let evil = Vote::sign(&ks[byz], height, far, VoteKind::Prevote, Some(x));
+    let evil = falcon_votes::fvote(&ks[byz], &fks[byz], height, far, VoteKind::Prevote, Some(x));
     assert!(evil.verify());
     hcs[victim].add_prevote(evil.clone()).unwrap();
     // Nobody else saw it.
@@ -205,7 +211,14 @@ fn adv_targeted_round_inflation_is_capped_and_victim_still_finalizes() {
     );
     // A second inflated claim still moves at most one more round.
     let far2: u32 = 900;
-    let evil2 = Vote::sign(&ks[byz], height, far2, VoteKind::Prevote, Some(x));
+    let evil2 = falcon_votes::fvote(
+        &ks[byz],
+        &fks[byz],
+        height,
+        far2,
+        VoteKind::Prevote,
+        Some(x),
+    );
     hcs[victim].add_prevote(evil2).unwrap();
     hcs[victim].advance_to_round(far2);
     assert_eq!(hcs[victim].round, 2, "N messages advance at most N rounds");
@@ -236,7 +249,7 @@ fn adv_targeted_round_inflation_is_capped_and_victim_still_finalizes() {
     for hc in reunion.iter_mut() {
         hc.receive_proposal(prop, z).unwrap();
     }
-    vote_all(&mut reunion, &ks, height, r, z, &honest);
+    vote_all(&mut reunion, &ks, &fks, height, r, z, &honest);
     for (k, hc) in reunion.iter_mut().enumerate() {
         assert_eq!(
             hc.try_precommit_quorum(),
@@ -251,7 +264,7 @@ fn adv_targeted_round_inflation_is_capped_and_victim_still_finalizes() {
 // withheld then replayed at H+1, is inert (no finalize, no rewind).
 #[test]
 fn adv_withheld_qc_replay_at_next_height_is_inert() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let h1 = 1u64;
     let h2 = 2u64;
@@ -259,14 +272,28 @@ fn adv_withheld_qc_replay_at_next_height_is_inert() {
 
     // Build a GENUINE QC for X at H=1 (3 prevotes + 3 precommits).
     let mut hc1 = HeightConsensus::new(h1, vs.clone());
-    for k in ks.iter().take(3) {
-        hc1.add_prevote(Vote::sign(k, h1, 0, VoteKind::Prevote, Some(x)))
-            .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        hc1.add_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            h1,
+            0,
+            VoteKind::Prevote,
+            Some(x),
+        ))
+        .unwrap();
     }
     assert_eq!(hc1.try_prevote_quorum(), Some(Some(x)));
-    for k in ks.iter().take(3) {
-        hc1.add_precommit(Vote::sign(k, h1, 0, VoteKind::Precommit, Some(x)))
-            .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        hc1.add_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            h1,
+            0,
+            VoteKind::Precommit,
+            Some(x),
+        ))
+        .unwrap();
     }
     assert_eq!(hc1.try_precommit_quorum(), Some(x));
     let qc = hc1
@@ -284,8 +311,8 @@ fn adv_withheld_qc_replay_at_next_height_is_inert() {
     assert_eq!(hc2.decided, None);
 
     // Replay: every vote inside the old QC is out-of-scope at H+1.
-    for k in ks.iter().take(3) {
-        let stale_pv = Vote::sign(k, h1, 0, VoteKind::Prevote, Some(x));
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        let stale_pv = falcon_votes::fvote(k, fk, h1, 0, VoteKind::Prevote, Some(x));
         let e = hc2
             .add_prevote(stale_pv)
             .expect_err("stale height-1 vote must be rejected");
@@ -293,7 +320,7 @@ fn adv_withheld_qc_replay_at_next_height_is_inert() {
             e.contains("out of scope"),
             "reject reason must be scope: {e}"
         );
-        let stale_pc = Vote::sign(k, h1, 0, VoteKind::Precommit, Some(x));
+        let stale_pc = falcon_votes::fvote(k, fk, h1, 0, VoteKind::Precommit, Some(x));
         let e2 = hc2
             .add_precommit(stale_pc)
             .expect_err("stale height-1 vote must be rejected");
@@ -314,14 +341,28 @@ fn adv_withheld_qc_replay_at_next_height_is_inert() {
 
     // And the fresh height still finalizes normally on a new value.
     let y = h(0x67);
-    for k in ks.iter().take(3) {
-        hc2.add_prevote(Vote::sign(k, h2, 0, VoteKind::Prevote, Some(y)))
-            .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        hc2.add_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            h2,
+            0,
+            VoteKind::Prevote,
+            Some(y),
+        ))
+        .unwrap();
     }
     assert_eq!(hc2.try_prevote_quorum(), Some(Some(y)));
-    for k in ks.iter().take(3) {
-        hc2.add_precommit(Vote::sign(k, h2, 0, VoteKind::Precommit, Some(y)))
-            .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        hc2.add_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            h2,
+            0,
+            VoteKind::Precommit,
+            Some(y),
+        ))
+        .unwrap();
     }
     assert_eq!(hc2.try_precommit_quorum(), Some(y));
 }
@@ -330,7 +371,7 @@ fn adv_withheld_qc_replay_at_next_height_is_inert() {
 // with valid signatures. The honest three still finalize; chain advances.
 #[test]
 fn adv_nil_grind_does_not_deny_quorum_and_chain_advances() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     assert_eq!(vs.quorum_power(), 3);
     // Byzantine is NOT the round-0 proposer, so proposals stay honest.
@@ -360,13 +401,13 @@ fn adv_nil_grind_does_not_deny_quorum_and_chain_advances() {
         }
         // Honest three prevote the block; byzantine prevotes NIL (valid sig).
         for &i in &honest {
-            let v = Vote::sign(&ks[i], height, r, VoteKind::Prevote, Some(bh));
+            let v = falcon_votes::fvote(&ks[i], &fks[i], height, r, VoteKind::Prevote, Some(bh));
             assert!(v.verify());
             for hc in hcs.iter_mut() {
                 hc.add_prevote(v.clone()).unwrap();
             }
         }
-        let nil_pv = Vote::sign(&ks[byz], height, r, VoteKind::Prevote, None);
+        let nil_pv = falcon_votes::fvote(&ks[byz], &fks[byz], height, r, VoteKind::Prevote, None);
         assert!(
             nil_pv.verify(),
             "nil vote carries an honest signature on nil"
@@ -386,12 +427,12 @@ fn adv_nil_grind_does_not_deny_quorum_and_chain_advances() {
         }
         // Precommits: same shape.
         for &i in &honest {
-            let v = Vote::sign(&ks[i], height, r, VoteKind::Precommit, Some(bh));
+            let v = falcon_votes::fvote(&ks[i], &fks[i], height, r, VoteKind::Precommit, Some(bh));
             for hc in hcs.iter_mut() {
                 hc.add_precommit(v.clone()).unwrap();
             }
         }
-        let nil_pc = Vote::sign(&ks[byz], height, r, VoteKind::Precommit, None);
+        let nil_pc = falcon_votes::fvote(&ks[byz], &fks[byz], height, r, VoteKind::Precommit, None);
         assert!(nil_pc.verify());
         for hc in hcs.iter_mut() {
             hc.add_precommit(nil_pc.clone()).unwrap();
@@ -412,7 +453,7 @@ fn adv_nil_grind_does_not_deny_quorum_and_chain_advances() {
 // out-of-scope and change nothing.
 #[test]
 fn adv_amnesia_replay_of_own_old_votes_is_rejected_and_inert() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let byz = 3usize;
     let old_h = 1u64;
@@ -420,8 +461,22 @@ fn adv_amnesia_replay_of_own_old_votes_is_rejected_and_inert() {
     let old_block = h(0x88);
 
     // Genuine old votes the adversary really cast at H=1.
-    let old_pv = Vote::sign(&ks[byz], old_h, 0, VoteKind::Prevote, Some(old_block));
-    let old_pc = Vote::sign(&ks[byz], old_h, 0, VoteKind::Precommit, Some(old_block));
+    let old_pv = falcon_votes::fvote(
+        &ks[byz],
+        &fks[byz],
+        old_h,
+        0,
+        VoteKind::Prevote,
+        Some(old_block),
+    );
+    let old_pc = falcon_votes::fvote(
+        &ks[byz],
+        &fks[byz],
+        old_h,
+        0,
+        VoteKind::Precommit,
+        Some(old_block),
+    );
     assert!(old_pv.verify() && old_pc.verify());
 
     let mut hc = HeightConsensus::new(cur_h, vs.clone());
@@ -455,14 +510,22 @@ fn adv_amnesia_replay_of_own_old_votes_is_rejected_and_inert() {
 
     // The current height still finalizes on fresh votes afterwards.
     let cur_block = h(0x89);
-    for k in ks.iter().take(3) {
-        hc.add_prevote(Vote::sign(k, cur_h, 0, VoteKind::Prevote, Some(cur_block)))
-            .unwrap();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            cur_h,
+            0,
+            VoteKind::Prevote,
+            Some(cur_block),
+        ))
+        .unwrap();
     }
     assert_eq!(hc.try_prevote_quorum(), Some(Some(cur_block)));
-    for k in ks.iter().take(3) {
-        hc.add_precommit(Vote::sign(
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        hc.add_precommit(falcon_votes::fvote(
             k,
+            fk,
             cur_h,
             0,
             VoteKind::Precommit,

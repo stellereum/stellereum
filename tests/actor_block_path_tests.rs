@@ -26,7 +26,8 @@
 
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
-use stellereum::consensus::{ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{register_validator_pq_key, ValidatorSet, VoteKind};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::runtime::{fund_genesis, ChainState, ValidatorRuntime};
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, ActorSendBody, InMemoryStateEngine};
@@ -43,6 +44,28 @@ const OTHER_SHARD: u32 = 1;
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
+}
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
+/// FULL-PQ companions for an existing Ed committee: the Falcon seed is the
+/// key's own first byte, so the same voter id always maps to the same Falcon
+/// key (parallel tests sharing an id cannot skew the registry). Registers
+/// each companion globally, which `Vote::verify` reads.
+fn fks_for(ks: &[SigningKey]) -> Vec<FalconKeypair> {
+    let fks: Vec<FalconKeypair> = ks
+        .iter()
+        .map(|k| FalconKeypair::generate_from_seed(k.to_bytes()[0]))
+        .collect();
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        register_validator_pq_key(
+            k.verifying_key().to_bytes(),
+            PqScheme::Falcon512,
+            fk.public_key.clone(),
+        );
+    }
+    fks
 }
 
 async fn balance(e: &InMemoryStateEngine, addr: &[u8; 32]) -> u64 {
@@ -717,14 +740,33 @@ async fn cross_shard_actor_send_is_refused() {
 /// attach the certificate the block body must carry (the shape
 /// `tests/block_apply_parity_tests.rs` uses - both paths must apply the SAME
 /// bytes, certificate included, or the comparison means nothing).
-async fn certify(live: &mut ValidatorRuntime, ks: &[SigningKey], blk: &mut Block) -> [u8; 32] {
+async fn certify(
+    live: &mut ValidatorRuntime,
+    ks: &[SigningKey],
+    fks: &[FalconKeypair],
+    blk: &mut Block,
+) -> [u8; 32] {
     let bh = blk.compute_hash();
     let height = blk.height;
-    for k in ks.iter().take(3) {
-        live.on_prevote(Vote::sign(k, height, 0, VoteKind::Prevote, Some(bh)))
-            .expect("prevote accepted");
-        live.on_precommit(Vote::sign(k, height, 0, VoteKind::Precommit, Some(bh)))
-            .expect("precommit accepted");
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        live.on_prevote(falcon_votes::fvote(
+            k,
+            fk,
+            height,
+            0,
+            VoteKind::Prevote,
+            Some(bh),
+        ))
+        .expect("prevote accepted");
+        live.on_precommit(falcon_votes::fvote(
+            k,
+            fk,
+            height,
+            0,
+            VoteKind::Precommit,
+            Some(bh),
+        ))
+        .expect("precommit accepted");
     }
     assert_eq!(
         live.hc.try_precommit_quorum(),
@@ -749,6 +791,7 @@ async fn live_and_reorg_paths_agree_on_an_actor_block() {
     let ks: Vec<SigningKey> = (0..4u8)
         .map(|i| SigningKey::from_bytes(&[0x60 + i; 32]))
         .collect();
+    let fks = fks_for(&ks);
     let vs = ValidatorSet::from_list(
         ks.iter()
             .map(|k| (k.verifying_key().to_bytes(), 1))
@@ -812,7 +855,7 @@ async fn live_and_reorg_paths_agree_on_an_actor_block() {
         order_merkle_root,
         epoch_key_commitment: [0u8; 32],
     };
-    let bh = certify(&mut live, &ks, &mut blk).await;
+    let bh = certify(&mut live, &ks, &fks, &mut blk).await;
 
     // ---- LIVE ----
     live.blocks.insert(bh, blk.clone());

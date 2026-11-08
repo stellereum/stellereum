@@ -33,17 +33,20 @@
 //! these tests pin the bounds so any regression fails loudly.
 
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::sync::Arc;
 use stellereum::consensus::{
-    HeightConsensus, ValidatorSet, Vote, VoteKind, MAX_DEADLOCK_JUMP, MAX_SYNC_JUMPS_PER_ROUND,
+    HeightConsensus, ValidatorSet, VoteKind, MAX_DEADLOCK_JUMP, MAX_SYNC_JUMPS_PER_ROUND,
     REPHASE_SCAN_WINDOW, ROUND_LOOKBACK,
 };
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::state_engine::InMemoryStateEngine;
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
+fn keys(n: usize) -> (Vec<SigningKey>, Vec<FalconKeypair>) {
+    falcon_votes::falcon_set(n)
 }
 
 fn id(k: &SigningKey) -> [u8; 32] {
@@ -56,13 +59,13 @@ fn vset(ks: &[SigningKey]) -> ValidatorSet {
 
 /// Three-member runtime (unanimity 3/3 shape: quorum needs every member, so a
 /// lone liar is 1 of 3 and corroboration needs 2 distinct supporters).
-async fn three_node() -> (ValidatorRuntime, Vec<SigningKey>) {
-    let ks = keys(3);
+async fn three_node() -> (ValidatorRuntime, Vec<SigningKey>, Vec<FalconKeypair>) {
+    let (ks, fks) = keys(3);
     let vs = vset(&ks);
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vs, 1_000_000_000_000_000).await;
     let rt = ValidatorRuntime::new(ks[0].clone(), vs, state, 1);
-    (rt, ks)
+    (rt, ks, fks)
 }
 
 fn per_round_cap() -> u32 {
@@ -78,9 +81,9 @@ fn per_round_cap() -> u32 {
 /// second distinct supporter.)
 #[tokio::test]
 async fn lone_vote_moves_at_most_one_lookback_step() {
-    let (mut rt, ks) = three_node().await;
+    let (mut rt, ks, fks) = three_node().await;
     let (h, r) = (rt.hc.height, rt.hc.round);
-    let far = Vote::sign(&ks[1], h, r + 100, VoteKind::Prevote, Some([7u8; 32]));
+    let far = falcon_votes::fvote(&ks[1], &fks[1], h, r + 100, VoteKind::Prevote, Some([7u8; 32]));
     rt.on_prevote(far).unwrap();
     assert_eq!(
         rt.hc.round,
@@ -99,13 +102,13 @@ async fn lone_vote_moves_at_most_one_lookback_step() {
 /// at the peer's round.
 #[tokio::test]
 async fn corroborated_chase_capped_by_per_round_budget() {
-    let (mut rt, ks) = three_node().await;
+    let (mut rt, ks, fks) = three_node().await;
     let (h, r) = (rt.hc.height, rt.hc.round);
     let target = r + 200;
-    rt.on_prevote(Vote::sign(&ks[1], h, target, VoteKind::Prevote, None))
+    rt.on_prevote(falcon_votes::fvote(&ks[1], &fks[1], h, target, VoteKind::Prevote, None))
         .unwrap();
     assert_eq!(rt.hc.round, r + ROUND_LOOKBACK);
-    rt.on_prevote(Vote::sign(&ks[2], h, target, VoteKind::Prevote, None))
+    rt.on_prevote(falcon_votes::fvote(&ks[2], &fks[2], h, target, VoteKind::Prevote, None))
         .unwrap();
     assert_eq!(
         rt.hc.round,
@@ -124,11 +127,11 @@ async fn corroborated_chase_capped_by_per_round_budget() {
 /// exactly one more lookback step per fresh vote.
 #[tokio::test]
 async fn spent_budget_blocks_fresh_votes_until_view_change() {
-    let (mut rt, ks) = three_node().await;
+    let (mut rt, ks, fks) = three_node().await;
     let (h, r) = (rt.hc.height, rt.hc.round);
     let target = r + 200;
-    for k in [&ks[1], &ks[2]] {
-        rt.on_prevote(Vote::sign(k, h, target, VoteKind::Prevote, None))
+    for (k, fk) in [(&ks[1], &fks[1]), (&ks[2], &fks[2])] {
+        rt.on_prevote(falcon_votes::fvote(k, fk, h, target, VoteKind::Prevote, None))
             .unwrap();
     }
     assert_eq!(rt.hc.round, r + per_round_cap());
@@ -166,9 +169,9 @@ async fn spent_budget_blocks_fresh_votes_until_view_change() {
 /// from a rejected vote must not mean an unbounded jump.
 #[tokio::test]
 async fn absurd_rejected_vote_still_bounded_to_one_step() {
-    let (mut rt, ks) = three_node().await;
+    let (mut rt, ks, fks) = three_node().await;
     let (h, r) = (rt.hc.height, rt.hc.round);
-    let absurd = Vote::sign(&ks[1], h, r + 5_000, VoteKind::Prevote, None);
+    let absurd = falcon_votes::fvote(&ks[1], &fks[1], h, r + 5_000, VoteKind::Prevote, None);
     assert!(
         absurd.verify(),
         "test setup: the absurd vote must be genuinely signed"
@@ -193,7 +196,7 @@ async fn absurd_rejected_vote_still_bounded_to_one_step() {
 /// wrong-height inputs never move the counter down (or at all).
 #[tokio::test]
 async fn sync_never_moves_backwards_on_any_path() {
-    let (mut rt, ks) = three_node().await;
+    let (mut rt, ks, fks) = three_node().await;
     for _ in 0..10 {
         rt.hc.next_round();
     }
@@ -213,7 +216,7 @@ async fn sync_never_moves_backwards_on_any_path() {
     assert_eq!(rt.hc.round, r);
 
     // Observed (possibly rejected) votes behind us move nothing.
-    let behind = Vote::sign(&ks[1], h, r - 2, VoteKind::Prevote, None);
+    let behind = falcon_votes::fvote(&ks[1], &fks[1], h, r - 2, VoteKind::Prevote, None);
     assert!(rt.observe_peer_vote(&behind), "behind vote still verifies");
     assert!(!rt.note_peer_vote_round(behind.height, behind.round));
     assert_eq!(rt.hc.round, r);
@@ -238,7 +241,9 @@ async fn sync_never_moves_backwards_on_any_path() {
 /// (and the breaker) backwards — nor re-arm a jump we already absorbed.
 #[tokio::test]
 async fn peer_round_counters_are_monotonic_per_voter() {
-    let (mut rt, ks) = three_node().await;
+    // `_fks`: registration side effect of `three_node()` matters for vote
+    // verification elsewhere in this binary; this test builds no votes itself.
+    let (mut rt, ks, _fks) = three_node().await;
     let peer = id(&ks[1]);
     rt.hc.note_peer_round(peer, 50);
     rt.hc.note_peer_round(peer, 3);
@@ -266,10 +271,10 @@ async fn peer_round_counters_are_monotonic_per_voter() {
 /// signatures converge to a constant.
 #[tokio::test]
 async fn lone_liar_trickle_capped_per_round_no_matter_how_many_votes() {
-    let (mut rt, ks) = three_node().await;
+    let (mut rt, ks, fks) = three_node().await;
     let (h, r) = (rt.hc.height, rt.hc.round);
     for i in 0..20u32 {
-        let v = Vote::sign(&ks[1], h, r + 100 + i, VoteKind::Prevote, None);
+        let v = falcon_votes::fvote(&ks[1], &fks[1], h, r + 100 + i, VoteKind::Prevote, None);
         let _ = rt.on_prevote(v);
     }
     let moved = rt.hc.round - r;
@@ -288,9 +293,9 @@ async fn lone_liar_trickle_capped_per_round_no_matter_how_many_votes() {
 /// no-op even though the vote still verifies.
 #[tokio::test]
 async fn replay_of_same_round_moves_exactly_once() {
-    let (mut rt, ks) = three_node().await;
+    let (mut rt, ks, fks) = three_node().await;
     let (h, r) = (rt.hc.height, rt.hc.round);
-    let v = Vote::sign(&ks[1], h, r + 50, VoteKind::Prevote, None);
+    let v = falcon_votes::fvote(&ks[1], &fks[1], h, r + 50, VoteKind::Prevote, None);
     rt.on_prevote(v.clone()).unwrap();
     assert_eq!(rt.hc.round, r + ROUND_LOOKBACK);
     // Same vote again: verifies, counted, but the round must not move twice.
@@ -311,14 +316,14 @@ async fn replay_of_same_round_moves_exactly_once() {
 /// is 1 and the chase stays a single nudge.
 #[tokio::test]
 async fn self_report_never_corroborates_an_ahead_jump() {
-    let (mut rt, ks) = three_node().await;
+    let (mut rt, ks, fks) = three_node().await;
     let (h, r) = (rt.hc.height, rt.hc.round);
     // Record our own current round (production feeds own votes through
     // on_prevote too — main.rs cast path).
-    let mine = Vote::sign(&ks[0], h, r, VoteKind::Prevote, None);
+    let mine = falcon_votes::fvote(&ks[0], &fks[0], h, r, VoteKind::Prevote, None);
     rt.on_prevote(mine).unwrap();
     // Lone liar far ahead.
-    let far = Vote::sign(&ks[1], h, r + 100, VoteKind::Prevote, None);
+    let far = falcon_votes::fvote(&ks[1], &fks[1], h, r + 100, VoteKind::Prevote, None);
     rt.on_prevote(far).unwrap();
     assert_eq!(
         rt.hc.supporting_peers_count(r + 100),
@@ -428,7 +433,7 @@ fn nil_wait_grace_is_bounded_and_expires_with_evidence() {
 /// the local reset. The chain cannot be parked by old news.
 #[tokio::test]
 async fn stale_peer_evidence_cannot_rearm_sync_after_convergence() {
-    let ks = keys(3);
+    let (ks, _fks) = keys(3);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(1, vs);
     // Two peers reported round 100 long ago (corroborated at the time).
@@ -462,7 +467,7 @@ async fn stale_peer_evidence_cannot_rearm_sync_after_convergence() {
 /// itself never moves backwards.
 #[test]
 fn breaker_target_is_gated_corroborated_and_jump_bounded() {
-    let ks = keys(3);
+    let (ks, _fks) = keys(3);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(7, vs);
     hc.round = 318;
@@ -514,7 +519,7 @@ fn breaker_target_is_gated_corroborated_and_jump_bounded() {
 /// rewind into a self-equivocation and cannot widen forever.
 #[test]
 fn local_reset_moves_forward_once_and_sticks() {
-    let ks = keys(3);
+    let (ks, _fks) = keys(3);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(9, vs);
     hc.round = 412;
@@ -550,7 +555,7 @@ fn local_reset_moves_forward_once_and_sticks() {
 /// once-per-window rate limit is owned by `last_breaker_at`.
 #[tokio::test]
 async fn runtime_breaker_quiet_without_silence() {
-    let ks = keys(3);
+    let (ks, _fks) = keys(3);
     let vs = vset(&ks);
     let state = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&state, &vs, 1_000_000_000_000_000).await;

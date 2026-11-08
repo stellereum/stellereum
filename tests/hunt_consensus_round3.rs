@@ -4,10 +4,13 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::Arc;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
@@ -32,7 +35,7 @@ fn vs_of(ks: &[SigningKey]) -> ValidatorSet {
 
 #[tokio::test]
 async fn hunt19_prevote_a_precommit_b_is_never_slashed() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vset = vs_of(&ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vset, 1_000_000_000_000_000).await;
@@ -42,16 +45,10 @@ async fn hunt19_prevote_a_precommit_b_is_never_slashed() {
     let slashed_before = st.staking_read().await.validators[&id(&honest)].total_slashed;
 
     // The textbook equivocation: says A out loud, commits B.
-    rt.on_prevote(Vote::sign(&honest, 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
+    rt.on_prevote(falcon_votes::fvote(&honest, &fks[1], 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
         .unwrap();
-    rt.on_precommit(Vote::sign(
-        &honest,
-        1,
-        0,
-        VoteKind::Precommit,
-        Some(bh(0xB2)),
-    ))
-    .unwrap();
+    rt.on_precommit(falcon_votes::fvote(&honest, &fks[1], 1, 0, VoteKind::Precommit, Some(bh(0xB2))))
+        .unwrap();
 
     let evidence = rt.hc.equivocations();
     eprintln!(
@@ -86,16 +83,16 @@ async fn hunt19_prevote_a_precommit_b_is_never_slashed() {
 
 #[tokio::test]
 async fn hunt20_equivocation_evidence_is_never_cleared_after_charging() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vset = vs_of(&ks);
     let st = Arc::new(InMemoryStateEngine::new());
     fund_genesis(&st, &vset, 1_000_000_000_000_000).await;
     let mut rt = ValidatorRuntime::new(ks[0].clone(), vset.clone(), st.clone(), 1);
     let victim = ks[3].clone();
 
-    rt.on_prevote(Vote::sign(&victim, 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
+    rt.on_prevote(falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA1))))
         .unwrap();
-    rt.on_prevote(Vote::sign(&victim, 1, 0, VoteKind::Prevote, Some(bh(0xA2))))
+    rt.on_prevote(falcon_votes::fvote(&victim, &fks[3], 1, 0, VoteKind::Prevote, Some(bh(0xA2))))
         .unwrap();
     let first = rt.apply_equivocation_slashes().await;
     let after_first = st.staking_read().await.validators[&id(&victim)].total_slashed;
@@ -176,10 +173,8 @@ fn hunt21_downtime_signer_membership_is_taken_on_the_raw_signature_list() {
 
 #[test]
 fn hunt22_negative_vote_scope_is_enforced() {
-    let (vset, ks) = {
-        let ks = keys(4);
-        (vs_of(&ks), ks)
-    };
+    let (ks, fks) = falcon_votes::falcon_set(4);
+    let vset = vs_of(&ks);
     let mut rt_rt = {
         let st = std::sync::Arc::new(InMemoryStateEngine::new());
         // not awaiting: just exercise HeightConsensus directly
@@ -191,13 +186,13 @@ fn hunt22_negative_vote_scope_is_enforced() {
 
     // wrong height
     assert!(hc
-        .add_prevote(Vote::sign(&ks[0], 2, 0, VoteKind::Prevote, Some(bh(1))))
+        .add_prevote(falcon_votes::fvote(&ks[0], &fks[0], 2, 0, VoteKind::Prevote, Some(bh(1))))
         .is_err());
     // wrong round for the CURRENT quorum: stored, but invisible to quorum.
-    hc.add_prevote(Vote::sign(&ks[0], 1, 5, VoteKind::Prevote, Some(bh(1))))
+    hc.add_prevote(falcon_votes::fvote(&ks[0], &fks[0], 1, 5, VoteKind::Prevote, Some(bh(1))))
         .unwrap();
-    for k in ks.iter() {
-        hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh(1))))
+    for (k, fk) in ks.iter().zip(fks.iter()) {
+        hc.add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh(1))))
             .unwrap();
     }
     assert_eq!(
@@ -265,7 +260,7 @@ async fn hunt23_adopt_committed_accepts_a_non_proposer_block() {
     // `assert_eq!(owned.len(), 1)` was RED by schedule luck). Retry with fresh
     // keys until some non-proposer owns a near round; the assertions below
     // then run against the COMPUTED schedule instead of assuming it.
-    let (ks, vset, imposter, owned_round) = {
+    let (ks, fks, vset, imposter, owned_round) = {
         let mut found = None;
         for _ in 0..200u32 {
             let ks = keys(4);
@@ -279,7 +274,25 @@ async fn hunt23_adopt_committed_accepts_a_non_proposer_block() {
                     (1..=4u32).find(|r| vset.proposer_for(1, *r).unwrap() == id(&ks[i]))
                 {
                     let imposter = ks[i].clone();
-                    found = Some((ks, vset, imposter, r));
+                    // Falcon companions for the CHOSEN set only: the retry loop
+                    // must not pollute the global PQ registry with losers.
+                    let fks = {
+                        use stellereum::consensus::register_validator_pq_key;
+                        use stellereum::post_quantum::{FalconKeypair, PqScheme};
+                        ks.iter()
+                            .enumerate()
+                            .map(|(j, k)| {
+                                let fk = FalconKeypair::generate_from_seed(0x33 + j as u8);
+                                register_validator_pq_key(
+                                    k.verifying_key().to_bytes(),
+                                    PqScheme::Falcon512,
+                                    fk.public_key.clone(),
+                                );
+                                fk
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    found = Some((ks, fks, vset, imposter, r));
                     break;
                 }
             }
@@ -341,20 +354,22 @@ async fn hunt23_adopt_committed_accepts_a_non_proposer_block() {
         "the live path still enforces the proposer slot AT THE ROUND OF ACCEPTANCE"
     );
     // ...but ACCEPTED on the peer-commit path.
-    let cert = QuorumCertificate {
-        height: 1,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bhash),
-        signatures: ks
-            .iter()
-            .take(3)
-            .map(|k| {
-                let v = Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bhash));
-                (v.voter, v.signature)
-            })
-            .collect(),
-    };
+    // Compiled by the committee path and bound to the block's parent, so it
+    // verifies on its own terms; adopt refuses it on the proposer slot.
+    let mut cset = stellereum::consensus::VoteSet::new();
+    for (k, fk) in ks.iter().zip(fks.iter()).take(3) {
+        cset.add(
+            falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bhash)),
+            &vset,
+            1,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
+    }
+    let cert = cset
+        .certificate(Some(bhash), &vset, &[0u8; 32])
+        .expect("3-of-4 reaches quorum");
     // The adopt path gets a FRESH runtime: the live path above legitimately
     // advanced this runtime's round by aligning, and adopt_committed checks
     // the certificate against the runtime's CURRENT round.

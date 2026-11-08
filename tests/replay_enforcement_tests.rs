@@ -35,7 +35,6 @@ use stellereum::rpc::{ReceiptIndex, RpcState};
 use stellereum::sharding::{ShardRegistry, Transaction};
 use stellereum::staking::StakingLedger;
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
-use stellereum::wallet::WalletAccount;
 
 const TEST_CHAIN_ID: u64 = 5757;
 const ACTIVATION_HEIGHT: u64 = 10_000;
@@ -72,21 +71,77 @@ impl Drop for ArmedEnv {
     }
 }
 
-fn wallet(seed: u8) -> WalletAccount {
-    WalletAccount::from_seed(&[seed; 32])
+/// FULL-PQ sender address for a seed: implicit Falcon-512, registered
+/// globally (no activation surcharge). Mirrors the `pq_tx` pattern in
+/// `audit_state_sync_closeout_tests.rs`.
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
 }
 
-/// The replay fixture: a legacy UNBOUND envelope (no chain id), fundable and
+/// FULL-PQ replacement for the wallet fixtures below: same to/amount/nonce/
+/// shards, implicit Falcon-512 envelope. Classical wallet envelopes are
+/// refused at admission under FULL-PQ ("Pure PQ mode") before the
+/// chain-binding gate is even reached, so the binding differentials below must
+/// ride PQ envelopes to exercise the gate at all. `chain: None` = unbound (no
+/// chain commitment, `chain_id()` is None); `Some(c)` = bound via
+/// `new_implicit_with_chain` (two-step sign over the chain-committed message,
+/// mirroring `rpc.rs::pq_tx_shard_chain`).
+fn pq_fixture(seed: u8, nonce: u64, chain: Option<u64>) -> Transaction {
+    use stellereum::post_quantum::PqScheme;
+    use stellereum::sharding::PqSignatureEnvelope;
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut tx = Transaction {
+        from,
+        to: [0x99u8; 32],
+        amount: 1_000,
+        gas_limit: stellereum::svm::GAS_BASIC_TRANSFER,
+        nonce,
+        source_shard: 0,
+        target_shard: 0,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    // Chain-bound envelopes commit the chain id in the signed message: sign
+    // the probe message that already carries it (dummy sig of pinned length
+    // — never decoded, only its chain field is read).
+    if let Some(c) = chain {
+        tx.signature = PqSignatureEnvelope::new_implicit_with_chain(
+            PqScheme::Falcon512,
+            vec![0u8; stellereum::post_quantum::FALCON512_SIG_LEN],
+            c,
+        )
+        .encode();
+    }
+    let msg = tx.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    tx.signature = match chain {
+        Some(c) => {
+            PqSignatureEnvelope::new_implicit_with_chain(PqScheme::Falcon512, sig, c).encode()
+        }
+        None => PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode(),
+    };
+    tx
+}
+
+/// The replay fixture: an UNBOUND PQ envelope (no chain id), fundable and
 /// nonce-ready. The SAME constructor feeds the refuse/accept sides of every
 /// differential below.
 fn unbound_fixture(seed: u8, nonce: u64) -> Transaction {
-    let tx = wallet(seed).unbound_legacy_transfer([0x99u8; 32], 1_000, nonce, 0, 0);
+    let tx = pq_fixture(seed, nonce, None);
     assert_eq!(tx.chain_id(), None, "replay fixture must stay unbound");
     tx
 }
 
 fn bound_fixture(seed: u8, nonce: u64) -> Transaction {
-    let tx = wallet(seed).create_bound_transaction([0x99u8; 32], 1_000, nonce, 0, 0, TEST_CHAIN_ID);
+    let tx = pq_fixture(seed, nonce, Some(TEST_CHAIN_ID));
     assert!(tx.chain_id().is_some(), "bound fixture must carry chain id");
     tx
 }

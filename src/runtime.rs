@@ -3001,6 +3001,26 @@ impl ValidatorRuntime {
     /// serving plain transactions.
     pub async fn sync_mev_epoch(&mut self) {
         let epoch = crate::mev_epoch::epoch_of_height(self.hc.height);
+        // --- MEV RESHARE HOOK (INACTIVE by default) ---
+        // While MEV_RESHARE_ACTIVATION_HEIGHT == u64::MAX this branch never
+        // fires and the single-DKG path below is byte-identical (pinned by the
+        // pre-activation no-op test). When the lead flips the activation
+        // height, a fresh DKG round starts only when reshare_due fires
+        // (key_epoch + DELTA* <= chain epoch); otherwise NOTHING is synced —
+        // the manager keeps the old key material AND the pool keeps admitting
+        // the key epoch, so wallets sealing to the advertised (old) key are
+        // still admitted (advancing admission without a fresh key would admit
+        // envelopes nobody can unseal).
+        if crate::mev_epoch::is_reshare_active(self.hc.height) {
+            let last_reshare = self.mempool.read().await.mev_seal.epoch;
+            if !crate::mev_epoch::reshare_due(
+                epoch,
+                last_reshare,
+                crate::mev_epoch::MEV_RESHARE_DELTA_STAR_EPOCHS,
+            ) {
+                return;
+            }
+        }
         let ids: Vec<[u8; 32]> = self.validators.validators.keys().copied().collect();
         let our_id = self.key.verifying_key().to_bytes();
         let seed = self.key.to_bytes();
@@ -7883,9 +7903,18 @@ impl Cluster {
                 .map(|(k, _)| (k.verifying_key().to_bytes(), 1))
                 .collect(),
         );
+        // FULL-PQ: every runtime carries a deterministic Falcon-512 keypair
+        // (index-seeded, mirrors `consensus::tests::vset_with_falcon` via
+        // `ValidatorRuntime::with_falcon_key` which registers the pubkey
+        // globally). Without it `make_prevote`/`make_precommit` mint Ed-only
+        // votes that `Vote::verify` refuses ("bad vote signature").
         let runtimes = nodes
             .into_iter()
-            .map(|(k, st)| ValidatorRuntime::new(k, validators.clone(), st, 1))
+            .enumerate()
+            .map(|(i, (k, st))| {
+                let fk = FalconKeypair::generate_from_seed(i as u8);
+                ValidatorRuntime::new(k, validators.clone(), st, 1).with_falcon_key(fk)
+            })
             .collect();
         Self { nodes: runtimes }
     }
@@ -7906,8 +7935,12 @@ impl Cluster {
         );
         let runtimes = nodes
             .into_iter()
-            .map(|(k, st)| {
+            .enumerate()
+            .map(|(i, (k, st))| {
+                // FULL-PQ: deterministic per-index Falcon key (see `Cluster::new`).
+                let fk = FalconKeypair::generate_from_seed(i as u8);
                 ValidatorRuntime::new(k, validators.clone(), st, 1)
+                    .with_falcon_key(fk)
                     .with_shard(shard_id, registry.clone())
             })
             .collect();

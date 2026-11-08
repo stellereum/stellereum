@@ -36,6 +36,52 @@ fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
+/// FULL-PQ sender address for a seed: implicit Falcon-512, registered
+/// globally (no activation surcharge). Mirrors
+/// `audit_state_sync_closeout_tests.rs::pq_id`.
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
+}
+
+/// FULL-PQ replacement for `Transaction::sign` in fixtures: same
+/// amount/gas/nonce/shards, implicit Falcon-512 envelope.
+#[allow(clippy::too_many_arguments)]
+fn pq_tx(
+    seed: u8,
+    to: [u8; 32],
+    amount: u64,
+    gas: u64,
+    nonce: u64,
+    source_shard: u32,
+    target_shard: u32,
+) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut t = Transaction {
+        from,
+        to,
+        amount,
+        gas_limit: gas,
+        nonce,
+        source_shard,
+        target_shard,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = t.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    t.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    t
+}
+
 fn sharded() -> ShardRegistry {
     ShardRegistry::from_ids([SHARD0, SHARD1])
 }
@@ -49,10 +95,26 @@ async fn sharded_pair(
     let s0 = Arc::new(InMemoryStateEngine::new());
     for (addr, bal) in shard0_funding {
         s0.update_account(AccountState::new(*addr, *bal)).await;
+        // PQ senders must live as 49-byte pinned leaves, else the source
+        // proof (49-byte, via registry metadata) mismatches the funded
+        // 16-byte leaf and target verification fails. Classical addrs miss
+        // the registry and stay 16-byte. Balances/addresses unchanged.
+        if let Some((scheme, pk)) = Transaction::global_implicit_registry().lookup(addr) {
+            use stellereum::post_quantum::DEFAULT_SALT;
+            s0.pin_pubkey(*addr, scheme, &pk, &DEFAULT_SALT)
+                .await
+                .expect("PQ sender must pin");
+        }
     }
     let s1 = Arc::new(InMemoryStateEngine::new());
     for (addr, bal) in shard1_funding {
         s1.update_account(AccountState::new(*addr, *bal)).await;
+        if let Some((scheme, pk)) = Transaction::global_implicit_registry().lookup(addr) {
+            use stellereum::post_quantum::DEFAULT_SALT;
+            s1.pin_pubkey(*addr, scheme, &pk, &DEFAULT_SALT)
+                .await
+                .expect("PQ sender must pin");
+        }
     }
     ShardedCluster::new(
         sharded(),
@@ -77,10 +139,8 @@ async fn balance(cluster: &Cluster, addr: &[u8; 32]) -> u64 {
 #[tokio::test]
 async fn cross_shard_transfer_debits_source_credits_target_and_conserves_supply() {
     let validator = key(1);
-    let sender = key(2);
-    let recipient = key(3);
-    let sender_addr = sender.verifying_key().to_bytes();
-    let recipient_addr = recipient.verifying_key().to_bytes();
+    let sender_addr = pq_id(2);
+    let recipient_addr = key(3).verifying_key().to_bytes();
     let validator_addr = validator.verifying_key().to_bytes();
 
     let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000)], &[]).await;
@@ -90,7 +150,7 @@ async fn cross_shard_transfer_debits_source_credits_target_and_conserves_supply(
 
     let amount = 100u64;
     let gas = 10u64;
-    let tx = Transaction::sign(&sender, recipient_addr, amount, gas, 0, SHARD0, SHARD1);
+    let tx = pq_tx(2, recipient_addr, amount, gas, 0, SHARD0, SHARD1);
 
     // Admitted to the SOURCE shard's mempool. The destination rejects it (its
     // sender has no balance there), which is exactly the single-source rule.
@@ -191,14 +251,12 @@ async fn cross_shard_transfer_debits_source_credits_target_and_conserves_supply(
 #[tokio::test]
 async fn replaying_a_consumed_message_is_credited_only_once() {
     let validator = key(10);
-    let sender = key(11);
-    let recipient = key(12);
-    let sender_addr = sender.verifying_key().to_bytes();
-    let recipient_addr = recipient.verifying_key().to_bytes();
+    let sender_addr = pq_id(11);
+    let recipient_addr = key(12).verifying_key().to_bytes();
 
     // Produce one genuine, proof-carrying message by running the source shard.
     let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000)], &[]).await;
-    let tx = Transaction::sign(&sender, recipient_addr, 250, 5, 0, SHARD0, SHARD1);
+    let tx = pq_tx(11, recipient_addr, 250, 5, 0, SHARD0, SHARD1);
     sc.shard_mut(SHARD0).broadcast_tx(tx).await;
     let src_bh = sc.run_height(SHARD0, 1).await;
     let msg = sc.shard(SHARD0).nodes[0]
@@ -213,8 +271,17 @@ async fn replaying_a_consumed_message_is_credited_only_once() {
     );
 
     // A pristine target engine (what a rebuilding node starts from).
+    // C1 anchor: it syncs source headers before applying, so share the
+    // live registry holding the genuine source header. Proof math alone
+    // (assert above) is not the credit rule; asserts below unchanged.
     let engine = Arc::new(InMemoryStateEngine::new());
     engine.enable_cross_shard();
+    engine.with_finalized_headers(
+        sc.shard(SHARD0).nodes[0]
+            .finalized_headers
+            .clone()
+            .expect("sharded cluster shares a header registry"),
+    );
     let block = Block {
         shard_id: SHARD1,
         height: 1,
@@ -263,13 +330,11 @@ async fn replaying_a_consumed_message_is_credited_only_once() {
 #[tokio::test]
 async fn target_filters_and_rejects_a_replayed_inbound_message() {
     let validator = key(20);
-    let sender = key(21);
-    let recipient = key(22);
-    let sender_addr = sender.verifying_key().to_bytes();
-    let recipient_addr = recipient.verifying_key().to_bytes();
+    let sender_addr = pq_id(21);
+    let recipient_addr = key(22).verifying_key().to_bytes();
 
     let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000)], &[]).await;
-    let tx = Transaction::sign(&sender, recipient_addr, 300, 5, 0, SHARD0, SHARD1);
+    let tx = pq_tx(21, recipient_addr, 300, 5, 0, SHARD0, SHARD1);
     sc.shard_mut(SHARD0).broadcast_tx(tx).await;
     let src_bh = sc.run_height(SHARD0, 1).await;
     let msg = sc.shard(SHARD0).nodes[0]
@@ -334,14 +399,12 @@ async fn target_filters_and_rejects_a_replayed_inbound_message() {
 #[tokio::test]
 async fn two_independent_target_shards_derive_the_same_root() {
     let validator = key(30);
-    let sender = key(31);
-    let recipient = key(32);
-    let sender_addr = sender.verifying_key().to_bytes();
-    let recipient_addr = recipient.verifying_key().to_bytes();
+    let sender_addr = pq_id(31);
+    let recipient_addr = key(32).verifying_key().to_bytes();
 
     // One source shard, to produce a genuine proof-carrying message.
     let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000)], &[]).await;
-    let tx = Transaction::sign(&sender, recipient_addr, 123, 7, 0, SHARD0, SHARD1);
+    let tx = pq_tx(31, recipient_addr, 123, 7, 0, SHARD0, SHARD1);
     sc.shard_mut(SHARD0).broadcast_tx(tx).await;
     let src_bh = sc.run_height(SHARD0, 1).await;
     let msg = sc.shard(SHARD0).nodes[0]
@@ -389,14 +452,12 @@ async fn two_independent_target_shards_derive_the_same_root() {
 #[tokio::test]
 async fn a_rebuilding_target_reproduces_the_same_root_and_rejects_replay() {
     let validator = key(40);
-    let sender = key(41);
-    let recipient = key(42);
-    let sender_addr = sender.verifying_key().to_bytes();
-    let recipient_addr = recipient.verifying_key().to_bytes();
+    let sender_addr = pq_id(41);
+    let recipient_addr = key(42).verifying_key().to_bytes();
     let proposer = validator.verifying_key().to_bytes();
 
     let mut sc = sharded_pair(&validator, &[(sender_addr, 1_000)], &[]).await;
-    let tx = Transaction::sign(&sender, recipient_addr, 400, 5, 0, SHARD0, SHARD1);
+    let tx = pq_tx(41, recipient_addr, 400, 5, 0, SHARD0, SHARD1);
     sc.shard_mut(SHARD0).broadcast_tx(tx).await;
     let src_bh = sc.run_height(SHARD0, 1).await;
     let _msg = sc.shard(SHARD0).nodes[0]
@@ -425,8 +486,16 @@ async fn a_rebuilding_target_reproduces_the_same_root_and_rejects_replay() {
     );
 
     // Rebuilding target: identical genesis, applies the SAME committed record.
+    // C1 anchor: it syncs source headers before applying, so share the
+    // live registry holding the genuine source header. Asserts unchanged.
     let engine = Arc::new(InMemoryStateEngine::new());
     engine.enable_cross_shard();
+    engine.with_finalized_headers(
+        sc.shard(SHARD0).nodes[0]
+            .finalized_headers
+            .clone()
+            .expect("sharded cluster shares a header registry"),
+    );
     let rebuild_block = Block {
         shard_id: SHARD1,
         height: live_block.height,

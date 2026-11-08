@@ -25,7 +25,7 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::Arc;
 use std::time::Instant;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind, VoteSet};
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::Block;
 use stellereum::state_engine::InMemoryStateEngine;
@@ -34,9 +34,9 @@ use stellereum::sync::{
     LIVE_ADOPT_GAP_THRESHOLD,
 };
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
-}
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 fn id(k: &SigningKey) -> [u8; 32] {
     k.verifying_key().to_bytes()
 }
@@ -52,10 +52,13 @@ async fn observer_runtime(ks: &[SigningKey]) -> ValidatorRuntime {
 }
 
 /// Пустой блок высоты `h` для текущего рута observer'а, подписанный плановым
-/// proposer'ом раунда 0, с подлинным precommit-QC (кворум 3/4).
+/// proposer'ом раунда 0, с подлинным precommit-QC (кворум 3/4), собранным
+/// производственным путём (`VoteSet::certificate`) и привязанным к родителю
+/// блока.
 async fn live_block_for(
     rt: &ValidatorRuntime,
     ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
     h: u64,
     prev: [u8; 32],
 ) -> (Block, QuorumCertificate) {
@@ -97,21 +100,20 @@ async fn live_block_for(
     }
     b.sign_block(pk);
     let bh = b.compute_hash();
-    let sigs = ks
-        .iter()
-        .take(3)
-        .map(|k| {
-            let v = Vote::sign(k, h, round, VoteKind::Precommit, Some(bh));
-            (v.voter, v.signature)
-        })
-        .collect();
-    let qc = QuorumCertificate {
-        height: h,
-        round,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: sigs,
-    };
+    let mut set = VoteSet::new();
+    for (i, k) in ks.iter().enumerate().take(3) {
+        set.add(
+            falcon_votes::fvote(k, &fks[i], h, round, VoteKind::Precommit, Some(bh)),
+            &vs,
+            h,
+            round,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
+    }
+    let qc = set
+        .certificate(Some(bh), &vs, &prev)
+        .expect("3-of-4 reaches quorum");
     assert!(qc.verify(&vs), "fixture QC must verify");
     (b, qc)
 }
@@ -315,9 +317,9 @@ async fn adopted_records_keep_order_and_completeness_off_tick() {
 /// (два сравнения хешей). Пин */
 #[tokio::test]
 async fn forked_commit_dies_on_linkage_before_quorum_crypto() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = observer_runtime(&ks).await;
-    let (mut b, _) = live_block_for(&rt, &ks, 1, [0u8; 32]).await;
+    let (mut b, _) = live_block_for(&rt, &ks, &fks, 1, [0u8; 32]).await;
     // Форк: чужой prev при нашей высоте.
     b.prev_hash = [0xEEu8; 32];
     // Мусорный QC той же формы (неверные подписи): отличить порядок можно только
@@ -352,7 +354,7 @@ async fn observer_holds_chain_tempo_on_empty_blocks() {
     // Цепь 1 блок/с → N блоков за N секунд. Бюджет adopt'а — 10с (≥3 блока/с),
     // с запасом от флаков CI, но на два порядка строже 30с/блок (900с на N).
     const BUDGET_SECS: u64 = 10;
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = observer_runtime(&ks).await;
     let t0 = Instant::now();
     for _ in 1..=N {
@@ -363,7 +365,7 @@ async fn observer_holds_chain_tempo_on_empty_blocks() {
             is_live_adoptable(h, prev, h, prev),
             "every tempo block must be live-adoptable (parent match)"
         );
-        let (b, qc) = live_block_for(&rt, &ks, h, prev).await;
+        let (b, qc) = live_block_for(&rt, &ks, &fks, h, prev).await;
         let bh = b.compute_hash();
         rt.adopt_committed(h, b, qc)
             .await

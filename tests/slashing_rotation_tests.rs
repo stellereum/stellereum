@@ -12,11 +12,15 @@
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::sync::Arc;
-use stellereum::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorId, ValidatorSet, VoteKind};
+use stellereum::post_quantum::FalconKeypair;
 use stellereum::runtime::{fund_genesis, ValidatorRuntime};
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::staking::{MIN_VALIDATOR_BOND, STAKING_POOL, STELL_MIN_BOND_BUFFER};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 const BAL: u64 = 10_000_000_000_000;
 
@@ -26,8 +30,8 @@ fn floor() -> u64 {
     MIN_VALIDATOR_BOND + STELL_MIN_BOND_BUFFER
 }
 
-fn keys(n: usize) -> Vec<SigningKey> {
-    (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
+fn keys(n: usize) -> (Vec<SigningKey>, Vec<FalconKeypair>) {
+    falcon_votes::falcon_set(n)
 }
 fn vset(ks: &[SigningKey]) -> ValidatorSet {
     ValidatorSet::from_list(
@@ -114,7 +118,7 @@ async fn preset_downtime_threshold(st: &Arc<InMemoryStateEngine>, silent: &Valid
 // BOTH paths must burn, debit and mark identically.
 #[tokio::test]
 async fn test1_downtime_parity_local_vs_adopt() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let vs = vset(&ks);
     let idv = ids(&ks);
     let silent = idv[3];
@@ -140,10 +144,10 @@ async fn test1_downtime_parity_local_vs_adopt() {
     // Height-1 round on path A (local): 3 honest votes, silent absent.
     for &i in &signers {
         c1[0]
-            .on_prevote(Vote::sign(&ks[i], 1, 0, VoteKind::Prevote, Some(bh1)))
+            .on_prevote(falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Prevote, Some(bh1)))
             .unwrap();
         c1[0]
-            .on_precommit(Vote::sign(&ks[i], 1, 0, VoteKind::Precommit, Some(bh1)))
+            .on_precommit(falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Precommit, Some(bh1)))
             .unwrap();
     }
     assert_eq!(c1[0].hc.try_precommit_quorum(), Some(bh1));
@@ -188,7 +192,7 @@ async fn test1_downtime_parity_local_vs_adopt() {
         signatures: signers
             .iter()
             .map(|&i| {
-                let v = Vote::sign(&ks[i], 2, 0, VoteKind::Precommit, Some(bh2));
+                let v = falcon_votes::fvote(&ks[i], &fks[i], 2, 0, VoteKind::Precommit, Some(bh2));
                 (v.voter, v.signature)
             })
             .collect(),
@@ -199,10 +203,10 @@ async fn test1_downtime_parity_local_vs_adopt() {
     let pool_before_l = pool_of(&c1[0].state).await;
     for &i in &signers {
         c1[0]
-            .on_prevote(Vote::sign(&ks[i], 2, 0, VoteKind::Prevote, Some(bh2)))
+            .on_prevote(falcon_votes::fvote(&ks[i], &fks[i], 2, 0, VoteKind::Prevote, Some(bh2)))
             .unwrap();
         c1[0]
-            .on_precommit(Vote::sign(&ks[i], 2, 0, VoteKind::Precommit, Some(bh2)))
+            .on_precommit(falcon_votes::fvote(&ks[i], &fks[i], 2, 0, VoteKind::Precommit, Some(bh2)))
             .unwrap();
     }
     assert_eq!(c1[0].hc.try_precommit_quorum(), Some(bh2));
@@ -284,7 +288,7 @@ async fn test1_downtime_parity_local_vs_adopt() {
 // ============================================================================
 #[tokio::test]
 async fn test2_equivocation_parity_local_vs_adopt() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let vs = vset(&ks);
     let idv = ids(&ks);
     let cheater = idv[3];
@@ -316,12 +320,12 @@ async fn test2_equivocation_parity_local_vs_adopt() {
     let pool_before_l = pool_of(&c1[0].state).await;
     for &i in &signers {
         c1[0]
-            .on_prevote(Vote::sign(&ks[i], 1, 0, VoteKind::Prevote, Some(bh)))
+            .on_prevote(falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Prevote, Some(bh)))
             .unwrap();
     }
     // Cheater's first prevote (for bh) then conflicting prevote (for 0x99..).
-    let v1 = Vote::sign(&ks[3], 1, 0, VoteKind::Prevote, Some(bh));
-    let v2 = Vote::sign(&ks[3], 1, 0, VoteKind::Prevote, Some([0x99u8; 32]));
+    let v1 = falcon_votes::fvote(&ks[3], &fks[3], 1, 0, VoteKind::Prevote, Some(bh));
+    let v2 = falcon_votes::fvote(&ks[3], &fks[3], 1, 0, VoteKind::Prevote, Some([0x99u8; 32]));
     c1[0].on_prevote(v1).unwrap();
     c1[0].on_prevote(v2).unwrap();
     assert_eq!(
@@ -331,7 +335,7 @@ async fn test2_equivocation_parity_local_vs_adopt() {
     );
     for &i in &signers {
         c1[0]
-            .on_precommit(Vote::sign(&ks[i], 1, 0, VoteKind::Precommit, Some(bh)))
+            .on_precommit(falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Precommit, Some(bh)))
             .unwrap();
     }
     assert_eq!(c1[0].hc.try_precommit_quorum(), Some(bh));
@@ -418,7 +422,7 @@ async fn test2_equivocation_parity_local_vs_adopt() {
 // ============================================================================
 #[tokio::test]
 async fn test3_bond_new_validator_mid_chain() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let mut nodes = cluster(&ks).await;
     // Drive one finished height so the bond happens "mid-chain".
     let vs0 = nodes[0].validators.clone();
@@ -426,12 +430,12 @@ async fn test3_bond_new_validator_mid_chain() {
     let root0 = nodes[0].state.get_state_root().await;
     let b1 = mkblock(&pkey0, 1, [0u8; 32], root0);
     let bh1 = b1.compute_hash();
-    for k in ks.iter() {
+    for (k, fk) in ks.iter().zip(fks.iter()) {
         nodes[0]
-            .on_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, Some(bh1)))
+            .on_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, Some(bh1)))
             .unwrap();
         nodes[0]
-            .on_precommit(Vote::sign(k, 1, 0, VoteKind::Precommit, Some(bh1)))
+            .on_precommit(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Precommit, Some(bh1)))
             .unwrap();
     }
     assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh1));
@@ -488,12 +492,12 @@ async fn test3_bond_new_validator_mid_chain() {
         .unwrap_or([0u8; 32]);
     let b2 = mkblock(&pkey2, 2, prev2, root2);
     let bh2 = b2.compute_hash();
-    for k in ks.iter() {
+    for (k, fk) in ks.iter().zip(fks.iter()) {
         nodes[0]
-            .on_prevote(Vote::sign(k, 2, 0, VoteKind::Prevote, Some(bh2)))
+            .on_prevote(falcon_votes::fvote(k, fk, 2, 0, VoteKind::Prevote, Some(bh2)))
             .unwrap();
         nodes[0]
-            .on_precommit(Vote::sign(k, 2, 0, VoteKind::Precommit, Some(bh2)))
+            .on_precommit(falcon_votes::fvote(k, fk, 2, 0, VoteKind::Precommit, Some(bh2)))
             .unwrap();
     }
     assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh2));
@@ -544,7 +548,7 @@ async fn test3_bond_new_validator_mid_chain() {
 // ============================================================================
 #[tokio::test]
 async fn test4_full_unbond_drops_validator_at_boundary() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let idv = ids(&ks);
     let mut nodes = cluster(&ks).await;
     let victim = idv[0];
@@ -594,14 +598,14 @@ async fn test4_full_unbond_drops_validator_at_boundary() {
     let blk = mkblock(&pkey, h, prev, root);
     let bh = blk.compute_hash();
     // Only the 3 remaining validators vote; the victim is silent/absent.
-    for k in ks.iter().skip(1) {
+    for (k, fk) in ks.iter().zip(fks.iter()).skip(1) {
         nodes[0]
-            .on_prevote(Vote::sign(k, h, r, VoteKind::Prevote, Some(bh)))
+            .on_prevote(falcon_votes::fvote(k, fk, h, r, VoteKind::Prevote, Some(bh)))
             .unwrap();
     }
-    for k in ks.iter().skip(1) {
+    for (k, fk) in ks.iter().zip(fks.iter()).skip(1) {
         nodes[0]
-            .on_precommit(Vote::sign(k, h, r, VoteKind::Precommit, Some(bh)))
+            .on_precommit(falcon_votes::fvote(k, fk, h, r, VoteKind::Precommit, Some(bh)))
             .unwrap();
     }
     assert_eq!(
@@ -628,7 +632,7 @@ async fn test4_full_unbond_drops_validator_at_boundary() {
 // ============================================================================
 #[tokio::test]
 async fn test5_downtime_slash_ejects_below_min_and_remainder_quorate() {
-    let ks = keys(4);
+    let (ks, fks) = keys(4);
     let vs = vset(&ks);
     let idv = ids(&ks);
     let victim = idv[3];
@@ -653,10 +657,10 @@ async fn test5_downtime_slash_ejects_below_min_and_remainder_quorate() {
     let bh = blk.compute_hash();
     for &i in &[0usize, 1, 2] {
         nodes[0]
-            .on_prevote(Vote::sign(&ks[i], 1, 0, VoteKind::Prevote, Some(bh)))
+            .on_prevote(falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Prevote, Some(bh)))
             .unwrap();
         nodes[0]
-            .on_precommit(Vote::sign(&ks[i], 1, 0, VoteKind::Precommit, Some(bh)))
+            .on_precommit(falcon_votes::fvote(&ks[i], &fks[i], 1, 0, VoteKind::Precommit, Some(bh)))
             .unwrap();
     }
     assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh));
@@ -690,10 +694,10 @@ async fn test5_downtime_slash_ejects_below_min_and_remainder_quorate() {
     let bh2 = blk2.compute_hash();
     for &i in &[0usize, 1, 2] {
         nodes[0]
-            .on_prevote(Vote::sign(&ks[i], 2, 0, VoteKind::Prevote, Some(bh2)))
+            .on_prevote(falcon_votes::fvote(&ks[i], &fks[i], 2, 0, VoteKind::Prevote, Some(bh2)))
             .unwrap();
         nodes[0]
-            .on_precommit(Vote::sign(&ks[i], 2, 0, VoteKind::Precommit, Some(bh2)))
+            .on_precommit(falcon_votes::fvote(&ks[i], &fks[i], 2, 0, VoteKind::Precommit, Some(bh2)))
             .unwrap();
     }
     assert_eq!(nodes[0].hc.try_precommit_quorum(), Some(bh2));
@@ -729,7 +733,7 @@ async fn test5_downtime_slash_ejects_below_min_and_remainder_quorate() {
     let sigs: Vec<(ValidatorId, Vec<u8>)> = [0usize, 1, 2]
         .iter()
         .map(|&i| {
-            let v = Vote::sign(&ks[i], h2, 0, VoteKind::Precommit, Some(bh2));
+            let v = falcon_votes::fvote(&ks[i], &fks[i], h2, 0, VoteKind::Precommit, Some(bh2));
             (v.voter, v.signature)
         })
         .collect();

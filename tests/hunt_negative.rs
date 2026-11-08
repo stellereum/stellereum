@@ -13,6 +13,9 @@ use stellereum::consensus::{
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::sync::collect_missing_blocks;
 
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
+
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
 }
@@ -26,23 +29,42 @@ fn vset(ks: &[SigningKey]) -> ValidatorSet {
 fn bh(n: u8) -> [u8; 32] {
     [n; 32]
 }
+/// Hand-assembled QC shape over genuinely signed votes: below quorum (or with
+/// non-member signers) no PQ envelope can be compiled and the envelope-less
+/// shape is unconditionally invalid under FULL-PQ; at quorum the committee
+/// path compiles a verifying envelope. Either way the refusal/acceptance
+/// asserts below hold for the same reason they would live.
+// GATE: fixture helper threads parallel signer/key/set/parent slices; the
+// arity documents the QC shape, and splitting it would obscure call sites.
+#[allow(clippy::too_many_arguments)]
 fn qc(
-    sigs: Vec<(SigningKey, Vote)>,
+    signers: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    vs: &ValidatorSet,
     h: u64,
     r: u32,
     kind: VoteKind,
     t: Option<[u8; 32]>,
+    parent: &[u8; 32],
 ) -> QuorumCertificate {
-    let _ = kind;
+    use stellereum::consensus::VoteSet;
+    let mut set = VoteSet::new();
+    let mut ed_sigs = Vec::new();
+    for (k, fk) in signers.iter().zip(fks.iter()) {
+        let v = falcon_votes::fvote(k, fk, h, r, kind, t);
+        if set.add(v.clone(), vs, h, r, kind).is_ok() {
+            ed_sigs.push((v.voter, v.ed25519_signature().to_vec()));
+        }
+    }
+    if let Some(qc) = set.certificate(t, vs, parent) {
+        return qc;
+    }
     QuorumCertificate {
         height: h,
         round: r,
         kind,
         block_hash: t,
-        signatures: sigs
-            .iter()
-            .map(|(k, v)| (k.verifying_key().to_bytes(), v.signature.clone()))
-            .collect(),
+        signatures: ed_sigs,
     }
 }
 
@@ -52,12 +74,12 @@ fn qc(
 
 #[test]
 fn hunt_neg_p1_a_forged_voter_field_contributes_no_power() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(1, vs.clone());
 
     // Sign with key A, but claim to be validator D.
-    let mut forged = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(bh(1)));
+    let mut forged = falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(bh(1)));
     let real_voter = ks[0].verifying_key().to_bytes();
     let claimed = ks[3].verifying_key().to_bytes();
     forged.voter = claimed;
@@ -78,17 +100,20 @@ fn hunt_neg_p1_a_forged_voter_field_contributes_no_power() {
 
 #[test]
 fn hunt_neg_p2_a_validators_power_cannot_be_counted_twice() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
 
     // (a) duplicate entries in a certificate
-    let v = Vote::sign(&ks[0], 1, 0, VoteKind::Precommit, Some(bh(9)));
+    let v = falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Precommit, Some(bh(9)));
     let dup = qc(
-        vec![(ks[0].clone(), v.clone())],
+        &ks[..1],
+        &fks[..1],
+        &vs,
         1,
         0,
         VoteKind::Precommit,
         Some(bh(9)),
+        &[0u8; 32],
     );
     let mut padded = dup.clone();
     for _ in 0..9 {
@@ -125,21 +150,24 @@ fn hunt_neg_p2_a_validators_power_cannot_be_counted_twice() {
 
 #[test]
 fn hunt_neg_p3_duplicate_detection_is_consistent_between_add_and_verify() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(1, vs.clone());
-    let a = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(bh(1)));
-    let b = Vote::sign(&ks[1], 1, 0, VoteKind::Prevote, Some(bh(1)));
+    let a = falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(bh(1)));
+    let b = falcon_votes::fvote(&ks[1], &fks[1], 1, 0, VoteKind::Prevote, Some(bh(1)));
     hc.add_prevote(a.clone()).unwrap();
     hc.add_prevote(b.clone()).unwrap();
     // add() sees two distinct voters; a certificate built from the same two
     // signatures must also see two distinct voters.
     let c = qc(
-        vec![(ks[0].clone(), a.clone()), (ks[1].clone(), b.clone())],
+        &ks[..2],
+        &fks[..2],
+        &vs,
         1,
         0,
         VoteKind::Prevote,
         Some(bh(1)),
+        &[0u8; 32],
     );
     let set = hc.prevote_set(0).unwrap();
     let distinct_add = set.len();
@@ -156,18 +184,18 @@ fn hunt_neg_p3_duplicate_detection_is_consistent_between_add_and_verify() {
 
 #[test]
 fn hunt_neg_p4_a_validator_removed_mid_height_loses_its_power() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let before = vset(&ks);
     let bhv = bh(1);
-    let a = Vote::sign(&ks[0], 1, 0, VoteKind::Precommit, Some(bhv));
-    let b = Vote::sign(&ks[1], 1, 0, VoteKind::Precommit, Some(bhv));
-    let cc = Vote::sign(&ks[2], 1, 0, VoteKind::Precommit, Some(bhv));
     let cert = qc(
-        vec![(ks[0].clone(), a), (ks[1].clone(), b), (ks[2].clone(), cc)],
+        &ks[..3],
+        &fks[..3],
+        &before,
         1,
         0,
         VoteKind::Precommit,
         Some(bhv),
+        &[0u8; 32],
     );
     assert!(cert.verify(&before), "3 of 4 with all four present");
 
@@ -183,7 +211,7 @@ fn hunt_neg_p4_a_validator_removed_mid_height_loses_its_power() {
     );
     // And its vote is refused on the live path too.
     let mut hc = HeightConsensus::new(1, after.clone());
-    let late = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some(bhv));
+    let late = falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some(bhv));
     let e = hc.add_prevote(late).unwrap_err();
     println!("[NEG P4] a vote from the departed validator -> {e:?}");
     assert_eq!(e, "vote from non-validator");
@@ -195,8 +223,8 @@ fn hunt_neg_p4_a_validator_removed_mid_height_loses_its_power() {
 
 #[test]
 fn hunt_neg_p5_no_prevote_precommit_height_or_round_replay() {
-    let ks = keys(1);
-    let pv = Vote::sign(&ks[0], 5, 2, VoteKind::Prevote, Some(bh(1)));
+    let (ks, fks) = falcon_votes::falcon_set(1);
+    let pv = falcon_votes::fvote(&ks[0], &fks[0], 5, 2, VoteKind::Prevote, Some(bh(1)));
     assert!(pv.verify());
 
     // Re-label the vote as a precommit. The kind byte is in the signed message.
@@ -220,11 +248,14 @@ fn hunt_neg_p5_no_prevote_precommit_height_or_round_replay() {
     // And the same holds through a certificate.
     let vs = ValidatorSet::from_list(vec![(ks[0].verifying_key().to_bytes(), 1)]);
     let good = qc(
-        vec![(ks[0].clone(), pv.clone())],
+        &ks,
+        &fks,
+        &vs,
         5,
         2,
         VoteKind::Prevote,
         Some(bh(1)),
+        &[0u8; 32],
     );
     assert!(good.verify(&vs));
     let mut relabelled = good.clone();
@@ -241,9 +272,9 @@ fn hunt_neg_p5_no_prevote_precommit_height_or_round_replay() {
 
 #[test]
 fn hunt_neg_p6_nil_and_all_zero_hash_votes_are_distinct() {
-    let ks = keys(1);
-    let nil = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, None);
-    let zero = Vote::sign(&ks[0], 1, 0, VoteKind::Prevote, Some([0u8; 32]));
+    let (ks, fks) = falcon_votes::falcon_set(1);
+    let nil = falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, None);
+    let zero = falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Prevote, Some([0u8; 32]));
     assert!(nil.verify() && zero.verify());
 
     // Same signature bytes? The sign message differs by the presence byte.
@@ -259,11 +290,11 @@ fn hunt_neg_p6_nil_and_all_zero_hash_votes_are_distinct() {
 
     // The VoteSets must also keep them apart: nil power and block power are
     // separate buckets, so a nil quorum cannot decide a block.
-    let k4 = keys(4);
+    let (k4, fk4) = falcon_votes::falcon_set(4);
     let vs = vset(&k4);
     let mut hc = HeightConsensus::new(1, vs.clone());
-    for k in &k4 {
-        hc.add_prevote(Vote::sign(k, 1, 0, VoteKind::Prevote, None))
+    for (k, fk) in k4.iter().zip(fk4.iter()) {
+        hc.add_prevote(falcon_votes::fvote(k, fk, 1, 0, VoteKind::Prevote, None))
             .unwrap();
     }
     let set = hc.prevote_set(0).unwrap();
@@ -285,17 +316,17 @@ fn hunt_neg_p6_nil_and_all_zero_hash_votes_are_distinct() {
 
 #[test]
 fn hunt_neg_p7_a_vote_from_the_wrong_height_or_kind_is_refused() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(1, vs);
     // WRONG HEIGHT
-    let wrong_h = Vote::sign(&ks[0], 2, 0, VoteKind::Prevote, Some(bh(1)));
+    let wrong_h = falcon_votes::fvote(&ks[0], &fks[0], 2, 0, VoteKind::Prevote, Some(bh(1)));
     assert_eq!(hc.add_prevote(wrong_h).unwrap_err(), "vote out of scope");
     // WRONG KIND
-    let wrong_k = Vote::sign(&ks[0], 1, 0, VoteKind::Precommit, Some(bh(1)));
+    let wrong_k = falcon_votes::fvote(&ks[0], &fks[0], 1, 0, VoteKind::Precommit, Some(bh(1)));
     assert_eq!(hc.add_prevote(wrong_k).unwrap_err(), "vote out of scope");
     // A DIFFERENT HEIGHT's consensus object accepts its own height.
-    let own_h = Vote::sign(&ks[0], 9, 9, VoteKind::Prevote, Some(bh(1)));
+    let own_h = falcon_votes::fvote(&ks[0], &fks[0], 9, 9, VoteKind::Prevote, Some(bh(1)));
     let mut hc2 = HeightConsensus::new(9, vset(&ks));
     assert!(
         hc2.add_prevote(own_h).is_ok(),
@@ -304,7 +335,7 @@ fn hunt_neg_p7_a_vote_from_the_wrong_height_or_kind_is_refused() {
     assert_eq!(hc2.try_prevote_quorum(), None, "one vote is not a quorum");
     // A vote for a FUTURE ROUND within the bound is legitimately accepted --
     // into its own bucket, which is never read at the current round.
-    let future_r = Vote::sign(&ks[0], 1, 1, VoteKind::Prevote, Some(bh(1)));
+    let future_r = falcon_votes::fvote(&ks[0], &fks[0], 1, 1, VoteKind::Prevote, Some(bh(1)));
     assert!(hc.add_prevote(future_r).is_ok());
     // The property that matters is that the future-round vote did not land in
     // round 0, not whether an empty bucket exists there.
@@ -354,8 +385,11 @@ fn hunt_neg_p8_the_zero_power_guard_holds_even_against_a_deserialized_set() {
     assert_eq!(vs.power_of(&[9u8; 32]), 0);
     // A vote from it is refused.
     let mut hc = HeightConsensus::new(1, vs);
+    // Falcon-registered throwaway: the vote verifies, so the refusal below is
+    // genuinely the zero-power membership the test pins (not a bad signature).
+    let (signers, signer_fks) = falcon_votes::falcon_set(1);
     let signer = {
-        let k = SigningKey::generate(&mut OsRng);
+        let k = signers[0].clone();
         // Register the REAL key with zero power, so the key is known but powerless.
         hc.validators
             .validators
@@ -363,7 +397,14 @@ fn hunt_neg_p8_the_zero_power_guard_holds_even_against_a_deserialized_set() {
         k
     };
     let e = hc
-        .add_prevote(Vote::sign(&signer, 1, 0, VoteKind::Prevote, Some(bh(1))))
+        .add_prevote(falcon_votes::fvote(
+            &signer,
+            &signer_fks[0],
+            1,
+            0,
+            VoteKind::Prevote,
+            Some(bh(1)),
+        ))
         .unwrap_err();
     println!("[NEG P8] vote from a zero-power key -> {e:?}");
     assert_eq!(e, "vote from non-validator");
@@ -709,7 +750,9 @@ fn hunt_neg_p13_sync_walk_rejects_cycles_gaps_and_overlong_chains() {
 
 #[test]
 fn hunt_neg_p14_a_one_validator_set_decides_alone_by_design() {
-    let k = SigningKey::generate(&mut OsRng);
+    let (sks, sfks) = falcon_votes::falcon_set(1);
+    let k = sks[0].clone();
+    let fk = sfks[0].clone();
     let vs = ValidatorSet::from_list(vec![(k.verifying_key().to_bytes(), 1)]);
     assert_eq!(vs.total_power(), 1);
     assert_eq!(
@@ -720,11 +763,25 @@ fn hunt_neg_p14_a_one_validator_set_decides_alone_by_design() {
     let mut hc = HeightConsensus::new(1, vs);
     let p = hc.proposer().unwrap();
     hc.receive_proposal(p, bh(1)).unwrap();
-    hc.add_prevote(Vote::sign(&k, 1, 0, VoteKind::Prevote, Some(bh(1))))
-        .unwrap();
+    hc.add_prevote(falcon_votes::fvote(
+        &k,
+        &fk,
+        1,
+        0,
+        VoteKind::Prevote,
+        Some(bh(1)),
+    ))
+    .unwrap();
     assert_eq!(hc.try_prevote_quorum(), Some(Some(bh(1))));
-    hc.add_precommit(Vote::sign(&k, 1, 0, VoteKind::Precommit, Some(bh(1))))
-        .unwrap();
+    hc.add_precommit(falcon_votes::fvote(
+        &k,
+        &fk,
+        1,
+        0,
+        VoteKind::Precommit,
+        Some(bh(1)),
+    ))
+    .unwrap();
     assert_eq!(hc.try_precommit_quorum(), Some(bh(1)));
     println!(
         "[NEG P14] a solo validator finalises alone -- intended for a single-validator testnet,"
@@ -734,11 +791,12 @@ fn hunt_neg_p14_a_one_validator_set_decides_alone_by_design() {
 
 #[test]
 fn hunt_neg_p15_far_future_votes_are_bounded_per_message() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(1, vs);
-    let far = Vote::sign(
+    let far = falcon_votes::fvote(
         &ks[0],
+        &fks[0],
         1,
         MAX_ROUND_AHEAD + 1,
         VoteKind::Prevote,
@@ -749,7 +807,14 @@ fn hunt_neg_p15_far_future_votes_are_bounded_per_message() {
     assert_eq!(e, "prevote round too far ahead");
     // A vote exactly at the bound is accepted -- but into a far-future bucket
     // that try_*_quorum never reads, so it contributes nothing (see FINDING 1).
-    let edge = Vote::sign(&ks[0], 1, MAX_ROUND_AHEAD, VoteKind::Prevote, Some(bh(1)));
+    let edge = falcon_votes::fvote(
+        &ks[0],
+        &fks[0],
+        1,
+        MAX_ROUND_AHEAD,
+        VoteKind::Prevote,
+        Some(bh(1)),
+    );
     assert!(hc.add_prevote(edge).is_ok());
     assert_eq!(
         hc.try_prevote_quorum(),

@@ -854,6 +854,64 @@ pub fn validator_powers_fragility(powers: &[u64]) -> Option<String> {
     None
 }
 
+/// Structural registration bound (papers/13_grinding_and_structural_capture.md
+/// §B, pure policy fn — NO wiring: the lead decides where, if anywhere, this
+/// gates registration/rotation).
+///
+/// Theorem B1: with committee size `k` and quorum `q = ⌊2k/3⌋+1`, a set with
+/// `n_B ≤ k − q` honest validators is captured DETERMINISTICALLY (`P=1`),
+/// however the stake is distributed (Sybil-split attacker stake vs.
+/// concentrated honest stake). The liveable floor is therefore
+///
+/// ```text
+/// n_B ≥ k − q + 1 = ⌈k/3⌉
+/// ```
+///
+/// Returns `true` iff `n_honest >= ceil(committee_size / 3)`. `committee_size
+/// == 0` is vacuously `true` (nothing is elected, nothing can be captured).
+/// Pure and deterministic: no ledger read, no env, no clock.
+///
+/// WIRING (lead's call — NOT wired here): the natural hook is
+/// `StakingLedger::to_validator_set` (the election filter that turns bonded
+/// stake into the consensus set) or the rotation path that installs it —
+/// report, don't wire.
+pub fn registration_bounds_ok(n_honest: usize, committee_size: u32) -> bool {
+    let need = committee_size.div_ceil(3) as usize;
+    n_honest >= need
+}
+
+/// Sybil-split bond bound (papers/13 §C.3, pure policy fn — NO wiring).
+///
+/// An attacker with stake fraction `α` of total `W` can mint `q` validators
+/// iff the minimum bond is cheap: the split costs `q · b_min` against an
+/// attacker budget of `α·W`. The split is unprofitable iff
+///
+/// ```text
+/// b_min > α·W / q    ⟺    b_min·q·α_den > α_num·W      (integer, strict)
+/// ```
+///
+/// with `α = α_num/α_den`. Returns `false` fail-closed on degenerate inputs
+/// (`quorum_seats == 0`: no quorum to price; `α_den == 0`: malformed
+/// fraction). Otherwise the strict integer inequality above, in `u128` (no
+/// overflow at any `u64` input). Pure and deterministic.
+///
+/// WIRING (lead's call — NOT wired here): the natural hook is the bond
+/// admission floor next to `MIN_VALIDATOR_BOND` / `required_bond_floor_nano`
+/// — report, don't wire.
+pub fn min_bond_ok(
+    b_min: u64,
+    alpha_num: u64,
+    alpha_den: u64,
+    total_stake: u64,
+    quorum_seats: u64,
+) -> bool {
+    if quorum_seats == 0 || alpha_den == 0 {
+        return false;
+    }
+    (b_min as u128) * (quorum_seats as u128) * (alpha_den as u128)
+        > (alpha_num as u128) * (total_stake as u128)
+}
+
 /// Re-entry liveness window in heights: a validator that rejoined the set
 /// and still shows no votes after this many heights is a liveness risk.
 ///
@@ -3506,6 +3564,62 @@ mod tests {
     }
     fn stell(n: u64) -> u64 {
         n * 1_000_000_000
+    }
+
+    /// Structural registration bound (papers/13 §B1): `n_B ≥ ⌈k/3⌉`, pinned
+    /// against the paper's table — pure fn, no wiring (lead wires).
+    #[test]
+    fn registration_bounds_enforces_ceil_k_over_3() {
+        // Paper table rows (k, q, min n_B): (32,22,11), (64,43,22),
+        // (105,71,35), (128,86,43), (177,119,59).
+        assert!(registration_bounds_ok(11, 32));
+        assert!(!registration_bounds_ok(10, 32));
+        assert!(registration_bounds_ok(22, 64));
+        assert!(!registration_bounds_ok(21, 64));
+        assert!(registration_bounds_ok(35, 105));
+        assert!(!registration_bounds_ok(34, 105));
+        assert!(registration_bounds_ok(43, 128));
+        assert!(!registration_bounds_ok(42, 128));
+        assert!(registration_bounds_ok(59, 177));
+        assert!(!registration_bounds_ok(58, 177));
+        // Degenerate: an empty committee needs nobody; nobody is never
+        // enough for a live committee.
+        assert!(registration_bounds_ok(0, 0));
+        assert!(!registration_bounds_ok(0, 64));
+    }
+
+    /// Sybil bond bound (papers/13 §C.3): `b_min > αW/q` (strict), integer
+    /// arithmetic — pure fn, no wiring (lead wires).
+    #[test]
+    fn min_bond_blocks_free_sybil_splits() {
+        // α=1/3, W=900, q=43: αW/q = 300/43 ≈ 6.98 → 6 refuses,
+        // 7 passes (7·43 = 301 > attacker budget 300; integer form
+        // 7·43·3 = 903 > 900), 8 passes.
+        assert!(!min_bond_ok(6, 1, 3, 900, 43));
+        assert!(min_bond_ok(7, 1, 3, 900, 43));
+        assert!(min_bond_ok(8, 1, 3, 900, 43));
+        // Strictness pin: exact equality is NOT enough (attacker breaks even).
+        // α=1/2, W=100, q=50: αW/q = 1 → 1 refuses, 2 passes.
+        assert!(!min_bond_ok(1, 1, 2, 100, 50));
+        assert!(min_bond_ok(2, 1, 2, 100, 50));
+        // u64-scale: α=1/3 of 10^18 with q=119 — strict, no overflow.
+        assert!(!min_bond_ok(
+            2_800_000_000_000_000,
+            1,
+            3,
+            1_000_000_000_000_000_000,
+            119
+        ));
+        assert!(min_bond_ok(
+            2_900_000_000_000_000,
+            1,
+            3,
+            1_000_000_000_000_000_000,
+            119
+        ));
+        // Degenerate inputs refuse fail-closed.
+        assert!(!min_bond_ok(u64::MAX, 1, 3, 900, 0));
+        assert!(!min_bond_ok(u64::MAX, 1, 0, 900, 43));
     }
 
     #[test]

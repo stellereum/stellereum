@@ -87,8 +87,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use stellereum::consensus::{
     BlockHash, Height, HeightConsensus, QuorumCertificate, Round, ValidatorId, ValidatorSet, Vote,
-    VoteKind,
+    VoteKind, register_validator_pq_key,
 };
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, Transaction, MASTERCHAIN_SHARD};
 use stellereum::state_engine::{AccountState, InMemoryStateEngine};
@@ -729,6 +730,7 @@ struct Member {
     index: usize,
     id: ValidatorId,
     key: SigningKey,
+    falcon: FalconKeypair,
     rt: ValidatorRuntime,
     profile: NodeProfile,
     /// Virtual ms at which this node joined the network.
@@ -918,15 +920,24 @@ impl ConsensusCluster {
         }
 
         // Deterministic keys: seed || index. No OS randomness.
+        // FULL-PQ: every runtime carries a deterministic Falcon-512 keypair
+        // (seed = index, mirrors `consensus::tests::vset_with_falcon` via
+        // `ValidatorRuntime::with_falcon_key` which registers the pubkey
+        // globally). Without it `make_prevote`/`make_precommit` mint Ed-only
+        // votes that `Vote::verify` refuses ("bad vote signature").
         for (i, profile) in profiles.iter().enumerate() {
             let key = key_at(seed, i as u64);
             let id = key.verifying_key().to_bytes();
             let profile = profile.clone();
+            let falcon = FalconKeypair::generate_from_seed(i as u8);
+            register_validator_pq_key(id, PqScheme::Falcon512, falcon.public_key.clone());
 
             // Every node gets its OWN state engine (nodes do not share
             // mutable state in reality).
             let state = Arc::new(InMemoryStateEngine::new());
-            let mut rt = ValidatorRuntime::new(key.clone(), validators.clone(), state, 1);
+            let mut rt =
+                ValidatorRuntime::new(key.clone(), validators.clone(), state, 1)
+                    .with_falcon_key(falcon.clone());
             // The base round of the cluster. A late node starts behind it.
             let mut hc = HeightConsensus::new(1, validators.clone());
             hc.round = base_round.saturating_sub(profile.late_rounds);
@@ -935,6 +946,7 @@ impl ConsensusCluster {
                 index: i,
                 id,
                 key,
+                falcon,
                 rt,
                 profile,
                 active_from_ms: 0,
@@ -1366,7 +1378,14 @@ impl ConsensusCluster {
         // (2) the moment it holds no live proposal for its lock. One vote
         // per (height, round): never an equivocation, always nil.
         if self.members[i].profile.byzantine == Byzantine::NilPrevote {
-            let vote = Vote::sign(&self.members[i].key, h, r, VoteKind::Prevote, None);
+            let vote = Vote::sign_with_falcon(
+                &self.members[i].key,
+                &self.members[i].falcon,
+                h,
+                r,
+                VoteKind::Prevote,
+                None,
+            );
             let locked = lock_hint(&self.members[i].rt, &vote);
             let _ = self.members[i].rt.on_prevote(vote.clone());
             self.members[i].stats.prevotes_cast += 1;
@@ -1425,7 +1444,14 @@ impl ConsensusCluster {
             && self.members[i].byzantine_round.is_none()
         {
             let fake = fake_target(h, r, &vote);
-            let evil = Vote::sign(&self.members[i].key, h, r, VoteKind::Prevote, Some(fake));
+            let evil = Vote::sign_with_falcon(
+                &self.members[i].key,
+                &self.members[i].falcon,
+                h,
+                r,
+                VoteKind::Prevote,
+                Some(fake),
+            );
             self.members[i].byzantine_round = Some((h, r));
             self.record_cast(i, &evil);
             self.broadcast(

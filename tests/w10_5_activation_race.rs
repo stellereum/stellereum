@@ -27,10 +27,15 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use stellereum::consensus::{QuorumCertificate, ValidatorSet, Vote, VoteKind};
+use stellereum::consensus::{QuorumCertificate, ValidatorSet, VoteKind};
+use stellereum::post_quantum::{FalconKeypair, PqScheme};
+use stellereum::consensus::register_validator_pq_key;
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 const H: u64 = 100;
 // Bond floor: MIN_VALIDATOR_BOND (1000 STELL) + buffer (100 STELL). Powers
@@ -71,6 +76,18 @@ async fn engine_with_bc(b: [u8; 32], c: [u8; 32]) -> Arc<InMemoryStateEngine> {
     e
 }
 
+/// Falcon half for an Ed key: deterministic from its seed byte, registered
+/// under the Ed id, so Ed ids stay byte-identical.
+fn fk_for(k: &SigningKey) -> FalconKeypair {
+    let fk = FalconKeypair::generate_from_seed(k.to_bytes()[0]);
+    register_validator_pq_key(
+        k.verifying_key().to_bytes(),
+        PqScheme::Falcon512,
+        fk.public_key.clone(),
+    );
+    fk
+}
+
 fn precommit_qc(
     signers: &[&SigningKey],
     height: u64,
@@ -80,7 +97,7 @@ fn precommit_qc(
     let sigs = signers
         .iter()
         .map(|k| {
-            let v = Vote::sign(k, height, round, VoteKind::Precommit, Some(block_hash));
+            let v = falcon_votes::fvote(k, &fk_for(k), height, round, VoteKind::Precommit, Some(block_hash));
             (v.voter, v.signature)
         })
         .collect();

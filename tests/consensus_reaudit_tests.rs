@@ -24,11 +24,14 @@ use rand::rngs::OsRng;
 use std::sync::{Arc, Mutex};
 use stellereum::chain::{ChainManager, InvalidationSignal, MAX_TRACKED_CANDIDATES};
 use stellereum::consensus::{
-    HeightConsensus, ValidatorSet, Vote, VoteKind, REPHASE_SCAN_WINDOW, ROUND_LOOKBACK,
+    HeightConsensus, ValidatorSet, VoteKind, REPHASE_SCAN_WINDOW, ROUND_LOOKBACK,
 };
 use stellereum::runtime::ValidatorRuntime;
 use stellereum::sharding::{Block, MASTERCHAIN_SHARD};
 use stellereum::state_engine::InMemoryStateEngine;
+
+#[path = "support/falcon_votes.rs"]
+mod falcon_votes;
 
 fn keys(n: usize) -> Vec<SigningKey> {
     (0..n).map(|_| SigningKey::generate(&mut OsRng)).collect()
@@ -104,7 +107,7 @@ fn an_unknown_sortition_parent_compiles_no_micro_certificate() {
     // elect a committee NOBODY else elects (and the certificate would then
     // fail the `binds_to_parent` check on the adopt path, refusing the
     // commit).
-    let ks = keys(3);
+    let (ks, fks) = falcon_votes::falcon_set(3);
     let vs = vset(&ks);
     let mut hc = HeightConsensus::new(H, vs.clone());
     assert!(
@@ -114,9 +117,16 @@ fn an_unknown_sortition_parent_compiles_no_micro_certificate() {
     assert!(hc.sortition_parent().is_none());
 
     let target = Some([0x77u8; 32]);
-    for k in ks.iter() {
-        hc.add_prevote(Vote::sign(k, H, 0, VoteKind::Prevote, target))
-            .unwrap();
+    for (i, k) in ks.iter().enumerate() {
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            0,
+            VoteKind::Prevote,
+            target,
+        ))
+        .unwrap();
     }
     let qc = hc
         .try_prevote_quorum_at()
@@ -126,9 +136,11 @@ fn an_unknown_sortition_parent_compiles_no_micro_certificate() {
         qc.pq_micro_certificate().is_none(),
         "an unknown parent must compile NO micro-certificate"
     );
+    // FULL-PQ (fail-closed, no compat): with no known parent no PQ envelope
+    // can be compiled, so the envelope-less shape is unconditionally invalid.
     assert!(
-        qc.verify(&vs),
-        "the classical full-set certificate still carries the quorum"
+        !qc.verify(&vs),
+        "without a PQ envelope the QC must NOT verify under FULL-PQ"
     );
 
     // With the parent known, the same votes compile a micro-certificate
@@ -136,14 +148,26 @@ fn an_unknown_sortition_parent_compiles_no_micro_certificate() {
     let mut hc = HeightConsensus::new(H, vs.clone());
     hc.set_parent_hash([0x88u8; 32]);
     assert!(hc.parent_hash_known());
-    for k in ks.iter() {
-        hc.add_prevote(Vote::sign(k, H, 0, VoteKind::Prevote, target))
-            .unwrap();
+    for (i, k) in ks.iter().enumerate() {
+        hc.add_prevote(falcon_votes::fvote(
+            k,
+            &fks[i],
+            H,
+            0,
+            VoteKind::Prevote,
+            target,
+        ))
+        .unwrap();
     }
     let _ = hc.try_prevote_quorum_at();
     let _qc = hc.prevote_qc.get(&0).expect("prevote QC");
-    // The classical set has no Falcon votes here, so no µQC is compiled —
-    // but the PARENT is now known, which is what the check above turns on.
+    // The parent is now known, so the committee path compiles the envelope —
+    // and the envelope verifies under the same set.
+    assert!(
+        _qc.pq_micro_certificate().is_some(),
+        "a known parent must compile a micro-certificate"
+    );
+    assert!(_qc.verify(&vs), "the enveloped QC must verify");
     assert!(hc.sortition_parent().is_some());
 }
 
@@ -231,7 +255,7 @@ async fn the_snapshot_anchor_returns_the_verified_boundary_hash() {
     // height). A peer-supplied header record's `prev_hash` is NOT covered by
     // the quorum certificate, so it can never be the source of that value.
     use stellereum::sync::{verify_snapshot_anchor_tail, HeaderLink};
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let vs = vset(&ks);
     let boundary = 100u64;
     let next_height = boundary + 1;
@@ -252,7 +276,7 @@ async fn the_snapshot_anchor_returns_the_verified_boundary_hash() {
                 prev_hash: [0x9Au8; 32],
                 state_root: [0x5u8; 32],
                 proposer: vs.proposer_for(boundary, 0).unwrap(),
-                qc: qc_for(&ks, vs.clone(), boundary, b_hash),
+                qc: qc_for(&ks, &fks, vs.clone(), boundary, b_hash, &[0x9Au8; 32]),
             })
         } else if h == next_height {
             Some(HeaderLink {
@@ -261,7 +285,7 @@ async fn the_snapshot_anchor_returns_the_verified_boundary_hash() {
                 prev_hash: b_hash,
                 state_root: [0x5u8; 32],
                 proposer: vs.proposer_for(next_height, 0).unwrap(),
-                qc: qc_for(&ks, vs.clone(), next_height, c_hash),
+                qc: qc_for(&ks, &fks, vs.clone(), next_height, c_hash, &b_hash),
             })
         } else if h + 1 == boundary {
             Some(HeaderLink {
@@ -270,7 +294,7 @@ async fn the_snapshot_anchor_returns_the_verified_boundary_hash() {
                 prev_hash: [0x8Au8; 32],
                 state_root: [0x5u8; 32],
                 proposer: vs.proposer_for(h, 0).unwrap(),
-                qc: qc_for(&ks, vs.clone(), h, [0x9Au8; 32]),
+                qc: qc_for(&ks, &fks, vs.clone(), h, [0x9Au8; 32], &[0x8Au8; 32]),
             })
         } else {
             None
@@ -320,24 +344,28 @@ fn candidate_block(height: u64, parent: [u8; 32], signer: &SigningKey) -> Block 
 
 fn qc_for(
     ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
     vs: ValidatorSet,
     height: u64,
     block_hash: [u8; 32],
+    parent: &[u8; 32],
 ) -> stellereum::consensus::QuorumCertificate {
-    use stellereum::consensus::QuorumCertificate;
-    let mut signatures = Vec::new();
-    for k in ks {
-        let v = Vote::sign(k, height, 0, VoteKind::Precommit, Some(block_hash));
-        signatures.push((v.voter, v.ed25519_signature().to_vec()));
+    use stellereum::consensus::VoteSet;
+    // A genuine 4-of-4 precommit QC compiled by the production committee
+    // path, bound to the block's real parent.
+    let mut set = VoteSet::new();
+    for (i, k) in ks.iter().enumerate() {
+        set.add(
+            falcon_votes::fvote(k, &fks[i], height, 0, VoteKind::Precommit, Some(block_hash)),
+            &vs,
+            height,
+            0,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
     }
-    let _ = vs;
-    QuorumCertificate {
-        height,
-        round: 0,
-        kind: VoteKind::Precommit,
-        block_hash: Some(block_hash),
-        signatures,
-    }
+    set.certificate(Some(block_hash), &vs, parent)
+        .expect("4-of-4 reaches quorum")
 }
 
 #[allow(clippy::assertions_on_constants)]
@@ -402,21 +430,30 @@ async fn block_at(round: u32, rt: &ValidatorRuntime, ks: &[SigningKey]) -> Block
     b
 }
 
-fn cert_at(ks: &[SigningKey], round: u32, bh: [u8; 32]) -> QuorumCertificate {
-    QuorumCertificate {
-        height: 1,
-        round,
-        kind: VoteKind::Precommit,
-        block_hash: Some(bh),
-        signatures: ks
-            .iter()
-            .take(3)
-            .map(|k| {
-                let v = Vote::sign(k, 1, round, VoteKind::Precommit, Some(bh));
-                (v.voter, v.ed25519_signature().to_vec())
-            })
-            .collect(),
+fn cert_at(
+    ks: &[SigningKey],
+    fks: &[stellereum::post_quantum::FalconKeypair],
+    round: u32,
+    bh: [u8; 32],
+    parent: &[u8; 32],
+) -> QuorumCertificate {
+    use stellereum::consensus::VoteSet;
+    // A genuine 3-of-4 precommit QC compiled by the production committee
+    // path, bound to the block's real parent.
+    let vs = vset(ks);
+    let mut set = VoteSet::new();
+    for (i, k) in ks.iter().enumerate().take(3) {
+        set.add(
+            falcon_votes::fvote(k, &fks[i], 1, round, VoteKind::Precommit, Some(bh)),
+            &vs,
+            1,
+            round,
+            VoteKind::Precommit,
+        )
+        .expect("genuine vote admits");
     }
+    set.certificate(Some(bh), &vs, parent)
+        .expect("3-of-4 reaches quorum")
 }
 
 #[tokio::test]
@@ -426,13 +463,13 @@ async fn a_later_round_certificate_supersedes_the_lock() {
     // superseded and the certificate is adopted — refusing it (the old
     // `locked_round <= certificate.round` test) partitioned the node from
     // every canonical commit after a single lost vote.
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = adopt_runtime(&ks, 0).await;
     rt.hc.round = 5;
     rt.hc.locked = Some(([0xA1u8; 32], 5));
     let blk = block_at(6, &rt, &ks).await;
     let bh = blk.compute_hash();
-    let cert = cert_at(&ks, 6, bh);
+    let cert = cert_at(&ks, &fks, 6, bh, &blk.prev_hash);
     let r = rt.adopt_committed(1, blk, cert).await;
     assert_eq!(
         r,
@@ -446,14 +483,14 @@ async fn a_same_round_certificate_naming_another_block_is_refused() {
     // Two conflicting polkas in ONE round need more than 1/3 Byzantine
     // power, so a certificate at the lock's own round that names a DIFFERENT
     // block is a genuine safety conflict and must be refused.
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = adopt_runtime(&ks, 0).await;
     rt.hc.round = 5;
     rt.hc.locked = Some(([0xA1u8; 32], 5));
     let blk = block_at(5, &rt, &ks).await;
     let bh = blk.compute_hash();
     assert_ne!(bh, [0xA1u8; 32], "the fixture must name a DIFFERENT block");
-    let cert = cert_at(&ks, 5, bh);
+    let cert = cert_at(&ks, &fks, 5, bh, &blk.prev_hash);
     let r = rt.adopt_committed(1, blk, cert).await;
     assert!(
         r.is_err(),
@@ -464,13 +501,13 @@ async fn a_same_round_certificate_naming_another_block_is_refused() {
 
 #[tokio::test]
 async fn an_earlier_round_certificate_naming_another_block_is_refused() {
-    let ks = keys(4);
+    let (ks, fks) = falcon_votes::falcon_set(4);
     let mut rt = adopt_runtime(&ks, 0).await;
     rt.hc.round = 5;
     rt.hc.locked = Some(([0xA1u8; 32], 5));
     let blk = block_at(4, &rt, &ks).await;
     let bh = blk.compute_hash();
-    let cert = cert_at(&ks, 4, bh);
+    let cert = cert_at(&ks, &fks, 4, bh, &blk.prev_hash);
     let r = rt.adopt_committed(1, blk, cert).await;
     assert!(
         r.is_err(),

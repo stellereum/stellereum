@@ -13,7 +13,6 @@
 //!  4. `CrossShardTransport::prune_consumed` drops consumed KV entries,
 //!     idempotently.
 
-use ed25519_dalek::SigningKey;
 use stellereum::network::CrossShardTransport;
 use stellereum::sharding::{
     Block, CrossShardKey, CrossShardMessage, L2Batch, L2Sequencer, SharedSequencer, Transaction,
@@ -23,12 +22,39 @@ use stellereum::sharding::{
 const SHARD0: u32 = MASTERCHAIN_SHARD;
 const SHARD1: u32 = BASE_WORKCHAIN_SHARD_INITIAL;
 
-fn key(seed: u8) -> SigningKey {
-    SigningKey::from_bytes(&[seed; 32])
+/// FULL-PQ sender address for a seed: implicit Falcon-512, registered
+/// globally (no activation surcharge). Mirrors
+/// `audit_state_sync_closeout_tests.rs::pq_id`.
+fn pq_id(seed: u8) -> [u8; 32] {
+    use stellereum::post_quantum::{derive_pq_address, PqScheme, DEFAULT_SALT};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = derive_pq_address(PqScheme::Falcon512, &pk, &DEFAULT_SALT);
+    Transaction::global_implicit_registry()
+        .register(from, PqScheme::Falcon512, &pk, &DEFAULT_SALT)
+        .expect("PQ test key must register");
+    from
 }
 
-fn tx_with_nonce(signer: &SigningKey, to: [u8; 32], nonce: u64, s: u32, t: u32) -> Transaction {
-    Transaction::sign(signer, to, 10, 1, nonce, s, t)
+fn tx_with_nonce(seed: u8, to: [u8; 32], nonce: u64, s: u32, t: u32) -> Transaction {
+    use stellereum::post_quantum::{PqScheme, PqSignatureEnvelope};
+    let pk = Transaction::sample_falcon512_pubkey(seed);
+    let from = pq_id(seed);
+    let mut tx = Transaction {
+        from,
+        to,
+        amount: 10,
+        gas_limit: 1,
+        nonce,
+        source_shard: s,
+        target_shard: t,
+        signature: Vec::new(),
+        payload: Vec::new(),
+        priority_fee_per_gas: 0,
+    };
+    let msg = tx.signing_message();
+    let sig = Transaction::create_falcon512_test_signature(&pk, &msg, seed);
+    tx.signature = PqSignatureEnvelope::new_implicit(PqScheme::Falcon512, sig).encode();
+    tx
 }
 
 fn msg_for(tx: Transaction, finalized: [u8; 32]) -> CrossShardMessage {
@@ -67,15 +93,12 @@ fn blank_block(shard: u32, height: u64, out: Vec<CrossShardMessage>) -> Block {
 /// order and are independent of carrier-vec order.
 #[test]
 fn sequencer_order_comes_from_blocks_not_carrier_order() {
-    let a = key(1);
-    let b = key(2);
-    let to = [9u8; 32];
-
     // Block on shard 0 at height 5 with two messages (crafted out of order).
-    let m1 = msg_for(tx_with_nonce(&a, to, 0, SHARD0, SHARD1), [0xA1u8; 32]);
-    let m2 = msg_for(tx_with_nonce(&a, to, 1, SHARD0, SHARD1), [0xA2u8; 32]);
+    let to = [9u8; 32];
+    let m1 = msg_for(tx_with_nonce(1, to, 0, SHARD0, SHARD1), [0xA1u8; 32]);
+    let m2 = msg_for(tx_with_nonce(1, to, 1, SHARD0, SHARD1), [0xA2u8; 32]);
     // Block on shard 1 at height 3 with one message (lower height: sequences first).
-    let m3 = msg_for(tx_with_nonce(&b, to, 0, SHARD1, SHARD0), [0xB1u8; 32]);
+    let m3 = msg_for(tx_with_nonce(2, to, 0, SHARD1, SHARD0), [0xB1u8; 32]);
 
     let b0 = blank_block(SHARD0, 5, vec![m2.clone(), m1.clone()]);
     let b1 = blank_block(SHARD1, 3, vec![m3.clone()]);
@@ -150,43 +173,42 @@ fn sequencer_watermark_advances_monotonically_from_finalized_blocks_only() {
 /// L2 admission: contiguous indices only, payload-hash bound, sigs verified.
 #[test]
 fn l2_submit_is_append_only_hash_bound_and_signature_checked() {
-    let user = key(11);
     let to = [7u8; 32];
     let mut l2 = L2Sequencer::new();
     assert_eq!(l2.expected_index(3), 0);
 
     // Gap rejected: index 1 before index 0.
-    let batch1 = L2Batch::new(3, 1, vec![tx_with_nonce(&user, to, 0, SHARD0, SHARD0)]);
+    let batch1 = L2Batch::new(3, 1, vec![tx_with_nonce(11, to, 0, SHARD0, SHARD0)]);
     assert!(l2.submit_batch(batch1).is_err());
     assert_eq!(l2.pending_len(), 0);
 
     // Index 0 accepted.
-    let batch0 = L2Batch::new(3, 0, vec![tx_with_nonce(&user, to, 0, SHARD0, SHARD0)]);
+    let batch0 = L2Batch::new(3, 0, vec![tx_with_nonce(11, to, 0, SHARD0, SHARD0)]);
     l2.submit_batch(batch0)
         .expect("first batch must be admitted");
     assert_eq!(l2.expected_index(3), 1);
 
     // Duplicate index rejected.
-    let dup = L2Batch::new(3, 0, vec![tx_with_nonce(&user, to, 1, SHARD0, SHARD0)]);
+    let dup = L2Batch::new(3, 0, vec![tx_with_nonce(11, to, 1, SHARD0, SHARD0)]);
     assert!(l2.submit_batch(dup).is_err());
 
     // Tampered payload hash rejected.
-    let mut tampered = L2Batch::new(3, 1, vec![tx_with_nonce(&user, to, 1, SHARD0, SHARD0)]);
+    let mut tampered = L2Batch::new(3, 1, vec![tx_with_nonce(11, to, 1, SHARD0, SHARD0)]);
     tampered.payload_hash = [0xFFu8; 32];
     assert!(l2.submit_batch(tampered).is_err());
 
     // Reordered txs change the binding hash: rebuild binds the new order, so
     // submit the swapped batch under the right index — it is a DIFFERENT
     // batch and must verify on its own hash.
-    let t1 = tx_with_nonce(&user, to, 1, SHARD0, SHARD0);
-    let t2 = tx_with_nonce(&user, to, 2, SHARD0, SHARD0);
+    let t1 = tx_with_nonce(11, to, 1, SHARD0, SHARD0);
+    let t2 = tx_with_nonce(11, to, 2, SHARD0, SHARD0);
     let swapped = L2Batch::new(3, 1, vec![t2.clone(), t1.clone()]);
     assert_eq!(swapped.payload_hash, L2Batch::payload_hash_of(&[t2, t1]));
     l2.submit_batch(swapped)
         .expect("correctly-bound batch admitted");
 
     // Bad signature rejected.
-    let mut bad = tx_with_nonce(&user, to, 3, SHARD0, SHARD0);
+    let mut bad = tx_with_nonce(11, to, 3, SHARD0, SHARD0);
     bad.signature[0] ^= 0xFF;
     let bad_batch = L2Batch::new(4, 0, vec![bad]);
     assert!(l2.submit_batch(bad_batch).is_err());
@@ -200,12 +222,11 @@ fn l2_submit_is_append_only_hash_bound_and_signature_checked() {
 /// marks prune pending deterministically and only move forward.
 #[test]
 fn l2_inclusion_order_is_canonical_and_marks_prune_forward_only() {
-    let user = key(21);
     let to = [7u8; 32];
     let mut l2 = L2Sequencer::new();
     for l2_id in [7u32, 5u32] {
         for idx in 0..3u64 {
-            let tx = tx_with_nonce(&user, to, (l2_id as u64) * 10 + idx, SHARD0, SHARD0);
+            let tx = tx_with_nonce(21, to, (l2_id as u64) * 10 + idx, SHARD0, SHARD0);
             l2.submit_batch(L2Batch::new(l2_id, idx, vec![tx])).unwrap();
         }
     }
@@ -238,11 +259,10 @@ fn l2_inclusion_order_is_canonical_and_marks_prune_forward_only() {
 /// Consumed-KV pruning: drops exactly the consumed ids, idempotently.
 #[tokio::test]
 async fn transport_prune_consumed_drops_only_consumed_ids_idempotently() {
-    let user = key(31);
     let to = [7u8; 32];
     let t = CrossShardTransport::local();
-    let m1 = msg_for(tx_with_nonce(&user, to, 0, SHARD0, SHARD1), [0x11u8; 32]);
-    let m2 = msg_for(tx_with_nonce(&user, to, 1, SHARD0, SHARD1), [0x12u8; 32]);
+    let m1 = msg_for(tx_with_nonce(31, to, 0, SHARD0, SHARD1), [0x11u8; 32]);
+    let m2 = msg_for(tx_with_nonce(31, to, 1, SHARD0, SHARD1), [0x12u8; 32]);
     t.broadcast_cross_shard(&m1).await.unwrap();
     t.broadcast_cross_shard(&m2).await.unwrap();
     assert_eq!(t.fetch_cross_shard_inbound(SHARD1).await.len(), 2);

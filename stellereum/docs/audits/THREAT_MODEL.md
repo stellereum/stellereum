@@ -15,7 +15,8 @@
 >
 > **Out of the attacker model** (i.e. *assumed*, not defended): a fully
 > compromised host with root, a malicious CPU/hardware supply chain, a
-> break of SHA-256/BLAKE3/Ed25519/BLS12-381/Falcon-512/curve25519, and a
+> break of SHA-256/BLAKE3/Ed25519/Falcon-512/curve25519 (BLS12-381 excised with
+> `src/bls.rs`), and a
 > 51%-of-stake coalition (which can censor and reorg but cannot break
 > BFT safety below 1/3 Byzantine power).
 >
@@ -43,7 +44,7 @@
 | **S**poofing | A peer claims to be a validator and injects votes under someone else's key. | Every vote is signed and verified on ingestion; the signer id is inside the signed preimage (`vote_sign_bytes`, domain `STELLEREUM_BFT_VOTE_V2`), so a vote cannot be re-labelled. Chain-id binding stops cross-deployment replay (**C-01**). | None known. |
 | **S**poofing | A peer injects a **proposal** signed by someone else. | `validate_proposal_unaligned` checks the declared proposer against the signature and the round schedule; `adopt_committed` refuses a certificate that does not name the scheduled proposer (**C-07**, **C-18**). | None known. |
 | **T**ampering | A proposer reorders a block after the votes, or swaps a transaction. | The **order Merkle root** is inside the signed block hash; every validator re-computes it from the proposed body and refuses a mismatch (`runtime::check_order_commitment`, `mev::compute_order_merkle_root`). The **shard-head commitment** is likewise inside the block hash. | The order check is a hard rule that every validator must run before it votes — a **coordinated rollout** requirement. The *vote* gate for MEV sealing is deferred (**KI-34**, **U-01**). |
-| **T**ampering | A peer forges a quorum certificate. | Certificates are verified against the **local** validator set with power weighting (`ValidatorSet::quorum_power`); an empty set fails closed with `u64::MAX` (**C-06**). The µQC path additionally demands a strict majority of the **network's** stake (**C-15**). | The quorum is over *this node's* set; a node with a stale set fails closed to observer (**C-14**). |
+| **T**ampering | A peer forges a quorum certificate. | Certificates are verified against the **local** validator set with power weighting (`ValidatorSet::quorum_power`); an empty set fails closed with `u64::MAX` (**C-06**). The µQC path additionally demands two-thirds of the **network's** stake (**C-15**). | The quorum is over *this node's* set; a node with a stale set fails closed to observer (**C-14**). |
 | **R**epudiation | A validator equivocates (signs two conflicting votes) and denies it. | Equivocation evidence is recorded as a signed pair, deduplicated by the pair, and consumed by `apply_equivocation_slashes`, which burns real stake from the pool (**C-10**, **C-12**). | Evidence is **locally observed**: a catching-up node saw nothing (**KI-08**). Ship the evidence with the commit certificate. |
 | **R**epudiation | A validator is punished for being partitioned rather than for misbehaving. | Downtime is derived from the **quorum certificate** of a finalized block, not from a local timer, and is replay-idempotent per height (**C-11**). | A validator that misses many blocks still loses a bounded amount (0.1% burn after 10 consecutive misses, 100-height cooldown). |
 | **I**nformation disclosure | A peer learns which transactions are pending before the block is built. | Transactions are sealed in the mempool under a round key; the block build re-opens the envelope and requires an exact byte match (`mev::verify_pool_tx`). | The round key is **node-local**, so the proposer itself sees the plaintext (**KI-34**). |
@@ -101,15 +102,15 @@
 
 ---
 
-## 5. Cryptography & keys (`src/post_quantum.rs`, `src/bls.rs`, `src/crypto_privacy.rs`, `src/node_keys.rs`, `src/address.rs`)
+## 5. Cryptography & keys (`src/post_quantum.rs`, `src/node_keys.rs`, `src/address.rs` — `src/bls.rs` and `src/crypto_privacy.rs` deleted in the FULL-PQ cut, see note)
 
 | STRIDE | Threat | Mitigation | Residual |
 | --- | --- | --- | --- |
-| **S**poofing | An attacker poses as a validator by forging its signature. | Ed25519 for votes, real BLS12-381 pairing for the aggregate certificate, Falcon-512 (FIPS 206) for the post-quantum path; scheme `0x03` is refused fail-closed (**K-03**). | The **legacy** Falcon derivation has ~32 bits of effective entropy — a key made that way is recoverable from its public key (**KI-02**). |
+| **S**poofing | An attacker poses as a validator by forging its signature. | Ed25519 for votes, Falcon-512 (FIPS 206) for the post-quantum path; scheme `0x03` is refused fail-closed (**K-03**). (Historical: real BLS12-381 pairing for the aggregate certificate — module excised, no BLS path in-tree.) | The **legacy** Falcon derivation has ~32 bits of effective entropy — a key made that way is recoverable from its public key (**KI-02**). |
 | **T**ampering | A signature is verified over different bytes than it was produced over (domain confusion). | Every preimage has a domain tag and a length-delimited layout: votes (`STELLEREUM_BFT_VOTE_V2`), blocks (`STELLEREUM_BLOCK_V3`), sortition (`STELL_SORTITION_V5`), the oracle, the commitment domains, the PQ envelopes, the epoch seal. The chain id is in the vote and block preimages (**C-01**, **C-02**). | None known. |
 | **R**epudiation | A validator claims it never signed. | Signatures are per-object and the equivocation evidence is a signed pair, recorded and deduplicated (**C-10**). | Evidence must be **observed** to be usable (**KI-08**). |
 | **I**nformation disclosure | The node's private key leaks through a log, an error message or a serialization. | The Falcon private half is **not** `pub` (`src/post_quantum.rs`); the key is encrypted at rest by default (Argon2id + XChaCha20-Poly1305) and the passphrase comes from the environment, never from a file (**K-06**). | An existing **plaintext** key still loads until a passphrase is available (**KI-20**). |
-| **D**enial of service | A peer makes the node burn CPU in a pairing check or a lattice verify. | The BLS path is off by default; the verifier is behind the same size caps as everything else. | A µQC with a large committee costs a batch verify per peer message. |
+| **D**enial of service | A peer makes the node burn CPU in a pairing check or a lattice verify. | ~~The BLS path is off by default;~~ the verifier is behind the same size caps as everything else. | A µQC with a large committee costs a batch verify per peer message. |
 | **E**levation of privilege | An attacker uses a disabled scheme to bypass signature verification. | `PqScheme::from_id(3)` refuses; `verify_pq_signature` returns `false`; every byte-driven admission path refuses at parse time (**K-03**). | The variant is retained so every `match` stays exhaustive — a future re-enable must be a coordinated hard fork (**KI-01**). |
 
 ---
@@ -164,13 +165,13 @@
 
 ---
 
-## 10. Privacy (`src/crypto_privacy.rs`, `src/zkml.rs`)
+## 10. Privacy (`src/zkml.rs` — `src/crypto_privacy.rs` deleted in the FULL-PQ cut; shielded rows retired below)
 
 | STRIDE | Threat | Mitigation | Residual |
 | --- | --- | --- | --- |
-| **I**nformation disclosure | The amount of a shielded transfer leaks. | Pedersen commitments with positional **range proofs** on every input and every output; fail-closed, no equation-only fallback (**K-09**). | — |
-| **S**poofing | A negative balance is minted (the "infinite mint" the audit flagged). | Range proofs bound every commitment to `[0, 2^64)`; the first-spender-wins rule and the ownership map close the double-spend and the theft paths (**K-09**, **K-10**). | A direct caller of the **bare** `apply_transfer` bypasses the range check (**KI-06**). |
-| **I**nformation disclosure | The sender of a shielded transfer is identified. | Stealth addresses for the recipient. | The **sender is always public** (`tx.from` + nonce + public gas); there is no RingCT and no anonymity (**KI-05**). |
+| **I**nformation disclosure | ~~The amount of a shielded transfer leaks.~~ — **RETIRED with `src/crypto_privacy.rs`.** | ~~Pedersen commitments with positional **range proofs** on every input and every output; fail-closed, no equation-only fallback (**K-09**).~~ | — |
+| **S**poofing | ~~A negative balance is minted (the "infinite mint" the audit flagged).~~ — **RETIRED with `src/crypto_privacy.rs`.** | ~~Range proofs bound every commitment to `[0, 2^64)`; the first-spender-wins rule and the ownership map close the double-spend and the theft paths (**K-09**, **K-10**).~~ | ~~A direct caller of the **bare** `apply_transfer` bypasses the range check (**KI-06**).~~ Retired with KI-06. |
+| **I**nformation disclosure | ~~The sender of a shielded transfer is identified.~~ — **RETIRED with `src/crypto_privacy.rs`.** | ~~Stealth addresses for the recipient.~~ | ~~The **sender is always public** (`tx.from` + nonce + public gas); there is no RingCT and no anonymity (**KI-05**).~~ Retired with KI-05. |
 | **T**ampering | A zkML proof is fabricated to trigger a value-bearing decision. | The sound path re-runs the deterministic integer model and hash-matches the on-chain model (`verify_inference_against`); the live opcodes are `SysCallVerifyZkMlReexec` and `SysCallVerifyZkMlAttestation`, and both use the sound path. | The structural check `verify_inference` is **not sound** and the legacy opcode `SysCallVerifyZkMl` uses it — it is unreachable on the block path (`VmContext.zkml_proof` is never supplied) (**KI-31**). |
 | **I**nformation disclosure | The model, the inputs or the outputs of an "zk" inference leak. | Nothing hides them: the proof carries the public inputs and outputs in the clear, and the verifier holds the whole model. | The subsystem is **sound but not zero-knowledge and not succinct**; `zkml::zkml_capabilities()` says so in machine-readable form (**KI-31**, **KI-33**). |
 
@@ -191,10 +192,10 @@ plainly in the deployment runbook.**
 | T-3 | **The epoch key** (the MEV committee's aggregate public key) | That the sealed-transaction key is known only to the committee. The epoch key **is** produced on the live path now (the DKG runs, the key is served as `stell_epochKey`, and its commitment is inside the signed block hash). The *node-local* blind-round key of `src/mev.rs` coexists with it. | `src/mev_epoch.rs`; `src/runtime.rs:2129` `sync_mev_epoch`; `src/rpc.rs:3499` `stell_epochKey`; `src/sharding.rs:4297` `Block::epoch_key_commitment`; `src/mev.rs` (the node-local layer) |
 | T-4 | **The local disk** (the data directory) | That the node's own persisted blocks, state and snapshots are what they claim. A tampered disk can withhold or reorder, and can make the node vote on a stale set (which the observer arm converts into *no vote*, not a wrong vote). | `src/storage.rs`; `src/node_keys.rs` (0600/0700, encrypted keys) |
 | T-5 | **The operator** (the environment, the config, the passphrase, the process) | That `STELL_CHAIN_ID`, `STELL_RPC_AUTH_TOKEN`, `STELL_FAUCET_TOKEN`, the data directory and the host are what the operator believes. | `src/main.rs`; `docs/OPERATIONS.md` |
-| T-6 | **The RPC token** (`STELL_RPC_AUTH_TOKEN`) | That whoever holds the token may use the write surface. The token is optional; without it the gated methods fail closed. | `src/rpc.rs` `RpcState::auth_token` |
+| T-6 | **The RPC token** (`STELL_RPC_AUTH_TOKEN`) | That whoever holds the token may use the write surface. Split posture: governance writes, contract previews and `stell_mempoolDump` are TOKEN-ALWAYS (fail closed with no token); `stell_submitPriceFeed`/`stell_pmmBuy`/`stell_pmmSell` are gated-when-set (open when unset). | `src/rpc.rs` `RpcState::auth_token` |
 | T-7 | **The bridge relayer set** (2/3 of distinct signers) | That a cross-chain deposit really happened. This is the bridge's biggest structural trust assumption. | `src/bridge.rs` `quorum_threshold` |
 | T-8 | **The oracle publisher set** (governance-approved keys) | That a price feed is honest. | `src/oracle.rs`; `src/governance.rs` |
-| T-9 | **The cryptography** (SHA-256, BLAKE3, Ed25519, BLS12-381, curve25519/Ristretto255, Falcon-512, Argon2id, XChaCha20-Poly1305, Ristretto255-based Shamir) | That the primitives hold. Explicitly *not* defended against. | — |
+| T-9 | **The cryptography** (SHA-256, BLAKE3, Ed25519, curve25519/Ristretto255, Falcon-512, Argon2id, XChaCha20-Poly1305, Ristretto255-based Shamir) | That the primitives hold. Explicitly *not* defended against. (BLS12-381 excised with `src/bls.rs`.) | — |
 | T-10 | **The host** (root, the OS, the CPU) | Not defended. | — |
 
 ### NOT trusted (and therefore defended by code)
@@ -205,7 +206,7 @@ plainly in the deployment runbook.**
 | N-2 | Every raw transaction an RPC client submits | `src/evm_adapter.rs` (strict RLP, canonical-form checks, depth limit), `src/mempool.rs` (admission), `src/state_engine.rs` (execution) |
 | N-3 | Every proof attached to a bridge deposit | `src/bridge_adapters.rs` (**G-12**) |
 | N-4 | Every zkML proof | `src/zkml.rs` `verify_inference_against` (**KI-31**) |
-| N-5 | Every confidential commitment | `src/crypto_privacy.rs` (range proofs, ownership, spent set) (**K-09**, **K-10**) |
+| N-5 | ~~Every confidential commitment~~ — **RETIRED (shielded-pool excision: `src/crypto_privacy.rs` deleted; K-09/K-10 retired)** | ~~`src/crypto_privacy.rs` (range proofs, ownership, spent set) (**K-09**, **K-10**)~~ |
 | N-6 | The **operator's** own configuration, insofar as it can change the *consensus* verdict | The chain id is **frozen once per process** (`FROZEN_CHAIN_ID`), so two nodes on one host cannot read it at different moments and derive different vote preimages. The EVM adapter's *served* id follows the environment but its *verification* pin is a constant, so a per-process env read at each verification site cannot let validators admit different transaction sets. |
 
 ---

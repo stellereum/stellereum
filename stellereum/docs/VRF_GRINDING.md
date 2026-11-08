@@ -1,17 +1,31 @@
 # VRF Grinding: Measurement + Remote-Signer Closure Design
 
+> **SUPERSEDED (FULL-PQ excision).** The deterministic-Schnorr VRF construction
+> measured below (`vrf_prove`/`vrf_verify`/`VrfBinding`/registry) has been
+> **deleted**: `src/vrf.rs` is now a 133-line math-only stub (live symbols are
+> `lottery_threshold` at `vrf.rs:33`, `expected_draws_to_include_member`,
+> `expected_draws_to_capture_seats` — pure stake math, no key material, no
+> registry, no filesystem/env reads). All `src/vrf.rs:NNN` ranges cited in this
+> file are void against the current tree, as are `tests/vrf_grinding_measure_tests.rs`,
+> `tests/vrf_audit_tests.rs`, `VrfBeaconSeal`/`vrf_election_seed`/`verify_vrf_seed_for_validator`
+> (no matches in `src/consensus.rs`), and the ECVRF phase-2 plan (`docs/PLAN-VRF.md`
+> is likewise superseded). Election is the canonical parent-hash draw
+> (`derive_sortition_committee` in `consensus.rs`), documented grindable with the
+> network-anchored quorum as mitigation. The statistical findings (§2) stand as
+> the historical reason the Schnorr construction was never wired to election.
+
 Status: **measurement + design only — no production crypto changes.**
 Scope: `tests/vrf_grinding_measure_tests.rs` (new) + this file. Zero `src/` changes.
 
 ## 1. Construction under test
 
-Deterministic-Schnorr VRF (`src/vrf.rs:336-348`, SECURITY SCOPE):
+Deterministic-Schnorr VRF (historical — deleted with the ECVRF excision, see banner; `src/vrf.rs` ranges below are void):
 
-- `vrf_prove` (`src/vrf.rs:499-511`): `s = scalar(seed)`,
+- `vrf_prove` (historical `src/vrf.rs:499-511`): `s = scalar(seed)`,
   `k = H(secret || seed_input)`, `R = kG`,
   `c = H(R || pk || seed_input)`, `z = k + c·s`,
   `output = BLAKE3(R || pk || seed)`, proof = `(R, z)`.
-- `vrf_verify` (`src/vrf.rs:518-546`): checks `zG == R + c·PK` and re-derives
+- `vrf_verify` (historical `src/vrf.rs:518-546`): checks `zG == R + c·PK` and re-derives
   `output` from the proof bytes. Fail-closed on every tamper class.
 
 ### 1.1 Degrees of freedom (exact)
@@ -20,8 +34,8 @@ For a fixed `(secret, seed_input)` pair:
 
 | Component | Grinder-controlled? |
 |---|---|
-| `seed_input` (beacon / `sortition_seed` output, `src/consensus.rs:1059`) | NO — fixed by the chain; the holder cannot change it |
-| secret scalar `s` (hence `pk`) | NO as a per-draw variable — fixed per key; key grinding (registering many keys) is one-binding-per-validator-id, Falcon-signed (`VrfBinding`, `src/vrf.rs:240-290`) and publicly visible, so it is not a per-input search |
+| `seed_input` (beacon / `sortition_seed` output — `sortition_seed` in `consensus.rs`) | NO — fixed by the chain; the holder cannot change it |
+| secret scalar `s` (hence `pk`) | NO as a per-draw variable — fixed per key; key grinding (registering many keys) is one-binding-per-validator-id, Falcon-signed (historical `VrfBinding`, deleted with ECVRF) and publicly visible, so it is not a per-input search |
 | challenge `c` / output structure | NO — pinned by verification equations |
 | **nonce `k`** | **YES — the entire surface.** `vrf_prove` derives one deterministic `k`, but `vrf_verify` accepts ANY nonzero `k'`: `R' = k'G`, `c' = H(R', pk, seed)`, `z' = k' + c's` always satisfies the Schnorr equation and mints a verifying `output' = BLAKE3(R' \|\| pk \|\| seed)` |
 
@@ -30,7 +44,7 @@ So the grinder's search space is the full 256-bit nonce field: **every fresh
 mul + two hashes.** There is no second degree of freedom and no need for one:
 the nonce alone gives unlimited valid proofs per input. This is what the audit
 test `documented_gap_no_uniqueness_second_valid_proof_exists`
-(`tests/vrf_audit_tests.rs:381-425`) demonstrates once; the measurement below
+(historical — `tests/vrf_audit_tests.rs` deleted with the excision) demonstrates once; the measurement below
 quantifies best-of-N selection over it.
 
 Only the secret holder can grind their OWN ticket (forging another
@@ -41,11 +55,11 @@ universal — but sortition fairness is exactly about selfish bias.
 
 Method (`tests/vrf_grinding_measure_tests.rs`): K=16 keys × M=16 inputs = 256
 trials. Per pair: one honest `vrf_prove` plus 32 alternate proofs minted with
-fresh nonces (test-local replica of the `src/vrf.rs` derivation with a fresh
+fresh nonces (test-local replica of the historical `src/vrf.rs` derivation with a fresh
 nonce tag — same domains, same equations; every alternate asserts
 `vrf_verify == Some`). Grinder strategy: keep the MINIMUM ticket, where
 `ticket = u128::from_le_bytes(output[0..16])` (matches the 128-bit
-`lottery_threshold` model, `src/vrf.rs:620-644`). Committee model:
+`lottery_threshold` model, `lottery_threshold` in `src/vrf.rs`). Committee model:
 equal-stake sets n ∈ {3,4,8,16}, one expected seat,
 threshold = `lottery_threshold(1, n, 1)`; elected ⟺ `ticket < threshold`.
 Closed form: `P_best(N) = 1-(1-p)^N`, `p = threshold/2^128`.
@@ -121,12 +135,13 @@ Consequences for the phase-3 lottery (`docs/PLAN-VRF.md` §2–3):
    the lottery degrades to "whoever grinds most wins most," i.e. the exact
    parent-hash-style search phase 3 was meant to remove.
 2. Detection is statistical, not cryptographic. Only the chosen proof is
-   gossiped (`VrfBeaconSeal`, `src/consensus.rs:528-535`); a grinder's
+   gossiped (historical `VrfBeaconSeal` design — never implemented, no
+   `VrfBeaconSeal` in `src/consensus.rs`); a grinder's
    win-rate anomaly is visible over many heights but no single proof is
    provably ground — so "slash the grinder" cannot be the security boundary.
 3. Zero live impact TODAY: phase 1 is metering + math; the election ignores
-   the registry (pinned by `phase1_sortition_election_ignores_vrf_registry`,
-   `src/vrf.rs:846-883`). This verdict is a precondition on phase-3
+   the registry (pinned by the historical `phase1_sortition_election_ignores_vrf_registry`
+   test — deleted with the excision). This verdict is a precondition on phase-3
    activation, not an incident.
 
 ## 4. Remote-signer VRF closure design (no implementation)
@@ -170,11 +185,11 @@ pub trait VrfSignerTransport: Send + Sync {
 - Holds `transport: Arc<dyn VrfSignerTransport>` + pinned `[u8; 32]` VRF key
   only — no secret, no seed (mirrors `src/remote_signer.rs:479-482`).
 - `new(transport)`: resolves the key, checks width AND that it decompresses to
-  a non-identity Ristretto point (`VrfPublicKey::from_bytes`,
-  `src/vrf.rs:163-176`); fails closed otherwise (mirrors
+  a non-identity Ristretto point (historical `VrfPublicKey::from_bytes` —
+  deleted with the excision); fails closed otherwise (mirrors
   `src/remote_signer.rs:491-501`).
 - `vrf_prove(seed_input)`: the one outside call; verifies the returned proof
-  against the PINNED key via `vrf_verify` (`src/vrf.rs:518-546`) AND checks
+  against the PINNED key via the historical `vrf_verify` (deleted) AND checks
   the `output` field matches the proof bytes; `ProofInvalid` otherwise
   (mirrors the re-verify in `src/remote_signer.rs:530-553`). Empty input
   refused (mirrors `SigningFailureKind::EmptyMessage`).
@@ -209,27 +224,28 @@ signer-side policy, which is the point of moving the key out of the host:
 ### 4.4 Message flow + integration points
 
 1. Consensus builds `seed_input = sortition_seed(parent, height, round)`
-   (`src/consensus.rs:1059-1065`) — or the post-activation
-   `vrf_election_seed` (`src/vrf.rs:571-576`). Unchanged preimage contract
-   (cf. `docs/PLAN-VRF.md` §2 row 6: `vote_sign_bytes` UNCHANGED).
-2. Proposer path (beside `Vote::sign`, `src/consensus.rs:1554-1585`) calls
+   (`sortition_seed` in `consensus.rs`) — or the post-activation
+   `vrf_election_seed` (historical — deleted with the excision). Unchanged preimage contract
+   (cf. `docs/PLAN-VRF.md` §2 row 6: `vote_sign_bytes` UNCHANGED — PLAN-VRF is likewise superseded).
+2. Proposer path (beside `Vote::sign`, historical `src/consensus.rs:1554-1585`) calls
    `vrf_signer.vrf_prove(seed_input)` OFF the async runtime
    (`spawn_blocking`; cf. threading rule `src/remote_signer.rs:99-102`) and
    packs the envelope into `VrfBeaconSeal::new(validator_id, proof)`
-   (`src/consensus.rs:537-543`).
+   (historical — `VrfBeaconSeal` was never implemented).
 3. Gossip carries the seal beside the vote halves (envelope change per
-   `docs/PLAN-VRF.md` §2 rows 3–5).
+   the superseded `docs/PLAN-VRF.md` §2 rows 3–5).
 4. Verifier re-derives `seed_input` from the certificate's OWN
    `(sortition_parent, height, round)` and calls
    `VrfBeaconSeal::verified_output(registry, seed_input)`
-   (`src/consensus.rs:548-560`) →
-   `verify_vrf_seed_for_validator` (`src/vrf.rs:554-562`) →
-   `vrf_verify` (`src/vrf.rs:518-546`); accepts ANY verifying proof and the
+   (historical — never implemented) →
+   `verify_vrf_seed_for_validator` (historical — deleted) →
+   `vrf_verify` (historical — deleted); accepts ANY verifying proof and the
    election is a pure function of the verified output (no-uniqueness
-   assumption already documented, `src/consensus.rs:524-526`).
+   assumption already documented, historical `src/consensus.rs:524-526`).
 5. ECVRF swap (phase 2) keeps this whole interface: `seed_input: [u8;32]`
    in, `VrfProof` out — only the signer/prover bodies change, matching the
-   plan that the swap keeps "THESE signatures" (`src/vrf.rs:341-346`).
+   plan that the swap keeps "THESE signatures" (historical `src/vrf.rs:341-346` —
+   deleted; the ECVRF swap never landed).
 
 ### 4.5 Fallback when unavailable: fail closed, never substitute
 
@@ -243,16 +259,18 @@ Mirrors remote-signer rule 1 (`src/remote_signer.rs:27-32`, `475-478`):
   fiction); (b) falling back to the parent-hash draw for that height
   (re-opens proposer grinding AND forks against nodes that halted).
 - Liveness note: per-height stall instead of re-roll is already the beacon
-  design (`beacon_next` chains published outputs only, `src/vrf.rs:596-606`;
-  `docs/PLAN-VRF.md` §5), so a signer outage stalls the height rather than
+  design (historical `beacon_next` chains published outputs only — deleted;
+  `docs/PLAN-VRF.md` §5 is superseded), so a signer outage stalls the height rather than
   weakening it — consistent, not new.
 
 ## 5. Recommendation
 
 1. **Require the audited ECVRF swap (RFC 9381 family, `docs/PLAN-VRF.md`
    phase 2) before ANY lottery activation — at every committee size, with no
-   "tolerate with cap" option.** A client-side cap on N is unenforceable:
-   verification accepts any valid proof (`src/consensus.rs:524-526`), so a
+   "tolerate with cap" option.** (Historical recommendation — the swap never
+   landed; the Schnorr construction was deleted instead and election stays on
+   the parent-hash draw.) A client-side cap on N is unenforceable:
+   verification accepts any valid proof (historical `src/consensus.rs:524-526`), so a
    cap is a request the adversary ignores. Uniqueness (exactly one verifiable
    output per `(pk, input)`) makes best-of-N cryptographically impossible and
    zeroes the lift regardless of compute — it is the only complete fix, and
@@ -264,9 +282,11 @@ Mirrors remote-signer rule 1 (`src/remote_signer.rs:27-32`, `475-478`):
    cannot bind a holder who kept a local copy — so it must never be cited as
    the reason to activate the lottery on Schnorr.
 3. **Until ECVRF lands: keep phase-1 posture** (no election effect; registry
-   + gossip + metering only). The measured numbers are the activation gate:
-   re-run `tests/vrf_grinding_measure_tests.rs` against the ECVRF backend at
-   swap time and expect best-of-N ≡ honest (lift 1.0x) by construction.
+   + gossip + metering only). (Historical — the ECVRF backend never landed;
+   the construction was deleted instead. The measured numbers below were the
+   activation gate at the time: re-running the deleted
+   `tests/vrf_grinding_measure_tests.rs` against an ECVRF backend would have
+   to show best-of-N ≡ honest (lift 1.0x) by construction.)
 
 ## 6. Gates
 

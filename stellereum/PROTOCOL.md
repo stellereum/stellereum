@@ -714,13 +714,13 @@ picks the committee: a subset weighted **proportionally to voting power**,
 drawn without replacement, returned in canonical sorted order.
 
 The committee size is `min(N, MICRO_COMMITTEE_MAX_SIZE)` with
-**`MICRO_COMMITTEE_MAX_SIZE = 64`**. It is deliberately *not* a constant
+**`MICRO_COMMITTEE_MAX_SIZE = 128`** (`consensus.rs:637`). It is deliberately *not* a constant
 smaller than the cap: with a fixed 16-seat committee and N = 100 uniformly
 staked validators, the committee holds only ~16 % of the network's stake, so a
 µQC could be forged by an attacker holding ~11 % — a ~6× weakening of the
-network's own 2/3 threshold. At 64 seats and N = 100 the committee holds ~64 %
-of the stake, and the network-anchored quorum (§6.3) then demands a strict
-majority of the *network's* stake.
+network's own 2/3 threshold. At 128 seats and N = 100 the committee is the
+whole set, and the network-anchored quorum (§6.3) then demands two-thirds
+of the *network's* stake (`pq_micro_required_power`, `consensus.rs:703`).
 
 ### 6.2 The parent-hash-seeded draw
 
@@ -754,7 +754,7 @@ re-derives exactly the committee the builders used.
 proposer of the parent block chooses the parent's bytes, hence its hash, hence
 the committee of the next height. A proposer that can vary the parent hash (a
 nonce, a timestamp, the tx set) can **search** for a favourable committee: each
-candidate parent hash is a fresh 16-draw sortition, and BLAKE3 is cheap enough
+candidate parent hash is a fresh sortition draw, and BLAKE3 is cheap enough
 (10⁹+ draws/s on a GPU) that a capture is a matter of minutes for an attacker
 who controls a meaningful share of the set.
 
@@ -767,7 +767,7 @@ surface entirely; that is the structural fix and is out of scope here.
 
 ```text
 required = max( floor(2 × W_committee / 3) + 1,      // the committee's own 2/3
-                 floor(W_network  / 2) + 1 )          // a STRICT MAJORITY of the network
+                 floor(2 × W_network  / 3) + 1 )          // the NETWORK's 2/3 (BFT floor)
 ```
 
 `pq_micro_required_power(committee_total_power, network_total_power)`.
@@ -775,9 +775,10 @@ required = max( floor(2 × W_committee / 3) + 1,      // the committee's own 2/3
 - The **first** term is the committee's own two-thirds, the classical BFT
   accounting applied to the sample.
 - The **second** term is what makes a µQC safe to accept as a **finality**
-  certificate on its own: `floor(W_network/2) + 1` is a strict majority of the
-  WHOLE network's stake, so any two conflicting certificates (µQC or full QC)
-  must share at least one signer — the classic quorum-intersection property
+  certificate on its own: `floor(2·W_network/3) + 1` is two-thirds of the
+  WHOLE network's stake, so no two conflicting certificates (µQC or full QC)
+  can both verify against an honest intersection — the classic
+  quorum-intersection property
   that a 16-seat committee's `2/3 of the committee` does **not** have (2/3 of a
   16 %-of-the-network sample is ~11 % of the network: no intersection, and an
   attacker with 11 % of the stake can finalise a conflicting block).
@@ -786,7 +787,7 @@ required = max( floor(2 × W_committee / 3) + 1,      // the committee's own 2/3
   threshold. The µQC is only an *accelerator*: the full Ed25519 QC path stays
   authoritative, so refusing a µQC costs bandwidth, never liveness.
 
-**I20 - A µQC must carry a strict majority of the whole network's stake.** The
+**I20 - A µQC must carry two-thirds of the whole network's stake.** The
 verifier sums the powers of the committee members with valid signatures and
 requires `>= required`. An empty committee or a zero-power committee is
 `false` (fail-closed), mirroring `ValidatorSet::quorum_power`'s `u64::MAX`
@@ -876,8 +877,9 @@ does not have to rediscover them.
   rotation story (a client that cannot update its set cannot follow a
   rotation).
 - **Ed25519 votes, not BLS.** 100+ validators means 100+ signatures per
-  certificate. (The BLS12-381 envelope exists and is opt-in; the deployed chain
-  still uses the Ed25519 certificate — see the security posture below.)
+  certificate. (The BLS12-381 module (`src/bls.rs`) has since been excised —
+  no `bls.rs`, no BLS envelope, no `qc_bls_enabled` in-tree; the deployed chain
+  uses the Ed25519/Falcon certificate — see the security posture below.)
 - **The commitment is recomputed per root read.** O(state) per block. Correct
   first, optimisable later.
 - **The sortition is grindable.** The parent hash makes the committee
@@ -942,7 +944,7 @@ field is mutated, so a rejected theft costs the attacker nothing.
   staking, orderbooks, escrow, PMM, contracts, governance, oracle and the bridge
   domain. This supersedes the earlier claim that the bridge (and, before it,
   governance and the oracle) were not folded in.
-- **BLS is now real pairing-based BLS.** `src/bls.rs` was a Schnorr-style
+- **BLS is now real pairing-based BLS — HISTORICAL, SUPERSEDED.** `src/bls.rs` was a Schnorr-style
   multi-signature at the time of the state-root audit, but commit `9a93ef0`
   (P1-c) replaced it with genuine BLS12-381 (`bls12_381` crate, pure Rust):
   48-byte G1 public keys, 96-byte G2 signatures, single-signature verification by
@@ -952,10 +954,14 @@ field is mutated, so a rejected theft costs the attacker nothing.
   consumes; `HybridCertificate`/`is_bls_active` model the soft-fork activation.
   The `src/consensus.rs` QC path still produces Ed25519 signatures by default
   (`qc_bls_enabled()`), so the deployed chain uses the Ed25519 certificate while
-  the BLS path is opt-in.
+  the BLS path is opt-in. **Update (FULL-PQ cut): the BLS module has since been
+  deleted outright — no `src/bls.rs`, no `bls12_381` dependency, no BLS envelope
+  or activation flag in-tree. Treat the paragraph above as audit history, not
+  live architecture.**
 - **The commitment is recomputed per root read.** O(state) per block.
 - P3 (performance and per-entry archive proofs) is deliberately not started. The
-  BLS pairing library portion of P3 is done (see the BLS entry above).
+  BLS pairing library portion of P3 was done at the time (see the BLS entry above);
+  the BLS module has since been excised in the FULL-PQ cut.
 
 `cargo test`: 618 passed, 0 failed (count at the time of this revision; the
 suite has since grown - see the total at the end of this document).
@@ -1004,7 +1010,7 @@ zero failures. The working tree at the time carried uncommitted wave edits
 | --- | --- | --- |
 | A vote or a block signed on one deployment verified on another | the chain id is in both preimages (`STELLEREUM_BFT_VOTE_V2`, `STELLEREUM_BLOCK_V3`) and frozen once per process | §2a, `consensus::consensus_chain_id` |
 | The sortition committee of a future height was computable in advance | the draw is seeded with the parent block hash (`STELL_SORTITION_V5`) | §6.2, `consensus::sortition_seed` |
-| A 16-seat µQC could be forged with ~11 % of the network's stake | the committee cap is 64 (`MICRO_COMMITTEE_MAX_SIZE`) and the threshold is **network-anchored**: `max(2/3 of the committee, a strict majority of the network)` | §6.1, §6.3, `consensus::pq_micro_required_power` |
+| A 16-seat µQC could be forged with ~11 % of the network's stake | the committee cap is 128 (`MICRO_COMMITTEE_MAX_SIZE`, `consensus.rs:637`) and the threshold is **network-anchored**: `max(2/3 of the committee, 2/3 of the network)` | §6.1, §6.3, `consensus::pq_micro_required_power` |
 | A masterchain block did not commit to the workchain shard heads | `Block::shard_headers`, mixed into the block hash under `SHARDHDR`; only a masterchain block may publish them, and the set must be canonical | §5.1 |
 | A proposer could reorder a block after the votes | `Block::order_merkle_root`, mixed into the block hash under `ORDROOT1`; every validator re-computes and refuses a mismatch | §5.2 |
 | The delegator payout formula was not committed | the lazy (F1) reward accumulator and the per-pair checkpoints are committed under `STAKING_REWARD_ACC_V1` | §1.4 |

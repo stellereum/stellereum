@@ -240,6 +240,6 @@ wallet flow and error table.
 - entry points: `src/rpc.rs`, `src/explorer.rs` (faucet-internal txs need no
   head), `src/main.rs` (gossip/overlay), `ValidatorRuntime::add_tx`;
 - conflict keys: `src/parallel_exec.rs` (`Account(sponsor)`);
-- tests: `tests/paymaster_tests.rs` (20 tests: success, failure, 6 named
+- tests: `tests/paymaster_tests.rs` (21 tests: success, failure, 6 named
   refusals, self-sponsored, golden wire/hash, 5 abuse, malformed,
   chain-id).

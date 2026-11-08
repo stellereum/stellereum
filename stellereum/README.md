@@ -24,7 +24,7 @@
 - Post-quantum always-on (FULL-PQ): the node binary forces pure-PQ at
   startup (`src/main.rs:2849` pins `set_pure_pq_override(Some(true))`), so
   only PQ schemes (Falcon-512 and Hybrid PQ1 envelopes) are admitted
-  chain-wide — classical Ed25519 is refused at intake (`src/rpc.rs:3768`).
+  chain-wide — classical Ed25519 is refused at intake (`src/rpc.rs:3791-3805`).
   `STELL_PURE_PQ` / `--pure-pq` are dead operator-compat knobs:
   parsed-and-ignored with a loud WARN, never a gate (M-01 closed by the
   FULL-PQ cut).

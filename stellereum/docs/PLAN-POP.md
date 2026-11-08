@@ -1,5 +1,13 @@
 # PLAN-POP — BLS proof-of-possession registry (A7/C2 structural fix)
 
+> **SUPERSEDED (FULL-PQ excision).** `src/bls.rs` has been **deleted** — no
+> BLS module, no `bls12_381` dependency, no `STELL_BLS_KEYS_FILE` registry, no
+> `refuse_bls_qc_if_enabled` / `parse_registry_entries` / `QcBlsConfig` /
+> `BLS_QC_MARKER_ID` / `QC_BLS_MAGIC` / `VOTE_BLS_MAGIC` / `bls_path_power` in
+> the tree. Every `src/bls.rs:NNN`, `bls_path_power`, and BLS-envelope
+> reference below is void. The rogue-key problem this plan fixed is gone with
+> the module (there is no BLS path left to count). Retained as design history.
+
 Status: **PHASE 1 BUILT** (PoP format + verify + accept-new registry parsing
 + metering; startup refusal UNCHANGED). Phases 2–3 specified for a follow-up.
 

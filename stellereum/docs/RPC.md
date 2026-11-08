@@ -1668,6 +1668,17 @@ Errors: `-32001` (no/invalid token), `-32602 "missing tx"` / `"bad hex: …"` /
 `"transaction too large"` / `"decode: …"` / `"payload does not carry …"`,
 `-32000 "invalid transaction signature"` / `"rejected: …"`.
 
+**Feed liveness note (FULL-PQ).** The classical `SysCallSubmitPriceFeed`
+(`svm.rs:551`) still admits through the path above, but it can never commit:
+`PriceFeedUpdate::verify()` is hardcoded `false` (`oracle.rs:322-330`), so
+`commit_feed` (`oracle.rs:487`) always reverts the transaction. The PQ
+successor exists one layer down — `PqPriceFeedUpdate` (`oracle.rs:339`,
+Falcon-512 `verify()` at `oracle.rs:380`) with `commit_feed_pq`
+(`oracle.rs:611`) — but no `SysCall*` opcode exposes it: the `OpCode` enum
+(`svm.rs`) carries only the classical feed variant, so today no PQ feed can
+be committed via a block. A PQ-feed opcode (and its RPC row) lands with the
+opcode it rides on; until then treat this method as admission-only.
+
 ### `stell_pmmState`
 
 Parameters: none.

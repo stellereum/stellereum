@@ -15,10 +15,10 @@
 //!
 //! Method: offline harness in /tmp (repo untouched) replicating the EXACT
 //! field order/types below with bincode 1.3.3 and serializing. Struct
-//! sources: `TransactionWire` (sharding.rs:2356-2369, `ShardId=u32` @:372),
-//! `Vote`/`VoteKind` (consensus.rs:1531-1546), `QuorumCertificate`
-//! (consensus.rs:2805-2812), `ConsensusMsg` (consensus_net.rs:270-305),
-//! `Block` (sharding.rs:4890-5070). Replicated substructures that are empty
+//! sources: `TransactionWire` (sharding.rs `TransactionWire`, `ShardId=u32` @:372),
+//! `Vote`/`VoteKind` (`Vote`/`VoteKind` in consensus.rs), `QuorumCertificate`
+//! (`QuorumCertificate` in consensus.rs), `ConsensusMsg` (`ConsensusMsg` in
+//! consensus_net.rs), `Block` (`Block` in sharding.rs). Replicated substructures that are empty
 //! in the measured case (payload, cross_shard_out, shard_headers, QCs)
 //! contribute only their framing bytes, which is exact for those cases.
 //!
@@ -27,11 +27,11 @@
 //! tx priority-bid envelope (80 B sig)              192 B
 //! vote bare, Some(hash)                            153 B  (= 8+4+4+33+32+72)
 //! vote bare, nil                                     121 B
-//! vote Falcon hybrid envelope (746 B sig)           835 B  (= 8+4+4+33+32+(8+746); sig field = 16 magic + 64 Ed + 666 Falcon per post_quantum.rs:115 FALCON512_SIG_LEN, consensus.rs:214 VOTE_FALCON_PART_LEN)
+//! vote Falcon hybrid envelope (746 B sig)           835 B  (= 8+4+4+33+32+(8+746); sig field = 16 magic + 64 Ed + 666 Falcon per `FALCON512_SIG_LEN` (post_quantum.rs), consensus.rs:214 VOTE_FALCON_PART_LEN)
 //! ConsensusMsg::Vote, locked=None (live path)       158 B
 //! ConsensusMsg::Vote, locked=Some                    190 B
 //! QC(k Ed25519 sigs, refused under pure PQ) = 57 + 104*k B  (k=1:161, 4:473, 7:785, 10:1097, 100:10457)
-//! µQC Falcon envelope = 73 + ceil(C/8) + s*670 B  (s sigs; 670 = 4 len + 666 Falcon; layout consensus.rs:825-836, formula pinned by pq_qc_sizes_vs_classical; C=4 full-sign: 2754, QC bincode 2851)
+//! µQC Falcon envelope = 73 + ceil(C/8) + s*670 B  (s sigs; 670 = 4 len + 666 Falcon; layout `PqMicroCertificate` (consensus.rs), formula pinned by pq_qc_sizes_vs_classical; C=4 full-sign: 2754, QC bincode 2851)
 //! block fixed part (0 txs, 1 proposer sig, no QCs)  350 B
 //! ConsensusMsg::Proposal(N) = 366 + 176*N B (16 B msg framing + 350 B header)
 //!   N=0:366  N=1:542  N=100:17966  N=428:75694  N=1000:176366
@@ -91,8 +91,8 @@
 //! Existing compact-ish mechanisms (read-only, no change): gossip `Batch`
 //! amortization (P3-H4), proposer-side exact-size trim under
 //! `MAX_CONSENSUS_MSG` (runtime.rs:4430-4449), `estimate_tx_wire_bytes`
-//! packing heuristic (mempool.rs:2614), µQC bitmask certs
-//! (consensus.rs:1203), thin-proposal outbox dedup (main.rs:1320-1335).
+//! packing heuristic (mempool.rs `estimate_tx_wire_bytes`), µQC bitmask certs
+//! (`PqMicroCertificate::signers_bitmask` in consensus.rs), thin-proposal outbox dedup (main.rs:1320-1335).
 //!
 //! # 3. Projected savings (arithmetic from §1 measurements)
 //!
@@ -245,7 +245,7 @@ pub const COMPACT_QC_MAX_COMMITTEE: usize = 4096;
 ///
 /// New DoS bound (no live counterpart: the µQC envelope has no per-sig cap,
 /// only the total-frame cap): Falcon-512 signatures are 666 B
-/// (`post_quantum.rs:115 FALCON512_SIG_LEN`), so 2048 B admits the live
+/// (`FALCON512_SIG_LEN` in post_quantum.rs), so 2048 B admits the live
 /// scheme with headroom while bounding per-sig allocation. Fail-closed:
 /// larger sigs refuse the whole frame.
 pub const COMPACT_QC_MAX_SIG_BYTES: usize = 2048;
@@ -257,13 +257,13 @@ pub const COMPACT_QC_MAX_SIG_BYTES: usize = 2048;
 /// Local mirror with citation (file stays `std`-only).
 pub const COMPACT_QC_MAX_BYTES: usize = 32 * 1024 * 1024;
 
-/// Falcon-512 wire signature length in bytes (`post_quantum.rs:115`).
+/// Falcon-512 wire signature length in bytes (`FALCON512_SIG_LEN` in post_quantum.rs).
 /// Cited here so the size projector below stays honest about the live
 /// signature width without importing the crate.
 pub const COMPACT_QC_SIG_LEN_FALCON: usize = 666;
 
 /// Vote-kind tags on the compact wire: 0 = Prevote, 1 = Precommit.
-/// Mirrors `vote_kind_tag` (`consensus_net.rs:164`); anything else refuses.
+/// Mirrors `vote_kind_tag` (consensus_net.rs); anything else refuses.
 pub const COMPACT_QC_KIND_PREVOTE: u8 = 0;
 pub const COMPACT_QC_KIND_PRECOMMIT: u8 = 1;
 

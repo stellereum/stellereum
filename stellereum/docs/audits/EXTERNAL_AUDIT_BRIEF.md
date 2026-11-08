@@ -89,7 +89,7 @@ standalone `stellereum-sdk/`, `scripts/tools/stelops`, `explorer-site`.
                                                         │                ├── src/token.rs, src/orderbook.rs, src/pmm.rs
                                                         │                ├── src/staking.rs, src/governance.rs, src/oracle.rs
                                                         │                ├── src/bridge.rs + bridge_adapters.rs
-                                                        │                ├── src/crypto_privacy.rs (shielded pool)
+                                                        │                ├── ~~src/crypto_privacy.rs (shielded pool)~~ (deleted — shielded pool excised)
                                                         │                └── src/zkml.rs (zkML + session keys)
                                                         ▼
                                               src/storage.rs (sled: blocks, state, domains, receipts)
@@ -121,8 +121,8 @@ background tasks.
 | **Sharding** | `src/sharding.rs` (8,606) | The masterchain/workchain topology, the address→shard rule, the split/merge state machine, the trie migration, the shard-head commitment, the cross-shard messages, the `Block` type and its hash. |
 | | `src/xshard2pc.rs` (610) | The cross-shard two-phase-commit state machine and its replay sets. |
 | **Cryptography** | `src/post_quantum.rs` (3,669) | The PQ scheme envelope (Ed25519 / Falcon-512 / ML-DSA-44-disabled / hybrid), the FIPS-206 FN-DSA key handling, the legacy-key warnings, the address derivation. |
-| | `src/bls.rs` (1,208) | Real pairing-based BLS12-381 aggregate signatures and the signer bitvector. |
-| | `src/crypto_privacy.rs` (2,090) | Pedersen commitments, range proofs, stealth addresses, viewing keys, the shielded pool and its solvency gate. |
+| | `src/bls.rs` (1,208) — **DELETED in the FULL-PQ cut** (no BLS module, no pairing dependency in-tree) | ~~Real pairing-based BLS12-381 aggregate signatures and the signer bitvector.~~ |
+| | `src/crypto_privacy.rs` (2,090) — **DELETED** (confidential/shielded ledger excised; transparent paths only) | ~~Pedersen commitments, range proofs, stealth addresses, viewing keys, the shielded pool and its solvency gate.~~ |
 | | `src/node_keys.rs` (1,230) | Key storage: Argon2id + XChaCha20-Poly1305 encryption at rest, 0600/0700 enforcement. |
 | | `src/address.rs` (365), `src/cpat2.rs` (2,107) | The branded `Stl57…` address format and the CPAT-2 Merkle proof format. |
 | **MEV** | `src/mev.rs` (919) | The node-local blind round: sealing at admission, `verify_pool_tx`, the order commitment. |
@@ -165,7 +165,7 @@ The shape of it:
 | --- | --- | --- |
 | **C — Consensus & BFT safety** | 20 | the prevote/precommit rule, the lock, the quorum, `adopt_committed`, catch-up, equivocation and downtime slashing, the validator set, the µQC's network-anchored quorum, the sortition seed |
 | **S — Execution & state** | 21 | the failure-fee contract, admission-before-execution, determinism, the value-movement commit point, the state-root completeness and determinism, the cross-shard replay set, the snapshot restore |
-| **K — Cryptography & keys** | 11 | domain separation, chain-id binding, the strict PQ envelope, the disabled ML-DSA scheme, real BLS, key encryption at rest, the file permissions, range proofs, the address format |
+| **K — Cryptography & keys** | 11 | domain separation, chain-id binding, the strict PQ envelope, the disabled ML-DSA scheme, key encryption at rest, the file permissions, the address format (BLS aggregate + range-proof rows RETIRED with their modules) |
 | **N — Networking & transport** | 12 | the size caps, the bounded decoder, the nested-batch refusal, the peer deferral, the fuzz coverage, the RPC token gate, the faucet gate, the per-IP budgets |
 | **G — Governance, economics & bridges** | 16 | the stake-weighted vote, execute-once, the governed parameters, the bridge quorum and mint caps, the time-lock, the refund, the mempool's nonce/flood rules, the owner-only syscalls |
 
@@ -179,10 +179,10 @@ And a **shortlist of what is *not* pinned** — §6 of `INVARIANTS.md`. That lis
 > Pinned by: `tests/failure_fee_contract_tests.rs::an_attributable_failure_pays_exactly_the_failure_fee`
 > and `tests/apply_floor_tests.rs::failed_tx_pays_floor_and_advances_nonce`.
 
-> **C-15 — A post-quantum micro-certificate must carry a strict majority of the
+> **C-15 — A post-quantum micro-certificate must carry two-thirds of the
 > whole network's stake.**
 > Implementation: `src/consensus.rs` `pq_micro_required_power` —
-> `max(floor(2·W_committee/3)+1, floor(W_network/2)+1)`.
+> `max(floor(2·W_committee/3)+1, floor(2·W_network/3)+1)`.
 > Pinned by: `tests/pq_uqc_power_quorum_tests.rs` (7 tests, including
 > `empty_committee_and_zero_weight_fail_closed`).
 
@@ -204,14 +204,14 @@ And a **shortlist of what is *not* pinned** — §6 of `INVARIANTS.md`. That lis
 | # | Trusted | Consequence of the trust |
 | --- | --- | --- |
 | T-1 | **The validator set** (the bonded stake) | Defines who may vote and with what power. Only as trustworthy as the staking ledger and the state root. |
-| T-2 | **The quorum** | A power-weighted 2/3; for the µQC, a strict majority of the **network's** stake. Below 1/3 Byzantine power, BFT safety holds. |
+| T-2 | **The quorum** | A power-weighted 2/3; for the µQC, two-thirds of the **network's** stake (`pq_micro_required_power`, `consensus.rs:703`). Below 1/3 Byzantine power, BFT safety holds. |
 | T-3 | **The epoch key** | The MEV committee's aggregate public key. **Today the epoch key is not produced on the live path** — the live MEV key is node-local. See §5.3. |
 | T-4 | **The local disk** | The node's own blocks, state and snapshots. A tampered disk can withhold or reorder, and can install a stale validator set — which the observer arm turns into *no vote*, not a wrong vote. |
 | T-5 | **The operator** | The environment: `STELL_CHAIN_ID`, the RPC token, the faucet token, the data directory, the host. |
-| T-6 | **The RPC token** | Whoever holds it may use the write surface. **The token is optional** — without it the gated methods fail closed, but a deployment with no token exposes the write surface to anyone who can reach the port. |
+| T-6 | **The RPC token** | Whoever holds it may use the write surface. Split posture (see `docs/RPC.md` row 22): the governance writes, contract previews and `stell_mempoolDump` are TOKEN-ALWAYS (fail closed with no token configured); `stell_submitPriceFeed`/`stell_pmmBuy`/`stell_pmmSell` are gated-when-set (open when unset). A deployment with no token exposes the gated-when-set arms to anyone who can reach the port. |
 | T-7 | **The bridge relayer set** (2/3 of distinct signers) | That a cross-chain deposit really happened. This is the bridge's biggest structural assumption. |
 | T-8 | **The oracle publisher set** | That a price feed is honest. |
-| T-9 | **The cryptography** | SHA-256, BLAKE3, Ed25519, BLS12-381, curve25519/Ristretto255, Falcon-512, Argon2id, XChaCha20-Poly1305. Explicitly not defended against. |
+| T-9 | **The cryptography** | SHA-256, BLAKE3, Ed25519, curve25519/Ristretto255, Falcon-512, Argon2id, XChaCha20-Poly1305. Explicitly not defended against. (BLS12-381 excised with `src/bls.rs`.) |
 | T-10 | **The host** | Root, the OS, the CPU. Not defended. |
 
 ### What is *not* trusted (and is therefore defended by code)
@@ -410,18 +410,18 @@ mandatory before mainnet?
 | Module | LOC | Why it is in scope |
 | --- | --- | --- |
 | `src/post_quantum.rs` | 3,669 | The scheme envelope, the FN-DSA key handling, the address derivation, the legacy-key warnings — and the **disabled** ML-DSA-44 verifier. |
-| `src/crypto_privacy.rs` | 2,090 | The Pedersen commitments, the range proofs, the shielded pool's solvency gate, the stealth addresses, the viewing keys. |
+| `src/crypto_privacy.rs` | ~~2,090~~ 0 (deleted — shielded pool excised) | ~~The Pedersen commitments, the range proofs, the shielded pool's solvency gate, the stealth addresses, the viewing keys.~~ |
 | `src/cpat2.rs` | 2,107 | The CPAT-2 Merkle proof format. |
 | `src/node_keys.rs` | 1,230 | The key encryption at rest and the permission enforcement. |
-| `src/bls.rs` | 1,208 | The pairing-based aggregate signatures and the signer bitvector. |
+| `src/bls.rs` | ~~1,208~~ 0 (deleted — BLS excised) | ~~The pairing-based aggregate signatures and the signer bitvector.~~ |
 | `src/address.rs` | 365 | The branded address format and its homoglyph defence. |
 | `src/cell.rs` | 360 | The trie and Merkle primitives. |
 
-**Questions we would like answered:** (1) is the range-proof construction in
-`src/crypto_privacy.rs` actually sound, or only plausible; (2) is the FN-DSA
+**Questions we would like answered:** (1) ~~is the range-proof construction in
+`src/crypto_privacy.rs` actually sound, or only plausible;~~ (1 — withdrawn: `src/crypto_privacy.rs` deleted with the shielded-pool excision, no range proofs in-tree;) (2) is the FN-DSA
 key path correct for the *complete* key, and is the legacy path fenced off
-completely; (3) does the BLS signer bitvector carry enough information for
-the downtime slashing to remain correct once signatures aggregate.
+completely; (3) ~~does the BLS signer bitvector carry enough information for
+the downtime slashing to remain correct once signatures aggregate.~~ (3 — withdrawn: `src/bls.rs` deleted, no aggregate path left to count.)
 
 ### (c) Execution & state — ~32,000 LOC
 

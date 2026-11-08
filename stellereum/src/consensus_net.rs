@@ -4598,7 +4598,7 @@ mod tests {
         let qc = sample_micro_qc(64, &signers, compact_prop::COMPACT_QC_SIG_LEN_FALCON);
         let full = bincode::serialize(&qc).expect("QC must serialize").len();
         let compact = encode_compact_qc_gossip(&qc).expect("must compact").len();
-        // Layout math (live µQC-envelope shape, consensus.rs:883-904):
+        // Layout math (live µQC-envelope shape, `PqMicroCertificate` in consensus.rs):
         // envelope = 16 magic + 32 parent + 1 scheme + 8 height + 4 round
         //   + 4 committee + 4 bitmask_len + 8 bitmask + 4 sig_count
         //   + 64*(4 len + 666 sig) = 42961;

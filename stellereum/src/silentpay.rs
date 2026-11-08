@@ -7,11 +7,12 @@
 //! (`tests/silentpay_tests.rs`: `#[path = "../src/silentpay.rs"] mod silentpay;`).
 //! To wire it for real, the lead adds `#[cfg(test)] mod silentpay;` to
 //! `lib.rs` (never a production `mod` before audit) and re-runs the gates.
-//! No new dependencies: `ml-kem` (already vendored, `Cargo.toml:59`) + `std`
+//! No new dependencies: `ml-kem` (already vendored, `Cargo.toml`) + `std`
 //! only. The SHAKE-256 sponge below is a self-contained copy of the tree
-//! sponge (`post_quantum.rs:573` `keccak_f1600`, absorb/squeeze shape of
-//! `cn_vrf.rs:118` `shake256_32`); it is pinned against the NIST vectors in
-//! the test file, exactly like `post_quantum.rs:2143` and `hashpool.rs`.
+//! sponge (`keccak_f1600` in post_quantum.rs, absorb/squeeze shape of
+//! `shake256_32` in cn_vrf.rs); it is pinned against the NIST vectors in
+//! the test file, exactly like `test_shake256_matches_the_nist_test_vectors`
+//! (post_quantum.rs) and `hashpool.rs`.
 //!
 //! # Construction (PQ silent payments WITHOUT interaction or ZK)
 //!
@@ -24,7 +25,7 @@
 //!    caller passes the raw `ek_bytes`, exactly 1184 B). The sender runs
 //!    `sp_send` (the `from_seed` / `encapsulate_deterministic` / `decapsulate`
 //!    idiom pinned in `infnode/crates/infnode/tests/kem_kat_tests.rs:139-177`
-//!    and mirrored in `mev_epoch.rs:1365`): encap to `ek_bytes` with explicit
+//!    and mirrored in `pq_kem_encapsulate_deterministic` (mev_epoch.rs)): encap to `ek_bytes` with explicit
 //!    32-byte randomness `m` yields `(ct, ss)`, and the stealth address is
 //!    `SHAKE256(SP_STEALTH_DST || chain_be64 || chain_state || ss || index_be64)`.
 //!    The recipient scans by decapsulation trial (`SpRecipient::receive`):
@@ -45,8 +46,8 @@
 //!    `Nf(serial) == stored Nf` (serial bound at deposit), checks `Nf`
 //!    unspent, then marks it spent. A Falcon-512 owner signature over
 //!    `sp_spend_sig_msg` additionally authorizes the spend (`spend_signed`);
-//!    production passes `post_quantum.rs:521`
-//!    `verify_pq_signature(PqScheme::Falcon512, …)` as the closure.
+//!    production passes `verify_pq_signature(PqScheme::Falcon512, …)`
+//!    (post_quantum.rs) as the closure.
 //!
 //! 3. FORWARD-SECRET ratchet. Each recipient holds `(chain, next_index)`.
 //!    Genesis is `SP_GENESIS_CHAIN` (all zeros); the address preimage commits
@@ -261,7 +262,7 @@ fn sp_keccak_f1600(state: &mut [u64; 25]) {
 }
 
 /// SHAKE-256 XOF squeeze over `data` (136-byte rate, `0x1F` pad, `0x80` final
-/// bit — the same sponge as `cn_vrf.rs:126` `shake256_xof`).
+/// bit — the same sponge as `shake256_xof` in cn_vrf.rs).
 pub fn sp_shake256(data: &[u8], out: &mut [u8]) {
     const RATE: usize = 136;
     const WORDS: usize = RATE / 8;

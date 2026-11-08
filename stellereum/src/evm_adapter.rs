@@ -6035,11 +6035,6 @@ fn parse_length(bytes: &[u8]) -> Result<usize, RlpError> {
     Ok(len)
 }
 
-#[allow(dead_code)] // GATE: non-depth-limited RLP entry point kept for tests and external callers; depth-limited variant is the internal path.
-fn decode_items_in_payload(payload: &[u8]) -> Result<Vec<RlpItem>, RlpError> {
-    decode_items_in_payload_with_depth(payload, 1)
-}
-
 fn decode_items_in_payload_with_depth(
     mut payload: &[u8],
     depth: usize,

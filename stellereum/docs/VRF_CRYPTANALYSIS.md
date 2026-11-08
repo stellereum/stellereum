@@ -1,35 +1,51 @@
-# VRF Cryptanalysis — deterministic-Schnorr construction (`src/vrf.rs`)
+# VRF Cryptanalysis — deterministic-Schnorr construction (DELETED)
+
+> **SUPERSEDED (FULL-PQ excision).** The construction analyzed below
+> (`vrf_prove`/`vrf_verify`/`VrfBinding`/registry/`VrfActivation`) has been
+> **deleted**: `src/vrf.rs` is now a 133-line math-only stub (live symbols are
+> `lottery_threshold` at `vrf.rs:33`, `expected_draws_to_include_member`,
+> `expected_draws_to_capture_seats`); no `VrfActivation`,
+> `vrf_activation_from_env`, `STELL_VRF_ACTIVATION_HEIGHT`,
+> `VRF_IS_POST_QUANTUM`, or `vrf_prove`/`vrf_verify` exists in `src/`, and
+> `tests/vrf_cryptanalysis_tests.rs`, `tests/vrf_audit_tests.rs`, and
+> `tests/vrf_bls_adversarial_tests.rs` are gone (remaining VRF tests:
+> `tests/cn_vrf_tests.rs`, `tests/vrf_canonical_draw_tests.rs`). All
+> `src/vrf.rs:NNN` ranges below are void. §6's "the ECVRF module stays —
+> deletion was rejected" verdict was later superseded by the lead's excision
+> decision: deletion happened. The report stands as the historical
+> cryptanalysis that justified first the NO-GO and then the deletion.
 
 Scope: the PHASE-1 wiring VRF — a deterministic Schnorr signature used AS a VRF
 (`output = BLAKE3(R || pk || seed)`, proof `(R, z)`), NOT RFC 9381 ECVRF.
-Read-only analysis; executable games live in
-`tests/vrf_cryptanalysis_tests.rs` (extends `tests/vrf_audit_tests.rs` and
-`tests/vrf_bls_adversarial_tests.rs` without duplicating them).
+Read-only analysis; executable games lived in
+`tests/vrf_cryptanalysis_tests.rs` (extended `tests/vrf_audit_tests.rs` and
+`tests/vrf_bls_adversarial_tests.rs` without duplicating them) — all three
+test files deleted with the excision.
 Prior battery (assumed proven, not re-litigated): determinism HOLDS, nonce
 uniqueness HOLDS, soundness HOLDS (64-position flip sweep), fail-closed edges
 HOLD, uniqueness DOES NOT HOLD (holder-minted second proof).
 
-All numbers below are measured from `cargo test --test vrf_cryptanalysis_tests`
+All numbers below were measured from `cargo test --test vrf_cryptanalysis_tests`
 (`GRIND:` / `EDGE:` / `MALLEABILITY:` lines, `-- --nocapture`), deterministic
-fixtures, no randomness.
+fixtures, no randomness — historical run, test binary deleted with the excision.
 
 ## 1. Per-property verdicts
 
 | # | Property | Verdict | Proof sketch / test pointer |
 |---|---|---|---|
-| 1 | Completeness (honest prove→verify) | HOLDS | `vrf_prove` (`src/vrf.rs:499`) → `vrf_verify` (`:518`) round-trips for 100×8 + 128×32 fixture matrix; `key_substitution…` control re-pins victim minting. |
+| 1 | Completeness (honest prove→verify) | HOLDS (historical) | `vrf_prove` (historical `src/vrf.rs:499`) → `vrf_verify` (`:518`) round-trips for 100×8 + 128×32 fixture matrix; `key_substitution…` control re-pins victim minting. |
 | 2 | Determinism (same key+input ⇒ same bytes) | HOLDS | Prior audit (100×8). Re-pinned incidentally: `grinding_…` calls `vrf_prove` twice per input (mint + assert round-trip) with byte-equality via `assert_eq!(vrf_verify…Some(output))` on the identical envelope. |
 | 3 | Unforgeability / soundness (no secret ⇒ no valid proof) | HOLDS | Prior 64-position sweep. Extended here to the FULL 512 single-bit mutants + 256 output-bit mutants + full-byte flips on a FRESH proof — all `None` (`malleability_fresh_proof…`). Forged/random corpora refused (prior BLS-adversarial file). |
 | 4 | Uniqueness (one verifiable output per pk+input) | DOES NOT HOLD | Construction limitation, demonstrated in both the prior audit (alternate-nonce second proof) and here constructively at scale: 128 inputs × 32 holder-ground alternates ALL verify (`grinding_…`). No fail-closed tweak inside Schnorr can close this; only the phase-2 ECVRF swap can. |
-| 5 | Key-substitution resistance (adversary claims victim identity) | HOLDS at registry layer; DOES NOT HOLD at raw-proof layer — BY DESIGN | `key_substitution_proof_binds_key_not_identity`: attacker proof VERIFIES under attacker key (`Some`) — raw `vrf_verify` authenticates the KEY, never the identity — but `verify_vrf_seed_for_validator` for the victim id returns `None`, and the forged binding (attacker Falcon sig over `(victim_id‖attacker_pk)`) fails `VrfBinding::verify` + `register`. Trust boundary: identity lives SOLELY in the Falcon-signed binding (`src/vrf.rs:240,267,310`); a proof without a registry-bound key mints nothing. |
+| 5 | Key-substitution resistance (adversary claims victim identity) | HOLDS at registry layer; DOES NOT HOLD at raw-proof layer — BY DESIGN | `key_substitution_proof_binds_key_not_identity`: attacker proof VERIFIES under attacker key (`Some`) — raw `vrf_verify` authenticates the KEY, never the identity — but `verify_vrf_seed_for_validator` for the victim id returns `None`, and the forged binding (attacker Falcon sig over `(victim_id‖attacker_pk)`) fails `VrfBinding::verify` + `register`. Trust boundary: identity lives SOLELY in the Falcon-signed binding (historical `src/vrf.rs:240,267,310` — deleted); a proof without a registry-bound key mints nothing. |
 | 6 | Pseudorandomness / output uniformity | HOLDS (statistical) | 4096 holder-ground outputs: first-byte χ² = 277.1 on 255 df (uniform mean 255, σ≈22.6 → +1σ); bin min 6 / max 31 at expected 16.0; first-bit fraction 0.4995. Gates: χ² < 500, balance ±0.10 (`grinding_…`). |
 | 7 | Self-grinding resistance (holder best-of-N) | DOES NOT HOLD (quantified, §2) | Holder picks min ticket of N: measured = closed form `1-(1-p)^N` within sampling noise. This is the SAME non-uniqueness as #4 viewed as an election attack. |
 | 8 | Nonce-misuse resistance (cross-input/nonce reuse, tag confusion) | HOLDS | Nonce binds secret+input (distinct R per input/key, prior audit). `domain_tags_distinct_and_binding`: all six domain tags pairwise distinct; nonce/challenge tag swap → `None`; one-bit proof-domain flip → `None`; foreign output domain → `None`; beacon/election role-swap never collides. |
-| 9 | Small-subgroup / identity / edge keys | HOLDS (vacuous cofactor — Ristretto) | Identity refused at parse (`from_bytes`, `src/vrf.rs:164`) AND at verify (`:525`); garbage `0xFF…` fails decompress; non-canonical high-bit key refuses; identity-R / garbage-R proofs refuse; 256 flat-pattern keys ALL refuse (19/256 parse as ordinary prime-order points — expected, harmless: Ristretto has no cofactor subgroup to smuggle in); zero/`0xFF`/near-zero seeds derive distinct valid keys with no degenerate path. |
+| 9 | Small-subgroup / identity / edge keys | HOLDS (vacuous cofactor — Ristretto) | Identity refused at parse (`from_bytes`, historical `src/vrf.rs:164`) AND at verify (`:525`); garbage `0xFF…` fails decompress; non-canonical high-bit key refuses; identity-R / garbage-R proofs refuse; 256 flat-pattern keys ALL refuse (19/256 parse as ordinary prime-order points — expected, harmless: Ristretto has no cofactor subgroup to smuggle in); zero/`0xFF`/near-zero seeds derive distinct valid keys with no degenerate path. |
 | 10 | Non-malleability (mutated proof ⇒ reject; no truncation/extension smuggling) | HOLDS | 512 + 256 single-bit mutants, full-byte flips, R/z halves swap+duplication, cross-proof splices (R_A+z_B, swapped outputs) — all `None`; serde envelope truncations (cuts 1/8/32/64), trailing-garbage extension, empty/null/wrong-shape payloads — all decode-fail (`malleability_…`). |
 | 11 | Binding unforgeability (Falcon-signed VRF key) | HOLDS | Wrong-id / wrong-Falcon-key / truncated-sig bindings refuse (in-module + audit tests); attacker-signed victim-id binding refused here. Reduces to Falcon-512 EUF-CMA. |
 | 12 | Seed/election-domain separation (VRF seed vs parent-hash seed) | HOLDS | `VRF_ELECTION_DOMAIN ≠ STELL_SORTITION_V5 ≠ VRF_BEACON_DOMAIN` pinned distinct + behaviorally: height/round/output moves the seed; role-swapped beacon/election bytes diverge. |
-| UNKNOWN | Side-channel (constant-time scalar ops), fault-injection on signer, PQ-migration of the VRF key itself | UNKNOWN | Out of scope for this battery: requires timing harness / hardware fault model / NIST hash-VRF spec. The VRF key is classical (documented residual in `src/vrf.rs:34-45`); VRF-key compromise biases ONE validator's own ticket (visible, slashable) but cannot forge others'. |
+| UNKNOWN | Side-channel (constant-time scalar ops), fault-injection on signer, PQ-migration of the VRF key itself | UNKNOWN | Out of scope for this battery: requires timing harness / hardware fault model / NIST hash-VRF spec. The VRF key is classical (documented residual in historical `src/vrf.rs:34-45` — deleted with the excision); VRF-key compromise biases ONE validator's own ticket (visible, slashable) but cannot forge others'. |
 
 No REAL-bug finding: every refusal path above behaves as specified. (No `CRITICAL`
 file:line to report — the construction's single load-bearing gap remains the
@@ -114,14 +130,14 @@ byte-identical, registry inert).**
 Conditions for flipping to GO (all required, in order):
 
 1. **Phase-2 ECVRF swap**: replace `vrf_prove`/`vrf_verify` bodies
-   (`src/vrf.rs:499`/`518`) with an audited RFC 9381 crate behind the SAME
+   (historical `src/vrf.rs:499`/`518` — deleted; the swap never landed) with an audited RFC 9381 crate behind the SAME
    signatures; re-run this battery plus the audit battery — the uniqueness
    test MUST flip to "second proof refuses" and §2's best-of-N MUST collapse
    to the honest row before any activation discussion.
 2. **Activation as flag-day with 100%-power binding readiness**: every
-   validator's `VrfBinding` registered and verified; `VrfActivation` boundary
+   validator's historical `VrfBinding` registered and verified; `VrfActivation` boundary
    published with the binary; pre-`H_vrf` history verifies under v5 forever
-   (already the pattern in `PLAN-VRF.md` §4).
+   (already the pattern in the superseded `PLAN-VRF.md` §4).
 3. **Grinding re-analysis post-swap**: with uniqueness, holder best-of-N
    disappears; residual grinding = VRF-key compromise (one validator's own
    ticket, visible/slashable) + beacon-withholding liveness stalls (stall,
@@ -137,10 +153,15 @@ sufficient for NO-GO and fully removed by the planned audited-ECVRF swap.
 
 ## 5. Classical status + LaV endgame (FULL-PQ verdict)
 
-ECVRF-EDWARDS25519 is CLASSICAL: Shor breaks the Edwards25519 discrete log and forges arbitrary proofs/outputs, so in the FULL-PQ architecture VRF stays default-off (`VrfActivation::Disabled`, parent-hash draw live) and sortition MUST NOT consume ECVRF output on the PQ path while `VRF_IS_POST_QUANTUM` reads `false` (pinned by `vrf_is_marked_classical_not_post_quantum`); any non-PQ use is LEGACY-ONLY behind a lead-defined opt-in, never a default. The PQ-native endgame is the LaV lattice VRF (`docs/PQ_VRF_LAV_FEASIBILITY.md`): long-term stateless with uniqueness YES under Module-LWR, but ~10.27 KB proofs, unpublished timings, unaudited research code, and 4–6 person-months plus external audit before any consensus wiring — so LaV stays research-only and nothing about the classical verdict changes until an audited, standardized PQ VRF lands.
+ECVRF-EDWARDS25519 is CLASSICAL: Shor breaks the Edwards25519 discrete log and forges arbitrary proofs/outputs, so in the FULL-PQ architecture VRF stayed default-off (historical `VrfActivation::Disabled`, parent-hash draw live) and sortition MUST NOT consume ECVRF output on the PQ path while the historical `VRF_IS_POST_QUANTUM` read `false` (pinned by the deleted `vrf_is_marked_classical_not_post_quantum`); any non-PQ use is LEGACY-ONLY behind a lead-defined opt-in, never a default. The PQ-native endgame is the LaV lattice VRF (historical `docs/PQ_VRF_LAV_FEASIBILITY.md` — file absent from tree): long-term stateless with uniqueness YES under Module-LWR, but ~10.27 KB proofs, unpublished timings, unaudited research code, and 4–6 person-months plus external audit before any consensus wiring — so LaV stays research-only and nothing about the classical verdict changes until an audited, standardized PQ VRF lands.
 
-## 6. Canonical-draw decision (LEAD, 2026-11-03): VRF arming retired
+## 6. Canonical-draw decision (LEAD, 2026-11-03): VRF arming retired — then excised
 LEAD DECISION: the parent-hash draw is THE canonical sortition mechanism; `STELL_VRF_ACTIVATION_HEIGHT` is retired.
 If set it warns loudly and is ignored (`vrf_activation_from_env` always returns `Disabled`): stale configs arm nothing, never panic.
 Pinned by `tests/vrf_canonical_draw_tests.rs`: a PQ-enforced run with the VRF module present-but-off elects byte-identically to the parent-hash draw (no VRF output consulted).
 The ECVRF module stays, marked classical and off — deletion was rejected (blast radius); a PQ-native VRF stays future work per §5.
+**Update (later excision — supersedes the "stays" verdict above): the ECVRF
+module was subsequently deleted outright (`src/vrf.rs` is now a 133-line
+math-only stub; no activation env, no registry, no `vrf_prove`/`vrf_verify`
+in-tree). The "warns loudly and is ignored" posture is moot — there is no
+reader left. A PQ-native VRF stays future work per §5.**

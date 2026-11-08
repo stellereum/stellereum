@@ -1,20 +1,31 @@
 # PLAN-VRF — VRF sortition (A6/C1 structural fix)
 
+> **SUPERSEDED (FULL-PQ excision).** The ECVRF/deterministic-Schnorr VRF stack
+> this plan wires (`VrfSecret`/`VrfPublicKey`, `VrfBinding`, registry,
+> `STELL_VRF_ACTIVATION_HEIGHT`, `vrf_election_seed`, `VrfBeaconSeal`,
+> `beacon_next`) has been **deleted**: `src/vrf.rs` is now a 133-line
+> math-only stub (live symbols are `lottery_threshold` at `vrf.rs:33` et al.),
+> and none of the `src/vrf.rs:NNN` / `src/consensus.rs:NNN` ranges below
+> resolve (sortition lives in `derive_sortition_committee` at
+> `consensus.rs:786`, `sortition_seed` at `consensus.rs:865`,
+> `pq_micro_required_power` at `consensus.rs:703`). Election stays on the
+> canonical parent-hash draw. Retained as design history.
+
 Status: **PHASE 1 WIRED, HEIGHT-GATED** (deterministic-Schnorr proofs + election seed plumbing behind `STELL_VRF_ACTIVATION_HEIGHT`, default off; pre-activation output byte-identical; call sites pinned Disabled pending phase-3 threading).
 Phases 2–3 are specified below for a follow-up.
 
 ## 1. Problem (verified)
 
-`derive_sortition_committee` (`src/consensus.rs:747`) seeds the draw with
-`sortition_seed(prev_block_hash, height, round)` (`src/consensus.rs:826`,
-domain `STELL_SORTITION_V5`, `src/consensus.rs:819`). The parent hash makes
+`derive_sortition_committee` (`consensus.rs`) seeds the draw with
+`sortition_seed(prev_block_hash, height, round)` (`consensus.rs`,
+domain `STELL_SORTITION_V5`). The parent hash makes
 the committee unknowable in advance, but the parent's proposer CHOOSES the
 parent bytes, so every candidate parent hash is a fresh sortition draw.
 Grinding cost for one target seat at N=100/k=64 is ~1.56 BLAKE3 draws
 (~microseconds on a GPU — pinned by
 `vrf::tests::grinding_cost_proves_parent_hash_is_not_a_security_boundary`).
-The network-anchored quorum (`pq_micro_required_power`,
-`src/consensus.rs:691`) is the current mitigation, not a fix: it bounds what
+The network-anchored quorum (`pq_micro_required_power` in
+`consensus.rs`) is the current mitigation, not a fix: it bounds what
 a ground committee can finalize, but the grinding surface itself stays open.
 
 ## 2. Consensus-breaking surface (exact — by grep, not guessed)

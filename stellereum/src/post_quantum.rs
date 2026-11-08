@@ -74,7 +74,7 @@ pub fn set_pure_pq_override(enabled: Option<bool>) {
 /// returns `true` unconditionally on the live path; `--pure-pq` /
 /// `STELL_PURE_PQ` are then parsed-and-ignored with a loud WARN
 /// (`main.rs:2839-2847`), never a gate. RPC intake additionally refuses
-/// classical envelopes before any crypto (`rpc.rs:3768-3779`). There is no
+/// classical envelopes before any crypto (`rpc.rs:3791-3802`). There is no
 /// dual-stack mode on a running node.
 ///
 /// BATCH-MIRROR CONTRACT (audit F-HIGH-2): every batched signature screen

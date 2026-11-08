@@ -94,42 +94,42 @@ superseded; confirm the three symbols are still absent from `src/`.
 
 ---
 
-### KI-04 — BLS is real, but **off** on the deployed chain
+### KI-04 — BLS ~~is real, but **off** on the deployed chain~~ **module deleted (FULL-PQ cut)**
 
 | | |
 | --- | --- |
 | **Severity** | INFO (bandwidth, not safety) |
-| **File** | `src/bls.rs` — `qc_bls_enabled` (≈ line 687); `src/consensus.rs` QC path |
+| **File** | ~~`src/bls.rs` — `qc_bls_enabled` (≈ line 687); `src/consensus.rs` QC path~~ — **module deleted in the FULL-PQ cut (no `src/bls.rs`, no `qc_bls_enabled` in-tree)** |
 | **Exploitability** | none |
-| **Status** | The certificate path still produces Ed25519 signatures by default. The BLS12-381 pairing code (`e(sig,G1) == e(H(m),pk)`) is genuine and unit-tested; it is simply not the default. The `SignerBitVector` is mandatory because `apply_downtime_slashes` derives the signer set from `cert.signatures` — that derivation breaks the moment signatures aggregate, so the bitvector is load-bearing, not decoration. |
+| **Status** | ~~The certificate path still produces Ed25519 signatures by default. The BLS12-381 pairing code (`e(sig,G1) == e(H(m),pk)`) is genuine and unit-tested; it is simply not the default. The `SignerBitVector` is mandatory because `apply_downtime_slashes` derives the signer set from `cert.signatures` — that derivation breaks the moment signatures aggregate, so the bitvector is load-bearing, not decoration.~~ **Closed by deletion: there is no BLS path left to turn on; the certificate path is Ed25519/Falcon. Retained as history.** |
 
 ---
 
-### KI-05 — The confidential pool has **no RingCT**: the sender is always visible
+### KI-05 — The confidential pool has **no RingCT**: the sender is always visible — RETIRED (module deleted)
 
 | | |
 | --- | --- |
 | **Severity** | MEDIUM (a design limit, not a bug) |
-| **File** | `src/crypto_privacy.rs`; `src/svm.rs` |
+| **File** | ~~`src/crypto_privacy.rs`; `src/svm.rs`~~ — **module deleted in the FULL-PQ cut (no shielded transfers in-tree)** |
 | **Exploitability** | `REMOTE` (passive observer) |
-| **Status** | Open by design. The sender of a shielded transfer is always public (`tx.from` + nonce + the public gas payment). Only the **amount** is hidden, and the **recipient** only behind a fresh one-time stealth address. There is no anonymity, and the passport explicitly forbids RingCT. |
+| **Status** | ~~Open by design. The sender of a shielded transfer is always public (`tx.from` + nonce + the public gas payment). Only the **amount** is hidden, and the **recipient** only behind a fresh one-time stealth address. There is no anonymity, and the passport explicitly forbids RingCT.~~ **Closed by deletion: no shielded transfers exist, so there is no sender-visibility question left. Retained as history.** |
 
 The confidentiality is *selective* and is enabled per-transaction; the
 default is transparent.
 
 ---
 
-### KI-06 — A bare `apply_transfer` call is still reachable by a direct pool caller
+### KI-06 — A bare `apply_transfer` call is still reachable by a direct pool caller — RETIRED (module deleted)
 
 | | |
 | --- | --- |
 | **Severity** | MEDIUM (latent) |
-| **File** | `src/crypto_privacy.rs` — `apply_transfer` (the equation-only path) vs `apply_transfer_with_ranges` |
+| **File** | ~~`src/crypto_privacy.rs` — `apply_transfer` (the equation-only path) vs `apply_transfer_with_ranges`~~ — **module deleted in the FULL-PQ cut** |
 | **Exploitability** | `REMOTE` **only if** a new call site reaches the bare method |
-| **Status** | Open by design; the method's own docs forbid it as a solvency gate. The live SVM handler runs `verify_balanced_with_ranges` before `apply_transfer` in the same synchronous handler, so the two-step verdict is identical to the atomic call. The hardening precondition (switching the handler to the single atomic call) is deferred by **one line** and lives in `src/svm.rs`. |
+| **Status** | ~~Open by design; the method's own docs forbid it as a solvency gate. The live SVM handler runs `verify_balanced_with_ranges` before `apply_transfer` in the same synchronous handler, so the two-step verdict is identical to the atomic call. The hardening precondition (switching the handler to the single atomic call) is deferred by **one line** and lives in `src/svm.rs`.~~ **Closed by deletion: `apply_transfer` / `verify_transfer_with_ranges` no longer exist. Retained as history.** |
 
-**Audit action:** grep every call site of `apply_transfer` and confirm each is
-either the ranged wrapper or an explicitly-approved path.
+**Audit action:** ~~grep every call site of `apply_transfer` and confirm each is
+either the ranged wrapper or an explicitly-approved path.~~ (Moot — module deleted.)
 
 ---
 
@@ -140,14 +140,14 @@ either the ranged wrapper or an explicitly-approved path.
 | | |
 | --- | --- |
 | **Severity** | MEDIUM |
-| **File** | `src/consensus.rs` — `sortition_seed` (≈ line 826), `derive_sortition_committee` (≈ line 747) |
+| **File** | `src/consensus.rs` — `sortition_seed` (`consensus.rs:865`), `derive_sortition_committee` (`consensus.rs:786`) |
 | **Exploitability** | `VALIDATOR` (a proposer) |
 | **Status** | Open, structurally mitigated. The parent block hash is in the preimage (`STELL_SORTITION_V5`), so a committee is unknowable until its parent exists and a fork re-elects a different committee — but the parent hash is **not unforgeable**: the proposer of the parent block chooses the parent's bytes, hence its hash, hence the next committee, and can search for a favourable draw. |
 
 Grinding only picks **which** honest validators are asked to sign; it cannot
 manufacture the stake. The network-anchored quorum
-(`max(floor(2·W_committee/3)+1, floor(W_network/2)+1)`) is what keeps the bar
-high. A VRF-based selection is the structural fix and is out of scope.
+(`max(floor(2·W_committee/3)+1, floor(2·W_network/3)+1)`, `pq_micro_required_power`
+at `consensus.rs:703`) is what keeps the bar high. A VRF-based selection is the structural fix and is out of scope.
 
 ---
 
@@ -175,12 +175,12 @@ high. A VRF-based selection is the structural fix and is out of scope.
 
 ---
 
-### KI-10 — The BLS/µQC decoder accepts a **non-canonical encoding** (deliberate)
+### KI-10 — The µQC decoder accepts a **non-canonical encoding** (deliberate)
 
 | | |
 | --- | --- |
 | **Severity** | LOW |
-| **File** | `src/consensus.rs` — the bincode fallback at the end of `decode_pq_micro_envelope` (≈ line 931, "Audit-consensus F9 … KEPT deliberately") |
+| **File** | `src/consensus.rs` — the bincode fallback at the end of `decode_pq_micro_envelope` (`consensus.rs:1065`, "Audit-consensus F9 … KEPT deliberately" at `consensus.rs:1128`) |
 | **Exploitability** | `REMOTE` (CPU only) |
 | **Status** | Accepted. The fallback lets a peer make the decoder do a second parse; `verify_micro_cert` re-checks everything load-bearing (bitmask length, trailing-bit zero, out-of-range signer bits, per-signature fail-closed verify, power quorum), so a non-canonical blob can decode but never **verify** unless it names a real quorum. |
 
@@ -658,13 +658,13 @@ hard abort).
 | D-01 | **Real threshold preemption**: asymmetric round sealing, a share-release round gated on a quorum-signed ordering commitment, and sealed mempool gossip (needs wire slots — a hard fork). | `src/mev.rs` module header; `src/mev_epoch.rs` (the library half exists) |
 | D-02 | **Per-entry archive proofs** (P3): per-key commitments so a light client can prove a staking entry or an orderbook level, not just a balance. Trie-resident per-key archive proofs + QC-authenticated historical roots are done (`PROTOCOL.md` §5.4); what remains is per-entry keys for the digest-folded domains. | `PROTOCOL.md` §5.4 + §7; `src/commitment.rs`; `src/storage.rs` (slot model) |
 | D-03 | **Cross-node shard state migration**: shipping a migrated trie to the new shard's validators. | `docs/SHARDING.md` §0 |
-| D-04 | **A native (light-client) bridge**: on-chain foreign headers, foreign validator sets, and consensus-level verification of their signatures. | `docs/handoff/STELLEREUM_REMAINING.txt` (bridge layers 2–3) |
+| D-04 | **A native (light-client) bridge**: on-chain foreign headers, foreign validator sets, and consensus-level verification of their signatures. | ~~`docs/handoff/STELLEREUM_REMAINING.txt` (bridge layers 2–3)~~ (handoff doc absent from tree; bridge design lives in `src/bridge.rs` / `src/bridge_adapters.rs`) |
 | D-05 | **Per-sender / destination-cluster / funding-graph bridge limits**, and a TWAP-anchored oracle commit guard. | `src/bridge.rs`; `src/oracle.rs` |
 | D-06 | **A real zero-knowledge proof system** for on-chain inference (a circuit + a polynomial commitment + a Fiat-Shamir transcript over it) and a private in/deployment wrapper. There is no ceremony to run: the current engine has no setup at all (see KI-33). | `src/zkml_attestation.rs` (module header); `src/zkml.rs:98` `zkml_capabilities` |
 | D-07 | **A real ML-DSA-44 (FIPS-204) verifier** and the coordinated hard fork to re-enable scheme `0x03`. | `src/post_quantum.rs` |
 | D-08 | **A VRF-based (ungrindable) sortition** selection. | `src/consensus.rs` `sortition_seed`; `PROTOCOL.md` §6.2 |
-| D-09 | **Identity / reputation** (`name.stl` as an NFT object, Sybil resistance). | `docs/handoff/STELLEREUM_REMAINING.txt` |
-| D-10 | **A real producer-side privacy entry/exit** (shield / unshield), deliberately blocked behind the range-proof work. | `src/crypto_privacy.rs`; `docs/handoff/STELLEREUM_REMAINING.txt` §9 |
+| D-09 | **Identity / reputation** (`name.stl` as an NFT object, Sybil resistance). | ~~`docs/handoff/STELLEREUM_REMAINING.txt`~~ (handoff doc absent from tree) |
+| D-10 | ~~**A real producer-side privacy entry/exit** (shield / unshield), deliberately blocked behind the range-proof work.~~ — **RETIRED (shielded-pool excision: `src/crypto_privacy.rs` deleted; `docs/handoff/` does not exist).** | ~~`src/crypto_privacy.rs`; `docs/handoff/STELLEREUM_REMAINING.txt` §9~~ |
 | D-11 | **User-level multisig / threshold accounts: explicit non-goal.** There is no on-chain M-of-N account, no threshold-signature account, and no multisig wallet contract in this tree (verified: `multisig`/`threshold` appear only for the *bridge relayer* quorum — `quorum_threshold`/`bridge_threshold`, `src/bridge.rs:535-550` — and for TON-side deposit evidence, never for user accounts). Every transaction is authorized by exactly one ed25519 (`Transaction.from` + signature) or one session grant. **Custody workaround until/unless D-11 ships:** split funds across independent validator/delegator accounts (no shared key to lose); keep the master key cold and operate day-to-day through `DelegateSession` scoped grants (amount caps + expiry, `RPC.md` wallet surface); rotate a compromised validator key atomically with `SysCallRotateValidatorKey` (no merge, old-key-only authorization). Do not emulate multisig by sharing one seed across operators — a shared seed is single-factor with extra steps. | `src/svm.rs` (`SysCallStake`/`SysCallRotateValidatorKey`); `stell-wallet` (`rotate-key`, session delegation); `RPC.md` §5 |
 
 ---

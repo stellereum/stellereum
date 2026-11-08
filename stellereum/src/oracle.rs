@@ -455,6 +455,20 @@ pub struct OracleState {
     pub publishers: BTreeSet<[u8; 32]>,
     /// Latest committed feed per asset, keyed by asset symbol.
     pub feeds: BTreeMap<String, CommittedFeed>,
+    /// Genesis anchor price per asset (micro-USD), set to the committed price
+    /// on the FIRST commit per asset and NEVER ratcheted afterwards.
+    ///
+    /// WHY THE ANCHOR MUST NOT MOVE: the per-step caps above ratchet the
+    /// baseline forward — each committed feed becomes the next step's
+    /// reference — so a slow walk (+5%/feed, inside every per-step cap)
+    /// escapes any step-relative guard while drifting +15.8% over three
+    /// steps. The cumulative latch in `commit_feed_pq` measures against THIS
+    /// anchor instead, so the walk trips the breaker once the total drift
+    /// exceeds `MAX_PRICE_DEVIATION_BPS` no matter how small the steps are.
+    /// A moved anchor is a moved goalpost; genesis is the only goalpost that
+    /// cannot be walked.
+    #[serde(default)]
+    pub anchor_price_micro_usd: BTreeMap<String, u64>,
     /// Circuit-breaker latch. Once true it refuses new feeds AND new orders
     /// until something deliberately resets it. Sticky by design: a gate that
     /// fires keeps the alarm even though its own transaction rolls back.
@@ -680,8 +694,43 @@ impl OracleState {
                 ));
             }
         }
+        // 6b. Cumulative-drift latch (B-GOV/O1): deviation of the CANDIDATE
+        // price against the GENESIS anchor (`anchor_price_micro_usd`), NOT the
+        // last feed. Per-step caps ratchet the baseline forward, so a slow
+        // walk stays inside every step while the total escapes; the anchor
+        // never moves, so the total cannot escape this. First commit per
+        // asset sets the anchor and passes (there is no drift from oneself);
+        // a legacy asset with a feed but no anchor yet (pre-latch state,
+        // direct-insert fixtures) is treated the same way — anchored at the
+        // candidate price, passing this once — so rollout needs no height
+        // gate and no migration. Past `MAX_PRICE_DEVIATION_BPS` cumulative
+        // (same 10% const, no new threshold) the breaker latches fail-closed
+        // with the same latch semantics as every other breaker trip, and the
+        // feed commits nothing.
+        //
+        // Ed `commit_feed` path: INTENTIONALLY untouched — that path is
+        // dead/refusing by design (`PriceFeedUpdate::verify` always fails
+        // closed under FULL-PQ), so no feed can commit through it and there
+        // is no walk to latch there. Keep the two functions' RULES in
+        // lockstep if the Ed path ever lives again.
+        if let Some(&anchor) = self.anchor_price_micro_usd.get(&feed.asset) {
+            let cumulative_bps = deviation_bps(feed.price_micro_usd, anchor);
+            if cumulative_bps > MAX_PRICE_DEVIATION_BPS {
+                self.breaker_tripped = true;
+                return Err(format!(
+                    "circuit breaker tripped: cumulative price drift {cumulative_bps} bps from genesis anchor exceeds limit {MAX_PRICE_DEVIATION_BPS} bps"
+                ));
+            }
+        }
 
         let price = feed.price_micro_usd;
+        // Genesis anchor: set once, on the first commit per asset, and never
+        // ratcheted afterwards (see the field docs for why it must not move).
+        // `or_insert` keeps a legacy anchor (pre-latch state anchored above)
+        // instead of overwriting it.
+        self.anchor_price_micro_usd
+            .entry(feed.asset.clone())
+            .or_insert(price);
         self.feeds.insert(
             feed.asset.clone(),
             CommittedFeed {

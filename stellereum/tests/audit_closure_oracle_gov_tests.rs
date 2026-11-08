@@ -62,37 +62,47 @@ fn o1_per_step_drift_cap_holds_and_resets_only_via_governance() {
     );
     assert!(!s.breaker_tripped);
     // Single-publisher walk is capped at 5%/step (O1 fix): a second +10%
-    // step from the SAME key is refused WITHOUT latching; +5% steps walk.
+    // step from the SAME key is refused WITHOUT latching; +5% steps walk
+    // until the cumulative latch (genesis anchor) fires.
     let p2 = p1 * 105 / 100;
-    assert_eq!(
-        s.commit_feed_pq(&feed_at(&pubk, "STELL", p2, t0 + 2), t0 + 2)
-            .unwrap(),
-        p2
+    let err = s
+        .commit_feed_pq(&feed_at(&pubk, "STELL", p2, t0 + 2), t0 + 2)
+        .expect_err("cumulative +10.25% must trip the latch");
+    assert!(
+        format!("{err:?}").contains("cumulative"),
+        "trip must name the cumulative rule: {err:?}"
     );
-    assert!(!s.breaker_tripped);
+    assert!(s.breaker_tripped, "cumulative trip latches");
+    assert_eq!(s.feeds.get("STELL").unwrap().price_micro_usd, p1);
+    // Latched by the cumulative trip: everything after is refused until
+    // governance resets (even an in-cap feed).
     let too_fast = p2 * 110 / 100;
     assert!(s
         .commit_feed_pq(&feed_at(&pubk, "STELL", too_fast, t0 + 3), t0 + 3)
         .is_err());
-    assert!(!s.breaker_tripped, "same-key 10% step refused, not latched");
-    assert_eq!(s.feeds.get("STELL").unwrap().price_micro_usd, p2);
-    // One step over the cap latches and commits nothing.
+    assert!(s.breaker_tripped, "cumulative trip stays latched");
+    assert_eq!(s.feeds.get("STELL").unwrap().price_micro_usd, p1);
+    // One step over the cap also stays refused while latched.
     let over = p2 + p2 * 1001 / 10_000 + 1;
     assert!(deviation_bps(over, p2) > MAX_PRICE_DEVIATION_BPS);
     assert!(s
         .commit_feed_pq(&feed_at(&pubk, "STELL", over, t0 + 3), t0 + 3)
         .is_err());
-    assert!(s.breaker_tripped, "deviation violation latches");
-    assert_eq!(s.feeds.get("STELL").unwrap().price_micro_usd, p2);
-    // Latched: even a perfect feed is refused until governance resets.
+    assert!(s.breaker_tripped, "still latched");
+    assert_eq!(s.feeds.get("STELL").unwrap().price_micro_usd, p1);
+    // Governance reset clears the latch but NOT the anchor: re-committing
+    // the drifted p2 re-trips, while a price back within 10% of the anchor
+    // (p1 = +5%) commits.
+    assert!(s.reset_breaker(), "reset reports a real reset");
     assert!(s
         .commit_feed_pq(&feed_at(&pubk, "STELL", p2, t0 + 4), t0 + 4)
         .is_err());
-    assert!(s.reset_breaker(), "reset reports a real reset");
+    assert!(s.breaker_tripped, "drifted price re-trips after reset");
+    assert!(s.reset_breaker());
     assert_eq!(
-        s.commit_feed_pq(&feed_at(&pubk, "STELL", p2, t0 + 4), t0 + 4)
+        s.commit_feed_pq(&feed_at(&pubk, "STELL", p1, t0 + 5), t0 + 5)
             .unwrap(),
-        p2
+        p1
     );
 }
 

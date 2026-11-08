@@ -1327,6 +1327,27 @@ fn oracle_digest<S: PreimageSink>(h: &mut S, o: &crate::oracle::OracleState) {
         put_u64(h, b"oracle_feed_timestamp", feed.timestamp);
         put_addr(h, b"oracle_feed_publisher", &feed.publisher);
     }
+
+    // Genesis-anchor domain, CONDITIONAL exactly like the session-key-registry
+    // precedent (`session_keys_digest`, called only when non-empty): while no
+    // anchor is set — every chain that never committed a feed through the
+    // latching path, i.e. every genesis KAT — this writes ZERO bytes, not
+    // even a length prefix, so empty-oracle chains digest byte-for-byte
+    // identically to before and `COMMITMENT_VERSION` stays put. APPENDED
+    // after every pre-existing oracle byte, so every already-committed
+    // preimage is a strict prefix of the new one. Inside the domain nothing
+    // is conditional: the `BTreeMap` walks in key order and the length is
+    // explicit, so two nodes with identical anchors hash identical bytes.
+    // The anchor decides whether the next commit latches the breaker (real
+    // coins pause), so it must move the root exactly like the feeds it guards.
+    if !o.anchor_price_micro_usd.is_empty() {
+        put_bytes(h, b"oracle_anchor_domain", b"ORACLE_ANCHOR_V1");
+        put_u64(h, b"oracle_anchors_len", o.anchor_price_micro_usd.len() as u64);
+        for (asset, price) in &o.anchor_price_micro_usd {
+            put_bytes(h, b"oracle_anchor_asset", asset.as_bytes());
+            put_u64(h, b"oracle_anchor_price", *price);
+        }
+    }
 }
 
 /// Session-key registry digest.

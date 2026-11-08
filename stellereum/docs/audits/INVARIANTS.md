@@ -21,7 +21,7 @@
 > | `PARTIAL` | the property is enforced on one path but not on every path that matters (the gap is named in the row) |
 > | `OPEN` | enforced in code but **not** pinned by any test we could find |
 
-**At a glance:** 80 numbered invariants — **78 PINNED**, **2 PARTIAL**
+**At a glance:** 81 numbered invariants — **79 PINNED**, **2 PARTIAL**
 (C-17, G-06) — plus a shortlist of **7 properties that are enforced in the
 code but not pinned by any test we could find** (§6, `U-01`…`U-07`). The
 groups are: C (consensus & BFT) 20, S (execution & state) 21, K
@@ -148,6 +148,7 @@ economics & bridges) 16.
 | G-14 | The mempool's packed cost equals its admission cost, and the fee floor is explicit and static (no hidden surcharge). | `src/mempool.rs` (packing cost) | `tests/mempool_mev_audit_closure_tests.rs:223` `f07_pack_cost_equals_admission_cost`; `:178` `f06_single_cost_formula_plain_and_activation`; `:267` `f11_floor_is_static_explicit_terms_only` | PINNED |
 | G-15 | A proposer cannot pay itself the rewards of another validator. | `src/runtime.rs` `apply_block_fees_rewards` | `tests/adversarial_regression_tests.rs:103` `adv_stranger_cannot_claim_anothers_rewards` | PINNED |
 | G-16 | A stranger cannot force a victim's unbond, rotate its key, or cancel its order: every such syscall is owner-only. | `src/svm.rs` syscalls | `tests/adversarial_regression_tests.rs:176` `adv_stranger_cannot_force_unbond`; `:230` `adv_stranger_cannot_rotate_anothers_key_but_owner_can`; `:340` `adv_stranger_cannot_cancel_anothers_order`; `tests/hunt_staking_theft.rs`; `tests/hunt_svm_steal.rs` | PINNED |
+| G-17 | Oracle cumulative drift latches: every `commit_feed_pq` candidate is deviation-checked against the per-asset **genesis anchor** (first committed price, never ratcheted — per-step caps ratchet the baseline forward, so a slow walk escapes them), and past `MAX_PRICE_DEVIATION_BPS` (10%, no new threshold) the breaker latches fail-closed and the feed commits nothing. The anchor map is a conditional commitment domain (zero bytes while empty, so empty-oracle chains stay byte-identical). NO height gate (N-01 precedent; coordinated binary upgrade covers rollout). | `src/oracle.rs:471` `anchor_price_micro_usd`; `src/oracle.rs:716` cumulative latch in `commit_feed_pq`; `src/commitment.rs:1343` anchor domain in `oracle_digest` | `tests/oracle_single_publisher_drift_tests.rs:284` `bgov_single_publisher_walk_drifts_past_ten_percent_without_latch` (same +5%×3 walk, latch now trips) | PINNED |
 
 ---
 

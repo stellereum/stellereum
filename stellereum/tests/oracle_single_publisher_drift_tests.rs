@@ -102,11 +102,22 @@ fn same_key_walk_is_capped_at_five_percent_per_step() {
         1_050_000,
         "refused feed commits nothing"
     );
-    // +500 bps over the new baseline (1_102_500): passes.
-    o.commit_feed_pq(&feed(&key_a(), 1_102_500, BLOCK_TIME - 5), BLOCK_TIME)
-        .expect("same-key +500bps must pass");
-    assert_eq!(committed_price(&o), 1_102_500);
-    assert!(!o.breaker_tripped);
+    // +500 bps over the new baseline (1_102_500): cumulative +10.25% vs the
+    // genesis anchor (1M) — the cumulative latch (audit O1 follow-up) trips
+    // instead of committing. The walk that used to escape now fails closed.
+    let err = o
+        .commit_feed_pq(&feed(&key_a(), 1_102_500, BLOCK_TIME - 5), BLOCK_TIME)
+        .expect_err("cumulative +10.25% must trip the latch");
+    assert!(
+        err.contains("cumulative"),
+        "trip must name the cumulative rule: {err}"
+    );
+    assert!(o.breaker_tripped, "cumulative trip latches");
+    assert_eq!(
+        committed_price(&o),
+        1_050_000,
+        "tripped feed commits nothing"
+    );
 }
 
 #[test]
@@ -140,11 +151,22 @@ fn key_rotation_keeps_the_ten_percent_rule() {
         .expect("rotated-key +6% must commit");
     assert_eq!(committed_price(&o), 1_060_000);
     assert!(!o.breaker_tripped);
-    // Exactly +10% across keys (bps == 1000, not > 1000): commits.
-    o.commit_feed_pq(&feed(&key_a(), 1_166_000, BLOCK_TIME - 5), BLOCK_TIME)
-        .expect("rotated-key +10% exactly must commit");
-    assert_eq!(committed_price(&o), 1_166_000);
-    assert!(!o.breaker_tripped);
+    // Exactly +10% across keys would previously commit — but cumulative
+    // +16.6% vs the genesis anchor (1M) trips the cumulative latch first.
+    // The walk that used to escape now fails closed.
+    let err = o
+        .commit_feed_pq(&feed(&key_a(), 1_166_000, BLOCK_TIME - 5), BLOCK_TIME)
+        .expect_err("cumulative +16.6% must trip the latch");
+    assert!(
+        err.contains("cumulative"),
+        "trip must name the cumulative rule: {err}"
+    );
+    assert!(o.breaker_tripped, "cumulative trip latches");
+    assert_eq!(
+        committed_price(&o),
+        1_060_000,
+        "tripped feed commits nothing"
+    );
 }
 
 // ===========================================================================
@@ -281,28 +303,42 @@ async fn same_key_six_percent_feed_fails_open_breaker() {
 // ===========================================================================
 
 #[test]
-fn bgov_single_publisher_walk_drifts_past_ten_percent_without_latch() {
+fn bgov_single_publisher_walk_trips_the_cumulative_latch() {
     let mut o = state_with_publishers();
     o.commit_feed_pq(&feed(&key_a(), 1_000_000, BLOCK_TIME - 30), BLOCK_TIME)
         .expect("genesis baseline commits");
-    // Three exact +5% same-key steps: each is == 500bps, not > 500, so each
-    // passes the per-publisher cap; each is < 1000bps so none latches.
-    for (price, ts) in [
-        (1_050_000u64, BLOCK_TIME - 20),
-        (1_102_500u64, BLOCK_TIME - 10),
-        (1_157_625u64, BLOCK_TIME - 5),
-    ] {
-        o.commit_feed_pq(&feed(&key_a(), price, ts), BLOCK_TIME)
-            .unwrap_or_else(|e| panic!("same-key +5% step to {price} must commit on current code: {e}"));
-    }
-    let cumulative = deviation_bps(committed_price(&o), 1_000_000);
+    // Same +5% x 3 walk, NEW verdict: the cumulative latch trips.
+    // Step 1 (+5%, cumulative 500bps <= 10%) still commits.
+    o.commit_feed_pq(&feed(&key_a(), 1_050_000, BLOCK_TIME - 20), BLOCK_TIME)
+        .expect("first +5% step must commit: cumulative 500bps is within 10%");
+    assert!(!o.breaker_tripped);
+    // Step 2 (+5% per-step, but cumulative +10.25% vs the genesis anchor):
+    // the per-publisher cap passes it, the cumulative latch trips it.
+    let err = o
+        .commit_feed_pq(&feed(&key_a(), 1_102_500, BLOCK_TIME - 10), BLOCK_TIME)
+        .expect_err("second +5% step must trip the cumulative latch");
     assert!(
-        cumulative > MAX_PRICE_DEVIATION_BPS,
-        "test bug: three +5% steps must drift >10% cumulatively, got {cumulative}bps"
+        err.contains("cumulative"),
+        "trip must name the cumulative rule: {err}"
     );
     assert!(
         o.breaker_tripped,
-        "B-GOV/O1 REAL: single key walked +15.8% (1M -> {}) with NO latch",
-        committed_price(&o)
+        "cumulative +10.25% (1M -> 1_102_500 candidate) must latch the breaker"
     );
+    assert_eq!(
+        committed_price(&o),
+        1_050_000,
+        "tripped feed commits nothing"
+    );
+    // Sanity: the refused candidate really was past 10% cumulatively.
+    let cumulative = deviation_bps(1_102_500u64, 1_000_000);
+    assert!(
+        cumulative > MAX_PRICE_DEVIATION_BPS,
+        "test bug: the walk must drift >10% cumulatively, got {cumulative}bps"
+    );
+    // Latched: the third step of the same walk is refused until governance resets.
+    assert!(o
+        .commit_feed_pq(&feed(&key_a(), 1_157_625, BLOCK_TIME - 5), BLOCK_TIME)
+        .is_err());
+    assert!(o.reset_breaker());
 }

@@ -205,6 +205,49 @@ async fn ed_feed_in_a_block_is_refused_fail_closed() {
     );
 }
 
+/// The PQ twin: a block carrying `SysCallSubmitPqPriceFeed` (Falcon-signed
+/// `PqPriceFeedUpdate`) commits the price through the SVM handler. This is
+/// the live oracle path — the Ed arm above is fail-closed dead, so without
+/// this opcode no feed could commit on chain at all.
+#[tokio::test]
+async fn pq_feed_in_a_block_commits_via_opcode() {
+    let e = wired_engine().await;
+    let before = e.get_state_root().await;
+    let feed = PqPriceFeedUpdate::sign("STELL", 250_000, BLOCK_TIME - 10, &publisher_kp());
+    assert!(feed.verify(), "precondition: PQ feed verifies");
+    let tx = pq_tx(
+        &sender_kp(),
+        vec![OpCode::SysCallSubmitPqPriceFeed(Box::new(feed))],
+        0,
+    );
+    let (applied, failed, _fees, status, _) = e
+        .apply_block_parallel_fees(std::slice::from_ref(&tx), BLOCK_TIME)
+        .await;
+    assert_eq!(
+        (applied, failed),
+        (1, 0),
+        "a valid PQ feed must apply as part of a block"
+    );
+    assert_eq!(status, vec![true]);
+    assert_ne!(
+        before,
+        e.get_state_root().await,
+        "a committed PQ feed must move the state root"
+    );
+    let committed = e
+        .oracle_read()
+        .await
+        .feeds
+        .get("STELL")
+        .cloned()
+        .expect("PQ feed committed via opcode");
+    assert_eq!(committed.price_micro_usd, 250_000);
+    assert!(
+        !e.oracle_read().await.breaker_tripped,
+        "an in-cap PQ feed latches nothing"
+    );
+}
+
 #[tokio::test]
 async fn gossip_without_a_block_does_not_move_the_root() {
     let e = wired_engine().await;

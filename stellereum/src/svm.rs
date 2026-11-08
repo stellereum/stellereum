@@ -117,6 +117,12 @@ pub const MAX_MATCH_LEVELS: usize = 64;
 /// map writes. Priced like the other signature-shaped syscalls so a feed flood
 /// cannot be cheaper than the block space it burns.
 pub const GAS_SUBMIT_PRICE_FEED: u64 = 1_500;
+/// Gas to commit a Falcon-signed PQ price feed: same map writes as the
+/// classical arm plus one Falcon-512 verify. Parity price with
+/// `GAS_SUBMIT_PRICE_FEED` (same logical op, same block space) — the PQ
+/// verify cost is absorbed, not itemized, so fee estimation stays stable
+/// across the scheme migration.
+pub const GAS_SUBMIT_PQ_PRICE_FEED: u64 = 1_500;
 /// Gas to run a PMM buy: the bonding-curve solve plus a wUSDT burn.
 pub const GAS_PMM_BUY: u64 = 1_800;
 /// Gas to run a PMM sell: the curve solve plus a wUSDT mint (the mirror of a
@@ -369,6 +375,7 @@ pub fn opcode_gas(op: &OpCode) -> u64 {
         OpCode::SysCallClaimDelegatorRewards { .. } => GAS_STAKE_CLAIM,
         OpCode::SysCallWithdrawSelfBond { .. } => GAS_STAKE_UNBOND,
         OpCode::SysCallSubmitPriceFeed(_) => GAS_SUBMIT_PRICE_FEED,
+        OpCode::SysCallSubmitPqPriceFeed(_) => GAS_SUBMIT_PQ_PRICE_FEED,
         OpCode::SysCallRevokeSession { .. } => GAS_SESSION_REVOKE,
         OpCode::SysCallPmmBuy { .. } => GAS_PMM_BUY,
         OpCode::SysCallPmmSell { .. } => GAS_PMM_SELL,
@@ -1061,6 +1068,13 @@ pub enum OpCode {
         choice: crate::governance::VoteChoice,
         height_observed: u64,
     },
+    // APPEND, never insert above: same bincode-discriminant rule (see the
+    // comment on `SysCallGovVote`). PQ price-feed submission: the wrapping
+    // transaction is PQ-enveloped (admission), the FEED ITSELF is Falcon
+    // (see `PqPriceFeedUpdate::verify`). The classical
+    // `SysCallSubmitPriceFeed` arm stays as the fail-closed refusal path —
+    // its `verify()` is hardcoded false, so no valid Ed feed exists.
+    SysCallSubmitPqPriceFeed(Box<crate::oracle::PqPriceFeedUpdate>),
 }
 
 /// One actor send the VM accepted, handed to the ENGINE through
@@ -2321,6 +2335,26 @@ impl Svm {
                         Ok(price) => state.stack.push(price),
                         Err(e) => {
                             return VmExecutionResult::Reverted(format!("price feed rejected: {e}"))
+                        }
+                    }
+                }
+                OpCode::SysCallSubmitPqPriceFeed(feed) => {
+                    charge!(GAS_SUBMIT_PQ_PRICE_FEED);
+                    // PQ price-feed submission (audit: the Ed arm above is
+                    // fail-closed dead — `PriceFeedUpdate::verify()` is
+                    // hardcoded false — so without this arm NO feed could
+                    // commit live). Same determinism contract: block
+                    // timestamp only, shared checks with the read path via
+                    // `commit_feed_pq`, whole-tx revert on rejection.
+                    let Some(oracle) = ctx.oracle.as_deref_mut() else {
+                        return VmExecutionResult::Reverted(
+                            "oracle state not available".to_string(),
+                        );
+                    };
+                    match oracle.commit_feed_pq(feed, ctx.timestamp) {
+                        Ok(price) => state.stack.push(price),
+                        Err(e) => {
+                            return VmExecutionResult::Reverted(format!("pq price feed rejected: {e}"))
                         }
                     }
                 }

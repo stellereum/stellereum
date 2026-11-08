@@ -807,8 +807,16 @@ impl OracleState {
     /// `GovAction::ResetOracleBreaker` may call this. Returns whether the
     /// breaker was latched, so "reset an already-clear breaker" is a no-op the
     /// caller (and the committed proposal) can tell apart from a real reset.
+    /// Governance reset: clears the latch AND the cumulative anchors,
+    /// returning the oracle to a genesis-like state — the next committed
+    /// feed re-anchors. Without anchor reset a legitimate regime change
+    /// (>10% from an ancient anchor) would brick the oracle forever; with
+    /// it, recovery is an explicit governance act (quorum + timelock), not
+    /// a silent ratchet an attacker can ride.
     pub fn reset_breaker(&mut self) -> bool {
-        std::mem::replace(&mut self.breaker_tripped, false)
+        let was = std::mem::replace(&mut self.breaker_tripped, false);
+        self.anchor_price_micro_usd.clear();
+        was
     }
 
     /// Freshness of the COMMITTED feed for `asset` against the BLOCK

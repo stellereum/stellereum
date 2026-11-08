@@ -90,17 +90,27 @@ fn o1_per_step_drift_cap_holds_and_resets_only_via_governance() {
         .is_err());
     assert!(s.breaker_tripped, "still latched");
     assert_eq!(s.feeds.get("STELL").unwrap().price_micro_usd, p1);
-    // Governance reset clears the latch but NOT the anchor: re-committing
-    // the drifted p2 re-trips, while a price back within 10% of the anchor
-    // (p1 = +5%) commits.
+    // Governance reset clears the latch AND the anchor (genesis-like
+    // state): the drifted p2 commits and re-anchors at p2 — recovery from
+    // a legitimate regime change is an explicit governance act.
     assert!(s.reset_breaker(), "reset reports a real reset");
+    assert_eq!(
+        s.commit_feed_pq(&feed_at(&pubk, "STELL", p2, t0 + 4), t0 + 4)
+            .unwrap(),
+        p2
+    );
+    assert!(!s.breaker_tripped);
+    // The new anchor holds from here: +11% over p2 trips again.
+    let p3 = p2 + p2 * 11 / 100;
     assert!(s
-        .commit_feed_pq(&feed_at(&pubk, "STELL", p2, t0 + 4), t0 + 4)
+        .commit_feed_pq(&feed_at(&pubk, "STELL", p3, t0 + 5), t0 + 5)
         .is_err());
-    assert!(s.breaker_tripped, "drifted price re-trips after reset");
+    assert!(s.breaker_tripped, "walk past the new anchor trips again");
+    // And a price back within 10% of the new anchor still commits
+    // once reset (no brick-forever).
     assert!(s.reset_breaker());
     assert_eq!(
-        s.commit_feed_pq(&feed_at(&pubk, "STELL", p1, t0 + 5), t0 + 5)
+        s.commit_feed_pq(&feed_at(&pubk, "STELL", p1, t0 + 6), t0 + 6)
             .unwrap(),
         p1
     );
